@@ -32,6 +32,7 @@ import { getTaxRates } from '@/app/actions/settings'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getCrossConnectorOrphanSummary, getFailedAccountingSyncSummary } from '@/app/actions/accounting-sync'
+import { getStrandedAccountingSyncRows } from '@/app/actions/accounting-settlement'
 import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-status'
 import { SyncDashboard } from './sync-dashboard'
 import { ConnectorOrphanBanner } from './connector-orphan-banner'
@@ -98,6 +99,9 @@ export default async function SyncPage() {
 
   // audit-H4: surface accounting sync rows stranded by a connector switch.
   const orphanSummary = await getCrossConnectorOrphanSummary().catch(() => null)
+  // o3d-osl8: the rows BEHIND that count, with identifying detail. Deliberately NOT scoped to
+  // the active connector — a row stranded on a retired one appears in no other view.
+  const strandedRows = await getStrandedAccountingSyncRows(50).catch(() => [])
   // audit-6vq0: surface accounting sync rows that exhausted retries (FAILED).
   const failedSyncSummary = await getFailedAccountingSyncSummary().catch(() => null)
   // 0jls5: surface IMS tax rates that have drifted from the live Xero definition.
@@ -120,7 +124,7 @@ export default async function SyncPage() {
         </Link>
       </div>
       {exceptionSummary && <ExceptionsBanner summary={exceptionSummary} />}
-      {orphanSummary && <ConnectorOrphanBanner summary={orphanSummary} />}
+      {orphanSummary && <ConnectorOrphanBanner summary={orphanSummary} stranded={strandedRows} />}
       {failedSyncSummary && <FailedSyncBanner summary={failedSyncSummary} />}
       {taxRateDrift && <TaxRateDriftBanner drift={taxRateDrift} />}
       <SyncDashboard

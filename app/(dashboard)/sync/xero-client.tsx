@@ -40,6 +40,7 @@ import {
   isFieldAvailableForConnector,
   settingKeyFor,
 } from './accounting-settings-fields'
+import { SettleSyncRowControl } from './settle-sync-row-control'
 import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
@@ -72,6 +73,8 @@ const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline
   PROCESSING: { variant: 'secondary', label: 'Processing' },
   SYNCED: { variant: 'default', label: 'Synced' },
   FAILED: { variant: 'destructive', label: 'Failed' },
+  // o3d-nf9i: a settled-as-NOT-POSTED row lands here, as do orphan-sweep retirements (audit-46ry).
+  CANCELLED: { variant: 'outline', label: 'Cancelled' },
 }
 
 // ---------------------------------------------------------------------------
@@ -1003,18 +1006,37 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                             {log.errorMessage ?? '—'}
                           </TableCell>
                           <TableCell>
-                            {log.status === 'FAILED' && (
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-7 w-7 p-0"
-                                title="Retry this entry"
-                                onClick={() => handleRetryOne(log.id)}
-                                disabled={retryingId === log.id}
-                              >
-                                {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
-                              </Button>
-                            )}
+                            <div className="flex items-center">
+                              {log.status === 'FAILED' && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 w-7 p-0"
+                                  title="Retry this entry"
+                                  onClick={() => handleRetryOne(log.id)}
+                                  disabled={retryingId === log.id}
+                                >
+                                  {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+                                </Button>
+                              )}
+                              {/*
+                                o3d-nf9i + o3d-osl8: settlement sits alongside Retry, not instead of it, and
+                                covers PROCESSING too. Retry re-attempts work the system already decided to
+                                do; settlement records a fact only a human can establish — and for the two
+                                stranded histories (a FAILED row that must NOT be retried, a PROCESSING claim
+                                on a retired connector) it is the ONLY way out.
+                              */}
+                              {(log.status === 'FAILED' || log.status === 'PROCESSING') && (
+                                <SettleSyncRowControl
+                                  syncLogId={log.id}
+                                  status={log.status}
+                                  type={log.type}
+                                  referenceType={log.referenceType}
+                                  referenceId={log.referenceId}
+                                  onSettled={() => router.refresh()}
+                                />
+                              )}
+                            </div>
                           </TableCell>
                         </TableRow>
                       )

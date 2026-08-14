@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { auth } from '@/lib/auth'
 import { cache } from 'react'
-import type { ActivityEntityType, ActivityLogLevel } from '@/app/generated/prisma/client'
+import type { ActivityEntityType, ActivityLogLevel, Prisma } from '@/app/generated/prisma/client'
 
 type LogParams = {
   entityType: ActivityEntityType
@@ -81,4 +81,46 @@ export async function logActivity(params: LogParams) {
     // Never let logging break the caller
     console.error('[activity-log] Failed to write:', e)
   }
+}
+
+/** The subset of a Prisma transaction client this module needs. */
+type ActivityLogTransactionClient = Pick<Prisma.TransactionClient, 'activityLog'>
+
+type TransactionalLogParams = Omit<LogParams, 'resolveUser'> & { userId: string | null }
+
+/**
+ * o3d-nf9i — a DURABLE activity-log write, inside the caller's transaction.
+ *
+ * logActivity() above deliberately swallows its own failures so that logging can never break
+ * the work it describes. That is the right default for the hundreds of informational writes in
+ * this codebase, and the wrong one for an OPERATOR ASSERTION: when a human is the only source
+ * of the fact that changed a ledger-affecting status, the record of who asserted what is not
+ * decoration, it is the evidence. Best-effort would let the status change commit with the
+ * assertion silently unrecorded, and nothing would ever surface the gap.
+ *
+ * So this variant (a) takes the caller's transaction client, so the audit row and the status
+ * change commit or roll back together, and (b) does NOT catch — a failed audit aborts the
+ * transaction and the status change with it.
+ *
+ * Identical redaction/sanitisation to logActivity: same redactActivityLogText on the
+ * description, same recursive sanitizeActivityLogMetadata on the metadata. `userId` is
+ * REQUIRED (pass null explicitly) because the session lookup logActivity falls back on is a
+ * React `cache()` read that has no place inside a database transaction.
+ */
+export async function logActivityInTransaction(
+  client: ActivityLogTransactionClient,
+  params: TransactionalLogParams,
+): Promise<void> {
+  await client.activityLog.create({
+    data: {
+      userId: params.userId,
+      entityType: params.entityType,
+      entityId: params.entityId ?? null,
+      action: params.action,
+      tag: params.tag,
+      level: params.level ?? 'INFO',
+      description: redactActivityLogText(params.description),
+      metadata: params.metadata ? JSON.parse(JSON.stringify(sanitizeActivityLogMetadata(params.metadata))) : undefined,
+    },
+  })
 }
