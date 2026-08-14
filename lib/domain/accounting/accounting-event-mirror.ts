@@ -149,6 +149,31 @@ export function isMirrorableAccountingSyncType(type: string): type is MirroredAc
   return MIRRORED_TYPES.has(type)
 }
 
+/**
+ * EVERY idempotency key `updateMirroredAccountingEventStatus` would try for these params, in the
+ * order it tries them: the primary key (which prefers the payload's `_idempotencyKey`, then the
+ * sync-log id) and the legacy, syncLogId-less key it falls back to when the primary matches no
+ * event. Empty for a non-mirrorable type — nothing is mirrored, so nothing can be touched.
+ *
+ * Exported because mirror identity is LOGICAL: two attempts at the same document share a key,
+ * so a caller that is about to terminalise a mirror needs to know whether the event it is about
+ * to write actually belongs to the row it is settling (o3d-nf9i / findMirrorOwnershipConflict).
+ * Both key forms count: the payload branch is shared by construction, and the legacy
+ * `<connector>:<type>:<ref>:<date>` form is shared by every attempt on the same day.
+ */
+export function mirroredAccountingEventIdempotencyKeys(params: {
+  syncLogId?: string
+  connector: string
+  type: string
+  referenceType: string
+  referenceId: string
+  payload: unknown
+}): string[] {
+  const primary = buildMirroredAccountingEventIdempotencyKey(params)
+  const legacy = buildMirroredAccountingEventIdempotencyKey({ ...params, syncLogId: undefined })
+  return [...new Set([primary, legacy].filter((key): key is string => typeof key === 'string' && key.length > 0))]
+}
+
 function isMirrorableJournalAccountingSyncType(type: string): type is MirroredJournalAccountingSyncType {
   return MIRRORED_JOURNAL_TYPES.has(type)
 }

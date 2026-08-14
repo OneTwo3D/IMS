@@ -41,6 +41,7 @@ import {
   settingKeyFor,
 } from './accounting-settings-fields'
 import { SettleSyncRowControl } from './settle-sync-row-control'
+import { isSettleableAccountingSyncType } from '@/lib/domain/accounting/sync-row-settlement'
 import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
@@ -1020,13 +1021,22 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                                 </Button>
                               )}
                               {/*
-                                o3d-nf9i + o3d-osl8: settlement sits alongside Retry, not instead of it, and
-                                covers PROCESSING too. Retry re-attempts work the system already decided to
-                                do; settlement records a fact only a human can establish — and for the two
-                                stranded histories (a FAILED row that must NOT be retried, a PROCESSING claim
-                                on a retired connector) it is the ONLY way out.
+                                o3d-nf9i: settlement sits alongside Retry, not instead of it. Retry
+                                re-attempts work the system already decided to do; settlement records a fact
+                                only a human can establish — and for a FAILED row that must NOT be retried
+                                (a part-payment where one of two genuine payments failed) it is the ONLY way
+                                out.
+
+                                FAILED ONLY. A PROCESSING row is deliberately not offered: its claim may
+                                still be in flight, and a CAS on the status fences the ROW, not the CLAIM, so
+                                nothing can prove the call finished or that this is the same attempt. That
+                                needs a claim generation the connectors' writeback also CASes on (o3d-osl8).
+
+                                DAILY_BATCH_* is excluded too: a batch row is keyed by the batch, not by one
+                                order, and CANCELLED reads as "never posted" to BOTH the batch recreators and
+                                the order delete guard.
                               */}
-                              {(log.status === 'FAILED' || log.status === 'PROCESSING') && (
+                              {log.status === 'FAILED' && isSettleableAccountingSyncType(log.type) && (
                                 <SettleSyncRowControl
                                   syncLogId={log.id}
                                   status={log.status}

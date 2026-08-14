@@ -131,9 +131,18 @@ export function ConnectorOrphanBanner({
                         <td className="pr-3 py-0.5">{row.status}</td>
                         <td className="pr-3 py-0.5">{row.ageDays}d</td>
                         <td className="py-0.5">
-                          {/* PENDING rows are listed for completeness but bulk-cancel is their remedy — nothing
-                              was sent, so there is nothing for an operator to assert (o3d-nf9i). */}
-                          {row.settleable && (
+                          {/*
+                            Only FAILED, non-daily-batch rows can be settled. The others are still LISTED —
+                            being visible is the whole of o3d-osl8 item 1 and does not depend on being
+                            fixable from here — but they carry the reason instead of a control:
+                              PENDING     nothing was sent, so there is nothing to assert; the sweeps own it.
+                              PROCESSING  the claim may still be in flight and nothing can prove otherwise
+                                          until it carries a generation (o3d-osl8).
+                              DAILY_BATCH cancelling one races the batch recreator against the delete guard.
+                            An omitted control with no explanation reads as "this row is fine", which is the
+                            opposite of true.
+                          */}
+                          {row.settleable ? (
                             <SettleSyncRowControl
                               syncLogId={row.id}
                               status={row.status}
@@ -142,6 +151,10 @@ export function ConnectorOrphanBanner({
                               referenceId={row.referenceId}
                               onSettled={() => router.refresh()}
                             />
+                          ) : (
+                            <span className="cursor-help opacity-60" title={row.notSettleableReason ?? ''}>
+                              not settleable
+                            </span>
                           )}
                         </td>
                       </tr>

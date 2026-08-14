@@ -68,17 +68,29 @@ export function SettleSyncRowControl({
       ? { observedStatus: status, outcome: 'POSTED' as const, externalTransactionId: externalId.trim() }
       : { observedStatus: status, outcome: 'NOT_POSTED' as const, reason: reason.trim() }
     const run = () => settleAccountingSyncRow(syncLogId, input) as Promise<MaybeFreshAuthFailure & { success: boolean; error?: string }>
-    let result = await run()
-    // requireFreshPermission('sync'): a ledger-affecting assertion needs a recently re-verified
-    // session, so a stale one is re-authed in place and the action retried ONCE.
-    if (isFreshAuthFailure(result) && (await promptReauth())) result = await run()
-    setBusy(false)
-    if (result.success) {
-      setOpen(false)
-      reset()
-      onSettled()
-    } else {
-      setError(result.error ?? 'Could not settle this row.')
+    // `finally`, not a plain `setBusy(false)` on the happy path. The action can REJECT rather
+    // than return a result — a server-side throw arrives here as a rejected promise — and
+    // without this the dialog would sit spinning forever with both buttons disabled and no
+    // explanation, which is precisely how the unhandled P2002 on the POSTED branch used to
+    // present. The action now translates that collision into a result, but the client must not
+    // depend on the server having thought of every throw.
+    try {
+      let result = await run()
+      // requireFreshPermission('sync'): a ledger-affecting assertion needs a recently re-verified
+      // session, so a stale one is re-authed in place and the action retried ONCE.
+      if (isFreshAuthFailure(result) && (await promptReauth())) result = await run()
+      if (result.success) {
+        setOpen(false)
+        reset()
+        onSettled()
+      } else {
+        setError(result.error ?? 'Could not settle this row.')
+      }
+    } catch {
+      // Deliberately does NOT promise nothing happened: an unexpected throw cannot tell us that.
+      setError('The server did not return a result for this settlement. Reload and check the row before trying again.')
+    } finally {
+      setBusy(false)
     }
   }
 
