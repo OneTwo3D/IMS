@@ -287,3 +287,136 @@ test('o3d-i4qd: a multi-component KIT missing ONE component is outstanding', asy
   assert.deepEqual(needing.map((o) => o.id), ['SO-KIT2'], 'a component with no rows at all must still be seen')
   expandRequirements = (productId: string) => new Map([[productId, 1]])
 })
+
+// --- o3d-i4qd, Codex adversarial review -------------------------------------------------
+//
+// The five cases above are guards: they document intent and they pin the KIT-unit division that
+// caused the forever-outstanding loop. Three of them, though, also pass with the production change
+// reverted, and the split fixture has no actual per-row rounding deficit (0.1110 + 0.1110 IS the
+// rounded aggregate 0.2220). The cases below are the mutation-sensitive ones: each FAILS with the
+// specific production change it guards reverted, and each is about the SPLIT ALLOWANCE, the
+// DECIMAL rounding rule, or the FAIL-CLOSED factor guard rather than about the scale alignment.
+
+/** One kit's worth of a factor that rounds DOWN per row but UP in aggregate. */
+const DRIFTING_FACTOR = 0.11104
+
+test('o3d-i4qd: a split line drifting a full ULP is RE-SELECTED, not declared covered', async () => {
+  const select = await load()
+  resetRefunds()
+  // The accepted trade-off. Two warehouses, one kit each: the writer stores round(0.11104, 4) =
+  // 0.1110 per row (0.2220 total), while the requirement for the 2-kit line is
+  // round(0.22208, 4) = 0.2221. Nothing is actually missing — the deficit is pure independent
+  // per-row rounding — but the allowance is capped at half an ULP, so the line is re-selected.
+  // Wasted work is the SAFE direction; the alternative (an allowance wide enough to absorb a
+  // full ULP) is the bug in the next test. Closing this needs per-warehouse expected quantities,
+  // i.e. the writer half of o3d-i4qd.
+  expandRequirements = () => new Map([['component-1', DRIFTING_FACTOR]])
+  allocRows = [
+    { orderId: 'SO-DRIFT', lineId: 'SO-DRIFT-l1', productId: 'component-1', qty: 0.111 },
+    { orderId: 'SO-DRIFT', lineId: 'SO-DRIFT-l1', productId: 'component-1', qty: 0.111 },
+  ]
+  const needing = await select([{ id: 'SO-DRIFT', lines: [{ id: 'SO-DRIFT-l1', qty: 2, productId: 'kit-1' }] }])
+  assert.deepEqual(
+    needing.map((o) => o.id),
+    ['SO-DRIFT'],
+    'an allowance that can absorb a full ULP would clear this — and would clear a real shortfall too',
+  )
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
+})
+
+test('o3d-i4qd: two rows one ULP SHORT of the requirement stay outstanding', async () => {
+  const select = await load()
+  resetRefunds()
+  // Same 2-kit nested requirement as the split guard above (required 0.2220), but the second
+  // warehouse row is 0.1109 — genuinely one ULP short. Every persisted qty and the quantized
+  // requirement are multiples of 1e-4, so ONE ULP is the smallest real shortfall the column can
+  // express: an allowance able to reach 1e-4 hides a real one. The old (rows + 1) x half-ULP
+  // budget was 1.51e-4 at two rows and did exactly that.
+  const candidate = kitOrder('SO-SHORT', 2)
+  allocRows = [
+    { orderId: 'SO-SHORT', lineId: 'SO-SHORT-l1', productId: 'component-1', qty: NESTED_PERSISTED },
+    { orderId: 'SO-SHORT', lineId: 'SO-SHORT-l1', productId: 'component-1', qty: 0.1109 },
+  ]
+  const needing = await select([candidate])
+  assert.deepEqual(needing.map((o) => o.id), ['SO-SHORT'])
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
+})
+
+test('o3d-i4qd: a whole kit missing across two warehouses at factor 1e-4 is outstanding', async () => {
+  const select = await load()
+  resetRefunds()
+  // Codex's counterexample for the growing split allowance. Factor 0.0001, three kits ordered =>
+  // required 0.0003. Two warehouses hold 0.0001 each: 0.0002 persisted, ONE KIT GENUINELY
+  // UNALLOCATED. The old allowance of 1.51e-4 declared it covered, so the missing kit would never
+  // be allocated and never be reported.
+  expandRequirements = () => new Map([['component-1', 0.0001]])
+  allocRows = [
+    { orderId: 'SO-TINY', lineId: 'SO-TINY-l1', productId: 'component-1', qty: 0.0001 },
+    { orderId: 'SO-TINY', lineId: 'SO-TINY-l1', productId: 'component-1', qty: 0.0001 },
+  ]
+  const needing = await select([{ id: 'SO-TINY', lines: [{ id: 'SO-TINY-l1', qty: 3, productId: 'kit-1' }] }])
+  assert.deepEqual(needing.map((o) => o.id), ['SO-TINY'], 'the split allowance must never hide a whole unit')
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
+})
+
+test('o3d-i4qd: an exact half quantizes the way the DATABASE rounds it, not the way a double does', async () => {
+  const select = await load()
+  resetRefunds()
+  // Net demand 0.0003 at factor 0.5 is exactly 0.00015. Postgres rounds Decimal(12,4) HALF-UP and
+  // stores 0.0002, so a row holding 0.0001 is one ULP short and the line is outstanding.
+  // `Math.round(0.00015 * 1e4) / 1e4` disagrees: the scaled product of the binary doubles is
+  // 1.4999999999999998, which rounds DOWN to 0.0001 and declares the short row sufficient.
+  expandRequirements = () => new Map([['component-1', 0.5]])
+  const candidate = { id: 'SO-HALF', lines: [{ id: 'SO-HALF-l1', qty: 0.0003, productId: 'kit-1' }] }
+
+  allocRows = [{ orderId: 'SO-HALF', lineId: 'SO-HALF-l1', productId: 'component-1', qty: 0.0001 }]
+  assert.deepEqual(
+    (await select([candidate])).map((o) => o.id),
+    ['SO-HALF'],
+    '0.0001 does not cover a requirement the writer would store as 0.0002',
+  )
+
+  allocRows = [{ orderId: 'SO-HALF', lineId: 'SO-HALF-l1', productId: 'component-1', qty: 0.0002 }]
+  assert.deepEqual(
+    (await select([candidate])).map((o) => o.id),
+    [],
+    'and what the writer WOULD store must read as covered, or the line is outstanding forever',
+  )
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
+})
+
+// ProductComponent.qty has no positivity constraint in the schema, so a zero or negative component
+// qty reaches the comparison as an unusable factor. It must make the line OUTSTANDING (what
+// calculateDecimalFulfillmentCoverage did by scoring 0), never skip the requirement — skipping is
+// fail OPEN and drops a line with positive demand out of the sweep entirely.
+for (const [label, factor] of [['zero', 0], ['negative', -2]] as const) {
+  test(`o3d-i4qd: a ${label} component factor makes the line outstanding (fail closed)`, async () => {
+    const select = await load()
+    resetRefunds()
+    expandRequirements = () => new Map([['component-1', factor]])
+    // Allocated far beyond any plausible requirement: only the guard can decide this case.
+    allocRows = [{ orderId: 'SO-BAD', lineId: 'SO-BAD-l1', productId: 'component-1', qty: 500 }]
+    const needing = await select([{ id: 'SO-BAD', lines: [{ id: 'SO-BAD-l1', qty: 1, productId: 'kit-1' }] }])
+    assert.deepEqual(
+      needing.map((o) => o.id),
+      ['SO-BAD'],
+      'an unusable factor is a data defect to keep visible, not a reason to declare the line covered',
+    )
+    expandRequirements = (productId: string) => new Map([[productId, 1]])
+  })
+}
+
+test('o3d-i4qd: a non-finite component factor never reads as covered', async () => {
+  const select = await load()
+  resetRefunds()
+  // NaN cannot survive the shared Decimal conversion (`toDecimal` throws on a non-finite input),
+  // so it never reaches the comparison at all — it fails LOUDLY instead of quietly. Either way the
+  // one outcome that must be impossible is an empty result, i.e. "nothing needs allocation".
+  expandRequirements = () => new Map([['component-1', Number.NaN]])
+  allocRows = [{ orderId: 'SO-NAN', lineId: 'SO-NAN-l1', productId: 'component-1', qty: 500 }]
+  const outcome = await select([{ id: 'SO-NAN', lines: [{ id: 'SO-NAN-l1', qty: 1, productId: 'kit-1' }] }])
+    .then((orders) => orders.map((o) => o.id))
+    .catch((error: unknown) => `rejected: ${(error as Error).message}`)
+  assert.notDeepEqual(outcome, [], 'a NaN factor must never silently clear an order')
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
+})
