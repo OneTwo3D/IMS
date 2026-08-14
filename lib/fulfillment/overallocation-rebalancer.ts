@@ -160,7 +160,9 @@ export async function releaseOverallocations(
             if (journaled) { pending.skipped += 1; continue }
             await tx.salesOrder.update({
               where: { id: alloc.orderId },
-              data: { inventoryAllocatedDate: null, allocationBatchAmount: null },
+              // o3d-0qoo: the A2 batch ref is cleared with its stamp in the same update — see the
+              // note at the REFUNDED un-stage in refund-service.ts for why the pair must move together.
+              data: { inventoryAllocatedDate: null, inventoryAllocatedBatchRef: null, allocationBatchAmount: null },
             })
             await tx.orderAllocation.updateMany({
               where: { orderId: alloc.orderId },

@@ -32,6 +32,11 @@ type Order = {
   unearnedRevenueAmount: number | null
   inventoryAllocatedDate: Date | null
   allocationBatchAmount: number | null
+  // o3d-0qoo: the exact AccountingSyncLog.referenceId each stamp was staged into. Optional
+  // here only so the many fixtures that never stage a batch stay unchanged; the un-stage
+  // path must null them alongside the stamps they pair with.
+  revenueDeferredBatchRef?: string | null
+  inventoryAllocatedBatchRef?: string | null
 }
 
 type LineTaxRate = { accountingTaxType: string | null; reverseCharge: boolean | null }
@@ -1833,8 +1838,10 @@ test('createSalesOrderRefund clears accounting deferral dates for full refunds',
       fxRateToBase: 1,
       totalBase: 100,
       revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      revenueDeferredBatchRef: 'A1-2026-01-01-deadbeef',
       unearnedRevenueAmount: 100,
       inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      inventoryAllocatedBatchRef: 'A2-2026-01-01-cafef00d',
       allocationBatchAmount: 20,
     }],
     shipments: [{
@@ -1866,6 +1873,11 @@ test('createSalesOrderRefund clears accounting deferral dates for full refunds',
   assert.equal(state.orders[0].refundStatus, 'FULL')
   assert.equal(state.orders[0].revenueDeferredDate, null)
   assert.equal(state.orders[0].inventoryAllocatedDate, null)
+  // o3d-0qoo: each batch ref must be nulled in the SAME update as the stamp it pairs with.
+  // A surviving ref with a cleared stamp still matches the delete guard's referenceId lookup,
+  // so the order would be blocked forever on a batch it is no longer part of.
+  assert.equal(state.orders[0].revenueDeferredBatchRef, null, 'A1 batch ref must be cleared with revenueDeferredDate')
+  assert.equal(state.orders[0].inventoryAllocatedBatchRef, null, 'A2 batch ref must be cleared with inventoryAllocatedDate')
   assert.deepEqual(state.refunds[0].accountingRetrySyncs, result.success ? result.accountingSyncs : [])
 })
 

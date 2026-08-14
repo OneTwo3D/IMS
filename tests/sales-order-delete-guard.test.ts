@@ -66,7 +66,11 @@ function matches(row: SyncLogRow, where: WhereNode): boolean {
 
 function makeTx(seed: {
   pushLink?: { state: string; externalOrderId: string | null; externalOrderNumber: string | null } | null
-  shipments?: string[]
+  /**
+   * Shipment ids, or full rows when the test cares about Group B staging (o3d-0qoo).
+   * A bare id means "never journalled", which is what every pre-existing test assumes.
+   */
+  shipments?: Array<string | { id: string; shipmentJournalDate?: Date | null; shipmentJournalBatchRef?: string | null }>
   syncLogs?: SyncLogRow[]
   /** Durable external-document markers on the order itself — these survive log retention. */
   order?: { accountingInvoiceId?: string | null; invoicedAt?: Date | null }
@@ -91,7 +95,13 @@ function makeTx(seed: {
       }),
     },
     wmsOrderPushLink: { findUnique: async () => seed.pushLink ?? null },
-    shipment: { findMany: async () => (seed.shipments ?? []).map((id) => ({ id })) },
+    shipment: {
+      findMany: async () => (seed.shipments ?? []).map((shipment) => (
+        typeof shipment === 'string'
+          ? { id: shipment, shipmentJournalDate: null, shipmentJournalBatchRef: null }
+          : { shipmentJournalDate: null, shipmentJournalBatchRef: null, ...shipment }
+      )),
+    },
     accountingSyncLog: {
       findFirst: async ({ where }: { where: WhereNode }) =>
         (seed.syncLogs ?? []).find((row) => matches(row, where)) ?? null,
@@ -102,8 +112,15 @@ function makeTx(seed: {
   } as any
 }
 
-const STAMPS = { revenueDeferredDate: null, inventoryAllocatedDate: null }
+const STAMPS = {
+  revenueDeferredDate: null,
+  inventoryAllocatedDate: null,
+  revenueDeferredBatchRef: null,
+  inventoryAllocatedBatchRef: null,
+}
 const A2_STAGED_AT = new Date('2026-07-20T23:15:00.000Z')
+/** o3d-0qoo: stamped just after midnight by a run whose batch was keyed on the previous day. */
+const PAST_MIDNIGHT = new Date('2026-07-21T00:04:00.000Z')
 
 function syncLog(overrides: Partial<SyncLogRow>): SyncLogRow {
   return {
@@ -134,6 +151,23 @@ test('dailyBatchReferenceWhere matches both the bare and digest-suffixed referen
   // A different day's batch must not match.
   assert.equal(matches(syncLog({ referenceId: 'A2-2026-07-21' }), where as WhereNode), false)
   assert.equal(dailyBatchReferenceWhere('A2', null), null)
+})
+
+test('o3d-0qoo: a persisted reference is matched in ADDITION to the derived shapes', () => {
+  // The union is deliberate. This guard refuses an irreversible delete, so it must never match
+  // a smaller set than it did before the column existed — a persisted reference that somehow
+  // disagreed with the real log would otherwise open exactly the hole it was added to close.
+  const where = dailyBatchReferenceWhere('A2', PAST_MIDNIGHT, 'A2-2026-07-20-1a2b3c4d') as WhereNode
+  assert.ok(where)
+  assert.equal(matches(syncLog({ referenceId: 'A2-2026-07-20-1a2b3c4d' }), where), true)
+  assert.equal(matches(syncLog({ referenceId: 'A2-2026-07-21' }), where), true)
+  // Neither the stored identity nor the stamp's own day — still no match.
+  assert.equal(matches(syncLog({ referenceId: 'A2-2026-07-19' }), where), false)
+  // A reference with no stamp at all is enough on its own.
+  const refOnly = dailyBatchReferenceWhere('A2', null, 'A2-2026-07-20-1a2b3c4d') as WhereNode
+  assert.equal(matches(syncLog({ referenceId: 'A2-2026-07-20-1a2b3c4d' }), refOnly), true)
+  assert.equal(matches(syncLog({ referenceId: 'A2-2026-07-20' }), refOnly), false)
+  assert.equal(dailyBatchReferenceWhere('A2', null, null), null)
 })
 
 test('an order with no external documents is deletable', async () => {
@@ -242,7 +276,7 @@ test('a POSTED A2 batch blocks even though the batch is DailyBatch-keyed, not or
       })],
     }),
     'order-1',
-    { revenueDeferredDate: null, inventoryAllocatedDate: A2_STAGED_AT },
+    { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT },
   )
   assert.equal(blocker?.code, 'daily_batch_staged')
   assert.match(blocker!.message, /A2 inventory allocation/)
@@ -258,7 +292,7 @@ test('a still-queued A2 batch blocks too — the order value is already inside t
       })],
     }),
     'order-1',
-    { revenueDeferredDate: null, inventoryAllocatedDate: A2_STAGED_AT },
+    { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT },
   )
   assert.equal(blocker?.code, 'daily_batch_staged')
 })
@@ -272,7 +306,7 @@ test('an A2 stamp with no matching batch log does not block (batch never queued)
       })],
     }),
     'order-1',
-    { revenueDeferredDate: null, inventoryAllocatedDate: A2_STAGED_AT },
+    { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT },
   )
   assert.equal(blocker, null)
 })
@@ -286,7 +320,7 @@ test('a posted A1 revenue-deferral batch blocks on the same DailyBatch-keyed rul
       })],
     }),
     'order-1',
-    { revenueDeferredDate: A2_STAGED_AT, inventoryAllocatedDate: null },
+    { ...STAMPS, revenueDeferredDate: A2_STAGED_AT },
   )
   assert.equal(blocker?.code, 'daily_batch_staged')
   assert.match(blocker!.message, /A1 revenue deferral/)
@@ -301,7 +335,123 @@ test('an A2 batch log of the right date but wrong TYPE does not block', async ()
       })],
     }),
     'order-1',
-    { revenueDeferredDate: null, inventoryAllocatedDate: A2_STAGED_AT },
+    { ...STAMPS, inventoryAllocatedDate: A2_STAGED_AT },
+  )
+  assert.equal(blocker, null)
+})
+
+// --- o3d-0qoo: batch identity is STORED, not re-derived from the stage stamp --------------
+//
+// Both daily-sync implementations capture the batch date ONCE at run start and write the stage
+// stamps with later new Date() calls, so a run crossing UTC midnight keys the batch on day D
+// and stamps its members D+1. Every one of these cases would pass the guard before o3d-0qoo:
+// the derived reference names a batch that does not exist, the guard reports no blocker, and an
+// order whose value is inside a queued or posted journal is hard-deleted.
+
+test('o3d-0qoo: an A2 batch staged across UTC midnight blocks — Xero digest reference', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        id: 'a2', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'SYNCED',
+        referenceType: 'DailyBatch', referenceId: 'A2-2026-07-20-1a2b3c4d',
+      })],
+    }),
+    'order-1',
+    {
+      ...STAMPS,
+      inventoryAllocatedDate: PAST_MIDNIGHT,
+      inventoryAllocatedBatchRef: 'A2-2026-07-20-1a2b3c4d',
+    },
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged')
+  assert.match(blocker!.message, /A2-2026-07-20-1a2b3c4d/)
+})
+
+test('o3d-0qoo: an A1 batch staged across UTC midnight blocks — bare QuickBooks reference', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        id: 'a1', connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'PENDING',
+        referenceType: 'DailyBatch', referenceId: 'A1-2026-07-20',
+      })],
+    }),
+    'order-1',
+    { ...STAMPS, revenueDeferredDate: PAST_MIDNIGHT, revenueDeferredBatchRef: 'A1-2026-07-20' },
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged')
+  assert.match(blocker!.message, /A1 revenue deferral/)
+})
+
+test('o3d-0qoo: a Group B shipment batch staged across UTC midnight blocks', async () => {
+  // Group B stamps the SHIPMENTS, not the order, and the shipment FK cascades — so deleting the
+  // order erases the only local record of what the journal was built from.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      shipments: [{
+        id: 'ship-1',
+        shipmentJournalDate: PAST_MIDNIGHT,
+        shipmentJournalBatchRef: 'B-2026-07-20-abcd1234',
+      }],
+      syncLogs: [syncLog({
+        id: 'b', type: 'DAILY_BATCH_GROUP_B', status: 'SYNCED',
+        referenceType: 'DailyBatch', referenceId: 'B-2026-07-20-abcd1234',
+      })],
+    }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged')
+  assert.match(blocker!.message, /B shipment revenue\/COGS/)
+})
+
+test('o3d-0qoo: a legacy row with no persisted reference still blocks via the derived key', async () => {
+  // Pre-migration rows carry no batch reference and will not for as long as they exist, so the
+  // derive-from-stamp path has to keep working exactly as it did.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      shipments: [{ id: 'ship-1', shipmentJournalDate: A2_STAGED_AT, shipmentJournalBatchRef: null }],
+      syncLogs: [syncLog({
+        id: 'b', type: 'DAILY_BATCH_GROUP_B', status: 'SYNCED',
+        referenceType: 'DailyBatch', referenceId: 'B-2026-07-20',
+      })],
+    }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'daily_batch_staged')
+})
+
+test('o3d-0qoo: a persisted reference whose batch log does not exist does NOT block', async () => {
+  // Guards against the fix becoming vacuous: matching on identity must still find nothing when
+  // there is nothing to find — a batch that produced no journal must not pin the order forever.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      syncLogs: [syncLog({
+        id: 'a2', type: 'DAILY_BATCH_INVENTORY_ALLOC', status: 'SYNCED',
+        referenceType: 'DailyBatch', referenceId: 'A2-2026-07-19-99999999',
+      })],
+    }),
+    'order-1',
+    {
+      ...STAMPS,
+      inventoryAllocatedDate: PAST_MIDNIGHT,
+      inventoryAllocatedBatchRef: 'A2-2026-07-20-1a2b3c4d',
+    },
+  )
+  assert.equal(blocker, null)
+})
+
+test('o3d-0qoo: an unjournalled shipment contributes no Group B check', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      shipments: ['ship-1'],
+      syncLogs: [syncLog({
+        id: 'b', type: 'DAILY_BATCH_GROUP_B', status: 'SYNCED',
+        referenceType: 'DailyBatch', referenceId: 'B-2026-07-20-abcd1234',
+      })],
+    }),
+    'order-1',
+    STAMPS,
   )
   assert.equal(blocker, null)
 })

@@ -9,6 +9,7 @@ import {
   buildAvailableStockMapIncludingOwnReservations,
   buildAvailableStockMap,
   cancelSalesOrderFulfillmentState,
+  resetAllocationAccountingIfStaged,
   updateSalesOrderStatusUnderLock,
   type AllocationServiceClient,
 } from '@/lib/domain/sales/allocation-service'
@@ -1603,4 +1604,97 @@ test('a FULL MONETARY refund deallocates and reports success too (o3d-754w)', as
   assert.notEqual(result.error, 'No stock available for allocation')
   assert.equal(result.unallocatedQty, 0)
   assert.deepEqual(state.allocations, [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0qoo — un-staging must clear the persisted batch reference TOGETHER with
+// the stamp it pairs with, in the same update. inventoryAllocatedBatchRef holds
+// the exact AccountingSyncLog.referenceId Group A2 staged the order into, and
+// findSalesOrderDeleteBlocker matches on it independently of the stamp. A row
+// left with a ref but no stamp is therefore blocked forever against a batch it
+// is no longer part of, which is strictly worse than clearing both.
+// ---------------------------------------------------------------------------
+
+/** Minimal transaction double: records every salesOrder.update payload verbatim. */
+function createResetTx(options: {
+  inventoryAllocatedDate: Date | null
+  journaledShipmentId?: string | null
+}) {
+  const salesOrderUpdates: Array<Record<string, unknown>> = []
+  const allocationUpdates: Array<Record<string, unknown>> = []
+  const tx = {
+    salesOrder: {
+      findUnique: async () => (
+        options.inventoryAllocatedDate === null
+          ? { inventoryAllocatedDate: null }
+          : { inventoryAllocatedDate: options.inventoryAllocatedDate }
+      ),
+      update: async ({ data }: { data: Record<string, unknown> }) => {
+        salesOrderUpdates.push(data)
+        return {}
+      },
+    },
+    shipment: {
+      findFirst: async () => (options.journaledShipmentId ? { id: options.journaledShipmentId } : null),
+    },
+    orderAllocation: {
+      updateMany: async ({ data }: { data: Record<string, unknown> }) => {
+        allocationUpdates.push(data)
+        return { count: 1 }
+      },
+    },
+  }
+  return { tx, salesOrderUpdates, allocationUpdates }
+}
+
+test('resetAllocationAccountingIfStaged clears inventoryAllocatedBatchRef in the same update as the stamp (o3d-0qoo)', async () => {
+  const { tx, salesOrderUpdates, allocationUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+  )
+
+  assert.equal(salesOrderUpdates.length, 1, 'the un-stage is a single write, not a stamp write plus a ref write')
+  // deepEqual, not a per-key lookup: it proves the key is PRESENT and null rather than merely
+  // absent-and-therefore-undefined, which is what an omitted Prisma field would look like.
+  assert.deepEqual(salesOrderUpdates[0], {
+    inventoryAllocatedDate: null,
+    inventoryAllocatedBatchRef: null,
+    allocationBatchAmount: null,
+  })
+  assert.equal(allocationUpdates.length, 1, 'and the cost snapshots are still nulled alongside it')
+})
+
+test('resetAllocationAccountingIfStaged writes nothing when A2 never staged the order (o3d-0qoo)', async () => {
+  // The no-op path must stay a no-op: an unstaged order has no ref to clear, and touching it
+  // would be a write the surrounding allocation transaction does not expect.
+  const { tx, salesOrderUpdates } = createResetTx({ inventoryAllocatedDate: null })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+  )
+
+  assert.deepEqual(salesOrderUpdates, [])
+})
+
+test('resetAllocationAccountingIfStaged refuses (and clears no ref) once a shipment is journaled (o3d-0qoo)', async () => {
+  // The Group B guard runs BEFORE the un-stage, so a posted shipment leaves both the stamp and
+  // the ref intact — the order stays findable against its A2 batch instead of silently losing it.
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+  })
+
+  await assert.rejects(
+    () => resetAllocationAccountingIfStaged(
+      tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+      'order-1',
+    ),
+    /posted to accounting/,
+  )
+  assert.deepEqual(salesOrderUpdates, [])
 })
