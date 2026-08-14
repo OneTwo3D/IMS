@@ -6,11 +6,16 @@ import test, { mock } from 'node:test'
 // reallocation sweep. The real (pure) coverage math is exercised; only the product graph and the
 // OrderAllocation read are stubbed.
 
-// A SIMPLE product expands to a single leaf requirement of factor 1.
+// A SIMPLE product expands to a single leaf requirement of factor 1. Overridable so the
+// nested-KIT cases (o3d-i4qd) can supply the unquantized multiplied factors that only a real
+// KIT graph produces; every other test leaves the simple default in place.
+let expandRequirements: (productId: string) => Map<string, number> =
+  (productId: string) => new Map([[productId, 1]])
+
 mock.module('@/lib/products/kit-fulfillment', {
   namedExports: {
     loadFulfillmentProductGraph: async () => ({}),
-    expandFulfillmentRequirementsDecimal: (productId: string) => new Map([[productId, 1]]),
+    expandFulfillmentRequirementsDecimal: (productId: string) => expandRequirements(productId),
   },
 })
 
@@ -205,4 +210,80 @@ test('a refund linked to ANOTHER order cannot cancel this order\'s demand (o3d-j
     ['SO-1', 'SO-2'],
     'the bad link is inert: it nets against SO-1 (which has no such line) and leaves SO-2 alone',
   )
+})
+
+// --- o3d-i4qd: nested KIT precision ------------------------------------------------------
+//
+// Nested KIT expansion multiplies factors without quantizing (0.3332 x 0.3332 = 0.11102224
+// component units per kit) while OrderAllocation.qty is Decimal(12,4), so the writer stores
+// 0.1110 — as much of that requirement as the schema can express. Dividing the stored figure
+// by the unquantized factor to get kit units reads 0.99979968 of one kit: short by ~2e-4,
+// two hundred times the 1e-6 tolerance. The line was therefore reported outstanding on every
+// rotation, forever, and no allocation run could ever close it.
+
+/** The factor a two-level KIT of 0.3332-per-level produces. */
+const NESTED_FACTOR = 0.3332 * 0.3332
+/** What OrderAllocation.qty can actually hold for one kit of that requirement. */
+const NESTED_PERSISTED = 0.111
+
+function kitOrder(id: string, qty: number) {
+  expandRequirements = () => new Map([['component-1', NESTED_FACTOR]])
+  return { id, lines: [{ id: `${id}-l1`, qty, productId: 'kit-1' }] }
+}
+
+test('o3d-i4qd: a nested-KIT line allocated to the persisted scale is NOT outstanding', async () => {
+  const select = await load()
+  resetRefunds()
+  const candidate = kitOrder('SO-KIT', 1)
+  allocRows = [{ orderId: 'SO-KIT', lineId: 'SO-KIT-l1', productId: 'component-1', qty: NESTED_PERSISTED }]
+  const needing = await select([candidate])
+  assert.deepEqual(needing, [], 'a line allocated as completely as Decimal(12,4) allows must not be re-selected')
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
+})
+
+test('o3d-i4qd: a nested-KIT line with NOTHING allocated is still outstanding', async () => {
+  const select = await load()
+  resetRefunds()
+  const candidate = kitOrder('SO-KIT', 1)
+  allocRows = []
+  const needing = await select([candidate])
+  assert.deepEqual(needing.map((o) => o.id), ['SO-KIT'], 'the fix must not make genuine shortfalls invisible')
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
+})
+
+test('o3d-i4qd: a nested-KIT line short by a whole kit is still outstanding', async () => {
+  const select = await load()
+  resetRefunds()
+  const candidate = kitOrder('SO-KIT', 2)
+  // Two kits ordered, one kit's worth of component allocated.
+  allocRows = [{ orderId: 'SO-KIT', lineId: 'SO-KIT-l1', productId: 'component-1', qty: NESTED_PERSISTED }]
+  const needing = await select([candidate])
+  assert.deepEqual(needing.map((o) => o.id), ['SO-KIT'])
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
+})
+
+test('o3d-i4qd: a nested-KIT line split across warehouses is not re-selected for per-row rounding', async () => {
+  const select = await load()
+  resetRefunds()
+  const candidate = kitOrder('SO-KIT', 2)
+  // Each warehouse row rounds independently: 2 x 0.1110 = 0.2220, while the single-row figure
+  // for 2 kits would be round(0.22204448, 4) = 0.2220. Both must read as covered.
+  allocRows = [
+    { orderId: 'SO-KIT', lineId: 'SO-KIT-l1', productId: 'component-1', qty: NESTED_PERSISTED },
+    { orderId: 'SO-KIT', lineId: 'SO-KIT-l1', productId: 'component-1', qty: NESTED_PERSISTED },
+  ]
+  const needing = await select([candidate])
+  assert.deepEqual(needing, [])
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
+})
+
+test('o3d-i4qd: a multi-component KIT missing ONE component is outstanding', async () => {
+  const select = await load()
+  resetRefunds()
+  expandRequirements = () => new Map([['component-1', NESTED_FACTOR], ['component-2', 2]])
+  const candidate = { id: 'SO-KIT2', lines: [{ id: 'SO-KIT2-l1', qty: 1, productId: 'kit-1' }] }
+  allocRows = [{ orderId: 'SO-KIT2', lineId: 'SO-KIT2-l1', productId: 'component-1', qty: NESTED_PERSISTED }]
+  const needing = await select([candidate])
+  assert.deepEqual(needing.map((o) => o.id), ['SO-KIT2'], 'a component with no rows at all must still be seen')
+  expandRequirements = (productId: string) => new Map([[productId, 1]])
 })

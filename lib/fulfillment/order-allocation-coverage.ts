@@ -1,7 +1,6 @@
 import { db } from '@/lib/db'
 import type { Prisma } from '@/app/generated/prisma/client'
 import {
-  calculateCoverageByLine,
   requirementsMapToRows,
   type FulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
@@ -25,6 +24,23 @@ export type CoverageOrder = {
 
 // Matches the tolerance the backorder report / allocator use when comparing ordered vs covered qty.
 const QUANTITY_TOLERANCE = 1e-6
+
+/**
+ * OrderAllocation.qty is `Decimal(12,4)` (prisma/schema.prisma), so 1e-4 is the smallest
+ * quantity a row can express and Postgres rounds HALF-UP into it on write.
+ */
+const ALLOCATION_QTY_SCALE = 1e4
+const ALLOCATION_QTY_ULP = 1 / ALLOCATION_QTY_SCALE
+
+/** Composite map key; the NUL separator cannot occur in a cuid. */
+function lineProductKey(lineId: string, productId: string): string {
+  return `${lineId}\u0000${productId}`
+}
+
+/** What the allocation writer would actually STORE for a computed component quantity. */
+function atPersistedScale(value: number): number {
+  return Math.round(value * ALLOCATION_QTY_SCALE) / ALLOCATION_QTY_SCALE
+}
 
 /**
  * From candidate sales orders (each with its lines), return those that have at least one line with
@@ -128,22 +144,69 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
 
   return candidates.filter((order) => {
     if (fullyRefunded(order)) return false
-    const coverageByLine = calculateCoverageByLine(
-      requirementsByLine,
-      coverageRowsByOrder.get(order.id) ?? [],
-    )
+
+    // Persisted component quantities per (line, product), with the number of ROWS that make
+    // them up — a line allocated across several warehouses has one row per warehouse, and
+    // Postgres rounds each of them independently.
+    const persistedByLineProduct = new Map<string, { qty: number; rows: number }>()
+    for (const row of coverageRowsByOrder.get(order.id) ?? []) {
+      const key = lineProductKey(row.lineId, row.productId)
+      const entry = persistedByLineProduct.get(key) ?? { qty: 0, rows: 0 }
+      entry.qty += row.qty
+      entry.rows += 1
+      persistedByLineProduct.set(key, entry)
+    }
+
     return order.lines.some((line) => {
       if (!line.productId) return false
       const reqs = requirementsByLine.get(line.id) ?? []
       if (lineNeedsAllocation && !lineNeedsAllocation(line, reqs)) return false
-      const coverage = coverageByLine.get(line.id) ?? 0
       // Net demand, matching allocateSalesOrder. Clamped at zero: over-refunding a line means
       // no demand, not negative demand.
       const netDemand = Math.max(
         0,
         Number(line.qty) - (refundedByOrderLine.get(refundKey(order.id, line.id)) ?? 0),
       )
-      return netDemand > coverage + QUANTITY_TOLERANCE
+      if (netDemand <= 0) return false
+      // No expandable requirement (e.g. a KIT with no components) covers nothing, so demand is
+      // outstanding — unchanged from the coverage-based form, where such a line scored 0.
+      if (reqs.length === 0) return true
+
+      // o3d-i4qd: compare in COMPONENT units at the scale the row is STORED at, rather than
+      // dividing a stored quantity by an unquantized factor to get kit units.
+      //
+      // Nested KIT expansion multiplies factors without quantizing — 0.3332 x 0.3332 needs
+      // 0.11102224 component units per kit — while OrderAllocation.qty holds Decimal(12,4), so
+      // the row stores 0.1110. Read back as kit units that is 0.1110/0.11102224 = 0.99979968
+      // of one kit: short by ~2e-4, two orders of magnitude beyond QUANTITY_TOLERANCE. A line
+      // that is allocated as completely as the schema can express was therefore reported
+      // outstanding on EVERY rotation, re-selecting the order forever and making
+      // pre-fulfilment reallocation log a shortfall that no allocation run can ever close.
+      //
+      // Asking instead "is the stored quantity at least what the writer would store for this
+      // demand" makes the question answerable: required and persisted are then the same kind
+      // of number. This changes only which orders are LOOKED at — never what is written or
+      // reserved. Canonicalising the written quantity is the rest of o3d-i4qd, and is an
+      // inventory decision (rounding a component requirement down under-reserves so the kit
+      // cannot be built; rounding up over-reserves and can block other orders).
+      return reqs.some((requirement) => {
+        if (!Number.isFinite(requirement.factor) || requirement.factor <= 0) return false
+        const required = atPersistedScale(netDemand * requirement.factor)
+        const persisted = persistedByLineProduct.get(lineProductKey(line.id, requirement.productId))
+        // A line allocated from ONE warehouse needs no slack at all: the writer stores exactly
+        // `required`, so the comparison is an identity and any shortfall is real. Slack is only
+        // for a line SPLIT across warehouses, where each row rounds independently and the sum
+        // can sit up to (rows + 1) half-ULPs below the single-row figure with nothing missing.
+        //
+        // Deliberately not a blanket tolerance: one wide enough to absorb this defect would
+        // also absorb a genuine shortfall, and the fix would then be the tolerance rather than
+        // the scale alignment — passing for the wrong reason.
+        const rows = persisted?.rows ?? 0
+        const allowance = rows > 1
+          ? QUANTITY_TOLERANCE + (rows + 1) * (ALLOCATION_QTY_ULP / 2)
+          : QUANTITY_TOLERANCE
+        return (persisted?.qty ?? 0) < required - allowance
+      })
     })
   })
 }
