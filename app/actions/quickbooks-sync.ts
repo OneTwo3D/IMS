@@ -334,9 +334,19 @@ export async function triggerQuickBooksSync(): Promise<{ success: boolean; resul
 export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
   try {
     await requireAdmin()
+    // o3d-nepa: a retention-COMPACTED row is NOT retryable, and that is what `compactedAt: null`
+    // says. Its payload has been deliberately reduced to idempotency tokens and settlement facts, so
+    // re-driving it would send a request body with no lines, no contact and no amounts — at best an
+    // instant re-failure that overwrites the real error with a meaningless one, at worst a junk
+    // document in the ledger. Nothing an operator is actually chasing is excluded: compaction only
+    // reaches rows that have been RESOLVED for the whole retention window (months), and the follow-up
+    // types whose stored body would be reused verbatim are never compacted while FAILED at all.
     const where = entryId
-      ? { id: entryId, connector: 'quickbooks', status: 'FAILED' as const }
-      : { connector: 'quickbooks', status: 'FAILED' as const }
+      ? { id: entryId, connector: 'quickbooks', status: 'FAILED' as const, compactedAt: null }
+      : { connector: 'quickbooks', status: 'FAILED' as const, compactedAt: null }
+    // Counted so the activity log can EXPLAIN a short reset — these rows still read FAILED on the
+    // dashboard, and a silently short reset makes the button look broken.
+    const skipped = await db.accountingSyncLog.count({ where: { ...where, compactedAt: { not: null } } })
     const result = await db.accountingSyncLog.updateMany({
       where,
       // o3d-nepa: DE-TERMINALISED (FAILED -> PENDING). Clear resolvedAt so retention's expiry clock
@@ -348,7 +358,8 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
       entityType: 'SYSTEM',
       action: 'quickbooks_retry_failed',
       tag: 'sync',
-      description: `Reset ${result.count} failed QuickBooks sync entry/entries for retry`,
+      description: `Reset ${result.count} failed QuickBooks sync entry/entries for retry`
+        + (skipped > 0 ? ` (${skipped} skipped: data retention has removed their request body)` : ''),
     })
     revalidatePath('/sync')
     return { success: true, reset: result.count }

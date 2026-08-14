@@ -249,11 +249,16 @@ async function lockCostLayers(
 
 async function resetFailedDailyBatchLogs(): Promise<void> {
   await db.$transaction(async (tx) => {
+    // o3d-nepa: `compactedAt: null` — a retention-COMPACTED row is NOT retryable. Its payload has
+    // been reduced to idempotency tokens and settlement facts on purpose, so re-queueing it would
+    // re-post a batch journal with no lines. Applied to the SELECT as well as the UPDATE so the
+    // mirrored accounting events are reset for exactly the rows that were actually revived.
     const failedLogs = await tx.accountingSyncLog.findMany({
       where: {
         connector: QBO_CONNECTOR,
         type: { in: [...DAILY_BATCH_TYPES] },
         status: 'FAILED',
+        compactedAt: null,
       },
       select: { referenceId: true },
     })
@@ -263,6 +268,7 @@ async function resetFailedDailyBatchLogs(): Promise<void> {
         connector: QBO_CONNECTOR,
         type: { in: [...DAILY_BATCH_TYPES] },
         status: 'FAILED',
+        compactedAt: null,
       },
       data: {
         status: 'PENDING',

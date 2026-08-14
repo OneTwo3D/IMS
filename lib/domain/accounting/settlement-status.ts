@@ -28,6 +28,32 @@ export type PaymentSyncRow = {
   paymentId?: string | null
 }
 
+/**
+ * The two settlement FACTS a payment sync row carries on its payload rather than in a column, read
+ * back identically by the sales path (loadInvoicePaymentSyncRows) and the bill path
+ * (latestBillPaymentSyncRows). One reader, because they must agree: the sales page and the PO page
+ * are answering the same question about the same kind of row.
+ *
+ * These are also exactly what o3d-nepa's retention tombstone has to PRESERVE. `amount` is the only
+ * thing that distinguishes a part payment or an over-payment from a full settlement below — drop it
+ * and a SYNCED row with an external id falls straight through to SETTLED, printing a green badge over
+ * a balance the ledger still shows outstanding (Codex NO-SHIP finding 3). `paymentId` is what ties
+ * the row to a local receipt, which is how effectivePaymentSyncRows drops rows whose receipt was
+ * deleted and how deletePayment finds the registration to retire. Neither is personal data — a number
+ * and a local cuid — so retention keeps them.
+ *
+ * SHAPE MATTERS, not just presence: `amount` is only usable as a number (settlementStatus compares
+ * `typeof paid === 'number'` and treats anything else as "cannot compare"), and `paymentId` only as a
+ * string.
+ */
+export function paymentSyncPayloadFacts(payload: unknown): { amount: number | null; paymentId: string | null } {
+  const source = (payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : {}) as Record<string, unknown>
+  return {
+    amount: typeof source.amount === 'number' ? source.amount : null,
+    paymentId: typeof source.paymentId === 'string' ? source.paymentId : null,
+  }
+}
+
 export type SettlementStatus =
   /** Not paid in IMS either — nothing to reconcile. */
   | 'UNPAID'

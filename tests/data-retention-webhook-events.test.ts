@@ -9,12 +9,16 @@ import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox
 //
 // o3d-nepa: the accountingSyncLog branch gets the same treatment, on a THREE-CASE rule keyed on
 // resolvedAt (when the row RESOLVED) rather than createdAt (when it was queued):
-//   1. unresolved (PENDING/PROCESSING) — never deleted, never compacted, at any age;
-//   2. CANCELLED with no externalTransactionId past the cutoff — deleted (no remote effect, and the
-//      order delete guard cannot see such a row anyway);
-//   3. every other expired terminal row — COMPACTED to a posting tombstone: the guard's fields stay,
-//      the payload is cut down to its idempotency TOKENS (never nulled — a FAILED row that reads as
-//      "no token" can rotate a money-moving remote key), errorMessage becomes a non-PII marker.
+//   1. NEVER TOUCHED — anything unresolved (PENDING/PROCESSING) at any age; the three types a later
+//      posting decision reads back off a SYNCED row; and a FAILED money-moving follow-up, whose
+//      stored request body is reused VERBATIM by whichever path revives it;
+//   2. DELETED — CANCELLED, no externalTransactionId, and not a type whose bare existence another
+//      sweep consumes as a do-not-re-enqueue marker (PURCHASE_CREDIT_NOTE_ALLOCATION);
+//   3. TOMBSTONED — every other expired terminal row: the delete guard's fields stay, the payload is
+//      cut down to its idempotency TOKENS plus the non-PII settlement FACTS the sales and bill
+//      display paths read back (amount, paymentId), errorMessage becomes a non-PII marker.
+// Each compaction is a CONDITIONAL write that re-checks the whole candidate predicate, because a row
+// can be revived between the select and the write.
 // The delegate below is a real fake rather than the previous noop, so all of that is actually pinned.
 
 type UpdateArgs = { where: Record<string, unknown>; data: Record<string, unknown> }
@@ -22,8 +26,11 @@ type FindManyArgs = { where: Record<string, unknown>; take?: number }
 
 type AccountingRow = {
   id: string
+  connector: string
   status: string
   type: string
+  referenceType: string
+  referenceId: string
   externalTransactionId: string | null
   payload: unknown
   errorMessage: string | null
@@ -39,19 +46,34 @@ const capture: { settingRows: Array<{ key: string; value: string }>; last?: Upda
 }
 
 /**
- * In-memory AccountingSyncLog. `deleteMany`/`findMany` evaluate the production `where` against the
- * seeded rows, so the tests exercise the real predicate rather than asserting on its shape.
+ * In-memory AccountingSyncLog. `deleteMany`/`findMany`/`updateMany` all evaluate the production
+ * `where` against the seeded rows, so the tests exercise the real predicate rather than asserting on
+ * its shape.
+ *
+ * `onFindMany` is the INTERLEAVING hook: it fires after a findMany has resolved its rows and before
+ * the caller writes any of them, which is exactly the window a concurrent revival lands in. Without
+ * it the double can never show the difference between an id-fenced write and a conditional one, and
+ * the retention tests would pass over a compaction that overwrites live work (Codex NO-SHIP #1).
  */
-const accounting: { rows: AccountingRow[]; deleted: string[]; updates: UpdateArgs[] } = {
+const accounting: {
+  rows: AccountingRow[]
+  deleted: string[]
+  updates: UpdateArgs[]
+  onFindMany?: () => void
+} = {
   rows: [],
   deleted: [],
   updates: [],
+  onFindMany: undefined,
 }
 
 function row(overrides: Partial<AccountingRow> & { id: string }): AccountingRow {
   const seeded: AccountingRow = {
+    connector: 'xero',
     status: 'SYNCED',
     type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so_1',
     externalTransactionId: null,
     payload: null,
     errorMessage: null,
@@ -75,6 +97,10 @@ function matchesWhere(target: AccountingRow, where: Record<string, unknown>): bo
   for (const [key, condition] of Object.entries(where)) {
     if (key === 'OR') {
       if (!(condition as Array<Record<string, unknown>>).some((clause) => matchesWhere(target, clause))) return false
+      continue
+    }
+    if (key === 'AND') {
+      if (!(condition as Array<Record<string, unknown>>).every((clause) => matchesWhere(target, clause))) return false
       continue
     }
     if (key === 'NOT') {
@@ -117,17 +143,26 @@ mock.module('@/lib/db', {
         },
         findMany: async ({ where, take }: FindManyArgs) => {
           const hit = accounting.rows.filter((candidate) => matchesWhere(candidate, where))
-          return (typeof take === 'number' ? hit.slice(0, take) : hit)
+          const selected = (typeof take === 'number' ? hit.slice(0, take) : hit)
             .map((candidate) => ({ id: candidate.id, payload: candidate.payload, errorMessage: candidate.errorMessage }))
+          // The rows are RESOLVED at this point and the caller has not written anything yet — the
+          // exact window a retry action or a revival lands in.
+          accounting.onFindMany?.()
+          return selected
         },
-        update: async (args: UpdateArgs) => {
+        update: async () => {
+          throw new Error(
+            'compaction must be a CONDITIONAL updateMany that re-checks the candidate predicate: an '
+            + 'update fenced only by id overwrites a row revived since the select (o3d-nepa, Codex #1)',
+          )
+        },
+        updateMany: async (args: UpdateArgs) => {
           accounting.updates.push(args)
-          const target = accounting.rows.find((candidate) => candidate.id === (args.where as { id: string }).id)
-          if (target) Object.assign(target, args.data)
-          return target
-        },
-        updateMany: async () => {
-          throw new Error('accounting rows are compacted per-row (each keeps its OWN tokens), never in bulk')
+          // Evaluated, not assumed: the whole point of the conditional write is that it matches
+          // NOTHING when the row no longer satisfies the predicate it was selected under.
+          const hit = accounting.rows.filter((candidate) => matchesWhere(candidate, args.where))
+          for (const target of hit) Object.assign(target, args.data)
+          return { count: hit.length }
         },
       },
       stockMovement: noopDelegate(),
@@ -154,11 +189,12 @@ async function loadPurge() {
 }
 
 /** Seed the accounting fake and run the sync-log branch with a 6-month window. */
-async function runAccountingCleanup(rows: AccountingRow[], months = '6') {
+async function runAccountingCleanup(rows: AccountingRow[], months = '6', onFindMany?: () => void) {
   const purgeExpiredData = await loadPurge()
   accounting.rows = rows
   accounting.deleted = []
   accounting.updates = []
+  accounting.onFindMany = onFindMany
   capture.settingRows = [{ key: 'retention_sync_logs_months', value: months }]
   capture.last = undefined
   capture.count = 0
@@ -168,6 +204,12 @@ async function runAccountingCleanup(rows: AccountingRow[], months = '6') {
 function updateFor(id: string): UpdateArgs {
   const found = accounting.updates.find((args) => (args.where as { id: string }).id === id)
   if (!found) throw new Error(`row ${id} was not compacted`)
+  return found
+}
+
+function rowById(id: string): AccountingRow {
+  const found = accounting.rows.find((candidate) => candidate.id === id)
+  if (!found) throw new Error(`row ${id} was deleted`)
   return found
 }
 
@@ -269,18 +311,21 @@ test('o3d-nepa case 3: an expired FAILED row keeps its follow-up idempotency tok
   // A nulled payload reads as "no token" to planFollowUpEnqueue, which either rotates the remote key
   // (a SECOND payment against the same invoice) or flips an INVOICE_PAYMENT plan to `refuse`. So
   // compaction REDUCES the payload to its tokens instead of clearing it (o3d-h2wx).
+  //
+  // INVOICE_PDF, not INVOICE_PAYMENT: a FAILED money-moving follow-up is no longer compacted at all
+  // (see the exemption test below). A PDF follow-up is re-driven with a freshly recomputed body, so
+  // carrying the token alone is exactly right for it.
   const result = await runAccountingCleanup([
     row({
-      id: 'failed-payment',
+      id: 'failed-pdf',
       status: 'FAILED',
-      type: 'INVOICE_PAYMENT',
+      type: 'INVOICE_PDF',
       resolvedAt: YEARS_AGO,
       errorMessage: 'Xero: contact Jane Doe <jane@example.com> is archived',
       payload: {
-        _followUpIdempotencyKey: 'followup:xero:INVOICE_PAYMENT:SalesOrder:so_1:INV-9:',
-        _idempotencyKey: 'invoice-payment:payment:pay_1',
+        _followUpIdempotencyKey: 'followup:xero:INVOICE_PDF:SalesOrder:so_1:INV-9:',
+        _idempotencyKey: 'invoice-pdf:so_1',
         accountingInvoiceId: 'INV-9',
-        amount: 129.99,
         contactEmail: 'jane@example.com',
         lines: [{ description: 'Widget', unitAmount: 129.99 }],
       },
@@ -288,10 +333,10 @@ test('o3d-nepa case 3: an expired FAILED row keeps its follow-up idempotency tok
   ])
 
   assert.equal(result.accountingSyncLogsCompacted, 1)
-  const { data } = updateFor('failed-payment')
+  const { data } = updateFor('failed-pdf')
   assert.deepEqual(data.payload, {
-    _idempotencyKey: 'invoice-payment:payment:pay_1',
-    _followUpIdempotencyKey: 'followup:xero:INVOICE_PAYMENT:SalesOrder:so_1:INV-9:',
+    _idempotencyKey: 'invoice-pdf:so_1',
+    _followUpIdempotencyKey: 'followup:xero:INVOICE_PDF:SalesOrder:so_1:INV-9:',
   }, 'ONLY the two idempotency tokens survive')
   // Personal and financial detail is gone; the connector's error text (which quotes contact names
   // back at us) is replaced by a marker rather than nulled, so the rejected-sync warning stays honest.
@@ -381,4 +426,324 @@ test('o3d-nepa: payloads a later posting decision reads off a SYNCED row are nev
   assert.equal(result.accountingSyncLogsCompacted, 0)
   assert.deepEqual(accounting.updates, [])
   assert.deepEqual(accounting.rows.map((candidate) => candidate.payload !== null), [true, true, true])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-nepa — Codex adversarial review (NO-SHIP r1). Four findings, four sets of
+// regression tests: a revival race, a destroyed money-moving request body, a part
+// payment turned green, and a deleted do-not-re-enqueue marker.
+// ---------------------------------------------------------------------------
+
+test('o3d-nepa #1: a row REVIVED between the select and the write is left completely alone', async () => {
+  // Candidates are selected in one statement and written one at a time afterwards. In that gap
+  // retryFailedXeroSync / retryFailedQuickBooksSync / resetFailedDailyBatchLogs can flip a FAILED row
+  // back to PENDING and CLEAR resolvedAt. A write fenced only by `id` would then stamp the tombstone
+  // computed from the stale read over a LIVE row — the processor is handed work whose request body
+  // retention has just destroyed, and the row looks like any other legitimate tombstone afterwards.
+  const live = row({
+    id: 'revived',
+    status: 'FAILED',
+    type: 'SALES_INVOICE',
+    resolvedAt: YEARS_AGO,
+    errorMessage: 'Xero: rate limited',
+    payload: { contactName: 'Jane Doe', lines: [{ description: 'Widget', unitAmount: 129.99 }] },
+  })
+
+  const result = await runAccountingCleanup([live], '6', () => {
+    // The operator presses "Retry failed" while the loop is between its read and its write.
+    live.status = 'PENDING'
+    live.resolvedAt = null
+    live.errorMessage = null
+  })
+
+  assert.equal(accounting.updates.length, 1, 'the write is still ATTEMPTED — this is a conditional write, not a skip')
+  assert.equal(result.accountingSyncLogsCompacted, 0, 'a write that matched nothing must not be counted')
+  assert.deepEqual(rowById('revived').payload, { contactName: 'Jane Doe', lines: [{ description: 'Widget', unitAmount: 129.99 }] },
+    'the revived request body survives intact')
+  assert.equal(rowById('revived').compactedAt, null, 'live work is never marked compacted')
+  assert.equal(rowById('revived').status, 'PENDING')
+})
+
+test('o3d-nepa #1: the conditional write re-checks EVERY condition that made the row a candidate', async () => {
+  // Pinning the guard itself, not just one race: whichever condition a future revival path happens to
+  // change, the write has to see it. `compactedAt` (someone else compacted it), the terminal status,
+  // both type exclusion sets, the disjointness with the delete branch, and the expiry — which is the
+  // one that catches a row revived AND re-resolved, since de-terminalising clears resolvedAt.
+  await runAccountingCleanup([
+    row({ id: 'plain', status: 'SYNCED', resolvedAt: YEARS_AGO, payload: { contactName: 'Jane Doe' } }),
+  ])
+
+  const { where } = updateFor('plain')
+  assert.equal(where.id, 'plain')
+  assert.equal(where.compactedAt, null)
+  assert.deepEqual(where.status, { in: ['SYNCED', 'FAILED', 'CANCELLED'] })
+  assert.ok(Array.isArray(where.OR), 'the expiry predicate is re-evaluated at write time')
+  assert.deepEqual((where.type as { notIn?: string[] })?.notIn, ['UNREALISED_FX_JOURNAL', 'UNEARNED_REV_REVERSAL', 'COGS_REVERSAL'])
+  const and = where.AND as Array<{ NOT: Record<string, unknown> }>
+  assert.equal(and.length, 2, 'both carve-outs are re-checked: the delete branch and the money-moving FAILED bodies')
+})
+
+test('o3d-nepa #2: a FAILED money-moving follow-up keeps its request body, at any age', async () => {
+  // FAILED is not "finished", it is "waiting for someone to press retry", and every retry path revives
+  // the row WITHOUT rebuilding its payload. For the money-moving follow-ups the stored body is reused
+  // VERBATIM (planFollowUpEnqueue's `bodyDisposition: 'pinned'`), so a compacted one can never post.
+  const result = await runAccountingCleanup([
+    row({
+      id: 'failed-payment',
+      status: 'FAILED',
+      type: 'INVOICE_PAYMENT',
+      resolvedAt: YEARS_AGO,
+      payload: { accountingInvoiceId: 'INV-9', bankAccountId: 'BANK-1', amount: 129.99 },
+    }),
+    row({
+      id: 'failed-allocation',
+      status: 'FAILED',
+      type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+      referenceType: 'SupplierCreditNote',
+      referenceId: 'scn_1',
+      resolvedAt: YEARS_AGO,
+      payload: { creditNoteId: 'CN-1', accountingInvoiceId: 'BILL-1', amount: 40 },
+    }),
+  ])
+
+  assert.equal(result.accountingSyncLogsCompacted, 0)
+  assert.deepEqual(accounting.updates, [], 'neither row is even attempted')
+  assert.deepEqual(rowById('failed-payment').payload, { accountingInvoiceId: 'INV-9', bankAccountId: 'BANK-1', amount: 129.99 })
+  assert.deepEqual(rowById('failed-allocation').payload, { creditNoteId: 'CN-1', accountingInvoiceId: 'BILL-1', amount: 40 })
+})
+
+test('o3d-nepa #2: the same row IS compacted once it stops being FAILED', async () => {
+  // The retention window is paused, not waived. A money-moving follow-up that was retried through to
+  // SYNCED is resolved in the ordinary sense and expires like anything else — which is what keeps this
+  // exemption from becoming "INVOICE_PAYMENT payloads are kept for ever".
+  const result = await runAccountingCleanup([
+    row({
+      id: 'settled-payment',
+      status: 'SYNCED',
+      type: 'INVOICE_PAYMENT',
+      externalTransactionId: 'PAY-1',
+      resolvedAt: YEARS_AGO,
+      payload: { accountingInvoiceId: 'INV-9', bankAccountId: 'BANK-1', amount: 129.99, contactEmail: 'jane@example.com' },
+    }),
+  ])
+
+  assert.equal(result.accountingSyncLogsCompacted, 1)
+  assert.equal((rowById('settled-payment').payload as Record<string, unknown>).contactEmail, undefined)
+})
+
+test('o3d-nepa #2 (composed): a retained FAILED payment still pins a POSTABLE body through planFollowUpEnqueue', async () => {
+  // The end-to-end shape of the finding: run retention, then feed what survived to the real planner.
+  //
+  // Had the row been compacted, the planner would treat the anchor-less tombstone as "possibly this
+  // one" (unknown must mean possible where money is concerned), find the body incomplete, drop it from
+  // `postable`, and then PIN it anyway as the last resort — a money-moving request with no
+  // bankAccountId and no amount, which both connectors reject before posting. The settlement could
+  // never go out and could never recover.
+  const { planFollowUpEnqueue } = await import('@/lib/domain/accounting/followup-idempotency')
+
+  await runAccountingCleanup([
+    row({
+      id: 'failed-payment',
+      status: 'FAILED',
+      type: 'INVOICE_PAYMENT',
+      resolvedAt: YEARS_AGO,
+      payload: {
+        _followUpIdempotencyKey: 'followup:xero:INVOICE_PAYMENT:SalesOrder:so_1:INV-9:',
+        accountingInvoiceId: 'INV-9',
+        bankAccountId: 'BANK-1',
+        amount: 129.99,
+      },
+    }),
+  ])
+
+  const plan = planFollowUpEnqueue({
+    connector: 'xero',
+    type: 'INVOICE_PAYMENT',
+    referenceType: 'SalesOrder',
+    referenceId: 'so_1',
+    payload: { accountingInvoiceId: 'INV-9', bankAccountId: 'BANK-1', amount: 129.99 },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'failed-payment',
+      payload: rowById('failed-payment').payload,
+      effectiveToken: 'followup:xero:INVOICE_PAYMENT:SalesOrder:so_1:INV-9:',
+    }],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  if (plan.action !== 'reuse') return
+  assert.equal(plan.bodyDisposition, 'pinned')
+  assert.equal(plan.payload.accountingInvoiceId, 'INV-9')
+  assert.equal(plan.payload.bankAccountId, 'BANK-1', 'the pinned body can actually be posted')
+  assert.equal(plan.payload.amount, 129.99)
+
+  // The control that makes the assertion above mean something: the token-only object compaction USED
+  // to leave behind produces a pinned body the connectors reject outright. This is why the retention
+  // rule exists rather than being a planner fix — the planner is behaving correctly here, on evidence
+  // retention had no business destroying.
+  const fromTombstone = planFollowUpEnqueue({
+    connector: 'xero',
+    type: 'INVOICE_PAYMENT',
+    referenceType: 'SalesOrder',
+    referenceId: 'so_1',
+    payload: { accountingInvoiceId: 'INV-9', bankAccountId: 'BANK-1', amount: 129.99 },
+    liveRowExists: false,
+    failedRows: [{
+      id: 'failed-payment',
+      payload: { _followUpIdempotencyKey: 'followup:xero:INVOICE_PAYMENT:SalesOrder:so_1:INV-9:' },
+      effectiveToken: 'followup:xero:INVOICE_PAYMENT:SalesOrder:so_1:INV-9:',
+    }],
+  })
+  assert.equal(fromTombstone.action, 'reuse')
+  if (fromTombstone.action !== 'reuse') return
+  assert.equal(fromTombstone.payload.bankAccountId, undefined, 'a tombstoned body pins as unpostable')
+  assert.equal(fromTombstone.payload.amount, undefined)
+})
+
+test('o3d-nepa #3 (sales): a compacted INVOICE_PAYMENT still shows a PART payment as a discrepancy', async () => {
+  // INVOICE_PAYMENT and BILL_PAYMENT are ordinary compaction candidates, and `payload.amount` is the
+  // ONLY thing that separates a part payment from a full settlement: settlementStatus can compare it
+  // to the document total only while it is numeric, and otherwise a SYNCED row with an external id
+  // falls straight through to SETTLED. Dropping it would print a green badge over a balance the
+  // ledger still shows outstanding — o3d-lgo.15's whole defect, reintroduced six months later.
+  const { aggregatePaymentSyncRows, effectivePaymentSyncRows, paymentSyncPayloadFacts, settlementStatus } =
+    await import('@/lib/domain/accounting/settlement-status')
+
+  await runAccountingCleanup([
+    row({
+      id: 'part-paid',
+      status: 'SYNCED',
+      type: 'INVOICE_PAYMENT',
+      externalTransactionId: 'PAY-1',
+      resolvedAt: YEARS_AGO,
+      payload: {
+        amount: 40,
+        paymentId: 'pay_1',
+        accountingInvoiceId: 'INV-9',
+        contactEmail: 'jane@example.com',
+        lines: [{ description: 'Widget', unitAmount: 40 }],
+      },
+    }),
+  ])
+
+  const compacted = rowById('part-paid')
+  // The personal/financial detail IS gone — this is not a test that compaction stopped happening.
+  assert.equal((compacted.payload as Record<string, unknown>).contactEmail, undefined)
+  assert.equal((compacted.payload as Record<string, unknown>).lines, undefined)
+
+  // loadInvoicePaymentSyncRows' own mapping, through the shared reader both display paths use.
+  const rows = [{
+    status: compacted.status as 'SYNCED',
+    externalTransactionId: compacted.externalTransactionId,
+    errorMessage: compacted.errorMessage,
+    retryCount: 0,
+    ...paymentSyncPayloadFacts(compacted.payload),
+  }]
+
+  const live = effectivePaymentSyncRows(rows, { livePaymentIds: new Set(['pay_1']) })
+  assert.equal(live.length, 1, 'paymentId survived, so the row is still attributed to its live receipt')
+  const verdict = settlementStatus({
+    paidLocally: true,
+    syncEnabled: true,
+    documentPosted: true,
+    payment: aggregatePaymentSyncRows(live),
+    totalForeign: 100,
+  })
+  assert.equal(verdict.status, 'PARTIALLY_SETTLED')
+  assert.equal(verdict.discrepancy, true)
+
+  // paymentId is load-bearing in the other direction too: it is how a row belonging to a DELETED
+  // receipt is dropped from the history (and how deletePayment finds the registration to retire).
+  assert.deepEqual(effectivePaymentSyncRows(rows, { livePaymentIds: new Set() }).map((r) => r.paymentId), ['pay_1'],
+    'a SYNCED row is history-filtered only when terminal, but its paymentId must still be readable')
+  assert.equal(rows[0].paymentId, 'pay_1')
+})
+
+test('o3d-nepa #3 (bills): a compacted BILL_PAYMENT still shows an OVER-payment as a discrepancy', async () => {
+  // The purchase side reads the same payload key through the same reader (latestBillPaymentSyncRows),
+  // and has its own over-payment branch. Both display paths, both directions of disagreement.
+  const { paymentSyncPayloadFacts, settlementStatus } = await import('@/lib/domain/accounting/settlement-status')
+
+  await runAccountingCleanup([
+    row({
+      id: 'over-paid',
+      status: 'SYNCED',
+      type: 'BILL_PAYMENT',
+      referenceType: 'PurchaseInvoice',
+      referenceId: 'pi_1',
+      externalTransactionId: 'PAY-9',
+      resolvedAt: YEARS_AGO,
+      payload: { amount: 1000, supplierName: 'Acme Ltd', reference: 'BILL-77' },
+    }),
+  ])
+
+  const compacted = rowById('over-paid')
+  assert.equal((compacted.payload as Record<string, unknown>).supplierName, undefined)
+
+  const verdict = settlementStatus({
+    paidLocally: true,
+    syncEnabled: true,
+    documentPosted: true,
+    payment: {
+      status: compacted.status as 'SYNCED',
+      externalTransactionId: compacted.externalTransactionId,
+      errorMessage: compacted.errorMessage,
+      retryCount: 0,
+      ...paymentSyncPayloadFacts(compacted.payload),
+    },
+    totalForeign: 400,
+  })
+  assert.equal(verdict.status, 'OVER_SETTLED')
+  assert.equal(verdict.discrepancy, true)
+})
+
+test('o3d-nepa #4: a CANCELLED credit-note allocation is TOMBSTONED, and the re-enqueue sweep still skips it', async () => {
+  // reenqueueMissingCreditNoteAllocations (audit-w77e) treats ANY PURCHASE_CREDIT_NOTE_ALLOCATION row
+  // — including CANCELLED — as "someone already owns this", and only fills the never-enqueued gap. The
+  // orphan sweep cancels PENDING rows of a non-active connector, and a pending allocation inherently
+  // has no externalTransactionId, so such a row lands squarely in retention's delete branch. Delete it
+  // and the sweep re-creates an allocation somebody intentionally abandoned: a real AP allocation
+  // applied in Xero months later.
+  const { selectCreditNotesNeedingAllocation } = await import('@/lib/connectors/xero/sync-processor')
+
+  const result = await runAccountingCleanup([
+    row({
+      id: 'abandoned-allocation',
+      status: 'CANCELLED',
+      type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+      referenceType: 'SupplierCreditNote',
+      referenceId: 'scn_1',
+      externalTransactionId: null,
+      resolvedAt: YEARS_AGO,
+      errorMessage: 'Cancelled: orphaned accounting sync row for xero',
+      payload: { creditNoteId: 'CN-1', accountingInvoiceId: 'BILL-1', amount: 40 },
+    }),
+  ])
+
+  assert.deepEqual(accounting.deleted, [], 'a do-not-re-enqueue marker is never deleted')
+  assert.equal(result.accountingSyncLogsCompacted, 1, 'it is tombstoned instead — the row stays, the payload goes')
+
+  // The sweep's OWN existence query (sync-processor.ts, reenqueueMissingCreditNoteAllocations):
+  // connector + type + referenceType + referenceId, and deliberately NO status clause. Evaluated
+  // against what actually survived retention.
+  const surviving = accounting.rows.filter((candidate) => matchesWhere(candidate, {
+    connector: 'xero',
+    type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+    referenceType: 'SupplierCreditNote',
+    referenceId: { in: ['scn_1'] },
+  }))
+  const candidate = {
+    id: 'scn_1',
+    accountingCreditNoteId: 'CN-1',
+    amountForeign: 40,
+    purchaseInvoice: { accountingInvoiceId: 'BILL-1' },
+  }
+  assert.deepEqual(
+    selectCreditNotesNeedingAllocation([candidate], new Set(surviving.map((r) => r.referenceId))),
+    [],
+    'the abandoned allocation is NOT recreated',
+  )
+  // The control: with the row gone (i.e. if retention had deleted it) the sweep re-enqueues it, which
+  // is the remote AP allocation this test exists to prevent.
+  assert.equal(selectCreditNotesNeedingAllocation([candidate], new Set()).length, 1)
 })

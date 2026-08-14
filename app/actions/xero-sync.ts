@@ -457,9 +457,20 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
 export async function retryFailedXeroSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
   try {
     await requireAdmin()
+    // o3d-nepa: a retention-COMPACTED row is NOT retryable, and that is what `compactedAt: null`
+    // says. Its payload has been deliberately reduced to idempotency tokens and settlement facts, so
+    // re-driving it would send a request body with no lines, no contact and no amounts — at best an
+    // instant re-failure that overwrites the real error with a meaningless one, at worst a junk
+    // document in the ledger. Nothing an operator is actually chasing is excluded: compaction only
+    // reaches rows that have been RESOLVED for the whole retention window (months), and the follow-up
+    // types whose stored body would be reused verbatim are never compacted while FAILED at all.
     const where = entryId
-      ? { id: entryId, connector: 'xero', status: 'FAILED' as const }
-      : { connector: 'xero', status: 'FAILED' as const }
+      ? { id: entryId, connector: 'xero', status: 'FAILED' as const, compactedAt: null }
+      : { connector: 'xero', status: 'FAILED' as const, compactedAt: null }
+    // Counted so the activity log can EXPLAIN a short reset. These rows still read FAILED on the
+    // dashboard, so silently resetting fewer than the operator can see would make the button look
+    // broken — the same reason cancelOrphanedAccountingSyncRows reports what it left behind.
+    const skipped = await db.accountingSyncLog.count({ where: { ...where, compactedAt: { not: null } } })
     const result = await db.accountingSyncLog.updateMany({
       where,
       // o3d-nepa: DE-TERMINALISED (FAILED -> PENDING). Clear resolvedAt so retention's expiry clock
@@ -471,7 +482,8 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
       entityType: 'SYSTEM',
       action: 'xero_retry_failed',
       tag: 'sync',
-      description: `Reset ${result.count} failed Xero sync entry/entries for retry`,
+      description: `Reset ${result.count} failed Xero sync entry/entries for retry`
+        + (skipped > 0 ? ` (${skipped} skipped: data retention has removed their request body)` : ''),
     })
     revalidatePath('/sync')
     return { success: true, reset: result.count }

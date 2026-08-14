@@ -64,6 +64,7 @@ import {
   aggregatePaymentSyncRows,
   effectivePaymentSyncRows,
   ledgerSalesInvoiceTotalForeign,
+  paymentSyncPayloadFacts,
   settlementStatus,
   type PaymentSyncRow,
   type SettlementVerdict,
@@ -698,18 +699,16 @@ async function loadInvoicePaymentSyncRows(orderId: string, connector: string | n
     select: { status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true },
     orderBy: { createdAt: 'desc' },
   })
-  return rows.map((r) => {
-    const payload = (r.payload && typeof r.payload === 'object' ? r.payload : {}) as Record<string, unknown>
-    return {
-      status: r.status,
-      externalTransactionId: r.externalTransactionId,
-      errorMessage: r.errorMessage,
-      retryCount: r.retryCount,
-      // The amount actually SENT, so a part payment is not mistaken for full settlement.
-      amount: typeof payload.amount === 'number' ? payload.amount : null,
-      paymentId: payloadPaymentId(r.payload),
-    }
-  })
+  return rows.map((r) => ({
+    status: r.status,
+    externalTransactionId: r.externalTransactionId,
+    errorMessage: r.errorMessage,
+    retryCount: r.retryCount,
+    // The amount actually SENT (so a part payment is not mistaken for full settlement) and the local
+    // receipt it belongs to, read through the shared reader the bill path uses — and the two keys
+    // o3d-nepa's retention tombstone deliberately preserves.
+    ...paymentSyncPayloadFacts(r.payload),
+  }))
 }
 
 /**
@@ -3020,10 +3019,15 @@ export type PaymentRow = {
   paidAt: string
 }
 
-/** The local Payment row an INVOICE_PAYMENT was queued for, when the payload records one. */
+/**
+ * The local Payment row an INVOICE_PAYMENT was queued for, when the payload records one.
+ *
+ * Delegates to the shared reader so deletePayment's matching and the settlement display agree on what
+ * counts as a payment id — and so o3d-nepa's retention tombstone has ONE list of payload facts it
+ * must preserve rather than one per caller.
+ */
 function payloadPaymentId(payload: unknown): string | null {
-  const p = (payload && typeof payload === 'object' ? payload : {}) as Record<string, unknown>
-  return typeof p.paymentId === 'string' ? p.paymentId : null
+  return paymentSyncPayloadFacts(payload).paymentId
 }
 
 /**

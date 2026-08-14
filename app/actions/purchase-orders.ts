@@ -26,7 +26,7 @@ import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purcha
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
-import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
+import { paymentSyncPayloadFacts, settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
@@ -568,14 +568,14 @@ async function latestBillPaymentSyncRows(
   })
   for (const r of rows) {
     if (out.has(r.referenceId)) continue // desc order: the first one seen is the latest
-    // The amount that was actually SENT, so a part payment is not mistaken for full settlement.
-    const payload = (r.payload && typeof r.payload === 'object' ? r.payload : {}) as Record<string, unknown>
+    // The amount that was actually SENT, so a part payment is not mistaken for full settlement — read
+    // through the same shared reader as the sales path, and preserved by o3d-nepa's tombstone.
     out.set(r.referenceId, {
       status: r.status,
       externalTransactionId: r.externalTransactionId,
       errorMessage: r.errorMessage,
       retryCount: r.retryCount,
-      amount: typeof payload.amount === 'number' ? payload.amount : null,
+      ...paymentSyncPayloadFacts(r.payload),
     })
   }
   return out

@@ -57,10 +57,18 @@ export const FOLLOW_UP_IDEMPOTENCY_KEY = '_followUpIdempotencyKey'
  * needs a manual reversal in the ledger. These get the strict treatment: the request body
  * is pinned alongside the token, and an ambiguous history refuses rather than guesses.
  */
-const MONEY_MOVING_FOLLOW_UP_TYPES = new Set(['INVOICE_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'])
+/**
+ * Exported as the LIST as well as the set because o3d-nepa's retention pass needs it inside a Prisma
+ * `where` (a compacted request body cannot be re-posted, so these are never compacted while FAILED).
+ * One declaration, two shapes — a second hand-written copy of this set in data-retention.ts would be
+ * a silent way for a new money-moving follow-up type to lose its body to retention.
+ */
+export const MONEY_MOVING_FOLLOW_UP_TYPES = ['INVOICE_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'] as const
+
+const MONEY_MOVING_FOLLOW_UP_TYPE_SET = new Set<string>(MONEY_MOVING_FOLLOW_UP_TYPES)
 
 export function isMoneyMovingFollowUp(type: string): boolean {
-  return MONEY_MOVING_FOLLOW_UP_TYPES.has(type)
+  return MONEY_MOVING_FOLLOW_UP_TYPE_SET.has(type)
 }
 
 /**

@@ -1,7 +1,8 @@
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
-import { FOLLOW_UP_IDEMPOTENCY_KEY } from '@/lib/domain/accounting/followup-idempotency'
+import { FOLLOW_UP_IDEMPOTENCY_KEY, MONEY_MOVING_FOLLOW_UP_TYPES } from '@/lib/domain/accounting/followup-idempotency'
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -80,6 +81,39 @@ const GENERIC_IDEMPOTENCY_KEY = '_idempotencyKey'
 const RETAINED_PAYLOAD_TOKEN_KEYS: readonly string[] = [GENERIC_IDEMPOTENCY_KEY, FOLLOW_UP_IDEMPOTENCY_KEY]
 
 /**
+ * Payload keys a tombstone ALSO keeps: non-PII settlement FACTS that a page still reads back off an
+ * already-terminal row to decide what to tell an operator (Codex NO-SHIP finding 3).
+ *
+ * The defect this closes: INVOICE_PAYMENT and BILL_PAYMENT rows are ordinary compaction candidates,
+ * and `payload.amount` is the ONLY thing that distinguishes a part payment (or an over-payment) from
+ * a full settlement. settlementStatus compares it against the document total and can only do so while
+ * it is numeric; with it gone, a SYNCED row carrying an external id falls straight through to
+ * SETTLED. A known GBP1-against-GBP1,000 part payment — the exact case o3d-lgo.15 exists to surface —
+ * would turn into a green "Settled" badge six months later, over a balance the ledger still shows
+ * outstanding. `paymentId` is what attributes the row to a local receipt: effectivePaymentSyncRows
+ * drops rows whose receipt was deleted by matching on it, and deletePayment finds the registration to
+ * retire the same way, so losing it silently changes receipt history and payment deletion too.
+ *
+ * PRESERVING BEATS AN "UNVERIFIABLE" STATE. Both are a number and a local cuid — not a customer name,
+ * an address or a line description — which is precisely the distinction this whole change is drawn
+ * on. Keeping them costs nothing the retention promise covers, while the alternative (teaching every
+ * settlement reader a fourth "we used to know" verdict) spreads retention's fingerprints across the
+ * accounting UI.
+ *
+ * Each key is kept ONLY IN THE SHAPE ITS READER TESTS FOR (see paymentSyncPayloadFacts): a
+ * non-numeric amount reads as "cannot compare" rather than as a shortfall, so carrying one forward in
+ * the wrong type would be worse than dropping it — it would look present.
+ *
+ * Kept for EVERY type rather than only the payment types: they are the same keys wherever they occur,
+ * a number and an id are non-PII on any row, and a type-conditional payload rule is one more thing to
+ * get wrong when a new payment-shaped sync type is added.
+ */
+const RETAINED_PAYLOAD_FACT_KEYS: readonly { key: string; kind: 'string' | 'number' }[] = [
+  { key: 'amount', kind: 'number' },
+  { key: 'paymentId', kind: 'string' },
+]
+
+/**
  * Sync types whose payload stays INTACT forever, because a LATER POSTING DECISION reads it back off
  * an already-terminal (SYNCED) row. Compacting one does not lose an audit detail, it changes what
  * the next journal posts:
@@ -99,6 +133,39 @@ const RETAINED_PAYLOAD_TOKEN_KEYS: readonly string[] = [GENERIC_IDEMPOTENCY_KEY,
  * (account codes and amounts), not personal data, so retaining them is a narrow, defensible cost.
  */
 const PAYLOAD_LOAD_BEARING_SYNC_TYPES = ['UNREALISED_FX_JOURNAL', 'UNEARNED_REV_REVERSAL', 'COGS_REVERSAL'] as const
+
+/**
+ * Sync types whose MERE EXISTENCE — at ANY status, CANCELLED included — is consumed as evidence by
+ * another sweep. Such a row is not a log entry, it is a durable DO-NOT-RE-ENQUEUE marker, and deleting
+ * it re-arms the very thing it was suppressing (Codex NO-SHIP finding 4).
+ *
+ * PURCHASE_CREDIT_NOTE_ALLOCATION. reenqueueMissingCreditNoteAllocations (audit-w77e) sweeps POSTED
+ * supplier credit notes and skips any that already has an allocation row — its query filters connector
+ * and type but NOT status, deliberately, because the question it asks is "does anyone already own
+ * this?". cancelOrphanedAccountingSyncRows cancels every PENDING row of a non-active connector, and a
+ * pending allocation inherently has no externalTransactionId, so a cancelled allocation lands exactly
+ * in the delete branch below. Delete it and the sweep sees a never-enqueued gap, re-creates the
+ * allocation somebody intentionally abandoned, and Xero applies a real AP allocation months late.
+ * Pre-migration rows reach this on the FIRST run through the createdAt fallback.
+ *
+ * This is the general refutation of the delete branch's original justification. That justification —
+ * "the delete guard matches a CANCELLED row only via a non-null external id, so one without it is
+ * invisible" — is true of order-delete-guard.ts and FALSE of the codebase: the guard is not the only
+ * reader of a sync row's existence. So the branch now carries an explicit type carve-out rather than
+ * an argument about one consumer.
+ *
+ * AUDITED, NOT GUESSED. Every accountingSyncLog findFirst/findMany/findUnique/count/groupBy in app/,
+ * lib/, scripts/ and prisma/ was checked for an existence test with no status clause (there is no raw
+ * SQL against the table anywhere). The full result is in the o3d-nepa PR notes; the only OTHER
+ * production hit is lib/ops/health.ts getLatestAccountingBatch, which reads the single most recent
+ * DAILY_BATCH_* row to report health. That one is not listed here: it consumes RECENCY, not existence,
+ * and retention only ever reaches rows that resolved a full retention window ago — for it to matter,
+ * the newest batch in the system would have to be older than the cutoff, in which case dropping from
+ * "CANCELLED months ago" to "no batch sync log found" makes the health check MORE alarming, not less.
+ *
+ * These types are TOMBSTONED instead of deleted: the row survives as the marker, the payload does not.
+ */
+const EXISTENCE_EVIDENCE_SYNC_TYPES = ['PURCHASE_CREDIT_NOTE_ALLOCATION'] as const
 
 /**
  * Replaces errorMessage on a compacted row. NOT simply nulled: rejected-sync-warnings.ts surfaces
@@ -127,9 +194,12 @@ const ACCOUNTING_COMPACT_MAX_PER_RUN = 5000
  * would ever be cleaned), so the fallback is the only third option — and it is sound ONLY because
  * of what the two branches it feeds can actually do:
  *
- *  - the DELETE branch is restricted to CANCELLED rows with no externalTransactionId, which
- *    lib/domain/sales/order-delete-guard.ts cannot see at all (it matches a CANCELLED row only via
- *    `externalTransactionId IS NOT NULL`). Deleting one removes no evidence any guard reads.
+ *  - the DELETE branch is restricted to CANCELLED rows with no externalTransactionId AND no type
+ *    whose bare existence another sweep consumes (EXISTENCE_EVIDENCE_SYNC_TYPES). What is left is
+ *    invisible to lib/domain/sales/order-delete-guard.ts (it matches a CANCELLED row only via
+ *    `externalTransactionId IS NOT NULL`) and to every other existence test in the codebase, so
+ *    deleting one removes no evidence anything reads. The earlier version of this argument rested on
+ *    the delete guard ALONE and was wrong in general — see EXISTENCE_EVIDENCE_SYNC_TYPES.
  *  - the COMPACT branch keeps every field the guard reads, so an over-eager fallback costs payload
  *    detail on an old row, never the row itself.
  *
@@ -148,28 +218,106 @@ function accountingRowExpiredWhere(cutoff: Date) {
 }
 
 /**
- * Reduce a payload to its remote idempotency tokens, dropping every other key. Returns null when
- * there is nothing to write (the payload is not an object), so the caller leaves it untouched.
+ * Reduce a payload to its remote idempotency TOKENS plus the non-PII settlement FACTS its readers
+ * still need, dropping every other key. Returns null when there is nothing to write (the payload is
+ * not an object), so the caller leaves it untouched.
  */
-export function compactAccountingSyncPayload(payload: unknown): Record<string, string> | null {
+export function compactAccountingSyncPayload(payload: unknown): Record<string, string | number> | null {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null
   const source = payload as Record<string, unknown>
-  const kept: Record<string, string> = {}
+  const kept: Record<string, string | number> = {}
   for (const key of RETAINED_PAYLOAD_TOKEN_KEYS) {
     const value = source[key]
     // Strings only, matching readFollowUpIdempotencyKey: a non-string is not a usable remote token,
     // and carrying one forward would preserve something that is not what this exemption is for.
     if (typeof value === 'string') kept[key] = value
   }
+  for (const { key, kind } of RETAINED_PAYLOAD_FACT_KEYS) {
+    const value = source[key]
+    // Only in the shape the reader tests for — see RETAINED_PAYLOAD_FACT_KEYS.
+    if (typeof value === kind) kept[key] = value as string | number
+  }
   return kept
+}
+
+/**
+ * The ONE row shape retention may DELETE outright, minus the expiry clause (which both branches add
+ * for themselves).
+ *
+ * A FUNCTION rather than a constant, and used in BOTH places, because the compact branch has to
+ * exclude exactly what this includes: two hand-written copies of the predicate would drift and the
+ * three cases would quietly stop being disjoint — a row could be compacted AND deleted in the same
+ * run, or fall through both and never expire at all.
+ */
+function accountingDeletableShape(): Prisma.AccountingSyncLogWhereInput {
+  return {
+    status: 'CANCELLED',
+    externalTransactionId: null,
+    // Codex NO-SHIP finding 4 — see EXISTENCE_EVIDENCE_SYNC_TYPES. A cancelled row of one of these
+    // types is a durable marker another sweep reads; it gets a tombstone, not a delete.
+    type: { notIn: [...EXISTENCE_EVIDENCE_SYNC_TYPES] },
+  }
+}
+
+/**
+ * Everything that makes a row a COMPACTION candidate. Used twice on purpose: once to select the
+ * batch, and again — unchanged, plus the row id — as the WHERE of each conditional write, so the
+ * write re-checks at commit time every condition that made the row eligible when it was read (see the
+ * loop in purgeExpiredData for why that matters).
+ */
+function accountingCompactCandidateWhere(cutoff: Date): Prisma.AccountingSyncLogWhereInput {
+  return {
+    status: { in: [...ACCOUNTING_TERMINAL_STATUSES] },
+    compactedAt: null,
+    // Payloads a FUTURE posting decision still reads off a SYNCED row — see the constant.
+    type: { notIn: [...PAYLOAD_LOAD_BEARING_SYNC_TYPES] },
+    AND: [
+      // Explicitly disjoint from the delete branch, so the three cases stay provably non-overlapping
+      // no matter what order they run in.
+      { NOT: accountingDeletableShape() },
+      // Codex NO-SHIP finding 2 — A FAILED MONEY-MOVING FOLLOW-UP KEEPS ITS REQUEST BODY.
+      //
+      // FAILED is not "finished", it is "waiting for someone to press retry", and three paths revive
+      // one WITHOUT rebuilding its payload: retryFailedXeroSync / retryFailedQuickBooksSync (any
+      // FAILED row on the connector, no age or type bound), resetFailedDailyBatchLogs, and
+      // planFollowUpEnqueue's reuse path.
+      //
+      // The planner is the sharp edge. A compacted INVOICE_PAYMENT tombstone has no anchors, so
+      // couldHaveCommittedThis reads it as "possibly this one" (correctly — unknown must mean
+      // possible where money is concerned); bodyCouldHaveReachedTheLedger then finds the body
+      // incomplete and drops it from `postable`; and the fallback pins that same token-only object as
+      // the request body. Both connectors reject a body with no accountingInvoiceId / bankAccountId /
+      // amount before they post, so the payment can never go out and never recovers — retention would
+      // have MANUFACTURED the "incomplete oldest attempt" case the planner was built to survive.
+      //
+      // THE TYPE SET IS MONEY_MOVING_FOLLOW_UP_TYPES, imported from followup-idempotency.ts rather
+      // than restated: it is the same set that decides `bodyDisposition: 'pinned'`, and the same set
+      // REQUIRED_BODY_FIELDS is keyed on. Those are the follow-ups whose stored body is REUSED
+      // verbatim; every other follow-up type is re-driven with a freshly recomputed body
+      // (`bodyDisposition: 'fresh'`), so losing the stored one costs nothing. The blunt retry actions
+      // cover every remaining type, and they are handled at their own end — they now refuse to revive
+      // a row whose body retention has already removed.
+      //
+      // The retention window is not lost, only paused: such a row is compacted as soon as it stops
+      // being FAILED (retried through to SYNCED, or cancelled), which is the same rule case 1 applies
+      // to PENDING/PROCESSING — an unresolved row has no expiry.
+      { NOT: { status: 'FAILED', type: { in: [...MONEY_MOVING_FOLLOW_UP_TYPES] } } },
+    ],
+    ...accountingRowExpiredWhere(cutoff),
+  }
 }
 
 /**
  * Purge or archive expired data based on retention settings.
  * - Storefront sync logs & stock movements: hard-deleted
  * - Accounting sync logs (o3d-nepa): three disjoint cases, all keyed on resolvedAt, never createdAt —
- *   unresolved rows are NEVER touched at any age; CANCELLED-with-no-external-id is deleted; every
- *   other expired terminal row is COMPACTED to a posting tombstone the delete guard can still read
+ *     NEVER TOUCHED  anything not terminal (PENDING/PROCESSING) at any age, the three types a later
+ *                    posting decision reads back, and a FAILED money-moving follow-up, whose stored
+ *                    request body is reused verbatim if anyone retries it;
+ *     DELETED        CANCELLED, no externalTransactionId, and not a type whose bare existence another
+ *                    sweep consumes as a do-not-re-enqueue marker;
+ *     TOMBSTONED     every other expired terminal row — COMPACTED in place to the fields the delete
+ *                    guard reads, its idempotency tokens and its non-PII settlement facts
  * - Shopping webhook inbox: processed rows compacted to a dedup tombstone (o3d-ahk)
  * - Sales orders, purchase orders, customers: soft-archived (archived = true)
  * Call on a daily schedule via /api/cron/activity-cleanup.
@@ -238,10 +386,15 @@ export async function purgeExpiredData(): Promise<{
       // What survives as a delete is the one shape proven to have had NO REMOTE EFFECT: CANCELLED
       // with no externalTransactionId. Note the proof is not "the cancel paths refuse rows carrying
       // an external id" — cancelPendingSalesInvoiceSyncForOrder also retires STALE PROCESSING rows,
-      // which o3d-sref establishes may have posted without recording an id. The proof is narrower and
-      // stronger: order-delete-guard matches a CANCELLED row ONLY via `externalTransactionId IS NOT
-      // NULL`, so a CANCELLED row without one is already invisible to every guard. Deleting it
-      // removes nothing that is read.
+      // which o3d-sref establishes may have posted without recording an id. The proof is narrower:
+      // order-delete-guard matches a CANCELLED row ONLY via `externalTransactionId IS NOT NULL`, so
+      // such a row is invisible to it.
+      //
+      // ...but the delete guard is NOT the only reader of a sync row's existence, which is what an
+      // earlier revision of this comment assumed (Codex NO-SHIP finding 4). A whole TYPE can be a
+      // durable do-not-re-enqueue marker whose bare presence another sweep consumes; those are carved
+      // out by accountingDeletableShape and tombstoned instead. See EXISTENCE_EVIDENCE_SYNC_TYPES for
+      // the carve-out and for the audit behind it.
       //
       // An earlier revision instead exempted PROCESSING rows from the age delete. That was REVERTED
       // for three reasons, all fixed by the three-case rule: it only DEFERRED the loss (expiry still
@@ -249,11 +402,7 @@ export async function purgeExpiredData(): Promise<{
       // holding customer names, emails and financial lines while the settings UI promised permanent
       // deletion; and it was the wrong shape, since the guard needs a handful of fields, not a row.
       db.accountingSyncLog.deleteMany({
-        where: {
-          status: 'CANCELLED',
-          externalTransactionId: null,
-          ...expired,
-        },
+        where: { ...accountingDeletableShape(), ...expired },
       }),
     ])
     shoppingSyncLogsDeleted = wc.count
@@ -276,17 +425,9 @@ export async function purgeExpiredData(): Promise<{
     // instead of rewriting the whole retained tombstone set. It is a column rather than a payload
     // marker so the exclusion is a plain indexed predicate (see the partial index in the migration)
     // and so an operator reading a thinned payload can see it was retention that thinned it.
+    const compactWhere = accountingCompactCandidateWhere(cutoff)
     const compactCandidates = await db.accountingSyncLog.findMany({
-      where: {
-        status: { in: [...ACCOUNTING_TERMINAL_STATUSES] },
-        compactedAt: null,
-        // Payloads a FUTURE posting decision still reads off a SYNCED row — see the constant.
-        type: { notIn: [...PAYLOAD_LOAD_BEARING_SYNC_TYPES] },
-        // Explicitly disjoint from the delete branch above, so the three cases stay provably
-        // non-overlapping no matter what order they run in.
-        NOT: { status: 'CANCELLED', externalTransactionId: null },
-        ...expired,
-      },
+      where: compactWhere,
       select: { id: true, payload: true, errorMessage: true },
       orderBy: { createdAt: 'asc' },
       take: ACCOUNTING_COMPACT_MAX_PER_RUN,
@@ -295,8 +436,28 @@ export async function purgeExpiredData(): Promise<{
     const compactedAt = new Date()
     for (const row of compactCandidates) {
       const payload = compactAccountingSyncPayload(row.payload)
-      await db.accountingSyncLog.update({
-        where: { id: row.id },
+      // A CONDITIONAL write, never an id-fenced update (Codex NO-SHIP finding 1).
+      //
+      // Candidates are SELECTED in one statement and written one at a time afterwards, and a row can
+      // be REVIVED in the gap: retryFailedXeroSync / retryFailedQuickBooksSync flip any FAILED row to
+      // PENDING and clear resolvedAt, resetFailedDailyBatchLogs does the same for a batch, and the
+      // follow-up revival path restores a live row for the same scope. Fenced only by id, this write
+      // would then overwrite a LIVE row's restored request body with the tombstone computed from the
+      // pre-revival read AND stamp compactedAt on it — handing the processor work whose payload we
+      // had just destroyed. Nothing about the shape of the write makes that visible afterwards: the
+      // row looks exactly like a legitimately compacted one.
+      //
+      // Re-checking the WHOLE candidate predicate (the identical object, unmodified) closes the
+      // window at commit time: compactedAt still null, status still terminal, type still outside both
+      // exclusion sets, still disjoint from the delete branch — and still EXPIRED, which is the
+      // condition that catches a row revived and re-resolved in between, because de-terminalising
+      // CLEARS resolvedAt and the next terminal transition stamps a fresh one that is nowhere near
+      // the cutoff.
+      //
+      // Counted from `count` rather than incremented per iteration: a row the predicate no longer
+      // matches is left completely alone, and must not be reported as compacted.
+      const { count } = await db.accountingSyncLog.updateMany({
+        where: { id: row.id, ...compactWhere },
         data: {
           // Left untouched when it is not an object — writing over a NULL payload would gain nothing
           // and needs Prisma's DbNull sentinel to express.
@@ -306,7 +467,7 @@ export async function purgeExpiredData(): Promise<{
           compactedAt,
         },
       })
-      accountingSyncLogsCompacted++
+      accountingSyncLogsCompacted += count
     }
   }
 
