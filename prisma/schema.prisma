@@ -2073,6 +2073,21 @@ model AccountingSyncLog {
   processingStartedAt   DateTime?
   syncedAt              DateTime?
   createdAt             DateTime             @default(now())
+  // o3d-nepa: when this row reached a TERMINAL state (SYNCED / FAILED / CANCELLED), and the ONLY
+  // clock retention is allowed to key on. createdAt is the wrong clock: terminalisation never
+  // refreshes it, so an old row that only just resolved — or that has not resolved at all — was
+  // deleted by the very next cleanup, taking with it the delete guard's only evidence that a
+  // document may exist in the ledger (o3d-ju8t: FAILED does not prove nothing posted; o3d-0g2n:
+  // QuickBooks' updateBackReference swallows its failure with no repair sweep, so the sync row can
+  // be the ONLY record that an invoice exists).
+  // CLEARED back to null wherever a row is de-terminalised (FAILED -> PENDING retry / revival), so
+  // the clock only ever runs while the row is genuinely resolved.
+  resolvedAt            DateTime?
+  // o3d-nepa: when retention reduced this row to a tombstone (payload cut down to its idempotency
+  // tokens, errorMessage replaced by a non-PII marker). NOT NULL means "already compacted" — the
+  // SQL-expressible idempotence guard that stops every daily run rewriting the whole retained
+  // tombstone set, and an honest record for anyone reading a payload that is missing detail.
+  compactedAt           DateTime?
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
@@ -2080,6 +2095,9 @@ model AccountingSyncLog {
   @@index([connector, referenceType, referenceId])
   @@index([connector, status, createdAt])
   @@index([connector, status, processingStartedAt])
+  // o3d-nepa: retention's expiry scan (status + resolvedAt cutoff) for both the delete and the
+  // compact branch. Deliberately NOT connector-scoped — retention sweeps every connector at once.
+  @@index([status, resolvedAt])
   @@map("accounting_sync_logs")
 }
 

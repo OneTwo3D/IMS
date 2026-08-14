@@ -3518,7 +3518,9 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       if (pendingIds.length > 0) {
         await db.accountingSyncLog.updateMany({
           where: { id: { in: pendingIds }, status: 'PENDING' },
-          data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
+          // o3d-nepa: resolvedAt starts retention's expiry clock in the SAME write as the terminal
+          // status. Guarded on status PENDING, so nothing was posted for this row.
+          data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.', resolvedAt: new Date() },
         })
         // Whichever ids did NOT transition were taken by a worker first, so they belong with the rows
         // that need reversing in the ledger rather than being silently forgotten.

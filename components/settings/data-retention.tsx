@@ -21,7 +21,11 @@ const FIELDS = [
   { key: 'retention_purchase_orders_months', label: 'Purchase Orders', stateKey: 'purchaseOrders' as const, hint: 'Archive received, closed, invoiced, returned, or cancelled POs' },
   { key: 'retention_customers_months', label: 'Customers', stateKey: 'customers' as const, hint: 'Archive inactive customers' },
   { key: 'retention_stock_movements_months', label: 'Stock Movements', stateKey: 'stockMovements' as const, hint: 'Permanently delete movements' },
-  { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete sync logs' },
+  // o3d-nepa: "permanently delete sync logs" is no longer the whole truth — accounting rows are
+  // reduced to a posting tombstone instead, so an order that may hold a document in the ledger stays
+  // protected from an irreversible delete. Phrased like the webhook hint below: what is cleared, and
+  // what survives, in one line.
+  { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Delete storefront logs, clear accounting payloads (keeps posting evidence)' },
   { key: 'retention_webhook_events_months', label: 'Webhook Events', stateKey: 'webhookEvents' as const, hint: 'Clear processed inbox payloads (keeps dedup + dead letters)' },
 ] as const
 
@@ -58,7 +62,7 @@ export function DataRetentionSetting({
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Set to 0 to keep records forever. Financial records (orders, customers) are soft-archived — hidden from lists but accessible via direct link. Operational data (movements, sync logs) is permanently deleted. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
+        Set to 0 to keep records forever. Financial records (orders, customers) are soft-archived — hidden from lists but accessible via direct link. Operational data (movements, storefront sync logs) is permanently deleted. Accounting sync logs keep a small posting tombstone once their payload is cleared, so an order whose document may still sit in the ledger cannot be deleted by mistake; unresolved ones are never cleared at all. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
       </p>
       <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-x-4 max-w-4xl">
         {FIELDS.map((f) => (

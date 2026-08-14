@@ -298,6 +298,9 @@ async function resetFailedDailyBatchLogs(): Promise<void> {
         retryCount: 0,
         errorMessage: null,
         processingStartedAt: null,
+        // o3d-nepa: DE-TERMINALISED (FAILED -> PENDING). Clear resolvedAt so retention's expiry clock
+        // stops while the batch is queued for another attempt.
+        resolvedAt: null,
       },
     })
 

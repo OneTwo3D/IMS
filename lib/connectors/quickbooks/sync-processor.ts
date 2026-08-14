@@ -215,6 +215,9 @@ async function enqueueFollowUpSyncLog(
           retryCount: 0,
           errorMessage: null,
           processingStartedAt: null,
+          // o3d-nepa: DE-TERMINALISED. The row is live work again, so its retention clock must stop —
+          // leaving a stale resolvedAt would let the next cleanup compact a row that is in flight.
+          resolvedAt: null,
         },
       })
       if (revived.count === 0) {
@@ -339,6 +342,11 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // o3d-nepa: retention keys on resolvedAt, never createdAt. Stamped in the SAME write as
+              // the terminal status. Matters most here: o3d-0g2n means QuickBooks' updateBackReference
+              // can fail silently with no repair sweep, so this row is sometimes the ONLY local record
+              // that an invoice exists.
+              resolvedAt: new Date(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -378,6 +386,8 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // o3d-nepa: retention's expiry clock, stamped with the terminal status.
+              resolvedAt: new Date(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -437,6 +447,9 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
                 retryCount,
                 errorMessage,
                 processingStartedAt: null,
+                // o3d-nepa: only the FAILED branch is terminal and starts retention's clock. The
+                // PENDING retry branch clears it — a row back in the queue is unresolved again.
+                resolvedAt: finalFailure ? new Date() : null,
               },
             })
             if (finalFailure) {
@@ -476,6 +489,9 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               retryCount,
               errorMessage,
               processingStartedAt: null,
+              // o3d-nepa: only the FAILED branch is terminal and starts retention's clock. The
+              // PENDING retry branch clears it — a row back in the queue is unresolved again.
+              resolvedAt: finalFailure ? new Date() : null,
             },
           })
           if (finalFailure) {

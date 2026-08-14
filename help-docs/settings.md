@@ -269,7 +269,7 @@ This means an admin viewing the activity log can see who did what but not see se
 - **Plugins** — enable or disable shopping/accounting connector plugins. Disabled plugins are hidden from menus and shared UI.
 - **Scheduler** — configure the public app URL used for external callbacks and manage scheduled jobs
 - **Activity log retention** — set how many days to keep log entries, configurable per log level
-- **Data retention** — configure archival/deletion windows for operational records
+- **Data retention** — configure archival/deletion windows for operational records. Orders, purchase orders and customers are soft-archived; stock movements and storefront sync logs are deleted outright. Accounting sync logs are treated differently: an expired one keeps a small tombstone (connector, document type, status, reference, external transaction id) after its payload is cleared, so an order whose invoice may still sit in the ledger stays protected from an irreversible delete — and a sync row that has not finished is never cleared at any age.
 - **System health** — at-a-glance status of FX sync, accounting sync, integration outbox depth, recent cron runs, and invariant check results
 - **Database reset** — reset system data with three levels of severity:
   - **Transactions only** — clears orders, invoices, and movements but keeps products and settings

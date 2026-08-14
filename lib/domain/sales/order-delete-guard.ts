@@ -121,12 +121,19 @@ export async function findSalesOrderDeleteBlocker(
   // required remedy is, so the operator is always told the most binding thing first.
   const blockers: SalesOrderDeleteBlocker[] = []
 
-  // 0. Durable external-document markers, checked FIRST because they are the only evidence here
-  // that survives retention (o3d-v7sy). Everything else in this guard reads AccountingSyncLog,
-  // and purgeExpiredData deletes those rows past the retention window (six months by default).
-  // An old order can therefore hold a real invoice in the external ledger, have no retained sync
-  // row, and pass every other check — hard-deleted, stranding the document with no IMS order
-  // behind it. accountingInvoiceId lives on the order itself and is never purged.
+  // 0. Durable external-document markers, checked FIRST because they were once the only evidence
+  // here that survived retention (o3d-v7sy). purgeExpiredData used to delete every AccountingSyncLog
+  // row past the retention window by age alone, so an old order could hold a real invoice in the
+  // external ledger, have no retained sync row, and pass every other check — hard-deleted, stranding
+  // the document with no IMS order behind it. accountingInvoiceId lives on the order itself and is
+  // never purged.
+  //
+  // Since o3d-nepa that hole is largely closed from the other side: retention now keys on resolvedAt
+  // and COMPACTS expired terminal rows to a tombstone that keeps exactly the fields read below
+  // (connector, type, status, referenceType, referenceId, externalTransactionId) rather than deleting
+  // them, and never touches an unresolved row at all. The only rows it still hard-deletes are
+  // CANCELLED ones carrying no externalTransactionId — which the checks below cannot match anyway.
+  // This marker therefore remains the belt to that braces, not a substitute for it.
   //
   // CAVEAT (o3d-0g2n): this marker is only as reliable as the writeback that sets it. On
   // QuickBooks, updateBackReference runs after the sync row is SYNCED, swallows its failure, and

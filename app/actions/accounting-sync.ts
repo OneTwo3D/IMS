@@ -185,7 +185,10 @@ export async function cancelOrphanedAccountingSyncRows(
     where: { AND: [scope, { status: 'PENDING' as const }] },
     // audit-46ry: CANCELLED (not FAILED) so these abandoned rows are excluded from
     // FAILED-scanning reconciliation/backfill sweeps and error dashboards.
-    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
+    // o3d-nepa: resolvedAt starts retention's expiry clock in the SAME write as the terminal status.
+    // Only PENDING rows are matched (o3d-sref), which are provably PRE-CALL, so these expire into the
+    // outright-delete branch rather than a tombstone.
+    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null, resolvedAt: new Date() },
   })
 
   // Counted, not cancelled — so the activity log explains why the orphan count did not reach zero.

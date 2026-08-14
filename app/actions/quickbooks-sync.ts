@@ -339,7 +339,10 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
       : { connector: 'quickbooks', status: 'FAILED' as const }
     const result = await db.accountingSyncLog.updateMany({
       where,
-      data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
+      // o3d-nepa: DE-TERMINALISED (FAILED -> PENDING). Clear resolvedAt so retention's expiry clock
+      // stops — a row an operator has just put back in the queue is unresolved again, and leaving a
+      // stale resolvedAt would let the next cleanup compact live work.
+      data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null, resolvedAt: null },
     })
     await logActivity({
       entityType: 'SYSTEM',

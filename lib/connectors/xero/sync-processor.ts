@@ -164,6 +164,11 @@ export async function markSyncLogForFollowUpRetry(
       retryCount,
       errorMessage,
       processingStartedAt: null,
+      // o3d-nepa: resolvedAt is retention's expiry clock and must move in the SAME write as the
+      // status. Only the FAILED branch is terminal — the PENDING retry branch explicitly clears it,
+      // because a row going back into the queue is unresolved again and must not keep ticking down
+      // toward deletion while it is still live.
+      resolvedAt: finalFailure ? new Date() : null,
     },
   })
   if (updated.count > 0) {
@@ -210,6 +215,9 @@ export async function applyMainSyncFailureRetry(
       retryCount,
       errorMessage,
       processingStartedAt: null,
+      // o3d-nepa: terminal FAILED starts retention's clock; the PENDING retry branch clears it so a
+      // row that is live again is never counted as resolved.
+      resolvedAt: computedFinal ? new Date() : null,
     },
   })
   if (updated.count > 0) {
@@ -338,6 +346,9 @@ async function enqueueFollowUpSyncLog(
             retryCount: 0,
             errorMessage: null,
             processingStartedAt: null,
+            // o3d-nepa: DE-TERMINALISED. The row is live work again, so its retention clock must stop
+            // — leaving a stale resolvedAt would let the next cleanup compact a row that is in flight.
+            resolvedAt: null,
           },
         })
         if (revived.count === 0) return 'cas-lost' as const
@@ -742,6 +753,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // o3d-nepa: retention keys on resolvedAt, never createdAt. Stamped in the SAME write as
+              // the terminal status. It is NOT syncedAt by another name — FAILED and CANCELLED have no
+              // syncedAt, and the back-reference repair sweep marks rows SYNCED without one.
+              resolvedAt: new Date(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -785,6 +800,8 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // o3d-nepa: retention's expiry clock, stamped with the terminal status.
+              resolvedAt: new Date(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -995,6 +1012,10 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // o3d-nepa: retention keys on resolvedAt, never createdAt. Stamped in the SAME write as
+              // the terminal status. It is NOT syncedAt by another name — FAILED and CANCELLED have no
+              // syncedAt, and the back-reference repair sweep marks rows SYNCED without one.
+              resolvedAt: new Date(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -1049,6 +1070,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // o3d-nepa: retention's expiry clock, stamped with the terminal status.
+              resolvedAt: new Date(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -1708,7 +1731,10 @@ export async function repairXeroBackReferences(limit = 200): Promise<BackReferen
       // source that would retry them, so a transient enqueue failure lost the payment or PDF
       // permanently (Codex review, r6). Leaving it FAILED is what makes the retry durable.
       if (row.status === 'FAILED' && followUpsEnqueued) {
-        await db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', errorMessage: null } })
+        // o3d-nepa: this repair sweep terminalises a FAILED row to SYNCED WITHOUT writing syncedAt,
+        // which is exactly why retention cannot key on syncedAt either — resolvedAt is the one clock
+        // every terminal transition stamps.
+        await db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', errorMessage: null, resolvedAt: new Date() } })
       }
       if (followUpsOnly) {
         // Nothing was repaired — this pass existed only to retry the follow-ups. Reporting it

@@ -51,7 +51,11 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
     // claimed PROCESSING row (recent processingStartedAt) is intentionally NOT matched — it is left to
     // finish; SYNCED rows are already posted and out of scope for retirement (a cancel-after-post needs
     // an explicit reversal, tracked separately).
-    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
+    // o3d-nepa: resolvedAt is retention's expiry clock and is stamped in the SAME write as the
+    // terminal status. Both cancel paths above require externalTransactionId: null, so a row retired
+    // here carries no external id — which is exactly what lets retention DELETE it once expired
+    // (the delete guard cannot see a CANCELLED row without an external id in the first place).
+    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null, resolvedAt: new Date() },
   })
 
   // Terminalise the mirrored events too, or a dangling PENDING mirror reads as work still owed.
@@ -86,7 +90,11 @@ export async function retireSalesInvoiceForCancelledOrder(
   // real Xero receivable). If the CAS matches nothing, leave the row and the mirror untouched.
   const retired = await client.accountingSyncLog.updateMany({
     where: { id: syncLogId, status: 'PROCESSING', processingStartedAt: claimedAt, externalTransactionId: null },
-    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
+    // o3d-nepa: resolvedAt is retention's expiry clock and is stamped in the SAME write as the
+    // terminal status. Both cancel paths above require externalTransactionId: null, so a row retired
+    // here carries no external id — which is exactly what lets retention DELETE it once expired
+    // (the delete guard cannot see a CANCELLED row without an external id in the first place).
+    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null, resolvedAt: new Date() },
   })
   if (retired.count === 0) return false
   await voidMirroredAccountingEventsForOrder(client, {
