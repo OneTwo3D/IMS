@@ -22,23 +22,38 @@ let syncLogs: SyncLogRow[] = []
 const created: CreatedLog[] = []
 const cogsMovements: Array<{ sourceRef: string; journalDate: unknown }> = []
 
-function matchesRef(value: string, condition: unknown): boolean {
+/** The only referenceId predicates the two sweeps emit: exact, `in`, or `startsWith`. */
+type RefCondition = string | { in?: string[]; startsWith?: string }
+
+function matchesRef(value: string, condition: RefCondition | undefined): boolean {
   if (typeof condition === 'string') return value === condition
   if (condition && typeof condition === 'object') {
-    const cond = condition as { in?: string[]; startsWith?: string }
-    if (Array.isArray(cond.in)) return cond.in.includes(value)
-    if (typeof cond.startsWith === 'string') return value.startsWith(cond.startsWith)
+    if (Array.isArray(condition.in)) return condition.in.includes(value)
+    if (typeof condition.startsWith === 'string') return value.startsWith(condition.startsWith)
   }
   return false
 }
 
-/** Minimal Prisma `where` evaluator covering exactly the shapes the sweep builds. */
-function matchesLog(row: SyncLogRow, where: Record<string, any>): boolean {
+/**
+ * Minimal Prisma `where` evaluator covering exactly the shapes the sweep builds.
+ * Typed rather than `any` so a shape the sweep starts emitting that this does not model
+ * fails to compile here instead of silently evaluating to "no match" (which would read as
+ * "no live log" — the direction that double-posts a journal).
+ */
+type LogWhere = {
+  connector?: string
+  type?: string
+  status?: { in?: string[] }
+  referenceId?: RefCondition
+  OR?: Array<{ referenceId?: RefCondition }>
+}
+
+function matchesLog(row: SyncLogRow, where: LogWhere): boolean {
   if (where.connector && row.connector !== where.connector) return false
   if (where.type && row.type !== where.type) return false
   if (where.status?.in && !where.status.in.includes(row.status)) return false
   if (where.referenceId !== undefined && !matchesRef(row.referenceId, where.referenceId)) return false
-  if (where.OR && !where.OR.some((alt: any) => matchesRef(row.referenceId, alt.referenceId))) return false
+  if (where.OR && !where.OR.some((alt) => matchesRef(row.referenceId, alt.referenceId))) return false
   return true
 }
 
@@ -67,7 +82,7 @@ mock.module('@/lib/db', {
       },
       shipment: { findMany: async () => shipmentRows },
       accountingSyncLog: {
-        count: async ({ where }: { where: Record<string, any> }) =>
+        count: async ({ where }: { where: LogWhere }) =>
           syncLogs.filter((row) => matchesLog(row, where)).length,
       },
       $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx),
