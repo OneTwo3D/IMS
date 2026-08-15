@@ -1,9 +1,10 @@
-import type { AccountingSyncType } from '@/app/generated/prisma/client'
+import type { AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   applyBackReference,
   backReferenceIsMissing,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
+  type AmbiguousPurchaseOrderAttribution,
   type BackReferenceDeps,
   type PurchaseOrderAttribution,
 } from './back-reference'
@@ -63,6 +64,42 @@ import {
 
 /** Sync types that can carry a back-reference. Matches syncTypeWritesBackReference's pairs. */
 export const BACK_REFERENCE_SWEEP_TYPES = ['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE'] as const
+
+/**
+ * Rows that are still UNRESOLVED BACK-REFERENCE EVIDENCE, i.e. rows this sweep has not reached a
+ * verdict on. Exported so data retention and the sweep cannot drift apart (o3d-9kek r2 finding 2).
+ *
+ * WHY RETENTION MUST NOT DELETE THESE. Retention deletes accounting_sync_logs by age alone, on its
+ * own schedule, while the sweep reads its candidate page outside the transaction that later acts
+ * on it. Deleting one of these rows destroys the only record that an external document exists
+ * with no local link — and, worse, deleting a COMPETING sibling silently converts an ambiguity
+ * into an apparent certainty: one unlinked bill, one surviving claimant, and the sweep attributes
+ * a bill whose competitor it can no longer see. Neither the resolver's exactly-one-row rule nor
+ * the unique index can detect that, because after the delete the state is genuinely
+ * indistinguishable from an unambiguous one.
+ *
+ * WHY THIS IS BOUNDED, unlike the PROCESSING exemption that was reverted in data-retention.ts.
+ * The sweep stamps backReferenceCheckedAt on every row it settles, so a settled row leaves this
+ * set permanently and expires on the normal schedule. What is retained is exactly the set a human
+ * is being warned about once a day. And once a row IS settled, the attribution no longer depends
+ * on the log at all: it lives on the document itself (purchase_invoices.accounting_invoice_id,
+ * which is never retention-deleted and is now unique), so deleting the settled log loses nothing.
+ *
+ * The known cost, stated rather than hidden: unresolved rows belonging to a connector that is
+ * later disconnected are never swept again and so are never stamped, and they will outlive the
+ * retention period until someone cancels them (audit-46ry's CANCELLED status is that lever).
+ */
+export const UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE: {
+  backReferenceCheckedAt: null
+  externalTransactionId: { not: null }
+  status: { in: AccountingSyncStatus[] }
+  type: { in: AccountingSyncType[] }
+} = {
+  backReferenceCheckedAt: null,
+  externalTransactionId: { not: null },
+  status: { in: ['SYNCED', 'FAILED'] },
+  type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
+}
 
 /** Rows examined per run, across all pages. */
 export const DEFAULT_BACK_REFERENCE_SWEEP_LIMIT = 200
@@ -142,7 +179,16 @@ export type BackReferenceSweepDeps = {
   connectorLabel: string
   /** Activity action prefix, e.g. 'xero' → 'xero_backreference_repaired'. */
   activityActionPrefix: string
-  logActivity: (entry: BackReferenceSweepActivity) => Promise<unknown>
+  /**
+   * MUST report whether the entry was PERSISTED — `true` only if it reached the activity log.
+   *
+   * The production logActivity swallows persistence errors and resolves normally, so awaiting it
+   * proves nothing (o3d-9kek r2 finding 3). That mattered here because the ambiguity warning and
+   * the 24-hour deferral are stamped together: a transient activity-log failure suppressed BOTH
+   * the operator's only notification AND any further repair attempt for a day. Connectors wire
+   * this to logActivityPersisted, whose return value is the confirmation.
+   */
+  logActivity: (entry: BackReferenceSweepActivity) => Promise<boolean>
   enqueueFollowUps: (
     entryId: string,
     type: AccountingSyncType,
@@ -172,6 +218,27 @@ export type BackReferenceRepairResult = {
 }
 
 export type BackReferenceCandidateCursor = { createdAt: Date; id: string }
+
+/**
+ * What each refusal means, in the operator's terms, and what they are being asked to do. Every
+ * one of them ends in a MANUAL action: the sweep has decided it cannot attribute the id safely,
+ * and no amount of re-running changes that on its own.
+ */
+const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason'], (a: AmbiguousPurchaseOrderAttribution) => string> = {
+  MULTIPLE_SYNC_ROWS: (a) =>
+    `${a.syncRowCount} posted bill sync rows reference this PO, so which bill this external id belongs to cannot be determined. Link them manually.`,
+  MULTIPLE_UNLINKED_BILLS: () =>
+    'the PO has several bills with no external id, so which one this external id belongs to cannot be determined. Link them manually.',
+  NO_LIVE_SYNC_ROW: () =>
+    'no live posted sync row for this PO carries this external id any more — its record was deleted or cancelled while the repair was in flight, '
+    + 'so there is no longer any evidence of which bill it posted. Check the accounting ledger and link the bill manually.',
+  EXTERNAL_ID_LINKED_ELSEWHERE: (a) =>
+    `this external id is already linked to bill ${a.linkedPurchaseInvoiceId ?? 'unknown'} on purchase order ${a.linkedPurchaseOrderId ?? 'unknown'}, `
+    + 'so it cannot also belong to a bill of this one. Either that link or this sync row is wrong — resolve it manually.',
+  EXTERNAL_ID_CLAIMED_CONCURRENTLY: () =>
+    'another bill claimed this external id while the repair was being written, so it is already attributed and was not copied. '
+    + 'Confirm the surviving link is the right one.',
+}
 
 /**
  * The candidate query. Pure, and exported so a test can assert the predicates the sweep
@@ -258,6 +325,76 @@ export async function repairAccountingBackReferences(
     })
   }
 
+  /**
+   * An attribution this run refuses to act on: count it, warn about it at most once per interval,
+   * and defer it for that interval. Shared by the probe and by the fenced re-resolve inside the
+   * apply, so a conflict that only surfaces at write time (the unique index rejecting an id
+   * another bill acquired) is reported and throttled exactly like one the probe saw — instead of
+   * being a bare console line counted as a generic failure (o3d-9kek r2 finding 1).
+   *
+   * THE WARNING AND THE DEFERRAL ARE NOT INDEPENDENT. The stamp is only written once the warning
+   * is CONFIRMED PERSISTED, because the deferral's whole justification is that a human has been
+   * told; stamping it after a failed write would hide the row for 24 hours and tell nobody
+   * (r2 finding 3). The ordering makes the failure modes asymmetric on purpose: warning-then-stamp
+   * can at worst repeat a warning if the stamp fails, which is noise, whereas stamp-then-warn can
+   * lose the only notification, which is silence. That asymmetry is why a transaction around the
+   * pair is not needed to make this safe.
+   */
+  const reportAmbiguity = async (row: BackReferenceSweepRow, attribution: AmbiguousPurchaseOrderAttribution) => {
+    result.skippedAmbiguous++
+    const previouslyLoggedAt = row.backReferenceAmbiguousLoggedAt
+    const observedAt = now()
+    // The candidate query already filtered on this, from the same cutoff. Re-asserted
+    // here so "at most one warning per interval" holds on the row itself and not only
+    // on a query a future edit could loosen.
+    const dueToReport = previouslyLoggedAt === null || previouslyLoggedAt < ambiguityRecheckBefore
+    if (!dueToReport) return
+
+    const persisted = await deps.logActivity({
+      entityType: 'SYSTEM',
+      action: `${prefix}_backreference_repair_ambiguous`,
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Skipped ${connectorLabel} back-reference repair for PO ${row.referenceId}: `
+        + AMBIGUITY_EXPLANATIONS[attribution.reason](attribution)
+        + (previouslyLoggedAt === null ? '' : ` Still unresolved since this was last reported at ${previouslyLoggedAt.toISOString()}.`),
+      metadata: {
+        syncLogId: row.id,
+        referenceId: row.referenceId,
+        reason: attribution.reason,
+        syncRowCount: attribution.syncRowCount,
+        unlinkedBillCount: attribution.unlinkedBillCount,
+        linkedPurchaseInvoiceId: attribution.linkedPurchaseInvoiceId ?? null,
+        linkedPurchaseOrderId: attribution.linkedPurchaseOrderId ?? null,
+        previouslyLoggedAt: previouslyLoggedAt?.toISOString() ?? null,
+      },
+    })
+    if (!persisted) {
+      // The warning did not reach the log. Leave the row immediately eligible: the next run
+      // re-probes and tries to report again. Deferring an unreported ambiguity is the one
+      // combination that helps nobody.
+      console.error(`${prefix}: back-reference ambiguity warning was not persisted; leaving row eligible`, row.id)
+      return
+    }
+    // A DEFERRAL, deliberately NOT backReferenceCheckedAt: ambiguity is not a verdict —
+    // a sibling can be cancelled or post, several unlinked bills can shrink to one, and
+    // the manual link this warning asks for changes the answer. Stamping it as checked
+    // excluded a row that had since become repairable, which is the starvation this sweep
+    // exists to prevent (Codex r9 #2). This takes the row out of the candidate set for ONE
+    // interval and no longer.
+    try {
+      await deps.db.accountingSyncLog.update({
+        where: { id: row.id },
+        data: { backReferenceAmbiguousLoggedAt: observedAt },
+      })
+    } catch (deferralError) {
+      // The row can legitimately be gone — retention, or a connector switch cancelling it —
+      // between the candidate read and here. Nothing to defer, and nothing to retry: a row that
+      // no longer exists cannot re-fill the head of the scan.
+      console.error(`${prefix}: could not defer back-reference ambiguity`, row.id, deferralError)
+    }
+  }
+
   let after: BackReferenceCandidateCursor | null = null
   while (result.scanned < limit) {
     const take = Math.min(pageSize, limit - result.scanned)
@@ -311,45 +448,7 @@ export async function repairAccountingBackReferences(
             continue
           }
           if (attribution.outcome === 'ambiguous') {
-            result.skippedAmbiguous++
-            const previouslyLoggedAt = row.backReferenceAmbiguousLoggedAt
-            const observedAt = now()
-            // The candidate query already filtered on this, from the same cutoff. Re-asserted
-            // here so "at most one warning per interval" holds on the row itself and not only
-            // on a query a future edit could loosen.
-            const dueToReport = previouslyLoggedAt === null || previouslyLoggedAt < ambiguityRecheckBefore
-            if (dueToReport) {
-              await deps.logActivity({
-                entityType: 'SYSTEM',
-                action: `${prefix}_backreference_repair_ambiguous`,
-                tag: 'sync',
-                level: 'WARNING',
-                description: `Skipped ${connectorLabel} back-reference repair for PO ${row.referenceId}: `
-                  + (attribution.reason === 'MULTIPLE_SYNC_ROWS'
-                    ? `${attribution.syncRowCount} posted bill sync rows reference this PO, so which bill this external id belongs to cannot be determined.`
-                    : 'the PO has several bills with no external id, so which one this external id belongs to cannot be determined.')
-                  + ' Link them manually.'
-                  + (previouslyLoggedAt === null ? '' : ` Still unresolved since this was last reported at ${previouslyLoggedAt.toISOString()}.`),
-                metadata: {
-                  syncLogId: row.id,
-                  referenceId: row.referenceId,
-                  reason: attribution.reason,
-                  syncRowCount: attribution.syncRowCount,
-                  unlinkedBillCount: attribution.unlinkedBillCount,
-                  previouslyLoggedAt: previouslyLoggedAt?.toISOString() ?? null,
-                },
-              })
-              // A DEFERRAL, deliberately NOT backReferenceCheckedAt: ambiguity is not a
-              // verdict — a sibling can be cancelled or post, several unlinked bills can
-              // shrink to one, and the manual link this warning asks for changes the answer.
-              // Stamping it as checked excluded a row that had since become repairable, which
-              // is the starvation this sweep exists to prevent (Codex r9 #2). This takes the
-              // row out of the candidate set for ONE interval and no longer.
-              await deps.db.accountingSyncLog.update({
-                where: { id: row.id },
-                data: { backReferenceAmbiguousLoggedAt: observedAt },
-              })
-            }
+            await reportAmbiguity(row, attribution)
             continue
           }
           // 'none' → every bill already linked; 'already-linked' → this row's own id is
@@ -391,12 +490,21 @@ export async function repairAccountingBackReferences(
             // atomic. Handing it a pre-resolved bill id is what made the write unconditional
             // and let it clobber a concurrently linked bill (o3d-9kek finding 3).
             const applied = await applyBackReference(deps.db, params)
+            if (applied.outcome === 'ambiguous') {
+              // The fenced re-resolve refused, or the unique index refused the swap because
+              // another bill had taken the id. Reported and throttled like any other refusal
+              // rather than counted as a generic failure: an attribution conflict names a manual
+              // action, and a bare console line names nobody (o3d-9kek r2 finding 1). Never
+              // stamped as checked — the conflict can be resolved by hand.
+              await reportAmbiguity(row, applied.attribution)
+              continue
+            }
             if (applied.outcome !== 'applied') {
               // `contended` — a concurrent writer linked the bill first, so the swap matched
-              // no row and nothing was overwritten. `ambiguous`/`nothing-to-apply`/
-              // `already-linked` — the population moved between the probe and the fenced
-              // re-resolve. Never stamp: the next run re-resolves from fresh state and will
-              // settle it (typically as already-linked).
+              // no row and nothing was overwritten. `nothing-to-apply`/`already-linked` — the
+              // population moved between the probe and the fenced re-resolve. Never stamp: the
+              // next run re-resolves from fresh state and will settle it (typically as
+              // already-linked).
               console.error(`${prefix}: back-reference apply declined`, row.id, applied.outcome)
               result.failed++
               continue

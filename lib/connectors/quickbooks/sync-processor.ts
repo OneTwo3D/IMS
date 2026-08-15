@@ -874,8 +874,23 @@ async function updateBackReference(
         console.warn(`quickbooks: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; the repair sweep will re-resolve it.`)
       }
     }
-  } catch {
-    // Non-critical — log entry already marked as SYNCED
+  } catch (error) {
+    // Pre-existing: QuickBooks swallows back-reference failures here (Xero does not — it
+    // propagates so the caller retries). Not changed in this pass, because de-swallowing alters
+    // QBO's retry semantics for every type at once. What IS changed is the SILENCE: since
+    // o3d-9kek made purchase_invoices.accounting_invoice_id unique, a real attribution conflict
+    // — two local bills pointing at one QuickBooks document — arrives here as an exception, and
+    // an invisible one is indistinguishable from success. The repair sweep still owns the retry.
+    console.error(`quickbooks: back-reference write failed for ${referenceType} ${referenceId}`, error)
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_backreference_failed',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Could not write the QuickBooks back-reference for ${referenceType} ${referenceId}: ${String(error)}. `
+        + 'The external id is on the sync row; the back-reference repair sweep will retry it.',
+      metadata: { type, referenceType, referenceId, externalId },
+    })
   }
 }
 

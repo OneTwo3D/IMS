@@ -1390,7 +1390,21 @@ model PurchaseInvoice {
   fxRateToBase     Decimal   @db.Decimal(18, 8)
   notes           String?
   supplierInvoiceUrl String? // path to uploaded supplier PDF
-  accountingInvoiceId String?  @map("accounting_invoice_id")
+  // o3d-9kek: ONE external bill ↔ ONE local bill, enforced by the database.
+  //
+  // Two bills carrying the same external id is the catastrophic failure this whole area exists
+  // to prevent: PURCHASE_INVOICE_UPDATE posts to /Invoices/{accountingInvoiceId}, so every later
+  // correction to one bill silently rewrites the other's document in the ledger (see the o3d-9oq
+  // note in app/actions/purchase-orders.ts). Until now nothing forbade it, so the invariant was
+  // only ever upheld by protocol — a guard on one code path, in a separate statement from the
+  // write, which no protocol can make atomic and a future writer can forget.
+  //
+  // Postgres does not collide NULLs, so this is exactly "unique where the id is set": any number
+  // of bills may be unlinked, no two may claim the same external id. A connector switch cannot
+  // produce a false conflict because the column holds one connector's id at a time (the same
+  // connector-agnostic shape as Product.accountingItemId) and the two connectors' id formats are
+  // disjoint (Xero GUID vs QuickBooks integer).
+  accountingInvoiceId String?  @unique @map("accounting_invoice_id")
   paidAt          DateTime?
   paymentAccountId   String?   // connector account id (e.g. Xero bank AccountID) used to pay this bill
   paymentAccountName String?   // snapshot of the bank account name at payment time

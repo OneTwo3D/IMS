@@ -6,7 +6,7 @@
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
 import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
@@ -1634,7 +1634,10 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     connector: XERO_CONNECTOR,
     connectorLabel: 'Xero',
     activityActionPrefix: 'xero',
-    logActivity,
+    // logActivityPersisted, NOT logActivity: the sweep defers an ambiguous row for 24 hours on
+    // the strength of having warned about it, and logActivity cannot tell it whether the warning
+    // was written (o3d-9kek r2 finding 3).
+    logActivity: logActivityPersisted,
     enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult) =>
       enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult),
   }, { limit })

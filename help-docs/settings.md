@@ -269,7 +269,11 @@ This means an admin viewing the activity log can see who did what but not see se
 - **Plugins** — enable or disable shopping/accounting connector plugins. Disabled plugins are hidden from menus and shared UI.
 - **Scheduler** — configure the public app URL used for external callbacks and manage scheduled jobs
 - **Activity log retention** — set how many days to keep log entries, configurable per log level
-- **Data retention** — configure archival/deletion windows for operational records
+- **Data retention** — configure archival/deletion windows for operational records. Two kinds of
+  record are deliberately kept past their window: shopping webhook events are compacted rather than
+  deleted (they are the idempotency record), and accounting sync rows whose back-reference is still
+  unresolved are retained until the repair sweep settles them — deleting those would erase the only
+  evidence of which accounting document an unlinked order or bill belongs to
 - **System health** — at-a-glance status of FX sync, accounting sync, integration outbox depth, recent cron runs, and invariant check results
 - **Database reset** — reset system data with three levels of severity:
   - **Transactions only** — clears orders, invoices, and movements but keeps products and settings

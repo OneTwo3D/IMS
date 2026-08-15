@@ -87,6 +87,7 @@ function makeDeps(overrides: {
     lastUpdateData: undefined as Record<string, unknown> | undefined,
     lastCountWhere: undefined as Record<string, unknown> | undefined,
     lastBillWhere: undefined as Record<string, unknown> | undefined,
+    billFindFirstWheres: [] as Array<Record<string, unknown>>,
     transactions: 0,
     rawStatements: [] as Array<{ sql: string; values: unknown[] }>,
   }
@@ -96,6 +97,26 @@ function makeDeps(overrides: {
   const matchBills = (where: Record<string, unknown>) => bills
     .filter((bill) => matches(bill as unknown as Record<string, unknown>, where, BILL_COLUMNS))
     .sort((a, b) => b.createdAt - a.createdAt)
+
+  /**
+   * THE UNIQUE INDEX, modelled. o3d-9kek r2 finding 1 is fixed by a database constraint, so a
+   * double that cannot RAISE one would leave the fix untestable while looking tested: every
+   * assertion about "the id was not duplicated" would pass against a production that had removed
+   * the constraint handling entirely.
+   *
+   * Raised as Prisma raises it — a P2002 with the offending column in meta.target — so the
+   * structural classifier in production is exercised rather than a bespoke error type.
+   */
+  const enforceExternalIdUniqueness = (data: Record<string, unknown>, writtenBillIds: string[]) => {
+    const externalId = data.accountingInvoiceId
+    if (typeof externalId !== 'string' || externalId === '') return
+    const holder = bills.find((bill) => bill.accountingInvoiceId === externalId && !writtenBillIds.includes(bill.id))
+    if (!holder) return
+    throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`)'), {
+      code: 'P2002',
+      meta: { target: ['accounting_invoice_id'] },
+    })
+  }
 
   const deps: BackReferenceDeps = {
     salesOrder: {
@@ -107,7 +128,16 @@ function makeDeps(overrides: {
       async findUnique() { return { accountingCreditNoteId: overrides.salesOrderRefundCreditNoteId ?? null } },
     },
     purchaseInvoice: {
-      async update(args) { maybeThrow(); calls.purchaseInvoiceUpdate++; calls.purchaseInvoiceUpdateIds.push(args.where.id); calls.lastUpdateData = args.data; return {} },
+      async update(args) {
+        maybeThrow()
+        enforceExternalIdUniqueness(args.data, [args.where.id])
+        calls.purchaseInvoiceUpdate++
+        calls.purchaseInvoiceUpdateIds.push(args.where.id)
+        calls.lastUpdateData = args.data
+        const bill = bills.find((candidate) => candidate.id === args.where.id)
+        if (bill) Object.assign(bill, args.data)
+        return {}
+      },
       // The COMPARE-AND-SWAP. It honours `accountingInvoiceId: null` and reports how many
       // rows it actually touched — a double that ignored the predicate, or that always
       // answered 1, would make finding 3's fix untestable while looking tested.
@@ -115,6 +145,7 @@ function makeDeps(overrides: {
         maybeThrow()
         calls.purchaseInvoiceUpdateMany++
         const matched = matchBills(args.where)
+        enforceExternalIdUniqueness(args.data, matched.map((bill) => bill.id))
         for (const bill of matched) {
           calls.purchaseInvoiceUpdateIds.push(bill.id)
           calls.lastUpdateData = args.data
@@ -129,8 +160,14 @@ function makeDeps(overrides: {
         // code path would find nothing and write nothing, instead of writing the wrong bill
         // — and it would make the already-linked probe indistinguishable from the
         // unlinked-bill probe, since both go through here with DIFFERENT predicates.
+        //
+        // Returns poId, because the claim lookup asks the WHOLE table who holds an id and then
+        // decides from the OWNER's PO whether that is "already linked" or a conflict. A double
+        // that dropped poId would answer every claim as a conflict — passing the new test for the
+        // wrong reason and silently breaking the already-linked one.
+        calls.billFindFirstWheres.push(args.where)
         const bill = matchBills(args.where)[0]
-        return bill ? { id: bill.id } : null
+        return bill ? { id: bill.id, poId: bill.poId } : null
       },
       // Honours the predicates production depends on: a double that returned every bill
       // regardless of poId / accountingInvoiceId would make the ambiguity tests vacuous.
@@ -425,6 +462,113 @@ test('applyBackReference reports nothing-to-apply when every bill on the PO is a
   assert.equal(applied.outcome, 'nothing-to-apply')
   assert.equal(calls.purchaseInvoiceUpdate, 0)
   assert.equal(calls.purchaseInvoiceUpdateMany, 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek ROUND 2 — the already-linked guard was PO-scoped and ran in a separate statement
+// from the compare-and-swap, so two interleavings still produced two bills carrying one
+// external id. The invariant is now enforced by a unique index; these tests exist to prove
+// the index is actually relied upon, and that a violation is CLASSIFIED rather than retried
+// into an overwrite.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek r2 f1] the claim lookup asks the whole table, not just this PO', async () => {
+  const { deps, calls } = makeDeps({
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
+  })
+  await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
+  // A poId in this predicate is the defect: it is what made an id held by another order's bill
+  // invisible, and the write a silent duplicate.
+  assert.deepEqual(calls.billFindFirstWheres[0], { accountingInvoiceId: 'XBILL-1' })
+})
+
+test('[o3d-9kek r2 f1] an external id already on ANOTHER PO\'s bill is a conflict, not a free slot', async () => {
+  const { deps, calls } = makeDeps({
+    bills: [
+      // The holder — a bill of a DIFFERENT order. The PO-scoped guard never saw it.
+      { id: 'bill-elsewhere', poId: 'po-2', accountingInvoiceId: 'XBILL-1', createdAt: 1 },
+      { id: 'bill-here', poId: 'po-1', accountingInvoiceId: null, createdAt: 9 },
+    ],
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
+  })
+
+  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
+  assert.equal(resolved.outcome, 'ambiguous')
+  assert.equal(resolved.outcome === 'ambiguous' && resolved.reason, 'EXTERNAL_ID_LINKED_ELSEWHERE')
+  assert.equal(resolved.outcome === 'ambiguous' && resolved.linkedPurchaseInvoiceId, 'bill-elsewhere')
+  assert.equal(resolved.outcome === 'ambiguous' && resolved.linkedPurchaseOrderId, 'po-2')
+
+  const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' })
+  assert.equal(applied.outcome, 'ambiguous')
+  assert.deepEqual(calls.purchaseInvoiceUpdateIds, [], 'nothing may be written while the id is spoken for')
+  assert.equal(calls.purchaseInvoiceUpdateMany, 0)
+})
+
+test('[o3d-9kek r2 f1] a SIBLING bill taking the id after the resolve cannot receive a second copy', async () => {
+  // The interleaving neither the guard nor the compare-and-swap can see. bill-a is the sole
+  // unlinked bill, so the attribution is legitimately unique; bill-b holds an older id, so the
+  // guard finds no conflict. Then the authoritative bill-keyed writer links bill-b with the very
+  // id this repair is about to write. The swap's predicate asks only whether BILL-A is still
+  // unlinked — it is — so the swap matches and the id lands twice. Only the unique index refuses.
+  let raced = false
+  const bills: FakeBill[] = [
+    { id: 'bill-a', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 },
+    { id: 'bill-b', poId: 'po-1', accountingInvoiceId: 'XBILL-old', createdAt: 9 },
+  ]
+  const { deps, calls } = makeDeps({
+    bills,
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
+    raceAfterResolve: (live) => {
+      if (raced) return
+      raced = true
+      live[1].accountingInvoiceId = 'XBILL-1'
+    },
+  })
+
+  const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' })
+  assert.equal(applied.outcome, 'ambiguous')
+  assert.equal(applied.outcome === 'ambiguous' && applied.attribution.reason, 'EXTERNAL_ID_CLAIMED_CONCURRENTLY')
+  assert.equal(calls.purchaseInvoiceUpdateMany, 1, 'the swap must have been attempted — that is the race')
+  // The point of the whole exercise: exactly ONE bill carries XBILL-1, and it is the one the
+  // authoritative writer chose. bill-a is still unlinked, which is the acceptable outcome.
+  assert.deepEqual(bills.filter((bill) => bill.accountingInvoiceId === 'XBILL-1').map((bill) => bill.id), ['bill-b'])
+  assert.equal(bills[0].accountingInvoiceId, null)
+  assert.deepEqual(calls.purchaseInvoiceUpdateIds, [], 'and the swap wrote nothing')
+})
+
+test('[o3d-9kek r2 f1] the authoritative bill-keyed write refuses a duplicate id with an explanation', async () => {
+  // The bill-keyed path is allowed to overwrite a legacy guess, but it is not allowed to give a
+  // second local bill the same ledger document (the o3d-6l3 upsert defect did exactly that).
+  const { deps } = makeDeps({
+    bills: [
+      { id: 'bill-1', poId: 'po-1', accountingInvoiceId: 'XBILL-1', createdAt: 1 },
+      { id: 'bill-2', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+    ],
+  })
+  await assert.rejects(
+    () => applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: 'bill-2', externalId: 'XBILL-1' }),
+    /another bill already carries that external id/,
+  )
+})
+
+test('[o3d-9kek r2 f2] ZERO live sync rows is refused, not silently treated as "exactly one"', async () => {
+  // Retention deletes accounting_sync_logs by age, independently of the sweep, so the row whose
+  // external id is being repaired can be gone by the time the attribution is decided. Zero used
+  // to fall through to `unique` and stamp an in-memory id after its evidence had disappeared.
+  const { deps, calls } = makeDeps({
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+    poSyncRows: [],
+  })
+
+  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
+  assert.equal(resolved.outcome, 'ambiguous')
+  assert.equal(resolved.outcome === 'ambiguous' && resolved.reason, 'NO_LIVE_SYNC_ROW')
+
+  const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' })
+  assert.equal(applied.outcome, 'ambiguous')
+  assert.equal(calls.purchaseInvoiceUpdateMany, 0)
+  assert.equal(calls.lastUpdateData, undefined)
 })
 
 test('[o3d-9kek f1] backReferenceIsMissing stops reporting a PO row whose id is already on a bill', async () => {

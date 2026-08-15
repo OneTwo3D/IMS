@@ -98,6 +98,24 @@ type Store = {
   orders: OrderRow[]
 }
 
+/**
+ * purchase_invoices.accounting_invoice_id is UNIQUE (o3d-9kek r2 finding 1), and the fix depends
+ * on that: the compare-and-swap's predicate cannot see a SIBLING bill acquiring the candidate id,
+ * so the constraint is the only thing that refuses it. A double that cannot raise the violation
+ * would leave "the id was not duplicated" passing against a production that dropped the handling.
+ * Raised as Prisma raises it: P2002 with the column in meta.target.
+ */
+function enforceExternalIdUniqueness(bills: BillRow[], data: Record<string, unknown>, writtenBillIds: string[]): void {
+  const externalId = data.accountingInvoiceId
+  if (typeof externalId !== 'string' || externalId === '') return
+  const holder = bills.find((bill) => bill.accountingInvoiceId === externalId && !writtenBillIds.includes(bill.id))
+  if (!holder) return
+  throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`)'), {
+    code: 'P2002',
+    meta: { target: ['accounting_invoice_id'] },
+  })
+}
+
 type Harness = {
   store: Store
   client: BackReferenceSweepClient
@@ -114,6 +132,13 @@ type Harness = {
   failFollowUpsFor: Set<string>
   failProbeFor: Set<string>
   /**
+   * Activity-log persistence failures, by action. The PRODUCTION logActivity swallows its write
+   * errors and resolves normally, so a double that always succeeds cannot exercise the contract
+   * the deferral depends on — which is exactly how "warn, then hide the row for 24 hours" shipped
+   * with a failing log untested (o3d-9kek r2 finding 3).
+   */
+  failActivityFor: Set<string>
+  /**
    * A concurrent writer, fired the instant the PO attribution has read the bills — i.e.
    * inside the resolve→apply window. Set by the finding-3 test.
    */
@@ -126,7 +151,8 @@ function makeHarness(store: Store): Harness {
   const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0, transactions: 0, rawStatements: [] as Array<{ sql: string; values: unknown[] }> }
   const failFollowUpsFor = new Set<string>()
   const failProbeFor = new Set<string>()
-  const harness = { store, activities, followUps, calls, failFollowUpsFor, failProbeFor, raceAfterBillRead: null } as Harness
+  const failActivityFor = new Set<string>()
+  const harness = { store, activities, followUps, calls, failFollowUpsFor, failProbeFor, failActivityFor, raceAfterBillRead: null } as Harness
 
   const client = {
     accountingSyncLog: {
@@ -177,7 +203,9 @@ function makeHarness(store: Store): Harness {
         const bill = store.bills
           .filter((candidate) => matches(candidate as unknown as Record<string, unknown>, args.where, BILL_COLUMNS))
           .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())[0]
-        return bill ? { id: bill.id } : null
+        // poId included: the claim lookup asks the whole table who holds an id, then decides from
+        // the HOLDER's order whether that is "already linked" or a cross-PO conflict.
+        return bill ? { id: bill.id, poId: bill.poId } : null
       },
       async findMany(args: { where: Record<string, unknown>; take?: number }) {
         const bills = store.bills
@@ -190,15 +218,18 @@ function makeHarness(store: Store): Harness {
       async update(args: { where: { id: string }; data: Record<string, unknown> }) {
         const bill = store.bills.find((candidate) => candidate.id === args.where.id)
         if (!bill) throw new Error(`fake db: no bill ${args.where.id}`)
+        enforceExternalIdUniqueness(store.bills, args.data, [bill.id])
         calls.billUpdates++
         Object.assign(bill, args.data)
         return bill
       },
       // The compare-and-swap. It honours `accountingInvoiceId: null` and reports the rows it
       // actually touched — a double that ignored the predicate would make finding 3's fix
-      // untestable while looking tested.
+      // untestable while looking tested. It also enforces the UNIQUE INDEX, which is what
+      // catches the interleaving the predicate cannot see (r2 finding 1).
       async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
         const matched = store.bills.filter((candidate) => matches(candidate as unknown as Record<string, unknown>, args.where, BILL_COLUMNS))
+        enforceExternalIdUniqueness(store.bills, args.data, matched.map((bill) => bill.id))
         for (const bill of matched) {
           calls.billUpdates++
           Object.assign(bill, args.data)
@@ -233,7 +264,13 @@ function sweepDeps(harness: Harness, now?: () => Date) {
     connectorLabel: 'Xero',
     activityActionPrefix: 'xero',
     now,
-    logActivity: async (entry: BackReferenceSweepActivity) => { harness.activities.push(entry) },
+    // Models the PRODUCTION contract: never throws, and reports whether the entry was PERSISTED.
+    // A failed write pushes nothing — the operator did not see it — and answers false.
+    logActivity: async (entry: BackReferenceSweepActivity) => {
+      if (harness.failActivityFor.has(entry.action)) return false
+      harness.activities.push(entry)
+      return true
+    },
     enqueueFollowUps: async (entryId: string, _type: string, referenceType: string, referenceId: string) => {
       if (harness.failFollowUpsFor.has(entryId)) throw new Error('follow-up enqueue failed')
       harness.followUps.push({ entryId, referenceType, referenceId })
@@ -720,6 +757,138 @@ test('[o3d-9kek f3] the PO repair resolves and writes inside one transaction, un
   assert.equal(harness.calls.rawStatements.length, 1)
   assert.match(harness.calls.rawStatements[0].sql, /pg_advisory_xact_lock/)
   assert.deepEqual(harness.calls.rawStatements[0].values, [BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE, 'po-1'])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek ROUND 2 — the already-linked guard was PO-scoped and not atomic with the write,
+// zero matching sync rows was accepted as "unique", and a failed warning still bought 24
+// hours of silence.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek r2 f2] evidence deleted mid-attribution is refused, not treated as certainty', async () => {
+  // Retention deletes accounting_sync_logs by AGE, on its own schedule, while the sweep reads its
+  // candidate page outside the transaction that acts on it. Here the row is deleted after the
+  // page read: the sweep still holds its external id in memory, and the PO still has exactly one
+  // unlinked bill. Accepting zero rows as "exactly one" stamped that id with nothing left to
+  // justify it — and no later reader could tell it had been guessed.
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1')],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
+    orders: [],
+  })
+  // Fires between the bill read and the sync-row count, i.e. exactly inside the window.
+  harness.raceAfterBillRead = () => { harness.store.syncRows.length = 0 }
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(run.repaired, 0)
+  assert.equal(run.skippedAmbiguous, 1)
+  assert.equal(harness.calls.billUpdates, 0)
+  assert.equal(harness.store.bills[0].accountingInvoiceId, null)
+  // The deferral stamp targets a row that no longer exists. That is expected, not a failure:
+  // there is nothing to defer, and nothing to retry.
+  assert.equal(run.failed, 0)
+
+  const warning = harness.activities.find((entry) => entry.action === 'xero_backreference_repair_ambiguous')
+  assert.ok(warning)
+  assert.equal(warning.metadata.reason, 'NO_LIVE_SYNC_ROW')
+  assert.equal(warning.level, 'WARNING')
+})
+
+test('[o3d-9kek r2 f1] a sibling bill claiming the id mid-apply is reported, not overwritten', async () => {
+  // bill-a is the only unlinked bill, so the attribution is legitimately unique, and bill-b holds
+  // an older id so nothing looks contested. The authoritative bill-keyed writer then links bill-b
+  // with THIS id between the fenced re-resolve and the swap. The swap's predicate only asks
+  // whether bill-a is still unlinked — it is — so nothing in the application layer refuses it.
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1')],
+    bills: [
+      { id: 'bill-a', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) },
+      { id: 'bill-b', poId: 'po-1', accountingInvoiceId: 'XBILL-old', createdAt: at(9) },
+    ],
+    orders: [],
+  })
+  let reads = 0
+  harness.raceAfterBillRead = (bills) => {
+    reads++
+    if (reads === 2) bills[1].accountingInvoiceId = 'XBILL-1'
+  }
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(run.repaired, 0)
+  assert.equal(run.skippedAmbiguous, 1, 'an attribution conflict is a refusal, not a generic failure')
+  // EXACTLY one bill carries the id, and it is the one the authoritative writer chose.
+  assert.deepEqual(harness.store.bills.filter((bill) => bill.accountingInvoiceId === 'XBILL-1').map((bill) => bill.id), ['bill-b'])
+  assert.equal(harness.store.bills[0].accountingInvoiceId, null, 'bill-a must not have received a second copy')
+
+  const warning = harness.activities.find((entry) => entry.action === 'xero_backreference_repair_ambiguous')
+  assert.ok(warning)
+  assert.equal(warning.metadata.reason, 'EXTERNAL_ID_CLAIMED_CONCURRENTLY')
+  // Deferred, never retired: the conflict can be resolved by hand.
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null)
+  assert.equal(harness.store.syncRows[0].backReferenceAmbiguousLoggedAt !== null, true)
+})
+
+test('[o3d-9kek r2 f1] an id held by ANOTHER PO\'s bill is reported, and no second copy is written', async () => {
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1')],
+    bills: [
+      // The holder sits on a different order, so the PO-scoped guard never looked at it.
+      { id: 'bill-elsewhere', poId: 'po-2', accountingInvoiceId: 'XBILL-1', createdAt: at(1) },
+      { id: 'bill-here', poId: 'po-1', accountingInvoiceId: null, createdAt: at(9) },
+    ],
+    orders: [],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(run.repaired, 0)
+  assert.equal(run.skippedAmbiguous, 1)
+  assert.equal(harness.calls.billUpdates, 0)
+  assert.equal(harness.store.bills[1].accountingInvoiceId, null)
+
+  const warning = harness.activities.find((entry) => entry.action === 'xero_backreference_repair_ambiguous')
+  assert.ok(warning)
+  assert.equal(warning.metadata.reason, 'EXTERNAL_ID_LINKED_ELSEWHERE')
+  assert.equal(warning.metadata.linkedPurchaseInvoiceId, 'bill-elsewhere')
+  assert.equal(warning.metadata.linkedPurchaseOrderId, 'po-2')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'a conflict is not a verdict')
+})
+
+test('[o3d-9kek r2 f3] a warning that was NOT persisted does not buy 24 hours of silence', async () => {
+  // logActivity swallows its write errors and resolves normally, so awaiting it cannot establish
+  // that anybody was told — yet the deferral stamp used to follow unconditionally. One transient
+  // activity-log failure therefore suppressed BOTH the operator's warning and any further repair
+  // attempt for a day, including one that would have succeeded because the ambiguity cleared.
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1')],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
+    orders: [],
+  })
+  const clock = fakeClock()
+  harness.failActivityFor.add('xero_backreference_repair_ambiguous')
+
+  const firstRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(firstRun.skippedAmbiguous, 2)
+  assert.equal(harness.activities.length, 0, 'nothing reached the log')
+  assert.equal(
+    harness.store.syncRows.every((row) => row.backReferenceAmbiguousLoggedAt === null),
+    true,
+    'an unreported ambiguity must not be deferred — that is silence with no warning behind it',
+  )
+  assert.equal(harness.store.syncRows.every((row) => row.backReferenceCheckedAt === null), true)
+
+  // The very next cycle, well INSIDE the recheck interval, tries again — and now that the log is
+  // healthy the operator is told. A deferred row would have reported nothing here.
+  harness.failActivityFor.clear()
+  clock.advance(60 * 1000)
+  const secondRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(secondRun.skippedAmbiguous, 2)
+  assert.equal(harness.activities.filter((entry) => entry.action === 'xero_backreference_repair_ambiguous').length, 2)
+  // ...and NOW it is deferred, because the warning is known to have landed.
+  assert.equal(harness.store.syncRows.every((row) => row.backReferenceAmbiguousLoggedAt !== null), true)
+
+  clock.advance(60 * 1000)
+  const thirdRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(thirdRun.skippedAmbiguous, 0, 'a reported ambiguity is throttled as before')
 })
 
 test('the sweep stays inside its own connector', async () => {

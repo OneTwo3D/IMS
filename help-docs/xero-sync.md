@@ -529,11 +529,47 @@ Deleting a payment removes its queued registration if it has not posted yet; if 
 
 Group B of the daily batch consumes FIFO (First In, First Out) cost layers when booking COGS. Each shipment line decrements `remainingQty` on the oldest cost layers first. This ensures COGS reflects the actual purchase cost of the specific units shipped.
 
+## Back-Reference Repair
+
+After a document posts, its external id has to be written back onto the source document
+(`accountingInvoiceId` on the order or bill). If that write fails, or the process dies between
+marking the sync row SYNCED and running it, the document is orphaned: it exists in Xero but IMS
+cannot link, update or pay it. The back-reference repair sweep runs inside
+`/api/cron/accounting-sync` (and on demand from **Integrations → Xero**), re-applies the id from
+the sync row, and re-enqueues the follow-ups (PDF, payment, attachment) that never ran.
+
+**It refuses to guess.** Sync rows created before the bill-keyed change name the *purchase order*,
+not the bill. When such a row cannot be attributed to exactly one bill, the sweep writes a WARNING
+to the activity log (`xero_backreference_repair_ambiguous`) asking you to link it manually, and
+tries again once every 24 hours until it can. The warning repeats — deliberately — so a row nobody
+ever links does not go quiet. Reasons you may see:
+
+| Reason | What it means |
+|---|---|
+| `MULTIPLE_SYNC_ROWS` | Two or more posted bill sync rows reference this PO |
+| `MULTIPLE_UNLINKED_BILLS` | The PO has several bills with no external id |
+| `NO_LIVE_SYNC_ROW` | The sync row's own record was deleted or cancelled mid-repair, so nothing evidences the attribution any more |
+| `EXTERNAL_ID_LINKED_ELSEWHERE` | Another bill — on another PO — already carries this Xero bill id |
+| `EXTERNAL_ID_CLAIMED_CONCURRENTLY` | Another bill claimed the id while this repair was being written |
+
+Two bills can never carry the same Xero bill id: the database enforces it with a unique index. That
+matters because bill updates post to `/Invoices/{id}`, so a duplicated id would make every later
+correction to one bill silently rewrite the other's document in Xero. If a link is refused for one
+of the conflict reasons above, resolve it by hand — IMS will not clear or move an existing link on
+its own, because nothing in IMS records whether that link was posted authoritatively or guessed.
+
+**Retention interacts with this.** Sync logs are normally deleted once they pass the retention
+period (Settings → Data Retention), but rows the sweep has *not yet settled* — a posted row whose
+document is still unlinked — are kept past it. Deleting one of those would erase the only evidence
+of which document an unlinked bill belongs to, and deleting a *competing* row would silently turn
+an ambiguity the sweep was refusing to guess at into a confident wrong answer. Once a row is
+settled, it expires normally.
+
 ## Cron Endpoints
 
 | Endpoint | Schedule | Purpose |
 |---|---|---|
-| `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals) |
+| `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals), then run the back-reference repair sweep |
 | `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |

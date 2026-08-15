@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
+import { UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE } from '@/lib/domain/accounting/back-reference-sweep'
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -105,7 +106,25 @@ export async function purgeExpiredData(): Promise<{
       // promises, and every connector switch would strand more. Doing it properly needs a compacted
       // tombstone carrying only what the guard reads, which is tracked in o3d-nepa rather than
       // bolted on here.
-      db.accountingSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
+      //
+      // o3d-9kek: what this DOES now exempt is UNRESOLVED BACK-REFERENCE EVIDENCE — a posted row
+      // whose repair sweep has not reached a verdict on it. Deleting one of those does not just
+      // lose an audit trail: deleting a COMPETING sibling turns an ambiguity the sweep was
+      // refusing to guess at into an apparent certainty (one unlinked bill, one surviving
+      // claimant), and the sweep then attributes an external id whose competitor it can no longer
+      // see. Nothing downstream can detect that, because the surviving state is genuinely
+      // indistinguishable from an unambiguous one.
+      //
+      // Bounded, unlike the reverted PROCESSING exemption above: the sweep stamps every row it
+      // settles, and a settled row leaves the exempt set and expires normally — by then the
+      // attribution lives on the document itself, which is never retention-deleted. See
+      // UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE for the full argument and its stated cost.
+      db.accountingSyncLog.deleteMany({
+        where: {
+          createdAt: { lt: cutoff },
+          NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
+        },
+      }),
     ])
     syncLogsDeleted = wc.count + acct.count
   }
