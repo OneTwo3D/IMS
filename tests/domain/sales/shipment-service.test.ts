@@ -418,6 +418,27 @@ test('confirmSalesOrderShipments only creates shipment lines for unshipped alloc
   assert.equal(pendingLine?.qty, 2)
 })
 
+test('o3d-4kfh: confirmSalesOrderShipments is NOT blocked by a partially dispatched allocation', async () => {
+  // The allocation row retains what it has dispatched (see the contract in allocation-service.ts),
+  // so a 3-unit row with 1 unit already shipped is the CORRECT shape, not over-allocation.
+  // validateAllocationIntegrity used to compare that raw 3 against a remaining demand of 2 — with
+  // the same shipment subtracted from one side only — and refused, blocking every further
+  // shipment of every partially dispatched order.
+  const state = baseState({
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 3, sku: 'SKU-1', description: 'Product 1' }],
+    shipments: [{ id: 'shipment-shipped', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-shipped', shipmentId: 'shipment-shipped', lineId: 'line-1', productId: 'product-1', qty: 1 }],
+  })
+
+  const result = await confirmSalesOrderShipments(createClient(state), 'order-1')
+
+  assert.equal(result.shipmentCount, 1)
+  assert.equal(result.createdShipments[0].totalQty, 2, 'the 2 units that have not shipped yet')
+  const pendingLine = state.shipmentLines.find((line) => line.shipmentId !== 'shipment-shipped')
+  assert.equal(pendingLine?.qty, 2)
+})
+
 test('confirmSalesOrderShipments does not ship refunded quantity from stale allocations', async () => {
   const state = baseState({
     allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],

@@ -693,6 +693,15 @@ export async function cancelSalesOrderFulfillmentState(
   }
 }
 
+/**
+ * Structural + quantity check on an order's allocation rows.
+ *
+ * o3d-4kfh — reads `OrderAllocation.qty` under the contract stated in `allocateSalesOrder`: a row
+ * covers its committed shipment lines as well as the outstanding demand. So the quantity test
+ * subtracts the SAME non-PENDING shipment set from both sides — from the rows (per allocation
+ * scope) and from the line's ordered quantity — and compares what is left. Comparing raw rows
+ * against a net demand figure is not a stricter check, it is an incoherent one.
+ */
 export async function validateAllocationIntegrity(
   client: AllocationServiceClient,
   orderId: string,
@@ -748,6 +757,9 @@ export async function validateAllocationIntegrity(
         lineId: true,
         productId: true,
         qty: true,
+        // o3d-4kfh: the warehouse is what makes a shipment line attributable to the allocation row
+        // it commits — (lineId, warehouseId, productId) is the grain both tables share.
+        shipment: { select: { warehouseId: true } },
       },
     }),
   ])
@@ -756,6 +768,17 @@ export async function validateAllocationIntegrity(
     requirementsByLine,
     activeShipmentLines,
   )
+  // o3d-4kfh: committed quantity per ALLOCATION ROW, the subtrahend that turns a retained row into
+  // the open (still-to-ship) quantity this check is about. Same non-PENDING set as committedByLine
+  // above, so the two sides of the final comparison net the SAME shipments out.
+  const committedByAllocationScope = new Map<string, Prisma.Decimal>()
+  for (const shipmentLine of activeShipmentLines) {
+    const key = `${shipmentLine.lineId}|${shipmentLine.shipment.warehouseId}|${shipmentLine.productId}`
+    committedByAllocationScope.set(
+      key,
+      (committedByAllocationScope.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)),
+    )
+  }
 
   for (const line of lines) {
     const requirements = requirementsByLine.get(line.id) ?? []
@@ -774,7 +797,10 @@ export async function validateAllocationIntegrity(
       byWarehouse.set(allocation.warehouseId, quantities)
     }
 
-    let allocatedCoverage = new Prisma.Decimal(0)
+    // o3d-4kfh: the STRUCTURAL checks below (complete component set, proportional components, no
+    // stranger components) run on the RAW row quantities, because that is what is persisted and
+    // what every other consumer expands. Only the total is netted, in `openCoverage`.
+    let openCoverage = new Prisma.Decimal(0)
     for (const [warehouseId, quantities] of byWarehouse) {
       const coverage = calculateDecimalFulfillmentCoverage(requirements, quantities)
       if (coverage.lte(ALLOCATION_EPSILON_DECIMAL)) {
@@ -795,12 +821,24 @@ export async function validateAllocationIntegrity(
         }
       }
 
-      allocatedCoverage = allocatedCoverage.add(coverage)
+      // The OPEN coverage of this warehouse's rows: the same rows with their own committed
+      // shipment lines netted off, floored per row exactly as `residualAllocationQty` floors.
+      // Without this the check compared a retained row (which covers its shipments by contract)
+      // against a demand figure with those same shipments already subtracted, so every partially
+      // dispatched order read as over-allocated by the dispatched amount — blocking shipment
+      // confirmation and every manual allocation edit for the rest of that order's life.
+      const openQuantities = new Map<string, Prisma.Decimal>()
+      for (const [productId, qty] of quantities) {
+        const committed = committedByAllocationScope.get(`${line.id}|${warehouseId}|${productId}`)
+          ?? new Prisma.Decimal(0)
+        openQuantities.set(productId, Prisma.Decimal.max(new Prisma.Decimal(0), qty.sub(committed)))
+      }
+      openCoverage = openCoverage.add(calculateDecimalFulfillmentCoverage(requirements, openQuantities))
     }
 
     const committedCoverage = committedByLine.get(line.id) ?? new Prisma.Decimal(0)
     const remainingQty = Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(committedCoverage))
-    if (allocatedCoverage.sub(remainingQty).abs().gt(ALLOCATION_EPSILON_DECIMAL) && allocatedCoverage.gt(remainingQty)) {
+    if (openCoverage.sub(remainingQty).abs().gt(ALLOCATION_EPSILON_DECIMAL) && openCoverage.gt(remainingQty)) {
       return `Allocation for sales line ${line.sku ?? line.description} exceeds the remaining quantity to fulfill`
     }
   }
@@ -1060,18 +1098,24 @@ export async function allocateSalesOrder(
         shipment: { select: { status: true, warehouseId: true } },
       },
     })
-    // o3d-4kfh: only DISPATCHED lines have given reservation back. Demand netting below uses every
-    // non-PENDING shipment (a picked line is committed and must not be re-allocated), but
-    // reservedQty is decremented solely on the transition to SHIPPED — so the reservation view must
-    // net a strictly narrower set than the demand view. Conflating the two under-releases.
-    const dispatchedAllocationLines = activeShipmentLines
-      .filter((line) => line.shipment.status === RESERVATION_RELEASING_SHIPMENT_STATUS)
-      .map((line) => ({
-        lineId: line.lineId,
-        productId: line.productId,
-        warehouseId: line.shipment.warehouseId,
-        qty: line.qty,
-      }))
+    // Every COMMITTED shipment line at allocation-row grain. "Committed" is the demand view: any
+    // non-PENDING shipment is a promise this order has already made, which is why the demand
+    // netting below subtracts it and why the rows must keep covering it (see persistedAllocations).
+    const committedAllocationLines = activeShipmentLines.map((line) => ({
+      lineId: line.lineId,
+      productId: line.productId,
+      warehouseId: line.shipment.warehouseId,
+      status: line.shipment.status,
+      qty: toDecimal(line.qty),
+    }))
+    // o3d-4kfh: only DISPATCHED lines have given reservation back. The reservation view is
+    // therefore a STRICT SUBSET of the committed set above: reservedQty is decremented solely on
+    // the transition to SHIPPED, so a PICKING/PACKED line is committed demand AND live reservation
+    // at the same time. Conflating the two under-releases (netting a picked line out of a residual
+    // strands its reservation forever).
+    const dispatchedAllocationLines = committedAllocationLines.filter(
+      (line) => line.status === RESERVATION_RELEASING_SHIPMENT_STATUS,
+    )
 
     const ownAllocations = await tx.orderAllocation.findMany({
       where: { orderId },
@@ -1199,38 +1243,52 @@ export async function allocateSalesOrder(
     // not fire for a nested KIT whose expanded factor is unrepresentable. Both are unchanged from
     // before this branch — no new breakage, and the short-circuit still fires for every ordinary
     // line, which is the overwhelming majority.
-    // The LIVE allocation: outstanding demand this run can reserve. Everything downstream that
-    // means "reservation" — the reserve delta, the backorder report, the status promotion — uses
-    // this set.
+
+    // The OUTSTANDING allocation: demand this run still had to place, and therefore the only part
+    // of the persisted set the allocator was free to choose. The backorder report and the status
+    // promotion read it, because both are about work still to do.
     const nextAllocations = mergeAllocationRows(nextAllocationRows)
 
-    // o3d-4kfh: what gets PERSISTED additionally RETAINS already-dispatched quantity, so that
-    // `residual = row qty − dispatched qty` is true of every allocation row all the time.
+    // o3d-4kfh — THE CONTRACT. `OrderAllocation.qty` is the order's WHOLE claim on that
+    // (line, warehouse, product): outstanding demand PLUS every committed shipment line, retained
+    // through pick, pack and dispatch. Two readings are derived from it, and both are subtractions
+    // of a shipment set the row is guaranteed to cover:
+    //
+    //   live reservation   = qty − SHIPPED          (reservedQty is decremented only there)
+    //   open (unshipped)   = qty − non-PENDING      (what still has to be picked and shipped)
     //
     // Dispatch decrements reservedQty and deliberately keeps the row (shipment-service, and the
-    // contract note in refund-service). Every other consumer of these rows already assumes that:
+    // contract note in refund-service). Every other consumer already reads it that way:
     // confirmSalesOrderShipments derives its remaining quantity as `alloc.qty − committed`, the
-    // reservation breakdown and the `stock_reserved_source_mismatch` invariant both compute
-    // `GREATEST(oa.qty − shipped, 0)`, and the release paths below now do the same.
+    // backorder-demand report as `alloc.qty − committed`, and the reservation breakdown plus the
+    // `stock_reserved_source_mismatch` invariant as `GREATEST(oa.qty − shipped, 0)`.
     //
-    // The one place that broke the assumption was HERE: demand is netted by committed shipments,
-    // so a rewrite after a dispatch shrank the rows to the undispatched remainder. From that
-    // moment `qty − dispatched` under-states the order's live reservation by exactly the shipped
-    // amount, and nothing in the row can tell you which of the two readings applies. That is not a
-    // formula you can fix — it is an ambiguity you have to remove. Adding the dispatched quantity
-    // back removes it: the reading is always the same one, and the first rewrite after a dispatch
-    // repairs any row that predates this change.
+    // The one place that broke the contract was HERE: demand is netted by committed shipments, so
+    // a rewrite shrank the rows to the undispatched remainder. From that moment neither reading is
+    // recoverable from the row, and nothing in it says which one applies. That is not a formula
+    // you can fix — it is an ambiguity you have to remove, by writing rows that cover the
+    // commitments again.
     //
-    // Nothing extra is reserved: the reserve delta below is `nextAllocations`, the live set.
+    // Retention is over the COMMITTED set, not the dispatched one. Retaining only dispatch would
+    // rebuild the same bug one status earlier: a PICKING shipment is netted out of demand but has
+    // released NO reservation, so a row shrunk to the outstanding remainder would under-state this
+    // order's live reservation by the picked quantity — released short here, and released again by
+    // the dispatch that follows.
     const persistedAllocations = mergeAllocationRows([
       ...nextAllocationRows,
-      ...dispatchedAllocationLines.map((line) => ({
+      ...committedAllocationLines.map((line) => ({
         lineId: line.lineId,
         productId: line.productId,
         warehouseId: line.warehouseId,
-        qty: toDecimal(line.qty),
+        qty: line.qty,
       })),
     ])
+    // What the persisted set claims on reservedQty: outstanding + picked/packed, i.e. everything
+    // except the part dispatch has already given back. This — not `nextAllocations` — is the
+    // reserve delta, precisely because the release below gives back the residual of the OLD rows
+    // on the same definition. Release residual, reserve residual: the two are the same reading of
+    // the same contract, so an unchanged commitment nets to exactly zero movement.
+    const reservationRows = residualAllocationRows(persistedAllocations, dispatchedAllocationLines)
 
     const existingAllocs = await tx.orderAllocation.findMany({
       where: { orderId },
@@ -1274,7 +1332,22 @@ export async function allocateSalesOrder(
       )
     }
 
-    // Compared in PERSISTED space (retained dispatch included), because that is what the rows hold.
+    // Compared in PERSISTED space (retained commitments included), because that is what the rows
+    // hold.
+    //
+    // o3d-4kfh — what this does NOT do: repair a row written under the pre-contract shape (shrunk
+    // to the undispatched remainder after a dispatch). Such a row reads as residual 0 while the
+    // order still holds a live reservation for it, and nothing here can tell that apart from
+    // another order holding the same units — reservedQty is an aggregate with no per-holder
+    // ledger. Either outcome is wrong: if the recomputed set matches, the short-circuit fires and
+    // the row is left as it is; if it differs, the rewrite releases the under-stated residual and
+    // reserves the full one, adding reservation rather than moving it. Neither is repaired here,
+    // and no cheap guard can be: the repair is a recompute of reservedQty from every live
+    // reservation source for the scope, which `invariants.ts`
+    // (`stock_reserved_source_mismatch`) is the census for. IMS has no production data, and the
+    // service is a single systemd unit restarted in place (deploy/systemd/ims-stage.service —
+    // Type=simple, one instance), so no rolling deployment can run the two shapes against one
+    // database and produce such a row after this ships.
     const unchanged = allocationSetsMatch(existingAllocs, persistedAllocations)
 
     if (!unchanged) {
@@ -1309,11 +1382,12 @@ export async function allocateSalesOrder(
           },
         })
       }
-      // Reserve the LIVE set only — the retained dispatch in the rows above was already released
-      // by the dispatch itself and must not be reserved a second time.
+      // Reserve the RESIDUAL of what was just written — the retained dispatch in those rows was
+      // already given back by the dispatch itself and must not be reserved a second time, while
+      // the retained PICK/PACK was never given back and must not be dropped.
       await applyAllocationReservationDelta(
         tx,
-        nextAllocations.map((alloc) => ({
+        reservationRows.map((alloc) => ({
           productId: alloc.productId,
           warehouseId: alloc.warehouseId,
           qty: alloc.qty,

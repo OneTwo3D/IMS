@@ -1780,6 +1780,12 @@ function partiallyDispatchedScope(options: {
   reservedQty: number
   oversellAllowed?: boolean
   refundedQty?: number
+  /**
+   * The shipment's status. SHIPPED (the default) is the only one that has released reservation;
+   * PICKING/PACKED are committed demand whose reservation is still LIVE, which is a different
+   * fixture entirely even though `dispatchedQty` is the knob for both.
+   */
+  shipmentStatus?: 'SHIPPED' | 'PICKING' | 'PACKED'
 }): MemoryState {
   const product = {
     id: 'product-1',
@@ -1814,7 +1820,13 @@ function partiallyDispatchedScope(options: {
       { orderId: 'order-2', lineId: 'line-2', productId: 'product-1', warehouseId: 'warehouse-1', qty: options.otherOrderQty },
     ],
     shipments: options.dispatchedQty > 0
-      ? [{ id: 'shipment-1', orderId: 'order-1', status: 'SHIPPED', warehouseId: 'warehouse-1', shipmentJournalDate: null }]
+      ? [{
+        id: 'shipment-1',
+        orderId: 'order-1',
+        status: options.shipmentStatus ?? 'SHIPPED',
+        warehouseId: 'warehouse-1',
+        shipmentJournalDate: null,
+      }]
       : [],
     shipmentLines: options.dispatchedQty > 0
       ? [{ shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: options.dispatchedQty }]
@@ -2057,4 +2069,103 @@ test('o3d-4kfh: findUnderReservedScopes on residual rows separates a real shortf
     [{ productId: 'p1', warehouseId: 'w1' }],
     '10 allocated, only 2 dispatched, 5 reserved is a genuine 3-unit shortfall',
   )
+})
+
+test('o3d-4kfh: reallocation KEEPS a PICKING commitment covered instead of dropping it', async () => {
+  // The mirror image of the dispatch bug, one status earlier. Demand netting excludes every
+  // NON-PENDING shipment, but a PICKING shipment has released NO reservation — reservedQty is
+  // decremented only on the transition to SHIPPED.
+  //
+  // Retaining only DISPATCHED quantity therefore rewrote a 10-unit row (5 picked, 5 outstanding)
+  // down to the 5 outstanding, released the residual 10 and reserved 5 — leaving the picked 5
+  // unbacked and free for another order to take, while the dispatch that follows still decrements
+  // reservedQty for them. Retaining the whole COMMITTED set is what makes the row cover both.
+  //
+  // Fixture: A holds 7 (5 picked + 2), B holds 3, scope has 13 units and reservedQty 10. The
+  // outstanding 5 fits, so the set really does change and the release/reserve branch really runs.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 7,
+    dispatchedQty: 5,
+    shipmentStatus: 'PICKING',
+    otherOrderQty: 3,
+    quantity: 13,
+    reservedQty: 10,
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(ownAllocation(state), 10, 'A\'s row covers its 5 picked units AND its 5 outstanding')
+  assert.equal(
+    state.stockLevels[0].reservedQty,
+    13,
+    'A holds 10 live (nothing has shipped yet) and B still holds 3',
+  )
+  assert.equal(otherOrderReservation(state), 3)
+})
+
+test('o3d-4kfh: a PICKED order that is already fully covered short-circuits (no churn)', async () => {
+  // Same shape, but the row already covers the commitment: the recomputed PERSISTED set is
+  // identical, so o3d-i5it's short-circuit must still fire. If retention and demand netting used
+  // different shipment sets, this order would be rewritten on every 15-minute sweep rotation.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 10,
+    dispatchedQty: 5,
+    shipmentStatus: 'PICKING',
+    otherOrderQty: 3,
+    quantity: 13,
+    reservedQty: 13,
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(writeCounts.allocationDeletes, 0, 'no deleteMany')
+  assert.equal(writeCounts.allocationCreates, 0, 'no re-create')
+  assert.equal(state.stockLevels[0].reservedQty, 13, 'no reservation movement')
+  assert.equal(ownAllocation(state), 10)
+})
+
+test('o3d-4kfh: a PACKED commitment is retained on the same footing as a PICKED one', async () => {
+  // PACKED is the other pre-dispatch committed status. Nothing about the reservation differs, and
+  // the retention must not be written against a single status name.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 6,
+    dispatchedQty: 4,
+    shipmentStatus: 'PACKED',
+    otherOrderQty: 0,
+    quantity: 10,
+    reservedQty: 6,
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(ownAllocation(state), 10, '4 packed + 6 outstanding')
+  assert.equal(state.stockLevels[0].reservedQty, 10, 'all ten are live — none of them has shipped')
+})
+
+test('o3d-4kfh: a zero-demand (cancelled) order keeps a PICKED commitment reserved', async () => {
+  // Deliberate consequence of retaining COMMITTED quantity. A cancelled / fully-refunded order has
+  // zero demand, so the whole outstanding reservation goes back — but a PICKING shipment is a
+  // commitment that still exists and whose dispatch will decrement reservedQty. Releasing its units
+  // here would leave that decrement to come out of some other order's reservation.
+  //
+  // Cancelling the order properly (cancelSalesOrderFulfillmentState) DELETES its PICKING/PACKED
+  // shipments and then releases everything; this path is only the allocator's view.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 10,
+    dispatchedQty: 4,
+    shipmentStatus: 'PICKING',
+    otherOrderQty: 0,
+    quantity: 10,
+    reservedQty: 10,
+  })
+  state.order.status = 'CANCELLED'
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(ownAllocation(state), 4, 'only the picked commitment survives')
+  assert.equal(state.stockLevels[0].reservedQty, 4, 'and only its 4 units stay reserved')
 })

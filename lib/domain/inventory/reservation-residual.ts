@@ -10,6 +10,14 @@ import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
  * `shipment-service.ts`, and the contract note in `refund-service.ts`). So an allocation row's
  * quantity is NOT what that order still holds reserved: the RESIDUAL is.
  *
+ * `OrderAllocation.qty` is the order's WHOLE claim on that (line, warehouse, product) — its
+ * outstanding demand PLUS every committed (non-PENDING) shipment line, retained through pick, pack
+ * and dispatch; `allocateSalesOrder` states the contract in full and is what keeps it true. Two
+ * readings come off it, and this module owns the first:
+ *
+ *     live reservation = qty − SHIPPED        (here)
+ *     open / to ship   = qty − non-PENDING    (confirmSalesOrderShipments, the backorder reports)
+ *
  *     residual(row) = MAX(row.qty − already-dispatched qty for that row, 0)
  *
  * Every path that gives reservation back MUST release the residual. Releasing the raw retained

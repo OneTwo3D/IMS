@@ -477,6 +477,9 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
       lineId: true,
       productId: true,
       qty: true,
+      // o3d-4kfh: both sides carry the warehouse so a shipment line can be netted out of the
+      // allocation row it was shipped from.
+      warehouseId: true,
     },
   })
   assert.deepEqual(calls.shipmentLine, {
@@ -485,7 +488,7 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
       lineId: true,
       productId: true,
       qty: true,
-      shipment: { select: { status: true } },
+      shipment: { select: { status: true, warehouseId: true } },
     },
   })
   assert.deepEqual(calls.product, {
@@ -506,4 +509,97 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
   assert.deepEqual(collected.requirementsByLine.get('line-kit'), [
     { productId: 'component-1', factor: 2 },
   ])
+})
+
+test('o3d-4kfh: the collector nets committed shipments out of the retained allocation row', async () => {
+  // The contract: an OrderAllocation row covers its committed shipment lines as well as the
+  // outstanding demand. Here the whole 5-unit row is consumed by a PICKING shipment and the other
+  // 5 ordered units have no allocation at all — a genuine 5-unit backorder. Fed the RAW row, the
+  // report sees 5 allocated against 5 remaining and calls the line fully covered.
+  const client = {
+    salesOrderLine: {
+      findMany: async () => [{
+        id: 'line-1',
+        orderId: 'order-1',
+        productId: 'product-1',
+        sku: 'SKU-1',
+        description: 'Stock product',
+        qty: 10,
+        product: { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE', oversellAllowed: true },
+      }],
+    },
+    orderAllocation: {
+      findMany: async () => [
+        { lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 5 },
+      ],
+    },
+    shipmentLine: {
+      findMany: async () => [{
+        lineId: 'line-1',
+        productId: 'product-1',
+        qty: 5,
+        shipment: { status: 'PICKING', warehouseId: 'warehouse-1' },
+      }],
+    },
+    product: { findMany: async () => [] },
+  }
+
+  const collected = await collectBackorderReportRows(
+    'order-1',
+    client as unknown as Parameters<typeof collectBackorderReportRows>[1],
+  )
+  assert.deepEqual(
+    collected.allocations,
+    [{ lineId: 'line-1', productId: 'product-1', qty: 0 }],
+    'the row is entirely committed, so it covers no OPEN demand',
+  )
+
+  const report = buildBackorderReport(collected)
+  assert.equal(report.lines[0].committedShipmentQty, 5)
+  assert.equal(report.lines[0].allocatedQty, 0)
+  assert.equal(report.lines[0].unallocatedQty, 5, 'the 5 unshipped, unallocated units ARE a backorder')
+})
+
+test('o3d-4kfh: netting is per allocation ROW, so a shipment cannot cancel another warehouse row', async () => {
+  // Dispatched quantity belongs to the warehouse it shipped from. Netting at line grain would let
+  // a warehouse-1 shipment eat the warehouse-2 allocation and under-report coverage.
+  const client = {
+    salesOrderLine: {
+      findMany: async () => [{
+        id: 'line-1',
+        orderId: 'order-1',
+        productId: 'product-1',
+        sku: 'SKU-1',
+        description: 'Stock product',
+        qty: 10,
+        product: { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE', oversellAllowed: true },
+      }],
+    },
+    orderAllocation: {
+      findMany: async () => [
+        { lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 6 },
+        { lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-2', qty: 4 },
+      ],
+    },
+    shipmentLine: {
+      findMany: async () => [{
+        lineId: 'line-1',
+        productId: 'product-1',
+        qty: 6,
+        shipment: { status: 'SHIPPED', warehouseId: 'warehouse-1' },
+      }],
+    },
+    product: { findMany: async () => [] },
+  }
+
+  const collected = await collectBackorderReportRows(
+    'order-1',
+    client as unknown as Parameters<typeof collectBackorderReportRows>[1],
+  )
+
+  assert.deepEqual(collected.allocations, [
+    { lineId: 'line-1', productId: 'product-1', qty: 0 },
+    { lineId: 'line-1', productId: 'product-1', qty: 4 },
+  ])
+  assert.equal(buildBackorderReport(collected).lines[0].unallocatedQty, 0, 'the remaining 4 are covered')
 })

@@ -60,6 +60,8 @@ The smart auto-allocation algorithm minimises the number of shipments by consoli
 
 When re-allocating after a partial shipment, the algorithm only allocates the **remaining unfulfilled quantity** — items already committed to active (non-PENDING) shipments are excluded automatically.
 
+The allocation rows themselves still **cover those commitments**: an allocation row records the order's whole claim on a warehouse — what is still to be picked plus what has already been picked, packed or dispatched from it. So a row does not shrink when a shipment goes out, and the allocation panel keeps showing the full allocated quantity. Two things are read off it: the stock still *reserved* for the order (allocated minus dispatched — dispatch is the point at which stock and reservation are actually released), and the quantity still *to ship* (allocated minus every non-PENDING shipment). Because the row keeps covering its shipments, a warehouse can only be changed, and a row only reduced, while nothing has shipped from it — dispatched quantity stays with the warehouse it shipped from.
+
 For Kit / Bundle products, allocation works from the underlying components rather than the virtual parent SKU. Bundle quantities are expanded into their component requirements, and shipment lines are created for those component rows.
 
 ### Allocation Panel

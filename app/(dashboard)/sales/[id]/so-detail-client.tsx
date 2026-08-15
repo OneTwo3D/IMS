@@ -382,8 +382,14 @@ function AllocationPanel({
       }))),
   )
 
-  // Find backordered lines (not fully allocated for remaining qty)
-  const allocatedByLine = calculateClientCoverageByLine(
+  // Find backordered lines (not fully allocated for remaining qty).
+  //
+  // o3d-4kfh: an OrderAllocation row covers its committed shipment lines as well as the
+  // outstanding demand — dispatch retains the row, and the allocator rewrites it to cover the
+  // commitments again. So the row quantity has to be netted by the SAME committed set that
+  // `remaining` below is netted by, or a line whose allocation is entirely consumed by a picked
+  // shipment reads as fully covered and its genuine backorder is never shown.
+  const rawAllocatedByLine = calculateClientCoverageByLine(
     requirementsByLine,
     allocations.map((allocation) => ({
       lineId: allocation.lineId,
@@ -399,7 +405,7 @@ function AllocationPanel({
     const refunded = refundedByLine.get(l.id) ?? 0
     const remaining = Math.max(0, l.qty - committed - refunded)
     if (remaining <= 0) return []
-    const allocated = allocatedByLine.get(l.id) ?? 0
+    const allocated = Math.max(0, (rawAllocatedByLine.get(l.id) ?? 0) - committed)
     const short = remaining - allocated
     if (short <= 0.0001) return []
     return [{ ...l, committed, remaining, allocated, short, backorderEligible: l.oversellAllowed }]

@@ -36,6 +36,7 @@ import {
   transitionShipmentStatus,
 } from '@/lib/domain/sales/shipment-service'
 import {
+  allocationScopeKey,
   loadDispatchedAllocationLines,
   residualAllocationQty,
   sumDispatchedQtyByAllocationScope,
@@ -449,6 +450,10 @@ export async function updateAllocation(
       })
       const stockMap = buildAvailableStockMap(stockLevels).get(alloc.productId) ?? new Map()
       const requestedQty = toDecimal(newQty)
+      // Both terms are RAW quantities and the dispatched part cancels: the row gives back
+      // `qty − dispatched` and takes `newQty − dispatched`, so `newQty <= available + qty` is the
+      // same inequality with the dispatch subtracted from both sides. It only holds while the row
+      // stays in one warehouse, which the dispatch guard below is what enforces.
       const effectiveAvailable = (stockMap.get(newWarehouseId) ?? toDecimal(0))
         .add(alloc.warehouseId === newWarehouseId ? toDecimal(alloc.qty) : toDecimal(0))
 
@@ -464,12 +469,46 @@ export async function updateAllocation(
       const dispatchedByScope = sumDispatchedQtyByAllocationScope(
         await loadDispatchedAllocationLines(tx, alloc.orderId),
       )
-      const releaseQty = residualAllocationQty({
+      const sourceScope = {
         lineId: alloc.lineId,
         productId: alloc.productId,
         warehouseId: alloc.warehouseId,
-        qty: alloc.qty,
-      }, dispatchedByScope)
+      }
+      const sourceDispatched = dispatchedByScope.get(allocationScopeKey(sourceScope)) ?? toDecimal(0)
+
+      // o3d-4kfh: DISPATCHED HISTORY DOES NOT MOVE, and it does not shrink.
+      //
+      // Dispatched quantity is attributed to the row it shipped from — a shipment line carries the
+      // lineId and productId, its shipment carries the warehouseId. Relocating or deleting that row
+      // strands the dispatch: `qty − dispatched` is then computed at a scope with no dispatch (so
+      // the destination reserves the shipped units all over again) while the source scope keeps a
+      // dispatch with no row to net it out of. W1 holding 10 with 5 shipped, moved to a W2 row of 4
+      // at newQty 10, released 5, wrote a W2 row of 14 and reserved 10 — 14 live reserved units
+      // where 9 is correct, and the W1 history gone. Large enough orders pass
+      // validateAllocationIntegrity, so it committed.
+      //
+      // Refusing is the whole fix. Splitting the row (leave `dispatched` behind at W1, move the
+      // residual) would need an operator answer this action cannot supply — whether `newQty` means
+      // the moved residual or the row total — and the operator can already express either intent
+      // with a residual-sized edit here plus an addAllocation at the destination.
+      if (sourceDispatched.gt(0)) {
+        if (newWarehouseId !== alloc.warehouseId) {
+          throw new Error(
+            `Cannot move this allocation to another warehouse: ${sourceDispatched.toString()} unit(s) have already `
+            + 'shipped from it. Dispatched quantity stays with the warehouse it shipped from — reduce this '
+            + 'allocation to its dispatched quantity and add a new allocation in the other warehouse instead.',
+          )
+        }
+        if (requestedQty.lt(sourceDispatched)) {
+          throw new Error(
+            `Cannot reduce this allocation below ${sourceDispatched.toString()}: that many unit(s) have already `
+            + 'shipped from it, and the allocation row is what the shipment, the reservation residual and the '
+            + 'accounting sub-ledger net against.',
+          )
+        }
+      }
+
+      const releaseQty = residualAllocationQty({ ...sourceScope, qty: alloc.qty }, dispatchedByScope)
 
       await applyAllocationReservationDelta(tx, [{
         productId: alloc.productId,
