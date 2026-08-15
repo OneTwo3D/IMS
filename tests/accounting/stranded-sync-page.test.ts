@@ -1,11 +1,20 @@
 import assert from 'node:assert/strict'
-import path from 'node:path'
-import test, { mock } from 'node:test'
+import test from 'node:test'
 
 import { PermissionDeniedError } from '@/lib/auth/session-gates'
-import { hasPermission, type Permission } from '@/lib/permissions'
 import type { ConnectorOrphanSummary } from '@/lib/domain/accounting/connector-orphans'
-import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sync-rows'
+import { mountClientComponent } from '@/tests/fixtures/render-client-component'
+import {
+  RedirectError,
+  callArgs,
+  elementOf,
+  installSyncPageMocks,
+  propsOf,
+  renderSyncPage,
+  resetSyncPageState,
+  state,
+  strandedRow,
+} from './sync-page-harness'
 
 // ---------------------------------------------------------------------------
 // o3d-osl8 item 1 — the Integrations page, as BEHAVIOUR.
@@ -16,7 +25,7 @@ import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sy
 // stayed green against code that called hasPermission as a dead expression, hardcoded the gate, or
 // passed constants to the decision functions.
 //
-// Three complementary observations are made of the result:
+// Four complementary observations are made of the result:
 //   * the CALL LOG — which reads the page performed, in order, with which arguments. Without this
 //     the mocks are all interchangeable and a rewired or re-limited read stays green.
 //   * the ELEMENT TREE (walked through props.children) — which components the page constructed and
@@ -24,244 +33,16 @@ import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sy
 //     22 reads are shown to reach the 26 dashboard props they claim to.
 //   * the RENDERED MARKUP (react-dom/server, already a dependency of any Next app; no DOM, no new
 //     package) — what the operator would actually read.
+//   * the CONTROLS, PRESSED (round 4, finding 3). Markup shows that buttons exist; only invoking
+//     their handlers shows what they DO. See "the cancel controls, actually used" below.
+//
+// The module fakes live in ./sync-page-harness, shared with sync-page-real-gates.test.ts — which
+// renders the same page with the real getPaymentMethodCombos and its real permission gate.
 // ---------------------------------------------------------------------------
 
-const SYNC_DIR = path.join(process.cwd(), 'app', '(dashboard)', 'sync')
+installSyncPageMocks()
 
-const OK_STRANDED: StrandedSyncRowsResult = { rows: [], hasMore: false, total: 0 }
-
-function strandedRow(over: Partial<StrandedSyncRowsResult['rows'][number]> = {}) {
-  return {
-    id: 'log-1',
-    connector: 'quickbooks',
-    type: 'SALES_INVOICE',
-    status: 'FAILED',
-    referenceType: 'SalesOrder',
-    referenceId: 'order-7',
-    externalTransactionId: null,
-    errorMessage: 'HTTP 500 from QuickBooks',
-    createdAt: new Date('2026-01-01T00:00:00.000Z').toISOString(),
-    ageDays: 12,
-    ...over,
-  }
-}
-
-/** Next signals redirect() by throwing an error carrying this digest. */
-class RedirectError extends Error {
-  digest: string
-  constructor(url: string) {
-    super('NEXT_REDIRECT')
-    this.digest = `NEXT_REDIRECT;replace;${url};307;`
-  }
-}
-
-/**
- * Every read the page makes, keyed by name. Each entry is replaced wholesale per test — that is
- * how a failure, a denial or a distinct sentinel value is injected — and every invocation is
- * recorded in `calls` with its arguments.
- */
-type Reads = Record<string, () => unknown>
-
-function defaultReads(): Reads {
-  return {
-    getIntegrationPluginState: () => state.plugins,
-    getStrandedAccountingSyncRows: () => OK_STRANDED,
-
-    // --- the 22 dashboard reads, in the order the page starts them ---
-    getShoppingSyncSettings: () => ({}),
-    getShoppingTaxRateMappings: () => [],
-    getShoppingStatusMappings: () => [],
-    getShoppingSyncLogs: () => [],
-    getShoppingConnectorCredentials: () => ({ url: '', key: '', secret: '', secretMasked: false, envOverrides: {}, connectionTest: null }),
-    getShopifySyncSettings: () => ({ shopify_sync_enabled: 'false' }),
-    getShopifyConnectorCredentials: () => ({}),
-    getShopifySyncLogs: () => [],
-    getTaxRates: () => [],
-    getAccountingSettingsMasked: () => ({}),
-    getAccountingConnectionStatus: () => ({ connected: false, tenantName: null }),
-    getAccountingConnectionTestState: () => null,
-    getAccountingAccounts: () => [],
-    getAccountingSyncLogs: () => [],
-    getPaymentMethodCombos: () => [],
-    getPaymentAccountMap: () => '{}',
-    getAccountingSyncReadiness: () => ({}),
-    getCurrencies: () => [],
-    getShoppingConnectorPaymentMethods: () => [],
-    getAccountingBatchPreview: () => ({}),
-    getAccountingBatchHistory: () => [],
-    getWmsSyncDashboardData: () => ({}),
-
-    // --- the conditional / banner reads ---
-    fetchAccountingTaxRates: () => [],
-    getCrossConnectorOrphanSummary: () => null,
-    getFailedAccountingSyncSummary: () => null,
-    getCurrentTaxRateDrift: () => null,
-    getExceptionInboxSummary: () => null,
-  }
-}
-
-const state = {
-  role: 'ADMIN' as string | null,
-  plugins: {} as Record<string, boolean>,
-  reads: defaultReads(),
-  /** Every read the page made, in order, with its arguments. */
-  calls: [] as Array<{ name: string; args: unknown[] }>,
-  redirects: [] as string[],
-}
-
-/** Wraps a read so it is recorded and its value comes from the (per-test) registry. */
-function read(name: string) {
-  return async (...args: unknown[]) => {
-    state.calls.push({ name, args })
-    return state.reads[name]()
-  }
-}
-
-/** The argument lists a named read was called with. `[]` proves it was never called. */
-function callArgs(name: string): unknown[][] {
-  return state.calls.filter((c) => c.name === name).map((c) => c.args)
-}
-
-mock.module('next/navigation', {
-  namedExports: {
-    redirect: (url: string) => { state.redirects.push(url); throw new RedirectError(url) },
-    useRouter: () => ({ refresh: () => {} }),
-  },
-})
-
-// The real @/lib/permissions matrix and the real PermissionDeniedError, on purpose: the role →
-// permission decision and the TYPE the page keys its fatal/degradable split on are both under
-// test here, so neither may be faked.
-mock.module('@/lib/auth/server', {
-  namedExports: {
-    requirePermission: async (permission: Permission) => {
-      state.calls.push({ name: 'requirePermission', args: [permission] })
-      if (!state.role) throw new RedirectError('/login')
-      if (!hasPermission(state.role, permission)) {
-        throw new PermissionDeniedError(`Forbidden: missing permission ${permission}`, permission)
-      }
-      return { user: { id: 'u1', role: state.role } }
-    },
-  },
-})
-
-mock.module('@/lib/integration-plugins', {
-  namedExports: {
-    getIntegrationPluginState: read('getIntegrationPluginState'),
-    isIntegrationPluginEnabled: async (id: string) => !!state.plugins[id],
-  },
-})
-
-mock.module('@/app/actions/accounting-stranded-rows', {
-  namedExports: { getStrandedAccountingSyncRows: read('getStrandedAccountingSyncRows') },
-})
-
-mock.module('@/app/actions/shopping-sync', {
-  namedExports: {
-    getShoppingConnectorCredentials: read('getShoppingConnectorCredentials'),
-    getShoppingConnectorPaymentMethods: read('getShoppingConnectorPaymentMethods'),
-    getShopifyConnectorCredentials: read('getShopifyConnectorCredentials'),
-    getShopifySyncLogs: read('getShopifySyncLogs'),
-    getShopifySyncSettings: read('getShopifySyncSettings'),
-    getShoppingStatusMappings: read('getShoppingStatusMappings'),
-    getShoppingSyncLogs: read('getShoppingSyncLogs'),
-    getShoppingSyncSettings: read('getShoppingSyncSettings'),
-    getShoppingTaxRateMappings: read('getShoppingTaxRateMappings'),
-  },
-})
-
-mock.module('@/app/actions/accounting-sync', {
-  namedExports: {
-    fetchAccountingTaxRates: read('fetchAccountingTaxRates'),
-    getAccountingAccounts: read('getAccountingAccounts'),
-    getAccountingConnectionStatus: read('getAccountingConnectionStatus'),
-    getAccountingConnectionTestState: read('getAccountingConnectionTestState'),
-    getAccountingSettingsMasked: read('getAccountingSettingsMasked'),
-    getAccountingSyncLogs: read('getAccountingSyncLogs'),
-    getAccountingSyncReadiness: read('getAccountingSyncReadiness'),
-    getCrossConnectorOrphanSummary: read('getCrossConnectorOrphanSummary'),
-    getFailedAccountingSyncSummary: read('getFailedAccountingSyncSummary'),
-    // Imported by the banner component itself.
-    cancelOrphanedAccountingSyncRows: async () => ({ success: true }),
-    retryFailedAccountingSync: async () => ({ success: true }),
-  },
-})
-
-mock.module('@/app/actions/accounting-batch', {
-  namedExports: {
-    getAccountingBatchPreview: read('getAccountingBatchPreview'),
-    getAccountingBatchHistory: read('getAccountingBatchHistory'),
-  },
-})
-
-mock.module('@/app/actions/wms-sync', { namedExports: { getWmsSyncDashboardData: read('getWmsSyncDashboardData') } })
-mock.module('@/app/actions/accounting', { namedExports: { getPaymentMethodCombos: read('getPaymentMethodCombos') } })
-mock.module('@/lib/accounting', { namedExports: { getPaymentAccountMap: read('getPaymentAccountMap') } })
-mock.module('@/app/actions/settings', { namedExports: { getTaxRates: read('getTaxRates') } })
-mock.module('@/app/actions/currencies', { namedExports: { getCurrencies: read('getCurrencies') } })
-mock.module('@/app/actions/sync-exceptions', { namedExports: { getExceptionInboxSummary: read('getExceptionInboxSummary') } })
-mock.module('@/lib/domain/accounting/tax-rate-drift-status', { namedExports: { getCurrentTaxRateDrift: read('getCurrentTaxRateDrift') } })
-
-// The dashboard is a large client component with its own reads; it is not what this file is about.
-// Stubbed to render nothing, so its PRESENCE is observable only in the element tree — and its
-// PROPS, which are the whole point of the 22 reads, are asserted from that tree.
-mock.module(path.join(SYNC_DIR, 'sync-dashboard.tsx'), {
-  namedExports: { SyncDashboard: function SyncDashboard() { return null } },
-})
-
-// --- observing the result ---------------------------------------------------
-
-type Element = { type?: unknown; props?: Record<string, unknown> }
-
-/** Names of every component element in the tree, walked through props.children. */
-function componentNames(node: unknown, found: string[] = []): string[] {
-  if (Array.isArray(node)) {
-    for (const child of node) componentNames(child, found)
-    return found
-  }
-  if (!node || typeof node !== 'object') return found
-  const element = node as Element
-  if (typeof element.type === 'function') {
-    const fn = element.type as { displayName?: string; name: string }
-    found.push(fn.displayName ?? fn.name)
-  }
-  if (element.props && 'children' in element.props) componentNames(element.props.children, found)
-  return found
-}
-
-/** The props of the first element of the named component, for asserting what the page handed it. */
-function propsOf(node: unknown, name: string): Record<string, unknown> | null {
-  if (Array.isArray(node)) {
-    for (const child of node) {
-      const hit = propsOf(child, name)
-      if (hit) return hit
-    }
-    return null
-  }
-  if (!node || typeof node !== 'object') return null
-  const element = node as Element
-  if (typeof element.type === 'function') {
-    const fn = element.type as { displayName?: string; name: string }
-    if ((fn.displayName ?? fn.name) === name) return element.props ?? {}
-  }
-  if (element.props && 'children' in element.props) return propsOf(element.props.children, name)
-  return null
-}
-
-async function renderSyncPage() {
-  const { default: SyncPage } = await import('@/app/(dashboard)/sync/page')
-  const { renderToStaticMarkup } = await import('react-dom/server')
-  const tree = await SyncPage()
-  return { tree, names: componentNames(tree), html: renderToStaticMarkup(tree) }
-}
-
-test.beforeEach(() => {
-  state.role = 'ADMIN'
-  state.plugins = {}
-  state.reads = defaultReads()
-  state.calls = []
-  state.redirects = []
-})
+test.beforeEach(resetSyncPageState)
 
 // ---------------------------------------------------------------------------
 // The page boundary: `sync` is what this page IS.
@@ -276,35 +57,71 @@ test('an authenticated role without `sync` gets NO page at all, not a partial on
   state.role = 'FINANCE' // authenticated, holds `analytics`/`sales`/`purchasing`, NOT `sync`
   state.plugins = { woocommerce: true, xero: true }
 
-  const { default: SyncPage } = await import('@/app/(dashboard)/sync/page')
-  await assert.rejects(
-    () => SyncPage(),
-    (error: unknown) => error instanceof PermissionDeniedError && error.permission === 'sync',
-    'the page must fail closed on the denial, not render around it',
-  )
+  const { names, html } = await renderSyncPage()
+
+  assert.deepEqual(names, ['SyncAccessDenied'], 'the access-denied state is the WHOLE page')
+  assert.ok(!names.includes('SyncDashboard') && !names.includes('ConnectorOrphanBanner'))
   assert.deepEqual(state.redirects, [], 'a denial is not a redirect to somewhere friendlier')
   assert.deepEqual(
     state.calls.map((c) => c.name),
     ['requirePermission'],
     'the gate runs before EVERY read — plugin state, banners and the 22 dashboard reads included',
   )
+  assert.match(html, /don&#x27;t have access to Integrations/)
+})
+
+test('the denial is EXPLAINED, not reported as an unexpected error with dead-end actions', async () => {
+  // FINDING 2 (round 4). Throwing the denial handed it to app/(dashboard)/error.tsx, which does not
+  // recognise authorization at all: the operator got "Something went wrong / an unexpected error
+  // occurred" plus Go to Login and Try Again — and in production the boundary sees only a digest,
+  // so it could not have told the cases apart even if it wanted to. Neither action can resolve a
+  // stable role denial: the same role signs back in, and the retry re-runs the same gate.
+  state.role = 'WAREHOUSE'
+  state.plugins = { woocommerce: true }
+
+  const { html } = await renderSyncPage()
+
+  assert.match(html, /requires the .*sync.* permission/, 'it names what is missing')
+  assert.match(html, /Signing in again or reloading will not change that/, 'and says the dead ends are dead')
+  assert.match(html, /ask an administrator/, 'and what would actually resolve it')
+  assert.ok(!/Try Again|Go to Login/.test(html), 'neither dead-end action is offered')
+  // The one destination any authenticated role can reach — not /settings/system, which this role
+  // may not be able to act on either.
+  assert.match(html, /href="\/dashboard"/)
+})
+
+test('a bookmarked /sync with every plugin disabled is refused explicitly, not redirected away', async () => {
+  // FINDING 2 (round 4), the other entry: before the page gate existed, a reader with no plugin
+  // enabled was bounced to the plugin settings, which at least went somewhere. The gate replaced
+  // that with a thrown denial — a crash screen for a bookmarked link. It must now state the reason,
+  // and must still not perform a single read on the way.
+  state.role = 'READONLY'
+  state.plugins = {}
+
+  const { names } = await renderSyncPage()
+
+  assert.deepEqual(names, ['SyncAccessDenied'])
+  assert.deepEqual(state.redirects, [], 'no tour of a page this role may not act on either')
+  assert.deepEqual(state.calls.map((c) => c.name), ['requirePermission'])
 })
 
 test('every role without `sync` is refused, and the two that hold it are not', async () => {
   // Pinned against the real ROLE_PERMISSIONS matrix so a future grant/revoke shows up here.
-  const { default: SyncPage } = await import('@/app/(dashboard)/sync/page')
   state.plugins = { woocommerce: true }
 
   for (const role of ['WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER']) {
     state.role = role
     state.calls = []
-    await assert.rejects(() => SyncPage(), PermissionDeniedError, `${role} must be refused`)
+    const { names } = await renderSyncPage()
+    assert.deepEqual(names, ['SyncAccessDenied'], `${role} must be refused`)
+    assert.deepEqual(callArgs('getStrandedAccountingSyncRows'), [], `${role} must cause no read`)
   }
   for (const role of ['ADMIN', 'MANAGER']) {
     state.role = role
     state.calls = []
-    await SyncPage()
+    const { names } = await renderSyncPage()
     assert.ok(callArgs('getStrandedAccountingSyncRows').length === 1, `${role} must reach the page`)
+    assert.ok(!names.includes('SyncAccessDenied'), `${role} must not be refused`)
   }
 })
 
@@ -312,17 +129,19 @@ test('a role without `sync` causes NO stranded read at all', async () => {
   // The loader returns per-row detail — sync-log ids, referenced entity ids, external transaction
   // ids, raw connector error text. A role without `sync` must not merely fail to render it; the
   // read must never happen.
-  const { default: SyncPage } = await import('@/app/(dashboard)/sync/page')
   state.role = 'WAREHOUSE'
 
-  await assert.rejects(() => SyncPage(), PermissionDeniedError)
+  const { names } = await renderSyncPage()
+
+  assert.deepEqual(names, ['SyncAccessDenied'])
   assert.deepEqual(callArgs('getStrandedAccountingSyncRows'), [], 'the unauthorised role must cause no read whatsoever')
   assert.deepEqual(state.redirects, [])
 })
 
 test('an unauthenticated session still redirects rather than being reported as a denial', async () => {
   // requirePermission → requireAuth redirects to /login (or /2fa, or the invalidated-session
-  // path). That is framework control flow and must survive untouched.
+  // path). That is framework control flow: it must survive the access-denied catch untouched and
+  // must NOT be rendered as "you don't have access".
   const { default: SyncPage } = await import('@/app/(dashboard)/sync/page')
   state.role = null
   state.plugins = { woocommerce: true }
@@ -335,11 +154,17 @@ test('an unauthenticated session still redirects rather than being reported as a
 // ---------------------------------------------------------------------------
 
 test('a permission denial inside a dashboard read fails the page, it does not degrade a panel', async () => {
-  // getPaymentMethodCombos requires `settings.company`, which MANAGER does not hold. Under the
-  // panelisation that became "the integration settings could not be loaded — reload this page",
-  // an instruction that can never succeed, on a page still showing warnings and controls.
+  // A read whose gate is STRICTER than the page's is a wiring bug, and it is surfaced as one: not
+  // as the access-denied state (the reader was entitled to this page) and not as "the integration
+  // settings could not be loaded — reload this page", an instruction that can never succeed, on a
+  // page still showing warnings and controls.
+  //
+  // This was not hypothetical: getPaymentMethodCombos required `settings.company`, which MANAGER
+  // does not hold, so MANAGER passed the page gate and died here. Round 4 aligned that read on
+  // `sync`; sync-page-real-gates.test.ts pins the alignment against the real action. The invariant
+  // itself is what this test keeps, for the next read that disagrees.
   state.plugins = { woocommerce: true }
-  state.reads.getPaymentMethodCombos = () => {
+  state.reads.getAccountingAccounts = () => {
     throw new PermissionDeniedError('Forbidden: missing permission settings.company', 'settings.company')
   }
 
@@ -467,12 +292,11 @@ test('a positive orphan summary renders the aggregate count AND the cancel contr
   // the summary null or failed, so deleting the count paragraph and both cancel controls outright
   // used to leave the whole file green — the "hides the cancel controls" assertion above passes
   // most easily when there are no cancel controls at all.
+  //
+  // What those controls DO is asserted below, in "the cancel controls, actually used": this test
+  // is only about what is on the page.
   state.plugins = { woocommerce: true }
-  const summary: ConnectorOrphanSummary = {
-    activeConnector: null,
-    orphanGroups: [{ connector: 'quickbooks', count: 2 }, { connector: 'xero', count: 1 }],
-    totalOrphans: 3,
-  }
+  const summary = orphanSummary()
   state.reads.getCrossConnectorOrphanSummary = () => summary
   state.reads.getStrandedAccountingSyncRows = () => ({ rows: [strandedRow()], hasMore: false, total: 1 })
 
@@ -508,6 +332,99 @@ test('a truncated list says how many of how many — never a bare count', async 
 
   assert.match(html, /Showing the oldest 3 of 137 stranded row\(s\) — 134 more are not listed here\./)
   assert.match(html, /The hidden rows stay hidden until the ones listed here are resolved\./)
+})
+
+// ---------------------------------------------------------------------------
+// The cancel controls, actually used.
+//
+// FINDING 3 (round 4): counting <button> elements and their labels proves only that something was
+// rendered. Removing an onClick, passing the wrong connector, or wiring a per-connector button to
+// the UNSCOPED cancel — which retires rows across EVERY inactive connector — all stayed green.
+// These tests press the controls the PAGE built (the banner element is taken straight out of the
+// page's tree, with the page's own props) and assert the argument each one sends.
+// ---------------------------------------------------------------------------
+
+function orphanSummary(): ConnectorOrphanSummary {
+  return {
+    activeConnector: null,
+    orphanGroups: [{ connector: 'quickbooks', count: 2 }, { connector: 'xero', count: 1 }],
+    totalOrphans: 3,
+  }
+}
+
+async function mountBannerFromPage() {
+  state.plugins = { woocommerce: true }
+  state.reads.getCrossConnectorOrphanSummary = () => orphanSummary()
+  state.reads.getStrandedAccountingSyncRows = () => ({ rows: [strandedRow()], hasMore: false, total: 1 })
+
+  const { tree } = await renderSyncPage()
+  const element = elementOf(tree, 'ConnectorOrphanBanner')
+  assert.ok(element, 'the page must construct the banner')
+  return mountClientComponent(element.type as (props: unknown) => unknown, element.props)
+}
+
+test('each per-connector control cancels THAT connector — never the unscoped operation', async () => {
+  const banner = await mountBannerFromPage()
+  const { controls } = banner.render()
+
+  assert.deepEqual(
+    controls.map((c) => c.label),
+    ['Cancel these', 'Cancel these', 'Cancel all orphaned rows'],
+    'three controls, and every one of them has a handler',
+  )
+
+  await banner.click(controls.find((c) => c.label === 'Cancel these' && c.scope.includes('QuickBooks')))
+  assert.deepEqual(state.cancel.calls, [['quickbooks']], 'the QuickBooks control is scoped to QuickBooks')
+
+  await banner.click(controls.find((c) => c.label === 'Cancel these' && c.scope.includes('Xero')))
+  assert.deepEqual(
+    state.cancel.calls,
+    [['quickbooks'], ['xero']],
+    'and the Xero control to Xero — the connector is the argument, not the label',
+  )
+})
+
+test('Cancel all sends NO connector, which is what makes it the unscoped operation', async () => {
+  // cancelOrphanedAccountingSyncRows(undefined) cancels every non-active connector's rows at once.
+  // That is deliberate for this control and catastrophic for the per-connector ones above, so the
+  // absence of the argument is asserted, not merely the presence of a call.
+  const banner = await mountBannerFromPage()
+  const { controls } = banner.render()
+
+  await banner.click(controls.find((c) => c.label === 'Cancel all orphaned rows'))
+
+  assert.deepEqual(state.cancel.calls, [[undefined]])
+})
+
+test('a successful cancel refreshes the page; a failed one explains itself and does not', async () => {
+  const banner = await mountBannerFromPage()
+
+  // Success: the server summary is the source of truth, so the banner re-reads it rather than
+  // editing its own copy. Without the refresh the cancelled rows stay on screen indefinitely.
+  await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
+  assert.equal(state.refreshes, 1, 'a successful cancel re-reads the summary')
+  assert.ok(!banner.render().html.includes('could not be cancelled'), 'and says nothing alarming')
+
+  // Failure: the action fails closed (e.g. the connector is the active one, or no connector was
+  // resolvable) and returns a reason. Swallowing it leaves a button that visibly does nothing.
+  state.cancel.result = { success: false, cancelled: 0, error: 'Cannot cancel sync rows for the active connector.' }
+  await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
+
+  assert.equal(state.refreshes, 1, 'a failed cancel must NOT refresh — there is nothing new to read')
+  assert.match(banner.render().html, /Cannot cancel sync rows for the active connector\./)
+})
+
+test('rows the cancel could not retire are reported, not silently left in the count', async () => {
+  // o3d-sref: PROCESSING rows are left alone, so the orphan count does not fall to zero. A control
+  // that appears to succeed while the warning stays put reads as broken.
+  state.cancel.result = { success: true, cancelled: 4, inFlightNotCancelled: 2 }
+  const banner = await mountBannerFromPage()
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
+
+  assert.equal(state.refreshes, 1)
+  assert.match(banner.render().html, /2 row\(s\) could not be cancelled/)
+  assert.match(banner.render().html, /a request may have reached it and been lost/)
 })
 
 // ---------------------------------------------------------------------------

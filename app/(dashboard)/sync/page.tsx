@@ -39,6 +39,7 @@ import { requirePermission } from '@/lib/auth/server'
 import { isAuthorizationDenial } from '@/lib/auth/session-gates'
 import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-status'
 import { SyncDashboard } from './sync-dashboard'
+import { SyncAccessDenied } from './access-denied'
 import { ConnectorOrphanBanner } from './connector-orphan-banner'
 import { FailedSyncBanner } from './failed-sync-banner'
 import { ExceptionsBanner } from './exceptions-banner'
@@ -112,11 +113,23 @@ export default async function SyncPage() {
    * (components/layout/sidebar.tsx) and every mutating control on it requires `sync`; the page
    * itself was the one entrance that checked only authentication.
    *
-   * requirePermission, not a redirect: an unentitled reader gets the same failure the analytics
-   * pages give (requireRole), not a tour of where else to look. requireAuth inside it still
-   * redirects an unauthenticated / unverified-2FA / invalidated session to the right challenge.
+   * The denial is ANSWERED HERE rather than thrown at the RSC boundary. It is still fail-closed —
+   * nothing below this line runs, no read happens, no page is rendered — but a role denial is a
+   * stable, explainable state, and app/(dashboard)/error.tsx renders it as "Something went wrong"
+   * with Go to Login and Try Again, neither of which can ever resolve it (in production the
+   * boundary sees only a digest, so it cannot even recognise the case). See access-denied.tsx.
+   *
+   * Not a redirect: an unentitled reader is told why, rather than given a tour of somewhere else
+   * it may not be able to act on either. requireAuth inside requirePermission still THROWS its
+   * redirect for an unauthenticated / unverified-2FA / invalidated session, and that is rethrown
+   * untouched below — an authentication challenge is not an authorization denial.
    */
-  await requirePermission('sync')
+  try {
+    await requirePermission('sync')
+  } catch (error) {
+    if (isAuthorizationDenial(error)) return <SyncAccessDenied />
+    throw error
+  }
 
   const pluginState = await getIntegrationPluginState()
   // Resolve the active WMS connector from this single plugin-state read and pass
