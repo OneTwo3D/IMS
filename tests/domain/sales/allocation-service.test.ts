@@ -278,10 +278,28 @@ function createClient(state: MemoryState): AllocationServiceClient {
       // The DEALLOCATION guard's read (releaseOrderAllocationsForDeallocationInTx): every
       // non-PENDING shipment on the order. Honours the `not` predicate, so a PENDING shipment
       // really does pass and a PICKING/PACKED/SHIPPED one really does block.
-      findMany: async ({ where }: { where: { orderId: string; status?: { not?: string } } }) => shipments
+      // Also serves the PENDING-draft sweep (`deleteUnbackedPendingShipments`), which asks for an
+      // EQUALITY status plus each shipment's own lines — so the predicate honours both the `not`
+      // shape and a plain string, and the rows carry their lines. A double that answered the
+      // equality shape with the `not` shape's row set would hand the sweep every shipment on the
+      // order (o3d-4kfh r3).
+      findMany: async ({ where }: { where: { orderId: string; status?: string | { not?: string } } }) => shipments
         .filter((shipment) => shipment.orderId === where.orderId)
-        .filter((shipment) => where.status?.not == null || (shipment.status ?? 'PENDING') !== where.status.not)
-        .map((shipment) => ({ id: shipment.id, status: shipment.status ?? 'PENDING' })),
+        .filter((shipment) => {
+          if (where.status == null) return true
+          const status = shipment.status ?? 'PENDING'
+          return typeof where.status === 'string'
+            ? status === where.status
+            : where.status.not == null || status !== where.status.not
+        })
+        .map((shipment) => ({
+          id: shipment.id,
+          status: shipment.status ?? 'PENDING',
+          warehouseId: shipment.warehouseId ?? 'warehouse-1',
+          lines: shipmentLines
+            .filter((line) => line.shipmentId === shipment.id)
+            .map((line) => ({ lineId: line.lineId, productId: line.productId, qty: line.qty })),
+        })),
       findFirst: async ({ where }: { where: { orderId: string; shipmentJournalDate?: { not: null }; status?: string; OR?: Array<{ shipmentJournalDate?: { not: null }; status?: string }> } }) => {
         const rows = shipments.filter((shipment) => shipment.orderId === where.orderId)
         const matchesClause = (clause: { shipmentJournalDate?: { not: null }; status?: string }, shipment: ShipmentRow) => {
@@ -297,12 +315,29 @@ function createClient(state: MemoryState): AllocationServiceClient {
         }
         return rows[0] ?? null
       },
-      deleteMany: async ({ where }: { where: { orderId: string; status: { in: string[] } } }) => {
+      // Three shapes, all real: `{ orderId, status: { in: [...] } }` (order cancellation),
+      // `{ orderId, status: 'PENDING' }` (the deallocation teardown) and `{ id: { in: [...] } }`
+      // (the invalidated-draft sweep). Deleting a shipment takes its lines with it, as the FK
+      // cascade does — leaving orphaned lines behind would let a deleted draft keep showing up in
+      // every shipmentLine query and quietly falsify the checks that read them.
+      deleteMany: async ({ where }: {
+        where: { orderId?: string; status?: string | { in: string[] }; id?: { in: string[] } }
+      }) => {
         const before = shipments.length
         for (let index = shipments.length - 1; index >= 0; index -= 1) {
           const shipment = shipments[index]
-          if (shipment.orderId === where.orderId && shipment.status && where.status.in.includes(shipment.status)) {
-            shipments.splice(index, 1)
+          if (where.orderId != null && shipment.orderId !== where.orderId) continue
+          if (where.id && !where.id.in.includes(shipment.id)) continue
+          if (where.status != null) {
+            const status = shipment.status ?? 'PENDING'
+            const matches = typeof where.status === 'string'
+              ? status === where.status
+              : where.status.in.includes(status)
+            if (!matches) continue
+          }
+          shipments.splice(index, 1)
+          for (let lineIndex = shipmentLines.length - 1; lineIndex >= 0; lineIndex -= 1) {
+            if (shipmentLines[lineIndex].shipmentId === shipment.id) shipmentLines.splice(lineIndex, 1)
           }
         }
         return { count: before - shipments.length }
@@ -1986,19 +2021,35 @@ function deallocationScope(options: {
   return state
 }
 
-test('o3d-4kfh: user deallocation is ALLOWED while the only shipment is still PENDING', async () => {
+test('o3d-4kfh: user deallocation is ALLOWED while the only shipment is still PENDING, and TAKES THE DRAFT WITH IT', async () => {
   // A PENDING shipment is a draft the warehouse has not acted on — confirmSalesOrderShipments
   // rewrites it freely and cancellation deletes it. It is not a commitment, so it must not block
   // the ordinary "I allocated the wrong thing, undo it" flow.
+  //
+  // o3d-4kfh r3 — but "does not block" was as far as this test went, and that was the defect it
+  // documented rather than caught. Deallocation deleted the allocation rows and left the draft
+  // sitting there: nothing on this branch objects to a PENDING shipment, so the draft survived
+  // a Re-Allocate to a different warehouse and then `PENDING -> PICKING` turned it into a
+  // commitment with no allocation, no reservation and no way back. The draft must die with the
+  // rows it was generated from, in the same transaction.
   const state = deallocationScope({
     allocatedQty: 10, committedQty: 10, shipmentStatus: 'PENDING', reservedQty: 13,
   })
+  assert.equal(state.shipments?.length, 1, 'fixture really does start with a draft shipment')
+  assert.ok((state.shipmentLines?.length ?? 0) > 0, 'and the draft really does have lines')
 
   const released = await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
 
   assert.equal(released.allocations.length, 1)
   assert.equal(ownAllocation(state), undefined, 'the order\'s rows are released and deleted')
   assert.equal(state.stockLevels[0].reservedQty, 3, 'its whole 10 went back, leaving order B\'s 3')
+  assert.equal(released.deletedPendingShipmentCount, 1)
+  assert.equal(
+    state.shipments?.filter((shipment) => shipment.orderId === 'order-1').length,
+    0,
+    'the draft shipment is gone — leaving it behind is what later becomes an unbacked commitment',
+  )
+  assert.equal(state.shipmentLines?.length, 0, 'and so are its lines')
 })
 
 test('o3d-4kfh: user deallocation is REFUSED while a PICKING shipment exists', async () => {
@@ -2312,4 +2363,60 @@ test('o3d-4kfh: a zero-demand (cancelled) order keeps a PICKED commitment reserv
 
   assert.equal(ownAllocation(state), 4, 'only the picked commitment survives')
   assert.equal(state.stockLevels[0].reservedQty, 4, 'and only its 4 units stay reserved')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r3 — a rewrite must not leave PENDING drafts it has invalidated behind.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r3: a rewrite DELETES the PENDING draft it no longer backs', async () => {
+  // 10 allocated with a matching 10-unit draft; stock has since fallen, so the recompute can only
+  // place 5. The draft still says 10 — and `PENDING -> PICKING` would have committed all ten of
+  // them against a row of five. Nothing else on this branch objects to it: a PENDING shipment is
+  // not a commitment, so demand netting ignores it and the retention set does not cover it.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 10,
+    dispatchedQty: 10,
+    shipmentStatus: 'PENDING',
+    otherOrderQty: 3,
+    quantity: 8,
+    reservedQty: 13,
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(ownAllocation(state), 5, 'the rewrite really did shrink the row (so the branch ran)')
+  assert.equal(
+    (state.shipments ?? []).filter((shipment) => shipment.orderId === 'order-1').length,
+    0,
+    'the 10-unit draft the new set cannot cover is gone',
+  )
+  assert.equal((state.shipmentLines ?? []).length, 0, 'and so are its lines')
+})
+
+test('o3d-4kfh r3: a rewrite KEEPS a PENDING draft the new set still covers', async () => {
+  // The complement, and the reason the sweep is selective rather than a blanket delete: the
+  // 15-minute reallocation sweep and every stock-event re-run reach this branch on perfectly
+  // ordinary orders, and a draft can already carry a tracking number and shipping service the
+  // operator typed onto it. Growing 7 -> 10 leaves the 7-unit draft fully backed, so it survives.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 7,
+    dispatchedQty: 7,
+    shipmentStatus: 'PENDING',
+    otherOrderQty: 3,
+    quantity: 13,
+    reservedQty: 10,
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(ownAllocation(state), 10, 'the row grew, so the rewrite branch really ran')
+  assert.equal(
+    (state.shipments ?? []).filter((shipment) => shipment.orderId === 'order-1').length,
+    1,
+    'the draft is still backed by the new set and must not be thrown away',
+  )
+  assert.equal((state.shipmentLines ?? []).length, 1)
 })

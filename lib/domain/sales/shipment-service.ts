@@ -11,7 +11,9 @@ import {
   lockSalesOrder,
   lockStockLevels,
   validateAllocationIntegrity,
+  validateCommittedShipmentCoverage,
 } from '@/lib/domain/sales/allocation-service'
+import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import {
   isStockMovementIdempotencyConflict,
   saleDispatchMovementKey,
@@ -614,16 +616,46 @@ export async function transitionShipmentStatus(
   }
 
   const transitioned = await runInTransaction(client, async (tx) => {
+    // o3d-4kfh r3: THE ORDER LOCK, taken before the shipment row lock so this path acquires locks
+    // in the SAME order as the dispatch branch above.
+    //
+    // PENDING -> PICKING is a COMMITMENT: from that moment the shipment counts against
+    // `OrderAllocation.qty` in every consumer (the residual, confirmSalesOrderShipments, the
+    // accounting sub-ledger) and can no longer be rewritten or deleted by any path IMS has. It used
+    // to lock nothing but the shipment row, so it could commit concurrently with the deallocation,
+    // re-allocation or manual edit that removed the very rows meant to back it — and, because a
+    // PENDING shipment is deliberately NOT a commitment, those paths were all entitled to ignore it
+    // while it was still pending.
+    await lockSalesOrder(tx, shipment.orderId)
     await tx.$queryRaw`SELECT id FROM shipments WHERE id = ${shipmentId} FOR UPDATE`
     const locked = await tx.shipment.findUnique({
       where: { id: shipmentId },
-      select: { status: true },
+      select: { status: true, orderId: true },
     })
     if (!locked) throw new Error('Shipment not found')
     if (locked.status === targetStatus) return false
     const lockedTransition = validateShipmentStatusTransition(locked.status, targetStatus)
     if (!lockedTransition.success) throw new Error(lockedTransition.error)
     await tx.shipment.update({ where: { id: shipmentId }, data })
+
+    if (locked.status === UNCOMMITTED_SHIPMENT_STATUS) {
+      // Verified AFTER the update on purpose: the check reads the non-PENDING set from the
+      // database, so updating first is what makes THIS shipment part of the commitment being
+      // validated. Scoped to the shipment's own sales lines so an unrelated pre-existing problem
+      // elsewhere on the order cannot block the warehouse from starting a pick.
+      const lockedLines = await tx.shipmentLine.findMany({
+        where: { shipmentId },
+        select: { lineId: true },
+      })
+      const coverageError = await validateCommittedShipmentCoverage(
+        tx,
+        locked.orderId,
+        [...new Set(lockedLines.map((line) => line.lineId))],
+      )
+      // THROWN, not returned: a `return { success: false }` out of a transaction callback commits
+      // whatever it has already written, and this one has already flipped the status.
+      if (coverageError) throw new Error(coverageError)
+    }
     return true
   })
 

@@ -177,8 +177,12 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       }),
     },
     orderAllocation: {
-      findMany: async ({ where }: { where: { orderId: string } }) => state.allocations
-        .filter((allocation) => allocation.orderId === where.orderId),
+      // `lineId: { in: [...] }` is a real predicate the scoped integrity/coverage checks pass;
+      // ignoring it would hand them the whole order's rows and let a check that should have been
+      // scoped to one shipment's lines pass on the strength of an unrelated allocation.
+      findMany: async ({ where }: { where: { orderId: string; lineId?: { in: string[] } } }) => state.allocations
+        .filter((allocation) => allocation.orderId === where.orderId)
+        .filter((allocation) => where.lineId?.in == null || where.lineId.in.includes(allocation.lineId)),
       findUnique: async ({ where }: { where: { lineId_warehouseId_productId: { lineId: string; warehouseId: string; productId: string } } }) => {
         const key = where.lineId_warehouseId_productId
         return state.allocations.find((allocation) => (
@@ -209,7 +213,12 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       findUnique: async ({ where, include, select }: { where: { id: string }; include?: unknown; select?: Record<string, boolean> }) => {
         const shipment = state.shipments.find((row) => row.id === where.id)
         if (!shipment) return null
-        if (select?.status) return { status: shipment.status }
+        // Projects exactly the keys asked for. Returning only `status` when the caller also asked
+        // for `orderId` handed the commitment check an undefined order id, which would have made it
+        // silently validate nothing (o3d-4kfh r3).
+        if (select?.status) {
+          return select.orderId ? { status: shipment.status, orderId: shipment.orderId } : { status: shipment.status }
+        }
         if (!include) return shipment
         const order = state.orders.find((row) => row.id === shipment.orderId)!
         return {
@@ -262,7 +271,10 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     shipmentLine: {
-      findMany: async ({ where, select }: { where: { shipment?: { orderId?: string; status?: string | { not: string } }; lineId?: { in: string[] } }; select?: Record<string, boolean> }) => state.shipmentLines
+      findMany: async ({ where, select }: { where: { shipmentId?: string; shipment?: { orderId?: string; status?: string | { not: string } }; lineId?: { in: string[] } }; select?: Record<string, boolean> }) => state.shipmentLines
+        // The commitment check reads the transitioning shipment's OWN lines by shipmentId; without
+        // this predicate the double would have returned every line on every shipment.
+        .filter((line) => where.shipmentId == null || line.shipmentId === where.shipmentId)
         .filter((line) => {
           if (where.shipment == null) return true
           const shipment = state.shipments.find((row) => row.id === line.shipmentId)
@@ -405,9 +417,16 @@ test('confirmSalesOrderShipments creates a full pending shipment from allocation
 })
 
 test('confirmSalesOrderShipments only creates shipment lines for unshipped allocation quantity', async () => {
+  // o3d-4kfh r3 — THE FIXTURE USED TO PUT THE COMMITTED SHIPMENT IN A DIFFERENT WAREHOUSE
+  // (warehouse-2) FROM THE ALLOCATION IT WAS SUPPOSED TO BE NETTED OUT OF (warehouse-1).
+  // `committedByAllocationKey` is keyed on (lineId, warehouseId, productId), so that mismatch meant
+  // the netting branch never fired: the expected `qty` of 2 was simply the whole allocation row,
+  // i.e. the value that means NO netting happened. The test asserted the opposite of its own name,
+  // and the shape it encoded — a picked shipment with no allocation behind it in that warehouse —
+  // is itself the unbacked commitment `findUncoveredCommittedShipment` now rejects.
   const state = baseState({
     allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
-    shipments: [{ id: 'shipment-active', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'PICKING', trackingNumber: null, shippingService: null }],
+    shipments: [{ id: 'shipment-active', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PICKING', trackingNumber: null, shippingService: null }],
     shipmentLines: [{ id: 'shipment-line-active', shipmentId: 'shipment-active', lineId: 'line-1', productId: 'product-1', qty: 1 }],
     lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 3, sku: 'SKU-1', description: 'Product 1' }],
   })
@@ -415,7 +434,7 @@ test('confirmSalesOrderShipments only creates shipment lines for unshipped alloc
 
   assert.equal(result.shipmentCount, 1)
   const pendingLine = state.shipmentLines.find((line) => line.shipmentId !== 'shipment-active')
-  assert.equal(pendingLine?.qty, 2)
+  assert.equal(pendingLine?.qty, 1, 'the 2-unit row minus the 1 unit already committed to the PICKING shipment')
 })
 
 test('o3d-4kfh: confirmSalesOrderShipments is NOT blocked by a partially dispatched allocation', async () => {
@@ -1048,4 +1067,134 @@ test('transitionShipmentStatus does not reject a fractional KIT on a rounding ul
 
   assert.equal(result.success, true, 'a kit shipped at exactly its persisted entitlement must dispatch')
   assert.equal(state.shipments[0].status, 'SHIPPED')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r3 — PENDING -> PICKING is a COMMITMENT, and it must be backed.
+//
+// A PENDING shipment is deliberately not a commitment: the deallocation refusal lets it through,
+// the committed floor in updateAllocation does not count it, and allocateSalesOrder does not retain
+// it. That is correct only for as long as nothing can turn an INVALIDATED draft into a commitment.
+// This transition is that one thing, so it verifies coverage under the order lock before letting go.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r3: PENDING -> PICKING is REFUSED when the allocation has moved to another warehouse', async () => {
+  // The exact UI sequence: raise a shipment, Deallocate, Re-Allocate (which lands in a different
+  // warehouse), Start Picking. The draft's warehouse has no allocation at all, so committing it
+  // would leave a pickable, dispatchable shipment whose units come out of whatever shared
+  // (product, warehouse) reservedQty happens to be there.
+  const state = baseState({
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-2', qty: 2 }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-1', targetStatus: 'PICKING' }),
+    /commit 2 unit\(s\) but only 0 are allocated there/,
+  )
+  assert.equal(state.shipments[0].status, 'PENDING', 'the status flip is rolled back with the transaction')
+})
+
+test('o3d-4kfh r3: PENDING -> PICKING is REFUSED when the shipment is bigger than the row backing it', async () => {
+  // Finding 3’s exact shape: committed 10 against an allocation row of 5. Both sides of
+  // validateAllocationIntegrity’s quantity test floor at zero (open coverage 0, remaining demand 0),
+  // so the full integrity check passed on it and the residual arithmetic credited only what was
+  // left — five committed units with nothing behind them, invisible to every check IMS had.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 5 }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 10 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 5 }],
+  })
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-1', targetStatus: 'PICKING' }),
+    /commit 10 unit\(s\) but only 5 are allocated there/,
+  )
+  assert.equal(state.shipments[0].status, 'PENDING')
+})
+
+test('o3d-4kfh r3: the ordinary PENDING -> PICKING is untouched', async () => {
+  // The guard must not turn "start picking" into a new operator dead end. This is the shape
+  // confirmSalesOrderShipments produces: draft lines copied straight off the allocation rows.
+  const state = baseState({
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'PICKING',
+  })
+
+  assert.equal(result.success, true, result.success ? undefined : result.error)
+  assert.equal(state.shipments[0].status, 'PICKING')
+})
+
+test('o3d-4kfh r3: a partially committed KIT is refused, a proportional one is allowed', async () => {
+  // Per-product coverage alone is not enough for a bundle. Committing 6 of comp-1 with none of
+  // comp-2 is covered product-by-product (6 <= 6) while covering ZERO whole kits, so
+  // calculateDecimalCoverageByLine credits nothing: those 6 units strand against demand that still
+  // reads as entirely unshipped.
+  const kitState = (shipmentLines: ShipmentLine[]) => baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 3, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-1', qty: 2, sku: 'COMP-1' }, { componentId: 'comp-2', qty: 1, sku: 'COMP-2' }] },
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-1', qty: 6 },
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-2', warehouseId: 'warehouse-1', qty: 3 },
+    ],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null }],
+    shipmentLines,
+    stockLevels: [
+      { productId: 'comp-1', warehouseId: 'warehouse-1', quantity: 6, reservedQty: 6 },
+      { productId: 'comp-2', warehouseId: 'warehouse-1', quantity: 3, reservedQty: 3 },
+    ],
+  })
+
+  const partial = kitState([
+    { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 6 },
+  ])
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(partial), { shipmentId: 'shipment-1', targetStatus: 'PICKING' }),
+    /do not commit a complete component set/,
+  )
+  assert.equal(partial.shipments[0].status, 'PENDING')
+
+  const proportional = kitState([
+    { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-1', qty: 6 },
+    { id: 'shipment-line-2', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-2', qty: 3 },
+  ])
+  const result = await transitionShipmentStatus(createClient(proportional), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'PICKING',
+  })
+  assert.equal(result.success, true, result.success ? undefined : result.error)
+  assert.equal(proportional.shipments[0].status, 'PICKING')
+})
+
+test('o3d-4kfh r3: confirmSalesOrderShipments refuses an order carrying an unbacked commitment', async () => {
+  // The same downward check reached through validateAllocationIntegrity rather than the
+  // commitment transition, so BOTH entry points are covered. line-2 carries a PICKING shipment of
+  // 10 against an allocation row of 5; line-1 is healthy, which is what keeps `effectiveAllocs`
+  // non-empty and drives the run all the way to the integrity check instead of bailing out early.
+  const state = baseState({
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 2, sku: 'SKU-1', description: 'Product 1' },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-2', qty: 10, sku: 'SKU-2', description: 'Product 2' },
+    ],
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 },
+      { orderId: 'order-1', lineId: 'line-2', productId: 'product-2', warehouseId: 'warehouse-1', qty: 5 },
+    ],
+    shipments: [{ id: 'shipment-committed', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PICKING', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-committed', shipmentId: 'shipment-committed', lineId: 'line-2', productId: 'product-2', qty: 10 }],
+  })
+
+  await assert.rejects(
+    () => confirmSalesOrderShipments(createClient(state), 'order-1'),
+    /commit 10 unit\(s\) but only 5 are allocated there/,
+  )
 })

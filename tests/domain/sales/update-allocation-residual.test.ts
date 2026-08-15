@@ -30,6 +30,9 @@ const state = {
   // anything, so every assertion about the post-edit state was made against a validator that had
   // been switched off (Codex review of o3d-4kfh).
   lines: [] as SalesOrderLineRow[],
+  // Set by the concurrency test only: the snapshot the NON-transactional pre-read still sees after
+  // a second editor has already committed. null = read the live rows like every other test.
+  staleOuterAllocations: null as AllocationRow[] | null,
 }
 
 function decimalLikeToNumber(value: unknown): number {
@@ -130,7 +133,13 @@ const tx = {
     },
   },
   orderAllocation: {
-    findUnique: async ({ where }: { where: { lineId_warehouseId_productId?: { lineId: string; warehouseId: string; productId: string } } }) => {
+    // Answers BOTH unique shapes production uses: the merge-target lookup by
+    // (lineId, warehouseId, productId), and — since o3d-4kfh round 3 — the re-read by `id` that
+    // updateAllocation performs under the order lock. A double that answered only the compound key
+    // would return null for the re-read and make every edit fail closed, which would look like the
+    // guard working when in fact nothing was being exercised.
+    findUnique: async ({ where }: { where: { id?: string; lineId_warehouseId_productId?: { lineId: string; warehouseId: string; productId: string } } }) => {
+      if (where.id) return state.allocations.find((row) => row.id === where.id) ?? null
       const key = where.lineId_warehouseId_productId
       if (!key) return null
       return state.allocations.find((row) => (
@@ -169,7 +178,12 @@ mock.module('@/lib/db', {
         ...tx.orderAllocation,
         findUnique: async ({ where }: { where: { id?: string } }) => {
           if (!where.id) return null
-          const row = state.allocations.find((candidate) => candidate.id === where.id)
+          // `staleOuterAllocations` models the ONE thing that separates the outer read from the
+          // in-transaction one: it happens before the order lock, so another editor can commit in
+          // between. When a test sets it, this read (and only this read) is served from that frozen
+          // snapshot while `tx` keeps serving the committed state.
+          const source = state.staleOuterAllocations ?? state.allocations
+          const row = source.find((candidate) => candidate.id === where.id)
           if (!row) return null
           return {
             ...row,
@@ -190,6 +204,7 @@ async function loadAction() {
 /** The order's own lines. Kept in step with the fixtures so the integrity check is answerable. */
 function seedLines(qty: number) {
   state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty, sku: 'SKU-1' }]
+  state.staleOuterAllocations = null
 }
 
 /**
@@ -532,4 +547,53 @@ test('o3d-4kfh: and it does NOT refuse a partially dispatched order (the retaine
 
   assert.equal(result.success, true, result.error)
   assert.equal(state.allocations[0].qty, 10)
+})
+
+test('o3d-4kfh r3: TWO CONCURRENT EDITORS of the same row cannot steal the neighbour\'s reservation', async () => {
+  // The A/B shared-scope case, run through the exact window the pre-transaction read opens.
+  //
+  // A=10 and B=3 share (product-1, warehouse-1); reservedQty 13 backs both. Two operators open the
+  // editor on A and both see 10. The first commits A=8 (release 10, reserve 8 -> reservedQty 11).
+  // The second then enters its transaction, takes the order lock — and used to carry on with its
+  // STALE 10: release 10 (11 >= 10, so the guarded decrement happily succeeds) and reserve 9,
+  // leaving reservedQty at 10 while the rows claim 8+3=12... except A is now 9, so 9+3=12 against
+  // an aggregate of 10. B is short by two units nobody will ever notice: validateAllocationIntegrity
+  // never looks at a stock level, and the guarded decrement had enough to hand over.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 13 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 },
+    // Order B's own row in the SAME (product, warehouse) scope. It is not this order's, so nothing
+    // in updateAllocation reads it — it exists purely to own 3 of the 13 reserved units.
+    { id: 'alloc-b', orderId: 'order-2', lineId: 'line-2', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 },
+  ]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  // Editor one, in full.
+  const first = await updateAllocation('alloc-a', 'warehouse-1', 8)
+  assert.equal(first.success, true, first.error)
+  assert.equal(reservedAt('warehouse-1'), 11, 'A now holds 8 live, B still holds 3')
+
+  // Editor two: its pre-read happened BEFORE the write above, so it still sees A=10.
+  state.staleOuterAllocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 },
+    { id: 'alloc-b', orderId: 'order-2', lineId: 'line-2', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 },
+  ]
+  const second = await updateAllocation('alloc-a', 'warehouse-1', 9)
+
+  // The invariant that actually matters FIRST, asserted independently of HOW it is kept: the shared
+  // aggregate still equals the sum of the rows claiming it, so B's 3 units are still B's. Asserted
+  // ahead of the message so a regression reports the theft rather than the wording.
+  const rowTotal = state.allocations
+    .filter((row) => row.productId === 'product-1' && row.warehouseId === 'warehouse-1')
+    .reduce((sum, row) => sum + row.qty, 0)
+  assert.equal(
+    reservedAt('warehouse-1'),
+    rowTotal,
+    `reservedQty ${reservedAt('warehouse-1')} must equal the ${rowTotal} units the allocation rows claim`,
+  )
+  assert.equal(state.allocations.find((row) => row.id === 'alloc-b')?.qty, 3, 'B\'s row is untouched')
+  assert.equal(second.success, false, 'the stale editor must be refused, not silently applied')
+  assert.match(String(second.error), /changed while you were editing/)
 })

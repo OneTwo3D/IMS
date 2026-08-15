@@ -380,7 +380,7 @@ export type ReleasedOrderAllocation = {
 export async function releaseOrderAllocationsInTx(
   tx: Prisma.TransactionClient,
   orderId: string,
-): Promise<{ allocations: ReleasedOrderAllocation[]; clampedReservationCount: number }> {
+): Promise<{ allocations: ReleasedOrderAllocation[]; clampedReservationCount: number; deletedPendingShipmentCount: number }> {
   await resetAllocationAccountingIfStaged(tx, orderId)
   const currentAllocs = await tx.orderAllocation.findMany({
     where: { orderId },
@@ -425,9 +425,27 @@ export async function releaseOrderAllocationsInTx(
   // Bracket the release with the same fail-closed assertion cancelSalesOrderFulfillmentState uses,
   // so the actual database delta is verified rather than the requested decrement merely trusted.
   assertReservationReleaseDelta(stockBefore, stockAfter, releasedRows)
+  // o3d-4kfh r3: THE DRAFTS GO WITH THE ROWS THEY WERE DRAWN FROM, in the same transaction.
+  //
+  // A PENDING shipment is a draft `confirmSalesOrderShipments` generated directly from these
+  // allocation rows — same (line, warehouse, product), same quantities. Deleting the rows and
+  // leaving the draft behind produced a shipment nothing backs, and PENDING is precisely the status
+  // every guard on this branch is entitled to ignore: the deallocation refusal lets it through, the
+  // committed floor in `updateAllocation` does not count it, and `allocateSalesOrder` does not
+  // retain it. The ordinary UI sequence — raise a shipment, Deallocate, Re-Allocate somewhere else,
+  // Start Picking — then committed a shipment with no allocation and no reservation behind it.
+  // Deleting them here is what makes the teardown TOTAL; the commitment-transition check in
+  // `transitionShipmentStatus` is the backstop for drafts invalidated by any other route.
+  const deletedPendingShipments = await tx.shipment.deleteMany({
+    where: { orderId, status: UNCOMMITTED_SHIPMENT_STATUS },
+  })
   await tx.orderAllocation.deleteMany({ where: { orderId } })
 
-  return { allocations, clampedReservationCount: clampedReservations.count }
+  return {
+    allocations,
+    clampedReservationCount: clampedReservations.count,
+    deletedPendingShipmentCount: deletedPendingShipments.count,
+  }
 }
 
 /**
@@ -442,7 +460,9 @@ export async function releaseOrderAllocationsInTx(
  * refuses to do one row at a time.
  *
  * The bounded fix is to refuse, not to invent cancellation semantics for a committed shipment.
- * A PENDING shipment is not a commitment and never blocks, so the ordinary case is unaffected.
+ * A PENDING shipment is not a commitment and never blocks — but it is DELETED with the rows it was
+ * drawn from (o3d-4kfh r3, see `releaseOrderAllocationsInTx`), because a draft that outlives its
+ * allocation is exactly what later becomes a committed shipment with nothing behind it.
  *
  * BUT NOTE WHAT THE OPERATOR IS ACTUALLY LEFT WITH, because it is narrower than it looks:
  * IMS has NO per-shipment cancel or rollback at all. `SHIPMENT_TRANSITIONS` is forward-only
@@ -458,7 +478,7 @@ export async function releaseOrderAllocationsInTx(
 export async function releaseOrderAllocationsForDeallocationInTx(
   tx: Prisma.TransactionClient,
   orderId: string,
-): Promise<{ allocations: ReleasedOrderAllocation[]; clampedReservationCount: number }> {
+): Promise<{ allocations: ReleasedOrderAllocation[]; clampedReservationCount: number; deletedPendingShipmentCount: number }> {
   const committedShipments = await tx.shipment.findMany({
     where: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } },
     select: { id: true, status: true },
@@ -761,20 +781,120 @@ export async function cancelSalesOrderFulfillmentState(
   }
 }
 
+/** A quantity carried at the grain `OrderAllocation` and `ShipmentLine` share (o3d-4kfh). */
+type AllocationScopeQty = {
+  lineId: string
+  warehouseId: string
+  productId: string
+  qty: DecimalInput
+}
+
 /**
- * Structural + quantity check on an order's allocation rows.
+ * IS EVERY COMMITTED SHIPMENT LINE BACKED BY AN ALLOCATION ROW BIG ENOUGH TO COVER IT (o3d-4kfh)?
  *
- * o3d-4kfh — reads `OrderAllocation.qty` under the contract stated in `allocateSalesOrder`: a row
- * covers its committed shipment lines as well as the outstanding demand. So the quantity test
- * subtracts the SAME non-PENDING shipment set from both sides — from the rows (per allocation
- * scope) and from the line's ordered quantity — and compares what is left. Comparing raw rows
- * against a net demand figure is not a stricter check, it is an incoherent one.
+ * The contract runs one way — `OrderAllocation.qty` = outstanding demand PLUS every committed
+ * (non-PENDING) shipment line — and every other consumer takes it on trust: the reservation
+ * residual, `confirmSalesOrderShipments`, the accounting sub-ledger and the reservation invariant
+ * all compute `qty − committed` and floor at zero. A commitment LARGER than its row therefore does
+ * not overflow anywhere; it silently vanishes, and the units it represents come out of whatever
+ * shared `(product, warehouse)` reservation happens to be there at dispatch time.
+ *
+ * Three things are checked per `(line, warehouse)` that has any commitment:
+ *   1. the committed product belongs to the line (no stranger components),
+ *   2. an allocation row exists at that exact scope with `qty >= committed`,
+ *   3. the committed quantities form a COMPLETE, PROPORTIONAL component set.
+ *
+ * (3) is not redundant with (2) for a KIT: 2 of a 2xA + 1xB kit committed as A-only is covered
+ * product-by-product while covering zero whole kits, so `calculateDecimalCoverageByLine` credits
+ * nothing and those A units strand against demand that still reads as unshipped. Shipment lines are
+ * created only by `confirmSalesOrderShipments`, straight from the allocation rows the structural
+ * check above already holds proportional to `ALLOCATION_EPSILON_DECIMAL`, so a proportional
+ * commitment is the normal case and the same epsilon is the right one to judge it by.
+ *
+ * Returns the operator-facing message, or null when every commitment is backed.
  */
-export async function validateAllocationIntegrity(
+export function findUncoveredCommittedShipment(
+  requirementsByLine: Map<string, DecimalFulfillmentRequirement[]>,
+  lineLabelById: Map<string, string>,
+  allocations: AllocationScopeQty[],
+  committedShipmentLines: AllocationScopeQty[],
+): string | null {
+  const scopeKey = (row: { lineId: string; warehouseId: string; productId: string }) =>
+    `${row.lineId}|${row.warehouseId}|${row.productId}`
+
+  const allocatedByScope = new Map<string, Prisma.Decimal>()
+  for (const allocation of allocations) {
+    const key = scopeKey(allocation)
+    allocatedByScope.set(
+      key,
+      (allocatedByScope.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(allocation.qty)),
+    )
+  }
+
+  // Grouped per (line, warehouse) because that is the grain a bundle is shipped at: one shipment
+  // belongs to one warehouse, and its component lines are only a complete kit together.
+  const committedByLineWarehouse = new Map<string, Map<string, Prisma.Decimal>>()
+  for (const shipmentLine of committedShipmentLines) {
+    // Lines outside the validated set (or with no product) have no requirements to judge against.
+    if (!requirementsByLine.has(shipmentLine.lineId)) continue
+    const group = `${shipmentLine.lineId}|${shipmentLine.warehouseId}`
+    const quantities = committedByLineWarehouse.get(group) ?? new Map<string, Prisma.Decimal>()
+    quantities.set(
+      shipmentLine.productId,
+      (quantities.get(shipmentLine.productId) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)),
+    )
+    committedByLineWarehouse.set(group, quantities)
+  }
+
+  for (const [group, quantities] of committedByLineWarehouse) {
+    // warehouseId never contains the separator, and lineId is whatever precedes the LAST one.
+    const separator = group.lastIndexOf('|')
+    const lineId = group.slice(0, separator)
+    const warehouseId = group.slice(separator + 1)
+    const requirements = requirementsByLine.get(lineId) ?? []
+    if (requirements.length === 0) continue
+    const label = lineLabelById.get(lineId) ?? lineId
+    const requiredProductIds = new Set(requirements.map((requirement) => requirement.productId))
+
+    for (const [productId, committedQty] of quantities) {
+      if (committedQty.lte(ALLOCATION_EPSILON_DECIMAL)) continue
+      if (!requiredProductIds.has(productId)) {
+        return `Shipments for sales line ${label} in warehouse ${warehouseId} commit a component that is not part of that line`
+      }
+      const allocatedQty = allocatedByScope.get(`${lineId}|${warehouseId}|${productId}`)
+        ?? new Prisma.Decimal(0)
+      if (committedQty.sub(allocatedQty).gt(ALLOCATION_EPSILON_DECIMAL)) {
+        return `Shipments for sales line ${label} in warehouse ${warehouseId} commit ${committedQty.toString()} unit(s) `
+          + `but only ${allocatedQty.toString()} are allocated there — the allocation row is what the shipment, the `
+          + 'reservation residual and the accounting sub-ledger net against, so it must cover what has been committed'
+      }
+    }
+
+    const committedCoverage = calculateDecimalFulfillmentCoverage(requirements, quantities)
+    for (const requirement of requirements) {
+      const actualQty = quantities.get(requirement.productId) ?? new Prisma.Decimal(0)
+      const expectedQty = committedCoverage.mul(requirement.factor)
+      if (actualQty.sub(expectedQty).abs().gt(ALLOCATION_EPSILON_DECIMAL)) {
+        return `Shipments for sales line ${label} in warehouse ${warehouseId} do not commit a complete component set`
+      }
+    }
+  }
+
+  return null
+}
+
+/**
+ * The rows both allocation checks read. Extracted so `validateCommittedShipmentCoverage` cannot
+ * end up asking a DIFFERENT question of a differently-filtered set than the full integrity check —
+ * the two must agree about which shipments count as committed and which rows back them.
+ *
+ * Returns null when the order has no product-bearing lines in scope; nothing to check.
+ */
+async function loadAllocationIntegrityRows(
   client: AllocationServiceClient,
   orderId: string,
   lineIds?: string[],
-): Promise<string | null> {
+) {
   const lines = await client.salesOrderLine.findMany({
     where: {
       orderId,
@@ -832,6 +952,64 @@ export async function validateAllocationIntegrity(
     }),
   ])
 
+  return { lines, requirementsByLine, allocations, activeShipmentLines }
+}
+
+/** The committed shipment lines re-expressed at allocation-row grain. */
+function committedScopeRows(
+  activeShipmentLines: Array<{ lineId: string; productId: string; qty: DecimalInput; shipment: { warehouseId: string } }>,
+): AllocationScopeQty[] {
+  return activeShipmentLines.map((shipmentLine) => ({
+    lineId: shipmentLine.lineId,
+    productId: shipmentLine.productId,
+    warehouseId: shipmentLine.shipment.warehouseId,
+    qty: shipmentLine.qty,
+  }))
+}
+
+/**
+ * The DOWNWARD half of the integrity check on its own (o3d-4kfh r3): every committed shipment line
+ * is backed by an allocation row big enough to cover it.
+ *
+ * Split out from {@link validateAllocationIntegrity} for the COMMITMENT TRANSITION
+ * (PENDING -> PICKING), where the upward half must not be run: an order can legitimately sit with
+ * allocation rows that a later refund has left above the remaining demand, and refusing to let the
+ * warehouse start picking because of that would be a new operator dead end. What must never happen
+ * is a shipment BECOMING committed with nothing behind it.
+ */
+export async function validateCommittedShipmentCoverage(
+  client: AllocationServiceClient,
+  orderId: string,
+  lineIds?: string[],
+): Promise<string | null> {
+  const rows = await loadAllocationIntegrityRows(client, orderId, lineIds)
+  if (!rows) return null
+  return findUncoveredCommittedShipment(
+    rows.requirementsByLine,
+    new Map(rows.lines.map((line) => [line.id, line.sku ?? line.description])),
+    rows.allocations,
+    committedScopeRows(rows.activeShipmentLines),
+  )
+}
+
+/**
+ * Structural + quantity check on an order's allocation rows.
+ *
+ * o3d-4kfh — reads `OrderAllocation.qty` under the contract stated in `allocateSalesOrder`: a row
+ * covers its committed shipment lines as well as the outstanding demand. So the quantity test
+ * subtracts the SAME non-PENDING shipment set from both sides — from the rows (per allocation
+ * scope) and from the line's ordered quantity — and compares what is left. Comparing raw rows
+ * against a net demand figure is not a stricter check, it is an incoherent one.
+ */
+export async function validateAllocationIntegrity(
+  client: AllocationServiceClient,
+  orderId: string,
+  lineIds?: string[],
+): Promise<string | null> {
+  const rows = await loadAllocationIntegrityRows(client, orderId, lineIds)
+  if (!rows) return null
+  const { lines, requirementsByLine, allocations, activeShipmentLines } = rows
+
   const committedByLine = calculateDecimalCoverageByLine(
     requirementsByLine,
     activeShipmentLines,
@@ -847,6 +1025,23 @@ export async function validateAllocationIntegrity(
       (committedByAllocationScope.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)),
     )
   }
+
+  // o3d-4kfh r3: THE COMMITMENT MUST BE BACKED, and this is the only check that looks DOWNWARD.
+  //
+  // Everything else here rejects coverage ABOVE the remaining demand. Nothing rejected coverage
+  // BELOW the commitment, and the arithmetic hid it perfectly: with committed 10 against a row of
+  // 5, `openQuantities` floors `5 - 10` to 0 and `remainingQty` floors `qty - 10` to 0, so open
+  // coverage 0 <= remaining 0 and validation SUCCEEDED on an order with five shipped-or-picked
+  // units no allocation row accounts for. The residual arithmetic cannot surface it either — it
+  // credits only what is actually left — so an order could be corrupted through the stale-PENDING
+  // path or an unlocked commitment race and then pass every check IMS has.
+  const committedCoverageError = findUncoveredCommittedShipment(
+    requirementsByLine,
+    new Map(lines.map((line) => [line.id, line.sku ?? line.description])),
+    allocations,
+    committedScopeRows(activeShipmentLines),
+  )
+  if (committedCoverageError) return committedCoverageError
 
   for (const line of lines) {
     const requirements = requirementsByLine.get(line.id) ?? []
@@ -992,6 +1187,74 @@ function collectNonOversellLeafComponents(
 
   visit(productId, new Set<string>())
   return [...blockers].sort()
+}
+
+/**
+ * Delete the order's PENDING shipments that the allocation set no longer backs (o3d-4kfh r3).
+ *
+ * "No longer backs" is measured at the grain the two tables share: a draft line needs OPEN
+ * allocation — `qty − committed` — at its own (line, warehouse, product), and drafts are charged
+ * against that open quantity oldest-first so two drafts cannot both claim the same units. A
+ * shipment is kept only if EVERY one of its lines fits; a partially-covered draft is deleted whole,
+ * because trimming it would silently ship less than the operator confirmed.
+ *
+ * Returns how many were deleted.
+ */
+async function deleteUnbackedPendingShipments(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  persistedAllocations: AllocationRowInput[],
+  committedShipmentLines: AllocationScopeQty[],
+): Promise<number> {
+  const pendingShipments = await tx.shipment.findMany({
+    where: { orderId, status: UNCOMMITTED_SHIPMENT_STATUS },
+    select: {
+      id: true,
+      warehouseId: true,
+      lines: { select: { lineId: true, productId: true, qty: true } },
+    },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+  })
+  if (pendingShipments.length === 0) return 0
+
+  const scopeKey = (row: { lineId: string; warehouseId: string; productId: string }) =>
+    `${row.lineId}|${row.warehouseId}|${row.productId}`
+  const openByScope = new Map<string, Prisma.Decimal>()
+  for (const allocation of persistedAllocations) {
+    const key = scopeKey(allocation)
+    openByScope.set(key, (openByScope.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(allocation.qty)))
+  }
+  for (const committed of committedShipmentLines) {
+    const key = scopeKey(committed)
+    openByScope.set(key, (openByScope.get(key) ?? new Prisma.Decimal(0)).sub(toDecimal(committed.qty)))
+  }
+
+  const doomed: string[] = []
+  for (const shipment of pendingShipments) {
+    const claim = new Map<string, Prisma.Decimal>()
+    let backed = true
+    for (const line of shipment.lines) {
+      const key = scopeKey({ ...line, warehouseId: shipment.warehouseId })
+      const wanted = (claim.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(line.qty))
+      claim.set(key, wanted)
+      const open = openByScope.get(key) ?? new Prisma.Decimal(0)
+      if (wanted.sub(open).gt(ALLOCATION_EPSILON_DECIMAL)) {
+        backed = false
+        break
+      }
+    }
+    if (!backed) {
+      doomed.push(shipment.id)
+      continue
+    }
+    for (const [key, qty] of claim) {
+      openByScope.set(key, (openByScope.get(key) ?? new Prisma.Decimal(0)).sub(qty))
+    }
+  }
+
+  if (doomed.length === 0) return 0
+  const deleted = await tx.shipment.deleteMany({ where: { id: { in: doomed } } })
+  return deleted.count
 }
 
 function noAllocationResult(error: string): AllocateSalesOrderResult {
@@ -1462,6 +1725,20 @@ export async function allocateSalesOrder(
         })),
         'reserve',
       )
+
+      // o3d-4kfh r3: DROP THE PENDING DRAFTS THIS REWRITE JUST INVALIDATED.
+      //
+      // The rows a PENDING shipment was generated from have just been deleted and rewritten,
+      // possibly in a different warehouse or at a different quantity. A draft the new set no longer
+      // covers is the same latent defect the deallocation path had: nothing refuses it while it is
+      // PENDING, and `PENDING -> PICKING` would then turn it into a commitment with no allocation
+      // behind it.
+      //
+      // Only the INVALIDATED ones. A draft the new set still covers is untouched — deleting every
+      // PENDING shipment on any re-allocation would throw away the tracking number and shipping
+      // service an operator had already typed onto it, on runs (the 15-minute reallocation sweep,
+      // a stock-event re-run) that changed nothing about that warehouse.
+      await deleteUnbackedPendingShipments(tx, orderId, persistedAllocations, committedAllocationLines)
     }
 
     // Promote to ALLOCATED only off the UNDER-LOCK status. Deciding on the stale pre-lock so.status

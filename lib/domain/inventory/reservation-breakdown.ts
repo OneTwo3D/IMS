@@ -272,7 +272,23 @@ export async function loadReservationSourceRows(
     }
   }
 
-  const rows: ReservationBreakdownRow[] = []
+  // o3d-4kfh r3: THE TOLERANCE IS APPLIED AT THE SAME AGGREGATION STAGE AS THE SQL FAST PATH.
+  //
+  // `invariants.ts` builds the identical census in SQL, and there the tolerance is a
+  // `HAVING SUM(...) > tolerance` — applied to the (product, warehouse) TOTAL of each UNION branch,
+  // after aggregation. This function used to drop each ROW whose credited residual was <= 0.0001
+  // BEFORE anything was summed, so two legitimate 0.0001 residuals contributed 0 here and 0.0002
+  // there. `knownReservedQty` then differed between the two implementations of the same check, and
+  // the SQL-shape assertion cannot see it because it compares query text, not results. Many
+  // fractional KIT rows in one scope amplify the gap without limit.
+  //
+  // Rows are therefore collected first and filtered per BRANCH-scoped (product, warehouse) group,
+  // where the branch is the UNION arm the SQL puts that row in — a scope dropped in one arm must
+  // not silently remove a sibling counted in another. Rows that are exactly zero are still dropped
+  // individually: they add nothing to either sum, so that costs no parity and keeps the breakdown
+  // free of empty lines.
+  type BranchedRow = { branch: string; productId: string; warehouseId: string; qty: Decimal; row: ReservationBreakdownRow }
+  const branched: BranchedRow[] = []
   for (const allocation of allocations) {
     if (options.productId && allocation.productId !== options.productId) continue
     if (options.warehouseId && allocation.warehouseId !== options.warehouseId) continue
@@ -291,26 +307,34 @@ export async function loadReservationSourceRows(
       (committedByAllocation.get(key) ?? ZERO).sub(dispatched),
     )
     const remaining = zeroDemand ? Prisma.Decimal.min(residual, committedResidual) : residual
-    if (remaining.lte(RESERVATION_EPSILON)) continue
+    if (remaining.lte(ZERO)) continue
 
     const reference = allocation.order.orderNumber
       ?? allocation.order.externalOrderNumber
       ?? allocation.orderId
     const detail = allocation.line.sku ?? allocation.line.description
-    rows.push({
-      source: 'sales_order',
+    branched.push({
+      // The two sales-order UNION arms in the SQL: one for orders with outstanding demand, one for
+      // the zero-demand orders it excludes.
+      branch: zeroDemand ? 'sales_zero_demand' : 'sales_active',
       productId: allocation.productId,
       warehouseId: allocation.warehouseId,
-      referenceId: allocation.orderId,
-      referenceLabel: sourceLabel(
-        'SO',
-        reference,
-        zeroDemand
-          ? `${detail} (committed shipment on ${allocation.order.status === 'CANCELLED' ? 'cancelled' : 'fully refunded'} order)`
-          : detail,
-      ),
-      qty: decimalString(remaining),
-      expectedDate: isoDate(allocation.order.expectedDelivery),
+      qty: remaining,
+      row: {
+        source: 'sales_order',
+        productId: allocation.productId,
+        warehouseId: allocation.warehouseId,
+        referenceId: allocation.orderId,
+        referenceLabel: sourceLabel(
+          'SO',
+          reference,
+          zeroDemand
+            ? `${detail} (committed shipment on ${allocation.order.status === 'CANCELLED' ? 'cancelled' : 'fully refunded'} order)`
+            : detail,
+        ),
+        qty: decimalString(remaining),
+        expectedDate: isoDate(allocation.order.expectedDelivery),
+      },
     })
   }
 
@@ -320,31 +344,54 @@ export async function loadReservationSourceRows(
       for (const component of order.outputProduct.productComponents) {
         if (options.productId && component.componentId !== options.productId) continue
         const qty = toDecimal(order.qtyPlanned).mul(toDecimal(component.qty))
-        if (qty.lte(RESERVATION_EPSILON)) continue
-        rows.push({
-          source: 'production_order',
+        if (qty.lte(ZERO)) continue
+        branched.push({
+          branch: 'production_assembly',
           productId: component.componentId,
           warehouseId: order.warehouseId,
-          referenceId: order.id,
-          referenceLabel: sourceLabel('MO', order.reference, 'assembly component'),
-          qty: decimalString(qty),
-          expectedDate: isoDate(order.scheduledAt),
+          qty,
+          row: {
+            source: 'production_order',
+            productId: component.componentId,
+            warehouseId: order.warehouseId,
+            referenceId: order.id,
+            referenceLabel: sourceLabel('MO', order.reference, 'assembly component'),
+            qty: decimalString(qty),
+            expectedDate: isoDate(order.scheduledAt),
+          },
         })
       }
     } else if (!options.productId || order.outputProductId === options.productId) {
       const qty = toDecimal(order.qtyPlanned)
-      if (qty.lte(RESERVATION_EPSILON)) continue
-      rows.push({
-        source: 'production_order',
+      if (qty.lte(ZERO)) continue
+      branched.push({
+        branch: 'production_disassembly',
         productId: order.outputProductId,
         warehouseId: order.warehouseId,
-        referenceId: order.id,
-        referenceLabel: sourceLabel('MO', order.reference, 'disassembly input'),
-        qty: decimalString(qty),
-        expectedDate: isoDate(order.scheduledAt),
+        qty,
+        row: {
+          source: 'production_order',
+          productId: order.outputProductId,
+          warehouseId: order.warehouseId,
+          referenceId: order.id,
+          referenceLabel: sourceLabel('MO', order.reference, 'disassembly input'),
+          qty: decimalString(qty),
+          expectedDate: isoDate(order.scheduledAt),
+        },
       })
     }
   }
+
+  const branchTotals = new Map<string, Decimal>()
+  for (const entry of branched) {
+    const key = `${entry.branch}|${entry.productId}|${entry.warehouseId}`
+    branchTotals.set(key, (branchTotals.get(key) ?? ZERO).add(entry.qty))
+  }
+  const rows = branched
+    .filter((entry) => (
+      (branchTotals.get(`${entry.branch}|${entry.productId}|${entry.warehouseId}`) ?? ZERO).gt(RESERVATION_EPSILON)
+    ))
+    .map((entry) => entry.row)
 
   return rows.sort((a, b) => {
     const sourceOrder = a.source.localeCompare(b.source)

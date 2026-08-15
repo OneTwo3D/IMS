@@ -135,12 +135,36 @@ export type InventoryInvariantStrandedTransferRow = {
   lines: Array<{ id: string; productId: string; qty: DecimalLike }>
 }
 
+/** An allocation row at the grain it and `ShipmentLine` share (o3d-4kfh). */
+export type InventoryInvariantAllocationRow = {
+  lineId: string
+  productId: string
+  warehouseId: string
+  qty: DecimalLike
+}
+
+/** A COMMITTED (non-PENDING) shipment line, at that same grain. */
+export type InventoryInvariantCommittedShipmentLineRow = {
+  lineId: string
+  productId: string
+  qty: DecimalLike
+  product: Pick<ProductSnapshot, 'sku'>
+  shipment: { orderId: string; warehouseId: string }
+}
+
 export type InventoryInvariantRows = {
   stockLevels: InventoryInvariantStockLevelRow[]
   costLayers: InventoryInvariantCostLayerRow[]
   stockMovements: InventoryInvariantStockMovementRow[]
   shippedShipmentLines: InventoryInvariantShipmentLineRow[]
   reservationSources?: ReservationBreakdownRow[]
+  /**
+   * o3d-4kfh r3: the two sides of the committed-coverage census. BOTH must be present for the
+   * check to run — an allocation set without its shipment lines (or the reverse) would report
+   * every commitment as unbacked. Undefined means "not collected", exactly like the two above.
+   */
+  orderAllocations?: InventoryInvariantAllocationRow[]
+  committedShipmentLines?: InventoryInvariantCommittedShipmentLineRow[]
   /**
    * Transfers stranded IN_TRANSIT (audit-C5). The caller (collector) applies the
    * status + age filter; the evaluator emits a per-line finding for each row here.
@@ -543,6 +567,66 @@ export function evaluateInventoryInvariantRows(
     }
   }
 
+  // o3d-4kfh r3: is every committed shipment line backed by an allocation row big enough to cover
+  // it? See the SQL branch of the same name for why nothing else can see this: every consumer
+  // computes `qty − committed` floored at zero, so an over-commitment vanishes rather than
+  // overflowing, and the reservation census credits only the residual that still exists.
+  //
+  // FLAT check only (per line/warehouse/product) — the KIT proportionality half needs the
+  // fulfillment requirement graph and lives in `findUncoveredCommittedShipment`, which runs at
+  // validateAllocationIntegrity and at the PENDING -> PICKING commitment transition.
+  if (rows.orderAllocations && rows.committedShipmentLines) {
+    const allocationScopeKey = (row: { lineId: string; warehouseId: string; productId: string }) =>
+      `${row.lineId}|${row.warehouseId}|${row.productId}`
+    const allocatedByScope = new Map<string, number>()
+    for (const allocation of rows.orderAllocations) {
+      const key = allocationScopeKey(allocation)
+      allocatedByScope.set(key, (allocatedByScope.get(key) ?? 0) + decimalToNumber(allocation.qty))
+    }
+    const committedByScope = new Map<string, {
+      lineId: string
+      productId: string
+      warehouseId: string
+      orderId: string
+      sku: string
+      qty: number
+    }>()
+    for (const shipmentLine of rows.committedShipmentLines) {
+      const scope = {
+        lineId: shipmentLine.lineId,
+        productId: shipmentLine.productId,
+        warehouseId: shipmentLine.shipment.warehouseId,
+      }
+      const key = allocationScopeKey(scope)
+      const current = committedByScope.get(key) ?? {
+        ...scope,
+        orderId: shipmentLine.shipment.orderId,
+        sku: shipmentLine.product.sku,
+        qty: 0,
+      }
+      current.qty += decimalToNumber(shipmentLine.qty)
+      committedByScope.set(key, current)
+    }
+    for (const [key, committed] of committedByScope) {
+      const allocatedQty = allocatedByScope.get(key) ?? 0
+      if (!greaterThanWithTolerance(committed.qty, allocatedQty, tolerance)) continue
+      findings.push({
+        severity: 'critical',
+        code: 'allocation_committed_shipment_uncovered',
+        productId: committed.productId,
+        warehouseId: committed.warehouseId,
+        message: `Committed shipment quantity exceeds the allocation backing it for ${committed.sku}`,
+        details: {
+          lineId: committed.lineId,
+          sku: committed.sku,
+          committedQty: committed.qty,
+          allocatedQty,
+          delta: committed.qty - allocatedQty,
+        },
+      })
+    }
+  }
+
   for (const costLayer of rows.costLayers) {
     const remainingQty = decimalToNumber(costLayer.remainingQty)
     const receivedQty = decimalToNumber(costLayer.receivedQty)
@@ -851,7 +935,16 @@ export async function collectInventoryInvariantRows(
   // audit-C5: transfers stranded IN_TRANSIT past the threshold (status + age
   // filter applied here so the evaluator stays pure).
   const strandedTransferCutoff = new Date(Date.now() - STRANDED_TRANSFER_DAYS * 24 * 60 * 60 * 1000)
-  const [stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources, strandedTransfers] = await Promise.all([
+  const [
+    stockLevels,
+    costLayers,
+    stockMovements,
+    shippedShipmentLines,
+    reservationSources,
+    strandedTransfers,
+    orderAllocations,
+    committedShipmentLines,
+  ] = await Promise.all([
     client.stockLevel.findMany({
       select: {
         id: true,
@@ -979,9 +1072,38 @@ export async function collectInventoryInvariantRows(
           },
         })
       : Promise.resolve(undefined),
+    // o3d-4kfh r3: the two sides of the committed-coverage census. Collected as a PAIR — the
+    // evaluator refuses to run on one without the other, because an allocation set with no shipment
+    // lines (or the reverse) would read as either "everything unbacked" or "nothing committed".
+    client.orderAllocation
+      ? client.orderAllocation.findMany({
+          select: { lineId: true, productId: true, warehouseId: true, qty: true },
+        }) as Promise<InventoryInvariantAllocationRow[]>
+      : Promise.resolve(undefined),
+    client.orderAllocation
+      ? client.shipmentLine.findMany({
+          where: { shipment: { status: { not: 'PENDING' } } },
+          select: {
+            lineId: true,
+            productId: true,
+            qty: true,
+            product: { select: { sku: true } },
+            shipment: { select: { orderId: true, warehouseId: true } },
+          },
+        }) as unknown as Promise<InventoryInvariantCommittedShipmentLineRow[]>
+      : Promise.resolve(undefined),
   ])
 
-  return { stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources, strandedTransfers }
+  return {
+    stockLevels,
+    costLayers,
+    stockMovements,
+    shippedShipmentLines,
+    reservationSources,
+    strandedTransfers,
+    orderAllocations,
+    committedShipmentLines,
+  }
 }
 
 function sqlFifoProductTypes(): Prisma.Sql {
@@ -1355,6 +1477,48 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       WHERE ABS(COALESCE(sl."reservedQty", 0) - COALESCE(rt."knownReservedQty", 0)) > ${toleranceSql}
         ${reservationProductFilter}
         ${reservationWarehouseFilter}
+
+      UNION ALL
+
+      -- o3d-4kfh r3: A COMMITMENT LARGER THAN THE ALLOCATION ROW BEHIND IT.
+      --
+      -- The contract runs one way: OrderAllocation.qty covers outstanding demand PLUS every
+      -- committed (non-PENDING) shipment line at that (line, warehouse, product). Every consumer
+      -- takes it on trust and computes qty - committed floored at zero, so a commitment ABOVE its
+      -- row does not overflow anywhere — it silently disappears, and the units come out of whatever
+      -- shared (product, warehouse) reservedQty is there at dispatch time. The reservation census
+      -- above cannot see it either: it credits only the residual, which is exactly the part that
+      -- still exists.
+      --
+      -- Reuses committed_shipment_lines, so it is scoped by the same product/warehouse filters and
+      -- the same non-PENDING definition as the reservation branches.
+      --
+      -- LIMIT: this is the FLAT check (per (line, warehouse, product)). It does NOT verify that a
+      -- KIT's committed components are a complete proportional set — that needs the fulfillment
+      -- requirement graph, which is a recursive expansion this sweep does not load. The proportional
+      -- half is enforced where the graph is available: validateAllocationIntegrity and the
+      -- PENDING -> PICKING commitment transition (findUncoveredCommittedShipment).
+      SELECT
+        'allocation_committed_shipment_uncovered:' || csl."lineId" || ':' || csl."warehouseId" || ':' || csl."productId" AS "sortKey",
+        'critical'::text AS severity,
+        'allocation_committed_shipment_uncovered'::text AS code,
+        csl."productId",
+        csl."warehouseId",
+        'Committed shipment quantity exceeds the allocation backing it for ' || p.sku AS message,
+        jsonb_build_object(
+          'lineId', csl."lineId",
+          'sku', p.sku,
+          'committedQty', csl."committedQty",
+          'allocatedQty', COALESCE(oa.qty, 0),
+          'delta', csl."committedQty" - COALESCE(oa.qty, 0)
+        ) AS details
+      FROM committed_shipment_lines csl
+      INNER JOIN "products" p ON p.id = csl."productId"
+      LEFT JOIN "order_allocations" oa
+        ON oa."lineId" = csl."lineId"
+       AND oa."productId" = csl."productId"
+       AND oa."warehouseId" = csl."warehouseId"
+      WHERE csl."committedQty" - COALESCE(oa.qty, 0) > ${toleranceSql}
 
       UNION ALL
 

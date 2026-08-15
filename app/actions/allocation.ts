@@ -442,21 +442,55 @@ export async function updateAllocation(
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, alloc.orderId)
-      await resetAllocationAccountingIfStaged(tx, alloc.orderId)
-      await lockStockLevels(tx, [alloc.productId], Array.from(new Set([alloc.warehouseId, newWarehouseId])))
+
+      // o3d-4kfh: RE-READ THE ROW UNDER THE ORDER LOCK, and derive EVERYTHING from that read.
+      //
+      // The snapshot above is taken outside the transaction, so a concurrent editor of a SIBLING
+      // row can commit between it and the lock. Everything below — the availability headroom, the
+      // committed floor, and above all the residual this path RELEASES — is derived from the
+      // allocation's own quantity, and `reservedQty` is a per-(product, warehouse) aggregate shared
+      // with every other order. Releasing a stale quantity is therefore not a lost update on this
+      // row, it is theft from the neighbours: rows A=10 and B=3 in one scope, two editors both
+      // reading A=10, the first writing A=8 (aggregate 11) and the second releasing its stale 10 and
+      // writing A=9 leaves the aggregate at 10 while the rows claim 12 — B silently short by two.
+      // The guarded decrement cannot catch it (11 >= 10 succeeds) and validateAllocationIntegrity
+      // never looks at stock levels, so it committed silently. Exactly the theft the residual
+      // release exists to stop, arriving through a TOCTOU instead of through the floor.
+      const locked = await tx.orderAllocation.findUnique({
+        where: { id: allocationId },
+        select: { id: true, orderId: true, lineId: true, productId: true, warehouseId: true, qty: true },
+      })
+      if (!locked) {
+        throw new Error('This allocation no longer exists — someone else changed it while you were editing. Reload and retry.')
+      }
+      // Identity or quantity moving under the operator invalidates the numbers the FORM was filled
+      // in against, not just the ones this function recomputes, so fail closed rather than silently
+      // applying an edit to a row that is no longer the one that was shown.
+      if (
+        locked.orderId !== alloc.orderId
+        || locked.lineId !== alloc.lineId
+        || locked.productId !== alloc.productId
+        || locked.warehouseId !== alloc.warehouseId
+        || !toDecimal(locked.qty).eq(toDecimal(alloc.qty))
+      ) {
+        throw new Error('This allocation changed while you were editing it. Reload and retry.')
+      }
+
+      await resetAllocationAccountingIfStaged(tx, locked.orderId)
+      await lockStockLevels(tx, [locked.productId], Array.from(new Set([locked.warehouseId, newWarehouseId])))
 
       const stockLevels = await tx.stockLevel.findMany({
-        where: { productId: alloc.productId, warehouseId: { in: Array.from(new Set([alloc.warehouseId, newWarehouseId])) } },
+        where: { productId: locked.productId, warehouseId: { in: Array.from(new Set([locked.warehouseId, newWarehouseId])) } },
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
-      const stockMap = buildAvailableStockMap(stockLevels).get(alloc.productId) ?? new Map()
+      const stockMap = buildAvailableStockMap(stockLevels).get(locked.productId) ?? new Map()
       const requestedQty = toDecimal(newQty)
       // Both terms are RAW quantities and the dispatched part cancels: the row gives back
       // `qty − dispatched` and takes `newQty − dispatched`, so `newQty <= available + qty` is the
       // same inequality with the dispatch subtracted from both sides. It only holds while the row
       // stays in one warehouse, which the dispatch guard below is what enforces.
       const effectiveAvailable = (stockMap.get(newWarehouseId) ?? toDecimal(0))
-        .add(alloc.warehouseId === newWarehouseId ? toDecimal(alloc.qty) : toDecimal(0))
+        .add(locked.warehouseId === newWarehouseId ? toDecimal(locked.qty) : toDecimal(0))
 
       if (requestedQty.gt(effectiveAvailable)) {
         throw new Error(`Only ${roundQuantity(effectiveAvailable, 4).toString()} available in this warehouse`)
@@ -464,22 +498,22 @@ export async function updateAllocation(
 
       // o3d-4kfh: reservations move by RESIDUAL, not by retained allocation quantity. Dispatch
       // decrements reservedQty and keeps the OrderAllocation row, so on a partially dispatched line
-      // `alloc.qty` is more than this order still holds — releasing it asked the shared
+      // `locked.qty` is more than this order still holds — releasing it asked the shared
       // (product, warehouse) aggregate for units that belong to other orders. This path has no
       // dispatched-shipment guard at all, so it is fully exposed to that.
       // ONE snapshot, TWO readings (o3d-4kfh). The guards below are about COMMITMENT — every
       // non-PENDING shipment line — while the reservation delta is about DISPATCH, the strict
       // subset that has actually given reservation back. Deriving both from the same query is what
       // stops them disagreeing about a shipment that changes status mid-flight.
-      const committedLines = await loadCommittedAllocationLines(tx, alloc.orderId)
+      const committedLines = await loadCommittedAllocationLines(tx, locked.orderId)
       const committedByScope = sumDispatchedQtyByAllocationScope(committedLines)
       const dispatchedByScope = sumDispatchedQtyByAllocationScope(
         dispatchedAllocationLines(committedLines),
       )
       const sourceScope = {
-        lineId: alloc.lineId,
-        productId: alloc.productId,
-        warehouseId: alloc.warehouseId,
+        lineId: locked.lineId,
+        productId: locked.productId,
+        warehouseId: locked.warehouseId,
       }
       const sourceKey = allocationScopeKey(sourceScope)
       const sourceCommitted = committedByScope.get(sourceKey) ?? toDecimal(0)
@@ -508,7 +542,7 @@ export async function updateAllocation(
       // moved remainder or the row total — and the operator can already express either intent with
       // a commitment-sized edit here plus an addAllocation at the destination.
       if (sourceCommitted.gt(0)) {
-        if (newWarehouseId !== alloc.warehouseId) {
+        if (newWarehouseId !== locked.warehouseId) {
           throw new Error(
             `Cannot move this allocation to another warehouse: ${sourceCommitted.toString()} unit(s) are already `
             + 'committed to shipments picked from it. Committed quantity stays with the warehouse its shipment '
@@ -525,11 +559,11 @@ export async function updateAllocation(
         }
       }
 
-      const releaseQty = residualAllocationQty({ ...sourceScope, qty: alloc.qty }, dispatchedByScope)
+      const releaseQty = residualAllocationQty({ ...sourceScope, qty: locked.qty }, dispatchedByScope)
 
       await applyAllocationReservationDelta(tx, [{
-        productId: alloc.productId,
-        warehouseId: alloc.warehouseId,
+        productId: locked.productId,
+        warehouseId: locked.warehouseId,
         qty: releaseQty,
       }], 'release')
 
@@ -539,9 +573,9 @@ export async function updateAllocation(
         const mergeTarget = await tx.orderAllocation.findUnique({
           where: {
             lineId_warehouseId_productId: {
-              lineId: alloc.lineId,
+              lineId: locked.lineId,
               warehouseId: newWarehouseId,
-              productId: alloc.productId,
+              productId: locked.productId,
             },
           },
         })
@@ -566,8 +600,8 @@ export async function updateAllocation(
         // holds a live reservation for its own residual; re-reserving its whole residual would
         // double-count it.
         const destinationScope = {
-          lineId: alloc.lineId,
-          productId: alloc.productId,
+          lineId: locked.lineId,
+          productId: locked.productId,
           warehouseId: newWarehouseId,
         }
         const reserveQty = residualAllocationQty(
@@ -579,13 +613,13 @@ export async function updateAllocation(
         ))
 
         await applyAllocationReservationDelta(tx, [{
-          productId: alloc.productId,
+          productId: locked.productId,
           warehouseId: newWarehouseId,
           qty: reserveQty,
         }], 'reserve')
       }
 
-      const integrityError = await validateAllocationIntegrity(tx, alloc.orderId, [alloc.lineId])
+      const integrityError = await validateAllocationIntegrity(tx, locked.orderId, [locked.lineId])
       if (integrityError) throw new Error(integrityError)
     }, STOCK_TX_OPTIONS)
 
@@ -729,7 +763,15 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         }
       }
 
-      return { allocs: released.allocations, clampedReservationCount: released.clampedReservationCount }
+      return {
+        allocs: released.allocations,
+        clampedReservationCount: released.clampedReservationCount,
+        // o3d-4kfh r3: surfaced because it deletes something the operator can SEE. Deallocation now
+        // removes the PENDING draft shipments generated from the rows it is releasing (leaving them
+        // behind is what later became a committed shipment with no allocation), and a draft
+        // disappearing without a word in the activity log is indistinguishable from a bug.
+        deletedPendingShipmentCount: released.deletedPendingShipmentCount,
+      }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/sales')
@@ -751,8 +793,14 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       action: 'deallocated',
       tag: 'sales',
       level: 'INFO',
-      description: `Deallocated stock for order ${so.orderNumber ?? so.externalOrderNumber}`,
-      metadata: { orderNumber: so.orderNumber ?? so.externalOrderNumber },
+      description: `Deallocated stock for order ${so.orderNumber ?? so.externalOrderNumber}`
+        + (deallocationResult.deletedPendingShipmentCount > 0
+          ? ` and deleted ${deallocationResult.deletedPendingShipmentCount} pending shipment(s) drawn from those allocations`
+          : ''),
+      metadata: {
+        orderNumber: so.orderNumber ?? so.externalOrderNumber,
+        deletedPendingShipmentCount: deallocationResult.deletedPendingShipmentCount,
+      },
     })
     try {
       const syncTargets = [...new Set(deallocationResult.allocs.map((alloc) => alloc.productId))]
