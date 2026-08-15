@@ -35,6 +35,11 @@ import {
   reconcileOrderAfterShipment,
   transitionShipmentStatus,
 } from '@/lib/domain/sales/shipment-service'
+import {
+  loadDispatchedAllocationLines,
+  residualAllocationQty,
+  sumDispatchedQtyByAllocationScope,
+} from '@/lib/domain/inventory/reservation-residual'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -451,10 +456,25 @@ export async function updateAllocation(
         throw new Error(`Only ${roundQuantity(effectiveAvailable, 4).toString()} available in this warehouse`)
       }
 
-      await applyAllocationReservationDelta(tx, [{
+      // o3d-4kfh: reservations move by RESIDUAL, not by retained allocation quantity. Dispatch
+      // decrements reservedQty and keeps the OrderAllocation row, so on a partially dispatched line
+      // `alloc.qty` is more than this order still holds — releasing it asked the shared
+      // (product, warehouse) aggregate for units that belong to other orders. This path has no
+      // dispatched-shipment guard at all, so it is fully exposed to that.
+      const dispatchedByScope = sumDispatchedQtyByAllocationScope(
+        await loadDispatchedAllocationLines(tx, alloc.orderId),
+      )
+      const releaseQty = residualAllocationQty({
+        lineId: alloc.lineId,
         productId: alloc.productId,
         warehouseId: alloc.warehouseId,
         qty: alloc.qty,
+      }, dispatchedByScope)
+
+      await applyAllocationReservationDelta(tx, [{
+        productId: alloc.productId,
+        warehouseId: alloc.warehouseId,
+        qty: releaseQty,
       }], 'release')
 
       if (newQty === 0) {
@@ -469,11 +489,14 @@ export async function updateAllocation(
             },
           },
         })
+        const isMerge = Boolean(mergeTarget && mergeTarget.id !== allocationId)
+        // Quantity already sitting at the destination row, whose reservation was NOT released above.
+        const retainedAtDestination = isMerge ? toDecimal(mergeTarget!.qty) : toDecimal(0)
 
-        if (mergeTarget && mergeTarget.id !== allocationId) {
+        if (isMerge) {
           await tx.orderAllocation.update({
-            where: { id: mergeTarget.id },
-            data: { qty: toDecimal(mergeTarget.qty).add(requestedQty) },
+            where: { id: mergeTarget!.id },
+            data: { qty: retainedAtDestination.add(requestedQty) },
           })
           await tx.orderAllocation.delete({ where: { id: allocationId } })
         } else {
@@ -483,10 +506,26 @@ export async function updateAllocation(
           })
         }
 
+        // Reserve the CHANGE in the destination row's residual. On a merge the destination already
+        // holds a live reservation for its own residual; re-reserving its whole residual would
+        // double-count it.
+        const destinationScope = {
+          lineId: alloc.lineId,
+          productId: alloc.productId,
+          warehouseId: newWarehouseId,
+        }
+        const reserveQty = residualAllocationQty(
+          { ...destinationScope, qty: retainedAtDestination.add(requestedQty) },
+          dispatchedByScope,
+        ).sub(residualAllocationQty(
+          { ...destinationScope, qty: retainedAtDestination },
+          dispatchedByScope,
+        ))
+
         await applyAllocationReservationDelta(tx, [{
           productId: alloc.productId,
           warehouseId: newWarehouseId,
-          qty: requestedQty,
+          qty: reserveQty,
         }], 'reserve')
       }
 

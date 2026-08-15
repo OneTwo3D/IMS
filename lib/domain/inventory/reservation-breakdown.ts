@@ -1,6 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { RESERVATION_RELEASING_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 
 export type ReservationBreakdownSource =
   | 'sales_order'
@@ -135,10 +136,14 @@ export async function loadReservationSourceRows(
     qty: { gt: 0 },
     order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
   }
+  // o3d-4kfh: DISPATCHED shipments only — the shared definition of what has already given
+  // reservation back. A PICKING/PACKED shipment has not decremented reservedQty, so netting it
+  // here understated every picked order's live reservation and pushed the difference into the
+  // "unattributed" bucket this breakdown exists to explain.
   const activeShipmentWhere = {
     ...(options.productId ? { productId: options.productId } : {}),
     shipment: {
-      status: { not: 'PENDING' },
+      status: RESERVATION_RELEASING_SHIPMENT_STATUS,
       ...(options.warehouseId ? { warehouseId: options.warehouseId } : {}),
       order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
     },

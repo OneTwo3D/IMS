@@ -8,6 +8,7 @@ import {
   loadReservationSourceRows,
   type ReservationBreakdownRow,
 } from '@/lib/domain/inventory/reservation-breakdown'
+import { RESERVATION_RELEASING_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { HISTORICAL_IMPORT_REFERENCE_TYPES } from '@/lib/domain/inventory/stock-movement-value'
 
 export type InventoryInvariantSeverity = 'info' | 'warning' | 'critical'
@@ -1142,6 +1143,12 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ${stockProductFilter}
         ${stockWarehouseFilter}
     ),
+    -- Dispatched quantity per allocation row. o3d-4kfh: the filter is the SHARED
+    -- RESERVATION_RELEASING_SHIPMENT_STATUS, not "any non-PENDING shipment". reservedQty is
+    -- decremented ONLY on the transition to SHIPPED, so netting a PICKING/PACKED shipment out of
+    -- knownReservedQty invented a stock_reserved_source_mismatch for every order sitting in the
+    -- pick/pack window, and — now that the release paths share this definition — would have made
+    -- them under-release and strand reservation on the stock level.
     active_shipment_lines AS (
       SELECT
         sl."lineId",
@@ -1151,7 +1158,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       FROM "shipment_lines" sl
       INNER JOIN "shipments" s ON s.id = sl."shipmentId"
       INNER JOIN "sales_orders" so ON so.id = s."orderId"
-      WHERE s.status <> 'PENDING'
+      WHERE s.status::text = ${RESERVATION_RELEASING_SHIPMENT_STATUS}
         AND so.status <> 'CANCELLED'
         AND so."refundStatus" <> 'FULL'
         ${activeShipmentProductFilter}

@@ -14,6 +14,11 @@ import {
   type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
 import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
+import {
+  RESERVATION_RELEASING_SHIPMENT_STATUS,
+  residualAllocationRows,
+  residualAllocationRowsForOrder,
+} from '@/lib/domain/inventory/reservation-residual'
 import { cancelPendingSalesInvoiceSyncForOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { PermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import {
@@ -127,6 +132,15 @@ export function buildAvailableStockMap(
   return stockMap
 }
 
+/**
+ * Available stock with THIS order's own reservation added back, so a recomputation is not fighting
+ * reservations it already holds.
+ *
+ * `ownRows` MUST be residual rows (`residualAllocationRows`) — this order's LIVE reservation, not
+ * its retained `OrderAllocation` quantities. Raw rows over-state ownQty on a dispatched order,
+ * which under-computes `otherReservedQty` by the shipped amount and lets this order allocate
+ * straight into another order's live reservation (o3d-4kfh).
+ */
 export function buildAvailableStockMapIncludingOwnReservations(
   stockRows: Array<{ productId: string; warehouseId: string; quantity: DecimalInput; reservedQty: DecimalInput }>,
   ownRows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
@@ -164,23 +178,22 @@ export function buildAvailableStockMapIncludingOwnReservations(
 }
 
 /**
- * (product, warehouse) scopes where this order's OWN allocation rows exceed what is actually
- * reserved against them (o3d-4kfh).
+ * (product, warehouse) scopes where this order's OWN LIVE reservation exceeds what is actually
+ * reserved against it (o3d-4kfh).
  *
- * `buildAvailableStockMapIncludingOwnReservations` adds an order's allocations back into
- * available stock so a recomputation is not fighting its own reservations — and it does that
- * unconditionally, even when reservedQty has already fallen BELOW those rows. It warns, but the
- * warning fed nothing.
+ * `ownRows` MUST be residual rows (`residualAllocationRows`), never raw `OrderAllocation` rows.
+ * Dispatch decrements reservedQty and retains the allocation row, so on any partially or fully
+ * dispatched order `rawQty > reservedQty` is the CORRECT steady state — feeding raw rows here made
+ * this fire on healthy data, which is exactly the noise that hid the real leak.
  *
  * Detection only. The unconditional release/delete/recreate/reserve cycle does NOT repair such a
  * row — it releases this order's own quantity and reserves the same quantity straight back, which
  * nets to zero against the discrepancy. So neither allocating nor short-circuiting fixes it, and
  * forcing a rewrite would only reintroduce churn.
  *
- * The consequence is real: stock this order believes it holds is available to another one, so a
- * second order can allocate it and a dispatch can fail. Repairing it means recomputing reservedQty
- * from every live reservation source for the scope — a stock-integrity change beyond this path,
- * tracked on o3d-4kfh. This makes the condition loud in the meantime.
+ * With the release paths fixed to release residuals and to fail closed rather than floor a whole
+ * scope to zero, the leak that GENERATED these shortfalls is gone. A surviving report now means a
+ * writer outside these paths, and `invariants.ts` (`stock_reserved_source_mismatch`) is the census.
  */
 export function findUnderReservedScopes(
   stockRows: Array<{ productId: string; warehouseId: string; reservedQty: DecimalInput }>,
@@ -371,11 +384,33 @@ export async function releaseOrderAllocationsInTx(
     warehouseId: alloc.warehouseId,
     qty: Number(alloc.qty),
   }))
-  await applyAllocationReservationDelta(tx, allocations, 'release')
+
+  // o3d-4kfh: release the RESIDUAL, not the retained quantity. This path has no dispatched-shipment
+  // guard at all, so it is routinely handed allocation rows whose units have already left: dispatch
+  // decrements reservedQty and RETAINS the row. Releasing the raw row quantity therefore asked for
+  // more than the order still holds, which the guarded decrement cannot satisfy.
+  const releasedRows = await residualAllocationRowsForOrder(tx, orderId, currentAllocs)
+  const releasedScopes = uniqueReservationScopes(releasedRows)
+  const stockBefore = releasedScopes.length
+    ? await tx.stockLevel.findMany({
+      where: { OR: releasedScopes },
+      select: { productId: true, warehouseId: true, reservedQty: true },
+    })
+    : []
+  await applyAllocationReservationDelta(tx, releasedRows, 'release')
   const clampedReservations = await tx.stockLevel.updateMany({
     where: { reservedQty: { lt: 0 } },
     data: { reservedQty: 0 },
   })
+  const stockAfter = releasedScopes.length
+    ? await tx.stockLevel.findMany({
+      where: { OR: releasedScopes },
+      select: { productId: true, warehouseId: true, reservedQty: true },
+    })
+    : []
+  // Bracket the release with the same fail-closed assertion cancelSalesOrderFulfillmentState uses,
+  // so the actual database delta is verified rather than the requested decrement merely trusted.
+  assertReservationReleaseDelta(stockBefore, stockAfter, releasedRows)
   await tx.orderAllocation.deleteMany({ where: { orderId } })
 
   return { allocations, clampedReservationCount: clampedReservations.count }
@@ -438,27 +473,29 @@ export async function applyAllocationReservationDelta(
     // reservedQty is a per-(product,warehouse) AGGREGATE: in the normal case
     // (reservedQty >= qty) the guarded decrement below releases exactly this
     // allocation's qty and PRESERVES any co-existing reservations from other
-    // orders (reservedQty - qty stays positive). The floor branch only runs on
-    // genuine upstream drift — a release exceeding the WHOLE aggregate
-    // (reservedQty < qty) — where max(0, reserved - qty) is 0 anyway; we floor to
-    // 0 rather than rely on the DB non-negative CHECK to abort the transaction.
+    // orders (reservedQty - qty stays positive).
     const released = await tx.stockLevel.updateMany({
       where: { productId: row.productId, warehouseId: row.warehouseId, reservedQty: { gte: qty } },
       data: { reservedQty: { decrement: qty } },
     })
     if (released.count === 0) {
-      const floored = await tx.stockLevel.updateMany({
-        where: { productId: row.productId, warehouseId: row.warehouseId },
-        data: { reservedQty: 0 },
-      })
-      if (floored.count > 0) {
-        // Loud: releasing more than the entire reserved aggregate means the
-        // reservation ledger drifted upstream and needs reconciliation.
-        console.error(
-          `[allocation] reservedQty drift on release for product ${row.productId} @ ${row.warehouseId}: ` +
-          `tried to release ${qty.toString()} but reserved was lower; floored to 0.`,
-        )
-      }
+      // o3d-4kfh: FAIL CLOSED. This used to floor the WHOLE (product, warehouse) scope to 0 and
+      // log about "upstream drift". reservedQty is an aggregate shared by every sales order and
+      // every production order, so that floor annihilated every OTHER holder's reservation in the
+      // scope — orders that were never touched by this transaction, and could not even be named in
+      // the log line. It was also self-fulfilling: the commonest way to reach it was releasing an
+      // allocation's RAW retained quantity instead of its residual after a partial dispatch, so the
+      // line blaming "upstream drift" WAS the upstream drift.
+      //
+      // Refusing the write is strictly better. The caller's transaction rolls back, this order's
+      // reservation is left exactly as it was, and no third party is silently robbed. It is the
+      // same stance assertReservationReleaseDelta already took for cancellation — which is why
+      // cancelSalesOrderFulfillmentState was the one release path that could not cause this.
+      throw new Error(
+        `Cannot release ${qty.toString()} reserved unit(s) of product ${row.productId} @ ${row.warehouseId}: `
+        + 'reservedQty is lower than the release, or no stock level exists. Releasing anyway would '
+        + 'zero the reservations of other orders sharing this product/warehouse (o3d-4kfh).',
+      )
     }
   }
 }
@@ -1009,18 +1046,46 @@ export async function allocateSalesOrder(
       where: { productId: { in: leafProductIds }, warehouseId: { in: sorted.map((warehouse) => warehouse.id) } },
       select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
     })
-    const ownAllocations = await tx.orderAllocation.findMany({
-      where: { orderId },
-      select: { productId: true, warehouseId: true, qty: true },
-    })
-    const stockMap = buildAvailableStockMapIncludingOwnReservations(stockLevels, ownAllocations)
-
+    // Loaded BEFORE the own-allocation read because the reservation view of those rows depends on
+    // it: warehouseId is selected so a shipment line can be attributed to the allocation row it
+    // dispatched, which is the (lineId, warehouseId, productId) grain.
     const activeShipmentLines = await tx.shipmentLine.findMany({
       where: {
         shipment: { orderId, status: { not: 'PENDING' } },
       },
-      select: { lineId: true, productId: true, qty: true, shipment: { select: { status: true } } },
+      select: {
+        lineId: true,
+        productId: true,
+        qty: true,
+        shipment: { select: { status: true, warehouseId: true } },
+      },
     })
+    // o3d-4kfh: only DISPATCHED lines have given reservation back. Demand netting below uses every
+    // non-PENDING shipment (a picked line is committed and must not be re-allocated), but
+    // reservedQty is decremented solely on the transition to SHIPPED — so the reservation view must
+    // net a strictly narrower set than the demand view. Conflating the two under-releases.
+    const dispatchedAllocationLines = activeShipmentLines
+      .filter((line) => line.shipment.status === RESERVATION_RELEASING_SHIPMENT_STATUS)
+      .map((line) => ({
+        lineId: line.lineId,
+        productId: line.productId,
+        warehouseId: line.shipment.warehouseId,
+        qty: line.qty,
+      }))
+
+    const ownAllocations = await tx.orderAllocation.findMany({
+      where: { orderId },
+      select: { lineId: true, productId: true, warehouseId: true, qty: true },
+    })
+    // o3d-4kfh: this order's LIVE reservation, not its retained allocation rows. Feeding the raw
+    // rows here did two separate kinds of damage on any partially/fully dispatched order:
+    // otherReservedQty came out too low, over-stating availability and letting this order allocate
+    // into another order's live reservation; and findUnderReservedScopes reported the perfectly
+    // healthy steady state (ownQty > reservedQty by exactly the shipped amount) as an integrity
+    // ERROR. Both are the same arithmetic mistake as the release paths.
+    const ownReservationRows = residualAllocationRows(ownAllocations, dispatchedAllocationLines)
+    const stockMap = buildAvailableStockMapIncludingOwnReservations(stockLevels, ownReservationRows)
+
     const committedByLine = calculateDecimalCoverageByLine(
       requirementsByLine,
       activeShipmentLines,
@@ -1134,7 +1199,39 @@ export async function allocateSalesOrder(
     // not fire for a nested KIT whose expanded factor is unrepresentable. Both are unchanged from
     // before this branch — no new breakage, and the short-circuit still fires for every ordinary
     // line, which is the overwhelming majority.
+    // The LIVE allocation: outstanding demand this run can reserve. Everything downstream that
+    // means "reservation" — the reserve delta, the backorder report, the status promotion — uses
+    // this set.
     const nextAllocations = mergeAllocationRows(nextAllocationRows)
+
+    // o3d-4kfh: what gets PERSISTED additionally RETAINS already-dispatched quantity, so that
+    // `residual = row qty − dispatched qty` is true of every allocation row all the time.
+    //
+    // Dispatch decrements reservedQty and deliberately keeps the row (shipment-service, and the
+    // contract note in refund-service). Every other consumer of these rows already assumes that:
+    // confirmSalesOrderShipments derives its remaining quantity as `alloc.qty − committed`, the
+    // reservation breakdown and the `stock_reserved_source_mismatch` invariant both compute
+    // `GREATEST(oa.qty − shipped, 0)`, and the release paths below now do the same.
+    //
+    // The one place that broke the assumption was HERE: demand is netted by committed shipments,
+    // so a rewrite after a dispatch shrank the rows to the undispatched remainder. From that
+    // moment `qty − dispatched` under-states the order's live reservation by exactly the shipped
+    // amount, and nothing in the row can tell you which of the two readings applies. That is not a
+    // formula you can fix — it is an ambiguity you have to remove. Adding the dispatched quantity
+    // back removes it: the reading is always the same one, and the first rewrite after a dispatch
+    // repairs any row that predates this change.
+    //
+    // Nothing extra is reserved: the reserve delta below is `nextAllocations`, the live set.
+    const persistedAllocations = mergeAllocationRows([
+      ...nextAllocationRows,
+      ...dispatchedAllocationLines.map((line) => ({
+        lineId: line.lineId,
+        productId: line.productId,
+        warehouseId: line.warehouseId,
+        qty: toDecimal(line.qty),
+      })),
+    ])
+
     const existingAllocs = await tx.orderAllocation.findMany({
       where: { orderId },
       select: { lineId: true, productId: true, warehouseId: true, qty: true },
@@ -1165,10 +1262,9 @@ export async function allocateSalesOrder(
     // release 2 from a reservedQty of 0 and re-reserve 2 ends exactly where it started. Forcing
     // the rewrite would reintroduce the perpetual churn o3d-i5it removed and fix nothing.
     //
-    // Real reconciliation means recomputing reservedQty from every live reservation source for
-    // the scope, which is a stock-integrity change well beyond this path. Until then the
-    // condition is at least LOUD instead of a bare console warning nothing reads (o3d-4kfh).
-    const underReserved = findUnderReservedScopes(stockLevels, ownAllocations)
+    // Compared against the order's LIVE reservation (residuals), so a dispatched order — where
+    // retained rows legitimately exceed reservedQty — no longer reports a phantom shortfall.
+    const underReserved = findUnderReservedScopes(stockLevels, ownReservationRows)
     if (underReserved.length > 0) {
       console.error(
         `[allocation-service] order ${orderId}: reservedQty is BELOW this order's own allocations for `
@@ -1178,25 +1274,31 @@ export async function allocateSalesOrder(
       )
     }
 
-    const unchanged = allocationSetsMatch(existingAllocs, nextAllocations)
+    // Compared in PERSISTED space (retained dispatch included), because that is what the rows hold.
+    const unchanged = allocationSetsMatch(existingAllocs, persistedAllocations)
 
     if (!unchanged) {
       // Reached only for a real modification, so the accounting reset — and its posted-shipment
       // guard — applies to an actual allocation change rather than to a no-op re-run.
       await resetAllocationAccountingIfStaged(tx, orderId)
 
+      // o3d-4kfh: release the RESIDUAL of the persisted rows, not their retained quantity.
+      //
+      // Worked example (the bug this replaces). Product P @ W holds 13 units, reservedQty 13:
+      // order A allocated 10, order B allocated 3. Dispatch 5 of A -> reservedQty 8, and A's row
+      // still says 10 because dispatch retains it. Re-allocating A recomputes demand net of the
+      // dispatch, so the set changes and this branch runs. Releasing the raw 10 against a
+      // reservedQty of 8 matched nothing, the old floor branch zeroed the WHOLE scope, and B's 3
+      // reserved units vanished without B ever being touched. Releasing the residual (10 - 5 = 5)
+      // takes reservedQty 8 -> 3, the re-reserve below puts A's 5 back, and B keeps its 3.
       await applyAllocationReservationDelta(
         tx,
-        existingAllocs.map((alloc) => ({
-          productId: alloc.productId,
-          warehouseId: alloc.warehouseId,
-          qty: alloc.qty,
-        })),
+        residualAllocationRows(existingAllocs, dispatchedAllocationLines),
         'release',
       )
       await tx.orderAllocation.deleteMany({ where: { orderId } })
 
-      for (const alloc of nextAllocations) {
+      for (const alloc of persistedAllocations) {
         await tx.orderAllocation.create({
           data: {
             orderId,
@@ -1207,6 +1309,8 @@ export async function allocateSalesOrder(
           },
         })
       }
+      // Reserve the LIVE set only — the retained dispatch in the rows above was already released
+      // by the dispatch itself and must not be reserved a second time.
       await applyAllocationReservationDelta(
         tx,
         nextAllocations.map((alloc) => ({
@@ -1282,7 +1386,7 @@ export async function allocateSalesOrder(
       // unconditionally is what produced the endless redundant syncs (o3d-i5it).
       syncProductIds: unchanged ? [] : [...new Set([
         ...existingAllocs.map((alloc) => alloc.productId),
-        ...nextAllocations.map((alloc) => alloc.productId),
+        ...persistedAllocations.map((alloc) => alloc.productId),
       ])],
       unallocatedLines: report.lines
         .filter((line) => line.unallocatedQty > ALLOCATION_EPSILON)
