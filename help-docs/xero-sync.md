@@ -602,7 +602,13 @@ Because the sync log is scoped to the active connector, unresolved rows left beh
 
 These rows still block their sales order from being deleted. To clear one, either re-enable the connector it was queued for (Pending rows then resume on the next cron run), or look the document up in that accounting system using the reference and external ID shown. Pending and Processing rows queued for an inactive connector can also be bulk-cancelled from the same banner; cancelling discards the queued row and does not stop the document syncing to the active connector later.
 
+**The list shows the oldest 50 rows only.** When there are more, it says so explicitly — "Showing the oldest 50 of 137 stranded row(s) — 87 more are not listed here." The hidden rows stay hidden until the listed ones are resolved: there is no per-row control here, and Failed rows in particular are not cleared by anything on this page, so a long-standing backlog at the front of the list will keep newer rows out of view. Resolve the oldest ones (re-enable their connector, or cancel the Pending/Processing ones) and the next set appears on reload. When the list is complete it says "Showing all N stranded row(s)" instead, so a count on this banner is never ambiguous about what it excludes.
+
+If the list itself cannot be loaded, the banner says so in red — "The list of stranded sync rows could not be loaded" — rather than showing nothing. An empty banner section always means there is nothing stranded; it never means the lookup failed.
+
 The list requires the **sync** permission (Admin and Manager). Roles without it do not see this section.
+
+**Turning every integration off does not hide these rows.** Integrations normally redirects to the plugin settings when no connector is enabled, but if you hold **sync** and unresolved accounting rows exist, the page still opens and shows this banner — switching the last accounting connector off is precisely what strands every unresolved row, so that is the state where the list matters most.
 ## Xero Daily Batch Retry Semantics
 
 The daily batch intentionally processes A1 revenue deferral, A2 inventory allocation, and Group B shipment recognition in separate database transactions. A crash can therefore leave a partially advanced day, but each group is idempotent:

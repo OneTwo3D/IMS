@@ -33,6 +33,8 @@ import { getCurrencies } from '@/app/actions/currencies'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getCrossConnectorOrphanSummary, getFailedAccountingSyncSummary } from '@/app/actions/accounting-sync'
 import { getStrandedAccountingSyncRows } from '@/app/actions/accounting-stranded-rows'
+import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sync-rows'
+import { shouldRedirectFromSyncPage } from '@/lib/domain/accounting/stranded-sync-visibility'
 import { getSession } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-status'
@@ -45,12 +47,62 @@ import { TaxRateDriftBanner } from './tax-rate-drift-banner'
 
 export const metadata: Metadata = { title: 'Integrations' }
 
+/**
+ * Next signals redirect() / notFound() by THROWING, so a catch around a server read will happily
+ * swallow them. requireAuth inside the stranded-row loader redirects for an unverified 2FA
+ * session or an invalidated one — silently turning that into "the stranded list failed to load"
+ * would leave the operator on this page instead of at the challenge.
+ */
+function isFrameworkControlFlow(error: unknown): boolean {
+  const digest = (error as { digest?: unknown } | null)?.digest
+  return typeof digest === 'string' && (digest.startsWith('NEXT_REDIRECT') || digest.startsWith('NEXT_HTTP_ERROR_FALLBACK'))
+}
+
 export default async function SyncPage() {
   const pluginState = await getIntegrationPluginState()
   // Resolve the active WMS connector from this single plugin-state read and pass
   // it to getWmsSyncDashboardData so the facade doesn't read plugin state again.
   const activeWmsConnector = WMS_CONNECTOR_IDS.find((id) => pluginState[id]) ?? null
-  if (!pluginState.woocommerce && !pluginState.shopify && !pluginState.xero && !pluginState.quickbooks && !activeWmsConnector) {
+  const anyIntegrationPluginEnabled = !!(
+    pluginState.woocommerce || pluginState.shopify || pluginState.xero || pluginState.quickbooks || activeWmsConnector
+  )
+
+  // o3d-osl8 item 1: the rows behind the orphan count, with identifying detail. Deliberately NOT
+  // scoped to the active connector — a row stranded on a retired one appears in no other view.
+  //
+  // READ BEFORE THE REDIRECT BELOW, on purpose. When the retired accounting connector was the
+  // last enabled plugin, every unresolved accounting row is stranded (buildStrandedSyncRowWhere
+  // returns an unscoped predicate) — and redirecting first made this page, the only one that can
+  // show them, unreachable in exactly that state.
+  //
+  // Gated on `sync` HERE as well as inside the action. The loader returns per-row detail (ids,
+  // referenced entities, external transaction ids, raw connector error text), so a role without
+  // `sync` must not merely fail to render it — it must never cause the read, and must redirect
+  // exactly as it did before. Checking the role first also keeps the page off the action's throw
+  // path, so an unauthorised role is a section that is absent, not one that silently failed.
+  const session = await getSession()
+  const canSeeStrandedRows = !!session && hasPermission(session.user.role, 'sync')
+  let stranded: StrandedSyncRowsResult | null = null
+  // A FAILED read is its own state, not an empty one. Collapsing it to [] silently demoted the
+  // banner to count-only — or, when only inactive FAILED rows exist, removed it altogether,
+  // recreating the precise blind spot this feature closes.
+  let strandedLoadFailed = false
+  if (canSeeStrandedRows) {
+    try {
+      stranded = await getStrandedAccountingSyncRows(50)
+    } catch (error) {
+      if (isFrameworkControlFlow(error)) throw error
+      strandedLoadFailed = true
+      console.error('[sync] failed to load stranded accounting sync rows', error)
+    }
+  }
+
+  if (shouldRedirectFromSyncPage({
+    anyIntegrationPluginEnabled,
+    hasSyncPermission: canSeeStrandedRows,
+    strandedRowsExist: (stranded?.rows.length ?? 0) > 0,
+    strandedRowsUnknown: strandedLoadFailed,
+  })) {
     redirect('/settings/system?tab=plugins')
   }
 
@@ -101,19 +153,6 @@ export default async function SyncPage() {
 
   // audit-H4: surface accounting sync rows stranded by a connector switch.
   const orphanSummary = await getCrossConnectorOrphanSummary().catch(() => null)
-  // o3d-osl8 item 1: the rows BEHIND that count, with identifying detail. Deliberately NOT
-  // scoped to the active connector — a row stranded on a retired one appears in no other view.
-  //
-  // Gated on `sync` HERE as well as inside the action. The loader returns per-row detail (ids,
-  // referenced entities, external transaction ids, raw connector error text), so a role without
-  // `sync` must not merely fail to render it — it must never cause the read. Checking the role
-  // first also keeps the page off the action's throw path, so an unauthorised role is a section
-  // that is absent, not a section that silently failed.
-  const session = await getSession()
-  const canSeeStrandedRows = !!session && hasPermission(session.user.role, 'sync')
-  const strandedRows = canSeeStrandedRows
-    ? await getStrandedAccountingSyncRows(50).catch(() => [])
-    : []
   // audit-6vq0: surface accounting sync rows that exhausted retries (FAILED).
   const failedSyncSummary = await getFailedAccountingSyncSummary().catch(() => null)
   // 0jls5: surface IMS tax rates that have drifted from the live Xero definition.
@@ -136,11 +175,15 @@ export default async function SyncPage() {
         </Link>
       </div>
       {exceptionSummary && <ExceptionsBanner summary={exceptionSummary} />}
-      {/* Rendered when EITHER source has something to show: the stranded list must survive a
-          failed orphan-summary fetch, since it is the only view of rows on a retired connector. */}
-      {(orphanSummary || strandedRows.length > 0) && (
-        <ConnectorOrphanBanner summary={orphanSummary} stranded={strandedRows} />
-      )}
+      {/* Unconditional: whether there is anything to show is resolveConnectorOrphanBannerState's
+          decision (the banner returns null when there is not), so the "does it render" rule lives
+          in ONE pure, tested place instead of being half-expressed here. It must render when the
+          summary failed but rows exist, and when the ROW READ failed regardless of the summary. */}
+      <ConnectorOrphanBanner
+        summary={orphanSummary}
+        stranded={stranded}
+        strandedLoadFailed={strandedLoadFailed}
+      />
       {failedSyncSummary && <FailedSyncBanner summary={failedSyncSummary} />}
       {taxRateDrift && <TaxRateDriftBanner drift={taxRateDrift} />}
       <SyncDashboard

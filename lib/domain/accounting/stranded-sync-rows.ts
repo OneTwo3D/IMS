@@ -45,6 +45,18 @@ export function buildStrandedSyncRowWhere(activeConnector: string | null): Prism
   return activeConnector ? { status, connector: { not: activeConnector } } : { status }
 }
 
+/**
+ * Oldest first — the longest-stuck row is the one most likely to be blocking a delete.
+ *
+ * Tie-broken on `id`. `createdAt` ALONE is not a total order: rows queued inside one transaction
+ * share a timestamp, so the database is free to return them in any order, and a truncated page
+ * would then be non-deterministic between renders — the same row could appear, vanish and
+ * reappear across refreshes. `id` is unique, so the pair is total.
+ */
+export function buildStrandedSyncRowOrderBy(): Prisma.AccountingSyncLogOrderByWithRelationInput[] {
+  return [{ createdAt: 'asc' }, { id: 'asc' }]
+}
+
 /** The columns the loader selects — the row as it comes off the database. */
 export type StrandedSyncRowSource = {
   id: string
@@ -87,4 +99,42 @@ export function describeStrandedSyncRow(row: StrandedSyncRowSource, now: Date): 
     createdAt: row.createdAt.toISOString(),
     ageDays: Math.floor(ageMs / 86_400_000),
   }
+}
+
+/** One page of stranded rows, with whether the list was cut short. */
+export type StrandedSyncRowPage = {
+  rows: StrandedSyncRow[]
+  /** True when stranded rows exist BEYOND the ones returned. */
+  hasMore: boolean
+}
+
+/**
+ * Turn a `take + 1` read into a page of `take` rows plus a truthful "there are more" flag.
+ *
+ * WHY `take + 1`. The list is READ-ONLY: there is no remedy here for a FAILED row (that needs
+ * the claim generation, o3d-e2mz), so the oldest rows cannot be cleared by anything the operator
+ * does on this page. A bare `take` with no truncation signal therefore means the oldest N rows
+ * can starve every newer one FOREVER — a stranded row created today is invisible for as long as
+ * 50 older FAILED rows sit in front of it, and nothing will ever move them. The extra row is how
+ * the UI gets to say so.
+ */
+export function pageStrandedSyncRows(
+  sourceRows: StrandedSyncRowSource[],
+  take: number,
+  now: Date,
+): StrandedSyncRowPage {
+  const hasMore = sourceRows.length > take
+  return {
+    rows: (hasMore ? sourceRows.slice(0, take) : sourceRows).map((row) => describeStrandedSyncRow(row, now)),
+    hasMore,
+  }
+}
+
+/** What the loader returns: the page, plus how many stranded rows exist in total. */
+export type StrandedSyncRowsResult = StrandedSyncRowPage & {
+  /**
+   * Total stranded rows matching the filter. Equal to `rows.length` when the list is complete;
+   * counted separately only when it is not, so the untruncated case stays a single query.
+   */
+  total: number
 }

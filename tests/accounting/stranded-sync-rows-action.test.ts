@@ -20,7 +20,12 @@ const state = {
   activeConnector: null as string | null,
   /** Every findMany the loader issued. Empty proves it never reached the database. */
   queries: [] as FindManyArgs[],
+  /** Every count the loader issued — only expected when the list was cut short. */
+  counts: [] as { where: Record<string, unknown> }[],
+  /** What findMany returns. The loader over-reads by one to detect truncation. */
   rows: [] as Record<string, unknown>[],
+  /** What count() returns. */
+  total: 0,
 }
 
 mock.module('@/lib/auth/server', {
@@ -46,6 +51,10 @@ mock.module('@/lib/db', {
         findMany: async (args: FindManyArgs) => {
           state.queries.push(args)
           return state.rows
+        },
+        count: async (args: { where: Record<string, unknown> }) => {
+          state.counts.push(args)
+          return state.total
         },
       },
     },
@@ -75,7 +84,9 @@ test.beforeEach(() => {
   state.permissions = new Set(['sync'])
   state.activeConnector = null
   state.queries = []
+  state.counts = []
   state.rows = []
+  state.total = 0
 })
 
 test('the stranded loader requires the `sync` permission, and reads NOTHING without it', async () => {
@@ -90,7 +101,7 @@ test('the stranded loader requires the `sync` permission, and reads NOTHING with
   assert.equal(state.queries.length, 0, 'the guard must fail BEFORE the query, not filter its result')
 
   state.permissions = new Set(['sync'])
-  assert.deepEqual(await getStrandedAccountingSyncRows(50), [])
+  assert.deepEqual(await getStrandedAccountingSyncRows(50), { rows: [], hasMore: false, total: 0 })
   assert.equal(state.queries.length, 1)
 })
 
@@ -103,8 +114,10 @@ test('the query is scoped AWAY from the active connector, oldest first', async (
     status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
     connector: { not: 'xero' },
   })
-  // Oldest first: the longest-stuck row is the one most likely to be blocking a delete.
-  assert.deepEqual(state.queries[0].orderBy, { createdAt: 'asc' })
+  // Oldest first: the longest-stuck row is the one most likely to be blocking a delete. Tie-
+  // broken on id, because rows queued in one transaction share a createdAt and a truncated page
+  // ordered on createdAt alone is non-deterministic between renders.
+  assert.deepEqual(state.queries[0].orderBy, [{ createdAt: 'asc' }, { id: 'asc' }])
 })
 
 test('with no accounting connector enabled, every unresolved row is stranded', async () => {
@@ -117,32 +130,63 @@ test('with no accounting connector enabled, every unresolved row is stranded', a
 
 test('the caller-supplied limit is honoured, and clamped rather than trusted', async () => {
   const getStrandedAccountingSyncRows = await loadLoader()
+  // Every take is limit + 1: the extra row is the truncation probe, and is dropped before the
+  // rows are returned.
 
   await getStrandedAccountingSyncRows()
-  assert.equal(state.queries[0].take, 50, 'default')
+  assert.equal(state.queries[0].take, 51, 'default')
 
   await getStrandedAccountingSyncRows(5)
-  assert.equal(state.queries[1].take, 5)
+  assert.equal(state.queries[1].take, 6)
 
   // A client-supplied bound: never let it become an unbounded / nonsensical read.
   await getStrandedAccountingSyncRows(100_000)
-  assert.equal(state.queries[2].take, 200)
+  assert.equal(state.queries[2].take, 201)
 
   await getStrandedAccountingSyncRows(0)
-  assert.equal(state.queries[3].take, 50, 'falsy limit falls back to the default')
+  assert.equal(state.queries[3].take, 51, 'falsy limit falls back to the default')
 
   await getStrandedAccountingSyncRows(-7)
-  assert.equal(state.queries[4].take, 1)
+  assert.equal(state.queries[4].take, 2)
 
   await getStrandedAccountingSyncRows(Number.NaN)
-  assert.equal(state.queries[5].take, 50)
+  assert.equal(state.queries[5].take, 51)
+})
+
+test('truncation is reported, not hidden — the read-only list cannot clear its own backlog', async () => {
+  // The starvation: nothing on this page can settle a FAILED row (that needs the claim
+  // generation, o3d-e2mz), so if the oldest `limit` rows are FAILED they never move and every
+  // newer stranded row is invisible forever. Returning a bare array of the oldest `limit` said
+  // nothing about that at all.
+  const getStrandedAccountingSyncRows = await loadLoader()
+  state.rows = Array.from({ length: 4 }, (_, i) => dbRow({ id: `log-${i}` }))
+  state.total = 137
+
+  const result = await getStrandedAccountingSyncRows(3)
+  assert.equal(state.queries[0].take, 4, 'reads one more than asked, to detect the overflow')
+  assert.equal(result.hasMore, true)
+  assert.equal(result.rows.length, 3, 'the probe row is not shown')
+  assert.equal(result.total, 137, 'the caller can say "the oldest 3 of 137", not a bare "3"')
+  // The count must match the SAME predicate as the page, or the total describes a different set.
+  assert.equal(state.counts.length, 1)
+  assert.deepEqual(state.counts[0].where, state.queries[0].where)
+})
+
+test('a complete list costs one query — the count runs only when rows are hidden', async () => {
+  const getStrandedAccountingSyncRows = await loadLoader()
+  state.rows = [dbRow({ id: 'log-0' }), dbRow({ id: 'log-1' })]
+
+  const result = await getStrandedAccountingSyncRows(3)
+  assert.equal(result.hasMore, false)
+  assert.equal(result.total, 2, 'a complete list is its own total')
+  assert.equal(state.counts.length, 0, 'no second query when nothing is hidden')
 })
 
 test('the rows come back described, with age and identifying detail', async () => {
   const getStrandedAccountingSyncRows = await loadLoader()
   state.rows = [dbRow({ externalTransactionId: 'INV-42' })]
 
-  const [row] = await getStrandedAccountingSyncRows()
+  const [row] = (await getStrandedAccountingSyncRows()).rows
   assert.equal(row.connector, 'quickbooks')
   assert.equal(row.status, 'PROCESSING')
   assert.equal(row.referenceType, 'SalesOrder')

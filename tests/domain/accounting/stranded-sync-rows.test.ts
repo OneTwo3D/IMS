@@ -3,8 +3,10 @@ import test from 'node:test'
 
 import {
   STRANDED_ACCOUNTING_SYNC_STATUSES,
+  buildStrandedSyncRowOrderBy,
   buildStrandedSyncRowWhere,
   describeStrandedSyncRow,
+  pageStrandedSyncRows,
 } from '@/lib/domain/accounting/stranded-sync-rows'
 
 // o3d-osl8 item 1. The stranded-row read model, tested without a database — the same way
@@ -35,6 +37,61 @@ test('only UNRESOLVED statuses are stranded — SYNCED and CANCELLED are finishe
   const where = buildStrandedSyncRowWhere('xero') as { status: { in: string[] } }
   assert.equal(where.status.in.includes('SYNCED'), false)
   assert.equal(where.status.in.includes('CANCELLED'), false)
+})
+
+test('the order is total — createdAt alone is not deterministic within a transaction', () => {
+  // Rows queued inside one transaction share a createdAt, so ordering on it alone lets the
+  // database return them in any order: a truncated page would then differ between renders, and
+  // the same row could appear, vanish and reappear on refresh. `id` is unique, so the pair is a
+  // total order.
+  assert.deepEqual(buildStrandedSyncRowOrderBy(), [{ createdAt: 'asc' }, { id: 'asc' }])
+})
+
+function sourceRow(over: Partial<Parameters<typeof describeStrandedSyncRow>[0]> = {}) {
+  return {
+    id: 'log-1',
+    connector: 'quickbooks',
+    type: 'INVOICE_PAYMENT',
+    status: 'FAILED',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-7',
+    externalTransactionId: null,
+    errorMessage: null,
+    createdAt: new Date('2026-08-04T10:00:00.000Z'),
+    ...over,
+  }
+}
+
+test('a `take + 1` read is paged down to `take`, and reports that rows are hidden', () => {
+  // The starvation this exists to expose: the list is READ-ONLY — nothing on the page can clear
+  // a FAILED row (that needs the claim generation, o3d-e2mz) — so if the oldest `take` rows are
+  // FAILED they never move, and every newer stranded row is invisible FOREVER. Returning a bare
+  // array of the oldest `take` said nothing about that.
+  const rows = Array.from({ length: 4 }, (_, i) => sourceRow({ id: `log-${i}` }))
+  const page = pageStrandedSyncRows(rows, 3, NOW)
+  assert.equal(page.hasMore, true, 'the extra row proves more exist')
+  assert.equal(page.rows.length, 3, 'the extra row is dropped, not shown')
+  assert.deepEqual(page.rows.map((row) => row.id), ['log-0', 'log-1', 'log-2'])
+})
+
+test('a complete page reports no more — and the probe row is not counted as one', () => {
+  const exact = pageStrandedSyncRows(Array.from({ length: 3 }, (_, i) => sourceRow({ id: `log-${i}` })), 3, NOW)
+  assert.equal(exact.hasMore, false, 'exactly `take` rows means the list is complete')
+  assert.equal(exact.rows.length, 3)
+
+  const short = pageStrandedSyncRows([sourceRow()], 3, NOW)
+  assert.equal(short.hasMore, false)
+  assert.equal(short.rows.length, 1)
+
+  const none = pageStrandedSyncRows([], 3, NOW)
+  assert.equal(none.hasMore, false)
+  assert.deepEqual(none.rows, [])
+})
+
+test('paged rows are described, not returned raw', () => {
+  const page = pageStrandedSyncRows([sourceRow()], 3, NOW)
+  assert.equal(page.rows[0].ageDays, 10)
+  assert.equal(page.rows[0].createdAt, '2026-08-04T10:00:00.000Z')
 })
 
 function stranded(over: Partial<Parameters<typeof describeStrandedSyncRow>[0]> = {}) {

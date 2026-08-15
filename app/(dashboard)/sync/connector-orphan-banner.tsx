@@ -6,7 +6,8 @@ import { AlertTriangle, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { cancelOrphanedAccountingSyncRows } from '@/app/actions/accounting-sync'
 import type { ConnectorOrphanSummary } from '@/lib/domain/accounting/connector-orphans'
-import type { StrandedSyncRow } from '@/lib/domain/accounting/stranded-sync-rows'
+import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sync-rows'
+import { resolveConnectorOrphanBannerState } from '@/lib/domain/accounting/stranded-sync-visibility'
 
 const CONNECTOR_LABELS: Record<string, string> = { xero: 'Xero', quickbooks: 'QuickBooks' }
 
@@ -21,7 +22,8 @@ function connectorLabel(connector: string): string {
  */
 export function ConnectorOrphanBanner({
   summary,
-  stranded = [],
+  stranded = null,
+  strandedLoadFailed = false,
 }: {
   /**
    * NULLABLE on purpose. getCrossConnectorOrphanSummary() is fetched with .catch(() => null),
@@ -40,9 +42,18 @@ export function ConnectorOrphanBanner({
    * error is what makes them actionable at all.
    *
    * Read-only: there is no per-row control here, because there is no per-row remedy anywhere
-   * yet (o3d-e2mz). Empty for a role without the `sync` permission — the page does not fetch it.
+   * yet (o3d-e2mz). Null for a role without the `sync` permission — the page does not fetch it —
+   * and also null when the fetch FAILED, which `strandedLoadFailed` distinguishes.
+   *
+   * Carries `hasMore` / `total` because the list is truncated to the oldest N and nothing here
+   * can clear the rows at the front of it.
    */
-  stranded?: StrandedSyncRow[]
+  stranded?: StrandedSyncRowsResult | null
+  /**
+   * The stranded-row read failed. Rendered as an explicit failure, NOT as an empty list: "we
+   * could not look" and "there is nothing there" are opposite messages for the operator.
+   */
+  strandedLoadFailed?: boolean
 }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
@@ -55,11 +66,19 @@ export function ConnectorOrphanBanner({
    */
   const [notice, setNotice] = useState<string | null>(null)
 
-  // The server summary is the source of truth: router.refresh() re-fetches it
-  // after a cancel, so the banner hides (or shows the remainder) on its own.
-  // The stranded list is checked too: it also covers FAILED rows on a retired connector, which
-  // the PENDING/PROCESSING orphan count never counted and nothing else ever showed.
-  if ((summary?.totalOrphans ?? 0) === 0 && stranded.length === 0) return null
+  // Every "is there anything to show" decision is the pure resolver's, so it can be tested —
+  // this repo has no React render harness, and logic left in here is logic nothing can reach.
+  // The server summary is the source of truth: router.refresh() re-fetches it after a cancel, so
+  // the banner hides (or shows the remainder) on its own.
+  const strandedRows = stranded?.rows ?? []
+  const bannerState = resolveConnectorOrphanBannerState({
+    summary,
+    rowCount: strandedRows.length,
+    totalStrandedRows: stranded?.total ?? 0,
+    hasMore: stranded?.hasMore ?? false,
+    loadFailed: strandedLoadFailed,
+  })
+  if (!bannerState.render) return null
 
   function handleCancel(connector?: string) {
     setError(null)
@@ -86,7 +105,7 @@ export function ConnectorOrphanBanner({
       <div className="flex gap-2">
         <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
         <div className="space-y-2">
-          {summary && summary.totalOrphans > 0 && (
+          {bannerState.showSummary && summary && (
             <p className="font-medium">
               {summary.totalOrphans} accounting sync row(s) are queued for a connector that is no longer active
               {summary.activeConnector ? ` (active: ${connectorLabel(summary.activeConnector)})` : ' (no accounting connector is enabled)'}.
@@ -112,13 +131,23 @@ export function ConnectorOrphanBanner({
           )}
           {error && <p className="text-xs text-destructive">{error}</p>}
           {notice && <p className="text-xs font-medium">{notice}</p>}
-          {stranded.length > 0 && (
+          {/* An explicit failure state. Silence here would read as "nothing is stranded", which
+              is the opposite of what a failed read means. */}
+          {bannerState.showLoadFailure && (
+            <p className="text-xs font-medium text-destructive">
+              The list of stranded sync rows could not be loaded, so it is not shown below. This does NOT mean there
+              are none — any count above excludes rows that already failed, and those appear in no other view.
+              Reload this page to try again.
+            </p>
+          )}
+          {bannerState.showRows && (
             <div className="space-y-1 pt-1">
               <p className="text-xs font-medium">
-                The rows themselves ({stranded.length} shown, oldest first). These do not appear in the sync log
+                The rows themselves. {bannerState.rowsSummary} These do not appear in the sync log
                 below — it only ever shows the ACTIVE connector. A stuck row keeps its order from being deleted, so
                 each one needs either its connector re-enabling (which lets it resume) or the document checking in
                 the accounting system it was queued for.
+                {bannerState.truncated && ' The hidden rows stay hidden until the ones listed here are resolved.'}
               </p>
               <div className="overflow-x-auto">
                 <table className="w-full text-[11px]">
@@ -133,7 +162,7 @@ export function ConnectorOrphanBanner({
                     </tr>
                   </thead>
                   <tbody>
-                    {stranded.map((row) => (
+                    {strandedRows.map((row) => (
                       <tr key={row.id} className="align-top">
                         <td className="pr-3 py-0.5">{connectorLabel(row.connector)}</td>
                         <td className="pr-3 py-0.5 font-mono">{row.type.replace(/_/g, ' ')}</td>
