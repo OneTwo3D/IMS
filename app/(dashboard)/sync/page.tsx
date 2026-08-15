@@ -32,6 +32,9 @@ import { getTaxRates } from '@/app/actions/settings'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getCrossConnectorOrphanSummary, getFailedAccountingSyncSummary } from '@/app/actions/accounting-sync'
+import { getStrandedAccountingSyncRows } from '@/app/actions/accounting-stranded-rows'
+import { getSession } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
 import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-status'
 import { SyncDashboard } from './sync-dashboard'
 import { ConnectorOrphanBanner } from './connector-orphan-banner'
@@ -98,6 +101,19 @@ export default async function SyncPage() {
 
   // audit-H4: surface accounting sync rows stranded by a connector switch.
   const orphanSummary = await getCrossConnectorOrphanSummary().catch(() => null)
+  // o3d-osl8 item 1: the rows BEHIND that count, with identifying detail. Deliberately NOT
+  // scoped to the active connector — a row stranded on a retired one appears in no other view.
+  //
+  // Gated on `sync` HERE as well as inside the action. The loader returns per-row detail (ids,
+  // referenced entities, external transaction ids, raw connector error text), so a role without
+  // `sync` must not merely fail to render it — it must never cause the read. Checking the role
+  // first also keeps the page off the action's throw path, so an unauthorised role is a section
+  // that is absent, not a section that silently failed.
+  const session = await getSession()
+  const canSeeStrandedRows = !!session && hasPermission(session.user.role, 'sync')
+  const strandedRows = canSeeStrandedRows
+    ? await getStrandedAccountingSyncRows(50).catch(() => [])
+    : []
   // audit-6vq0: surface accounting sync rows that exhausted retries (FAILED).
   const failedSyncSummary = await getFailedAccountingSyncSummary().catch(() => null)
   // 0jls5: surface IMS tax rates that have drifted from the live Xero definition.
@@ -120,7 +136,11 @@ export default async function SyncPage() {
         </Link>
       </div>
       {exceptionSummary && <ExceptionsBanner summary={exceptionSummary} />}
-      {orphanSummary && <ConnectorOrphanBanner summary={orphanSummary} />}
+      {/* Rendered when EITHER source has something to show: the stranded list must survive a
+          failed orphan-summary fetch, since it is the only view of rows on a retired connector. */}
+      {(orphanSummary || strandedRows.length > 0) && (
+        <ConnectorOrphanBanner summary={orphanSummary} stranded={strandedRows} />
+      )}
       {failedSyncSummary && <FailedSyncBanner summary={failedSyncSummary} />}
       {taxRateDrift && <TaxRateDriftBanner drift={taxRateDrift} />}
       <SyncDashboard

@@ -588,13 +588,21 @@ The hash suffix is deterministic (computed from the entity IDs in the batch), so
 
 ## Sync Log
 
-The sync log at **Integrations → Xero** shows all queued transactions with their status:
+The sync log at **Integrations → Xero** shows queued transactions for the **currently active** accounting connector, with their status:
 
 - **Pending** — Queued, waiting for next cron run
 - **Synced** — Successfully pushed to Xero (shows Xero transaction ID)
 - **Failed** — Failed after 5 retries (shows error message)
 
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
+
+### Rows stranded on a connector you switched away from
+
+Because the sync log is scoped to the active connector, unresolved rows left behind on a connector that has since been turned off appear in **no** sync log. They are listed instead in the amber banner at the top of **Integrations**, which shows each row's connector, type, reference, status, age in days, and last error — plus the external transaction ID if the row already posted something before it stalled.
+
+These rows still block their sales order from being deleted. To clear one, either re-enable the connector it was queued for (Pending rows then resume on the next cron run), or look the document up in that accounting system using the reference and external ID shown. Pending and Processing rows queued for an inactive connector can also be bulk-cancelled from the same banner; cancelling discards the queued row and does not stop the document syncing to the active connector later.
+
+The list requires the **sync** permission (Admin and Manager). Roles without it do not see this section.
 ## Xero Daily Batch Retry Semantics
 
 The daily batch intentionally processes A1 revenue deferral, A2 inventory allocation, and Group B shipment recognition in separate database transactions. A crash can therefore leave a partially advanced day, but each group is idempotent:
