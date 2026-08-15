@@ -2778,6 +2778,8 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
           shipFromWarehouseId: true,
           revenueDeferredDate: true,
           inventoryAllocatedDate: true,
+          revenueDeferredBatchRef: true,
+          inventoryAllocatedBatchRef: true,
           lines: { select: { productId: true, qty: true } },
           _count: { select: { refunds: true, payments: true } },
         },
@@ -2789,6 +2791,10 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       const blocker = await findSalesOrderDeleteBlocker(tx, id, {
         revenueDeferredDate: so.revenueDeferredDate,
         inventoryAllocatedDate: so.inventoryAllocatedDate,
+        // o3d-0qoo: the exact batch ids this order was staged into, so the guard matches a
+        // batch by identity instead of re-deriving one from the stamps above.
+        revenueDeferredBatchRef: so.revenueDeferredBatchRef,
+        inventoryAllocatedBatchRef: so.inventoryAllocatedBatchRef,
       })
       if (blocker) return { error: blocker.message }
 

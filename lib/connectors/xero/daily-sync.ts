@@ -41,6 +41,12 @@ import { buildCogsReconciliationSweepJournal, loadCogsGlReconciliation } from '@
 import { buildTransitReconciliationSweepJournal, loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recreateJournaledDateFilter } from '@/lib/domain/accounting/daily-batch-retention'
+import {
+  dailyBatchLiveRefs,
+  foldDailyBatchRow,
+  type DailyBatchLiveRefs,
+  type DailyBatchRecreateBucket,
+} from '@/lib/domain/accounting/daily-batch-reference'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
@@ -348,85 +354,125 @@ export function takeDailyBatchWindow<T>(
   }
 }
 
-async function hasLiveDailyBatchLog(type: DailyBatchLogType, bareReferenceId: string): Promise<boolean> {
+/**
+ * Is a daily-batch log for this batch still live (PENDING/PROCESSING/SYNCED)?
+ *
+ * Accepts either a single derived `<group>-<date>` key (the reconciliation sweeps, whose
+ * identity is `<PREFIX>-<date>` by construction and never persisted) or a bucket's full
+ * set of candidate referenceIds.
+ *
+ * This probe is the ONLY thing standing between the recreate sweep and a duplicate
+ * journal, so it errs towards "live": every candidate is ORed together, and a bucket with
+ * no candidates at all is reported LIVE rather than recreated blind.
+ */
+async function hasLiveDailyBatchLog(
+  type: DailyBatchLogType,
+  refs: string | DailyBatchLiveRefs,
+): Promise<boolean> {
+  const { exact, derived } = typeof refs === 'string' ? { exact: [], derived: [refs] } : refs
+  const alternatives: Prisma.AccountingSyncLogWhereInput[] = []
+  // The exact persisted referenceId of the batch this row was staged into — the only
+  // candidate that survives a run crossing UTC midnight (o3d-0qoo).
+  for (const referenceId of exact) alternatives.push({ referenceId })
   // The live daily-batch posting stamps a digest-suffixed referenceId
   // (buildDailyBatchReferenceId -> `<group>-<date>-<8 hex>`), so an exact match on
   // the bare `<group>-<date>` never finds it and recreate would post a duplicate
   // batch (double-post). Match the bare key OR any digest-suffixed variant for the
-  // same group+date (scjz.37).
+  // same group+date (scjz.37). Kept ALONGSIDE the persisted refs, never replaced by
+  // them: this probe must never see fewer live logs than it did before the column.
+  for (const bareReferenceId of derived) {
+    alternatives.push(
+      { referenceId: bareReferenceId },
+      { referenceId: { startsWith: `${bareReferenceId}-` } },
+    )
+  }
+  if (alternatives.length === 0) return true
   const count = await db.accountingSyncLog.count({
     where: {
       connector: XERO_CONNECTOR,
       type,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-      OR: [
-        { referenceId: bareReferenceId },
-        { referenceId: { startsWith: `${bareReferenceId}-` } },
-      ],
+      OR: alternatives,
     },
   })
   return count > 0
 }
 
-async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getXeroSettings>>, baseCurrency: string): Promise<void> {
+/**
+ * Rebuild daily-batch logs that went missing before they posted.
+ *
+ * o3d-0qoo: rows are bucketed by the referenceId the daily sync PERSISTED on them, not by
+ * a key re-derived from their stage stamp. A run crossing UTC midnight stamps the row on
+ * the day AFTER its batch's own date, so the derived key names a batch that never existed
+ * — the sweep found no live log for it and re-posted a journal that was already in the
+ * ledger. The persisted reference is the batch's real identity, so it is what the sweep
+ * probes for, recreates under, and dates the journal from. Rows staged before that column
+ * existed have no persisted ref and keep the old derived-key behaviour exactly.
+ */
+export async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getXeroSettings>>, baseCurrency: string): Promise<void> {
   // scjz.36: only recreate within the sync-log retention window — beyond it, SYNCED
   // daily-batch logs are pruned by data-retention, so a "missing" log can't be told
   // apart from one that already posted, and rebuilding would double-post the journal.
   const journaledDateFilter = await recreateJournaledDateFilter()
   const orphanA1Orders = await db.salesOrder.findMany({
     where: { revenueDeferredDate: journaledDateFilter },
-    select: { revenueDeferredDate: true, unearnedRevenueAmount: true },
+    select: { revenueDeferredDate: true, revenueDeferredBatchRef: true, unearnedRevenueAmount: true },
   })
   const orphanA2Orders = await db.salesOrder.findMany({
     where: { inventoryAllocatedDate: journaledDateFilter },
-    select: { inventoryAllocatedDate: true, allocationBatchAmount: true },
+    select: { inventoryAllocatedDate: true, inventoryAllocatedBatchRef: true, allocationBatchAmount: true },
   })
   const orphanBShipments = await db.shipment.findMany({
     where: { shipmentJournalDate: journaledDateFilter },
-    select: { id: true, shipmentJournalDate: true, revenueRecognizedAmount: true, cogsBatchAmount: true },
+    select: { id: true, shipmentJournalDate: true, shipmentJournalBatchRef: true, revenueRecognizedAmount: true, cogsBatchAmount: true },
   })
 
-  const a1ByDate = new Map<string, { orderCount: number; total: number }>()
+  const a1Batches = new Map<string, DailyBatchRecreateBucket<{ orderCount: number; total: number }>>()
   for (const order of orphanA1Orders) {
-    const stagedAt = order.revenueDeferredDate
-    if (!stagedAt) continue
-    const key = stagedAt.toISOString().slice(0, 10)
-    const existing = a1ByDate.get(key) ?? { orderCount: 0, total: 0 }
-    existing.orderCount += 1
-    existing.total += Number(order.unearnedRevenueAmount ?? 0)
-    a1ByDate.set(key, existing)
+    const summary = foldDailyBatchRow(
+      a1Batches,
+      'A1',
+      { stagedAt: order.revenueDeferredDate, persistedRef: order.revenueDeferredBatchRef },
+      () => ({ orderCount: 0, total: 0 }),
+    )
+    if (!summary) continue
+    summary.orderCount += 1
+    summary.total += Number(order.unearnedRevenueAmount ?? 0)
   }
 
-  const a2ByDate = new Map<string, { orderCount: number; total: number }>()
+  const a2Batches = new Map<string, DailyBatchRecreateBucket<{ orderCount: number; total: number }>>()
   for (const order of orphanA2Orders) {
-    const stagedAt = order.inventoryAllocatedDate
-    if (!stagedAt) continue
-    const key = stagedAt.toISOString().slice(0, 10)
-    const existing = a2ByDate.get(key) ?? { orderCount: 0, total: 0 }
-    existing.orderCount += 1
-    existing.total += Number(order.allocationBatchAmount ?? 0)
-    a2ByDate.set(key, existing)
+    const summary = foldDailyBatchRow(
+      a2Batches,
+      'A2',
+      { stagedAt: order.inventoryAllocatedDate, persistedRef: order.inventoryAllocatedBatchRef },
+      () => ({ orderCount: 0, total: 0 }),
+    )
+    if (!summary) continue
+    summary.orderCount += 1
+    summary.total += Number(order.allocationBatchAmount ?? 0)
   }
 
-  const bByDate = new Map<string, { shipmentCount: number; revenue: number; cogs: number; shipments: Array<{ id: string; cogs: number }> }>()
+  const bBatches = new Map<string, DailyBatchRecreateBucket<{ shipmentCount: number; revenue: number; cogs: number; shipments: Array<{ id: string; cogs: number }> }>>()
   for (const shipment of orphanBShipments) {
-    const stagedAt = shipment.shipmentJournalDate
-    if (!stagedAt) continue
-    const key = stagedAt.toISOString().slice(0, 10)
-    const existing = bByDate.get(key) ?? { shipmentCount: 0, revenue: 0, cogs: 0, shipments: [] }
+    const summary = foldDailyBatchRow(
+      bBatches,
+      'B',
+      { stagedAt: shipment.shipmentJournalDate, persistedRef: shipment.shipmentJournalBatchRef },
+      () => ({ shipmentCount: 0, revenue: 0, cogs: 0, shipments: [] }),
+    )
+    if (!summary) continue
     const shipmentCogs = Number(shipment.cogsBatchAmount ?? 0)
-    existing.shipmentCount += 1
-    existing.revenue += Number(shipment.revenueRecognizedAmount ?? 0)
-    existing.cogs += shipmentCogs
+    summary.shipmentCount += 1
+    summary.revenue += Number(shipment.revenueRecognizedAmount ?? 0)
+    summary.cogs += shipmentCogs
     // bcz9.3: carry the per-shipment list so the recreate path can write the same
     // per-shipment DISPATCH ledger rows the live dispatch path writes.
-    existing.shipments.push({ id: shipment.id, cogs: shipmentCogs })
-    bByDate.set(key, existing)
+    summary.shipments.push({ id: shipment.id, cogs: shipmentCogs })
   }
 
-  for (const [date, summary] of a1ByDate) {
-    const referenceId = `A1-${date}`
-    if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_REVENUE_DEFERRAL', referenceId)) continue
+  for (const { referenceId, date, summary, ...batch } of a1Batches.values()) {
+    if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_REVENUE_DEFERRAL', dailyBatchLiveRefs(batch))) continue
     await db.$transaction(async (tx) => {
       await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -447,9 +493,8 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
     })
   }
 
-  for (const [date, summary] of a2ByDate) {
-    const referenceId = `A2-${date}`
-    if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_ALLOC', referenceId)) continue
+  for (const { referenceId, date, summary, ...batch } of a2Batches.values()) {
+    if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_ALLOC', dailyBatchLiveRefs(batch))) continue
     await db.$transaction(async (tx) => {
       await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
@@ -470,9 +515,8 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
     })
   }
 
-  for (const [date, summary] of bByDate) {
-    const referenceId = `B-${date}`
-    if ((summary.revenue <= 0 && summary.cogs <= 0) || await hasLiveDailyBatchLog('DAILY_BATCH_GROUP_B', referenceId)) continue
+  for (const { referenceId, date, summary, ...batch } of bBatches.values()) {
+    if ((summary.revenue <= 0 && summary.cogs <= 0) || await hasLiveDailyBatchLog('DAILY_BATCH_GROUP_B', dailyBatchLiveRefs(batch))) continue
     const lines: JournalLinePayload[] = []
     if (round2(summary.revenue) > 0) {
       lines.push(
@@ -502,7 +546,9 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
       })
       // bcz9.3: the recreated Group B journal moves GL COGS, so write the same
       // per-shipment DISPATCH ledger rows the live dispatch path writes, dated to the
-      // recreated journal date and keyed identically (dispatch:<shipmentId>). The key
+      // recreated journal date — the BATCH's own date, from its persisted reference, so a
+      // midnight-crossing run does not date the subledger a day after its GL journal
+      // (o3d-0qoo) — and keyed identically (dispatch:<shipmentId>). The key
       // is idempotent: where a live dispatch row already exists (the common case) this
       // is a no-op preserving the original value; where a shipment never got one it
       // fills the gap so the COGS reconciliation ties out instead of perpetually flagging.
@@ -618,9 +664,15 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         )
       }
 
+      // o3d-0qoo: computed ONCE, here, and stamped onto every member order inside the same
+      // transaction as the stage stamp. It is deliberately NOT re-derived per order from
+      // revenueDeferredDate: `today` is captured at run start while the stamps are written
+      // with later new Date() calls, so a run crossing UTC midnight makes the two disagree
+      // and every consumer that re-derives looks for a batch that does not exist.
+      const referenceId = buildDailyBatchReferenceId('A1', today, orders.map((order) => order.id))
+
       await db.$transaction(async (tx) => {
         if (journalLines.length > 0) {
-          const referenceId = buildDailyBatchReferenceId('A1', today, orders.map((order) => order.id))
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_REVENUE_DEFERRAL',
             referenceId,
@@ -647,6 +699,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             where: { id: order.id },
             data: {
               revenueDeferredDate: new Date(),
+              revenueDeferredBatchRef: referenceId,
               unearnedRevenueAmount: deferralByOrderId.get(order.id) ?? 0,
             },
           })
@@ -707,6 +760,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     result.hasMore.groupA2 = orderWindow.hasMore
 
     if (orders.length > 0) {
+      // o3d-0qoo: batch identity, computed once from the run-start date and this batch's own
+      // order set, then persisted on every member row alongside its stage stamp. See the A1
+      // note above for why deriving it back from inventoryAllocatedDate is not equivalent.
+      const referenceId = buildDailyBatchReferenceId('A2', today, orders.map((order) => order.id))
+
       await db.$transaction(async (tx) => {
         let totalAllocatedValue = toDecimal(0)
         const unshippedOrders = orders.filter((order) => order.shipments.length === 0)
@@ -747,7 +805,6 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
         const totalAllocatedValueNumber = round2Decimal(totalAllocatedValue)
         if (totalAllocatedValueNumber > 0) {
-          const referenceId = buildDailyBatchReferenceId('A2', today, orders.map((order) => order.id))
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_INVENTORY_ALLOC',
             referenceId,
@@ -783,6 +840,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             where: { id: order.id },
             data: {
               inventoryAllocatedDate: new Date(),
+              inventoryAllocatedBatchRef: referenceId,
               allocationBatchAmount: orderValues.get(order.id) ?? 0,
             },
           })
@@ -1250,8 +1308,14 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         )
       }
 
+      // o3d-0qoo: identity over the shipments that actually made it into this batch —
+      // shipmentResults has already had failed orders' shipments removed, and the stamping
+      // loop below skips exactly the same ones, so the digest input and the stamped set are
+      // the same set by construction. Persisted per shipment rather than re-derived from
+      // shipmentJournalDate, which is written later and can land on the next UTC day.
+      const referenceId = buildDailyBatchReferenceId('B', today, [...shipmentResults.keys()])
+
       if (journalLines.length > 0) {
-        const referenceId = buildDailyBatchReferenceId('B', today, [...shipmentResults.keys()])
         await createPendingSyncLog(tx, {
           type: 'DAILY_BATCH_GROUP_B',
           referenceId,
@@ -1294,6 +1358,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           where: { id: shipment.id },
           data: {
             shipmentJournalDate,
+            shipmentJournalBatchRef: referenceId,
             cogsBatchAmount: resultForShipment.cogs,
             revenueRecognizedAmount: resultForShipment.revenue,
           },
@@ -1302,12 +1367,20 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         // an immutable, correctly-dated row. The reconciliation reads the ledger (not
         // the live, revaluation-mutated cogsBatchAmount), so a same-window dispatch +
         // revaluation can't double-count. Idempotent per shipment.
+        //
+        // Dated on `today` — the BATCH's date — NOT on shipmentJournalDate (o3d-0qoo r1,
+        // found by Codex). The GL journal above is posted under `today`, while the stamp is
+        // written with a later new Date(); on a midnight-crossing run the two differ, and
+        // the subledger row would land a day after the journal whose value it records.
+        // Reconciliation windows on journalDate, so that gap reads as a real one — and
+        // because this upsert is first-write-wins and keyed per shipment, a row written on
+        // the wrong day can never be corrected by a later run.
         await recordCogsSubledgerMovement(tx, {
           sourceType: 'DISPATCH',
           sourceRef: shipment.id,
           idempotencyKey: `dispatch:${shipment.id}`,
           baseDelta: resultForShipment.cogs,
-          journalDate: shipmentJournalDate,
+          journalDate: today,
         })
       }
 

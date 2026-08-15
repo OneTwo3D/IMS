@@ -1457,11 +1457,18 @@ async function stageRefundAccountingReversals(
     ))
 
     if (params.newStatus === 'REFUNDED') {
+      // o3d-0qoo: each batch ref is cleared IN THE SAME UPDATE as the stamp it pairs with. A row
+      // left holding a ref with no stamp would make the delete guard match a batch the row is no
+      // longer part of, and block that order forever. Clearing both preserves EXACTLY today's
+      // behaviour — it is not an endorsement of it: this discards the only handle the guard and
+      // the invariants have on an A1/A2 journal that may already be POSTED (pre-existing, o3d-o97).
       await tx.salesOrder.update({
         where: { id: params.orderId },
         data: {
           revenueDeferredDate: null,
+          revenueDeferredBatchRef: null,
           inventoryAllocatedDate: null,
+          inventoryAllocatedBatchRef: null,
         },
       })
     }

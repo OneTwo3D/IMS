@@ -318,7 +318,10 @@ export async function resetAllocationAccountingIfStaged(
   await tx.salesOrder.update({
     where: { id: orderId },
     data: {
+      // o3d-0qoo: the A2 batch ref goes with its stamp in the same update — see the note at the
+      // REFUNDED un-stage in refund-service.ts for why a ref without a stamp is worse than neither.
       inventoryAllocatedDate: null,
+      inventoryAllocatedBatchRef: null,
       allocationBatchAmount: null,
     },
   })
