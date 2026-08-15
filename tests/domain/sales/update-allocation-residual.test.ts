@@ -99,7 +99,11 @@ const tx = {
         lineId: line.lineId,
         productId: line.productId,
         qty: line.qty,
-        shipment: { warehouseId: line.warehouseId },
+        // The STATUS is part of the row, not just of the filter. loadCommittedAllocationLines
+        // fetches the non-PENDING set once and splits it into "committed" (the edit floor) and
+        // "dispatched" (the reservation delta) by this field — a double that omitted it made every
+        // line look un-dispatched, so the residual silently became the whole row (o3d-4kfh r2).
+        shipment: { warehouseId: line.warehouseId, status: line.status },
       })),
   },
   stockLevel: {
@@ -361,23 +365,121 @@ test('o3d-4kfh: an UNdispatched row still merges, and reserves only the units it
   assert.equal(reservedAt('warehouse-2'), 10, '4 residual + 6 moved — not 16')
 })
 
-test('o3d-4kfh: a PICKED (not dispatched) shipment nets nothing — its reservation is still live', async () => {
-  // reservedQty is decremented on the transition to SHIPPED and nowhere else. Treating a PICKING
-  // shipment as "already released" would under-release and strand reservation on the stock level.
+/** 10 allocated at W1 with a `status` shipment of 5 against it, and nothing dispatched. */
+function seedCommittedNotDispatched(status: 'PICKING' | 'PACKED') {
   seedLines(10)
   state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 10 }]
   state.allocations = [
     { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 },
   ]
   state.shipmentLines = [
-    { lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', status: 'PICKING', qty: 5 },
+    { lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', status, qty: 5 },
   ]
+}
+
+test('o3d-4kfh: a PICKED (not dispatched) shipment nets nothing from the reservation, but it IS a floor', async () => {
+  // Two different subtractions, and this row is subject to both. reservedQty is decremented on the
+  // transition to SHIPPED and nowhere else, so a PICKING shipment has released NOTHING and the
+  // reservation delta must not net it (netting it would under-release and strand reservation
+  // forever). But the picked units are still attached to this row: the shipment carries
+  // (lineId, productId) and its shipment the warehouseId, and that triple is the only thing tying
+  // them together. Cutting the row to 4 used to SUCCEED and drop the reservation to 4, leaving a
+  // 5-unit shipment that transitionShipmentStatus can only dispatch by taking the missing unit out
+  // of another order's share of the aggregate.
+  seedCommittedNotDispatched('PICKING')
   const { updateAllocation } = await loadAction()
 
   const result = await updateAllocation('alloc-a', 'warehouse-1', 4)
 
+  assert.equal(result.success, false, 'the edit is refused, not applied')
+  assert.match(String(result.error), /Cannot reduce this allocation below 5/)
+  assert.equal(state.allocations[0].qty, 10, 'the row still covers its committed shipment')
+  assert.equal(reservedAt('warehouse-1'), 10, 'and the reservation is untouched')
+})
+
+test('o3d-4kfh: a PICKED shipment can still be trimmed DOWN TO its committed quantity', async () => {
+  // The floor is a floor, not a freeze: the 5 uncommitted units are still the operator's to give
+  // back, and doing so must release exactly 5 (the residual of the old row minus the residual of
+  // the new one) — the picked 5 stay reserved because they have not shipped.
+  seedCommittedNotDispatched('PICKING')
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 5)
+
   assert.equal(result.success, true, result.error)
-  assert.equal(reservedAt('warehouse-1'), 4, 'the full 10 was released and 4 re-reserved')
+  assert.equal(state.allocations[0].qty, 5)
+  assert.equal(reservedAt('warehouse-1'), 5, 'the 5 picked units keep their live reservation')
+})
+
+test('o3d-4kfh: a PACKED shipment is a floor too — reducing below it is refused', async () => {
+  // PACKED is further along than PICKING and just as un-dispatched. Both are non-PENDING, which is
+  // the whole test: the floor is the COMMITTED set, not the shipped one.
+  seedCommittedNotDispatched('PACKED')
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 2)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /Cannot reduce this allocation below 5/)
+  assert.equal(state.allocations[0].qty, 10)
+  assert.equal(reservedAt('warehouse-1'), 10)
+})
+
+test('o3d-4kfh: an allocation with a PACKED shipment cannot be MOVED to another warehouse', async () => {
+  // The packed units were picked from warehouse-1. Moving the row takes their only attribution with
+  // it: warehouse-2 has no shipment to net, so it re-reserves them, and warehouse-1 keeps a packed
+  // shipment with no allocation row behind it.
+  seedCommittedNotDispatched('PACKED')
+  state.stockLevels.push({ productId: 'product-1', warehouseId: 'warehouse-2', quantity: 50, reservedQty: 0 })
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-2', 10)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /Cannot move this allocation to another warehouse/)
+  assert.equal(state.allocations[0].warehouseId, 'warehouse-1', 'the row stays where the shipment was picked')
+  assert.equal(reservedAt('warehouse-1'), 10)
+  assert.equal(reservedAt('warehouse-2'), 0, 'nothing was re-reserved at the destination')
+})
+
+test('o3d-4kfh: DELETING an allocation with a PACKED shipment is refused', async () => {
+  // newQty 0 is the sharpest version of the under-allocation: the row that the shipment, the
+  // residual and the accounting sub-ledger all resolve through simply stops existing, while the
+  // packed shipment stays dispatchable.
+  seedCommittedNotDispatched('PACKED')
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 0)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /Cannot reduce this allocation below 5/)
+  assert.equal(state.allocations.length, 1, 'the row survives')
+  assert.equal(reservedAt('warehouse-1'), 10)
+})
+
+test('o3d-4kfh: after the refusal the reservation still satisfies the DISPATCH precondition', async () => {
+  // The consequence the guard exists to prevent, stated as the condition dispatch actually tests.
+  // transitionShipmentStatus decrements stock with
+  //   where: { ..., quantity: { gte: qty }, reservedQty: { gte: qty } }
+  // and throws "Insufficient physical or reserved stock to dispatch" when that matches no row.
+  // reservedQty is the SHARED per-(product, warehouse) aggregate, so a shortfall is resolved
+  // either by failing the dispatch outright or — when another order happens to be holding enough
+  // there — by silently spending that order's reservation.
+  seedCommittedNotDispatched('PICKING')
+  const committedShipmentQty = state.shipmentLines[0].qty
+  const { updateAllocation } = await loadAction()
+
+  await updateAllocation('alloc-a', 'warehouse-1', 4)
+
+  assert.ok(
+    (reservedAt('warehouse-1') ?? 0) >= committedShipmentQty,
+    `reservedQty ${reservedAt('warehouse-1')} must still cover the ${committedShipmentQty} picked units; `
+    + 'letting the edit through left 4 and made the dispatch impossible without robbing another order',
+  )
+  assert.ok(
+    state.allocations[0].qty >= committedShipmentQty,
+    'and the allocation row still covers the shipment it will be dispatched against',
+  )
 })
 
 test('o3d-4kfh: a release bigger than the whole aggregate is REFUSED, not floored', async () => {

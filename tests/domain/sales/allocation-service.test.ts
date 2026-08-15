@@ -9,6 +9,7 @@ import {
   buildAvailableStockMapIncludingOwnReservations,
   buildAvailableStockMap,
   cancelSalesOrderFulfillmentState,
+  releaseOrderAllocationsForDeallocationInTx,
   releaseOrderAllocationsInTx,
   resetAllocationAccountingIfStaged,
   updateSalesOrderStatusUnderLock,
@@ -87,6 +88,10 @@ type AllocationRow = {
   productId: string
   warehouseId: string
   qty: number
+  /** o3d-4kfh: the IDENTITY Group B and the refund cost reversal resolve through
+   *  (`costLayerSnapshot[].orderAllocationId`). Deleting the row destroys it. */
+  id?: string
+  costLayerSnapshot?: unknown
 }
 
 type ShipmentRow = {
@@ -255,9 +260,28 @@ function createClient(state: MemoryState): AllocationServiceClient {
         allocations.push({ ...data, qty: persistAllocationQty(decimalLikeToNumber(data.qty)) })
         return data
       },
-      updateMany: async () => ({ count: 0 }),
+      // resetAllocationAccountingIfStaged clears costLayerSnapshot through here. A double that
+      // no-opped made any assertion about the snapshot vacuous in BOTH directions — it could
+      // neither observe the clear happening nor the row keeping its snapshot (o3d-4kfh r2).
+      updateMany: async ({ where, data }: {
+        where: { orderId: string }
+        data: { costLayerSnapshot?: unknown }
+      } = { where: { orderId: '' }, data: {} }) => {
+        const rows = allocations.filter((allocation) => allocation.orderId === where.orderId)
+        for (const row of rows) {
+          if ('costLayerSnapshot' in data) row.costLayerSnapshot = null
+        }
+        return { count: rows.length }
+      },
     },
     shipment: {
+      // The DEALLOCATION guard's read (releaseOrderAllocationsForDeallocationInTx): every
+      // non-PENDING shipment on the order. Honours the `not` predicate, so a PENDING shipment
+      // really does pass and a PICKING/PACKED/SHIPPED one really does block.
+      findMany: async ({ where }: { where: { orderId: string; status?: { not?: string } } }) => shipments
+        .filter((shipment) => shipment.orderId === where.orderId)
+        .filter((shipment) => where.status?.not == null || (shipment.status ?? 'PENDING') !== where.status.not)
+        .map((shipment) => ({ id: shipment.id, status: shipment.status ?? 'PENDING' })),
       findFirst: async ({ where }: { where: { orderId: string; shipmentJournalDate?: { not: null }; status?: string; OR?: Array<{ shipmentJournalDate?: { not: null }; status?: string }> } }) => {
         const rows = shipments.filter((shipment) => shipment.orderId === where.orderId)
         const matchesClause = (clause: { shipmentJournalDate?: { not: null }; status?: string }, shipment: ShipmentRow) => {
@@ -1785,7 +1809,7 @@ function partiallyDispatchedScope(options: {
    * PICKING/PACKED are committed demand whose reservation is still LIVE, which is a different
    * fixture entirely even though `dispatchedQty` is the knob for both.
    */
-  shipmentStatus?: 'SHIPPED' | 'PICKING' | 'PACKED'
+  shipmentStatus?: 'SHIPPED' | 'PICKING' | 'PACKED' | 'PENDING'
 }): MemoryState {
   const product = {
     id: 'product-1',
@@ -1925,6 +1949,126 @@ test('o3d-4kfh: releasing a FULLY dispatched allocation releases nothing and can
   assert.equal(state.stockLevels[0].reservedQty, 2, 'order B keeps its reservation')
   assert.equal(ownAllocation(state), undefined, 'and order-1\'s rows are deleted')
   assert.equal(otherOrderReservation(state), 2)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh — user deallocation vs teardown release
+//
+// The test directly above asserts that the TEARDOWN helper deletes a fully dispatched row, and that
+// expectation is still correct for what that helper is now for: `deleteSalesOrder` (the order row,
+// its lines and — by cascade — its shipments are all about to be destroyed, so there is no
+// surviving entity for the allocation to be evidence FOR) and the cancellation shape, which deletes
+// the PENDING/PICKING/PACKED shipments in the same transaction and refuses outright if anything has
+// dispatched. What was wrong was that USER deallocation reached the same helper on a LIVE order.
+// ---------------------------------------------------------------------------
+
+/** The order under test, with an allocation row carrying the identity + cost snapshot Group B uses. */
+function deallocationScope(options: {
+  allocatedQty: number
+  committedQty: number
+  shipmentStatus: 'PENDING' | 'PICKING' | 'PACKED' | 'SHIPPED'
+  reservedQty: number
+}): MemoryState {
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: options.allocatedQty,
+    // The fixture's knob for "there is a shipment of this size"; its STATUS decides whether it has
+    // dispatched. Only SHIPPED has released reservation.
+    dispatchedQty: options.committedQty,
+    otherOrderQty: 3,
+    quantity: 20,
+    reservedQty: options.reservedQty,
+    shipmentStatus: options.shipmentStatus,
+  })
+  const own = (state.allocations ?? []).find((row) => row.orderId === 'order-1')!
+  own.id = 'alloc-a'
+  own.costLayerSnapshot = [{ costLayerId: 'layer-1', qty: options.committedQty, unitCost: 4 }]
+  return state
+}
+
+test('o3d-4kfh: user deallocation is ALLOWED while the only shipment is still PENDING', async () => {
+  // A PENDING shipment is a draft the warehouse has not acted on — confirmSalesOrderShipments
+  // rewrites it freely and cancellation deletes it. It is not a commitment, so it must not block
+  // the ordinary "I allocated the wrong thing, undo it" flow.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PENDING', reservedQty: 13,
+  })
+
+  const released = await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(released.allocations.length, 1)
+  assert.equal(ownAllocation(state), undefined, 'the order\'s rows are released and deleted')
+  assert.equal(state.stockLevels[0].reservedQty, 3, 'its whole 10 went back, leaving order B\'s 3')
+})
+
+test('o3d-4kfh: user deallocation is REFUSED while a PICKING shipment exists', async () => {
+  // The reservation would go back while the shipment stayed dispatchable, and dispatch checks only
+  // the shared per-(product, warehouse) reservedQty — so it would either fail outright or take its
+  // units out of order B's 3.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 5, shipmentStatus: 'PICKING', reservedQty: 13,
+  })
+
+  await assert.rejects(
+    () => releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1'),
+    /Cannot deallocate this order while it has committed shipments \(1 picking\)/,
+  )
+  assert.equal(ownAllocation(state), 10, 'the allocation row survives intact')
+  assert.equal(state.stockLevels[0].reservedQty, 13, 'and no reservation was given back')
+})
+
+test('o3d-4kfh: user deallocation is REFUSED while a PACKED shipment exists', async () => {
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 5, shipmentStatus: 'PACKED', reservedQty: 13,
+  })
+
+  await assert.rejects(
+    () => releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1'),
+    /Cannot deallocate this order while it has committed shipments \(1 packed\)/,
+  )
+  assert.equal(ownAllocation(state), 10)
+  assert.equal(state.stockLevels[0].reservedQty, 13)
+})
+
+test('o3d-4kfh: user deallocation is REFUSED on a PARTIALLY dispatched order', async () => {
+  // 10 allocated, 5 already shipped, 5 still live. The teardown helper would have released the
+  // residual 5 correctly — and then deleted the row that is the only record of the 5 that shipped.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 5, shipmentStatus: 'SHIPPED', reservedQty: 8,
+  })
+
+  await assert.rejects(
+    () => releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1'),
+    /Cannot deallocate this order while it has committed shipments \(1 shipped\)/,
+  )
+  assert.equal(ownAllocation(state), 10, 'the retained row — 5 live + 5 dispatched — is intact')
+  assert.equal(state.stockLevels[0].reservedQty, 8)
+})
+
+test('o3d-4kfh: the refusal preserves the allocation IDENTITY and cost snapshot Group B resolves through', async () => {
+  // The accounting reason, distinct from the stock reason. The Group B shipment journal and the
+  // refund cost reversal both resolve a cost-layer entry back to its allocation through
+  // `orderAllocationId`, and the pinned layers live in `costLayerSnapshot` on that same row. A
+  // SHIPPED-but-UNJOURNALED shipment passes resetAllocationAccountingIfStaged (it only refuses on
+  // shipmentJournalDate), so deallocation used to delete both — silently, and by exactly the route
+  // updateAllocation now refuses to take one row at a time.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'SHIPPED', reservedQty: 3,
+  })
+  state.shipments![0].shipmentJournalDate = null
+
+  await assert.rejects(
+    () => releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1'),
+    /Cannot deallocate this order/,
+  )
+
+  const own = (state.allocations ?? []).find((row) => row.orderId === 'order-1')
+  assert.equal(own?.id, 'alloc-a', 'the allocation identity survives')
+  assert.deepEqual(
+    own?.costLayerSnapshot,
+    [{ costLayerId: 'layer-1', qty: 10, unitCost: 4 }],
+    'and so does the pinned cost snapshot the reversal reads',
+  )
 })
 
 test('o3d-4kfh: a release bigger than the whole aggregate FAILS CLOSED instead of zeroing the scope', async () => {

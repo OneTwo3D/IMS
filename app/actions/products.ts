@@ -27,6 +27,11 @@ import { productSchema } from '@/lib/products/product-schema'
 import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
+  RESERVATION_RELEASING_SHIPMENT_STATUS,
+  residualAllocationQty,
+  sumDispatchedQtyByAllocationScope,
+} from '@/lib/domain/inventory/reservation-residual'
+import {
   cleanProductCategoryName,
   listProductCategoryNodes,
   PRODUCT_CATEGORY_NAME_MAX_LENGTH,
@@ -1873,6 +1878,9 @@ export async function getAllocationDetails(productId: string, warehouseId: strin
         },
       },
       select: {
+        // o3d-4kfh: lineId is half the grain a dispatch is attributed at — a shipment line carries
+        // (lineId, productId) and its shipment the warehouseId — so it is needed to net below.
+        lineId: true,
         qty: true,
         order: { select: { id: true, externalOrderNumber: true, status: true } },
       },
@@ -1913,14 +1921,48 @@ export async function getAllocationDetails(productId: string, warehouseId: strin
     }),
   ])
 
+  // o3d-4kfh: this popup explains a stock level's RESERVED quantity, so it must report the LIVE
+  // reservation — `OrderAllocation.qty` is the order's whole claim, retained through dispatch. A
+  // partially shipped order commonly stays ALLOCATED, so a row of 10 with 5 already dispatched was
+  // reported as 10 reserved when only 5 of it still contributes to reservedQty.
+  const dispatchedByScope = sumDispatchedQtyByAllocationScope(
+    salesAllocs.length === 0
+      ? []
+      : (await db.shipmentLine.findMany({
+        where: {
+          productId,
+          lineId: { in: [...new Set(salesAllocs.map((alloc) => alloc.lineId))] },
+          shipment: { warehouseId, status: RESERVATION_RELEASING_SHIPMENT_STATUS },
+        },
+        select: {
+          lineId: true,
+          productId: true,
+          qty: true,
+          shipment: { select: { warehouseId: true } },
+        },
+      })).map((line) => ({
+        lineId: line.lineId,
+        productId: line.productId,
+        warehouseId: line.shipment.warehouseId,
+        qty: line.qty,
+      })),
+  )
+
   const results: AllocationDetail[] = []
 
   for (const alloc of salesAllocs) {
+    const liveQty = residualAllocationQty(
+      { lineId: alloc.lineId, productId, warehouseId, qty: alloc.qty },
+      dispatchedByScope,
+    ).toNumber()
+    // A fully dispatched row holds no reservation at all; listing it as a 0 would imply the
+    // reserved balance has a source it does not have.
+    if (liveQty <= 0) continue
     results.push({
       type: 'sales_order',
       id: alloc.order.id,
       reference: alloc.order.externalOrderNumber ?? alloc.order.id.slice(0, 8),
-      qty: Number(alloc.qty),
+      qty: liveQty,
       status: alloc.order.status,
     })
   }

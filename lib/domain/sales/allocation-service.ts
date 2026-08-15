@@ -16,6 +16,7 @@ import {
 import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
 import {
   RESERVATION_RELEASING_SHIPMENT_STATUS,
+  UNCOMMITTED_SHIPMENT_STATUS,
   residualAllocationRows,
   residualAllocationRowsForOrder,
 } from '@/lib/domain/inventory/reservation-residual'
@@ -352,11 +353,24 @@ export type ReleasedOrderAllocation = {
 }
 
 /**
- * Release every allocation on an order and give the reserved quantities back, inside a
+ * TEARDOWN release: give the reserved quantities back and DESTROY every allocation row, inside a
  * caller-supplied transaction. Extracted from deallocateOrder (o3d-5r8) so deleteSalesOrder
  * can run the guard checks, the release and the delete under ONE order-row lock — checking
  * deletability in one transaction and deleting in another reopens exactly the window a
  * posting worker needs to claim the order out from under the deleter.
+ *
+ * o3d-4kfh — THIS FUNCTION IS FOR PATHS WHERE THE ORDER ITSELF IS GOING AWAY (hard delete, and the
+ * cancellation shape that deletes the shipments alongside it). It deletes the rows unconditionally,
+ * so it destroys two things a surviving order still needs:
+ *
+ *   - the row a committed (PICKING/PACKED) shipment was picked from. The reservation goes back but
+ *     the shipment stays dispatchable, and dispatch checks only the shared per-(product, warehouse)
+ *     `reservedQty` — so it either fails or spends another order's reservation.
+ *   - the allocation IDENTITY and its `costLayerSnapshot`, which the Group B shipment journal and
+ *     the refund cost reversal resolve through `orderAllocationId`.
+ *
+ * User-initiated deallocation on a LIVE order must therefore go through
+ * {@link releaseOrderAllocationsForDeallocationInTx}, which refuses instead.
  *
  * The caller MUST already hold the order's row lock (lockSalesOrder).
  *
@@ -414,6 +428,60 @@ export async function releaseOrderAllocationsInTx(
   await tx.orderAllocation.deleteMany({ where: { orderId } })
 
   return { allocations, clampedReservationCount: clampedReservations.count }
+}
+
+/**
+ * USER deallocation: the same release, but REFUSED while the order holds any committed shipment
+ * (o3d-4kfh).
+ *
+ * "Deallocate" is offered in the SO detail UI whenever allocations exist, and it used to run the
+ * teardown release above on any order at all. On a PICKING or PACKED shipment that released the
+ * live reservation while leaving the shipment dispatchable; on a SHIPPED-but-unjournaled one it
+ * deleted the allocation identity and cost snapshot the Group B journal and the refund reversal
+ * resolve through `orderAllocationId` — the very thing the manual-edit guard in `updateAllocation`
+ * refuses to do one row at a time.
+ *
+ * The bounded fix is to refuse, not to invent cancellation semantics for a committed shipment.
+ * A PENDING shipment is not a commitment and never blocks, so the ordinary case is unaffected.
+ *
+ * BUT NOTE WHAT THE OPERATOR IS ACTUALLY LEFT WITH, because it is narrower than it looks:
+ * IMS has NO per-shipment cancel or rollback at all. `SHIPMENT_TRANSITIONS` is forward-only
+ * (PENDING -> PICKING -> PACKED -> SHIPPED) and no action deletes a non-PENDING shipment. So the
+ * only two ways out of this refusal are to DISPATCH the shipment, or to cancel the WHOLE order —
+ * `cancelSalesOrderFulfillmentState` deletes the PENDING/PICKING/PACKED shipments in the same
+ * transaction as the release, which is exactly the atomicity this path lacks. The refusal message
+ * must therefore not tell the operator to "cancel the shipment": that button does not exist.
+ * Filling that gap (o3d-tv1q) is a product decision, not part of this fix.
+ *
+ * The caller MUST already hold the order's row lock (lockSalesOrder).
+ */
+export async function releaseOrderAllocationsForDeallocationInTx(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<{ allocations: ReleasedOrderAllocation[]; clampedReservationCount: number }> {
+  const committedShipments = await tx.shipment.findMany({
+    where: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } },
+    select: { id: true, status: true },
+  })
+  if (committedShipments.length > 0) {
+    const byStatus = new Map<string, number>()
+    for (const shipment of committedShipments) {
+      const status = String(shipment.status)
+      byStatus.set(status, (byStatus.get(status) ?? 0) + 1)
+    }
+    const summary = [...byStatus.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([status, count]) => `${count} ${status.toLowerCase()}`)
+      .join(', ')
+    throw new Error(
+      `Cannot deallocate this order while it has committed shipments (${summary}). `
+      + 'A picked or packed shipment is stock the warehouse is already holding against this order, and a '
+      + 'shipped one is the cost evidence the accounting sub-ledger reverses through its allocation row — '
+      + 'releasing either would leave the shipment dispatchable against another order\'s reservation. '
+      + 'Dispatch those shipments, or cancel the whole order.',
+    )
+  }
+  return releaseOrderAllocationsInTx(tx, orderId)
 }
 
 export async function updateSalesOrderStatusUnderLock(

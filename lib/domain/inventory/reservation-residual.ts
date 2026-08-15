@@ -42,6 +42,20 @@ import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
  */
 export const RESERVATION_RELEASING_SHIPMENT_STATUS = 'SHIPPED'
 
+/**
+ * The only shipment status that has committed NOTHING.
+ *
+ * A PENDING shipment is a draft the warehouse has not acted on — `confirmSalesOrderShipments`
+ * rewrites it freely and `cancelSalesOrderFulfillmentState` deletes it. Everything else
+ * (PICKING, PACKED, SHIPPED) is a COMMITMENT: stock is being physically handled against it, the
+ * allocation row is required to cover it (see the contract in `allocateSalesOrder`), and the
+ * accounting sub-ledger resolves through the allocation row it was picked from.
+ *
+ * `qty − non-PENDING` is therefore the OPEN (still-to-ship) reading, and the floor below which an
+ * allocation row must never be edited or moved.
+ */
+export const UNCOMMITTED_SHIPMENT_STATUS = 'PENDING'
+
 /** Identity of an allocation row — the grain both `OrderAllocation` and `ShipmentLine` share. */
 export type AllocationScope = {
   lineId: string
@@ -131,6 +145,49 @@ export async function loadDispatchedAllocationLines(
     lineId: line.lineId,
     productId: line.productId,
     warehouseId: line.shipment.warehouseId,
+    qty: line.qty,
+  }))
+}
+
+/** A committed shipment line at allocation-row grain, carrying the status that classifies it. */
+export type CommittedAllocationLine = AllocationQtyRow & { status: string }
+
+/**
+ * The DISPATCHED subset of a committed set — the strict subset that has actually given reservation
+ * back. Kept here so no caller re-derives "which statuses released stock" for itself.
+ */
+export function dispatchedAllocationLines<T extends { status: string }>(lines: T[]): T[] {
+  return lines.filter((line) => line.status === RESERVATION_RELEASING_SHIPMENT_STATUS)
+}
+
+/**
+ * Load this order's COMMITTED (non-PENDING) shipment lines at allocation-row grain, each tagged
+ * with its shipment status.
+ *
+ * One query serves both readings: pass the result straight through for the open/committed view, or
+ * through {@link dispatchedAllocationLines} for the live-reservation view. Callers that need both —
+ * `updateAllocation` guards on committed quantity but moves reservation by dispatched quantity —
+ * MUST derive them from the same snapshot, or the guard and the delta can disagree about the same
+ * shipment.
+ */
+export async function loadCommittedAllocationLines(
+  client: DispatchedLineLoaderClient,
+  orderId: string,
+): Promise<CommittedAllocationLine[]> {
+  const lines = await client.shipmentLine.findMany({
+    where: { shipment: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } } },
+    select: {
+      lineId: true,
+      productId: true,
+      qty: true,
+      shipment: { select: { warehouseId: true, status: true } },
+    },
+  })
+  return lines.map((line) => ({
+    lineId: line.lineId,
+    productId: line.productId,
+    warehouseId: line.shipment.warehouseId,
+    status: line.shipment.status as string,
     qty: line.qty,
   }))
 }

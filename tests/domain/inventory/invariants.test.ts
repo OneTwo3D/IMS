@@ -1351,6 +1351,40 @@ test('inventory SQL collector keeps partially refunded orders eligible for shipp
   assert.doesNotMatch(sql, /PARTIALLY_REFUNDED/)
 })
 
+test('o3d-4kfh: the reservation census credits COMMITTED reservations on zero-demand orders', async () => {
+  // The SQL twin of the reservation-breakdown tests. A CANCELLED / fully-refunded order still holds
+  // its PICKING/PACKED commitment on reservedQty (allocation retains the committed set; only
+  // dispatch decrements the stock level), so omitting those rows made knownReservedQty short by
+  // exactly that amount and reported a correctly-held reservation as a CRITICAL mismatch.
+  //
+  // Asserted on the generated SQL because this branch has no in-process evaluator to exercise — the
+  // arithmetic is done by Postgres. Its behaviour is covered by the identical TS implementation in
+  // reservation-breakdown.test.ts, and the query is executed against a real database by the
+  // invariant report itself.
+  let capturedQuery: unknown
+  const client: InventoryInvariantSqlClient = {
+    async $queryRaw<T = unknown>(query: unknown) {
+      capturedQuery = query
+      return [] as T
+    },
+  }
+
+  await collectSqlInventoryInvariantFindingsPage(client, { limit: 10 })
+  const sql = String((capturedQuery as { sql?: string }).sql ?? '')
+
+  // ONE shipment-line CTE, split into the two readings the contract defines.
+  assert.match(sql, /WHERE s\.status::text <> 'PENDING'/)
+  assert.match(sql, /SUM\(sl\.qty\) FILTER \(WHERE s\.status::text = \?\)/)
+  // The active branch still nets DISPATCHED only — a PICKING/PACKED shipment has released nothing.
+  assert.match(sql, /SUM\(GREATEST\(oa\.qty - COALESCE\(csl\."dispatchedQty", 0\), 0\)\)/)
+  // And the zero-demand branch credits the still-committed portion, bounded by the residual.
+  assert.match(sql, /\(so\.status = 'CANCELLED' OR so\."refundStatus" = 'FULL'\)/)
+  assert.match(
+    sql,
+    /LEAST\(\s*GREATEST\(oa\.qty - COALESCE\(csl\."dispatchedQty", 0\), 0\),\s*GREATEST\(COALESCE\(csl\."committedQty", 0\) - COALESCE\(csl\."dispatchedQty", 0\), 0\)\s*\)/,
+  )
+})
+
 function findingKey(finding: InventoryInvariantFinding): string {
   return [
     finding.severity,

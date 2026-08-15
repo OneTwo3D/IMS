@@ -1143,24 +1143,28 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ${stockProductFilter}
         ${stockWarehouseFilter}
     ),
-    -- Dispatched quantity per allocation row. o3d-4kfh: the filter is the SHARED
-    -- RESERVATION_RELEASING_SHIPMENT_STATUS, not "any non-PENDING shipment". reservedQty is
-    -- decremented ONLY on the transition to SHIPPED, so netting a PICKING/PACKED shipment out of
-    -- knownReservedQty invented a stock_reserved_source_mismatch for every order sitting in the
-    -- pick/pack window, and — now that the release paths share this definition — would have made
-    -- them under-release and strand reservation on the stock level.
-    active_shipment_lines AS (
+    -- Shipment quantity per allocation row, in BOTH readings the contract defines (o3d-4kfh):
+    --   "dispatchedQty" — the SHARED RESERVATION_RELEASING_SHIPMENT_STATUS, i.e. what has actually
+    --     given reservation back. reservedQty is decremented ONLY on the transition to SHIPPED, so
+    --     netting a PICKING/PACKED shipment out of knownReservedQty invented a
+    --     stock_reserved_source_mismatch for every order sitting in the pick/pack window, and — now
+    --     that the release paths share this definition — would have made them under-release and
+    --     strand reservation on the stock level.
+    --   "committedQty" — every non-PENDING line, i.e. what the warehouse is holding against this
+    --     order. Used only by the zero-demand branch below.
+    -- Deliberately NOT filtered by order status: the zero-demand branch needs the committed lines
+    -- of exactly the orders the active branch excludes, and (lineId, productId, warehouseId) never
+    -- spans two orders, so nothing can be miscredited.
+    committed_shipment_lines AS (
       SELECT
         sl."lineId",
         sl."productId",
         s."warehouseId",
-        SUM(sl.qty) AS qty
+        SUM(sl.qty) AS "committedQty",
+        COALESCE(SUM(sl.qty) FILTER (WHERE s.status::text = ${RESERVATION_RELEASING_SHIPMENT_STATUS}), 0) AS "dispatchedQty"
       FROM "shipment_lines" sl
       INNER JOIN "shipments" s ON s.id = sl."shipmentId"
-      INNER JOIN "sales_orders" so ON so.id = s."orderId"
-      WHERE s.status::text = ${RESERVATION_RELEASING_SHIPMENT_STATUS}
-        AND so.status <> 'CANCELLED'
-        AND so."refundStatus" <> 'FULL'
+      WHERE s.status::text <> 'PENDING'
         ${activeShipmentProductFilter}
         ${activeShipmentWarehouseFilter}
       GROUP BY sl."lineId", sl."productId", s."warehouseId"
@@ -1169,20 +1173,57 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       SELECT
         oa."productId",
         oa."warehouseId",
-        SUM(GREATEST(oa.qty - COALESCE(asl.qty, 0), 0)) AS qty
+        SUM(GREATEST(oa.qty - COALESCE(csl."dispatchedQty", 0), 0)) AS qty
       FROM "order_allocations" oa
       INNER JOIN "sales_orders" so ON so.id = oa."orderId"
-      LEFT JOIN active_shipment_lines asl
-        ON asl."lineId" = oa."lineId"
-       AND asl."productId" = oa."productId"
-       AND asl."warehouseId" = oa."warehouseId"
+      LEFT JOIN committed_shipment_lines csl
+        ON csl."lineId" = oa."lineId"
+       AND csl."productId" = oa."productId"
+       AND csl."warehouseId" = oa."warehouseId"
       WHERE oa.qty > 0
         AND so.status <> 'CANCELLED'
         AND so."refundStatus" <> 'FULL'
         ${allocationProductFilter}
         ${allocationWarehouseFilter}
       GROUP BY oa."productId", oa."warehouseId"
-      HAVING SUM(GREATEST(oa.qty - COALESCE(asl.qty, 0), 0)) > ${toleranceSql}
+      HAVING SUM(GREATEST(oa.qty - COALESCE(csl."dispatchedQty", 0), 0)) > ${toleranceSql}
+
+      UNION ALL
+
+      -- o3d-4kfh: ZERO-DEMAND ORDERS STILL HOLD THEIR COMMITTED RESERVATION.
+      --
+      -- A CANCELLED or fully-refunded order has no outstanding demand, which is why the branch
+      -- above excludes it. But a full refund on an order that already has a PICKING or PACKED
+      -- shipment leaves the COMMITTED portion reserved on the stock level: allocation retains the
+      -- committed set (see allocateSalesOrder), and only dispatch decrements reservedQty. Omitting
+      -- it made knownReservedQty short by exactly that amount and reported a correctly-held
+      -- reservation as a critical stock_reserved_source_mismatch.
+      --
+      -- Credited for the still-committed portion ONLY — LEAST(residual, committed − dispatched).
+      -- Any stale outstanding quantity above that has no demand and no shipment behind it: that
+      -- part IS a leak, and it must keep showing up as a mismatch.
+      SELECT
+        oa."productId",
+        oa."warehouseId",
+        SUM(LEAST(
+          GREATEST(oa.qty - COALESCE(csl."dispatchedQty", 0), 0),
+          GREATEST(COALESCE(csl."committedQty", 0) - COALESCE(csl."dispatchedQty", 0), 0)
+        )) AS qty
+      FROM "order_allocations" oa
+      INNER JOIN "sales_orders" so ON so.id = oa."orderId"
+      LEFT JOIN committed_shipment_lines csl
+        ON csl."lineId" = oa."lineId"
+       AND csl."productId" = oa."productId"
+       AND csl."warehouseId" = oa."warehouseId"
+      WHERE oa.qty > 0
+        AND (so.status = 'CANCELLED' OR so."refundStatus" = 'FULL')
+        ${allocationProductFilter}
+        ${allocationWarehouseFilter}
+      GROUP BY oa."productId", oa."warehouseId"
+      HAVING SUM(LEAST(
+        GREATEST(oa.qty - COALESCE(csl."dispatchedQty", 0), 0),
+        GREATEST(COALESCE(csl."committedQty", 0) - COALESCE(csl."dispatchedQty", 0), 0)
+      )) > ${toleranceSql}
 
       UNION ALL
 
