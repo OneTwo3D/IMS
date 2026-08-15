@@ -35,8 +35,8 @@ import { getCrossConnectorOrphanSummary, getFailedAccountingSyncSummary } from '
 import { getStrandedAccountingSyncRows } from '@/app/actions/accounting-stranded-rows'
 import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sync-rows'
 import { shouldRedirectFromSyncPage } from '@/lib/domain/accounting/stranded-sync-visibility'
-import { getSession } from '@/lib/auth/server'
-import { hasPermission } from '@/lib/permissions'
+import { requirePermission } from '@/lib/auth/server'
+import { isAuthorizationDenial } from '@/lib/auth/session-gates'
 import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-status'
 import { SyncDashboard } from './sync-dashboard'
 import { ConnectorOrphanBanner } from './connector-orphan-banner'
@@ -59,6 +59,22 @@ function isFrameworkControlFlow(error: unknown): boolean {
 }
 
 /**
+ * Errors this page must NEVER absorb into a degraded panel.
+ *
+ * Two categories, for the same reason: neither is a dependency outage.
+ *   * framework control flow — a redirect() is the answer, not an error to report;
+ *   * an authorization denial — the reader was never entitled to this. Rendering that as
+ *     "temporarily unavailable" hands a role without the permission a partially populated
+ *     Integrations page (banners, accounting state, controls) and tells it to reload. The page
+ *     gate below should already have stopped such a reader, so a denial reaching here means a
+ *     read demands MORE than the page does; the honest response is to fail the whole page, which
+ *     is exactly what the pre-panelisation Promise.all did.
+ */
+function isFatal(error: unknown): boolean {
+  return isFrameworkControlFlow(error) || isAuthorizationDenial(error)
+}
+
+/**
  * One independent panel's read.
  *
  * This page aggregates a dozen unrelated panels, and an `await` that rejects anywhere in a server
@@ -70,19 +86,38 @@ function isFrameworkControlFlow(error: unknown): boolean {
  * declared-unavailable panel instead of taking the page down.
  *
  * `null` is "this panel is unavailable", which every consumer already distinguishes from empty.
- * Framework control flow is rethrown, never absorbed: an auth redirect must still redirect.
+ * Framework control flow and authorization denials are rethrown, never absorbed: an auth redirect
+ * must still redirect, and "you may not see this" must not read as "this is temporarily down".
  */
 async function panel<T>(label: string, read: () => Promise<T>): Promise<T | null> {
   try {
     return await read()
   } catch (error) {
-    if (isFrameworkControlFlow(error)) throw error
+    if (isFatal(error)) throw error
     console.error(`[sync] the ${label} panel failed to load`, error)
     return null
   }
 }
 
 export default async function SyncPage() {
+  /**
+   * THE PAGE BOUNDARY. `sync` is what this page is, and it is enforced here — before any
+   * dashboard read, any banner read and any plugin-state read — rather than being left to the
+   * individual actions.
+   *
+   * Why it has to be here and not only in the reads: the page renders a dozen independently
+   * degradable panels, so a role that merely fails every read still gets an Integrations page
+   * back, and a read whose own gate is weaker than `sync` (several require only authentication)
+   * would populate it. The sidebar already shows this page only to `sync` holders
+   * (components/layout/sidebar.tsx) and every mutating control on it requires `sync`; the page
+   * itself was the one entrance that checked only authentication.
+   *
+   * requirePermission, not a redirect: an unentitled reader gets the same failure the analytics
+   * pages give (requireRole), not a tour of where else to look. requireAuth inside it still
+   * redirects an unauthenticated / unverified-2FA / invalidated session to the right challenge.
+   */
+  await requirePermission('sync')
+
   const pluginState = await getIntegrationPluginState()
   // Resolve the active WMS connector from this single plugin-state read and pass
   // it to getWmsSyncDashboardData so the facade doesn't read plugin state again.
@@ -99,31 +134,29 @@ export default async function SyncPage() {
   // returns an unscoped predicate) — and redirecting first made this page, the only one that can
   // show them, unreachable in exactly that state.
   //
-  // Gated on `sync` HERE as well as inside the action. The loader returns per-row detail (ids,
-  // referenced entities, external transaction ids, raw connector error text), so a role without
-  // `sync` must not merely fail to render it — it must never cause the read, and must redirect
-  // exactly as it did before. Checking the role first also keeps the page off the action's throw
-  // path, so an unauthorised role is a section that is absent, not one that silently failed.
-  const session = await getSession()
-  const canSeeStrandedRows = !!session && hasPermission(session.user.role, 'sync')
+  // The loader returns per-row detail (ids, referenced entities, external transaction ids, raw
+  // connector error text) and requires `sync`, which the page boundary above has already
+  // established — a reader without it never reaches this line, so the read still cannot happen
+  // for an unentitled role. The action re-checks anyway; this is not the only gate.
   let stranded: StrandedSyncRowsResult | null = null
   // A FAILED read is its own state, not an empty one. Collapsing it to [] silently demoted the
   // banner to count-only — or, when only inactive FAILED rows exist, removed it altogether,
   // recreating the precise blind spot this feature closes.
   let strandedLoadFailed = false
-  if (canSeeStrandedRows) {
-    try {
-      stranded = await getStrandedAccountingSyncRows(50)
-    } catch (error) {
-      if (isFrameworkControlFlow(error)) throw error
-      strandedLoadFailed = true
-      console.error('[sync] failed to load stranded accounting sync rows', error)
-    }
+  try {
+    stranded = await getStrandedAccountingSyncRows(50)
+  } catch (error) {
+    // A denial from the action means its gate is stricter than the page's; that is a bug to
+    // surface, not a row list to quietly report as unavailable.
+    if (isFatal(error)) throw error
+    strandedLoadFailed = true
+    console.error('[sync] failed to load stranded accounting sync rows', error)
   }
 
   if (shouldRedirectFromSyncPage({
     anyIntegrationPluginEnabled,
-    hasSyncPermission: canSeeStrandedRows,
+    // Invariant, not a shortcut: requirePermission('sync') above is the only way to get here.
+    hasSyncPermission: true,
     strandedRowsExist: (stranded?.rows.length ?? 0) > 0,
     strandedRowsUnknown: strandedLoadFailed,
   })) {
@@ -175,8 +208,13 @@ export default async function SyncPage() {
   // settles before anything is decided, and control flow wins over any number of ordinary errors.
   const settledDashboardReads = await Promise.allSettled(dashboardReads)
   const dashboardRejections = settledDashboardReads.filter((r) => r.status === 'rejected')
+  // Control flow first (a redirect is the most specific answer available), then denials. Both are
+  // decided across ALL rejections, before any panel decision: a single denial among twenty-two
+  // reads must take the page down rather than be outvoted into "this panel is unavailable".
   const dashboardControlFlow = dashboardRejections.find((r) => isFrameworkControlFlow(r.reason))
   if (dashboardControlFlow) throw dashboardControlFlow.reason
+  const dashboardDenial = dashboardRejections.find((r) => isAuthorizationDenial(r.reason))
+  if (dashboardDenial) throw dashboardDenial.reason
   for (const rejection of dashboardRejections) {
     // No per-read label: the rejection's own stack names the action, and a parallel label array
     // would silently misattribute the moment a read is inserted.

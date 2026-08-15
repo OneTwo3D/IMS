@@ -12,13 +12,19 @@ import {
   requireApiFreshAdminSession,
   requireFreshAuthSession,
   requireRoleSession,
+  PermissionDeniedError,
   type AuthSession,
 } from '@/lib/auth/session-gates'
 import { loginPathForSessionInvalidReason } from '@/lib/auth/session-state'
 
 export type { Permission }
 export type { AuthSession } from '@/lib/auth/session-gates'
-export { FreshAuthRequiredError, freshAuthFailureResult } from '@/lib/auth/session-gates'
+export {
+  FreshAuthRequiredError,
+  freshAuthFailureResult,
+  PermissionDeniedError,
+  isAuthorizationDenial,
+} from '@/lib/auth/session-gates'
 
 /**
  * Returns the current session or redirects to /login.
@@ -82,7 +88,9 @@ export async function requireFreshAdmin(): Promise<AuthSession> {
 export async function requirePermission(permission: Permission): Promise<AuthSession> {
   const session = await requireAuth()
   if (!hasPermission(session.user.role, permission)) {
-    throw new Error(`Forbidden: missing permission ${permission}`)
+    // Typed, not a bare Error: callers that aggregate several reads must be able to tell a denial
+    // from an unavailable dependency without matching on this message. See isAuthorizationDenial.
+    throw new PermissionDeniedError(`Forbidden: missing permission ${permission}`, permission)
   }
   return session
 }
@@ -92,7 +100,7 @@ export async function requireFreshPermission(
 ): Promise<AuthSession> {
   const session = await requireAuth()
   if (!hasPermission(session.user.role, permission)) {
-    throw new Error(`Forbidden: missing permission ${permission}`)
+    throw new PermissionDeniedError(`Forbidden: missing permission ${permission}`, permission)
   }
   return requireFreshAuthSession(session)
 }
