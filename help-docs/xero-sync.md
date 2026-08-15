@@ -606,6 +606,8 @@ These rows still block their sales order from being deleted. To clear one, eithe
 
 If the list itself cannot be loaded, the banner says so in red — "The list of stranded sync rows could not be loaded" — rather than showing nothing. An empty banner section always means there is nothing stranded; it never means the lookup failed.
 
+The banner does not depend on the rest of the page loading. If the integration settings and sync history below it cannot be read, they are replaced by a notice saying so and the banners above still render. This matters because the usual reason the stranded list fails — the database being unreachable — is the same reason those panels fail, and that is precisely when you need the banner. As with the banner, an unavailable panel says so: it is never rendered as "nothing is configured" or "nothing has synced".
+
 The list requires the **sync** permission (Admin and Manager). Roles without it do not see this section.
 
 **Turning every integration off does not hide these rows.** Integrations normally redirects to the plugin settings when no connector is enabled, but if you hold **sync** and unresolved accounting rows exist, the page still opens and shows this banner — switching the last accounting connector off is precisely what strands every unresolved row, so that is the state where the list matters most.

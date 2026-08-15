@@ -6,12 +6,15 @@ import type { ConnectorOrphanSummary } from './connector-orphans'
  *
  * WHY THIS MODULE EXISTS. The stranded-row list lives on the Integrations page, and the two
  * decisions that determine whether an operator ever sees it were previously expressed only
- * inside `app/(dashboard)/sync/page.tsx` and `connector-orphan-banner.tsx`. This repo has no
- * React render harness (there is not a single .tsx file under tests/), so logic living in a
- * component is logic that no test can reach: the wiring could be reverted wholesale and every
- * test would stay green. Both decisions are therefore extracted here and unit-tested the way
- * connector-orphans.ts and stranded-sync-rows.ts are, with the components kept as thin wrappers
- * that render what these functions return.
+ * inside `app/(dashboard)/sync/page.tsx` and `connector-orphan-banner.tsx` — as conditions
+ * reachable one page-state at a time. Extracted here they are enumerable: every input
+ * combination is covered directly and cheaply, the way connector-orphans.ts and
+ * stranded-sync-rows.ts are, with the components kept as thin wrappers that render what these
+ * functions return.
+ *
+ * This is NOT because a component is untestable — tests/accounting/stranded-sync-page.test.ts
+ * awaits the server component and renders the result, so the wiring itself is covered as
+ * behaviour. The split is about which layer covers WHICH combinations exhaustively.
  */
 
 // ---------------------------------------------------------------------------

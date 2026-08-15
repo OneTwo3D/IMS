@@ -66,8 +66,8 @@ export function ConnectorOrphanBanner({
    */
   const [notice, setNotice] = useState<string | null>(null)
 
-  // Every "is there anything to show" decision is the pure resolver's, so it can be tested —
-  // this repo has no React render harness, and logic left in here is logic nothing can reach.
+  // Every "is there anything to show" decision is the pure resolver's, so all of them can be
+  // enumerated in one place rather than reached one page-state at a time.
   // The server summary is the source of truth: router.refresh() re-fetches it after a cancel, so
   // the banner hides (or shows the remainder) on its own.
   const strandedRows = stranded?.rows ?? []

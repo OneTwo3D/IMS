@@ -10,10 +10,14 @@ import {
 // o3d-osl8 item 1 — the VISIBILITY rules, tested as pure functions.
 //
 // These decisions used to live inside app/(dashboard)/sync/page.tsx and connector-orphan-banner
-// .tsx. This repo has no React render harness (no .tsx under tests/, no render library), so the
-// whole wiring could be reverted with every test still green — nothing protected
-// permission-before-fetch, the nullable-summary matrix, visibility after a failed read, or the
-// truncation message. Extracting them here is what makes them testable at all.
+// .tsx, where each combination could only be reached by constructing a whole page state. Pulled
+// out, the full matrix is enumerable here in a few lines: the permission/plugin/rows/unknown
+// grid, the nullable-summary cases, visibility after a failed read, and the truncation message.
+//
+// The WIRING — that the page calls these with the real inputs and renders what they return — is
+// covered as behaviour in tests/accounting/stranded-sync-page.test.ts, which awaits the server
+// component and renders its output. These two files cover different things; neither implies the
+// other.
 
 // ---------------------------------------------------------------------------
 // shouldRedirectFromSyncPage
