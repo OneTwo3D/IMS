@@ -88,6 +88,57 @@ export function isAdmin(role: string): boolean {
 }
 
 /**
+ * ROLES, in the order the matrix above declares them. Exported so an exhaustiveness test cannot
+ * be satisfied by a hand-maintained list that silently misses a newly added role.
+ */
+export const ROLES = Object.keys(ROLE_PERMISSIONS) as Role[]
+
+/**
+ * Where a role can actually LAND — the destination a "you may not see this page" screen is allowed
+ * to offer it.
+ *
+ * o3d-osl8 round 5, finding 4. The Integrations denial screen offered `/dashboard` on the claim
+ * that "every authenticated role can reach it". SUPPLIER cannot: it does not hold `dashboard`, so
+ * /dashboard's own read (getDashboardData → requirePermission('dashboard')) throws a typed denial
+ * and drops the reader into the generic error boundary — the exact dead end that screen was
+ * introduced to remove, reached one click later.
+ *
+ * A route NAME proves nothing about reachability, so each destination carries the gate it actually
+ * has to pass, and the gate is checked against this same matrix (and, in tests, against the target
+ * file's own source). Two shapes because the two destinations are gated differently and pretending
+ * otherwise is how the original claim went wrong:
+ *   • `permission` — the destination's read calls requirePermission(p);
+ *   • `role`       — the destination gates on the ROLE itself (the supplier portal redirects any
+ *                    non-SUPPLIER session away, so holding a permission is not sufficient there).
+ *
+ * The `/help` fallback is not decorative: it is the only destination in the product that every
+ * declared role holds, so it is what an unknown or future role gets rather than a link that
+ * type-checks and then fails at runtime.
+ */
+export type RoleLanding = {
+  href: string
+  label: string
+  gate: { kind: 'permission'; permission: Permission } | { kind: 'role'; role: Role }
+}
+
+export function landingForRole(role: string | null | undefined): RoleLanding {
+  if (role === 'SUPPLIER') {
+    return { href: '/supplier/rfqs', label: 'Go to your RFQs', gate: { kind: 'role', role: 'SUPPLIER' } }
+  }
+  if (role && hasPermission(role, 'dashboard')) {
+    return { href: '/dashboard', label: 'Back to dashboard', gate: { kind: 'permission', permission: 'dashboard' } }
+  }
+  return { href: '/help', label: 'Go to Help', gate: { kind: 'permission', permission: 'help' } }
+}
+
+/** Whether `role` genuinely satisfies a landing's own gate. The check the original claim skipped. */
+export function landingIsReachableBy(landing: RoleLanding, role: string): boolean {
+  return landing.gate.kind === 'role'
+    ? role === landing.gate.role
+    : hasPermission(role, landing.gate.permission)
+}
+
+/**
  * Navigation items visible per role.
  */
 export type NavItem = {

@@ -102,6 +102,12 @@ export const state = {
   cancel: {
     calls: [] as unknown[][],
     result: { success: true } as { success: boolean; cancelled?: number; error?: string; inFlightNotCancelled?: number },
+    /**
+     * Make the action REJECT instead of returning. The production action's permission gate and its
+     * concurrency fence both throw rather than returning `{ success: false }` (round 5, finding 3),
+     * and a fake that can only resolve cannot show what the banner does with that.
+     */
+    rejectWith: null as Error | null,
   },
   /** router.refresh() calls made by client components under test. */
   refreshes: 0,
@@ -114,7 +120,7 @@ export function resetSyncPageState() {
   state.calls = []
   state.redirects = []
   state.salesOrderRows = []
-  state.cancel = { calls: [], result: { success: true } }
+  state.cancel = { calls: [], result: { success: true }, rejectWith: null }
   state.refreshes = 0
 }
 
@@ -161,6 +167,13 @@ export function installSyncPageMocks(options: { realPaymentMethodCombos?: boolea
         }
         return { user: { id: 'u1', role: state.role } }
       },
+      // Read only on the denial path, to decide WHERE the access-denied screen may send this role
+      // (round 5, finding 4). Non-redirecting by contract, so it returns null rather than throwing
+      // for a session that is not there.
+      getSession: async () => {
+        state.calls.push({ name: 'getSession', args: [] })
+        return state.role ? { user: { id: 'u1', role: state.role } } : null
+      },
     },
   })
 
@@ -204,6 +217,7 @@ export function installSyncPageMocks(options: { realPaymentMethodCombos?: boolea
       // between "cancel this connector's rows" and the UNSCOPED cancel is a single argument.
       cancelOrphanedAccountingSyncRows: async (...args: unknown[]) => {
         state.cancel.calls.push(args)
+        if (state.cancel.rejectWith) throw state.cancel.rejectWith
         return state.cancel.result
       },
       retryFailedAccountingSync: async () => ({ success: true }),

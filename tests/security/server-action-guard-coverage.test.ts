@@ -19,7 +19,7 @@ const GUARD_IDENTIFIERS = new Set([
   'requirePermission', 'requireFreshPermission', 'requireApiAuth', 'requireApiAdmin',
   'requireApiFreshAdmin', 'requireSupplier', 'assertSupplierOwnsResource',
   'requireMintsoftReadAccess', 'requireMintsoftWriteAccess', 'requireFreshMintsoftWriteAccess',
-  'requireMintsoftReturnsWriteAccess', 'requireShoppingAdmin', 'requireFreshShoppingAdmin',
+  'requireMintsoftReturnsWriteAccess', 'requireSyncPermission', 'requireFreshShoppingAdmin',
   'getVerifiedSession', 'consumeDestructiveActionCode', 'validateImportFile',
 ])
 

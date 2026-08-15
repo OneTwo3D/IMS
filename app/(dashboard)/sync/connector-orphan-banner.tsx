@@ -24,6 +24,7 @@ export function ConnectorOrphanBanner({
   summary,
   stranded = null,
   strandedLoadFailed = false,
+  canCancel,
 }: {
   /**
    * NULLABLE on purpose. getCrossConnectorOrphanSummary() is fetched with .catch(() => null),
@@ -54,6 +55,20 @@ export function ConnectorOrphanBanner({
    * could not look" and "there is nothing there" are opposite messages for the operator.
    */
   strandedLoadFailed?: boolean
+  /**
+   * o3d-osl8 round 5, finding 3. Whether this reader may actually run the cancel.
+   *
+   * REQUIRED, with no default, on purpose: a default would let a new call site inherit a guess,
+   * and the guess this component made before was "everyone". `sync` is what gets a reader onto
+   * this page; cancelOrphanedAccountingSyncRows is a destructive write and requires `settings`,
+   * which MANAGER does not hold. Its gate throws a typed denial rather than returning
+   * `{ success: false }`, and that throw happens outside the action's result-returning path — so
+   * rendering the buttons for MANAGER produced a REJECTED action inside startTransition, with no
+   * error line, no notice, and nothing in the UI to say why. The controls are therefore absent for
+   * a reader who cannot use them, with the reason stated rather than left as a silent omission
+   * (the rows themselves stay listed either way — reading them is what `sync` is for).
+   */
+  canCancel: boolean
 }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
@@ -84,18 +99,30 @@ export function ConnectorOrphanBanner({
     setError(null)
     setNotice(null)
     startTransition(async () => {
-      const result = await cancelOrphanedAccountingSyncRows(connector)
-      if (result.success) {
-        const inFlight = result.inFlightNotCancelled ?? 0
-        setNotice(inFlight > 0
-          ? `${inFlight} row(s) could not be cancelled: their sync was already in flight when the `
-            + `connector was switched off, so a request may have reached it and been lost. Check that `
-            + `connector for the document(s) — these rows stay listed here, and continue to block `
-            + `deleting their orders, until they are resolved.`
-          : null)
-        router.refresh()
-      } else {
-        setError(result.error ?? 'Failed to cancel orphaned rows.')
+      // CATCH, unconditionally. Even with the controls hidden for a reader who cannot cancel, the
+      // action can still REJECT rather than return: its permission gate throws (a stale session
+      // whose role changed since this page rendered lands exactly here), the concurrency fence
+      // throws to roll the transaction back, and any transport failure of the server action
+      // rejects too. An uncaught rejection inside startTransition surfaces as a blank
+      // non-response; the banner has an error line and it must be what the reader gets.
+      try {
+        const result = await cancelOrphanedAccountingSyncRows(connector)
+        if (result.success) {
+          const inFlight = result.inFlightNotCancelled ?? 0
+          setNotice(inFlight > 0
+            ? `${inFlight} row(s) could not be cancelled: their sync was already in flight when the `
+              + `connector was switched off, so a request may have reached it and been lost. Check that `
+              + `connector for the document(s) — these rows stay listed here, and continue to block `
+              + `deleting their orders, until they are resolved.`
+            : null)
+          router.refresh()
+        } else {
+          setError(result.error ?? 'Failed to cancel orphaned rows.')
+        }
+      } catch {
+        // No message from the error itself: a server action's error reaches the client as an
+        // opaque digest in production, so echoing it would print a hex string at the operator.
+        setError('Cancelling the orphaned rows failed, and nothing was cancelled. You may no longer have permission to cancel them, or the accounting connector changed while the request was running. Reload this page and check the rows below before trying again.')
       }
     })
   }
@@ -110,24 +137,36 @@ export function ConnectorOrphanBanner({
               {summary.totalOrphans} accounting sync row(s) are queued for a connector that is no longer active
               {summary.activeConnector ? ` (active: ${connectorLabel(summary.activeConnector)})` : ' (no accounting connector is enabled)'}.
               They will not be processed while that connector is inactive. Re-enable the connector to let them resume,
-              or cancel them below to permanently discard them. (Cancelling does not stop the document itself from
-              syncing to the active connector later.)
+              {canCancel
+                ? ' or cancel them below to permanently discard them. (Cancelling does not stop the document itself from syncing to the active connector later.)'
+                : ' or ask an administrator to cancel them.'}
             </p>
           )}
           <ul className="space-y-1 text-xs">
             {(summary?.orphanGroups ?? []).map((group) => (
               <li key={group.connector} className="flex items-center gap-2">
                 <span><span className="font-medium">{connectorLabel(group.connector)}</span>: {group.count} row(s)</span>
-                <Button size="sm" variant="outline" className="h-6 text-xs" disabled={pending} onClick={() => handleCancel(group.connector)}>
-                  {pending ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Cancel these'}
-                </Button>
+                {canCancel && (
+                  <Button size="sm" variant="outline" className="h-6 text-xs" disabled={pending} onClick={() => handleCancel(group.connector)}>
+                    {pending ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Cancel these'}
+                  </Button>
+                )}
               </li>
             ))}
           </ul>
-          {(summary?.orphanGroups.length ?? 0) > 1 && (
+          {canCancel && (summary?.orphanGroups.length ?? 0) > 1 && (
             <Button size="sm" variant="outline" className="h-7 text-xs" disabled={pending} onClick={() => handleCancel()}>
               {pending ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Cancel all orphaned rows'}
             </Button>
+          )}
+          {/* Stated, not silently omitted: a missing button with no explanation reads as "there is
+              nothing to do here", which is the opposite of the truth for a reader who can SEE the
+              stranded rows below and cannot retire them. */}
+          {!canCancel && (summary?.orphanGroups.length ?? 0) > 0 && (
+            <p className="text-xs opacity-80">
+              Cancelling these rows needs the <span className="font-medium">settings</span> permission, which your role
+              does not have — ask an administrator. The rows themselves are listed below either way.
+            </p>
           )}
           {error && <p className="text-xs text-destructive">{error}</p>}
           {notice && <p className="text-xs font-medium">{notice}</p>}

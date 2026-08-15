@@ -64,7 +64,9 @@ test('an authenticated role without `sync` gets NO page at all, not a partial on
   assert.deepEqual(state.redirects, [], 'a denial is not a redirect to somewhere friendlier')
   assert.deepEqual(
     state.calls.map((c) => c.name),
-    ['requirePermission'],
+    // getSession is not a read of anything this role may not see — it is the session it already
+    // has, re-read only to decide WHERE the denial screen may send it (round 5, finding 4).
+    ['requirePermission', 'getSession'],
     'the gate runs before EVERY read — plugin state, banners and the 22 dashboard reads included',
   )
   assert.match(html, /don&#x27;t have access to Integrations/)
@@ -85,8 +87,10 @@ test('the denial is EXPLAINED, not reported as an unexpected error with dead-end
   assert.match(html, /Signing in again or reloading will not change that/, 'and says the dead ends are dead')
   assert.match(html, /ask an administrator/, 'and what would actually resolve it')
   assert.ok(!/Try Again|Go to Login/.test(html), 'neither dead-end action is offered')
-  // The one destination any authenticated role can reach — not /settings/system, which this role
-  // may not be able to act on either.
+  // WAREHOUSE holds `dashboard`, so /dashboard is genuinely reachable FOR THIS ROLE — not
+  // /settings/system, which it may not be able to act on either. The claim that this held for
+  // EVERY role was wrong and is now decided per role; every denied role's destination, SUPPLIER
+  // included, is checked in sync-access-denied-landing.test.ts.
   assert.match(html, /href="\/dashboard"/)
 })
 
@@ -102,7 +106,7 @@ test('a bookmarked /sync with every plugin disabled is refused explicitly, not r
 
   assert.deepEqual(names, ['SyncAccessDenied'])
   assert.deepEqual(state.redirects, [], 'no tour of a page this role may not act on either')
-  assert.deepEqual(state.calls.map((c) => c.name), ['requirePermission'])
+  assert.deepEqual(state.calls.map((c) => c.name), ['requirePermission', 'getSession'])
 })
 
 test('every role without `sync` is refused, and the two that hold it are not', async () => {
@@ -425,6 +429,69 @@ test('rows the cancel could not retire are reported, not silently left in the co
   assert.equal(state.refreshes, 1)
   assert.match(banner.render().html, /2 row\(s\) could not be cancelled/)
   assert.match(banner.render().html, /a request may have reached it and been lost/)
+})
+
+// ---------------------------------------------------------------------------
+// Round 5, finding 3 — the controls are offered only to a reader who can USE them.
+//
+// `sync` gets a reader onto this page; cancelOrphanedAccountingSyncRows requires `settings`, which
+// MANAGER does not hold, and its gate THROWS rather than returning a failure. Every test above
+// passes for MANAGER only because the harness's cancel fake authorises everybody — which is the
+// whole point: the capability is decided by the page (from the session) and passed in, and the
+// REAL gate is exercised in orphan-cancel-authorization.test.ts.
+// ---------------------------------------------------------------------------
+
+test('MANAGER is shown the rows and the reason, and NO cancel control', async () => {
+  state.role = 'MANAGER'
+  const banner = await mountBannerFromPage()
+  const { controls, html } = banner.render()
+
+  assert.deepEqual(controls, [], 'not one control a MANAGER click would turn into a rejected action')
+  assert.match(html, /needs the .*settings.* permission/, 'the absence is explained, not silent')
+  assert.match(html, /ask an administrator/)
+  // The read-only view it IS entitled to is untouched — that is what `sync` is for.
+  assert.match(html, /SalesOrder:order-7/, 'the stranded rows are still listed')
+  assert.match(html, /3 accounting sync row\(s\) are queued/, 'and so is the count')
+  assert.ok(!html.includes('cancel them below'), 'and it is not told to use a control it does not have')
+})
+
+test('ADMIN still gets every control — the capability is narrowed, not removed', async () => {
+  state.role = 'ADMIN'
+  const banner = await mountBannerFromPage()
+
+  assert.deepEqual(
+    banner.render().controls.map((c) => c.label),
+    ['Cancel these', 'Cancel these', 'Cancel all orphaned rows'],
+  )
+})
+
+test('the page derives canCancel from the session, rather than the banner assuming it', async () => {
+  for (const [role, expected] of [['ADMIN', true], ['MANAGER', false]] as const) {
+    state.role = role
+    state.calls = []
+    state.plugins = { woocommerce: true }
+    state.reads.getCrossConnectorOrphanSummary = () => orphanSummary()
+    const { tree } = await renderSyncPage()
+    assert.equal(propsOf(tree, 'ConnectorOrphanBanner')?.canCancel, expected, `${role}`)
+  }
+})
+
+test('a REJECTED cancel becomes the banner\'s error line, not an unhandled rejection', async () => {
+  // The gate is not the only thing that throws: the concurrency fence rolls back by throwing, and a
+  // stale session whose role changed since render hits the gate itself. Before the catch, the
+  // transition simply rejected — the operator saw the button do nothing and was told nothing.
+  const banner = await mountBannerFromPage()
+  state.cancel.rejectWith = new PermissionDeniedError('Forbidden: missing permission settings', 'settings')
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
+
+  assert.deepEqual(state.cancel.calls, [[undefined]], 'the action was called and it rejected')
+  assert.equal(state.refreshes, 0, 'a rejected cancel must not refresh — nothing changed')
+  const { html } = banner.render()
+  assert.match(html, /nothing was cancelled/, 'the operator is told what happened')
+  assert.match(html, /Reload this page/, 'and what to do')
+  // The raw error must not be echoed: in production it reaches the client as an opaque digest.
+  assert.ok(!html.includes('Forbidden'), 'and not the server error text')
 })
 
 // ---------------------------------------------------------------------------

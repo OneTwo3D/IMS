@@ -35,7 +35,8 @@ import { getCrossConnectorOrphanSummary, getFailedAccountingSyncSummary } from '
 import { getStrandedAccountingSyncRows } from '@/app/actions/accounting-stranded-rows'
 import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sync-rows'
 import { shouldRedirectFromSyncPage } from '@/lib/domain/accounting/stranded-sync-visibility'
-import { requirePermission } from '@/lib/auth/server'
+import { getSession, requirePermission } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
 import { isAuthorizationDenial } from '@/lib/auth/session-gates'
 import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-status'
 import { SyncDashboard } from './sync-dashboard'
@@ -124,12 +125,31 @@ export default async function SyncPage() {
    * redirect for an unauthenticated / unverified-2FA / invalidated session, and that is rethrown
    * untouched below — an authentication challenge is not an authorization denial.
    */
+  let session
   try {
-    await requirePermission('sync')
+    session = await requirePermission('sync')
   } catch (error) {
-    if (isAuthorizationDenial(error)) return <SyncAccessDenied />
+    if (isAuthorizationDenial(error)) {
+      // The denial screen's destination depends on the ROLE (round 5, finding 4): SUPPLIER cannot
+      // reach /dashboard. requirePermission threw before handing back a session, so it is read
+      // again here. getSession does NOT redirect — an unauthenticated session cannot reach this
+      // line (requirePermission redirects it), and if one somehow did, a null role falls back to
+      // the destination every role holds rather than to a second denial.
+      const denied = await getSession()
+      return <SyncAccessDenied role={denied?.user?.role ?? null} />
+    }
     throw error
   }
+
+  /**
+   * Round 5, finding 3. `sync` gets you this page; CANCELLING an orphaned connector's queue is a
+   * destructive write and stays on `settings`, which MANAGER does not hold. The banner used to
+   * render its cancel buttons for everyone, and cancelOrphanedAccountingSyncRows' gate throws
+   * rather than returning `{ success: false }` — so a MANAGER click produced an unhandled
+   * rejection inside a transition, not the banner's own error line. The capability is now decided
+   * HERE, where the session is, and passed down; the action still re-checks.
+   */
+  const canCancelOrphans = hasPermission(session.user.role, 'settings')
 
   const pluginState = await getIntegrationPluginState()
   // Resolve the active WMS connector from this single plugin-state read and pass
@@ -216,7 +236,7 @@ export default async function SyncPage() {
   ] as const
 
   // allSettled, NOT all. Promise.all rejects on the FIRST rejection, so a redirect thrown by one
-  // read (requireShoppingAdmin and friends redirect an unverified-2FA or invalidated session)
+  // read (requireSyncPermission and friends redirect an unverified-2FA or invalidated session)
   // could be masked by an ordinary failure in another that happened to lose the race. Every read
   // settles before anything is decided, and control flow wins over any number of ordinary errors.
   const settledDashboardReads = await Promise.allSettled(dashboardReads)
@@ -312,6 +332,7 @@ export default async function SyncPage() {
         summary={orphanSummary}
         stranded={stranded}
         strandedLoadFailed={strandedLoadFailed}
+        canCancel={canCancelOrphans}
       />
       {failedSyncSummary && <FailedSyncBanner summary={failedSyncSummary} />}
       {taxRateDrift && <TaxRateDriftBanner drift={taxRateDrift} />}

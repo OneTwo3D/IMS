@@ -4,7 +4,7 @@ import { useState, useTransition } from 'react'
 import { Check, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Switch } from '@/components/ui/switch'
-import { setSetting } from '@/app/actions/settings'
+import { saveIntegrationPluginState } from '@/app/actions/settings'
 import { syncCrontab } from '@/app/actions/cron'
 
 type Props = {
@@ -37,13 +37,21 @@ export function IntegrationPluginsSettings({
 
     startTransition(async () => {
       try {
-        await Promise.all([
-          setSetting('plugin_woocommerce_enabled', String(woocommerceEnabled)),
-          setSetting('plugin_shopify_enabled', String(shopifyEnabled)),
-          setSetting('plugin_xero_enabled', String(xeroEnabled)),
-          setSetting('plugin_quickbooks_enabled', String(quickbooksEnabled)),
-          setSetting('plugin_mintsoft_enabled', String(mintsoftEnabled)),
-        ])
+        // ONE atomic, connector-selection-locked write (o3d-osl8 round 5, finding 2). This used to
+        // be five parallel setSetting calls, so switching accounting connectors was observable
+        // mid-flight as both-off or both-on — and a concurrent orphan cancel could discard the
+        // incoming connector's queue from inside that window.
+        const saved = await saveIntegrationPluginState({
+          woocommerce: woocommerceEnabled,
+          shopify: shopifyEnabled,
+          xero: xeroEnabled,
+          quickbooks: quickbooksEnabled,
+          mintsoft: mintsoftEnabled,
+        })
+        if (!saved.success) {
+          setError(saved.error ?? 'Failed to save plugin settings')
+          return
+        }
 
         const result = await syncCrontab()
         if (!result.success) {

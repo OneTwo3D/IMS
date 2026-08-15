@@ -3,8 +3,14 @@
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
+import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import {
+  getIntegrationPluginState,
+  INTEGRATION_PLUGIN_SETTING_KEYS,
+  type IntegrationPluginId,
+} from '@/lib/integration-plugins'
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
@@ -762,6 +768,16 @@ export async function getUsers(): Promise<UserOption[]> {
 
 export async function setSetting(key: string, value: string): Promise<void> {
   await requirePermission('settings.company')
+  // o3d-osl8 round 5, finding 2. The integration plugin flags decide WHICH connector is active,
+  // and other writers make destructive decisions from that answer (cancelOrphanedAccountingSyncRows
+  // discards a non-active connector's queue). Changing them one generic key at a time is neither
+  // atomic — the plugins UI fired five of these in parallel, so "Xero off, QuickBooks on" passed
+  // through both-off and both-on states — nor serialized against those readers. Routed through
+  // saveIntegrationPluginState instead, which does both. Refused rather than silently allowed so
+  // the guarantee cannot be bypassed by a new call site.
+  if ((Object.values(INTEGRATION_PLUGIN_SETTING_KEYS) as string[]).includes(key)) {
+    throw new Error(`Use saveIntegrationPluginState to change ${key} — it must be written atomically and under the connector-selection lock.`)
+  }
   await db.setting.upsert({
     where: { key },
     create: { key, value: serializeSettingValue(key, value) },
@@ -769,6 +785,73 @@ export async function setSetting(key: string, value: string): Promise<void> {
   })
   await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated setting: ${key}` })
   revalidatePath('/settings', 'layout')
+}
+
+/** Not exported: nothing outside needs the name, and a 'use server' module's export surface is an RPC manifest. */
+type IntegrationPluginStateInput = Partial<Record<IntegrationPluginId, boolean>>
+
+/**
+ * Write the integration plugin flags ATOMICALLY and under the accounting connector-selection lock
+ * (o3d-osl8 round 5, finding 2).
+ *
+ * Both properties matter, for different readers:
+ *   • ATOMIC — the plugins settings page previously issued one setSetting per flag, in parallel.
+ *     A switch from Xero to QuickBooks therefore passed through observable both-off and both-on
+ *     states. getActiveConnector resolves xero-first and returns null when both are off, so a
+ *     reader landing in that window sees a DIFFERENT active connector than either the before or
+ *     the after — including "none", which is the state the orphan cancel treats as "specify a
+ *     connector" and the banner reports as "no accounting connector is enabled".
+ *   • LOCKED — cancelOrphanedAccountingSyncRows takes the same lock around its
+ *     read-decide-update, so a switch cannot land inside that window at all. Its generation check
+ *     is the backstop if a writer ever skips this path; this is what keeps the backstop from
+ *     firing during ordinary use.
+ *
+ * Only the keys PRESENT in `state` are written, so a caller cannot silently disable a plugin it
+ * did not mean to mention.
+ */
+export async function saveIntegrationPluginState(
+  state: IntegrationPluginStateInput,
+): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('settings.company')
+
+  const entries = (Object.entries(state) as Array<[IntegrationPluginId, boolean | undefined]>)
+    .filter((entry): entry is [IntegrationPluginId, boolean] => typeof entry[1] === 'boolean')
+  if (entries.length === 0) return { success: true }
+
+  // The same exclusivity the onboarding step enforces. Checked against the RESULTING state, not
+  // just the payload, so a partial write cannot turn both on between two calls.
+  const resulting = { ...(await getIntegrationPluginState()) }
+  for (const [id, enabled] of entries) resulting[id] = enabled
+  if (resulting.xero && resulting.quickbooks) {
+    return { success: false, error: 'Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector.' }
+  }
+  if (resulting.woocommerce && resulting.shopify) {
+    return { success: false, error: 'Enable either WooCommerce or Shopify, not both.' }
+  }
+
+  await db.$transaction([
+    // FIRST in the sequence: Prisma runs an array transaction in order, so the lock is held before
+    // any flag moves.
+    db.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`,
+    ...entries.map(([id, enabled]) => {
+      const key = INTEGRATION_PLUGIN_SETTING_KEYS[id]
+      return db.setting.upsert({
+        where: { key },
+        create: { key, value: serializeSettingValue(key, String(enabled)) },
+        update: { value: serializeSettingValue(key, String(enabled)) },
+      })
+    }),
+  ])
+
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'settings',
+    action: 'updated',
+    description: `Updated integration plugins: ${entries.map(([id, enabled]) => `${id}=${enabled}`).join(', ')}`,
+    metadata: Object.fromEntries(entries),
+  })
+  revalidatePath('/settings', 'layout')
+  return { success: true }
 }
 
 // ---------------------------------------------------------------------------

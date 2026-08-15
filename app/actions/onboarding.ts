@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { logActivity } from '@/lib/activity-log'
 import { requireAdmin } from '@/lib/auth/server'
 import { getSettingValue } from '@/lib/settings-store'
@@ -250,6 +251,10 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
   }
 
   await db.$transaction([
+    // o3d-osl8 round 5, finding 2: the SAME lock cancelOrphanedAccountingSyncRows holds while it
+    // decides which connector's queue is orphaned. First in the array, because Prisma runs an
+    // array transaction in order and a lock taken after the write it guards guards nothing.
+    db.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`,
     db.setting.upsert({
       where: { key: 'plugin_woocommerce_enabled' },
       create: { key: 'plugin_woocommerce_enabled', value: String(state.woocommerce) },

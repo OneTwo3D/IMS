@@ -45,8 +45,14 @@ test('the sweep cancels PENDING and leaves PROCESSING alone (o3d-sref)', async (
 
   // The updateMany that retires rows must scope to PENDING only. Asserted against the source
   // because the alternative — a full server-action harness with auth, settings and revalidatePath —
-  // would test the mocks rather than the predicate that matters.
-  const update = src.slice(src.indexOf('const result = await db.accountingSyncLog.updateMany('))
+  // would test the mocks rather than the predicate that matters. (Round 5 built that harness after
+  // all, for the concurrency fence: tests/accounting/orphan-cancel-fence.test.ts now asserts the
+  // same predicate on the arguments the action really passes. This stays because it is the cheaper
+  // guard and it reads the intent at the call site.)
+  //
+  // Anchored on the QUERY, not on the client it runs against: round 5 moved the update inside a
+  // fenced transaction, so it is `tx.accountingSyncLog.updateMany` now and could be renamed again.
+  const update = src.slice(src.indexOf('accountingSyncLog.updateMany('))
   const updateArgs = update.slice(0, update.indexOf('})'))
 
   assert.match(updateArgs, /status: 'PENDING' as const/, 'PENDING rows are still retired')

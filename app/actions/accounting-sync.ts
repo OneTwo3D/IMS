@@ -5,6 +5,7 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { accountMappingRuleKeys, validateAccountingAccountMapping } from '@/app/(dashboard)/sync/accounting-settings-fields'
 import { db } from '@/lib/db'
+import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { freshAuthFailureResult, requireAuth, requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -131,6 +132,17 @@ export async function getFailedAccountingSyncSummary(): Promise<FailedAccounting
 
 
 /**
+ * Thrown when the active accounting connector CHANGED while a cancel was deciding what to
+ * discard. Never surfaces as an error to the operator — it exists to abort the transaction, and
+ * the caller converts it into a refusal (o3d-osl8 round 5, finding 2).
+ */
+class AccountingConnectorChangedError extends Error {
+  constructor(readonly before: string | null, readonly after: string | null) {
+    super(`Active accounting connector changed from ${before ?? 'none'} to ${after ?? 'none'} mid-cancel`)
+  }
+}
+
+/**
  * audit-H4: bulk-cancel orphaned live sync rows. Marks them CANCELLED (audit-46ry)
  * so neither processor will claim them AND reconciliation / event-backfill sweeps
  * and FAILED dashboards (which scan explicit PENDING/PROCESSING/SYNCED/FAILED lists)
@@ -138,21 +150,129 @@ export async function getFailedAccountingSyncSummary(): Promise<FailedAccounting
  * Records a clear reason and an activity log. When `connector` is given, only that
  * connector's orphans are cancelled; otherwise every non-active connector's live
  * rows are cancelled.
+ *
+ * FENCED AGAINST A CONCURRENT CONNECTOR SWITCH (o3d-osl8 round 5, finding 2). Everything from
+ * "which connector is active" to the update itself runs in ONE transaction holding
+ * ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY, the same lock the plugin-state writers take.
+ *
+ * Why it needed more than the re-read that was already here. The action sampled the active
+ * connector, derived a cancellation scope from it, and then ran an unfenced updateMany. If
+ * another administrator switched Xero→QuickBooks in that window, the QuickBooks-scoped (or
+ * unscoped) update marked QuickBooks PENDING rows CANCELLED *after* QuickBooks became the active
+ * connector — discarding the live queue of the connector now in use. The later re-read only
+ * corrected the survivor COUNT; nothing restores a cancelled row, and the activity log would
+ * describe healthy work as abandoned.
+ *
+ * Two mechanisms, because they fail differently:
+ *   • the LOCK serializes the switch against this sweep, so the window closes for any writer that
+ *     takes it (both do — app/actions/settings.ts and app/actions/onboarding.ts);
+ *   • the GENERATION CHECK re-reads the selection before commit and throws if it moved, which
+ *     rolls the update back. It costs one read and it holds even if some future writer forgets
+ *     the lock — and forgetting the lock is silent, whereas this is not.
+ *
+ * Aborting DISCARDS NOTHING: the operator is told to look again, which is right, because the
+ * scope they asked for was computed against a connector selection that no longer exists.
  */
 export async function cancelOrphanedAccountingSyncRows(
   connector?: string,
 ): Promise<{ success: boolean; cancelled: number; error?: string; inFlightNotCancelled?: number }> {
   await requirePermission('settings')
+
+  let outcome: {
+    refusal?: string
+    activeConnector: string | null
+    cancelled: number
+    inFlight: number
+  }
+  try {
+    outcome = await db.$transaction(async (tx) => {
+      // Taken FIRST, before anything is read: a lock acquired after the read it is meant to
+      // protect protects nothing.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`
+      return cancelOrphanedRowsUnderLock(tx, connector)
+    })
+  } catch (error) {
+    if (error instanceof AccountingConnectorChangedError) {
+      // Logged, because it is evidence: an operator saw a button do nothing, and the reason is a
+      // second administrator switching connectors at the same moment.
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'accounting_sync_orphans_cancel_aborted',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Aborted cancelling orphaned accounting sync rows for ${connector ?? 'non-active connector(s)'}: `
+          + `the active accounting connector changed from ${error.before ?? 'none'} to ${error.after ?? 'none'} while the `
+          + `request was running, so the rows targeted may belong to the connector that is now ACTIVE. Nothing was cancelled.`,
+        metadata: { connector: connector ?? null, activeConnectorBefore: error.before, activeConnectorAfter: error.after },
+      })
+      return {
+        success: false,
+        cancelled: 0,
+        error: 'The active accounting connector changed while this ran, so nothing was cancelled — '
+          + 'the rows selected may now belong to the connector that is active. Reload and check before retrying.',
+      }
+    }
+    throw error
+  }
+
+  if (outcome.refusal) return { success: false, cancelled: 0, error: outcome.refusal }
+  const { activeConnector, cancelled, inFlight } = outcome
+
+  if (cancelled > 0 || inFlight > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'accounting_sync_orphans_cancelled',
+      tag: 'sync',
+      level: 'WARNING',
+      description: inFlight > 0
+        ? `Cancelled ${cancelled} orphaned accounting sync row(s) for ${connector ?? 'non-active connector(s)'}${activeConnector ? ` (active connector: ${activeConnector})` : ''}. `
+          + `${inFlight} row(s) were NOT cancelled: their claim had already been taken, so a request may `
+          + `have reached the connector and been lost. Check ${connector ?? 'that connector'} for the `
+          + `document(s); these rows stay in the orphan count and continue to block deleting their `
+          + `orders until resolved (o3d-sref).`
+        : `Cancelled ${cancelled} orphaned accounting sync row(s) for ${connector ?? 'non-active connector(s)'}${activeConnector ? ` (active connector: ${activeConnector})` : ''}.`,
+      metadata: {
+        cancelledCount: cancelled,
+        connector: connector ?? null,
+        activeConnector,
+        // Separate because the remedy differs: these need a human to look at the connector.
+        inFlightNotCancelled: inFlight,
+      },
+    })
+  }
+
+  revalidatePath('/sync')
+  return { success: true, cancelled, inFlightNotCancelled: inFlight }
+}
+
+/**
+ * The decide-and-update half, run inside the fenced transaction. Split out only so the lock, the
+ * abort translation and the activity log stay legible above; it is not called from anywhere else.
+ *
+ * `tx` is the transaction client. The plugin-state reads deliberately go through
+ * getActiveConnector (the ordinary pooled client): the alternative is a second, transaction-local
+ * definition of "which connector is active", and two definitions of that is a worse bug than the
+ * extra connection. READ COMMITTED means it still sees every committed switch.
+ */
+async function cancelOrphanedRowsUnderLock(
+  tx: Pick<typeof db, 'accountingSyncLog'>,
+  connector?: string,
+): Promise<{ refusal?: string; activeConnector: string | null; cancelled: number; inFlight: number }> {
   const activeConnector = await getActiveConnector()
   // Never cancel the active connector's own queue.
   if (connector && connector === activeConnector) {
-    return { success: false, cancelled: 0, error: 'Cannot cancel sync rows for the active connector.' }
+    return { refusal: 'Cannot cancel sync rows for the active connector.', activeConnector, cancelled: 0, inFlight: 0 }
   }
   // With no active connector, an un-scoped cancel would wipe EVERY connector's
   // queue — require an explicit connector so a transient both-plugins-off state
   // can't silently destroy all pending work (audit-H4 review).
   if (!connector && !activeConnector) {
-    return { success: false, cancelled: 0, error: 'No active accounting connector — specify which connector’s orphaned rows to cancel.' }
+    return {
+      refusal: 'No active accounting connector — specify which connector’s orphaned rows to cancel.',
+      activeConnector,
+      cancelled: 0,
+      inFlight: 0,
+    }
   }
 
   // o3d-sref: ONLY PENDING rows are cancelled. A PROCESSING row — stale claim or not — is left
@@ -181,7 +301,7 @@ export async function cancelOrphanedAccountingSyncRows(
   const scope = connector ? { connector } : { connector: { not: activeConnector ?? undefined } }
 
   const reason = `Cancelled: orphaned accounting sync row for ${connector ?? 'a non-active connector'} (no longer the active connector${activeConnector ? ` — now ${activeConnector}` : ''}).`
-  const result = await db.accountingSyncLog.updateMany({
+  const result = await tx.accountingSyncLog.updateMany({
     where: { AND: [scope, { status: 'PENDING' as const }] },
     // audit-46ry: CANCELLED (not FAILED) so these abandoned rows are excluded from
     // FAILED-scanning reconciliation/backfill sweeps and error dashboards.
@@ -204,41 +324,28 @@ export async function cancelOrphanedAccountingSyncRows(
   // possibly lost, while the refreshed banner correctly excluded it. Contradictory accounting
   // evidence is worse than a slightly stale count, so this reads the current state.
   const activeNow = await getActiveConnector()
+
+  // THE FENCE (round 5, finding 2). The update above ran against a scope derived from
+  // `activeConnector`; if the selection has moved, that scope may name the connector that is now
+  // ACTIVE, and the rows just marked CANCELLED are its live queue. Throwing rolls the update back
+  // — the only outcome that is recoverable, since no later read can un-cancel a row.
+  //
+  // Kept even though the advisory lock above should make it unreachable for the two writers that
+  // exist today: the lock binds only writers that take it, and a future one that does not would
+  // reintroduce the bug silently. This turns that into a loud, harmless refusal.
+  if (activeNow !== activeConnector) throw new AccountingConnectorChangedError(activeConnector, activeNow)
+
   const stillOrphaned = connector
     ? (connector === activeNow ? null : { connector })
     : { connector: { not: activeNow ?? undefined } }
 
   const inFlight = stillOrphaned === null
     ? 0
-    : await db.accountingSyncLog.count({
+    : await tx.accountingSyncLog.count({
       where: { AND: [stillOrphaned, { status: 'PROCESSING' as const }] },
     })
 
-  if (result.count > 0 || inFlight > 0) {
-    await logActivity({
-      entityType: 'SYSTEM',
-      action: 'accounting_sync_orphans_cancelled',
-      tag: 'sync',
-      level: 'WARNING',
-      description: inFlight > 0
-        ? `Cancelled ${result.count} orphaned accounting sync row(s) for ${connector ?? 'non-active connector(s)'}${activeConnector ? ` (active connector: ${activeConnector})` : ''}. `
-          + `${inFlight} row(s) were NOT cancelled: their claim had already been taken, so a request may `
-          + `have reached the connector and been lost. Check ${connector ?? 'that connector'} for the `
-          + `document(s); these rows stay in the orphan count and continue to block deleting their `
-          + `orders until resolved (o3d-sref).`
-        : `Cancelled ${result.count} orphaned accounting sync row(s) for ${connector ?? 'non-active connector(s)'}${activeConnector ? ` (active connector: ${activeConnector})` : ''}.`,
-      metadata: {
-        cancelledCount: result.count,
-        connector: connector ?? null,
-        activeConnector,
-        // Separate because the remedy differs: these need a human to look at the connector.
-        inFlightNotCancelled: inFlight,
-      },
-    })
-  }
-
-  revalidatePath('/sync')
-  return { success: true, cancelled: result.count, inFlightNotCancelled: inFlight }
+  return { activeConnector, cancelled: result.count, inFlight }
 }
 
 export async function getAccountingIntegrationConnector() {

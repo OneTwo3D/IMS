@@ -20,7 +20,12 @@ import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/se
 
 export type { QuickBooksSettings } from '@/lib/connectors/quickbooks/settings'
 
-async function requireAdmin() {
+/**
+ * `sync` for every guarded export here - ADMIN and MANAGER both hold it. Renamed from
+ * `requireAdmin`, which shadowed the ADMIN-only helper of that name in @/lib/auth/server.
+ * See the fuller note in app/actions/xero-sync.ts.
+ */
+async function requireSyncPermission() {
   return requirePermission('sync')
 }
 
@@ -40,7 +45,7 @@ export async function getQuickBooksSettingsMasked(): Promise<QuickBooksSettings 
 
 export async function saveQuickBooksSettings(data: Partial<QuickBooksSettings>): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAdmin()
+    await requireSyncPermission()
     if (shouldFreshGateSecretWrite(data, 'quickbooks_client_secret')) {
       await requireFreshAdmin()
     }
@@ -236,7 +241,7 @@ export async function disconnectQuickBooks(): Promise<{ success: boolean; error?
 // ---------------------------------------------------------------------------
 
 export async function syncQuickBooksAccounts(): Promise<{ synced: number; errors: string[] }> {
-  await requireAdmin()
+  await requireSyncPermission()
   const result = await syncChartOfAccounts()
 
   await logActivity({
@@ -307,7 +312,7 @@ export async function getQuickBooksSyncLogs(limit = 50): Promise<QuickBooksSyncL
 
 export async function triggerQuickBooksSync(): Promise<{ success: boolean; result?: unknown; error?: string }> {
   try {
-    await requireAdmin()
+    await requireSyncPermission()
 
     const enabled = await db.setting.findUnique({ where: { key: 'quickbooks_sync_enabled' } })
     if (enabled?.value !== 'true') {
@@ -333,7 +338,7 @@ export async function triggerQuickBooksSync(): Promise<{ success: boolean; resul
 
 export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
   try {
-    await requireAdmin()
+    await requireSyncPermission()
     const where = entryId
       ? { id: entryId, connector: 'quickbooks', status: 'FAILED' as const }
       : { connector: 'quickbooks', status: 'FAILED' as const }
