@@ -20,6 +20,7 @@ import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/acc
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
+import { applyBackReference } from '@/lib/domain/accounting/back-reference'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -847,17 +848,23 @@ async function updateBackReference(
         data: { accountingInvoiceId: externalId },
       })
     } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseOrder') {
-      // Entries are queued with referenceType 'PurchaseOrder' — find the
-      // latest PurchaseInvoice for this PO and store the external bill ID.
-      const invoice = await db.purchaseInvoice.findFirst({
-        where: { poId: referenceId, accountingInvoiceId: null },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true },
-      })
-      if (invoice) {
-        await db.purchaseInvoice.update({
-          where: { id: invoice.id },
-          data: { accountingInvoiceId: externalId },
+      // o3d-9kek: a legacy PurchaseOrder-keyed row names the ORDER, not the bill. This
+      // used to write the external id onto "the newest bill with no id yet" — which
+      // stamps the wrong bill the moment a PO has two, and a wrong id is worse than a
+      // missing one because it looks correct (later payments and bill updates then post
+      // against the wrong QuickBooks document). The shared resolver decides from the whole
+      // population for that PO and refuses to guess. Same code path as Xero, so the two
+      // connectors cannot drift on this again.
+      const applied = await applyBackReference(db, { connector: QBO_CONNECTOR, type, referenceType, referenceId, externalId, invoiceNumber })
+      if (applied.outcome === 'ambiguous') {
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'quickbooks_backreference_ambiguous',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Did not write the QuickBooks back-reference for PO ${referenceId}: its bill cannot be identified `
+            + `(${applied.attribution.reason}). Link the bill manually — the external id is on the sync row.`,
+          metadata: { referenceType, referenceId, externalId, reason: applied.attribution.reason },
         })
       }
     }
