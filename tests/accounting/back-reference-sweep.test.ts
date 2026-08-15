@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import {
+  BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS,
   BACK_REFERENCE_SWEEP_TYPES,
   buildBackReferenceCandidateQuery,
   repairAccountingBackReferences,
@@ -32,6 +34,7 @@ type SyncRow = {
   payload: unknown
   createdAt: Date
   backReferenceCheckedAt: Date | null
+  backReferenceAmbiguousLoggedAt: Date | null
 }
 
 type BillRow = { id: string; poId: string; accountingInvoiceId: string | null; createdAt: Date }
@@ -39,7 +42,7 @@ type OrderRow = { id: string; accountingInvoiceId: string | null; invoiceNumber?
 
 const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId',
-  'status', 'payload', 'createdAt', 'backReferenceCheckedAt',
+  'status', 'payload', 'createdAt', 'backReferenceCheckedAt', 'backReferenceAmbiguousLoggedAt',
 ])
 const BILL_COLUMNS = new Set(['id', 'poId', 'accountingInvoiceId', 'createdAt'])
 
@@ -100,17 +103,30 @@ type Harness = {
   client: BackReferenceSweepClient
   activities: BackReferenceSweepActivity[]
   followUps: Array<{ entryId: string; referenceType: string; referenceId: string }>
-  calls: { candidateQueries: number; syncRowsRead: number; probes: number; billUpdates: number }
+  calls: {
+    candidateQueries: number
+    syncRowsRead: number
+    probes: number
+    billUpdates: number
+    transactions: number
+    rawStatements: Array<{ sql: string; values: unknown[] }>
+  }
   failFollowUpsFor: Set<string>
   failProbeFor: Set<string>
+  /**
+   * A concurrent writer, fired the instant the PO attribution has read the bills — i.e.
+   * inside the resolve→apply window. Set by the finding-3 test.
+   */
+  raceAfterBillRead: ((bills: BillRow[]) => void) | null
 }
 
 function makeHarness(store: Store): Harness {
   const activities: BackReferenceSweepActivity[] = []
   const followUps: Harness['followUps'] = []
-  const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0 }
+  const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0, transactions: 0, rawStatements: [] as Array<{ sql: string; values: unknown[] }> }
   const failFollowUpsFor = new Set<string>()
   const failProbeFor = new Set<string>()
+  const harness = { store, activities, followUps, calls, failFollowUpsFor, failProbeFor, raceAfterBillRead: null } as Harness
 
   const client = {
     accountingSyncLog: {
@@ -167,7 +183,9 @@ function makeHarness(store: Store): Harness {
         const bills = store.bills
           .filter((candidate) => matches(candidate as unknown as Record<string, unknown>, args.where, BILL_COLUMNS))
           .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime())
-        return (args.take ? bills.slice(0, args.take) : bills).map((bill) => ({ id: bill.id }))
+        const page = (args.take ? bills.slice(0, args.take) : bills).map((bill) => ({ id: bill.id }))
+        harness.raceAfterBillRead?.(store.bills)
+        return page
       },
       async update(args: { where: { id: string }; data: Record<string, unknown> }) {
         const bill = store.bills.find((candidate) => candidate.id === args.where.id)
@@ -176,22 +194,45 @@ function makeHarness(store: Store): Harness {
         Object.assign(bill, args.data)
         return bill
       },
+      // The compare-and-swap. It honours `accountingInvoiceId: null` and reports the rows it
+      // actually touched — a double that ignored the predicate would make finding 3's fix
+      // untestable while looking tested.
+      async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
+        const matched = store.bills.filter((candidate) => matches(candidate as unknown as Record<string, unknown>, args.where, BILL_COLUMNS))
+        for (const bill of matched) {
+          calls.billUpdates++
+          Object.assign(bill, args.data)
+        }
+        return { count: matched.length }
+      },
     },
     supplierCreditNote: {
       async findUnique() { return null },
       async update() { throw new Error('unexpected supplierCreditNote.update') },
     },
+    async $transaction(fn: (tx: unknown) => Promise<unknown>) {
+      calls.transactions++
+      return fn({
+        ...client,
+        async $executeRaw(query: TemplateStringsArray, ...values: unknown[]) {
+          calls.rawStatements.push({ sql: query.join('?'), values })
+          return 0
+        },
+      })
+    },
   } as unknown as BackReferenceSweepClient
 
-  return { store, client, activities, followUps, calls, failFollowUpsFor, failProbeFor }
+  harness.client = client
+  return harness
 }
 
-function sweepDeps(harness: Harness) {
+function sweepDeps(harness: Harness, now?: () => Date) {
   return {
     db: harness.client,
     connector: 'xero',
     connectorLabel: 'Xero',
     activityActionPrefix: 'xero',
+    now,
     logActivity: async (entry: BackReferenceSweepActivity) => { harness.activities.push(entry) },
     enqueueFollowUps: async (entryId: string, _type: string, referenceType: string, referenceId: string) => {
       if (harness.failFollowUpsFor.has(entryId)) throw new Error('follow-up enqueue failed')
@@ -216,6 +257,7 @@ function salesInvoiceRow(index: number, overrides: Partial<SyncRow> = {}): SyncR
     payload: {},
     createdAt: at(index),
     backReferenceCheckedAt: null,
+    backReferenceAmbiguousLoggedAt: null,
     ...overrides,
   }
 }
@@ -226,21 +268,34 @@ function salesInvoiceRow(index: number, overrides: Partial<SyncRow> = {}): SyncR
 // ---------------------------------------------------------------------------
 
 test('the candidate query excludes already-checked rows and keyset-paginates past the page boundary', () => {
-  const first = buildBackReferenceCandidateQuery({ connector: 'xero', after: null, take: 50 })
+  const recheckBefore = at(100)
+  const deferralClause = {
+    OR: [
+      { backReferenceAmbiguousLoggedAt: null },
+      { backReferenceAmbiguousLoggedAt: { lt: recheckBefore } },
+    ],
+  }
+  const first = buildBackReferenceCandidateQuery({ connector: 'xero', after: null, ambiguityRecheckBefore: recheckBefore, take: 50 })
   assert.equal(first.where.connector, 'xero')
   assert.deepEqual(first.where.status, { in: ['SYNCED', 'FAILED'] })
   assert.deepEqual(first.where.externalTransactionId, { not: null })
   assert.deepEqual(first.where.type, { in: [...BACK_REFERENCE_SWEEP_TYPES] })
-  // The marker: a row the sweep has settled is no longer a candidate.
+  // The verdict marker: a row the sweep has settled is no longer a candidate, ever.
   assert.equal(first.where.backReferenceCheckedAt, null)
-  assert.equal(first.where.OR, undefined)
+  // The DEFERRAL marker: an ambiguous row is out of the set for one interval, not for good.
+  assert.deepEqual(first.where.AND, [deferralClause])
   assert.deepEqual(first.orderBy, [{ createdAt: 'asc' }, { id: 'asc' }])
 
   const cursor = { createdAt: at(7), id: 'log-0007' }
-  const next = buildBackReferenceCandidateQuery({ connector: 'xero', after: cursor, take: 50 })
-  assert.deepEqual(next.where.OR, [
-    { createdAt: { gt: cursor.createdAt } },
-    { AND: [{ createdAt: cursor.createdAt }, { id: { gt: cursor.id } }] },
+  const next = buildBackReferenceCandidateQuery({ connector: 'xero', after: cursor, ambiguityRecheckBefore: recheckBefore, take: 50 })
+  assert.deepEqual(next.where.AND, [
+    deferralClause,
+    {
+      OR: [
+        { createdAt: { gt: cursor.createdAt } },
+        { AND: [{ createdAt: cursor.createdAt }, { id: { gt: cursor.id } }] },
+      ],
+    },
   ])
 })
 
@@ -452,20 +507,219 @@ test('the unambiguous single-bill PO row is still repaired, onto that exact bill
   assert.equal(repairLog.metadata.referenceId, 'bill-1')
 })
 
-test('an ambiguous PO row is warned about once, not on every cron cycle', async () => {
+test('an ambiguous PO row is warned about once per interval, not on every cron cycle', async () => {
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1')],
     bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
+  let clock = new Date(Date.UTC(2026, 1, 1))
+  const now = () => clock
 
-  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
-  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
-  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  await repairAccountingBackReferences(sweepDeps(harness, now), { limit: 10 })
+  const afterFirst = harness.activities.filter((entry) => entry.action === 'xero_backreference_repair_ambiguous').length
+  assert.equal(afterFirst, 2, 'both rows report once')
 
+  // Two more cycles inside the interval: no new warnings.
+  clock = new Date(clock.getTime() + 60 * 60 * 1000)
+  await repairAccountingBackReferences(sweepDeps(harness, now), { limit: 10 })
+  await repairAccountingBackReferences(sweepDeps(harness, now), { limit: 10 })
   assert.equal(harness.activities.filter((entry) => entry.action === 'xero_backreference_repair_ambiguous').length, 2)
-  assert.equal(harness.store.syncRows.every((row) => row.backReferenceCheckedAt !== null), true)
+
+  // ...and the row is DEFERRED, not retired: no verdict was recorded, so it comes back.
+  assert.equal(harness.store.syncRows.every((row) => row.backReferenceCheckedAt === null), true)
   assert.equal(harness.store.bills[0].accountingInvoiceId, null)
+
+  // Past the interval it reports again, saying it is a repeat — silence would read as
+  // "handled" for a row that needs a human.
+  clock = new Date(clock.getTime() + BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS)
+  await repairAccountingBackReferences(sweepDeps(harness, now), { limit: 10 })
+  const warnings = harness.activities.filter((entry) => entry.action === 'xero_backreference_repair_ambiguous')
+  assert.equal(warnings.length, 4)
+  assert.equal(warnings[0].metadata.previouslyLoggedAt, null)
+  assert.equal(typeof warnings[2].metadata.previouslyLoggedAt, 'string')
+  assert.match(warnings[2].description, /Still unresolved since this was last reported/)
+})
+
+// ---------------------------------------------------------------------------
+// Defect 3 — an already-repaired legacy row stamping its id onto a DIFFERENT bill,
+// ambiguity frozen as a permanent verdict, and an unconditional apply.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek f1] a legacy row already linked to one bill does not stamp its id onto another', async () => {
+  // ONE live sync row, and its external id is already on bill-a from an earlier repair.
+  // bill-b is unlinked and belongs to something else. "Exactly one live row AND exactly one
+  // unlinked bill" calls that unique — and copies bill-a's id onto bill-b.
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1')],
+    bills: [
+      { id: 'bill-a', poId: 'po-1', accountingInvoiceId: 'XBILL-1', createdAt: at(1) },
+      { id: 'bill-b', poId: 'po-1', accountingInvoiceId: null, createdAt: at(9) },
+    ],
+    orders: [],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(run.repaired, 0)
+  assert.equal(run.skippedAmbiguous, 0)
+  assert.equal(harness.calls.billUpdates, 0)
+  assert.equal(harness.store.bills[1].accountingInvoiceId, null, 'bill-b must be untouched')
+  assert.equal(harness.store.bills[0].accountingInvoiceId, 'XBILL-1')
+  // Already linked and SYNCED is a genuine verdict: the row leaves the candidate set.
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt !== null, true)
+})
+
+/** A clock the sweep can be driven by, so the recheck interval is exercised rather than waited on. */
+function fakeClock(start = new Date(Date.UTC(2026, 1, 1))) {
+  let clock = start
+  return { now: () => clock, advance: (ms: number) => { clock = new Date(clock.getTime() + ms) } }
+}
+
+test('[o3d-9kek f2] an ambiguous row stays eligible and is repaired once the ambiguity clears', async () => {
+  // The starvation bug's second route: stamping transient ambiguity as a verdict excluded
+  // the row for good, so the repair never happened even after the competing row was
+  // cancelled.
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1')],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
+    orders: [],
+  })
+  const clock = fakeClock()
+
+  const firstRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(firstRun.skippedAmbiguous, 2)
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'ambiguity is not a verdict')
+
+  // The competing row is cancelled (audit-46ry — deliberately abandoned).
+  harness.store.syncRows[1].status = 'CANCELLED'
+
+  clock.advance(BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS + 1)
+  const secondRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(secondRun.repaired, 1)
+  assert.equal(harness.store.bills[0].accountingInvoiceId, 'XBILL-1')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt !== null, true)
+})
+
+test('[o3d-9kek f2] MULTIPLE_UNLINKED_BILLS also stays eligible, and repairs when the other bill links', async () => {
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1')],
+    bills: [
+      { id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) },
+      { id: 'bill-2', poId: 'po-1', accountingInvoiceId: null, createdAt: at(9) },
+    ],
+    orders: [],
+  })
+  const clock = fakeClock()
+
+  const firstRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(firstRun.skippedAmbiguous, 1)
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null)
+
+  // bill-2's own bill-keyed sync posts and links it — the population shrank to one.
+  harness.store.bills[1].accountingInvoiceId = 'XBILL-2'
+
+  clock.advance(BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS + 1)
+  const secondRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(secondRun.repaired, 1)
+  assert.equal(harness.store.bills[0].accountingInvoiceId, 'XBILL-1')
+})
+
+test('[o3d-9kek f2] a backlog of unattributable rows does not starve a newer broken row', async () => {
+  // The reason ambiguity is DEFERRED rather than merely left eligible. Ten legacy PO rows
+  // that can never be attributed sit at the head of the scan, and the run budget is ten.
+  // Left fully eligible they would consume the whole budget on every cycle forever, and the
+  // newer broken row behind them would never be reached — the starvation this sweep exists
+  // to fix, arriving through the fix for the stamping bug.
+  const syncRows: SyncRow[] = []
+  const bills: BillRow[] = []
+  for (let index = 1; index <= 10; index++) {
+    syncRows.push(poRow(index, `po-${index}`))
+    bills.push({ id: `bill-${index}a`, poId: `po-${index}`, accountingInvoiceId: null, createdAt: at(index) })
+    bills.push({ id: `bill-${index}b`, poId: `po-${index}`, accountingInvoiceId: null, createdAt: at(index + 1) })
+  }
+  syncRows.push(salesInvoiceRow(50))
+  const harness = makeHarness({ syncRows, bills, orders: [{ id: 'so-50', accountingInvoiceId: null }] })
+  const clock = fakeClock()
+
+  const firstRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(firstRun.scanned, 10)
+  assert.equal(firstRun.skippedAmbiguous, 10)
+  assert.equal(harness.store.orders[0].accountingInvoiceId, null, 'the newer row is out of budget')
+
+  // Next cycle, same day: the ten are deferred, so the budget reaches the row behind them.
+  clock.advance(60 * 1000)
+  const secondRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(secondRun.skippedAmbiguous, 0)
+  assert.equal(secondRun.repaired, 1)
+  assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-50')
+
+  // ...and the deferred rows come back once the interval passes: deferred, not retired.
+  clock.advance(BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS)
+  const thirdRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.equal(thirdRun.skippedAmbiguous, 10)
+})
+
+test('[o3d-9kek f2] a sibling that never posted carries no external id and manufactures no ambiguity', async () => {
+  const harness = makeHarness({
+    syncRows: [
+      poRow(1, 'po-1'),
+      poRow(2, 'po-1', { status: 'FAILED', externalTransactionId: null }),
+      poRow(3, 'po-1', { status: 'PENDING', externalTransactionId: null }),
+    ],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
+    orders: [],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(run.skippedAmbiguous, 0)
+  assert.equal(run.repaired, 1)
+  assert.equal(harness.store.bills[0].accountingInvoiceId, 'XBILL-1')
+})
+
+test('[o3d-9kek f3] a bill linked between the probe and the apply keeps the winner\'s id', async () => {
+  // The probe resolves bill-1 as the only unlinked bill; a normal bill-keyed sync links it
+  // with its OWN correct id before the write lands. The unconditional update replaced that
+  // valid id with the legacy row's.
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1')],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
+    orders: [],
+  })
+  let reads = 0
+  harness.raceAfterBillRead = (bills) => {
+    // Fire on the FENCED re-read only, i.e. genuinely inside the resolve→apply window.
+    reads++
+    if (reads === 2) bills[0].accountingInvoiceId = 'XBILL-authoritative'
+  }
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(run.repaired, 0)
+  assert.equal(run.failed, 1)
+  assert.equal(harness.store.bills[0].accountingInvoiceId, 'XBILL-authoritative')
+  // Not stamped: the next run re-resolves and will settle it as already-linked.
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null)
+
+  harness.raceAfterBillRead = null
+  const secondRun = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(secondRun.repaired, 0)
+  assert.equal(secondRun.failed, 0)
+  assert.equal(harness.store.bills[0].accountingInvoiceId, 'XBILL-authoritative')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt !== null, true)
+})
+
+test('[o3d-9kek f3] the PO repair resolves and writes inside one transaction, under a per-PO lock', async () => {
+  const harness = makeHarness({
+    syncRows: [poRow(1, 'po-1')],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
+    orders: [],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  assert.equal(run.repaired, 1)
+  assert.equal(harness.calls.transactions, 1)
+  assert.equal(harness.calls.rawStatements.length, 1)
+  assert.match(harness.calls.rawStatements[0].sql, /pg_advisory_xact_lock/)
+  assert.deepEqual(harness.calls.rawStatements[0].values, [BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE, 'po-1'])
 })
 
 test('the sweep stays inside its own connector', async () => {

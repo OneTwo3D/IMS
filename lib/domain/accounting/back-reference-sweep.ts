@@ -19,7 +19,7 @@ import {
 // ran, so no document is permanently orphaned. Idempotent; safe to run from cron and on
 // demand.
 //
-// TWO DEFECTS THIS SHAPE EXISTS TO AVOID (o3d-9kek):
+// THREE DEFECTS THIS SHAPE EXISTS TO AVOID (o3d-9kek):
 //
 // 1. STARVATION. The sweep used to take the oldest 200 eligible rows every run. A row
 //    probed and found already linked was skipped but stayed ELIGIBLE — nothing recorded
@@ -37,6 +37,26 @@ import {
 //    written onto the wrong bill. Ambiguity is now decided from the actual population
 //    for that PO (see resolvePurchaseOrderBackReference).
 //
+// 3. RESOLVE-THEN-APPLY. The sweep used to resolve a PO row to a bill and then issue an
+//    UNCONDITIONAL update against it, with a comment claiming the apply could detect a
+//    population change — it could not: `update` matches on the primary key alone. A normal
+//    bill-keyed sync linking that bill in between had its valid id replaced by the legacy
+//    row's. The apply is now a resolve-and-compare-and-swap inside ONE transaction, under a
+//    per-PurchaseOrder advisory lock (see applyBackReference).
+//
+// WHAT IS STAMPED, AND WHAT IS NOT (o3d-9kek, Codex r9 #2). The marker is a VERDICT, and a
+// verdict must be about something that cannot change. Stamped: a row structurally incapable
+// of carrying a back-reference, and a row whose document is linked and whose follow-ups are
+// done. NOT stamped: any transient failure, and — this is the correction — ANY ambiguous PO
+// row. Both ambiguity inputs are mutable. A PENDING/PROCESSING/FAILED sibling can be
+// cancelled or post; several unlinked bills shrink to one as their own bill-keyed syncs
+// finish; and a human acting on the warning links a bill by hand, which is exactly what the
+// warning asks for. Stamping any of those permanently excludes a row that has since become
+// repairable — the starvation bug again, by a second route. An ambiguous row is instead
+// DEFERRED: backReferenceAmbiguousLoggedAt takes it out of the candidate set for one recheck
+// interval, so a backlog of unattributable legacy rows can neither spam the activity log nor
+// re-fill the head of the scan, and it comes back on its own when the interval passes.
+//
 // The sweep must keep refusing to guess: failing to repair is acceptable, repairing onto
 // the wrong bill is not.
 // ---------------------------------------------------------------------------
@@ -49,6 +69,22 @@ export const DEFAULT_BACK_REFERENCE_SWEEP_LIMIT = 200
 /** Rows fetched per query. Several small pages, not one big head-read. */
 export const DEFAULT_BACK_REFERENCE_SWEEP_PAGE_SIZE = 50
 
+/**
+ * How long an unresolved PO ambiguity is deferred before it is re-probed and re-reported.
+ *
+ * ONE interval doing two jobs, deliberately, because they are the same event. An ambiguous
+ * row is NOT stamped as checked — it can become repairable, and excluding it before that
+ * happens is the starvation this sweep exists to fix. But leaving it fully eligible means
+ * re-probing it on every cron cycle and re-writing its WARNING every time; a backlog of them
+ * would also re-fill the head of the scan and starve newer rows across runs. So it is
+ * deferred for this interval, then looked at again.
+ *
+ * Not "log exactly once", which is what stamping gave: the warning names a MANUAL action,
+ * and silence about a row nobody ever linked reads as "handled". The repeat carries
+ * `previouslyLoggedAt` so it is visibly a repeat rather than a new problem.
+ */
+export const BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS = 24 * 60 * 60 * 1000
+
 export type BackReferenceSweepRow = {
   id: string
   type: AccountingSyncType
@@ -58,6 +94,8 @@ export type BackReferenceSweepRow = {
   status: string
   payload: unknown
   createdAt: Date
+  /** When this row's PO ambiguity was last reported. NULL = never. */
+  backReferenceAmbiguousLoggedAt: Date | null
 }
 
 /** The columns the sweep reads. `as const` so the Prisma client's row type resolves. */
@@ -70,6 +108,7 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   status: true,
   payload: true,
   createdAt: true,
+  backReferenceAmbiguousLoggedAt: true,
 } as const
 
 export type BackReferenceCandidateQuery = {
@@ -124,7 +163,11 @@ export type BackReferenceRepairResult = {
   repaired: number
   /** Rows that errored during probe or repair. Deliberately left unstamped, so they retry. */
   failed: number
-  /** Legacy PO-keyed rows whose bill could not be attributed; logged for manual linking. */
+  /**
+   * Legacy PO-keyed rows whose bill could not be attributed. They stay ELIGIBLE (the
+   * ambiguity can resolve), so this counts the same row on every run until it does — the
+   * WARNING behind it is throttled, this number is not.
+   */
   skippedAmbiguous: number
 }
 
@@ -134,25 +177,51 @@ export type BackReferenceCandidateCursor = { createdAt: Date; id: string }
  * The candidate query. Pure, and exported so a test can assert the predicates the sweep
  * depends on rather than trusting a double to honour them.
  *
- * `backReferenceCheckedAt: null` is the marker that makes the set shrink; the keyset
- * clause on (createdAt, id) is what walks the population instead of re-reading its head.
+ * Three predicates carry the anti-starvation design, and they are NOT interchangeable:
+ *
+ *   • `backReferenceCheckedAt: null` — the permanent verdict. A reconciled row leaves the
+ *     candidate set for good, which is what stopped 200 ordinary historical rows filling
+ *     the bounded page on every cron cycle forever.
+ *   • the keyset on (createdAt, id) — walks the population instead of re-reading its head,
+ *     so a row this run cannot settle never blocks the rows behind it WITHIN a run.
+ *   • `backReferenceAmbiguousLoggedAt` older than the recheck cutoff — a DEFERRAL, not a
+ *     verdict. Ambiguity can clear (a sibling is cancelled or posts, several unlinked bills
+ *     shrink to one, a human links a bill), so the row must stay eligible; but re-probing
+ *     it every cycle would let a backlog of unattributable legacy rows re-fill the head of
+ *     the scan ACROSS runs and starve everything newer — the original bug wearing the
+ *     other defect's clothes. Deferring it for the interval keeps both properties.
  */
 export function buildBackReferenceCandidateQuery(params: {
   connector: string
   after: BackReferenceCandidateCursor | null
+  /** Rows whose ambiguity was reported at or after this are deferred until it passes. */
+  ambiguityRecheckBefore: Date
   take: number
 }): BackReferenceCandidateQuery {
+  const notRecentlyAmbiguous = {
+    OR: [
+      { backReferenceAmbiguousLoggedAt: null },
+      { backReferenceAmbiguousLoggedAt: { lt: params.ambiguityRecheckBefore } },
+    ],
+  }
   const where: Record<string, unknown> = {
     connector: params.connector,
     status: { in: ['SYNCED', 'FAILED'] },
     externalTransactionId: { not: null },
     type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
     backReferenceCheckedAt: null,
+    // Nested under AND because the keyset clause below also needs the top-level OR slot.
+    AND: [notRecentlyAmbiguous],
   }
   if (params.after) {
-    where.OR = [
-      { createdAt: { gt: params.after.createdAt } },
-      { AND: [{ createdAt: params.after.createdAt }, { id: { gt: params.after.id } }] },
+    where.AND = [
+      notRecentlyAmbiguous,
+      {
+        OR: [
+          { createdAt: { gt: params.after.createdAt } },
+          { AND: [{ createdAt: params.after.createdAt }, { id: { gt: params.after.id } }] },
+        ],
+      },
     ]
   }
   return {
@@ -173,10 +242,14 @@ export async function repairAccountingBackReferences(
   const { connector, connectorLabel, activityActionPrefix: prefix } = deps
 
   const result: BackReferenceRepairResult = { scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0 }
+  // One cutoff for the whole run, so every page of the scan agrees on which deferred rows
+  // are due — a per-page `new Date()` would let a row fall on both sides of the boundary.
+  const ambiguityRecheckBefore = new Date(now().getTime() - BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS)
 
   /**
    * Record a verdict: this row needs nothing further, so it leaves the candidate set.
-   * NEVER called for a transient failure — such a row must stay eligible.
+   * NEVER called for a transient failure, and never for an AMBIGUOUS PO row — both can
+   * become repairable, and a row excluded before that happens is starved for good.
    */
   const markChecked = async (id: string, extra?: Record<string, unknown>) => {
     await deps.db.accountingSyncLog.update({
@@ -189,7 +262,7 @@ export async function repairAccountingBackReferences(
   while (result.scanned < limit) {
     const take = Math.min(pageSize, limit - result.scanned)
     const page = await deps.db.accountingSyncLog.findMany(
-      buildBackReferenceCandidateQuery({ connector, after, take }),
+      buildBackReferenceCandidateQuery({ connector, after, ambiguityRecheckBefore, take }),
     )
     if (page.length === 0) break
 
@@ -219,15 +292,19 @@ export async function repairAccountingBackReferences(
           invoiceNumber,
         }
 
-        // A PO-keyed row is attributed from the whole population for that PO, not from
-        // this page. `applyParams` names the resolved BILL, so the apply cannot fall back
-        // to a heuristic.
-        let applyParams = params
+        // A PO-keyed row is attributed from the whole population for that PO, not from this
+        // page. This probe only CLASSIFIES the row; the authoritative attribution is redone
+        // inside applyBackReference's transaction, under the per-PO lock, so nothing decided
+        // here can be acted on after the state it read has moved (o3d-9kek finding 3).
         let missing: boolean
         if (row.type === 'PURCHASE_INVOICE' && row.referenceType === 'PurchaseOrder') {
           let attribution: PurchaseOrderAttribution
           try {
-            attribution = await resolvePurchaseOrderBackReference(deps.db, { connector, purchaseOrderId: row.referenceId })
+            attribution = await resolvePurchaseOrderBackReference(deps.db, {
+              connector,
+              purchaseOrderId: row.referenceId,
+              externalId: row.externalTransactionId,
+            })
           } catch (attributionError) {
             console.error(`${prefix}: back-reference PO attribution failed`, row.id, attributionError)
             result.failed++
@@ -235,36 +312,50 @@ export async function repairAccountingBackReferences(
           }
           if (attribution.outcome === 'ambiguous') {
             result.skippedAmbiguous++
-            await deps.logActivity({
-              entityType: 'SYSTEM',
-              action: `${prefix}_backreference_repair_ambiguous`,
-              tag: 'sync',
-              level: 'WARNING',
-              description: `Skipped ${connectorLabel} back-reference repair for PO ${row.referenceId}: `
-                + (attribution.reason === 'MULTIPLE_SYNC_ROWS'
-                  ? `${attribution.syncRowCount} posted bill sync rows reference this PO, so which bill this external id belongs to cannot be determined.`
-                  : 'the PO has several bills with no external id, so which one this external id belongs to cannot be determined.')
-                + ' Link them manually.',
-              metadata: {
-                syncLogId: row.id,
-                referenceId: row.referenceId,
-                reason: attribution.reason,
-                syncRowCount: attribution.syncRowCount,
-                unlinkedBillCount: attribution.unlinkedBillCount,
-              },
-            })
-            // Verdict reached: it will not become attributable on its own, and re-logging
-            // the same warning every cron cycle is noise. A manual link clears the bill's
-            // null id, which is the state this row is waiting on anyway.
-            await markChecked(row.id)
+            const previouslyLoggedAt = row.backReferenceAmbiguousLoggedAt
+            const observedAt = now()
+            // The candidate query already filtered on this, from the same cutoff. Re-asserted
+            // here so "at most one warning per interval" holds on the row itself and not only
+            // on a query a future edit could loosen.
+            const dueToReport = previouslyLoggedAt === null || previouslyLoggedAt < ambiguityRecheckBefore
+            if (dueToReport) {
+              await deps.logActivity({
+                entityType: 'SYSTEM',
+                action: `${prefix}_backreference_repair_ambiguous`,
+                tag: 'sync',
+                level: 'WARNING',
+                description: `Skipped ${connectorLabel} back-reference repair for PO ${row.referenceId}: `
+                  + (attribution.reason === 'MULTIPLE_SYNC_ROWS'
+                    ? `${attribution.syncRowCount} posted bill sync rows reference this PO, so which bill this external id belongs to cannot be determined.`
+                    : 'the PO has several bills with no external id, so which one this external id belongs to cannot be determined.')
+                  + ' Link them manually.'
+                  + (previouslyLoggedAt === null ? '' : ` Still unresolved since this was last reported at ${previouslyLoggedAt.toISOString()}.`),
+                metadata: {
+                  syncLogId: row.id,
+                  referenceId: row.referenceId,
+                  reason: attribution.reason,
+                  syncRowCount: attribution.syncRowCount,
+                  unlinkedBillCount: attribution.unlinkedBillCount,
+                  previouslyLoggedAt: previouslyLoggedAt?.toISOString() ?? null,
+                },
+              })
+              // A DEFERRAL, deliberately NOT backReferenceCheckedAt: ambiguity is not a
+              // verdict — a sibling can be cancelled or post, several unlinked bills can
+              // shrink to one, and the manual link this warning asks for changes the answer.
+              // Stamping it as checked excluded a row that had since become repairable, which
+              // is the starvation this sweep exists to prevent (Codex r9 #2). This takes the
+              // row out of the candidate set for ONE interval and no longer.
+              await deps.db.accountingSyncLog.update({
+                where: { id: row.id },
+                data: { backReferenceAmbiguousLoggedAt: observedAt },
+              })
+            }
             continue
           }
-          // 'none' → every bill already linked; nothing to apply, but a FAILED row may
-          // still owe its follow-ups, so fall through to the shared path below.
+          // 'none' → every bill already linked; 'already-linked' → this row's own id is
+          // where it belongs. Nothing to apply either way, but a FAILED row may still owe
+          // its follow-ups, so fall through to the shared path below.
           missing = attribution.outcome === 'unique'
-          if (attribution.outcome === 'unique') {
-            applyParams = { ...params, referenceType: 'PurchaseInvoice', referenceId: attribution.purchaseInvoiceId }
-          }
         } else {
           try {
             missing = await backReferenceIsMissing(deps.db, params)
@@ -289,16 +380,28 @@ export async function repairAccountingBackReferences(
         // re-applied, so it must not inflate `repaired` (Codex review, r8).
         result.checked++
 
+        // Where the write actually landed. For a PO-keyed row that is the bill the FENCED
+        // attribution chose, which is the only attribution that ever reaches a write.
+        let appliedTo = { referenceType: row.referenceType, referenceId: row.referenceId }
         try {
           if (!followUpsOnly) {
-            const applied = await applyBackReference(deps.db, applyParams)
+            // Passed with its ORIGINAL PurchaseOrder reference, not the bill this pass's
+            // probe resolved: applyBackReference re-resolves under a per-PO advisory lock and
+            // writes with a compare-and-swap on the bill still being unlinked, so the pair is
+            // atomic. Handing it a pre-resolved bill id is what made the write unconditional
+            // and let it clobber a concurrently linked bill (o3d-9kek finding 3).
+            const applied = await applyBackReference(deps.db, params)
             if (applied.outcome !== 'applied') {
-              // The population changed under us between resolving and applying. Do not stamp
-              // — the next run re-resolves from fresh state.
+              // `contended` — a concurrent writer linked the bill first, so the swap matched
+              // no row and nothing was overwritten. `ambiguous`/`nothing-to-apply`/
+              // `already-linked` — the population moved between the probe and the fenced
+              // re-resolve. Never stamp: the next run re-resolves from fresh state and will
+              // settle it (typically as already-linked).
               console.error(`${prefix}: back-reference apply declined`, row.id, applied.outcome)
               result.failed++
               continue
             }
+            appliedTo = { referenceType: applied.referenceType, referenceId: applied.referenceId }
           }
           // The follow-ups (PDF, payment, attachment) never ran on the original failed pass —
           // enqueue them now. The connector's own idempotency makes this safe to repeat.
@@ -352,13 +455,13 @@ export async function repairAccountingBackReferences(
             action: `${prefix}_backreference_repaired`,
             tag: 'sync',
             level: 'INFO',
-            description: `Re-applied missing ${connectorLabel} back-reference for ${applyParams.referenceType} ${applyParams.referenceId} `
+            description: `Re-applied missing ${connectorLabel} back-reference for ${appliedTo.referenceType} ${appliedTo.referenceId} `
               + `(external id ${row.externalTransactionId}).`,
             metadata: {
               syncLogId: row.id,
               type: row.type,
-              referenceType: applyParams.referenceType,
-              referenceId: applyParams.referenceId,
+              referenceType: appliedTo.referenceType,
+              referenceId: appliedTo.referenceId,
             },
           })
         } catch (repairError) {

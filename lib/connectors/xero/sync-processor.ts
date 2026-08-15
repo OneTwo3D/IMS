@@ -1612,6 +1612,12 @@ async function updateBackReference(
       metadata: { referenceType, referenceId, externalId, reason: applied.attribution.reason },
     })
   }
+  // o3d-9kek finding 3: the resolved bill gained an external id between the resolve and the
+  // compare-and-swap, so nothing was written and nothing was overwritten. Not an error — the
+  // repair sweep re-resolves it from the state that actually won.
+  if (applied.outcome === 'contended') {
+    console.warn(`xero: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; the repair sweep will re-resolve it.`)
+  }
 }
 
 export type { BackReferenceRepairResult }

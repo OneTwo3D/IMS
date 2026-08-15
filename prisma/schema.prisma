@@ -2092,8 +2092,19 @@ model AccountingSyncLog {
   // the bounded page and starve every newer broken row behind them.
   //
   // Deliberately NOT stamped on a transient failure (probe threw, repair threw, follow-up
-  // enqueue deferred): those rows must stay eligible so the next sweep retries them.
+  // enqueue deferred), NOR on an ambiguous legacy PurchaseOrder-keyed row: a competing sibling
+  // can be cancelled or post, several unlinked bills can shrink to one, and the manual link the
+  // warning asks for changes the answer. Those rows must stay eligible so the next sweep
+  // retries them.
   backReferenceCheckedAt DateTime?
+  // o3d-9kek: when the sweep last REPORTED that this row's bill cannot be attributed. A
+  // DEFERRAL, not a verdict: the candidate query skips the row until one recheck interval has
+  // passed, then looks again. Ambiguous rows must stay eligible (the ambiguity can clear), but
+  // fully eligible meant re-probing and re-warning on every cron cycle, and a backlog of them
+  // would re-fill the head of the scan and starve newer rows — the same starvation, one column
+  // over. The repeat warning carries the previous timestamp so a row nobody ever links by hand
+  // cannot go quiet.
+  backReferenceAmbiguousLoggedAt DateTime?
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.

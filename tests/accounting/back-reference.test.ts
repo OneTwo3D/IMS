@@ -8,34 +8,95 @@ import {
   syncTypeWritesBackReference,
   type BackReferenceDeps,
 } from '@/lib/domain/accounting/back-reference'
+import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 
 type FakeBill = { id: string; poId: string; accountingInvoiceId: string | null; createdAt: number }
+/** A competing PURCHASE_INVOICE sync row for the PO. Counted, not canned (see below). */
+type FakeSyncRow = {
+  id: string
+  connector?: string
+  type?: string
+  referenceType?: string
+  referenceId?: string
+  status: string
+  externalTransactionId: string | null
+}
+
+const SYNC_ROW_COLUMNS = new Set(['connector', 'type', 'referenceType', 'referenceId', 'status', 'externalTransactionId'])
+const BILL_COLUMNS = new Set(['poId', 'accountingInvoiceId', 'id'])
+
+/**
+ * A where-clause interpreter, shared by the count and the bill queries.
+ *
+ * `accountingSyncLog.count` used to return a canned `poSyncRowCount` and IGNORE its where
+ * entirely — which meant the status predicate and (once it existed) the
+ * `externalTransactionId: { not: null }` predicate could not be exercised at all: a version
+ * of production that dropped either one passed every test. It throws on an unknown column or
+ * an unsupported operator so a predicate cannot silently become a no-op.
+ */
+function matches(row: Record<string, unknown>, where: Record<string, unknown>, columns: Set<string>): boolean {
+  for (const [key, condition] of Object.entries(where)) {
+    if (!columns.has(key)) throw new Error(`fake db: unknown column "${key}" in where clause`)
+    const value = row[key] ?? null
+    if (condition === null) {
+      if (value !== null) return false
+      continue
+    }
+    if (condition !== null && typeof condition === 'object') {
+      const operators = condition as Record<string, unknown>
+      const unsupported = Object.keys(operators).filter((op) => !['in', 'not'].includes(op))
+      if (unsupported.length > 0) throw new Error(`fake db: unsupported operator(s) ${unsupported.join(', ')} on "${key}"`)
+      if ('in' in operators && !(operators.in as unknown[]).includes(value)) return false
+      if ('not' in operators) {
+        if (operators.not === null) { if (value === null) return false } else if (value === operators.not) return false
+      }
+      continue
+    }
+    if (value !== condition) return false
+  }
+  return true
+}
 
 function makeDeps(overrides: {
   salesOrderAccountingInvoiceId?: string | null
   salesOrderRefundCreditNoteId?: string | null
   purchaseInvoiceAccountingInvoiceId?: string | null
-  poNullInvoiceId?: string | null
   supplierCreditNoteAccountingCreditNoteId?: string | null
   throwOnUpdate?: boolean
   /** Bills the PO attribution sees. Filtered on poId + accountingInvoiceId, as production does. */
   bills?: FakeBill[]
-  /** How many live sync rows reference the PO (o3d-9kek: counted globally). */
-  poSyncRowCount?: number
+  /** Live sync rows for the PO. The count interprets its where against these (o3d-9kek). */
+  poSyncRows?: FakeSyncRow[]
+  /** Omit the transaction seam, i.e. behave like a client already inside a transaction. */
+  unfenced?: boolean
+  /**
+   * A concurrent writer, run the instant the attribution has read the bills — i.e. exactly
+   * in the resolve→apply window that finding 3 is about. Mutates the SAME bill array the
+   * conditional write then matches against.
+   */
+  raceAfterResolve?: (bills: FakeBill[]) => void
 }) {
+  const bills = overrides.bills ?? []
   const calls = {
     salesOrderUpdate: 0,
     salesOrderRefundUpdate: 0,
     purchaseInvoiceUpdate: 0,
+    purchaseInvoiceUpdateMany: 0,
     supplierCreditNoteUpdate: 0,
     purchaseInvoiceUpdateIds: [] as string[],
     lastUpdateData: undefined as Record<string, unknown> | undefined,
     lastCountWhere: undefined as Record<string, unknown> | undefined,
     lastBillWhere: undefined as Record<string, unknown> | undefined,
+    transactions: 0,
+    rawStatements: [] as Array<{ sql: string; values: unknown[] }>,
   }
   const maybeThrow = () => {
     if (overrides.throwOnUpdate) throw new Error('back-reference write failed')
   }
+  const matchBills = (where: Record<string, unknown>) => bills
+    .filter((bill) => matches(bill as unknown as Record<string, unknown>, where, BILL_COLUMNS))
+    .sort((a, b) => b.createdAt - a.createdAt)
+
   const deps: BackReferenceDeps = {
     salesOrder: {
       async update(args) { maybeThrow(); calls.salesOrderUpdate++; calls.lastUpdateData = args.data; return {} },
@@ -47,31 +108,38 @@ function makeDeps(overrides: {
     },
     purchaseInvoice: {
       async update(args) { maybeThrow(); calls.purchaseInvoiceUpdate++; calls.purchaseInvoiceUpdateIds.push(args.where.id); calls.lastUpdateData = args.data; return {} },
+      // The COMPARE-AND-SWAP. It honours `accountingInvoiceId: null` and reports how many
+      // rows it actually touched — a double that ignored the predicate, or that always
+      // answered 1, would make finding 3's fix untestable while looking tested.
+      async updateMany(args) {
+        maybeThrow()
+        calls.purchaseInvoiceUpdateMany++
+        const matched = matchBills(args.where)
+        for (const bill of matched) {
+          calls.purchaseInvoiceUpdateIds.push(bill.id)
+          calls.lastUpdateData = args.data
+          Object.assign(bill, args.data)
+        }
+        return { count: matched.length }
+      },
       async findUnique() { return { accountingInvoiceId: overrides.purchaseInvoiceAccountingInvoiceId ?? null } },
       async findFirst(args) {
         // Honours poId / accountingInvoiceId like findMany does. A findFirst that ignored
         // its where would make "refuses to guess" pass for the wrong reason: the legacy
-        // code path would find nothing and write nothing, instead of writing the wrong bill.
-        if (overrides.bills) {
-          const where = args.where as { poId?: string; accountingInvoiceId?: string | null }
-          const bill = overrides.bills
-            .filter((candidate) => (where.poId === undefined || candidate.poId === where.poId))
-            .filter((candidate) => (where.accountingInvoiceId === undefined || candidate.accountingInvoiceId === where.accountingInvoiceId))
-            .sort((a, b) => b.createdAt - a.createdAt)[0]
-          return bill ? { id: bill.id } : null
-        }
-        return overrides.poNullInvoiceId ? { id: overrides.poNullInvoiceId } : null
+        // code path would find nothing and write nothing, instead of writing the wrong bill
+        // — and it would make the already-linked probe indistinguishable from the
+        // unlinked-bill probe, since both go through here with DIFFERENT predicates.
+        const bill = matchBills(args.where)[0]
+        return bill ? { id: bill.id } : null
       },
       // Honours the predicates production depends on: a double that returned every bill
       // regardless of poId / accountingInvoiceId would make the ambiguity tests vacuous.
       async findMany(args) {
         calls.lastBillWhere = args.where
-        const where = args.where as { poId?: string; accountingInvoiceId?: string | null }
-        const matched = (overrides.bills ?? [])
-          .filter((bill) => (where.poId === undefined || bill.poId === where.poId))
-          .filter((bill) => (where.accountingInvoiceId === undefined || bill.accountingInvoiceId === where.accountingInvoiceId))
-          .sort((a, b) => b.createdAt - a.createdAt)
-        return (args.take ? matched.slice(0, args.take) : matched).map((bill) => ({ id: bill.id }))
+        const matched = matchBills(args.where)
+        const page = (args.take ? matched.slice(0, args.take) : matched).map((bill) => ({ id: bill.id }))
+        overrides.raceAfterResolve?.(bills)
+        return page
       },
     },
     supplierCreditNote: {
@@ -81,11 +149,30 @@ function makeDeps(overrides: {
     accountingSyncLog: {
       async count(args) {
         calls.lastCountWhere = args.where
-        return overrides.poSyncRowCount ?? 1
+        return (overrides.poSyncRows ?? [])
+          .filter((row) => matches(row as unknown as Record<string, unknown>, args.where, SYNC_ROW_COLUMNS))
+          .length
       },
     },
   }
+  if (!overrides.unfenced) {
+    deps.$transaction = async (fn) => {
+      calls.transactions++
+      return fn({
+        ...deps,
+        async $executeRaw(query, ...values) {
+          calls.rawStatements.push({ sql: query.join('?'), values })
+          return 0
+        },
+      })
+    }
+  }
   return { deps, calls }
+}
+
+/** The row under repair itself — every PO scenario has one, and it is counted like any other. */
+function selfRow(poId: string, externalTransactionId: string | null, status = 'SYNCED'): FakeSyncRow {
+  return { id: 'log-self', connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: poId, status, externalTransactionId }
 }
 
 test('syncTypeWritesBackReference covers the four back-referencing pairs only', () => {
@@ -135,10 +222,13 @@ test('repair flow: a document orphaned by a back-reference failure is detected a
 })
 
 test('backReferenceIsMissing for PURCHASE_INVOICE/PurchaseOrder reflects an unlinked bill', async () => {
-  const hasNull = makeDeps({ poNullInvoiceId: 'pi-1' })
+  // Bill-backed rather than a canned findFirst result: `poNullInvoiceId` answered the SAME
+  // id to every query, so the already-linked probe and the unlinked-bill probe were
+  // indistinguishable and either one could be deleted without a test noticing.
+  const hasNull = makeDeps({ bills: [{ id: 'pi-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }] })
   assert.equal(await backReferenceIsMissing(hasNull.deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' }), true)
 
-  const allLinked = makeDeps({ poNullInvoiceId: null })
+  const allLinked = makeDeps({ bills: [{ id: 'pi-1', poId: 'po-1', accountingInvoiceId: 'XBILL-other', createdAt: 1 }] })
   assert.equal(await backReferenceIsMissing(allLinked.deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' }), false)
 })
 
@@ -166,9 +256,9 @@ test('PURCHASE_CREDIT_NOTE/SupplierCreditNote writes accountingCreditNoteId back
 test('resolvePurchaseOrderBackReference counts the whole population for the PO, not a page', async () => {
   const { deps, calls } = makeDeps({
     bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
-    poSyncRowCount: 1,
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
   })
-  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1' })
+  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
   assert.deepEqual(resolved, { outcome: 'unique', purchaseInvoiceId: 'bill-1' })
 
   // The count must be scoped to this connector, this PO, and the row shapes that
@@ -178,15 +268,16 @@ test('resolvePurchaseOrderBackReference counts the whole population for the PO, 
   assert.equal(calls.lastCountWhere?.referenceType, 'PurchaseOrder')
   assert.equal(calls.lastCountWhere?.referenceId, 'po-1')
   assert.deepEqual(calls.lastCountWhere?.status, { in: ['PENDING', 'PROCESSING', 'SYNCED', 'FAILED'] })
+  assert.deepEqual(calls.lastCountWhere?.externalTransactionId, { not: null })
   assert.deepEqual(calls.lastBillWhere, { poId: 'po-1', accountingInvoiceId: null })
 })
 
 test('resolvePurchaseOrderBackReference is ambiguous when another sync row references the PO', async () => {
   const { deps } = makeDeps({
     bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
-    poSyncRowCount: 2,
+    poSyncRows: [selfRow('po-1', 'XBILL-1'), { id: 'log-other', connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: 'XBILL-2' }],
   })
-  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1' })
+  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
   assert.equal(resolved.outcome, 'ambiguous')
   assert.equal(resolved.outcome === 'ambiguous' && resolved.reason, 'MULTIPLE_SYNC_ROWS')
 })
@@ -197,11 +288,47 @@ test('resolvePurchaseOrderBackReference is ambiguous when the PO has several unl
       { id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 },
       { id: 'bill-2', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
     ],
-    poSyncRowCount: 1,
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
   })
-  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1' })
+  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
   assert.equal(resolved.outcome, 'ambiguous')
   assert.equal(resolved.outcome === 'ambiguous' && resolved.reason, 'MULTIPLE_UNLINKED_BILLS')
+})
+
+test('[o3d-9kek f1] an external id already on a bill of the PO is already-linked, never re-attributed', async () => {
+  // The exact shape of the defect: ONE legacy sync row, repaired long ago onto bill-a, and
+  // ONE unlinked bill that belongs to something else. "Exactly one live row, exactly one
+  // unlinked bill" calls that unique — and copies bill-a's id onto bill-b. Nothing in the
+  // schema forbids the duplicate.
+  const { deps, calls } = makeDeps({
+    bills: [
+      { id: 'bill-a', poId: 'po-1', accountingInvoiceId: 'XBILL-1', createdAt: 1 },
+      { id: 'bill-b', poId: 'po-1', accountingInvoiceId: null, createdAt: 9 },
+    ],
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
+  })
+  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
+  assert.deepEqual(resolved, { outcome: 'already-linked', purchaseInvoiceId: 'bill-a' })
+
+  const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' })
+  assert.deepEqual(applied, { outcome: 'already-linked', purchaseInvoiceId: 'bill-a' })
+  assert.deepEqual(calls.purchaseInvoiceUpdateIds, [], 'bill-b must not have been written to')
+})
+
+test('[o3d-9kek f2] a sibling with NO external id has posted nothing and cannot make the PO ambiguous', async () => {
+  // A FAILED sibling that never reached the connector carries no external id, so it competes
+  // for no bill link. Counting it manufactured ambiguity and blocked a repair that was in
+  // fact unambiguous.
+  const { deps } = makeDeps({
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+    poSyncRows: [
+      selfRow('po-1', 'XBILL-1'),
+      { id: 'log-failed', connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'FAILED', externalTransactionId: null },
+      { id: 'log-pending', connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'PENDING', externalTransactionId: null },
+    ],
+  })
+  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
+  assert.deepEqual(resolved, { outcome: 'unique', purchaseInvoiceId: 'bill-1' })
 })
 
 test('applyBackReference REFUSES to guess which bill an ambiguous PO row belongs to', async () => {
@@ -210,12 +337,13 @@ test('applyBackReference REFUSES to guess which bill an ambiguous PO row belongs
       { id: 'bill-old', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 },
       { id: 'bill-new', poId: 'po-1', accountingInvoiceId: null, createdAt: 9 },
     ],
-    poSyncRowCount: 1,
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
   })
   const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' })
   assert.equal(applied.outcome, 'ambiguous')
   // The old code wrote onto bill-new — the newest unlinked bill — which is a guess.
   assert.equal(calls.purchaseInvoiceUpdate, 0)
+  assert.equal(calls.purchaseInvoiceUpdateMany, 0)
 })
 
 test('applyBackReference writes an unambiguous PO row onto that exact bill', async () => {
@@ -224,20 +352,100 @@ test('applyBackReference writes an unambiguous PO row onto that exact bill', asy
       { id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 },
       { id: 'bill-linked', poId: 'po-1', accountingInvoiceId: 'XBILL-0', createdAt: 9 },
     ],
-    poSyncRowCount: 1,
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
   })
   const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' })
-  assert.equal(applied.outcome, 'applied')
+  // The outcome names the BILL it wrote, not the PO the row named — the caller logs that.
+  assert.deepEqual(applied, { outcome: 'applied', referenceType: 'PurchaseInvoice', referenceId: 'bill-1' })
   assert.deepEqual(calls.purchaseInvoiceUpdateIds, ['bill-1'])
   assert.equal(calls.lastUpdateData?.accountingInvoiceId, 'XBILL-1')
 })
 
+test('[o3d-9kek f3] the PO apply resolves and writes inside ONE transaction, under a per-PO advisory lock', async () => {
+  const { deps, calls } = makeDeps({
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
+  })
+  const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' })
+  assert.equal(applied.outcome, 'applied')
+  assert.equal(calls.transactions, 1)
+  assert.equal(calls.rawStatements.length, 1)
+  assert.match(calls.rawStatements[0].sql, /pg_advisory_xact_lock/)
+  // Keyed on the PurchaseOrder — the scope the attribution reads.
+  assert.deepEqual(calls.rawStatements[0].values, [BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE, 'po-1'])
+})
+
+test('[o3d-9kek f3] a bill linked between the resolve and the write is NOT overwritten', async () => {
+  // The real race: the attribution reads bill-1 as the one unlinked bill, and a normal
+  // bill-keyed sync links it with its OWN (correct) external id before the write lands.
+  let raced = false
+  const { deps, calls } = makeDeps({
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+    poSyncRows: [selfRow('po-1', 'XBILL-legacy')],
+    raceAfterResolve: (bills) => {
+      if (raced) return
+      raced = true
+      bills[0].accountingInvoiceId = 'XBILL-authoritative'
+    },
+  })
+  const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-legacy' })
+  assert.deepEqual(applied, { outcome: 'contended', purchaseInvoiceId: 'bill-1' })
+  assert.equal(calls.purchaseInvoiceUpdateMany, 1, 'the conditional write must be attempted')
+  assert.deepEqual(calls.purchaseInvoiceUpdateIds, [], 'and must match no row')
+  // The winner's id survives. The old unconditional update replaced it with XBILL-legacy.
+  assert.equal(calls.lastUpdateData, undefined)
+})
+
+test('[o3d-9kek f3] the conditional write still fences when the caller is already in a transaction', async () => {
+  // A tx client has no `$transaction`, so the lock cannot be taken — the compare-and-swap is
+  // what still refuses the overwrite.
+  let raced = false
+  const { deps, calls } = makeDeps({
+    unfenced: true,
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+    poSyncRows: [selfRow('po-1', 'XBILL-legacy')],
+    raceAfterResolve: (bills) => {
+      if (raced) return
+      raced = true
+      bills[0].accountingInvoiceId = 'XBILL-authoritative'
+    },
+  })
+  const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-legacy' })
+  assert.equal(applied.outcome, 'contended')
+  assert.equal(calls.transactions, 0)
+  assert.equal(calls.rawStatements.length, 0)
+})
+
 test('applyBackReference reports nothing-to-apply when every bill on the PO is already linked', async () => {
   const { deps, calls } = makeDeps({
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: 'XBILL-1', createdAt: 1 }],
-    poSyncRowCount: 1,
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: 'XBILL-other', createdAt: 1 }],
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
   })
   const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' })
   assert.equal(applied.outcome, 'nothing-to-apply')
   assert.equal(calls.purchaseInvoiceUpdate, 0)
+  assert.equal(calls.purchaseInvoiceUpdateMany, 0)
+})
+
+test('[o3d-9kek f1] backReferenceIsMissing stops reporting a PO row whose id is already on a bill', async () => {
+  const alreadyApplied = makeDeps({
+    bills: [
+      { id: 'bill-a', poId: 'po-1', accountingInvoiceId: 'XBILL-1', createdAt: 1 },
+      { id: 'bill-b', poId: 'po-1', accountingInvoiceId: null, createdAt: 9 },
+    ],
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
+  })
+  assert.equal(
+    await backReferenceIsMissing(alreadyApplied.deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' }),
+    false,
+  )
+
+  const genuinelyMissing = makeDeps({
+    bills: [{ id: 'bill-b', poId: 'po-1', accountingInvoiceId: null, createdAt: 9 }],
+    poSyncRows: [selfRow('po-1', 'XBILL-1')],
+  })
+  assert.equal(
+    await backReferenceIsMissing(genuinelyMissing.deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' }),
+    true,
+  )
 })
