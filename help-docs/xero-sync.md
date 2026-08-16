@@ -610,13 +610,35 @@ live, correct link, so the decision is yours.
    document, stop.** Releasing it detaches a good link, which is worse than the refusal.
 3. Dry-run (reads only, writes nothing):
    `tsx scripts/release-accounting-external-id-claim.ts --sync-log <id> --holder <id>`
+   It reports the blocking record, the document the id belongs to, and whether that document is
+   still unlinked — if it has acquired its own id since the warning was written, `--apply` will
+   refuse and say so.
 4. Re-run with `--apply`. The id is cleared from the blocking record and written onto the document
-   that actually posted it, in one step. Both halves are written to the activity log.
+   that actually posted it, in **one transaction**. Both halves are written to the activity log.
 
-The release and the re-link are one operation on purpose: clearing the id and stopping would leave
-the ledger document attached to nothing at all, and on QuickBooks nothing would pick it up
-afterwards. If the named record has stopped holding that id since you read the warning, the command
-refuses and writes nothing.
+The release and the re-link are one atomic operation on purpose: clearing the id and stopping would
+leave the ledger document attached to nothing at all, and on QuickBooks nothing would pick it up
+afterwards. Because they are one transaction, **any** failure — a refusal, an error, a lost
+connection part-way through — leaves everything exactly as it was, and the recovery is simply to run
+the command again.
+
+Everything it acts on is re-checked at the moment it writes, not when you read the warning, and
+anything unexpected is a refusal rather than a write:
+
+- the sync row must still be the one you named — still carrying the record of the refusal, still
+  carrying the same external id, and still in a state a repair applies to. A row that has re-posted
+  under a new id is no longer about the id you are releasing, and a row with a sync **in flight**
+  (`PENDING`/`PROCESSING`) may be about to post again under a different id;
+- the blocking record must still be the one you confirmed, and must still hold exactly that id;
+- the document being linked must still **have no external id of its own**. If it has been linked
+  correctly in the meantime, the older id from your warning is refused, never written over the top.
+
+**Which sync rows this applies to.** The two connectors record the same conflict differently, and the
+command accepts both: QuickBooks keeps the row `SYNCED` and writes the conflict into its error text,
+while Xero lets the refusal fail the row, so it retries and ends up `FAILED` — still carrying the
+external id, because that is stored before the local write is ever attempted. A `FAILED` row is the
+normal shape of a Xero conflict, not a broken one. Running the command a second time after it has
+succeeded is safe: it reports that the id is already on the document and does nothing.
 
 **Rows past their retention window.** Data retention clears the stored payload of an unresolved sync
 row once it is older than the sync-log retention period, keeping only the identifying record. Such a

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
   backReferenceHolder,
   backReferenceIsMissing,
@@ -12,8 +13,12 @@ import {
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
   type BackReferenceDeps,
-  type ExternalDocumentIdClaimDeps,
+  type ExternalDocumentIdReleaseDeps,
 } from '@/lib/domain/accounting/back-reference'
+import {
+  UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
+  buildBackReferenceCandidateQuery,
+} from '@/lib/domain/accounting/back-reference-sweep'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { adapterUniqueViolation, legacyUniqueViolation } from '../helpers/prisma-unique-error'
 
@@ -245,13 +250,20 @@ function makeDeps(overrides: {
   if (!overrides.unfenced) {
     deps.$transaction = async (fn) => {
       calls.transactions++
-      return fn({
+      // The tx client has NO `$transaction` of its own — a Prisma interactive transaction client
+      // does not (ITXClientDenyList), and that absence is load-bearing: it is what makes
+      // applyBackReference take its "already inside somebody else's transaction" branch instead of
+      // opening a second one. A double that kept it would let a nested transaction pass here and
+      // fail in production (o3d-9kek r8).
+      const tx = {
         ...deps,
-        async $executeRaw(query, ...values) {
+        async $executeRaw(query: TemplateStringsArray, ...values: unknown[]) {
           calls.rawStatements.push({ sql: query.join('?'), values })
           return 0
         },
-      })
+      }
+      delete (tx as { $transaction?: unknown }).$transaction
+      return fn(tx)
     }
   }
   return { deps, calls }
@@ -917,42 +929,217 @@ test('[o3d-9kek r7 f2] the cause chain is still walked, in the live shape', () =
 
 type ClaimRow = { id: string; accountingInvoiceId: string | null }
 
-function makeClaimDeps(options: {
-  bills: Array<{ id: string; poId: string; accountingInvoiceId: string | null; createdAt: number }>
-  salesOrders?: ClaimRow[]
-  /** Runs after the claim lookup and before the conditional clear — the race `contended` reports. */
-  raceAfterClaimLookup?: (bills: Array<{ id: string; accountingInvoiceId: string | null }>) => void
-}) {
-  const { deps, calls } = makeDeps({ bills: options.bills })
-  const salesOrders = options.salesOrders ?? []
-  const claimCalls = { salesOrderFindFirst: 0, billUpdateManyWheres: [] as Array<Record<string, unknown>> }
+/** The sync row the operator names on the command line, as the release re-reads it at write time. */
+type ReleaseSourceRow = {
+  id: string
+  connector: string
+  type: string
+  referenceType: string
+  referenceId: string
+  externalTransactionId: string | null
+  status: string
+  errorMessage: string | null
+  backReferenceAmbiguousLoggedAt: Date | null
+  backReferenceEvidenceCompactedAt: Date | null
+}
 
-  const claimDeps: ExternalDocumentIdClaimDeps & BackReferenceDeps = {
+const CLAIM_ROW_COLUMNS = new Set(['id', 'accountingInvoiceId'])
+
+/**
+ * The double for the release path, and the two things it MUST be able to do (o3d-9kek r8):
+ *
+ *   • ROLL BACK. The whole of finding 1 is a failure BETWEEN the release and the re-link, so a
+ *     double whose `$transaction` merely calls its callback cannot model the defect at all: every
+ *     test of "the holder survives a failed re-link" would pass against a production that had no
+ *     transaction, because the double never undoes anything either. This one snapshots every table
+ *     it owns on entry and restores it when the callback throws.
+ *   • FAIL AT A CHOSEN POINT, so that "between the two writes" is a place a test can stand.
+ *
+ * It also hands out a tx client with NO `$transaction`, exactly as Prisma does — see makeDeps.
+ */
+function makeClaimDeps(options: {
+  bills: FakeBill[]
+  salesOrders?: ClaimRow[]
+  /** Live PURCHASE_INVOICE sync rows for the PO, for the PO-keyed attribution's count. */
+  poSyncRows?: FakeSyncRow[]
+  /** The named sync row. Defaults to the quarantined row RELEASE_PARAMS describes; null = deleted. */
+  source?: Partial<ReleaseSourceRow> | null
+  /** Runs after the claim lookup and before the conditional clear — the race `contended` reports. */
+  raceAfterClaimLookup?: (bills: FakeBill[]) => void
+  /** Runs after the destination has been READ as unlinked — the race the write-time fence catches. */
+  raceAfterDestinationRead?: (bills: FakeBill[], salesOrders: ClaimRow[]) => void
+  /** Runs after the PO attribution has read its bills — the sibling-bill interleaving. */
+  raceAfterResolve?: (bills: FakeBill[]) => void
+  /** Called by the write that LINKS the destination. Throw from it to die between the two writes. */
+  onLinkWrite?: () => void
+}) {
+  const { deps, calls } = makeDeps({ bills: options.bills, poSyncRows: options.poSyncRows, raceAfterResolve: options.raceAfterResolve })
+  const bills = options.bills
+  const salesOrders = options.salesOrders ?? []
+  const source: ReleaseSourceRow | null = options.source === null ? null : {
+    id: 'log-1',
+    connector: 'quickbooks',
+    type: 'PURCHASE_INVOICE',
+    referenceType: 'PurchaseInvoice',
+    referenceId: 'bill-target',
+    externalTransactionId: '145',
+    status: 'SYNCED',
+    errorMessage: 'QuickBooks PURCHASE_INVOICE for PurchaseInvoice bill-target POSTED SUCCESSFULLY as external id 145, but …',
+    backReferenceAmbiguousLoggedAt: null,
+    backReferenceEvidenceCompactedAt: null,
+    ...options.source,
+  }
+  const claimCalls = {
+    salesOrderFindFirst: 0,
+    transactions: 0,
+    rollbacks: 0,
+    /** Every conditional write the release makes, in order, so a test can see WHAT it fenced on. */
+    updateManyWheres: [] as Array<Record<string, unknown>>,
+    sourceUpdates: [] as Array<Record<string, unknown>>,
+  }
+  let claimLookupsSeen = 0
+
+  /** Fires the claim-lookup race exactly once, and only for the lookup's own where shape. */
+  const afterClaimLookup = (where: Record<string, unknown>) => {
+    const isClaimLookup = Object.keys(where).length === 1 && 'accountingInvoiceId' in where
+    if (!isClaimLookup) return
+    if (claimLookupsSeen++ > 0) return
+    options.raceAfterClaimLookup?.(bills)
+  }
+
+  const matchSalesOrders = (where: Record<string, unknown>) => salesOrders
+    .filter((row) => matches(row as unknown as Record<string, unknown>, where, CLAIM_ROW_COLUMNS))
+
+  /**
+   * THE UNDO LOG — what makes the rollback below a rollback rather than a time machine.
+   *
+   * It records only what a write THROUGH A DELEGATE changed, by comparing the rows either side of
+   * the call. The race hooks mutate the arrays directly, standing in for another database session,
+   * and their writes must SURVIVE our rollback exactly as a committed concurrent transaction does.
+   * A snapshot-and-restore of every row would undo those too — and the `contended` test, whose whole
+   * subject is a concurrent writer, would then assert that the concurrent write never happened.
+   */
+  const undo: Array<() => void> = []
+  const trackWrite = async <T>(rows: Array<Record<string, unknown>>, field: string, run: () => Promise<T>): Promise<T> => {
+    const before = rows.map((row) => ({ row, value: row[field] }))
+    try {
+      return await run()
+    } finally {
+      for (const { row, value } of before) if (row[field] !== value) undo.push(() => { row[field] = value })
+    }
+  }
+  const asRows = (rows: unknown[]) => rows as Array<Record<string, unknown>>
+
+  const claimDeps = {
     ...deps,
     salesOrder: {
       ...deps.salesOrder,
       async findFirst(args: { where: Record<string, unknown> }) {
         claimCalls.salesOrderFindFirst++
-        return salesOrders.find((row) => row.accountingInvoiceId === args.where.accountingInvoiceId) ?? null
+        const row = matchSalesOrders(args.where)[0]
+        afterClaimLookup(args.where)
+        return row ? { id: row.id } : null
       },
-      async updateMany() { throw new Error('the sales-order claim must not be touched by a bill release') },
-    } as never,
-    salesOrderRefund: { ...deps.salesOrderRefund, async findFirst() { return null }, async updateMany() { return { count: 0 } } } as never,
-    supplierCreditNote: { ...deps.supplierCreditNote, async findFirst() { return null }, async updateMany() { return { count: 0 } } } as never,
+      async findUnique(args: { where: { id: string } }) {
+        const found = salesOrders.find((candidate) => candidate.id === args.where.id)
+        const row = found ? { accountingInvoiceId: found.accountingInvoiceId } : null
+        options.raceAfterDestinationRead?.(bills, salesOrders)
+        return row
+      },
+      async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+        return trackWrite(asRows(salesOrders), 'accountingInvoiceId', async () => {
+          if (args.data.accountingInvoiceId != null) options.onLinkWrite?.()
+          const row = salesOrders.find((candidate) => candidate.id === args.where.id)
+          if (row) row.accountingInvoiceId = args.data.accountingInvoiceId as string | null
+          return {}
+        })
+      },
+      async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
+        claimCalls.updateManyWheres.push(args.where)
+        return trackWrite(asRows(salesOrders), 'accountingInvoiceId', async () => {
+          if (args.data.accountingInvoiceId != null) options.onLinkWrite?.()
+          const matched = matchSalesOrders(args.where)
+          for (const row of matched) row.accountingInvoiceId = args.data.accountingInvoiceId as string | null
+          return { count: matched.length }
+        })
+      },
+    },
+    salesOrderRefund: { ...deps.salesOrderRefund, async findFirst() { return null }, async updateMany() { return { count: 0 } } },
+    supplierCreditNote: { ...deps.supplierCreditNote, async findFirst() { return null }, async updateMany() { return { count: 0 } } },
     purchaseInvoice: {
       ...deps.purchaseInvoice,
       async findFirst(args: { where: Record<string, unknown>; select: Record<string, unknown> }) {
         const found = await deps.purchaseInvoice.findFirst(args as never)
-        options.raceAfterClaimLookup?.(options.bills)
+        afterClaimLookup(args.where)
         return found
       },
-      async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
-        claimCalls.billUpdateManyWheres.push(args.where)
-        return deps.purchaseInvoice.updateMany(args as never)
+      // Per-id, against the SAME array everything else mutates. The canned version in makeDeps
+      // answers every id with one value, which would make the destination check below unable to
+      // tell the destination from the holder — i.e. vacuous exactly where finding 2 lives.
+      async findUnique(args: { where: { id: string } }) {
+        // The value is read BEFORE the concurrent writer runs, because that is what the sequence
+        // being modelled is: this read saw an unlinked destination, and the link landed after it. A
+        // double that returned the post-race value would collapse the race into the plain
+        // already-linked case and leave the write-time fence untested.
+        const bill = bills.find((candidate) => candidate.id === args.where.id)
+        const row = bill ? { accountingInvoiceId: bill.accountingInvoiceId } : null
+        options.raceAfterDestinationRead?.(bills, salesOrders)
+        return row
       },
-    } as never,
+      async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+        return trackWrite(asRows(bills), 'accountingInvoiceId', async () => {
+          if (args.data.accountingInvoiceId != null) options.onLinkWrite?.()
+          return deps.purchaseInvoice.update(args as never)
+        })
+      },
+      async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
+        claimCalls.updateManyWheres.push(args.where)
+        return trackWrite(asRows(bills), 'accountingInvoiceId', async () => {
+          if (args.data.accountingInvoiceId != null) options.onLinkWrite?.()
+          return deps.purchaseInvoice.updateMany(args as never)
+        })
+      },
+    },
+    accountingSyncLog: {
+      ...deps.accountingSyncLog,
+      async findUnique(args: { where: { id: string } }) {
+        return source && source.id === args.where.id ? { ...source } : null
+      },
+      async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+        claimCalls.sourceUpdates.push(args.data)
+        return trackWrite(source ? [source as unknown as Record<string, unknown>] : [], 'errorMessage', async () => {
+          if (source && source.id === args.where.id) Object.assign(source, args.data)
+          return {}
+        })
+      },
+    },
   }
-  return { claimDeps, calls, claimCalls, bills: options.bills }
+
+  const txClient = {
+    ...claimDeps,
+    async $executeRaw(query: TemplateStringsArray, ...values: unknown[]) {
+      calls.rawStatements.push({ sql: query.join('?'), values })
+      return 0
+    },
+  }
+  delete (txClient as { $transaction?: unknown }).$transaction
+
+  ;(claimDeps as { $transaction?: unknown }).$transaction = async (fn: (tx: unknown) => Promise<unknown>) => {
+    claimCalls.transactions++
+    undo.length = 0
+    try {
+      return await fn(txClient)
+    } catch (error) {
+      // Reverse order, so a row written twice inside the transaction ends on the value it had
+      // before the FIRST of those writes.
+      for (const restore of undo.reverse()) restore()
+      undo.length = 0
+      claimCalls.rollbacks++
+      throw error
+    }
+  }
+
+  return { claimDeps: claimDeps as unknown as ExternalDocumentIdReleaseDeps, calls, claimCalls, bills, salesOrders, source }
 }
 
 const RELEASE_PARAMS = {
@@ -961,12 +1148,22 @@ const RELEASE_PARAMS = {
   referenceType: 'PurchaseInvoice',
   referenceId: 'bill-target',
   externalId: '145',
+  syncLogId: 'log-1',
 }
+
+/** The legacy keying: the row names the ORDER, so the bill is resolved rather than named. */
+const PO_RELEASE_PARAMS = { ...RELEASE_PARAMS, referenceType: 'PurchaseOrder', referenceId: 'po-1' }
+const PO_SOURCE = { referenceType: 'PurchaseOrder', referenceId: 'po-1' }
+/** The one live row the PO attribution requires as evidence — the row under repair itself. */
+const PO_SYNC_ROWS = [{
+  id: 'log-1', connector: 'quickbooks', type: 'PURCHASE_INVOICE',
+  referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: '145',
+}]
 
 test('[o3d-9kek r7 f1] releasing the confirmed holder links the id to the document that posted it', async () => {
   // The realm switch, end to end: company A's retired bill holds 145, company B has just issued 145
   // to bill-target, and the index refused the write. One confirmed operator action resolves both.
-  const { claimDeps, bills } = makeClaimDeps({
+  const { claimDeps, bills, source, claimCalls } = makeClaimDeps({
     bills: [
       { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
       { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
@@ -982,6 +1179,32 @@ test('[o3d-9kek r7 f1] releasing the confirmed holder links the id to the docume
   })
   assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, null, 'the stale claim is gone')
   assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '145', 'and the ledger document is recorded')
+  // Both halves in ONE transaction, and the quarantine marker cleared inside it: a resolved conflict
+  // that keeps advertising itself is exactly the marker something else acts on later.
+  assert.equal(claimCalls.transactions, 1)
+  assert.equal(claimCalls.rollbacks, 0)
+  assert.equal(source?.errorMessage, null)
+})
+
+test('[o3d-9kek r8 f2] running the same command a SECOND time is already-correct, not a refusal', async () => {
+  // Success clears the quarantine text, which is the only conflict evidence a QuickBooks row has —
+  // so a re-run has to be answered by "the id is already where you were putting it", not by the
+  // no-conflict-evidence refusal, which reads as "you named the wrong row". The distinction matters
+  // because the wrong reading sends an operator looking for another row to release.
+  const { claimDeps, bills, claimCalls } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+  })
+  const first = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+  assert.equal(first.outcome, 'relinked')
+
+  const second = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(second, { outcome: 'already-correct' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '145', 'and it is still linked')
+  assert.equal(claimCalls.rollbacks, 1, 'the second run wrote nothing — the no-op unwinds like any other refusal')
 })
 
 test('[o3d-9kek r7 f1] a holder the operator did NOT confirm is refused, not released', async () => {
@@ -1007,7 +1230,7 @@ test('[o3d-9kek r7 f1] a SAME-VALUE id in another table is not a claim on this o
   // sequences, so Invoice 145 and Bill 145 routinely coexist and are unrelated. A lookup across all
   // four tables would name an innocent sales order as the blocker — and this path then invites an
   // operator to detach it.
-  const { claimDeps } = makeClaimDeps({
+  const { claimDeps, salesOrders } = makeClaimDeps({
     bills: [{ id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 }],
     salesOrders: [{ id: 'so-unrelated', accountingInvoiceId: '145' }],
   })
@@ -1016,6 +1239,7 @@ test('[o3d-9kek r7 f1] a SAME-VALUE id in another table is not a claim on this o
 
   // No bill holds 145, so nothing is blocking — and the sales order is neither consulted nor cleared.
   assert.deepEqual(result, { outcome: 'no-claim' })
+  assert.equal(salesOrders[0].accountingInvoiceId, '145', 'the innocent sales order keeps its invoice id')
 })
 
 test('[o3d-9kek r7 f1] a holder that changes under the read is contended, not clobbered', async () => {
@@ -1048,6 +1272,464 @@ test('[o3d-9kek r7 f1] the id already being where it belongs is a no-op, not a r
 
   assert.deepEqual(result, { outcome: 'already-correct' })
   assert.equal(bills[0].accountingInvoiceId, '145', 'the link this row asked for must never be cleared by its own release')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek r8 finding 1 — the release and the re-link are ONE TRANSACTION.
+//
+// Doing both halves in one FUNCTION was the r7 answer, and it was not enough: a failure between the
+// two writes left the id owned by nobody — the exact state the design existed to prevent — and left
+// it UNRECOVERABLE, because a re-run no longer found the holder the operator had confirmed and
+// answered `no-claim` for ever. These tests stand in that window.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek r8 f1] a re-link that dies mid-operation rolls the RELEASE back', async () => {
+  // The connection drops after the claim has been cleared and before the id has been written. The
+  // pre-atomic version left bill-retired with no id and bill-target with no id: one ledger document
+  // attached to nothing at all, permanently for QuickBooks.
+  const { claimDeps, bills, source, claimCalls } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    onLinkWrite: () => { throw new Error('Connection terminated unexpectedly') },
+  })
+
+  await assert.rejects(
+    releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' }),
+    /Connection terminated unexpectedly/,
+  )
+
+  assert.equal(claimCalls.rollbacks, 1)
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145', 'the holder still holds the id')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, null, 'and nothing was linked')
+  assert.notEqual(source?.errorMessage, null, 'the conflict is still recorded, because it is still unresolved')
+})
+
+test('[o3d-9kek r8 f1] and the recovery from that failure is simply running the command again', async () => {
+  // The half-state was not merely bad, it was a DEAD END: with the id cleared, the operator's
+  // confirmed holder no longer held anything, so every retry answered `no-claim` and the document
+  // stayed detached. Rolling back is what makes the retry meaningful.
+  let dropConnection = true
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    onLinkWrite: () => { if (dropConnection) throw new Error('Connection terminated unexpectedly') },
+  })
+  await assert.rejects(releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' }))
+
+  dropConnection = false
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, {
+    outcome: 'relinked',
+    releasedFrom: 'bill-retired',
+    appliedTo: { referenceType: 'PurchaseInvoice', referenceId: 'bill-target' },
+  })
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, null)
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '145')
+})
+
+test('[o3d-9kek r8 f1] a re-link REFUSED (not thrown) also rolls the release back', async () => {
+  // Not every failed re-link throws: a PO-keyed row whose bill cannot be identified returns
+  // `ambiguous`, and the r7 code took that as licence to leave the id released. The PO here has two
+  // unlinked bills once the retired claim is gone, so the attribution refuses to guess.
+  const { claimDeps, bills, source } = makeClaimDeps({
+    bills: [
+      { id: 'bill-a', poId: 'po-1', accountingInvoiceId: null, createdAt: 3 },
+      { id: 'bill-b', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    poSyncRows: PO_SYNC_ROWS,
+    source: PO_SOURCE,
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...PO_RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'not-relinked', applyOutcome: 'ambiguous' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145', 'nothing was released')
+  assert.equal(bills.find((bill) => bill.id === 'bill-a')?.accountingInvoiceId, null)
+  assert.equal(bills.find((bill) => bill.id === 'bill-b')?.accountingInvoiceId, null)
+  assert.notEqual(source?.errorMessage, null, 'and the conflict is still marked as unresolved')
+})
+
+test('[o3d-9kek r8 f1] a concurrent claimant taking the id after the resolve rolls the release back', async () => {
+  // THE INTERLEAVING NO COMPARE-AND-SWAP CAN SEE, and the one only the unique index forbids: between
+  // the attribution's read and its conditional write, the AUTHORITATIVE bill-keyed writer — which
+  // does not take the per-PO advisory lock, because it is allowed to overwrite a legacy guess —
+  // links a bill of a DIFFERENT order with this same external id. The swap's own predicate is
+  // satisfied (its bill is still unlinked), the PO-scoped resolve never saw that bill at all, and
+  // only the constraint stops 145 landing on two bills. The release must not survive it: the id
+  // would end up on the other order's bill with the confirmed holder emptied for nothing.
+  //
+  // The concurrent bill is on ANOTHER PO deliberately. A second unlinked bill of THIS PO is refused
+  // one step earlier, by the resolve, as MULTIPLE_UNLINKED_BILLS — which is a different code path,
+  // and staging it that way leaves the constraint-classification below completely unexercised while
+  // looking exactly like this test.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 3 },
+      { id: 'bill-elsewhere', poId: 'po-2', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    poSyncRows: PO_SYNC_ROWS,
+    source: PO_SOURCE,
+    raceAfterResolve: (rows) => {
+      const elsewhere = rows.find((row) => row.id === 'bill-elsewhere')
+      // Only once the resolve has read its page and chosen bill-target, and only if 145 is free —
+      // i.e. after the release cleared it, which is exactly the window being modelled.
+      if (elsewhere && !elsewhere.accountingInvoiceId && !rows.some((row) => row.accountingInvoiceId === '145')) {
+        elsewhere.accountingInvoiceId = '145'
+      }
+    },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...PO_RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.equal(result.outcome, 'not-relinked')
+  assert.equal(result.outcome === 'not-relinked' && result.applyOutcome, 'ambiguous')
+  // The constraint's own words survive the classification — reaching this assertion at all is what
+  // proves the write got as far as the DATABASE refusing it, rather than the resolve refusing first.
+  // (On the PO-keyed path the violation propagates raw: applyBackReference's descriptive rewrite is
+  // on the bill-keyed and sales-side branches, not this one.)
+  assert.match(String(result.outcome === 'not-relinked' && result.conflictMessage), /Unique constraint failed/)
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145', 'the release was rolled back')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, null)
+  // The concurrent writer's own commit SURVIVES our rollback, as a committed concurrent transaction
+  // does. A double that snapshot-restored everything would undo it and make this assert the race
+  // never happened.
+  assert.equal(bills.find((bill) => bill.id === 'bill-elsewhere')?.accountingInvoiceId, '145')
+})
+
+test('[o3d-9kek r8 f1] the PO-keyed release takes the per-PO advisory lock in its OWN transaction', async () => {
+  // applyBackReference cannot open its transaction from inside ours — a Prisma tx client has no
+  // `$transaction` — so the lock it would have taken has to be taken here, or the resolve-and-swap
+  // runs unfenced against another repair of the same PO.
+  const { claimDeps, calls, claimCalls } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    poSyncRows: PO_SYNC_ROWS,
+    source: PO_SOURCE,
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...PO_RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.equal(result.outcome, 'relinked')
+  assert.equal(claimCalls.transactions, 1, 'ONE transaction — the re-link must not open a second one')
+  assert.equal(calls.transactions, 0, 'and applyBackReference did not open its own')
+  assert.equal(calls.rawStatements.length, 1)
+  assert.match(calls.rawStatements[0].sql, /pg_advisory_xact_lock/)
+  assert.deepEqual(calls.rawStatements[0].values, [BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE, 'po-1'])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek r8 finding 2 — the DESTINATION and the SOURCE are re-verified at write time.
+//
+// The operator names a sync row read off an activity entry that may be hours old. Nothing re-checked
+// that the destination still NEEDED the link, so a document that had since acquired a newer, valid
+// back-reference was overwritten with the older id — and the unique index could not object, because
+// the old value had just been released and the two values differ.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek r8 f2] a destination that has since acquired a NEWER id is refused, not overwritten', async () => {
+  const { claimDeps, bills, source } = makeClaimDeps({
+    bills: [
+      // Linked correctly since the warning was written — 900 is the id this bill really posted as.
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: '900', createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'destination-refused', reason: 'ALREADY_LINKED' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '900', 'the newer link stands')
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145', 'and nothing was released for it')
+  assert.notEqual(source?.errorMessage, null)
+})
+
+test('[o3d-9kek r8 f2] a destination linked BETWEEN the read and the write is refused by the fence', async () => {
+  // The read alone cannot be the guarantee: the operator's confirmation is minutes old and another
+  // writer can land between the check and the write. The write is predicated on the column still
+  // being null, so the concurrent link wins and this refuses.
+  let linked = false
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    raceAfterDestinationRead: (rows) => {
+      if (linked) return
+      const target = rows.find((row) => row.id === 'bill-target')
+      if (target) { target.accountingInvoiceId = '900'; linked = true }
+    },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'destination-refused', reason: 'CHANGED_UNDER_READ' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '900', 'the newer link stands')
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145', 'and the holder was not emptied for it')
+})
+
+test('[o3d-9kek r8 f2] a destination that no longer exists is refused, and says so', async () => {
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [{ id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 }],
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'destination-refused', reason: 'MISSING' })
+  assert.equal(bills[0].accountingInvoiceId, '145')
+})
+
+test('[o3d-9kek r8 f2] the sales-side release fences its destination the same way', async () => {
+  // The same defect, one table over: a stale CREDIT_NOTE/SALES_INVOICE warning would move an old
+  // invoice id onto a sales order that had since been invoiced properly — and payment polling marks
+  // EVERY order carrying a matching id as paid, so the damage is a wrong payment, not just a wrong link.
+  const { claimDeps, salesOrders } = makeClaimDeps({
+    bills: [],
+    salesOrders: [
+      { id: 'so-target', accountingInvoiceId: '900' },
+      { id: 'so-retired', accountingInvoiceId: '145' },
+    ],
+    source: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-target' },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, {
+    ...RELEASE_PARAMS, type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-target', confirmedHolderId: 'so-retired',
+  })
+
+  assert.deepEqual(result, { outcome: 'destination-refused', reason: 'ALREADY_LINKED' })
+  assert.equal(salesOrders.find((row) => row.id === 'so-target')?.accountingInvoiceId, '900')
+  assert.equal(salesOrders.find((row) => row.id === 'so-retired')?.accountingInvoiceId, '145')
+})
+
+test('[o3d-9kek r8 f2] a PO whose bill already carries the id is already-correct, not a re-attribution', async () => {
+  // The PO-keyed destination is not named, it is resolved — so "does it still need the link?" has to
+  // be asked of the whole order. A bill of THIS PO already holding 145 means the repair happened;
+  // releasing it and re-resolving could land the id on a DIFFERENT bill of the same order.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-done', poId: 'po-1', accountingInvoiceId: '145', createdAt: 2 },
+      { id: 'bill-other', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 },
+    ],
+    poSyncRows: PO_SYNC_ROWS,
+    source: PO_SOURCE,
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...PO_RELEASE_PARAMS, confirmedHolderId: 'bill-done' })
+
+  assert.deepEqual(result, { outcome: 'already-correct' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-done')?.accountingInvoiceId, '145')
+  assert.equal(bills.find((bill) => bill.id === 'bill-other')?.accountingInvoiceId, null)
+})
+
+test('[o3d-9kek r8 f2] a sync row that has since re-posted under a NEW id is refused', async () => {
+  // The row the operator read said 145; it now says 146, so 145 is an id this row no longer owns and
+  // releasing another record's claim on its behalf is a guess.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    source: { externalTransactionId: '146' },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'source-refused', reason: 'EXTERNAL_ID_CHANGED' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, null)
+})
+
+test('[o3d-9kek r8 f2] a sync row with a sync IN FLIGHT is refused', async () => {
+  // PENDING/PROCESSING means a sync is running that may post again and return a DIFFERENT id, so the
+  // id the operator confirmed a holder for may be about to stop being this row's id at all.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    source: { status: 'PENDING' },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'source-refused', reason: 'NOT_REPAIRABLE_STATUS' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145')
+})
+
+test('[o3d-9kek r8 f2] a CANCELLED sync row is refused', async () => {
+  // Deliberately abandoned (audit-46ry) — not evidence of anything owed.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    source: { status: 'CANCELLED' },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'source-refused', reason: 'NOT_REPAIRABLE_STATUS' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145')
+})
+
+test('[o3d-9kek r8 f2] a FAILED sync row is repairable — it is what a XERO conflict looks like', async () => {
+  // The question the previous attempt at r8 left open, and getting it wrong would have made this
+  // whole command useless for Xero. Xero does NOT quarantine a refused back-reference the way
+  // QuickBooks does: updateBackReference lets the refusal propagate, markSyncLogForFollowUpRetry
+  // retries it, and the last retry lands the row on FAILED — still carrying the external id, which
+  // is persisted before the back-reference is ever attempted. So SYNCED-only would have refused
+  // every Xero conflict there is: sound, and useless. The sweep and retention already treat FAILED
+  // as repairable, and the release reads the SAME list.
+  const { claimDeps, bills, source, claimCalls } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    source: {
+      connector: 'xero',
+      status: 'FAILED',
+      errorMessage: 'Xero follow-up work failed after connector post: Error: Refusing to link PurchaseInvoice bill-target …',
+    },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, connector: 'xero', confirmedHolderId: 'bill-retired' })
+
+  assert.equal(result.outcome, 'relinked')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '145')
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, null)
+  // And its errorMessage is LEFT ALONE. On a SYNCED row that text is the quarantine marker and must
+  // not outlive the conflict; on a FAILED row it is the record of what actually went wrong, and
+  // erasing it would leave a FAILED row with no explanation. The status is not rewritten either —
+  // moving a row into or out of SYNCED changes whether it suppresses its own re-enqueue.
+  assert.deepEqual(claimCalls.sourceUpdates, [])
+  assert.equal(source?.status, 'FAILED')
+  assert.match(String(source?.errorMessage), /Refusing to link/)
+})
+
+test('[o3d-9kek r8 f2] the repairable-status list is the sweep\'s, not a copy of it', () => {
+  // r6 finding 2 was a restated list that silently dropped a document type; the same mistake with a
+  // STATUS list would have made a whole connector's conflicts unrepairable by one route and swept by
+  // the other. Both read this constant, so they cannot disagree.
+  assert.deepEqual([...BACK_REFERENCE_REPAIRABLE_STATUSES], ['SYNCED', 'FAILED'])
+  // What retention protects from deletion / compacts to a tombstone …
+  assert.deepEqual(UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE.status.in, [...BACK_REFERENCE_REPAIRABLE_STATUSES])
+  // … and what the sweep actually selects to repair.
+  const candidates = buildBackReferenceCandidateQuery({
+    connector: 'xero', after: null, ambiguityRecheckBefore: new Date('2026-08-01T00:00:00Z'), take: 10,
+  })
+  assert.deepEqual((candidates.where as { status: { in: string[] } }).status.in, [...BACK_REFERENCE_REPAIRABLE_STATUSES])
+})
+
+test('[o3d-9kek r8 f2] a sync row with no record of a refusal is not evidence of one', async () => {
+  // Any SYNCED row carrying an external id would otherwise do, including one whose back-reference
+  // was never refused at all — and releasing another document's claim on the strength of that is the
+  // wrong-document write this whole module refuses everywhere else.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    source: { errorMessage: null, backReferenceAmbiguousLoggedAt: null },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'source-refused', reason: 'NO_CONFLICT_EVIDENCE' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145')
+})
+
+test('[o3d-9kek r8 f2] the repair sweep\'s deferred-refusal stamp counts as evidence too', async () => {
+  // Xero's refusals come from the connector-agnostic sweep, which records them by DEFERRING the row
+  // rather than by writing errorMessage. Accepting only errorMessage would leave every Xero conflict
+  // with no route out at all — the defect r7 fixed, reintroduced by the fix to r8.
+  const { claimDeps, bills, source, claimCalls } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    source: { connector: 'xero', errorMessage: null, backReferenceAmbiguousLoggedAt: new Date('2026-08-01T00:00:00Z') },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, {
+    ...RELEASE_PARAMS, connector: 'xero', confirmedHolderId: 'bill-retired',
+  })
+
+  assert.equal(result.outcome, 'relinked')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '145')
+  // Nothing to clear, so nothing is written to the row: the deferral stamp is the sweep's
+  // once-per-interval throttle, not a conflict marker to be reset.
+  assert.deepEqual(claimCalls.sourceUpdates, [])
+  assert.notEqual(source?.backReferenceAmbiguousLoggedAt, null)
+})
+
+test('[o3d-9kek r8 f2] a RETENTION TOMBSTONE is still evidence — the route out must survive compaction', async () => {
+  // The guard undoing the thing it guards, one more time. Data retention compacts an unresolved row
+  // to an attribution-only tombstone and NULLS errorMessage (it is free text quoting the payload).
+  // For a QuickBooks conflict that erases the only marker there is — QuickBooks has no repair sweep,
+  // so there is no deferred-refusal stamp either — and a release that accepted only the other
+  // markers would let RETENTION permanently retire the operator's ability to fix it. Compaction is
+  // scheduled by AGE and says nothing about repairability; the stamp is written exclusively to rows
+  // matching UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE, so it is the strongest marker of the four.
+  const { claimDeps, bills, claimCalls } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    source: {
+      errorMessage: null,
+      backReferenceAmbiguousLoggedAt: null,
+      backReferenceEvidenceCompactedAt: new Date('2026-07-01T00:00:00Z'),
+    },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.equal(result.outcome, 'relinked')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '145')
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, null)
+  // Nothing to clear — the tombstone already nulled the text, and the stamp itself is a retention
+  // fact, not a conflict marker to be reset.
+  assert.deepEqual(claimCalls.sourceUpdates, [])
+})
+
+test('[o3d-9kek r8 f2] a sync row that has been deleted is refused', async () => {
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    source: null,
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'source-refused', reason: 'MISSING' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '145')
+})
+
+test('[o3d-9kek r8 f1] a non-transactional client is refused outright, not run unprotected', async () => {
+  // There is no degraded mode: without a transaction the release cannot be rolled back, and a
+  // release that cannot be rolled back is the defect, not a lesser version of the fix.
+  const { claimDeps } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+  })
+  delete (claimDeps as { $transaction?: unknown }).$transaction
+
+  await assert.rejects(
+    releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' }),
+    /requires a transactional client/,
+  )
 })
 
 test('[o3d-9kek r7 f1] the holder table is derived from BACK_REFERENCE_PAIRS, not restated', () => {

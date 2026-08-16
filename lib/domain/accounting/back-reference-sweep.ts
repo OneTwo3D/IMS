@@ -1,5 +1,6 @@
 import type { AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import {
+  BACK_REFERENCE_REPAIRABLE_STATUSES,
   BACK_REFERENCE_TYPES,
   applyBackReference,
   backReferenceIsMissing,
@@ -170,7 +171,11 @@ export const UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE: {
 } = {
   backReferenceCheckedAt: null,
   externalTransactionId: { not: null },
-  status: { in: ['SYNCED', 'FAILED'] },
+  // Read, not restated (o3d-9kek r8). The operator release path asks the SAME question of the SAME
+  // column — "is this row's external id a durable record of a post that may still need linking?" —
+  // and the two answering differently is how a class of row becomes repairable by one route and
+  // invisible to the other. r6 finding 2 was that mistake with a type list.
+  status: { in: [...BACK_REFERENCE_REPAIRABLE_STATUSES] },
   type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
 }
 
@@ -490,7 +495,8 @@ export function buildBackReferenceCandidateQuery(params: {
   }
   const where: Record<string, unknown> = {
     connector: params.connector,
-    status: { in: ['SYNCED', 'FAILED'] },
+    // The same one definition the evidence predicate above reads (o3d-9kek r8).
+    status: { in: [...BACK_REFERENCE_REPAIRABLE_STATUSES] },
     externalTransactionId: { not: null },
     type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
     backReferenceCheckedAt: null,

@@ -1,4 +1,4 @@
-import type { AccountingSyncType } from '@/app/generated/prisma/client'
+import type { AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { isUniqueConstraintViolation, uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 
@@ -455,6 +455,30 @@ export function backReferenceHolder(type: AccountingSyncType, referenceType: str
   return BACK_REFERENCE_PAIRS.find((pair) => pair.type === type && pair.referenceTypes.includes(referenceType))?.holder ?? null
 }
 
+/**
+ * THE STATUSES whose external id is a durable record of a post that may still need linking locally.
+ *
+ * SYNCED is the obvious one — the post succeeded and the row is the local record of it, including
+ * the QuickBooks quarantine state (SYNCED with the conflict in `errorMessage`, deliberately not
+ * flipped out of SYNCED because that would stop the row suppressing its own re-enqueue and the
+ * document would post twice).
+ *
+ * FAILED belongs here too, and getting that wrong would have silently gutted the release path. XERO
+ * DOES NOT QUARANTINE: `updateBackReference` lets the refusal propagate, the caller runs
+ * markSyncLogForFollowUpRetry, and after MAX_RETRIES the row lands on FAILED — still carrying the
+ * externalTransactionId the ledger issued, because that is persisted before the back-reference is
+ * ever attempted. So a Xero external-id conflict is ONLY ever visible as a FAILED row, and a release
+ * that accepted SYNCED alone would refuse every Xero conflict there is: the exact "posted, refused,
+ * and no way out" defect this path was built to remove, reintroduced by its own guard.
+ *
+ * PENDING/PROCESSING are excluded because a sync is in flight that may post again and return a
+ * DIFFERENT id, and CANCELLED because the row was deliberately abandoned (audit-46ry).
+ *
+ * ONE definition, read by the sweep's candidate window, by the retention evidence predicate and by
+ * the release. A restated copy is how a whole document type fell out of the sweep in r6 finding 2.
+ */
+export const BACK_REFERENCE_REPAIRABLE_STATUSES: readonly AccountingSyncStatus[] = ['SYNCED', 'FAILED']
+
 /** The sync types in BACK_REFERENCE_PAIRS. Derived, so it can never drift from the pairs. */
 export const BACK_REFERENCE_TYPES: readonly AccountingSyncType[] = BACK_REFERENCE_PAIRS.map((pair) => pair.type)
 
@@ -759,6 +783,62 @@ export type ExternalDocumentIdClaimDeps = {
   supplierCreditNote: ExternalDocumentIdClaimDelegate
 }
 
+/**
+ * The sync row the operator named, re-read AT WRITE TIME (o3d-9kek r8 finding 2).
+ *
+ * The operator types a `--sync-log` id copied out of an activity entry that may be hours old. Every
+ * fact the release acts on comes from that row — which external id, and onto which document — so the
+ * row is the SOURCE, and a source that has moved on since it was read is not evidence of anything.
+ */
+type ExternalDocumentIdReleaseSourceDelegate = {
+  findUnique(args: {
+    where: { id: string }
+    select: {
+      id: true
+      connector: true
+      type: true
+      referenceType: true
+      referenceId: true
+      externalTransactionId: true
+      status: true
+      errorMessage: true
+      backReferenceAmbiguousLoggedAt: true
+      backReferenceEvidenceCompactedAt: true
+    }
+  }): Promise<{
+    id: string
+    connector: string
+    type: AccountingSyncType
+    referenceType: string
+    referenceId: string
+    externalTransactionId: string | null
+    status: string
+    errorMessage: string | null
+    backReferenceAmbiguousLoggedAt: Date | null
+    backReferenceEvidenceCompactedAt: Date | null
+  } | null>
+  update(args: { where: { id: string }; data: { errorMessage: null } }): Promise<unknown>
+}
+
+/**
+ * Everything the release touches, WITHOUT the transaction seam — i.e. what the callback of
+ * `$transaction` receives. `applyBackReference` sees this as an ordinary `BackReferenceDeps` that
+ * happens to have no `$transaction` of its own, which is exactly what a Prisma interactive
+ * transaction client is, and is why the PO-keyed path inside takes its "already inside somebody
+ * else's transaction" branch instead of opening a second one.
+ */
+export type ExternalDocumentIdReleaseClient =
+  ExternalDocumentIdClaimDeps
+  & Omit<BackReferenceDeps, '$transaction' | 'accountingSyncLog'>
+  & { accountingSyncLog: BackReferenceDeps['accountingSyncLog'] & ExternalDocumentIdReleaseSourceDelegate }
+
+/** The release's client, which MUST be transactional — see releaseAndRelinkExternalDocumentId. */
+export type ExternalDocumentIdReleaseDeps = ExternalDocumentIdReleaseClient & {
+  $transaction<T>(fn: (tx: ExternalDocumentIdReleaseClient & {
+    $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>
+  }) => Promise<T>): Promise<T>
+}
+
 const CLAIM_DELEGATES: Record<ExternalDocumentIdHolder['model'], keyof ExternalDocumentIdClaimDeps> = {
   SalesOrder: 'salesOrder',
   SalesOrderRefund: 'salesOrderRefund',
@@ -804,53 +884,272 @@ export type ExternalDocumentIdReleaseOutcome =
    * Nothing was cleared and nothing was written; re-read and confirm again.
    */
   | { outcome: 'contended'; holderId: string }
-  /** Released, but the back-reference write still did not land. Says what applyBackReference returned. */
-  | { outcome: 'released-not-applied'; releasedFrom: string; applyOutcome: BackReferenceApplyOutcome['outcome'] }
+  /**
+   * THE SOURCE ROW is not the row the operator read (o3d-9kek r8 finding 2). Nothing was written.
+   *
+   *   MISSING              — the sync row is gone (retention, or a connector switch).
+   *   NOT_REPAIRABLE_STATUS — it is outside BACK_REFERENCE_REPAIRABLE_STATUSES: PENDING/PROCESSING
+   *                          means a sync is in flight that may post again under a DIFFERENT id, and
+   *                          CANCELLED means the row was deliberately abandoned.
+   *   NO_CONFLICT_EVIDENCE — nothing on the row records that its back-reference was ever refused, so
+   *                          there is no durable evidence this is the conflict being resolved.
+   *   EXTERNAL_ID_CHANGED  — it now carries a different external id: it re-posted, and the id the
+   *                          operator confirmed a holder for is no longer the one this row is about.
+   *   TARGET_CHANGED       — connector/type/reference moved, so it no longer names this document.
+   */
+  | { outcome: 'source-refused'; reason: 'MISSING' | 'NOT_REPAIRABLE_STATUS' | 'NO_CONFLICT_EVIDENCE' | 'EXTERNAL_ID_CHANGED' | 'TARGET_CHANGED' }
+  /**
+   * THE DESTINATION no longer needs this link (o3d-9kek r8 finding 2). Nothing was written.
+   *
+   *   ALREADY_LINKED     — it already carries a back-reference. A DIFFERENT one: an id equal to this
+   *                        one is `already-correct` above. Overwriting it would replace a newer,
+   *                        valid link with an older id read off a stale activity entry.
+   *   MISSING            — the document itself is gone.
+   *   CHANGED_UNDER_READ — it was unlinked when read and had acquired an id by the time the write
+   *                        fenced it. The compare-and-swap refused; the newer link stands.
+   */
+  | { outcome: 'destination-refused'; reason: 'ALREADY_LINKED' | 'MISSING' | 'CHANGED_UNDER_READ' }
+  /**
+   * The re-link would not have landed, so NOTHING WAS RELEASED — the whole operation rolled back and
+   * the holder still holds the id. Says what applyBackReference returned (or, for a violation of the
+   * unique index raised inside the transaction, `ambiguous`, which is how applyBackReference's own
+   * outer catch classifies the same interleaving).
+   *
+   * `conflictMessage` carries the unique-index refusal's own text when there was one. Without it the
+   * operator would be told only "ambiguous" — while applyBackReference's message, the one that names
+   * which document holds the id and what to do about it, was thrown away by the classification.
+   */
+  | { outcome: 'not-relinked'; applyOutcome: BackReferenceApplyOutcome['outcome']; conflictMessage?: string }
   /** This type/reference pair does not write a back-reference at all, so there is no claim to release. */
   | { outcome: 'not-applicable' }
+
+/**
+ * Thrown to ROLL THE TRANSACTION BACK while still reporting a structured outcome (r8 finding 1).
+ *
+ * Every refusal below has to unwind whatever the operation had already written, and the only way to
+ * unwind a Prisma interactive transaction is to leave it by throwing. Caught immediately outside, so
+ * it never escapes this module.
+ */
+class ExternalDocumentIdReleaseAbort extends Error {
+  constructor(readonly result: ExternalDocumentIdReleaseOutcome) {
+    super(`external id release aborted: ${result.outcome}`)
+  }
+}
+
+/** Whether the sync row is still the one the operator read, or why it is not. */
+function releaseSourceRefusal(
+  source: Awaited<ReturnType<ExternalDocumentIdReleaseSourceDelegate['findUnique']>>,
+  params: BackReferenceParams,
+): Extract<ExternalDocumentIdReleaseOutcome, { outcome: 'source-refused' }>['reason'] | null {
+  if (!source) return 'MISSING'
+  // The same window the sweep and retention use, imported rather than restated. A row outside it is
+  // not a posted-but-unlinked document: PENDING/PROCESSING means a sync is in flight that may return
+  // a DIFFERENT id, CANCELLED means it was abandoned.
+  if (!(BACK_REFERENCE_REPAIRABLE_STATUSES as readonly string[]).includes(source.status)) return 'NOT_REPAIRABLE_STATUS'
+  // DURABLE EVIDENCE that this row's back-reference was actually refused — not merely a row that
+  // happens to carry an external id, which is most of the table. Four paths leave a marker:
+  //
+  //   • QuickBooks quarantines the conflict into `errorMessage` on a row it keeps SYNCED;
+  //   • Xero lets the refusal propagate, so markSyncLogForFollowUpRetry writes the same refusal text
+  //     into `errorMessage` and the row exhausts its retries to FAILED;
+  //   • the connector-agnostic repair sweep defers a refusal by stamping
+  //     `backReferenceAmbiguousLoggedAt` rather than writing any text at all;
+  //   • DATA RETENTION stamps `backReferenceEvidenceCompactedAt`, and that one has to be here or the
+  //     guard would undo the thing it guards. The tombstone deliberately NULLS `errorMessage` (it is
+  //     free text quoting the payload), so at the retention horizon a QuickBooks quarantine loses
+  //     its only marker — and QuickBooks has no repair sweep to leave the other one, so this command
+  //     is the sole route out. Accepting only the first three would let retention permanently retire
+  //     an operator's ability to fix it: the r4 finding 3 mistake — compaction is scheduled by AGE
+  //     and says nothing about repairability — in a new place. It is also the STRONGEST of the four:
+  //     the stamp is written exclusively to rows matching UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
+  //     i.e. to unresolved back-reference candidates and nothing else.
+  //
+  // A FAILED row's errorMessage can also be an ordinary failure unrelated to any conflict, so this
+  // is a FLOOR, not a proof: what actually stops a wrong write is the operator's confirmation of the
+  // holder, the holder still holding exactly this id, and the destination fence below.
+  if (!source.errorMessage && !source.backReferenceAmbiguousLoggedAt && !source.backReferenceEvidenceCompactedAt) {
+    return 'NO_CONFLICT_EVIDENCE'
+  }
+  if (source.externalTransactionId !== params.externalId) return 'EXTERNAL_ID_CHANGED'
+  if (source.connector !== params.connector || source.type !== params.type
+    || source.referenceType !== params.referenceType || source.referenceId !== params.referenceId) return 'TARGET_CHANGED'
+  return null
+}
 
 /**
  * RELEASE the named holder's claim on an external id and immediately link it to the document that
  * actually posted it. The operator route out of a refused back-reference.
  *
- * Both halves in one call on purpose. Releasing alone leaves the id owned by nobody, which is a
- * WORSE state than the refusal it replaced: the ledger document is now attached to nothing at all,
- * and for QuickBooks nothing sweeps it up afterwards. Whoever takes the id off one document must
- * put it on the other in the same breath.
+ * ONE TRANSACTION, not one call (o3d-9kek r8 finding 1). Releasing alone leaves the id owned by
+ * nobody, which is a WORSE state than the refusal it replaced: the ledger document is attached to
+ * nothing at all, and for QuickBooks nothing sweeps it up afterwards. Doing both halves in one
+ * FUNCTION was not enough to prevent that — a crash, a dropped connection or a refused re-link
+ * between the two writes left exactly the state the design existed to avoid, and it was not even
+ * recoverable by re-running: the holder no longer held the id, so the operator's confirmation no
+ * longer matched anything and the command answered `no-claim` for ever. So the clear and the write
+ * are one atomic unit; anything short of `applied` throws, the transaction rolls back to the
+ * pre-release state, and the recovery procedure is simply to run the command again.
  *
- * The release itself is a conditional `updateMany` requiring exactly one affected row — the same
- * compare-and-swap idiom as the PO attribution — so a holder that changed underneath us is a no-op
- * rather than a clobber. The write is the ordinary applyBackReference, which means it is still
- * subject to every guard: a PO-keyed row is still re-resolved under the advisory lock and can still
- * refuse, and the unique index still has the final say.
+ * WHAT IS VERIFIED, and where:
+ *   • the SOURCE sync row is re-read inside the transaction and must still be the row the operator
+ *     read — same external id, same target, still in BACK_REFERENCE_REPAIRABLE_STATUSES (SYNCED for
+ *     QuickBooks' quarantine, FAILED for Xero's propagated refusal), still carrying conflict
+ *     evidence (r8 finding 2). A row that re-posted under a new id is not evidence for moving the
+ *     old one;
+ *   • the HOLDER must still be the document the operator confirmed, and the clear is conditional on
+ *     it still holding exactly that id;
+ *   • the DESTINATION must still lack a back-reference, checked AND fenced under the same
+ *     transaction: a no-op conditional write predicated on the column being null both proves it and
+ *     row-locks it for the rest of the transaction, so a destination that has since acquired a
+ *     newer, valid id is refused rather than overwritten. For a PO-keyed row the destination is not
+ *     known until it is resolved, and that resolve — plus its own compare-and-swap — runs inside
+ *     this transaction under the per-PurchaseOrder advisory lock, taken HERE because
+ *     applyBackReference cannot open its own transaction from inside ours.
+ *
+ * Fails closed throughout: an unexpected state at any of those points refuses and reports, and
+ * refusing to repair is acceptable in a way that repairing onto the wrong document is not.
  */
 export async function releaseAndRelinkExternalDocumentId(
-  deps: ExternalDocumentIdClaimDeps & BackReferenceDeps,
-  params: BackReferenceParams & { confirmedHolderId: string },
+  deps: ExternalDocumentIdReleaseDeps,
+  params: BackReferenceParams & { syncLogId: string; confirmedHolderId: string },
 ): Promise<ExternalDocumentIdReleaseOutcome> {
   const holder = backReferenceHolder(params.type, params.referenceType)
   if (!holder || !params.externalId) return { outcome: 'not-applicable' }
-
-  const claim = await findExternalDocumentIdClaim(deps, { holder, externalId: params.externalId })
-  if (!claim) return { outcome: 'no-claim' }
-  // The id is already exactly where this row says it belongs. Only meaningful for the reference
-  // types that name their own document — a PurchaseOrder-keyed row names an order, never a bill.
-  if (claim.id === params.referenceId && params.referenceType === holder.model) return { outcome: 'already-correct' }
-  if (claim.id !== params.confirmedHolderId) return { outcome: 'holder-mismatch', currentHolderId: claim.id }
-
-  const released = await deps[CLAIM_DELEGATES[holder.model]].updateMany({
-    where: { id: params.confirmedHolderId, [holder.column]: params.externalId },
-    data: { [holder.column]: null },
-  })
-  if (released.count !== 1) return { outcome: 'contended', holderId: params.confirmedHolderId }
-
-  const applied = await applyBackReference(deps, params)
-  if (applied.outcome !== 'applied') {
-    return { outcome: 'released-not-applied', releasedFrom: params.confirmedHolderId, applyOutcome: applied.outcome }
+  if (typeof deps.$transaction !== 'function') {
+    // Not a fallback. A non-transactional client cannot roll the release back, and a release that
+    // cannot roll back is the defect this function exists to not have.
+    throw new Error('releaseAndRelinkExternalDocumentId requires a transactional client: the release and the re-link must be one atomic unit')
   }
-  return {
-    outcome: 'relinked',
-    releasedFrom: params.confirmedHolderId,
-    appliedTo: { referenceType: applied.referenceType, referenceId: applied.referenceId },
+  // A PurchaseOrder-keyed row names the ORDER; every other pair names the document that holds the
+  // id itself (BACK_REFERENCE_PAIRS), which is what lets the destination be fenced by id below.
+  const poKeyed = params.type === 'PURCHASE_INVOICE' && params.referenceType === 'PurchaseOrder'
+
+  try {
+    return await deps.$transaction(async (tx) => {
+      if (poKeyed) {
+        // The same lock applyBackReference would have taken, taken one level up: inside our
+        // transaction it has no `$transaction` of its own, so it runs the resolve-and-swap unfenced
+        // unless we hold the lock for it. Held to commit, so the resolve, the release and the swap
+        // are all serialized against another repair of the same PO.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE}::int4, hashtext(${params.referenceId})::int4)`
+      }
+
+      const claim = await findExternalDocumentIdClaim(tx, { holder, externalId: params.externalId })
+      if (!claim) throw new ExternalDocumentIdReleaseAbort({ outcome: 'no-claim' })
+      // The id is already exactly where this row says it belongs. Only meaningful for the reference
+      // types that name their own document — a PurchaseOrder-keyed row names an order, never a bill.
+      //
+      // ASKED BEFORE THE SOURCE IS VERIFIED, deliberately: it writes nothing, and it is the answer a
+      // SECOND RUN of a command that already succeeded deserves. The first run clears the sync row's
+      // quarantine text (below), so a re-run would otherwise be met with NO_CONFLICT_EVIDENCE —
+      // technically a refusal that writes nothing, but one that reads as "you have the wrong row"
+      // when the truth is "this is already done".
+      if (claim.id === params.referenceId && params.referenceType === holder.model) {
+        throw new ExternalDocumentIdReleaseAbort({ outcome: 'already-correct' })
+      }
+
+      const source = await tx.accountingSyncLog.findUnique({
+        where: { id: params.syncLogId },
+        select: {
+          id: true, connector: true, type: true, referenceType: true, referenceId: true,
+          externalTransactionId: true, status: true, errorMessage: true,
+          backReferenceAmbiguousLoggedAt: true, backReferenceEvidenceCompactedAt: true,
+        },
+      })
+      const sourceRefusal = releaseSourceRefusal(source, params)
+      if (sourceRefusal) throw new ExternalDocumentIdReleaseAbort({ outcome: 'source-refused', reason: sourceRefusal })
+
+      if (claim.id !== params.confirmedHolderId) {
+        throw new ExternalDocumentIdReleaseAbort({ outcome: 'holder-mismatch', currentHolderId: claim.id })
+      }
+
+      // ONE delegate for both halves: the claim lookup only ever searches `holder.model`, and for
+      // every non-PO pair the destination is a row of that same model (BACK_REFERENCE_PAIRS), so the
+      // holder being released and the document being linked are rows of the same table.
+      const table = tx[CLAIM_DELEGATES[holder.model]]
+      if (poKeyed) {
+        // The PO's own resolver already answers "does this PO still need the link?" — and it is the
+        // only thing that can, since the bill is not named. `already-linked` means a bill of THIS
+        // order already carries the id (including the case where the confirmed holder IS that bill),
+        // so there is nothing to release and nothing to move.
+        const attribution = await resolvePurchaseOrderBackReference(tx, {
+          connector: params.connector, purchaseOrderId: params.referenceId, externalId: params.externalId,
+        })
+        if (attribution.outcome === 'already-linked') throw new ExternalDocumentIdReleaseAbort({ outcome: 'already-correct' })
+      } else {
+        // READ, then FENCE. The read distinguishes "already linked to something newer" from "gone"
+        // for the operator; the conditional no-op write is what makes it safe — it matches only
+        // while the column is still null and row-locks the destination until this transaction
+        // commits, so nothing can link it between here and the write below.
+        //
+        // Writing the column to the value it already has looks pointless and is not: Postgres takes
+        // the same row lock for a same-value UPDATE as for any other, which is the whole point, and
+        // the `count` reports whether the predicate still held. Three of the four holder models
+        // carry `@updatedAt`, so this does touch that column — only on a run that goes on to link
+        // the row anyway (any refusal after this rolls back), so it never leaves a bare timestamp
+        // bump behind.
+        if (!await backReferenceIsMissing(tx, params)) {
+          const exists = await table.findFirst({ where: { id: params.referenceId }, select: { id: true } })
+          throw new ExternalDocumentIdReleaseAbort({ outcome: 'destination-refused', reason: exists ? 'ALREADY_LINKED' : 'MISSING' })
+        }
+        const fenced = await table.updateMany({
+          where: { id: params.referenceId, [holder.column]: null },
+          data: { [holder.column]: null },
+        })
+        if (fenced.count !== 1) throw new ExternalDocumentIdReleaseAbort({ outcome: 'destination-refused', reason: 'CHANGED_UNDER_READ' })
+      }
+
+      const released = await table.updateMany({
+        where: { id: params.confirmedHolderId, [holder.column]: params.externalId },
+        data: { [holder.column]: null },
+      })
+      if (released.count !== 1) throw new ExternalDocumentIdReleaseAbort({ outcome: 'contended', holderId: params.confirmedHolderId })
+
+      const applied = await applyBackReference(tx, params)
+      if (applied.outcome !== 'applied') {
+        throw new ExternalDocumentIdReleaseAbort({ outcome: 'not-relinked', applyOutcome: applied.outcome })
+      }
+
+      // The QUARANTINE MARKER is resolved, so it must not outlive the conflict — cleared in the SAME
+      // transaction, or a failure here would leave a resolved conflict still advertising itself as
+      // unresolved. Two deliberate limits on that:
+      //
+      //   • ONLY ON A SYNCED ROW. `SYNCED` + `errorMessage` is the unreachable-by-any-other-route
+      //     state QuickBooks writes to quarantine a refused back-reference (the success path nulls
+      //     it), so clearing it says exactly "that quarantine is over". On a FAILED row the
+      //     errorMessage is the ordinary record of what went wrong; erasing it would leave an
+      //     inexplicable FAILED row, and the row's own status is not this command's to rewrite.
+      //   • NEVER the STATUS. A row moved out of SYNCED stops suppressing its own re-enqueue and the
+      //     document posts to the ledger a second time; a row moved INTO SYNCED is a claim about the
+      //     sync that only the sync processor and the repair sweep are entitled to make.
+      //
+      // `backReferenceAmbiguousLoggedAt` is likewise NOT cleared: it is the sweep's once-per-interval
+      // throttle, and a repaired row simply stops being a candidate.
+      if (source?.status === 'SYNCED' && source.errorMessage) {
+        await tx.accountingSyncLog.update({ where: { id: params.syncLogId }, data: { errorMessage: null } })
+      }
+
+      return {
+        outcome: 'relinked' as const,
+        releasedFrom: params.confirmedHolderId,
+        appliedTo: { referenceType: applied.referenceType, referenceId: applied.referenceId },
+      }
+    })
+  } catch (error) {
+    if (error instanceof ExternalDocumentIdReleaseAbort) return error.result
+    // The unique index refused the re-link from inside the transaction — the sibling-bill
+    // interleaving applyBackReference classifies in its own outer catch for exactly this reason (a
+    // failed statement aborts the Postgres transaction, so it cannot be caught and returned from
+    // within). Same classification here, and the rollback has already undone the release.
+    if (isExternalDocumentIdConflict(error)) {
+      return {
+        outcome: 'not-relinked',
+        applyOutcome: 'ambiguous',
+        conflictMessage: error instanceof Error ? error.message : String(error),
+      }
+    }
+    // Anything else — a dropped connection, a lock timeout — propagates with the transaction rolled
+    // back, so the pre-release state is intact and re-running the command is the whole recovery.
+    throw error
   }
 }

@@ -5,9 +5,16 @@
  * WHEN YOU NEED THIS. A document posted successfully to the accounting ledger, and the write of its
  * external id onto the local record was rejected because another local record of the SAME TYPE
  * already holds that id. The commonest cause is a QuickBooks realm switch: company B reissues an
- * integer a retired company A's bill still carries. You will have seen a
- * `quickbooks_backreference_id_conflict` activity entry, and the sync row itself carries the same
- * text in `errorMessage` while staying SYNCED.
+ * integer a retired company A's bill still carries.
+ *
+ * WHAT THE ROW LOOKS LIKE depends on the connector, and both are handled:
+ *   • QUICKBOOKS quarantines it — a `quickbooks_backreference_id_conflict` activity entry, and the
+ *     sync row keeps `status = SYNCED` with the same text in `errorMessage`. It is left SYNCED on
+ *     purpose: a row out of SYNCED stops suppressing its own re-enqueue and the document posts twice.
+ *   • XERO does not quarantine — the refusal propagates, the row retries, and after the last retry
+ *     it lands on `status = FAILED` with the refusal text in `errorMessage`. It still carries the
+ *     external id, which is written before the back-reference is ever attempted. A FAILED row is
+ *     therefore the NORMAL shape of a Xero conflict, not a broken one.
  *
  * WHY IT CANNOT BE DONE BY HAND, and why it is not automatic either. "Link the document by hand" is
  * not a remedy: the same unique index refuses a manual link for exactly the same reason. And nothing
@@ -26,21 +33,29 @@
  *   3. Dry-run, which reads and reports and writes nothing:
  *        tsx scripts/release-accounting-external-id-claim.ts --sync-log <id> --holder <id>
  *   4. Re-run with --apply. The claim is cleared from the blocking record and the external id is
- *      written onto the document that actually posted it, in one step. Both halves are logged.
+ *      written onto the document that actually posted it, in ONE TRANSACTION. Both halves are logged.
  *
- * The release and the re-link are ONE operation on purpose. Clearing the id and stopping leaves the
- * ledger document attached to nothing at all — for QuickBooks, permanently, because no repair sweep
- * runs there. Whoever takes an id off one document must put it on the other in the same breath.
+ * The release and the re-link are one atomic unit on purpose (r8 finding 1). Clearing the id and
+ * stopping leaves the ledger document attached to nothing at all — for QuickBooks, permanently,
+ * because no repair sweep runs there — and it is not recoverable by re-running, because the holder
+ * no longer holds the id and your confirmation stops matching anything. So anything short of a
+ * completed re-link rolls the release back, and the recovery procedure for ANY failure of this
+ * command — including a crash or a lost connection mid-way — is to run it again.
  *
- * The clear is conditional on the named record still holding exactly that id, and the re-link is the
- * ordinary applyBackReference, so a PO-keyed row is still re-resolved under its advisory lock and
- * can still refuse. Nothing here bypasses a guard; it only removes the ONE obstacle a human has
- * confirmed is stale.
+ * Every fact it acts on is re-verified inside that transaction, against the state at write time
+ * rather than the state you read: the sync row must still be the row you named (same external id,
+ * same document, still repairable, still carrying the conflict marker), the blocking record must
+ * still be the one you confirmed and must still hold exactly that id, and the destination must still
+ * LACK a back-reference — a destination that has acquired a newer, valid id in the meantime is
+ * refused, never overwritten. Nothing here bypasses a guard; it only removes the ONE obstacle a
+ * human has confirmed is stale.
  */
 import { config } from 'dotenv'
 
 import {
+  BACK_REFERENCE_REPAIRABLE_STATUSES,
   backReferenceHolder,
+  backReferenceIsMissing,
   findExternalDocumentIdClaim,
   releaseAndRelinkExternalDocumentId,
 } from '../lib/domain/accounting/back-reference'
@@ -75,7 +90,11 @@ async function main() {
 
   const row = await db.accountingSyncLog.findUnique({
     where: { id: syncLogId },
-    select: { id: true, connector: true, type: true, referenceType: true, referenceId: true, externalTransactionId: true, status: true },
+    select: {
+      id: true, connector: true, type: true, referenceType: true, referenceId: true,
+      externalTransactionId: true, status: true, errorMessage: true,
+      backReferenceAmbiguousLoggedAt: true, backReferenceEvidenceCompactedAt: true,
+    },
   })
   if (!row) throw new Error(`No accounting sync row ${syncLogId}`)
   if (!row.externalTransactionId) {
@@ -85,7 +104,6 @@ async function main() {
   if (!holder) {
     throw new Error(`Sync row ${syncLogId} (${row.type}/${row.referenceType}) does not write a back-reference at all`)
   }
-
   const params = {
     connector: row.connector,
     type: row.type,
@@ -105,12 +123,61 @@ async function main() {
   console.log(`current holder:  ${claim ? `${holder.model} ${claim.id}` : '(none — nothing is blocking)'}`)
   console.log(`you confirmed:   ${holder.model} ${confirmedHolderId}`)
 
+  // ALREADY DONE is answered before anything is refused. A successful --apply clears the sync row's
+  // quarantine text, so re-running the exact same command would otherwise be met with the
+  // no-conflict-marker refusal below — a refusal that writes nothing, but that reads as "you have
+  // the wrong row" when the truth is "this is already finished".
+  if (claim && claim.id === row.referenceId && row.referenceType === holder.model) {
+    console.log(`\nThe id is already on ${row.referenceType} ${row.referenceId}. Nothing to release, nothing to do.`)
+    return
+  }
+
+  // THE ROW MUST STILL BE A REPAIRABLE ONE (r8 finding 2). Re-checked inside the transaction too —
+  // that is the check that counts — but refused here as well so a mistyped or stale --sync-log is
+  // named by the DRY RUN, before an operator has been told to re-run with --apply.
+  //
+  // SYNCED **or** FAILED, from the one shared definition the repair sweep and data retention read.
+  // Restating it as "SYNCED only" here would have refused every Xero conflict there is, since Xero
+  // never quarantines and its refusals exhaust their retries to FAILED — the tool would have been
+  // sound and useless. PENDING/PROCESSING means a sync is in flight that may post again under a
+  // different id; CANCELLED means the row was deliberately abandoned.
+  if (!BACK_REFERENCE_REPAIRABLE_STATUSES.includes(row.status)) {
+    throw new Error(
+      `Sync row ${syncLogId} is ${row.status}, which is not a repairable status `
+      + `(${BACK_REFERENCE_REPAIRABLE_STATUSES.join(' or ')}). PENDING/PROCESSING means a sync is in flight that may post again `
+      + 'under a different id, and CANCELLED means this row was deliberately abandoned — releasing another record\'s claim on '
+      + 'its behalf would be a guess either way.',
+    )
+  }
+  // The row must carry SOME durable record that its back-reference was refused. Four things count,
+  // and the fourth is the retention tombstone: compaction NULLS errorMessage, and for a QuickBooks
+  // conflict (no repair sweep, so no deferred-refusal stamp either) that would otherwise erase the
+  // last marker and close this route for good at the retention horizon.
+  const marker = row.errorMessage ? 'errorMessage on the sync row'
+    : row.backReferenceAmbiguousLoggedAt ? 'deferred-refusal stamp from the repair sweep'
+    : row.backReferenceEvidenceCompactedAt ? 'retention tombstone (payload and error text compacted away; attribution kept)'
+    : null
+  if (!marker) {
+    throw new Error(
+      `Sync row ${syncLogId} carries no record of a refused back-reference (no errorMessage, no deferred-refusal stamp, no `
+      + 'retention tombstone). Nothing here is evidence that this id was ever blocked, so there is nothing to release — find the '
+      + 'row the conflict was actually reported on.',
+    )
+  }
+  console.log(`conflict marker: ${marker}`)
+  // And the DESTINATION, which is the half a dry run used to say nothing about: a document that has
+  // since acquired its own back-reference does not need this one, and the apply will refuse rather
+  // than overwrite it (r8 finding 2). Better to see that here than to be told it after --apply.
+  const destinationNeedsLink = await backReferenceIsMissing(db, params)
+  console.log(`destination:     ${row.referenceType} ${row.referenceId} — `
+    + (destinationNeedsLink ? 'still unlinked' : 'ALREADY LINKED or gone; --apply will refuse'))
+
   if (!apply) {
     console.log('\nDRY RUN — nothing written. Re-run with --apply once you have confirmed the holder above is stale.')
     return
   }
 
-  const result = await releaseAndRelinkExternalDocumentId(db, { ...params, confirmedHolderId })
+  const result = await releaseAndRelinkExternalDocumentId(db, { ...params, syncLogId: row.id, confirmedHolderId })
   console.log(`\noutcome: ${result.outcome}`)
 
   switch (result.outcome) {
@@ -134,9 +201,9 @@ async function main() {
           appliedTo: result.appliedTo,
         },
       })
-      // The conflict is resolved, so the quarantine text must not outlive it — a stale errorMessage
-      // on a SYNCED row is exactly the marker something else may act on later.
-      await db.accountingSyncLog.update({ where: { id: row.id }, data: { errorMessage: null } })
+      // NOTE: the quarantine text on the sync row is cleared by the release itself, inside the same
+      // transaction — a resolved conflict must not survive as an unresolved-looking marker, and a
+      // separate update here could fail on its own and leave exactly that.
       break
     case 'holder-mismatch':
       console.error(`REFUSED: ${holder.model} ${result.currentHolderId} holds the id, not the ${confirmedHolderId} you confirmed.`)
@@ -153,27 +220,30 @@ async function main() {
       console.error(`REFUSED: ${holder.model} ${result.holderId} stopped holding the id between the read and the write. Nothing was written.`)
       process.exitCode = 1
       break
-    case 'released-not-applied':
-      // The dangerous half-state, and it must be shouted about: the id is now owned by nobody.
-      console.error(`RELEASED ${holder.model} ${result.releasedFrom}, but the re-link did NOT land (${result.applyOutcome}).`)
-      console.error('The external id is currently held by NO local record. Resolve this now — re-run once the apply outcome above is understood.')
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'accounting_external_id_claim_release_incomplete',
-        tag: 'sync',
-        level: 'ERROR',
-        description: `Released the ${row.connector} external id ${row.externalTransactionId} from ${holder.model} ${result.releasedFrom}, `
-          + `but could not link it to ${row.referenceType} ${row.referenceId} (${result.applyOutcome}). The ledger document is now `
-          + 'linked to NOTHING locally.',
-        metadata: {
-          syncLogId: row.id,
-          connector: row.connector,
-          externalId: row.externalTransactionId,
-          releasedModel: holder.model,
-          releasedFrom: result.releasedFrom,
-          applyOutcome: result.applyOutcome,
-        },
-      })
+    case 'source-refused':
+      // The row you named is not the row you read. Nothing was written.
+      console.error(`REFUSED: sync row ${row.id} is no longer the quarantined conflict you named (${result.reason}).`)
+      console.error('Nothing was written. Re-read the row and the activity entry — if it re-posted, its external id has changed and this '
+        + 'release is about an id that row no longer owns.')
+      process.exitCode = 1
+      break
+    case 'destination-refused':
+      // The half r8 finding 2 is about: the destination acquired a valid link while the warning sat
+      // unread, and the older id would have overwritten it.
+      console.error(`REFUSED: ${row.referenceType} ${row.referenceId} does not need this link (${result.reason}).`)
+      console.error('Nothing was written, and nothing was released. A destination that already carries a back-reference is NEVER '
+        + 'overwritten from here — check which id it holds and why before doing anything else.')
+      process.exitCode = 1
+      break
+    case 'not-relinked':
+      // NOT a half-state: the release and the re-link are one transaction, so a re-link that would
+      // not land takes the release down with it.
+      console.error(`REFUSED: the re-link would not have landed (${result.applyOutcome}), so the release was rolled back.`)
+      // The unique index's own explanation, when there was one — it names which document holds the
+      // id and what to do about it, which "ambiguous" on its own does not.
+      if (result.conflictMessage) console.error(result.conflictMessage)
+      console.error(`${holder.model} ${confirmedHolderId} still holds ${row.externalTransactionId} and nothing was changed. `
+        + 'Resolve the apply outcome above, then run this command again.')
       process.exitCode = 1
       break
     case 'not-applicable':
@@ -186,5 +256,11 @@ async function main() {
 main()
   .catch((error) => {
     console.error(error)
+    // Worth saying out loud, because the previous version of this command COULD leave something
+    // half-done and the habit of assuming so is expensive: the release and the re-link are one
+    // transaction, so a failure anywhere — including a dropped connection between the two writes —
+    // rolls back to the state before the command ran.
+    console.error('\nFAILED — and nothing was written: the release and the re-link are one transaction, so the blocking record still '
+      + 'holds the id. Fix the cause above and run the command again.')
     process.exitCode = 1
   })
