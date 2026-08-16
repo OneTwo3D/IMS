@@ -36,12 +36,28 @@ const accountingSyncLog = {
   count: async () => 0,
 }
 
+/** The plugin rows as the locked `SELECT ... FOR UPDATE` returns them. */
+function pluginRows() {
+  return [
+    { key: 'plugin_mintsoft_enabled', value: 'false' },
+    { key: 'plugin_quickbooks_enabled', value: String(state.activeConnector === 'quickbooks') },
+    { key: 'plugin_shiphero_enabled', value: 'false' },
+    { key: 'plugin_shopify_enabled', value: 'false' },
+    { key: 'plugin_woocommerce_enabled', value: 'false' },
+    { key: 'plugin_xero_enabled', value: String(state.activeConnector === 'xero') },
+  ]
+}
+
 mock.module('@/lib/db', {
   namedExports: {
     db: {
       accountingSyncLog,
+      // $queryRaw answers the locked plugin-row read the action does inside its transaction
+      // (o3d-osl8 round 6, finding 2). A double that returned [] here would make every role look
+      // like "no accounting connector is active" and turn the ADMIN test below vacuous — it would
+      // pass on the refusal path without ever reaching the update it claims to prove.
       $transaction: async (callback: (tx: unknown) => Promise<unknown>) =>
-        callback({ accountingSyncLog, $executeRaw: async () => 1 }),
+        callback({ accountingSyncLog, $executeRaw: async () => 1, $queryRaw: async () => pluginRows() }),
     },
   },
 })

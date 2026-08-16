@@ -32,41 +32,117 @@ const state = {
   role: 'ADMIN' as string,
   /** Which accounting plugin is enabled. Mutated mid-action by the tests. */
   activeConnector: null as string | null,
-  /** Runs the moment the fenced updateMany is issued — the exact window the finding describes. */
+  /** Runs the moment the fenced updateMany is issued — the exact window round 5 described. */
   onUpdate: null as null | (() => void),
+  /**
+   * Runs when the survivor COUNT is issued — i.e. AFTER the generation check and BEFORE the
+   * transaction commits. That is the window round 6, finding 2 is about, and it is the one the
+   * generation check cannot see: there is nothing left to re-check after it.
+   */
+  onCount: null as null | (() => void),
   updates: [] as UpdateArgs[],
   counts: [] as unknown[],
   /** Raw statements the transaction issued, in order. The lock must be the first. */
   raw: [] as string[],
+  /** Every operation the transaction performed, in order, for sequencing assertions. */
+  ops: [] as string[],
   /** How the transaction ended. */
   transactions: [] as Array<'committed' | 'rolled-back'>,
   activity: [] as Array<{ action: string; description: string }>,
   pending: 3,
   processing: 0,
+  /**
+   * A SIMULATED Postgres row lock on the plugin setting rows.
+   *
+   * `SELECT ... FOR UPDATE` takes it; the transaction ending releases it. `commitBypassingWrite`
+   * models a writer that never takes the ADVISORY lock — the quiesce harness, a fixture upsert,
+   * the full reset — and can therefore only be stopped by this. It is a model, not Postgres: what
+   * it proves is that the action takes the row lock before it reads and holds it to commit, which
+   * is the part of the protocol that lives in our code. That the lock then blocks is Postgres's
+   * job and is NOT exercised here (see the file footer).
+   */
+  rowLockHeld: false,
+  rowLockWaiters: [] as Array<() => void>,
+  /** Set to the number of ops that had run when a bypassing write actually landed. */
+  bypassLandedAfterOps: null as number | null,
+  /** Reads of the plugin state that did NOT go through the transaction. Must stay at zero. */
+  pluginReadsOutsideTx: 0,
 }
 
 function reset() {
   state.role = 'ADMIN'
   state.activeConnector = null
   state.onUpdate = null
+  state.onCount = null
   state.updates = []
   state.counts = []
   state.raw = []
+  state.ops = []
   state.transactions = []
   state.activity = []
   state.pending = 3
   state.processing = 0
+  state.rowLockHeld = false
+  state.rowLockWaiters = []
+  state.bypassLandedAfterOps = null
+  state.pluginReadsOutsideTx = 0
+}
+
+function takeRowLock() {
+  state.rowLockHeld = true
+}
+
+function releaseRowLock() {
+  state.rowLockHeld = false
+  const waiters = state.rowLockWaiters
+  state.rowLockWaiters = []
+  for (const wake of waiters) wake()
+}
+
+/**
+ * A plugin-key writer that takes NO advisory lock. It blocks only on the simulated row lock, so it
+ * lands the instant the cancel transaction ends — or immediately, if the row lock was never taken.
+ */
+function commitBypassingWrite(to: string | null): Promise<void> {
+  const apply = () => {
+    state.activeConnector = to
+    state.bypassLandedAfterOps = state.ops.length
+  }
+  if (!state.rowLockHeld) {
+    apply()
+    return Promise.resolve()
+  }
+  return new Promise<void>((resolve) => {
+    state.rowLockWaiters.push(() => { apply(); resolve() })
+  })
+}
+
+/** The plugin setting rows as `SELECT key, value FROM settings ... FOR UPDATE` would return them. */
+function pluginRows() {
+  return [
+    { key: 'plugin_mintsoft_enabled', value: 'false' },
+    { key: 'plugin_quickbooks_enabled', value: String(state.activeConnector === 'quickbooks') },
+    { key: 'plugin_shiphero_enabled', value: 'false' },
+    { key: 'plugin_shopify_enabled', value: 'false' },
+    { key: 'plugin_woocommerce_enabled', value: 'false' },
+    { key: 'plugin_xero_enabled', value: String(state.activeConnector === 'xero') },
+  ]
 }
 
 const accountingSyncLog = {
   updateMany: async (args: UpdateArgs) => {
+    state.ops.push('updateMany')
     state.updates.push(args)
     // The switch lands HERE: after the action resolved its scope, while the update is in flight.
     state.onUpdate?.()
     return { count: state.pending }
   },
   count: async (args: unknown) => {
+    state.ops.push('count')
     state.counts.push(args)
+    // POST-CHECK, PRE-COMMIT. The generation check has already run and passed by the time the
+    // survivor count is issued.
+    state.onCount?.()
     return state.processing
   },
   groupBy: async () => [],
@@ -80,22 +156,48 @@ mock.module('@/lib/db', {
       // the update, and that is the property under test.
       $transaction: async (callback: (tx: unknown) => Promise<unknown>) => {
         try {
-          const result = await callback({ accountingSyncLog, $executeRaw: rawInTx })
+          const result = await callback({ accountingSyncLog, $executeRaw: rawInTx, $queryRaw: queryInTx })
           state.transactions.push('committed')
           return result
         } catch (error) {
           state.transactions.push('rolled-back')
           throw error
+        } finally {
+          // The transaction ending is what releases the row locks it held. Recorded as an OP so a
+          // write that lands "after commit" is distinguishable from one that lands during the last
+          // statement — without this marker the two have the same op count and the post-commit
+          // assertion below is vacuous.
+          state.ops.push('tx-end')
+          releaseRowLock()
         }
       },
     },
   },
 })
 
+/** Renders a tagged template back into inspectable SQL text. */
+function renderSql(strings: TemplateStringsArray, values: unknown[]) {
+  return strings.raw.map((s, i) => s + (i < values.length ? String(values[i]) : '')).join('')
+}
+
 /** Records the raw SQL a transaction issues, tagged-template style. */
 async function rawInTx(strings: TemplateStringsArray, ...values: unknown[]) {
-  state.raw.push(strings.raw.map((s, i) => s + (i < values.length ? String(values[i]) : '')).join(''))
+  const sql = renderSql(strings, values)
+  state.raw.push(sql)
+  state.ops.push(/pg_advisory_xact_lock/.test(sql) ? 'advisory-lock' : 'materialise-rows')
   return 1
+}
+
+/**
+ * The `SELECT ... FOR UPDATE` read of the plugin rows. Takes the simulated row lock, and answers
+ * from the CURRENT connector selection — so a switch that managed to land is visible to it.
+ */
+async function queryInTx(strings: TemplateStringsArray, ...values: unknown[]) {
+  const sql = renderSql(strings, values)
+  state.raw.push(sql)
+  state.ops.push('select-plugin-rows-for-update')
+  if (/FOR UPDATE/i.test(sql)) takeRowLock()
+  return pluginRows()
 }
 
 mock.module('@/lib/auth/server', {
@@ -114,7 +216,14 @@ mock.module('@/lib/auth/server', {
 })
 
 mock.module('@/lib/integration-plugins', {
-  namedExports: { isIntegrationPluginEnabled: async (id: string) => state.activeConnector === id },
+  namedExports: {
+    // The POOLED, unlocked read. Counted rather than removed: the cancel must not use it, and a
+    // double that simply threw would say "it was not called" without saying what called it.
+    isIntegrationPluginEnabled: async (id: string) => {
+      state.pluginReadsOutsideTx += 1
+      return state.activeConnector === id
+    },
+  },
 })
 
 mock.module('@/lib/activity-log', {
@@ -132,19 +241,96 @@ async function cancel(connector?: string) {
 
 test.beforeEach(reset)
 
-test('the whole decision runs in ONE transaction, and the lock is taken before anything is read', async () => {
+test('the whole decision runs in ONE transaction, and BOTH locks are taken before anything is read', async () => {
   state.activeConnector = 'xero'
 
   await cancel('quickbooks')
 
   assert.deepEqual(state.transactions, ['committed'], 'exactly one transaction, and it committed')
-  assert.equal(state.raw.length, 1, 'one statement before the work: the lock')
+
+  // The order is the property. An advisory lock taken after the read protects nothing, and a row
+  // lock taken after the read protects nothing either.
+  assert.deepEqual(
+    state.ops,
+    [
+      'advisory-lock',
+      'materialise-rows',
+      'select-plugin-rows-for-update',
+      'updateMany',
+      'select-plugin-rows-for-update',
+      'count',
+      'tx-end',
+    ],
+    'lock, materialise, locked read, update, locked re-read (the fence), count — in that order',
+  )
+
   assert.match(state.raw[0], /pg_advisory_xact_lock/)
   assert.ok(
     state.raw[0].includes(String(ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY)),
     'and it is the SAME lock the plugin-state writers take — a private key would serialize nothing',
   )
+
+  // Round 6, finding 2. The advisory lock binds only writers that take it, and three real ones do
+  // not (the quiesce harness, the e2e fixtures, the full reset). `FOR UPDATE` on the plugin rows is
+  // what binds those, because it is Postgres rather than a convention.
+  assert.match(state.raw[2], /FOR UPDATE/i, 'the selection is read under a row lock, not a bare SELECT')
+  assert.match(state.raw[2], /plugin_xero_enabled|ANY\(/, 'and it is the plugin rows that are locked')
+  // Materialised first, because FOR UPDATE locks only rows that EXIST — an absent
+  // plugin_quickbooks_enabled would otherwise be INSERTable by a bypassing writer mid-transaction.
+  assert.match(state.raw[1], /INSERT INTO settings/i)
+  assert.match(state.raw[1], /ON CONFLICT \(key\) DO NOTHING/i, 'idempotent: it writes the value an absent row already means')
+
   assert.equal(state.updates.length, 1, 'the update ran inside it')
+})
+
+test('the selection is read THROUGH the transaction, never through the pooled client', async () => {
+  // The round 5 code read it with getActiveConnector() on the ordinary pooled client and argued
+  // that a single definition of "which connector is active" beat the extra connection. The cost of
+  // that was the whole of finding 2: a pooled read holds no lock, so nothing it observes is fenced.
+  // If this ever regresses, `isIntegrationPluginEnabled` starts being called again.
+  state.activeConnector = 'xero'
+  state.pluginReadsOutsideTx = 0
+
+  await cancel('quickbooks')
+
+  assert.equal(state.pluginReadsOutsideTx, 0, 'no unlocked read decided anything')
+  assert.equal(
+    state.ops.filter((op) => op === 'select-plugin-rows-for-update').length,
+    2,
+    'both the decision and the fence read the LOCKED rows',
+  )
+})
+
+test('a writer that skips the advisory lock cannot land in the post-check/pre-commit window', async () => {
+  // THE WINDOW ROUND 6, FINDING 2 IS ABOUT, and the one round 5 left open while describing itself
+  // as closed. The generation check verifies at one instant and the transaction commits at another.
+  // A writer that never takes the advisory lock — the full-chain quiesce harness writing
+  // plugin_xero_enabled over raw SQL, an e2e fixture upsert, resetDatabase deleting every settings
+  // row — could commit a switch in between, and the rows just marked CANCELLED then belonged to the
+  // connector that had just become ACTIVE. Nothing re-checks after the check.
+  //
+  // Injected AFTER the fence has already passed (the survivor count is the first thing that runs
+  // past it), which is what makes this test different from the four below: there is no later check
+  // that could catch it. Only the row lock can.
+  state.activeConnector = 'xero'
+  let bypass: Promise<void> = Promise.resolve()
+  state.onCount = () => { bypass = commitBypassingWrite('quickbooks') }
+
+  const result = await cancel('quickbooks')
+  await bypass
+
+  assert.equal(result.success, true, 'the cancel was correct when it started and is allowed to finish')
+  assert.equal(result.cancelled, 3)
+  assert.deepEqual(state.transactions, ['committed'])
+  assert.equal(
+    state.ops[(state.bypassLandedAfterOps ?? 0) - 1],
+    'tx-end',
+    'the bypassing switch landed only AFTER the transaction ended — it was held off by the row lock, '
+      + 'not merely un-noticed. Without the FOR UPDATE it lands during the count, which is PAST the '
+      + 'generation check: QuickBooks becomes active while its own queue is being retired, and '
+      + 'nothing left in the transaction can notice.',
+  )
+  assert.equal(state.bypassLandedAfterOps, state.ops.length, 'and it was the last thing to happen')
 })
 
 test('a switch landing between scope resolution and the update ABORTS — the new active queue survives', async () => {
@@ -226,21 +412,49 @@ test('the pre-existing refusals still refuse, and no longer write anything at al
   assert.deepEqual(state.updates, [], 'a transient both-plugins-off state still cannot wipe every queue')
 })
 
-test('the connector-selection writers take the SAME lock — otherwise it serializes nothing', async () => {
-  // The lock only binds writers that take it. Both paths that change which accounting connector is
-  // active must, or the fence below them is doing all the work alone.
+test('the LOCKED resolution and the POOLED one answer identically for every combination', async () => {
+  // Round 6 replaced the cancel's pooled getActiveConnector() with resolveActiveAccountingConnector
+  // over a locked read. Two sources for one question is only safe while it is ONE rule, and the
+  // objection round 5 raised against exactly this — "two definitions of which connector is active
+  // is a worse bug than the extra connection" — is correct in general. It is answered by keeping
+  // the rule in one pure function and pinning the agreement here, over every input, rather than by
+  // asserting it in a comment.
+  const { getAccountingIntegrationConnector } = await import('@/app/actions/accounting-sync')
+  const { resolveActiveAccountingConnector } = await import('@/lib/integration-plugin-selection-lock')
+
+  for (const [xero, quickbooks] of [[false, false], [true, false], [false, true], [true, true]] as const) {
+    // The pooled path is driven by isIntegrationPluginEnabled, which this file's double answers
+    // from state.activeConnector — so it can only express one at a time. The both-on case is
+    // therefore checked against the resolver alone, and it is the case that matters most: it is
+    // the invalid state finding 1 could produce, and Xero-first is what silently picks a winner.
+    if (xero && quickbooks) {
+      assert.equal(resolveActiveAccountingConnector({ xero, quickbooks }), 'xero')
+      continue
+    }
+    state.activeConnector = xero ? 'xero' : quickbooks ? 'quickbooks' : null
+    const pooled = await getAccountingIntegrationConnector()
+    assert.equal(
+      pooled?.id ?? null,
+      resolveActiveAccountingConnector({ xero, quickbooks }),
+      `xero=${xero} quickbooks=${quickbooks}`,
+    )
+  }
+})
+
+test('the generic key-value writer is still not a way around the lock', async () => {
+  // setSetting takes no lock and writes one key at a time. It must REFUSE the plugin keys rather
+  // than quietly providing an unlocked, non-atomic path to the same rows.
+  //
+  // WHAT THIS TEST USED TO BE, and why it was wrong: it grepped app/actions/settings.ts and
+  // app/actions/onboarding.ts for the strings ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY and
+  // pg_advisory_xact_lock. That asserted a spelling, not a behaviour — it passed for a file that
+  // merely mentioned the constant, and it would have FAILED the moment the lock was factored into
+  // a shared helper, which is exactly what round 6 did. The real inventory of plugin-key writers
+  // now lives in tests/accounting/plugin-selection-lock.test.ts, where it is enumerated and
+  // discovered rather than spelled.
   const { readFileSync } = await import('node:fs')
   const path = await import('node:path')
-  const read = (...p: string[]) => readFileSync(path.join(process.cwd(), ...p), 'utf8')
-
-  for (const file of [['app', 'actions', 'settings.ts'], ['app', 'actions', 'onboarding.ts']]) {
-    const src = read(...file)
-    assert.match(src, /ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY/, `${file.join('/')} must take the selection lock`)
-    assert.match(src, /pg_advisory_xact_lock/, `${file.join('/')} must actually issue it`)
-  }
-
-  // And the generic key-value writer must no longer be a way around them.
-  const settings = read('app', 'actions', 'settings.ts')
+  const settings = readFileSync(path.join(process.cwd(), 'app', 'actions', 'settings.ts'), 'utf8')
   const setSetting = settings.slice(settings.indexOf('export async function setSetting'))
   assert.match(
     setSetting.slice(0, setSetting.indexOf('\n}\n')),
@@ -248,3 +462,18 @@ test('the connector-selection writers take the SAME lock — otherwise it serial
     'setSetting must refuse the plugin keys rather than writing them unlocked',
   )
 })
+
+// ---------------------------------------------------------------------------
+// WHAT IS AND IS NOT PROVEN HERE, stated because the previous round overstated it.
+//
+// PROVEN: the action takes the advisory lock and the row lock BEFORE it reads, reads the selection
+// through the transaction, holds both to commit, and rolls back rather than committing a decision
+// made against a selection that moved. All of that lives in our code and all of it is asserted
+// above against the statements the action really issues.
+//
+// NOT PROVEN: that `pg_advisory_xact_lock` and `SELECT ... FOR UPDATE` actually block a second
+// session. That is Postgres's behaviour, the row lock above is a model of it, and no test in this
+// file runs against a live database — so the protocol is verified STRUCTURALLY and its enforcement
+// is taken on Postgres's documented semantics. Two concurrent connections contending for real would
+// need a live-Postgres test in tests/concurrency/ (the *.concurrent.test.ts convention).
+// ---------------------------------------------------------------------------

@@ -476,22 +476,60 @@ test('the page derives canCancel from the session, rather than the banner assumi
   }
 })
 
-test('a REJECTED cancel becomes the banner\'s error line, not an unhandled rejection', async () => {
-  // The gate is not the only thing that throws: the concurrency fence rolls back by throwing, and a
-  // stale session whose role changed since render hits the gate itself. Before the catch, the
-  // transition simply rejected — the operator saw the button do nothing and was told nothing.
+test('a THROWN failure is reported as an UNKNOWN outcome, and refreshes the rows', async () => {
+  // o3d-osl8 round 6, finding 3.
+  //
+  // WHAT THIS TEST USED TO ASSERT, and why that was the defect rather than the guarantee: it
+  // required the words "nothing was cancelled" and required `refreshes === 0`, on the reasoning
+  // that a rejected action changed nothing. That is true of a permission denial and of the
+  // concurrency fence — and FALSE of the third thing that lands in the same catch, a transport
+  // failure that loses the reply AFTER the server transaction committed. The client cannot tell
+  // them apart (a server action's error arrives as an opaque digest), so the component was
+  // guaranteeing an outcome it had no way to know, and this test was pinning that guarantee in
+  // place. The unsafe direction is specific: an operator told nothing happened retries, against a
+  // state they have not looked at.
+  //
+  // The rejection injected here IS the permission denial — the case where "nothing was cancelled"
+  // happens to be true — precisely because the component must not say it even then. It cannot
+  // distinguish this from the case where it is false.
   const banner = await mountBannerFromPage()
   state.cancel.rejectWith = new PermissionDeniedError('Forbidden: missing permission settings', 'settings')
 
   await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
 
   assert.deepEqual(state.cancel.calls, [[undefined]], 'the action was called and it rejected')
-  assert.equal(state.refreshes, 0, 'a rejected cancel must not refresh — nothing changed')
+  assert.equal(state.refreshes, 1, 'the authoritative rows are re-fetched, because they MAY have changed')
   const { html } = banner.render()
-  assert.match(html, /nothing was cancelled/, 'the operator is told what happened')
-  assert.match(html, /Reload this page/, 'and what to do')
+  assert.match(html, /NOT known whether any rows were cancelled/, 'the outcome is reported as unknown')
+  assert.ok(
+    !/nothing was cancelled/i.test(html),
+    'and never as a guarantee the client cannot make — that claim is reserved for the typed refusals',
+  )
+  assert.match(html, /before retrying/, 'the operator is told not to retry blind')
+  assert.match(html, /reloaded from the server/, 'and that the view below is now the server\'s answer')
   // The raw error must not be echoed: in production it reaches the client as an opaque digest.
   assert.ok(!html.includes('Forbidden'), 'and not the server error text')
+})
+
+test('a STRUCTURED refusal still says nothing was cancelled — that one really did roll back', async () => {
+  // The other half of finding 3. "Nothing was cancelled" is not banned; it is reserved. The action
+  // returns `{ success: false, error }` only on paths that committed nothing — the two pre-update
+  // refusals, and the concurrency fence, whose transaction was rolled back before the caller
+  // formatted this message. That result is a promise the server can keep, so the banner passes it
+  // through verbatim, and it must NOT be downgraded to "unknown".
+  const banner = await mountBannerFromPage()
+  state.cancel.result = {
+    success: false,
+    cancelled: 0,
+    error: 'The active accounting connector changed while this ran, so nothing was cancelled — reload and check before retrying.',
+  }
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
+
+  const { html } = banner.render()
+  assert.match(html, /nothing was cancelled/, 'the server\'s guarantee is shown as given')
+  assert.ok(!/NOT known whether/.test(html), 'and not weakened into an unknown outcome')
+  assert.equal(state.refreshes, 0, 'nothing changed, so there is nothing to re-fetch')
 })
 
 // ---------------------------------------------------------------------------

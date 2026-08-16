@@ -5,7 +5,13 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
 import { accountMappingRuleKeys, validateAccountingAccountMapping } from '@/app/(dashboard)/sync/accounting-settings-fields'
 import { db } from '@/lib/db'
-import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
+import {
+  lockIntegrationPluginSelection,
+  readLockedPluginSelection,
+  resolveActiveAccountingConnector,
+  type PluginSelectionLockTx,
+} from '@/lib/integration-plugin-selection-lock'
+import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { freshAuthFailureResult, requireAuth, requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -151,9 +157,10 @@ class AccountingConnectorChangedError extends Error {
  * connector's orphans are cancelled; otherwise every non-active connector's live
  * rows are cancelled.
  *
- * FENCED AGAINST A CONCURRENT CONNECTOR SWITCH (o3d-osl8 round 5, finding 2). Everything from
- * "which connector is active" to the update itself runs in ONE transaction holding
- * ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY, the same lock the plugin-state writers take.
+ * FENCED AGAINST A CONCURRENT CONNECTOR SWITCH (o3d-osl8 round 5, finding 2; round 6, finding 2).
+ * Everything from "which connector is active" to the update itself runs in ONE transaction that
+ * holds ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY — the same lock the plugin-state writers take —
+ * AND row-locks the plugin setting rows themselves, via lockIntegrationPluginSelection.
  *
  * Why it needed more than the re-read that was already here. The action sampled the active
  * connector, derived a cancellation scope from it, and then ran an unfenced updateMany. If
@@ -163,12 +170,18 @@ class AccountingConnectorChangedError extends Error {
  * corrected the survivor COUNT; nothing restores a cancelled row, and the activity log would
  * describe healthy work as abandoned.
  *
- * Two mechanisms, because they fail differently:
- *   • the LOCK serializes the switch against this sweep, so the window closes for any writer that
- *     takes it (both do — app/actions/settings.ts and app/actions/onboarding.ts);
+ * Three mechanisms, because they fail differently:
+ *   • the ADVISORY LOCK serializes the switch against this sweep, for any writer that takes it
+ *     (both app writers do — app/actions/settings.ts and app/actions/onboarding.ts);
+ *   • the `FOR UPDATE` ROW LOCKS on the plugin setting rows (round 6, finding 2) fence the writers
+ *     that DO NOT take the advisory lock, and those are real, not hypothetical: the full-chain
+ *     quiesce harness writes plugin_xero_enabled with raw SQL over its own pg client, the e2e
+ *     fixture scripts upsert it through Prisma, and resetDatabase deletes every settings row. None
+ *     of them can commit a change to those rows while this transaction is open, which is what
+ *     removes the post-check/pre-commit window the generation check alone left open;
  *   • the GENERATION CHECK re-reads the selection before commit and throws if it moved, which
- *     rolls the update back. It costs one read and it holds even if some future writer forgets
- *     the lock — and forgetting the lock is silent, whereas this is not.
+ *     rolls the update back. With the row locks held it should be unreachable — it is kept as the
+ *     loud failure if they are ever removed, not as the guarantee.
  *
  * Aborting DISCARDS NOTHING: the operator is told to look again, which is right, because the
  * scope they asked for was computed against a connector selection that no longer exists.
@@ -187,9 +200,11 @@ export async function cancelOrphanedAccountingSyncRows(
   try {
     outcome = await db.$transaction(async (tx) => {
       // Taken FIRST, before anything is read: a lock acquired after the read it is meant to
-      // protect protects nothing.
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`
-      return cancelOrphanedRowsUnderLock(tx, connector)
+      // protect protects nothing. lockIntegrationPluginSelection takes the advisory lock AND row-
+      // locks the plugin setting rows `FOR UPDATE`, which is what fences the writers that never
+      // take the advisory lock at all (round 6, finding 2).
+      const selection = await lockIntegrationPluginSelection(tx)
+      return cancelOrphanedRowsUnderLock(tx, selection, connector)
     })
   } catch (error) {
     if (error instanceof AccountingConnectorChangedError) {
@@ -249,16 +264,22 @@ export async function cancelOrphanedAccountingSyncRows(
  * The decide-and-update half, run inside the fenced transaction. Split out only so the lock, the
  * abort translation and the activity log stay legible above; it is not called from anywhere else.
  *
- * `tx` is the transaction client. The plugin-state reads deliberately go through
- * getActiveConnector (the ordinary pooled client): the alternative is a second, transaction-local
- * definition of "which connector is active", and two definitions of that is a worse bug than the
- * extra connection. READ COMMITTED means it still sees every committed switch.
+ * `selection` is the plugin state read by lockIntegrationPluginSelection — through the TRANSACTION
+ * client, from rows this transaction holds `FOR UPDATE` (round 6, finding 2). It used to be read
+ * through the ordinary pooled client via getActiveConnector, on the argument that a second
+ * definition of "which connector is active" would be worse than the extra connection. That
+ * argument was wrong in one specific way: a pooled read holds no lock, so nothing stopped a writer
+ * that skips the advisory lock from committing a switch AFTER the verification below and BEFORE
+ * this transaction committed. The single definition is preserved instead by
+ * resolveActiveAccountingConnector, which is the same Xero-first rule getActiveConnector applies —
+ * one rule, two sources, and the source used here is the one that can be locked.
  */
 async function cancelOrphanedRowsUnderLock(
-  tx: Pick<typeof db, 'accountingSyncLog'>,
+  tx: Pick<typeof db, 'accountingSyncLog'> & PluginSelectionLockTx,
+  selection: IntegrationPluginState,
   connector?: string,
 ): Promise<{ refusal?: string; activeConnector: string | null; cancelled: number; inFlight: number }> {
-  const activeConnector = await getActiveConnector()
+  const activeConnector = resolveActiveAccountingConnector(selection)
   // Never cancel the active connector's own queue.
   if (connector && connector === activeConnector) {
     return { refusal: 'Cannot cancel sync rows for the active connector.', activeConnector, cancelled: 0, inFlight: 0 }
@@ -323,16 +344,25 @@ async function cancelOrphanedRowsUnderLock(
   // response and the permanent activity log would describe live, healthy work as switched-off and
   // possibly lost, while the refreshed banner correctly excluded it. Contradictory accounting
   // evidence is worse than a slightly stale count, so this reads the current state.
-  const activeNow = await getActiveConnector()
+  // Re-read THROUGH THE TRANSACTION, from the rows it holds `FOR UPDATE`. Under READ COMMITTED
+  // each statement takes a fresh snapshot, so this sees any switch that managed to commit.
+  const activeNow = resolveActiveAccountingConnector(await readLockedPluginSelection(tx))
 
-  // THE FENCE (round 5, finding 2). The update above ran against a scope derived from
-  // `activeConnector`; if the selection has moved, that scope may name the connector that is now
-  // ACTIVE, and the rows just marked CANCELLED are its live queue. Throwing rolls the update back
-  // — the only outcome that is recoverable, since no later read can un-cancel a row.
+  // THE FENCE (round 5, finding 2; strengthened round 6, finding 2). The update above ran against a
+  // scope derived from `activeConnector`; if the selection has moved, that scope may name the
+  // connector that is now ACTIVE, and the rows just marked CANCELLED are its live queue. Throwing
+  // rolls the update back — the only outcome that is recoverable, since no later read can un-cancel
+  // a row.
   //
-  // Kept even though the advisory lock above should make it unreachable for the two writers that
-  // exist today: the lock binds only writers that take it, and a future one that does not would
-  // reintroduce the bug silently. This turns that into a loud, harmless refusal.
+  // WHAT CHANGED. This check on its own was never sufficient, and round 5 described it as if it
+  // were: it verifies at one instant and then commits at another, so an unlocked writer committing
+  // in between still produced the exact bug. It is the `FOR UPDATE` row locks taken at the top of
+  // the transaction that close that window — nothing outside can commit a change to those rows
+  // until this transaction ends, so there is no post-check/pre-commit gap left to exploit.
+  //
+  // The check is KEPT because it is the loud failure if that ever regresses (a removed row lock, a
+  // caller that reaches this function without going through lockIntegrationPluginSelection). It is
+  // a cheap assertion on an invariant, not the invariant itself.
   if (activeNow !== activeConnector) throw new AccountingConnectorChangedError(activeConnector, activeNow)
 
   const stillOrphaned = connector

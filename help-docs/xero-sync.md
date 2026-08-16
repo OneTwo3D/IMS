@@ -602,6 +602,13 @@ Because the sync log is scoped to the active connector, unresolved rows left beh
 
 These rows still block their sales order from being deleted. To clear one, either re-enable the connector it was queued for (Pending rows then resume on the next cron run), or look the document up in that accounting system using the reference and external ID shown. Pending and Processing rows queued for an inactive connector can also be bulk-cancelled from the same banner; cancelling discards the queued row and does not stop the document syncing to the active connector later.
 
+**If a cancel reports an error, read which kind it is.** There are two, and they mean different things:
+
+- A stated refusal — for example "The active accounting connector changed while this ran, so nothing was cancelled" — is a guarantee. Nothing was discarded, the reason is recorded in the activity log, and it is safe to reload and try again.
+- "The cancel request failed before it could report its outcome, so it is NOT known whether any rows were cancelled" means exactly that. The request may have been refused, or it may have completed and lost its reply on the way back. The banner reloads the stranded rows from the server when this happens: check that list, and the activity log, before pressing the button again — do not assume the attempt did nothing.
+
+Cancelling cannot be caught out by a connector switch happening at the same moment. The plugin selection is locked for the duration of the cancel, so a switch either lands entirely before it or entirely after it; if one somehow does land in between, the whole cancel is rolled back and reported rather than half-applied.
+
 **The list shows the oldest 50 rows only.** When there are more, it says so explicitly — "Showing the oldest 50 of 137 stranded row(s) — 87 more are not listed here." The hidden rows stay hidden until the listed ones are resolved: there is no per-row control here, and Failed rows in particular are not cleared by anything on this page, so a long-standing backlog at the front of the list will keep newer rows out of view. Resolve the oldest ones (re-enable their connector, or cancel the Pending/Processing ones) and the next set appears on reload. When the list is complete it says "Showing all N stranded row(s)" instead, so a count on this banner is never ambiguous about what it excludes.
 
 If the list itself cannot be loaded, the banner says so in red — "The list of stranded sync rows could not be loaded" — rather than showing nothing. An empty banner section always means there is nothing stranded; it never means the lookup failed.

@@ -105,6 +105,9 @@ export function ConnectorOrphanBanner({
       // throws to roll the transaction back, and any transport failure of the server action
       // rejects too. An uncaught rejection inside startTransition surfaces as a blank
       // non-response; the banner has an error line and it must be what the reader gets.
+      //
+      // Those three are NOT the same outcome, and the catch cannot distinguish them — see the
+      // message below.
       try {
         const result = await cancelOrphanedAccountingSyncRows(connector)
         if (result.success) {
@@ -120,9 +123,26 @@ export function ConnectorOrphanBanner({
           setError(result.error ?? 'Failed to cancel orphaned rows.')
         }
       } catch {
-        // No message from the error itself: a server action's error reaches the client as an
-        // opaque digest in production, so echoing it would print a hex string at the operator.
-        setError('Cancelling the orphaned rows failed, and nothing was cancelled. You may no longer have permission to cancel them, or the accounting connector changed while the request was running. Reload this page and check the rows below before trying again.')
+        // THE OUTCOME IS UNKNOWN, and saying anything stronger is a lie (o3d-osl8 round 6,
+        // finding 3).
+        //
+        // This branch used to claim "nothing was cancelled". That is true of some of the things
+        // that land here — the permission gate throwing, the concurrency fence rolling the
+        // transaction back — and false of the rest: a server action can also fail in TRANSPORT,
+        // and a reply lost after the server transaction committed arrives here identically. The
+        // client cannot tell those apart, because a server action's error reaches it as an opaque
+        // digest in production. Telling an operator that nothing was cancelled when rows may have
+        // been is the worst available answer: it invites a confident retry against a state they
+        // have not looked at.
+        //
+        // The guarantee of rollback belongs to the STRUCTURED refusals — the typed
+        // `{ success: false }` results the action returns, handled above, which are only produced
+        // on paths that committed nothing. This one gets "unknown", and a refresh so the
+        // authoritative rows are on screen while the operator decides.
+        setError('The cancel request failed before it could report its outcome, so it is NOT known whether any rows were cancelled — the request may have been refused, or it may have completed and lost its reply. The stranded rows below have been reloaded from the server: check them (and the activity log) before retrying, rather than assuming this attempt did nothing.')
+        // Immediately, not on the next navigation: the list on screen was rendered before an
+        // action that may have changed it.
+        router.refresh()
       }
     })
   }

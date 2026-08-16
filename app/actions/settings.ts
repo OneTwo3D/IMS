@@ -3,14 +3,13 @@
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
-import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
-  getIntegrationPluginState,
   INTEGRATION_PLUGIN_SETTING_KEYS,
   type IntegrationPluginId,
 } from '@/lib/integration-plugins'
+import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
@@ -805,6 +804,10 @@ type IntegrationPluginStateInput = Partial<Record<IntegrationPluginId, boolean>>
  *     read-decide-update, so a switch cannot land inside that window at all. Its generation check
  *     is the backstop if a writer ever skips this path; this is what keeps the backstop from
  *     firing during ordinary use.
+ *   • VALIDATED UNDER THE LOCK (round 6, finding 1) — the exclusivity rule is evaluated against
+ *     state read THROUGH the transaction, after the lock and the `FOR UPDATE` row locks. Reading
+ *     it beforehand made the check advisory only: two concurrent partial requests each saw both
+ *     connectors off, enabled one apiece, and committed a both-enabled state.
  *
  * Only the keys PRESENT in `state` are written, so a caller cannot silently disable a plugin it
  * did not mean to mention.
@@ -818,30 +821,44 @@ export async function saveIntegrationPluginState(
     .filter((entry): entry is [IntegrationPluginId, boolean] => typeof entry[1] === 'boolean')
   if (entries.length === 0) return { success: true }
 
-  // The same exclusivity the onboarding step enforces. Checked against the RESULTING state, not
-  // just the payload, so a partial write cannot turn both on between two calls.
-  const resulting = { ...(await getIntegrationPluginState()) }
-  for (const [id, enabled] of entries) resulting[id] = enabled
-  if (resulting.xero && resulting.quickbooks) {
-    return { success: false, error: 'Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector.' }
-  }
-  if (resulting.woocommerce && resulting.shopify) {
-    return { success: false, error: 'Enable either WooCommerce or Shopify, not both.' }
-  }
+  // READ, VALIDATE AND WRITE IN ONE LOCKED TRANSACTION (o3d-osl8 round 6, finding 1).
+  //
+  // The exclusivity rule is checked against the RESULTING state, not just the payload, so a
+  // PARTIAL write cannot turn both connectors on across two calls. That check is only worth
+  // anything if the state it reads cannot move before the write lands — and it could: this used to
+  // read through the pooled client BEFORE opening the locked transaction. Two concurrent partial
+  // requests then both observed both connectors disabled, one enabled Xero and the other
+  // QuickBooks, their writes serialized, and the result was BOTH ENABLED — an invalid state that
+  // no later validation ever revisits and that getActiveConnector silently resolves Xero-first, so
+  // nothing ever complains. WooCommerce/Shopify had the identical race.
+  //
+  // The read now goes through the transaction client, after the lock and under a `FOR UPDATE` row
+  // lock on the plugin rows (lockIntegrationPluginSelection), so the state validated IS the state
+  // written against — for writers that take the lock and for writers that do not.
+  const conflict = await db.$transaction(async (tx) => {
+    const resulting = { ...(await lockIntegrationPluginSelection(tx)) }
+    for (const [id, enabled] of entries) resulting[id] = enabled
+    if (resulting.xero && resulting.quickbooks) {
+      return 'Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector.'
+    }
+    if (resulting.woocommerce && resulting.shopify) {
+      return 'Enable either WooCommerce or Shopify, not both.'
+    }
 
-  await db.$transaction([
-    // FIRST in the sequence: Prisma runs an array transaction in order, so the lock is held before
-    // any flag moves.
-    db.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`,
-    ...entries.map(([id, enabled]) => {
+    for (const [id, enabled] of entries) {
       const key = INTEGRATION_PLUGIN_SETTING_KEYS[id]
-      return db.setting.upsert({
+      await tx.setting.upsert({
         where: { key },
         create: { key, value: serializeSettingValue(key, String(enabled)) },
         update: { value: serializeSettingValue(key, String(enabled)) },
       })
-    }),
-  ])
+    }
+    return null
+  })
+
+  // Returned rather than thrown: a refusal is an ordinary outcome the form displays, and throwing
+  // would reach the client as an opaque digest. The transaction has already committed nothing.
+  if (conflict) return { success: false, error: conflict }
 
   await logActivity({
     entityType: 'SETTING',

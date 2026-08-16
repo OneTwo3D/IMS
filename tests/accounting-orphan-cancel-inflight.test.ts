@@ -176,7 +176,14 @@ test('the survivor count re-derives its scope instead of reusing a pre-update sa
   const { join } = await import('node:path')
   const src = readFileSync(join(process.cwd(), 'app/actions/accounting-sync.ts'), 'utf8')
 
-  const countSection = src.slice(src.indexOf('const activeNow = await getActiveConnector()'))
+  // Anchored on the DECLARATION, not on the expression that initialises it. It used to be
+  // `const activeNow = await getActiveConnector()`; round 6 changed that to a locked read through
+  // the transaction, and `indexOf` then returned -1, making `slice(-1)` a one-character string that
+  // this test happened to notice only because BOTH assertions below failed. A source scan anchored
+  // on an implementation detail is one refactor away from asserting nothing at all.
+  const anchor = src.indexOf('const activeNow =')
+  assert.ok(anchor > 0, 'the re-read is still named activeNow — this scan has no other anchor')
+  const countSection = src.slice(anchor)
   const upToCount = countSection.slice(0, countSection.indexOf('})') + 2)
 
   assert.match(upToCount, /stillOrphaned/, 'the count uses a freshly derived orphan scope')

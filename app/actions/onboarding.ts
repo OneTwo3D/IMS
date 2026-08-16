@@ -2,7 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
-import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { logActivity } from '@/lib/activity-log'
 import { requireAdmin } from '@/lib/auth/server'
 import { getSettingValue } from '@/lib/settings-store'
@@ -243,6 +243,8 @@ type PluginStateInput = {
 export async function saveOnboardingPluginState(state: PluginStateInput): Promise<{ success: boolean; error?: string }> {
   await requireAdmin()
 
+  // A cheap payload-only pre-check, so an obviously contradictory form never opens a transaction.
+  // It is NOT the guarantee — `resulting`, below, is (round 6, finding 1).
   if (state.woocommerce && state.shopify) {
     return { success: false, error: 'Choose either WooCommerce or Shopify, not both.' }
   }
@@ -250,37 +252,45 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
     return { success: false, error: 'Choose either Xero or QuickBooks, not both.' }
   }
 
-  await db.$transaction([
-    // o3d-osl8 round 5, finding 2: the SAME lock cancelOrphanedAccountingSyncRows holds while it
-    // decides which connector's queue is orphaned. First in the array, because Prisma runs an
-    // array transaction in order and a lock taken after the write it guards guards nothing.
-    db.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`,
-    db.setting.upsert({
-      where: { key: 'plugin_woocommerce_enabled' },
-      create: { key: 'plugin_woocommerce_enabled', value: String(state.woocommerce) },
-      update: { value: String(state.woocommerce) },
-    }),
-    db.setting.upsert({
-      where: { key: 'plugin_shopify_enabled' },
-      create: { key: 'plugin_shopify_enabled', value: String(state.shopify) },
-      update: { value: String(state.shopify) },
-    }),
-    db.setting.upsert({
-      where: { key: 'plugin_xero_enabled' },
-      create: { key: 'plugin_xero_enabled', value: String(state.xero) },
-      update: { value: String(state.xero) },
-    }),
-    db.setting.upsert({
-      where: { key: 'plugin_quickbooks_enabled' },
-      create: { key: 'plugin_quickbooks_enabled', value: String(state.quickbooks) },
-      update: { value: String(state.quickbooks) },
-    }),
-    db.setting.upsert({
-      where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft },
-      create: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft, value: String(state.mintsoft) },
-      update: { value: String(state.mintsoft) },
-    }),
-  ])
+  // Lock, read, validate, write — in that order, inside one transaction (o3d-osl8 round 6,
+  // finding 1). This step writes every exclusivity-bearing key, so the RESULTING state is
+  // determined by the payload; the read still matters because the lock it comes with is what stops
+  // a concurrent PARTIAL write (saveIntegrationPluginState) from landing between this validation
+  // and this commit and leaving both accounting connectors enabled.
+  const conflict = await db.$transaction(async (tx) => {
+    const current = await lockIntegrationPluginSelection(tx)
+    const resulting = {
+      ...current,
+      woocommerce: state.woocommerce,
+      shopify: state.shopify,
+      xero: state.xero,
+      quickbooks: state.quickbooks,
+      mintsoft: state.mintsoft,
+    }
+    if (resulting.woocommerce && resulting.shopify) {
+      return 'Choose either WooCommerce or Shopify, not both.'
+    }
+    if (resulting.xero && resulting.quickbooks) {
+      return 'Choose either Xero or QuickBooks, not both.'
+    }
+
+    for (const [id, enabled] of [
+      ['woocommerce', state.woocommerce],
+      ['shopify', state.shopify],
+      ['xero', state.xero],
+      ['quickbooks', state.quickbooks],
+      ['mintsoft', state.mintsoft],
+    ] as const) {
+      const key = INTEGRATION_PLUGIN_SETTING_KEYS[id]
+      await tx.setting.upsert({
+        where: { key },
+        create: { key, value: String(enabled) },
+        update: { value: String(enabled) },
+      })
+    }
+    return null
+  })
+  if (conflict) return { success: false, error: conflict }
 
   await logActivity({
     entityType: 'SETTING',
