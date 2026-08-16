@@ -270,10 +270,13 @@ This means an admin viewing the activity log can see who did what but not see se
 - **Scheduler** — configure the public app URL used for external callbacks and manage scheduled jobs
 - **Activity log retention** — set how many days to keep log entries, configurable per log level
 - **Data retention** — configure archival/deletion windows for operational records. Two kinds of
-  record are deliberately kept past their window: shopping webhook events are compacted rather than
-  deleted (they are the idempotency record), and accounting sync rows whose back-reference is still
-  unresolved are retained until the repair sweep settles them — deleting those would erase the only
-  evidence of which accounting document an unlinked order or bill belongs to
+  record are compacted rather than deleted at the end of their window, because deleting them would
+  break something that cannot be reconstructed: shopping webhook events (the row is the idempotency
+  record) and accounting sync rows whose back-reference is still unresolved (the row is the only
+  evidence of which accounting document an unlinked order or bill belongs to, and deleting a
+  competing one would silently turn a refused-because-ambiguous attribution into a wrong answer). In
+  both cases the *content* — payloads, error text, and the customer details and financial lines they
+  contain — is cleared on schedule; only the small identifying record is kept
 - **System health** — at-a-glance status of FX sync, accounting sync, integration outbox depth, recent cron runs, and invariant check results
 - **Database reset** — reset system data with three levels of severity:
   - **Transactions only** — clears orders, invoices, and movements but keeps products and settings

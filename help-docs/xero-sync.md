@@ -552,24 +552,59 @@ ever links does not go quiet. Reasons you may see:
 | `EXTERNAL_ID_LINKED_ELSEWHERE` | Another bill — on another PO — already carries this Xero bill id |
 | `EXTERNAL_ID_CLAIMED_CONCURRENTLY` | Another bill claimed the id while this repair was being written |
 
-Two bills can never carry the same Xero bill id: the database enforces it with a unique index. That
-matters because bill updates post to `/Invoices/{id}`, so a duplicated id would make every later
-correction to one bill silently rewrite the other's document in Xero. If a link is refused for one
-of the conflict reasons above, resolve it by hand — IMS will not clear or move an existing link on
-its own, because nothing in IMS records whether that link was posted authoritatively or guessed.
+Two bills can never carry the same bill id **within one connected company**: the database enforces
+it with a unique index over the id *and* the connection that issued it. That matters because bill
+updates post to `/Invoices/{id}`, so a duplicated id would make every later correction to one bill
+silently rewrite the other's document in the ledger. If a link is refused for one of the conflict
+reasons above, resolve it by hand — IMS will not clear or move an existing link on its own, because
+nothing in IMS records whether that link was posted authoritatively or guessed.
+
+**Why the connection is part of the rule.** External ids are owned by the company that issued them.
+QuickBooks realm ids in particular are plain integers and repeat across companies, so the same
+number can legitimately be two different bills in two different companies. Every stored external id
+therefore carries the tenant/realm it came from.
+
+### Disconnecting and reconnecting
+
+Disconnecting clears the token, the company pin, and the cached contact/item ids — but **not** the
+external ids on your orders, bills and credit notes. Those are the only local record of which ledger
+document each one became, and every later correction or payment posts against them.
+
+- **Reconnect to the same company** — everything resumes where it was.
+- **Reconnect to a different company** — the old ids belong to a different company's namespace.
+  They are kept and stay readable, but they are inert: they are not treated as links for the new
+  company, they do not block a new bill that happens to be issued the same number, and sync rows
+  from the old company are not touched by the repair sweep. Documents linked in the old company
+  read as unlinked in the new one and can post afresh.
+
+Re-authorising to a *different* company while still connected is refused; only an explicit
+disconnect clears the pin.
+
+**The sweep always makes forward progress.** It examines a bounded number of rows per run and
+remembers where it stopped, so the next run resumes behind them and wraps round to the start when it
+reaches the end. Rows it cannot settle — a permanent ambiguity, a connector outage — are retried
+rather than retired, and because the sweep resumes rather than restarting, they cannot consume every
+run's budget and hide newer breakages behind them.
 
 **Retention interacts with this.** Sync logs are normally deleted once they pass the retention
-period (Settings → Data Retention), but rows the sweep has *not yet settled* — a posted row whose
-document is still unlinked — are kept past it. Deleting one of those would erase the only evidence
-of which document an unlinked bill belongs to, and deleting a *competing* row would silently turn
-an ambiguity the sweep was refusing to guess at into a confident wrong answer. Once a row is
-settled, it expires normally.
+period (Settings → Data Retention). A row the sweep has *not yet settled* — a posted row whose
+document is still unlinked — is not deleted, because deleting it would erase the only evidence of
+which document an unlinked bill belongs to, and deleting a *competing* row would silently turn an
+ambiguity the sweep was refusing to guess at into a confident wrong answer.
+
+It is **compacted** instead: at the retention cutoff the row keeps its connector, company, type,
+reference and external id, and loses its payload and error message — the parts holding customer
+details, addresses and financial lines. Nothing is retained past the retention period in full. A
+compacted row is evidence only: it still counts as a claim when the sweep decides whether a purchase
+order's bill is ambiguous, but it can no longer be repaired automatically, because the follow-ups
+cannot be rebuilt without the payload. If you want such a row gone entirely, cancel it — cancelled
+rows are deleted on the normal schedule. Rows the sweep settles expire normally.
 
 ## Cron Endpoints
 
 | Endpoint | Schedule | Purpose |
 |---|---|---|
-| `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals), then run the back-reference repair sweep |
+| `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals), then run the back-reference repair sweep (both Xero and QuickBooks) |
 | `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |

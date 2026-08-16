@@ -1,7 +1,10 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
-import { UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE } from '@/lib/domain/accounting/back-reference-sweep'
+import {
+  UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
+  backReferenceEvidenceTombstone,
+} from '@/lib/domain/accounting/back-reference-sweep'
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -53,6 +56,8 @@ function monthsAgo(months: number): Date {
  */
 export async function purgeExpiredData(): Promise<{
   syncLogsDeleted: number
+  /** Expired-but-unresolved accounting sync rows reduced to an attribution-only tombstone (o3d-9kek). */
+  backReferenceEvidenceCompacted: number
   stockMovementsDeleted: number
   webhookEventsCompacted: number
   salesOrdersArchived: number
@@ -61,6 +66,7 @@ export async function purgeExpiredData(): Promise<{
 }> {
   const settings = await getRetentionSettings()
   let syncLogsDeleted = 0
+  let backReferenceEvidenceCompacted = 0
   let stockMovementsDeleted = 0
   let webhookEventsCompacted = 0
   let salesOrdersArchived = 0
@@ -107,7 +113,7 @@ export async function purgeExpiredData(): Promise<{
       // tombstone carrying only what the guard reads, which is tracked in o3d-nepa rather than
       // bolted on here.
       //
-      // o3d-9kek: what this DOES now exempt is UNRESOLVED BACK-REFERENCE EVIDENCE — a posted row
+      // o3d-9kek: what this does NOT delete is UNRESOLVED BACK-REFERENCE EVIDENCE — a posted row
       // whose repair sweep has not reached a verdict on it. Deleting one of those does not just
       // lose an audit trail: deleting a COMPETING sibling turns an ambiguity the sweep was
       // refusing to guess at into an apparent certainty (one unlinked bill, one surviving
@@ -115,10 +121,14 @@ export async function purgeExpiredData(): Promise<{
       // see. Nothing downstream can detect that, because the surviving state is genuinely
       // indistinguishable from an unambiguous one.
       //
-      // Bounded, unlike the reverted PROCESSING exemption above: the sweep stamps every row it
-      // settles, and a settled row leaves the exempt set and expires normally — by then the
-      // attribution lives on the document itself, which is never retention-deleted. See
-      // UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE for the full argument and its stated cost.
+      // Those rows are COMPACTED instead (below), not exempted. An earlier revision of this branch
+      // exempted them outright and called it bounded because "the sweep stamps every row it
+      // settles". It is not bounded: a permanently ambiguous row is never stamped by design, a
+      // disconnected connector's rows are never swept at all, and no QuickBooks sweep existed, so
+      // full payloads — customer names, emails, addresses, financial lines — could outlive the
+      // configured retention period indefinitely. That is the same defect as the reverted
+      // PROCESSING exemption above, and it is fixed the same way the o3d-nepa note prescribes: a
+      // compacted tombstone carrying only what a later reader must be able to see.
       db.accountingSyncLog.deleteMany({
         where: {
           createdAt: { lt: cutoff },
@@ -127,6 +137,24 @@ export async function purgeExpiredData(): Promise<{
       }),
     ])
     syncLogsDeleted = wc.count + acct.count
+
+    // The other half: expired-but-unresolved rows lose their CONTENT and keep their ATTRIBUTION.
+    // Ordered after the delete deliberately — the two predicates are exact complements, so a row
+    // belongs to one pass or the other and never both, and doing the delete first means a crash
+    // between them leaves rows un-compacted (repeated next run) rather than un-deleted.
+    //
+    // `backReferenceEvidenceCompactedAt: null` PERMANENTLY excludes already-compacted rows, so each
+    // daily run rewrites only the newly-eligible slice instead of the whole tombstone set — the
+    // same shape as the o3d-ahk webhook inbox compaction below.
+    const { count: compacted } = await db.accountingSyncLog.updateMany({
+      where: {
+        createdAt: { lt: cutoff },
+        ...UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
+        backReferenceEvidenceCompactedAt: null,
+      },
+      data: backReferenceEvidenceTombstone(new Date()),
+    })
+    backReferenceEvidenceCompacted = compacted
   }
 
   // Shopping webhook inbox — COMPACT succeeded rows (o3d-ahk). Clear the bulky payloadJson to reclaim
@@ -230,6 +258,7 @@ export async function purgeExpiredData(): Promise<{
   // Log activity for each type that had changes
   const parts: string[] = []
   if (syncLogsDeleted > 0) parts.push(`${syncLogsDeleted} sync logs deleted`)
+  if (backReferenceEvidenceCompacted > 0) parts.push(`${backReferenceEvidenceCompacted} unresolved back-reference sync logs compacted`)
   if (stockMovementsDeleted > 0) parts.push(`${stockMovementsDeleted} stock movements deleted`)
   if (webhookEventsCompacted > 0) parts.push(`${webhookEventsCompacted} webhook events compacted`)
   if (salesOrdersArchived > 0) parts.push(`${salesOrdersArchived} sales orders archived`)
@@ -242,10 +271,10 @@ export async function purgeExpiredData(): Promise<{
       action: 'cleanup',
       tag: 'system',
       description: `Data retention cleanup: ${parts.join(', ')}`,
-      metadata: { syncLogsDeleted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
+      metadata: { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
       resolveUser: false,
     })
   }
 
-  return { syncLogsDeleted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
+  return { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
 }

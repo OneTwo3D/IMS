@@ -60,9 +60,18 @@ export async function GET(request: Request) {
     // connector-agnostic (queueAccountingSync routes to the active connector), so
     // they must drain under QuickBooks too, not just Xero.
     const landedCostJournalOutbox = await drainLandedCostJournalOutbox()
-    const { processPendingQuickBooksSync } = await import('@/lib/connectors/quickbooks/sync-processor')
+    const { processPendingQuickBooksSync, repairQuickBooksBackReferences } = await import('@/lib/connectors/quickbooks/sync-processor')
     const result = await processPendingQuickBooksSync()
-    return NextResponse.json({ ...result, landedCostJournalOutbox })
+    // o3d-9kek r3 finding 2: QuickBooks swallows back-reference write failures and defers PO
+    // ambiguity, and both told the operator the repair sweep would retry — while the sweep was
+    // bound for Xero only, so nothing ever did. Same connector-agnostic sweep as the Xero branch.
+    let backReferenceRepair: Awaited<ReturnType<typeof repairQuickBooksBackReferences>> | undefined
+    try {
+      backReferenceRepair = await repairQuickBooksBackReferences()
+    } catch (repairError) {
+      console.error('accounting-sync cron: QuickBooks back-reference repair sweep failed', repairError)
+    }
+    return NextResponse.json({ ...result, backReferenceRepair, landedCostJournalOutbox })
   }
 
   return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })

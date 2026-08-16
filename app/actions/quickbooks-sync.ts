@@ -315,13 +315,23 @@ export async function triggerQuickBooksSync(): Promise<{ success: boolean; resul
     }
 
     const result = await processPendingQuickBooksSync()
+    // o3d-9kek r3 finding 2: also repair documents whose back-reference was never written — the
+    // manual path is where an operator acts on the ambiguity warnings, so it must be able to pick
+    // up an ambiguity they have just resolved by hand rather than waiting for the next cron cycle.
+    let backReferenceRepair: unknown
+    try {
+      const { repairQuickBooksBackReferences } = await import('@/lib/connectors/quickbooks/sync-processor')
+      backReferenceRepair = await repairQuickBooksBackReferences()
+    } catch (repairError) {
+      console.error('Manual QuickBooks sync: back-reference repair failed', repairError)
+    }
 
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_manual_sync',
       tag: 'sync',
       description: `Manual QuickBooks sync: ${result.succeeded} synced, ${result.failed} failed`,
-      metadata: result,
+      metadata: { ...result, backReferenceRepair },
     })
 
     revalidatePath('/sync')

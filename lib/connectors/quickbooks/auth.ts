@@ -405,6 +405,33 @@ export async function refreshToken(): Promise<{ accessToken: string; realmId: st
 
 /**
  * Disconnect from QuickBooks — clears stored token and revokes refresh token.
+ *
+ * THE REALM/TENANT-SWITCH LIFECYCLE (o3d-9kek r3 finding 1), which this function defines.
+ *
+ * Disconnect deliberately does NOT clear the external ids on documents — purchase_invoices
+ * .accounting_invoice_id, sales_orders.accounting_invoice_id and the rest. They are financial
+ * evidence: the only local record of which ledger document a bill or invoice became, and the
+ * anchor every later correction and payment posts against. Cached LOOKUP ids (contacts, items) are
+ * different — they are a performance cache with an authoritative source, so they are cleared.
+ *
+ * That retention is exactly why the ids are namespaced. Each stored bill id carries the
+ * "<connector>:<tenantId>" of the connection that issued it, and uniqueness is enforced over the
+ * PAIR, so:
+ *
+ *   1. DISCONNECT — token and pin go, ids stay. Nothing can be attributed: with no active
+ *      provenance the repair sweep does nothing at all and the back-reference writers refuse.
+ *   2. RECONNECT TO THE SAME tenant/realm — the provenance matches again and everything resumes
+ *      exactly where it was. Nothing was destroyed to make the switch possible.
+ *   3. RECONNECT TO A DIFFERENT ONE — the new connection has a new provenance. Every old id is in
+ *      a foreign namespace: it is not a uniqueness conflict (a new QuickBooks bill may legitimately
+ *      be issued the same integer), it is not "already linked" (a document linked in the old realm
+ *      reads as unlinked here and can post afresh), and old sync rows are invisible to the sweep
+ *      because their stored provenance no longer matches. The old realm's history stays readable
+ *      and stays inert.
+ *
+ * The pin (the *_EXPECTED_* setting) is what makes step 3 deliberate rather than accidental:
+ * re-authorising to a different company while still connected is refused, and only an explicit
+ * disconnect clears the pin.
  */
 export async function disconnect(): Promise<void> {
   // Attempt to revoke the refresh token (best-effort)

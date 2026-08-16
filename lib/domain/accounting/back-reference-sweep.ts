@@ -58,6 +58,22 @@ import {
 // interval, so a backlog of unattributable legacy rows can neither spam the activity log nor
 // re-fill the head of the scan, and it comes back on its own when the interval passes.
 //
+// TWO MORE, FOUND IN ROUND 3:
+//
+// 4. THE NAMESPACE. External ids are TENANT-OWNED, and QuickBooks realm ids are integers that
+//    repeat across companies. A sweep that reasons about ids globally will take a row posted to
+//    realm A and attribute its id under realm B, where the same integer is a different document.
+//    The sweep therefore runs inside ONE namespace: `deps.provenance` is the connected
+//    "<connector>:<tenantId>", the candidate query matches the row's own stored provenance against
+//    it, and a run with no connected tenant does nothing at all.
+//
+// 5. THE CURSOR RESET. The keyset walked the population within a run but started at the head on
+//    every invocation, and the budget counts rows SCANNED — including rows left eligible by a
+//    failure. A persistently failing oldest `limit` rows therefore ate every run's budget and the
+//    row behind them was never reached: starvation for a third time. The cursor is now persisted
+//    between runs and rotates, so the next run resumes BEHIND the rows this one could not settle —
+//    which is what makes it work for exactly the rows about which nothing can be recorded.
+//
 // The sweep must keep refusing to guess: failing to repair is acceptable, repairing onto
 // the wrong bill is not.
 // ---------------------------------------------------------------------------
@@ -78,16 +94,19 @@ export const BACK_REFERENCE_SWEEP_TYPES = ['SALES_INVOICE', 'CREDIT_NOTE', 'PURC
  * the unique index can detect that, because after the delete the state is genuinely
  * indistinguishable from an unambiguous one.
  *
- * WHY THIS IS BOUNDED, unlike the PROCESSING exemption that was reverted in data-retention.ts.
- * The sweep stamps backReferenceCheckedAt on every row it settles, so a settled row leaves this
- * set permanently and expires on the normal schedule. What is retained is exactly the set a human
- * is being warned about once a day. And once a row IS settled, the attribution no longer depends
- * on the log at all: it lives on the document itself (purchase_invoices.accounting_invoice_id,
- * which is never retention-deleted and is now unique), so deleting the settled log loses nothing.
+ * WHY THIS IS NOT AN OPEN-ENDED EXEMPTION ANY MORE (o3d-9kek r3 finding 3). The earlier argument —
+ * "the sweep stamps everything it settles, so this set drains" — was wrong, and provably so:
  *
- * The known cost, stated rather than hidden: unresolved rows belonging to a connector that is
- * later disconnected are never swept again and so are never stamped, and they will outlive the
- * retention period until someone cancels them (audit-46ry's CANCELLED status is that lever).
+ *   • a permanently ambiguous row is never stamped BY DESIGN (stamping it is the starvation bug);
+ *   • rows of a connector that is later disconnected are never swept at all, so never stamped;
+ *   • every QuickBooks invoice/bill row was unstamped forever, because no QuickBooks sweep ran.
+ *
+ * Full payload rows — customer names, emails, addresses, financial lines — could therefore survive
+ * a configured retention policy indefinitely, and a retention policy that silently fails to delete
+ * is worse than one that deletes too much. So the row is no longer EXEMPTED: at the cutoff it is
+ * COMPACTED to an attribution-only tombstone (see backReferenceEvidenceTombstone), which keeps the
+ * competing-claimant evidence and drops the content. This predicate now selects what to compact as
+ * well as what not to delete, which is why the two can never disagree about the same row.
  */
 export const UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE: {
   backReferenceCheckedAt: null
@@ -99,6 +118,34 @@ export const UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE: {
   externalTransactionId: { not: null },
   status: { in: ['SYNCED', 'FAILED'] },
   type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
+}
+
+/**
+ * The TOMBSTONE an expired-but-unresolved row is compacted to (o3d-9kek r3 finding 3).
+ *
+ * WHAT IT KEEPS, and why each column is load-bearing: connector + provenance + type +
+ * referenceType + referenceId + externalTransactionId + status. That is exactly the set the
+ * PurchaseOrder resolver counts to decide "does more than one posted row claim this order's bill".
+ * Keeping it is what stops retention converting an ambiguity into a confident wrong answer.
+ *
+ * WHAT IT DELIBERATELY DOES NOT KEEP:
+ *   • `payload` — the document as sent: customer and supplier names, email addresses, delivery
+ *     addresses, line descriptions and amounts. This is the bulk AND the personal data, and it is
+ *     the reason the old exemption could not simply be left alone.
+ *   • `errorMessage` — free text echoing connector responses, which routinely quote the payload.
+ *
+ * The cost, stated rather than hidden: a tombstoned row can no longer be REPAIRED, because the
+ * follow-ups (PDF, payment, attachment) cannot be rebuilt without the payload. It is evidence, not
+ * work. That is the right trade at the retention horizon — a row still unresolved months later is
+ * one the sweep has already refused to attribute and warned a human about daily — and it obeys the
+ * governing principle: failing to repair is acceptable, repairing onto the wrong bill is not.
+ */
+export function backReferenceEvidenceTombstone(now: Date): {
+  payload: Record<string, never>
+  errorMessage: null
+  backReferenceEvidenceCompactedAt: Date
+} {
+  return { payload: {}, errorMessage: null, backReferenceEvidenceCompactedAt: now }
 }
 
 /** Rows examined per run, across all pages. */
@@ -148,6 +195,82 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   backReferenceAmbiguousLoggedAt: true,
 } as const
 
+/**
+ * Where the previous run stopped, persisted BETWEEN runs (o3d-9kek r3 finding 4).
+ *
+ * The in-memory keyset walked the population within a run but restarted at the head on every
+ * invocation, and the run budget counts rows SCANNED — including rows left eligible because their
+ * probe, apply, follow-up or activity-log write failed. So if the oldest `limit` rows fail
+ * persistently (the sweep's own reason to exist: things that are broken tend to stay broken), every
+ * run spends its entire budget on the same rows and row `limit + 1` is never reached. That is the
+ * original starvation bug in a third form, and no per-row marker fixes it, because the rows in
+ * question are precisely the ones that must NOT be marked.
+ *
+ * A persisted cursor fixes it independently of any per-row state: the next run RESUMES where this
+ * one stopped, so the failing head is skipped whether or not anything about it could be recorded.
+ *
+ * The alternative — deferring every unsettled row with a retry timestamp — was rejected: it would
+ * re-introduce the r2 finding 3 hole. An ambiguity whose WARNING could not be persisted is left
+ * immediately eligible on purpose, because deferring a row nobody was told about is silence with
+ * no notification behind it. Deferring it to fix starvation trades one defect for the other; the
+ * cursor fixes starvation without touching that property at all.
+ */
+export type BackReferenceCandidateCursorStore = {
+  load(): Promise<BackReferenceCandidateCursor | null>
+  save(cursor: BackReferenceCandidateCursor | null): Promise<void>
+}
+
+/** The Setting row a connector's sweep cursor lives in. One per connector, never shared. */
+export function backReferenceSweepCursorSettingKey(connector: string): string {
+  return `${connector}_backreference_sweep_cursor`
+}
+
+/** The minimal Setting surface the cursor store needs — structural, so a test double satisfies it. */
+export type BackReferenceCursorSettingClient = {
+  setting: {
+    findUnique(args: { where: { key: string } }): Promise<{ value: string } | null>
+    upsert(args: {
+      where: { key: string }
+      create: { key: string; value: string }
+      update: { value: string }
+    }): Promise<unknown>
+  }
+}
+
+/**
+ * A cursor store backed by one Setting row, holding `{"createdAt":"…","id":"…"}`.
+ *
+ * NOT written through settings-store's serialize/deserialize: this is machine state, not a
+ * configured value, it is not in RETENTION_KEYS or the settings UI, and it must never pick up an
+ * env-var fallback. A malformed or unparseable value reads as "no cursor" — the sweep then starts
+ * at the head, which is slower but never wrong.
+ */
+export function createBackReferenceSweepCursorStore(
+  db: BackReferenceCursorSettingClient,
+  connector: string,
+): BackReferenceCandidateCursorStore {
+  const key = backReferenceSweepCursorSettingKey(connector)
+  return {
+    async load() {
+      const row = await db.setting.findUnique({ where: { key } })
+      if (!row?.value) return null
+      try {
+        const parsed = JSON.parse(row.value) as { createdAt?: unknown; id?: unknown }
+        if (typeof parsed.id !== 'string' || typeof parsed.createdAt !== 'string') return null
+        const createdAt = new Date(parsed.createdAt)
+        if (Number.isNaN(createdAt.getTime())) return null
+        return { createdAt, id: parsed.id }
+      } catch {
+        return null
+      }
+    },
+    async save(cursor) {
+      const value = cursor === null ? '' : JSON.stringify({ createdAt: cursor.createdAt.toISOString(), id: cursor.id })
+      await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+    },
+  }
+}
+
 export type BackReferenceCandidateQuery = {
   where: Record<string, unknown>
   select: typeof BACK_REFERENCE_CANDIDATE_SELECT
@@ -175,6 +298,26 @@ export type BackReferenceSweepDeps = {
   db: BackReferenceSweepClient
   /** AccountingSyncLog.connector value this sweep owns, e.g. 'xero'. */
   connector: string
+  /**
+   * "<connector>:<tenantId>" for the CURRENTLY CONNECTED tenant/realm (o3d-9kek r3 finding 1), or
+   * null when that connector has no token.
+   *
+   * External bill ids are tenant-owned: QuickBooks realm ids are integers that repeat across
+   * companies, so a row posted to realm A carries an id that means something entirely different in
+   * realm B. The candidate query matches this against the row's own stored provenance, which makes
+   * foreign-realm rows structurally invisible to the sweep instead of relying on a rule a future
+   * edit can drop.
+   *
+   * NULL refuses the whole run rather than sweeping with an unknown namespace: there is no company
+   * to attribute anything to, and every write would be a guess.
+   */
+  provenance: string | null
+  /**
+   * Where the last run stopped. Optional: a sweep without one still keyset-paginates WITHIN a run,
+   * it just restarts at the head each time — which is the starvation described on
+   * BackReferenceCandidateCursorStore, so every production binding passes one.
+   */
+  cursorStore?: BackReferenceCandidateCursorStore
   /** Human name used in activity-log descriptions, e.g. 'Xero'. */
   connectorLabel: string
   /** Activity action prefix, e.g. 'xero' → 'xero_backreference_repaired'. */
@@ -260,6 +403,8 @@ const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason']
  */
 export function buildBackReferenceCandidateQuery(params: {
   connector: string
+  /** The ACTIVE connection's namespace. Rows issued by any other one are not candidates. */
+  provenance: string
   after: BackReferenceCandidateCursor | null
   /** Rows whose ambiguity was reported at or after this are deferred until it passes. */
   ambiguityRecheckBefore: Date
@@ -273,10 +418,18 @@ export function buildBackReferenceCandidateQuery(params: {
   }
   const where: Record<string, unknown> = {
     connector: params.connector,
+    // THE NAMESPACE (r3 finding 1). An exact match, so a row posted to a former QuickBooks realm —
+    // or one whose issuing connection cannot be identified (NULL) — is never attributed under the
+    // current one. Its integer external id means something else here, and copying it onto a bill of
+    // this company is precisely the wrong-bill write the whole area exists to prevent.
+    provenance: params.provenance,
     status: { in: ['SYNCED', 'FAILED'] },
     externalTransactionId: { not: null },
     type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
     backReferenceCheckedAt: null,
+    // A tombstoned row (r3 finding 3) is evidence, not work: retention has cleared the payload, so
+    // its follow-ups can no longer be rebuilt and there is nothing left for a repair to do.
+    backReferenceEvidenceCompactedAt: null,
     // Nested under AND because the keyset clause below also needs the top-level OR slot.
     AND: [notRecentlyAmbiguous],
   }
@@ -309,6 +462,14 @@ export async function repairAccountingBackReferences(
   const { connector, connectorLabel, activityActionPrefix: prefix } = deps
 
   const result: BackReferenceRepairResult = { scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0 }
+  // No live connection means no namespace to attribute within (r3 finding 1). Sweeping anyway
+  // would take external ids issued by whatever company was connected before and write them onto
+  // bills as if they belonged to the current one.
+  const provenance = deps.provenance
+  if (!provenance) {
+    console.warn(`${prefix}: back-reference sweep skipped — no connected tenant/realm to attribute external ids to`)
+    return result
+  }
   // One cutoff for the whole run, so every page of the scan agrees on which deferred rows
   // are due — a per-page `new Date()` would let a row fall on both sides of the boundary.
   const ambiguityRecheckBefore = new Date(now().getTime() - BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS)
@@ -395,13 +556,42 @@ export async function repairAccountingBackReferences(
     }
   }
 
+  // RESUME where the previous run stopped (r3 finding 4). A cursor that reset to null every
+  // invocation meant a persistently failing head — rows whose probe, apply, follow-up or activity
+  // log write keeps failing, and which must therefore NOT be stamped — consumed the whole budget
+  // on every run, so the row behind them was never reached. Resuming skips them without recording
+  // anything about them, which is what makes it work for exactly the rows nothing can be recorded
+  // about.
+  //
+  // A load failure degrades to a head-start scan rather than to no scan at all: the sweep is a
+  // repair mechanism, and refusing to run because a bookmark could not be read would be worse than
+  // re-examining rows it has already seen.
   let after: BackReferenceCandidateCursor | null = null
+  if (deps.cursorStore) {
+    try {
+      after = await deps.cursorStore.load()
+    } catch (cursorError) {
+      console.error(`${prefix}: back-reference sweep cursor could not be read; starting from the oldest row`, cursorError)
+    }
+  }
+  // The cursor ROTATES: when the scan runs off the end of the population it wraps to the start
+  // once, so rows BEFORE the resume point (a deferral that has since expired, an ambiguity that
+  // has cleared) are picked up on the next lap instead of waiting for new rows to push the cursor
+  // around. At most one wrap per run, and none at all for a run that already started at the head,
+  // so an exhausted population cannot spin.
+  const startedAtHead = after === null
+  let wrapped = startedAtHead
   while (result.scanned < limit) {
     const take = Math.min(pageSize, limit - result.scanned)
     const page = await deps.db.accountingSyncLog.findMany(
-      buildBackReferenceCandidateQuery({ connector, after, ambiguityRecheckBefore, take }),
+      buildBackReferenceCandidateQuery({ connector, provenance, after, ambiguityRecheckBefore, take }),
     )
-    if (page.length === 0) break
+    if (page.length === 0) {
+      if (wrapped) break
+      wrapped = true
+      after = null
+      continue
+    }
 
     for (const row of page) {
       // Advance the cursor for EVERY row read, settled or not — a row this run cannot
@@ -422,6 +612,7 @@ export async function repairAccountingBackReferences(
         const invoiceNumber = typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : undefined
         const params = {
           connector,
+          provenance,
           type: row.type,
           referenceType: row.referenceType,
           referenceId: row.referenceId,
@@ -439,6 +630,7 @@ export async function repairAccountingBackReferences(
           try {
             attribution = await resolvePurchaseOrderBackReference(deps.db, {
               connector,
+              provenance,
               purchaseOrderId: row.referenceId,
               externalId: row.externalTransactionId,
             })
@@ -584,7 +776,23 @@ export async function repairAccountingBackReferences(
       }
     }
 
-    if (page.length < take) break
+    if (page.length < take) {
+      if (wrapped) break
+      wrapped = true
+      after = null
+    }
+  }
+
+  // Persist where this run stopped, so the next one starts BEHIND the rows this one could not
+  // settle. Written after the loop rather than per page: a run that dies mid-scan re-examines the
+  // rows it had already reached, which is wasteful but never wrong, whereas a cursor saved ahead
+  // of the work would skip rows that were never actually looked at.
+  if (deps.cursorStore) {
+    try {
+      await deps.cursorStore.save(after)
+    } catch (cursorError) {
+      console.error(`${prefix}: back-reference sweep cursor could not be saved; the next run restarts from the oldest row`, cursorError)
+    }
   }
 
   return result

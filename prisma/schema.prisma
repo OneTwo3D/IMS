@@ -1399,12 +1399,29 @@ model PurchaseInvoice {
   // only ever upheld by protocol — a guard on one code path, in a separate statement from the
   // write, which no protocol can make atomic and a future writer can forget.
   //
-  // Postgres does not collide NULLs, so this is exactly "unique where the id is set": any number
-  // of bills may be unlinked, no two may claim the same external id. A connector switch cannot
-  // produce a false conflict because the column holds one connector's id at a time (the same
-  // connector-agnostic shape as Product.accountingItemId) and the two connectors' id formats are
-  // disjoint (Xero GUID vs QuickBooks integer).
-  accountingInvoiceId String?  @unique @map("accounting_invoice_id")
+  // THE NAMESPACE (o3d-9kek r3 finding 1). An external bill id is TENANT-OWNED, not global. The
+  // first version of this index was value-only, on the reasoning that a Xero GUID can never equal
+  // a QuickBooks integer. That reasoning is irrelevant to the collision that actually happens:
+  // QuickBooks realm A against QuickBooks realm B, numeric on both sides. Disconnecting clears the
+  // realm pin but deliberately keeps historical bill ids (they are financial evidence), so after a
+  // reconnect to a different company a NEW bill can post successfully to the ledger and then fail
+  // its LOCAL back-reference because an old realm's bill already holds that integer.
+  //
+  // So the id is stored with the identity of the connection that issued it, and uniqueness is
+  // enforced over the PAIR. Provenance is "<connector>:<tenantId>" — the same string, from the
+  // same AccountingToken row, as Product.accountingItemProvenance (o3d-6nd), where QuickBooks
+  // stores its realmId in the tenantId column.
+  //
+  // NOT NULL with an empty-string sentinel, deliberately, and this is the whole reason the column
+  // is not nullable: Postgres does not collide NULLs, so a nullable provenance would let ANY
+  // writer that forgot to set it opt out of the constraint entirely and silently — the invariant
+  // would evaporate exactly where a bug put it. With '' the worst a forgetful writer gets is the
+  // old GLOBAL uniqueness (all sentinel rows share one namespace), which fails closed.
+  //
+  // accountingInvoiceId itself stays nullable and NULLs still do not collide, so any number of
+  // bills may be unlinked; no two may claim the same external id WITHIN one connection's namespace.
+  accountingInvoiceId String?  @map("accounting_invoice_id")
+  accountingInvoiceProvenance String @default("") @map("accounting_invoice_provenance")
   paidAt          DateTime?
   paymentAccountId   String?   // connector account id (e.g. Xero bank AccountID) used to pay this bill
   paymentAccountName String?   // snapshot of the bank account name at payment time
@@ -1417,6 +1434,9 @@ model PurchaseInvoice {
   supplierCreditNotes SupplierCreditNote[]
 
   @@index([poId])
+  // Named explicitly: the generated name for this pair is 73 characters, over Postgres's
+  // 63-character identifier limit.
+  @@unique([accountingInvoiceId, accountingInvoiceProvenance], map: "purchase_invoices_accounting_invoice_id_provenance_key")
   @@map("purchase_invoices")
 }
 
@@ -2119,6 +2139,25 @@ model AccountingSyncLog {
   // over. The repeat warning carries the previous timestamp so a row nobody ever links by hand
   // cannot go quiet.
   backReferenceAmbiguousLoggedAt DateTime?
+  // o3d-9kek r3 finding 1: "<connector>:<tenantId>" of the connection that ISSUED
+  // externalTransactionId — the same provenance string as Product.accountingItemProvenance
+  // (o3d-6nd). External ids are tenant-owned, so a row posted to QuickBooks realm A must not be
+  // attributed by a sweep running against realm B: its integer id means something else there, and
+  // copying it onto a realm-B bill is the wrong-bill write this whole area exists to prevent. The
+  // sweep's candidate query matches this against the ACTIVE connection, so foreign-realm rows are
+  // structurally invisible to it rather than being filtered by a rule someone can forget.
+  //
+  // NULL means "issued before this column existed, or by a connection that can no longer be
+  // identified". Such rows are never swept — an id whose namespace is unknown cannot be attributed
+  // safely — and they are counted as COMPETING claims by the PO resolver, which fails closed.
+  provenance            String?
+  // o3d-9kek r3 finding 3: when this row's full payload was compacted to an attribution-only
+  // TOMBSTONE because it outlived the retention period while still unresolved. Tombstones keep the
+  // (connector, provenance, type, referenceType, referenceId, externalTransactionId) evidence that
+  // stops an ambiguity silently becoming a certainty, but drop the payload and errorMessage, which
+  // are where the customer names, emails, addresses and financial lines live. They are not sweep
+  // candidates: without a payload the follow-ups cannot be rebuilt.
+  backReferenceEvidenceCompactedAt DateTime?
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
@@ -2126,8 +2165,8 @@ model AccountingSyncLog {
   @@index([connector, referenceType, referenceId])
   @@index([connector, status, createdAt])
   @@index([connector, status, processingStartedAt])
-  // The sweep's candidate scan: one connector, never-checked rows, oldest first.
-  @@index([connector, backReferenceCheckedAt, createdAt], map: "accounting_sync_logs_backref_sweep_idx")
+  // The sweep's candidate scan: one connection's namespace, never-checked rows, oldest first.
+  @@index([connector, provenance, backReferenceCheckedAt, createdAt], map: "accounting_sync_logs_backref_sweep_idx")
   @@map("accounting_sync_logs")
 }
 

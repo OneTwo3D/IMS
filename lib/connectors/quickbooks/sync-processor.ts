@@ -9,7 +9,7 @@ import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditMemo } from './credit-notes'
@@ -21,6 +21,12 @@ import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/ac
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import { applyBackReference } from '@/lib/domain/accounting/back-reference'
+import {
+  DEFAULT_BACK_REFERENCE_SWEEP_LIMIT,
+  createBackReferenceSweepCursorStore,
+  repairAccountingBackReferences,
+  type BackReferenceRepairResult,
+} from '@/lib/domain/accounting/back-reference-sweep'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -367,6 +373,12 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
+        // o3d-9kek r3 finding 1: stamp the row with the connection that ISSUED this external id.
+        // External ids are tenant-owned — QuickBooks realm ids are integers that repeat across
+        // companies — so a repair sweep running under a different realm must be able to see that
+        // this row is not its business. Resolved per entry rather than once per run: a token can
+        // be replaced mid-run, and a row must record the connection it actually posted to.
+        const provenance = await activeAccountingIdProvenance(QBO_CONNECTOR)
         // Persist external ID and SYNCED status BEFORE any follow-up work.
         // If follow-ups fail, the next retry will see externalTransactionId
         // and skip the QBO write (idempotency guard above).
@@ -376,6 +388,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             data: {
               status: 'SYNCED',
               externalTransactionId: syncResult.externalId ?? null,
+              provenance,
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
@@ -826,61 +839,69 @@ async function updateBackReference(
   invoiceNumber?: string,
 ): Promise<void> {
   if (!externalId) return
+  // o3d-9kek r3 finding 1: bill ids are REALM-owned. QuickBooks realm ids are integers that repeat
+  // across companies, so the id is stored with the connection that issued it and uniqueness is
+  // enforced over the pair. With no connected realm there is no namespace to write into — refuse,
+  // and let the repair sweep link it once a connection exists.
+  const provenance = await activeAccountingIdProvenance(QBO_CONNECTOR)
+  if (!provenance) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_backreference_no_realm',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Did not write the QuickBooks back-reference for ${referenceType} ${referenceId}: no connected QuickBooks company to `
+        + `attribute external id ${externalId} to. The id is on the sync row and the repair sweep links it once a company is connected.`,
+      metadata: { type, referenceType, referenceId, externalId },
+    })
+    return
+  }
 
   try {
-    if (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') {
-      await db.salesOrder.update({
-        where: { id: referenceId },
-        data: {
-          accountingInvoiceId: externalId,
-          invoiceNumber: invoiceNumber ?? undefined,
-          invoicedAt: new Date(),
-        },
+    // EVERY type goes through the shared writer, exactly as Xero's does. Hand-rolled per-type
+    // updates here were how the two connectors drifted: the bill-keyed branch wrote
+    // accountingInvoiceId with a bare `update`, which since o3d-9kek r3 finding 1 would have
+    // stored the id WITHOUT the realm that issued it — landing it in the '' sentinel namespace,
+    // where a genuinely different company's bill can collide with it. The namespace and the id
+    // must be written together, and there is exactly one place that does that.
+    const applied = await applyBackReference(db, { connector: QBO_CONNECTOR, provenance, type, referenceType, referenceId, externalId, invoiceNumber })
+    // o3d-9kek: a legacy PurchaseOrder-keyed row names the ORDER, not the bill. It used to write
+    // the external id onto "the newest bill with no id yet" — which stamps the wrong bill the
+    // moment a PO has two, and a wrong id is worse than a missing one because it looks correct
+    // (later payments and bill updates then post against the wrong QuickBooks document). The
+    // shared resolver decides from the whole population for that PO and refuses to guess.
+    if (applied.outcome === 'ambiguous') {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'quickbooks_backreference_ambiguous',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Did not write the QuickBooks back-reference for PO ${referenceId}: its bill cannot be identified `
+          + `(${applied.attribution.reason}). Link the bill manually — the external id is on the sync row, and the repair `
+          + 'sweep re-checks it daily in case the ambiguity clears on its own.',
+        metadata: { referenceType, referenceId, externalId, reason: applied.attribution.reason },
       })
-    } else if (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') {
-      await db.salesOrderRefund.update({
-        where: { id: referenceId },
-        data: { accountingCreditNoteId: externalId },
-      })
-    } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseInvoice') {
-      await db.purchaseInvoice.update({
-        where: { id: referenceId },
-        data: { accountingInvoiceId: externalId },
-      })
-    } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseOrder') {
-      // o3d-9kek: a legacy PurchaseOrder-keyed row names the ORDER, not the bill. This
-      // used to write the external id onto "the newest bill with no id yet" — which
-      // stamps the wrong bill the moment a PO has two, and a wrong id is worse than a
-      // missing one because it looks correct (later payments and bill updates then post
-      // against the wrong QuickBooks document). The shared resolver decides from the whole
-      // population for that PO and refuses to guess. Same code path as Xero, so the two
-      // connectors cannot drift on this again.
-      const applied = await applyBackReference(db, { connector: QBO_CONNECTOR, type, referenceType, referenceId, externalId, invoiceNumber })
-      if (applied.outcome === 'ambiguous') {
-        await logActivity({
-          entityType: 'SYSTEM',
-          action: 'quickbooks_backreference_ambiguous',
-          tag: 'sync',
-          level: 'WARNING',
-          description: `Did not write the QuickBooks back-reference for PO ${referenceId}: its bill cannot be identified `
-            + `(${applied.attribution.reason}). Link the bill manually — the external id is on the sync row.`,
-          metadata: { referenceType, referenceId, externalId, reason: applied.attribution.reason },
-        })
-      }
-      // o3d-9kek finding 3: the resolved bill gained an external id between the resolve and
-      // the compare-and-swap, so nothing was written and nothing was overwritten. Not an
-      // error — the repair sweep re-resolves it from the state that actually won.
-      if (applied.outcome === 'contended') {
-        console.warn(`quickbooks: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; the repair sweep will re-resolve it.`)
-      }
+    }
+    // o3d-9kek finding 3: the resolved bill gained an external id between the resolve and
+    // the compare-and-swap, so nothing was written and nothing was overwritten. Not an
+    // error — the repair sweep re-resolves it from the state that actually won.
+    if (applied.outcome === 'contended') {
+      console.warn(`quickbooks: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; the repair sweep will re-resolve it.`)
     }
   } catch (error) {
     // Pre-existing: QuickBooks swallows back-reference failures here (Xero does not — it
-    // propagates so the caller retries). Not changed in this pass, because de-swallowing alters
-    // QBO's retry semantics for every type at once. What IS changed is the SILENCE: since
-    // o3d-9kek made purchase_invoices.accounting_invoice_id unique, a real attribution conflict
-    // — two local bills pointing at one QuickBooks document — arrives here as an exception, and
-    // an invisible one is indistinguishable from success. The repair sweep still owns the retry.
+    // propagates so the caller retries). Still not changed, because de-swallowing alters QBO's
+    // retry semantics for every type at once. What IS changed is the SILENCE: since o3d-9kek made
+    // the bill's external id unique, a real attribution conflict — two local bills pointing at one
+    // QuickBooks document — arrives here as an exception, and an invisible one is
+    // indistinguishable from success.
+    //
+    // Swallowing is only defensible because the row is left in an EXPLICITLY RETRYABLE state and
+    // something actually retries it: the row keeps its externalTransactionId with
+    // backReferenceCheckedAt NULL, which is exactly the repair sweep's candidate shape, and
+    // repairQuickBooksBackReferences now runs from the QuickBooks cron and the manual sync
+    // (o3d-9kek r3 finding 2). Until this branch that sentence was false — the message below
+    // promised a sweep that existed for Xero only.
     console.error(`quickbooks: back-reference write failed for ${referenceType} ${referenceId}`, error)
     await logActivity({
       entityType: 'SYSTEM',
@@ -1026,4 +1047,42 @@ async function enqueueFollowUps(
       await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId })
     }
   }
+}
+
+export type { BackReferenceRepairResult }
+
+/**
+ * audit-H3 repair sweep, QuickBooks binding (o3d-9kek r3 finding 2).
+ *
+ * WHY THIS EXISTS NOW. updateBackReference above swallows its write failures — including the
+ * load-bearing P2002 from the bill's unique index — and both it and the PO-ambiguity path told the
+ * operator "the back-reference repair sweep will retry it". No such sweep ran for QuickBooks:
+ * repairAccountingBackReferences was bound for Xero only, and the QuickBooks cron merely processed
+ * pending rows. So those rows stayed permanently unlinked even after the ambiguity cleared, and the
+ * message an operator read was false. Telling someone a retry will happen when nothing retries is
+ * worse than saying nothing.
+ *
+ * The implementation is connector-agnostic on purpose — same starvation fix, same namespace
+ * scoping, same refusal to guess which bill a PO-keyed row belongs to — so the two connectors
+ * cannot drift on this the way they just did.
+ */
+export async function repairQuickBooksBackReferences(limit = DEFAULT_BACK_REFERENCE_SWEEP_LIMIT): Promise<BackReferenceRepairResult> {
+  return repairAccountingBackReferences({
+    db,
+    connector: QBO_CONNECTOR,
+    connectorLabel: 'QuickBooks',
+    activityActionPrefix: 'quickbooks',
+    // The realm whose external ids this run may attribute (r3 finding 1). NULL — no connected
+    // company — makes the sweep do nothing, which is correct: a QuickBooks bill id is an integer
+    // that means something different in every realm.
+    provenance: await activeAccountingIdProvenance(QBO_CONNECTOR),
+    // Resume behind the rows the last run could not settle (r3 finding 4).
+    cursorStore: createBackReferenceSweepCursorStore(db, QBO_CONNECTOR),
+    // logActivityPersisted, NOT logActivity: the sweep defers an ambiguous row for 24 hours on the
+    // strength of having warned about it, and logActivity swallows its own write failures, so
+    // awaiting it cannot establish that anybody was told (o3d-9kek r2 finding 3).
+    logActivity: logActivityPersisted,
+    enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult) =>
+      enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult),
+  }, { limit })
 }

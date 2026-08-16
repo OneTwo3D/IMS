@@ -20,9 +20,11 @@ import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/can
 import { applyBackReference } from '@/lib/domain/accounting/back-reference'
 import {
   DEFAULT_BACK_REFERENCE_SWEEP_LIMIT,
+  createBackReferenceSweepCursorStore,
   repairAccountingBackReferences,
   type BackReferenceRepairResult,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
@@ -781,12 +783,19 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
+        // o3d-9kek r3 finding 1: stamp the row with the connection that ISSUED this external id.
+        // External ids are tenant-owned — QuickBooks realm ids are integers that repeat across
+        // companies — so a repair sweep running under a different realm must be able to see that
+        // this row is not its business. Resolved per entry rather than once per run: a token can
+        // be replaced mid-run, and a row must record the connection it actually posted to.
+        const provenance = await activeAccountingIdProvenance(XERO_CONNECTOR)
         await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
             where: { id: entry.id },
             data: {
               status: 'SYNCED',
               externalTransactionId: syncResult.externalId ?? null,
+              provenance,
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
@@ -1045,12 +1054,19 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
+        // o3d-9kek r3 finding 1: stamp the row with the connection that ISSUED this external id.
+        // External ids are tenant-owned — QuickBooks realm ids are integers that repeat across
+        // companies — so a repair sweep running under a different realm must be able to see that
+        // this row is not its business. Resolved per entry rather than once per run: a token can
+        // be replaced mid-run, and a row must record the connection it actually posted to.
+        const provenance = await activeAccountingIdProvenance(XERO_CONNECTOR)
         await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
             where: { id: entry.id },
             data: {
               status: 'SYNCED',
               externalTransactionId: syncResult.externalId ?? null,
+              provenance,
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
@@ -1593,11 +1609,19 @@ async function updateBackReference(
   invoiceNumber?: string,
 ): Promise<void> {
   if (!externalId) return
+  // o3d-9kek r3 finding 1: the id is stored WITH the connection that issued it, and uniqueness is
+  // enforced over that pair. Without a live connection there is no namespace to write into, so the
+  // link is refused (and the row stays FAILED for the sweep) rather than stamped into the shared
+  // legacy namespace where it could collide with another company's document.
+  const provenance = await activeAccountingIdProvenance(XERO_CONNECTOR)
+  if (!provenance) {
+    throw new Error(`Cannot write the Xero back-reference for ${referenceType} ${referenceId}: no connected Xero tenant to attribute external id ${externalId} to.`)
+  }
   // audit-H3: do NOT swallow failures here. The external id is already persisted
   // on the sync row (externalTransactionId) before this runs, and the caller's
   // catch marks the row for retry so the next pass re-applies the back-reference
   // from the stored id. Swallowing left the document permanently orphaned.
-  const applied = await applyBackReference(db, { connector: XERO_CONNECTOR, type, referenceType, referenceId, externalId, invoiceNumber })
+  const applied = await applyBackReference(db, { connector: XERO_CONNECTOR, provenance, type, referenceType, referenceId, externalId, invoiceNumber })
   // o3d-9kek: a legacy PurchaseOrder-keyed row that cannot be attributed to one bill is
   // refused rather than written onto the newest unlinked bill. Surface it — silence here
   // is what let a wrong id look like a successful write.
@@ -1634,6 +1658,12 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     connector: XERO_CONNECTOR,
     connectorLabel: 'Xero',
     activityActionPrefix: 'xero',
+    // The tenant whose external ids this run may attribute (o3d-9kek r3 finding 1). NULL — no
+    // connected tenant — makes the sweep do nothing, which is correct: there is no company to
+    // attribute anything to.
+    provenance: await activeAccountingIdProvenance(XERO_CONNECTOR),
+    // Resume behind the rows the last run could not settle (r3 finding 4).
+    cursorStore: createBackReferenceSweepCursorStore(db, XERO_CONNECTOR),
     // logActivityPersisted, NOT logActivity: the sweep defers an ambiguous row for 24 hours on
     // the strength of having warned about it, and logActivity cannot tell it whether the warning
     // was written (o3d-9kek r2 finding 3).
