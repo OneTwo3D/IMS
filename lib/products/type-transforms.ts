@@ -10,6 +10,21 @@ const CHILD_CAPABLE_TYPES = new Set<ProductType>([ProductType.VARIANT, ProductTy
 const COMPONENT_TYPES = new Set<ProductType>([ProductType.KIT, ProductType.BOM])
 const TRANSFORMABLE_TYPES = new Set<ProductType>([ProductType.SIMPLE, ProductType.VARIANT, ProductType.KIT, ProductType.BOM])
 
+/**
+ * Everything a structure validation reads: the product row itself AND the five tables that
+ * say whether the row is live (o3d-y89x r2).
+ *
+ * It has to name all six. `getProductTransformBlockers` used to read the module-level `db`
+ * regardless of what the caller passed, so the editor's INSIDE-the-transaction re-validation
+ * (o3d-42hw) checked the row under `tx` and the blockers on a different connection — i.e.
+ * outside the locks it had just taken, against a snapshot that could already have moved.
+ * Threading the client through is what makes `client: tx` mean what it says.
+ */
+export type ProductStructureClient = Pick<
+  typeof db,
+  'product' | 'stockLevel' | 'salesOrderLine' | 'purchaseOrderLine' | 'productionOrder' | 'stockTransferLine'
+>
+
 type ProductStructureInput = {
   productId?: string
   type: ProductType
@@ -21,7 +36,7 @@ type ProductStructureInput = {
    * nothing — a WooCommerce import committing in between would still be overwritten with
    * structure decided against a state that no longer exists.
    */
-  client?: Pick<typeof db, 'product'>
+  client?: ProductStructureClient
 }
 
 type CurrentProductShape = {
@@ -45,7 +60,7 @@ export type ProductStructureValidationResult =
       message: string
     }
 
-type ProductTransformBlockers = {
+export type ProductTransformBlockers = {
   stockQty: number
   reservedQty: number
   openSalesOrderLines: number
@@ -66,7 +81,17 @@ export function isComponentProductType(type: ProductType): boolean {
   return COMPONENT_TYPES.has(type)
 }
 
-function summarizeTransformBlockers(blockers: ProductTransformBlockers): string {
+/** True when any blocker is present. The one place "is this row live?" is decided. */
+export function hasProductTransformBlockers(blockers: ProductTransformBlockers): boolean {
+  return blockers.stockQty > 0
+    || blockers.reservedQty > 0
+    || blockers.openSalesOrderLines > 0
+    || blockers.openPurchaseOrderLines > 0
+    || blockers.openProductionOrders > 0
+    || blockers.openTransferLines > 0
+}
+
+export function summarizeTransformBlockers(blockers: ProductTransformBlockers): string {
   const parts: string[] = []
   if (blockers.stockQty > 0) parts.push(`stock on hand (${blockers.stockQty.toFixed(2)})`)
   if (blockers.reservedQty > 0) parts.push(`reserved stock (${blockers.reservedQty.toFixed(2)})`)
@@ -77,7 +102,22 @@ function summarizeTransformBlockers(blockers: ProductTransformBlockers): string 
   return parts.join(', ')
 }
 
-async function getProductTransformBlockers(productId: string): Promise<ProductTransformBlockers> {
+/**
+ * The rows that make a product LIVE: stock, reservations, open sales/purchase/production/
+ * transfer documents. Transforming a product's type or parent while any of these exist is
+ * what the editor refuses (`Cannot change product type while this product has ...`).
+ *
+ * Exported (o3d-y89x r2) so the WooCommerce connector runs the SAME checks rather than a
+ * second copy that drifts: the connector transforms SIMPLE rows too (SIMPLE→VARIABLE on the
+ * parent branch, SIMPLE→VARIANT when adopting a variation) and was doing so without asking
+ * any of these questions.
+ *
+ * `client` must be the transaction that holds the row locks; see ProductStructureClient.
+ */
+export async function getProductTransformBlockers(
+  productId: string,
+  client: ProductStructureClient = db,
+): Promise<ProductTransformBlockers> {
   const [
     stockAggregate,
     openSalesOrderLines,
@@ -85,11 +125,11 @@ async function getProductTransformBlockers(productId: string): Promise<ProductTr
     openProductionOrders,
     openTransferLines,
   ] = await Promise.all([
-    db.stockLevel.aggregate({
+    client.stockLevel.aggregate({
       where: { productId },
       _sum: { quantity: true, reservedQty: true },
     }),
-    db.salesOrderLine.count({
+    client.salesOrderLine.count({
       where: {
         productId,
         order: {
@@ -97,7 +137,7 @@ async function getProductTransformBlockers(productId: string): Promise<ProductTr
         },
       },
     }),
-    db.purchaseOrderLine.count({
+    client.purchaseOrderLine.count({
       where: {
         productId,
         po: {
@@ -105,7 +145,7 @@ async function getProductTransformBlockers(productId: string): Promise<ProductTr
         },
       },
     }),
-    db.productionOrder.count({
+    client.productionOrder.count({
       where: {
         status: { in: [...OPEN_PRODUCTION_ORDER_STATUSES] },
         OR: [
@@ -114,7 +154,7 @@ async function getProductTransformBlockers(productId: string): Promise<ProductTr
         ],
       },
     }),
-    db.stockTransferLine.count({
+    client.stockTransferLine.count({
       where: {
         productId,
         transfer: {
@@ -230,16 +270,11 @@ export async function validateProductStructureChange(
     }
 
     if (typeChanged || parentChanged) {
-      const blockers = await getProductTransformBlockers(current.id)
-      const hasBlockers =
-        blockers.stockQty > 0
-        || blockers.reservedQty > 0
-        || blockers.openSalesOrderLines > 0
-        || blockers.openPurchaseOrderLines > 0
-        || blockers.openProductionOrders > 0
-        || blockers.openTransferLines > 0
+      // `client`, not the ambient `db`: inside the editor's write transaction this must read
+      // the state the locks are holding, not a parallel connection's snapshot (o3d-y89x r2).
+      const blockers = await getProductTransformBlockers(current.id, client)
 
-      if (hasBlockers) {
+      if (hasProductTransformBlockers(blockers)) {
         const summary = summarizeTransformBlockers(blockers)
         return {
           ok: false,

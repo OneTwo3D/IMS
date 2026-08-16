@@ -163,7 +163,14 @@ WooCommerce models two product shapes (`simple`, `variable`); IMS models six. A 
 
 A brand-new product still takes its type from WooCommerce: a row that does not exist yet has no structure to protect.
 
-A variation is also only matched to an existing IMS row when that row is genuinely the one the WooCommerce variation owns: not mapped to a different WooCommerce object, not already a child of a *different* IMS parent, not itself a parent, and of a type that can sit under a variable parent. A bare SKU match is not enough.
+Two further refusals apply to rows the table above allows the connector to change:
+
+- **A product that is in use is not restructured.** Before turning a SIMPLE row into a variable parent, or into a variation of one, the import runs the same checks the product editor runs: a product carrying stock, reserved stock, or open sales / purchase / manufacturing / stock-transfer documents is left exactly as it is. The exception row names what is blocking it — "stock on hand (5.00)", "1 open sales order line" — so the fix is the same one the editor would ask for.
+- **A product that is already somebody's variation never becomes a parent.** If the IMS row carries a parent of its own, no variations are attached to it, whatever its type currently says.
+
+When a refusal applies, the row is left **structurally and commercially** untouched: its type, its own regular/sale price and its variation options all stay as they are. Only the fields WooCommerce genuinely owns — name, description, images, dimensions, trade fields, category, status, WooCommerce mapping — are still written.
+
+A variation is also only matched to an existing IMS row when that row is genuinely the one the WooCommerce variation owns: not mapped to a different WooCommerce object, not already a child of a *different* IMS parent, not itself a parent, of a type that can sit under a variable parent, and not carrying stock or open documents. A bare SKU match is not enough.
 
 When a refusal means WooCommerce data goes **unimported** — a variable WooCommerce product paired with an IMS kit, or a variation whose SKU resolves to an incompatible row — the import is reported as failed, the product is not marked synced, the reconcile cursor does not advance past it, and a row appears in the [Sync Exception Inbox](sync-exceptions.md). Resolve it in IMS or in WooCommerce; the next successful sync clears the row by itself.
 

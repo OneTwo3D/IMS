@@ -29,6 +29,26 @@ const state = {
   componentDeletes: 0,
   /** Every `Setting` key written by an upsert — the bulk sync's cursor is one of these. */
   settingUpserts: [] as string[],
+
+  // --- what makes a product LIVE (o3d-y89x r2) ---------------------------------
+  // The editor refuses a type OR parent change on a product carrying any of these, and the
+  // connector now asks the same question through the same function. Modelled as rows rather
+  // than as a boolean so the double answers PER PRODUCT: a blocker double that ignored
+  // `where.productId` would make every "blocked" test and every "not blocked" test pass for
+  // the same reason.
+  stockLevels: [] as Array<{ productId: string; quantity: number; reservedQty: number }>,
+  /** Open sales-order lines. The double is handed rows already restricted to open orders. */
+  salesOrderLines: [] as Array<{ productId: string }>,
+  purchaseOrderLines: [] as Array<{ productId: string }>,
+  productionOrders: [] as Array<{ outputProductId: string }>,
+  stockTransferLines: [] as Array<{ productId: string }>,
+  /**
+   * Every productId the connector asked the blocker question about, in order.
+   *
+   * The claim "a steady-state re-sync costs no extra queries" is a claim about this list being
+   * EMPTY, and it is not observable any other way.
+   */
+  blockerQueries: [] as string[],
 }
 
 function snapshot() {
@@ -176,7 +196,72 @@ const productDelegate = {
   upsert: async () => ({}),
 }
 
+/**
+ * The five blocker queries `getProductTransformBlockers` makes, each honouring its own
+ * `where`, each recording that it was asked.
+ *
+ * They throw on a `where` they do not recognise for the same reason `findManyMatching` does:
+ * if the editor's query ever changes shape, the connector must fail loudly here rather than
+ * quietly start answering "clean" for every product.
+ */
+function requireProductId(where: Row | undefined, delegate: string): string {
+  const productId = where?.productId
+  if (typeof productId !== 'string') {
+    throw new Error(`${delegate} double got an unmodelled where: ${JSON.stringify(where)}`)
+  }
+  state.blockerQueries.push(productId)
+  return productId
+}
+
+const blockerDelegates = {
+  stockLevel: {
+    aggregate: async ({ where }: { where?: Row } = {}) => {
+      const productId = requireProductId(where, 'stockLevel.aggregate')
+      const rows = state.stockLevels.filter((row) => row.productId === productId)
+      return {
+        _sum: {
+          quantity: rows.reduce((sum, row) => sum + row.quantity, 0),
+          reservedQty: rows.reduce((sum, row) => sum + row.reservedQty, 0),
+        },
+      }
+    },
+  },
+  salesOrderLine: {
+    count: async ({ where }: { where?: Row } = {}) => {
+      const productId = requireProductId(where, 'salesOrderLine.count')
+      return state.salesOrderLines.filter((row) => row.productId === productId).length
+    },
+  },
+  purchaseOrderLine: {
+    count: async ({ where }: { where?: Row } = {}) => {
+      const productId = requireProductId(where, 'purchaseOrderLine.count')
+      return state.purchaseOrderLines.filter((row) => row.productId === productId).length
+    },
+  },
+  productionOrder: {
+    // The only one whose `where` names the product inside an OR (output product, or a product
+    // consumed as a component of the output). The double answers the first arm, which is the
+    // one every test here exercises, and refuses the shape it cannot answer.
+    count: async ({ where }: { where?: Row } = {}) => {
+      const or = where?.OR as Array<Row> | undefined
+      const outputProductId = or?.[0]?.outputProductId
+      if (typeof outputProductId !== 'string') {
+        throw new Error(`productionOrder.count double got an unmodelled where: ${JSON.stringify(where)}`)
+      }
+      state.blockerQueries.push(outputProductId)
+      return state.productionOrders.filter((row) => row.outputProductId === outputProductId).length
+    },
+  },
+  stockTransferLine: {
+    count: async ({ where }: { where?: Row } = {}) => {
+      const productId = requireProductId(where, 'stockTransferLine.count')
+      return state.stockTransferLines.filter((row) => row.productId === productId).length
+    },
+  },
+}
+
 const txClient = {
+  ...blockerDelegates,
   product: productDelegate,
   productComponent: {
     findMany: async ({ where }: { where?: { productId?: string } } = {}) =>
@@ -334,6 +419,12 @@ function resetState() {
   state.updateData.length = 0
   state.componentDeletes = 0
   state.settingUpserts.length = 0
+  state.stockLevels.length = 0
+  state.salesOrderLines.length = 0
+  state.purchaseOrderLines.length = 0
+  state.productionOrders.length = 0
+  state.stockTransferLines.length = 0
+  state.blockerQueries.length = 0
   nextId = 1
   productPages = {}
   variationPages = {
@@ -476,6 +567,43 @@ test('DOUBLE AUDIT: shoppingSyncLog.deleteMany removes the matching rows and onl
   assert.equal(byExternal.count, 1)
 })
 
+test('DOUBLE AUDIT: the blocker doubles answer per product, not with a constant', async () => {
+  // Every live-row test below rests on these five. A double that ignored `where.productId`
+  // would report the same answer for every product, so "this row is blocked" and "that row is
+  // clean" would both pass without production ever having asked about the right row.
+  resetState()
+  state.stockLevels.push({ productId: 'live', quantity: 5, reservedQty: 2 })
+  state.salesOrderLines.push({ productId: 'live' })
+  state.purchaseOrderLines.push({ productId: 'live' })
+  state.productionOrders.push({ outputProductId: 'live' })
+  state.stockTransferLines.push({ productId: 'live' })
+
+  const live = await blockerDelegates.stockLevel.aggregate({ where: { productId: 'live' } })
+  assert.equal(live._sum.quantity, 5)
+  assert.equal(live._sum.reservedQty, 2)
+  const clean = await blockerDelegates.stockLevel.aggregate({ where: { productId: 'clean' } })
+  assert.equal(clean._sum.quantity, 0, 'a different product is not blocked by this one')
+
+  assert.equal(await blockerDelegates.salesOrderLine.count({ where: { productId: 'live' } }), 1)
+  assert.equal(await blockerDelegates.salesOrderLine.count({ where: { productId: 'clean' } }), 0)
+  assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: { productId: 'live' } }), 1)
+  assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: { productId: 'clean' } }), 0)
+  assert.equal(await blockerDelegates.stockTransferLine.count({ where: { productId: 'live' } }), 1)
+  assert.equal(await blockerDelegates.stockTransferLine.count({ where: { productId: 'clean' } }), 0)
+  assert.equal(
+    await blockerDelegates.productionOrder.count({ where: { OR: [{ outputProductId: 'live' }, {}] } }),
+    1,
+  )
+  assert.equal(
+    await blockerDelegates.productionOrder.count({ where: { OR: [{ outputProductId: 'clean' }, {}] } }),
+    0,
+  )
+
+  // And an unrecognised `where` is a loud failure, not a silent "clean".
+  await assert.rejects(() => blockerDelegates.salesOrderLine.count({ where: {} }), /unmodelled where/)
+  await assert.rejects(() => blockerDelegates.productionOrder.count({ where: {} }), /unmodelled where/)
+})
+
 test('DOUBLE AUDIT: shoppingSyncLog.create applies the schema default for `connector`', async () => {
   // Production never sets `connector` (it is @default("woocommerce")). If the double stored
   // the row without it, every delete above — and the exception-inbox filter these tests read
@@ -551,6 +679,134 @@ test('POLICY: refuseVariationAdoption, per type and per relationship', async () 
 
   // Precedence: the parent check answers first, because it is the more specific fact.
   assert.equal(adopt({ type: 'VARIABLE', parentId: 'ims-other' })?.reason, 'different_ims_parent')
+})
+
+test('POLICY: decideConnectorParentWrite gates type, pricing, options and children TOGETHER (o3d-y89x r2)', async () => {
+  const policy = await loadPolicy()
+  const decide = (row: Record<string, unknown> | null, incoming: string, summary?: string) =>
+    policy.decideConnectorParentWrite({
+      row: row === null ? null : ({ id: 'r', sku: 'S', parentId: null, ...row } as never),
+      incoming: incoming as never,
+      transformBlockerSummary: summary ?? null,
+    })
+
+  // r1 answered ONE question ("may I write `type`?") and the surrounding code kept answering
+  // the others from `wcProduct.type`. Each row below is the full set of answers for one shape.
+  const kitAsParent = decide({ type: 'KIT' }, 'VARIABLE')
+  assert.equal(kitAsParent.effectiveType, 'KIT')
+  assert.equal(kitAsParent.suppressTypeWrite, true)
+  assert.equal(kitAsParent.canBeVariableParent, false, 'no children, no variable-only options')
+  assert.equal(kitAsParent.appliesWooPriceShape, false, 'and its IMS pricing is not erased')
+  assert.equal(kitAsParent.parentRoleRefusal?.reason, 'type_cannot_be_a_variable_parent')
+
+  // The counterweight: a KIT paired with a WooCommerce SIMPLE product is the ORDINARY bundle
+  // pairing. The type write is still suppressed, but the shapes agree about pricing — both
+  // say "not a variable parent" — so WooCommerce's price must still land.
+  const kitAsSimple = decide({ type: 'KIT' }, 'SIMPLE')
+  assert.equal(kitAsSimple.suppressTypeWrite, true)
+  assert.equal(kitAsSimple.appliesWooPriceShape, true, 'a bundle must keep receiving price updates')
+
+  // A VARIABLE parent paired with a WooCommerce simple product is the same disagreement in the
+  // other direction: stamping a standalone product's price onto a parent that shows min-max
+  // from its variants is the same mistake as erasing the kit's.
+  const variableAsSimple = decide({ type: 'VARIABLE' }, 'SIMPLE')
+  assert.equal(variableAsSimple.effectiveType, 'VARIABLE')
+  assert.equal(variableAsSimple.appliesWooPriceShape, false)
+
+  // Agreement, both directions.
+  const steadyParent = decide({ type: 'VARIABLE' }, 'VARIABLE')
+  assert.equal(steadyParent.suppressTypeWrite, false)
+  assert.equal(steadyParent.canBeVariableParent, true)
+  assert.equal(steadyParent.appliesWooPriceShape, true, 'a real parent clears its own prices')
+  assert.equal(steadyParent.needsTransformBlockerCheck, false, 'nothing is changing — ask nothing')
+
+  const simpleAsSimple = decide({ type: 'SIMPLE' }, 'SIMPLE')
+  assert.equal(simpleAsSimple.appliesWooPriceShape, true)
+  assert.equal(simpleAsSimple.needsTransformBlockerCheck, false)
+
+  // The create branch is deliberately unguarded.
+  const created = decide(null, 'VARIABLE')
+  assert.equal(created.suppressTypeWrite, false)
+  assert.equal(created.canBeVariableParent, true)
+  assert.equal(created.needsTransformBlockerCheck, false, 'a new row has nothing live pointing at it')
+})
+
+test('POLICY: a live row is not transformed, and the question is only asked when it matters (o3d-y89x r2)', async () => {
+  const policy = await loadPolicy()
+  const decide = (row: Record<string, unknown>, incoming: string, summary?: string) =>
+    policy.decideConnectorParentWrite({
+      row: { id: 'r', sku: 'S', parentId: null, ...row } as never,
+      incoming: incoming as never,
+      transformBlockerSummary: summary ?? null,
+    })
+
+  // SIMPLE -> VARIABLE is the one transform the allow-list permits, so it is the one that owes
+  // the editor's live-row question.
+  const pending = decide({ type: 'SIMPLE' }, 'VARIABLE')
+  assert.equal(pending.needsTransformBlockerCheck, true)
+  assert.equal(pending.canBeVariableParent, true, 'clean, so the takeover path still works')
+
+  const blocked = decide({ type: 'SIMPLE' }, 'VARIABLE', 'stock on hand (5.00)')
+  assert.equal(blocked.suppressTypeWrite, true, 'the row stays SIMPLE')
+  assert.equal(blocked.effectiveType, 'SIMPLE')
+  assert.equal(blocked.canBeVariableParent, false)
+  assert.equal(blocked.appliesWooPriceShape, false)
+  assert.equal(blocked.parentRoleRefusal?.reason, 'transform_blocked')
+  assert.match(String(blocked.parentRoleRefusal?.detail), /stock on hand \(5\.00\)/)
+
+  // A protected row never gets there: the allow-list has already refused, so no query is owed.
+  assert.equal(decide({ type: 'KIT' }, 'VARIABLE').needsTransformBlockerCheck, false)
+  assert.equal(decide({ type: 'VARIABLE' }, 'VARIABLE').needsTransformBlockerCheck, false)
+})
+
+test("POLICY: a row that is somebody's CHILD may not become a parent, type change or not (o3d-y89x r2)", async () => {
+  const policy = await loadPolicy()
+  const decide = (row: Record<string, unknown>, incoming: string) =>
+    policy.decideConnectorParentWrite({
+      row: { id: 'r', sku: 'S', ...row } as never,
+      incoming: incoming as never,
+    })
+
+  // THIS is the escape hatch r1 left open. `existing !== incoming` was added so a steady-state
+  // re-sync would not warn, and it silently turned off the whole guard for a row whose type is
+  // unchanged — including a VARIABLE row that already (invalidly) carries a parentId, the exact
+  // shape the pre-fix parent branch could mint. Adopting children into it does not merely
+  // preserve the broken chain, it deepens it.
+  const invalidChain = decide({ type: 'VARIABLE', parentId: 'ims-other' }, 'VARIABLE')
+  assert.equal(invalidChain.canBeVariableParent, false, 'the guard must not be skipped by a no-op type')
+  assert.equal(invalidChain.parentRoleRefusal?.reason, 'row_is_a_child')
+  assert.equal(invalidChain.appliesWooPriceShape, false)
+  assert.equal(invalidChain.needsTransformBlockerCheck, false, 'and it costs no query to say so')
+
+  // The same fact refuses the changing case too, and outranks the allow-list's reason because
+  // it is the more specific statement about this row.
+  assert.equal(decide({ type: 'SIMPLE', parentId: 'ims-other' }, 'VARIABLE').suppressTypeWrite, true)
+  assert.equal(
+    decide({ type: 'SIMPLE', parentId: 'ims-other' }, 'VARIABLE').parentRoleRefusal?.reason,
+    'row_is_a_child',
+  )
+  assert.equal(decide({ type: 'VARIANT', parentId: 'ims-other' }, 'VARIABLE').parentRoleRefusal?.reason, 'row_is_a_child')
+
+  // ...but a genuine steady state stays quiet, which is what `existing !== incoming` was for.
+  const steady = decide({ type: 'VARIABLE', parentId: null }, 'VARIABLE')
+  assert.equal(steady.canBeVariableParent, true)
+  assert.equal(steady.suppressTypeWrite, false)
+  assert.equal(steady.parentRoleRefusal, null)
+})
+
+test('POLICY: connectorVariationAdoptionChangesStructure is true only for a real transform (o3d-y89x r2)', async () => {
+  const policy = await loadPolicy()
+  const changes = (row: Record<string, unknown>) =>
+    policy.connectorVariationAdoptionChangesStructure({
+      row: { type: 'SIMPLE', parentId: null, ...row } as never,
+      imsParentId: 'ims-parent',
+    })
+
+  // The editor gates on `typeChanged || parentChanged`, so this must too — no more, no less.
+  assert.equal(changes({ type: 'SIMPLE', parentId: null }), true, 'type AND parent both change')
+  assert.equal(changes({ type: 'KIT', parentId: null }), true, 'type preserved, but the reparent is still a change')
+  assert.equal(changes({ type: 'VARIANT', parentId: 'ims-parent' }), false, 'the steady state changes nothing')
+  assert.equal(changes({ type: 'KIT', parentId: 'ims-parent' }), false, 'a bundle variant already in place')
 })
 
 // --- the rule --------------------------------------------------------------
@@ -663,6 +919,15 @@ test('a VARIABLE parent is NOT flattened to SIMPLE by a WooCommerce simple produ
     !('type' in (state.updateData[0] ?? {})),
     '`type` must be omitted from the UPDATE entirely, not written back',
   )
+  // The other half of the same refusal (o3d-y89x r2): the row stays a VARIABLE parent, whose
+  // own price columns show min-max from its variants. Stamping a WooCommerce SIMPLE product's
+  // 49/39 onto them is the same mistake as erasing a kit's price because WooCommerce called
+  // the pairing variable — a shape belief that has already been refused, applied anyway.
+  assert.ok(
+    !('salesPriceBase' in (state.updateData[0] ?? {})),
+    'a refused shape must not decide the price columns either',
+  )
+  assert.ok(!('salePriceBase' in (state.updateData[0] ?? {})))
   assert.equal(findProductBySku('CHILD-1')?.parentId, 'ims-var', 'its child still points at a VARIABLE parent')
   assert.equal(findProductBySku('KIT-SKU')?.name, 'Widget Bundle (from WooCommerce)', 'leaf fields still sync')
 
@@ -818,6 +1083,11 @@ test('a KIT matched by a WooCommerce VARIABLE parent keeps its type and adopts n
   // keep receiving price and status updates, or the fix costs more than the bug.
   assert.equal(findProductBySku('PARENT-SKU')?.name, 'Parent Widget', 'leaf fields still applied')
   assert.equal(state.components.length, 1, 'and its composition is untouched')
+  // ...and nothing that belongs to the parent role it was refused (o3d-y89x r2). This test
+  // used to stop at the type, which is why the r1 fix could erase the row's pricing and give
+  // it variable-only options while every assertion here still passed.
+  assert.deepEqual(state.options.map((option) => option.name), [], 'no variable-only ProductOption rows on a refused row')
+  assert.ok(!('salesPriceBase' in (state.updateData[0] ?? {})), 'and its price columns are not named')
 })
 
 test('a repeated sync leaves exactly ONE open conflict row, not one per run (o3d-fjqk)', async () => {
@@ -854,6 +1124,228 @@ test('resolving the conflict clears the exception with no acknowledge step (o3d-
   assert.deepEqual(quarantinedConflicts(), [], 'the exception clears itself when the sync works')
   assert.equal(findProductBySku('VAR-1')?.type, 'VARIANT', 'and the variations finally land')
   assert.equal(findProductBySku('VAR-2')?.type, 'VARIANT')
+})
+
+// --- a refusal leaves the row OTHERWISE untouched (o3d-y89x r2) --------------
+//
+// The r1 tests asserted the type survived and stopped there, so they passed while the very
+// same UPDATE erased the row's pricing and `applyProductOptions` gave it variable-only option
+// rows. "The type was preserved" is not the claim; "the protected row was left alone" is.
+
+test('a refused variable parent keeps its own IMS pricing — a refusal erases nothing (o3d-y89x r2)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  // A KIT priced in IMS, paired with a WooCommerce VARIABLE product. The old code took the
+  // `else` arm of the price rule purely because the INCOMING type was variable, so it wrote
+  // salesPriceBase = null / salePriceBase = null onto the row whose adoption it had just
+  // refused — and re-applied that on every retry.
+  state.products.push(imsRow({
+    id: 'ims-kit',
+    sku: 'PARENT-SKU',
+    name: 'A kit, not a parent',
+    type: 'KIT',
+    salesPriceBase: 12.34,
+    salePriceBase: 9.99,
+  }))
+
+  const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+
+  assert.equal(result.success, false, 'still a conflict — the variations went unimported')
+  const row = findProductBySku('PARENT-SKU')
+  assert.equal(Number(row?.salesPriceBase), 12.34, 'the IMS regular price survives the refusal')
+  assert.equal(Number(row?.salePriceBase), 9.99, 'and so does the IMS sale price')
+  // Untouched means the columns are never NAMED in the UPDATE, not that they were rewritten
+  // with the same value — the same distinction the `type` fix turns on.
+  const written = state.updateData[0] ?? {}
+  assert.ok(!('salesPriceBase' in written), '`salesPriceBase` must be omitted from the UPDATE entirely')
+  assert.ok(!('salePriceBase' in written), '`salePriceBase` must be omitted from the UPDATE entirely')
+  assert.ok(!('type' in written), 'and `type` still is too')
+  // ...while the fields WooCommerce genuinely owns still land.
+  assert.equal(row?.name, 'Parent Widget', 'leaf fields still sync')
+})
+
+test('a refused variable parent is given no variable-only ProductOption rows (o3d-y89x r2)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  // applyProductOptions ran unconditionally, so a KIT that was refused the parent role still
+  // acquired a "Colour: Red,Blue" option row — options for variants that exist nowhere in IMS,
+  // on a row the UI only shows options for when it is VARIABLE.
+  state.products.push(imsRow({ id: 'ims-kit', sku: 'PARENT-SKU', name: 'A kit', type: 'KIT' }))
+
+  const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+
+  assert.equal(result.success, false)
+  assert.deepEqual(state.options.map((option) => option.name), [], 'no options are written onto a row refused the parent role')
+
+  // The counterweight: when the row really does become the parent, the options DO get written —
+  // otherwise this assertion would pass by the feature never working at all.
+  resetState()
+  state.products.push(imsRow({ id: 'ims-simple', sku: 'PARENT-SKU', name: 'Was simple', type: 'SIMPLE' }))
+  const adopted = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+  assert.equal(adopted.success, true, `the takeover path must still work, got: ${adopted.error}`)
+  assert.deepEqual(
+    state.options.map((option) => `${option.name}=${option.values}`),
+    ['Colour=Red,Blue'],
+    'a real variable parent still gets its options',
+  )
+})
+
+// --- the editor's live-row checks, reused (o3d-y89x r2) ----------------------
+//
+// "SIMPLE owns no structure" is a statement about the row's SHAPE. It says nothing about
+// whether the row is IN USE, and the editor refuses a type or parent change on a product with
+// stock, reservations or open documents. The connector performs the same two changes, so it
+// asks the same question through the editor's own getProductTransformBlockers.
+
+test('a SIMPLE row with stock is not turned into a variable parent (o3d-y89x r2)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  state.products.push(imsRow({ id: 'ims-live', sku: 'PARENT-SKU', name: 'In use', type: 'SIMPLE' }))
+  state.stockLevels.push({ productId: 'ims-live', quantity: 5, reservedQty: 0 })
+
+  const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+
+  assert.equal(findProductBySku('PARENT-SKU')?.type, 'SIMPLE', 'the editor would refuse this, so the connector does')
+  assert.ok(!('type' in (state.updateData[0] ?? {})), '`type` is omitted, not written back')
+  assert.equal(findProductBySku('VAR-1'), null, 'and no children are attached to it')
+  assert.equal(findProductBySku('VAR-2'), null)
+  assert.deepEqual(state.options.map((option) => option.name), [], 'nor any variable-only options')
+
+  assert.equal(result.success, false, 'WooCommerce data went unapplied, so this is not a clean sync')
+  assert.equal(result.permanent, true)
+  const conflicts = quarantinedConflicts()
+  assert.equal(conflicts.length, 1)
+  assert.match(String(conflicts[0].errorMessage), /stock on hand \(5\.00\)/, "the editor's own wording")
+  assert.match(String(conflicts[0].errorMessage), /None of its variations were imported/)
+
+  // ...and the row still receives everything WooCommerce genuinely owns.
+  assert.equal(findProductBySku('PARENT-SKU')?.name, 'Parent Widget')
+})
+
+test("each of the editor's five blockers refuses the transform, in the editor's words (o3d-y89x r2)", async () => {
+  const syncWcProductToIms = await loadSync()
+  // One case per table getProductTransformBlockers reads. Enumerated rather than spot-checked
+  // because the whole point of reusing the editor's function is that a table added there is
+  // picked up here — a copy that answered only "stock" would pass a single-case test.
+  const cases: Array<[string, () => void, RegExp]> = [
+    ['stock on hand', () => state.stockLevels.push({ productId: 'ims-live', quantity: 3, reservedQty: 0 }), /stock on hand \(3\.00\)/],
+    ['reserved stock', () => state.stockLevels.push({ productId: 'ims-live', quantity: 0, reservedQty: 2 }), /reserved stock \(2\.00\)/],
+    ['open sales order line', () => state.salesOrderLines.push({ productId: 'ims-live' }), /1 open sales order line/],
+    ['open purchase order line', () => state.purchaseOrderLines.push({ productId: 'ims-live' }), /1 open purchase order line/],
+    ['open manufacturing order', () => state.productionOrders.push({ outputProductId: 'ims-live' }), /1 open manufacturing order/],
+    ['open stock transfer line', () => state.stockTransferLines.push({ productId: 'ims-live' }), /1 open stock transfer line/],
+  ]
+
+  for (const [label, seed, expected] of cases) {
+    resetState()
+    state.products.push(imsRow({ id: 'ims-live', sku: 'PARENT-SKU', name: 'In use', type: 'SIMPLE' }))
+    seed()
+
+    const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+
+    assert.equal(findProductBySku('PARENT-SKU')?.type, 'SIMPLE', `${label} must block the transform`)
+    assert.equal(result.success, false, `${label} must be reported`)
+    assert.match(String(quarantinedConflicts()[0]?.errorMessage), expected, `${label} names itself`)
+  }
+
+  // The negative: the same row with nothing live IS transformed. Without this the six cases
+  // above would pass just as well against a connector that refused every transform outright.
+  resetState()
+  state.products.push(imsRow({ id: 'ims-live', sku: 'PARENT-SKU', name: 'Not in use', type: 'SIMPLE' }))
+  const clean = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+  assert.equal(clean.success, true, `a clean row still transforms, got: ${clean.error}`)
+  assert.equal(findProductBySku('PARENT-SKU')?.type, 'VARIABLE')
+  assert.equal(findProductBySku('VAR-1')?.type, 'VARIANT')
+})
+
+test('a live SIMPLE row is not adopted as a WooCommerce variation either (o3d-y89x r2)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  // The variation path performs the MORE structural of the two changes — type AND parentId —
+  // and had exactly the same hole. An IMS-native product with an open sales order was pulled
+  // under a WooCommerce parent, which the editor blocks outright.
+  state.products.push(imsRow({ id: 'ims-parent', sku: 'PARENT-SKU', name: 'Parent', type: 'VARIABLE' }))
+  state.products.push(imsRow({ id: 'ims-native', sku: 'VAR-1', name: 'IMS-native product', type: 'SIMPLE' }))
+  state.salesOrderLines.push({ productId: 'ims-native' })
+
+  const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+
+  const row = findProductBySku('VAR-1')
+  assert.equal(row?.type, 'SIMPLE', 'not rewritten to VARIANT')
+  assert.equal(row?.parentId, null, 'and not pulled under the WooCommerce parent')
+  assert.equal(row?.externalProductId, null, 'and not remapped')
+  assert.equal(row?.name, 'IMS-native product', 'the whole row is left alone, not just its type')
+
+  assert.equal(result.success, false)
+  assert.match(String(quarantinedConflicts()[0]?.errorMessage), /1 open sales order line/)
+
+  // One refused row must not cost its healthy siblings their update — the same rule as the
+  // other variation refusals.
+  assert.equal(findProductBySku('VAR-2')?.type, 'VARIANT', 'the sibling variation still synced')
+  assert.equal(findProductBySku('PARENT-SKU')?.name, 'Parent Widget', 'and the parent still synced')
+})
+
+test('the steady state asks the live-row question about nothing at all (o3d-y89x r2)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  // The check runs inside the write transaction, which already holds this SKU's advisory lock.
+  // Five queries per row per sync of a 200-variation product would be a contention regression
+  // paid on every reconcile, so it must be owed only when something is actually transforming.
+  state.products.push(imsRow({ id: 'ims-parent', sku: 'PARENT-SKU', name: 'Parent', type: 'VARIABLE' }))
+  state.products.push(imsRow({ id: 'ims-v1', sku: 'VAR-1', name: 'Red', type: 'VARIANT', parentId: 'ims-parent' }))
+  state.products.push(imsRow({ id: 'ims-v2', sku: 'VAR-2', name: 'Blue', type: 'VARIANT', parentId: 'ims-parent' }))
+
+  const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+
+  assert.equal(result.success, true, `sync must succeed, got: ${result.error}`)
+  assert.deepEqual([...state.blockerQueries], [], 'nothing is changing shape, so nothing is asked')
+
+  // And it IS asked when something transforms — otherwise "asks nothing" would be satisfied by
+  // a connector that never asks anything.
+  resetState()
+  state.products.push(imsRow({ id: 'ims-simple', sku: 'PARENT-SKU', name: 'Was simple', type: 'SIMPLE' }))
+  await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+  assert.ok(state.blockerQueries.includes('ims-simple'), 'the transforming row IS asked about')
+})
+
+// --- an invalid parent chain is caught, not deepened (o3d-y89x r2) -----------
+
+test('a VARIABLE row that is itself a CHILD adopts no children (o3d-y89x r2)', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  // The shape r1's `existing !== incoming` condition let straight through. A row typed VARIABLE
+  // that still carries a parentId is invalid and predates this sync — the pre-fix parent branch
+  // could mint it by writing VARIABLE over a VARIANT without clearing parentId. Because its
+  // type is UNCHANGED, the guard was skipped entirely and the sync attached two more children
+  // to it: a two-level chain IMS has no concept of, reported as a clean run.
+  state.products.push(imsRow({ id: 'ims-other-parent', sku: 'OTHER-PARENT', name: 'The real parent', type: 'VARIABLE' }))
+  state.products.push(imsRow({
+    id: 'ims-broken',
+    sku: 'PARENT-SKU',
+    name: "VARIABLE, but somebody's child",
+    type: 'VARIABLE',
+    parentId: 'ims-other-parent',
+    salesPriceBase: 15,
+  }))
+
+  const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+
+  assert.equal(findProductBySku('VAR-1'), null, 'the chain is not extended')
+  assert.equal(findProductBySku('VAR-2'), null)
+  assert.deepEqual(state.options.map((option) => option.name), [], 'nor given the options of a parent it may not be')
+  const row = findProductBySku('PARENT-SKU')
+  assert.equal(row?.parentId, 'ims-other-parent', 'the existing (invalid) chain is left exactly as found')
+  assert.equal(Number(row?.salesPriceBase), 15, 'and its pricing is untouched')
+
+  assert.equal(result.success, false, 'caught, not silently preserved')
+  const conflicts = quarantinedConflicts()
+  assert.equal(conflicts.length, 1)
+  assert.match(String(conflicts[0].errorMessage), /is itself a child of IMS product ims-other-parent/)
+  assert.match(String(conflicts[0].errorMessage), /None of its variations were imported/)
+
+  // No blocker query: the answer came from the row already in hand. A guard that is not an
+  // escape hatch still must not cost five queries to say "unchanged".
+  assert.deepEqual([...state.blockerQueries], [])
 })
 
 // --- variation row matching (o3d-h2cz) --------------------------------------

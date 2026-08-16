@@ -33,12 +33,19 @@ import {
   deriveWooStatusFromLifecycleStatus,
 } from '@/lib/products/lifecycle'
 import {
-  effectiveImsProductType,
+  connectorVariationAdoptionChangesStructure,
+  decideConnectorParentWrite,
   isConnectorTypeWriteSuppressed,
   refuseVariationAdoption,
   summarizeWcProductStructureConflicts,
+  type ConnectorParentWriteDecision,
   type WcProductStructureConflict,
 } from './product-structure-policy'
+import {
+  getProductTransformBlockers,
+  hasProductTransformBlockers,
+  summarizeTransformBlockers,
+} from '@/lib/products/type-transforms'
 import type { Prisma, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 
@@ -99,6 +106,30 @@ function warnImsProductTypePreserved(args: {
     wcType: args.wcType ?? null,
     suppressedType: args.suppressedType,
   })
+}
+
+/**
+ * The editor's live-row question, asked with the editor's own query (o3d-y89x r2).
+ *
+ * `getProductTransformBlockers` is what `validateProductStructureChange` runs before it lets
+ * an operator change a product's type or parent; the connector performs the SAME two changes
+ * (SIMPLE→VARIABLE on the parent branch, SIMPLE→VARIANT + parentId in applyVariations) and
+ * used to perform them without asking. Reusing the function rather than restating its five
+ * queries is the point: a second copy would drift the moment a new document type is added.
+ *
+ * Returns the operator-facing summary when the row is live, null when it is clean.
+ *
+ * `tx` — not the ambient `db` — because this runs inside the write transaction that already
+ * holds this SKU's advisory lock, and the answer has to describe the state those locks hold.
+ * Callers ask only when a transform is genuinely on the table, so a steady-state re-sync of a
+ * 200-variation product still makes zero of these queries.
+ */
+async function connectorTransformBlockerSummary(
+  tx: Prisma.TransactionClient,
+  productId: string,
+): Promise<string | null> {
+  const blockers = await getProductTransformBlockers(productId, tx)
+  return hasProductTransformBlockers(blockers) ? summarizeTransformBlockers(blockers) : null
 }
 
 /**
@@ -689,12 +720,20 @@ export async function syncWcProductToIms(
         let productSku: string
         let changes: WcTradeFieldChange[] = []
         /**
-         * The type the parent row actually carries after this transaction — the incoming
-         * WooCommerce type when the connector may write it, the existing IMS one when it may
-         * not. The variation decision below turns on THIS, not on the WooCommerce type: only
-         * a VARIABLE row may be a parent.
+         * ONE decision covering every write whose correctness depends on the row really being
+         * the shape WooCommerce described (o3d-y89x r2): the `type` column, the row's own
+         * price columns, its variable-only ProductOption rows and its children.
+         *
+         * r1 guarded only `type`, so a refused adoption still erased the protected row's
+         * pricing and gave it variable-only options — the type survived and everything around
+         * it was rewritten anyway. Gating them together is what makes a refusal mean the row
+         * is left alone.
+         *
+         * Seeded with the create-branch answer (WooCommerce decides, because a new row has no
+         * structure to protect) and replaced below when there is an existing row.
          */
-        let effectiveParentType: ProductType = productType
+        let parentWrite: ConnectorParentWriteDecision =
+          decideConnectorParentWrite({ row: null, incoming: productType })
         const structureConflicts: WcProductStructureConflict[] = []
 
         if (existing) {
@@ -702,9 +741,23 @@ export async function syncWcProductToIms(
           // it. `type` is therefore omitted from the update entirely on a protected row —
           // omitted, not set to `existing.type`, so the column is never named in the UPDATE at
           // all — while every other field below still applies.
-          const preserveType = isConnectorTypeWriteSuppressed(existing.type, productType)
-          effectiveParentType = effectiveImsProductType(existing.type, productType)
-          if (preserveType) {
+          //
+          // Decided in two passes so the live-row query is only paid for when a transform is
+          // actually on the table: the first pass answers from the row alone and says whether
+          // the editor's question is even relevant.
+          parentWrite = decideConnectorParentWrite({ row: existing, incoming: productType })
+          if (parentWrite.needsTransformBlockerCheck) {
+            const transformBlockerSummary = await connectorTransformBlockerSummary(tx, existing.id)
+            if (transformBlockerSummary) {
+              parentWrite = decideConnectorParentWrite({
+                row: existing,
+                incoming: productType,
+                transformBlockerSummary,
+              })
+            }
+          }
+
+          if (parentWrite.suppressTypeWrite) {
             warnImsProductTypePreserved({
               imsProductId: existing.id,
               sku: existing.sku,
@@ -726,17 +779,22 @@ export async function syncWcProductToIms(
             heightCm: heightCm ?? existing.heightCm,
             active,
             lifecycleStatus,
-            ...(preserveType ? {} : { type: productType }),
+            ...(parentWrite.suppressTypeWrite ? {} : { type: productType }),
             externalProductId: BigInt(wcProduct.id),
           }
 
-          // Prices — only set on non-VARIABLE products (VARIABLE shows min-max from variants)
-          if (productType !== 'VARIABLE') {
-            if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
-            if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
-          } else {
-            updateData.salesPriceBase = null
-            updateData.salePriceBase = null
+          // Prices — only when IMS and WooCommerce AGREE on the row's shape. A variable parent
+          // shows min-max from its variants and carries none of its own; a standalone product
+          // carries exactly these. On a disagreement neither arm is right, so the columns are
+          // left untouched rather than cleared by WooCommerce's refused belief.
+          if (parentWrite.appliesWooPriceShape) {
+            if (productType !== 'VARIABLE') {
+              if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
+              if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
+            } else {
+              updateData.salesPriceBase = null
+              updateData.salePriceBase = null
+            }
           }
 
           // GTIN — only set if IMS field is currently null/empty
@@ -806,17 +864,17 @@ export async function syncWcProductToIms(
         // each one becomes an order line with no product and no inventory allocation. That
         // is a conflict, not a silent skip — hence the durable record below and the failure
         // this function returns.
-        if (isVariable && effectiveParentType !== 'VARIABLE') {
+        if (isVariable && parentWrite.parentRoleRefusal) {
+          const refusal = parentWrite.parentRoleRefusal
           structureConflicts.push({
             kind: 'variations_not_imported',
             sku: productSku,
             imsProductId: productId,
-            imsType: effectiveParentType,
+            imsType: parentWrite.effectiveType,
             wcObjectId: String(wcProduct.id),
             detail: `WooCommerce product ${wcProduct.id} ("${productSku}") is variable with `
-              + `${variations.length} variation(s), but IMS product ${productId} is ${effectiveParentType}, `
-              + 'which cannot be a variable parent. None of its variations were imported. '
-              + 'Convert the IMS product to a variable parent, or point the WooCommerce product at a different SKU.',
+              + `${variations.length} variation(s), but ${refusal.detail} `
+              + `None of its variations were imported. ${refusal.remedy}`,
           })
         } else if (isVariable) {
           structureConflicts.push(
@@ -825,7 +883,14 @@ export async function syncWcProductToIms(
         }
 
         // --- Product options (variation attributes) ---
-        await applyProductOptions(tx, productId, variationAttrs)
+        //
+        // Gated on the SAME decision as the children (o3d-y89x r2). These rows are the parent
+        // half of a variable product — the UI only shows them for a VARIABLE row — so writing
+        // them onto a row we just refused to make a parent left a KIT carrying options for
+        // variants that were never imported, re-applied on every retry.
+        if (parentWrite.canBeVariableParent) {
+          await applyProductOptions(tx, productId, variationAttrs)
+        }
 
         // SYNCED on the clean path, a deduplicated exception-inbox row otherwise — and in
         // BOTH cases any previously recorded conflict for this pairing is cleared, so a
@@ -1130,11 +1195,31 @@ async function applyVariations(
       // one straight through — that is the initial-import takeover path. So an IMS-native row
       // that merely shares a SKU was silently reparented and remapped, which the o3d-y89x type
       // guard did not stop: it suppressed the `type` write and let `parentId` through.
-      const refusal = refuseVariationAdoption({
+      let refusal = refuseVariationAdoption({
         row: existing,
         imsParentId,
         rowHasChildren: rowsWithChildren.has(existing.id),
       })
+      // The editor's live-row gate, on the connector's other transforming path (o3d-y89x r2).
+      // Adoption writes `parentId` and — for a SIMPLE row — `type`, which is exactly the pair
+      // validateProductStructureChange refuses to change on a product with stock, reservations
+      // or open documents. Asked LAST and only when the adoption really would transform the
+      // row, so the steady-state re-sync of an existing variation pays nothing and a row
+      // already refused above is never queried at all.
+      if (
+        refusal === null
+        && connectorVariationAdoptionChangesStructure({ row: existing, imsParentId })
+      ) {
+        const transformBlockerSummary = await connectorTransformBlockerSummary(tx, existing.id)
+        if (transformBlockerSummary) {
+          refusal = refuseVariationAdoption({
+            row: existing,
+            imsParentId,
+            rowHasChildren: rowsWithChildren.has(existing.id),
+            transformBlockerSummary,
+          })
+        }
+      }
       if (refusal) {
         conflicts.push({
           kind: 'variation_row_refused',

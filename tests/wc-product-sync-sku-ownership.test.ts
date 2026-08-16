@@ -28,6 +28,21 @@ const state = {
   syncLogs: [] as Row[],
   /** Advisory-lock IDs handed to pg_advisory_xact_lock, in acquisition order. */
   advisoryLocks: [] as number[],
+  /**
+   * What makes a product LIVE (o3d-y89x r2). The connector now runs the editor's
+   * `getProductTransformBlockers` before it transforms a row, so this suite's transaction
+   * double has to answer those five queries.
+   *
+   * Modelled as seedable, per-product rows rather than hardcoded zeroes even though every
+   * product in THIS suite is clean: a double that answered "clean" unconditionally would let
+   * a future ownership test seed a live row and never notice the transform being refused,
+   * which is the failure mode the whole file exists to catch.
+   */
+  stockLevels: [] as Array<{ productId: string; quantity: number; reservedQty: number }>,
+  salesOrderLines: [] as Array<{ productId: string }>,
+  purchaseOrderLines: [] as Array<{ productId: string }>,
+  productionOrders: [] as Array<{ outputProductId: string }>,
+  stockTransferLines: [] as Array<{ productId: string }>,
 }
 
 function snapshot() {
@@ -152,8 +167,50 @@ const productDelegate = {
   upsert: async () => ({}),
 }
 
+/** The five queries `getProductTransformBlockers` makes, each honouring its own `where`. */
+function blockerProductId(where: Row | undefined, delegate: string): string {
+  const productId = where?.productId
+  if (typeof productId !== 'string') {
+    throw new Error(`${delegate} double got an unmodelled where: ${JSON.stringify(where)}`)
+  }
+  return productId
+}
+
 const txClient = {
   product: productDelegate,
+  stockLevel: {
+    aggregate: async ({ where }: { where?: Row } = {}) => {
+      const productId = blockerProductId(where, 'stockLevel.aggregate')
+      const rows = state.stockLevels.filter((row) => row.productId === productId)
+      return {
+        _sum: {
+          quantity: rows.reduce((sum, row) => sum + row.quantity, 0),
+          reservedQty: rows.reduce((sum, row) => sum + row.reservedQty, 0),
+        },
+      }
+    },
+  },
+  salesOrderLine: {
+    count: async ({ where }: { where?: Row } = {}) =>
+      state.salesOrderLines.filter((row) => row.productId === blockerProductId(where, 'salesOrderLine.count')).length,
+  },
+  purchaseOrderLine: {
+    count: async ({ where }: { where?: Row } = {}) =>
+      state.purchaseOrderLines.filter((row) => row.productId === blockerProductId(where, 'purchaseOrderLine.count')).length,
+  },
+  productionOrder: {
+    count: async ({ where }: { where?: Row } = {}) => {
+      const outputProductId = (where?.OR as Array<Row> | undefined)?.[0]?.outputProductId
+      if (typeof outputProductId !== 'string') {
+        throw new Error(`productionOrder.count double got an unmodelled where: ${JSON.stringify(where)}`)
+      }
+      return state.productionOrders.filter((row) => row.outputProductId === outputProductId).length
+    },
+  },
+  stockTransferLine: {
+    count: async ({ where }: { where?: Row } = {}) =>
+      state.stockTransferLines.filter((row) => row.productId === blockerProductId(where, 'stockTransferLine.count')).length,
+  },
   productOption: {
     upsert: async ({ create }: { create: Row }) => {
       state.options.push({ ...create })
@@ -282,6 +339,11 @@ function resetState() {
   state.options.length = 0
   state.syncLogs.length = 0
   state.advisoryLocks.length = 0
+  state.stockLevels.length = 0
+  state.salesOrderLines.length = 0
+  state.purchaseOrderLines.length = 0
+  state.productionOrders.length = 0
+  state.stockTransferLines.length = 0
   nextId = 1
   variationTotalPages = 1
   hashOverrides = {}
