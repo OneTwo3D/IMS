@@ -20,6 +20,16 @@ type AllocationRow = {
 }
 type ShipmentLineRow = { lineId: string; productId: string; warehouseId: string; status: string; qty: number }
 type SalesOrderLineRow = { id: string; orderId: string; productId: string; qty: number; sku: string }
+/** A PENDING draft, with the label metadata a retirement has to report (o3d-4kfh r4). */
+type PendingShipmentRow = {
+  id: string
+  orderId: string
+  warehouseId: string
+  trackingNumber: string | null
+  shippingService: string | null
+  createdAt: string
+  lines: Array<{ lineId: string; productId: string; qty: number }>
+}
 
 const state = {
   stockLevels: [] as StockLevelRow[],
@@ -33,6 +43,11 @@ const state = {
   // Set by the concurrency test only: the snapshot the NON-transactional pre-read still sees after
   // a second editor has already committed. null = read the live rows like every other test.
   staleOuterAllocations: null as AllocationRow[] | null,
+  // o3d-4kfh r4: the order's PENDING drafts. updateAllocation had NO draft cleanup at all, so a
+  // double without them could not observe the defect in either direction.
+  pendingShipments: [] as PendingShipmentRow[],
+  /** Every activity-log entry, so the retirement record can be asserted rather than assumed. */
+  activity: [] as Record<string, unknown>[],
 }
 
 function decimalLikeToNumber(value: unknown): number {
@@ -43,7 +58,11 @@ function decimalLikeToNumber(value: unknown): number {
 }
 
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
-mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
+mock.module('@/lib/activity-log', {
+  namedExports: {
+    logActivity: async (entry: Record<string, unknown>) => { state.activity.push(entry) },
+  },
+})
 mock.module('@/lib/auth/server', {
   namedExports: { requirePermission: async () => {}, requireAuth: async () => ({}) },
 })
@@ -62,6 +81,29 @@ const tx = {
   },
   shipment: {
     findFirst: async () => null,
+    // Honours the PENDING equality predicate and returns each draft's own lines plus its label
+    // metadata, because that is exactly what `reconcilePendingShipments` reads. A double that
+    // returned `[]` here (or ignored the status) would make every draft assertion below vacuous.
+    findMany: async ({ where }: { where: { orderId: string; status?: string } }) => state.pendingShipments
+      .filter((shipment) => shipment.orderId === where.orderId)
+      .filter(() => where.status == null || where.status === 'PENDING')
+      .slice()
+      .sort((a, b) => (a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : a.id < b.id ? -1 : 1))
+      .map((shipment) => ({
+        id: shipment.id,
+        warehouseId: shipment.warehouseId,
+        trackingNumber: shipment.trackingNumber,
+        shippingService: shipment.shippingService,
+        lines: shipment.lines.map((line) => ({ ...line })),
+      })),
+    // Real deletion, and it takes the draft's lines with it as the FK cascade does. Returning a
+    // hard-coded `{ count: 0 }` here is precisely the vacuous double that hid the rebalancer's
+    // destructive behaviour for a whole review round.
+    deleteMany: async ({ where }: { where: { id: { in: string[] } } }) => {
+      const before = state.pendingShipments.length
+      state.pendingShipments = state.pendingShipments.filter((shipment) => !where.id.in.includes(shipment.id))
+      return { count: before - state.pendingShipments.length }
+    },
   },
   salesOrderLine: {
     findMany: async ({ where }: { where: { orderId: string; id?: { in: string[] } } }) => state.lines
@@ -205,6 +247,8 @@ async function loadAction() {
 function seedLines(qty: number) {
   state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty, sku: 'SKU-1' }]
   state.staleOuterAllocations = null
+  state.pendingShipments = []
+  state.activity.length = 0
 }
 
 /**
@@ -596,4 +640,182 @@ test('o3d-4kfh r3: TWO CONCURRENT EDITORS of the same row cannot steal the neigh
   assert.equal(state.allocations.find((row) => row.id === 'alloc-b')?.qty, 3, 'B\'s row is untouched')
   assert.equal(second.success, false, 'the stale editor must be refused, not silently applied')
   assert.match(String(second.error), /changed while you were editing/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r4 (Codex finding 3) — a manual edit must reconcile the PENDING drafts it invalidates.
+//
+// updateAllocation validated only NON-PENDING commitments and then committed. Reducing an
+// allocation 10 -> 5 left its 10-unit PENDING draft intact and perfectly ordinary-looking; the very
+// next Start Picking — or a WMS dispatch applied against it — then failed the r3 commitment
+// coverage guard. An external fulfilment dead-letter caused by an EARLIER SUCCESSFUL IMS action.
+//
+// The retirement now runs inside the same transaction, through the shared
+// `reconcilePendingShipments`, and only drafts the post-edit rows no longer back are touched.
+// ---------------------------------------------------------------------------
+
+/** A PENDING draft on `warehouseId` for `qty` of product-1, as confirmAllocations would build it. */
+function draft(
+  id: string,
+  warehouseId: string,
+  qty: number,
+  extra: { trackingNumber?: string; shippingService?: string; createdAt?: string; lineId?: string; productId?: string } = {},
+) {
+  return {
+    id,
+    orderId: 'order-1',
+    warehouseId,
+    trackingNumber: extra.trackingNumber ?? null,
+    shippingService: extra.shippingService ?? null,
+    createdAt: extra.createdAt ?? '2026-01-01T00:00:00Z',
+    lines: [{ lineId: extra.lineId ?? 'line-1', productId: extra.productId ?? 'product-1', qty }],
+  }
+}
+
+function draftIds(): string[] {
+  return state.pendingShipments.map((shipment) => shipment.id).sort()
+}
+
+function retirementLog() {
+  return state.activity.find((entry) => entry.action === 'pending_shipments_retired')
+}
+
+test('o3d-4kfh r4: SHRINKING an allocation retires the oversized PENDING draft it no longer backs', async () => {
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 10 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 },
+  ]
+  state.shipmentLines = []
+  state.pendingShipments = [draft('draft-1', 'warehouse-1', 10)]
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 5)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(state.allocations[0].qty, 5)
+  assert.deepEqual(draftIds(), [], 'the 10-unit draft cannot survive a 5-unit allocation')
+  assert.deepEqual(
+    (result.retiredPendingShipments ?? []).map((row) => row.id),
+    ['draft-1'],
+    'and the caller is told which draft went, not merely that one did',
+  )
+})
+
+test('o3d-4kfh r4: an edit that still backs its draft leaves it — and its tracking number — alone', async () => {
+  // The complement, and the reason this is a coverage charge rather than a blanket delete: growing
+  // (or trimming to a quantity the draft still fits inside) invalidates nothing, so a draft an
+  // operator has already put a tracking number on must survive untouched.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 4 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 4 },
+  ]
+  state.shipmentLines = []
+  state.pendingShipments = [draft('draft-1', 'warehouse-1', 4, { trackingNumber: 'TRACK-KEEP', shippingService: 'DPD' })]
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 8)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(draftIds(), ['draft-1'])
+  assert.equal(state.pendingShipments[0].trackingNumber, 'TRACK-KEEP', 'the label is not thrown away')
+  assert.deepEqual(result.retiredPendingShipments, [], 'and nothing is reported as retired')
+  assert.equal(retirementLog(), undefined, 'a no-op retirement writes no activity at all')
+})
+
+test('o3d-4kfh r4: MOVING an allocation retires the draft at the old warehouse only', async () => {
+  // Warehouse moves invalidate a draft without changing any quantity: the draft still points at the
+  // warehouse the units left. A draft in the destination warehouse that its own row still backs is
+  // untouched — the per-draft, per-scope charge is what tells the two apart.
+  seedLines(20)
+  state.stockLevels = [
+    { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 6, reservedQty: 6 },
+    { productId: 'product-1', warehouseId: 'warehouse-2', quantity: 50, reservedQty: 3 },
+  ]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 6 },
+    { id: 'alloc-b', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-2', qty: 3 },
+  ]
+  state.shipmentLines = []
+  state.pendingShipments = [
+    draft('draft-w1', 'warehouse-1', 6, { createdAt: '2026-01-01T00:00:00Z' }),
+    draft('draft-w2', 'warehouse-2', 3, { createdAt: '2026-01-02T00:00:00Z', trackingNumber: 'TRACK-W2' }),
+  ]
+  const { updateAllocation } = await loadAction()
+
+  // Move W1's 6 into W2, merging with the existing 3.
+  const result = await updateAllocation('alloc-a', 'warehouse-2', 6)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(draftIds(), ['draft-w2'], 'only the draft whose warehouse lost its row is retired')
+  assert.equal(state.pendingShipments[0].trackingNumber, 'TRACK-W2', 'the surviving draft keeps its label')
+})
+
+test('o3d-4kfh r4: a retired draft carrying a tracking number is logged with enough identity to cancel the label', async () => {
+  // Codex finding 2's complaint, asserted on the shared retirement record: a bare count cannot tell
+  // an operator WHICH externally purchased label IMS has stopped referencing.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 10 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 },
+  ]
+  state.shipmentLines = []
+  state.pendingShipments = [draft('draft-1', 'warehouse-1', 10, { trackingNumber: 'TRACK-LOST', shippingService: 'DPD Next Day' })]
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 2)
+
+  assert.equal(result.success, true, result.error)
+  const entry = retirementLog()
+  assert.ok(entry, 'the retirement is recorded')
+  const metadata = entry!.metadata as Record<string, unknown>
+  assert.deepEqual(metadata.retiredTrackingNumbers, ['TRACK-LOST'])
+  assert.deepEqual(metadata.retiredShipments, [{
+    shipmentId: 'draft-1',
+    warehouseId: 'warehouse-1',
+    trackingNumber: 'TRACK-LOST',
+    shippingService: 'DPD Next Day',
+    lineCount: 1,
+    totalQty: 10,
+  }])
+  assert.match(String(entry!.description), /TRACK-LOST/)
+})
+
+test('o3d-4kfh r4: a REFUSED edit retires nothing — the reconciliation is inside the transaction', async () => {
+  // The floor refusal throws out of the transaction callback, so the draft must survive with the
+  // row it is drawn from. A reconciliation that ran after the transaction (or that ignored the
+  // throw) would delete a draft the edit never applied.
+  seedCommittedNotDispatched('PICKING')
+  state.pendingShipments = [draft('draft-1', 'warehouse-1', 5)]
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 4)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /Cannot reduce this allocation below 5/)
+  assert.deepEqual(draftIds(), ['draft-1'], 'the draft survives the refusal')
+  assert.equal(retirementLog(), undefined)
+})
+
+test('o3d-4kfh r4: a committed shipment is NOT counted as backing for a draft on the same scope', async () => {
+  // 10 allocated, 5 of them already PICKING. Open quantity is 5, so a 10-unit draft is not backed —
+  // charging it against the raw row instead of `qty - committed` would let a draft and a commitment
+  // both claim the same units, which is the exact over-commitment r3 exists to reject.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 10 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 },
+  ]
+  state.shipmentLines = [
+    { lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', status: 'PICKING', qty: 5 },
+  ]
+  state.pendingShipments = [draft('draft-1', 'warehouse-1', 10)]
+  const { updateAllocation } = await loadAction()
+
+  // A no-op-sized edit (10 -> 10 is rejected as unchanged upstream, so trim to the floor).
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 5)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(draftIds(), [], 'the draft claimed units the PICKING shipment already owns')
 })

@@ -21,6 +21,7 @@ import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { findComponentGraphEditBlockers } from '@/lib/products/component-graph-edit-guard'
 
 /**
  * Product types that can own ProductComponent rows. The CSV import queues a row for the
@@ -461,7 +462,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
         // Carried as the transaction's RETURN value rather than a closure assignment, which
         // TypeScript cannot narrow through.
         type EffectiveStructure = { type: ProductType; parentId: string | null }
-        type RenameOutcome = { conflict: 'moved' | 'taken' | 'structure' } | { conflict: null; structure: EffectiveStructure }
+        type RenameOutcome = { conflict: 'moved' | 'taken' | 'structure' | 'in-flight-sales' } | { conflict: null; structure: EffectiveStructure }
         let effectiveStructure: EffectiveStructure | null = null
         if (!preview) {
           let resolvedCategoryId: string | null = null
@@ -527,6 +528,12 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               },
             })
             if (revalidated.clearComponents) {
+              // o3d-4kfh r4: converting a KIT away from a component-bearing type deletes its
+              // components, which retroactively changes what every in-flight order for that kit
+              // requires. Refused for the same reason as the editor; reported as a row conflict so
+              // the rest of the import still lands.
+              const inFlight = await findComponentGraphEditBlockers(tx, existingProduct.id)
+              if (inFlight.length > 0) return { conflict: 'in-flight-sales' as const }
               await tx.productComponent.deleteMany({ where: { productId: existingProduct.id } })
             }
             // The structure this row ACTUALLY committed, for the in-run cache below. The
@@ -542,6 +549,15 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           })
           // Returned, never thrown: this loop has no per-row catch, so a throw would discard
           // every remaining row over one contended product.
+          if (outcome.conflict === 'in-flight-sales') {
+            result.errors.push(
+              `Row ${lineNum} (${sku}): this product's components could not be cleared because sales orders `
+              + 'are in flight against its component graph (allocated or picked/packed/shipped) — the row '
+              + 'was skipped rather than retroactively changing what those orders require',
+            )
+            result.skipped++
+            continue
+          }
           if (outcome.conflict) {
             result.errors.push(
               `Row ${lineNum} (${sku}): another writer changed this product while the import was running `
@@ -834,6 +850,14 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId), tx)
             if (cycle.kind !== 'ok') return false
 
+            // o3d-4kfh r4: same in-flight sales refusal as the editor. A bulk CSV pass is not a
+            // licence to retroactively rewrite what an already-allocated or already-picked order
+            // requires — the corruption it produces (an incomplete kit dispatched, credited as a
+            // partial kit, reported by nothing) is identical however the graph was edited. Reported
+            // per row rather than aborting the import, so the remaining rows still land.
+            const inFlight = await findComponentGraphEditBlockers(tx, productId)
+            if (inFlight.length > 0) return 'in-flight-sales' as const
+
             await tx.productComponent.deleteMany({ where: { productId } })
             await tx.productComponent.createMany({
               data: components.map((c, i) => ({
@@ -845,6 +869,14 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             })
             return true
           })
+          if (wrote === 'in-flight-sales') {
+            result.errors.push(
+              `Row ${cr.lineNum}: ${cr.sku} has sales orders in flight against its component graph `
+              + '(allocated or picked/packed/shipped) — components were not written, because changing '
+              + 'them would retroactively change what those orders require',
+            )
+            continue
+          }
           if (!wrote) {
             // Reported, not silent: the operator supplied components for this row and none
             // were written. Returning rather than throwing keeps the remaining rows going.

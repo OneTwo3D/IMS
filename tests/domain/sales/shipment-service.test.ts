@@ -785,6 +785,14 @@ test('transitionShipmentStatus lets an unrelated line dispatch after another lin
       { id: 'line-a', orderId: 'order-1', productId: 'product-a', qty: 2, sku: 'SKU-A', description: 'Product A' },
       { id: 'line-b', orderId: 'order-1', productId: 'product-b', qty: 1, sku: 'SKU-B', description: 'Product B' },
     ],
+    // o3d-4kfh r4: the allocation rows behind the committed shipments. The default fixture rows are
+    // for line-1/product-1, which this override replaces — leaving them made every committed line
+    // here unbacked, which the dispatch-time coverage check now (correctly) refuses. Production
+    // cannot reach that state: shipment lines are only ever built from allocation rows.
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-a', productId: 'product-a', warehouseId: 'warehouse-1', qty: 2 },
+      { orderId: 'order-1', lineId: 'line-b', productId: 'product-b', warehouseId: 'warehouse-1', qty: 1 },
+    ],
     shipments: [
       { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
       { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
@@ -885,6 +893,12 @@ test('transitionShipmentStatus rolls back earlier line mutations when a later di
     lines: [
       { id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 1, sku: 'SKU-1', description: 'Product 1' },
       { id: 'line-2', orderId: 'order-1', productId: 'product-2', qty: 1, sku: 'SKU-2', description: 'Product 2' },
+    ],
+    // o3d-4kfh r4: both committed lines need their backing allocation row, or the dispatch-time
+    // coverage check refuses before the stock arithmetic this test is actually about.
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 1 },
+      { orderId: 'order-1', lineId: 'line-2', productId: 'product-2', warehouseId: 'warehouse-1', qty: 1 },
     ],
     shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
     shipmentLines: [
@@ -1049,6 +1063,8 @@ test('transitionShipmentStatus does not reject a fractional KIT on a rounding ul
   const state = baseState({
     lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1', description: 'Kit 1' }],
     kits: { 'kit-1': [{ componentId: 'comp-1', qty: 0.3333, sku: 'COMP-1' }] },
+    // o3d-4kfh r4: the leaf allocation the draft was built from, quantised the same way.
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'comp-1', warehouseId: 'warehouse-1', qty: 0.1667 }],
     shipments: [
       { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
     ],
@@ -1197,4 +1213,134 @@ test('o3d-4kfh r3: confirmSalesOrderShipments refuses an order carrying an unbac
     () => confirmSalesOrderShipments(createClient(state), 'order-1'),
     /commit 10 unit\(s\) but only 5 are allocated there/,
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r4 (Codex finding 1) — the KIT graph edit that bypassed every proportionality backstop.
+//
+// The r3 check ran ONLY when the locked source status was PENDING, so it was unreachable from the
+// mutation that creates the corruption. A KIT requiring 2xA + 1xB, allocated and PICKING at
+// A=2/B=1, re-composed to 2xA + 2xB by the product-component editor, crosses no PENDING seam ever
+// again: PICKING -> PACKED skipped the check entirely, and the per-leaf cap in
+// validateActiveShipmentTotalsWithinOrder accepts A=2/B=1 because neither leaf EXCEEDS its (now
+// larger) demand. IMS dispatched an incomplete kit and nothing reported it.
+//
+// The mutation itself is now refused at source (findComponentGraphEditBlockers), but the graph can
+// still be reached by other routes, so the graph-aware check runs at EVERY transition including
+// dispatch.
+// ---------------------------------------------------------------------------
+
+/**
+ * A KIT line of 1, allocated and committed at A=2 / B=1, whose live recipe has since been changed
+ * to require 2 of B. `shipmentStatus` is where the shipment already sits.
+ */
+function recomposedKitState(shipmentStatus: 'PICKING' | 'PACKED') {
+  return baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
+    // THE EDIT: the live graph now says 2xA + 2xB. The allocation and shipment rows were written
+    // against the old 2xA + 1xB and nothing rewrote them.
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2, sku: 'COMP-A' }, { componentId: 'comp-b', qty: 2, sku: 'COMP-B' }] },
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-a', warehouseId: 'warehouse-1', qty: 2 },
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-b', warehouseId: 'warehouse-1', qty: 1 },
+    ],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: shipmentStatus, trackingNumber: null, shippingService: null }],
+    shipmentLines: [
+      { id: 'shipment-line-a', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-a', qty: 2 },
+      { id: 'shipment-line-b', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-b', qty: 1 },
+    ],
+    stockLevels: [
+      { productId: 'comp-a', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 },
+      { productId: 'comp-b', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 },
+    ],
+    costLayers: [
+      { id: 'layer-a', productId: 'comp-a', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 },
+      { id: 'layer-b', productId: 'comp-b', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 },
+    ],
+  })
+}
+
+test('o3d-4kfh r4: DISPATCH is refused when a live KIT edit left the committed set disproportionate', async () => {
+  const state = recomposedKitState('PACKED')
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false, 'an incomplete kit must not dispatch')
+  assert.match((result as { error: string }).error, /do not commit a complete component set/)
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.movements.length, 0, 'and no stock moved')
+  assert.equal(state.stockLevels[0].quantity, 2)
+})
+
+test('o3d-4kfh r4: PICKING -> PACKED is refused too — every transition is checked, not just the first', async () => {
+  // The seam that made the r3 residual wrong: gating the check on `locked.status === PENDING` meant
+  // an already-committed shipment could never be re-checked, so the corruption sailed through here.
+  const state = recomposedKitState('PICKING')
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-1', targetStatus: 'PACKED' }),
+    /do not commit a complete component set/,
+  )
+  assert.equal(state.shipments[0].status, 'PICKING', 'the status flip is rolled back with the transaction')
+})
+
+test('o3d-4kfh r4: a proportional KIT still dispatches and still packs', async () => {
+  // The guard must not become a dead end for healthy orders. Same kit, but the rows match the live
+  // graph, so both transitions go through.
+  const proportional = () => baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2, sku: 'COMP-A' }, { componentId: 'comp-b', qty: 2, sku: 'COMP-B' }] },
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-a', warehouseId: 'warehouse-1', qty: 2 },
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-b', warehouseId: 'warehouse-1', qty: 2 },
+    ],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PICKING', trackingNumber: null, shippingService: null }],
+    shipmentLines: [
+      { id: 'shipment-line-a', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-a', qty: 2 },
+      { id: 'shipment-line-b', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-b', qty: 2 },
+    ],
+    stockLevels: [
+      { productId: 'comp-a', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 },
+      { productId: 'comp-b', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 },
+    ],
+    costLayers: [
+      { id: 'layer-a', productId: 'comp-a', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 },
+      { id: 'layer-b', productId: 'comp-b', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 },
+    ],
+  })
+
+  const packing = proportional()
+  const packed = await transitionShipmentStatus(createClient(packing), { shipmentId: 'shipment-1', targetStatus: 'PACKED' })
+  assert.equal(packed.success, true, packed.success ? undefined : packed.error)
+  assert.equal(packing.shipments[0].status, 'PACKED')
+
+  const dispatching = proportional()
+  dispatching.shipments[0].status = 'PACKED'
+  const shipped = await transitionShipmentStatus(createClient(dispatching), { shipmentId: 'shipment-1', targetStatus: 'SHIPPED' })
+  assert.equal(shipped.success, true, shipped.success ? undefined : shipped.error)
+  assert.equal(dispatching.shipments[0].status, 'SHIPPED')
+  assert.equal(dispatching.movements.length, 2)
+})
+
+test('o3d-4kfh r4: DISPATCH is refused when the allocation row behind a commitment was destroyed', async () => {
+  // The flat half of the same check, reached at dispatch. A committed 2 against an allocation row
+  // of 0 is invisible to every other consumer — they all compute `qty - committed` floored at zero.
+  const state = baseState({
+    allocations: [],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match((result as { error: string }).error, /commit 2 unit\(s\) but only 0 are allocated there/)
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.movements.length, 0)
 })

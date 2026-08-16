@@ -2,6 +2,12 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import {
+  describeRetiredPendingShipments,
+  reconcilePendingShipments,
+  retiredPendingShipmentMetadata,
+  type RetiredPendingShipment,
+} from '@/lib/domain/sales/pending-shipment-reconciliation'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -47,7 +53,7 @@ export async function releaseOverallocations(
 
   type TxOutcome = {
     releases: Array<{ orderId: string; orderRef: string; productId: string; warehouseId: string; qty: number }>
-    pendingShipmentDeletes: Array<{ orderId: string; orderRef: string; count: number }>
+    pendingShipmentDeletes: Array<{ orderId: string; orderRef: string; retired: RetiredPendingShipment[] }>
     skipped: number
   }
 
@@ -146,7 +152,10 @@ export async function releaseOverallocations(
         })
 
         const lockedOrderIdSet = new Set(candidateOrderIds)
-        const pendingShipmentsCleared = new Set<string>()
+        // o3d-4kfh r4: the orders this pass actually WROTE to, reconciled once each after the
+        // release loop. See the note at the reconciliation call below for why the cleanup cannot
+        // happen inside the loop.
+        const releasedOrderRefs = new Map<string, string>()
         for (const alloc of allocs) {
           if (excess <= 1e-6) break
           if (!lockedOrderIdSet.has(alloc.orderId)) { pending.skipped += 1; continue }
@@ -168,23 +177,6 @@ export async function releaseOverallocations(
               where: { orderId: alloc.orderId },
               data: { costLayerSnapshot: Prisma.DbNull },
             })
-          }
-
-          // Clear any PENDING shipments tied to this order so ShipmentLines
-          // don't outlive their backing OrderAllocation. Matches the
-          // delete-and-rebuild pattern used by confirmAllocations — the
-          // order reverts to pre-picking state and the user re-runs
-          // confirm-for-picking to regenerate shipments.
-          if (!pendingShipmentsCleared.has(alloc.orderId)) {
-            const deletedPending = await tx.shipment.deleteMany({ where: { orderId: alloc.orderId, status: 'PENDING' } })
-            if (deletedPending.count > 0) {
-              pending.pendingShipmentDeletes.push({
-                orderId: alloc.orderId,
-                orderRef: alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8),
-                count: deletedPending.count,
-              })
-            }
-            pendingShipmentsCleared.add(alloc.orderId)
           }
 
           const allocQty = Number(alloc.qty)
@@ -210,13 +202,40 @@ export async function releaseOverallocations(
           }
 
           excess -= release
+          const orderRef = alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8)
+          releasedOrderRefs.set(alloc.orderId, orderRef)
           pending.releases.push({
             orderId: alloc.orderId,
-            orderRef: alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8),
+            orderRef,
             productId: item.productId,
             warehouseId: item.warehouseId,
             qty: release,
           })
+        }
+
+        // o3d-4kfh r4: RETIRE ONLY THE DRAFTS THIS RELEASE ACTUALLY UNBACKED.
+        //
+        // This used to be `deleteMany({ orderId, status: 'PENDING' })` inside the loop above — a
+        // blanket delete copied from the deallocation TEARDOWN, where it is correct only because
+        // that path deletes every allocation row on the order in the same breath. Here exactly one
+        // (product, warehouse) allocation is being trimmed, so the blanket delete destroyed drafts
+        // that were still fully backed: with drafts A@W1 and B@W2 on one order, an A@W1 stock
+        // decrease erased B@W2 too, cascaded its shipment lines, and threw away whatever tracking
+        // number and shipping service it carried — recorded as a bare count, so the label could not
+        // even be correlated afterwards.
+        //
+        // Runs AFTER the loop, once per order: the loop can trim several allocations on the same
+        // order, and a mid-loop reconciliation would judge a draft against a half-applied release.
+        // Uses the SAME shared rule as the allocator, the teardown and the manual editor.
+        for (const [releasedOrderId, orderRef] of releasedOrderRefs) {
+          const reconciliation = await reconcilePendingShipments(tx, releasedOrderId)
+          if (reconciliation.retired.length > 0) {
+            pending.pendingShipmentDeletes.push({
+              orderId: releasedOrderId,
+              orderRef,
+              retired: reconciliation.retired,
+            })
+          }
         }
         return pending
       }, STOCK_TX_OPTIONS)
@@ -226,14 +245,28 @@ export async function releaseOverallocations(
       if (txOutcome) {
         result.skipped += txOutcome.skipped
         for (const entry of txOutcome.pendingShipmentDeletes) {
+          // o3d-4kfh r4: IDENTITY, not a count. A retired draft can carry a tracking number and a
+          // shipping service — a purchased label IMS no longer references — and `count: 2` gives an
+          // operator nothing to cancel or correlate. Same metadata shape as every other retirement
+          // site (`retiredPendingShipmentMetadata`).
+          const carryingLabels = entry.retired.filter((row) => row.trackingNumber).length
           await logActivity({
             entityType: 'SALES_ORDER',
             entityId: entry.orderId,
-            action: 'pending_shipments_deleted',
+            action: 'pending_shipments_retired',
             tag: 'sales',
             level: 'WARNING',
-            description: `Deleted ${entry.count} pending shipment(s) for order ${entry.orderRef} while releasing overallocations due to ${context.referenceLabel ?? context.source}`,
-            metadata: { source: context.source, referenceId: context.referenceId ?? null, count: entry.count },
+            description: `Retired ${entry.retired.length} pending shipment(s) for order ${entry.orderRef} left unbacked by an overallocation release due to ${context.referenceLabel ?? context.source}`
+              + (carryingLabels > 0
+                ? ` — ${carryingLabels} carried a tracking number that IMS no longer references, cancel the label(s) with the carrier if unused`
+                : '')
+              + `: ${describeRetiredPendingShipments(entry.retired)}`,
+            metadata: {
+              source: context.source,
+              referenceId: context.referenceId ?? null,
+              cause: 'an overallocation release',
+              ...retiredPendingShipmentMetadata(entry.retired),
+            },
           })
         }
         for (const entry of txOutcome.releases) {

@@ -574,7 +574,11 @@ export function evaluateInventoryInvariantRows(
   //
   // FLAT check only (per line/warehouse/product) — the KIT proportionality half needs the
   // fulfillment requirement graph and lives in `findUncoveredCommittedShipment`, which runs at
-  // validateAllocationIntegrity and at the PENDING -> PICKING commitment transition.
+  // validateAllocationIntegrity and (o3d-4kfh r4) at EVERY shipment transition including dispatch,
+  // not just PENDING -> PICKING. This sweep is still FLAT and deliberately so: expanding the graph
+  // here means a recursive walk over product_components, which the paged SQL collector below cannot
+  // do without a recursive CTE. So a disproportionate committed KIT set is caught at the transition
+  // seams and refused at the component editor, but is NOT reported by this census.
   if (rows.orderAllocations && rows.committedShipmentLines) {
     const allocationScopeKey = (row: { lineId: string; warehouseId: string; productId: string }) =>
       `${row.lineId}|${row.warehouseId}|${row.productId}`
@@ -1496,8 +1500,10 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       -- LIMIT: this is the FLAT check (per (line, warehouse, product)). It does NOT verify that a
       -- KIT's committed components are a complete proportional set — that needs the fulfillment
       -- requirement graph, which is a recursive expansion this sweep does not load. The proportional
-      -- half is enforced where the graph is available: validateAllocationIntegrity and the
-      -- PENDING -> PICKING commitment transition (findUncoveredCommittedShipment).
+      -- half is enforced where the graph is available: validateAllocationIntegrity and (o3d-4kfh r4)
+      -- EVERY shipment transition including dispatch (findUncoveredCommittedShipment), plus the
+      -- component-graph edit refusal that stops the mutation creating it in the first place. The
+      -- SCHEDULED SWEEP ITSELF REMAINS FLAT.
       SELECT
         'allocation_committed_shipment_uncovered:' || csl."lineId" || ':' || csl."warehouseId" || ':' || csl."productId" AS "sortKey",
         'critical'::text AS severity,

@@ -27,6 +27,11 @@ import { productSchema } from '@/lib/products/product-schema'
 import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
+  ComponentGraphInFlightSalesError,
+  describeComponentGraphEditBlockers,
+  findComponentGraphEditBlockers,
+} from '@/lib/products/component-graph-edit-guard'
+import {
   RESERVATION_RELEASING_SHIPMENT_STATUS,
   residualAllocationQty,
   sumDispatchedQtyByAllocationScope,
@@ -975,6 +980,20 @@ export async function updateProduct(
     })
 
     if (revalidated.clearComponents) {
+      // o3d-4kfh r4: converting a KIT to a non-component type deletes its components, which is the
+      // SAME retroactive rewrite as re-composing it — every in-flight order for that kit stops
+      // expanding into components and starts requiring the parent as a leaf. Guarded identically to
+      // saveProductComponents.
+      //
+      // NOTE this path deliberately holds only its per-SKU lock, not the coarse component-graph
+      // advisory one (taking that here would invert the lock order — see lib/db/advisory-locks.ts),
+      // so the check is not atomic against an allocation committing in the same instant. The
+      // graph-aware committed-coverage check that now runs at every shipment transition including
+      // dispatch is the atomic backstop for that window.
+      const blockers = await findComponentGraphEditBlockers(tx, id)
+      if (blockers.length > 0) {
+        throw new ComponentGraphInFlightSalesError(describeComponentGraphEditBlockers(blockers))
+      }
       await tx.productComponent.deleteMany({ where: { productId: id } })
     }
 
@@ -988,6 +1007,11 @@ export async function updateProduct(
     // identically whether the conflict is caught before the lock or under it.
     if (error instanceof ProductSkuTakenError) {
       return { errors: { sku: ['SKU already in use by another product'] } }
+    }
+    // Before the ProductStructureChangedError branch: this is not a stale-read conflict and
+    // reloading will not help, so it must not be told to reload.
+    if (error instanceof ComponentGraphInFlightSalesError) {
+      return { message: error.message }
     }
     if (error instanceof ProductStructureChangedError) {
       return { message: `${error.message} Reload the product and try again.` }
@@ -1356,6 +1380,21 @@ export async function saveProductComponents(
       if (current.sku !== _sku) return 'moved' as const
       if (current.type !== 'KIT' && current.type !== 'BOM') return 'not-component-bearing' as const
 
+      // o3d-4kfh r4 (Codex finding 1): REFUSE WHILE SALES WORK IS IN FLIGHT AGAINST THIS GRAPH.
+      //
+      // Every fulfilment consumer expands the CURRENT component graph, so re-composing a KIT that
+      // an order has already allocated or picked retroactively changes what that order requires —
+      // and no downstream check could see it: the flat committed-coverage backstop compares per
+      // (line, warehouse, product), the dispatch cap only rejects leaves that EXCEED demand, and
+      // whole-kit coverage credits the half-kit that ships. The result was a dispatched incomplete
+      // kit that the census reported as healthy.
+      //
+      // Inside the transaction and under the same advisory graph lock as the write, so an
+      // allocation cannot commit between the check and the edit. See the guard module for why only
+      // KIT-typed ancestors are affected, and why a PENDING draft alone does not block.
+      const blockers = await findComponentGraphEditBlockers(tx, productId)
+      if (blockers.length > 0) return { kind: 'in-flight-sales' as const, blockers }
+
       await tx.productComponent.deleteMany({ where: { productId } })
       if (components.length > 0) {
         await tx.productComponent.createMany({
@@ -1379,6 +1418,9 @@ export async function saveProductComponents(
     }
     if (conflict === 'not-component-bearing') {
       return { success: false, error: 'This product is no longer a kit or BOM, so it cannot have components' }
+    }
+    if (conflict && typeof conflict === 'object' && conflict.kind === 'in-flight-sales') {
+      return { success: false, error: describeComponentGraphEditBlockers(conflict.blockers) }
     }
     const warnings = await findMatchingProductComponentConfigurations(productId, components)
     await logActivity({

@@ -20,6 +20,11 @@ import {
   residualAllocationRows,
   residualAllocationRowsForOrder,
 } from '@/lib/domain/inventory/reservation-residual'
+import {
+  EMPTY_PENDING_SHIPMENT_RECONCILIATION,
+  reconcilePendingShipments,
+  type RetiredPendingShipment,
+} from '@/lib/domain/sales/pending-shipment-reconciliation'
 import { cancelPendingSalesInvoiceSyncForOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { PermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import {
@@ -71,6 +76,12 @@ export type AllocateSalesOrderResult = {
   unallocatedLines: AllocationUnallocatedLine[]
   unallocatedQty: number
   backorderLineCount: number
+  /**
+   * o3d-4kfh r4: the PENDING drafts this rewrite invalidated and retired, with their tracking /
+   * shipping-service metadata. Reported so the caller can log something an operator can correlate
+   * against an externally purchased label — a bare count cannot be.
+   */
+  retiredPendingShipments?: RetiredPendingShipment[]
   orderRef?: string
   isShoppingOrder?: boolean
   shipFromWarehouseId?: string | null
@@ -377,10 +388,18 @@ export type ReleasedOrderAllocation = {
  * Throws (via resetAllocationAccountingIfStaged) when a shipment on this order has already
  * been journaled — those allocations back a posted cost entry and must not be released.
  */
+export type ReleaseOrderAllocationsResult = {
+  allocations: ReleasedOrderAllocation[]
+  clampedReservationCount: number
+  deletedPendingShipmentCount: number
+  /** o3d-4kfh r4: identity + tracking metadata of every retired draft, for the caller's log. */
+  retiredPendingShipments: RetiredPendingShipment[]
+}
+
 export async function releaseOrderAllocationsInTx(
   tx: Prisma.TransactionClient,
   orderId: string,
-): Promise<{ allocations: ReleasedOrderAllocation[]; clampedReservationCount: number; deletedPendingShipmentCount: number }> {
+): Promise<ReleaseOrderAllocationsResult> {
   await resetAllocationAccountingIfStaged(tx, orderId)
   const currentAllocs = await tx.orderAllocation.findMany({
     where: { orderId },
@@ -436,15 +455,23 @@ export async function releaseOrderAllocationsInTx(
   // Start Picking — then committed a shipment with no allocation and no reservation behind it.
   // Deleting them here is what makes the teardown TOTAL; the commitment-transition check in
   // `transitionShipmentStatus` is the backstop for drafts invalidated by any other route.
-  const deletedPendingShipments = await tx.shipment.deleteMany({
-    where: { orderId, status: UNCOMMITTED_SHIPMENT_STATUS },
-  })
+  //
+  // o3d-4kfh r4: through the SHARED reconciliation, and AFTER the allocation rows are gone. This
+  // path used to `deleteMany({ orderId, status: 'PENDING' })` directly — correct here (there is no
+  // backing left at all, so every draft is unbacked and the shared rule retires all of them) but it
+  // was that blanket delete which got copied into the rebalancer, where it destroyed drafts that
+  // were still fully backed. One rule, one implementation, no copy to get wrong.
+  //
+  // The allocation rows are deleted FIRST so the shared helper reads the true post-teardown state
+  // (zero open quantity everywhere) rather than being told what to conclude.
   await tx.orderAllocation.deleteMany({ where: { orderId } })
+  const pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId)
 
   return {
     allocations,
     clampedReservationCount: clampedReservations.count,
-    deletedPendingShipmentCount: deletedPendingShipments.count,
+    deletedPendingShipmentCount: pendingShipmentReconciliation.retired.length,
+    retiredPendingShipments: pendingShipmentReconciliation.retired,
   }
 }
 
@@ -478,7 +505,7 @@ export async function releaseOrderAllocationsInTx(
 export async function releaseOrderAllocationsForDeallocationInTx(
   tx: Prisma.TransactionClient,
   orderId: string,
-): Promise<{ allocations: ReleasedOrderAllocation[]; clampedReservationCount: number; deletedPendingShipmentCount: number }> {
+): Promise<ReleaseOrderAllocationsResult> {
   const committedShipments = await tx.shipment.findMany({
     where: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } },
     select: { id: true, status: true },
@@ -1189,74 +1216,6 @@ function collectNonOversellLeafComponents(
   return [...blockers].sort()
 }
 
-/**
- * Delete the order's PENDING shipments that the allocation set no longer backs (o3d-4kfh r3).
- *
- * "No longer backs" is measured at the grain the two tables share: a draft line needs OPEN
- * allocation — `qty − committed` — at its own (line, warehouse, product), and drafts are charged
- * against that open quantity oldest-first so two drafts cannot both claim the same units. A
- * shipment is kept only if EVERY one of its lines fits; a partially-covered draft is deleted whole,
- * because trimming it would silently ship less than the operator confirmed.
- *
- * Returns how many were deleted.
- */
-async function deleteUnbackedPendingShipments(
-  tx: Prisma.TransactionClient,
-  orderId: string,
-  persistedAllocations: AllocationRowInput[],
-  committedShipmentLines: AllocationScopeQty[],
-): Promise<number> {
-  const pendingShipments = await tx.shipment.findMany({
-    where: { orderId, status: UNCOMMITTED_SHIPMENT_STATUS },
-    select: {
-      id: true,
-      warehouseId: true,
-      lines: { select: { lineId: true, productId: true, qty: true } },
-    },
-    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
-  })
-  if (pendingShipments.length === 0) return 0
-
-  const scopeKey = (row: { lineId: string; warehouseId: string; productId: string }) =>
-    `${row.lineId}|${row.warehouseId}|${row.productId}`
-  const openByScope = new Map<string, Prisma.Decimal>()
-  for (const allocation of persistedAllocations) {
-    const key = scopeKey(allocation)
-    openByScope.set(key, (openByScope.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(allocation.qty)))
-  }
-  for (const committed of committedShipmentLines) {
-    const key = scopeKey(committed)
-    openByScope.set(key, (openByScope.get(key) ?? new Prisma.Decimal(0)).sub(toDecimal(committed.qty)))
-  }
-
-  const doomed: string[] = []
-  for (const shipment of pendingShipments) {
-    const claim = new Map<string, Prisma.Decimal>()
-    let backed = true
-    for (const line of shipment.lines) {
-      const key = scopeKey({ ...line, warehouseId: shipment.warehouseId })
-      const wanted = (claim.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(line.qty))
-      claim.set(key, wanted)
-      const open = openByScope.get(key) ?? new Prisma.Decimal(0)
-      if (wanted.sub(open).gt(ALLOCATION_EPSILON_DECIMAL)) {
-        backed = false
-        break
-      }
-    }
-    if (!backed) {
-      doomed.push(shipment.id)
-      continue
-    }
-    for (const [key, qty] of claim) {
-      openByScope.set(key, (openByScope.get(key) ?? new Prisma.Decimal(0)).sub(qty))
-    }
-  }
-
-  if (doomed.length === 0) return 0
-  const deleted = await tx.shipment.deleteMany({ where: { id: { in: doomed } } })
-  return deleted.count
-}
-
 function noAllocationResult(error: string): AllocateSalesOrderResult {
   return {
     success: false,
@@ -1681,6 +1640,11 @@ export async function allocateSalesOrder(
     // database and produce such a row after this ships.
     const unchanged = allocationSetsMatch(existingAllocs, persistedAllocations)
 
+    // o3d-i5it: stays EMPTY on the unchanged short-circuit. A run that rewrote nothing cannot have
+    // invalidated a draft, so it must not retire one — that short-circuit is what stopped the
+    // 15-minute sweep churning healthy orders.
+    let pendingShipmentReconciliation = EMPTY_PENDING_SHIPMENT_RECONCILIATION
+
     if (!unchanged) {
       // Reached only for a real modification, so the accounting reset — and its posted-shipment
       // guard — applies to an actual allocation change rather than to a no-op re-run.
@@ -1738,7 +1702,14 @@ export async function allocateSalesOrder(
       // PENDING shipment on any re-allocation would throw away the tracking number and shipping
       // service an operator had already typed onto it, on runs (the 15-minute reallocation sweep,
       // a stock-event re-run) that changed nothing about that warehouse.
-      await deleteUnbackedPendingShipments(tx, orderId, persistedAllocations, committedAllocationLines)
+      //
+      // o3d-4kfh r4: the rule now lives in ONE place (`reconcilePendingShipments`) and all four
+      // mutation paths call it. The rows are passed in rather than re-read purely because this
+      // path has just written them itself; the rule applied is identical.
+      pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
+        allocations: persistedAllocations,
+        committedShipmentLines: committedAllocationLines,
+      })
     }
 
     // Promote to ALLOCATED only off the UNDER-LOCK status. Deciding on the stale pre-lock so.status
@@ -1829,6 +1800,7 @@ export async function allocateSalesOrder(
         }),
       unallocatedQty: report.summary.unallocatedQty,
       backorderLineCount: report.lines.filter((line) => line.unallocatedQty > ALLOCATION_EPSILON && line.backorderEligible).length,
+      retiredPendingShipments: pendingShipmentReconciliation.retired,
       refused: false as const,
       skippedStatus: null,
     }
@@ -1889,6 +1861,7 @@ export async function allocateSalesOrder(
     unallocatedLines: allocationResult.unallocatedLines,
     unallocatedQty: allocationResult.unallocatedQty,
     backorderLineCount: allocationResult.backorderLineCount,
+    retiredPendingShipments: allocationResult.retiredPendingShipments,
     orderRef,
     isShoppingOrder,
     shipFromWarehouseId: so.shipFromWarehouseId,

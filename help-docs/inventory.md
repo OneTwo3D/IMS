@@ -107,6 +107,14 @@ Bundle handling is component-driven:
 
 To set up a Kit, use the component search to add products and specify the quantity of each component required per Kit.
 
+**Kit components cannot be changed while sales orders are in flight against them.** Allocation,
+shipment drafts, dispatch checks and stock reporting all read the kit's *current* component list, so
+changing it would retroactively change what an already-allocated or already-picked order is deemed to
+require — and an incomplete kit could then be dispatched without any warning. The editor refuses the
+save and names the orders involved; the same applies to a CSV import that carries a components column,
+and to converting a Kit to a non-component type. Deallocate or dispatch those orders first, or clone
+the product and change the copy.
+
 ### BOM (Bill of Materials)
 
 A product that is manufactured from components. Unlike a Kit, a BOM product holds its own stock. Components are consumed during a build order, and the finished product's stock increases.

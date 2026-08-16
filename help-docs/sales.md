@@ -64,6 +64,23 @@ The allocation rows themselves still **cover those commitments**: an allocation 
 
 For Kit / Bundle products, allocation works from the underlying components rather than the virtual parent SKU. Bundle quantities are expanded into their component requirements, and shipment lines are created for those component rows.
 
+### Draft Shipments and Allocation Changes
+
+A shipment stays in **Pending** until someone starts picking it, and while it is Pending it is only a
+draft built from the allocation rows behind it. So whenever those rows change — a manual allocation
+edit, a re-allocation, a deallocation, or an automatic release after a stock decrease — any Pending
+draft the new allocation no longer covers is **retired** in the same step. Drafts the change still
+covers are left exactly as they are, including any tracking number and shipping service already on
+them.
+
+Retirement is recorded in the activity log with the shipment's id, warehouse, line count, quantity
+and tracking number. If a retired draft already carried a tracking number, the label was bought
+outside IMS and IMS no longer references it — **cancel it with the carrier if it was not used**. Once
+the allocations are right again, run **Confirm for Picking** to rebuild the drafts.
+
+Shipments that are already Picking, Packed or Shipped are commitments, not drafts: they are never
+retired this way, and allocation edits that would leave them uncovered are refused instead.
+
 ### Allocation Panel
 
 The order detail page includes an allocation panel that shows:

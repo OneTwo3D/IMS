@@ -31,6 +31,13 @@ import {
   type AllocationUnallocatedLine,
 } from '@/lib/domain/sales/allocation-service'
 import {
+  EMPTY_PENDING_SHIPMENT_RECONCILIATION,
+  describeRetiredPendingShipments,
+  reconcilePendingShipments,
+  retiredPendingShipmentMetadata,
+  type RetiredPendingShipment,
+} from '@/lib/domain/sales/pending-shipment-reconciliation'
+import {
   confirmSalesOrderShipments,
   reconcileOrderAfterShipment,
   transitionShipmentStatus,
@@ -63,6 +70,12 @@ function shouldLogShipmentStatusFailure(error: string): boolean {
     error.startsWith('Shipment status changed') ||
     error.startsWith('Insufficient physical or reserved stock to dispatch') ||
     error.startsWith('Shipment quantity for line') ||
+    // o3d-4kfh r4: the graph-aware committed-coverage refusal, which can now come back from a
+    // DISPATCH as well as from Start Picking. Its two messages both begin this way. Without it a
+    // dispatch refused because a live KIT edit left the committed set disproportionate would fail
+    // silently as far as the activity log is concerned — which is most of what made the original
+    // corruption invisible.
+    error.startsWith('Shipments for sales line') ||
     error === 'Shipment lines changed. Reload and retry.' ||
     error === 'Shipment has no lines to dispatch'
   )
@@ -106,6 +119,40 @@ async function requireAuth() {
   const session = await auth()
   if (!session?.user?.id) throw new Error('Unauthorized')
   return session
+}
+
+/**
+ * o3d-4kfh r4: ONE activity entry per mutation that retired PENDING drafts, carrying enough
+ * identity to act on it.
+ *
+ * The rebalancer used to log a bare `count`, which is unusable: a draft can already carry a
+ * tracking number and a shipping service (typed in by an operator, or written back by a carrier
+ * integration), and once the row is deleted a count tells nobody WHICH label was bought or which
+ * warehouse it shipped from. Every retirement site logs through here so the shape cannot drift.
+ *
+ * Silent when nothing was retired — the o3d-i5it "changed nothing, said nothing" property.
+ */
+async function logRetiredPendingShipments(
+  orderId: string,
+  orderRef: string,
+  retired: RetiredPendingShipment[],
+  cause: string,
+) {
+  if (retired.length === 0) return
+  const carryingLabels = retired.filter((row) => row.trackingNumber).length
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'pending_shipments_retired',
+    tag: 'sales',
+    level: 'WARNING',
+    description: `Retired ${retired.length} pending shipment(s) for order ${orderRef} that ${cause} left unbacked`
+      + (carryingLabels > 0
+        ? ` — ${carryingLabels} carried a tracking number that IMS no longer references, cancel the label(s) with the carrier if unused`
+        : '')
+      + `: ${describeRetiredPendingShipments(retired)}`,
+    metadata: { cause, ...retiredPendingShipmentMetadata(retired) },
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +417,14 @@ export async function autoAllocateOrder(
         },
       })
     }
+    // Outside the logAttempt branch on purpose: a rewrite can retire a draft on a run that is
+    // otherwise unremarkable, and the retirement is the part an operator has to know about.
+    await logRetiredPendingShipments(
+      orderId,
+      allocationResult.orderRef ?? orderId.slice(0, 8),
+      allocationResult.retiredPendingShipments ?? [],
+      'a re-allocation of the order',
+    )
     if (!allocationResult.success) {
       if (!options?.deferStockSync && allocationResult.syncProductIds.length > 0) {
         try {
@@ -430,7 +485,7 @@ export async function updateAllocation(
   allocationId: string,
   newWarehouseId: string,
   newQty: number,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; retiredPendingShipments?: RetiredPendingShipment[] }> {
   try {
     await requirePermission('sales.process')
     const alloc = await db.orderAllocation.findUnique({
@@ -439,6 +494,10 @@ export async function updateAllocation(
     })
     if (!alloc) return { success: false, error: 'Allocation not found' }
     if (newQty < 0) return { success: false, error: 'Quantity cannot be negative' }
+
+    // Assigned inside the transaction; read only after it commits, so a rolled-back edit reports
+    // nothing retired.
+    let pendingShipmentReconciliation = EMPTY_PENDING_SHIPMENT_RECONCILIATION
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, alloc.orderId)
@@ -619,6 +678,19 @@ export async function updateAllocation(
         }], 'reserve')
       }
 
+      // o3d-4kfh r4: RECONCILE THE DRAFTS THIS EDIT JUST INVALIDATED, in the same transaction.
+      //
+      // This action had no pending-draft cleanup at all. Reducing an allocation 10 -> 5 left its
+      // 10-unit PENDING draft intact and perfectly valid-looking; the very next Start Picking (or a
+      // WMS dispatch applied against it) then failed the commitment coverage guard added in r3 —
+      // an external fulfilment dead-letter caused by an EARLIER SUCCESSFUL IMS action. Warehouse
+      // moves are the same story from the other side: the draft still points at the old warehouse.
+      //
+      // Runs AFTER the allocation write and reads live state, so what it judges is the post-edit
+      // truth. Same shared rule as the allocator, the deallocation teardown and the rebalancer —
+      // a draft the edit still backs is left completely alone (including its tracking number).
+      pendingShipmentReconciliation = await reconcilePendingShipments(tx, locked.orderId)
+
       const integrityError = await validateAllocationIntegrity(tx, locked.orderId, [locked.lineId])
       if (integrityError) throw new Error(integrityError)
     }, STOCK_TX_OPTIONS)
@@ -633,12 +705,18 @@ export async function updateAllocation(
       description: `Updated allocation for order ${alloc.order.orderNumber ?? alloc.order.externalOrderNumber}`,
       metadata: { allocationId, newWarehouseId, newQty },
     })
+    await logRetiredPendingShipments(
+      alloc.orderId,
+      alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8),
+      pendingShipmentReconciliation.retired,
+      'a manual allocation edit',
+    )
     try {
       await enqueueStockSync([alloc.productId], 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
-    return { success: true }
+    return { success: true, retiredPendingShipments: pendingShipmentReconciliation.retired }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     return { success: false, error: message }
@@ -771,6 +849,9 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         // behind is what later became a committed shipment with no allocation), and a draft
         // disappearing without a word in the activity log is indistinguishable from a bug.
         deletedPendingShipmentCount: released.deletedPendingShipmentCount,
+        // o3d-4kfh r4: and the IDENTITY of each, so the entry below names the shipment and any
+        // tracking number it carried rather than just how many vanished.
+        retiredPendingShipments: released.retiredPendingShipments,
       }
     }, STOCK_TX_OPTIONS)
 
@@ -802,6 +883,12 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         deletedPendingShipmentCount: deallocationResult.deletedPendingShipmentCount,
       },
     })
+    await logRetiredPendingShipments(
+      orderId,
+      so.orderNumber ?? so.externalOrderNumber ?? orderId.slice(0, 8),
+      deallocationResult.retiredPendingShipments,
+      'deallocating the order',
+    )
     try {
       const syncTargets = [...new Set(deallocationResult.allocs.map((alloc) => alloc.productId))]
       await enqueueStockSync(syncTargets, 'IMS_CHANGE')

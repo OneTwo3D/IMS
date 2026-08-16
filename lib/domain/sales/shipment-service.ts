@@ -13,7 +13,6 @@ import {
   validateAllocationIntegrity,
   validateCommittedShipmentCoverage,
 } from '@/lib/domain/sales/allocation-service'
-import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import {
   isStockMovementIdempotencyConflict,
   saleDispatchMovementKey,
@@ -164,9 +163,15 @@ async function validateActiveShipmentTotalsWithinOrder(
   // NB: this expands ordered/refunded qty through the CURRENT kit graph, matching the existing
   // build-time refund netting (confirmSalesOrderShipments) and the allocation path — the codebase has
   // no immutable per-order BOM snapshot, so a kit re-composed BETWEEN packing and dispatch can drift
-  // this cap. Fixing that uniformly (persist a per-order-line fulfillment snapshot, or lock kit edits
-  // while orders are in flight) is systemic and tracked separately; this guard is a strict improvement
-  // over shipping every refunded unit and shares the same live-graph assumption already in force.
+  // this cap. o3d-4kfh r4 closed the hole from BOTH ends instead of taking the snapshot: the
+  // component editor, the KIT-conversion paths and the CSV component pass now REFUSE while an
+  // affected order holds allocations or a non-PENDING shipment
+  // (`findComponentGraphEditBlockers`), and `validateCommittedShipmentCoverage` — the only check
+  // that expands the graph and demands a COMPLETE PROPORTIONAL component set — now runs at every
+  // shipment transition INCLUDING the dispatch below. This cap remains a per-leaf upper bound and
+  // cannot see a disproportionate set on its own: A=2/B=1 against a 2xA+2xB kit exceeds neither
+  // leaf. The durable per-line requirement snapshot is still the right long-term fix and is still
+  // NOT implemented.
   const productIds = [...new Set([
     ...orderLines.map((line) => line.productId).filter((id): id is string => !!id),
     ...refundLines.map((refundLine) => refundLine.productId).filter((id): id is string => !!id),
@@ -479,6 +484,34 @@ export async function transitionShipmentStatus(
         }
       }
 
+      // o3d-4kfh r4: THE GRAPH-AWARE COMMITTED-COVERAGE CHECK RUNS AT DISPATCH TOO.
+      //
+      // In r3 this check ran ONLY at the PENDING -> PICKING seam, which is not reachable from the
+      // mutation that creates the corruption. A KIT requiring 2xA + 1xB, allocated and PICKING with
+      // A=2/B=1, re-composed to 2xA + 2xB by the component editor, crosses no PENDING seam ever
+      // again: PICKING -> PACKED skipped the check entirely, and the per-leaf cap in
+      // `validateActiveShipmentTotalsWithinOrder` above accepts A=2/B=1 because neither leaf
+      // EXCEEDS its (now larger) demand. An incomplete kit shipped, and because
+      // `calculateDecimalCoverageByLine` credits whole kits, the census reported nothing.
+      //
+      // `findUncoveredCommittedShipment` is the only check that expands the fulfilment graph and
+      // asks whether the committed components are a COMPLETE, PROPORTIONAL set. Running it here,
+      // under the order lock and immediately before the irreversible act, is what makes the
+      // proportional half reachable from every route into dispatch — including a WMS-driven one.
+      // Scoped to this shipment's own sales lines so an unrelated pre-existing problem elsewhere on
+      // the order cannot wedge a correct dispatch.
+      const dispatchCoverageError = await validateCommittedShipmentCoverage(
+        tx,
+        lockedShipment.orderId,
+        [...new Set(lockedShipment.lines.map((line) => line.lineId))],
+      )
+      if (dispatchCoverageError) {
+        return {
+          success: false as const,
+          error: dispatchCoverageError,
+        }
+      }
+
       const lockedProductIds = [...new Set(lockedShipment.lines.map((line) => line.productId))]
 
       await tx.shipment.update({ where: { id: shipmentId }, data })
@@ -638,24 +671,29 @@ export async function transitionShipmentStatus(
     if (!lockedTransition.success) throw new Error(lockedTransition.error)
     await tx.shipment.update({ where: { id: shipmentId }, data })
 
-    if (locked.status === UNCOMMITTED_SHIPMENT_STATUS) {
-      // Verified AFTER the update on purpose: the check reads the non-PENDING set from the
-      // database, so updating first is what makes THIS shipment part of the commitment being
-      // validated. Scoped to the shipment's own sales lines so an unrelated pre-existing problem
-      // elsewhere on the order cannot block the warehouse from starting a pick.
-      const lockedLines = await tx.shipmentLine.findMany({
-        where: { shipmentId },
-        select: { lineId: true },
-      })
-      const coverageError = await validateCommittedShipmentCoverage(
-        tx,
-        locked.orderId,
-        [...new Set(lockedLines.map((line) => line.lineId))],
-      )
-      // THROWN, not returned: a `return { success: false }` out of a transaction callback commits
-      // whatever it has already written, and this one has already flipped the status.
-      if (coverageError) throw new Error(coverageError)
-    }
+    // Verified AFTER the update on purpose: the check reads the non-PENDING set from the
+    // database, so updating first is what makes THIS shipment part of the commitment being
+    // validated. Scoped to the shipment's own sales lines so an unrelated pre-existing problem
+    // elsewhere on the order cannot block the warehouse from starting a pick.
+    //
+    // o3d-4kfh r4: EVERY transition, not just the PENDING -> PICKING one. Gating on
+    // `locked.status === PENDING` meant a shipment that was ALREADY committed could never be
+    // re-checked, so a KIT re-composed by the component editor while a shipment sat in PICKING
+    // sailed through PICKING -> PACKED and on to dispatch without the proportionality half ever
+    // running. The check is idempotent and reads only committed rows, so re-running it on a
+    // healthy order is free.
+    const lockedLines = await tx.shipmentLine.findMany({
+      where: { shipmentId },
+      select: { lineId: true },
+    })
+    const coverageError = await validateCommittedShipmentCoverage(
+      tx,
+      locked.orderId,
+      [...new Set(lockedLines.map((line) => line.lineId))],
+    )
+    // THROWN, not returned: a `return { success: false }` out of a transaction callback commits
+    // whatever it has already written, and this one has already flipped the status.
+    if (coverageError) throw new Error(coverageError)
     return true
   })
 

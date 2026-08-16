@@ -100,6 +100,11 @@ type ShipmentRow = {
   status?: string
   warehouseId?: string
   shipmentJournalDate: Date | null
+  // o3d-4kfh r4: a draft can already carry a purchased label, and a retirement has to report it —
+  // a double without these fields could not tell a preserved label from a silently dropped one.
+  trackingNumber?: string | null
+  shippingService?: string | null
+  createdAt?: string
 }
 
 /** o3d-4kfh: dispatched quantity is what makes an allocation row's residual differ from its qty. */
@@ -292,10 +297,21 @@ function createClient(state: MemoryState): AllocationServiceClient {
             ? status === where.status
             : where.status.not == null || status !== where.status.not
         })
+        .slice()
+        // Oldest-first, as production asks. The charging order below depends on it, so a double
+        // that ignored `orderBy` would make the two-draft ordering test decide nothing.
+        .sort((a, b) => {
+          const left = a.createdAt ?? ''
+          const right = b.createdAt ?? ''
+          if (left !== right) return left < right ? -1 : 1
+          return a.id < b.id ? -1 : 1
+        })
         .map((shipment) => ({
           id: shipment.id,
           status: shipment.status ?? 'PENDING',
           warehouseId: shipment.warehouseId ?? 'warehouse-1',
+          trackingNumber: shipment.trackingNumber ?? null,
+          shippingService: shipment.shippingService ?? null,
           lines: shipmentLines
             .filter((line) => line.shipmentId === shipment.id)
             .map((line) => ({ lineId: line.lineId, productId: line.productId, qty: line.qty })),
@@ -1424,6 +1440,28 @@ test('re-allocating an unchanged set preserves accounting state and emits no syn
   assert.equal(writeCounts.allocationCreates, 0, 'no re-create')
 })
 
+test('o3d-i5it x 4kfh r4: an unchanged re-allocation retires no PENDING draft either', async () => {
+  // The short-circuit has to cover the draft reconciliation as well. A run that rewrote nothing
+  // cannot have invalidated a draft, and the 15-minute sweep reaches this branch on perfectly
+  // ordinary orders — retiring a draft (and its tracking number) there would be pure churn.
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+    // A draft that is DELIBERATELY bigger than its backing row: even an unbacked draft must not be
+    // touched by a run that changed nothing, because this branch is not the one that invalidated it
+    // (the transition guard and the mutation paths that DID change something own that).
+    shipments: [{ id: 'draft-1', orderId: 'order-1', status: 'PENDING', warehouseId: 'warehouse-1', shipmentJournalDate: null, trackingNumber: 'TRACK-1' }],
+    shipmentLines: [{ shipmentId: 'draft-1', lineId: 'line-1', productId: 'product-1', qty: 5 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(writeCounts.allocationDeletes, 0, 'the destructive cycle really was skipped')
+  assert.deepEqual(result.retiredPendingShipments, [], 'and nothing was retired')
+  assert.deepEqual((state.shipments ?? []).map((row) => row.id), ['draft-1'])
+})
+
 test('a genuine allocation change still resets accounting state (o3d-i5it)', async () => {
   // The other side of the same line: more stock has arrived, so the set really does change and
   // the reset must still run. Skipping it here would leave a stale A2 stamp against new numbers.
@@ -2050,6 +2088,35 @@ test('o3d-4kfh: user deallocation is ALLOWED while the only shipment is still PE
     'the draft shipment is gone — leaving it behind is what later becomes an unbacked commitment',
   )
   assert.equal(state.shipmentLines?.length, 0, 'and so are its lines')
+})
+
+test('o3d-4kfh r4: deallocation reports the retired draft\'s identity and tracking number', async () => {
+  // The teardown used to `deleteMany({ orderId, status: 'PENDING' })` and return only a COUNT. It
+  // now goes through the shared reconciliation, which returns what it deleted — so the caller can
+  // log something an operator could use to cancel an externally purchased label.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PENDING', reservedQty: 13,
+  })
+  state.shipments![0].trackingNumber = 'TRACK-DEALLOC'
+  state.shipments![0].shippingService = 'DPD Next Day'
+  // Captured BEFORE the call: the double really deletes the row, so reading it afterwards would
+  // yield undefined and quietly turn the id assertion into a comparison against a fallback.
+  const draftId = state.shipments![0].id
+
+  const released = await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(released.deletedPendingShipmentCount, 1)
+  assert.deepEqual(released.retiredPendingShipments.map((row) => ({
+    id: row.id,
+    trackingNumber: row.trackingNumber,
+    shippingService: row.shippingService,
+    lineCount: row.lineCount,
+  })), [{
+    id: draftId,
+    trackingNumber: 'TRACK-DEALLOC',
+    shippingService: 'DPD Next Day',
+    lineCount: 1,
+  }])
 })
 
 test('o3d-4kfh: user deallocation is REFUSED while a PICKING shipment exists', async () => {
