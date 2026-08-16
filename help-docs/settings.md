@@ -269,7 +269,7 @@ This means an admin viewing the activity log can see who did what but not see se
 - **Plugins** — enable or disable shopping/accounting connector plugins. Disabled plugins are hidden from menus and shared UI.
 - **Scheduler** — configure the public app URL used for external callbacks and manage scheduled jobs
 - **Activity log retention** — set how many days to keep log entries, configurable per log level
-- **Data retention** — configure archival/deletion windows for operational records
+- **Data retention** — configure archival/deletion windows for operational records. Accounting sync entries that are still **pending, in progress or failed** are exempt from the age-based deletion: they are unfinished work rather than history, their payload is what a retry posts, and deleting one while a worker is holding it would land a document in the accounting system that nothing in IMS records. They expire normally once they settle (synced or cancelled), so the way to clear them is to resolve them on the Accounting Sync page.
 - **System health** — at-a-glance status of FX sync, accounting sync, integration outbox depth, recent cron runs, and invariant check results
 - **Database reset** — reset system data with three levels of severity:
   - **Transactions only** — clears orders, invoices, and movements but keeps products and settings

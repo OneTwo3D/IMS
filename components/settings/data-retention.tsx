@@ -21,7 +21,7 @@ const FIELDS = [
   { key: 'retention_purchase_orders_months', label: 'Purchase Orders', stateKey: 'purchaseOrders' as const, hint: 'Archive received, closed, invoiced, returned, or cancelled POs' },
   { key: 'retention_customers_months', label: 'Customers', stateKey: 'customers' as const, hint: 'Archive inactive customers' },
   { key: 'retention_stock_movements_months', label: 'Stock Movements', stateKey: 'stockMovements' as const, hint: 'Permanently delete movements' },
-  { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete sync logs' },
+  { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete settled sync logs (unfinished accounting work is kept)' },
   { key: 'retention_webhook_events_months', label: 'Webhook Events', stateKey: 'webhookEvents' as const, hint: 'Clear processed inbox payloads (keeps dedup + dead letters)' },
 ] as const
 
@@ -59,6 +59,9 @@ export function DataRetentionSetting({
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
         Set to 0 to keep records forever. Financial records (orders, customers) are soft-archived — hidden from lists but accessible via direct link. Operational data (movements, sync logs) is permanently deleted. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
+      </p>
+      <p className="text-xs text-muted-foreground">
+        One exception: accounting sync entries that are still <strong>pending, in progress or failed</strong> are never deleted by age. They are unfinished work, not history — the payload is what a retry posts, and deleting one while a worker still holds it would put a document in the ledger that nothing here records. They expire normally once they settle (synced or cancelled), so clearing them is a matter of resolving them on the Accounting Sync page.
       </p>
       <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-x-4 max-w-4xl">
         {FIELDS.map((f) => (

@@ -3,25 +3,53 @@
  * o3d-y14: clear the DUPLICATED order-level coupon on legacy WooCommerce orders.
  *
  * All of the judgement lives in lib/connectors/woocommerce/sync/coupon-discount-backfill.ts — read
- * that file for why each decision is made. This is the reporting and driving shell: it reads the
- * evidence, prints what would happen, and (with --apply) runs each correction through the fenced
- * writer one transaction at a time.
+ * that file for why each decision is made. This is the reporting and driving shell.
+ *
+ * IT IS A TWO-PHASE, OPT-IN WORKFLOW, because it rewrites amounts on invoices that are already
+ * posted to the ledger, and no field on a row distinguishes "written by the pre-fix importer" from
+ * "corrected by hand afterwards" or "written by the fixed importer before it stamped the marker".
+ * So a machine may PROPOSE, and only a human may APPROVE:
+ *
+ *   1. REPORT / PROPOSE (no writes)
+ *        tsx scripts/backfill-wc-coupon-order-discount.ts \
+ *          --imported-before 2026-07-25T14:00:00Z --allowlist-out y14-allowlist.json
+ *
+ *   2. REVIEW — see "WHAT A REVIEWER CHECKS" below. Move rows, delete rows, then sign the file.
+ *
+ *   3. APPLY (writes; consumes ONLY the reviewed file, never a fresh scan)
+ *        tsx scripts/backfill-wc-coupon-order-discount.ts --allowlist y14-allowlist.json --apply
+ *
+ * WHAT A REVIEWER CHECKS, per entry:
+ *   • `importedAt` vs the DEPLOYMENT RECORD. The cutoff must be the EARLIEST moment the fixed
+ *     importer could have written a row on this instance — earlier is safe (fewer candidates),
+ *     later silently sweeps in correct rows. Every entry with `"nearCutoff": true` is one the
+ *     cutoff CHOICE decided rather than a comfortable margin; those are the markerless-interval
+ *     risk and each needs an individual answer.
+ *   • MANUAL CORRECTIONS. If this order's discount was ever fixed by hand (raw SQL, an ad-hoc
+ *     script), its amount is ALREADY the residual: move the entry to `stampOnly`. Clearing it would
+ *     subtract the line discounts a second time and then stamp the wrong figure permanently.
+ *   • `storedOrderDiscount` / `lineDiscountTotal` / `keptOrderLevel` — does the residual make sense
+ *     for that order's coupons? `"partial": true` means a residual SURVIVES; those are unmodelled
+ *     coupon shapes and are worth opening individually.
+ *   • `accountingInvoiceId` — non-null means the ledger document ALREADY understates. Clearing the
+ *     IMS field does not reach it; each needs a manual credit/adjustment in the accounting system.
+ *   • Anything you are not sure about: DELETE the entry. Skipping is re-runnable; a wrong correction
+ *     is not.
+ *
+ * Signing means setting `"reviewed": true` and `"reviewedBy": "<your name>"`. Apply refuses
+ * otherwise. Apply also re-verifies every evidence field against the live row and RE-DERIVES the
+ * amount it writes, so a row that moved between review and apply is SKIPPED, and an edited
+ * `keptOrderLevel` causes a refusal rather than a write.
  *
  * IT ONLY EVER TOUCHES SalesOrder.discountAmount + discountModel, and only on orders with a
  * WooCommerce link. It never touches the accounting queue: an order with unposted invoice work is
  * DECLINED and reported (o3d-5ct).
  *
- *   tsx scripts/backfill-wc-coupon-order-discount.ts                                   # report only
- *   tsx scripts/backfill-wc-coupon-order-discount.ts --csv out.csv
- *   tsx scripts/backfill-wc-coupon-order-discount.ts --imported-before 2026-07-25T14:00:00Z --apply
- *
  * --imported-before is the moment the o3d-y14 importer fix went LIVE on this instance. It is dated
  * against ShoppingOrderLink.createdAt — when IMS imported the order — and never against
  * SalesOrder.createdAt, which the initial import backdates to the historical Woo order date.
- *
- * Nothing is written without --apply, and --apply is refused without --imported-before.
  */
-import { writeFileSync } from 'node:fs'
+import { readFileSync, writeFileSync } from 'node:fs'
 
 import { config } from 'dotenv'
 
@@ -30,8 +58,15 @@ import {
   LIVE_SALES_INVOICE_STATUSES,
   SALES_INVOICE_SYNC_TYPES,
   applyWcCouponCorrection,
+  buildWcCouponAllowlistEntry,
   decideWcCouponBackfill,
+  isNearWcCouponCutoff,
+  parseWcCouponAllowlist,
+  parseWcCouponCutoff,
+  stampWcCouponDiscountModel,
   sumLineDiscounts,
+  type WcCouponAllowlist,
+  type WcCouponAllowlistEntry,
   type WcCouponBackfillDecision,
   type WcCouponBackfillRow,
 } from '../lib/connectors/woocommerce/sync/coupon-discount-backfill'
@@ -50,34 +85,96 @@ function flagValue(name: string): string | null {
 
 const LOG = '[backfill-wc-coupon-order-discount]'
 
-async function main() {
+// ---------------------------------------------------------------------------
+// APPLY — consumes the reviewed allowlist and nothing else
+// ---------------------------------------------------------------------------
+
+async function apply(allowlistPath: string) {
   const { db } = await import('../lib/db/index')
 
-  const importedBeforeRaw = flagValue('imported-before')
-  const csvPath = flagValue('csv')
-
-  let importedBefore: Date | null = null
-  if (importedBeforeRaw) {
-    importedBefore = new Date(importedBeforeRaw)
-    if (Number.isNaN(importedBefore.getTime())) {
-      console.error(`${LOG} --imported-before "${importedBeforeRaw}" is not a date.`)
-      process.exitCode = 1
-      return
-    }
-  }
-  if (APPLY && !importedBefore) {
-    console.error(
-      `${LOG} REFUSING to apply without --imported-before <ISO timestamp>.\n` +
-        'Pass the moment the o3d-y14 importer fix went live on this instance. Orders imported before it\n' +
-        'stored the whole coupon in the order-level slot; orders imported after it already stored the\n' +
-        'correct residual, and re-deriving that would erase a real discount. Rows the fix stamped with\n' +
-        'discountModel are recognised without a cutoff; the unstamped historical ones need this.',
-    )
+  let parsedJson: unknown
+  try {
+    parsedJson = JSON.parse(readFileSync(allowlistPath, 'utf8'))
+  } catch (error) {
+    console.error(`${LOG} could not read ${allowlistPath}: ${String(error)}`)
     process.exitCode = 1
     return
   }
 
-  console.log(`${LOG} mode: ${APPLY ? 'APPLY' : 'DRY RUN'}`)
+  const parsed = parseWcCouponAllowlist(parsedJson)
+  if (!parsed.ok) {
+    console.error(`${LOG} REFUSING to apply ${allowlistPath}: ${parsed.reason} — ${parsed.detail}`)
+    process.exitCode = 1
+    return
+  }
+  const allowlist = parsed.allowlist
+
+  console.log(`${LOG} mode: APPLY`)
+  console.log(
+    `${LOG} allowlist: ${allowlistPath} — generated ${allowlist.generatedAt || '(unrecorded)'} under cutoff ` +
+      `${allowlist.cutoff || '(unrecorded)'}, reviewed by ${allowlist.reviewedBy}` +
+      (allowlist.reviewedAt ? ` on ${allowlist.reviewedAt}` : ''),
+  )
+  console.log(
+    `${LOG} ${allowlist.stampOnly.length} order(s) to STAMP as already-correct, ` +
+      `${allowlist.clear.length} to CLEAR. No other order can be touched by this run.`,
+  )
+
+  // STAMP FIRST, deliberately. A stamped row is excluded from every later run by its own evidence
+  // rather than by anyone remembering to exclude it — so if this run dies half way, the rows that
+  // must never be re-derived are the ones already protected.
+  let stamped = 0
+  const declined: string[] = []
+  for (const entry of allowlist.stampOnly) {
+    const result = await db.$transaction((tx) => stampWcCouponDiscountModel(tx, entry))
+    if (result.outcome === 'CORRECTED') stamped += 1
+    else declined.push(`stamp ${entry.orderNumber || entry.orderId}: ${result.reason} — ${result.detail}`)
+  }
+
+  let corrected = 0
+  const posted: WcCouponAllowlistEntry[] = []
+  for (const entry of allowlist.clear) {
+    const result = await db.$transaction((tx) => applyWcCouponCorrection(tx, entry))
+    if (result.outcome === 'CORRECTED') {
+      corrected += 1
+      if (entry.accountingInvoiceId) posted.push(entry)
+    } else {
+      declined.push(`clear ${entry.orderNumber || entry.orderId}: ${result.reason} — ${result.detail}`)
+    }
+  }
+
+  console.log('')
+  console.log(
+    `${LOG} stamped ${stamped} order(s) as already-correct; corrected ${corrected} order(s). ` +
+      'No queued or posted accounting payload was modified.',
+  )
+  if (posted.length) {
+    console.log(
+      `${LOG} ${posted.length} corrected order(s) are ALREADY POSTED to accounting. Their ledger ` +
+        'documents understate revenue by the cleared amount and each needs a manual credit/adjustment — ' +
+        'clearing the IMS field does not reach the posted document:',
+    )
+    for (const entry of posted) {
+      console.log(`${LOG}   posted: ${entry.orderNumber || entry.orderId} -> ${entry.accountingInvoiceId}`)
+    }
+  }
+  if (declined.length) {
+    console.log(
+      `${LOG} ${declined.length} entr(ies) were declined at write time — the row no longer matches the ` +
+        'evidence it was reviewed with, so it was left untouched. Re-run the report to re-propose them:',
+    )
+    for (const line of declined) console.log(`${LOG}   ${line}`)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// REPORT / PROPOSE — never writes
+// ---------------------------------------------------------------------------
+
+async function report(importedBefore: Date | null, csvPath: string | null, allowlistOut: string | null) {
+  const { db } = await import('../lib/db/index')
+
+  console.log(`${LOG} mode: DRY RUN`)
   console.log(
     `${LOG} cutoff: ${
       importedBefore
@@ -178,31 +275,47 @@ async function main() {
     if (decision.action === 'SKIP' && decision.reason !== 'NOTHING_DUPLICATED') continue
     const keep = decision.action === 'CORRECT' ? String(decision.keptOrderLevel) : '-'
     const clear = decision.action === 'CORRECT' ? String(decision.clearedBy) : '-'
+    const near = isNearWcCouponCutoff(row.importedAt, importedBefore) ? ' [NEAR CUTOFF]' : ''
     console.log(
       `${(row.orderNumber || row.orderId).padEnd(18)} ${row.externalOrderNumber.padEnd(10)} ` +
         `${row.currency.padEnd(6)} ${String(row.storedOrderDiscount).padStart(6)} ` +
         `${String(row.lineDiscountTotal).padStart(8)} ${keep.padStart(5)} ${clear.padStart(6)} ` +
         `${(row.accountingInvoiceId ? 'YES' : 'no').padEnd(7)} ${decision.action}` +
-        (decision.action === 'CORRECT' ? (decision.partial ? ' (PARTIAL)' : '') : ` — ${decision.reason}`),
+        (decision.action === 'CORRECT' ? (decision.partial ? ' (PARTIAL)' : '') : ` — ${decision.reason}`) +
+        near,
     )
   }
 
-  const posted = corrections.filter((entry) => entry.row.accountingInvoiceId)
+  const postedCandidates = corrections.filter((entry) => entry.row.accountingInvoiceId)
+  const nearCutoff = corrections.filter((entry) => isNearWcCouponCutoff(entry.row.importedAt, importedBefore))
   console.log('')
   console.log(
-    `${LOG} ${corrections.length} order(s) to correct ` +
+    `${LOG} ${corrections.length} candidate(s) ` +
       `(${corrections.filter((e) => e.decision.action === 'CORRECT' && e.decision.partial).length} keep a residual), ` +
       `${skipped.length} skipped, ${unproven.length} UNPROVEN, ${blocked.length} BLOCKED`,
   )
 
-  if (posted.length) {
+  if (postedCandidates.length) {
     console.log(
-      `${LOG} ${posted.length} of them are ALREADY POSTED to accounting. Their ledger documents ` +
-        'understate revenue by the cleared amount and a manual credit/adjustment is needed for each — ' +
-        'clearing the IMS field does not reach the posted document.',
+      `${LOG} ${postedCandidates.length} of the candidates are ALREADY POSTED to accounting. Their ledger ` +
+        'documents understate revenue by the cleared amount and a manual credit/adjustment is needed for ' +
+        'each — clearing the IMS field does not reach the posted document.',
     )
-    for (const { row } of posted) {
+    for (const { row } of postedCandidates) {
       console.log(`${LOG}   posted: ${row.orderNumber || row.orderId} -> ${row.accountingInvoiceId}`)
+    }
+  }
+
+  if (nearCutoff.length) {
+    console.log('')
+    console.log(
+      `${LOG} ${nearCutoff.length} candidate(s) were classified by the CUTOFF CHOICE rather than by a ` +
+        'comfortable margin — they were imported shortly before it. The fixed importer ran for a while ' +
+        'WITHOUT stamping discountModel, so a cutoff even slightly late sweeps in correct rows. Check ' +
+        'each of these against the deployment record before approving it:',
+    )
+    for (const { row } of nearCutoff) {
+      console.log(`${LOG}   ${row.orderNumber || row.orderId}: imported ${row.importedAt?.toISOString()}`)
     }
   }
 
@@ -225,8 +338,7 @@ async function main() {
     console.log(
       `${LOG} ${blocked.length} order(s) are BLOCKED by live invoice work. A queued SALES_INVOICE ` +
         'carries a payload snapshot the processors post from, and a worker may already hold it, so ' +
-        'this run will not record them as corrected. Let the queue drain (or resolve the failed jobs) ' +
-        'and re-run:',
+        'this run will not propose them. Let the queue drain (or resolve the failed jobs) and re-run:',
     )
     for (const { row, decision } of blocked) {
       console.log(`${LOG}   ${row.orderNumber || row.orderId}: ${decision.detail}`)
@@ -236,7 +348,7 @@ async function main() {
   if (csvPath) {
     const header =
       'salesOrderId,orderNumber,externalOrderNumber,currency,storedOrderDiscount,lineDiscountTotal,' +
-      'importedAt,discountModel,accountingInvoiceId,liveInvoiceJobs,action,reason,keptOrderLevel,clearedBy,detail'
+      'importedAt,nearCutoff,discountModel,accountingInvoiceId,liveInvoiceJobs,action,reason,keptOrderLevel,clearedBy,detail'
     const body = rows.map(({ row, decision }) =>
       [
         row.orderId,
@@ -246,6 +358,7 @@ async function main() {
         row.storedOrderDiscount,
         row.lineDiscountTotal,
         row.importedAt?.toISOString() ?? '',
+        isNearWcCouponCutoff(row.importedAt, importedBefore) ? 'NEAR_CUTOFF' : '',
         row.discountModel ?? '',
         row.accountingInvoiceId ?? '',
         row.liveInvoiceJobs,
@@ -260,39 +373,88 @@ async function main() {
     console.log(`${LOG} wrote ${csvPath} (EVERY order, including the ones left alone)`)
   }
 
-  if (!APPLY) {
+  if (allowlistOut) {
+    const proposal: WcCouponAllowlist = {
+      version: 1,
+      generatedAt: new Date().toISOString(),
+      cutoff: importedBefore ? importedBefore.toISOString() : '',
+      // UNSIGNED. Apply refuses this file until a human sets these three.
+      reviewed: false,
+      reviewedBy: null,
+      reviewedAt: null,
+      stampOnly: [],
+      clear: corrections.map(({ row, decision }) => buildWcCouponAllowlistEntry(row, decision, importedBefore)),
+    }
+    writeFileSync(allowlistOut, JSON.stringify(proposal, null, 2) + '\n')
     console.log('')
-    console.log(`${LOG} DRY RUN — nothing written. Re-run with --imported-before <ISO> --apply to clear.`)
-    return
-  }
-
-  let corrected = 0
-  const declined: string[] = []
-  for (const { row, decision } of corrections) {
-    const result = await db.$transaction((tx) =>
-      applyWcCouponCorrection(tx, {
-        orderId: row.orderId,
-        currency: row.currency,
-        couponTotal: decision.couponTotal,
-        lineDiscountTotal: decision.lineDiscountTotal,
-        keptOrderLevel: decision.keptOrderLevel,
-        clearedBy: decision.clearedBy,
-        accountingInvoiceId: row.accountingInvoiceId,
-      }),
+    console.log(
+      `${LOG} wrote ${allowlistOut} — a PROPOSAL of ${proposal.clear.length} order(s), unsigned.\n` +
+        `${LOG} Review every entry (see the header of this script for what to check), move any row ` +
+        'whose amount is ALREADY correct into "stampOnly", delete anything you are unsure of, then set\n' +
+        `${LOG}   "reviewed": true, "reviewedBy": "<your name>", "reviewedAt": "<ISO>"\n` +
+        `${LOG} and run:  --allowlist ${allowlistOut} --apply`,
     )
-    if (result.outcome === 'CORRECTED') corrected += 1
-    else declined.push(`${row.orderNumber || row.orderId}: ${result.reason} — ${result.detail}`)
   }
 
   console.log('')
-  console.log(`${LOG} corrected ${corrected} order(s); no queued or posted accounting payload was modified.`)
-  if (declined.length) {
-    console.log(
-      `${LOG} ${declined.length} order(s) were declined at write time — the row moved between the ` +
-        'report and the write, so they were left untouched. Re-run to re-evaluate them:',
-    )
-    for (const line of declined) console.log(`${LOG}   ${line}`)
+  console.log(
+    `${LOG} DRY RUN — nothing written. Apply consumes a REVIEWED allowlist only: ` +
+      're-run with --allowlist-out <path> if you did not produce one.',
+  )
+}
+
+async function main() {
+  const importedBeforeRaw = flagValue('imported-before')
+  const csvPath = flagValue('csv')
+  const allowlistPath = flagValue('allowlist')
+  const allowlistOut = flagValue('allowlist-out')
+
+  if (APPLY) {
+    if (!allowlistPath) {
+      console.error(
+        `${LOG} REFUSING to apply without --allowlist <path>.\n` +
+          'This rewrites the discount on orders whose invoices are already in the ledger, and no field on\n' +
+          'a row distinguishes a pre-fix import from one corrected by hand or written by the fixed importer\n' +
+          'before it stamped its marker. So apply consumes a REVIEWED list of order ids, never a fresh scan.\n' +
+          'Produce one with:  --imported-before <ISO> --allowlist-out <path>',
+      )
+      process.exitCode = 1
+      return
+    }
+    if (importedBeforeRaw) {
+      // The cutoff belongs to the PROPOSAL. Accepting it here would invite "apply with a different
+      // cutoff", which is exactly the re-scan the review exists to prevent.
+      console.error(
+        `${LOG} --imported-before is not accepted with --apply. The cutoff decided which orders were ` +
+          'PROPOSED; what apply may touch is decided by the reviewed allowlist alone.',
+      )
+      process.exitCode = 1
+      return
+    }
+    await apply(allowlistPath)
+    return
   }
+
+  let importedBefore: Date | null = null
+  if (importedBeforeRaw) {
+    const parsed = parseWcCouponCutoff(importedBeforeRaw, new Date())
+    if (!parsed.ok) {
+      console.error(`${LOG} --imported-before rejected: ${parsed.reason} — ${parsed.detail}`)
+      process.exitCode = 1
+      return
+    }
+    importedBefore = parsed.cutoff
+  }
+  if (allowlistOut && !importedBefore) {
+    console.error(
+      `${LOG} --allowlist-out needs --imported-before <ISO instant>: without a cutoff every unstamped ` +
+        'order is UNPROVEN, so the proposal would be empty.',
+    )
+    process.exitCode = 1
+    return
+  }
+
+  await report(importedBefore, csvPath, allowlistOut)
 }
 
 // Only when RUN, not when imported: the unit tests import the decision helpers, and a module-load

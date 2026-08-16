@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
+import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -91,21 +92,42 @@ export async function purgeExpiredData(): Promise<{
           },
         },
       }),
-      // o3d-sref / o3d-nepa: this deletes by AGE ALONE, and that is a KNOWN, PRE-EXISTING gap in
-      // the order delete guard's evidence — not one introduced here.
+      // o3d-nepa / o3d-y14: age alone NEVER expires accounting work that can still be posted.
       //
-      // A row that is unresolved (PROCESSING with a taken claim, or FAILED, which o3d-ju8t
-      // established does NOT prove nothing was posted) is the guard's only evidence that a document
-      // may exist in the ledger, since no externalTransactionId was ever written. Deleting it by age
-      // makes the order hard-deletable again.
+      // A PENDING, PROCESSING or FAILED row is not a log of something that happened — it is an
+      // UNFINISHED JOB carrying the payload a worker will post from. Deleting one does not merely
+      // lose an audit trail:
       //
-      // An earlier revision of this branch exempted PROCESSING rows from deletion. That was
-      // REVERTED: it retains the full row — payload included, holding customer names, emails and
-      // financial lines — indefinitely, which contradicts the retention period the settings UI
-      // promises, and every connector switch would strand more. Doing it properly needs a compacted
-      // tombstone carrying only what the guard reads, which is tracked in o3d-nepa rather than
-      // bolted on here.
-      db.accountingSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
+      //   • Both processors read the sync row and its payload BEFORE they conditionally claim it,
+      //     so a worker can be holding the payload in memory while retention removes the row. The
+      //     remote call then still happens, and there is nothing left to record that it did — its
+      //     own status write-back fails against a row that no longer exists.
+      //   • Anything that reasons about "is there live accounting work for this order" reads this
+      //     table. `applyWcCouponCorrection` (o3d-y14) counts these statuses under the sales-order
+      //     row lock and declines to correct an order that has any, because a queued payload is a
+      //     SNAPSHOT built from the pre-correction amount. A retention pass that deletes the row
+      //     turns that decided fact into a false one: the backfill counts zero, permanently stamps
+      //     the order as corrected, and the worker still posts the understated invoice. The same
+      //     count backs the hard-delete guard (o3d-sref, o3d-ju8t: FAILED does not prove nothing
+      //     was posted).
+      //
+      // So the exemption is keyed on the SHARED constant both readers use — if the two sets ever
+      // drift the hole reopens silently, which is why neither side spells the statuses out.
+      //
+      // AN EARLIER REVISION of this branch exempted PROCESSING only, and was reverted on the
+      // grounds that retaining whole rows contradicts the retention period the settings UI
+      // promises. That objection is answered by fixing the PROMISE rather than the data, because
+      // there is no version of this that keeps both: a compacted payload cannot be posted, so
+      // retaining unfinished work whole is the only shape that works. What is retained is bounded
+      // by the OUTSTANDING WORK BACKLOG (visible and actionable on the failed-sync dashboard), not
+      // by history — every row leaves the exemption the moment it reaches SYNCED or CANCELLED, and
+      // is then expired by age normally. components/settings/data-retention.tsx says so.
+      db.accountingSyncLog.deleteMany({
+        where: {
+          createdAt: { lt: cutoff },
+          status: { notIn: [...POSTABLE_ACCOUNTING_SYNC_STATUSES] },
+        },
+      }),
     ])
     syncLogsDeleted = wc.count + acct.count
   }
