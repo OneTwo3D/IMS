@@ -1031,11 +1031,16 @@ export function findStaleFulfillmentGraphAllocation(
  * end up asking a DIFFERENT question of a differently-filtered set than the full integrity check —
  * the two must agree about which shipments count as committed and which rows back them.
  *
- * THE SNAPSHOT BOUNDARY (o3d-4kfh r7, Codex finding 1). There is exactly ONE read on this path that
- * is allowed to answer "what does this line require, and which version of the graph says so", and
- * it is `loadFulfillmentProductGraph` below. Both answers come out of the same statement per node
- * (see `FulfillmentGraphNode.fulfillmentGraphVersion`), so the version the CAS compares against is
- * the version of the recipe the quantities were checked against — by construction, not by luck.
+ * THE SNAPSHOT BOUNDARY (o3d-4kfh r7/r8, Codex finding 1). There is exactly ONE read on this path
+ * that is allowed to answer "what does this line require, and which version of the graph says so",
+ * and it is `loadFulfillmentProductGraph` below. r7 said the two answers "come out of the same
+ * statement per node" and treated that as sufficient; it is not, and r8 corrects it. Per-node
+ * atomicity leaves the MAP torn: the walk is one statement per BFS level, so a nested KIT edited
+ * between two levels paired an OLD root version with a NEW descendant recipe, and the CAS compares
+ * the stamp to the ROOT. `loadFulfillmentProductGraph` now re-reads the version of EVERY visited
+ * node after the walk and re-walks if any moved, so the map it returns belongs to one version of
+ * the graph — that, not the per-node select, is why the version the CAS compares against is the
+ * version of the recipe the quantities were checked against.
  *
  * r6 got this half right. It stamped the ALLOCATOR from the graph node, and then let VALIDATION
  * read `Product.fulfillmentGraphVersion` back through `salesOrderLine.product` — a THIRD snapshot,
@@ -1047,9 +1052,14 @@ export function findStaleFulfillmentGraphAllocation(
  * `select` is gone rather than merely unused, so the stale value is not available to be read again.
  *
  * NOT solved here, and not claimed to be: this path still takes no lock against graph writers, so
- * an edit committing after the graph read is invisible to the whole transaction. That is the
- * serialization gap filed as o3d-57b0 and described in the component-graph guard's docstring; what
- * this removes is the SECOND, avoidable window that existed inside our own read sequence.
+ * an edit committing AFTER the graph load's verify read is invisible to the whole transaction. That
+ * is the serialization gap filed as o3d-57b0 and described in the component-graph guard's
+ * docstring. Nor is the CAS a whole-graph CAS — the stamp is still the ROOT's single `Int`, so a
+ * descendant edit is caught only because `bumpFulfillmentGraphVersions` walks up to the root; the
+ * per-node version set is validated inside the loader, not persisted onto the allocation rows. What
+ * r7 and r8 removed are the two AVOIDABLE windows inside our own read sequence: the third snapshot
+ * that read `Product.fulfillmentGraphVersion` back through `salesOrderLine.product`, and the tear
+ * between the graph walk's own statements.
  *
  * Returns null when the order has no product-bearing lines in scope; nothing to check.
  */

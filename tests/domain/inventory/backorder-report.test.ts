@@ -392,6 +392,7 @@ test('report lines preserve collector ordering', () => {
 
 test('collector uses the order-scoped query shapes and expands kit requirements', async () => {
   const calls: Record<string, unknown> = {}
+  const productCalls: unknown[] = []
   const client = {
     salesOrderLine: {
       findMany: async (args: unknown) => {
@@ -427,8 +428,11 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
       },
     },
     product: {
+      // o3d-4kfh r8: the graph load is a BFS walk FOLLOWED BY a verify read, so this receives more
+      // than one call and the shapes differ. Recording every call keeps the walk's shape asserted
+      // instead of being silently overwritten by the verify read's.
       findMany: async (args: unknown) => {
-        calls.product = args
+        productCalls.push(args)
         return [
           {
             id: 'kit-1',
@@ -491,7 +495,8 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
       shipment: { select: { status: true, warehouseId: true } },
     },
   })
-  assert.deepEqual(calls.product, {
+  assert.equal(productCalls.length, 2, 'o3d-4kfh r8: one BFS walk batch, then the snapshot verify read')
+  assert.deepEqual(productCalls[0], {
     where: { id: { in: ['kit-1'] } },
     select: {
       id: true,
@@ -510,6 +515,12 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
         orderBy: { sortOrder: 'asc' },
       },
     },
+  })
+  // o3d-4kfh r8: the verify read covers EVERY node the walk visited and asks only for the version,
+  // so the returned map is proved to belong to one version of the graph rather than to several.
+  assert.deepEqual(productCalls[1], {
+    where: { id: { in: ['kit-1'] } },
+    select: { id: true, fulfillmentGraphVersion: true },
   })
   assert.deepEqual(collected.requirementsByLine.get('line-kit'), [
     { productId: 'component-1', factor: 2 },
