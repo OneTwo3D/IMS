@@ -7,6 +7,7 @@ import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { setSetting } from '@/app/actions/settings'
 import { syncCrontab } from '@/app/actions/cron'
+import { resolveSchedulerFollowUp } from '@/lib/domain/integrations/scheduler-followup'
 import { ALL_PRESETS } from '@/lib/cron-registry'
 
 export type CronJobState = {
@@ -28,6 +29,8 @@ export function CronJobsSettings({ jobs: initial }: Props) {
   const [isPending, startTransition] = useTransition()
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
+  /** Saved, but the crontab is behind. Not an error — see handleSave. */
+  const [schedulerWarning, setSchedulerWarning] = useState('')
   const [jobs, setJobs] = useState(initial)
 
   // Group by module preserving registration order
@@ -48,6 +51,7 @@ export function CronJobsSettings({ jobs: initial }: Props) {
   function handleSave() {
     setSaved(false)
     setError('')
+    setSchedulerWarning('')
     startTransition(async () => {
       try {
         // Persist all settings
@@ -58,13 +62,18 @@ export function CronJobsSettings({ jobs: initial }: Props) {
           ])
         )
 
-        // Sync to system crontab
-        const result = await syncCrontab()
-        if (!result.success) {
-          setError(result.error ?? 'Failed to sync crontab')
-          return
-        }
-
+        // POST-COMMIT (o3d-osl8 round 8, finding 1 — the same shape as the plugin screen). Every
+        // setting above is already stored by the time this runs, so a failure here — returned or
+        // thrown — is the crontab being out of step with them, not the save failing. Reporting it
+        // as a red error with no "Saved" was read as "your schedule changes were lost", which is
+        // the opposite of the truth: they ARE stored, and they are what the next successful sync
+        // will write.
+        const followUp = await resolveSchedulerFollowUp({
+          what: 'Your scheduled-job settings',
+          sync: syncCrontab,
+          fallbackError: 'Failed to sync crontab',
+        })
+        setSchedulerWarning(followUp.warning)
         setSaved(true)
         setTimeout(() => setSaved(false), 2000)
       } catch (e) {
@@ -132,6 +141,9 @@ export function CronJobsSettings({ jobs: initial }: Props) {
           <span className="text-sm text-destructive">{error}</span>
         )}
       </div>
+      {schedulerWarning && (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">{schedulerWarning}</p>
+      )}
     </div>
   )
 }

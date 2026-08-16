@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { setSetting } from '@/app/actions/settings'
 import { syncCrontab } from '@/app/actions/cron'
+import { resolveSchedulerFollowUp } from '@/lib/domain/integrations/scheduler-followup'
 
 type Props = {
   currentValue: string
@@ -19,10 +20,13 @@ export function PublicAppUrlSettings({ currentValue, source, suggestedValue }: P
   const [value, setValue] = useState(currentValue || suggestedValue || '')
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
+  /** Saved, but the scheduler is behind. Not an error — see handleSave. */
+  const [schedulerWarning, setSchedulerWarning] = useState('')
 
   function handleSave() {
     setSaved(false)
     setError('')
+    setSchedulerWarning('')
 
     startTransition(async () => {
       try {
@@ -43,13 +47,15 @@ export function PublicAppUrlSettings({ currentValue, source, suggestedValue }: P
           return
         }
 
+        // COMMITTED. setSetting returns void and throws on failure, so reaching the next line means
+        // the URL is stored (o3d-osl8 round 8, finding 1 — the same shape as the plugin screen).
         await setSetting('public_app_url', normalized)
-        const result = await syncCrontab()
-        if (!result.success) {
-          setError(result.error ?? 'Failed to apply scheduler changes')
-          return
-        }
 
+        // The crontab reconciliation is a POST-COMMIT step. Reporting its failure — returned or
+        // thrown — as a red error with no "Saved" told the operator their URL had not been stored,
+        // which is false, and invited them to enter it again. It is a warning about the scheduler.
+        const followUp = await resolveSchedulerFollowUp({ what: 'The Public App URL', sync: syncCrontab })
+        setSchedulerWarning(followUp.warning)
         setSaved(true)
         setTimeout(() => setSaved(false), 2000)
       } catch (e) {
@@ -92,6 +98,9 @@ export function PublicAppUrlSettings({ currentValue, source, suggestedValue }: P
         )}
         {error && <span className="text-sm text-destructive">{error}</span>}
       </div>
+      {schedulerWarning && (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">{schedulerWarning}</p>
+      )}
     </div>
   )
 }

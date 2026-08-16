@@ -52,6 +52,14 @@ const state = {
   maxConcurrentTransactions: 0,
   /** What the (mocked) crontab reconciliation reports after a committed write. */
   cronResult: { success: true } as { success: boolean; error?: string },
+  /**
+   * …or what it THROWS instead of returning (round 8, finding 1). A double that can only RETURN a
+   * failure cannot show the defect: the round-7 fix classified returned failures and let thrown
+   * ones escape the union entirely.
+   */
+  cronThrows: null as Error | null,
+  /** Likewise for the post-commit activity-log write, which is an `await` after the commit too. */
+  logActivityThrows: null as Error | null,
   /** Paths revalidated after the action returned. */
   revalidated: [] as string[],
   /** How many settings writes had landed when the scheduler reconciliation was invoked. */
@@ -68,6 +76,8 @@ function reset() {
   state.openTransactions = 0
   state.maxConcurrentTransactions = 0
   state.cronResult = { success: true }
+  state.cronThrows = null
+  state.logActivityThrows = null
   state.revalidated = []
   state.cronCalledAfterWrites = -1
   state.openTransactionsWhenCronRan = -1
@@ -165,7 +175,11 @@ mock.module('@/lib/auth/server', {
   },
 })
 
-mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
+mock.module('@/lib/activity-log', {
+  namedExports: {
+    logActivity: async () => { if (state.logActivityThrows) throw state.logActivityThrows },
+  },
+})
 mock.module('next/cache', { namedExports: { revalidatePath: (path: string) => { state.revalidated.push(path) } } })
 /**
  * INJECTABLE, not pinned to success (o3d-osl8 round 7, finding 1). A double that can only succeed
@@ -177,6 +191,7 @@ mock.module('@/app/actions/cron', {
     syncCrontab: async () => {
       state.cronCalledAfterWrites = state.writes.length
       state.openTransactionsWhenCronRan = state.openTransactions
+      if (state.cronThrows) throw state.cronThrows
       return state.cronResult
     },
   },
@@ -213,9 +228,10 @@ test('two concurrent PARTIAL enables cannot leave BOTH accounting connectors on'
   ])
 
   const outcomes = [xero, quickbooks]
-  assert.equal(outcomes.filter((r) => r.success).length, 1, 'exactly one of them succeeds')
-  const refused = outcomes.find((r) => !r.success)!
-  assert.match(refused.error ?? '', /either Xero or QuickBooks/, 'and the other is REFUSED, with the reason')
+  assert.equal(outcomes.filter((r) => r.status === 'saved').length, 1, 'exactly one of them succeeds')
+  const refused = outcomes.find((r) => r.status === 'refused')
+  assert.ok(refused?.status === 'refused', 'and the other is REFUSED — the outcome that committed nothing')
+  assert.match(refused.error, /either Xero or QuickBooks/, 'with the reason')
 
   assert.ok(
     !(enabled('xero') && enabled('quickbooks')),
@@ -231,8 +247,10 @@ test('the same race on the COMMERCE pair is closed too — it was never accounti
     savePlugins({ shopify: true }),
   ])
 
-  assert.equal(results.filter((r) => r.success).length, 1)
-  assert.match(results.find((r) => !r.success)!.error ?? '', /either WooCommerce or Shopify/)
+  assert.equal(results.filter((r) => r.status === 'saved').length, 1)
+  const commerceRefusal = results.find((r) => r.status === 'refused')
+  assert.ok(commerceRefusal?.status === 'refused')
+  assert.match(commerceRefusal.error, /either WooCommerce or Shopify/)
   assert.ok(!(enabled('woocommerce') && enabled('shopify')))
 })
 
@@ -261,8 +279,9 @@ test('a partial enable is refused against the state the ONBOARDING step just com
 
   const partial = await savePlugins({ xero: true })
 
-  assert.equal(partial.success, false, 'the second connector is refused')
-  assert.match(partial.error ?? '', /either Xero or QuickBooks/)
+  assert.equal(partial.status, 'refused', 'the second connector is refused')
+  assert.ok(partial.status === 'refused')
+  assert.match(partial.error, /either Xero or QuickBooks/)
   assert.ok(!enabled('xero'))
   assert.ok(enabled('quickbooks'), 'and the connector that was already on is untouched')
 })
@@ -290,7 +309,7 @@ test('an unchanged-but-legal partial write still succeeds — the check must not
 
   const result = await savePlugins({ woocommerce: true })
 
-  assert.deepEqual(result, { success: true })
+  assert.deepEqual(result, { status: 'saved' })
   assert.ok(enabled('xero') && enabled('woocommerce'))
 })
 
@@ -299,7 +318,7 @@ test('a refused write commits NOTHING — not even the keys that were individual
 
   const result = await savePlugins({ quickbooks: true, mintsoft: true })
 
-  assert.equal(result.success, false)
+  assert.equal(result.status, 'refused')
   assert.ok(!enabled('quickbooks'))
   assert.ok(!enabled('mintsoft'), 'mintsoft was legal on its own and must not have slipped through a partial commit')
 })
@@ -372,6 +391,114 @@ test('the scheduler is only consulted AFTER every plugin key has been written', 
 
   assert.equal(state.cronCalledAfterWrites, 5, 'all five plugin keys were already written when the scheduler ran')
   assert.equal(state.openTransactionsWhenCronRan, 0, 'and the transaction had ended')
+})
+
+// ---------------------------------------------------------------------------
+// Round 8, finding 1 — a THROWN post-commit failure is the same outcome as a RETURNED one.
+//
+// Round 7 wrote the classification by hand at one call site: `if (!cronResult.success) return
+// { status: 'scheduler-failed', ... }`. A throw walks past that `if` and out of the action, and a
+// rejected server action means "the outcome is unknown" to every caller — so the one fact that was
+// certain (the write committed) was reported as the one thing nobody knew. syncCrontab throws
+// readily: its own requirePermission, getCronSecret, getPublicAppUrl, its settings read and its
+// activity-log write are all awaits that can reject.
+// ---------------------------------------------------------------------------
+
+test('a scheduler failure that THROWS is the same outcome as one that RETURNS', async () => {
+  state.cronThrows = new Error('crontab: EACCES writing /var/spool/cron/ims')
+
+  const result = await saveOnboarding({
+    woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false,
+  })
+
+  // THE ASSERTION THAT FAILS WITHOUT THE FIX: before the post-commit guard this call REJECTED, so
+  // `await` here threw and the test never reached a status at all.
+  assert.equal(result.status, 'scheduler-failed', 'not a rejection — the write is durable either way')
+  assert.ok(result.status === 'scheduler-failed')
+  assert.match(result.error, /EACCES/, 'the thrown reason is carried through, like a returned one')
+  assert.deepEqual(
+    result.pluginState,
+    { woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false, shiphero: false },
+    'with the committed selection, read back under the lock',
+  )
+  assert.ok(enabled('quickbooks') && enabled('woocommerce'), 'and it really is stored')
+})
+
+test('a post-commit ACTIVITY LOG failure is not a rejected save either', async () => {
+  // The same shape, one await earlier. logActivity has no "returned failure" to conflate with, so
+  // the only way it could ever be reported was as a rejection — over a committed write. Everything
+  // after the commit is inside the guard for that reason, not just the scheduler call.
+  state.logActivityThrows = new Error('activity log unavailable')
+
+  const result = await saveOnboarding({
+    woocommerce: false, shopify: false, xero: true, quickbooks: false, mintsoft: false,
+  })
+
+  assert.equal(result.status, 'scheduler-failed')
+  assert.ok(result.status === 'scheduler-failed')
+  assert.match(result.error, /activity log unavailable/)
+  assert.ok(enabled('xero'), 'the selection is stored, which is what the caller must be told')
+})
+
+// ---------------------------------------------------------------------------
+// Round 8, finding 2 — the SETTINGS writer is the same writer.
+//
+// Round 7 cross-ported the warning to components/settings/integration-plugins-settings.tsx but not
+// the classification, so that screen kept a parallel copy of the rule and still rendered a
+// committed write as a failed save. The rule now has ONE implementation: saveIntegrationPluginState
+// returns the same union, from the same post-commit guard, and reconciles the crontab itself
+// instead of leaving the caller to do it and classify the result.
+// ---------------------------------------------------------------------------
+
+test('the SETTINGS writer reports a scheduler failure as committed, not as a refusal', async () => {
+  state.cronResult = { success: false, error: 'crontab write failed: no crontab for ims' }
+
+  const result = await savePlugins({ xero: true, mintsoft: true })
+
+  assert.equal(result.status, 'scheduler-failed')
+  assert.ok(result.status === 'scheduler-failed')
+  assert.match(result.error, /crontab write failed/)
+  assert.ok(enabled('xero') && enabled('mintsoft'), 'the partial write really did commit')
+  assert.deepEqual(
+    result.pluginState,
+    // The full state read back under the lock, not the two keys this partial payload named.
+    { woocommerce: false, shopify: false, xero: true, quickbooks: false, mintsoft: true, shiphero: false },
+  )
+})
+
+test('the SETTINGS writer treats a THROWN scheduler failure identically', async () => {
+  state.cronThrows = new Error('Public app URL is not configured.')
+
+  const result = await savePlugins({ woocommerce: true })
+
+  assert.equal(result.status, 'scheduler-failed', 'the call must not reject over a committed write')
+  assert.ok(result.status === 'scheduler-failed')
+  assert.match(result.error, /Public app URL is not configured/)
+  assert.ok(enabled('woocommerce'))
+})
+
+test('the SETTINGS writer reconciles the crontab ITSELF, after every key it writes', async () => {
+  // The reconciliation used to be a second server round-trip made by the component, which is what
+  // let the component own (and get wrong) the classification. Ordering is asserted for the same
+  // reason as on the onboarding path: a scheduler call made before or inside the transaction could
+  // fail over a write that had not landed, and calling THAT "committed" is the same lie mirrored.
+  await savePlugins({ xero: true, mintsoft: true })
+
+  assert.equal(state.cronCalledAfterWrites, 2, 'both keys were written before the scheduler ran')
+  assert.equal(state.openTransactionsWhenCronRan, 0, 'and the transaction had ended')
+  assert.deepEqual(state.revalidated, ['/settings'])
+})
+
+test('a REFUSED settings write never reaches the scheduler at all', async () => {
+  // Nothing committed, so there is nothing for the crontab to catch up with — and a scheduler call
+  // here would produce a `scheduler-failed` outcome carrying a state that was never written.
+  store.set(INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true')
+
+  const result = await savePlugins({ quickbooks: true })
+
+  assert.equal(result.status, 'refused')
+  assert.equal(state.cronCalledAfterWrites, -1, 'the scheduler was not consulted')
+  assert.deepEqual(state.revalidated, [], 'and nothing was revalidated')
 })
 
 // ---------------------------------------------------------------------------
@@ -523,8 +650,9 @@ test('the quiesce harness takes the SAME advisory key and the SAME row locks, in
 })
 
 // ---------------------------------------------------------------------------
-// Round 7, finding 2 — the inventory above is LEXICAL, and a lexical sweep cannot enumerate
-// GENERIC REPLAY.
+// Round 7, finding 2 / round 8, finding 5 — the inventory above is LEXICAL, and a lexical sweep
+// cannot enumerate GENERIC REPLAY. Nor, as it turned out, could the round-7 replacement enumerate
+// everything that reaches this database.
 //
 // The scan above finds a writer by the fact that it NAMES a plugin key. The database restore route
 // rewrites `settings` (plugin selection rows included) and `accounting_sync_logs` without naming
@@ -537,27 +665,101 @@ test('the quiesce harness takes the SAME advisory key and the SAME row locks, in
 // `accounting_sync_logs` before `settings` takes them the other way round — and PostgreSQL resolves
 // that by aborting one of the two.
 //
-// So this second inventory asks a different question: WHAT EXECUTES SQL IT DID NOT AUTHOR? Every
-// discovered path is classified, and a new one fails this test until it is classified deliberately.
+// ROUND 7 ASKED: "what executes SQL it did not author?", and looked for a database CLI spawned from
+// a .ts file under four roots. That question encoded a guess about the FORM a writer takes, and the
+// guess was wrong twice over:
+//
+//   * MIGRATION RUNNERS. `prisma migrate deploy` applies repo-authored SQL that is never seen by
+//     any TypeScript scan, and three migrations in this repo already write `settings` rows. It runs
+//     from .sh files, which the walker did not even open.
+//   * SHELL EXECUTION PATHS. install.sh, update.sh, deploy.sh, backup.sh and provision-ims-tenant.sh
+//     all reach this database — as psql, pg_dump or a migration runner — and every one of them was
+//     invisible for the same reason: the file walker collected `.ts`/`.tsx` only.
+//
+// So the walker here opens `.mjs`, `.cjs`, `.js` and `.sh` as well, adds `prisma/`, and the
+// question is broadened to: WHAT CAN REACH THIS DATABASE OTHER THAN THROUGH THE APP'S OWN
+// TRANSACTIONS? Every discovered path is classified, and a new one fails this test until it is
+// classified deliberately.
+//
+// WHAT THIS STILL CANNOT SEE — stated, because two inventories in a row implied a completeness a
+// source scan cannot deliver:
+//
+//   1. Anything outside this repository. An operator at a `psql` prompt, a host crontab entry, an
+//      ops runbook, a pgAdmin session, a second IMS instance or a replica promotion all write this
+//      database and appear in no file here. The advisory lock binds only writers that take it, and
+//      none of those do.
+//   2. Indirection a regex cannot follow: a command name held in a variable or read from the
+//      environment, a `npm run` script name that resolves to a database task, a helper inside
+//      node_modules, a `sh -c` string built at runtime.
+//   3. The database's own side: triggers, rules, extensions, and Prisma's engine itself.
+//   4. WHAT a classified path actually executes. `migration-runner` says a file applies migration
+//      SQL, not that the SQL is safe; the plugin-key assertion below is what covers that, and it
+//      only covers migrations that live in this repo.
+//
+// These are limits of a source scan, not gaps to be closed by a better regex. The list below is a
+// floor — "at least these" — never a ceiling.
 // ---------------------------------------------------------------------------
 
-/** A database CLI invoked as a child process — the only generic-replay shape in this repo. */
+/** A database CLI invoked as a child process, or named in a shell script. */
 const RUNS_A_DATABASE_CLI = /\(\s*['"`](psql|pg_restore|pg_dump)['"`]\s*,/
 /** Server-side bulk ingestion of an external file straight into the database. */
 const COPIES_EXTERNAL_DATA = /COPY[\s\S]{0,60}FROM\s+(?:STDIN|PROGRAM)/i
+/** A migration runner: applies (or inspects) SQL that no TypeScript scan will ever open. */
+const RUNS_A_MIGRATION_RUNNER = /\bprisma\s+(?:migrate|db)\b|['"`]prisma['"`]\s*,\s*['"`](?:migrate|db)['"`]|@prisma\/migrate/
+/** A shell-out path that can reach the database at all — the whole class round 7 could not open. */
+const SHELLS_A_DATABASE_TOOL = /\b(?:psql|pg_dump|pg_restore|pg_isready)\b/
+/** SQL assembled at runtime rather than written as a tagged template. */
+const RUNS_RUNTIME_ASSEMBLED_SQL = /\$(?:execute|query)RawUnsafe/
+
+const EXECUTION_ROOTS = ['app', 'lib', 'scripts', 'e2e', 'prisma']
+const EXECUTABLE_FILE = /\.(?:ts|tsx|mjs|cjs|js|sh)$/
+
+function executableFiles(dir: string, found: string[] = []): string[] {
+  for (const entry of readdirSync(dir)) {
+    const path = join(dir, entry)
+    if (statSync(path).isDirectory()) {
+      // `migrations` holds .sql, which is inventoried separately below.
+      if (['node_modules', 'generated', '.next', 'migrations'].includes(entry)) continue
+      executableFiles(path, found)
+      continue
+    }
+    if (EXECUTABLE_FILE.test(path)) found.push(path)
+  }
+  return found
+}
 
 /**
- * Every discovered replay path, and what it is.
+ * Every discovered path, and what it is.
  *
- *   'replays-external-sql' — executes statements whose CONTENT comes from outside the repo (a
- *                            backup file, an upload, a dump). MUST take the selection lock.
- *   'dump-only'            — produces a dump and writes nothing to this database.
- *   'inline-sql-cli'       — shells a CLI with statements authored in the file itself. Not generic
- *                            replay: any plugin-key write there NAMES the key, so the lexical
- *                            inventory above already covers it. These are e2e drivers against the
- *                            stage database.
+ *   'replays-external-sql'  — executes statements whose CONTENT comes from outside the repo (a
+ *                             backup file, an upload, a dump). MUST take the selection lock.
+ *   'dump-only'             — produces a dump and writes nothing to this database.
+ *   'inline-sql-cli'        — shells a CLI with statements authored in the file itself. Not generic
+ *                             replay: any plugin-key write there NAMES the key, so the lexical
+ *                             inventory above already covers it. These are e2e drivers against the
+ *                             stage database.
+ *   'migration-runner'      — applies repo-authored migration SQL through `prisma migrate deploy`.
+ *                             It does NOT take the selection lock and cannot be made to; what keeps
+ *                             it safe is that no migration writes a plugin key, asserted below.
+ *                             Deploy-time only, with the app being restarted around it.
+ *   'schema-diff-only'      — invokes the migration CLI in a read-only mode (`migrate diff`).
+ *   'provisioning-cli'      — psql as a database SUPERUSER, creating roles/databases before this
+ *                             app's schema exists. Nothing to serialize against.
+ *   'runtime-assembled-sql' — Prisma `$executeRawUnsafe`/`$queryRawUnsafe`: the STATEMENT is built
+ *                             in the file (identifier interpolation), not supplied from outside, so
+ *                             a plugin-key write there names the key and the lexical inventory
+ *                             covers it. Listed because "unsafe" is where external content would
+ *                             enter if it ever did.
  */
-const REPLAY_PATHS: Record<string, 'replays-external-sql' | 'dump-only' | 'inline-sql-cli'> = {
+const DATABASE_EXECUTION_PATHS: Record<string,
+  | 'replays-external-sql'
+  | 'dump-only'
+  | 'inline-sql-cli'
+  | 'migration-runner'
+  | 'schema-diff-only'
+  | 'provisioning-cli'
+  | 'runtime-assembled-sql'
+> = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
   'app/api/backup/create/route.ts': 'dump-only',
   'app/api/cron/backup/route.ts': 'dump-only',
@@ -568,30 +770,89 @@ const REPLAY_PATHS: Record<string, 'replays-external-sql' | 'dump-only' | 'inlin
   'e2e/woocommerce-product-types.spec.ts': 'inline-sql-cli',
   'e2e/woocommerce.spec.ts': 'inline-sql-cli',
   'e2e/woocommerce-xero-bundle-refund.spec.ts': 'inline-sql-cli',
+  'lib/backup-manifest.ts': 'runtime-assembled-sql',
+  'lib/cost-layers.ts': 'runtime-assembled-sql',
+  'lib/db/savepoint.ts': 'runtime-assembled-sql',
+  'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
+  'scripts/backup.sh': 'dump-only',
+  'scripts/check-prisma-drift.mjs': 'schema-diff-only',
+  'scripts/deploy.sh': 'migration-runner',
+  'scripts/install.sh': 'migration-runner',
+  'scripts/prisma-dev-db.sh': 'migration-runner',
+  'scripts/update.sh': 'migration-runner',
+  'scripts/provision-ims-tenant.sh': 'provisioning-cli',
 }
 
 function replayPaths(): string[] {
   const found: string[] = []
-  for (const root of SCANNED_ROOTS) {
-    for (const path of sourceFiles(join(REPO, root))) {
+  for (const root of EXECUTION_ROOTS) {
+    for (const path of executableFiles(join(REPO, root))) {
       const src = readFileSync(path, 'utf8')
-      if (RUNS_A_DATABASE_CLI.test(src) || COPIES_EXTERNAL_DATA.test(src)) found.push(relative(REPO, path))
+      if (
+        RUNS_A_DATABASE_CLI.test(src)
+        || COPIES_EXTERNAL_DATA.test(src)
+        || RUNS_A_MIGRATION_RUNNER.test(src)
+        || SHELLS_A_DATABASE_TOOL.test(src)
+        || RUNS_RUNTIME_ASSEMBLED_SQL.test(src)
+      ) found.push(relative(REPO, path))
     }
   }
   return found.sort()
 }
 
-test('every path that executes SQL it did not author is classified', () => {
-  // Pinned in BOTH directions: an unclassified new replay path fails here, and a classified one
-  // that disappears fails here too, so the classification cannot rot into a list of files that no
-  // longer exist while the scan quietly finds nothing.
-  assert.deepEqual(replayPaths(), Object.keys(REPLAY_PATHS).sort())
+test('every path that can reach this database outside the app\'s transactions is classified', () => {
+  // Pinned in BOTH directions: an unclassified new path fails here, and a classified one that
+  // disappears fails here too, so the classification cannot rot into a list of files that no longer
+  // exist while the scan quietly finds nothing.
+  assert.deepEqual(replayPaths(), Object.keys(DATABASE_EXECUTION_PATHS).sort())
+})
+
+test('the inventory opens the file types a migration runner and a shell path actually live in', () => {
+  // The round-7 walker collected `.ts`/`.tsx` under four roots, which is why `prisma migrate deploy`
+  // and five shell scripts were absent from an inventory that read as complete. Asserting the
+  // EXTENSIONS is asserting the thing that was wrong, rather than the symptom.
+  const discovered = replayPaths()
+  assert.ok(discovered.some((p) => p.endsWith('.sh')), 'shell scripts are opened')
+  assert.ok(discovered.some((p) => p.endsWith('.mjs')), 'and .mjs tooling')
+  assert.ok(
+    discovered.filter((p) => DATABASE_EXECUTION_PATHS[p] === 'migration-runner').length >= 3,
+    'and the migration runners are found, not assumed absent',
+  )
+})
+
+test('no repo migration writes a plugin selection key', () => {
+  // The one thing that makes 'migration-runner' safe. Migrations run outside every lock this
+  // application takes — `prisma migrate deploy` is a separate process against a database the app
+  // may still be connected to — so a migration that set `plugin_xero_enabled` would change the
+  // active accounting connector with nothing serializing it against the orphan-cancel sweep. Three
+  // migrations here already write `settings`; none may write these keys.
+  const migrationsDir = join(REPO, 'prisma', 'migrations')
+  const offenders: string[] = []
+  let scanned = 0
+  for (const entry of readdirSync(migrationsDir)) {
+    const file = join(migrationsDir, entry, 'migration.sql')
+    let src: string
+    try {
+      src = readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    scanned += 1
+    if (/plugin_\w+_enabled/.test(src)) offenders.push(relative(REPO, file))
+  }
+
+  assert.ok(scanned > 0, 'the migration directory was actually read — an empty scan proves nothing')
+  assert.deepEqual(
+    offenders,
+    [],
+    'a migration cannot take the selection lock; move a plugin-key change into the application',
+  )
 })
 
 test('every EXTERNAL-SQL replay path takes the connector-selection lock first', () => {
   const offenders: string[] = []
   for (const path of replayPaths()) {
-    if (REPLAY_PATHS[path] !== 'replays-external-sql') continue
+    if (DATABASE_EXECUTION_PATHS[path] !== 'replays-external-sql') continue
     const src = readFileSync(join(REPO, path), 'utf8')
     if (!/ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY/.test(src)) offenders.push(path)
   }
@@ -602,18 +863,32 @@ test('every EXTERNAL-SQL replay path takes the connector-selection lock first', 
   )
 })
 
-test('the restore takes the lock as the FIRST statement, inside the single transaction', async () => {
-  // Not a name check: the statement text itself, the shared constant's value, and the psql flag
-  // that makes an xact-scoped advisory lock last longer than the statement that took it.
-  const { buildRestoreSelectionLockStatement } = await import('@/app/api/backup/restore/route')
-  const statement = buildRestoreSelectionLockStatement()
-
-  assert.equal(statement, `SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY});\n`)
+test('the restore holds the lock in a SESSION THE DUMP CANNOT REACH, not on psql\'s own stdin', () => {
+  // ROUND 8, FINDING 3. Round 7 prepended `SELECT pg_advisory_xact_lock(k);` to psql's stdin, so
+  // the lock was held by the very session that then executed the untrusted stream — and any
+  // COMMIT/END/ROLLBACK in the dump ended that transaction and released the lock mid-replay. The
+  // lock is now taken in a separate Prisma interactive transaction (one pinned connection) that
+  // wraps the whole psql run, which nothing in the replayed SQL can reach.
+  //
+  // Asserted at source level HERE because this file owns the inventory question ("does the replay
+  // path take the lock at all"); the runtime ordering — acquired before spawn, released after exit,
+  // never written to stdin — is asserted in tests/api/backup-restore.test.ts.
   const src = readFileSync(join(REPO, 'app/api/backup/restore/route.ts'), 'utf8')
-  assert.ok(src.includes("'--single-transaction'"), 'an xact lock outside a transaction is released immediately')
-  const writeAt = src.indexOf('child.stdin.write(buildRestoreSelectionLockStatement())')
-  const pipeAt = src.indexOf('input.pipe(child.stdin)')
-  assert.ok(writeAt > 0 && pipeAt > writeAt, 'the lock statement is written before the dump is piped')
+
+  assert.ok(
+    /createPrismaRestoreSelectionLockHolder[\s\S]{0,600}\$transaction/.test(src),
+    'the holder is a transaction on the app\'s own client, i.e. a session of its own',
+  )
+  assert.ok(
+    src.includes('pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})'),
+    'and it locks the SHARED constant — a copied literal would serialize against nothing',
+  )
+  assert.ok(
+    !/child\.stdin\.write\(/.test(src),
+    'nothing is written to psql stdin any more: a lock statement there would deadlock against the '
+      + 'holder, and a lock held there could be released by the dump',
+  )
+  assert.ok(src.includes("'--single-transaction'"), 'the replay is still one transaction, for atomicity')
 })
 
 test('no path takes a settings row lock and THEN the selection advisory lock', () => {

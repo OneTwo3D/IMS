@@ -1400,18 +1400,44 @@ test('non-admin restore requests still return the authorization response', async
 //     updates accounting_sync_logs second. PostgreSQL resolves a cycle by aborting one — either the
 //     critical restore, or a cancellation that has already decided what to destroy.
 //
-// The fix is to take the same advisory lock, in the same order every other caller uses (advisory
-// lock first, rows second), as the FIRST statement psql executes inside its single transaction.
-// These tests observe the bytes that reach psql's stdin, because the ORDER is the guarantee.
+// ROUND 7's FIX, and why it was not enough (round 8, finding 3). It prepended
+// `SELECT pg_advisory_xact_lock(k);` to psql's own stdin, so the lock lived in the SAME session that
+// then executed the untrusted stream — and any COMMIT/END/ROLLBACK in an accepted dump ended that
+// transaction and released the lock with the replay still running. It protected the OPENING of the
+// restore. The defence was an argument about what plain `pg_dump` emits, over an operator-supplied
+// upload.
+//
+// The lock is now held by a DIFFERENT session — a Prisma interactive transaction, which pins one
+// connection — wrapped around the whole psql run, and psql's stdin carries the dump and nothing
+// else. Nothing in the replayed SQL can reach that session, so no accepted input can release the
+// lock. These tests observe the ORDER of lock/spawn/exit/release and the bytes that reach stdin,
+// because that order IS the guarantee.
 // ---------------------------------------------------------------------------
 
-async function captureRestoreStdin(sqlBody: string): Promise<{ written: string; args: string[] }> {
+type RestoreRun = {
+  /** Every observable step of one runRestore call, in the order it happened. */
+  events: string[]
+  /** Bytes that reached psql's stdin. */
+  written: string
+  args: string[]
+}
+
+/**
+ * Drive `runRestore` with a fake psql AND a fake lock holder, recording the order of both.
+ *
+ * The holder double is the important half (round 8, finding 3). A double that merely *ran* the work
+ * could not distinguish "the lock is held for the whole restore" from "the lock was taken at some
+ * point", which is the difference the finding is about — so it records entry and exit around the
+ * work it wraps, and the work itself records when psql was spawned and when psql exited.
+ */
+async function captureRestore(sqlBody: string): Promise<RestoreRun> {
   const { runRestore } = await import('../../app/api/backup/restore/route.ts')
 
   const dir = await mkdtemp(path.join(os.tmpdir(), 'restore-stdin-'))
   const file = path.join(dir, 'backup.sql')
   await writeFile(file, sqlBody)
 
+  const events: string[] = []
   const chunks: string[] = []
   let args: string[] = []
   const stdin = new PassThrough()
@@ -1425,16 +1451,28 @@ async function captureRestoreStdin(sqlBody: string): Promise<{ written: string; 
   child.stdin = stdin
   child.stderr = new EventEmitter()
   child.kill = () => {}
-  // psql exits only once its input is closed, which is what makes "written before the pipe" an
-  // observable ordering rather than a race.
-  stdin.on('end', () => child.emit('close', 0))
+  // psql exits only once its input is closed, which is what makes the ordering below observable
+  // rather than a race.
+  stdin.on('end', () => {
+    events.push('psql-exited')
+    child.emit('close', 0)
+  })
 
   try {
     await runRestore(
       file,
       { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
       {
+        withSelectionLock: async (work) => {
+          events.push('lock-acquired')
+          try {
+            return await work()
+          } finally {
+            events.push('lock-released')
+          }
+        },
         spawnProcess: ((_command: string, spawnArgs: string[]) => {
+          events.push('psql-spawned')
           args = spawnArgs
           return child
         }) as never,
@@ -1444,58 +1482,121 @@ async function captureRestoreStdin(sqlBody: string): Promise<{ written: string; 
     await rm(dir, { recursive: true, force: true })
   }
 
-  return { written: chunks.join(''), args }
+  return { events, written: chunks.join(''), args }
 }
 
-test('the restore takes the connector-selection advisory lock before any dump byte reaches psql', async () => {
+test('the selection lock is held, by a session of its own, for the WHOLE restore', async () => {
   const dump = "UPDATE settings SET value = 'true' WHERE key = 'plugin_quickbooks_enabled';\n"
-  const { written, args } = await captureRestoreStdin(dump)
+  const { events, written, args } = await captureRestore(dump)
 
-  const lockAt = written.indexOf('pg_advisory_xact_lock')
-  const dumpAt = written.indexOf('UPDATE settings')
-
-  assert.ok(lockAt >= 0, 'the lock statement is sent at all')
-  assert.ok(dumpAt > lockAt, 'and it precedes the replayed SQL — a lock taken afterwards fences nothing')
-  assert.ok(
-    written.startsWith('SELECT pg_advisory_xact_lock('),
-    'it is the FIRST statement of the transaction, before any row the dump locks',
+  assert.deepEqual(
+    events,
+    ['lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released'],
+    'acquired before psql is even spawned, released only after it has exited',
   )
-  assert.ok(written.endsWith(dump), 'and the dump is replayed unchanged after it')
-  // An xact-scoped advisory lock outside a transaction is released the instant the statement
-  // returns, so this flag is load-bearing rather than incidental.
-  assert.ok(args.includes('--single-transaction'))
+  // THE ROUND-8 ASSERTION. The dump reaches psql UNCHANGED and nothing precedes it: the lock is not
+  // in this stream, so no statement in this stream can end the transaction that holds it.
+  assert.equal(written, dump, 'the dump is replayed byte-for-byte, with nothing prepended')
+  assert.ok(
+    !written.includes('pg_advisory_xact_lock'),
+    'the lock statement is NOT on psql stdin — held there, an accepted COMMIT would release it '
+      + 'mid-replay, and taking it in both places would deadlock against the holder',
+  )
+  assert.ok(args.includes('--single-transaction'), 'the replay is still one transaction, for atomicity')
   assert.ok(args.includes('ON_ERROR_STOP=1'))
 })
 
-test('the restore locks the SHARED constant, not a copied literal', async () => {
-  // A hand-copied number would serialize against nothing, and the symptom would be silence — the
-  // exact failure lib/db/advisory-locks.ts exists to prevent.
-  const { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } = await import('../../lib/db/advisory-locks.ts')
-  const { written } = await captureRestoreStdin('SELECT 1;\n')
+test('a dump that COMMITS mid-stream cannot release the lock', async () => {
+  // The residue round 7 documented and argued away ("plain pg_dump emits no transaction control").
+  // The input is operator-supplied, so the guarantee cannot rest on what a well-formed dump
+  // contains. With the lock in a different session this input is simply replayed: it can still end
+  // psql's own transaction — an ATOMICITY problem, stated in the route — but the lock is untouched.
+  const dump = [
+    "UPDATE settings SET value = 'false' WHERE key = 'plugin_xero_enabled';",
+    'COMMIT;',
+    'BEGIN;',
+    "UPDATE settings SET value = 'true' WHERE key = 'plugin_quickbooks_enabled';",
+    '',
+  ].join('\n')
 
-  assert.ok(written.startsWith(`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY});`))
+  const { events, written } = await captureRestore(dump)
+
+  assert.deepEqual(events, ['lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released'])
+  assert.equal(written, dump, 'replayed as given — the route does not rewrite or reject it')
+  assert.ok(
+    events.indexOf('lock-released') > events.indexOf('psql-exited'),
+    'and the lock outlives the replay regardless of what the replay did to its own transaction',
+  )
+})
+
+test('the default holder takes the SHARED key in a transaction, before the work and around all of it', async () => {
+  // The production wiring, not a test double: a Prisma interactive transaction pins one connection,
+  // which is what makes it a session the replayed SQL cannot reach.
+  const { createPrismaRestoreSelectionLockHolder } = await import('../../app/api/backup/restore/route.ts')
+  const { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } = await import('../../lib/db/advisory-locks.ts')
+
+  const events: string[] = []
+  let statement = ''
+  let values: unknown[] = []
+  let options: { timeout?: number; maxWait?: number } | undefined
+
+  const holder = createPrismaRestoreSelectionLockHolder({
+    $transaction: async <T,>(fn: (tx: { $executeRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<number> }) => Promise<T>, opts?: { timeout?: number; maxWait?: number }) => {
+      events.push('transaction-open')
+      options = opts
+      const result = await fn({
+        $executeRaw: async (query: TemplateStringsArray, ...v: unknown[]) => {
+          statement = query.join('?')
+          values = v
+          events.push('lock-statement')
+          return 1
+        },
+      })
+      events.push('transaction-close')
+      return result
+    },
+  })
+
+  const returned = await holder(async () => {
+    events.push('work')
+    return 'restored'
+  })
+
+  assert.equal(returned, 'restored', 'the holder returns the work\'s value rather than swallowing it')
+  assert.deepEqual(events, ['transaction-open', 'lock-statement', 'work', 'transaction-close'])
+  assert.match(statement, /pg_advisory_xact_lock/)
+  assert.deepEqual(values, [ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY], 'the shared constant, not a copied literal')
+  // A default 5s interactive-transaction timeout would abort the holder — and release the lock —
+  // minutes before a real restore finishes.
+  assert.ok((options?.timeout ?? 0) > 300_000, 'the holder outlives the psql timeout')
 })
 
 test('the restore still refuses psql metacommands before it locks anything', async () => {
   // The lock must not have moved the validation: a file that cannot be replayed must fail without
-  // ever taking a lock the whole application contends on.
+  // ever taking a lock the whole application contends on — and without opening the holder's
+  // transaction, which would pin a connection for nothing.
   const { runRestore } = await import('../../app/api/backup/restore/route.ts')
   const dir = await mkdtemp(path.join(os.tmpdir(), 'restore-meta-'))
   const file = path.join(dir, 'backup.sql')
   await writeFile(file, '\\connect postgres\n')
 
   let spawned = 0
+  let locked = 0
   try {
     await assert.rejects(
       () => runRestore(
         file,
         { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
-        { spawnProcess: ((() => { spawned += 1; throw new Error('must not spawn') })) as never },
+        {
+          withSelectionLock: async (work) => { locked += 1; return work() },
+          spawnProcess: ((() => { spawned += 1; throw new Error('must not spawn') })) as never,
+        },
       ),
       /unsupported psql metacommand/,
     )
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
-  assert.equal(spawned, 0, 'nothing was spawned, so nothing was locked')
+  assert.equal(spawned, 0, 'nothing was spawned')
+  assert.equal(locked, 0, 'and nothing was locked')
 })

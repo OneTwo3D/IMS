@@ -418,8 +418,26 @@ async function validateRestoreSqlFile(filePath: string): Promise<void> {
   }
 }
 
+/** Enough for the psql timeout below plus spawn/teardown, so the holder outlives the replay. */
+const RESTORE_PSQL_TIMEOUT_MS = 300_000
+const RESTORE_SELECTION_LOCK_TIMEOUT_MS = RESTORE_PSQL_TIMEOUT_MS + 60_000
+const RESTORE_SELECTION_LOCK_MAX_WAIT_MS = 60_000
+
+/** The one statement the holder session runs. Structural, so a test can supply the client. */
+type RestoreLockTx = { $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number> }
+type RestoreLockDbClient = {
+  $transaction<T>(
+    fn: (tx: RestoreLockTx) => Promise<T>,
+    options?: { timeout?: number; maxWait?: number },
+  ): Promise<T>
+}
+
+/** Runs `work` while the connector-selection lock is held by a session `work` does not control. */
+export type RestoreSelectionLockHolder = <T>(work: () => Promise<T>) => Promise<T>
+
 /**
- * THE FIRST STATEMENT OF THE RESTORE TRANSACTION (o3d-osl8 round 7, finding 2).
+ * HOLD THE CONNECTOR-SELECTION LOCK IN A SEPARATE SESSION FOR THE WHOLE RESTORE
+ * (o3d-osl8 round 7 finding 2, made structural in round 8 finding 3).
  *
  * A restore replays arbitrary validated SQL over the whole database. It rewrites `settings` — plugin
  * selection rows included — and `accounting_sync_logs`, and it does so WITHOUT naming a single
@@ -427,7 +445,7 @@ async function validateRestoreSqlFile(filePath: string): Promise<void> {
  * tests/accounting/plugin-selection-lock.test.ts could never have found it: a name-based sweep
  * cannot enumerate a generic replay path.
  *
- * Two things go wrong without this lock.
+ * Two things go wrong without the lock.
  *
  *   1. NO SERIALIZATION. `cancelOrphanedAccountingSyncRows` reads the connector selection under
  *      this lock and decides from it which queue to discard. A restore committing a DIFFERENT
@@ -439,35 +457,67 @@ async function validateRestoreSqlFile(filePath: string): Promise<void> {
  *      resolves that by aborting one of the two — either the critical restore, or a cancellation
  *      that has already decided what to discard.
  *
- * Taking the advisory lock as the first statement fixes both, and in the SAME order every other
- * caller uses (`lockIntegrationPluginSelection`: advisory lock, then rows), so it cannot introduce a
- * new cycle: whichever of the two transactions gets the advisory lock runs to completion while the
- * other waits.
+ * WHY THE ROUND-7 SHAPE WAS NOT ENOUGH. It wrote `SELECT pg_advisory_xact_lock(k);` as the first
+ * statement on psql's OWN stdin, inside the transaction `--single-transaction` opens. The lock was
+ * therefore held by the very session that then executed the untrusted stream — so any `COMMIT;`,
+ * `END;`, `ROLLBACK;` or `\.`-terminated transaction control anywhere in the dump ended that
+ * transaction and released the lock with the replay still running, leaving it protecting only the
+ * OPENING of the restore. Round 7 argued that plain `pg_dump` emits no transaction control and left
+ * it as documented residue; that argument is about what a well-formed input contains, and this
+ * route accepts an operator-supplied upload.
  *
- * `pg_advisory_xact_lock` is held until the transaction ends, which is why `--single-transaction`
- * below is load-bearing rather than incidental — outside a transaction this lock would be released
- * the moment the statement returned.
+ * The lock is now held by a DIFFERENT session — a Prisma interactive transaction, which pins one
+ * connection for its whole body — and the restore runs inside that body. Nothing in the replayed
+ * stream can reach that session, so no accepted input can release the lock. That is a structural
+ * guarantee rather than an argument about dump contents, which is why transaction control is NOT
+ * scanned for: a scan would have to tell a real `COMMIT;` from `BEGIN`/`COMMIT` inside a PL/pgSQL
+ * body or a dollar-quoted string, and would both false-positive and miss cases.
  *
- * WHAT THIS DOES NOT COVER, stated rather than implied: a backup whose SQL contains its own
- * `COMMIT;` would end psql's single transaction early and release the lock with the replay still
- * running. Plain `pg_dump` output (which is all this route accepts — see the `.sql`-only check and
- * the metacommand validator) does not emit transaction control, and scanning for it is not
- * available as a cheap guard because `BEGIN` legitimately appears inside PL/pgSQL function bodies.
- * The maintenance-mode gate remains the coarse protection for that residue.
+ * WHY IT CANNOT DEADLOCK AGAINST THE RESTORE IT PROTECTS. The holder session takes the advisory
+ * lock and nothing else — no table lock, no row lock, no snapshot the replay needs — so psql can
+ * DROP, CREATE and rewrite freely while it waits. And the restore no longer takes the advisory lock
+ * itself: two sessions asking for the same advisory key WOULD block on each other forever, which is
+ * exactly why the stdin statement had to go rather than being kept "for belt and braces".
+ *
+ * WHAT IS STILL NOT COVERED, stated rather than implied:
+ *   • ATOMICITY, not mutual exclusion. A `COMMIT;` inside the dump still splits psql's
+ *     `--single-transaction` into several, so a mid-file failure can leave the database partly
+ *     restored. That is a real residue — it is just not this lock's job, and it no longer lets a
+ *     concurrent connector switch in.
+ *   • The lock ends with the HOLDER's transaction, so anything that kills that session early
+ *     (a dropped connection, a server restart, a non-zero `idle_in_transaction_session_timeout`)
+ *     releases it while psql runs on. Nothing in the replayed SQL can cause that; an operator or an
+ *     outage can. The maintenance-mode gate remains the coarse protection for that case.
+ *   • Only writers that TAKE this lock are serialized against the restore. That set is asserted by
+ *     the inventories in tests/accounting/plugin-selection-lock.test.ts, with their own limits
+ *     recorded there.
  */
-export function buildRestoreSelectionLockStatement(): string {
-  return `SELECT pg_advisory_xact_lock(${Number(ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY)});\n`
+export function createPrismaRestoreSelectionLockHolder(
+  client: RestoreLockDbClient = db as unknown as RestoreLockDbClient,
+): RestoreSelectionLockHolder {
+  return <T>(work: () => Promise<T>) => client.$transaction(
+    async (tx) => {
+      // FIRST, and in the same order every other caller uses (advisory lock, then rows — this
+      // session never takes rows at all), so it cannot introduce a new cycle.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`
+      return work()
+    },
+    { timeout: RESTORE_SELECTION_LOCK_TIMEOUT_MS, maxWait: RESTORE_SELECTION_LOCK_MAX_WAIT_MS },
+  )
 }
 
 export async function runRestore(
   filePath: string,
   db: ReturnType<typeof getDbConfig>,
-  options: { spawnProcess?: typeof spawn } = {},
+  options: { spawnProcess?: typeof spawn; withSelectionLock?: RestoreSelectionLockHolder } = {},
 ): Promise<void> {
+  // Before the lock: a file that cannot be replayed must fail without ever taking a lock the whole
+  // application contends on.
   await validateRestoreSqlFile(filePath)
   const spawnProcess = options.spawnProcess ?? spawn
+  const withSelectionLock = options.withSelectionLock ?? createPrismaRestoreSelectionLockHolder()
 
-  await new Promise<void>((resolve, reject) => {
+  await withSelectionLock(() => new Promise<void>((resolve, reject) => {
     const args = [
       '-X',
       '-h', db.host,
@@ -486,7 +536,7 @@ export async function runRestore(
     const timeout = setTimeout(() => {
       child.kill('SIGKILL')
       reject(new Error('Restore timed out'))
-    }, 300000)
+    }, RESTORE_PSQL_TIMEOUT_MS)
 
     child.stderr.on('data', (chunk: Buffer | string) => {
       stderr += chunk.toString()
@@ -514,12 +564,12 @@ export async function runRestore(
     child.stdin.on('error', () => {
       // handled by child close/error paths
     })
-    // Written BEFORE the pipe, so it is the first statement psql executes inside the transaction
-    // `--single-transaction` opened — ahead of any row the dump locks. Ordered writes on one
-    // writable stream, so `pipe` cannot overtake it.
-    child.stdin.write(buildRestoreSelectionLockStatement())
+    // The dump, and NOTHING else. The lock statement that used to be prepended here moved into a
+    // separate session (createPrismaRestoreSelectionLockHolder) — held there, it cannot be released
+    // by the stream below, and prepending it as well would make psql wait forever for a lock the
+    // holder already has.
     input.pipe(child.stdin)
-  })
+  }))
 }
 
 async function sha256OfFile(filePath: string): Promise<string> {

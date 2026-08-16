@@ -8,6 +8,7 @@ import { cancelOrphanedAccountingSyncRows } from '@/app/actions/accounting-sync'
 import type { ConnectorOrphanSummary } from '@/lib/domain/accounting/connector-orphans'
 import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sync-rows'
 import { resolveConnectorOrphanBannerState } from '@/lib/domain/accounting/stranded-sync-visibility'
+import { observeServerRender } from '@/lib/domain/accounting/server-render-marker'
 
 const CONNECTOR_LABELS: Record<string, string> = { xero: 'Xero', quickbooks: 'QuickBooks' }
 
@@ -29,9 +30,11 @@ type CancelOutcome =
   /**
    * The action REJECTED. Nothing here can tell a refusal from a lost reply, so nothing here may
    * claim either. `serverRenderedAtWhenRequested` is the render marker observed at the moment
-   * `router.refresh()` was called — the refresh is confirmed only once the prop differs from it.
+   * `router.refresh()` was called — a STRICTLY GREATER marker means a newer server render has
+   * arrived, which is a weaker fact than "the rows reflect the cancel" and is worded as such
+   * (round 8, finding 4).
    */
-  | { kind: 'unknown'; serverRenderedAtWhenRequested: string }
+  | { kind: 'unknown'; serverRenderedAtWhenRequested: number }
 
 /**
  * audit-H4: warns when PENDING/PROCESSING accounting sync rows belong to a
@@ -89,27 +92,17 @@ export function ConnectorOrphanBanner({
    */
   canCancel: boolean
   /**
-   * o3d-osl8 round 7, finding 3. The instant the SERVER rendered the rows below, as an opaque
-   * marker. REQUIRED, and required for the same reason `canCancel` is: a default would let a call
-   * site inherit a guess, and the only available guess ("it refreshed") is the lie this exists to
-   * stop.
+   * o3d-osl8 round 7 finding 3, round 8 finding 4. A MONOTONIC marker of the server render that
+   * produced the rows below. REQUIRED, and required for the same reason `canCancel` is: a default
+   * would let a call site inherit a guess, and the only available guess ("it refreshed") is the lie
+   * this exists to stop.
    *
-   * WHY THE CLIENT NEEDS IT AT ALL. `router.refresh()` returns void. It reports no completion, it
-   * can be served from cache, and it can fail — so after calling it a client component knows only
-   * that it ASKED. The previous message went further and told the operator the stranded rows "have
-   * been reloaded from the server", in the one branch where the cancellation may have committed:
-   * an invitation to read stale rows as authoritative and retry a destructive action against them.
-   *
-   * A new server render produces a new marker; the rows re-render with it. Comparing the current
-   * prop against the one captured when the refresh was requested is therefore an OBSERVATION that
-   * a fresh payload arrived, not an assumption. When it has not changed, the banner says so and
-   * tells the operator to reload the page themselves.
-   *
-   * It is deliberately a render marker rather than a hash of the rows: a cancellation that changed
-   * nothing legitimately leaves identical rows, and content equality would then report a completed
-   * refresh as never having happened.
+   * The full reasoning — including why `!==` was not enough, and why genuine causality between this
+   * marker and the cancel attempt is NOT achievable — lives with the source in
+   * lib/domain/accounting/server-render-marker.ts. The short version: a greater marker proves a
+   * newer render arrived, and nothing more, so the message below claims nothing more.
    */
-  serverRenderedAt: string
+  serverRenderedAt: number
 }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
@@ -136,9 +129,10 @@ export function ConnectorOrphanBanner({
   })
   if (!bannerState.render) return null
 
-  // Derived at RENDER time, not at catch time: this is the whole mechanism. `refreshObserved` is
-  // false until a server render with a different marker has actually reached this component.
-  const refreshObserved = outcome?.kind === 'unknown' && serverRenderedAt !== outcome.serverRenderedAtWhenRequested
+  // Derived at RENDER time, not at catch time: this is the whole mechanism. Strictly greater, not
+  // merely different — a stale payload arriving late must not count as a refresh.
+  const newerRenderArrived = outcome?.kind === 'unknown'
+    && observeServerRender({ current: serverRenderedAt, whenRequested: outcome.serverRenderedAtWhenRequested }).newerRenderArrived
 
   function handleCancel(connector?: string) {
     setOutcome(null)
@@ -190,7 +184,10 @@ export function ConnectorOrphanBanner({
         // fail. In the very scenario where the cancellation MAY have committed, that certified
         // stale rows as authoritative and invited a retry against them. So the marker in effect
         // when the refresh is REQUESTED is recorded here, and the wording below is decided at
-        // render time by whether a new server payload has actually arrived.
+        // render time by whether a strictly newer server payload has arrived.
+        //
+        // ROUND 8, FINDING 4. A newer payload is still not a payload read AFTER the cancel, and the
+        // wording no longer implies it is.
         setOutcome({ kind: 'unknown', serverRenderedAtWhenRequested: serverRenderedAt })
         // Immediately, not on the next navigation: the list on screen was rendered before an
         // action that may have changed it.
@@ -245,11 +242,15 @@ export function ConnectorOrphanBanner({
             <p className="text-xs text-destructive">
               The cancel request failed before it could report its outcome, so it is NOT known whether any rows were
               cancelled — the request may have been refused, or it may have completed and lost its reply.
-              {refreshObserved
-                // Observed, not assumed: a server render newer than the one in effect when the
-                // refresh was requested has reached this component, so the rows below came from it.
-                ? ' The stranded rows below have since been re-rendered by the server, so they are its current answer:'
-                  + ' check them (and the activity log) before retrying, rather than assuming this attempt did nothing.'
+              {newerRenderArrived
+                // Observed, and deliberately NOT overclaimed (round 8, finding 4). What is known is
+                // that a render newer than the one in effect when the refresh was requested has
+                // arrived. What is NOT known — and cannot be, for an attempt whose reply was lost —
+                // is whether that render happened after the cancel took effect.
+                ? ' A NEWER server render of the rows below has since arrived. That is not proof they reflect this'
+                  + ' attempt: a render already in flight when you pressed cancel arrives the same way, and a request'
+                  + ' whose reply was lost can still commit after any render. Treat them as newer, not as'
+                  + ' authoritative — check the activity log before retrying.'
                 // The honest report of an unobservable completion.
                 : ' A reload of the rows below was requested but has NOT been confirmed — it reports no completion, it can'
                   + ' be served from cache, and it can fail. Do NOT treat the rows below as authoritative: reload this page'

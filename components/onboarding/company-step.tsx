@@ -10,6 +10,7 @@ import { Label } from '@/components/ui/label'
 import { updateOrganisation, saveEmailSettings, sendTestEmailSettings, type EmailSettings, type OrganisationData } from '@/app/actions/company'
 import { setSetting } from '@/app/actions/settings'
 import { syncCrontab } from '@/app/actions/cron'
+import { resolveSchedulerFollowUp } from '@/lib/domain/integrations/scheduler-followup'
 import type { PublicAppUrlInfo } from '@/lib/public-app-url'
 
 export type CompanyStepHandle = {
@@ -84,6 +85,8 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
   const [emailTestResult, setEmailTestResult] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState('')
+  /** Saved, but the scheduler is behind. Not an error — see handleSave. */
+  const [schedulerWarning, setSchedulerWarning] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -220,6 +223,7 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
 
   const handleSave = useCallback(async function handleSave() {
     setError('')
+    setSchedulerWarning('')
     try {
       const normalizedPublicAppUrl = publicAppUrl.trim() ? normalizePublicAppUrl(publicAppUrl) : null
       if (publicAppUrl.trim() && !normalizedPublicAppUrl) {
@@ -239,12 +243,19 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
       }
 
       if (normalizedPublicAppUrl) {
+        // COMMITTED — setSetting throws on failure, so the URL is stored past this line.
         await setSetting('public_app_url', normalizedPublicAppUrl)
-        const cronResult = await syncCrontab()
-        if (!cronResult.success) {
-          setError(cronResult.error ?? 'Failed to apply Public App URL changes.')
-          return false
-        }
+        // POST-COMMIT (o3d-osl8 round 8, finding 1). A crontab reconciliation that fails — returned
+        // OR thrown, which used to fall through to the catch below and print "Failed to save" —
+        // does not un-save the company details or the URL. Reporting it as a save failure AND
+        // refusing to advance the wizard told the operator to enter everything again, over data
+        // that is already in the database. It is a warning, and the step continues.
+        const followUp = await resolveSchedulerFollowUp({
+          what: 'The Public App URL',
+          sync: syncCrontab,
+          fallbackError: 'Failed to apply Public App URL changes.',
+        })
+        setSchedulerWarning(followUp.warning)
       }
 
       router.refresh()
@@ -427,6 +438,9 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {schedulerWarning && (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">{schedulerWarning}</p>
+      )}
       <p className="text-xs text-muted-foreground">Your changes will be saved when you continue.</p>
     </div>
   )

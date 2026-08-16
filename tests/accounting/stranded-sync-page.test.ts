@@ -506,30 +506,59 @@ test('a THROWN failure whose refresh NEVER LANDS does not present the visible ro
   )
 })
 
-test('a THROWN failure whose refresh DOES land says so, once the new server payload is observed', async () => {
-  // The other half: the certification is not banned, it is EARNED. `serverRenderedAt` is the page's
-  // per-render marker; a new server payload carries a new one. Only when the component has actually
-  // been re-rendered with a different marker may it describe the rows as the server's answer.
+test('a THROWN failure whose refresh DOES land reports a NEWER render — and nothing stronger', async () => {
+  // The other half: the certification is not banned, it is EARNED — and round 8, finding 4 is that
+  // what it earns is weaker than round 7 claimed. A greater marker proves a newer render arrived.
+  // It does NOT prove the rows were read after the cancel: a render already in flight when the
+  // button was pressed carries an older-generated marker and arrives afterwards, and a request
+  // whose reply was lost can commit after any render at all. The wording says exactly that much.
   const banner = await mountBannerFromPage()
   state.cancel.rejectWith = new PermissionDeniedError('Forbidden: missing permission settings', 'settings')
-  // The refresh, modelled by its EFFECT: a fresh RSC payload, with rows that changed and a new
+  // The refresh, modelled by its EFFECT: a fresh RSC payload, with rows that changed and a greater
   // render marker. This is what the counter-only double could never express.
   state.onRefresh = () => banner.setProps({
     ...banner.props,
-    serverRenderedAt: '2026-08-15T12:00:01.000Z',
+    serverRenderedAt: (banner.props.serverRenderedAt as number) + 1,
     stranded: { rows: [strandedRow({ id: 'log-9', referenceId: 'order-99' })], hasMore: false, total: 1 },
   })
 
   await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
 
   const { html } = banner.render()
-  assert.match(html, /NOT known whether any rows were cancelled/, 'the OUTCOME is still unknown — only the refresh is settled')
-  assert.match(html, /have since been re-rendered by the server/)
+  assert.match(html, /NOT known whether any rows were cancelled/, 'the OUTCOME is still unknown')
+  assert.match(html, /A NEWER server render of the rows below has since arrived/)
   assert.ok(!/has NOT been confirmed/.test(html))
   assert.match(html, /SalesOrder:order-99/, 'and the rows on screen really are the new payload, not the old one')
+  // THE ROUND-8 ASSERTIONS. The old wording — "so they are its current answer: check them ...
+  // rather than assuming this attempt did nothing" — presented a render with no causal relationship
+  // to the cancel as the server's answer ABOUT the cancel.
+  assert.match(html, /not proof they reflect this attempt/, 'the limit of the observation is stated')
+  assert.match(html, /already in flight when you pressed cancel/, 'including the case that defeats it')
+  assert.match(html, /check the activity log before retrying/, 'and the operator is still sent somewhere real')
+  assert.ok(
+    !/current answer|authoritative:/.test(html),
+    'and the rows are never certified as the server\'s answer about this attempt',
+  )
 })
 
-test('the refresh marker must actually differ — a payload with the SAME marker is not a refresh', async () => {
+test('an OLDER payload arriving late is not a refresh — the comparison is ordered, not merely unequal', async () => {
+  // Round 7 compared markers with `!==`, so ANY difference counted — including a stale payload
+  // delivered out of order, or a cached render from before the page was even on screen. The marker
+  // is monotonic and the comparison is `>`, so going backwards cannot pass as going forwards.
+  const banner = await mountBannerFromPage()
+  state.cancel.rejectWith = new Error('transport failure')
+  state.onRefresh = () => banner.setProps({
+    ...banner.props,
+    serverRenderedAt: (banner.props.serverRenderedAt as number) - 1,
+  })
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
+
+  assert.match(banner.render().html, /has NOT been confirmed/, 'an older render leaves the reload unconfirmed')
+  assert.ok(!/A NEWER server render/.test(banner.render().html))
+})
+
+test('the refresh marker must actually advance — a payload with the SAME marker is not a refresh', async () => {
   // Guards the mechanism against being satisfied by any re-render at all. If the comparison were
   // dropped (or made against something that changes on every client render), the unconfirmed
   // branch would become unreachable and the wording would silently return to a blanket claim.
@@ -540,6 +569,18 @@ test('the refresh marker must actually differ — a payload with the SAME marker
   await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
 
   assert.match(banner.render().html, /has NOT been confirmed/)
+})
+
+test('the page hands the banner a NUMBER that advances between renders', async () => {
+  // The prop is the mechanism's input; a string, a constant, or anything a client render can change
+  // would make the comparison above meaningless while every message still rendered.
+  state.plugins = { woocommerce: true }
+  state.reads.getCrossConnectorOrphanSummary = () => orphanSummary()
+  const first = propsOf((await renderSyncPage()).tree, 'ConnectorOrphanBanner')?.serverRenderedAt
+  const second = propsOf((await renderSyncPage()).tree, 'ConnectorOrphanBanner')?.serverRenderedAt
+
+  assert.equal(typeof first, 'number')
+  assert.ok((second as number) > (first as number), 'a later render carries a strictly greater marker')
 })
 
 test('a THROWN failure is reported as an UNKNOWN outcome, and refreshes the rows', async () => {

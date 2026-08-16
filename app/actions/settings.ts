@@ -8,8 +8,11 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import {
   INTEGRATION_PLUGIN_SETTING_KEYS,
   type IntegrationPluginId,
+  type IntegrationPluginState,
 } from '@/lib/integration-plugins'
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
+import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
+import { syncCrontab } from '@/app/actions/cron'
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
@@ -811,15 +814,23 @@ type IntegrationPluginStateInput = Partial<Record<IntegrationPluginId, boolean>>
  *
  * Only the keys PRESENT in `state` are written, so a caller cannot silently disable a plugin it
  * did not mean to mention.
+ *
+ * THE SAME THREE OUTCOMES AS THE WIZARD'S WRITER, from the same union and the same guard (round 8,
+ * finding 2). Round 7 split "refused" from "committed but the scheduler is behind" in
+ * saveOnboardingPluginState and cross-ported only the WARNING to this screen, leaving the
+ * classification itself duplicated in a component's try/catch — where a thrown `syncCrontab` was
+ * still rendered as a failed save over a committed write. The scheduler reconciliation moved in
+ * here for that reason: it is a post-commit step of this write, so it belongs inside the same
+ * post-commit guard rather than being a second server round-trip the caller has to classify.
  */
 export async function saveIntegrationPluginState(
   state: IntegrationPluginStateInput,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<PluginSelectionSaveResult> {
   await requirePermission('settings.company')
 
   const entries = (Object.entries(state) as Array<[IntegrationPluginId, boolean | undefined]>)
     .filter((entry): entry is [IntegrationPluginId, boolean] => typeof entry[1] === 'boolean')
-  if (entries.length === 0) return { success: true }
+  if (entries.length === 0) return { status: 'saved' }
 
   // READ, VALIDATE AND WRITE IN ONE LOCKED TRANSACTION (o3d-osl8 round 6, finding 1).
   //
@@ -835,14 +846,14 @@ export async function saveIntegrationPluginState(
   // The read now goes through the transaction client, after the lock and under a `FOR UPDATE` row
   // lock on the plugin rows (lockIntegrationPluginSelection), so the state validated IS the state
   // written against — for writers that take the lock and for writers that do not.
-  const conflict = await db.$transaction(async (tx) => {
+  const outcome = await db.$transaction(async (tx): Promise<{ conflict: string } | { committed: IntegrationPluginState }> => {
     const resulting = { ...(await lockIntegrationPluginSelection(tx)) }
     for (const [id, enabled] of entries) resulting[id] = enabled
     if (resulting.xero && resulting.quickbooks) {
-      return 'Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector.'
+      return { conflict: 'Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector.' }
     }
     if (resulting.woocommerce && resulting.shopify) {
-      return 'Enable either WooCommerce or Shopify, not both.'
+      return { conflict: 'Enable either WooCommerce or Shopify, not both.' }
     }
 
     for (const [id, enabled] of entries) {
@@ -853,22 +864,28 @@ export async function saveIntegrationPluginState(
         update: { value: serializeSettingValue(key, String(enabled)) },
       })
     }
-    return null
+    return { committed: resulting }
   })
 
   // Returned rather than thrown: a refusal is an ordinary outcome the form displays, and throwing
   // would reach the client as an opaque digest. The transaction has already committed nothing.
-  if (conflict) return { success: false, error: conflict }
+  if ('conflict' in outcome) return { status: 'refused', error: outcome.conflict }
 
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: `Updated integration plugins: ${entries.map(([id, enabled]) => `${id}=${enabled}`).join(', ')}`,
-    metadata: Object.fromEntries(entries),
+  // Post-commit, so no failure below may be reported as a rejected save — returned or thrown.
+  return completePluginSelectionSave({
+    committed: outcome.committed,
+    postCommit: async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'updated',
+        description: `Updated integration plugins: ${entries.map(([id, enabled]) => `${id}=${enabled}`).join(', ')}`,
+        metadata: Object.fromEntries(entries),
+      })
+      revalidatePath('/settings', 'layout')
+      return syncCrontab()
+    },
   })
-  revalidatePath('/settings', 'layout')
-  return { success: true }
 }
 
 // ---------------------------------------------------------------------------

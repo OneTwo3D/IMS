@@ -8,7 +8,7 @@ import { requireAdmin } from '@/lib/auth/server'
 import { getSettingValue } from '@/lib/settings-store'
 import { getIntegrationPluginState, INTEGRATION_PLUGIN_SETTING_KEYS, type IntegrationPluginState } from '@/lib/integration-plugins'
 import { isBaseCurrencyLocked } from '@/lib/base-currency'
-import type { SaveOnboardingPluginStateResult } from '@/lib/domain/onboarding/plugin-save-outcome'
+import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
 import { syncCrontab } from '@/app/actions/cron'
 
 // ---------------------------------------------------------------------------
@@ -242,20 +242,11 @@ type PluginStateInput = {
 }
 
 /**
- * THREE outcomes, not two (o3d-osl8 round 7, finding 1). The union and the reasoning live in
- * lib/domain/onboarding/plugin-save-outcome.ts, next to the resolver that consumes it.
- *
- * WHY NOT A DURABLE OUTBOX RETRY for the scheduler half, which the repo does have
- * (lib/domain/integrations/outbox.ts). Every outbox drain in this app is a cron route
- * (app/api/cron/*) invoked BY the crontab this step is trying to write. An outbox row that
- * reconciles the crontab would therefore be drained by the crontab: in the failure that matters —
- * the managed block is absent, stale or unwritable — nothing would ever run it, and the row would
- * sit PENDING while the UI reported the work as scheduled. That is the same class of lie this
- * finding is about, moved into the queue. The recovery is instead an EXPLICIT operator action with
- * an existing home: Settings → System → Scheduler, which already reports crontab drift
- * (getCrontabStatus) and can re-run syncCrontab.
+ * THREE outcomes, not two (o3d-osl8 round 7, finding 1). The union, the reasoning and the
+ * post-commit guard live in lib/domain/integrations/plugin-save-outcome.ts, next to the resolver
+ * that consumes them and shared with the Settings screen's writer (round 8, finding 2).
  */
-export async function saveOnboardingPluginState(state: PluginStateInput): Promise<SaveOnboardingPluginStateResult> {
+export async function saveOnboardingPluginState(state: PluginStateInput): Promise<PluginSelectionSaveResult> {
   await requireAdmin()
 
   // A cheap payload-only pre-check, so an obviously contradictory form never opens a transaction.
@@ -307,32 +298,34 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
   })
   if ('conflict' in outcome) return { status: 'refused', error: outcome.conflict }
 
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: 'Updated onboarding plugin selection',
-    metadata: state,
+  // EVERYTHING BELOW HAPPENS AFTER THE COMMIT, so none of it may reach the caller as a rejection
+  // (round 8, finding 1). Round 7 caught only the scheduler's RETURNED failure; a throw — from
+  // syncCrontab's own permission gate, from getCronSecret/getPublicAppUrl, from the activity-log
+  // write, from any of them — escaped the union and landed in the caller's "outcome unknown" path,
+  // over a selection that is unambiguously stored. The guard is shared with the Settings writer so
+  // the shape cannot drift back apart.
+  return completePluginSelectionSave({
+    committed: outcome.committed,
+    postCommit: async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'updated',
+        description: 'Updated onboarding plugin selection',
+        metadata: state,
+      })
+
+      // UNCONDITIONAL, and before the scheduler result is inspected (round 7, finding 1). The
+      // selection is durable at this point; leaving the route cache holding the previous answer on
+      // the scheduler-failure path made the server itself agree with the rolled-back UI, which is
+      // how a stale connector survived a reload.
+      revalidatePath('/onboarding')
+      revalidatePath('/dashboard')
+
+      // syncCrontab logs its own crontab_sync ERROR; what the outcome adds is the committed
+      // selection, so the caller can keep showing what is actually stored instead of guessing from
+      // its own optimistic copy.
+      return syncCrontab()
+    },
   })
-
-  // UNCONDITIONAL, and before the scheduler result is inspected (round 7, finding 1). The
-  // selection is durable at this point; leaving the route cache holding the previous answer on the
-  // scheduler-failure path made the server itself agree with the rolled-back UI, which is how a
-  // stale connector survived a reload.
-  revalidatePath('/onboarding')
-  revalidatePath('/dashboard')
-
-  const cronResult = await syncCrontab()
-  if (!cronResult.success) {
-    // NOT a rejected save. syncCrontab already logged its own crontab_sync ERROR; what this adds is
-    // the committed selection, so the caller can keep showing what is actually stored instead of
-    // guessing from its own optimistic copy.
-    return {
-      status: 'scheduler-failed',
-      error: cronResult.error ?? 'Failed to apply scheduler changes',
-      pluginState: outcome.committed,
-    }
-  }
-
-  return { status: 'saved' }
 }

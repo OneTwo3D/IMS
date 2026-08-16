@@ -17,9 +17,9 @@ import { saveShoppingConnectorCredentials, saveShopifyConnectorCredentials } fro
 import { connectAccountingConnector, saveAccountingConnectionSettings } from '@/app/actions/accounting-sync'
 import { saveOnboardingPluginState } from '@/app/actions/onboarding'
 import {
-  resolveOnboardingPluginSaveView,
-  type OnboardingPluginSaveView,
-} from '@/lib/domain/onboarding/plugin-save-outcome'
+  resolvePluginSelectionSaveView,
+  type PluginSelectionSaveView,
+} from '@/lib/domain/integrations/plugin-save-outcome'
 import { WmsOnboardingConnection } from '@/components/onboarding/wms-onboarding-connection'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
@@ -205,11 +205,11 @@ export function IntegrationsStep({
    * used the NEW one. During an accounting-connector switch that is the dangerous direction: the
    * operator believes Xero is still selected while QuickBooks is what dispatches.
    *
-   * The decision is now `resolveOnboardingPluginSaveView`'s — pure, exhaustive over all four
+   * The decision is now `resolvePluginSelectionSaveView`'s — pure, exhaustive over all four
    * outcomes (including the REJECTION, which is not a refusal), and testable on its own. This
    * function only applies what it returns.
    */
-  function applySaveView(view: OnboardingPluginSaveView) {
+  function applySaveView(view: PluginSelectionSaveView) {
     setPlugins(view.plugins)
     setError(view.error)
     setSchedulerWarning(view.schedulerWarning)
@@ -219,7 +219,7 @@ export function IntegrationsStep({
 
   async function persistPlugins(nextPlugins: IntegrationPluginState, previousPlugins: IntegrationPluginState) {
     const result = await saveOnboardingPluginState(nextPlugins)
-    return applySaveView(resolveOnboardingPluginSaveView({
+    return applySaveView(resolvePluginSelectionSaveView({
       attempt: { kind: 'result', result },
       requested: nextPlugins,
       previous: previousPlugins,
@@ -248,7 +248,7 @@ export function IntegrationsStep({
         // so an automatic re-sync of these switches would be indistinguishable from them never
         // having moved, and the operator would have no way to tell which state is stored. The
         // instruction is explicit instead.
-        applySaveView(resolveOnboardingPluginSaveView({
+        applySaveView(resolvePluginSelectionSaveView({
           attempt: { kind: 'rejected', error: e },
           requested: nextPlugins,
           previous: previousPlugins,

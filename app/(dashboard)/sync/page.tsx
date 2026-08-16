@@ -39,6 +39,7 @@ import { getSession, requirePermission } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { isAuthorizationDenial } from '@/lib/auth/session-gates'
 import { getCurrentTaxRateDrift } from '@/lib/domain/accounting/tax-rate-drift-status'
+import { nextServerRenderMarker } from '@/lib/domain/accounting/server-render-marker'
 import { SyncDashboard } from './sync-dashboard'
 import { SyncAccessDenied } from './access-denied'
 import { ConnectorOrphanBanner } from './connector-orphan-banner'
@@ -333,11 +334,12 @@ export default async function SyncPage() {
         stranded={stranded}
         strandedLoadFailed={strandedLoadFailed}
         canCancel={canCancelOrphans}
-        // o3d-osl8 round 7, finding 3: the marker that lets the banner OBSERVE that a
-        // router.refresh() actually produced a new server payload, instead of asserting it did.
-        // Generated per render, so a cached RSC payload carries the marker of the render it was
-        // cached from and is correctly reported as "not refreshed".
-        serverRenderedAt={new Date().toISOString()}
+        // o3d-osl8 round 7 finding 3, round 8 finding 4: the marker that lets the banner OBSERVE
+        // that a router.refresh() produced a NEWER server payload, instead of asserting it did.
+        // Generated per render and strictly increasing, so a cached RSC payload carries the marker
+        // of the render it was cached from and is correctly reported as "not refreshed" — and an
+        // older payload arriving late cannot pass as a refresh merely by differing.
+        serverRenderedAt={nextServerRenderMarker()}
       />
       {failedSyncSummary && <FailedSyncBanner summary={failedSyncSummary} />}
       {taxRateDrift && <TaxRateDriftBanner drift={taxRateDrift} />}
