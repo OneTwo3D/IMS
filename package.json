@@ -24,6 +24,7 @@
     "invariant-check:preflight": "tsx scripts/invariant-check-preflight.ts",
     "invariant-check:preflight:fixture": "tsx scripts/invariant-check-preflight-fixture.ts",
     "inventory:snapshots:backfill": "tsx scripts/backfill-inventory-snapshots.ts",
+    "wc:coupon-discount:backfill": "tsx scripts/backfill-wc-coupon-order-discount.ts",
     "validate": "bash scripts/validate-local.sh",
     "validate:db": "bash scripts/validate-db.sh",
     "db:migrate:status": "bash scripts/prisma-dev-db.sh status",

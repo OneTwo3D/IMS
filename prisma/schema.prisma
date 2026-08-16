@@ -112,6 +112,26 @@ enum RefundDisposition {
   FULL
 }
 
+// o3d-9te: WHAT SalesOrder.discountAmount MEANS on this row, recorded by whoever wrote it.
+//
+// The o3d-y14 double-count existed because two different meanings shared one column and
+// nothing on the row said which was stored. `SalesOrder.createdAt` cannot answer it — the
+// WooCommerce initial import backdates that field to the historical Woo order date
+// (importWcOrder's useWcDateAsCreatedAt), so a legacy-dated order can have been imported
+// yesterday. This enum is the answer written down at the moment the value is computed.
+//
+// NULL means "not recorded", which is the honest state of every row written before this
+// column existed, of native/manual orders, and of any connector that has not adopted it. It
+// is NOT a synonym for the pre-fix meaning: a consumer that must know MUST treat NULL as
+// unknown and refuse to reinterpret the amount.
+enum OrderDiscountModel {
+  // The storefront allocated its cart coupon INTO the line items (each
+  // SalesOrderLine.discountAmount carries its share), and discountAmount holds ONLY the
+  // unallocated residual — normally zero. Written by the post-o3d-y14 WooCommerce importer
+  // and by the o3d-y14 backfill on rows it corrects.
+  LINE_ALLOCATED
+}
+
 enum ShipmentStatus {
   PENDING
   PICKING
@@ -1620,6 +1640,9 @@ model SalesOrder {
   trackingNumber    String?
   discountStr       String?    // order-level discount input e.g. "10%" or "5.00"
   discountAmount    Decimal    @db.Decimal(18, 4) @default(0) // computed order discount in foreign currency
+  // o3d-9te: what discountAmount above MEANS, stamped in the same write that computes it.
+  // NULL = not recorded (pre-column rows, native orders); see OrderDiscountModel.
+  discountModel     OrderDiscountModel? @map("discount_model")
   invoiceNumber     String?    // generated invoice reference
   invoicedAt        DateTime?
   paymentDueAt      DateTime?

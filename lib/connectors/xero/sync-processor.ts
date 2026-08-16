@@ -17,6 +17,7 @@ import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { readClaimedSyncLogPayload } from '@/lib/domain/accounting/claimed-sync-payload'
 import { applyBackReference, backReferenceIsMissing, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
@@ -719,9 +720,20 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     if (claim.count === 0) continue
 
     result.processed++
-    const payload = (entry.payload ?? {}) as SyncPayload
+    // o3d-5ct: RE-READ the payload now that the claim has succeeded, instead of posting the
+    // snapshot taken by the findMany above. That snapshot was read BEFORE the claim, so a corrective
+    // writer could have rewritten the row in between and this worker would still post the old
+    // figure — and then mirror it into the AccountingEvent as the posted document. No predicate the
+    // writer adds can close that: it cannot reach a value already in this process's memory. Claiming
+    // first and reading second is what makes the read authoritative, because the claim's status
+    // transition stops anyone else claiming the row.
+    //
+    // The pre-claim snapshot survives only as the seed value: if the re-read itself throws, the
+    // catch below records a FAILURE with it. Nothing is posted on that path.
+    let payload = (entry.payload ?? {}) as SyncPayload
 
     try {
+      payload = await readClaimedSyncLogPayload(db, entry.id) as SyncPayload
       if (blockedPaymentEntryIds.has(entry.id)) {
         await deferPaymentUntilEarlierLogsPost(entry)
         result.skipped++
@@ -949,9 +961,20 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     }
 
     result.processed++
-    const payload = (entry.payload ?? {}) as SyncPayload
+    // o3d-5ct: RE-READ the payload now that the claim has succeeded, instead of posting the
+    // snapshot taken by the findMany above. That snapshot was read BEFORE the claim, so a corrective
+    // writer could have rewritten the row in between and this worker would still post the old
+    // figure — and then mirror it into the AccountingEvent as the posted document. No predicate the
+    // writer adds can close that: it cannot reach a value already in this process's memory. Claiming
+    // first and reading second is what makes the read authoritative, because the claim's status
+    // transition stops anyone else claiming the row.
+    //
+    // The pre-claim snapshot survives only as the seed value: if the re-read itself throws, the
+    // catch below records a FAILURE with it. Nothing is posted on that path.
+    let payload = (entry.payload ?? {}) as SyncPayload
 
     try {
+      payload = await readClaimedSyncLogPayload(db, entry.id) as SyncPayload
       if (blockedPaymentEntryIds.has(entry.id)) {
         await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
