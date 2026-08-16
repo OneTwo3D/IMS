@@ -28,6 +28,12 @@ const state = {
   syncLogs: [] as Row[],
   /** Advisory-lock IDs handed to pg_advisory_xact_lock, in acquisition order. */
   advisoryLocks: [] as number[],
+  /**
+   * o3d-4kfh r7 (Codex finding 2): `ProductComponent` rows, so the connector's graph-version bump
+   * can walk the KIT ancestors the way it does in production. Without them the bump would appear to
+   * work on the edited product alone and a nested-kit regression would be invisible.
+   */
+  components: [] as Array<{ productId: string; componentId: string }>,
 }
 
 function snapshot() {
@@ -35,6 +41,7 @@ function snapshot() {
     products: state.products.map((row) => ({ ...row })),
     options: state.options.map((row) => ({ ...row })),
     syncLogs: state.syncLogs.map((row) => ({ ...row })),
+    components: state.components.map((row) => ({ ...row })),
   }
 }
 
@@ -42,6 +49,7 @@ function restore(snap: ReturnType<typeof snapshot>) {
   state.products.splice(0, state.products.length, ...snap.products)
   state.options.splice(0, state.options.length, ...snap.options)
   state.syncLogs.splice(0, state.syncLogs.length, ...snap.syncLogs)
+  state.components.splice(0, state.components.length, ...snap.components)
 }
 
 let nextId = 1
@@ -117,10 +125,40 @@ function updateManyMatching(where: Row, data: Row): { count: number } {
 }
 
 const productDelegate = {
-  findFirst: async ({ where }: { where: { sku?: unknown } }) => findProductBySku(where?.sku),
-  findUnique: async ({ where }: { where: { id: string } }) =>
-    state.products.find((row) => row.id === where.id) ?? null,
-  updateMany: async ({ where, data }: { where: Row; data: Row }) => updateManyMatching(where, data),
+  // o3d-4kfh r7: DETACHED COPIES, as Prisma returns. These used to hand back the live state object,
+  // so a later `Object.assign` in the update path mutated the caller's "pre-update snapshot" too —
+  // `existing.type` read AFTER the write returned the NEW type, and a test could not distinguish
+  // "the code captured the old value" from "the code read a value that had already moved".
+  findFirst: async ({ where }: { where: { sku?: unknown } }) => {
+    const row = findProductBySku(where?.sku)
+    return row ? { ...row } : null
+  },
+  findUnique: async ({ where }: { where: { id: string } }) => {
+    const row = state.products.find((candidate) => candidate.id === where.id)
+    return row ? { ...row } : null
+  },
+  // TWO shapes, and they are different questions. `{ id: '...' }` (+ an OR over externalProductId)
+  // is the conditional ownership update. `{ id: { in: [...] } }` with an `{ increment }` op is
+  // `bumpFulfillmentGraphVersions` (o3d-4kfh r7) — which `updateManyMatching` silently matched
+  // NOTHING for, because it compares `row.id === where.id` and `where.id` is an object there. A
+  // double that answers a real call with a silent `{ count: 0 }` cannot tell a working bump from an
+  // absent one.
+  updateMany: async ({ where, data }: { where: Row; data: Row }) => {
+    const idIn = (where.id as { in?: string[] } | undefined)?.in
+    if (Array.isArray(idIn)) {
+      const rows = state.products.filter((row) => idIn.includes(row.id as string))
+      for (const row of rows) {
+        for (const [field, value] of Object.entries(data)) {
+          const increment = (value as { increment?: number } | null)?.increment
+          row[field] = typeof increment === 'number'
+            ? Number(row[field] ?? 0) + increment
+            : value
+        }
+      }
+      return { count: rows.length }
+    }
+    return updateManyMatching(where, data)
+  },
   findMany: async ({ where }: { where?: { sku?: { in?: unknown[] } } } = {}) => {
     const wanted = where?.sku?.in
     if (!Array.isArray(wanted)) return state.products.map((row) => ({ ...row }))
@@ -142,6 +180,23 @@ const productDelegate = {
 
 const txClient = {
   product: productDelegate,
+  // o3d-4kfh r7: the ancestor walk `bumpFulfillmentGraphVersions` shares with the component-graph
+  // guard. Honours the `componentId: { in }` predicate and the parent's TYPE filter, because a BOM
+  // parent is a fulfilment leaf and must not be walked through.
+  productComponent: {
+    findMany: async ({ where }: { where: { componentId: { in: string[] } } }) => state.components
+      .filter((row) => where.componentId.in.includes(row.componentId))
+      .map((row) => ({
+        productId: row.productId,
+        product: { type: state.products.find((p) => p.id === row.productId)?.type ?? 'SIMPLE' },
+      })),
+  },
+  // Only reached by `findComponentGraphEditBlockers`, which the connector path deliberately does
+  // NOT call. Present and honest so that a change which starts calling it fails loudly on the
+  // fixture rather than throwing an unrelated TypeError.
+  salesOrderLine: {
+    findMany: async () => [],
+  },
   productOption: {
     upsert: async ({ create }: { create: Row }) => {
       state.options.push({ ...create })
@@ -253,6 +308,7 @@ function resetState() {
   state.options.length = 0
   state.syncLogs.length = 0
   state.advisoryLocks.length = 0
+  state.components.length = 0
   nextId = 1
   variationTotalPages = 1
   hashOverrides = {}
@@ -655,4 +711,103 @@ test('a later duplicate sibling sees the FIRST sibling\'s applied fields, not st
     'Fresh description from WooCommerce',
     'the second sibling must not write the pre-import description back',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r7 (Codex finding 2) — the connector is a component-graph writer, and must bump.
+//
+// `OrderAllocation.fulfillmentGraphVersion` is what tells commitment and dispatch that a row was
+// expanded from a recipe that no longer exists. The editor and the CSV import bump it — for the
+// edited product AND every KIT above it — in the same transaction as the type write. This path did
+// not, so an IMS KIT adopted by SKU could be re-typed with every allocation stamp and every ancestor
+// version left untouched: the rows were reinterpreted against a different graph while still
+// MATCHING, which is precisely the state the stamp exists to make unreachable.
+//
+// These tests are about the BUMP, not about whether the connector should be allowed to make the
+// change at all — that is #617 (branch o3d-y89x-wc-type-guard), which stops the downgrade. The two
+// compose: with #617 in, a preserved type makes `nextType === existing.type` and the bump below is
+// a no-op that reads nothing; what remains is the legitimate type change, which must still bump.
+// ---------------------------------------------------------------------------
+
+function simpleProduct(overrides: Partial<Row> = {}): WcFullProduct {
+  return {
+    id: 77,
+    sku: 'KIT-SKU',
+    name: 'Adopted Kit',
+    type: 'simple',
+    status: 'publish',
+    description: '',
+    short_description: '',
+    regular_price: '10.00',
+    sale_price: '',
+    weight: '',
+    dimensions: { length: '', width: '', height: '' },
+    images: [],
+    attributes: [],
+    categories: [],
+    meta_data: [],
+    variations: [],
+    ...overrides,
+  } as unknown as WcFullProduct
+}
+
+function versionOf(sku: string): number {
+  return Number(findProductBySku(sku)?.fulfillmentGraphVersion ?? 0)
+}
+
+test('o3d-4kfh r7: a connector type change that loses KIT-ness bumps the version, and every KIT ancestor\'s', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  variationPages = { '1': [] }
+
+  // PARENT-KIT (a KIT) contains KIT-SKU (a KIT). WooCommerce claims KIT-SKU is a simple product.
+  state.products.push(imsRow({ id: 'ims-kit', sku: 'KIT-SKU', name: 'Adopted Kit', type: 'KIT', fulfillmentGraphVersion: 3 }))
+  state.products.push(imsRow({ id: 'ims-parent', sku: 'PARENT-KIT', name: 'Parent Kit', type: 'KIT', fulfillmentGraphVersion: 8 }))
+  state.components.push({ productId: 'ims-parent', componentId: 'ims-kit' })
+
+  const result = await syncWcProductToIms(simpleProduct())
+
+  assert.equal(result.success, true, `expected success, got: ${result.error}`)
+  assert.equal(findProductBySku('KIT-SKU')?.type, 'SIMPLE', 'the connector really did re-type it')
+  assert.equal(versionOf('KIT-SKU'), 4, 'the edited product\'s stamp moves')
+  assert.equal(
+    versionOf('PARENT-KIT'),
+    9,
+    'and so does the KIT above it — its expansion changed even though its own row did not',
+  )
+})
+
+test('o3d-4kfh r7: an ordinary connector update that changes no KIT-ness bumps nothing', async () => {
+  // The boundary. Bumping on every import would refuse commitments across the catalogue every time
+  // the reconcile sweep ran, which is a worse failure than the one being fixed.
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  variationPages = { '1': [] }
+  state.products.push(imsRow({ id: 'ims-simple', sku: 'KIT-SKU', name: 'Plain', type: 'SIMPLE', fulfillmentGraphVersion: 3 }))
+
+  const result = await syncWcProductToIms(simpleProduct({ name: 'Renamed' }))
+
+  assert.equal(result.success, true, `expected success, got: ${result.error}`)
+  assert.equal(findProductBySku('KIT-SKU')?.name, 'Renamed', 'the import still applied')
+  assert.equal(versionOf('KIT-SKU'), 3, 'and the version did not move')
+})
+
+test('o3d-4kfh r7: the VARIATION path bumps too when it overwrites a KIT', async () => {
+  // The same corruption through the other door: an IMS KIT whose SKU is adopted as a WC variation
+  // is rewritten to VARIANT by applyVariations, which is just as much a KIT-ness change.
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  variationPages = { '1': [wcVariation(111, 'VAR-1', 'Red')] }
+
+  state.products.push(imsRow({ id: 'ims-parent-wc', sku: 'PARENT-SKU', name: 'Parent Widget', type: 'VARIABLE', fulfillmentGraphVersion: 0 }))
+  state.products.push(imsRow({ id: 'ims-var-kit', sku: 'VAR-1', name: 'Adopted Kit', type: 'KIT', fulfillmentGraphVersion: 2 }))
+  state.products.push(imsRow({ id: 'ims-ancestor', sku: 'ANCESTOR-KIT', name: 'Ancestor', type: 'KIT', fulfillmentGraphVersion: 5 }))
+  state.components.push({ productId: 'ims-ancestor', componentId: 'ims-var-kit' })
+
+  const result = await syncWcProductToIms(variableProduct({ variations: [111] }))
+
+  assert.equal(result.success, true, `expected success, got: ${result.error}`)
+  assert.equal(findProductBySku('VAR-1')?.type, 'VARIANT')
+  assert.equal(versionOf('VAR-1'), 3)
+  assert.equal(versionOf('ANCESTOR-KIT'), 6, 'the ancestor walk runs on this path as well')
 })

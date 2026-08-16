@@ -33,7 +33,9 @@ async function componentPassBody(): Promise<string> {
   assert.notEqual(at, -1, 'the component pass must take its own lock')
   const txAt = src.lastIndexOf('await db.$transaction', at)
   assert.notEqual(txAt, -1, 'it must open its own transaction')
-  return src.slice(txAt, at + 1400)
+  // Widened as the pass grew (o3d-4kfh r4 added the in-flight sales guard). It has to reach the
+  // deleteMany, or the ordering assertions degrade into claims about a truncated slice.
+  return src.slice(txAt, at + 2200)
 }
 
 test('the component pass takes the write lock (o3d-w998)', async () => {

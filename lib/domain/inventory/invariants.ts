@@ -8,6 +8,7 @@ import {
   loadReservationSourceRows,
   type ReservationBreakdownRow,
 } from '@/lib/domain/inventory/reservation-breakdown'
+import { RESERVATION_RELEASING_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { HISTORICAL_IMPORT_REFERENCE_TYPES } from '@/lib/domain/inventory/stock-movement-value'
 
 export type InventoryInvariantSeverity = 'info' | 'warning' | 'critical'
@@ -134,12 +135,36 @@ export type InventoryInvariantStrandedTransferRow = {
   lines: Array<{ id: string; productId: string; qty: DecimalLike }>
 }
 
+/** An allocation row at the grain it and `ShipmentLine` share (o3d-4kfh). */
+export type InventoryInvariantAllocationRow = {
+  lineId: string
+  productId: string
+  warehouseId: string
+  qty: DecimalLike
+}
+
+/** A COMMITTED (non-PENDING) shipment line, at that same grain. */
+export type InventoryInvariantCommittedShipmentLineRow = {
+  lineId: string
+  productId: string
+  qty: DecimalLike
+  product: Pick<ProductSnapshot, 'sku'>
+  shipment: { orderId: string; warehouseId: string }
+}
+
 export type InventoryInvariantRows = {
   stockLevels: InventoryInvariantStockLevelRow[]
   costLayers: InventoryInvariantCostLayerRow[]
   stockMovements: InventoryInvariantStockMovementRow[]
   shippedShipmentLines: InventoryInvariantShipmentLineRow[]
   reservationSources?: ReservationBreakdownRow[]
+  /**
+   * o3d-4kfh r3: the two sides of the committed-coverage census. BOTH must be present for the
+   * check to run — an allocation set without its shipment lines (or the reverse) would report
+   * every commitment as unbacked. Undefined means "not collected", exactly like the two above.
+   */
+  orderAllocations?: InventoryInvariantAllocationRow[]
+  committedShipmentLines?: InventoryInvariantCommittedShipmentLineRow[]
   /**
    * Transfers stranded IN_TRANSIT (audit-C5). The caller (collector) applies the
    * status + age filter; the evaluator emits a per-line finding for each row here.
@@ -542,6 +567,79 @@ export function evaluateInventoryInvariantRows(
     }
   }
 
+  // o3d-4kfh r3: is every committed shipment line backed by an allocation row big enough to cover
+  // it? See the SQL branch of the same name for why nothing else can see this: every consumer
+  // computes `qty − committed` floored at zero, so an over-commitment vanishes rather than
+  // overflowing, and the reservation census credits only the residual that still exists.
+  //
+  // FLAT check only (per line/warehouse/product) — the KIT proportionality half needs the
+  // fulfillment requirement graph and lives in `findUncoveredCommittedShipment`, which runs at
+  // validateAllocationIntegrity and (o3d-4kfh r4) at EVERY shipment transition including dispatch,
+  // not just PENDING -> PICKING. This sweep is still FLAT and deliberately so: expanding the graph
+  // here means a recursive walk over product_components, which the paged SQL collector below cannot
+  // do without a recursive CTE. So a disproportionate committed KIT set is caught at the transition
+  // seams and refused at the component editor, but is NOT reported by this census.
+  //
+  // o3d-4kfh r6: nor is proportionality itself sufficient at those seams. A UNIFORM rescale of a kit
+  // (2xA + 1xB -> 4xA + 2xB) leaves an A=2/B=1 commitment exactly proportional to the NEW recipe at
+  // coverage 0.5, so every graph-aware check passes while half a kit ships. What refuses that is the
+  // graph-version CAS (`findStaleFulfillmentGraphAllocation`): allocations stamp
+  // `Product.fulfillmentGraphVersion` and commitment/dispatch reject a stamp that no longer matches.
+  // A STALE STAMP IS ALSO NOT REPORTED BY THIS CENSUS — it surfaces only when someone tries to pick
+  // or dispatch. Adding it would need the allocation rows joined to products, which this collector
+  // does not load.
+  if (rows.orderAllocations && rows.committedShipmentLines) {
+    const allocationScopeKey = (row: { lineId: string; warehouseId: string; productId: string }) =>
+      `${row.lineId}|${row.warehouseId}|${row.productId}`
+    const allocatedByScope = new Map<string, number>()
+    for (const allocation of rows.orderAllocations) {
+      const key = allocationScopeKey(allocation)
+      allocatedByScope.set(key, (allocatedByScope.get(key) ?? 0) + decimalToNumber(allocation.qty))
+    }
+    const committedByScope = new Map<string, {
+      lineId: string
+      productId: string
+      warehouseId: string
+      orderId: string
+      sku: string
+      qty: number
+    }>()
+    for (const shipmentLine of rows.committedShipmentLines) {
+      const scope = {
+        lineId: shipmentLine.lineId,
+        productId: shipmentLine.productId,
+        warehouseId: shipmentLine.shipment.warehouseId,
+      }
+      const key = allocationScopeKey(scope)
+      const current = committedByScope.get(key) ?? {
+        ...scope,
+        orderId: shipmentLine.shipment.orderId,
+        sku: shipmentLine.product.sku,
+        qty: 0,
+      }
+      current.qty += decimalToNumber(shipmentLine.qty)
+      committedByScope.set(key, current)
+    }
+    for (const [key, committed] of committedByScope) {
+      const allocatedQty = allocatedByScope.get(key) ?? 0
+      if (!greaterThanWithTolerance(committed.qty, allocatedQty, tolerance)) continue
+      findings.push({
+        severity: 'critical',
+        code: 'allocation_committed_shipment_uncovered',
+        productId: committed.productId,
+        warehouseId: committed.warehouseId,
+        message: `Committed shipment quantity exceeds the allocation backing it for ${committed.sku}`,
+        details: {
+          lineId: committed.lineId,
+          sku: committed.sku,
+          committedQty: committed.qty,
+          allocatedQty,
+          delta: committed.qty - allocatedQty,
+        },
+      })
+    }
+  }
+
   for (const costLayer of rows.costLayers) {
     const remainingQty = decimalToNumber(costLayer.remainingQty)
     const receivedQty = decimalToNumber(costLayer.receivedQty)
@@ -850,7 +948,16 @@ export async function collectInventoryInvariantRows(
   // audit-C5: transfers stranded IN_TRANSIT past the threshold (status + age
   // filter applied here so the evaluator stays pure).
   const strandedTransferCutoff = new Date(Date.now() - STRANDED_TRANSFER_DAYS * 24 * 60 * 60 * 1000)
-  const [stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources, strandedTransfers] = await Promise.all([
+  const [
+    stockLevels,
+    costLayers,
+    stockMovements,
+    shippedShipmentLines,
+    reservationSources,
+    strandedTransfers,
+    orderAllocations,
+    committedShipmentLines,
+  ] = await Promise.all([
     client.stockLevel.findMany({
       select: {
         id: true,
@@ -978,9 +1085,38 @@ export async function collectInventoryInvariantRows(
           },
         })
       : Promise.resolve(undefined),
+    // o3d-4kfh r3: the two sides of the committed-coverage census. Collected as a PAIR — the
+    // evaluator refuses to run on one without the other, because an allocation set with no shipment
+    // lines (or the reverse) would read as either "everything unbacked" or "nothing committed".
+    client.orderAllocation
+      ? client.orderAllocation.findMany({
+          select: { lineId: true, productId: true, warehouseId: true, qty: true },
+        }) as Promise<InventoryInvariantAllocationRow[]>
+      : Promise.resolve(undefined),
+    client.orderAllocation
+      ? client.shipmentLine.findMany({
+          where: { shipment: { status: { not: 'PENDING' } } },
+          select: {
+            lineId: true,
+            productId: true,
+            qty: true,
+            product: { select: { sku: true } },
+            shipment: { select: { orderId: true, warehouseId: true } },
+          },
+        }) as unknown as Promise<InventoryInvariantCommittedShipmentLineRow[]>
+      : Promise.resolve(undefined),
   ])
 
-  return { stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources, strandedTransfers }
+  return {
+    stockLevels,
+    costLayers,
+    stockMovements,
+    shippedShipmentLines,
+    reservationSources,
+    strandedTransfers,
+    orderAllocations,
+    committedShipmentLines,
+  }
 }
 
 function sqlFifoProductTypes(): Prisma.Sql {
@@ -1142,18 +1278,28 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ${stockProductFilter}
         ${stockWarehouseFilter}
     ),
-    active_shipment_lines AS (
+    -- Shipment quantity per allocation row, in BOTH readings the contract defines (o3d-4kfh):
+    --   "dispatchedQty" — the SHARED RESERVATION_RELEASING_SHIPMENT_STATUS, i.e. what has actually
+    --     given reservation back. reservedQty is decremented ONLY on the transition to SHIPPED, so
+    --     netting a PICKING/PACKED shipment out of knownReservedQty invented a
+    --     stock_reserved_source_mismatch for every order sitting in the pick/pack window, and — now
+    --     that the release paths share this definition — would have made them under-release and
+    --     strand reservation on the stock level.
+    --   "committedQty" — every non-PENDING line, i.e. what the warehouse is holding against this
+    --     order. Used only by the zero-demand branch below.
+    -- Deliberately NOT filtered by order status: the zero-demand branch needs the committed lines
+    -- of exactly the orders the active branch excludes, and (lineId, productId, warehouseId) never
+    -- spans two orders, so nothing can be miscredited.
+    committed_shipment_lines AS (
       SELECT
         sl."lineId",
         sl."productId",
         s."warehouseId",
-        SUM(sl.qty) AS qty
+        SUM(sl.qty) AS "committedQty",
+        COALESCE(SUM(sl.qty) FILTER (WHERE s.status::text = ${RESERVATION_RELEASING_SHIPMENT_STATUS}), 0) AS "dispatchedQty"
       FROM "shipment_lines" sl
       INNER JOIN "shipments" s ON s.id = sl."shipmentId"
-      INNER JOIN "sales_orders" so ON so.id = s."orderId"
-      WHERE s.status <> 'PENDING'
-        AND so.status <> 'CANCELLED'
-        AND so."refundStatus" <> 'FULL'
+      WHERE s.status::text <> 'PENDING'
         ${activeShipmentProductFilter}
         ${activeShipmentWarehouseFilter}
       GROUP BY sl."lineId", sl."productId", s."warehouseId"
@@ -1162,20 +1308,57 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       SELECT
         oa."productId",
         oa."warehouseId",
-        SUM(GREATEST(oa.qty - COALESCE(asl.qty, 0), 0)) AS qty
+        SUM(GREATEST(oa.qty - COALESCE(csl."dispatchedQty", 0), 0)) AS qty
       FROM "order_allocations" oa
       INNER JOIN "sales_orders" so ON so.id = oa."orderId"
-      LEFT JOIN active_shipment_lines asl
-        ON asl."lineId" = oa."lineId"
-       AND asl."productId" = oa."productId"
-       AND asl."warehouseId" = oa."warehouseId"
+      LEFT JOIN committed_shipment_lines csl
+        ON csl."lineId" = oa."lineId"
+       AND csl."productId" = oa."productId"
+       AND csl."warehouseId" = oa."warehouseId"
       WHERE oa.qty > 0
         AND so.status <> 'CANCELLED'
         AND so."refundStatus" <> 'FULL'
         ${allocationProductFilter}
         ${allocationWarehouseFilter}
       GROUP BY oa."productId", oa."warehouseId"
-      HAVING SUM(GREATEST(oa.qty - COALESCE(asl.qty, 0), 0)) > ${toleranceSql}
+      HAVING SUM(GREATEST(oa.qty - COALESCE(csl."dispatchedQty", 0), 0)) > ${toleranceSql}
+
+      UNION ALL
+
+      -- o3d-4kfh: ZERO-DEMAND ORDERS STILL HOLD THEIR COMMITTED RESERVATION.
+      --
+      -- A CANCELLED or fully-refunded order has no outstanding demand, which is why the branch
+      -- above excludes it. But a full refund on an order that already has a PICKING or PACKED
+      -- shipment leaves the COMMITTED portion reserved on the stock level: allocation retains the
+      -- committed set (see allocateSalesOrder), and only dispatch decrements reservedQty. Omitting
+      -- it made knownReservedQty short by exactly that amount and reported a correctly-held
+      -- reservation as a critical stock_reserved_source_mismatch.
+      --
+      -- Credited for the still-committed portion ONLY — LEAST(residual, committed − dispatched).
+      -- Any stale outstanding quantity above that has no demand and no shipment behind it: that
+      -- part IS a leak, and it must keep showing up as a mismatch.
+      SELECT
+        oa."productId",
+        oa."warehouseId",
+        SUM(LEAST(
+          GREATEST(oa.qty - COALESCE(csl."dispatchedQty", 0), 0),
+          GREATEST(COALESCE(csl."committedQty", 0) - COALESCE(csl."dispatchedQty", 0), 0)
+        )) AS qty
+      FROM "order_allocations" oa
+      INNER JOIN "sales_orders" so ON so.id = oa."orderId"
+      LEFT JOIN committed_shipment_lines csl
+        ON csl."lineId" = oa."lineId"
+       AND csl."productId" = oa."productId"
+       AND csl."warehouseId" = oa."warehouseId"
+      WHERE oa.qty > 0
+        AND (so.status = 'CANCELLED' OR so."refundStatus" = 'FULL')
+        ${allocationProductFilter}
+        ${allocationWarehouseFilter}
+      GROUP BY oa."productId", oa."warehouseId"
+      HAVING SUM(LEAST(
+        GREATEST(oa.qty - COALESCE(csl."dispatchedQty", 0), 0),
+        GREATEST(COALESCE(csl."committedQty", 0) - COALESCE(csl."dispatchedQty", 0), 0)
+      )) > ${toleranceSql}
 
       UNION ALL
 
@@ -1307,6 +1490,51 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       WHERE ABS(COALESCE(sl."reservedQty", 0) - COALESCE(rt."knownReservedQty", 0)) > ${toleranceSql}
         ${reservationProductFilter}
         ${reservationWarehouseFilter}
+
+      UNION ALL
+
+      -- o3d-4kfh r3: A COMMITMENT LARGER THAN THE ALLOCATION ROW BEHIND IT.
+      --
+      -- The contract runs one way: OrderAllocation.qty covers outstanding demand PLUS every
+      -- committed (non-PENDING) shipment line at that (line, warehouse, product). Every consumer
+      -- takes it on trust and computes qty - committed floored at zero, so a commitment ABOVE its
+      -- row does not overflow anywhere — it silently disappears, and the units come out of whatever
+      -- shared (product, warehouse) reservedQty is there at dispatch time. The reservation census
+      -- above cannot see it either: it credits only the residual, which is exactly the part that
+      -- still exists.
+      --
+      -- Reuses committed_shipment_lines, so it is scoped by the same product/warehouse filters and
+      -- the same non-PENDING definition as the reservation branches.
+      --
+      -- LIMIT: this is the FLAT check (per (line, warehouse, product)). It does NOT verify that a
+      -- KIT's committed components are a complete proportional set — that needs the fulfillment
+      -- requirement graph, which is a recursive expansion this sweep does not load. The proportional
+      -- half is enforced where the graph is available: validateAllocationIntegrity and (o3d-4kfh r4)
+      -- EVERY shipment transition including dispatch (findUncoveredCommittedShipment), plus the
+      -- component-graph edit refusal that stops the mutation creating it in the first place, plus
+      -- (o3d-4kfh r6) the graph-version CAS that catches the uniform rescale proportionality cannot
+      -- see. The SCHEDULED SWEEP ITSELF REMAINS FLAT and reports neither.
+      SELECT
+        'allocation_committed_shipment_uncovered:' || csl."lineId" || ':' || csl."warehouseId" || ':' || csl."productId" AS "sortKey",
+        'critical'::text AS severity,
+        'allocation_committed_shipment_uncovered'::text AS code,
+        csl."productId",
+        csl."warehouseId",
+        'Committed shipment quantity exceeds the allocation backing it for ' || p.sku AS message,
+        jsonb_build_object(
+          'lineId', csl."lineId",
+          'sku', p.sku,
+          'committedQty', csl."committedQty",
+          'allocatedQty', COALESCE(oa.qty, 0),
+          'delta', csl."committedQty" - COALESCE(oa.qty, 0)
+        ) AS details
+      FROM committed_shipment_lines csl
+      INNER JOIN "products" p ON p.id = csl."productId"
+      LEFT JOIN "order_allocations" oa
+        ON oa."lineId" = csl."lineId"
+       AND oa."productId" = csl."productId"
+       AND oa."warehouseId" = csl."warehouseId"
+      WHERE csl."committedQty" - COALESCE(oa.qty, 0) > ${toleranceSql}
 
       UNION ALL
 

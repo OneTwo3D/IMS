@@ -971,14 +971,25 @@ test('backorder report aggregates active sales demand not covered by committed s
         },
       ],
     },
+    // The fulfillment graph the report now converts component rows through. Both lines are SIMPLE,
+    // so each is a single self-requirement of factor 1 and the arithmetic below is unchanged.
+    product: {
+      findMany: async (args?: unknown) => (args as { where: { id: { in: string[] } } }).where.id.in
+        .map((id) => ({ id, type: ProductType.SIMPLE, productComponents: [] })),
+    },
     orderAllocation: {
       findMany: async (args?: unknown) => {
         assert.deepEqual((args as { where: { lineId: { in: string[] } } }).where.lineId.in.sort(), ['line-1', 'line-2'])
-        return [{ lineId: 'line-1', qty: decimal('4') }]
+        return [{ lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: decimal('4') }]
       },
     },
     shipmentLine: {
-      findMany: async () => [{ lineId: 'line-1', qty: decimal('2'), shipment: { status: 'PACKED' } }],
+      findMany: async () => [{
+        lineId: 'line-1',
+        productId: 'product-1',
+        qty: decimal('2'),
+        shipment: { status: 'PACKED', warehouseId: 'warehouse-1' },
+      }],
     },
     purchaseOrderLine: {
       findMany: async () => [{
@@ -1270,4 +1281,75 @@ test('reorder report aggregates raw-material demand across multiple parent BOMs'
   // 5 tables × 2 oak + 4 shelves × 1 oak = 14 extra units of demand.
   assert.equal(rawRow?.suggestedReorderQty, '14')
   assert.deepEqual(rawRow?.neededFor, ['BOM BOM-SHELF', 'BOM BOM-TABLE'])
+})
+
+test('backorder report counts KIT coverage in kits, not in component units (o3d-4kfh r3)', async () => {
+  // OrderAllocation and ShipmentLine rows are LEAF-COMPONENT quantities; the sales line is in
+  // parent units. Summing them by line and comparing against `line.qty` compares two different
+  // units of measure, and the `min(orderedQty, ...)` clamp then made the mismatch invisible.
+  //
+  // 10 kits ordered, kit = 2 x COMP-A + 1 x COMP-B (deliberately unequal factors). Five kits are
+  // PICKING, which is 10 + 5 = 15 COMPONENT units: clamped to 10 that read as "all ten kits
+  // committed", so remaining demand was zero, backorderQty was zero and the row was dropped from
+  // the report entirely. The other five kits are not allocated at all — a real, five-kit
+  // replenishment demand that never reached the report.
+  const kitProduct = {
+    id: 'kit-1',
+    sku: 'KIT-1',
+    name: 'Widget kit',
+    type: ProductType.KIT,
+    stockUnit: 'pcs',
+    category,
+    supplierProducts: [{ supplier }],
+  }
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    salesOrderLine: {
+      findMany: async () => [{
+        id: 'line-1',
+        orderId: 'order-1',
+        productId: 'kit-1',
+        sku: 'KIT-1',
+        description: 'Widget kit',
+        qty: decimal('10'),
+        order: { orderNumber: 'SO-1', createdAt: new Date('2026-05-01T00:00:00.000Z'), expectedDelivery: null, status: 'PROCESSING' },
+        product: kitProduct,
+      }],
+    },
+    product: {
+      findMany: async (args?: unknown) => (args as { where: { id: { in: string[] } } }).where.id.in
+        .map((id) => (id === 'kit-1'
+          ? {
+            id,
+            type: ProductType.KIT,
+            productComponents: [
+              { componentId: 'comp-a', qty: decimal('2'), component: { sku: 'COMP-A', type: ProductType.SIMPLE, oversellAllowed: false } },
+              { componentId: 'comp-b', qty: decimal('1'), component: { sku: 'COMP-B', type: ProductType.SIMPLE, oversellAllowed: false } },
+            ],
+          }
+          : { id, type: ProductType.SIMPLE, productComponents: [] })),
+    },
+    // Exactly the five picked kits are allocated; nothing backs the other five.
+    orderAllocation: {
+      findMany: async () => [
+        { lineId: 'line-1', productId: 'comp-a', warehouseId: 'warehouse-1', qty: decimal('10') },
+        { lineId: 'line-1', productId: 'comp-b', warehouseId: 'warehouse-1', qty: decimal('5') },
+      ],
+    },
+    shipmentLine: {
+      findMany: async () => [
+        { lineId: 'line-1', productId: 'comp-a', qty: decimal('10'), shipment: { status: 'PICKING', warehouseId: 'warehouse-1' } },
+        { lineId: 'line-1', productId: 'comp-b', qty: decimal('5'), shipment: { status: 'PICKING', warehouseId: 'warehouse-1' } },
+      ],
+    },
+  }
+
+  const report = await getBackorderDemandReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+
+  assert.equal(report.rows.length, 1, 'the five-kit shortage must reach the report at all')
+  assert.equal(report.rows[0]?.productId, 'kit-1')
+  assert.equal(report.rows[0]?.orderedQty, '10')
+  assert.equal(report.rows[0]?.committedQty, '5', 'five KITS committed, not fifteen component units')
+  assert.equal(report.rows[0]?.allocatedQty, '0', 'the retained rows cover only what is already committed')
+  assert.equal(report.rows[0]?.backorderQty, '5')
 })

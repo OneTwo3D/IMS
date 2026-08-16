@@ -2,6 +2,8 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { canonicalAllocationQty } from '@/lib/domain/sales/allocation-service'
+import { reconcilePendingShipments } from '@/lib/domain/sales/pending-shipment-reconciliation'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -47,7 +49,6 @@ export async function releaseOverallocations(
 
   type TxOutcome = {
     releases: Array<{ orderId: string; orderRef: string; productId: string; warehouseId: string; qty: number }>
-    pendingShipmentDeletes: Array<{ orderId: string; orderRef: string; count: number }>
     skipped: number
   }
 
@@ -80,7 +81,7 @@ export async function releaseOverallocations(
       const lockOrderIds = [...candidateOrderIds].sort()
 
       const txOutcome: TxOutcome = await db.$transaction(async (tx) => {
-        const pending: TxOutcome = { releases: [], pendingShipmentDeletes: [], skipped: 0 }
+        const pending: TxOutcome = { releases: [], skipped: 0 }
 
         await tx.$queryRaw(
           Prisma.sql`SELECT id FROM "sales_orders" WHERE id IN (${Prisma.join(lockOrderIds)}) FOR UPDATE`,
@@ -146,7 +147,10 @@ export async function releaseOverallocations(
         })
 
         const lockedOrderIdSet = new Set(candidateOrderIds)
-        const pendingShipmentsCleared = new Set<string>()
+        // o3d-4kfh r4: the orders this pass actually WROTE to, reconciled once each after the
+        // release loop. See the note at the reconciliation call below for why the cleanup cannot
+        // happen inside the loop.
+        const releasedOrderRefs = new Map<string, string>()
         for (const alloc of allocs) {
           if (excess <= 1e-6) break
           if (!lockedOrderIdSet.has(alloc.orderId)) { pending.skipped += 1; continue }
@@ -170,33 +174,31 @@ export async function releaseOverallocations(
             })
           }
 
-          // Clear any PENDING shipments tied to this order so ShipmentLines
-          // don't outlive their backing OrderAllocation. Matches the
-          // delete-and-rebuild pattern used by confirmAllocations — the
-          // order reverts to pre-picking state and the user re-runs
-          // confirm-for-picking to regenerate shipments.
-          if (!pendingShipmentsCleared.has(alloc.orderId)) {
-            const deletedPending = await tx.shipment.deleteMany({ where: { orderId: alloc.orderId, status: 'PENDING' } })
-            if (deletedPending.count > 0) {
-              pending.pendingShipmentDeletes.push({
-                orderId: alloc.orderId,
-                orderRef: alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8),
-                count: deletedPending.count,
-              })
-            }
-            pendingShipmentsCleared.add(alloc.orderId)
-          }
-
           const allocQty = Number(alloc.qty)
-          const release = Math.min(allocQty, excess)
+          const wantedRelease = Math.min(allocQty, excess)
+          if (wantedRelease <= 0) continue
+
+          // o3d-4kfh r7 (Codex finding 4): THE ROW IS QUANTISED, AND THE RESERVATION FOLLOWS THE
+          // ROW. `excess` is `reservedQty − quantity`, and `reservedQty` carries more decimal
+          // places than `OrderAllocation.qty` can hold, so `allocQty − wantedRelease` was routinely
+          // a quantity Postgres rounded on write while `reservedQty` was decremented by the
+          // unrounded figure. The difference is small and permanent, and it lands on an aggregate
+          // shared with every other order in the scope. Deriving the decrement from what the row
+          // ACTUALLY gave up — the same "one canonical representation" rule the allocator and the
+          // manual writers now follow — keeps the two books equal by construction.
+          const wholeRow = wantedRelease >= allocQty - 1e-6
+          const nextQty = wholeRow ? null : canonicalAllocationQty(allocQty - wantedRelease)
+          const release = wholeRow ? allocQty : allocQty - nextQty!.toNumber()
+          // A release the column cannot represent is not a release: the row would be rewritten to
+          // its own value and `reservedQty` decremented for a reduction that never happened.
           if (release <= 0) continue
 
-          if (release >= allocQty - 1e-6) {
+          if (wholeRow) {
             await tx.orderAllocation.delete({ where: { id: alloc.id } })
           } else {
             await tx.orderAllocation.update({
               where: { id: alloc.id },
-              data: { qty: allocQty - release },
+              data: { qty: nextQty! },
             })
           }
           await tx.stockLevel.updateMany({
@@ -210,12 +212,44 @@ export async function releaseOverallocations(
           }
 
           excess -= release
+          const orderRef = alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8)
+          releasedOrderRefs.set(alloc.orderId, orderRef)
           pending.releases.push({
             orderId: alloc.orderId,
-            orderRef: alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8),
+            orderRef,
             productId: item.productId,
             warehouseId: item.warehouseId,
             qty: release,
+          })
+        }
+
+        // o3d-4kfh r4: RETIRE ONLY THE DRAFTS THIS RELEASE ACTUALLY UNBACKED.
+        //
+        // This used to be `deleteMany({ orderId, status: 'PENDING' })` inside the loop above — a
+        // blanket delete copied from the deallocation TEARDOWN, where it is correct only because
+        // that path deletes every allocation row on the order in the same breath. Here exactly one
+        // (product, warehouse) allocation is being trimmed, so the blanket delete destroyed drafts
+        // that were still fully backed: with drafts A@W1 and B@W2 on one order, an A@W1 stock
+        // decrease erased B@W2 too, cascaded its shipment lines, and threw away whatever tracking
+        // number and shipping service it carried — recorded as a bare count, so the label could not
+        // even be correlated afterwards.
+        //
+        // Runs AFTER the loop, once per order: the loop can trim several allocations on the same
+        // order, and a mid-loop reconciliation would judge a draft against a half-applied release.
+        // Uses the SAME shared rule as the allocator, the teardown and the manual editor.
+        //
+        // o3d-4kfh r5 (Codex finding 7): the retirement AUDIT ROW is written by the reconciler
+        // inside THIS transaction, before the drafts are deleted. It used to be written here, after
+        // the commit, via a `logActivity` that swallows its own failures — so a crash in that window
+        // destroyed the only record of which purchased label IMS had stopped referencing.
+        for (const [releasedOrderId, orderRef] of releasedOrderRefs) {
+          await reconcilePendingShipments(tx, releasedOrderId, {
+            cause: `an overallocation release due to ${context.referenceLabel ?? context.source}`,
+            auditMetadata: {
+              source: context.source,
+              referenceId: context.referenceId ?? null,
+              orderRef,
+            },
           })
         }
         return pending
@@ -225,17 +259,6 @@ export async function releaseOverallocations(
       // back, any in-memory bookkeeping above is discarded.
       if (txOutcome) {
         result.skipped += txOutcome.skipped
-        for (const entry of txOutcome.pendingShipmentDeletes) {
-          await logActivity({
-            entityType: 'SALES_ORDER',
-            entityId: entry.orderId,
-            action: 'pending_shipments_deleted',
-            tag: 'sales',
-            level: 'WARNING',
-            description: `Deleted ${entry.count} pending shipment(s) for order ${entry.orderRef} while releasing overallocations due to ${context.referenceLabel ?? context.source}`,
-            metadata: { source: context.source, referenceId: context.referenceId ?? null, count: entry.count },
-          })
-        }
         for (const entry of txOutcome.releases) {
           result.released += entry.qty
           touchedOrders.add(entry.orderId)
