@@ -60,6 +60,14 @@ const state = {
   /** Every orderAllocation.updateMany payload. */
   allocationUpdates: [] as Row[],
   activity: [] as Row[],
+  /**
+   * o3d-4kfh r5 (finding 7): the draft-retirement audit row is written on the TRANSACTION client
+   * now, not post-commit. Recorded separately from `activity` (which is the post-commit
+   * `logActivity` mock) so a test can tell the two apart — that distinction is the whole point.
+   */
+  txActivity: [] as Row[],
+  /** o3d-4kfh r5 (finding 4): what the post-release FIFO pass was actually asked to repair. */
+  backorderCalls: [] as Array<{ productIds: string[] }>,
   stockLevels: [] as StockLevelRow[],
   allocations: [] as AllocationRow[],
   shipments: [] as ShipmentRow[],
@@ -73,6 +81,8 @@ function reset() {
   state.salesOrderUpdates.length = 0
   state.allocationUpdates.length = 0
   state.activity.length = 0
+  state.txActivity.length = 0
+  state.backorderCalls.length = 0
   state.allocations.length = 0
   state.shipments.length = 0
   state.shipmentLines.length = 0
@@ -91,8 +101,20 @@ mock.module('@/lib/activity-log', {
 
 // Dynamically imported by the reconcile pass at the end of releaseOverallocations; stubbed so
 // the test never reaches the real allocator (which would want a database).
+//
+// o3d-4kfh r5 (Codex finding 4): THIS MOCK IS WHY THE RETAINED-DRAFT STRAND WAS INVISIBLE HERE.
+// Stubbing the allocator out entirely means this file can say nothing at all about whether the
+// post-release repair actually runs — the strand lived inside `allocateBackordersForProducts`'s
+// candidate filter, which this replaces. It now at least RECORDS the call, so a regression that
+// stops dispatching the repair is visible; the filter itself is tested against its own doubles in
+// tests/fulfillment/backorder-allocator.test.ts, which is the only place it can be.
 mock.module('@/lib/fulfillment/backorder-allocator', {
-  namedExports: { allocateBackordersForProducts: async () => ({}) },
+  namedExports: {
+    allocateBackordersForProducts: async (productIds: string[]) => {
+      state.backorderCalls.push({ productIds: [...productIds] })
+      return {}
+    },
+  },
 })
 
 function decimalLikeToNumber(value: unknown): number {
@@ -104,6 +126,25 @@ function decimalLikeToNumber(value: unknown): number {
 
 const tx = {
   $queryRaw: async () => [],
+  // o3d-4kfh r5 (finding 7): reconcilePendingShipments writes its audit row through the tx client,
+  // before the delete. A double without this throws, which is the correct failure for a production
+  // change that stopped writing it in-transaction.
+  activityLog: {
+    create: async ({ data }: { data: Row }) => { state.txActivity.push(data); return data },
+  },
+  salesOrder: {
+    findUnique: async ({ where }: { where: { id: string } }) => {
+      const alloc = state.allocations.find((row) => row.orderId === where.id)
+      return {
+        orderNumber: alloc?.order.orderNumber ?? null,
+        externalOrderNumber: alloc?.order.externalOrderNumber ?? null,
+      }
+    },
+    update: async ({ data }: { data: Row }) => {
+      state.salesOrderUpdates.push(data)
+      return {}
+    },
+  },
   stockLevel: {
     findUnique: async ({ where }: { where: { productId_warehouseId: { productId: string; warehouseId: string } } }) => {
       const key = where.productId_warehouseId
@@ -184,12 +225,6 @@ const tx = {
       state.shipments = state.shipments.filter((shipment) => !doomedIds.has(shipment.id))
       state.shipmentLines = state.shipmentLines.filter((line) => !doomedIds.has(line.shipmentId))
       return { count: doomed.length }
-    },
-  },
-  salesOrder: {
-    update: async ({ data }: { data: Row }) => {
-      state.salesOrderUpdates.push(data)
-      return {}
     },
   },
   orderAllocation: {
@@ -289,8 +324,13 @@ function assertNoSwallowedFailure() {
   )
 }
 
+/**
+ * o3d-4kfh r5 (finding 7): read from `txActivity`, NOT `activity`. The retirement record is written
+ * through the transaction client now, so a post-commit `logActivity` entry would mean the durable
+ * write had been lost — reading the post-commit mock would hide exactly the regression this guards.
+ */
 function retirementEntries() {
-  return state.activity.filter((entry) => entry.action === 'pending_shipments_retired')
+  return state.txActivity.filter((entry) => entry.action === 'pending_shipments_retired')
 }
 
 function shipmentIds(): string[] {
@@ -564,4 +604,60 @@ test('o3d-4kfh r4: a COMMITTED shipment on the released order is never deleted',
   assert.equal(result.skipped, 1)
   assert.deepEqual(shipmentIds(), ['picking-a'], 'and its shipment is untouched')
   assert.deepEqual(retirementEntries(), [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r5 (Codex finding 4) — a RETAINED draft must not stop the post-release repair.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r5: a KIT leaf release retains the unrelated draft AND still dispatches the repair pass', async () => {
+  // The strand, end to end from this side. A KIT line holds leaf A and leaf B; only A's stock drops,
+  // so this pass trims A alone and leaves B disproportionate — a half-kit reservation. The repair is
+  // `allocateBackordersForProducts`, which rebuilds the order through autoAllocateOrder.
+  //
+  // The order also carries a PENDING draft in ANOTHER warehouse that is still fully backed, so the
+  // selective reconciler deliberately KEEPS it. Under the old blanket `shipments: { none: {} }`
+  // candidate filter plus `refuseIfShipmentsExist`, that retained draft made the repair a no-op and
+  // B's reservation stayed stranded until it failed integrity at confirm-for-picking.
+  //
+  // What this file can assert is that the retention happens and the repair is DISPATCHED with the
+  // right product. Whether the repair is then accepted lives in the allocator's candidate filter and
+  // is tested in tests/fulfillment/backorder-allocator.test.ts — mocking the allocator here is
+  // exactly why this defect was invisible in this file.
+  reset()
+  state.stockLevels = [
+    { productId: 'kit-leaf-a', warehouseId: 'warehouse-1', quantity: 0, reservedQty: 2 },
+    { productId: 'kit-leaf-b', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 },
+    { productId: 'product-c', warehouseId: 'warehouse-2', quantity: 4, reservedQty: 4 },
+  ]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-kit', productId: 'kit-leaf-a', warehouseId: 'warehouse-1', qty: 2, order: order('order-1') },
+    { id: 'alloc-b', orderId: 'order-1', lineId: 'line-kit', productId: 'kit-leaf-b', warehouseId: 'warehouse-1', qty: 1, order: order('order-1') },
+    { id: 'alloc-c', orderId: 'order-1', lineId: 'line-c', productId: 'product-c', warehouseId: 'warehouse-2', qty: 4, order: order('order-1') },
+  ]
+  state.shipments = [{
+    id: 'draft-c', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'PENDING',
+    trackingNumber: 'TRACK-C', shippingService: 'DPD', createdAt: '2026-01-01T00:00:00Z',
+  }]
+  state.shipmentLines = [{ id: 'sl-c', shipmentId: 'draft-c', lineId: 'line-c', productId: 'product-c', qty: 4 }]
+  const { releaseOverallocations } = await loadRebalancer()
+
+  await releaseOverallocations(
+    [{ productId: 'kit-leaf-a', warehouseId: 'warehouse-1' }],
+    { source: 'stock_adjustment', referenceId: 'adj-kit', referenceLabel: 'stock adjustment ADJ-KIT' },
+  )
+
+  assertNoSwallowedFailure()
+  assert.deepEqual(shipmentIds(), ['draft-c'], 'the unrelated, still-backed draft is RETAINED')
+  assert.deepEqual(retirementEntries(), [], 'and nothing was retired, so nothing was recorded')
+  assert.deepEqual(
+    state.allocations.map((row) => [row.productId, row.qty]),
+    [['kit-leaf-b', 1], ['product-c', 4]],
+    'leaf A is released and leaf B is left disproportionate — this is the state needing repair',
+  )
+  assert.deepEqual(
+    state.backorderCalls,
+    [{ productIds: ['kit-leaf-a'] }],
+    'the repair pass is dispatched for the released leaf',
+  )
 })

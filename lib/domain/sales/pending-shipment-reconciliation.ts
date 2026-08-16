@@ -44,12 +44,30 @@ import {
  * TRACKING / LABEL METADATA IS RETIRED, NOT SILENTLY DROPPED. IMS cannot re-attach a label to a
  * shipment that no longer exists, and a draft may legitimately already carry a tracking number and
  * shipping service an operator typed in (or a connector wrote back) before the allocation moved.
- * So this returns the full identity of everything it deleted — id, warehouse, tracking number,
- * shipping service, line count, total quantity — and every caller logs that detail. A bare count
- * is what made an externally purchased label impossible to correlate or cancel from IMS.
+ * So the full identity of everything deleted — id, warehouse, tracking number, shipping service,
+ * line count, total quantity — is both returned to the caller AND written to the activity log. A
+ * bare count is what made an externally purchased label impossible to correlate or cancel from IMS.
  * `confirmSalesOrderShipments` still PRESERVES tracking/service across its own delete-and-rebuild
  * (it re-applies them per warehouse), so the metadata survives the ordinary rebuild; it is only
  * genuinely retired when the draft is not rebuilt in the same transaction.
+ *
+ * o3d-4kfh r5 (Codex finding 7): THE AUDIT ROW IS WRITTEN IN THIS TRANSACTION, BEFORE THE DELETE.
+ *
+ * Every caller used to write it AFTER the transaction committed, through `logActivity` — which
+ * swallows persistence failures by design. So a crash, a connection loss or a failing insert between
+ * the commit and the log permanently destroyed the only record of WHICH shipment and WHICH tracking
+ * number had gone, which is precisely the recovery path this branch advertises (cancel the purchased
+ * label with the carrier). Writing `activityLog` through the same client makes the record and the
+ * deletion succeed or fail together: there is no state in which the draft is gone and the evidence
+ * is not. It is the ordinary in-transaction pattern used elsewhere in this codebase
+ * (`lib/cost-layers.ts`, `lib/domain/purchasing/preferred-supplier.ts`) — IMS has no general
+ * transactional-outbox table to reuse; `IntegrationOutbox` is connector-delivery state with a
+ * `connector`/`operation`/`idempotencyKey` contract and a dispatcher that would try to SEND this,
+ * so it is the wrong home.
+ *
+ * The cost is attribution: this write does not resolve the session, so `userId` must be supplied by
+ * a caller that has one, and is null for the batch paths (the rebalancer, the sweep) that have no
+ * user anyway.
  */
 
 /** Matches `ALLOCATION_EPSILON_DECIMAL` in allocation-service — the same quantity grain. */
@@ -86,18 +104,31 @@ export type PendingShipmentReconciliationClient = Prisma.TransactionClient
 
 export type ReconcilePendingShipmentsOptions = {
   /**
-   * The allocation rows the drafts must be backed by. Optional ONLY as an in-memory shortcut for a
-   * caller that has just written them itself (`allocateSalesOrder` creates its rows a few lines
-   * earlier); omitting it reads the order's rows through the SAME transaction client, which is the
-   * correct default for every caller that has mutated one row rather than the whole set.
-   *
-   * NOT a semantic switch: the rule applied is identical either way. Supplying a set that differs
-   * from what is persisted is a caller bug.
+   * Operator-facing phrase naming what invalidated the drafts, e.g. `'a re-allocation of the
+   * order'`. Required: the durable audit row is written here now, so there is no later opportunity
+   * to say why.
    */
-  allocations?: AllocationQtyRow[]
-  /** Same shortcut for the committed (non-PENDING) shipment lines subtracted from the rows. */
-  committedShipmentLines?: AllocationQtyRow[]
+  cause: string
+  /** Merged into the audit metadata — the batch callers' `source` / `referenceId` context. */
+  auditMetadata?: Record<string, unknown>
+  /** The acting user, when the caller has a session. Null for cron/batch paths. */
+  userId?: string | null
 }
+
+/**
+ * o3d-4kfh r5 (Codex finding 3): THERE IS NO in-memory SHORTCUT ANY MORE.
+ *
+ * `allocateSalesOrder` used to hand its freshly-computed `persistedAllocations` in, on the argument
+ * that it had just written them itself. It had not written THOSE values: `OrderAllocation.qty` is
+ * `Decimal(12,4)`, so a computed fractional-KIT quantity of 0.33335 persists as 0.3334. The
+ * reconciler then judged a draft holding the stored 0.3334 against the in-memory 0.33335, found a
+ * 0.00005 shortfall — an order of magnitude above the 0.000001 epsilon — and deleted a draft that
+ * the stored row backed exactly. Its unit test supplied rows that bypassed the rounding, so it
+ * asserted the defect rather than equivalence with production.
+ *
+ * Both sets are therefore always re-read through the caller's transaction client, which is the only
+ * state a later reader (Start Picking, dispatch) will ever see.
+ */
 
 /**
  * Retire the order's PENDING shipment drafts that its allocation rows no longer back.
@@ -109,7 +140,7 @@ export type ReconcilePendingShipmentsOptions = {
 export async function reconcilePendingShipments(
   client: PendingShipmentReconciliationClient,
   orderId: string,
-  options: ReconcilePendingShipmentsOptions = {},
+  options: ReconcilePendingShipmentsOptions,
 ): Promise<PendingShipmentReconciliation> {
   const pendingShipments = await client.shipment.findMany({
     where: { orderId, status: UNCOMMITTED_SHIPMENT_STATUS },
@@ -126,11 +157,11 @@ export async function reconcilePendingShipments(
   })
   if (pendingShipments.length === 0) return { retired: [], retainedCount: 0 }
 
-  const allocations = options.allocations ?? await client.orderAllocation.findMany({
+  const allocations: AllocationQtyRow[] = await client.orderAllocation.findMany({
     where: { orderId },
     select: { lineId: true, productId: true, warehouseId: true, qty: true },
   })
-  const committedShipmentLines = options.committedShipmentLines ?? (
+  const committedShipmentLines: AllocationQtyRow[] = (
     await client.shipmentLine.findMany({
       where: { shipment: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } } },
       select: {
@@ -203,14 +234,49 @@ export async function reconcilePendingShipments(
 
   if (doomed.length === 0) return { retired: [], retainedCount }
 
+  // BEFORE the delete, and in the SAME transaction (r5 Codex finding 7). Ordering matters as much
+  // as the client does: written afterwards, a failure of this insert would abort the transaction —
+  // correct, but only because the delete is rolled back with it. Written first, the record exists
+  // for certain by the time the rows are destroyed, and either both land or neither does.
+  const order = await client.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { orderNumber: true, externalOrderNumber: true },
+  })
+  const orderRef = order?.orderNumber ?? order?.externalOrderNumber ?? orderId.slice(0, 8)
+  const carryingLabels = doomed.filter((row) => row.trackingNumber).length
+  await client.activityLog.create({
+    data: {
+      userId: options.userId ?? null,
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'pending_shipments_retired',
+      tag: 'sales',
+      level: 'WARNING',
+      description: `Retired ${doomed.length} pending shipment(s) for order ${orderRef} that ${options.cause} left unbacked`
+        + (carryingLabels > 0
+          ? ` — ${carryingLabels} carried a tracking number that IMS no longer references, cancel the label(s) with the carrier if unused`
+          : '')
+        + `: ${describeRetiredPendingShipments(doomed)}`,
+      metadata: {
+        cause: options.cause,
+        ...(options.auditMetadata ?? {}),
+        ...retiredPendingShipmentMetadata(doomed),
+      },
+    },
+  })
+
   await client.shipment.deleteMany({ where: { id: { in: doomed.map((row) => row.id) } } })
   return { retired: doomed, retainedCount }
 }
 
 /**
  * One operator-facing sentence describing what was retired, with enough identity in it to find an
- * externally purchased label. Shared so the four call sites cannot describe the same event four
- * different ways.
+ * externally purchased label.
+ *
+ * Now used only by the in-transaction audit write above — the four call sites used to narrate this
+ * themselves after the commit, which is the lossiness r5 finding 7 removed. Kept exported so the
+ * wording is testable on its own and so a future reader (a UI toast, a connector error) has one
+ * place to reuse rather than a fifth phrasing.
  */
 export function describeRetiredPendingShipments(retired: RetiredPendingShipment[]): string {
   return retired
@@ -223,7 +289,7 @@ export function describeRetiredPendingShipments(retired: RetiredPendingShipment[
     .join('; ')
 }
 
-/** The activity-log metadata every caller attaches, so the shape cannot drift between them. */
+/** The activity-log metadata attached to the in-transaction retirement record. */
 export function retiredPendingShipmentMetadata(retired: RetiredPendingShipment[]) {
   return {
     retiredShipmentCount: retired.length,

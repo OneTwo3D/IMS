@@ -28,6 +28,7 @@ import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForW
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
   ComponentGraphInFlightSalesError,
+  componentGraphMutationAffectsFulfillment,
   describeComponentGraphEditBlockers,
   findComponentGraphEditBlockers,
 } from '@/lib/products/component-graph-edit-guard'
@@ -936,6 +937,37 @@ export async function updateProduct(
     const previousCategoryName = previous?.category?.name ?? null
     const categoryId = await resolveProductCategoryIdByName(data.categoryName, { client: tx })
 
+    // o3d-4kfh r5 (Codex finding 1): GUARD EVERY KIT-NESS CHANGE, AND DO IT BEFORE THE TYPE MOVES.
+    //
+    // r4 guarded only `clearComponents` — true solely when a component-bearing type becomes a
+    // non-component one — and it ran AFTER `tx.product.update` had already written the new type.
+    // KIT <-> BOM satisfies neither: both bear components, so `clearComponents` is false and no
+    // check ran at all. Flipping a NESTED inner KIT to BOM turns recursively-expanded components
+    // into a fulfilment leaf, instantly reinterpreting every existing allocation and PICKING
+    // shipment for every KIT above it against a different graph — and `validateProductStructureChange`
+    // cannot see it, because it counts open sales order lines on THIS product and a nested inner kit
+    // has none. Running after the write also meant the invalid state had already been committed to
+    // before any later transition could refuse it.
+    //
+    // KIT -> KIT (a rename, a price change) is NOT a KIT-ness change and must not be guarded, or
+    // every ordinary edit to a kit would be refused while any order is in flight.
+    const kitnessMutation = {
+      kind: 'kitness' as const,
+      currentType: revalidated.current?.type ?? data.type,
+      nextType: data.type,
+    }
+    if (componentGraphMutationAffectsFulfillment(kitnessMutation)) {
+      // Best-effort and NOT atomic — this path deliberately holds only its per-SKU lock, not the
+      // coarse component-graph advisory one (taking it here would invert the lock order; see
+      // lib/db/advisory-locks.ts), and the allocation/commitment writers take neither. See the guard
+      // module docstring: `validateCommittedShipmentCoverage` at every shipment transition including
+      // dispatch is the atomic backstop, and the CAS is filed as o3d-57b0.
+      const blockers = await findComponentGraphEditBlockers(tx, id, kitnessMutation)
+      if (blockers.length > 0) {
+        throw new ComponentGraphInFlightSalesError(describeComponentGraphEditBlockers(blockers))
+      }
+    }
+
     await tx.product.update({
       where: { id },
       data: {
@@ -980,20 +1012,10 @@ export async function updateProduct(
     })
 
     if (revalidated.clearComponents) {
-      // o3d-4kfh r4: converting a KIT to a non-component type deletes its components, which is the
-      // SAME retroactive rewrite as re-composing it — every in-flight order for that kit stops
-      // expanding into components and starts requiring the parent as a leaf. Guarded identically to
-      // saveProductComponents.
-      //
-      // NOTE this path deliberately holds only its per-SKU lock, not the coarse component-graph
-      // advisory one (taking that here would invert the lock order — see lib/db/advisory-locks.ts),
-      // so the check is not atomic against an allocation committing in the same instant. The
-      // graph-aware committed-coverage check that now runs at every shipment transition including
-      // dispatch is the atomic backstop for that window.
-      const blockers = await findComponentGraphEditBlockers(tx, id)
-      if (blockers.length > 0) {
-        throw new ComponentGraphInFlightSalesError(describeComponentGraphEditBlockers(blockers))
-      }
+      // Converting a component-bearing type to a non-component one deletes its components. When
+      // that loses KIT-ness the `kitnessMutation` guard above already refused, BEFORE the type was
+      // written; BOM -> SIMPLE reaches here unguarded on purpose, because fulfilment never expanded
+      // that BOM's components and deleting them changes no sales line's requirements.
       await tx.productComponent.deleteMany({ where: { productId: id } })
     }
 
@@ -1380,19 +1402,26 @@ export async function saveProductComponents(
       if (current.sku !== _sku) return 'moved' as const
       if (current.type !== 'KIT' && current.type !== 'BOM') return 'not-component-bearing' as const
 
-      // o3d-4kfh r4 (Codex finding 1): REFUSE WHILE SALES WORK IS IN FLIGHT AGAINST THIS GRAPH.
+      // o3d-4kfh r5: REFUSE EARLY WHILE SALES WORK IS IN FLIGHT AGAINST THIS GRAPH.
       //
       // Every fulfilment consumer expands the CURRENT component graph, so re-composing a KIT that
       // an order has already allocated or picked retroactively changes what that order requires —
-      // and no downstream check could see it: the flat committed-coverage backstop compares per
+      // and no FLAT check can see it: the committed-coverage backstop compares per
       // (line, warehouse, product), the dispatch cap only rejects leaves that EXCEED demand, and
-      // whole-kit coverage credits the half-kit that ships. The result was a dispatched incomplete
-      // kit that the census reported as healthy.
+      // whole-kit coverage credits the half-kit that ships.
       //
-      // Inside the transaction and under the same advisory graph lock as the write, so an
-      // allocation cannot commit between the check and the edit. See the guard module for why only
-      // KIT-typed ancestors are affected, and why a PENDING draft alone does not block.
-      const blockers = await findComponentGraphEditBlockers(tx, productId)
+      // BEST-EFFORT, NOT ATOMIC (r5 Codex finding 2). This transaction holds the component-graph
+      // advisory lock, but `allocateSalesOrder`, `confirmSalesOrderShipments` and PENDING -> PICKING
+      // take no such lock, so under MVCC an allocation can be committing against the OLD graph in
+      // parallel with this check and this edit. The atomic guarantee is
+      // `validateCommittedShipmentCoverage`, which runs under the sales order's row lock at every
+      // shipment transition including dispatch. A graph-version CAS is filed as o3d-57b0.
+      //
+      // `kind: 'components'` — this path never changes the type, so on a BOM it is a no-op by
+      // construction: fulfilment never reads a BOM's component list (r5 Codex finding 6), and a
+      // manufacturing recipe edit must not be refused for a sales reason.
+      const componentMutation = { kind: 'components' as const, currentType: current.type }
+      const blockers = await findComponentGraphEditBlockers(tx, productId, componentMutation)
       if (blockers.length > 0) return { kind: 'in-flight-sales' as const, blockers }
 
       await tx.productComponent.deleteMany({ where: { productId } })

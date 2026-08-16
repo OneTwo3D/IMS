@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import test from 'node:test'
 
 import { reconcilePendingShipments } from '@/lib/domain/sales/pending-shipment-reconciliation'
@@ -28,10 +30,27 @@ type Committed = { lineId: string; productId: string; warehouseId: string; qty: 
 function client(fixture: { drafts: Draft[]; allocations: Allocation[]; committed?: Committed[] }) {
   const state = { drafts: [...fixture.drafts] }
   const calls = { orderAllocationReads: 0, committedReads: 0 }
+  const activity: Array<Record<string, unknown>> = []
+  // o3d-4kfh r5 (finding 7): the audit row and the delete must land in ONE transaction, in that
+  // order. Recording the interleaving is the only way a double can tell "written first" from
+  // "written afterwards, when the rows it describes are already gone".
+  const writeOrder: string[] = []
   return {
     calls,
     state,
+    activity,
+    writeOrder,
     client: {
+      salesOrder: {
+        findUnique: async () => ({ orderNumber: 'SO-1', externalOrderNumber: null }),
+      },
+      activityLog: {
+        create: async ({ data }: { data: Record<string, unknown> }) => {
+          activity.push(data)
+          writeOrder.push('activityLog.create')
+          return data
+        },
+      },
       shipment: {
         findMany: async ({ where }: { where: { orderId: string; status: string } }) => {
           assert.equal(where.status, 'PENDING', 'only PENDING drafts may ever be considered')
@@ -47,6 +66,7 @@ function client(fixture: { drafts: Draft[]; allocations: Allocation[]; committed
             }))
         },
         deleteMany: async ({ where }: { where: { id: { in: string[] } } }) => {
+          writeOrder.push('shipment.deleteMany')
           const before = state.drafts.length
           state.drafts = state.drafts.filter((draft) => !where.id.in.includes(draft.id))
           return { count: before - state.drafts.length }
@@ -96,7 +116,7 @@ test('o3d-4kfh r4: two drafts on the same scope are charged OLDEST-FIRST, so the
     ],
   })
 
-  const result = await reconcilePendingShipments(harness.client, 'order-1')
+  const result = await reconcilePendingShipments(harness.client, 'order-1', { cause: 'a test mutation' })
 
   assert.deepEqual(result.retired.map((row) => row.id), ['younger'])
   assert.equal(result.retainedCount, 1)
@@ -115,7 +135,7 @@ test('o3d-4kfh r4: a DOOMED draft does not consume open quantity on its way out'
     ],
   })
 
-  const result = await reconcilePendingShipments(harness.client, 'order-1')
+  const result = await reconcilePendingShipments(harness.client, 'order-1', { cause: 'a test mutation' })
 
   assert.deepEqual(result.retired.map((row) => row.id), ['older'])
   assert.deepEqual(harness.state.drafts.map((row) => row.id), ['younger'])
@@ -130,7 +150,7 @@ test('o3d-4kfh r4: COMMITTED quantity is subtracted before any draft is charged'
     drafts: [draft('d1', 6)],
   })
 
-  const result = await reconcilePendingShipments(harness.client, 'order-1')
+  const result = await reconcilePendingShipments(harness.client, 'order-1', { cause: 'a test mutation' })
 
   assert.deepEqual(result.retired.map((row) => row.id), ['d1'])
 })
@@ -159,7 +179,7 @@ test('o3d-4kfh r4: a MULTI-LINE draft is retired WHOLE when any one line is shor
     }],
   })
 
-  const result = await reconcilePendingShipments(harness.client, 'order-1')
+  const result = await reconcilePendingShipments(harness.client, 'order-1', { cause: 'a test mutation' })
 
   assert.deepEqual(result.retired, [{
     id: 'd1',
@@ -181,7 +201,7 @@ test('o3d-4kfh r4: an allocation in a DIFFERENT warehouse does not back a draft'
     drafts: [draft('d1', 4, { warehouseId: 'w1' })],
   })
 
-  const result = await reconcilePendingShipments(harness.client, 'order-1')
+  const result = await reconcilePendingShipments(harness.client, 'order-1', { cause: 'a test mutation' })
 
   assert.deepEqual(result.retired.map((row) => row.id), ['d1'])
 })
@@ -190,28 +210,126 @@ test('o3d-4kfh r4: no drafts means no reads and no writes at all', async () => {
   // The cheap path matters: this runs on every allocation rewrite, including the 15-minute sweep.
   const harness = client({ allocations: [], drafts: [] })
 
-  const result = await reconcilePendingShipments(harness.client, 'order-1')
+  const result = await reconcilePendingShipments(harness.client, 'order-1', { cause: 'a test mutation' })
 
   assert.deepEqual(result, { retired: [], retainedCount: 0 })
   assert.equal(harness.calls.orderAllocationReads, 0, 'nothing is loaded when there is nothing to judge')
   assert.equal(harness.calls.committedReads, 0)
 })
 
-test('o3d-4kfh r4: supplied rows are used verbatim, and then nothing is read', async () => {
-  // The in-memory shortcut the allocator uses (it has just written the rows itself). Same rule —
-  // this asserts it really is the same rule, and that supplying rows does not ALSO trigger a read
-  // that could disagree with them.
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r5 (Codex finding 3) — the rows are ALWAYS re-read; there is no supplied-rows shortcut.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r5: drafts are judged against the rows the CLIENT returns, at the persisted precision', async () => {
+  // The removed shortcut let `allocateSalesOrder` supply its in-memory, unrounded computation
+  // instead. OrderAllocation.qty is Decimal(12,4): a computed 0.33338 persists as 0.3334, and the
+  // draft holds the persisted 0.3334 because confirmSalesOrderShipments builds it from the row.
+  // Judged against 0.33338 the draft showed a 0.00002 shortage — twenty epsilons — and was deleted.
+  // Judged against what the client actually holds, it is backed exactly.
   const harness = client({
-    allocations: [{ lineId: 'line-1', productId: 'p1', warehouseId: 'w1', qty: 99 }],
-    drafts: [draft('d1', 4)],
+    allocations: [{ lineId: 'line-1', productId: 'p1', warehouseId: 'w1', qty: 0.3334 }],
+    drafts: [draft('d1', 0.3334, { trackingNumber: 'TRACK-1' })],
+  })
+
+  const result = await reconcilePendingShipments(harness.client, 'order-1', { cause: 'a re-allocation' })
+
+  assert.deepEqual(result.retired, [], 'the stored row backs the draft to the digit')
+  assert.equal(result.retainedCount, 1)
+  assert.equal(harness.calls.orderAllocationReads, 1, 'read, never told')
+  assert.equal(harness.calls.committedReads, 1)
+  assert.deepEqual(harness.state.drafts.map((row) => row.id), ['d1'])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r5 (Codex finding 7) — the retirement audit is durable with the deletion.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r5: the audit row is written on the SAME client, BEFORE the drafts are deleted', async () => {
+  const harness = client({
+    allocations: [{ lineId: 'line-1', productId: 'p1', warehouseId: 'w1', qty: 1 }],
+    drafts: [draft('d1', 4, { trackingNumber: 'TRACK-9', shippingService: 'DPD' })],
   })
 
   const result = await reconcilePendingShipments(harness.client, 'order-1', {
-    allocations: [{ lineId: 'line-1', productId: 'p1', warehouseId: 'w1', qty: 1 }],
-    committedShipmentLines: [],
+    cause: 'a manual allocation edit',
+    auditMetadata: { source: 'stock_adjustment' },
+    userId: 'user-1',
   })
 
-  assert.deepEqual(result.retired.map((row) => row.id), ['d1'], 'judged against the SUPPLIED rows, not the fixture\'s 99')
-  assert.equal(harness.calls.orderAllocationReads, 0)
-  assert.equal(harness.calls.committedReads, 0)
+  assert.deepEqual(result.retired.map((row) => row.id), ['d1'])
+  assert.deepEqual(
+    harness.writeOrder,
+    ['activityLog.create', 'shipment.deleteMany'],
+    'evidence first: a crash after the delete must not be able to lose the label id',
+  )
+  assert.equal(harness.activity.length, 1)
+  const entry = harness.activity[0] as {
+    userId: string | null
+    action: string
+    level: string
+    description: string
+    metadata: {
+      cause: string
+      source: string
+      retiredTrackingNumbers: string[]
+      retiredShipments: Array<{ shipmentId: string; trackingNumber: string | null }>
+    }
+  }
+  assert.equal(entry.action, 'pending_shipments_retired')
+  assert.equal(entry.level, 'WARNING')
+  assert.equal(entry.userId, 'user-1')
+  assert.equal(entry.metadata.cause, 'a manual allocation edit')
+  assert.equal(entry.metadata.source, 'stock_adjustment', 'caller context is merged, not dropped')
+  assert.deepEqual(entry.metadata.retiredTrackingNumbers, ['TRACK-9'])
+  assert.deepEqual(entry.metadata.retiredShipments, [{
+    shipmentId: 'd1',
+    warehouseId: 'w1',
+    trackingNumber: 'TRACK-9',
+    shippingService: 'DPD',
+    lineCount: 1,
+    totalQty: 4,
+  }])
+  assert.match(entry.description, /TRACK-9/, 'the operator can find the purchased label from the entry alone')
+})
+
+test('o3d-4kfh r5: nothing retired means no audit row at all', async () => {
+  const harness = client({
+    allocations: [{ lineId: 'line-1', productId: 'p1', warehouseId: 'w1', qty: 10 }],
+    drafts: [draft('d1', 4)],
+  })
+
+  const result = await reconcilePendingShipments(harness.client, 'order-1', { cause: 'a re-allocation' })
+
+  assert.equal(result.retainedCount, 1)
+  assert.deepEqual(harness.activity, [])
+  assert.deepEqual(harness.writeOrder, [], 'no delete and no record — the run changed nothing')
+})
+
+test('o3d-4kfh r5: the caller-supplied allocation shortcut is GONE from both the module and the allocator', async () => {
+  // The behavioural half of finding 3 lives where the rounding happens — see
+  // "a fractional KIT draft backed by its ROUNDED row survives the rewrite" in
+  // tests/domain/sales/allocation-service.test.ts, which is the test that goes red if the shortcut
+  // comes back. This pins the shortcut's ABSENCE at its own seam, because the defect was not a wrong
+  // rule but an extra parameter that let one caller bypass the persisted state.
+  const moduleSource = await readFile(
+    path.join(process.cwd(), 'lib/domain/sales/pending-shipment-reconciliation.ts'),
+    'utf8',
+  )
+  const allocatorSource = await readFile(
+    path.join(process.cwd(), 'lib/domain/sales/allocation-service.ts'),
+    'utf8',
+  )
+
+  assert.doesNotMatch(
+    moduleSource,
+    /options\.allocations|options\.committedShipmentLines/,
+    'the reconciler must read the rows, never be told them',
+  )
+  assert.doesNotMatch(
+    allocatorSource,
+    /allocations: persistedAllocations/,
+    'and the allocator must not hand over its unrounded in-memory computation',
+  )
 })

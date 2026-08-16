@@ -21,7 +21,10 @@ import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
-import { findComponentGraphEditBlockers } from '@/lib/products/component-graph-edit-guard'
+import {
+  componentGraphMutationAffectsFulfillment,
+  findComponentGraphEditBlockers,
+} from '@/lib/products/component-graph-edit-guard'
 
 /**
  * Product types that can own ProductComponent rows. The CSV import queues a row for the
@@ -514,6 +517,22 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             })
             if (!revalidated.ok) return { conflict: 'structure' as const }
 
+            // o3d-4kfh r5 (Codex finding 1): the KIT-ness guard runs BEFORE the type is written,
+            // and on EVERY KIT-ness change — not only the `clearComponents` ones. KIT <-> BOM keeps
+            // components (so clearComponents is false) while flipping whether fulfilment expands
+            // them, which is exactly the reinterpretation this refuses. Same reasoning as the
+            // editor; see app/actions/products.ts and the guard module for why this is best-effort
+            // rather than atomic (o3d-57b0).
+            const kitnessMutation = {
+              kind: 'kitness' as const,
+              currentType: current.type,
+              nextType: (updateData.type as ProductType | undefined) ?? current.type,
+            }
+            if (componentGraphMutationAffectsFulfillment(kitnessMutation)) {
+              const inFlight = await findComponentGraphEditBlockers(tx, existingProduct.id, kitnessMutation)
+              if (inFlight.length > 0) return { conflict: 'in-flight-sales' as const }
+            }
+
             if (categoryName) {
               resolvedCategoryId = await resolveImportedCategoryId(categoryName, tx)
             }
@@ -528,12 +547,8 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               },
             })
             if (revalidated.clearComponents) {
-              // o3d-4kfh r4: converting a KIT away from a component-bearing type deletes its
-              // components, which retroactively changes what every in-flight order for that kit
-              // requires. Refused for the same reason as the editor; reported as a row conflict so
-              // the rest of the import still lands.
-              const inFlight = await findComponentGraphEditBlockers(tx, existingProduct.id)
-              if (inFlight.length > 0) return { conflict: 'in-flight-sales' as const }
+              // Losing KIT-ness was already refused above, before the type moved. BOM -> SIMPLE
+              // reaches here unguarded on purpose: fulfilment never expanded that BOM's components.
               await tx.productComponent.deleteMany({ where: { productId: existingProduct.id } })
             }
             // The structure this row ACTUALLY committed, for the in-run cache below. The
@@ -551,9 +566,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           // every remaining row over one contended product.
           if (outcome.conflict === 'in-flight-sales') {
             result.errors.push(
-              `Row ${lineNum} (${sku}): this product's components could not be cleared because sales orders `
-              + 'are in flight against its component graph (allocated or picked/packed/shipped) — the row '
-              + 'was skipped rather than retroactively changing what those orders require',
+              `Row ${lineNum} (${sku}): this product's type could not be changed because sales orders are `
+              + 'still in flight against its component graph (holding allocations, or picking/packed '
+              + 'shipments) — changing whether it is a kit changes what those orders are deemed to require, '
+              + 'so the row was skipped. Dispatch, deallocate or cancel those orders and re-run; already '
+              + 'shipped, completed, delivered or cancelled orders do not block',
             )
             result.skipped++
             continue
@@ -850,12 +867,18 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId), tx)
             if (cycle.kind !== 'ok') return false
 
-            // o3d-4kfh r4: same in-flight sales refusal as the editor. A bulk CSV pass is not a
-            // licence to retroactively rewrite what an already-allocated or already-picked order
+            // o3d-4kfh r5: same in-flight sales refusal as the editor. A bulk CSV pass is not a
+            // licence to retroactively rewrite what an already-allocated or already-picking order
             // requires — the corruption it produces (an incomplete kit dispatched, credited as a
             // partial kit, reported by nothing) is identical however the graph was edited. Reported
             // per row rather than aborting the import, so the remaining rows still land.
-            const inFlight = await findComponentGraphEditBlockers(tx, productId)
+            //
+            // `kind: 'components'` with the type read under the lock: on a BOM this is a no-op, so a
+            // CSV that maintains manufacturing recipes is no longer refused for a sales reason.
+            const inFlight = await findComponentGraphEditBlockers(tx, productId, {
+              kind: 'components',
+              currentType: current.type,
+            })
             if (inFlight.length > 0) return 'in-flight-sales' as const
 
             await tx.productComponent.deleteMany({ where: { productId } })
@@ -871,9 +894,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           })
           if (wrote === 'in-flight-sales') {
             result.errors.push(
-              `Row ${cr.lineNum}: ${cr.sku} has sales orders in flight against its component graph `
-              + '(allocated or picked/packed/shipped) — components were not written, because changing '
-              + 'them would retroactively change what those orders require',
+              `Row ${cr.lineNum}: ${cr.sku} has sales orders still in flight against its component graph `
+              + '(holding allocations, or picking/packed shipments) — components were not written, because '
+              + 'changing them would retroactively change what those orders require. Dispatch, deallocate '
+              + 'or cancel those orders and re-run; already shipped, completed, delivered or cancelled '
+              + 'orders do not block',
             )
             continue
           }

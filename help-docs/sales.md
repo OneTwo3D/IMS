@@ -74,9 +74,15 @@ covers are left exactly as they are, including any tracking number and shipping 
 them.
 
 Retirement is recorded in the activity log with the shipment's id, warehouse, line count, quantity
-and tracking number. If a retired draft already carried a tracking number, the label was bought
-outside IMS and IMS no longer references it — **cancel it with the carrier if it was not used**. Once
-the allocations are right again, run **Confirm for Picking** to rebuild the drafts.
+and tracking number. The record is written in the *same database transaction* as the deletion, so
+there is no window in which a draft can disappear without leaving its identity behind. If a retired
+draft already carried a tracking number, the label was bought outside IMS and IMS no longer
+references it — **cancel it with the carrier if it was not used**. Once the allocations are right
+again, run **Confirm for Picking** to rebuild the drafts.
+
+Because a retained draft is genuinely harmless, an order carrying nothing but Pending drafts is still
+eligible for automatic backorder allocation — that is what repairs a kit whose sibling component was
+trimmed by a stock decrease. An order holding a Picking, Packed or Shipped shipment is not.
 
 Shipments that are already Picking, Packed or Shipped are commitments, not drafts: they are never
 retired this way, and allocation edits that would leave them uncovered are refused instead.

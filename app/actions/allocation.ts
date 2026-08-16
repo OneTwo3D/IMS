@@ -32,9 +32,7 @@ import {
 } from '@/lib/domain/sales/allocation-service'
 import {
   EMPTY_PENDING_SHIPMENT_RECONCILIATION,
-  describeRetiredPendingShipments,
   reconcilePendingShipments,
-  retiredPendingShipmentMetadata,
   type RetiredPendingShipment,
 } from '@/lib/domain/sales/pending-shipment-reconciliation'
 import {
@@ -122,38 +120,18 @@ async function requireAuth() {
 }
 
 /**
- * o3d-4kfh r4: ONE activity entry per mutation that retired PENDING drafts, carrying enough
- * identity to act on it.
+ * o3d-4kfh r5 (Codex finding 7): THE RETIREMENT ENTRY IS NO LONGER WRITTEN HERE.
  *
- * The rebalancer used to log a bare `count`, which is unusable: a draft can already carry a
- * tracking number and a shipping service (typed in by an operator, or written back by a carrier
- * integration), and once the row is deleted a count tells nobody WHICH label was bought or which
- * warehouse it shipped from. Every retirement site logs through here so the shape cannot drift.
+ * It used to be: every caller deleted the drafts inside its transaction and then wrote the activity
+ * entry after the commit, through `logActivity` — which swallows persistence failures by design. A
+ * crash or a failed insert in that window permanently lost the shipment id and tracking number an
+ * operator needs to cancel a purchased label, which is the exact recovery path this branch
+ * advertises. `reconcilePendingShipments` now writes the record through the SAME transaction
+ * client, immediately before the delete, so the evidence and the deletion commit together or not at
+ * all. Callers pass the `cause` (and their session user) down instead of narrating afterwards.
  *
- * Silent when nothing was retired — the o3d-i5it "changed nothing, said nothing" property.
+ * The returned `retiredPendingShipments` are still surfaced to the UI; only the logging moved.
  */
-async function logRetiredPendingShipments(
-  orderId: string,
-  orderRef: string,
-  retired: RetiredPendingShipment[],
-  cause: string,
-) {
-  if (retired.length === 0) return
-  const carryingLabels = retired.filter((row) => row.trackingNumber).length
-  await logActivity({
-    entityType: 'SALES_ORDER',
-    entityId: orderId,
-    action: 'pending_shipments_retired',
-    tag: 'sales',
-    level: 'WARNING',
-    description: `Retired ${retired.length} pending shipment(s) for order ${orderRef} that ${cause} left unbacked`
-      + (carryingLabels > 0
-        ? ` — ${carryingLabels} carried a tracking number that IMS no longer references, cancel the label(s) with the carrier if unused`
-        : '')
-      + `: ${describeRetiredPendingShipments(retired)}`,
-    metadata: { cause, ...retiredPendingShipmentMetadata(retired) },
-  })
-}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -309,6 +287,10 @@ export async function autoAllocateOrder(
     internalBypassToken?: symbol
     deferStockSync?: boolean
     refuseIfShipmentsExist?: boolean
+    // o3d-4kfh r5: the narrower refusal — decline only on a COMMITTED (non-PENDING) shipment, so an
+    // order whose only shipments are PENDING drafts can still be rebuilt (the reconciler retires
+    // exactly the drafts the rewrite unbacks). See AllocateSalesOrderInput.refuseIfCommittedShipmentsExist.
+    refuseIfCommittedShipmentsExist?: boolean
     // o3d-67y (Codex r11): resolve a durable backstop INSIDE the allocation tx (committed path only) so a
     // redundant re-allocation can't run in the commit→resolve window. See AllocateSalesOrderInput.onReconciledInTx.
     onReconciledInTx?: (tx: Prisma.TransactionClient) => Promise<void>
@@ -353,6 +335,7 @@ export async function autoAllocateOrder(
     const allocationResult = await allocateSalesOrder(db, {
       orderId,
       refuseIfShipmentsExist: options?.refuseIfShipmentsExist,
+      refuseIfCommittedShipmentsExist: options?.refuseIfCommittedShipmentsExist,
       onReconciledInTx: options?.onReconciledInTx,
       requireStatusUnderLock: options?.requireStatusUnderLock,
     })
@@ -417,14 +400,6 @@ export async function autoAllocateOrder(
         },
       })
     }
-    // Outside the logAttempt branch on purpose: a rewrite can retire a draft on a run that is
-    // otherwise unremarkable, and the retirement is the part an operator has to know about.
-    await logRetiredPendingShipments(
-      orderId,
-      allocationResult.orderRef ?? orderId.slice(0, 8),
-      allocationResult.retiredPendingShipments ?? [],
-      'a re-allocation of the order',
-    )
     if (!allocationResult.success) {
       if (!options?.deferStockSync && allocationResult.syncProductIds.length > 0) {
         try {
@@ -487,7 +462,7 @@ export async function updateAllocation(
   newQty: number,
 ): Promise<{ success: boolean; error?: string; retiredPendingShipments?: RetiredPendingShipment[] }> {
   try {
-    await requirePermission('sales.process')
+    const session = await requirePermission('sales.process')
     const alloc = await db.orderAllocation.findUnique({
       where: { id: allocationId },
       include: { line: { select: { qty: true } }, order: { select: { orderNumber: true, externalOrderNumber: true } } },
@@ -689,7 +664,10 @@ export async function updateAllocation(
       // Runs AFTER the allocation write and reads live state, so what it judges is the post-edit
       // truth. Same shared rule as the allocator, the deallocation teardown and the rebalancer —
       // a draft the edit still backs is left completely alone (including its tracking number).
-      pendingShipmentReconciliation = await reconcilePendingShipments(tx, locked.orderId)
+      pendingShipmentReconciliation = await reconcilePendingShipments(tx, locked.orderId, {
+        cause: 'a manual allocation edit',
+        userId: session.user.id,
+      })
 
       const integrityError = await validateAllocationIntegrity(tx, locked.orderId, [locked.lineId])
       if (integrityError) throw new Error(integrityError)
@@ -705,12 +683,6 @@ export async function updateAllocation(
       description: `Updated allocation for order ${alloc.order.orderNumber ?? alloc.order.externalOrderNumber}`,
       metadata: { allocationId, newWarehouseId, newQty },
     })
-    await logRetiredPendingShipments(
-      alloc.orderId,
-      alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8),
-      pendingShipmentReconciliation.retired,
-      'a manual allocation edit',
-    )
     try {
       await enqueueStockSync([alloc.productId], 'IMS_CHANGE')
     } catch (syncError) {
@@ -813,7 +785,7 @@ export async function addAllocation(
 
 export async function deallocateOrder(orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('sales.process')
+    const session = await requirePermission('sales.process')
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: { orderNumber: true, externalOrderNumber: true, status: true },
@@ -825,7 +797,10 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       // o3d-4kfh: the DEALLOCATION variant, which refuses outright while any non-PENDING shipment
       // exists rather than releasing the reservation out from under it (and deleting the allocation
       // identity the accounting sub-ledger resolves through).
-      const released = await releaseOrderAllocationsForDeallocationInTx(tx, orderId)
+      const released = await releaseOrderAllocationsForDeallocationInTx(tx, orderId, {
+        cause: 'deallocating the order',
+        userId: session.user.id,
+      })
 
       if (so.status === 'ALLOCATED') {
         // Re-read rather than assume: the guard above has already established there is no
@@ -883,12 +858,6 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         deletedPendingShipmentCount: deallocationResult.deletedPendingShipmentCount,
       },
     })
-    await logRetiredPendingShipments(
-      orderId,
-      so.orderNumber ?? so.externalOrderNumber ?? orderId.slice(0, 8),
-      deallocationResult.retiredPendingShipments,
-      'deallocating the order',
-    )
     try {
       const syncTargets = [...new Set(deallocationResult.allocs.map((alloc) => alloc.productId))]
       await enqueueStockSync(syncTargets, 'IMS_CHANGE')

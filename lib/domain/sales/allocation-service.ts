@@ -45,6 +45,27 @@ export type AllocateSalesOrderInput = {
   orderId: string
   refuseIfShipmentsExist?: boolean
   /**
+   * o3d-4kfh r5 (Codex finding 4): the NARROWER refusal — decline only when a COMMITTED
+   * (non-PENDING) shipment exists, and proceed when the order's only shipments are PENDING drafts.
+   *
+   * `refuseIfShipmentsExist` predates `reconcilePendingShipments`. It exists because rebuilding
+   * `OrderAllocation` while leaving stale draft ShipmentLines behind produced a dispatch against
+   * rows that no longer matched. That hazard is now closed at the source: every allocation rewrite
+   * reconciles the drafts against the rows it just wrote, retiring exactly the ones it unbacked and
+   * leaving the rest — with their tracking metadata — alone.
+   *
+   * Keeping the blanket refusal after that turned a fix into a trap: the overallocation rebalancer
+   * releases ONE (product, warehouse) row at a time, so trimming leaf A of an A+B kit leaves sibling
+   * B disproportionate, and its post-release FIFO pass is what is supposed to rebuild the order. The
+   * selective reconciler now RETAINS an unrelated still-backed PENDING draft — and that retained
+   * draft made the rebuild refuse, stranding B's reservation until it failed integrity at
+   * confirm-for-picking. The flat census does not report it.
+   *
+   * A non-PENDING shipment still refuses: those are commitments, and rebuilding rows underneath one
+   * is the original hazard.
+   */
+  refuseIfCommittedShipmentsExist?: boolean
+  /**
    * o3d-67y (Codex review r11): run INSIDE the allocation transaction, after reservations are mutated and
    * immediately before it commits, ONLY on the committed (non-refused) path. Lets the caller atomically mark a
    * durable backstop resolved so a redundant, non-idempotent re-allocation cannot run in the window between the
@@ -399,6 +420,12 @@ export type ReleaseOrderAllocationsResult = {
 export async function releaseOrderAllocationsInTx(
   tx: Prisma.TransactionClient,
   orderId: string,
+  /**
+   * o3d-4kfh r5: who/what to attribute the draft retirement to. The audit row is written inside
+   * this transaction now (see `reconcilePendingShipments`), so the cause must arrive with the call
+   * rather than being narrated by the caller after the commit.
+   */
+  audit: { cause?: string; userId?: string | null } = {},
 ): Promise<ReleaseOrderAllocationsResult> {
   await resetAllocationAccountingIfStaged(tx, orderId)
   const currentAllocs = await tx.orderAllocation.findMany({
@@ -465,7 +492,10 @@ export async function releaseOrderAllocationsInTx(
   // The allocation rows are deleted FIRST so the shared helper reads the true post-teardown state
   // (zero open quantity everywhere) rather than being told what to conclude.
   await tx.orderAllocation.deleteMany({ where: { orderId } })
-  const pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId)
+  const pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
+    cause: audit.cause ?? 'a release of the order’s allocations',
+    userId: audit.userId ?? null,
+  })
 
   return {
     allocations,
@@ -505,6 +535,7 @@ export async function releaseOrderAllocationsInTx(
 export async function releaseOrderAllocationsForDeallocationInTx(
   tx: Prisma.TransactionClient,
   orderId: string,
+  audit: { cause?: string; userId?: string | null } = {},
 ): Promise<ReleaseOrderAllocationsResult> {
   const committedShipments = await tx.shipment.findMany({
     where: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } },
@@ -528,7 +559,10 @@ export async function releaseOrderAllocationsForDeallocationInTx(
       + 'Dispatch those shipments, or cancel the whole order.',
     )
   }
-  return releaseOrderAllocationsInTx(tx, orderId)
+  return releaseOrderAllocationsInTx(tx, orderId, {
+    cause: audit.cause ?? 'deallocating the order',
+    userId: audit.userId ?? null,
+  })
 }
 
 export async function updateSalesOrderStatusUnderLock(
@@ -1312,9 +1346,16 @@ export async function allocateSalesOrder(
     })
     const lockedStatus = locked?.status ?? so.status
 
-    if (input.refuseIfShipmentsExist) {
+    if (input.refuseIfShipmentsExist || input.refuseIfCommittedShipmentsExist) {
       const shipmentExists = await tx.shipment.findFirst({
-        where: { orderId },
+        where: {
+          orderId,
+          // o3d-4kfh r5: the narrow flag ignores PENDING drafts entirely — `reconcilePendingShipments`
+          // below handles them selectively. Both flags set means the strict one wins.
+          ...(input.refuseIfShipmentsExist
+            ? {}
+            : { status: { not: UNCOMMITTED_SHIPMENT_STATUS } }),
+        },
         select: { id: true },
       })
       if (shipmentExists) {
@@ -1704,11 +1745,18 @@ export async function allocateSalesOrder(
       // a stock-event re-run) that changed nothing about that warehouse.
       //
       // o3d-4kfh r4: the rule now lives in ONE place (`reconcilePendingShipments`) and all four
-      // mutation paths call it. The rows are passed in rather than re-read purely because this
-      // path has just written them itself; the rule applied is identical.
+      // mutation paths call it.
+      //
+      // o3d-4kfh r5 (Codex finding 3): AND IT RE-READS. This call used to hand over the in-memory
+      // `persistedAllocations` on the grounds that the rows had just been written from them. They
+      // had not been written FAITHFULLY: `OrderAllocation.qty` is Decimal(12,4), so a fractional
+      // KIT quantity of 0.33335 lands as 0.3334. Reconciling the stored 0.3334 draft against the
+      // in-memory 0.33335 showed a 0.00005 shortage — fifty times the 0.000001 epsilon — and
+      // deleted a draft the persisted row backed exactly, along with any label on it. The rounded
+      // rows are the only ones Start Picking and dispatch will ever see, so they are the only ones
+      // worth judging against.
       pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
-        allocations: persistedAllocations,
-        committedShipmentLines: committedAllocationLines,
+        cause: 'a re-allocation of the order',
       })
     }
 

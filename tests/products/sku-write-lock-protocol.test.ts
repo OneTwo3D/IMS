@@ -115,7 +115,10 @@ test('the CSV rename path re-validates structure under its locks (o3d-42hw)', as
   const source = await readFile(IMPORT_ACTIONS, 'utf8')
   const renameAt = source.indexOf('lockProductSkusForWrite(tx, [sku, existingProduct.sku])')
   assert.notEqual(renameAt, -1, 'the CSV rename must lock BOTH the old and the new sku')
-  const body = source.slice(renameAt, renameAt + 3400)
+  // o3d-4kfh r5: widened because the KIT-ness guard now sits between the re-validation and the
+  // write. The window must still END inside this transaction, or the assertions below could be
+  // satisfied by an unrelated later block.
+  const body = source.slice(renameAt, renameAt + 4600)
 
   assert.match(body, /validateProductStructureChange\(/, 'the rename must re-validate under the locks')
   assert.match(body, /client: tx/, 'the re-validation must run against tx, or it re-reads pre-lock state')

@@ -140,9 +140,21 @@ function decimalLikeToNumber(value: number | { toNumber(): number } | undefined)
  *  merely ending with equal row values — a delete+recreate leaves those identical. */
 const writeCounts = { allocationCreates: 0, allocationDeletes: 0 }
 
+/**
+ * o3d-4kfh r5 (Codex finding 7): the draft-retirement audit row is written THROUGH THE
+ * TRANSACTION CLIENT now, not by a post-commit `logActivity` that swallows its own failures. The
+ * double therefore has to offer `activityLog.create` — and it records the interleaving with
+ * `shipment.deleteMany`, because "written in the same transaction" is worth nothing if it is
+ * written after the rows it describes have already gone.
+ */
+const activityLogWrites: Array<Record<string, unknown>> = []
+const txWriteOrder: string[] = []
+
 function createClient(state: MemoryState): AllocationServiceClient {
   writeCounts.allocationCreates = 0
   writeCounts.allocationDeletes = 0
+  activityLogWrites.length = 0
+  txWriteOrder.length = 0
   const allocations = state.allocations ?? []
   const shipments = state.shipments ?? []
   const shipmentLines = state.shipmentLines ?? []
@@ -316,8 +328,30 @@ function createClient(state: MemoryState): AllocationServiceClient {
             .filter((line) => line.shipmentId === shipment.id)
             .map((line) => ({ lineId: line.lineId, productId: line.productId, qty: line.qty })),
         })),
-      findFirst: async ({ where }: { where: { orderId: string; shipmentJournalDate?: { not: null }; status?: string; OR?: Array<{ shipmentJournalDate?: { not: null }; status?: string }> } }) => {
-        const rows = shipments.filter((shipment) => shipment.orderId === where.orderId)
+      // o3d-4kfh r5: the `status` predicate is HONOURED here, including the `{ not }` shape. It was
+      // not — the fallthrough returned the first shipment on the order whatever its status — so the
+      // narrow `refuseIfCommittedShipmentsExist` refusal read as firing on a PENDING draft when
+      // production would have ignored it. A double that answers a filtered question with an
+      // unfiltered row set cannot tell a working filter from a missing one.
+      findFirst: async ({ where }: {
+        where: {
+          orderId: string
+          shipmentJournalDate?: { not: null }
+          status?: string | { not?: string; in?: string[] }
+          OR?: Array<{ shipmentJournalDate?: { not: null }; status?: string }>
+        }
+      }) => {
+        const statusMatches = (shipment: ShipmentRow) => {
+          if (where.status == null) return true
+          const status = shipment.status ?? 'PENDING'
+          if (typeof where.status === 'string') return status === where.status
+          if (where.status.not != null) return status !== where.status.not
+          if (where.status.in != null) return where.status.in.includes(status)
+          return true
+        }
+        const rows = shipments
+          .filter((shipment) => shipment.orderId === where.orderId)
+          .filter(statusMatches)
         const matchesClause = (clause: { shipmentJournalDate?: { not: null }; status?: string }, shipment: ShipmentRow) => {
           if (clause.shipmentJournalDate?.not === null) return shipment.shipmentJournalDate != null
           if (clause.status !== undefined) return shipment.status === clause.status
@@ -339,6 +373,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
       deleteMany: async ({ where }: {
         where: { orderId?: string; status?: string | { in: string[] }; id?: { in: string[] } }
       }) => {
+        txWriteOrder.push('shipment.deleteMany')
         const before = shipments.length
         for (let index = shipments.length - 1; index >= 0; index -= 1) {
           const shipment = shipments[index]
@@ -401,6 +436,13 @@ function createClient(state: MemoryState): AllocationServiceClient {
     },
     accountingEventLog: {
       createMany: async () => ({ count: 0 }),
+    },
+    activityLog: {
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        activityLogWrites.push(data)
+        txWriteOrder.push('activityLog.create')
+        return data
+      },
     },
   }
 
@@ -2486,4 +2528,185 @@ test('o3d-4kfh r3: a rewrite KEEPS a PENDING draft the new set still covers', as
     'the draft is still backed by the new set and must not be thrown away',
   )
   assert.equal((state.shipmentLines ?? []).length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r5 (Codex finding 3) — the reconciler must judge drafts against the PERSISTED rows.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r5: a fractional KIT draft backed by its ROUNDED row survives the rewrite', async () => {
+  // The defect: `allocateSalesOrder` handed `reconcilePendingShipments` its in-memory
+  // `persistedAllocations` on the grounds that it had just written them. It had not written THOSE
+  // values — OrderAllocation.qty is Decimal(12,4), so a computed 0.33338 lands as 0.3334. The draft
+  // holds what the ROW holds (0.3334, because confirmSalesOrderShipments builds it from the row);
+  // reconciled against the unrounded 0.33338 it showed a 0.00002 shortage, twenty times the
+  // 0.000001 epsilon, and the whole draft — tracking number included — was deleted.
+  //
+  // The double rounds on write exactly as numeric(12,4) does (`persistAllocationQty`), so this is
+  // the production arithmetic and not a fixture convenience.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      lines: [{
+        id: 'line-1',
+        productId: 'kit-1',
+        qty: 1,
+        sku: 'KIT-1',
+        description: 'Kit 1',
+        product: { id: 'kit-1', sku: 'KIT-1', type: 'KIT', oversellAllowed: false },
+      }],
+    },
+    products: [{
+      id: 'kit-1',
+      type: 'KIT',
+      productComponents: [{ componentId: 'component-1', qty: 0.33338, componentType: 'SIMPLE' }],
+    }],
+    stockLevels: [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 0.3334 }],
+    // The persisted row, at the precision the column can actually hold.
+    allocations: [{
+      orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 0.3334,
+    }],
+    shipments: [{
+      id: 'draft-1', orderId: 'order-1', status: 'PENDING', warehouseId: 'warehouse-1',
+      trackingNumber: 'TRACK-FRACTIONAL', shippingService: 'DPD', createdAt: '2026-01-01T00:00:00Z',
+      shipmentJournalDate: null,
+    }],
+    shipmentLines: [{ shipmentId: 'draft-1', lineId: 'line-1', productId: 'component-1', qty: 0.3334 }],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  // The rewrite branch really did run: `allocationSetsMatch` is exact (o3d-i4qd), so 0.3334 vs the
+  // recomputed 0.33338 reads as a change and the rows are deleted and recreated.
+  assert.equal(writeCounts.allocationCreates, 1, 'the rewrite branch ran, so the reconciler was reached')
+  assert.equal(state.allocations?.[0]?.qty, 0.3334, 'and re-persisted at the column precision')
+  assert.deepEqual(
+    (state.shipments ?? []).map((shipment) => shipment.id),
+    ['draft-1'],
+    'the draft is exactly backed by the stored row and must survive',
+  )
+  assert.equal((state.shipmentLines ?? []).length, 1, 'with its lines, and its label metadata, intact')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r5 (Codex finding 7) — the retirement audit row is durable with the deletion.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r5: the retirement audit row is written through the SAME client, BEFORE the delete', async () => {
+  // Every caller used to log this after the transaction committed, through `logActivity`, which
+  // swallows persistence failures. A crash in that window permanently destroyed the shipment id and
+  // tracking number an operator needs to cancel a purchased label.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 10,
+    dispatchedQty: 10,
+    shipmentStatus: 'PENDING',
+    otherOrderQty: 3,
+    quantity: 8,
+    reservedQty: 13,
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(activityLogWrites.length, 1, 'exactly one retirement record, written on the tx client')
+  const entry = activityLogWrites[0] as {
+    action: string
+    entityId: string
+    metadata: { cause: string; retiredShipments: Array<{ shipmentId: string }> }
+  }
+  assert.equal(entry.action, 'pending_shipments_retired')
+  assert.equal(entry.entityId, 'order-1')
+  assert.equal(entry.metadata.cause, 'a re-allocation of the order')
+  assert.equal(entry.metadata.retiredShipments.length, 1, 'carrying the identity, not a bare count')
+  assert.deepEqual(
+    txWriteOrder,
+    ['activityLog.create', 'shipment.deleteMany'],
+    'the evidence is persisted BEFORE the rows it describes are destroyed',
+  )
+})
+
+test('o3d-4kfh r5: a rewrite that retires nothing writes no audit row', async () => {
+  // The o3d-i5it property, restated for the audit trail: a run that changed nothing must say
+  // nothing. An unconditional record would drown the real ones every 15 minutes.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 7,
+    dispatchedQty: 7,
+    shipmentStatus: 'PENDING',
+    otherOrderQty: 3,
+    quantity: 13,
+    reservedQty: 10,
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(activityLogWrites.length, 0)
+  assert.deepEqual(txWriteOrder, [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r5 (Codex finding 4) — refuseIfCommittedShipmentsExist.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r5: refuseIfCommittedShipmentsExist ALLOWS an order whose only shipment is a PENDING draft', async () => {
+  // The rebalancer's repair path. Its post-release FIFO pass sets this flag; under the old blanket
+  // `refuseIfShipmentsExist` a RETAINED, still-backed draft (which the selective reconciler now
+  // deliberately keeps) made the repair refuse, stranding the disproportionate sibling leaf.
+  const state = baseState({
+    shipments: [{
+      id: 'draft-1', orderId: 'order-1', status: 'PENDING', warehouseId: 'warehouse-1',
+      trackingNumber: 'TRACK-RETAINED', createdAt: '2026-01-01T00:00:00Z', shipmentJournalDate: null,
+    }],
+    // A draft the rebuilt rows still back completely — the case the rebalancer strands.
+    shipmentLines: [{ shipmentId: 'draft-1', lineId: 'line-1', productId: 'product-1', qty: 3 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    refuseIfCommittedShipmentsExist: true,
+  })
+
+  assert.equal(result.refused, undefined, 'a draft is not a commitment and must not refuse the rebuild')
+  assert.equal(result.allocationCount, 1, 'the order really was allocated (3 units on one row)')
+  assert.deepEqual(
+    (state.shipments ?? []).map((shipment) => shipment.id),
+    ['draft-1'],
+    'and the still-backed draft is kept, tracking number and all',
+  )
+})
+
+test('o3d-4kfh r5: refuseIfCommittedShipmentsExist still REFUSES on a PICKING shipment', async () => {
+  const state = baseState({
+    shipments: [{
+      id: 'ship-1', orderId: 'order-1', status: 'PICKING', warehouseId: 'warehouse-1',
+      createdAt: '2026-01-01T00:00:00Z', shipmentJournalDate: null,
+    }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    refuseIfCommittedShipmentsExist: true,
+  })
+
+  assert.equal(result.refused, true, 'rebuilding rows underneath a commitment is the original hazard')
+  assert.equal(result.error, 'Order has existing shipments; reallocation refused')
+})
+
+test('o3d-4kfh r5: the strict refuseIfShipmentsExist still refuses on a PENDING draft', async () => {
+  // The narrow flag is additive. Every existing caller (the sweep, pre-fulfilment reallocation, the
+  // refund release outbox) keeps the blanket behaviour it was written against.
+  const state = baseState({
+    shipments: [{
+      id: 'draft-1', orderId: 'order-1', status: 'PENDING', warehouseId: 'warehouse-1',
+      createdAt: '2026-01-01T00:00:00Z', shipmentJournalDate: null,
+    }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    refuseIfShipmentsExist: true,
+  })
+
+  assert.equal(result.refused, true)
 })

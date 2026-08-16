@@ -48,6 +48,12 @@ const state = {
   pendingShipments: [] as PendingShipmentRow[],
   /** Every activity-log entry, so the retirement record can be asserted rather than assumed. */
   activity: [] as Record<string, unknown>[],
+  /**
+   * o3d-4kfh r5 (finding 7): entries written through the TRANSACTION client. The retirement record
+   * moved here from the post-commit `logActivity` above, because that one swallows its own failures
+   * and could lose a purchased label's identity after the rows were already gone.
+   */
+  txActivity: [] as Record<string, unknown>[],
 }
 
 function decimalLikeToNumber(value: unknown): number {
@@ -64,7 +70,13 @@ mock.module('@/lib/activity-log', {
   },
 })
 mock.module('@/lib/auth/server', {
-  namedExports: { requirePermission: async () => {}, requireAuth: async () => ({}) },
+  // o3d-4kfh r5: production's requirePermission RETURNS the AuthSession (lib/auth/server.ts), and
+  // the allocation actions now read session.user.id to attribute the draft-retirement audit row. A
+  // double returning undefined models an API that does not exist.
+  namedExports: {
+    requirePermission: async () => ({ user: { id: 'user-test', role: 'ADMIN' } }),
+    requireAuth: async () => ({ user: { id: 'user-test', role: 'ADMIN' } }),
+  },
 })
 mock.module('@/lib/shopping', {
   namedExports: {
@@ -75,8 +87,18 @@ mock.module('@/lib/shopping', {
 
 const tx = {
   $queryRaw: async () => [],
+  activityLog: {
+    create: async ({ data }: { data: Record<string, unknown> }) => {
+      state.txActivity.push(data)
+      return data
+    },
+  },
   salesOrder: {
-    findUnique: async () => ({ inventoryAllocatedDate: null }),
+    findUnique: async () => ({
+      inventoryAllocatedDate: null,
+      orderNumber: 'SO-1',
+      externalOrderNumber: null,
+    }),
     update: async () => ({}),
   },
   shipment: {
@@ -249,6 +271,7 @@ function seedLines(qty: number) {
   state.staleOuterAllocations = null
   state.pendingShipments = []
   state.activity.length = 0
+  state.txActivity.length = 0
 }
 
 /**
@@ -676,8 +699,13 @@ function draftIds(): string[] {
   return state.pendingShipments.map((shipment) => shipment.id).sort()
 }
 
+/**
+ * o3d-4kfh r5 (finding 7): read from `txActivity`. Finding it in the post-commit `activity` mock
+ * would mean the record had gone back to the lossy path — `logActivity` swallows persistence
+ * failures, so a crash after the commit destroyed the only trace of a purchased label.
+ */
 function retirementLog() {
-  return state.activity.find((entry) => entry.action === 'pending_shipments_retired')
+  return state.txActivity.find((entry) => entry.action === 'pending_shipments_retired')
 }
 
 test('o3d-4kfh r4: SHRINKING an allocation retires the oversized PENDING draft it no longer backs', async () => {
