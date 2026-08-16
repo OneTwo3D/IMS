@@ -60,18 +60,16 @@ export async function GET(request: Request) {
     // connector-agnostic (queueAccountingSync routes to the active connector), so
     // they must drain under QuickBooks too, not just Xero.
     const landedCostJournalOutbox = await drainLandedCostJournalOutbox()
-    const { processPendingQuickBooksSync, repairQuickBooksBackReferences } = await import('@/lib/connectors/quickbooks/sync-processor')
+    const { processPendingQuickBooksSync } = await import('@/lib/connectors/quickbooks/sync-processor')
     const result = await processPendingQuickBooksSync()
-    // o3d-9kek r3 finding 2: QuickBooks swallows back-reference write failures and defers PO
-    // ambiguity, and both told the operator the repair sweep would retry — while the sweep was
-    // bound for Xero only, so nothing ever did. Same connector-agnostic sweep as the Xero branch.
-    let backReferenceRepair: Awaited<ReturnType<typeof repairQuickBooksBackReferences>> | undefined
-    try {
-      backReferenceRepair = await repairQuickBooksBackReferences()
-    } catch (repairError) {
-      console.error('accounting-sync cron: QuickBooks back-reference repair sweep failed', repairError)
-    }
-    return NextResponse.json({ ...result, backReferenceRepair, landedCostJournalOutbox })
+    // NO back-reference repair sweep in this branch, and that asymmetry with Xero above is
+    // DELIBERATE (o3d-9kek r6). The sweep's candidate query is scoped by connector alone, and a
+    // QuickBooks external id is only meaningful inside one realm — after a reconnect to a different
+    // company it would write a retired realm's id onto a live document, which the payment poller
+    // then acts on as if it were current. Failing to repair is acceptable; repairing onto the wrong
+    // document is not. Precondition for binding it: o3d-s36z (connector-tenant isolation). See the
+    // note at the end of lib/connectors/quickbooks/sync-processor.ts.
+    return NextResponse.json({ ...result, landedCostJournalOutbox })
   }
 
   return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })

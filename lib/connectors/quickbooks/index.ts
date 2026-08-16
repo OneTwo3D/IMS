@@ -82,7 +82,9 @@ export { pushSalesInvoice } from './invoices'
 export { pushPurchaseBill } from './bills'
 export { pushCreditMemo } from './credit-notes'
 export { pushJournalEntry } from './journals'
-export { processPendingQuickBooksSync, repairQuickBooksBackReferences } from './sync-processor'
+// No repairQuickBooksBackReferences: the back-reference repair sweep is deliberately NOT bound for
+// QuickBooks until o3d-s36z delivers realm isolation. See the note at the end of ./sync-processor.
+export { processPendingQuickBooksSync } from './sync-processor'
 export { pollQuickBooksPayments } from './payment-poller'
 export { downloadQuickBooksInvoicePdf, saveInvoicePdf } from './invoice-pdf'
 export { runDailyBatchSync } from './daily-sync'

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { BACK_REFERENCE_PAIRS, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
 import {
   BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS,
   BACK_REFERENCE_SWEEP_TYPES,
@@ -49,6 +50,8 @@ type BillRow = {
   createdAt: Date
 }
 type OrderRow = { id: string; accountingInvoiceId: string | null; invoiceNumber?: string | null; invoicedAt?: Date | null }
+/** Supplier (purchase) credit note — PURCHASE_CREDIT_NOTE / ACCPAYCREDIT (r6 finding 2). */
+type CreditNoteRow = { id: string; accountingCreditNoteId: string | null }
 
 const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId',
@@ -107,6 +110,8 @@ type Store = {
   syncRows: SyncRow[]
   bills: BillRow[]
   orders: OrderRow[]
+  /** Optional so the existing stores need no edit; defaulted in makeHarness. */
+  creditNotes?: CreditNoteRow[]
 }
 
 /**
@@ -159,6 +164,7 @@ type Harness = {
 }
 
 function makeHarness(store: Store): Harness {
+  store.creditNotes ??= []
   const activities: BackReferenceSweepActivity[] = []
   const followUps: Harness['followUps'] = []
   const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0, transactions: 0, rawStatements: [] as Array<{ sql: string; values: unknown[] }> }
@@ -199,6 +205,16 @@ function makeHarness(store: Store): Harness {
       async update(args: { where: { id: string }; data: Record<string, unknown> }) {
         const order = store.orders.find((candidate) => candidate.id === args.where.id)
         if (!order) throw new Error(`fake db: no sales order ${args.where.id}`)
+        // sales_orders.accounting_invoice_id is UNIQUE too now (r6 finding 3). Modelled here for the
+        // same reason the bill index is: a double that cannot raise the violation would leave the
+        // sweep's handling of it untestable while looking tested.
+        const externalId = args.data.accountingInvoiceId
+        if (typeof externalId === 'string' && store.orders.some((other) => other.id !== order.id && other.accountingInvoiceId === externalId)) {
+          throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`)'), {
+            code: 'P2002',
+            meta: { target: ['accounting_invoice_id'] },
+          })
+        }
         Object.assign(order, args.data)
         return order
       },
@@ -250,9 +266,23 @@ function makeHarness(store: Store): Harness {
         return { count: matched.length }
       },
     },
+    // r6 finding 2: BACKED BY THE STORE, not stubbed out. It used to answer null/throw, which is
+    // why "PURCHASE_CREDIT_NOTE is not in the sweep's candidate types" was invisible — no test
+    // could drive the type through the sweep at all, so the existing writer tests proved the pair
+    // in isolation while the sweep never selected it.
     supplierCreditNote: {
-      async findUnique() { return null },
-      async update() { throw new Error('unexpected supplierCreditNote.update') },
+      async findUnique(args: { where: { id: string } }) {
+        calls.probes++
+        if (failProbeFor.has(args.where.id)) throw new Error('probe blew up')
+        const note = store.creditNotes!.find((candidate) => candidate.id === args.where.id)
+        return note ? { accountingCreditNoteId: note.accountingCreditNoteId } : null
+      },
+      async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+        const note = store.creditNotes!.find((candidate) => candidate.id === args.where.id)
+        if (!note) throw new Error(`fake db: no supplier credit note ${args.where.id}`)
+        Object.assign(note, args.data)
+        return note
+      },
     },
     async $transaction(fn: (tx: unknown) => Promise<unknown>) {
       calls.transactions++
@@ -1157,4 +1187,193 @@ test('[o3d-9kek r3 f4] the Setting-backed cursor store round-trips, and treats j
   assert.equal(await store.load(), null)
   await store.save(null)
   assert.equal(await store.load(), null)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek r6 finding 2 — SUPPLIER CREDIT NOTES were excluded from the sweep entirely.
+//
+// BACK_REFERENCE_SWEEP_TYPES was a hand-written list whose comment claimed it matched
+// syncTypeWritesBackReference's pairs; it omitted PURCHASE_CREDIT_NOTE, which the shared writer has
+// supported since audit-g5u2 (Xero posts ACCPAYCREDIT and writes
+// SupplierCreditNote.accountingCreditNoteId). Two consequences, from one list:
+//
+//   • a credit note whose post SUCCEEDED and whose local id write FAILED was never a candidate —
+//     its retries exhausted to FAILED and nothing ever came back to it;
+//   • retention reads the same list, so the only row that knew an external credit note existed with
+//     no local link was DELETED by age instead of compacted to a tombstone.
+//
+// The existing writer tests proved the PURCHASE_CREDIT_NOTE pair in isolation and stayed green
+// throughout, which is precisely the non-discriminating coverage this drives out: these tests go
+// through the real candidate query.
+// ---------------------------------------------------------------------------
+
+function creditNoteRow(index: number, overrides: Partial<SyncRow> = {}): SyncRow {
+  return {
+    id: `log-cn-${String(index).padStart(4, '0')}`,
+    connector: 'xero',
+    type: 'PURCHASE_CREDIT_NOTE',
+    referenceType: 'SupplierCreditNote',
+    referenceId: `scn-${index}`,
+    externalTransactionId: `XCN-${index}`,
+    status: 'FAILED',
+    payload: { invoiceNumber: `CN-${index}` },
+    createdAt: at(index),
+    backReferenceCheckedAt: null,
+    backReferenceAmbiguousLoggedAt: null,
+    backReferenceEvidenceCompactedAt: null,
+    ...overrides,
+  }
+}
+
+test('[o3d-9kek r6 f2] the candidate query SELECTS supplier credit notes', () => {
+  const query = buildBackReferenceCandidateQuery({
+    connector: 'xero',
+    after: null,
+    ambiguityRecheckBefore: at(100),
+    take: 50,
+  })
+  const types = (query.where.type as { in: string[] }).in
+  assert.ok(types.includes('PURCHASE_CREDIT_NOTE'), 'a type the shared writer supports must be swept')
+  // Asserted as a SET against the writer's own pair table rather than as a literal, so the two
+  // cannot drift again: the previous list was a literal, and the literal was the bug.
+  assert.deepEqual([...types].sort(), [...new Set(BACK_REFERENCE_PAIRS.map((pair) => pair.type))].sort())
+})
+
+test('[o3d-9kek r6 f2] every pair the sweep selects is one applyBackReference actually writes', () => {
+  // The derivation is only worth anything if the pairs it derives from are real. A pair listed but
+  // unhandled would make the sweep select rows it can only ever mark structurally-incapable.
+  for (const pair of BACK_REFERENCE_PAIRS) {
+    for (const referenceType of pair.referenceTypes) {
+      assert.equal(
+        syncTypeWritesBackReference(pair.type, referenceType),
+        true,
+        `${pair.type}/${referenceType} must be writable`,
+      )
+    }
+  }
+  assert.equal(syncTypeWritesBackReference('PURCHASE_CREDIT_NOTE', 'SupplierCreditNote'), true)
+  // ...and the derivation must not have widened it: a type with the wrong reference type still fails.
+  assert.equal(syncTypeWritesBackReference('PURCHASE_CREDIT_NOTE', 'PurchaseInvoice'), false)
+  assert.equal(syncTypeWritesBackReference('COGS_JOURNAL', 'CogsEntry'), false)
+})
+
+test('[o3d-9kek r6 f2] a supplier credit note whose id write failed is REPAIRED end-to-end', async () => {
+  const harness = makeHarness({
+    syncRows: [creditNoteRow(1)],
+    bills: [],
+    orders: [],
+    creditNotes: [{ id: 'scn-1', accountingCreditNoteId: null }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.scanned, 1, 'the row must reach the sweep at all — it never did before')
+  assert.equal(run.repaired, 1)
+  assert.equal(harness.store.creditNotes![0].accountingCreditNoteId, 'XCN-1')
+  // A FAILED row whose back-reference is now applied AND whose follow-ups were enqueued is fully
+  // reconciled: Xero's enqueueFollowUps routes PURCHASE_CREDIT_NOTE to its allocation follow-up,
+  // so this is not a no-op branch.
+  assert.deepEqual(harness.followUps, [{ entryId: 'log-cn-0001', referenceType: 'SupplierCreditNote', referenceId: 'scn-1' }])
+  assert.equal(harness.store.syncRows[0].status, 'SYNCED')
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+  assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_repaired'))
+})
+
+test('[o3d-9kek r6 f2] an already-linked supplier credit note is settled, not rewritten', async () => {
+  // The probe has to work for this type too, not just the apply: a resolver that answered "missing"
+  // for every credit note would re-write the id on every run and never settle the row.
+  const harness = makeHarness({
+    syncRows: [creditNoteRow(1, { status: 'SYNCED' })],
+    bills: [],
+    orders: [],
+    creditNotes: [{ id: 'scn-1', accountingCreditNoteId: 'XCN-1' }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.checked, 0, 'nothing was missing')
+  assert.equal(run.repaired, 0)
+  assert.deepEqual(harness.followUps, [])
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'reconciled rows leave the candidate set for good')
+})
+
+test('[o3d-9kek r6 f2] a TOMBSTONED supplier credit note is still id-repaired, follow-ups discarded', async () => {
+  // The retention half of the same finding: the row survived to the cutoff unresolved, so it is a
+  // tombstone rather than a deletion — and a tombstone is still a repair candidate.
+  const harness = makeHarness({
+    syncRows: [creditNoteRow(1, { payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
+    bills: [],
+    orders: [],
+    creditNotes: [{ id: 'scn-1', accountingCreditNoteId: null }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1)
+  assert.equal(harness.store.creditNotes![0].accountingCreditNoteId, 'XCN-1')
+  assert.equal(run.followUpsDiscarded, 1)
+  assert.deepEqual(harness.followUps, [], 'the allocation follow-up cannot be rebuilt from `{}`')
+  assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_followups_discarded'))
+  // Not flipped to SYNCED: the allocation was abandoned, not done.
+  assert.equal(harness.store.syncRows[0].status, 'FAILED')
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+})
+
+test('[o3d-9kek r6 f3] an external id already held by another order is REPORTED and deferred, not console-only', async () => {
+  // The sales-side unique index refuses the repair. Left in the generic catch this was a
+  // `console.error` and a `failed++`: a permanent, human-only-fixable condition reported to nobody
+  // and re-attempted every five minutes forever — exactly the defect r2 finding 1 fixed for the PO
+  // path. It gets the same treatment: warn once per interval, then defer.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1)],
+    bills: [],
+    orders: [
+      { id: 'so-1', accountingInvoiceId: null },
+      // Another order already holds the id this row wants to write.
+      { id: 'so-other', accountingInvoiceId: 'XINV-1' },
+    ],
+  })
+  const clock = fakeClock()
+
+  const firstRun = await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+
+  assert.equal(firstRun.failed, 1, 'nothing was repaired, and the number must not quietly improve')
+  assert.equal(harness.store.orders[0].accountingInvoiceId, null, 'nothing was overwritten')
+  const conflict = harness.activities.find((entry) => entry.action === 'xero_backreference_id_conflict')
+  assert.ok(conflict, 'a refusal only a human can clear must name the human action')
+  assert.equal(conflict.level, 'WARNING')
+  assert.match(conflict.description, /already held by another local record/)
+  assert.equal(conflict.metadata.externalId, 'XINV-1')
+  // DEFERRED, not stamped: unlinking the wrong record makes this repairable again, and a row
+  // excluded for good would never be reconsidered.
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null)
+  assert.ok(harness.store.syncRows[0].backReferenceAmbiguousLoggedAt)
+
+  // Throttled: the next run inside the interval must not re-warn, or a permanent conflict writes an
+  // activity entry every five minutes.
+  harness.activities.length = 0
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.deepEqual(harness.activities.filter((entry) => entry.action === 'xero_backreference_id_conflict'), [])
+
+  // ...and it comes back once the interval passes, because nothing has been retired.
+  clock.advance(BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS + 1)
+  harness.activities.length = 0
+  await repairAccountingBackReferences(sweepDeps(harness, clock.now), { limit: 10 })
+  assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_id_conflict'))
+})
+
+test('[o3d-9kek r6 f3] a TRANSIENT repair failure is still left alone — no warning, no deferral', async () => {
+  // The conflict branch must not become a catch-all. A follow-up enqueue failure is expected to
+  // succeed on its own, so deferring it for 24 hours would delay a repair nobody needs to touch.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED' })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.failFollowUpsFor.add('log-0001')
+
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.deepEqual(harness.activities.filter((entry) => entry.action === 'xero_backreference_id_conflict'), [])
+  assert.equal(harness.store.syncRows[0].backReferenceAmbiguousLoggedAt, null, 'a transient failure is retried immediately')
 })

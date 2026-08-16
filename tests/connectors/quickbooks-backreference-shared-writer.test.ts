@@ -40,7 +40,7 @@ type BillRow = { id: string; poId: string; accountingInvoiceId: string | null; c
 const state = {
   syncRows: [] as SyncRow[],
   bills: [] as BillRow[],
-  activities: [] as Array<{ action: string; metadata?: Record<string, unknown> }>,
+  activities: [] as Array<{ action: string; description?: string; metadata?: Record<string, unknown> }>,
   rawStatements: [] as Array<{ sql: string; values: unknown[] }>,
   billUpdates: [] as Array<{ id: string; data: Record<string, unknown> }>,
 }
@@ -78,6 +78,16 @@ const billClient = {
   async update(args: { where: { id: string }; data: Record<string, unknown> }) {
     const bill = state.bills.find((candidate) => candidate.id === args.where.id)
     if (!bill) throw new Error(`fake db: no bill ${args.where.id}`)
+    // purchase_invoices.accounting_invoice_id is UNIQUE, globally, on the value alone. Raised the
+    // way Prisma raises it, so the writer's conflict classification is exercised rather than
+    // assumed — and so the QuickBooks catch below actually has an exception to swallow.
+    const externalId = args.data.accountingInvoiceId
+    if (typeof externalId === 'string' && state.bills.some((other) => other.id !== bill.id && other.accountingInvoiceId === externalId)) {
+      throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`)'), {
+        code: 'P2002',
+        meta: { target: ['accounting_invoice_id'] },
+      })
+    }
     state.billUpdates.push({ id: bill.id, data: args.data })
     Object.assign(bill, args.data)
     return bill
@@ -124,8 +134,8 @@ const db = {
 mock.module('@/lib/db', { namedExports: { db } })
 mock.module('@/lib/activity-log', {
   namedExports: {
-    logActivity: async (entry: { action: string; metadata?: Record<string, unknown> }) => { state.activities.push(entry) },
-    logActivityPersisted: async (entry: { action: string; metadata?: Record<string, unknown> }) => { state.activities.push(entry); return true },
+    logActivity: async (entry: { action: string; description?: string; metadata?: Record<string, unknown> }) => { state.activities.push(entry) },
+    logActivityPersisted: async (entry: { action: string; description?: string; metadata?: Record<string, unknown> }) => { state.activities.push(entry); return true },
   },
 })
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
@@ -173,6 +183,43 @@ test('[o3d-9kek] QuickBooks REFUSES an ambiguous PO instead of stamping the newe
   const warning = state.activities.find((entry) => entry.action === 'quickbooks_backreference_ambiguous')
   assert.ok(warning, 'the refusal must name a manual action, not be silent')
   assert.equal(warning.metadata?.reason, 'MULTIPLE_UNLINKED_BILLS')
+  // r6 finding 1: the warning MUST NOT promise a repair sweep. QuickBooks has no back-reference
+  // sweep binding — one existed briefly on this branch and was removed, because the sweep is scoped
+  // by connector alone and a QuickBooks id is realm-local. A message that says a sweep "re-checks
+  // it daily" reads as "nothing to do", and nothing would ever come back to the row.
+  assert.doesNotMatch(
+    String(warning.description),
+    /sweep (?:will retry|retries|re-checks|rechecks)/i,
+    'no sweep exists for QuickBooks — the previous text promised one that re-checked daily',
+  )
+  assert.match(String(warning.description), /NOTHING re-checks this automatically/, 'the absence has to be stated, not left implied')
+  assert.match(String(warning.description), /manually/i, 'the only remedy is manual, and must be named')
+})
+
+test('[o3d-9kek r6 f1] a refused bill-keyed link is reported WITHOUT promising a retry', async () => {
+  // The unique index refuses the write because another bill already holds this QuickBooks id — the
+  // realm-switch case the index exists to catch. updateBackReference swallows the exception (still
+  // deliberate: de-swallowing changes QBO's retry semantics for every type at once), so the ACTIVITY
+  // ENTRY is the operator's only signal, and what it claims has to be true.
+  reset([
+    { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 },
+    { id: 'bill-other', poId: 'po-9', accountingInvoiceId: '1042', createdAt: 2 },
+  ])
+  state.syncRows = [{ ...poRow('1042'), referenceType: 'PurchaseInvoice', referenceId: 'bill-target' }]
+  const { processPendingQuickBooksSync } = await import('@/lib/connectors/quickbooks/sync-processor')
+
+  await processPendingQuickBooksSync()
+
+  assert.equal(state.bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, null, 'the index refused it')
+  const failure = state.activities.find((entry) => entry.action === 'quickbooks_backreference_failed')
+  assert.ok(failure, 'a swallowed exception must still reach the operator')
+  assert.doesNotMatch(
+    String(failure.description),
+    /sweep (?:will retry|retries|re-checks|rechecks)/i,
+    'the previous text said "the back-reference repair sweep will retry it" — nothing retries it',
+  )
+  assert.match(String(failure.description), /NOTHING retries this/, 'the absence has to be stated, not left implied')
+  assert.match(String(failure.description), /by hand/i, 'the message must name the manual action it actually requires')
 })
 
 test('[o3d-9kek] an unambiguous QuickBooks PO row is written under the per-PO advisory lock', async () => {

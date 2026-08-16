@@ -1508,7 +1508,16 @@ model SupplierCreditNote {
   // allowances), so a manual credit can't silently suppress return credit.
   isReturnGenerated     Boolean                  @default(false)
   // Accounting-connector credit-note id (Xero ACCPAYCREDIT), set once POSTED.
-  accountingCreditNoteId String?                 @map("accounting_credit_note_id")
+  //
+  // o3d-9kek r6: ONE external credit note ↔ ONE local credit note, globally unique on the value.
+  // This is the one of the four where the constraint has live work to do TODAY: Xero's
+  // POST /CreditNotes is create-or-update on CreditNoteNumber (the o3d-6l3 ACCPAY defect, one
+  // document type over), and buildSupplierCreditNotePayload falls back to the PURCHASE ORDER
+  // REFERENCE when the operator leaves the number blank — so two manual credit notes on one PO can
+  // post the same number, the second silently REPLACING the first in the ledger and returning its
+  // id. Without this index that lands as two local rows pointing at one ledger document; with it,
+  // the second link is refused loudly. The number-collision defect itself is o3d-tfri.
+  accountingCreditNoteId String?                 @unique @map("accounting_credit_note_id")
   recordedAt            DateTime                 @default(now())
   postedAt              DateTime?
   createdBy             String?
@@ -1644,7 +1653,18 @@ model SalesOrder {
   invoiceNumber     String?    // generated invoice reference
   invoicedAt        DateTime?
   paymentDueAt      DateTime?
-  accountingInvoiceId     String?    @map("accounting_invoice_id") // Accounting invoice ID after sync
+  // o3d-9kek r6: ONE external invoice ↔ ONE local order, enforced by the database — the same
+  // invariant as PurchaseInvoice.accountingInvoiceId, and for a sharper reason. Payment polling
+  // selects EVERY order carrying a matching external id and marks each one paid, advances its
+  // lifecycle and can auto-allocate it, so two orders sharing one InvoiceID means one customer
+  // payment settles two orders; SALES_INVOICE_UPDATE then posts every later correction against a
+  // document that belongs to both. Nothing in IMS legitimately shares one external invoice between
+  // orders (no consolidated invoicing; a re-invoice becomes SALES_INVOICE_UPDATE, which does not
+  // write this column; cloneSalesOrder deliberately does not copy it).
+  //
+  // Global and on the VALUE alone, deliberately — see PurchaseInvoice.accountingInvoiceId. NULLs are
+  // not equal in Postgres, so any number of orders may be unlinked.
+  accountingInvoiceId     String?    @unique @map("accounting_invoice_id") // Accounting invoice ID after sync
   paidAt            DateTime?
   orderNumber       String?    // IMS order number (prefix + WC number, or manual)
   paymentMethod     String?    // e.g. "stripe", "paypal", "bacs" — populated by any shopping channel
@@ -1731,7 +1751,11 @@ model SalesOrderRefund {
   id              String     @id @default(cuid())
   orderId         String
   creditNoteNumber String?   // e.g. "CN-2025-00001"
-  accountingCreditNoteId String?   @map("accounting_credit_note_id") // Accounting credit note ID after sync
+  // o3d-9kek r6: ONE external credit note ↔ ONE local refund. Each refund mints its own sequential
+  // creditNoteNumber and gets its own CREDIT_NOTE sync row, and the external-refund/chargeback
+  // replay paths return the EXISTING refund rather than creating a second one — so no split or
+  // partial refund legitimately shares a credit note. Global, on the value alone, NULLs unconstrained.
+  accountingCreditNoteId String?   @unique @map("accounting_credit_note_id") // Accounting credit note ID after sync
   externalRefundId Int?
   returnWarehouseId String?
   reason          String?
@@ -2128,9 +2152,11 @@ model AccountingSyncLog {
   backReferenceAmbiguousLoggedAt DateTime?
   // o3d-9kek r3 finding 3: when this row's full payload was compacted to an attribution-only
   // TOMBSTONE because it outlived the retention period while still unresolved. Tombstones keep the
-  // (connector, provenance, type, referenceType, referenceId, externalTransactionId) evidence that
-  // stops an ambiguity silently becoming a certainty, but drop the payload and errorMessage, which
-  // are where the customer names, emails, addresses and financial lines live.
+  // (connector, type, status, referenceType, referenceId, externalTransactionId) evidence that stops
+  // an ambiguity silently becoming a certainty, but drop the payload and errorMessage, which are
+  // where the customer names, emails, addresses and financial lines live. (An earlier revision of
+  // this comment listed a `provenance` column: that was part of the per-realm namespacing work,
+  // which was tried and REVERTED — this model has no such column. See o3d-gt8r / o3d-s36z.)
   //
   // r4 finding 3: a tombstone IS still a sweep candidate. The columns the id write reads
   // all survive compaction, so an ambiguity that clears after the retention horizon — or a

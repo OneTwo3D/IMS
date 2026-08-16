@@ -2,11 +2,20 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 // ---------------------------------------------------------------------------
-// o3d-9kek r3 finding 2, the second wiring point. The cron is where the sweep matters unattended,
-// but the MANUAL sync is where it matters to a person: the ambiguity warning asks an operator to
-// link a bill by hand, and the obvious next thing they do is press Sync. If that path does not
-// sweep, the row they have just made repairable waits for the next cron cycle while the UI reports
-// a successful sync — which reads as "and nothing was left over".
+// o3d-9kek r6 — the MANUAL QuickBooks sync must not run the back-reference repair sweep either.
+//
+// This is the tempting one. The manual sync is the button an operator presses right after linking a
+// bill by hand, so an earlier revision of this branch bound the sweep here as well as in the cron.
+// It was removed for the same reason: repairAccountingBackReferences is scoped by `connector` alone,
+// a QuickBooks external id is only meaningful inside one realm, and disconnecting drops the
+// expected-realm pin — so after a reconnect to a different company the sweep can write a retired
+// company's id onto a live document, which the payment poller then acts on as current. Failing to
+// repair is acceptable; repairing onto the wrong document is not.
+//
+// The operator is not left guessing: updateBackReference's ambiguity and failure warnings say in as
+// many words that nothing retries a QuickBooks back-reference and the link must be made by hand.
+// This asserts the absence, because re-adding the call is one line and no other test would notice.
+// Precondition for re-adding it: o3d-s36z (connector-tenant isolation).
 // ---------------------------------------------------------------------------
 
 const calls: string[] = []
@@ -41,6 +50,8 @@ mock.module('@/lib/connectors/quickbooks', {
     },
   },
 })
+// Deliberately still offered by the double, so a re-added call is RECORDED rather than failing as a
+// missing import — the failure must read as "the binding came back", not as "the test is broken".
 mock.module('@/lib/connectors/quickbooks/sync-processor', {
   namedExports: {
     repairQuickBooksBackReferences: async () => {
@@ -50,17 +61,18 @@ mock.module('@/lib/connectors/quickbooks/sync-processor', {
   },
 })
 
-test('[o3d-9kek r3 f2] the manual QuickBooks sync also runs the back-reference repair sweep', async () => {
+test('[o3d-9kek r6] the manual QuickBooks sync does NOT run the back-reference repair sweep', async () => {
   calls.length = 0
   activities.length = 0
   const { triggerQuickBooksSync } = await import('@/app/actions/quickbooks-sync')
 
   const result = await triggerQuickBooksSync()
   assert.equal(result.success, true)
-  assert.deepEqual(calls, ['process', 'repair'], 'sweep after processing, so this cycle\'s rows are included')
+  assert.deepEqual(calls, ['process'], 'no sweep: it can attribute a previous realm\'s external id (o3d-s36z)')
 
-  // Surfaced, not swallowed: the activity entry is the operator's record that the retry ran.
   const logged = activities.find((entry) => entry.action === 'quickbooks_manual_sync')
   assert.ok(logged)
-  assert.deepEqual(logged.metadata?.backReferenceRepair, { scanned: 5, checked: 2, repaired: 2, failed: 0, skippedAmbiguous: 1 })
+  // Not reported as an empty repair result either — that would read as "a sweep ran and found
+  // nothing", which is precisely the false reassurance this removal exists to avoid.
+  assert.equal('backReferenceRepair' in (logged.metadata ?? {}), false)
 })

@@ -84,6 +84,13 @@ function makeDeps(overrides: {
    * conditional write then matches against.
    */
   raceAfterResolve?: (bills: FakeBill[]) => void
+  /**
+   * Which of the sales-side writes the UNIQUE INDEX rejects (o3d-9kek r6 finding 3). The three
+   * sales-side columns are globally unique now too, so these updates can be refused exactly as the
+   * bill update already could — and a double that could not raise the violation would leave the new
+   * classification and its operator message untestable while looking tested.
+   */
+  uniqueViolationOn?: Array<'salesOrder' | 'salesOrderRefund' | 'supplierCreditNote'>
 }) {
   const bills = overrides.bills ?? []
   const calls = {
@@ -102,6 +109,14 @@ function makeDeps(overrides: {
   }
   const maybeThrow = () => {
     if (overrides.throwOnUpdate) throw new Error('back-reference write failed')
+  }
+  /** Raised the way Prisma raises it, with the offending column in meta.target. */
+  const maybeUniqueViolation = (model: 'salesOrder' | 'salesOrderRefund' | 'supplierCreditNote', column: string) => {
+    if (!overrides.uniqueViolationOn?.includes(model)) return
+    throw Object.assign(new Error(`Unique constraint failed on the fields: (\`${column}\`)`), {
+      code: 'P2002',
+      meta: { target: [column] },
+    })
   }
   const matchBills = (where: Record<string, unknown>) => bills
     .filter((bill) => matches(bill as unknown as Record<string, unknown>, where, BILL_COLUMNS))
@@ -132,11 +147,11 @@ function makeDeps(overrides: {
 
   const deps: BackReferenceDeps = {
     salesOrder: {
-      async update(args) { maybeThrow(); calls.salesOrderUpdate++; calls.lastUpdateData = args.data; return {} },
+      async update(args) { maybeThrow(); maybeUniqueViolation('salesOrder', 'accounting_invoice_id'); calls.salesOrderUpdate++; calls.lastUpdateData = args.data; return {} },
       async findUnique() { return { accountingInvoiceId: overrides.salesOrderAccountingInvoiceId ?? null } },
     },
     salesOrderRefund: {
-      async update(args) { maybeThrow(); calls.salesOrderRefundUpdate++; calls.lastUpdateData = args.data; return {} },
+      async update(args) { maybeThrow(); maybeUniqueViolation('salesOrderRefund', 'accounting_credit_note_id'); calls.salesOrderRefundUpdate++; calls.lastUpdateData = args.data; return {} },
       async findUnique() { return { accountingCreditNoteId: overrides.salesOrderRefundCreditNoteId ?? null } },
     },
     purchaseInvoice: {
@@ -194,7 +209,7 @@ function makeDeps(overrides: {
       },
     },
     supplierCreditNote: {
-      async update(args) { maybeThrow(); calls.supplierCreditNoteUpdate++; calls.lastUpdateData = args.data; return {} },
+      async update(args) { maybeThrow(); maybeUniqueViolation('supplierCreditNote', 'accounting_credit_note_id'); calls.supplierCreditNoteUpdate++; calls.lastUpdateData = args.data; return {} },
       async findUnique() { return { accountingCreditNoteId: overrides.supplierCreditNoteAccountingCreditNoteId ?? null } },
     },
     accountingSyncLog: {
@@ -691,4 +706,98 @@ test('[o3d-9kek] the PO-keyed repair path reports the same collision instead of 
   const applied = await applyBackReference(deps, { connector: 'quickbooks', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: '1042' })
   assert.equal(applied.outcome, 'ambiguous')
   assert.equal(calls.purchaseInvoiceUpdateIds.length, 0, 'the new bill must NOT receive a second copy of 1042')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek r6 finding 3 — the SALES-SIDE columns are globally unique too.
+//
+// 20260815140000 constrained purchase_invoices.accounting_invoice_id and argued the case in full,
+// but the argument was never bill-specific: it is about what a stored external id is USED FOR.
+// sales_orders.accounting_invoice_id, sales_order_refunds.accounting_credit_note_id and
+// supplier_credit_notes.accounting_credit_note_id had no constraint at all, and on the sales side a
+// duplicate is if anything worse — payment polling selects EVERY local row carrying a matching id
+// and marks each one paid, so one customer payment settles two orders.
+//
+// These tests are about the WRITER's half: a refusal has to arrive as something an operator can act
+// on. A bare `update` would surface Prisma's `Unique constraint failed on the fields:
+// (accounting_invoice_id)` — a column name, no document, no action — which is indistinguishable
+// from a schema bug.
+// ---------------------------------------------------------------------------
+
+const CONFLICT_CASES = [
+  {
+    label: 'SalesOrder',
+    model: 'salesOrder' as const,
+    params: { type: 'SALES_INVOICE' as const, referenceType: 'SalesOrder', referenceId: 'so-1', externalId: 'XINV-9' },
+    expectDocument: /SalesOrder so-1/,
+    expectRemote: /invoice XINV-9/,
+  },
+  {
+    label: 'SalesOrderRefund',
+    model: 'salesOrderRefund' as const,
+    params: { type: 'CREDIT_NOTE' as const, referenceType: 'SalesOrderRefund', referenceId: 'ref-1', externalId: 'XCN-9' },
+    expectDocument: /SalesOrderRefund ref-1/,
+    expectRemote: /credit note XCN-9/,
+  },
+  {
+    label: 'SupplierCreditNote',
+    model: 'supplierCreditNote' as const,
+    params: { type: 'PURCHASE_CREDIT_NOTE' as const, referenceType: 'SupplierCreditNote', referenceId: 'scn-1', externalId: 'XCN-8' },
+    expectDocument: /SupplierCreditNote scn-1/,
+    expectRemote: /credit note XCN-8/,
+  },
+]
+
+for (const testCase of CONFLICT_CASES) {
+  test(`[o3d-9kek r6 f3] a duplicate external id on ${testCase.label} is refused with an explanation`, async () => {
+    const { deps } = makeDeps({ uniqueViolationOn: [testCase.model] })
+
+    await assert.rejects(
+      () => applyBackReference(deps, { connector: 'xero', ...testCase.params }),
+      (error: Error) => {
+        // The document, the remote id, and what the operator must do. Prisma's own message has none
+        // of the three.
+        assert.match(error.message, /Refusing to link/)
+        assert.match(error.message, testCase.expectDocument)
+        assert.match(error.message, testCase.expectRemote)
+        assert.match(error.message, /ALREADY HELD LOCALLY/)
+        assert.match(error.message, /resolve it by hand/)
+        // The realm-switch cause named, as the bill writer does: this is the single likeliest
+        // explanation and the one an operator would otherwise never think of.
+        assert.match(error.message, /reconnected to a different company/)
+        // The original P2002 is preserved as the cause — the sweep classifies on it, and a message
+        // that replaced rather than wrapped it would make every explanatory rethrow unrecognisable.
+        assert.equal((error.cause as { code?: string } | undefined)?.code, 'P2002')
+        return true
+      },
+    )
+  })
+}
+
+test('[o3d-9kek r6 f3] the supplier credit-note refusal names the blank-number collision', async () => {
+  // Xero's POST /CreditNotes is create-or-update on CreditNoteNumber, and the payload builder falls
+  // back to the PO reference when the operator leaves the number blank — so two manual credit notes
+  // on one PO can post the same number and come back with the same id. That is the one cause with a
+  // live code path today, and the message points at it rather than leaving a puzzle.
+  const { deps } = makeDeps({ uniqueViolationOn: ['supplierCreditNote'] })
+
+  await assert.rejects(
+    () => applyBackReference(deps, {
+      connector: 'xero', type: 'PURCHASE_CREDIT_NOTE', referenceType: 'SupplierCreditNote', referenceId: 'scn-1', externalId: 'XCN-8',
+    }),
+    /blank credit-note number/,
+  )
+})
+
+test('[o3d-9kek r6 f3] a NON-uniqueness write failure is still propagated untouched', async () => {
+  // The classification must not become a catch-all: a transient write error has to keep reaching the
+  // caller as itself, so the sync row retries instead of being reported as a permanent conflict.
+  const { deps } = makeDeps({ throwOnUpdate: true })
+
+  await assert.rejects(
+    () => applyBackReference(deps, {
+      connector: 'xero', type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-1', externalId: 'XINV-9',
+    }),
+    /back-reference write failed/,
+  )
 })

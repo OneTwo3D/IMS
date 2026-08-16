@@ -277,12 +277,16 @@ This means an admin viewing the activity log can see who did what but not see se
   competing one would silently turn a refused-because-ambiguous attribution into a wrong answer). In
   both cases the *content* — payloads, error text, and the customer details and financial lines they
   contain — is cleared on schedule; only the small identifying record is kept.
-  A compacted accounting sync row is **still repaired**: the repair sweep can still write its
-  external id onto the order or bill, because everything that write needs survives compaction. What
-  cannot survive is the follow-up work built from the payload (invoice PDF, payment registration,
-  bill attachment). If the sweep repairs one of these rows it writes a WARNING to the activity log
-  (`*_backreference_followups_discarded`) naming the document, so you can check whether its PDF or
-  payment is missing and re-drive it by hand
+  On **Xero**, a compacted accounting sync row is **still repaired**: the repair sweep can still
+  write its external id onto the order or bill, because everything that write needs survives
+  compaction. What cannot survive is the follow-up work built from the payload (invoice PDF, payment
+  registration, bill attachment). If the sweep repairs one of these rows it writes a WARNING to the
+  activity log (`xero_backreference_followups_discarded`) naming the document, so you can check
+  whether its PDF or payment is missing and re-drive it by hand. On **QuickBooks** there is
+  deliberately no repair sweep at all — a QuickBooks document id is a per-company integer, so a sweep
+  could not tell a previously connected company's id from the current one's — and an unresolved row
+  is compacted on the same schedule but only ever links by hand. See *Back-Reference Repair* in the
+  accounting sync guide
 - **System health** — at-a-glance status of FX sync, accounting sync, integration outbox depth, recent cron runs, and invariant check results
 - **Database reset** — reset system data with three levels of severity:
   - **Transactions only** — clears orders, invoices, and movements but keeps products and settings

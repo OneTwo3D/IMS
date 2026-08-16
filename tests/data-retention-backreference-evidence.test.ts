@@ -146,6 +146,10 @@ test('[o3d-9kek r2 f2] retention keeps UNRESOLVED back-reference evidence past t
   // ...and so are the sales-side types the sweep repairs.
   assert.equal(matches(row({ type: 'SALES_INVOICE' }), where), false)
   assert.equal(matches(row({ type: 'CREDIT_NOTE' }), where), false)
+  // r6 finding 2: AND supplier credit notes. This type was missing from the shared list, so the
+  // only row that knew an external ACCPAYCREDIT existed with no local link was DELETED by age —
+  // taking the evidence with it, and with nothing to repair from afterwards.
+  assert.equal(matches(row({ type: 'PURCHASE_CREDIT_NOTE', externalTransactionId: 'XCN-1' }), where), false)
 })
 
 test('[o3d-9kek r2 f2] retention still deletes everything the sweep has SETTLED or never owned', async () => {
@@ -168,8 +172,8 @@ test('[o3d-9kek r2 f2] retention still deletes everything the sweep has SETTLED 
 // ---------------------------------------------------------------------------
 // o3d-9kek r3 finding 3 — the exemption above was called "bounded" because the sweep stamps every
 // row it settles. It is not: a permanently ambiguous row is never stamped BY DESIGN, a
-// disconnected connector's rows are never swept at all, and until this branch no QuickBooks sweep
-// ran, so every QuickBooks invoice/bill row stayed unstamped forever. Full payloads — customer
+// disconnected connector's rows are never swept at all, and no QuickBooks sweep runs (deliberately
+// — r6 finding 1), so every QuickBooks invoice/bill row stays unstamped forever. Full payloads — customer
 // names, emails, addresses, financial lines — could therefore outlive the configured retention
 // period without limit. A retention policy that silently fails to delete is worse than one that
 // deletes too much.
@@ -186,6 +190,10 @@ test('[o3d-9kek r3 f3] expired unresolved evidence is COMPACTED, not kept whole 
   assert.equal(matches(row({ id: 'sibling', externalTransactionId: 'XBILL-2' }), compact.where), true)
   assert.equal(matches(row({ status: 'FAILED' }), compact.where), true)
   assert.equal(matches(row({ type: 'SALES_INVOICE' }), compact.where), true)
+  // r6 finding 2: a supplier credit note is compacted like any other unresolved row. Before it was
+  // added to the shared type list this row was DELETED here instead — the one case where "not
+  // compacted" and "not exempt" coincide, which is exactly how it went unnoticed.
+  assert.equal(matches(row({ type: 'PURCHASE_CREDIT_NOTE', externalTransactionId: 'XCN-1' }), compact.where), true)
 
   // Not inside the retention window — content is retained until the period the settings UI promises.
   assert.equal(matches(row({ createdAt: NOW }), compact.where), false)

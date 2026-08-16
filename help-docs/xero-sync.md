@@ -532,11 +532,23 @@ Group B of the daily batch consumes FIFO (First In, First Out) cost layers when 
 ## Back-Reference Repair
 
 After a document posts, its external id has to be written back onto the source document
-(`accountingInvoiceId` on the order or bill). If that write fails, or the process dies between
+(`accountingInvoiceId` on a sales order or bill, `accountingCreditNoteId` on a customer refund or a
+supplier credit note). If that write fails, or the process dies between
 marking the sync row SYNCED and running it, the document is orphaned: it exists in Xero but IMS
-cannot link, update or pay it. The back-reference repair sweep runs inside
+cannot link, update or pay it. All four document types are repaired. The back-reference repair sweep runs inside
 `/api/cron/accounting-sync` (and on demand from **Integrations → Xero**), re-applies the id from
 the sync row, and re-enqueues the follow-ups (PDF, payment, attachment) that never ran.
+
+**The sweep runs for Xero only.** There is deliberately no QuickBooks equivalent, and that is not an
+oversight to be reported. A QuickBooks document id is a per-company integer, and disconnecting clears
+the company pin, so a sweep scoped to "the QuickBooks connector" could not tell an id issued by a
+previously connected company from one issued by the current one — it would write a retired company's
+integer onto a live order or bill, and payment polling would then act on it as if it were current.
+Failing to repair is acceptable; repairing onto the wrong document is not. On QuickBooks, a
+back-reference that fails to write is therefore **not retried by anything**: the warning in the
+activity log (`quickbooks_backreference_failed` or `quickbooks_backreference_ambiguous`) says so, and
+the link has to be made by hand. The external id is on the sync row, so nothing is lost — only
+automatic. See *Connecting a different company* below for why the company boundary is the blocker.
 
 **It refuses to guess.** Sync rows created before the bill-keyed change name the *purchase order*,
 not the bill. When such a row cannot be attributed to exactly one bill, the sweep writes a WARNING
@@ -548,22 +560,38 @@ ever links does not go quiet. Reasons you may see:
 |---|---|
 | `MULTIPLE_SYNC_ROWS` | Two or more posted bill sync rows reference this PO |
 | `MULTIPLE_UNLINKED_BILLS` | The PO has several bills with no external id |
-| `NO_LIVE_SYNC_ROW` | The sync row's own record was deleted or cancelled mid-repair, so nothing evidences the attribution any more |
+| `NO_LIVE_SYNC_ROW` | No live sync row for this PO carries this external id any more — it was cancelled, or its external id was cleared, mid-repair — so nothing evidences the attribution |
 | `EXTERNAL_ID_LINKED_ELSEWHERE` | Another bill — on another PO — already carries this Xero bill id |
 | `EXTERNAL_ID_CLAIMED_CONCURRENTLY` | Another bill claimed the id while this repair was being written |
 
-Two bills can never carry the same bill id: the database enforces it with a unique index on the id.
-That matters because bill updates post to `/Invoices/{id}`, so a duplicated id would make every later
-correction to one bill silently rewrite the other's document in the ledger. If a link is refused for
-one of the conflict reasons above, resolve it by hand — IMS will not clear or move an existing link
-on its own, because nothing in IMS records whether that link was posted authoritatively or guessed.
+**One ledger document, one local record — enforced by the database.** Two purchase invoices can
+never carry the same bill id, two sales orders can never carry the same invoice id, and two credit
+notes (customer or supplier) can never carry the same credit-note id: each of those columns has a
+unique index. That matters because a stored external id is what every later action is aimed at —
+invoice and bill updates post to `/Invoices/{id}`, and payment polling marks **every** local record
+carrying a matching id as paid. A duplicate would mean one correction rewriting the wrong document,
+or one customer payment silently settling two orders.
+
+So a write that would duplicate an id is **refused**, with an error naming the document, the id and
+the record that already holds it. Nothing is overwritten. Resolve it by hand — IMS will not clear or
+move an existing link on its own, because nothing in IMS records whether that link was posted
+authoritatively or deduced. The repair sweep reports a refusal it hits as
+`xero_backreference_id_conflict` and re-reports it once a day until it is resolved, rather than
+retrying silently.
+
+The likeliest causes are a connector reconnected to a different company that has reissued an id (see
+below), and the ledger merging two of our documents because they were posted under the same document
+number. Supplier credit notes are the live case of the second: if two credit notes are raised against
+one purchase order and the **credit-note number is left blank on both**, they post under the purchase
+order's own reference and Xero treats the second as an edit of the first. Give each supplier credit
+note its own number.
 
 **Rows past their retention window.** Data retention clears the stored payload of an unresolved sync
 row once it is older than the sync-log retention period, keeping only the identifying record. Such a
 row is still repaired — the external id can still be written onto the order or bill — but its
 outstanding follow-ups (PDF, payment, attachment) can no longer be rebuilt. When that happens the
-sweep logs `*_backreference_followups_discarded` naming the document, so you can check for a missing
-PDF or payment and re-drive it manually.
+sweep logs `xero_backreference_followups_discarded` naming the document, so you can check for a
+missing PDF, payment or credit allocation and re-drive it manually.
 
 ## Connecting a different company
 
@@ -577,15 +605,20 @@ simply resolves to nothing, and the failure is a loud "not found" rather than a 
 
 For **QuickBooks** it is not harmless, because document ids are per-company integers: company B
 routinely issues the same id company A did. IMS keeps the rule that one ledger document belongs to
-exactly one local bill, enforced by the database, so if the new company issues an id an old bill
-still holds, **the new bill's link is refused** with an error saying the id is already held locally
-and naming a company reconnect as the likely cause. The document really is in QuickBooks; only the
-local link is missing, and someone has to resolve it by hand.
+exactly one local record, enforced by the database, so if the new company issues an id an old order,
+bill or credit note still holds, **the new link is refused** with an error saying the id is already
+held locally and naming a company reconnect as the likely cause. The document really is in
+QuickBooks; only the local link is missing, and someone has to resolve it by hand.
 
-That is deliberate. Letting both bills hold the same integer would be worse: the many places that
+That is deliberate. Letting both records hold the same integer would be worse: the many places that
 read a stored external id — payment matching, reconciliation, document updates, attachments — cannot
-tell two companies' ids apart, and sales orders and credit notes do not record an issuing company at
-all. A refused link is visible and fixable; a payment settling the wrong bill is neither.
+tell two companies' ids apart, and orders, refunds and credit notes do not record an issuing company
+at all. A refused link is visible and fixable; a payment settling the wrong document is neither.
+
+It is also why there is no back-reference repair sweep on QuickBooks (see *Back-Reference Repair*
+above). The refusal only fires when some local record still holds the id; after a company switch the
+usual case is that **nothing** holds it, and an automatic repair would then link a retired company's
+document with no constraint to stop it.
 
 **Practically:** if you need to move a QuickBooks connection to a different company, treat it as a
 migration, not a reconnect. Export the existing links first (they are financial records), then clear
@@ -615,19 +648,31 @@ document is still unlinked — is not deleted, because deleting it would erase t
 which document an unlinked bill belongs to, and deleting a *competing* row would silently turn an
 ambiguity the sweep was refusing to guess at into a confident wrong answer.
 
-It is **compacted** instead: at the retention cutoff the row keeps its connector, company, type,
-reference and external id, and loses its payload and error message — the parts holding customer
-details, addresses and financial lines. Nothing is retained past the retention period in full. A
-compacted row is evidence only: it still counts as a claim when the sweep decides whether a purchase
-order's bill is ambiguous, but it can no longer be repaired automatically, because the follow-ups
-cannot be rebuilt without the payload. If you want such a row gone entirely, cancel it — cancelled
-rows are deleted on the normal schedule. Rows the sweep settles expire normally.
+It is **compacted** instead: at the retention cutoff the row keeps its connector, type, reference and
+external id, and loses its payload and error message — the parts holding customer details, addresses
+and financial lines. Nothing is retained past the retention period in full.
+
+A compacted row is **still a repair candidate**, and the split is by what each piece of work needs
+rather than by the row as a whole. Everything the id write reads — the reference and the external
+id — survives compaction, so the sweep can still link the order or bill, including one whose
+ambiguity only cleared *after* the retention cutoff. What cannot survive is the follow-up work built
+from the payload (PDF, payment registration, bill attachment); when the sweep repairs one of these
+rows it logs `*_backreference_followups_discarded` naming the document, so you can check for a
+missing PDF or payment and re-drive it by hand. A compacted row also still counts as a claim when the
+sweep decides whether a purchase order's bill is ambiguous.
+
+**Do not cancel one of these rows to tidy it away.** Cancelling is irreversible in two ways the row
+gives no warning about: a cancelled row is no longer a repair candidate, so the link that was still
+perfectly possible is given up permanently; and it no longer counts as a competing claim, so an
+ambiguity the sweep was refusing to guess at can silently become a confident wrong answer on some
+other row. Cancel only when you have decided the document is genuinely abandoned. Rows the sweep
+settles expire normally.
 
 ## Cron Endpoints
 
 | Endpoint | Schedule | Purpose |
 |---|---|---|
-| `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals), then run the back-reference repair sweep (both Xero and QuickBooks) |
+| `/api/cron/accounting-sync` | Every 5 min | Process pending accounting sync entries (invoices, journals) for whichever accounting connector is active, then — for Xero only — run the back-reference repair sweep |
 | `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |

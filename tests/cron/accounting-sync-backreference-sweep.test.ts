@@ -2,19 +2,24 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 // ---------------------------------------------------------------------------
-// o3d-9kek r3 finding 2 — QuickBooks DECLARED its back-reference failures repairable and no
-// QuickBooks sweep existed.
+// o3d-9kek — which cron branch runs the back-reference repair sweep, and which deliberately does
+// not.
 //
-// updateBackReference swallows its write failures (including the load-bearing P2002 from the
-// bill's unique index) and logs "the back-reference repair sweep will retry it"; the PO-ambiguity
-// path logs "link the bill manually" and returns success. Both are only defensible if something
-// actually comes back to the row — and repairAccountingBackReferences was bound for Xero alone,
-// while the QuickBooks cron branch merely processed pending rows. Those rows therefore stayed
-// unlinked permanently, even after the ambiguity cleared, and the message the operator read was
-// false.
+// XERO RUNS IT. audit-H3: a document whose back-reference was never written (the process died after
+// the connector post, or the retries exhausted to FAILED) is otherwise orphaned forever.
 //
-// This asserts the WIRING, because the wiring is the defect. A test of the sweep function in
-// isolation passes just as happily when nobody calls it.
+// QUICKBOOKS DELIBERATELY DOES NOT (r6). A binding existed briefly on this branch and was removed.
+// repairAccountingBackReferences scopes its candidate query by `connector` and nothing else, and a
+// QuickBooks external id is a small integer that only means anything inside ONE realm; disconnecting
+// removes the expected-realm pin, so after reconnecting to company B an unresolved company-A row is
+// still a candidate and the sweep would write company A's id onto a live document. The payment
+// poller then treats that id as a company-B document and can mark the WRONG bill or order paid. The
+// global unique index does not cover it: it only stops a second local row taking an id another row
+// holds, and after a realm switch no local row holds the orphaned id at all.
+//
+// Failing to repair is acceptable; repairing onto the wrong document is not. So this file asserts
+// the ABSENCE as firmly as the presence — re-adding the binding is one line, and no other test in
+// the suite would go red. Precondition for re-adding it: o3d-s36z (connector-tenant isolation).
 // ---------------------------------------------------------------------------
 
 type Call = { connector: string; what: 'process' | 'repair' }
@@ -41,6 +46,10 @@ mock.module('@/lib/db', {
 mock.module('@/lib/domain/purchasing/landed-cost-journal-outbox', {
   namedExports: { processLandedCostJournalOutbox: async () => ({ drained: 0 }) },
 })
+// The QuickBooks processor double DOES offer a sweep. That is the point: if the cron branch ever
+// imports and calls one again, this double records it and the test below fails. A double that
+// omitted the export would fail with an import error instead, which reads as a broken test rather
+// than as the regression it is.
 mock.module('@/lib/connectors/quickbooks/sync-processor', {
   namedExports: {
     processPendingQuickBooksSync: async () => {
@@ -79,21 +88,22 @@ async function runCron(plugin: string): Promise<Record<string, unknown>> {
   return await response.json() as Record<string, unknown>
 }
 
-test('[o3d-9kek r3 f2] the QuickBooks cron branch RUNS the back-reference repair sweep', async () => {
+test('[o3d-9kek r6] the QuickBooks cron branch does NOT run the back-reference repair sweep', async () => {
   const body = await runCron('quickbooks')
 
   assert.deepEqual(calls, [
     { connector: 'quickbooks', what: 'process' },
-    { connector: 'quickbooks', what: 'repair' },
-  ], 'the sweep must run AFTER processing, so rows this cycle posted are examined too')
-  // Reported, not swallowed: an operator reading the cron result must be able to see that the
-  // retry the warnings promise actually happened, and what it did.
-  assert.deepEqual(body.backReferenceRepair, REPAIR_RESULT)
+  ], 'the sweep must not be bound for QuickBooks: it can attribute a previous realm\'s external id (o3d-s36z)')
+  // Nothing to report, and reporting an absent sweep as an empty result would read as "it ran and
+  // found nothing" — which is the opposite of the truth.
+  assert.equal('backReferenceRepair' in body, false)
 })
 
-test('[o3d-9kek r3 f2] the Xero branch is unchanged — both connectors sweep, neither by copy', async () => {
+test('[o3d-9kek] the Xero cron branch DOES run it — Xero is the connector with no realm exposure', async () => {
   const body = await runCron('xero')
 
   assert.deepEqual(calls.filter((call) => call.what === 'repair'), [{ connector: 'xero', what: 'repair' }])
+  // Reported, not swallowed: an operator reading the cron result must be able to see what the
+  // repair pass did.
   assert.deepEqual(body.backReferenceRepair, REPAIR_RESULT)
 })

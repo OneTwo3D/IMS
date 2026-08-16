@@ -1,7 +1,9 @@
 import type { AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import {
+  BACK_REFERENCE_TYPES,
   applyBackReference,
   backReferenceIsMissing,
+  isExternalDocumentIdConflict,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
   type AmbiguousPurchaseOrderAttribution,
@@ -80,22 +82,57 @@ import {
 //    compaction removed. Only the payload-dependent FOLLOW-UPS are genuinely unrecoverable, and
 //    those are discarded under an explicit terminal policy that warns before it settles the row.
 //
-// DELIBERATELY NOT IN SCOPE: connector-TENANT isolation. External ids are tenant-owned (a
-// QuickBooks realm id is an integer that repeats across companies), so a sweep running against a
-// different realm than the one a row posted to could in principle attribute the wrong document.
-// What stops that here is not a namespace on the row but the GLOBAL unique index on
-// purchase_invoices.accounting_invoice_id: a second bill can never take an id another bill holds,
-// so the worst outcome is a refused repair with a loud error rather than a wrong link. Namespacing
-// the id per connection was tried and reverted — it lets both bills exist, which moves the problem
-// to ~190 call sites that read a naked external id, on models that have no provenance column at
-// all. o3d-gt8r carries that design and its findings.
+// DELIBERATELY NOT IN SCOPE: connector-TENANT isolation — AND THAT IS WHY THIS SWEEP IS BOUND FOR
+// XERO ONLY (r6 finding 1).
+//
+// This module is connector-agnostic, but its candidate query is scoped by `connector` and nothing
+// else. External ids are TENANT-owned, so what that scope means differs sharply by connector:
+//
+//   • XERO: organisation and document ids are GUIDs. An id issued by a previously connected
+//     organisation cannot collide with one of the current organisation's documents — it resolves to
+//     nothing, loudly. There is no cross-tenant attribution to make.
+//   • QUICKBOOKS: document ids are small per-company integers, and company B routinely reissues an
+//     integer company A used. Disconnecting clears the expected-realm pin, so after reconnecting to
+//     company B an unresolved company-A row is still a candidate and this sweep would write company
+//     A's integer onto a live document; payment polling then acts on it as current.
+//
+// The global unique index on purchase_invoices.accounting_invoice_id does NOT close that: it only
+// stops a SECOND local row taking an id another row already holds. After a realm switch no local
+// row holds the orphaned id, so the write succeeds and the wrong-document link is created rather
+// than refused. (Where a local row DOES hold it, the index is what turns the collision into a
+// refused repair with a loud error, which is the acceptable failure.)
+//
+// So there is no QuickBooks binding, on purpose — failing to repair is acceptable, repairing onto
+// the wrong document is not. Namespacing the id per connection was tried and reverted: it lets both
+// bills exist, which moves the problem to ~190 call sites that read a naked external id, on models
+// that have no provenance column at all. o3d-gt8r carries that design and its findings; o3d-s36z is
+// the realm-isolation work that a QuickBooks binding is waiting on.
 //
 // The sweep must keep refusing to guess: failing to repair is acceptable, repairing onto
 // the wrong bill is not.
 // ---------------------------------------------------------------------------
 
-/** Sync types that can carry a back-reference. Matches syncTypeWritesBackReference's pairs. */
-export const BACK_REFERENCE_SWEEP_TYPES = ['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE'] as const
+/**
+ * Sync types that can carry a back-reference — DERIVED from BACK_REFERENCE_PAIRS, never restated
+ * (o3d-9kek r6 finding 2).
+ *
+ * This used to be a hand-written `['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE']` whose
+ * comment claimed it matched syncTypeWritesBackReference's pairs. It did not: PURCHASE_CREDIT_NOTE
+ * was missing, and the shared writer has supported it since audit-g5u2 (Xero posts ACCPAYCREDIT and
+ * writes SupplierCreditNote.accountingCreditNoteId). The omission cost two things at once, because
+ * retention reads the same list:
+ *
+ *   • a supplier credit note whose post succeeded and whose id write failed was NEVER a repair
+ *     candidate — its retries exhausted to FAILED and nothing ever came back to it;
+ *   • it was never retention-protected either, so the only row that knew an external credit note
+ *     existed with no local link was DELETED by age rather than compacted to a tombstone.
+ *
+ * Nothing in the sweep needed changing for it: PURCHASE_CREDIT_NOTE/SupplierCreditNote goes down the
+ * generic backReferenceIsMissing → applyBackReference path (the PO-attribution branch is scoped to
+ * PURCHASE_INVOICE/PurchaseOrder), and Xero's enqueueFollowUps already routes the type to its
+ * allocation follow-up. The defect was ONLY the restated list, which is why it is now derived.
+ */
+export const BACK_REFERENCE_SWEEP_TYPES: readonly AccountingSyncType[] = BACK_REFERENCE_TYPES
 
 /**
  * Rows that are still UNRESOLVED BACK-REFERENCE EVIDENCE, i.e. rows this sweep has not reached a
@@ -115,7 +152,8 @@ export const BACK_REFERENCE_SWEEP_TYPES = ['SALES_INVOICE', 'CREDIT_NOTE', 'PURC
  *
  *   • a permanently ambiguous row is never stamped BY DESIGN (stamping it is the starvation bug);
  *   • rows of a connector that is later disconnected are never swept at all, so never stamped;
- *   • every QuickBooks invoice/bill row was unstamped forever, because no QuickBooks sweep ran.
+ *   • every QuickBooks row is unstamped forever, because no QuickBooks sweep runs — deliberately,
+ *     see the tenant note below and lib/connectors/quickbooks/sync-processor.ts.
  *
  * Full payload rows — customer names, emails, addresses, financial lines — could therefore survive
  * a configured retention policy indefinitely, and a retention policy that silently fails to delete
@@ -526,8 +564,10 @@ export async function repairAccountingBackReferences(
    * lose the only notification, which is silence. That asymmetry is why a transaction around the
    * pair is not needed to make this safe.
    */
-  const reportAmbiguity = async (row: BackReferenceSweepRow, attribution: AmbiguousPurchaseOrderAttribution) => {
-    result.skippedAmbiguous++
+  const warnAndDefer = async (
+    row: BackReferenceSweepRow,
+    build: (previouslyLoggedAt: Date | null) => { action: string; description: string; metadata: Record<string, unknown> },
+  ) => {
     const previouslyLoggedAt = row.backReferenceAmbiguousLoggedAt
     const observedAt = now()
     // The candidate query already filtered on this, from the same cutoff. Re-asserted
@@ -536,35 +576,26 @@ export async function repairAccountingBackReferences(
     const dueToReport = previouslyLoggedAt === null || previouslyLoggedAt < ambiguityRecheckBefore
     if (!dueToReport) return
 
+    const entry = build(previouslyLoggedAt)
     const persisted = await deps.logActivity({
       entityType: 'SYSTEM',
-      action: `${prefix}_backreference_repair_ambiguous`,
+      action: entry.action,
       tag: 'sync',
       level: 'WARNING',
-      description: `Skipped ${connectorLabel} back-reference repair for PO ${row.referenceId}: `
-        + AMBIGUITY_EXPLANATIONS[attribution.reason](attribution)
+      description: entry.description
         + (previouslyLoggedAt === null ? '' : ` Still unresolved since this was last reported at ${previouslyLoggedAt.toISOString()}.`),
-      metadata: {
-        syncLogId: row.id,
-        referenceId: row.referenceId,
-        reason: attribution.reason,
-        syncRowCount: attribution.syncRowCount,
-        unlinkedBillCount: attribution.unlinkedBillCount,
-        linkedPurchaseInvoiceId: attribution.linkedPurchaseInvoiceId ?? null,
-        linkedPurchaseOrderId: attribution.linkedPurchaseOrderId ?? null,
-        previouslyLoggedAt: previouslyLoggedAt?.toISOString() ?? null,
-      },
+      metadata: { ...entry.metadata, previouslyLoggedAt: previouslyLoggedAt?.toISOString() ?? null },
     })
     if (!persisted) {
       // The warning did not reach the log. Leave the row immediately eligible: the next run
-      // re-probes and tries to report again. Deferring an unreported ambiguity is the one
+      // re-probes and tries to report again. Deferring an unreported refusal is the one
       // combination that helps nobody.
-      console.error(`${prefix}: back-reference ambiguity warning was not persisted; leaving row eligible`, row.id)
+      console.error(`${prefix}: back-reference refusal warning was not persisted; leaving row eligible`, row.id)
       return
     }
-    // A DEFERRAL, deliberately NOT backReferenceCheckedAt: ambiguity is not a verdict —
-    // a sibling can be cancelled or post, several unlinked bills can shrink to one, and
-    // the manual link this warning asks for changes the answer. Stamping it as checked
+    // A DEFERRAL, deliberately NOT backReferenceCheckedAt: neither an ambiguity nor an id conflict
+    // is a verdict — a sibling can be cancelled or post, several unlinked bills can shrink to one,
+    // and the manual link these warnings ask for changes the answer. Stamping it as checked
     // excluded a row that had since become repairable, which is the starvation this sweep
     // exists to prevent (Codex r9 #2). This takes the row out of the candidate set for ONE
     // interval and no longer.
@@ -577,8 +608,58 @@ export async function repairAccountingBackReferences(
       // The row can legitimately be gone — retention, or a connector switch cancelling it —
       // between the candidate read and here. Nothing to defer, and nothing to retry: a row that
       // no longer exists cannot re-fill the head of the scan.
-      console.error(`${prefix}: could not defer back-reference ambiguity`, row.id, deferralError)
+      console.error(`${prefix}: could not defer back-reference refusal`, row.id, deferralError)
     }
+  }
+
+  const reportAmbiguity = async (row: BackReferenceSweepRow, attribution: AmbiguousPurchaseOrderAttribution) => {
+    result.skippedAmbiguous++
+    await warnAndDefer(row, () => ({
+      action: `${prefix}_backreference_repair_ambiguous`,
+      description: `Skipped ${connectorLabel} back-reference repair for PO ${row.referenceId}: `
+        + AMBIGUITY_EXPLANATIONS[attribution.reason](attribution),
+      metadata: {
+        syncLogId: row.id,
+        referenceId: row.referenceId,
+        reason: attribution.reason,
+        syncRowCount: attribution.syncRowCount,
+        unlinkedBillCount: attribution.unlinkedBillCount,
+        linkedPurchaseInvoiceId: attribution.linkedPurchaseInvoiceId ?? null,
+        linkedPurchaseOrderId: attribution.linkedPurchaseOrderId ?? null,
+      },
+    }))
+  }
+
+  /**
+   * The unique index REFUSED the id write (o3d-9kek r6 finding 3).
+   *
+   * The sales-side columns are globally unique now too, so a SalesOrder / SalesOrderRefund /
+   * SupplierCreditNote write can be rejected the way a bill write already could — and unlike the
+   * PO-keyed path, which classifies its own P2002 and returns `ambiguous`, these arrive here as a
+   * thrown error. Left in the generic catch they were a `console.error` and a `failed++`: a
+   * permanent, human-only-fixable condition reported to nobody, re-attempted every five minutes
+   * forever. That is exactly the defect r2 finding 1 fixed for the PO path, so it gets the same
+   * treatment — warn once per interval, then defer.
+   *
+   * DEFERRED, not stamped: the conflict is resolvable by hand (unlink the wrong record), and a row
+   * excluded for good would never be re-examined afterwards. Still counted in `failed`, because
+   * nothing was repaired and the number must not quietly improve.
+   */
+  const reportExternalIdConflict = async (row: BackReferenceSweepRow, error: unknown) => {
+    await warnAndDefer(row, () => ({
+      action: `${prefix}_backreference_id_conflict`,
+      description: `Refused the ${connectorLabel} back-reference repair for ${row.referenceType} ${row.referenceId}: `
+        + `external id ${row.externalTransactionId} is already held by another local record, so it cannot also belong to this one. `
+        + 'Nothing was overwritten. Resolve it by hand — this will keep being refused until you do. '
+        + `Underlying error: ${String(error)}`,
+      metadata: {
+        syncLogId: row.id,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        externalId: row.externalTransactionId,
+      },
+    }))
   }
 
   /**
@@ -867,6 +948,12 @@ export async function repairAccountingBackReferences(
         } catch (repairError) {
           result.failed++
           console.error(`${prefix}: back-reference repair failed`, row.id, repairError)
+          // An external id already attributed to another local record is NOT a transient failure —
+          // no number of retries clears it, only a human does — so it is reported and throttled
+          // rather than left as a console line the next run repeats (r6 finding 3). Everything else
+          // stays exactly as it was: transient failures are silent-but-counted on purpose, because
+          // they are expected to succeed on their own.
+          if (isExternalDocumentIdConflict(repairError)) await reportExternalIdConflict(row, repairError)
         }
       } catch (rowError) {
         // Anything the per-row handling did not anticipate (e.g. the marker write itself

@@ -9,7 +9,7 @@ import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { activeAccountingIdProvenance, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { logActivity, logActivityPersisted } from '@/lib/activity-log'
+import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditMemo } from './credit-notes'
@@ -21,12 +21,6 @@ import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/ac
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import { applyBackReference } from '@/lib/domain/accounting/back-reference'
-import {
-  DEFAULT_BACK_REFERENCE_SWEEP_LIMIT,
-  createBackReferenceSweepCursorStore,
-  repairAccountingBackReferences,
-  type BackReferenceRepairResult,
-} from '@/lib/domain/accounting/back-reference-sweep'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -852,8 +846,9 @@ async function updateBackReference(
         tag: 'sync',
         level: 'WARNING',
         description: `Did not write the QuickBooks back-reference for PO ${referenceId}: its bill cannot be identified `
-          + `(${applied.attribution.reason}). Link the bill manually — the external id is on the sync row, and the repair `
-          + 'sweep re-checks it daily in case the ambiguity clears on its own.',
+          + `(${applied.attribution.reason}). Link the bill manually — the external id is on the sync row. `
+          + 'NOTHING re-checks this automatically: QuickBooks has no back-reference repair sweep (it is blocked on realm '
+          + 'isolation, o3d-s36z), so resolving the ambiguity on its own will not link the bill.',
         metadata: { referenceType, referenceId, externalId, reason: applied.attribution.reason },
       })
     }
@@ -861,7 +856,7 @@ async function updateBackReference(
     // the compare-and-swap, so nothing was written and nothing was overwritten. Not an
     // error — the repair sweep re-resolves it from the state that actually won.
     if (applied.outcome === 'contended') {
-      console.warn(`quickbooks: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; the repair sweep will re-resolve it.`)
+      console.warn(`quickbooks: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; it must be linked by hand.`)
     }
   } catch (error) {
     // Pre-existing: QuickBooks swallows back-reference failures here (Xero does not — it
@@ -871,12 +866,14 @@ async function updateBackReference(
     // QuickBooks document — arrives here as an exception, and an invisible one is
     // indistinguishable from success.
     //
-    // Swallowing is only defensible because the row is left in an EXPLICITLY RETRYABLE state and
-    // something actually retries it: the row keeps its externalTransactionId with
-    // backReferenceCheckedAt NULL, which is exactly the repair sweep's candidate shape, and
-    // repairQuickBooksBackReferences now runs from the QuickBooks cron and the manual sync
-    // (o3d-9kek r3 finding 2). Until this branch that sentence was false — the message below
-    // promised a sweep that existed for Xero only.
+    // THE WARNING MUST NOT PROMISE A RETRY (o3d-9kek r6). An earlier revision of this branch bound
+    // the connector-agnostic repair sweep to QuickBooks and this message said the sweep would retry
+    // it. That binding was removed — see the block at the end of this file: the sweep is scoped by
+    // connector alone, and a QuickBooks external id only means anything within one realm, so after a
+    // realm switch it could attribute a retired company's id to a live document. Nothing retries a
+    // failed QuickBooks back-reference now, and the operator is told exactly that instead of being
+    // told a sweep exists. Telling someone a retry will happen when nothing retries is worse than
+    // saying nothing; o3d-s36z is what would make the sweep safe to bind again.
     console.error(`quickbooks: back-reference write failed for ${referenceType} ${referenceId}`, error)
     await logActivity({
       entityType: 'SYSTEM',
@@ -884,7 +881,8 @@ async function updateBackReference(
       tag: 'sync',
       level: 'WARNING',
       description: `Could not write the QuickBooks back-reference for ${referenceType} ${referenceId}: ${String(error)}. `
-        + 'The external id is on the sync row; the back-reference repair sweep will retry it.',
+        + 'The external id is on the sync row, but NOTHING retries this: QuickBooks has no back-reference repair sweep '
+        + '(blocked on realm isolation, o3d-s36z). Link the document to that external id by hand.',
       metadata: { type, referenceType, referenceId, externalId },
     })
   }
@@ -1024,36 +1022,32 @@ async function enqueueFollowUps(
   }
 }
 
-export type { BackReferenceRepairResult }
-
-/**
- * audit-H3 repair sweep, QuickBooks binding (o3d-9kek).
- *
- * WHY THIS EXISTS NOW. updateBackReference above swallows its write failures — including the
- * load-bearing P2002 from the bill's unique index — and both it and the PO-ambiguity path told the
- * operator "the back-reference repair sweep will retry it". No such sweep ran for QuickBooks:
- * repairAccountingBackReferences was bound for Xero only, and the QuickBooks cron merely processed
- * pending rows. So those rows stayed permanently unlinked even after the ambiguity cleared, and the
- * message an operator read was false. Telling someone a retry will happen when nothing retries is
- * worse than saying nothing.
- *
- * The implementation is connector-agnostic on purpose — same starvation fix, same refusal to guess
- * which bill a PO-keyed row belongs to — so the two connectors cannot drift on this the way they
- * just did.
- */
-export async function repairQuickBooksBackReferences(limit = DEFAULT_BACK_REFERENCE_SWEEP_LIMIT): Promise<BackReferenceRepairResult> {
-  return repairAccountingBackReferences({
-    db,
-    connector: QBO_CONNECTOR,
-    connectorLabel: 'QuickBooks',
-    activityActionPrefix: 'quickbooks',
-    // Resume behind the rows the last run could not settle (r3 finding 4).
-    cursorStore: createBackReferenceSweepCursorStore(db, QBO_CONNECTOR),
-    // logActivityPersisted, NOT logActivity: the sweep defers an ambiguous row for 24 hours on the
-    // strength of having warned about it, and logActivity swallows its own write failures, so
-    // awaiting it cannot establish that anybody was told (o3d-9kek r2 finding 3).
-    logActivity: logActivityPersisted,
-    enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult) =>
-      enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult),
-  }, { limit })
-}
+// ---------------------------------------------------------------------------
+// THERE IS DELIBERATELY NO QuickBooks BINDING OF THE BACK-REFERENCE REPAIR SWEEP (o3d-9kek r6).
+//
+// One existed briefly on this branch and was REMOVED on purpose. Do not re-add it without first
+// closing o3d-s36z (connector-tenant / realm isolation) — that issue is this binding's precondition,
+// not a nice-to-have alongside it.
+//
+// WHY. repairAccountingBackReferences scopes its candidate query by `connector` and nothing else. A
+// QuickBooks external id is a small integer that is only meaningful inside ONE realm (company), and
+// disconnecting removes the expected-realm pin entirely — so after reconnecting to realm B, an
+// unresolved row that posted to realm A is still a candidate, and the sweep would write realm A's
+// integer onto a local document. The payment poller then reads that id as a realm-B document and can
+// mark or update the WRONG bill or order.
+//
+// The global unique index on purchase_invoices.accounting_invoice_id does NOT cover this: it only
+// stops a SECOND local row taking an id another row already holds. When no local row holds the
+// orphaned id — which is exactly the state a realm switch leaves behind — the write succeeds.
+//
+// So the choice was between a sweep that can attribute across realms and no sweep at all, and the
+// governing principle decides it: failing to repair is acceptable, repairing onto the wrong document
+// is not. QuickBooks is the secondary connector; Xero is the priority one and has no realm exposure
+// here (its poller builds its match set from Xero itself), so the Xero binding stays.
+//
+// The cost of the absence is real and is stated honestly rather than papered over: a QuickBooks
+// back-reference that fails to write is NOT retried by anything, and updateBackReference's warnings
+// above say so in as many words instead of promising a sweep. Whoever closes o3d-s36z should re-add
+// the binding here — the connector-agnostic sweep module needs no changes for it, only a trustworthy
+// realm boundary underneath.
+// ---------------------------------------------------------------------------

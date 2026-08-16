@@ -160,7 +160,7 @@ export type AmbiguousPurchaseOrderAttribution = {
 }
 
 /**
- * A Prisma unique-constraint violation (P2002) raised by the bill's external-id index.
+ * A Prisma unique-constraint violation (P2002) raised by one of the external-id indexes.
  *
  * Structural rather than `instanceof Prisma.PrismaClientKnownRequestError` — the same idiom as
  * shopping-webhook-inbox's isUniqueViolation — for two reasons: this module keeps its Prisma
@@ -170,16 +170,71 @@ export type AmbiguousPurchaseOrderAttribution = {
  * An unnamed target is treated as ours (fail closed): refusing a write we could have made is the
  * acceptable failure, making one we should not have is not.
  *
- * Prisma may report the column name or the index name; both contain `accounting_invoice_id`, which
- * is what this matches on.
+ * Prisma may report the column name or the index name; both contain the column, which is what this
+ * matches on.
  */
+function isExternalIdConflict(error: unknown, column: string): boolean {
+  // WALKS THE CAUSE CHAIN (o3d-9kek r6 finding 3). Every branch below re-describes the violation in
+  // the operator's terms and rethrows a plain Error with the P2002 as `cause`, so by the time the
+  // repair sweep sees one, the code is no longer on the top-level object. Looking only at the top
+  // would classify every one of our own explanatory rethrows as an unrelated failure — i.e. the
+  // clearer the message, the less the caller could tell what it was.
+  let current: unknown = error
+  for (let depth = 0; depth < 5 && typeof current === 'object' && current !== null; depth++) {
+    if ((current as { code?: unknown }).code === 'P2002') {
+      const target = (current as { meta?: { target?: unknown } }).meta?.target
+      if (target === undefined || target === null) return true
+      const targets = Array.isArray(target) ? target.map((entry) => String(entry)) : [String(target)]
+      return targets.some((name) => name.includes(column))
+    }
+    current = (current as { cause?: unknown }).cause
+  }
+  return false
+}
+
+/** The bill / sales-invoice index: purchase_invoices + sales_orders both use accounting_invoice_id. */
 export function isExternalBillIdConflict(error: unknown): boolean {
-  if (typeof error !== 'object' || error === null) return false
-  if ((error as { code?: unknown }).code !== 'P2002') return false
-  const target = (error as { meta?: { target?: unknown } }).meta?.target
-  if (target === undefined || target === null) return true
-  const targets = Array.isArray(target) ? target.map((entry) => String(entry)) : [String(target)]
-  return targets.some((name) => name.includes('accounting_invoice_id'))
+  return isExternalIdConflict(error, 'accounting_invoice_id')
+}
+
+/** The credit-note indexes: sales_order_refunds + supplier_credit_notes (o3d-9kek r6 finding 3). */
+export function isExternalCreditNoteIdConflict(error: unknown): boolean {
+  return isExternalIdConflict(error, 'accounting_credit_note_id')
+}
+
+/**
+ * Either of the above — for callers that only need "this write was refused because the external id
+ * is already attributed", without caring which document type raised it (the repair sweep).
+ */
+export function isExternalDocumentIdConflict(error: unknown): boolean {
+  return isExternalBillIdConflict(error) || isExternalCreditNoteIdConflict(error)
+}
+
+/**
+ * The shared refusal message for a duplicated external id (o3d-9kek r6 finding 3).
+ *
+ * One wording for all four columns, because the situation and the remedy are identical: the ledger
+ * document is already spoken for locally, IMS will not move or clear the existing link on its own
+ * (nothing records whether that link was posted authoritatively or deduced), and a human has to
+ * decide which local document is the real one. Written out rather than left as Prisma's
+ * `Unique constraint failed on the fields: (...)`, which names a column and no action.
+ */
+function externalIdConflictMessage(params: {
+  connector: string
+  documentLabel: string
+  localId: string
+  externalId: string
+  remoteLabel: string
+  otherLabel: string
+}): string {
+  return (
+    `Refusing to link ${params.documentLabel} ${params.localId} to ${params.connector} ${params.remoteLabel} ${params.externalId}: `
+    + `that external id is ALREADY HELD LOCALLY by another ${params.otherLabel}, and one ledger document cannot belong to two `
+    + 'local documents — every later correction, payment or status update would act on the wrong one. The likeliest cause is that '
+    + 'this connector was reconnected to a different company/organisation which has reissued an id a document from the previous one '
+    + `still holds; the next likeliest is that the ledger merged two of our documents on a shared number. Check which record currently `
+    + `carries ${params.externalId} and resolve it by hand — nothing here will overwrite it.`
+  )
 }
 
 export type PurchaseOrderAttribution =
@@ -313,14 +368,37 @@ export async function resolvePurchaseOrderBackReference(
   return { outcome: 'unique', purchaseInvoiceId: unlinkedBills[0].id }
 }
 
+/**
+ * THE ONE AUTHORITATIVE LIST of sync type → reference type pairs that write a back-reference.
+ *
+ * Exported and derived-from rather than restated, because restating it is how a whole document type
+ * silently fell out of the repair sweep (o3d-9kek r6 finding 2). The sweep and data retention both
+ * filtered on a hand-written `['SALES_INVOICE', 'CREDIT_NOTE', 'PURCHASE_INVOICE']`, whose comment
+ * claimed it matched these pairs — it did not. PURCHASE_CREDIT_NOTE was missing, so a supplier
+ * credit note whose post succeeded and whose local id write failed was never a candidate for repair,
+ * AND was never protected from retention: the only row carrying the external credit-note id was
+ * deleted by age instead of compacted to a tombstone, taking the evidence with it.
+ *
+ * Every consumer that needs "which types can carry a back-reference" must read this, never a copy.
+ * applyBackReference and backReferenceIsMissing below still branch per pair — they have to, the
+ * columns differ — but a pair present here and absent there is caught by a test rather than by a
+ * missing repair a year later.
+ */
+export const BACK_REFERENCE_PAIRS: ReadonlyArray<{ type: AccountingSyncType; referenceTypes: readonly string[] }> = [
+  { type: 'SALES_INVOICE', referenceTypes: ['SalesOrder'] },
+  { type: 'CREDIT_NOTE', referenceTypes: ['SalesOrderRefund'] },
+  // PurchaseOrder is the LEGACY keying (pre-o3d-9oq): the row names the order, not the bill, and is
+  // attributed by resolvePurchaseOrderBackReference or refused.
+  { type: 'PURCHASE_INVOICE', referenceTypes: ['PurchaseInvoice', 'PurchaseOrder'] },
+  { type: 'PURCHASE_CREDIT_NOTE', referenceTypes: ['SupplierCreditNote'] },
+]
+
+/** The sync types in BACK_REFERENCE_PAIRS. Derived, so it can never drift from the pairs. */
+export const BACK_REFERENCE_TYPES: readonly AccountingSyncType[] = BACK_REFERENCE_PAIRS.map((pair) => pair.type)
+
 /** Whether a sync type/reference pair writes a back-reference at all. */
 export function syncTypeWritesBackReference(type: AccountingSyncType, referenceType: string): boolean {
-  return (
-    (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') ||
-    (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') ||
-    (type === 'PURCHASE_INVOICE' && (referenceType === 'PurchaseInvoice' || referenceType === 'PurchaseOrder')) ||
-    (type === 'PURCHASE_CREDIT_NOTE' && referenceType === 'SupplierCreditNote')
-  )
+  return BACK_REFERENCE_PAIRS.some((pair) => pair.type === type && pair.referenceTypes.includes(referenceType))
 }
 
 /**
@@ -377,20 +455,50 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
   const { connector, type, referenceType, referenceId, externalId, invoiceNumber } = params
   if (!externalId) return { outcome: 'nothing-to-apply' }
 
+  // o3d-9kek r6 finding 3: the three sales-side columns are globally unique too, so each of these
+  // writes can now be REFUSED by the database — and each one classifies and re-describes the
+  // refusal exactly as the bill writer below does. A bare `update` here would let Prisma's
+  // `Unique constraint failed on the fields: (accounting_invoice_id)` be the only thing an operator
+  // ever sees: a column name, no document, and no action.
   if (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') {
-    await deps.salesOrder.update({
-      where: { id: referenceId },
-      data: {
-        accountingInvoiceId: externalId,
-        invoiceNumber: invoiceNumber ?? undefined,
-        invoicedAt: new Date(),
-      },
-    })
+    try {
+      await deps.salesOrder.update({
+        where: { id: referenceId },
+        data: {
+          accountingInvoiceId: externalId,
+          invoiceNumber: invoiceNumber ?? undefined,
+          invoicedAt: new Date(),
+        },
+      })
+    } catch (error) {
+      if (!isExternalBillIdConflict(error)) throw error
+      // Worse here than on a bill, which is why it is refused rather than allowed: payment polling
+      // selects EVERY order carrying a matching external id and marks each one paid, so a duplicate
+      // makes one customer payment settle two orders.
+      throw new Error(
+        externalIdConflictMessage({
+          connector, documentLabel: 'SalesOrder', localId: referenceId, externalId,
+          remoteLabel: 'invoice', otherLabel: 'sales order',
+        }),
+        { cause: error },
+      )
+    }
   } else if (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') {
-    await deps.salesOrderRefund.update({
-      where: { id: referenceId },
-      data: { accountingCreditNoteId: externalId },
-    })
+    try {
+      await deps.salesOrderRefund.update({
+        where: { id: referenceId },
+        data: { accountingCreditNoteId: externalId },
+      })
+    } catch (error) {
+      if (!isExternalCreditNoteIdConflict(error)) throw error
+      throw new Error(
+        externalIdConflictMessage({
+          connector, documentLabel: 'SalesOrderRefund', localId: referenceId, externalId,
+          remoteLabel: 'credit note', otherLabel: 'refund',
+        }),
+        { cause: error },
+      )
+    }
   } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseInvoice') {
     // The AUTHORITATIVE path: the row names its own bill, so there is nothing to deduce and this
     // write is allowed to overwrite a legacy guess. It is still subject to the unique index, and
@@ -462,10 +570,29 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
     // transaction aborted while telling them everything is fine.
     return resolveAndApplyPurchaseOrderBackReference(deps, resolveAndApply)
   } else if (type === 'PURCHASE_CREDIT_NOTE' && referenceType === 'SupplierCreditNote') {
-    await deps.supplierCreditNote.update({
-      where: { id: referenceId },
-      data: { accountingCreditNoteId: externalId },
-    })
+    try {
+      await deps.supplierCreditNote.update({
+        where: { id: referenceId },
+        data: { accountingCreditNoteId: externalId },
+      })
+    } catch (error) {
+      if (!isExternalCreditNoteIdConflict(error)) throw error
+      // The one of the four with a live cause today: Xero's POST /CreditNotes is create-or-update
+      // on CreditNoteNumber (the o3d-6l3 ACCPAY defect, one document type over), and
+      // buildSupplierCreditNotePayload falls back to the PO reference when the number is blank —
+      // so two manual credit notes on one PO can post the same number and come back with the same
+      // CreditNoteID, the second having replaced the first in the ledger. The index turns that from
+      // two local rows quietly sharing one document into a refusal somebody reads.
+      throw new Error(
+        externalIdConflictMessage({
+          connector, documentLabel: 'SupplierCreditNote', localId: referenceId, externalId,
+          remoteLabel: 'credit note', otherLabel: 'supplier credit note',
+        })
+        + ' If both credit notes were raised against the same purchase order with a blank credit-note number,'
+        + ' they will have posted under the same number and the ledger will hold only one of them — check it there first.',
+        { cause: error },
+      )
+    }
   } else {
     return { outcome: 'nothing-to-apply' }
   }
