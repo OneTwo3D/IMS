@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { adapterUniqueViolation } from '../helpers/prisma-unique-error'
+
 // ---------------------------------------------------------------------------
 // o3d-9kek — QuickBooks writes its back-references through the SHARED writer.
 //
@@ -33,6 +35,8 @@ type SyncRow = {
   retryCount: number
   processingStartedAt: Date | null
   createdAt: Date
+  /** Written by the quarantine path (r7 finding 1) — the durable half of the conflict record. */
+  errorMessage?: string | null
 }
 
 type BillRow = { id: string; poId: string; accountingInvoiceId: string | null; createdAt: number }
@@ -81,11 +85,13 @@ const billClient = {
     // purchase_invoices.accounting_invoice_id is UNIQUE, globally, on the value alone. Raised the
     // way Prisma raises it, so the writer's conflict classification is exercised rather than
     // assumed — and so the QuickBooks catch below actually has an exception to swallow.
+    // In the LIVE ADAPTER'S shape (o3d-9kek r7 finding 2): `meta.target` is undefined under
+    // `@prisma/adapter-pg` and the columns arrive at driverAdapterError.cause.constraint.fields.
     const externalId = args.data.accountingInvoiceId
     if (typeof externalId === 'string' && state.bills.some((other) => other.id !== bill.id && other.accountingInvoiceId === externalId)) {
-      throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`)'), {
-        code: 'P2002',
-        meta: { target: ['accounting_invoice_id'] },
+      throw adapterUniqueViolation(['accounting_invoice_id'], {
+        modelName: 'PurchaseInvoice',
+        constraintName: 'purchase_invoices_accounting_invoice_id_key',
       })
     }
     state.billUpdates.push({ id: bill.id, data: args.data })
@@ -196,11 +202,13 @@ test('[o3d-9kek] QuickBooks REFUSES an ambiguous PO instead of stamping the newe
   assert.match(String(warning.description), /manually/i, 'the only remedy is manual, and must be named')
 })
 
-test('[o3d-9kek r6 f1] a refused bill-keyed link is reported WITHOUT promising a retry', async () => {
+test('[o3d-9kek r7 f1] a refused bill-keyed link is QUARANTINED with a route forward, not just reported', async () => {
   // The unique index refuses the write because another bill already holds this QuickBooks id — the
-  // realm-switch case the index exists to catch. updateBackReference swallows the exception (still
-  // deliberate: de-swallowing changes QBO's retry semantics for every type at once), so the ACTIVITY
-  // ENTRY is the operator's only signal, and what it claims has to be true.
+  // realm-switch case the index exists to catch. The document IS IN QUICKBOOKS; only its local
+  // record was refused. The old warning ended in "link the document by hand", which cannot be done:
+  // the same index refuses a manual link for exactly the same reason, and with the QuickBooks sweep
+  // unwired nothing ever came back to it. A refusal with no route forward is not acceptable for a
+  // document that already exists in the ledger.
   reset([
     { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 },
     { id: 'bill-other', poId: 'po-9', accountingInvoiceId: '1042', createdAt: 2 },
@@ -211,13 +219,47 @@ test('[o3d-9kek r6 f1] a refused bill-keyed link is reported WITHOUT promising a
   await processPendingQuickBooksSync()
 
   assert.equal(state.bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, null, 'the index refused it')
+  const conflict = state.activities.find((entry) => entry.action === 'quickbooks_backreference_id_conflict')
+  assert.ok(conflict, 'an external-id conflict is not an ordinary back-reference failure')
+  const description = String(conflict.description)
+
+  // What actually happened, stated: the ledger document exists.
+  assert.match(description, /POSTED SUCCESSFULLY as external id 1042/)
+  // WHO is blocking. Without this the operator has four tables to search by hand.
+  assert.match(description, /PurchaseInvoice bill-other currently holds it/)
+  assert.equal(conflict.metadata?.blockedById, 'bill-other')
+  assert.equal(conflict.metadata?.blockedByModel, 'PurchaseInvoice')
+  // THE ROUTE FORWARD, with both ids already filled in.
+  assert.match(description, /release-accounting-external-id-claim\.ts --sync-log log-1 --holder bill-other --apply/)
+  // …and the guard on it, because releasing a LIVE link is worse than the refusal it replaces.
+  assert.match(description, /Do NOT release it if that record is a live, correctly linked document/)
+  // r6 finding 1 still holds: no sweep exists for QuickBooks and the message must not imply one.
+  assert.doesNotMatch(description, /sweep (?:will retry|retries|re-checks|rechecks)/i)
+  assert.match(description, /NOT retried/)
+
+  // THE DURABLE HALF. An activity entry can be pruned or never read; the row that carries the
+  // external id carries the conflict too.
+  const row = state.syncRows.find((candidate) => candidate.id === 'log-1')
+  assert.match(String(row?.errorMessage), /POSTED SUCCESSFULLY as external id 1042/)
+  // …and it stays SYNCED. Moving it to FAILED would surface it in the failed-sync banner, and would
+  // also stop it suppressing its own re-enqueue — queueQuickBooksSync dedupes on
+  // `status in (PENDING, PROCESSING, SYNCED)` — so the document would post to QuickBooks twice.
+  assert.equal(row?.status, 'SYNCED', 'a posted document that cannot be recorded is bad; two posted documents are worse')
+})
+
+test('[o3d-9kek r7 f1] a NON-conflict back-reference failure still gets the generic warning', async () => {
+  // The quarantine must not become a catch-all: a transient write failure is a different thing with
+  // a different remedy, and telling an operator to release a claim that is not blocking anything
+  // would send them to detach a document for no reason.
+  reset([{ id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }])
+  state.syncRows = [{ ...poRow('1042'), referenceType: 'PurchaseInvoice', referenceId: 'bill-missing' }]
+  const { processPendingQuickBooksSync } = await import('@/lib/connectors/quickbooks/sync-processor')
+
+  await processPendingQuickBooksSync()
+
+  assert.equal(state.activities.find((entry) => entry.action === 'quickbooks_backreference_id_conflict'), undefined)
   const failure = state.activities.find((entry) => entry.action === 'quickbooks_backreference_failed')
   assert.ok(failure, 'a swallowed exception must still reach the operator')
-  assert.doesNotMatch(
-    String(failure.description),
-    /sweep (?:will retry|retries|re-checks|rechecks)/i,
-    'the previous text said "the back-reference repair sweep will retry it" — nothing retries it',
-  )
   assert.match(String(failure.description), /NOTHING retries this/, 'the absence has to be stated, not left implied')
   assert.match(String(failure.description), /by hand/i, 'the message must name the manual action it actually requires')
 })

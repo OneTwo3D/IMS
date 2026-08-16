@@ -1,5 +1,6 @@
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { isUniqueConstraintViolation, uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 
 // ---------------------------------------------------------------------------
 // Accounting back-reference write + repair (audit-H3)
@@ -160,33 +161,77 @@ export type AmbiguousPurchaseOrderAttribution = {
 }
 
 /**
+ * The names a P2002 can use for the bill / sales-invoice column, and for the credit-note column.
+ *
+ * BOTH the DATABASE column and the PRISMA FIELD, because which of the two arrives depends on which
+ * of the three shapes lib/db/prisma-unique-violation reads the violation from:
+ *
+ *   • `@prisma/adapter-pg` — what lib/db/index.ts actually builds the client with — reports the
+ *     DATABASE columns at `meta.driverAdapterError.cause.constraint.fields`. All four of these
+ *     columns are `@map`ped to all-lowercase snake_case (`accounting_invoice_id`,
+ *     `accounting_credit_note_id`), and the live probe recorded in prisma-unique-violation.ts found
+ *     that Postgres reports all-lowercase identifiers UNQUOTED — so `accounting_invoice_id`;
+ *   • some adapter builds report the INDEX NAME there instead, and the raw-message fallback always
+ *     does (`purchase_invoices_accounting_invoice_id_key`). The shared reader anchors those on the
+ *     `_<column>_key` suffix rather than matching a substring;
+ *   • the classic query engine's `meta.target` is a fallback path this codebase no longer runs on,
+ *     and across Prisma versions it has carried column names, index names AND model field names.
+ *
+ * Listing the Prisma field name alongside the column costs nothing and removes the guess:
+ * `accountingInvoiceId` is not a column ANY of these four tables has, so accepting it cannot widen
+ * the match onto some other real column.
+ *
+ * NOT VERIFIED FROM HERE: the exact `constraint` payload for THESE indexes, which needs a live
+ * database. What was verified live (see prisma-unique-violation.ts) is the shape of the envelope and
+ * the quoting rule; the reader covers all three shapes, so the classification does not depend on
+ * which one a given Prisma build picks.
+ */
+const EXTERNAL_BILL_ID_NAMES = ['accounting_invoice_id', 'accountingInvoiceId'] as const
+const EXTERNAL_CREDIT_NOTE_ID_NAMES = ['accounting_credit_note_id', 'accountingCreditNoteId'] as const
+
+/**
  * A Prisma unique-constraint violation (P2002) raised by one of the external-id indexes.
  *
  * Structural rather than `instanceof Prisma.PrismaClientKnownRequestError` — the same idiom as
  * shopping-webhook-inbox's isUniqueViolation — for two reasons: this module keeps its Prisma
  * import type-only, and a test double must be able to RAISE one. A double that cannot produce a
- * constraint violation would make the handling below untestable while looking tested.
+ * constraint violation would make the handling below untestable while looking tested — and a double
+ * that produces the WRONG shape is worse, because it looks tested and is not. See the doubles in
+ * tests/accounting/back-reference.test.ts, which raise the live adapter's envelope.
  *
- * An unnamed target is treated as ours (fail closed): refusing a write we could have made is the
- * acceptable failure, making one we should not have is not.
+ * FIELD IDENTIFICATION IS DELEGATED to lib/db/prisma-unique-violation (o3d-9kek r7 finding 2).
+ * This used to read `meta.target` and nothing else, which is the ONE shape production never
+ * produces: under `@prisma/adapter-pg` `meta.target` is `undefined` and the columns arrive at
+ * `meta.driverAdapterError.cause.constraint.fields`. So every live P2002 fell into the old
+ * "unnamed target" branch — and that branch returned TRUE. A `SalesOrderRefund.externalRefundId`
+ * violation, or any other unique constraint on any of these models, was therefore reported to the
+ * operator as an accounting-id collision, with a message naming a realm switch and a remedy that
+ * has nothing to do with the constraint that actually failed.
  *
- * Prisma may report the column name or the index name; both contain the column, which is what this
- * matches on.
+ * It also matched by SUBSTRING, so a hypothetical `accounting_invoice_id_hash` counted as ours.
+ *
+ * FAILS CLOSED, in the direction that phrase actually points here: a P2002 that does not identify
+ * ITSELF as one of our columns is NOT claimed. The old comment called returning `true` "fail closed"
+ * on the grounds that refusing a write is the safe failure — but these classifiers do not decide
+ * whether to write. Every caller below has ALREADY had its write refused by the database; what the
+ * classifier decides is what the operator is TOLD, and — in the sweep — whether the row is deferred
+ * as a human-resolvable id conflict or counted as an ordinary transient failure. Claiming an
+ * unidentified violation there is not caution, it is a wrong diagnosis; declining it surfaces the
+ * real constraint instead.
  */
-function isExternalIdConflict(error: unknown, column: string): boolean {
+function isExternalIdConflict(error: unknown, names: readonly string[]): boolean {
   // WALKS THE CAUSE CHAIN (o3d-9kek r6 finding 3). Every branch below re-describes the violation in
   // the operator's terms and rethrows a plain Error with the P2002 as `cause`, so by the time the
   // repair sweep sees one, the code is no longer on the top-level object. Looking only at the top
   // would classify every one of our own explanatory rethrows as an unrelated failure — i.e. the
   // clearer the message, the less the caller could tell what it was.
+  //
+  // The FIRST P2002 in the chain decides. Our rethrows wrap the original violation, so the outermost
+  // one is the real one; continuing past a P2002 that names a different constraint would let an
+  // unrelated inner violation re-classify it.
   let current: unknown = error
   for (let depth = 0; depth < 5 && typeof current === 'object' && current !== null; depth++) {
-    if ((current as { code?: unknown }).code === 'P2002') {
-      const target = (current as { meta?: { target?: unknown } }).meta?.target
-      if (target === undefined || target === null) return true
-      const targets = Array.isArray(target) ? target.map((entry) => String(entry)) : [String(target)]
-      return targets.some((name) => name.includes(column))
-    }
+    if (isUniqueConstraintViolation(current)) return uniqueViolationTargetsField(current, names)
     current = (current as { cause?: unknown }).cause
   }
   return false
@@ -194,12 +239,12 @@ function isExternalIdConflict(error: unknown, column: string): boolean {
 
 /** The bill / sales-invoice index: purchase_invoices + sales_orders both use accounting_invoice_id. */
 export function isExternalBillIdConflict(error: unknown): boolean {
-  return isExternalIdConflict(error, 'accounting_invoice_id')
+  return isExternalIdConflict(error, EXTERNAL_BILL_ID_NAMES)
 }
 
 /** The credit-note indexes: sales_order_refunds + supplier_credit_notes (o3d-9kek r6 finding 3). */
 export function isExternalCreditNoteIdConflict(error: unknown): boolean {
-  return isExternalIdConflict(error, 'accounting_credit_note_id')
+  return isExternalIdConflict(error, EXTERNAL_CREDIT_NOTE_ID_NAMES)
 }
 
 /**
@@ -384,14 +429,31 @@ export async function resolvePurchaseOrderBackReference(
  * columns differ — but a pair present here and absent there is caught by a test rather than by a
  * missing repair a year later.
  */
-export const BACK_REFERENCE_PAIRS: ReadonlyArray<{ type: AccountingSyncType; referenceTypes: readonly string[] }> = [
-  { type: 'SALES_INVOICE', referenceTypes: ['SalesOrder'] },
-  { type: 'CREDIT_NOTE', referenceTypes: ['SalesOrderRefund'] },
+export const BACK_REFERENCE_PAIRS: ReadonlyArray<{
+  type: AccountingSyncType
+  referenceTypes: readonly string[]
+  /**
+   * The model that HOLDS the external id, and the column it holds it in. Not always the reference
+   * type: a PurchaseOrder-keyed row is attributed to one of that order's PurchaseInvoices.
+   *
+   * Carried here, on the same table as the pair, so the four (model, column) facts the release path
+   * needs cannot drift from the four branches applyBackReference writes — the r6 finding 2 mistake
+   * was a restated list, and a second restated list is the same defect with a new name.
+   */
+  holder: ExternalDocumentIdHolder
+}> = [
+  { type: 'SALES_INVOICE', referenceTypes: ['SalesOrder'], holder: { model: 'SalesOrder', column: 'accountingInvoiceId' } },
+  { type: 'CREDIT_NOTE', referenceTypes: ['SalesOrderRefund'], holder: { model: 'SalesOrderRefund', column: 'accountingCreditNoteId' } },
   // PurchaseOrder is the LEGACY keying (pre-o3d-9oq): the row names the order, not the bill, and is
   // attributed by resolvePurchaseOrderBackReference or refused.
-  { type: 'PURCHASE_INVOICE', referenceTypes: ['PurchaseInvoice', 'PurchaseOrder'] },
-  { type: 'PURCHASE_CREDIT_NOTE', referenceTypes: ['SupplierCreditNote'] },
+  { type: 'PURCHASE_INVOICE', referenceTypes: ['PurchaseInvoice', 'PurchaseOrder'], holder: { model: 'PurchaseInvoice', column: 'accountingInvoiceId' } },
+  { type: 'PURCHASE_CREDIT_NOTE', referenceTypes: ['SupplierCreditNote'], holder: { model: 'SupplierCreditNote', column: 'accountingCreditNoteId' } },
 ]
+
+/** Which model/column a sync type+reference pair's external id lands on, or null if it lands nowhere. */
+export function backReferenceHolder(type: AccountingSyncType, referenceType: string): ExternalDocumentIdHolder | null {
+  return BACK_REFERENCE_PAIRS.find((pair) => pair.type === type && pair.referenceTypes.includes(referenceType))?.holder ?? null
+}
 
 /** The sync types in BACK_REFERENCE_PAIRS. Derived, so it can never drift from the pairs. */
 export const BACK_REFERENCE_TYPES: readonly AccountingSyncType[] = BACK_REFERENCE_PAIRS.map((pair) => pair.type)
@@ -641,4 +703,154 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
     return cn != null && !cn.accountingCreditNoteId
   }
   return false
+}
+
+// ---------------------------------------------------------------------------
+// THE ROUTE FORWARD out of a refused external-id write (o3d-9kek r7 finding 1).
+//
+// The global unique index turns a realm collision into a REFUSAL, which is the right trade —
+// see applyBackReference. But a refusal is only acceptable if something can still be done, and
+// for a document that has ALREADY POSTED to the remote ledger there was nothing:
+//
+//   • QuickBooks posts a bill under company B and gets id 145 back. The sync row is marked SYNCED
+//     with externalTransactionId = 145 — so the fact of the post is durable and retention-protected
+//     (UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE compacts that row to a tombstone rather than
+//     deleting it, and the tombstone keeps the external id). Nothing is lost.
+//   • The write of 145 onto the local bill is then refused, because a bill from the retired
+//     company A still holds 145.
+//   • The warning said "link the document by hand". THAT INSTRUCTION COULD NOT BE CARRIED OUT: the
+//     same index refuses a manual link for exactly the same reason. And with the QuickBooks sweep
+//     deliberately unwired (o3d-s36z is its precondition) nothing retried it either.
+//
+// So the missing piece was never the record — it was the RELEASE. The retired company's claim has
+// to come off before anything, human or machine, can put the id where it belongs.
+//
+// WHY THIS IS NOT AUTOMATIC. Nothing in the database can tell a retired realm's stale id from a
+// live, correct link: SalesOrder, SalesOrderRefund, PurchaseInvoice and SupplierCreditNote have no
+// provenance column for the accounting id (that is what o3d-gt8r/o3d-s36z would add). Clearing the
+// wrong one silently detaches a document that IS correctly linked — the governing principle again,
+// pointing the other way. So the holder is NAMED BY THE OPERATOR and re-verified here, and the
+// clear is conditional on that document still holding exactly that id.
+//
+// WHY THE SYNC ROW IS NOT FLIPPED TO FAILED to make it visible, which is the obvious move and is
+// wrong: queueQuickBooksSync (and Xero's equivalent) dedupes new enqueues on
+// `status in (PENDING, PROCESSING, SYNCED)`. A row moved out of SYNCED stops suppressing its own
+// re-enqueue, and the document posts to the ledger a SECOND time. A posted document that cannot be
+// recorded is bad; two posted documents are worse.
+// ---------------------------------------------------------------------------
+
+/** The four local models that can hold an accounting external document id, and the column they use. */
+export type ExternalDocumentIdHolder =
+  | { model: 'SalesOrder'; column: 'accountingInvoiceId' }
+  | { model: 'SalesOrderRefund'; column: 'accountingCreditNoteId' }
+  | { model: 'PurchaseInvoice'; column: 'accountingInvoiceId' }
+  | { model: 'SupplierCreditNote'; column: 'accountingCreditNoteId' }
+
+/** The Prisma delegate surface the claim lookup and release need. Structural, so a double satisfies it. */
+type ExternalDocumentIdClaimDelegate = {
+  findFirst(args: { where: Record<string, unknown>; select: { id: true } }): Promise<{ id: string } | null>
+  updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
+}
+
+export type ExternalDocumentIdClaimDeps = {
+  salesOrder: ExternalDocumentIdClaimDelegate
+  salesOrderRefund: ExternalDocumentIdClaimDelegate
+  purchaseInvoice: ExternalDocumentIdClaimDelegate
+  supplierCreditNote: ExternalDocumentIdClaimDelegate
+}
+
+const CLAIM_DELEGATES: Record<ExternalDocumentIdHolder['model'], keyof ExternalDocumentIdClaimDeps> = {
+  SalesOrder: 'salesOrder',
+  SalesOrderRefund: 'salesOrderRefund',
+  PurchaseInvoice: 'purchaseInvoice',
+  SupplierCreditNote: 'supplierCreditNote',
+}
+
+/**
+ * Which local record currently holds `externalId` in `holder`'s column — i.e. what is BLOCKING the
+ * write, named so the operator does not have to go looking.
+ *
+ * SCOPED TO THE ONE MODEL, deliberately. The four unique indexes are PER TABLE, not global across
+ * the four: `sales_orders.accounting_invoice_id` and `purchase_invoices.accounting_invoice_id` are
+ * separate constraints, and QuickBooks issues Invoice ids and Bill ids from separate sequences — so
+ * Invoice 145 and Bill 145 routinely coexist and are not related in any way. Searching all four
+ * tables would report a perfectly innocent sales order as the blocker of a bill write, and the
+ * release path below would then invite an operator to detach it.
+ */
+export async function findExternalDocumentIdClaim(
+  deps: ExternalDocumentIdClaimDeps,
+  params: { holder: ExternalDocumentIdHolder; externalId: string },
+): Promise<{ id: string } | null> {
+  if (!params.externalId) return null
+  const delegate = deps[CLAIM_DELEGATES[params.holder.model]]
+  return delegate.findFirst({ where: { [params.holder.column]: params.externalId }, select: { id: true } })
+}
+
+export type ExternalDocumentIdReleaseOutcome =
+  /** The named holder released the id, and the back-reference was then written to its rightful owner. */
+  | { outcome: 'relinked'; releasedFrom: string; appliedTo: { referenceType: string; referenceId: string } }
+  /** The id is already on the document that should have it. Nothing to release, nothing to write. */
+  | { outcome: 'already-correct' }
+  /** Nothing holds the id in this model any more — so nothing is blocking. Re-run the repair instead. */
+  | { outcome: 'no-claim' }
+  /**
+   * The document currently holding the id is NOT the one the operator confirmed. Refused rather than
+   * released: the confirmation is the only thing separating "a retired realm's stale id" from "a
+   * correct link", so a confirmation about a different document confirms nothing.
+   */
+  | { outcome: 'holder-mismatch'; currentHolderId: string }
+  /**
+   * The conditional clear matched no row — the holder changed its id between the read and the write.
+   * Nothing was cleared and nothing was written; re-read and confirm again.
+   */
+  | { outcome: 'contended'; holderId: string }
+  /** Released, but the back-reference write still did not land. Says what applyBackReference returned. */
+  | { outcome: 'released-not-applied'; releasedFrom: string; applyOutcome: BackReferenceApplyOutcome['outcome'] }
+  /** This type/reference pair does not write a back-reference at all, so there is no claim to release. */
+  | { outcome: 'not-applicable' }
+
+/**
+ * RELEASE the named holder's claim on an external id and immediately link it to the document that
+ * actually posted it. The operator route out of a refused back-reference.
+ *
+ * Both halves in one call on purpose. Releasing alone leaves the id owned by nobody, which is a
+ * WORSE state than the refusal it replaced: the ledger document is now attached to nothing at all,
+ * and for QuickBooks nothing sweeps it up afterwards. Whoever takes the id off one document must
+ * put it on the other in the same breath.
+ *
+ * The release itself is a conditional `updateMany` requiring exactly one affected row — the same
+ * compare-and-swap idiom as the PO attribution — so a holder that changed underneath us is a no-op
+ * rather than a clobber. The write is the ordinary applyBackReference, which means it is still
+ * subject to every guard: a PO-keyed row is still re-resolved under the advisory lock and can still
+ * refuse, and the unique index still has the final say.
+ */
+export async function releaseAndRelinkExternalDocumentId(
+  deps: ExternalDocumentIdClaimDeps & BackReferenceDeps,
+  params: BackReferenceParams & { confirmedHolderId: string },
+): Promise<ExternalDocumentIdReleaseOutcome> {
+  const holder = backReferenceHolder(params.type, params.referenceType)
+  if (!holder || !params.externalId) return { outcome: 'not-applicable' }
+
+  const claim = await findExternalDocumentIdClaim(deps, { holder, externalId: params.externalId })
+  if (!claim) return { outcome: 'no-claim' }
+  // The id is already exactly where this row says it belongs. Only meaningful for the reference
+  // types that name their own document — a PurchaseOrder-keyed row names an order, never a bill.
+  if (claim.id === params.referenceId && params.referenceType === holder.model) return { outcome: 'already-correct' }
+  if (claim.id !== params.confirmedHolderId) return { outcome: 'holder-mismatch', currentHolderId: claim.id }
+
+  const released = await deps[CLAIM_DELEGATES[holder.model]].updateMany({
+    where: { id: params.confirmedHolderId, [holder.column]: params.externalId },
+    data: { [holder.column]: null },
+  })
+  if (released.count !== 1) return { outcome: 'contended', holderId: params.confirmedHolderId }
+
+  const applied = await applyBackReference(deps, params)
+  if (applied.outcome !== 'applied') {
+    return { outcome: 'released-not-applied', releasedFrom: params.confirmedHolderId, applyOutcome: applied.outcome }
+  }
+  return {
+    outcome: 'relinked',
+    releasedFrom: params.confirmedHolderId,
+    appliedTo: { referenceType: applied.referenceType, referenceId: applied.referenceId },
+  }
 }

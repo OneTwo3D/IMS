@@ -20,7 +20,12 @@ import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/acc
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
-import { applyBackReference } from '@/lib/domain/accounting/back-reference'
+import {
+  applyBackReference,
+  backReferenceHolder,
+  findExternalDocumentIdClaim,
+  isExternalDocumentIdConflict,
+} from '@/lib/domain/accounting/back-reference'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -352,7 +357,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             externalId: entry.externalTransactionId,
           })
         })
-        await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+        await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
         await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
         result.succeeded++
         continue
@@ -396,7 +401,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // These are best-effort: if they fail, the external post is already
         // safely recorded and won't be replayed.
         try {
-          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
+          await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
         } catch (followUpError) {
           // ERROR, not WARNING: the external post is committed and this entry is about to be
@@ -818,7 +823,85 @@ async function processEntry(
   }
 }
 
+/**
+ * QUARANTINE a posted document whose back-reference the unique index refused (o3d-9kek r7 finding 1).
+ *
+ * The remote document exists. The sync row already records that durably — status SYNCED,
+ * externalTransactionId set, and retention compacts it to a tombstone that KEEPS the external id
+ * rather than deleting it — so nothing is lost. What was missing is a route forward, because the
+ * message told the operator to "link it by hand" and the same index refuses a manual link for
+ * exactly the same reason. This writes the conflict onto the row, names the document that is
+ * blocking, and names the one command that resolves it.
+ *
+ * STATUS STAYS SYNCED. Moving it to FAILED would surface it in the failed-sync banner, which is
+ * tempting and is wrong: queueQuickBooksSync suppresses a duplicate enqueue by looking for a row in
+ * `PENDING | PROCESSING | SYNCED`, so a row moved out of SYNCED stops suppressing itself and the
+ * document posts to QuickBooks a second time. `SYNCED` with a non-null `errorMessage` is otherwise
+ * an unreachable state — the success path nulls it — so it is an unambiguous marker on its own.
+ */
+async function quarantineRefusedBackReference(params: {
+  syncLogId: string
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  externalId: string
+  error: unknown
+}): Promise<void> {
+  const holder = backReferenceHolder(params.type, params.referenceType)
+  let blockedBy: string | null = null
+  if (holder) {
+    try {
+      blockedBy = (await findExternalDocumentIdClaim(db, { holder, externalId: params.externalId }))?.id ?? null
+    } catch (lookupError) {
+      // Naming the blocker is an improvement to the message, not a precondition for recording the
+      // conflict. A failed lookup must not swallow the quarantine as well.
+      console.error('quickbooks: could not identify the holder of external id', params.externalId, lookupError)
+    }
+  }
+  const blockerText = blockedBy
+    ? `${holder?.model} ${blockedBy} currently holds it`
+    : 'the record holding it could not be identified'
+  const remedy = blockedBy
+    ? 'If that is a bill/invoice from a QuickBooks company this system is no longer connected to, its id is stale and can be '
+      + `released: run \`tsx scripts/release-accounting-external-id-claim.ts --sync-log ${params.syncLogId} `
+      + `--holder ${blockedBy} --apply\`, which clears the id from that record and writes it onto this one in a single step. `
+      + 'Do NOT release it if that record is a live, correctly linked document — check it first.'
+    : 'Find the record carrying that id and, once you have confirmed it is stale, release it with '
+      + `\`tsx scripts/release-accounting-external-id-claim.ts --sync-log ${params.syncLogId} --holder <id> --apply\`.`
+  const description = `QuickBooks ${params.type} for ${params.referenceType} ${params.referenceId} POSTED SUCCESSFULLY as `
+    + `external id ${params.externalId}, but that id could not be recorded locally: ${blockerText}. `
+    + 'The document exists in QuickBooks and this sync row is the only local record of it — it is NOT re-posted and NOT retried '
+    + '(QuickBooks has no back-reference repair sweep; blocked on realm isolation, o3d-s36z). '
+    + remedy
+
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'quickbooks_backreference_id_conflict',
+    tag: 'sync',
+    level: 'ERROR',
+    description,
+    metadata: {
+      syncLogId: params.syncLogId,
+      type: params.type,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      externalId: params.externalId,
+      blockedByModel: holder?.model ?? null,
+      blockedById: blockedBy,
+      error: String(params.error),
+    },
+  })
+  try {
+    // The DURABLE half. The activity log is the notification; this is the state, on the row that
+    // carries the external id, so the conflict survives a log that has been pruned or never read.
+    await db.accountingSyncLog.update({ where: { id: params.syncLogId }, data: { errorMessage: description } })
+  } catch (markError) {
+    console.error('quickbooks: could not record the back-reference conflict on the sync row', params.syncLogId, markError)
+  }
+}
+
 async function updateBackReference(
+  syncLogId: string,
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
@@ -859,6 +942,16 @@ async function updateBackReference(
       console.warn(`quickbooks: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; it must be linked by hand.`)
     }
   } catch (error) {
+    // AN EXTERNAL-ID CONFLICT IS NOT A FAILURE TO REPORT AND FORGET (o3d-9kek r7 finding 1). The
+    // document is already in the QuickBooks ledger; the index refused only the LOCAL record of it.
+    // It gets the quarantine treatment above — the conflict written onto the row, the blocking
+    // document named, and the one command that resolves it — because the generic warning below
+    // ends in "link it by hand", and for THIS failure that instruction cannot be carried out: the
+    // same index refuses a manual link too.
+    if (isExternalDocumentIdConflict(error)) {
+      await quarantineRefusedBackReference({ syncLogId, type, referenceType, referenceId, externalId, error })
+      return
+    }
     // Pre-existing: QuickBooks swallows back-reference failures here (Xero does not — it
     // propagates so the caller retries). Still not changed, because de-swallowing alters QBO's
     // retry semantics for every type at once. What IS changed is the SILENCE: since o3d-9kek made

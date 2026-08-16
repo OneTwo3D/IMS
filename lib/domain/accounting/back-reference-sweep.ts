@@ -651,6 +651,12 @@ export async function repairAccountingBackReferences(
       description: `Refused the ${connectorLabel} back-reference repair for ${row.referenceType} ${row.referenceId}: `
         + `external id ${row.externalTransactionId} is already held by another local record, so it cannot also belong to this one. `
         + 'Nothing was overwritten. Resolve it by hand — this will keep being refused until you do. '
+        // NAMES THE ROUTE (r7 finding 1). "Resolve it by hand" is not, on its own, an instruction
+        // anyone can follow: the same unique index refuses a manual link for exactly the reason it
+        // refused this one, so the holder's claim has to come off first. Releasing a LIVE link is
+        // worse than the refusal, which is why the command requires the holder to be named.
+        + 'Once you have identified the record carrying that id and confirmed it is stale, release it with '
+        + `\`tsx scripts/release-accounting-external-id-claim.ts --sync-log ${row.id} --holder <id> --apply\`. `
         + `Underlying error: ${String(error)}`,
       metadata: {
         syncLogId: row.id,

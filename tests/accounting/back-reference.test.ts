@@ -3,12 +3,27 @@ import test from 'node:test'
 
 import {
   applyBackReference,
+  backReferenceHolder,
   backReferenceIsMissing,
+  isExternalBillIdConflict,
+  isExternalCreditNoteIdConflict,
+  isExternalDocumentIdConflict,
+  releaseAndRelinkExternalDocumentId,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
   type BackReferenceDeps,
+  type ExternalDocumentIdClaimDeps,
 } from '@/lib/domain/accounting/back-reference'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { adapterUniqueViolation, legacyUniqueViolation } from '../helpers/prisma-unique-error'
+
+/** The mapped table names, so a constraint-name fixture reads like the one Postgres actually raises. */
+const TABLES = {
+  salesOrder: 'sales_orders',
+  salesOrderRefund: 'sales_order_refunds',
+  supplierCreditNote: 'supplier_credit_notes',
+  purchaseInvoice: 'purchase_invoices',
+} as const
 
 type FakeBill = {
   id: string
@@ -110,13 +125,18 @@ function makeDeps(overrides: {
   const maybeThrow = () => {
     if (overrides.throwOnUpdate) throw new Error('back-reference write failed')
   }
-  /** Raised the way Prisma raises it, with the offending column in meta.target. */
+  /**
+   * Raised the way PRODUCTION raises it (o3d-9kek r7 finding 2).
+   *
+   * This used to hand-build `meta: { target: [column] }`, which is the one shape production never
+   * produces: lib/db/index.ts builds the client with `@prisma/adapter-pg`, under which `meta.target`
+   * is `undefined` and the column list arrives at `meta.driverAdapterError.cause.constraint.fields`.
+   * Every assertion below about the conflict message therefore passed against a classifier that,
+   * live, classified EVERY P2002 — including unrelated ones — as an external-id conflict.
+   */
   const maybeUniqueViolation = (model: 'salesOrder' | 'salesOrderRefund' | 'supplierCreditNote', column: string) => {
     if (!overrides.uniqueViolationOn?.includes(model)) return
-    throw Object.assign(new Error(`Unique constraint failed on the fields: (\`${column}\`)`), {
-      code: 'P2002',
-      meta: { target: [column] },
-    })
+    throw adapterUniqueViolation([column], { modelName: model, constraintName: `${TABLES[model]}_${column}_key` })
   }
   const matchBills = (where: Record<string, unknown>) => bills
     .filter((bill) => matches(bill as unknown as Record<string, unknown>, where, BILL_COLUMNS))
@@ -128,8 +148,9 @@ function makeDeps(overrides: {
    * assertion about "the id was not duplicated" would pass against a production that had removed
    * the constraint handling entirely.
    *
-   * Raised as Prisma raises it — a P2002 with the offending column in meta.target — so the
-   * structural classifier in production is exercised rather than a bespoke error type.
+   * Raised in the LIVE ADAPTER'S shape (o3d-9kek r7 finding 2) — `@prisma/adapter-pg`'s
+   * `meta.driverAdapterError.cause.constraint.fields`, not the query engine's `meta.target`, which
+   * production has not produced since the driver adapter was adopted. See tests/helpers.
    */
   const enforceExternalIdUniqueness = (data: Record<string, unknown>, writtenBillIds: string[]) => {
     const externalId = data.accountingInvoiceId
@@ -139,9 +160,9 @@ function makeDeps(overrides: {
     // refuses it — which is the behaviour the global index was deliberately kept for.
     const holder = bills.find((bill) => bill.accountingInvoiceId === externalId && !writtenBillIds.includes(bill.id))
     if (!holder) return
-    throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`)'), {
-      code: 'P2002',
-      meta: { target: ['accounting_invoice_id'] },
+    throw adapterUniqueViolation(['accounting_invoice_id'], {
+      modelName: 'PurchaseInvoice',
+      constraintName: 'purchase_invoices_accounting_invoice_id_key',
     })
   }
 
@@ -800,4 +821,243 @@ test('[o3d-9kek r6 f3] a NON-uniqueness write failure is still propagated untouc
     }),
     /back-reference write failed/,
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek r7 finding 2 — the P2002 classifier must identify the CONSTRAINT, not just the code.
+//
+// The classifier read `meta.target` and nothing else, and treated an absent target as "ours".
+// `meta.target` is `undefined` under `@prisma/adapter-pg`, which is what lib/db/index.ts builds the
+// client with — so LIVE, every unique-constraint violation of any kind on any of these models was
+// reported to the operator as an accounting external-id collision, complete with a message about
+// realm switches and a remedy for a constraint that had not failed.
+//
+// Every test below is paired with the OTHER column's classifier returning false, because that pairing
+// is what the old code could not satisfy: it answered true to both for anything it could not read.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek r7 f2] the LIVE adapter shape is classified by the right column classifier only', () => {
+  const violation = adapterUniqueViolation(['accounting_invoice_id'], {
+    modelName: 'PurchaseInvoice',
+    constraintName: 'purchase_invoices_accounting_invoice_id_key',
+  })
+
+  assert.equal(isExternalBillIdConflict(violation), true, 'meta.target is undefined here — the adapter reports constraint.fields')
+  assert.equal(isExternalCreditNoteIdConflict(violation), false, 'a bill-column violation is not a credit-note conflict')
+})
+
+test('[o3d-9kek r7 f2] an UNRELATED unique constraint is NOT reported as an external-id conflict', () => {
+  // The concrete regression: SalesOrderRefund carries its own unique externalRefundId. Under the
+  // live adapter this violation has no meta.target at all, so the old classifier claimed it — and
+  // the operator was told an accounting id was duplicated and pointed at a realm switch.
+  const violation = adapterUniqueViolation(['externalRefundId'], {
+    modelName: 'SalesOrderRefund',
+    constraintName: 'sales_order_refunds_connector_externalRefundId_key',
+  })
+
+  assert.equal(isExternalBillIdConflict(violation), false)
+  assert.equal(isExternalCreditNoteIdConflict(violation), false)
+  assert.equal(isExternalDocumentIdConflict(violation), false, 'the sweep would have deferred it as a human-only id conflict')
+})
+
+test('[o3d-9kek r7 f2] a P2002 that identifies NOTHING is not claimed — fail closed', () => {
+  // FAIL CLOSED means "do not claim what you cannot identify". The old comment called the opposite
+  // fail-closed on the grounds that refusing a write is safe — but nothing here decides whether to
+  // write. The write has ALREADY been refused by the database; this only decides what is reported.
+  assert.equal(isExternalBillIdConflict({ code: 'P2002' }), false)
+  assert.equal(isExternalCreditNoteIdConflict({ code: 'P2002', meta: {} }), false)
+})
+
+test('[o3d-9kek r7 f2] a column that merely CONTAINS ours is not ours', () => {
+  // The old matcher was `String(target).includes(column)`.
+  assert.equal(isExternalBillIdConflict(legacyUniqueViolation(['accounting_invoice_id_hash'])), false)
+  assert.equal(isExternalCreditNoteIdConflict(legacyUniqueViolation(['accounting_credit_note_id_digest'])), false)
+})
+
+test('[o3d-9kek r7 f2] the constraint NAME alone identifies the column when no field list arrives', () => {
+  // Some adapter builds report the index name rather than the columns, and the raw-message fallback
+  // always does. Postgres names a single-column unique index `<table>_<column>_key`, which the
+  // shared reader anchors on by suffix.
+  const byMessageOnly = {
+    code: 'P2002',
+    meta: {
+      driverAdapterError: {
+        cause: { originalMessage: 'duplicate key value violates unique constraint "purchase_invoices_accounting_invoice_id_key"' },
+      },
+    },
+  }
+
+  assert.equal(isExternalBillIdConflict(byMessageOnly), true)
+  assert.equal(isExternalCreditNoteIdConflict(byMessageOnly), false, 'the old reader saw no meta.target here and claimed it for both columns')
+
+  const byIndexName = legacyUniqueViolation('purchase_invoices_accounting_invoice_id_key')
+  assert.equal(isExternalBillIdConflict(byIndexName), true)
+  assert.equal(isExternalCreditNoteIdConflict(byIndexName), false)
+})
+
+test('[o3d-9kek r7 f2] the cause chain is still walked, in the live shape', () => {
+  // applyBackReference rethrows a plain Error with the violation as `cause`, so the sweep only ever
+  // sees the wrapper. r6 finding 3 fixed that; this holds it while the shape underneath changes.
+  const wrapped = new Error('Refusing to link PurchaseInvoice bill-1 …', {
+    cause: adapterUniqueViolation(['accounting_invoice_id'], { constraintName: 'purchase_invoices_accounting_invoice_id_key' }),
+  })
+
+  assert.equal(isExternalDocumentIdConflict(wrapped), true)
+  assert.equal(isExternalCreditNoteIdConflict(wrapped), false)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek r7 finding 1 — the release path.
+//
+// A refused back-reference for a document that HAS ALREADY POSTED left the operator with an
+// instruction they could not carry out: "link it by hand" is refused by the same unique index.
+// releaseAndRelinkExternalDocumentId is the route out — but it is also the one operation in this
+// module that DELIBERATELY clears a link, so the guards on it are the whole point.
+// ---------------------------------------------------------------------------
+
+type ClaimRow = { id: string; accountingInvoiceId: string | null }
+
+function makeClaimDeps(options: {
+  bills: Array<{ id: string; poId: string; accountingInvoiceId: string | null; createdAt: number }>
+  salesOrders?: ClaimRow[]
+  /** Runs after the claim lookup and before the conditional clear — the race `contended` reports. */
+  raceAfterClaimLookup?: (bills: Array<{ id: string; accountingInvoiceId: string | null }>) => void
+}) {
+  const { deps, calls } = makeDeps({ bills: options.bills })
+  const salesOrders = options.salesOrders ?? []
+  const claimCalls = { salesOrderFindFirst: 0, billUpdateManyWheres: [] as Array<Record<string, unknown>> }
+
+  const claimDeps: ExternalDocumentIdClaimDeps & BackReferenceDeps = {
+    ...deps,
+    salesOrder: {
+      ...deps.salesOrder,
+      async findFirst(args: { where: Record<string, unknown> }) {
+        claimCalls.salesOrderFindFirst++
+        return salesOrders.find((row) => row.accountingInvoiceId === args.where.accountingInvoiceId) ?? null
+      },
+      async updateMany() { throw new Error('the sales-order claim must not be touched by a bill release') },
+    } as never,
+    salesOrderRefund: { ...deps.salesOrderRefund, async findFirst() { return null }, async updateMany() { return { count: 0 } } } as never,
+    supplierCreditNote: { ...deps.supplierCreditNote, async findFirst() { return null }, async updateMany() { return { count: 0 } } } as never,
+    purchaseInvoice: {
+      ...deps.purchaseInvoice,
+      async findFirst(args: { where: Record<string, unknown>; select: Record<string, unknown> }) {
+        const found = await deps.purchaseInvoice.findFirst(args as never)
+        options.raceAfterClaimLookup?.(options.bills)
+        return found
+      },
+      async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
+        claimCalls.billUpdateManyWheres.push(args.where)
+        return deps.purchaseInvoice.updateMany(args as never)
+      },
+    } as never,
+  }
+  return { claimDeps, calls, claimCalls, bills: options.bills }
+}
+
+const RELEASE_PARAMS = {
+  connector: 'quickbooks' as const,
+  type: 'PURCHASE_INVOICE' as const,
+  referenceType: 'PurchaseInvoice',
+  referenceId: 'bill-target',
+  externalId: '145',
+}
+
+test('[o3d-9kek r7 f1] releasing the confirmed holder links the id to the document that posted it', async () => {
+  // The realm switch, end to end: company A's retired bill holds 145, company B has just issued 145
+  // to bill-target, and the index refused the write. One confirmed operator action resolves both.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, {
+    outcome: 'relinked',
+    releasedFrom: 'bill-retired',
+    appliedTo: { referenceType: 'PurchaseInvoice', referenceId: 'bill-target' },
+  })
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, null, 'the stale claim is gone')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, '145', 'and the ledger document is recorded')
+})
+
+test('[o3d-9kek r7 f1] a holder the operator did NOT confirm is refused, not released', async () => {
+  // The confirmation is the ONLY thing separating a retired realm's stale id from a live, correct
+  // link — nothing in the database distinguishes them. A confirmation about a different document
+  // confirms nothing, so this must write nothing at all.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-live', poId: 'po-other', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-stale-from-an-old-warning' })
+
+  assert.deepEqual(result, { outcome: 'holder-mismatch', currentHolderId: 'bill-live' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-live')?.accountingInvoiceId, '145', 'the unconfirmed link is untouched')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, null)
+})
+
+test('[o3d-9kek r7 f1] a SAME-VALUE id in another table is not a claim on this one', async () => {
+  // The four unique indexes are PER TABLE. QuickBooks issues Invoice ids and Bill ids from separate
+  // sequences, so Invoice 145 and Bill 145 routinely coexist and are unrelated. A lookup across all
+  // four tables would name an innocent sales order as the blocker — and this path then invites an
+  // operator to detach it.
+  const { claimDeps } = makeClaimDeps({
+    bills: [{ id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 }],
+    salesOrders: [{ id: 'so-unrelated', accountingInvoiceId: '145' }],
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'so-unrelated' })
+
+  // No bill holds 145, so nothing is blocking — and the sales order is neither consulted nor cleared.
+  assert.deepEqual(result, { outcome: 'no-claim' })
+})
+
+test('[o3d-9kek r7 f1] a holder that changes under the read is contended, not clobbered', async () => {
+  // The clear is a conditional updateMany requiring exactly one row, the same compare-and-swap idiom
+  // as the PO attribution. Without the predicate this would blank whatever the id had become.
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+    raceAfterClaimLookup: (rows) => {
+      const retired = rows.find((row) => row.id === 'bill-retired')
+      if (retired) retired.accountingInvoiceId = '999'
+    },
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' })
+
+  assert.deepEqual(result, { outcome: 'contended', holderId: 'bill-retired' })
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceId, '999', 'the id it had gained is not blanked')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceId, null)
+})
+
+test('[o3d-9kek r7 f1] the id already being where it belongs is a no-op, not a release', async () => {
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [{ id: 'bill-target', poId: 'po-1', accountingInvoiceId: '145', createdAt: 2 }],
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-target' })
+
+  assert.deepEqual(result, { outcome: 'already-correct' })
+  assert.equal(bills[0].accountingInvoiceId, '145', 'the link this row asked for must never be cleared by its own release')
+})
+
+test('[o3d-9kek r7 f1] the holder table is derived from BACK_REFERENCE_PAIRS, not restated', () => {
+  // r6 finding 2 was a restated list that silently dropped a document type. A second restated list
+  // would be the same defect with a new name, so the (model, column) facts live on the pairs table.
+  assert.deepEqual(backReferenceHolder('SALES_INVOICE', 'SalesOrder'), { model: 'SalesOrder', column: 'accountingInvoiceId' })
+  assert.deepEqual(backReferenceHolder('CREDIT_NOTE', 'SalesOrderRefund'), { model: 'SalesOrderRefund', column: 'accountingCreditNoteId' })
+  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseInvoice'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId' })
+  // A PO-keyed row names the ORDER; the id still lands on one of its bills.
+  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseOrder'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId' })
+  assert.deepEqual(backReferenceHolder('PURCHASE_CREDIT_NOTE', 'SupplierCreditNote'), { model: 'SupplierCreditNote', column: 'accountingCreditNoteId' })
+  assert.equal(backReferenceHolder('COGS_JOURNAL', 'Shipment'), null)
 })

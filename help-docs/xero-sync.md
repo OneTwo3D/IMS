@@ -550,6 +550,14 @@ activity log (`quickbooks_backreference_failed` or `quickbooks_backreference_amb
 the link has to be made by hand. The external id is on the sync row, so nothing is lost — only
 automatic. See *Connecting a different company* below for why the company boundary is the blocker.
 
+**When the id itself is the blocker.** One case cannot be resolved by linking the document by hand:
+the write was refused because *another local record already holds that id* — typically a bill from a
+QuickBooks company you are no longer connected to, whose integer the new company has since reissued.
+A manual link is refused for exactly the same reason, so the stale claim has to come off first. IMS
+logs `quickbooks_backreference_id_conflict` at ERROR, writes the same text onto the sync row's error
+message, and names both the blocking record and the command that resolves it. See *Releasing a stale
+external id* below.
+
 **It refuses to guess.** Sync rows created before the bill-keyed change name the *purchase order*,
 not the bill. When such a row cannot be attributed to exactly one bill, the sweep writes a WARNING
 to the activity log (`xero_backreference_repair_ambiguous`) asking you to link it manually, and
@@ -573,11 +581,11 @@ carrying a matching id as paid. A duplicate would mean one correction rewriting 
 or one customer payment silently settling two orders.
 
 So a write that would duplicate an id is **refused**, with an error naming the document, the id and
-the record that already holds it. Nothing is overwritten. Resolve it by hand — IMS will not clear or
-move an existing link on its own, because nothing in IMS records whether that link was posted
-authoritatively or deduced. The repair sweep reports a refusal it hits as
-`xero_backreference_id_conflict` and re-reports it once a day until it is resolved, rather than
-retrying silently.
+the record that already holds it. Nothing is overwritten. IMS will not clear or move an existing link
+on its own, because nothing in IMS records whether that link was posted authoritatively or deduced —
+releasing it is an explicit, confirmed operator action (see *Releasing a stale external id* below).
+The repair sweep reports a refusal it hits as `xero_backreference_id_conflict` and re-reports it once
+a day until it is resolved, rather than retrying silently.
 
 The likeliest causes are a connector reconnected to a different company that has reissued an id (see
 below), and the ledger merging two of our documents because they were posted under the same document
@@ -585,6 +593,30 @@ number. Supplier credit notes are the live case of the second: if two credit not
 one purchase order and the **credit-note number is left blank on both**, they post under the purchase
 order's own reference and Xero treats the second as an edit of the first. Give each supplier credit
 note its own number.
+
+### Releasing a stale external id
+
+A refused write leaves the ledger document with no local record of it, and "resolve it by hand" is
+not something you can actually do while the id is claimed — the unique index refuses a manual link
+for the same reason it refused the automatic one. The claim has to be released first, and IMS will
+not do that on its own: nothing in the database distinguishes a retired company's stale id from a
+live, correct link, so the decision is yours.
+
+1. Read the activity entry (`quickbooks_backreference_id_conflict`, or
+   `xero_backreference_id_conflict` from the sweep). It names the **blocking record** and the
+   command, with the ids already filled in.
+2. Open that record in IMS and confirm it is stale — it belongs to a company this system is no longer
+   connected to, or to a ledger document that no longer exists. **If it is a live, correctly linked
+   document, stop.** Releasing it detaches a good link, which is worse than the refusal.
+3. Dry-run (reads only, writes nothing):
+   `tsx scripts/release-accounting-external-id-claim.ts --sync-log <id> --holder <id>`
+4. Re-run with `--apply`. The id is cleared from the blocking record and written onto the document
+   that actually posted it, in one step. Both halves are written to the activity log.
+
+The release and the re-link are one operation on purpose: clearing the id and stopping would leave
+the ledger document attached to nothing at all, and on QuickBooks nothing would pick it up
+afterwards. If the named record has stopped holding that id since you read the warning, the command
+refuses and writes nothing.
 
 **Rows past their retention window.** Data retention clears the stored payload of an unresolved sync
 row once it is older than the sync-log retention period, keeping only the identifying record. Such a

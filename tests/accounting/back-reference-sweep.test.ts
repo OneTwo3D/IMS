@@ -14,6 +14,7 @@ import {
   type BackReferenceSweepActivity,
   type BackReferenceSweepClient,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import { adapterUniqueViolation } from '../helpers/prisma-unique-error'
 
 // ---------------------------------------------------------------------------
 // o3d-9kek — the repair sweep starved newer rows and inferred PO ambiguity from the
@@ -119,7 +120,10 @@ type Store = {
  * on that: the compare-and-swap's predicate cannot see a SIBLING bill acquiring the candidate id,
  * so the constraint is the only thing that refuses it. A double that cannot raise the violation
  * would leave "the id was not duplicated" passing against a production that dropped the handling.
- * Raised as Prisma raises it: P2002 with the column in meta.target.
+ *
+ * Raised in the LIVE ADAPTER'S shape (o3d-9kek r7 finding 2). It used to hand-build
+ * `meta: { target: [...] }`, which `@prisma/adapter-pg` never produces — so the sweep's
+ * classification of this violation was exercised only against a shape that does not occur.
  */
 function enforceExternalIdUniqueness(bills: BillRow[], data: Record<string, unknown>, writtenBillIds: string[]): void {
   const externalId = data.accountingInvoiceId
@@ -128,9 +132,9 @@ function enforceExternalIdUniqueness(bills: BillRow[], data: Record<string, unkn
   // would let a collision through here and hide the fact that production refuses it.
   const holder = bills.find((bill) => bill.accountingInvoiceId === externalId && !writtenBillIds.includes(bill.id))
   if (!holder) return
-  throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`)'), {
-    code: 'P2002',
-    meta: { target: ['accounting_invoice_id'] },
+  throw adapterUniqueViolation(['accounting_invoice_id'], {
+    modelName: 'PurchaseInvoice',
+    constraintName: 'purchase_invoices_accounting_invoice_id_key',
   })
 }
 
@@ -210,9 +214,9 @@ function makeHarness(store: Store): Harness {
         // sweep's handling of it untestable while looking tested.
         const externalId = args.data.accountingInvoiceId
         if (typeof externalId === 'string' && store.orders.some((other) => other.id !== order.id && other.accountingInvoiceId === externalId)) {
-          throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`)'), {
-            code: 'P2002',
-            meta: { target: ['accounting_invoice_id'] },
+          throw adapterUniqueViolation(['accounting_invoice_id'], {
+            modelName: 'SalesOrder',
+            constraintName: 'sales_orders_accounting_invoice_id_key',
           })
         }
         Object.assign(order, args.data)
@@ -1343,6 +1347,10 @@ test('[o3d-9kek r6 f3] an external id already held by another order is REPORTED 
   assert.ok(conflict, 'a refusal only a human can clear must name the human action')
   assert.equal(conflict.level, 'WARNING')
   assert.match(conflict.description, /already held by another local record/)
+  // r7 finding 1: "resolve it by hand" is not an instruction anyone can follow on its own — the same
+  // index refuses a manual link too — so the message names the command that releases the claim, with
+  // this row's id already in it.
+  assert.match(conflict.description, /release-accounting-external-id-claim\.ts --sync-log log-0001 --holder <id> --apply/)
   assert.equal(conflict.metadata.externalId, 'XINV-1')
   // DEFERRED, not stamped: unlinking the wrong record makes this repairable again, and a row
   // excluded for good would never be reconsidered.
