@@ -5,9 +5,9 @@ import { Check, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { setSetting } from '@/app/actions/settings'
-import { syncCrontab } from '@/app/actions/cron'
-import { resolveSchedulerFollowUp } from '@/lib/domain/integrations/scheduler-followup'
+import { savePublicAppUrl } from '@/app/actions/settings'
+import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
+import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outcome'
 
 type Props = {
   currentValue: string
@@ -30,32 +30,27 @@ export function PublicAppUrlSettings({ currentValue, source, suggestedValue }: P
 
     startTransition(async () => {
       try {
-        const normalized = value.trim().replace(/\/+$/, '')
-        if (!normalized) {
-          setError('Enter the public base URL.')
+        // Immediate feedback only. The SAME function is the server action's gate, so a value that
+        // slips past here is still refused there rather than stored.
+        const normalized = normalizePublicAppUrl(value)
+        if (!normalized.ok) {
+          setError(normalized.error)
           return
         }
 
-        try {
-          const parsed = new URL(normalized)
-          if (!['http:', 'https:'].includes(parsed.protocol)) {
-            setError('URL must start with http:// or https://')
-            return
-          }
-        } catch {
-          setError('Enter a valid URL.')
+        // ONE round trip (o3d-osl8 round 9, finding 1). The write, the audit row, the cache
+        // revalidation and the crontab reconciliation are all inside the action, which classifies
+        // its own post-commit failures instead of rejecting. The screen renders the outcome; it
+        // does not reconstruct it. Reaching this catch now means the outcome is genuinely unknown.
+        const view = resolveSettingSaveView({
+          result: await savePublicAppUrl(normalized.url),
+          what: 'The Public App URL',
+        })
+        if (!view.committed) {
+          setError(view.error)
           return
         }
-
-        // COMMITTED. setSetting returns void and throws on failure, so reaching the next line means
-        // the URL is stored (o3d-osl8 round 8, finding 1 — the same shape as the plugin screen).
-        await setSetting('public_app_url', normalized)
-
-        // The crontab reconciliation is a POST-COMMIT step. Reporting its failure — returned or
-        // thrown — as a red error with no "Saved" told the operator their URL had not been stored,
-        // which is false, and invited them to enter it again. It is a warning about the scheduler.
-        const followUp = await resolveSchedulerFollowUp({ what: 'The Public App URL', sync: syncCrontab })
-        setSchedulerWarning(followUp.warning)
+        setSchedulerWarning(view.warning)
         setSaved(true)
         setTimeout(() => setSaved(false), 2000)
       } catch (e) {

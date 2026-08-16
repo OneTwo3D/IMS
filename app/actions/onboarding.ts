@@ -9,7 +9,7 @@ import { getSettingValue } from '@/lib/settings-store'
 import { getIntegrationPluginState, INTEGRATION_PLUGIN_SETTING_KEYS, type IntegrationPluginState } from '@/lib/integration-plugins'
 import { isBaseCurrencyLocked } from '@/lib/base-currency'
 import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
-import { syncCrontab } from '@/app/actions/cron'
+import { reconcileCrontab } from '@/lib/crontab-reconcile'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -322,10 +322,14 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
       revalidatePath('/onboarding')
       revalidatePath('/dashboard')
 
-      // syncCrontab logs its own crontab_sync ERROR; what the outcome adds is the committed
+      // The RECONCILIATION, not the gated `syncCrontab` server action (round 9, finding 4): that
+      // one re-runs a permission gate whose answer to an invalidated session is a thrown
+      // NEXT_REDIRECT, and a post-commit guard is exactly where such a throw must not be classified
+      // as an application failure. This action gated with requireAdmin before the transaction.
+      // reconcileCrontab logs its own crontab_sync ERROR; what the outcome adds is the committed
       // selection, so the caller can keep showing what is actually stored instead of guessing from
       // its own optimistic copy.
-      return syncCrontab()
+      return reconcileCrontab()
     },
   })
 }

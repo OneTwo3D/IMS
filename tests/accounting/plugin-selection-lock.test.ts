@@ -185,15 +185,23 @@ mock.module('next/cache', { namedExports: { revalidatePath: (path: string) => { 
  * INJECTABLE, not pinned to success (o3d-osl8 round 7, finding 1). A double that can only succeed
  * cannot show what the action does when the write has committed and the scheduler has not — which
  * was the entire defect.
+ *
+ * ROUND 9, FINDING 4 — this doubles `@/lib/crontab-reconcile`, not `@/app/actions/cron`. The
+ * reconciliation moved out of the `'use server'` module precisely so a post-commit step does not
+ * re-enter a permission gate that answers by THROWING `NEXT_REDIRECT`. A double left pointing at
+ * the old module would have silently stopped intercepting anything, letting the real crontab work
+ * run inside these tests — which is how the double is audited: the assertions below observe calls
+ * through it, so a stale mock target fails loudly rather than passing vacuously.
  */
-mock.module('@/app/actions/cron', {
+mock.module('@/lib/crontab-reconcile', {
   namedExports: {
-    syncCrontab: async () => {
+    reconcileCrontab: async () => {
       state.cronCalledAfterWrites = state.writes.length
       state.openTransactionsWhenCronRan = state.openTransactions
       if (state.cronThrows) throw state.cronThrows
       return state.cronResult
     },
+    readOwnCrontab: async () => '',
   },
 })
 
@@ -551,6 +559,113 @@ test('the Xero-first resolution rule is one rule', () => {
 })
 
 // ---------------------------------------------------------------------------
+// Round 9, finding 1 — the GENERIC settings writer, which the round-8 sweep declared clean.
+//
+// `setSetting` committed a `settings` upsert and THEN awaited `logActivity` and `revalidatePath`.
+// A rejection from either escaped as a rejected server action, which fourteen screens render as a
+// failed save — over a value that is in the database. And the screens that saved several keys did
+// so as `Promise.all` of independent calls, so a "failed" save could leave an arbitrary committed
+// subset behind.
+// ---------------------------------------------------------------------------
+
+async function setMany(values: Record<string, string>) {
+  const { setSettings } = await import('@/app/actions/settings')
+  return setSettings(values)
+}
+
+test('a generic settings save writes every key in ONE transaction', async () => {
+  const result = await setMany({ backup_retention_days: '30', backup_max_count: '10', backup_auto_upload: 'true' })
+
+  assert.deepEqual(result, { status: 'saved' })
+  assert.deepEqual(state.writes, ['backup_retention_days=30', 'backup_max_count=10', 'backup_auto_upload=true'])
+  assert.equal(
+    state.maxConcurrentTransactions,
+    1,
+    'one transaction for the whole save — Promise.all over independent writes could commit a subset',
+  )
+})
+
+test('a generic settings save that COMMITS and then fails its post-commit step says so', async () => {
+  // THE DEFECT, exactly. The write below lands; `logActivity` then throws; the old code rejected.
+  state.logActivityThrows = new Error('activity log unavailable')
+
+  const result = await setMany({ public_app_url: 'https://ims.example.com' })
+
+  assert.deepEqual(result, {
+    status: 'post-commit-failed',
+    step: 'local',
+    error: 'activity log unavailable',
+  })
+  assert.equal(store.get('public_app_url'), 'https://ims.example.com', 'and the value really is stored')
+})
+
+test('the Public App URL action refuses an invalid URL BEFORE writing anything', async () => {
+  const { savePublicAppUrl } = await import('@/app/actions/settings')
+
+  const refused = await savePublicAppUrl('ftp://nope')
+  assert.equal(refused.status, 'refused')
+  assert.deepEqual(state.writes, [], 'a refusal writes nothing, which is what makes it a refusal')
+
+  // ...and a valid one commits, then reconciles the crontab as a post-commit step.
+  const saved = await savePublicAppUrl('https://ims.example.com/')
+  assert.deepEqual(saved, { status: 'saved' })
+  assert.equal(store.get('public_app_url'), 'https://ims.example.com', 'normalised once, server-side')
+  assert.ok(state.cronCalledAfterWrites >= 1, 'the crontab was reconciled AFTER the write')
+})
+
+test('the Public App URL action reports a scheduler failure as committed, not as a failed save', async () => {
+  state.cronThrows = new Error('crontab write failed: no crontab for ims')
+  const { savePublicAppUrl } = await import('@/app/actions/settings')
+
+  const result = await savePublicAppUrl('https://ims.example.com')
+
+  assert.deepEqual(result, {
+    status: 'post-commit-failed',
+    step: 'scheduler',
+    error: 'crontab write failed: no crontab for ims',
+  })
+  assert.equal(store.get('public_app_url'), 'https://ims.example.com')
+})
+
+test('the scheduled-jobs action writes every job in one transaction, then reconciles once', async () => {
+  const { saveCronJobSettings } = await import('@/app/actions/cron')
+
+  const result = await saveCronJobSettings([
+    { settingKey: 'wc_order_sync', enabled: true, schedule: '*/15 * * * *' },
+    { settingKey: 'xero_payment_poll', enabled: false, schedule: '0 * * * *' },
+  ])
+
+  assert.deepEqual(result, { status: 'saved' })
+  assert.deepEqual(state.writes, [
+    'cron_wc_order_sync_enabled=true',
+    'cron_wc_order_sync_schedule=*/15 * * * *',
+    'cron_xero_payment_poll_enabled=false',
+    'cron_xero_payment_poll_schedule=0 * * * *',
+  ])
+  assert.equal(state.maxConcurrentTransactions, 1)
+  assert.equal(
+    state.cronCalledAfterWrites,
+    4,
+    'the crontab is reconciled only once EVERY key has landed — a reconciliation from a partial '
+      + 'write would schedule half of one operator edit',
+  )
+})
+
+test('the scheduled-jobs action reports a crontab failure as committed', async () => {
+  state.cronResult = { success: false, error: 'crontab write failed: no crontab for ims' }
+  const { saveCronJobSettings } = await import('@/app/actions/cron')
+
+  const result = await saveCronJobSettings([{ settingKey: 'wc_order_sync', enabled: true, schedule: '*/15 * * * *' }])
+
+  assert.deepEqual(result, {
+    status: 'post-commit-failed',
+    step: 'scheduler',
+    error: 'crontab write failed: no crontab for ims',
+  })
+  assert.equal(store.get('cron_wc_order_sync_enabled'), 'true', 'the settings really are stored')
+})
+
+// ---------------------------------------------------------------------------
 // Finding 2 — the INVENTORY of plugin-key writers.
 //
 // The lock only binds writers that take it, and round 5 asserted that "both writers take it" by
@@ -563,7 +678,10 @@ test('the Xero-first resolution rule is one rule', () => {
 // ---------------------------------------------------------------------------
 
 const REPO = process.cwd()
-const SCANNED_ROOTS = ['app', 'lib', 'scripts', 'e2e']
+// `prisma` added in round 9, finding 5: prisma/seed.ts builds its own PrismaClient and writes this
+// database, install.sh runs it, and it was in NEITHER guard — a `db.setting.upsert({ key:
+// 'plugin_xero_enabled' })` added there would have left both scans green.
+const SCANNED_ROOTS = ['app', 'lib', 'scripts', 'e2e', 'prisma']
 
 /** Files that DEFINE the mechanism rather than use it. */
 const MECHANISM_FILES = new Set([
@@ -585,10 +703,20 @@ function sourceFiles(dir: string, found: string[] = []): string[] {
 }
 
 const NAMES_A_PLUGIN_KEY = /plugin_\w+_enabled|INTEGRATION_PLUGIN_SETTING_KEYS|INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER/
-const WRITES_SETTINGS = /setting\.upsert|setting\.update|setting\.create|setting\.delete|insert into settings|update settings set/i
+const WRITES_SETTINGS = /setting\.upsert|setting\.update|setting\.create|setting\.delete|insert into settings|update settings set|delete from settings|truncate\s+(?:table\s+)?settings/i
 /** An unconditional wipe writes every plugin key without naming one. */
-const WIPES_SETTINGS = /setting\.deleteMany\(\{\s*\}\)/
+const WIPES_SETTINGS = /setting\.deleteMany\(\{\s*\}\)|delete from settings\s*;|truncate\s+(?:table\s+)?settings/i
 const TAKES_THE_LOCK = /lockIntegrationPluginSelection|writeSettingsUnderPluginSelectionLock/
+
+/**
+ * The rule, as a function, so it can be fed a FIXTURE as well as the repository (round 9, finding
+ * 5). Asserting "no offenders" over real files proves the scan found nothing; it does not prove the
+ * scan can find anything. The fixture test below is what proves that.
+ */
+export function isUnfencedPluginWriter(src: string): boolean {
+  const writesPluginKeys = (NAMES_A_PLUGIN_KEY.test(src) && WRITES_SETTINGS.test(src)) || WIPES_SETTINGS.test(src)
+  return writesPluginKeys && !TAKES_THE_LOCK.test(src)
+}
 
 test('every plugin-key writer in the repo goes through the selection lock', () => {
   const offenders: string[] = []
@@ -695,6 +823,12 @@ test('the quiesce harness takes the SAME advisory key and the SAME row locks, in
 //   4. WHAT a classified path actually executes. `migration-runner` says a file applies migration
 //      SQL, not that the SQL is safe; the plugin-key assertion below is what covers that, and it
 //      only covers migrations that live in this repo.
+//   5. STANDALONE CLIENTS OUTSIDE `app`/`lib`/`prisma`. `CONSTRUCTS_A_DATABASE_CLIENT` is applied
+//      to those three roots only: `scripts/` and `e2e/` contain roughly two dozen fixture and
+//      harness files that each build their own client, and classifying them one by one would be
+//      churn without a guarantee. What covers THEM is the lexical plugin-key writer scan above,
+//      whose roots include both — so an unfenced plugin write there fails that test instead of this
+//      one. The two scans are complementary, and neither is complete alone.
 //
 // These are limits of a source scan, not gaps to be closed by a better regex. The list below is a
 // floor — "at least these" — never a ceiling.
@@ -710,6 +844,17 @@ const RUNS_A_MIGRATION_RUNNER = /\bprisma\s+(?:migrate|db)\b|['"`]prisma['"`]\s*
 const SHELLS_A_DATABASE_TOOL = /\b(?:psql|pg_dump|pg_restore|pg_isready)\b/
 /** SQL assembled at runtime rather than written as a tagged template. */
 const RUNS_RUNTIME_ASSEMBLED_SQL = /\$(?:execute|query)RawUnsafe/
+/**
+ * A file that builds its OWN database client instead of importing `lib/db` (round 9, finding 5).
+ *
+ * This is the question round 8 still did not ask. It asked what SHELLS OUT to a database tool, so
+ * `prisma/seed.ts` — which constructs a PrismaClient, writes this database, and is run by
+ * `install.sh` — appeared in no inventory at all. A repository writer does not have to spawn
+ * anything to be a writer.
+ */
+const CONSTRUCTS_A_DATABASE_CLIENT = /new\s+PrismaClient\s*\(|new\s+(?:pg\.)?(?:Client|Pool)\s*\(/
+/** Roots where constructing a client is itself notable — the shipped app, plus the seed. */
+const CLIENT_CONSTRUCTION_ROOTS = ['app', 'lib', 'prisma']
 
 const EXECUTION_ROOTS = ['app', 'lib', 'scripts', 'e2e', 'prisma']
 const EXECUTABLE_FILE = /\.(?:ts|tsx|mjs|cjs|js|sh)$/
@@ -750,6 +895,17 @@ function executableFiles(dir: string, found: string[] = []): string[] {
  *                             a plugin-key write there names the key and the lexical inventory
  *                             covers it. Listed because "unsafe" is where external content would
  *                             enter if it ever did.
+ *   'validates-external-sql'— READS a dump and decides whether it may be replayed. Executes nothing
+ *                             against the database; appears here only because it names the tools.
+ *   'app-database-client'   — the application's own pooled client. Everything routed through it is
+ *                             covered by the lexical inventory above.
+ *   'pinned-lock-session'   — builds a small dedicated `pg` pool/client to hold ONE advisory lock on
+ *                             a connection Prisma will not reassign. Takes a lock; writes nothing.
+ *   'seed'                  — a standalone client that WRITES this database, run from install.sh.
+ *                             It takes no lock and cannot practically be made to (it runs before the
+ *                             app is up); what keeps it safe is that it must not write a plugin key,
+ *                             which is now asserted by the writer scan above — `prisma` was added to
+ *                             SCANNED_ROOTS for exactly this file.
  */
 const DATABASE_EXECUTION_PATHS: Record<string,
   | 'replays-external-sql'
@@ -759,6 +915,10 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'schema-diff-only'
   | 'provisioning-cli'
   | 'runtime-assembled-sql'
+  | 'validates-external-sql'
+  | 'app-database-client'
+  | 'pinned-lock-session'
+  | 'seed'
 > = {
   'app/api/backup/restore/route.ts': 'replays-external-sql',
   'app/api/backup/create/route.ts': 'dump-only',
@@ -781,6 +941,15 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'scripts/prisma-dev-db.sh': 'migration-runner',
   'scripts/update.sh': 'migration-runner',
   'scripts/provision-ims-tenant.sh': 'provisioning-cli',
+  // Round 9, finding 5 — discovered by asking "what builds its own database client?", which is the
+  // question the round-8 inventory did not ask.
+  'lib/backup/restore-sql-guard.ts': 'validates-external-sql',
+  'lib/db/index.ts': 'app-database-client',
+  'lib/db/pinned-advisory-lock.ts': 'pinned-lock-session',
+  'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
+  'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
+  'lib/ops/production-preflight.ts': 'pinned-lock-session',
+  'prisma/seed.ts': 'seed',
 }
 
 function replayPaths(): string[] {
@@ -794,6 +963,7 @@ function replayPaths(): string[] {
         || RUNS_A_MIGRATION_RUNNER.test(src)
         || SHELLS_A_DATABASE_TOOL.test(src)
         || RUNS_RUNTIME_ASSEMBLED_SQL.test(src)
+        || (CLIENT_CONSTRUCTION_ROOTS.includes(root) && CONSTRUCTS_A_DATABASE_CLIENT.test(src))
       ) found.push(relative(REPO, path))
     }
   }
@@ -863,32 +1033,131 @@ test('every EXTERNAL-SQL replay path takes the connector-selection lock first', 
   )
 })
 
-test('the restore holds the lock in a SESSION THE DUMP CANNOT REACH, not on psql\'s own stdin', () => {
-  // ROUND 8, FINDING 3. Round 7 prepended `SELECT pg_advisory_xact_lock(k);` to psql's stdin, so
-  // the lock was held by the very session that then executed the untrusted stream — and any
-  // COMMIT/END/ROLLBACK in the dump ended that transaction and released the lock mid-replay. The
-  // lock is now taken in a separate Prisma interactive transaction (one pinned connection) that
-  // wraps the whole psql run, which nothing in the replayed SQL can reach.
+test('the restore holds the lock in a SESSION THE DUMP CANNOT REACH, and with no expiry', () => {
+  // ROUND 8, FINDING 3 → ROUND 9, FINDING 2. Round 7 prepended `SELECT pg_advisory_xact_lock(k);` to
+  // psql's stdin, so the lock was held by the very session that then executed the untrusted stream —
+  // and any COMMIT/END/ROLLBACK in the dump released it mid-replay. Round 8 moved it to a Prisma
+  // interactive transaction, which was the right session but the wrong LIFETIME: an interactive
+  // transaction has a timeout, its clock starts before the lock is acquired, and when it expired it
+  // released the lock while psql was still writing.
   //
+  // It is now a dedicated `pg` session holding a SESSION advisory lock, which has no timeout at all.
   // Asserted at source level HERE because this file owns the inventory question ("does the replay
-  // path take the lock at all"); the runtime ordering — acquired before spawn, released after exit,
-  // never written to stdin — is asserted in tests/api/backup-restore.test.ts.
-  const src = readFileSync(join(REPO, 'app/api/backup/restore/route.ts'), 'utf8')
+  // path take the lock at all"); the runtime ordering — acquired before spawn, released after exit
+  // and after the backend is terminated — is asserted in tests/api/backup-restore.test.ts.
+  const raw = readFileSync(join(REPO, 'app/api/backup/restore/route.ts'), 'utf8')
+  // Comments stripped: this file DOCUMENTS the two shapes it no longer uses, and matching that
+  // prose would be asserting against the explanation instead of the code.
+  const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 
   assert.ok(
-    /createPrismaRestoreSelectionLockHolder[\s\S]{0,600}\$transaction/.test(src),
-    'the holder is a transaction on the app\'s own client, i.e. a session of its own',
+    /createRestoreSelectionLockHolder[\s\S]{0,1200}pg_try_advisory_lock/.test(src),
+    'the holder takes a SESSION advisory lock on a connection of its own',
   )
   assert.ok(
-    src.includes('pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})'),
-    'and it locks the SHARED constant — a copied literal would serialize against nothing',
+    src.includes('pg_advisory_unlock'),
+    'and releases it explicitly, rather than relying on a transaction ending',
+  )
+  assert.ok(
+    !src.includes('pg_advisory_xact_lock'),
+    'NOT the transaction-scoped form: its lifetime is the transaction\'s, and an interactive '
+      + 'transaction\'s timeout is what released the lock mid-restore in round 8',
+  )
+  assert.ok(
+    !/\$transaction\(/.test(src),
+    'and no interactive transaction is opened at all, so there is no timeout to reconcile against psql\'s',
   )
   assert.ok(
     !/child\.stdin\.write\(/.test(src),
     'nothing is written to psql stdin any more: a lock statement there would deadlock against the '
       + 'holder, and a lock held there could be released by the dump',
   )
-  assert.ok(src.includes("'--single-transaction'"), 'the replay is still one transaction, for atomicity')
+  assert.ok(raw.includes("'--single-transaction'"), 'the replay is still one transaction, for atomicity')
+  assert.ok(
+    /validateRestoreSqlFile[\s\S]{0,400}createRestoreSqlScanner\(/.test(src),
+    'and the validator LEXES the dump for transaction control — an import alone would satisfy a '
+      + 'substring check while the old line-based rule was still what ran (round 9, finding 3)',
+  )
+})
+
+/**
+ * Migrations that mutate `settings` rows, and why each is safe.
+ *
+ * A migration runs OUTSIDE every lock this application takes — `prisma migrate deploy` is a separate
+ * process against a database the app may still be connected to — so anything it does to these rows
+ * is unserialized against the orphan-cancel sweep. A new one fails the test below until it is
+ * reviewed and recorded here.
+ */
+const MIGRATIONS_THAT_MUTATE_SETTINGS: Record<string, string> = {
+  '20260410180000_generic_payment_account_map':
+    'Renames ONE key by exact literal match (xero_payment_account_map → accounting_payment_account_map). '
+    + 'Touches no plugin key and no other row.',
+}
+
+test('no migration performs a WHOLESALE settings mutation', () => {
+  // ROUND 9, FINDING 5. The previous migration assertion looked for literal `plugin_*_enabled`
+  // names. A migration that deleted or rewrote the settings table wholesale would change every
+  // plugin key without naming one — the same blind spot the restore route exposed at a different
+  // scale, and one a name-based scan can never see.
+  //
+  // LIMIT, stated: this flags the SHAPE (`UPDATE`/`DELETE`/`TRUNCATE` against `settings`) and then
+  // requires a human decision per migration. It does not decide for itself whether a given WHERE
+  // clause is narrow enough — that is a SQL-semantics question, and guessing it is how a guard ends
+  // up quietly permitting the case it was written for.
+  const migrationsDir = join(REPO, 'prisma', 'migrations')
+  const found: Record<string, string[]> = {}
+  let scanned = 0
+  for (const entry of readdirSync(migrationsDir)) {
+    const file = join(migrationsDir, entry, 'migration.sql')
+    let src: string
+    try {
+      src = readFileSync(file, 'utf8')
+    } catch {
+      continue
+    }
+    scanned += 1
+    const mutations = src.match(/(?:DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?|UPDATE)\s+"?settings"?/gi) ?? []
+    if (mutations.length > 0) found[entry] = mutations
+  }
+
+  assert.ok(scanned > 0, 'the migration directory was actually read — an empty scan proves nothing')
+  assert.deepEqual(
+    Object.keys(found).sort(),
+    Object.keys(MIGRATIONS_THAT_MUTATE_SETTINGS).sort(),
+    'an unreviewed settings mutation in a migration, or a reviewed one that has disappeared. Each '
+      + 'must be recorded in MIGRATIONS_THAT_MUTATE_SETTINGS with why it cannot reach a plugin key.',
+  )
+})
+
+test('the writer scan can actually FIND an unfenced plugin write — including in the seed', () => {
+  // ROUND 9, FINDING 5. Every scan in this file asserts "no offenders", which proves the scan found
+  // nothing and says nothing about whether it COULD. Fed the exact code Codex proposed — a plugin
+  // key written from prisma/seed.ts, which was in neither guard before this round — it must fail.
+  const seedWithPluginWrite = [
+    "import { PrismaClient } from '../app/generated/prisma/client'",
+    'const db = new PrismaClient({ adapter })',
+    'async function main() {',
+    "  await db.setting.upsert({ where: { key: 'plugin_xero_enabled' }, create: { key: 'plugin_xero_enabled', value: 'true' }, update: { value: 'true' } })",
+    '}',
+  ].join('\n')
+  assert.equal(isUnfencedPluginWriter(seedWithPluginWrite), true, 'an unfenced seed plugin write is an offender')
+
+  // The same write through the lock helper is not.
+  assert.equal(
+    isUnfencedPluginWriter(seedWithPluginWrite.replace('async function main() {', 'async function main() {\n  await lockIntegrationPluginSelection(db)')),
+    false,
+  )
+  // A raw-SQL wipe of the table is an offender even though it names no key.
+  assert.equal(isUnfencedPluginWriter("await client.query('delete from settings;')"), true)
+  // And an ordinary settings write that names no plugin key is not.
+  assert.equal(isUnfencedPluginWriter("await db.setting.upsert({ where: { key: 'public_app_url' } })"), false)
+
+  // The seed is genuinely IN the scan's roots now, rather than merely being testable by it.
+  assert.ok(SCANNED_ROOTS.includes('prisma'), 'prisma/ is scanned')
+  assert.ok(
+    isUnfencedPluginWriter(readFileSync(join(REPO, 'prisma/seed.ts'), 'utf8')) === false,
+    'and today\'s seed passes it',
+  )
 })
 
 test('no path takes a settings row lock and THEN the selection advisory lock', () => {

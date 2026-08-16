@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
@@ -6,7 +8,8 @@ import {
   completePluginSelectionSave,
   resolvePluginSelectionSaveView,
 } from '@/lib/domain/integrations/plugin-save-outcome'
-import { resolveSchedulerFollowUp, schedulerBehindWarning } from '@/lib/domain/integrations/scheduler-followup'
+import { schedulerBehindWarning, SCHEDULER_RECOVERY } from '@/lib/domain/integrations/scheduler-followup'
+import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outcome'
 
 // ---------------------------------------------------------------------------
 // o3d-osl8 round 7, finding 1 — THE CALLER'S half.
@@ -224,49 +227,65 @@ test('the guard\'s outcome feeds the resolver, so a THROWN failure keeps the swi
 // ---------------------------------------------------------------------------
 // The same shape at the three OTHER screens that reconcile the crontab after a committed write
 // (the onboarding company step, the Public App URL setting, the scheduled-jobs editor). They save
-// something other than the plugin selection, so they cannot use the resolver — but the classifying
-// rule and the sentence are shared rather than re-typed.
+// something other than the plugin selection, so they cannot use the resolver above — but the
+// classifying rule and the sentence are shared rather than re-typed.
+//
+// ROUND 9, FINDING 4 — those three used to classify CLIENT-SIDE, via `resolveSchedulerFollowUp`,
+// which ran `syncCrontab` from the browser and caught everything it threw. Two problems: the catch
+// swallowed Next's `NEXT_REDIRECT` (raised by `syncCrontab`'s own re-entered permission gate), and
+// running the reconciliation as a second round trip meant the commit and its post-commit step could
+// never be one guarded unit. They now call a server action that commits and then runs every
+// post-commit step inside `runPostCommit`, and render `resolveSettingSaveView` over its result.
 // ---------------------------------------------------------------------------
 
-test('a scheduler follow-up that succeeds warns about nothing', async () => {
+test('a settings save with no post-commit failure warns about nothing', () => {
   assert.deepEqual(
-    await resolveSchedulerFollowUp({ what: 'The Public App URL', sync: async () => ({ success: true }) }),
-    { warning: '' },
+    resolveSettingSaveView({ result: { status: 'saved' }, what: 'The Public App URL' }),
+    { committed: true, error: '', warning: '' },
   )
 })
 
-test('a scheduler follow-up warns identically whether it returns or throws', async () => {
-  const returned = await resolveSchedulerFollowUp({
+test('a post-commit SCHEDULER failure is a warning over a committed save, never an error', () => {
+  const view = resolveSettingSaveView({
+    result: { status: 'post-commit-failed', step: 'scheduler', error: 'crontab write failed' },
     what: 'The Public App URL',
-    sync: async () => ({ success: false, error: 'boom' }),
-  })
-  const thrown = await resolveSchedulerFollowUp({
-    what: 'The Public App URL',
-    sync: async () => { throw new Error('boom') },
   })
 
-  assert.deepEqual(returned, thrown, 'returned and thrown are ONE outcome — that is the whole point')
-  assert.match(returned.warning, /^The Public App URL was SAVED, but the scheduler could not be updated/)
-  assert.match(returned.warning, /Settings → System → Scheduler/, 'with the recovery that applies')
-  assert.ok(
-    !/failed to save|could not be saved/i.test(returned.warning),
-    'and it never says the save failed, because it did not',
-  )
+  assert.equal(view.committed, true, 'the value IS stored — that is the whole point')
+  assert.equal(view.error, '', 'and nothing is presented as a failed save')
+  assert.match(view.warning, /^The Public App URL was SAVED, but the scheduler could not be updated/)
+  assert.match(view.warning, /Settings → System → Scheduler/, 'with the recovery that applies')
+  assert.ok(!/failed to save|could not be saved/i.test(view.warning))
 })
 
-test('a scheduler follow-up with no stated reason falls back rather than warning about "undefined"', async () => {
-  const followUp = await resolveSchedulerFollowUp({
-    what: 'Your scheduled-job settings',
-    sync: async () => ({ success: false }),
-    fallbackError: 'Failed to sync crontab',
+test('a post-commit LOCAL failure gets its own sentence rather than blaming the scheduler', () => {
+  // The sentence has to stay TRUE. `setSettings`’ post-commit tail is the activity-log row and the
+  // cache revalidation; telling an operator to go and sync the crontab because THAT failed would be
+  // a second, smaller lie in the place built to stop the first one.
+  const view = resolveSettingSaveView({
+    result: { status: 'post-commit-failed', step: 'local', error: 'activity log unavailable' },
+    what: 'Your delivery tracking settings',
   })
 
-  assert.match(followUp.warning, /Failed to sync crontab/)
-  assert.ok(!followUp.warning.includes('undefined'))
+  assert.equal(view.committed, true)
+  assert.equal(view.error, '')
+  assert.match(view.warning, /was SAVED, but a follow-up step after the save did not complete/)
+  assert.match(view.warning, /activity log unavailable/)
+  assert.ok(!/Scheduler/.test(view.warning), 'it does not send them to a page that cannot help')
+})
+
+test('a REFUSED settings save is the only one that reports a failure', () => {
+  // Refused means the action rejected the input BEFORE its transaction, so nothing was written.
+  // It is the only outcome where "your value was not saved" is true.
+  const view = resolveSettingSaveView({
+    result: { status: 'refused', error: 'URL must start with http:// or https://' },
+    what: 'The Public App URL',
+  })
+  assert.deepEqual(view, { committed: false, error: 'URL must start with http:// or https://', warning: '' })
 })
 
 test('the warning sentence has ONE definition', () => {
-  // Both users of it — the plugin resolver and the three other screens — go through this function,
+  // Both users of it — the plugin resolver and the settings resolver — go through this function,
   // so the wording cannot drift into per-screen variants that each say something slightly different
   // about what is and is not saved.
   assert.equal(
@@ -277,4 +296,24 @@ test('the warning sentence has ONE definition', () => {
       previous,
     }).schedulerWarning.replace('Your integration plugin selection', 'X'),
   )
+})
+
+test('the recovery names a control that actually exists on that page', () => {
+  // ROUND 9. Rounds 7 and 8 told the operator to "use Sync crontab there". No such button exists —
+  // the scheduler tab renders CronJobsSettings, whose only control is Save & Apply, and that page's
+  // own drift warnings say "Save the scheduler settings". A warning that sends someone looking for
+  // a control nobody built is the same defect the warning was written to fix: a message the reader
+  // cannot act on. It survived two rounds because every assertion matched on
+  // "Settings → System → Scheduler" and stopped there.
+  const schedulerTab = readFileSync(join(process.cwd(), 'components/settings/cron-jobs-settings.tsx'), 'utf8')
+  const controls = [...schedulerTab.matchAll(/<Button[\s\S]{0,200}?>([\s\S]*?)<\/Button>/g)]
+    .map((m) => m[1].replace(/\{[\s\S]*?\}/g, '').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim())
+    .filter(Boolean)
+
+  assert.deepEqual(controls, ['Save & Apply'], 'the scheduler tab offers exactly one control')
+  assert.ok(
+    SCHEDULER_RECOVERY.includes('Save & Apply'),
+    `the recovery must name it; it says: ${SCHEDULER_RECOVERY}`,
+  )
+  assert.ok(!/Sync crontab/i.test(SCHEDULER_RECOVERY), 'and must not name a button that does not exist')
 })

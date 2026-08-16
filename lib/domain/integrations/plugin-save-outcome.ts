@@ -1,5 +1,6 @@
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { schedulerBehindWarning } from '@/lib/domain/integrations/scheduler-followup'
+import { runPostCommit } from '@/lib/domain/post-commit'
 
 /**
  * WHAT A PLUGIN-SELECTION SAVE CAN ACTUALLY REPORT, and what a caller may conclude from each
@@ -30,7 +31,7 @@ import { schedulerBehindWarning } from '@/lib/domain/integrations/scheduler-foll
  * PENDING while the UI reported the work as scheduled. That is the same class of lie this finding
  * is about, moved into the queue. The recovery is instead an EXPLICIT operator action with an
  * existing home: Settings → System → Scheduler, which already reports crontab drift
- * (getCrontabStatus) and can re-run syncCrontab.
+ * (getCrontabStatus) and reconciles the crontab whenever the scheduler settings are saved.
  */
 export type PluginSelectionSaveResult =
   /** Committed, and the scheduler now matches it. */
@@ -105,26 +106,23 @@ const UNKNOWN_OUTCOME =
  *
  * `postCommit` may still RETURN a failure; returned and thrown produce the identical outcome, which
  * is the invariant this round is enforcing.
+ *
+ * ROUND 9, FINDING 4 — the classification is delegated to `runPostCommit` rather than written here,
+ * because the catch this function used to own was a catch-all: it mapped Next's `NEXT_REDIRECT` to
+ * `scheduler-failed` too, so a post-commit step that re-entered a permission gate produced a
+ * "saved, but the scheduler is behind" warning instead of the auth redirect the framework was
+ * asking for. One guard, one `unstable_rethrow`, every post-commit site.
  */
 export async function completePluginSelectionSave(input: {
   /** The selection read back under the lock, inside the transaction that wrote it. */
   committed: IntegrationPluginState
-  postCommit: () => Promise<{ success: boolean; error?: string }>
+  postCommit: () => Promise<void | { success: boolean; error?: string }>
   /** Fallback text when the step failed without saying why. */
   fallbackError?: string
 }): Promise<PluginSelectionSaveResult> {
-  const fallback = input.fallbackError ?? 'Failed to apply scheduler changes'
-  try {
-    const result = await input.postCommit()
-    if (result.success) return { status: 'saved' }
-    return { status: 'scheduler-failed', error: result.error ?? fallback, pluginState: input.committed }
-  } catch (error) {
-    return {
-      status: 'scheduler-failed',
-      error: error instanceof Error ? error.message : fallback,
-      pluginState: input.committed,
-    }
-  }
+  const outcome = await runPostCommit(input.postCommit, input.fallbackError ?? 'Failed to apply scheduler changes')
+  if (outcome.status === 'ok') return { status: 'saved' }
+  return { status: 'scheduler-failed', error: outcome.error, pluginState: input.committed }
 }
 
 /**

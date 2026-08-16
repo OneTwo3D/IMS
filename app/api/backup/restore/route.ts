@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createHash, randomBytes } from 'crypto'
 import { spawn } from 'child_process'
+import pg from 'pg'
 import { createReadStream, createWriteStream } from 'fs'
 import { mkdir, access, unlink, stat, statfs } from 'fs/promises'
 import path from 'path'
-import readline from 'readline'
 import { pipeline } from 'stream/promises'
 import { Readable } from 'stream'
 import type { ReadableStream as NodeReadableStream } from 'stream/web'
@@ -16,6 +16,7 @@ import { sendEmail } from '@/lib/mailer'
 import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { db } from '@/lib/db'
 import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
+import { createRestoreSqlScanner } from '@/lib/backup/restore-sql-guard'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { getClientIp } from '@/lib/request-ip'
 import {
@@ -399,125 +400,214 @@ function formatRestoreEmail(token: string) {
   `
 }
 
+/**
+ * REFUSE ANYTHING THE REPLAY CANNOT BE HELD TO ONE TRANSACTION (o3d-osl8 round 9, finding 3).
+ *
+ * The previous check was `/^\s*\\/` per line — a psql-metacommand scan that ALSO rejected every
+ * `\.` COPY terminator, i.e. every plain `pg_dump` this application produces (both writers here use
+ * `--format=plain` with default COPY output). It rejected the app's own backups and, being purely
+ * lexical, could not see transaction control at all.
+ *
+ * `createRestoreSqlScanner` lexes the file instead: it knows strings, dollar-quoted bodies,
+ * comments and COPY data blocks, so a top-level `COMMIT;` is caught and a `COMMIT` inside a PL/pgSQL
+ * body is not. Its guarantees and its stated limits are in lib/backup/restore-sql-guard.ts —
+ * including the two classes it cannot see (indirect transaction control, and statements that cannot
+ * run in a transaction block), both of which PostgreSQL turns into a clean rollback rather than a
+ * partial apply.
+ */
 async function validateRestoreSqlFile(filePath: string): Promise<void> {
-  const rl = readline.createInterface({
-    input: createReadStream(filePath, { encoding: 'utf8' }),
-    crlfDelay: Infinity,
-  })
-
-  let lineNumber = 0
+  const scanner = createRestoreSqlScanner()
+  const stream = createReadStream(filePath, { encoding: 'utf8' })
   try {
-    for await (const line of rl) {
-      lineNumber++
-      if (/^\s*\\/.test(line)) {
-        throw new Error(`Restore file contains unsupported psql metacommand on line ${lineNumber}`)
-      }
-    }
+    for await (const chunk of stream) scanner.push(chunk as string)
   } finally {
-    rl.close()
+    stream.destroy()
   }
+  scanner.end()
 }
 
-/** Enough for the psql timeout below plus spawn/teardown, so the holder outlives the replay. */
 const RESTORE_PSQL_TIMEOUT_MS = 300_000
-const RESTORE_SELECTION_LOCK_TIMEOUT_MS = RESTORE_PSQL_TIMEOUT_MS + 60_000
+/** Bounded acquisition: a restore that cannot get the lock fails fast and says so. */
 const RESTORE_SELECTION_LOCK_MAX_WAIT_MS = 60_000
+const RESTORE_SELECTION_LOCK_POLL_MS = 250
+/**
+ * After SIGKILL, how long we wait to observe psql's `close` before giving up on it. SIGKILL cannot
+ * be caught, so this is teardown time, not a grace period.
+ */
+const RESTORE_PSQL_KILL_GRACE_MS = 30_000
+/** Keeps the holder session from being reaped by an `idle_session_timeout` or an idle TCP path. */
+const RESTORE_LOCK_KEEPALIVE_MS = 30_000
 
-/** The one statement the holder session runs. Structural, so a test can supply the client. */
-type RestoreLockTx = { $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number> }
-type RestoreLockDbClient = {
-  $transaction<T>(
-    fn: (tx: RestoreLockTx) => Promise<T>,
-    options?: { timeout?: number; maxWait?: number },
-  ): Promise<T>
+/** What the holder lends the work it wraps. */
+export type RestoreLockContext = {
+  /**
+   * Terminate any backend still executing this restore, identified by `application_name`.
+   * Returns how many were terminated. Used only on the timeout path.
+   */
+  terminateRestoreBackends: (applicationName: string) => Promise<number>
 }
 
 /** Runs `work` while the connector-selection lock is held by a session `work` does not control. */
-export type RestoreSelectionLockHolder = <T>(work: () => Promise<T>) => Promise<T>
+export type RestoreSelectionLockHolder = <T>(work: (ctx: RestoreLockContext) => Promise<T>) => Promise<T>
+
+/** The minimum of a `pg` client this needs. Structural, so a test can supply one. */
+export type RestoreLockClient = {
+  connect(): Promise<void>
+  query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
+  end(): Promise<void>
+}
 
 /**
- * HOLD THE CONNECTOR-SELECTION LOCK IN A SEPARATE SESSION FOR THE WHOLE RESTORE
- * (o3d-osl8 round 7 finding 2, made structural in round 8 finding 3).
+ * HOLD THE CONNECTOR-SELECTION LOCK, WITH NO EXPIRY, FOR THE WHOLE RESTORE
+ * (o3d-osl8 round 7 finding 2 → round 8 finding 3 → round 9 finding 2).
  *
- * A restore replays arbitrary validated SQL over the whole database. It rewrites `settings` — plugin
- * selection rows included — and `accounting_sync_logs`, and it does so WITHOUT naming a single
- * plugin key, which is precisely why the lexical writer inventory in
- * tests/accounting/plugin-selection-lock.test.ts could never have found it: a name-based sweep
- * cannot enumerate a generic replay path.
+ * A restore replays arbitrary SQL over the whole database. It rewrites `settings` — plugin selection
+ * rows included — and `accounting_sync_logs` WITHOUT naming a single plugin key, which is why the
+ * lexical writer inventory in tests/accounting/plugin-selection-lock.test.ts could never have found
+ * it: a name-based sweep cannot enumerate a generic replay path.
  *
  * Two things go wrong without the lock.
  *
- *   1. NO SERIALIZATION. `cancelOrphanedAccountingSyncRows` reads the connector selection under
- *      this lock and decides from it which queue to discard. A restore committing a DIFFERENT
- *      selection while that decision is in flight is exactly the transition the lock exists to
- *      stop, reached by a path that never took it.
- *   2. DEADLOCK, in the opposite direction. The cancellation locks the plugin `settings` rows
- *      first and updates `accounting_sync_logs` second. A restore whose SQL happens to touch
+ *   1. NO SERIALIZATION. `cancelOrphanedAccountingSyncRows` reads the connector selection under this
+ *      lock and decides from it which queue to discard. A restore committing a DIFFERENT selection
+ *      while that decision is in flight is exactly the transition the lock exists to stop.
+ *   2. DEADLOCK, in the opposite direction. The cancellation locks the plugin `settings` rows first
+ *      and updates `accounting_sync_logs` second. A restore whose SQL happens to touch
  *      `accounting_sync_logs` before `settings` takes them in the reverse order, and PostgreSQL
- *      resolves that by aborting one of the two — either the critical restore, or a cancellation
- *      that has already decided what to discard.
+ *      resolves that by aborting one of the two.
  *
- * WHY THE ROUND-7 SHAPE WAS NOT ENOUGH. It wrote `SELECT pg_advisory_xact_lock(k);` as the first
- * statement on psql's OWN stdin, inside the transaction `--single-transaction` opens. The lock was
- * therefore held by the very session that then executed the untrusted stream — so any `COMMIT;`,
- * `END;`, `ROLLBACK;` or `\.`-terminated transaction control anywhere in the dump ended that
- * transaction and released the lock with the replay still running, leaving it protecting only the
- * OPENING of the restore. Round 7 argued that plain `pg_dump` emits no transaction control and left
- * it as documented residue; that argument is about what a well-formed input contains, and this
- * route accepts an operator-supplied upload.
+ * THREE SHAPES, AND WHY THE FIRST TWO FAILED.
  *
- * The lock is now held by a DIFFERENT session — a Prisma interactive transaction, which pins one
- * connection for its whole body — and the restore runs inside that body. Nothing in the replayed
- * stream can reach that session, so no accepted input can release the lock. That is a structural
- * guarantee rather than an argument about dump contents, which is why transaction control is NOT
- * scanned for: a scan would have to tell a real `COMMIT;` from `BEGIN`/`COMMIT` inside a PL/pgSQL
- * body or a dollar-quoted string, and would both false-positive and miss cases.
+ *   ROUND 7 put `SELECT pg_advisory_xact_lock(k);` on psql's OWN stdin, inside the transaction
+ *   `--single-transaction` opens. Any `COMMIT;` in the dump ended that transaction and released the
+ *   lock with the replay still running.
  *
- * WHY IT CANNOT DEADLOCK AGAINST THE RESTORE IT PROTECTS. The holder session takes the advisory
- * lock and nothing else — no table lock, no row lock, no snapshot the replay needs — so psql can
- * DROP, CREATE and rewrite freely while it waits. And the restore no longer takes the advisory lock
- * itself: two sessions asking for the same advisory key WOULD block on each other forever, which is
- * exactly why the stdin statement had to go rather than being kept "for belt and braces".
+ *   ROUND 8 moved it into a Prisma interactive transaction — a session the dump cannot reach, which
+ *   was the right move — but an interactive transaction HAS A TIMEOUT, and its clock starts when
+ *   the transaction opens, BEFORE `pg_advisory_xact_lock` returns. A restore queued behind another
+ *   one could therefore acquire the lock with a minute of its 360s budget left, whereupon Prisma
+ *   aborted the transaction and released the lock while psql kept writing for another four minutes.
+ *   Strictly worse than round 7: it looked protected. Reconciling that timeout against psql's own
+ *   ceiling was not a matter of picking a bigger number, because the two clocks start at different
+ *   moments and the gap between them is unbounded queueing time.
+ *
+ *   THIS SHAPE removes the clock instead of raising it. A dedicated `pg` session takes a SESSION
+ *   advisory lock — `pg_try_advisory_lock`, which is held until it is explicitly unlocked or the
+ *   session ends, and has no timeout of any kind. There is no transaction open on the holder, so
+ *   `idle_in_transaction_session_timeout` cannot reach it either, and a keepalive `SELECT 1` every
+ *   30s defends the session against `idle_session_timeout` and idle TCP reaping. The lifetime
+ *   question therefore has no numbers to reconcile: the lock is released by the `finally` after the
+ *   restore promise settles, and by nothing else.
+ *
+ * ACQUISITION IS BOUNDED, RELEASE IS NOT. `pg_advisory_lock` waits forever, which would turn a
+ * contended restore into a hung request; `pg_try_advisory_lock` polled to a 60s deadline fails fast
+ * with a message naming the cause. That is the one place a timeout belongs.
+ *
+ * WHY IT CANNOT DEADLOCK AGAINST THE RESTORE IT PROTECTS. The holder session takes the advisory lock
+ * and nothing else — no table lock, no row lock, no snapshot the replay needs — so psql can DROP,
+ * CREATE and rewrite freely while it waits. And the restore no longer takes the advisory lock
+ * itself: two sessions asking for the same key WOULD block on each other forever.
  *
  * WHAT IS STILL NOT COVERED, stated rather than implied:
- *   • ATOMICITY, not mutual exclusion. A `COMMIT;` inside the dump still splits psql's
- *     `--single-transaction` into several, so a mid-file failure can leave the database partly
- *     restored. That is a real residue — it is just not this lock's job, and it no longer lets a
- *     concurrent connector switch in.
- *   • The lock ends with the HOLDER's transaction, so anything that kills that session early
- *     (a dropped connection, a server restart, a non-zero `idle_in_transaction_session_timeout`)
- *     releases it while psql runs on. Nothing in the replayed SQL can cause that; an operator or an
- *     outage can. The maintenance-mode gate remains the coarse protection for that case.
+ *   • The lock ends with the holder's SESSION, so anything that kills that session (a dropped
+ *     connection, a database restart, an operator's `pg_terminate_backend`) releases it while psql
+ *     runs on. Nothing in the replayed SQL can cause that; an outage or an operator can. The
+ *     maintenance-mode gate remains the coarse protection for that case. This is inherent to
+ *     advisory locks — there is no PostgreSQL lock that outlives its session.
  *   • Only writers that TAKE this lock are serialized against the restore. That set is asserted by
  *     the inventories in tests/accounting/plugin-selection-lock.test.ts, with their own limits
  *     recorded there.
  */
-export function createPrismaRestoreSelectionLockHolder(
-  client: RestoreLockDbClient = db as unknown as RestoreLockDbClient,
-): RestoreSelectionLockHolder {
-  return <T>(work: () => Promise<T>) => client.$transaction(
-    async (tx) => {
-      // FIRST, and in the same order every other caller uses (advisory lock, then rows — this
-      // session never takes rows at all), so it cannot introduce a new cycle.
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY})`
-      return work()
-    },
-    { timeout: RESTORE_SELECTION_LOCK_TIMEOUT_MS, maxWait: RESTORE_SELECTION_LOCK_MAX_WAIT_MS },
-  )
+export function createRestoreSelectionLockHolder(options: {
+  createClient?: () => RestoreLockClient
+  now?: () => number
+  delay?: (ms: number) => Promise<void>
+  maxWaitMs?: number
+} = {}): RestoreSelectionLockHolder {
+  const createClient = options.createClient ?? (() => new pg.Client({
+    connectionString: process.env.DATABASE_URL,
+    application_name: 'ims_restore_lock_holder',
+  }) as unknown as RestoreLockClient)
+  const now = options.now ?? Date.now
+  const delay = options.delay ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms) }))
+  const maxWaitMs = options.maxWaitMs ?? RESTORE_SELECTION_LOCK_MAX_WAIT_MS
+
+  return async <T>(work: (ctx: RestoreLockContext) => Promise<T>): Promise<T> => {
+    const client = createClient()
+    await client.connect()
+    let acquired = false
+    let keepalive: ReturnType<typeof setInterval> | undefined
+    try {
+      const deadline = now() + maxWaitMs
+      for (;;) {
+        const result = await client.query(
+          'SELECT pg_try_advisory_lock($1) AS locked',
+          [ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY],
+        )
+        if (result.rows[0]?.locked === true) { acquired = true; break }
+        if (now() >= deadline) {
+          throw new Error(
+            'Could not acquire the accounting connector-selection lock within '
+            + `${Math.round(maxWaitMs / 1000)}s — another restore or a connector-selection change is `
+            + 'in progress. Nothing was restored.',
+          )
+        }
+        await delay(RESTORE_SELECTION_LOCK_POLL_MS)
+      }
+
+      keepalive = setInterval(() => { void client.query('SELECT 1').catch(() => {}) }, RESTORE_LOCK_KEEPALIVE_MS)
+      keepalive.unref?.()
+
+      return await work({
+        terminateRestoreBackends: async (applicationName: string) => {
+          const terminated = await client.query(
+            'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1 AND pid <> pg_backend_pid()',
+            [applicationName],
+          )
+          return terminated.rows.length
+        },
+      })
+    } finally {
+      if (keepalive) clearInterval(keepalive)
+      // Explicit unlock first so the lock is gone before the socket teardown races; ending the
+      // session releases it anyway, which is the belt to this brace.
+      if (acquired) {
+        try {
+          await client.query('SELECT pg_advisory_unlock($1)', [ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY])
+        } catch {
+          // The session is about to end, which releases the lock regardless.
+        }
+      }
+      await client.end().catch(() => {})
+    }
+  }
 }
 
 export async function runRestore(
   filePath: string,
   db: ReturnType<typeof getDbConfig>,
-  options: { spawnProcess?: typeof spawn; withSelectionLock?: RestoreSelectionLockHolder } = {},
+  options: {
+    spawnProcess?: typeof spawn
+    withSelectionLock?: RestoreSelectionLockHolder
+    /** Injected so the timeout path is testable without waiting five minutes. */
+    psqlTimeoutMs?: number
+    killGraceMs?: number
+    applicationName?: string
+  } = {},
 ): Promise<void> {
-  // Before the lock: a file that cannot be replayed must fail without ever taking a lock the whole
-  // application contends on.
+  // Before the lock: a file that cannot be replayed — a psql metacommand, transaction control, an
+  // unterminated construct — must fail without ever taking a lock the whole application contends
+  // on, and without opening a session for nothing.
   await validateRestoreSqlFile(filePath)
   const spawnProcess = options.spawnProcess ?? spawn
-  const withSelectionLock = options.withSelectionLock ?? createPrismaRestoreSelectionLockHolder()
+  const withSelectionLock = options.withSelectionLock ?? createRestoreSelectionLockHolder()
+  const psqlTimeoutMs = options.psqlTimeoutMs ?? RESTORE_PSQL_TIMEOUT_MS
+  const killGraceMs = options.killGraceMs ?? RESTORE_PSQL_KILL_GRACE_MS
+  // Unique per run so the timeout path terminates THIS restore's backend and nothing else — another
+  // restore cannot be running (the lock is held), but ordinary psql sessions may be.
+  const applicationName = options.applicationName ?? `ims_restore_${randomBytes(6).toString('hex')}`
 
-  await withSelectionLock(() => new Promise<void>((resolve, reject) => {
+  await withSelectionLock(async (lock) => {
     const args = [
       '-X',
       '-h', db.host,
@@ -528,33 +618,51 @@ export async function runRestore(
       '--set', 'ON_ERROR_STOP=1',
     ]
     const child = spawnProcess('psql', args, {
-      env: { ...process.env, PGPASSWORD: db.password },
+      // PGAPPNAME becomes the backend's `application_name`, which is the only handle we have on the
+      // server-side half of this restore once the client process is gone.
+      env: { ...process.env, PGPASSWORD: db.password, PGAPPNAME: applicationName },
       stdio: ['pipe', 'ignore', 'pipe'],
     })
 
     let stderr = ''
-    const timeout = setTimeout(() => {
-      child.kill('SIGKILL')
-      reject(new Error('Restore timed out'))
-    }, RESTORE_PSQL_TIMEOUT_MS)
+    let timedOut = false
 
-    child.stderr.on('data', (chunk: Buffer | string) => {
-      stderr += chunk.toString()
-      if (stderr.length > 2000) stderr = stderr.slice(-2000)
-    })
+    /**
+     * Resolves when psql's `close` is observed, or when `killGraceMs` elapses after SIGKILL.
+     *
+     * ROUND 9, FINDING 2 — the old timeout path called `child.kill('SIGKILL')` and rejected
+     * IMMEDIATELY, so the holder's `finally` released the lock while the child (and, more to the
+     * point, its BACKEND) might still be writing. Rejecting before the process is confirmed dead is
+     * releasing the lock on an assumption.
+     */
+    const exited = new Promise<{ code: number | null; error?: Error }>((resolve) => {
+      let settled = false
+      let grace: ReturnType<typeof setTimeout> | undefined
 
-    child.on('error', (error) => {
-      clearTimeout(timeout)
-      reject(error)
-    })
+      // Declared BEFORE the listeners that clear it, so `settle` never reads it in its temporal
+      // dead zone — a hazard that only bites when a child emits synchronously.
+      const timeout = setTimeout(() => {
+        timedOut = true
+        child.kill('SIGKILL')
+        // The promise still settles on `close` if it arrives; this only BOUNDS how long we wait
+        // for it, rather than assuming the process is gone the moment SIGKILL is sent.
+        grace = setTimeout(() => settle({ code: null }), killGraceMs)
+      }, psqlTimeoutMs)
 
-    child.on('close', (code) => {
-      clearTimeout(timeout)
-      if (code === 0) {
-        resolve()
-        return
+      const settle = (value: { code: number | null; error?: Error }) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        if (grace) clearTimeout(grace)
+        resolve(value)
       }
-      reject(new Error(stderr.trim() || `psql exited with code ${code}`))
+
+      child.on('error', (error) => settle({ code: null, error }))
+      child.on('close', (code) => settle({ code }))
+      child.stderr.on('data', (chunk: Buffer | string) => {
+        stderr += chunk.toString()
+        if (stderr.length > 2000) stderr = stderr.slice(-2000)
+      })
     })
 
     const input = createReadStream(filePath)
@@ -565,11 +673,34 @@ export async function runRestore(
       // handled by child close/error paths
     })
     // The dump, and NOTHING else. The lock statement that used to be prepended here moved into a
-    // separate session (createPrismaRestoreSelectionLockHolder) — held there, it cannot be released
-    // by the stream below, and prepending it as well would make psql wait forever for a lock the
-    // holder already has.
+    // separate session (createRestoreSelectionLockHolder) — held there, it cannot be released by the
+    // stream below, and prepending it as well would make psql wait forever for a lock the holder
+    // already has.
     input.pipe(child.stdin)
-  }))
+
+    const result = await exited
+
+    if (timedOut) {
+      // WHAT HAPPENS IF PSQL OUTLIVES ITS OWN CEILING. SIGKILL cannot be caught, so the client is
+      // gone; its BACKEND, however, keeps executing the current statement until it next notices the
+      // dead socket, which for a long DDL statement can be minutes. Terminating it from the holder
+      // session — which still holds the lock at this point — is what makes "the restore has stopped
+      // writing" true rather than assumed. `--single-transaction` means the terminated backend
+      // rolls back everything it had applied.
+      //
+      // If even this fails (the holder session is unusable, say), we still reject and release. That
+      // residue is stated rather than hidden: from here on the maintenance-mode gate is the only
+      // protection, exactly as it is for a holder whose connection dropped.
+      const terminated = await lock.terminateRestoreBackends(applicationName).catch(() => -1)
+      throw new Error(
+        terminated === -1
+          ? 'Restore timed out; the database backend could not be confirmed terminated'
+          : `Restore timed out (terminated ${terminated} database backend${terminated === 1 ? '' : 's'})`,
+      )
+    }
+    if (result.error) throw result.error
+    if (result.code !== 0) throw new Error(stderr.trim() || `psql exited with code ${result.code}`)
+  })
 }
 
 async function sha256OfFile(filePath: string): Promise<string> {

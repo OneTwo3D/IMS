@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugin-keys'
+
 import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { PermissionDeniedError, isAuthorizationDenial } from '@/lib/auth/session-gates'
 import { hasPermission, type Permission } from '@/lib/permissions'
@@ -223,6 +225,11 @@ mock.module('@/lib/integration-plugins', {
       state.pluginReadsOutsideTx += 1
       return state.activeConnector === id
     },
+    // The REAL key map, re-exported rather than invented: the settings writer's refusal is keyed on
+    // it, and a double that made the keys up would prove the refusal against names that do not
+    // exist. (Audited in round 9 — this export was MISSING, so the guard test below crashed on
+    // `Object.values(undefined)` rather than exercising anything.)
+    INTEGRATION_PLUGIN_SETTING_KEYS,
   },
 })
 
@@ -442,24 +449,36 @@ test('the LOCKED resolution and the POOLED one answer identically for every comb
 })
 
 test('the generic key-value writer is still not a way around the lock', async () => {
-  // setSetting takes no lock and writes one key at a time. It must REFUSE the plugin keys rather
-  // than quietly providing an unlocked, non-atomic path to the same rows.
+  // The generic settings writer takes no connector-selection lock, so it must REFUSE the plugin keys
+  // rather than quietly providing an unlocked, non-atomic path to the same rows.
   //
-  // WHAT THIS TEST USED TO BE, and why it was wrong: it grepped app/actions/settings.ts and
-  // app/actions/onboarding.ts for the strings ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY and
-  // pg_advisory_xact_lock. That asserted a spelling, not a behaviour — it passed for a file that
-  // merely mentioned the constant, and it would have FAILED the moment the lock was factored into
-  // a shared helper, which is exactly what round 6 did. The real inventory of plugin-key writers
-  // now lives in tests/accounting/plugin-selection-lock.test.ts, where it is enumerated and
-  // discovered rather than spelled.
-  const { readFileSync } = await import('node:fs')
-  const path = await import('node:path')
-  const settings = readFileSync(path.join(process.cwd(), 'app', 'actions', 'settings.ts'), 'utf8')
-  const setSetting = settings.slice(settings.indexOf('export async function setSetting'))
-  assert.match(
-    setSetting.slice(0, setSetting.indexOf('\n}\n')),
-    /INTEGRATION_PLUGIN_SETTING_KEYS/,
-    'setSetting must refuse the plugin keys rather than writing them unlocked',
+  // WHAT THIS TEST USED TO BE, and why it was wrong TWICE. First it grepped app/actions/settings.ts
+  // for the strings ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY and pg_advisory_xact_lock — a spelling
+  // check, which would have failed the moment round 6 factored the lock into a shared helper. Then
+  // it grepped the body of `setSetting` for INTEGRATION_PLUGIN_SETTING_KEYS — still a spelling
+  // check, and it broke silently in round 9 when `setSetting` became a one-line delegate to
+  // `setSettings` and the guard moved with the write. A source scan pinned to one function name
+  // cannot survive that function being refactored; the BEHAVIOUR can.
+  const { setSetting, setSettings } = await import('@/app/actions/settings')
+  const transactionsBefore = state.transactions.length
+
+  await assert.rejects(
+    () => setSetting('plugin_xero_enabled', 'true'),
+    /must be written atomically and under the connector-selection lock/,
+  )
+  // ...and through the multi-key form, including when a plugin key is smuggled in alongside
+  // innocent ones.
+  await assert.rejects(
+    () => setSettings({ public_app_url: 'https://x', plugin_quickbooks_enabled: 'true' }),
+    /must be written atomically and under the connector-selection lock/,
+  )
+
+  // Refused BEFORE the transaction is even opened, so the innocent key beside it is not written
+  // either — a partial apply there would be the multi-key version of the same defect.
+  assert.equal(
+    state.transactions.length,
+    transactionsBefore,
+    'nothing in a refused batch reaches the database',
   )
 })
 

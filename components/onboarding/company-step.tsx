@@ -8,9 +8,9 @@ import { CountrySelect } from '@/components/ui/country-select'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { updateOrganisation, saveEmailSettings, sendTestEmailSettings, type EmailSettings, type OrganisationData } from '@/app/actions/company'
-import { setSetting } from '@/app/actions/settings'
-import { syncCrontab } from '@/app/actions/cron'
-import { resolveSchedulerFollowUp } from '@/lib/domain/integrations/scheduler-followup'
+import { savePublicAppUrl } from '@/app/actions/settings'
+import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
+import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outcome'
 import type { PublicAppUrlInfo } from '@/lib/public-app-url'
 
 export type CompanyStepHandle = {
@@ -157,23 +157,6 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
     setEmailSettings((prev) => ({ ...prev, [key]: value }))
   }
 
-  function normalizePublicAppUrl(value: string): string | null {
-    const normalized = value.trim().replace(/\/+$/, '')
-    if (!normalized) return null
-
-    try {
-      const parsed = new URL(normalized)
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        setError('Public App URL must start with http:// or https://')
-        return null
-      }
-      return normalized
-    } catch {
-      setError('Enter a valid Public App URL.')
-      return null
-    }
-  }
-
   async function handleLogoUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
@@ -225,8 +208,12 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
     setError('')
     setSchedulerWarning('')
     try {
+      // Client-side pre-check only, for immediate feedback: savePublicAppUrl re-runs the identical
+      // rule server-side and REFUSES rather than storing. One rule, one implementation
+      // (o3d-osl8 round 9, finding 1) — this step used to carry its own copy of it.
       const normalizedPublicAppUrl = publicAppUrl.trim() ? normalizePublicAppUrl(publicAppUrl) : null
-      if (publicAppUrl.trim() && !normalizedPublicAppUrl) {
+      if (normalizedPublicAppUrl && !normalizedPublicAppUrl.ok) {
+        setError(normalizedPublicAppUrl.error)
         return false
       }
 
@@ -242,20 +229,21 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
         return false
       }
 
-      if (normalizedPublicAppUrl) {
-        // COMMITTED — setSetting throws on failure, so the URL is stored past this line.
-        await setSetting('public_app_url', normalizedPublicAppUrl)
-        // POST-COMMIT (o3d-osl8 round 8, finding 1). A crontab reconciliation that fails — returned
-        // OR thrown, which used to fall through to the catch below and print "Failed to save" —
-        // does not un-save the company details or the URL. Reporting it as a save failure AND
-        // refusing to advance the wizard told the operator to enter everything again, over data
-        // that is already in the database. It is a warning, and the step continues.
-        const followUp = await resolveSchedulerFollowUp({
+      if (normalizedPublicAppUrl && normalizedPublicAppUrl.ok) {
+        // ONE server action (o3d-osl8 round 9, finding 1). The write, the audit row, the cache
+        // revalidation and the crontab reconciliation all happen inside it, and it classifies its
+        // own post-commit failures rather than rejecting — so none of them can reach the catch
+        // below, where this step printed "Failed to save" AND refused to advance over data that was
+        // already in the database.
+        const view = resolveSettingSaveView({
+          result: await savePublicAppUrl(normalizedPublicAppUrl.url),
           what: 'The Public App URL',
-          sync: syncCrontab,
-          fallbackError: 'Failed to apply Public App URL changes.',
         })
-        setSchedulerWarning(followUp.warning)
+        if (!view.committed) {
+          setError(view.error)
+          return false
+        }
+        setSchedulerWarning(view.warning)
       }
 
       router.refresh()

@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
-import { setSetting } from '@/app/actions/settings'
+import { setSettings } from '@/app/actions/settings'
 
 type Props = {
   s3: { endpoint: string; region: string; bucket: string; accessKey: string; secretKey: string; secretKeyConfigured: boolean; prefix: string }
@@ -50,18 +50,19 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
     }
 
     startTransition(async () => {
-      const ops = [
-        setSetting('backup_s3_endpoint', s3State.endpoint),
-        setSetting('backup_s3_region', s3State.region),
-        setSetting('backup_s3_bucket', s3State.bucket),
-        setSetting('backup_s3_access_key', s3State.accessKey),
-        setSetting('backup_s3_prefix', s3State.prefix),
-      ]
-      // Only save secret if user replaced the masked value
-      if (!isMasked(s3State.secretKey)) {
-        ops.push(setSetting('backup_s3_secret_key', s3State.secretKey))
+      // ONE transaction (o3d-osl8 round 9, finding 1). A Promise.all of six independent writes
+      // could store the bucket without the credentials, leaving the backup target pointed somewhere
+      // it cannot authenticate to while the screen showed a plain failure.
+      const values: Record<string, string> = {
+        backup_s3_endpoint: s3State.endpoint,
+        backup_s3_region: s3State.region,
+        backup_s3_bucket: s3State.bucket,
+        backup_s3_access_key: s3State.accessKey,
+        backup_s3_prefix: s3State.prefix,
       }
-      await Promise.all(ops)
+      // Only save secret if user replaced the masked value
+      if (!isMasked(s3State.secretKey)) values.backup_s3_secret_key = s3State.secretKey
+      await setSettings(values)
       showSaved('s3')
     })
   }
@@ -77,21 +78,19 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
     }
 
     startTransition(async () => {
-      const ops = [
-        setSetting('backup_sftp_host', sftpState.host),
-        setSetting('backup_sftp_port', sftpState.port),
-        setSetting('backup_sftp_user', sftpState.user),
-        setSetting('backup_sftp_host_fingerprint', sftpState.hostFingerprint),
-        setSetting('backup_sftp_path', sftpState.path),
-      ]
+      // ONE transaction (o3d-osl8 round 9, finding 1) — a host stored without its fingerprint is
+      // the same class of half-applied target as the S3 case above.
+      const values: Record<string, string> = {
+        backup_sftp_host: sftpState.host,
+        backup_sftp_port: sftpState.port,
+        backup_sftp_user: sftpState.user,
+        backup_sftp_host_fingerprint: sftpState.hostFingerprint,
+        backup_sftp_path: sftpState.path,
+      }
       // Only save secrets if user replaced the masked values
-      if (!isMasked(sftpState.password)) {
-        ops.push(setSetting('backup_sftp_password', sftpState.password))
-      }
-      if (!isMasked(sftpState.privateKey)) {
-        ops.push(setSetting('backup_sftp_private_key', sftpState.privateKey))
-      }
-      await Promise.all(ops)
+      if (!isMasked(sftpState.password)) values.backup_sftp_password = sftpState.password
+      if (!isMasked(sftpState.privateKey)) values.backup_sftp_private_key = sftpState.privateKey
+      await setSettings(values)
       showSaved('sftp')
     })
   }

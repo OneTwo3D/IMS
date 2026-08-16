@@ -1420,17 +1420,23 @@ type RestoreRun = {
   /** Bytes that reached psql's stdin. */
   written: string
   args: string[]
+  env: Record<string, string | undefined>
+  /** The rejection, if `runRestore` rejected. Captured rather than thrown so the ORDER stays observable. */
+  error?: Error
 }
 
 /**
  * Drive `runRestore` with a fake psql AND a fake lock holder, recording the order of both.
  *
- * The holder double is the important half (round 8, finding 3). A double that merely *ran* the work
- * could not distinguish "the lock is held for the whole restore" from "the lock was taken at some
- * point", which is the difference the finding is about — so it records entry and exit around the
- * work it wraps, and the work itself records when psql was spawned and when psql exited.
+ * The holder double is the important half. A double that merely *ran* the work could not
+ * distinguish "the lock is held for the whole restore" from "the lock was taken at some point",
+ * which is the difference findings 2 and 3 are about — so it records entry and exit around the work
+ * it wraps, and the work itself records when psql was spawned and when psql exited.
  */
-async function captureRestore(sqlBody: string): Promise<RestoreRun> {
+async function captureRestore(
+  sqlBody: string,
+  options: { autoExit?: boolean; exitCode?: number; psqlTimeoutMs?: number; killGraceMs?: number } = {},
+): Promise<RestoreRun> {
   const { runRestore } = await import('../../app/api/backup/restore/route.ts')
 
   const dir = await mkdtemp(path.join(os.tmpdir(), 'restore-stdin-'))
@@ -1440,54 +1446,69 @@ async function captureRestore(sqlBody: string): Promise<RestoreRun> {
   const events: string[] = []
   const chunks: string[] = []
   let args: string[] = []
+  let env: Record<string, string | undefined> = {}
   const stdin = new PassThrough()
   stdin.on('data', (chunk: Buffer) => chunks.push(chunk.toString('utf8')))
 
   const child = new EventEmitter() as EventEmitter & {
     stdin: typeof stdin
     stderr: EventEmitter
-    kill: () => void
+    kill: (signal?: string) => void
   }
   child.stdin = stdin
   child.stderr = new EventEmitter()
-  child.kill = () => {}
+  child.kill = (signal?: string) => { events.push(`psql-killed(${signal})`) }
   // psql exits only once its input is closed, which is what makes the ordering below observable
   // rather than a race.
-  stdin.on('end', () => {
-    events.push('psql-exited')
-    child.emit('close', 0)
-  })
+  if (options.autoExit !== false) {
+    stdin.on('end', () => {
+      events.push('psql-exited')
+      child.emit('close', options.exitCode ?? 0)
+    })
+  }
 
+  let error: Error | undefined
   try {
     await runRestore(
       file,
       { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
       {
+        psqlTimeoutMs: options.psqlTimeoutMs,
+        killGraceMs: options.killGraceMs,
+        applicationName: 'ims_restore_test',
         withSelectionLock: async (work) => {
           events.push('lock-acquired')
           try {
-            return await work()
+            return await work({
+              terminateRestoreBackends: async (name: string) => {
+                events.push(`terminate-backends(${name})`)
+                return 1
+              },
+            })
           } finally {
             events.push('lock-released')
           }
         },
-        spawnProcess: ((_command: string, spawnArgs: string[]) => {
+        spawnProcess: ((_command: string, spawnArgs: string[], spawnOptions: { env: Record<string, string | undefined> }) => {
           events.push('psql-spawned')
           args = spawnArgs
+          env = spawnOptions.env
           return child
         }) as never,
       },
     )
+  } catch (thrown) {
+    error = thrown as Error
   } finally {
     await rm(dir, { recursive: true, force: true })
   }
 
-  return { events, written: chunks.join(''), args }
+  return { events, written: chunks.join(''), args, env, error }
 }
 
 test('the selection lock is held, by a session of its own, for the WHOLE restore', async () => {
   const dump = "UPDATE settings SET value = 'true' WHERE key = 'plugin_quickbooks_enabled';\n"
-  const { events, written, args } = await captureRestore(dump)
+  const { events, written, args, env } = await captureRestore(dump)
 
   assert.deepEqual(
     events,
@@ -1504,71 +1525,266 @@ test('the selection lock is held, by a session of its own, for the WHOLE restore
   )
   assert.ok(args.includes('--single-transaction'), 'the replay is still one transaction, for atomicity')
   assert.ok(args.includes('ON_ERROR_STOP=1'))
+  assert.equal(
+    env.PGAPPNAME,
+    'ims_restore_test',
+    'the backend is labelled, which is the only handle the timeout path has on it once psql is dead',
+  )
 })
 
-test('a dump that COMMITS mid-stream cannot release the lock', async () => {
-  // The residue round 7 documented and argued away ("plain pg_dump emits no transaction control").
-  // The input is operator-supplied, so the guarantee cannot rest on what a well-formed dump
-  // contains. With the lock in a different session this input is simply replayed: it can still end
-  // psql's own transaction — an ATOMICITY problem, stated in the route — but the lock is untouched.
-  const dump = [
+test('a dump that COMMITS mid-stream is REFUSED, before anything is spawned or locked', async () => {
+  // ROUND 9, FINDING 3 — this is the assertion that reversed. Round 8's version of this test
+  // ACCEPTED such a dump and asserted only that the lock survived it, recording the atomicity hole
+  // as documented residue. It is not residue: a `COMMIT;` splits psql's `--single-transaction`, so a
+  // failure later in the file leaves the database PARTIALLY RESTORED while the endpoint reports the
+  // restore as failed and turns maintenance mode off again.
+  const { runRestore } = await import('../../app/api/backup/restore/route.ts')
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'restore-commit-'))
+  const file = path.join(dir, 'backup.sql')
+  await writeFile(file, [
     "UPDATE settings SET value = 'false' WHERE key = 'plugin_xero_enabled';",
     'COMMIT;',
     'BEGIN;',
     "UPDATE settings SET value = 'true' WHERE key = 'plugin_quickbooks_enabled';",
     '',
-  ].join('\n')
+  ].join('\n'))
 
-  const { events, written } = await captureRestore(dump)
-
-  assert.deepEqual(events, ['lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released'])
-  assert.equal(written, dump, 'replayed as given — the route does not rewrite or reject it')
-  assert.ok(
-    events.indexOf('lock-released') > events.indexOf('psql-exited'),
-    'and the lock outlives the replay regardless of what the replay did to its own transaction',
-  )
+  let spawned = 0
+  let locked = 0
+  try {
+    await assert.rejects(
+      () => runRestore(
+        file,
+        { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
+        {
+          withSelectionLock: async (work) => { locked += 1; return work({ terminateRestoreBackends: async () => 0 }) },
+          spawnProcess: ((() => { spawned += 1; throw new Error('must not spawn') })) as never,
+        },
+      ),
+      /top-level transaction control \(COMMIT\)/,
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+  assert.equal(spawned, 0, 'nothing was spawned')
+  assert.equal(locked, 0, 'and nothing was locked — a file that cannot be replayed must not contend')
 })
 
-test('the default holder takes the SHARED key in a transaction, before the work and around all of it', async () => {
-  // The production wiring, not a test double: a Prisma interactive transaction pins one connection,
-  // which is what makes it a session the replayed SQL cannot reach.
-  const { createPrismaRestoreSelectionLockHolder } = await import('../../app/api/backup/restore/route.ts')
+// ---------------------------------------------------------------------------
+// ROUND 9, FINDING 2 — the holder's lifetime.
+//
+// Round 8 held the lock in a Prisma interactive transaction. Interactive transactions have a
+// TIMEOUT, and its clock starts when the transaction opens — BEFORE `pg_advisory_xact_lock`
+// returns. A restore queued behind another one could acquire the lock with a fraction of its budget
+// left, whereupon Prisma aborted the transaction and released the lock while psql kept writing. The
+// two clocks start at different moments and the gap between them is unbounded queueing time, so no
+// choice of number reconciles them.
+//
+// The holder is now a dedicated `pg` session taking a SESSION advisory lock, which has no timeout at
+// all. These tests assert the properties that replaces the number: no transaction is opened,
+// acquisition is bounded and release is not, and the unlock happens strictly after the work.
+// ---------------------------------------------------------------------------
+
+type FakeLockClient = {
+  client: {
+    connect(): Promise<void>
+    query(text: string, values?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
+    end(): Promise<void>
+  }
+  events: string[]
+  queries: Array<{ text: string; values?: unknown[] }>
+}
+
+function fakeLockClient(options: { lockedAfter?: number; terminated?: number } = {}): FakeLockClient {
+  const events: string[] = []
+  const queries: Array<{ text: string; values?: unknown[] }> = []
+  let tries = 0
+  return {
+    events,
+    queries,
+    client: {
+      async connect() { events.push('connect') },
+      async query(text: string, values?: unknown[]) {
+        queries.push({ text, values })
+        if (text.includes('pg_try_advisory_lock')) {
+          tries += 1
+          const locked = tries > (options.lockedAfter ?? 0)
+          events.push(locked ? 'lock-acquired' : 'lock-busy')
+          return { rows: [{ locked }] }
+        }
+        if (text.includes('pg_advisory_unlock')) { events.push('lock-released'); return { rows: [{}] } }
+        if (text.includes('pg_terminate_backend')) {
+          events.push('terminate')
+          return { rows: Array.from({ length: options.terminated ?? 0 }, () => ({})) }
+        }
+        return { rows: [] }
+      },
+      async end() { events.push('end') },
+    },
+  }
+}
+
+test('the default holder takes a SESSION advisory lock — no transaction, therefore no expiry', async () => {
+  const { createRestoreSelectionLockHolder } = await import('../../app/api/backup/restore/route.ts')
   const { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } = await import('../../lib/db/advisory-locks.ts')
 
-  const events: string[] = []
-  let statement = ''
-  let values: unknown[] = []
-  let options: { timeout?: number; maxWait?: number } | undefined
-
-  const holder = createPrismaRestoreSelectionLockHolder({
-    $transaction: async <T,>(fn: (tx: { $executeRaw: (q: TemplateStringsArray, ...v: unknown[]) => Promise<number> }) => Promise<T>, opts?: { timeout?: number; maxWait?: number }) => {
-      events.push('transaction-open')
-      options = opts
-      const result = await fn({
-        $executeRaw: async (query: TemplateStringsArray, ...v: unknown[]) => {
-          statement = query.join('?')
-          values = v
-          events.push('lock-statement')
-          return 1
-        },
-      })
-      events.push('transaction-close')
-      return result
-    },
-  })
+  const fake = fakeLockClient()
+  const holder = createRestoreSelectionLockHolder({ createClient: () => fake.client })
 
   const returned = await holder(async () => {
-    events.push('work')
+    fake.events.push('work')
+    // Several turns of the event loop: anything time-based watching this holder would have to fire
+    // between 'lock-acquired' and 'work-done', and nothing may.
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => { setImmediate(resolve) })
+    fake.events.push('work-done')
     return 'restored'
   })
 
   assert.equal(returned, 'restored', 'the holder returns the work\'s value rather than swallowing it')
-  assert.deepEqual(events, ['transaction-open', 'lock-statement', 'work', 'transaction-close'])
-  assert.match(statement, /pg_advisory_xact_lock/)
-  assert.deepEqual(values, [ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY], 'the shared constant, not a copied literal')
-  // A default 5s interactive-transaction timeout would abort the holder — and release the lock —
-  // minutes before a real restore finishes.
-  assert.ok((options?.timeout ?? 0) > 300_000, 'the holder outlives the psql timeout')
+  assert.deepEqual(fake.events, ['connect', 'lock-acquired', 'work', 'work-done', 'lock-released', 'end'])
+
+  const lockQuery = fake.queries.find((q) => q.text.includes('pg_try_advisory_lock'))
+  assert.deepEqual(lockQuery?.values, [ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY], 'the shared constant, not a copied literal')
+  assert.ok(
+    !fake.queries.some((q) => /\bBEGIN\b/i.test(q.text)),
+    'no transaction is opened: a session advisory lock has no timeout, and an interactive '
+      + 'transaction\'s timeout was exactly what released the lock mid-restore in round 8',
+  )
+  assert.ok(
+    !fake.queries.some((q) => q.text.includes('pg_advisory_xact_lock')),
+    'and it is the SESSION form, not the transaction-scoped one',
+  )
+})
+
+test('the holder waits for a contended lock, then fails fast and runs nothing', async () => {
+  const { createRestoreSelectionLockHolder } = await import('../../app/api/backup/restore/route.ts')
+
+  // Acquisition is the ONE place a bound belongs: `pg_advisory_lock` would wait forever and turn a
+  // contended restore into a hung request.
+  const busy = fakeLockClient({ lockedAfter: Number.MAX_SAFE_INTEGER })
+  let clock = 0
+  let ran = 0
+  const failing = createRestoreSelectionLockHolder({
+    createClient: () => busy.client,
+    now: () => clock,
+    delay: async (ms: number) => { clock += ms },
+    maxWaitMs: 1_000,
+  })
+  await assert.rejects(
+    () => failing(async () => { ran += 1 }),
+    /Could not acquire the accounting connector-selection lock within 1s[\s\S]*Nothing was restored/,
+  )
+  assert.equal(ran, 0, 'the restore never started')
+  assert.ok(busy.events.filter((e) => e === 'lock-busy').length > 1, 'it polled rather than giving up at once')
+  assert.equal(busy.events.at(-1), 'end', 'and the session was closed rather than leaked')
+  assert.ok(!busy.events.includes('lock-released'), 'nothing it never acquired was unlocked')
+
+  // ...and a lock that frees up in time is simply taken.
+  const contended = fakeLockClient({ lockedAfter: 2 })
+  clock = 0
+  const succeeding = createRestoreSelectionLockHolder({
+    createClient: () => contended.client,
+    now: () => clock,
+    delay: async (ms: number) => { clock += ms },
+    maxWaitMs: 60_000,
+  })
+  assert.equal(await succeeding(async () => 'ok'), 'ok')
+  assert.deepEqual(contended.events, ['connect', 'lock-busy', 'lock-busy', 'lock-acquired', 'lock-released', 'end'])
+})
+
+test('the holder releases the lock even when the restore throws', async () => {
+  const { createRestoreSelectionLockHolder } = await import('../../app/api/backup/restore/route.ts')
+  const fake = fakeLockClient()
+  const holder = createRestoreSelectionLockHolder({ createClient: () => fake.client })
+
+  await assert.rejects(() => holder(async () => { throw new Error('psql exited with code 3') }), /code 3/)
+  assert.deepEqual(fake.events, ['connect', 'lock-acquired', 'lock-released', 'end'])
+})
+
+test('a psql that overruns its ceiling is killed AND its backend terminated before the lock is released', async () => {
+  // ROUND 9, FINDING 2, second half. The old timeout path called `child.kill('SIGKILL')` and
+  // rejected IMMEDIATELY, so the holder's `finally` released the lock while the child — and, more
+  // to the point, its BACKEND, which keeps executing until it notices the dead socket — might still
+  // be writing. Killing the client is not the same as stopping the writes, and releasing the lock
+  // on that assumption is what "protected" meant in round 8.
+  const run = await captureRestore('SELECT 1;\n', { autoExit: false, psqlTimeoutMs: 5, killGraceMs: 1_000 })
+
+  assert.match(run.error?.message ?? '', /Restore timed out \(terminated 1 database backend\)/)
+  assert.deepEqual(
+    run.events,
+    [
+      'lock-acquired',
+      'psql-spawned',
+      'psql-killed(SIGKILL)',
+      'terminate-backends(ims_restore_test)',
+      'lock-released',
+    ],
+    'SIGKILL, then the backend terminated from the holder session, and only THEN the lock released',
+  )
+})
+
+test('the timeout path waits for psql to actually exit before terminating and releasing', async () => {
+  // The grace window is teardown time, not a grace period — SIGKILL cannot be caught. What it buys
+  // is that `close` is OBSERVED where it arrives, rather than assumed.
+  const { runRestore } = await import('../../app/api/backup/restore/route.ts')
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'restore-kill-'))
+  const file = path.join(dir, 'backup.sql')
+  await writeFile(file, 'SELECT 1;\n')
+
+  const events: string[] = []
+  const stdin = new PassThrough()
+  stdin.resume()
+  const child = new EventEmitter() as EventEmitter & { stdin: typeof stdin; stderr: EventEmitter; kill: (s?: string) => void }
+  child.stdin = stdin
+  child.stderr = new EventEmitter()
+  child.kill = (signal?: string) => {
+    events.push(`psql-killed(${signal})`)
+    // psql takes a moment to be reaped; the close must be waited for, not assumed.
+    setTimeout(() => { events.push('psql-close'); child.emit('close', null) }, 20)
+  }
+
+  try {
+    await assert.rejects(
+      () => runRestore(
+        file,
+        { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
+        {
+          psqlTimeoutMs: 5,
+          killGraceMs: 5_000,
+          applicationName: 'ims_restore_wait',
+          withSelectionLock: async (work) => {
+            events.push('lock-acquired')
+            try {
+              return await work({
+                terminateRestoreBackends: async (name: string) => { events.push(`terminate(${name})`); return 0 },
+              })
+            } finally {
+              events.push('lock-released')
+            }
+          },
+          spawnProcess: ((() => { events.push('psql-spawned'); return child })) as never,
+        },
+      ),
+      /Restore timed out \(terminated 0 database backends\)/,
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+
+  assert.deepEqual(events, [
+    'lock-acquired',
+    'psql-spawned',
+    'psql-killed(SIGKILL)',
+    'psql-close',
+    'terminate(ims_restore_wait)',
+    'lock-released',
+  ])
+})
+
+test('a non-zero psql exit still reports its stderr, and still releases the lock afterwards', async () => {
+  const run = await captureRestore('SELECT 1;\n', { exitCode: 3 })
+  assert.match(run.error?.message ?? '', /psql exited with code 3/)
+  assert.deepEqual(run.events, ['lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released'])
 })
 
 test('the restore still refuses psql metacommands before it locks anything', async () => {
@@ -1588,7 +1804,7 @@ test('the restore still refuses psql metacommands before it locks anything', asy
         file,
         { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
         {
-          withSelectionLock: async (work) => { locked += 1; return work() },
+          withSelectionLock: async (work) => { locked += 1; return work({ terminateRestoreBackends: async () => 0 }) },
           spawnProcess: ((() => { spawned += 1; throw new Error('must not spawn') })) as never,
         },
       ),

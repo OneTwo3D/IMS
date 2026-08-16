@@ -5,9 +5,8 @@ import { Loader2, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Select } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
-import { setSetting } from '@/app/actions/settings'
-import { syncCrontab } from '@/app/actions/cron'
-import { resolveSchedulerFollowUp } from '@/lib/domain/integrations/scheduler-followup'
+import { saveCronJobSettings } from '@/app/actions/cron'
+import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outcome'
 import { ALL_PRESETS } from '@/lib/cron-registry'
 
 export type CronJobState = {
@@ -54,26 +53,25 @@ export function CronJobsSettings({ jobs: initial }: Props) {
     setSchedulerWarning('')
     startTransition(async () => {
       try {
-        // Persist all settings
-        await Promise.all(
-          jobs.flatMap((j) => [
-            setSetting(`cron_${j.settingKey}_enabled`, String(j.enabled)),
-            setSetting(`cron_${j.settingKey}_schedule`, j.schedule),
-          ])
-        )
-
-        // POST-COMMIT (o3d-osl8 round 8, finding 1 — the same shape as the plugin screen). Every
-        // setting above is already stored by the time this runs, so a failure here — returned or
-        // thrown — is the crontab being out of step with them, not the save failing. Reporting it
-        // as a red error with no "Saved" was read as "your schedule changes were lost", which is
-        // the opposite of the truth: they ARE stored, and they are what the next successful sync
-        // will write.
-        const followUp = await resolveSchedulerFollowUp({
+        // ONE server action, ONE transaction (o3d-osl8 round 9, finding 1). This used to be
+        // `Promise.all` over 2N independent `setSetting` calls: the first rejection surfaced as a
+        // red "An error occurred" while the other writes carried on committing, so the operator was
+        // told their schedule changes were lost over an arbitrary subset that was stored. The write
+        // is now atomic, and every post-commit step — the audit row, the cache, the crontab — is
+        // classified inside the action instead of rejecting it.
+        const view = resolveSettingSaveView({
+          result: await saveCronJobSettings(jobs.map((j) => ({
+            settingKey: j.settingKey,
+            enabled: j.enabled,
+            schedule: j.schedule,
+          }))),
           what: 'Your scheduled-job settings',
-          sync: syncCrontab,
-          fallbackError: 'Failed to sync crontab',
         })
-        setSchedulerWarning(followUp.warning)
+        if (!view.committed) {
+          setError(view.error)
+          return
+        }
+        setSchedulerWarning(view.warning)
         setSaved(true)
         setTimeout(() => setSaved(false), 2000)
       } catch (e) {
