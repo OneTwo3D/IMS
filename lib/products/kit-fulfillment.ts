@@ -7,6 +7,18 @@ type FulfillmentClient = Prisma.TransactionClient | typeof db
 export type FulfillmentGraphNode = {
   id: string
   type: ProductType
+  /**
+   * o3d-4kfh r6: `Product.fulfillmentGraphVersion`, read in the SAME statement as this node's
+   * component list. That matters: under READ COMMITTED every statement takes a fresh snapshot, so
+   * reading the version in a separate query could see a version the loaded components do not belong
+   * to — and the stamp would then certify a graph that was never expanded.
+   *
+   * Within one node it is exact. ACROSS the BFS batches it is conservative in the safe direction: a
+   * nested KIT edited between batch 1 and batch 2 bumps its ancestors' versions too, so the root's
+   * batch-1 version is now stale and the commitment check refuses. A false refusal, never a false
+   * acceptance.
+   */
+  fulfillmentGraphVersion: number
   productComponents: Array<{
     componentId: string
     componentSku: string
@@ -33,6 +45,7 @@ export async function loadFulfillmentProductGraph(
       select: {
         id: true,
         type: true,
+        fulfillmentGraphVersion: true,
         productComponents: {
           select: {
             componentId: true,
@@ -48,6 +61,7 @@ export async function loadFulfillmentProductGraph(
       graph.set(row.id, {
         id: row.id,
         type: row.type,
+        fulfillmentGraphVersion: row.fulfillmentGraphVersion ?? 0,
         productComponents: row.productComponents.map((component) => ({
           componentId: component.componentId,
           componentSku: component.component.sku,

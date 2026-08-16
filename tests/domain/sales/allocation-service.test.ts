@@ -9,6 +9,7 @@ import {
   buildAvailableStockMapIncludingOwnReservations,
   buildAvailableStockMap,
   cancelSalesOrderFulfillmentState,
+  findStaleFulfillmentGraphAllocation,
   releaseOrderAllocationsForDeallocationInTx,
   releaseOrderAllocationsInTx,
   resetAllocationAccountingIfStaged,
@@ -29,6 +30,8 @@ type ProductRow = {
   type: 'SIMPLE' | 'KIT'
   sku?: string
   oversellAllowed?: boolean
+  /** o3d-4kfh r6: `Product.fulfillmentGraphVersion`. NOT NULL DEFAULT 0, so absent means 0. */
+  fulfillmentGraphVersion?: number
   productComponents?: Array<{
     componentId: string
     componentSku?: string
@@ -92,6 +95,13 @@ type AllocationRow = {
    *  (`costLayerSnapshot[].orderAllocationId`). Deleting the row destroys it. */
   id?: string
   costLayerSnapshot?: unknown
+  /**
+   * o3d-4kfh r6: `Product.fulfillmentGraphVersion` at the moment the row was expanded. The column is
+   * `NOT NULL DEFAULT 0`, so a real read ALWAYS returns it — the double normalises seeded fixtures
+   * to 0 for that reason. A double that let it be `undefined` on a seeded row and `0` on a written
+   * one would make the stale-graph refusal fire on fixtures that production would have accepted.
+   */
+  fulfillmentGraphVersion?: number
 }
 
 type ShipmentRow = {
@@ -156,6 +166,11 @@ function createClient(state: MemoryState): AllocationServiceClient {
   activityLogWrites.length = 0
   txWriteOrder.length = 0
   const allocations = state.allocations ?? []
+  // The column is NOT NULL DEFAULT 0; normalise in place so a seeded row and a written row are
+  // indistinguishable to every reader, exactly as they are in Postgres.
+  for (const allocation of allocations) {
+    allocation.fulfillmentGraphVersion = allocation.fulfillmentGraphVersion ?? 0
+  }
   const shipments = state.shipments ?? []
   const shipmentLines = state.shipmentLines ?? []
   const refundLines = state.refundLines ?? []
@@ -190,6 +205,9 @@ function createClient(state: MemoryState): AllocationServiceClient {
         .map((product) => ({
           id: product.id,
           type: product.type,
+          // Selected in the SAME statement as the components in production; a double that omitted
+          // it would leave every stamp `undefined` and the CAS unable to report either answer.
+          fulfillmentGraphVersion: product.fulfillmentGraphVersion ?? 0,
           productComponents: (product.productComponents ?? []).map((component, index) => ({
             componentId: component.componentId,
             qty: component.qty,
@@ -494,6 +512,8 @@ test('allocateSalesOrder excludes refunded quantity from demand', async () => {
   assert.equal(result.allocationCount, 1)
   assert.deepEqual(state.allocations, [{
     orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 1,
+    // o3d-4kfh r6: every row carries the graph version it was expanded against.
+    fulfillmentGraphVersion: 0,
   }])
   assert.equal(state.stockLevels[0].reservedQty, 1)
 })
@@ -519,6 +539,7 @@ test('allocateSalesOrder allocates available stock and advances order status', a
     productId: 'product-1',
     warehouseId: 'warehouse-1',
     qty: 3,
+    fulfillmentGraphVersion: 0,
   }])
   assert.equal(state.stockLevels[0].reservedQty, 3)
   assert.equal(state.order.status, 'ALLOCATED')
@@ -595,6 +616,7 @@ test('allocateSalesOrder reserves only physical stock and reports oversell remai
     productId: 'product-1',
     warehouseId: 'warehouse-1',
     qty: 2,
+    fulfillmentGraphVersion: 0,
   }])
   assert.equal(state.stockLevels[0].reservedQty, 2)
   assert.equal(state.order.status, 'ALLOCATED')
@@ -650,6 +672,7 @@ test('allocateSalesOrder reports failure when any short line is not oversell eli
     productId: 'product-1',
     warehouseId: 'warehouse-1',
     qty: 2,
+    fulfillmentGraphVersion: 0,
   }])
   assert.equal(state.stockLevels[0].reservedQty, 2)
 })
@@ -685,8 +708,8 @@ test('allocateSalesOrder expands kit lines into component allocations', async ()
   assert.equal(result.success, true)
   assert.equal(result.allocationCount, 2)
   assert.deepEqual(state.allocations, [
-    { orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 4 },
-    { orderId: 'order-1', lineId: 'line-1', productId: 'component-2', warehouseId: 'warehouse-1', qty: 2 },
+    { orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 4, fulfillmentGraphVersion: 0 },
+    { orderId: 'order-1', lineId: 'line-1', productId: 'component-2', warehouseId: 'warehouse-1', qty: 2, fulfillmentGraphVersion: 0 },
   ])
   assert.deepEqual(state.stockLevels.map((row) => [row.productId, row.reservedQty]), [
     ['component-1', 4],
@@ -731,6 +754,7 @@ test('Decimal fulfillment helpers preserve repeated fractional component sums', 
     ['kit-1', {
       id: 'kit-1',
       type: 'KIT',
+      fulfillmentGraphVersion: 0,
       productComponents: Array.from({ length: 100 }, (_, index) => ({
         componentId: 'component-1',
         componentSku: `COMP-${index}`,
@@ -751,6 +775,7 @@ test('Decimal fulfillment availability preserves fractional kit component covera
     ['kit-1', {
       id: 'kit-1',
       type: 'KIT',
+      fulfillmentGraphVersion: 0,
       productComponents: [{
         componentId: 'component-1',
         componentSku: 'COMP-1',
@@ -847,6 +872,7 @@ test('allocateSalesOrder preserves this order own reservations when reallocating
     productId: 'product-1',
     warehouseId: 'warehouse-1',
     qty: 2,
+    fulfillmentGraphVersion: 0,
   }])
   assert.equal(state.stockLevels[0].reservedQty, 2)
 })
@@ -885,6 +911,7 @@ test('allocateSalesOrder caps legacy own over-reservations to physical stock', a
     productId: 'product-1',
     warehouseId: 'warehouse-1',
     qty: 2,
+    fulfillmentGraphVersion: 0,
   }])
   assert.equal(state.stockLevels[0].reservedQty, 2)
 })
@@ -1458,13 +1485,17 @@ test('re-allocating an unchanged set preserves accounting state and emits no syn
       qty: 2,
     }],
   })
+  // The client is built FIRST so the snapshot is taken of the normalised rows — a real read always
+  // returns `fulfillmentGraphVersion` (NOT NULL DEFAULT 0), so comparing a pre-normalisation
+  // fixture against a post-read row would fail on the double's own shape rather than on churn.
+  const client = createClient(state)
   const before = {
     allocations: (state.allocations ?? []).map((row) => ({ ...row })),
     reservedQty: state.stockLevels[0].reservedQty,
     inventoryAllocatedDate: state.order.inventoryAllocatedDate,
   }
 
-  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+  const result = await allocateSalesOrder(client, { orderId: 'order-1' })
 
   // The report is still faithful: 2 of 3 allocated, 1 outstanding.
   assert.equal(result.allocationCount, 1, 'one allocation row')
@@ -1482,26 +1513,78 @@ test('re-allocating an unchanged set preserves accounting state and emits no syn
   assert.equal(writeCounts.allocationCreates, 0, 'no re-create')
 })
 
-test('o3d-i5it x 4kfh r4: an unchanged re-allocation retires no PENDING draft either', async () => {
-  // The short-circuit has to cover the draft reconciliation as well. A run that rewrote nothing
-  // cannot have invalidated a draft, and the 15-minute sweep reaches this branch on perfectly
-  // ordinary orders — retiring a draft (and its tracking number) there would be pure churn.
+test('o3d-4kfh r6 (finding 3): an unchanged re-allocation REPAIRS an invalid draft, it does not preserve it', async () => {
+  // REPLACES the r5 characterisation test, which built exactly this fixture — a 5-unit PENDING
+  // draft backed by a 2-unit allocation — and asserted the draft SURVIVED. That test encoded the
+  // defect: r5 skipped `reconcilePendingShipments` on the unchanged path on the reasoning that "a
+  // run that rewrote nothing cannot have invalidated a draft". True, and beside the point — the
+  // draft was invalidated EARLIER, and the widened backorder allocator routinely selects
+  // draft-bearing orders and computes an identical set. Start Picking (or a WMS transition) then
+  // failed on a shipment nothing backed, instead of the allocator repairing it.
   const state = baseState({
     order: { ...baseState().order, status: 'ALLOCATED' },
     stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
     allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
-    // A draft that is DELIBERATELY bigger than its backing row: even an unbacked draft must not be
-    // touched by a run that changed nothing, because this branch is not the one that invalidated it
-    // (the transition guard and the mutation paths that DID change something own that).
     shipments: [{ id: 'draft-1', orderId: 'order-1', status: 'PENDING', warehouseId: 'warehouse-1', shipmentJournalDate: null, trackingNumber: 'TRACK-1' }],
     shipmentLines: [{ shipmentId: 'draft-1', lineId: 'line-1', productId: 'product-1', qty: 5 }],
   })
 
   const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
-  assert.equal(writeCounts.allocationDeletes, 0, 'the destructive cycle really was skipped')
-  assert.deepEqual(result.retiredPendingShipments, [], 'and nothing was retired')
-  assert.deepEqual((state.shipments ?? []).map((row) => row.id), ['draft-1'])
+  assert.equal(writeCounts.allocationDeletes, 0, 'the allocation set really was unchanged — this IS the short-circuit path')
+  assert.equal(writeCounts.allocationCreates, 0)
+  assert.deepEqual(
+    result.retiredPendingShipments?.map((row) => row.id),
+    ['draft-1'],
+    'the unbacked draft is retired, not left for Start Picking to fail on',
+  )
+  assert.deepEqual((state.shipments ?? []).map((row) => row.id), [], 'and it is gone from the database')
+  assert.equal((state.shipmentLines ?? []).length, 0, 'with its lines')
+  assert.equal(activityLogWrites.length, 1, 'and the durable identity record is written for it')
+  assert.equal(
+    (activityLogWrites[0] as { metadata: { retiredTrackingNumbers: string[] } }).metadata.retiredTrackingNumbers[0],
+    'TRACK-1',
+    'carrying the purchased label the operator now has to cancel with the carrier',
+  )
+  assert.deepEqual(
+    txWriteOrder,
+    ['activityLog.create', 'shipment.deleteMany'],
+    'evidence before destruction, on the unchanged path too',
+  )
+})
+
+test('o3d-4kfh r6 (finding 3): an unchanged, FULLY BACKED order still writes absolutely nothing (o3d-i5it)', async () => {
+  // The churn property the short-circuit was built for, restated as the boundary of the repair
+  // above. The 15-minute reallocation sweep reaches this branch on perfectly ordinary orders; a
+  // draft carrying a tracking number must survive it untouched, and nothing at all may be written —
+  // no accounting reset, no allocation churn, no reservation movement, no audit noise.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+    // Backed EXACTLY by the row: 2 allocated, 2 drafted.
+    shipments: [{ id: 'draft-1', orderId: 'order-1', status: 'PENDING', warehouseId: 'warehouse-1', shipmentJournalDate: null, trackingNumber: 'TRACK-KEEP' }],
+    shipmentLines: [{ shipmentId: 'draft-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(writeCounts.allocationDeletes, 0)
+  assert.equal(writeCounts.allocationCreates, 0)
+  assert.deepEqual(result.retiredPendingShipments, [], 'nothing retired')
+  assert.deepEqual((state.shipments ?? []).map((row) => row.id), ['draft-1'], 'the draft survives')
+  assert.equal(state.shipments?.[0].trackingNumber, 'TRACK-KEEP', 'with its label metadata')
+  assert.equal(state.stockLevels[0].reservedQty, 2, 'no reservation churn')
+  assert.equal(
+    state.order.inventoryAllocatedDate?.toISOString(),
+    '2026-01-01T00:00:00.000Z',
+    'and the A2 stamp survives — clearing it lets the daily batch re-post the same journal',
+  )
+  assert.deepEqual(txWriteOrder, [], 'no audit row, so the real retirements are not drowned every 15 minutes')
 })
 
 test('a genuine allocation change still resets accounting state (o3d-i5it)', async () => {
@@ -2534,17 +2617,24 @@ test('o3d-4kfh r3: a rewrite KEEPS a PENDING draft the new set still covers', as
 // o3d-4kfh r5 (Codex finding 3) — the reconciler must judge drafts against the PERSISTED rows.
 // ---------------------------------------------------------------------------
 
-test('o3d-4kfh r5: a fractional KIT draft backed by its ROUNDED row survives the rewrite', async () => {
-  // The defect: `allocateSalesOrder` handed `reconcilePendingShipments` its in-memory
-  // `persistedAllocations` on the grounds that it had just written them. It had not written THOSE
-  // values — OrderAllocation.qty is Decimal(12,4), so a computed 0.33338 lands as 0.3334. The draft
-  // holds what the ROW holds (0.3334, because confirmSalesOrderShipments builds it from the row);
-  // reconciled against the unrounded 0.33338 it showed a 0.00002 shortage, twenty times the
-  // 0.000001 epsilon, and the whole draft — tracking number included — was deleted.
-  //
-  // The double rounds on write exactly as numeric(12,4) does (`persistAllocationQty`), so this is
-  // the production arithmetic and not a fixture convenience.
-  const state = baseState({
+/**
+ * o3d-4kfh r6 (Codex finding 2) — a fractional-KIT fixture whose expanded component quantity
+ * (0.33338) is NOT representable in `OrderAllocation.qty`'s `Decimal(12,4)`.
+ *
+ * Shared so the survival test and the reservation-drift tests below cannot drift apart about what
+ * "the same order" is; `otherOrderReservedQty` seeds a co-tenant's reservation in the SAME
+ * (product, warehouse) aggregate, which is the only way to observe the theft rather than the
+ * fail-closed throw that hides it.
+ */
+function fractionalKitState(options: {
+  allocatedQty?: number
+  reservedQty?: number
+  draftQty?: number | null
+  otherOrderReservedQty?: number
+} = {}) {
+  const allocatedQty = options.allocatedQty ?? 0.3334
+  const otherOrderReservedQty = options.otherOrderReservedQty ?? 0
+  return baseState({
     order: {
       ...baseState().order,
       status: 'ALLOCATED',
@@ -2562,31 +2652,126 @@ test('o3d-4kfh r5: a fractional KIT draft backed by its ROUNDED row survives the
       type: 'KIT',
       productComponents: [{ componentId: 'component-1', qty: 0.33338, componentType: 'SIMPLE' }],
     }],
-    stockLevels: [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 0.3334 }],
-    // The persisted row, at the precision the column can actually hold.
+    stockLevels: [{
+      productId: 'component-1',
+      warehouseId: 'warehouse-1',
+      quantity: 10,
+      reservedQty: (options.reservedQty ?? allocatedQty) + otherOrderReservedQty,
+    }],
     allocations: [{
-      orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 0.3334,
+      orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: allocatedQty,
     }],
-    shipments: [{
-      id: 'draft-1', orderId: 'order-1', status: 'PENDING', warehouseId: 'warehouse-1',
-      trackingNumber: 'TRACK-FRACTIONAL', shippingService: 'DPD', createdAt: '2026-01-01T00:00:00Z',
-      shipmentJournalDate: null,
-    }],
-    shipmentLines: [{ shipmentId: 'draft-1', lineId: 'line-1', productId: 'component-1', qty: 0.3334 }],
+    ...(options.draftQty == null ? {} : {
+      shipments: [{
+        id: 'draft-1', orderId: 'order-1', status: 'PENDING', warehouseId: 'warehouse-1',
+        trackingNumber: 'TRACK-FRACTIONAL', shippingService: 'DPD', createdAt: '2026-01-01T00:00:00Z',
+        shipmentJournalDate: null,
+      }],
+      shipmentLines: [{ shipmentId: 'draft-1', lineId: 'line-1', productId: 'component-1', qty: options.draftQty }],
+    }),
   })
+}
+
+/** The sum of this order's persisted allocation rows — the figure `reservedQty` must equal. */
+function ownAllocatedTotal(state: MemoryState): number {
+  return (state.allocations ?? [])
+    .filter((row) => row.orderId === 'order-1')
+    .reduce((sum, row) => sum + Number(row.qty), 0)
+}
+
+test('o3d-4kfh r6 (finding 2): a fractional KIT run leaves reservedQty EQUAL to the persisted rows', async () => {
+  // THE ASSERTION r5's version omitted, which is why the defect survived a passing suite. It
+  // checked only that the draft was still there.
+  //
+  // The computed component quantity is 0.33338 and the column holds 0.3334. r5 derived the reserve
+  // delta from the UNROUNDED in-memory set, so `reservedQty` received 0.333380 while the row stored
+  // 0.3334 — two books for the same units, differing by 0.00002. r6 derives it from the rows as
+  // re-read through the transaction, so there is one book.
+  const state = fractionalKitState({ allocatedQty: 0.3334, reservedQty: 0 })
+  state.allocations = []
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
-  // The rewrite branch really did run: `allocationSetsMatch` is exact (o3d-i4qd), so 0.3334 vs the
-  // recomputed 0.33338 reads as a change and the rows are deleted and recreated.
-  assert.equal(writeCounts.allocationCreates, 1, 'the rewrite branch ran, so the reconciler was reached')
-  assert.equal(state.allocations?.[0]?.qty, 0.3334, 'and re-persisted at the column precision')
+  assert.equal(state.allocations?.length, 1, 'the row was written')
+  assert.equal(state.allocations?.[0].qty, 0.3334, 'at the precision the column can hold')
+  assert.equal(
+    state.stockLevels[0].reservedQty,
+    ownAllocatedTotal(state),
+    'reservedQty must equal the PERSISTED total, not an unrounded intermediate',
+  )
+})
+
+test('o3d-4kfh r6 (finding 2): repeated fractional runs cannot drift, and cannot consume a co-tenant\'s reservation', async () => {
+  // The consequence r5 left open. With reservedQty at 0.333380 and the row at 0.3334, the exact
+  // `allocationSetsMatch` reported a change on the NEXT run too; that rewrite released the
+  // persisted 0.3334 from a reservedQty this order had only funded to 0.333380, so the guarded
+  // decrement either failed closed (hiding the drift as an error) or — with another order sharing
+  // the (product, warehouse) aggregate, as here — succeeded by taking 0.00002 out of that order.
+  // That is the theft the whole branch exists to stop.
+  const state = fractionalKitState({ allocatedQty: 0.3334, reservedQty: 0, otherOrderReservedQty: 5 })
+  state.allocations = []
+
+  for (let run = 0; run < 4; run += 1) {
+    await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+    assert.equal(
+      state.stockLevels[0].reservedQty,
+      ownAllocatedTotal(state) + 5,
+      `run ${run + 1}: reservedQty must stay this order's persisted total plus the co-tenant's untouched 5`,
+    )
+  }
+
+  assert.equal(state.stockLevels[0].reservedQty, 5.3334, 'no accumulated drift across four runs')
+})
+
+test('o3d-4kfh r6 (finding 2): a fractional KIT set that rounds to the persisted rows SHORT-CIRCUITS', async () => {
+  // The equality half of "one canonical representation". Comparing a persisted 0.3334 against an
+  // unrounded computed 0.33338 reported a change forever, so this order was destructively rewritten
+  // on every stock event and every 15-minute sweep — and each rewrite was the drift above. Rounding
+  // the computed set to the scale the column will store it at is not loosening the comparison; it
+  // is asking the question the comparison is for: WOULD REWRITING CHANGE WHAT IS STORED?
+  const state = fractionalKitState({ allocatedQty: 0.3334 })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(writeCounts.allocationDeletes, 0, 'no destructive rewrite')
+  assert.equal(writeCounts.allocationCreates, 0)
+  assert.equal(state.allocations?.[0].qty, 0.3334)
+  assert.equal(state.stockLevels[0].reservedQty, 0.3334, 'and no reservation movement')
+})
+
+test('o3d-4kfh r5/r6: a fractional KIT draft backed by its ROUNDED row survives', async () => {
+  // The defect: `allocateSalesOrder` handed `reconcilePendingShipments` its in-memory
+  // `persistedAllocations` on the grounds that it had just written them. It had not written THOSE
+  // values — OrderAllocation.qty is Decimal(12,4), so a computed 0.33338 lands as 0.3334. The draft
+  // holds what the ROW holds (0.3334, because confirmSalesOrderShipments builds it from the row);
+  // reconciled against the unrounded 0.33338 it showed a 0.00002 shortage, twenty times the
+  // 0.000001 epsilon, and the whole draft — tracking number included — was deleted.
+  //
+  // The double rounds on write exactly as numeric(12,4) does (`persistAllocationQty`), so this is
+  // the production arithmetic and not a fixture convenience.
+  //
+  // r6: the draft is now reconciled on BOTH branches (finding 3), so this fixture no longer proves
+  // the reconciler was reached by proving a rewrite happened — it is reached either way. What it
+  // still pins is the r5 property: the reconciler judges the draft against the STORED 0.3334 and
+  // not against the in-memory 0.33338, so an exactly-backed draft and its label survive.
+  const state = fractionalKitState({ allocatedQty: 0.3334, draftQty: 0.3334 })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(result.retiredPendingShipments, [], 'nothing may be retired: the stored row backs the draft exactly')
+  assert.equal(state.allocations?.[0]?.qty, 0.3334, 'the row is at the column precision')
   assert.deepEqual(
     (state.shipments ?? []).map((shipment) => shipment.id),
     ['draft-1'],
     'the draft is exactly backed by the stored row and must survive',
   )
-  assert.equal((state.shipmentLines ?? []).length, 1, 'with its lines, and its label metadata, intact')
+  assert.equal((state.shipmentLines ?? []).length, 1, 'with its lines intact')
+  assert.equal(state.shipments?.[0].trackingNumber, 'TRACK-FRACTIONAL', 'and its label metadata')
+  assert.equal(
+    state.stockLevels[0].reservedQty,
+    ownAllocatedTotal(state),
+    'and reservedQty still equals the persisted rows',
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -2709,4 +2894,118 @@ test('o3d-4kfh r5: the strict refuseIfShipmentsExist still refuses on a PENDING 
   })
 
   assert.equal(result.refused, true)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r6 (Codex finding 1) — the graph-version stamp and the CAS that reads it.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r6: findStaleFulfillmentGraphAllocation accepts a matched stamp and refuses a moved one', () => {
+  const lines = [{ id: 'line-1', sku: 'KIT-1', description: 'Kit 1', graphVersion: 3 }]
+
+  assert.equal(
+    findStaleFulfillmentGraphAllocation(lines, [{ lineId: 'line-1', fulfillmentGraphVersion: 3 }]),
+    null,
+    'a row expanded from the current recipe is fine',
+  )
+  const stale = findStaleFulfillmentGraphAllocation(lines, [{ lineId: 'line-1', fulfillmentGraphVersion: 2 }])
+  assert.match(String(stale), /KIT-1/, 'the message names the line')
+  assert.match(String(stale), /allocation 2, product 3/, 'and both versions, so the operator can see the drift')
+  assert.match(String(stale), /Re-allocate this order/)
+  // A stamp AHEAD of the product is just as wrong as one behind: it means the rows and the product
+  // disagree, and "which is newer" is not a question the row can answer.
+  assert.notEqual(
+    findStaleFulfillmentGraphAllocation(lines, [{ lineId: 'line-1', fulfillmentGraphVersion: 4 }]),
+    null,
+  )
+})
+
+test('o3d-4kfh r6: a stale row on a line OUTSIDE the validated set is not this check\'s business', () => {
+  // The dispatch call is scoped to the transitioning shipment's own sales lines, so an unrelated
+  // pre-existing problem elsewhere on the order must not wedge a correct dispatch — the same
+  // scoping rule the coverage check already follows.
+  assert.equal(
+    findStaleFulfillmentGraphAllocation(
+      [{ id: 'line-1', sku: 'SKU-1', description: 'Product 1', graphVersion: 1 }],
+      [{ lineId: 'line-2', fulfillmentGraphVersion: 0 }],
+    ),
+    null,
+  )
+})
+
+test('o3d-4kfh r6: allocateSalesOrder stamps every row with the version it expanded', async () => {
+  // Read out of the graph node, i.e. out of the SAME statement as the component list. A separate
+  // query under READ COMMITTED could see a version the loaded components do not belong to, and the
+  // stamp would then certify a recipe that was never read.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      lines: [{
+        id: 'line-1',
+        productId: 'kit-1',
+        qty: 1,
+        sku: 'KIT-1',
+        description: 'Kit 1',
+        product: { id: 'kit-1', sku: 'KIT-1', type: 'KIT', oversellAllowed: false },
+      }],
+    },
+    products: [{
+      id: 'kit-1',
+      type: 'KIT',
+      fulfillmentGraphVersion: 9,
+      productComponents: [
+        { componentId: 'component-1', qty: 2, componentType: 'SIMPLE' },
+        { componentId: 'component-2', qty: 1, componentType: 'SIMPLE' },
+      ],
+    }],
+    stockLevels: [
+      { productId: 'component-1', warehouseId: 'warehouse-1', quantity: 4, reservedQty: 0 },
+      { productId: 'component-2', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 0 },
+    ],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(
+    (state.allocations ?? []).map((row) => row.fulfillmentGraphVersion),
+    [9, 9],
+    'every component row of the line carries the LINE PRODUCT\'s version',
+  )
+})
+
+test('o3d-4kfh r6: a re-allocation RE-STAMPS, which is what makes it the advertised repair', async () => {
+  // The refusal tells the operator to re-allocate. If the rewrite kept the old stamp that advice
+  // would send them round a loop that can never succeed — the r4 failure mode, in a new place.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      lines: [{
+        id: 'line-1',
+        productId: 'kit-1',
+        qty: 1,
+        sku: 'KIT-1',
+        description: 'Kit 1',
+        product: { id: 'kit-1', sku: 'KIT-1', type: 'KIT', oversellAllowed: false },
+      }],
+    },
+    products: [{
+      id: 'kit-1',
+      type: 'KIT',
+      fulfillmentGraphVersion: 4,
+      // The kit now needs 4; the stale row below holds 2, written against the old recipe.
+      productComponents: [{ componentId: 'component-1', qty: 4, componentType: 'SIMPLE' }],
+    }],
+    stockLevels: [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 4, reservedQty: 2 }],
+    allocations: [{
+      orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1',
+      qty: 2, fulfillmentGraphVersion: 1,
+    }],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(state.allocations?.[0].qty, 4, 'rebuilt against the current recipe')
+  assert.equal(state.allocations?.[0].fulfillmentGraphVersion, 4, 'and re-stamped, so the CAS now passes')
+  assert.equal(state.stockLevels[0].reservedQty, 4, 'with the reservation moved to match the persisted row')
 })

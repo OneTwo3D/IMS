@@ -32,12 +32,42 @@ import {
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
-import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
 const ALLOCATION_EPSILON = 0.000001
 const ALLOCATION_EPSILON_DECIMAL = new Prisma.Decimal('0.000001')
+
+/**
+ * The scale `OrderAllocation.qty` is persisted at — `@db.Decimal(12, 4)` (o3d-4kfh r6, Codex
+ * finding 2).
+ *
+ * THE ONE CANONICAL REPRESENTATION. Everything downstream reads the PERSISTED row: the reservation
+ * residual, `confirmSalesOrderShipments`, the draft reconciler, the accounting sub-ledger and the
+ * `stock_reserved_source_mismatch` census. So a computed quantity the column cannot hold is not a
+ * quantity IMS has — it is a quantity IMS is about to round. Deciding equality, feasibility, the
+ * release and the reserve against three different renderings of "the same" number is what let
+ * reservedQty and the rows disagree by 0.00002 per fractional-KIT run.
+ */
+const ALLOCATION_QTY_DP = 4
+
+/**
+ * Quantise to the persisted scale, with the SAME rounding Postgres `numeric(12,4)` applies on write
+ * (half-up). Not a floor and not a truncation: flooring each row independently breaks the KIT
+ * proportionality invariant (`validateAllocationIntegrity` enforces it to 1e-6) and — worse —
+ * disagrees with what the column would have stored anyway, which is the divergence being removed.
+ *
+ * This does NOT fix o3d-i4qd. Rounding half-up can still land a row fractionally above the
+ * availability the allocator proved, and with the reserve now taken from the persisted value that
+ * over-claim reaches `reservedQty` as well as the row instead of only the row. That is a deliberate
+ * trade: an over-claim of at most half an ulp that the row and the reservation AGREE about is
+ * recoverable and visible to the census, whereas a disagreement between them silently consumed
+ * another order's reservation on every subsequent rewrite.
+ */
+export function canonicalAllocationQty(qty: DecimalInput): Prisma.Decimal {
+  return roundQuantity(qty, ALLOCATION_QTY_DP)
+}
 
 export type AllocationServiceClient = Prisma.TransactionClient | typeof db
 
@@ -945,6 +975,52 @@ export function findUncoveredCommittedShipment(
 }
 
 /**
+ * IS EVERY ALLOCATION ROW STILL ANSWERING THE QUESTION IT WAS COMPUTED FOR (o3d-4kfh r6, Codex
+ * finding 1)?
+ *
+ * `OrderAllocation.fulfillmentGraphVersion` records `Product.fulfillmentGraphVersion` of the ORDER
+ * LINE's product at the moment the row was expanded. A component-graph edit bumps that version for
+ * the edited product AND every KIT above it, in the same transaction as the edit
+ * (`bumpFulfillmentGraphVersions`). A stamp that no longer matches therefore means: these rows were
+ * derived from a recipe that no longer exists.
+ *
+ * THIS IS THE CHECK THE PROPORTIONALITY BACKSTOP CANNOT REPLACE, and r5 was wrong to claim it
+ * could. Interleave an allocation with an editor:
+ *
+ *   allocation reads 2xA + 1xB and computes A=2 / B=1;
+ *   the editor sees no committed allocation (that transaction is still open) and rescales the kit
+ *   to 4xA + 2xB;
+ *   the allocation commits A=2 / B=1.
+ *
+ * `findUncoveredCommittedShipment` computes coverage 0.5 against the NEW graph and expects exactly
+ * A=2 / B=1 — which is what it finds. The per-leaf dispatch cap sees neither leaf exceeding
+ * A=4 / B=2. Both pass, and half the current kit ships. Proportionality against a MUTABLE current
+ * graph cannot distinguish that race from a legitimate partial shipment, because on the numbers it
+ * is not distinguishable. The version moves even when the proportions scale uniformly, which is
+ * exactly why it catches this.
+ *
+ * Rows and products both start at 0, so nothing pre-existing reads as stale.
+ */
+export function findStaleFulfillmentGraphAllocation(
+  lines: Array<{ id: string; sku: string | null; description: string; graphVersion: number }>,
+  allocations: Array<{ lineId: string; fulfillmentGraphVersion: number }>,
+): string | null {
+  const lineById = new Map(lines.map((line) => [line.id, line]))
+  for (const allocation of allocations) {
+    const line = lineById.get(allocation.lineId)
+    if (!line) continue // outside the validated set — not this check's business
+    if (allocation.fulfillmentGraphVersion === line.graphVersion) continue
+    return `Allocation for sales line ${line.sku ?? line.description} was computed against an older `
+      + `version of that product's component graph (allocation ${allocation.fulfillmentGraphVersion}, `
+      + `product ${line.graphVersion}). The kit recipe changed after these rows were written, so what `
+      + 'they represent is no longer what the order requires — a uniform rescale of a kit passes every '
+      + 'quantity and proportionality check while shipping a fraction of it. Re-allocate this order '
+      + 'to rebuild the rows against the current graph, then retry.'
+  }
+  return null
+}
+
+/**
  * The rows both allocation checks read. Extracted so `validateCommittedShipmentCoverage` cannot
  * end up asking a DIFFERENT question of a differently-filtered set than the full integrity check —
  * the two must agree about which shipments count as committed and which rows back them.
@@ -968,6 +1044,8 @@ async function loadAllocationIntegrityRows(
       qty: true,
       sku: true,
       description: true,
+      // o3d-4kfh r6: the CURRENT graph version of the line's own product, for the CAS below.
+      product: { select: { fulfillmentGraphVersion: true } },
     },
   })
   if (lines.length === 0) return null
@@ -995,6 +1073,7 @@ async function loadAllocationIntegrityRows(
         productId: true,
         warehouseId: true,
         qty: true,
+        fulfillmentGraphVersion: true,
       },
     }),
     client.shipmentLine.findMany({
@@ -1045,6 +1124,20 @@ export async function validateCommittedShipmentCoverage(
 ): Promise<string | null> {
   const rows = await loadAllocationIntegrityRows(client, orderId, lineIds)
   if (!rows) return null
+  // o3d-4kfh r6: THE CAS FIRST. It is the only check that catches a uniform kit rescale, and it is
+  // cheap (an integer comparison on rows already loaded). Running it before the proportionality
+  // check also means the operator gets the accurate, actionable message ("re-allocate") rather than
+  // a proportionality complaint about numbers that are, against the new graph, proportional.
+  const staleGraphError = findStaleFulfillmentGraphAllocation(
+    rows.lines.map((line) => ({
+      id: line.id,
+      sku: line.sku,
+      description: line.description,
+      graphVersion: line.product?.fulfillmentGraphVersion ?? 0,
+    })),
+    rows.allocations,
+  )
+  if (staleGraphError) return staleGraphError
   return findUncoveredCommittedShipment(
     rows.requirementsByLine,
     new Map(rows.lines.map((line) => [line.id, line.sku ?? line.description])),
@@ -1070,6 +1163,22 @@ export async function validateAllocationIntegrity(
   const rows = await loadAllocationIntegrityRows(client, orderId, lineIds)
   if (!rows) return null
   const { lines, requirementsByLine, allocations, activeShipmentLines } = rows
+
+  // o3d-4kfh r6: the graph-version CAS runs here too, not only at the commitment/dispatch seam.
+  // `confirmSalesOrderShipments` builds its drafts straight from these rows, so letting a stale set
+  // through here would only move the refusal to the warehouse floor at Start Picking. The manual
+  // allocation editor calls this as well: a stale row cannot be repaired by editing its quantity —
+  // the whole set has to be rebuilt — so refusing with "re-allocate" is the correct answer there.
+  const staleGraphError = findStaleFulfillmentGraphAllocation(
+    lines.map((line) => ({
+      id: line.id,
+      sku: line.sku,
+      description: line.description,
+      graphVersion: line.product?.fulfillmentGraphVersion ?? 0,
+    })),
+    allocations,
+  )
+  if (staleGraphError) return staleGraphError
 
   const committedByLine = calculateDecimalCoverageByLine(
     requirementsByLine,
@@ -1400,12 +1509,21 @@ export async function allocateSalesOrder(
     // set is known to DIFFER from the persisted one — see the unchanged-set check below.
     const graph = await loadFulfillmentProductGraph(tx, productIds)
     const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
+    // o3d-4kfh r6: THE VERSION OF THE GRAPH THIS RUN IS ABOUT TO EXPAND, per sales line.
+    //
+    // Taken from the graph node, which means it came out of the SAME statement as that product's
+    // component list — under READ COMMITTED a second query could see a version the components do
+    // not belong to, and the stamp would then certify a recipe that was never read. A line whose
+    // product is missing from the graph (a deleted product) stamps 0 and is left to the existing
+    // checks; there is no recipe to be stale about.
+    const graphVersionByLine = new Map<string, number>()
     for (const line of so.lines) {
       if (!line.productId) continue
       requirementsByLine.set(
         line.id,
         requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
       )
+      graphVersionByLine.set(line.id, graph.get(line.productId)?.fulfillmentGraphVersion ?? 0)
     }
 
     const leafProductIds = listFulfillmentLeafProductIds(productIds, graph)
@@ -1605,6 +1723,20 @@ export async function allocateSalesOrder(
     // released NO reservation, so a row shrunk to the outstanding remainder would under-state this
     // order's live reservation by the picked quantity — released short here, and released again by
     // the dispatch that follows.
+    //
+    // o3d-4kfh r6 (Codex finding 2): CANONICALISED TO THE PERSISTED SCALE, once, here.
+    //
+    // `OrderAllocation.qty` is `Decimal(12,4)`. Everything downstream reads the STORED row, so a
+    // computed 0.33338 is not a quantity IMS has — it is a quantity IMS is about to round to
+    // 0.3334. Carrying the unrounded value past this point is what let the equality test, the
+    // reservation delta and the persisted row be three different numbers: reservedQty received
+    // 0.333380 while the row held 0.3334, the exact comparison then reported a change on every
+    // subsequent run, and that rewrite's release of the persisted 0.3334 either failed closed (this
+    // order only held 0.33338) or took 0.00002 out of another order sharing the scope — the exact
+    // theft this branch exists to stop.
+    //
+    // Rounded AFTER the merge, so a scope receiving several contributions rounds its TOTAL once
+    // rather than accumulating a rounding error per contribution.
     const persistedAllocations = mergeAllocationRows([
       ...nextAllocationRows,
       ...committedAllocationLines.map((line) => ({
@@ -1613,13 +1745,7 @@ export async function allocateSalesOrder(
         warehouseId: line.warehouseId,
         qty: line.qty,
       })),
-    ])
-    // What the persisted set claims on reservedQty: outstanding + picked/packed, i.e. everything
-    // except the part dispatch has already given back. This — not `nextAllocations` — is the
-    // reserve delta, precisely because the release below gives back the residual of the OLD rows
-    // on the same definition. Release residual, reserve residual: the two are the same reading of
-    // the same contract, so an unchanged commitment nets to exactly zero movement.
-    const reservationRows = residualAllocationRows(persistedAllocations, dispatchedAllocationLines)
+    ]).map((row) => ({ ...row, qty: canonicalAllocationQty(row.qty) }))
 
     const existingAllocs = await tx.orderAllocation.findMany({
       where: { orderId },
@@ -1681,9 +1807,6 @@ export async function allocateSalesOrder(
     // database and produce such a row after this ships.
     const unchanged = allocationSetsMatch(existingAllocs, persistedAllocations)
 
-    // o3d-i5it: stays EMPTY on the unchanged short-circuit. A run that rewrote nothing cannot have
-    // invalidated a draft, so it must not retire one — that short-circuit is what stopped the
-    // 15-minute sweep churning healthy orders.
     let pendingShipmentReconciliation = EMPTY_PENDING_SHIPMENT_RECONCILIATION
 
     if (!unchanged) {
@@ -1715,12 +1838,30 @@ export async function allocateSalesOrder(
             productId: alloc.productId,
             warehouseId: alloc.warehouseId,
             qty: alloc.qty,
+            // o3d-4kfh r6: the graph version THIS run expanded, from the same statement as the
+            // components. Commitment and dispatch refuse when the product has moved past it.
+            fulfillmentGraphVersion: graphVersionByLine.get(alloc.lineId) ?? 0,
           },
         })
       }
-      // Reserve the RESIDUAL of what was just written — the retained dispatch in those rows was
-      // already given back by the dispatch itself and must not be reserved a second time, while
-      // the retained PICK/PACK was never given back and must not be dropped.
+
+      // o3d-4kfh r6 (Codex finding 2): THE RESERVE DELTA COMES FROM THE ROWS AS PERSISTED.
+      //
+      // Not from the in-memory set, even though it was canonicalised above — the database is the
+      // authority on what its own column stored, and the row is what every later release will read.
+      // Deriving the reserve from anything else is the same class of mistake r5 fixed in the draft
+      // reconciler and left in place here: it makes `reservedQty` and `OrderAllocation` two
+      // different books that have to be reconciled by hand afterwards, and the reconciliation is
+      // what steals from other orders in the shared (product, warehouse) aggregate.
+      //
+      // Still the RESIDUAL of those rows: the retained dispatch in them was already given back by
+      // the dispatch itself and must not be reserved a second time, while the retained PICK/PACK
+      // was never given back and must not be dropped.
+      const writtenAllocations = await tx.orderAllocation.findMany({
+        where: { orderId },
+        select: { lineId: true, productId: true, warehouseId: true, qty: true },
+      })
+      const reservationRows = residualAllocationRows(writtenAllocations, dispatchedAllocationLines)
       await applyAllocationReservationDelta(
         tx,
         reservationRows.map((alloc) => ({
@@ -1757,6 +1898,31 @@ export async function allocateSalesOrder(
       // worth judging against.
       pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
         cause: 'a re-allocation of the order',
+      })
+    } else {
+      // o3d-4kfh r6 (Codex finding 3): THE UNCHANGED PATH RECONCILES TOO.
+      //
+      // r5 skipped it here, on the reasoning that "a run that rewrote nothing cannot have
+      // invalidated a draft". True and irrelevant: the draft may have been invalidated EARLIER, by
+      // a mutation whose own reconciliation was not reached, by a row an operator edited through a
+      // path that predates the shared rule, or by a shipment that committed after the draft was
+      // raised. The widened backorder allocator selects draft-bearing orders, computes an identical
+      // set, and — under r5 — left that invalid draft in place for Start Picking or a WMS
+      // transition to fail on, instead of the allocator repairing it. The claim that "no invalid
+      // draft survives a mutation that invalidated it" was true; the claim it was standing in for,
+      // that no invalid draft survives an allocation run, was false.
+      //
+      // The o3d-i5it churn property is preserved exactly, because `reconcilePendingShipments` is
+      // read-only when nothing is unbacked: it returns immediately when the order has no drafts,
+      // and writes neither the audit row nor the delete when every draft is fully backed. An
+      // unchanged, fully-backed order therefore still writes NOTHING — no accounting reset, no
+      // allocation churn, no reservation movement, no audit noise — which is what the 15-minute
+      // sweep needed. The cost is at most two extra indexed reads on an order that has drafts.
+      //
+      // The cause is worded for what actually happened: this run changed nothing, so whatever
+      // unbacked the draft came before it.
+      pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
+        cause: 'an earlier allocation change (this re-allocation computed the same set)',
       })
     }
 

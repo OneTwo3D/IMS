@@ -37,6 +37,7 @@ import {
 } from '@/lib/domain/sales/pending-shipment-reconciliation'
 import {
   confirmSalesOrderShipments,
+  discardCancelledOrderShipmentsInTx,
   reconcileOrderAfterShipment,
   transitionShipmentStatus,
 } from '@/lib/domain/sales/shipment-service'
@@ -745,7 +746,22 @@ export async function addAllocation(
           })
         } else {
           await tx.orderAllocation.create({
-            data: { orderId, lineId, productId: leafProductId, warehouseId, qty: requiredQty },
+            data: {
+              orderId,
+              lineId,
+              productId: leafProductId,
+              warehouseId,
+              qty: requiredQty,
+              // o3d-4kfh r6: stamp the graph version this expansion came from, out of the SAME
+              // statement that loaded the components (`loadFulfillmentProductGraph` above).
+              //
+              // The `update` branch above deliberately leaves an existing row's stamp alone. If
+              // that stamp is stale the whole row stays stale, `validateAllocationIntegrity` below
+              // refuses this action, and the operator is told to re-allocate — which is right:
+              // re-stamping a row we only ADDED to would bless the part of it that was expanded
+              // from a recipe that no longer exists.
+              fulfillmentGraphVersion: graph.get(productId)?.fulfillmentGraphVersion ?? 0,
+            },
           })
         }
       }
@@ -867,6 +883,38 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Discard the non-dispatched shipments left on a CANCELLED order (o3d-4kfh r6)
+// ---------------------------------------------------------------------------
+
+/**
+ * The repair path a cancelled order needs when a shipment is still sitting on it.
+ *
+ * This is the exit the component-graph refusal names for that case, and the reason it can name one
+ * at all: dispatching such a shipment is now refused (it would ship goods for a cancelled sale) and
+ * cancelling again is not a transition CANCELLED has, so before r6 there was no way out.
+ *
+ * Idempotent — a cancelled order with nothing left to discard writes nothing and reports zero.
+ */
+export async function discardCancelledOrderShipments(
+  orderId: string,
+): Promise<{ success: boolean; error?: string; discardedCount?: number }> {
+  try {
+    const session = await requirePermission('sales.process')
+
+    const result = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      return discardCancelledOrderShipmentsInTx(tx, orderId, { userId: session.user.id })
+    }, STOCK_TX_OPTIONS)
+
+    revalidateSalesAllocationPaths(orderId)
+    return { success: true, discardedCount: result.discarded.length }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    return { success: false, error: message }
   }
 }
 

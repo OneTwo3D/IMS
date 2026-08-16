@@ -22,6 +22,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
+  bumpFulfillmentGraphVersions,
   componentGraphMutationAffectsFulfillment,
   findComponentGraphEditBlockers,
 } from '@/lib/products/component-graph-edit-guard'
@@ -551,6 +552,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               // reaches here unguarded on purpose: fulfilment never expanded that BOM's components.
               await tx.productComponent.deleteMany({ where: { productId: existingProduct.id } })
             }
+            // o3d-4kfh r6: bump the graph version for this product and every KIT above it, in the
+            // same transaction as the type write. An allocation that read the OLD recipe stamped the
+            // old version, so commitment and dispatch now refuse it even when the guard above saw an
+            // empty blocker set because that allocation's transaction was still open.
+            await bumpFulfillmentGraphVersions(tx, existingProduct.id, kitnessMutation)
             // The structure this row ACTUALLY committed, for the in-run cache below. The
             // locked defaults can preserve a concurrent type/parent, so the pre-lock values
             // no longer describe the row (Codex review, r3).
@@ -875,10 +881,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             //
             // `kind: 'components'` with the type read under the lock: on a BOM this is a no-op, so a
             // CSV that maintains manufacturing recipes is no longer refused for a sales reason.
-            const inFlight = await findComponentGraphEditBlockers(tx, productId, {
-              kind: 'components',
+            const componentMutation = {
+              kind: 'components' as const,
               currentType: current.type,
-            })
+            }
+            const inFlight = await findComponentGraphEditBlockers(tx, productId, componentMutation)
             if (inFlight.length > 0) return 'in-flight-sales' as const
 
             await tx.productComponent.deleteMany({ where: { productId } })
@@ -890,6 +897,9 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 sortOrder: i,
               })),
             })
+            // o3d-4kfh r6: the CAS half of the same protection — see the kitness path above. A no-op
+            // on a BOM, whose component list no sales line expands.
+            await bumpFulfillmentGraphVersions(tx, productId, componentMutation)
             return true
           })
           if (wrote === 'in-flight-sales') {

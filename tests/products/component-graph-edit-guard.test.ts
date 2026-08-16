@@ -4,6 +4,7 @@ import path from 'node:path'
 import test from 'node:test'
 
 import {
+  bumpFulfillmentGraphVersions,
   collectFulfillmentAffectedRootProducts,
   componentGraphMutationAffectsFulfillment,
   describeComponentGraphEditBlockers,
@@ -89,7 +90,10 @@ function client(edges: ComponentEdge[], lines: LineFixture[]) {
             productId: line.productId,
             sku: line.sku,
             description: line.sku,
-            order: { orderNumber: line.orderNumber, externalOrderNumber: null },
+            // o3d-4kfh r6: `order.status` is selected for real now — the exit the refusal names
+            // depends on it, and a double that omitted it would let the message advise dispatching
+            // a cancelled order's shipment and still pass.
+            order: { orderNumber: line.orderNumber, externalOrderNumber: null, status: line.orderStatus },
             allocations: line.allocationCount > 0 ? [{ id: `alloc-${line.id}` }] : [],
             shipmentLines: line.shipmentLineStatuses
               .filter((status) => selectedShipmentStatuses.includes(status))
@@ -275,9 +279,12 @@ test('o3d-4kfh r5: COMPLETED, DELIVERED and CANCELLED orders do not block either
 
 test('o3d-4kfh r5: a PICKING shipment on a CANCELLED order STILL blocks', async () => {
   // The shipment branch carries no order-status filter on purpose: units physically picked are in
-  // flight whatever the order says. It has an exit — cancelSalesOrderFulfillmentState deletes
-  // PENDING/PICKING/PACKED shipments, and dispatch does not require an open order — so this is not a
-  // permanent freeze.
+  // flight whatever the order says.
+  //
+  // o3d-4kfh r6 (finding 4): its exit is NOT dispatch. r5's comment here said "dispatch does not
+  // require an open order", which was true and was the defect — dispatching this would ship goods
+  // for a cancelled sale. `transitionShipmentStatus` refuses it now, and the exit is the discard
+  // repair. See the message test below.
   const edges: ComponentEdge[] = [{ productId: 'kit-1', componentId: 'comp', parentType: 'KIT' }]
   const lines = [line({
     id: 'l1', productId: 'kit-1', orderStatus: 'CANCELLED', allocationCount: 1, shipmentLineStatuses: ['PICKING'],
@@ -286,6 +293,7 @@ test('o3d-4kfh r5: a PICKING shipment on a CANCELLED order STILL blocks', async 
   const blockers = await findComponentGraphEditBlockers(client(edges, lines), 'comp', KIT_RECIPE_EDIT)
 
   assert.deepEqual(blockers.map((blocker) => blocker.reason), ['committed_shipment'])
+  assert.deepEqual(blockers.map((blocker) => blocker.orderStatus), ['CANCELLED'])
 })
 
 test('o3d-4kfh: an order line with only a PENDING draft does NOT block', async () => {
@@ -336,9 +344,143 @@ test('o3d-4kfh r5: the refusal names real exits and says terminal orders do not 
   assert.match(message, /dispatching it or cancelling its order/i)
   assert.match(
     message,
-    /already shipped, completed, delivered or cancelled do NOT block/i,
+    /already shipped, completed or delivered do NOT block/i,
     'the operator must be told the blocker CAN be cleared, which was untrue in r4',
   )
+  assert.doesNotMatch(
+    message,
+    /Discard shipments/i,
+    'and a live order must not be offered the cancelled-order repair',
+  )
+})
+
+test('o3d-4kfh r6 (finding 4): the exit for a CANCELLED order is the discard repair, never dispatch', async () => {
+  // r5's message named dispatch as the exit for any picking/packed shipment, without looking at the
+  // parent order. On a CANCELLED order that advised shipping goods for a cancelled sale — worse
+  // than the block it resolved — and the alternative it offered (cancel the order) is not a
+  // transition CANCELLED has, so the blocker had no exit at all.
+  const edges: ComponentEdge[] = [{ productId: 'kit-1', componentId: 'comp', parentType: 'KIT' }]
+  const lines = [line({
+    id: 'l1', productId: 'kit-1', orderStatus: 'CANCELLED', allocationCount: 1, shipmentLineStatuses: ['PACKED'],
+  })]
+
+  const message = describeComponentGraphEditBlockers(
+    await findComponentGraphEditBlockers(client(edges, lines), 'comp', KIT_RECIPE_EDIT),
+  )
+
+  assert.match(message, /must NOT be dispatched/i)
+  assert.match(message, /ship goods for a cancelled sale/i)
+  assert.match(message, /Discard shipments/i, 'the repair action is named')
+  assert.match(message, /SO-l1/, 'and the cancelled order is named, so the operator knows which one')
+  assert.doesNotMatch(
+    message,
+    /a shipment already at picking\/packed can only be cleared by dispatching it/i,
+    'the live-order advice must not be emitted for a cancelled order',
+  )
+})
+
+test('o3d-4kfh r6 (finding 4): a mixed set gets BOTH exits, each attached to the right orders', async () => {
+  const edges: ComponentEdge[] = [{ productId: 'kit-1', componentId: 'comp', parentType: 'KIT' }]
+  const lines = [
+    line({ id: 'live', productId: 'kit-1', orderStatus: 'PICKING', allocationCount: 1, shipmentLineStatuses: ['PICKING'] }),
+    line({ id: 'dead', productId: 'kit-1', orderStatus: 'CANCELLED', allocationCount: 1, shipmentLineStatuses: ['PACKED'] }),
+  ]
+
+  const message = describeComponentGraphEditBlockers(
+    await findComponentGraphEditBlockers(client(edges, lines), 'comp', KIT_RECIPE_EDIT),
+  )
+
+  assert.match(message, /dispatching it or cancelling its order/i, 'the live order keeps the dispatch exit')
+  assert.match(message, /Discard shipments/i, 'and the cancelled one gets the repair')
+  assert.match(message, /order\(s\) SO-dead/, 'named specifically, so dispatch advice is never read onto it')
+  assert.doesNotMatch(message, /order\(s\) SO-live/, 'the live order is not listed under the discard advice')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r6 (Codex finding 1) — the version bump that makes the CAS work.
+// ---------------------------------------------------------------------------
+
+/** Records what `product.updateMany` was asked to do, so the bump SET is observable, not just its count. */
+function bumpClient(edges: ComponentEdge[]) {
+  const calls: Array<{ ids: string[]; increment: number }> = []
+  return {
+    calls,
+    client: {
+      productComponent: {
+        findMany: async ({ where }: { where: { componentId: { in: string[] } } }) => edges
+          .filter((edge) => where.componentId.in.includes(edge.componentId))
+          .map((edge) => ({ productId: edge.productId, product: { type: edge.parentType } })),
+      },
+      salesOrderLine: {
+        findMany: async () => { throw new Error('the bump must not read sales lines') },
+      },
+      product: {
+        updateMany: async ({ where, data }: {
+          where: { id: { in: string[] } }
+          data: { fulfillmentGraphVersion: { increment: number } }
+        }) => {
+          calls.push({ ids: [...where.id.in].sort(), increment: data.fulfillmentGraphVersion.increment })
+          return { count: where.id.in.length }
+        },
+      },
+    } as never,
+  }
+}
+
+test('o3d-4kfh r6 (finding 1): the bump covers the product AND every KIT above it', async () => {
+  // Bumping only the edited product would leave every KIT ancestor stamping an unchanged version
+  // while its expansion moved — the nested-kit hole, reopened one level up.
+  const { client: bumpTarget, calls } = bumpClient([
+    { productId: 'inner-kit', componentId: 'comp', parentType: 'KIT' },
+    { productId: 'outer-kit', componentId: 'inner-kit', parentType: 'KIT' },
+  ])
+
+  const bumped = await bumpFulfillmentGraphVersions(bumpTarget, 'comp', KIT_RECIPE_EDIT)
+
+  assert.deepEqual([...bumped].sort(), ['comp', 'inner-kit', 'outer-kit'])
+  assert.deepEqual(calls, [{ ids: ['comp', 'inner-kit', 'outer-kit'], increment: 1 }])
+})
+
+test('o3d-4kfh r6 (finding 1): a BOM parent is not bumped — its component list no sales line expands', async () => {
+  const { client: bumpTarget, calls } = bumpClient([
+    { productId: 'bom-parent', componentId: 'comp', parentType: 'BOM' },
+  ])
+
+  const bumped = await bumpFulfillmentGraphVersions(bumpTarget, 'comp', KIT_RECIPE_EDIT)
+
+  assert.deepEqual(bumped, ['comp'])
+  assert.deepEqual(calls, [{ ids: ['comp'], increment: 1 }])
+})
+
+test('o3d-4kfh r6 (finding 1): a mutation that cannot affect fulfilment bumps NOTHING, without reading', async () => {
+  // Same predicate as the guard. A spurious bump is not harmless: it invalidates in-flight
+  // allocations that were never wrong, and the only repair is a re-allocation.
+  const { client: bumpTarget, calls } = bumpClient([])
+
+  assert.deepEqual(
+    await bumpFulfillmentGraphVersions(bumpTarget, 'bom-1', { kind: 'components', currentType: 'BOM' }),
+    [],
+    'a BOM recipe edit',
+  )
+  assert.deepEqual(
+    await bumpFulfillmentGraphVersions(bumpTarget, 'bom-1', { kind: 'kitness', currentType: 'BOM', nextType: 'SIMPLE' }),
+    [],
+    'and a leaf-to-leaf type change',
+  )
+  assert.deepEqual(calls, [], 'no write at all')
+})
+
+test('o3d-4kfh r6 (finding 1): a KIT-ness flip DOES bump', async () => {
+  const { client: bumpTarget, calls } = bumpClient([
+    { productId: 'outer-kit', componentId: 'inner', parentType: 'KIT' },
+  ])
+
+  const bumped = await bumpFulfillmentGraphVersions(bumpTarget, 'inner', {
+    kind: 'kitness', currentType: 'BOM', nextType: 'KIT',
+  })
+
+  assert.deepEqual([...bumped].sort(), ['inner', 'outer-kit'])
+  assert.deepEqual(calls, [{ ids: ['inner', 'outer-kit'], increment: 1 }])
 })
 
 // --- Where the guard sits ---
@@ -414,10 +556,68 @@ test('o3d-4kfh: the CSV component pass is guarded, as a component-list mutation'
   assert.notEqual(csvGuardAt, -1, 'the CSV component write must consult the guard')
   assert.ok(csvGuardAt < csvDeleteAt, 'before it deletes the existing components')
   assert.match(
-    csvBody.slice(csvGuardAt, csvGuardAt + 300),
-    /kind: 'components',\s*\n\s*currentType: current\.type,/,
+    csvBody.slice(Math.max(0, csvGuardAt - 300), csvGuardAt),
+    /kind: 'components' as const,\s*\n\s*currentType: current\.type,/,
     'with the type read under the lock',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r6 (finding 1) — the bump has to be in the same transaction as the write, and after it.
+//
+// These are ORDERING assertions on the source, the same shape as the guard-placement tests above.
+// They prove the CAS is wired at all four mutation sites; the CAS's BEHAVIOUR is proved by the
+// dispatch/commitment tests in tests/domain/sales/shipment-service.test.ts.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r6 (finding 1): all four graph-mutation sites bump the version after their write', async () => {
+  const productsSource = await readFile(PRODUCTS_ACTIONS, 'utf8')
+  const importSource = await readFile(IMPORT_ACTIONS, 'utf8')
+
+  const sites: Array<{ label: string; source: string; anchor: string; length: number; write: string }> = [
+    {
+      label: 'updateProduct (KIT-ness)',
+      source: productsSource,
+      anchor: 'let updatedCategoryChange',
+      length: 8000,
+      write: 'await tx.product.update(',
+    },
+    {
+      label: 'saveProductComponents (component list)',
+      source: productsSource,
+      anchor: 'const conflict = await db.$transaction',
+      length: 5200,
+      write: 'tx.productComponent.deleteMany',
+    },
+    {
+      label: 'CSV row update (KIT-ness)',
+      source: importSource,
+      anchor: 'const outcome: RenameOutcome = await db.$transaction',
+      length: 6200,
+      write: 'await tx.product.update(',
+    },
+    {
+      label: 'CSV component pass (component list)',
+      source: importSource,
+      anchor: 'await lockProductSkusForWrite(tx, [cr.sku])',
+      length: 3200,
+      write: 'tx.productComponent.deleteMany',
+    },
+  ]
+
+  for (const site of sites) {
+    const at = site.source.indexOf(site.anchor)
+    assert.notEqual(at, -1, `${site.label}: anchor must still exist`)
+    const body = site.source.slice(at, at + site.length)
+    const writeAt = body.indexOf(site.write)
+    const bumpAt = body.indexOf('bumpFulfillmentGraphVersions(tx')
+    assert.notEqual(writeAt, -1, `${site.label}: the graph write must still be present`)
+    assert.notEqual(bumpAt, -1, `${site.label}: the version bump must be wired against tx`)
+    assert.ok(
+      writeAt < bumpAt,
+      `${site.label}: the bump must follow the write it describes — a version that moves without the graph is a spurious refusal`,
+    )
+  }
 })
 
 test('o3d-4kfh r5 (finding 2): nothing claims the guard is atomic', async () => {
@@ -437,6 +637,21 @@ test('o3d-4kfh r5 (finding 2): nothing claims the guard is atomic', async () => 
     'the atomicity claim must be gone from the editor',
   )
   assert.match(guardSource, /NOT ATOMIC|NOT A SERIALIZATION BOUNDARY/, 'the module must say so plainly')
-  assert.match(guardSource, /o3d-57b0/, 'and point at the filed graph-version CAS')
   assert.match(guardSource, /o3d-kouj/, 'and at the completed-history residual it does not solve')
+
+  // o3d-4kfh r6 (finding 1): the CAS the r5 module deferred to o3d-57b0 is IMPLEMENTED, so the
+  // module must point at it rather than at a ticket. The r5 text also called
+  // `validateCommittedShipmentCoverage` the correctness boundary; it is not — a uniform kit rescale
+  // passes it — and leaving that claim standing is the same failure as r4's atomicity claim.
+  assert.doesNotMatch(
+    guardSource,
+    /o3d-57b0/,
+    'the CAS is no longer deferred, so the module must not still point at the ticket for it',
+  )
+  assert.match(guardSource, /GRAPH-VERSION CAS/, 'it must name what the boundary actually is now')
+  assert.match(
+    guardSource,
+    /proportionality against a mutable current graph cannot distinguish a uniform rescale/i,
+    'and state plainly why proportionality could never have been the boundary',
+  )
 })

@@ -17,9 +17,24 @@ type AllocationRow = {
   productId: string
   warehouseId: string
   qty: number
+  /**
+   * o3d-4kfh r6: the graph version this row was expanded against. `NOT NULL DEFAULT 0` in the
+   * schema, so a real read NEVER returns undefined — the double defaults it for the same reason.
+   * Leaving it undefined made every row read as stale against a product at 0, which is a defect in
+   * the double, not a behaviour to encode.
+   */
+  fulfillmentGraphVersion?: number
 }
 type ShipmentLineRow = { lineId: string; productId: string; warehouseId: string; status: string; qty: number }
-type SalesOrderLineRow = { id: string; orderId: string; productId: string; qty: number; sku: string }
+type SalesOrderLineRow = {
+  id: string
+  orderId: string
+  productId: string
+  qty: number
+  sku: string
+  /** o3d-4kfh r6: `Product.fulfillmentGraphVersion` of this line's product. Absent means 0. */
+  graphVersion?: number
+}
 /** A PENDING draft, with the label metadata a retirement has to report (o3d-4kfh r4). */
 type PendingShipmentRow = {
   id: string
@@ -137,6 +152,9 @@ const tx = {
         qty: line.qty,
         sku: line.sku,
         description: line.sku,
+        // o3d-4kfh r6: production selects this for the graph-version CAS. Omitting it would leave
+        // the check comparing every stamp against `undefined`.
+        product: { fulfillmentGraphVersion: line.graphVersion ?? 0 },
       })),
   },
   // Every product here is SIMPLE, so the fulfillment graph is a single self-requirement of
@@ -217,7 +235,7 @@ const tx = {
       .allocations
       .filter((row) => where?.orderId == null || row.orderId === where.orderId)
       .filter((row) => !where?.lineId || where.lineId.in.includes(row.lineId))
-      .map((row) => ({ ...row })),
+      .map((row) => ({ ...row, fulfillmentGraphVersion: row.fulfillmentGraphVersion ?? 0 })),
     update: async ({ where, data }: { where: { id: string }; data: { warehouseId?: string; qty?: unknown } }) => {
       const row = state.allocations.find((candidate) => candidate.id === where.id)
       if (!row) throw new Error('allocation not found')
@@ -846,4 +864,53 @@ test('o3d-4kfh r4: a committed shipment is NOT counted as backing for a draft on
 
   assert.equal(result.success, true, result.error)
   assert.deepEqual(draftIds(), [], 'the draft claimed units the PICKING shipment already owns')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r6 (Codex finding 1) — the manual editor is inside the CAS too.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r6: updateAllocation REFUSES a row written against an older component graph', async () => {
+  // A stale row cannot be repaired by editing its quantity — the whole set has to be rebuilt from
+  // the current recipe — so the editor must refuse and point at Re-Allocate rather than let the
+  // operator adjust numbers that mean something different from what they say.
+  seedLines(10)
+  state.lines[0].graphVersion = 5
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10, fulfillmentGraphVersion: 4 },
+  ]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 8)
+
+  assert.equal(result.success, false)
+  assert.match(String(result.error), /older version of that product's component graph/)
+  assert.match(String(result.error), /Re-allocate this order/)
+  // NOT asserted here: that the write is rolled back. This file's `$transaction` double just calls
+  // the callback (line ~277) and keeps no snapshot, so post-throw state proves nothing about
+  // rollback either way — claiming it would be exactly the kind of vacuous assertion this round is
+  // auditing out. The rollback comes from `db.$transaction` propagating the throw, and it IS
+  // exercised against a snapshotting double in
+  // tests/domain/sales/shipment-service.test.ts ("the status flip is rolled back with the
+  // transaction").
+})
+
+test('o3d-4kfh r6: updateAllocation is untouched when the stamp matches', async () => {
+  // The boundary: the CAS must not become a dead end for the ordinary editor.
+  seedLines(10)
+  state.lines[0].graphVersion = 5
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10, fulfillmentGraphVersion: 5 },
+  ]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 8)
+
+  assert.equal(result.success, true, result.success ? undefined : result.error)
+  assert.equal(state.allocations[0].qty, 8)
+  assert.equal(reservedAt('warehouse-1'), 8)
 })

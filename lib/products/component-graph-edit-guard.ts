@@ -10,21 +10,24 @@ import type { Prisma, ProductType } from '@/app/generated/prisma/client'
  *
  *   - NOT A SERIALIZATION BOUNDARY (r5 Codex finding 2). The component writers take
  *     `COMPONENT_GRAPH_WRITE_LOCK_KEY`; `allocateSalesOrder`, `confirmSalesOrderShipments` and the
- *     PENDING -> PICKING commitment do NOT take it, and there is no plan in this PR to make them.
- *     Under Postgres' default READ COMMITTED / MVCC snapshotting, this query can therefore see an
- *     empty blocker set while a concurrent transaction is reading the OLD graph, committing
- *     old-graph allocations, even starting to pick — and then the edit commits on top. Nothing here
- *     detects that. Tests that assert local call ordering (guard inside the transaction, before the
- *     write) prove the ordering and nothing about the race. The real fix is a graph-version CAS
- *     across the allocation and commitment write protocols, which is a larger change than this PR
- *     and is filed with a design sketch as **o3d-57b0**.
+ *     PENDING -> PICKING commitment do NOT take it. Under Postgres' default READ COMMITTED / MVCC
+ *     snapshotting, this query can therefore see an empty blocker set while a concurrent transaction
+ *     is reading the OLD graph, committing old-graph allocations, even starting to pick — and then
+ *     the edit commits on top. Nothing here detects that. Tests that assert local call ordering
+ *     (guard inside the transaction, before the write) prove the ordering and nothing about the race.
  *
- *   - NOT THE THING THAT GUARANTEES CORRECTNESS. That is `validateCommittedShipmentCoverage` /
- *     `findUncoveredCommittedShipment` in allocation-service, which runs under the sales order's row
- *     lock at every shipment transition INCLUDING dispatch, expands the fulfilment graph, and
- *     rejects a commitment that is not a complete, proportional component set. A 2xA+1xB commitment
- *     against a graph since re-composed to 2xA+2xB fails it (coverage 0.5, so A is 2 where 1 is
- *     expected). That check is atomic with the irreversible act; this one is not.
+ *   - NOT THE THING THAT GUARANTEES CORRECTNESS. That is the GRAPH-VERSION CAS (r6 Codex finding 1):
+ *     `bumpFulfillmentGraphVersions` below moves `Product.fulfillmentGraphVersion` for this product
+ *     and every KIT above it in the same transaction as the edit; `allocateSalesOrder` stamps the
+ *     version it expanded onto every `OrderAllocation` row; and `validateAllocationIntegrity` /
+ *     `validateCommittedShipmentCoverage` refuse a commitment or a dispatch whose stamp no longer
+ *     matches. That is what catches the race, in EITHER interleaving, and it is the only thing that
+ *     can: proportionality against a mutable current graph cannot distinguish a uniform rescale
+ *     (2xA+1xB -> 4xA+2xB, committed A=2/B=1) from a legitimate half shipment.
+ *
+ *   - The proportionality backstop (`findUncoveredCommittedShipment`) still runs at every shipment
+ *     transition including dispatch and still catches NON-uniform edits. It is a second net, not the
+ *     boundary; r5 claimed it was the boundary and that was wrong.
  *
  * What this IS: an early, cheap, operator-facing refusal that stops the ordinary (uncontended)
  * editor/import case from creating the corruption at all, so the dispatch-time check is a backstop
@@ -49,7 +52,9 @@ import type { Prisma, ProductType } from '@/app/generated/prisma/client'
  *   - a committed shipment blocks only while it is PICKING or PACKED. SHIPPED is done.
  *
  * Both blockers have a real operator exit (see `describeComponentGraphEditBlockers`), which is the
- * property r4 lacked.
+ * property r4 lacked — and r6 fixed the second half of that property: the exit must not be HARMFUL
+ * either. A PICKING shipment on a CANCELLED order still blocks (units are physically picked), but
+ * the exit is the repair action that discards it, never "dispatch it".
  *
  * THE RESIDUAL, STATED PLAINLY AND NOT SOLVED HERE: completed history still reads against the
  * CURRENT graph. A DELIVERED order's fulfilment analytics, its coverage figures and any later
@@ -118,6 +123,13 @@ export function componentGraphMutationAffectsFulfillment(mutation: ComponentGrap
 export type ComponentGraphEditBlocker = {
   orderId: string
   orderRef: string
+  /**
+   * The SALES ORDER's status. Carried because the exit an operator is given depends on it: a
+   * PICKING shipment on a CANCELLED order must NOT be cleared by dispatching it (r6 Codex finding
+   * 4 — that ships goods for a cancelled sale), and dispatch on a cancelled order is refused
+   * outright now. See {@link describeComponentGraphEditBlockers}.
+   */
+  orderStatus: string
   lineId: string
   lineLabel: string
   /** The order line's own product — P itself, or the KIT ancestor that reaches it. */
@@ -127,6 +139,7 @@ export type ComponentGraphEditBlocker = {
 }
 
 type GuardClient = Pick<Prisma.TransactionClient, 'productComponent' | 'salesOrderLine'>
+type GraphVersionClient = GuardClient & Pick<Prisma.TransactionClient, 'product'>
 
 /**
  * Order statuses from which a line can still be picked, packed or re-allocated. The complement —
@@ -228,7 +241,7 @@ export async function findComponentGraphEditBlockers(
       productId: true,
       sku: true,
       description: true,
-      order: { select: { orderNumber: true, externalOrderNumber: true } },
+      order: { select: { orderNumber: true, externalOrderNumber: true, status: true } },
       allocations: { select: { id: true }, take: 1 },
       shipmentLines: {
         where: { shipment: { status: { in: [...IN_FLIGHT_COMMITTED_SHIPMENT_STATUSES] } } },
@@ -241,6 +254,7 @@ export async function findComponentGraphEditBlockers(
   return lines.map((line) => ({
     orderId: line.orderId,
     orderRef: line.order.orderNumber ?? line.order.externalOrderNumber ?? line.orderId.slice(0, 8),
+    orderStatus: String(line.order.status),
     lineId: line.id,
     lineLabel: line.sku ?? line.description,
     productId: line.productId!,
@@ -249,24 +263,82 @@ export async function findComponentGraphEditBlockers(
 }
 
 /**
+ * BUMP THE FULFILMENT GRAPH VERSION of `productId` and every KIT that reaches it (o3d-4kfh r6,
+ * Codex finding 1).
+ *
+ * The bump set is exactly {@link collectFulfillmentAffectedRootProducts} — the same walk the guard
+ * uses — because "whose expansion changed?" and "whose in-flight work is invalidated?" are the same
+ * question. Bumping only the edited product would leave every KIT ABOVE it stamping an unchanged
+ * version while its expansion moved, which is the nested-kit hole all over again.
+ *
+ * MUST run in the same transaction as the component/type write it describes, and AFTER it: a
+ * version that moves without the graph moving is a spurious refusal, and a graph that moves without
+ * the version moving is the defect this closes.
+ *
+ * Returns the product ids whose version was bumped.
+ */
+export async function bumpFulfillmentGraphVersions(
+  client: GraphVersionClient,
+  productId: string,
+  mutation: ComponentGraphMutation,
+): Promise<string[]> {
+  // Same predicate as the guard: a BOM recipe edit and a BOM <-> SIMPLE conversion cannot change
+  // any sales line's requirements, so bumping for them would refuse commitments for no reason.
+  if (!componentGraphMutationAffectsFulfillment(mutation)) return []
+
+  const affectedProductIds = await collectFulfillmentAffectedRootProducts(client, productId)
+  if (affectedProductIds.length === 0) return []
+  await client.product.updateMany({
+    where: { id: { in: affectedProductIds } },
+    data: { fulfillmentGraphVersion: { increment: 1 } },
+  })
+  return affectedProductIds
+}
+
+/** The order statuses from which nothing can be dispatched any more (r6 Codex finding 4). */
+const TERMINAL_REFUSING_ORDER_STATUSES = new Set(['CANCELLED'])
+
+/**
  * The operator-facing refusal.
  *
- * Every action it names ACTUALLY CLEARS THE BLOCKER — the r4 message told the operator to dispatch
- * the orders when dispatch could not clear it, because the guard had no lifecycle filter and a
- * shipped order blocked forever. With the in-flight scope above:
+ * EVERY ACTION IT NAMES MUST ACTUALLY CLEAR THE BLOCKER, *AND* MUST NOT BE HARMFUL. Two rounds have
+ * broken one half or the other:
+ *
+ *   - r4 told the operator to dispatch the orders when dispatch could not clear it, because the
+ *     guard had no lifecycle filter and a shipped order blocked forever;
+ *   - r5 (this message, before r6) named dispatch as the exit for a PICKING/PACKED shipment
+ *     WITHOUT looking at the parent order. On a CANCELLED order that advised dispatching goods for
+ *     a cancelled sale, which is worse than the block it resolves. An exit that resolves the block
+ *     by doing something harmful is not an exit.
+ *
+ * So the exits are now split by the parent order's status:
  *
  *   - an ALLOCATION blocker clears when the order is deallocated, dispatched, or cancelled (all
- *     three either remove the rows or move the order to a terminal status);
- *   - a PICKING/PACKED SHIPMENT blocker clears when that shipment is DISPATCHED, or when the whole
- *     order is CANCELLED — `cancelSalesOrderFulfillmentState` deletes PENDING/PICKING/PACKED
- *     shipments outright. Those are the only two: `SHIPMENT_TRANSITIONS` is forward-only and IMS has
- *     no per-shipment cancel (o3d-tv1q), which is why the message must not offer one.
+ *     three either remove the rows or move the order to a terminal status). An allocation blocker
+ *     can only exist on an in-flight order by construction (`IN_FLIGHT_ORDER_STATUSES`), so no
+ *     cancelled-order case arises here;
+ *   - a PICKING/PACKED SHIPMENT blocker on a LIVE order clears by DISPATCHING that shipment, or by
+ *     cancelling the whole order — `cancelSalesOrderFulfillmentState` deletes PENDING/PICKING/PACKED
+ *     shipments outright. `SHIPMENT_TRANSITIONS` is forward-only and IMS has no per-shipment cancel
+ *     (o3d-tv1q), which is why the message must not offer one;
+ *   - a PICKING/PACKED SHIPMENT blocker on a CANCELLED order clears ONLY through the repair action
+ *     (`discardCancelledOrderShipments`), which deletes the order's remaining non-dispatched
+ *     shipments. Dispatch is refused on a cancelled order now (`transitionShipmentStatus`), and
+ *     cancelling again is not a transition CANCELLED has — which is exactly why r5's advice was a
+ *     dead end as well as a harmful one.
  */
 export function describeComponentGraphEditBlockers(
   blockers: ComponentGraphEditBlocker[],
 ): string {
   const committed = blockers.filter((blocker) => blocker.reason === 'committed_shipment')
+  const cancelledCommitted = committed.filter(
+    (blocker) => TERMINAL_REFUSING_ORDER_STATUSES.has(blocker.orderStatus),
+  )
+  const liveCommitted = committed.filter(
+    (blocker) => !TERMINAL_REFUSING_ORDER_STATUSES.has(blocker.orderStatus),
+  )
   const orderRefs = [...new Set(blockers.map((blocker) => blocker.orderRef))].sort()
+  const cancelledRefs = [...new Set(cancelledCommitted.map((blocker) => blocker.orderRef))].sort()
   const shown = orderRefs.slice(0, 10).join(', ')
   const overflow = orderRefs.length > 10 ? ` and ${orderRefs.length - 10} more` : ''
   return 'Cannot change these components while sales orders are in flight against them: '
@@ -276,10 +348,16 @@ export function describeComponentGraphEditBlockers(
     + 'everywhere — allocation, shipment drafts, the dispatch cap, the reservation census — so '
     + 'editing it now would silently change what those orders are deemed to require and let an '
     + 'incomplete kit ship. To clear this: deallocate, dispatch or cancel those orders'
-    + (committed.length > 0
+    + (liveCommitted.length > 0
       ? '; a shipment already at picking/packed can only be cleared by dispatching it or cancelling '
         + 'its order (there is no route back to draft and no per-shipment cancel)'
       : '')
-    + '. Orders that are already shipped, completed, delivered or cancelled do NOT block — only '
-    + 'work still in flight does. Alternatively, clone this product and change the copy.'
+    + (cancelledRefs.length > 0
+      ? `; the picking/packed shipment(s) on already-cancelled order(s) ${cancelledRefs.join(', ')} `
+        + 'must NOT be dispatched — that would ship goods for a cancelled sale, and IMS refuses it — '
+        + 'use "Discard shipments" on those cancelled orders, which deletes their remaining '
+        + 'non-dispatched shipments'
+      : '')
+    + '. Orders that are already shipped, completed or delivered do NOT block — only work still in '
+    + 'flight does. Alternatively, clone this product and change the copy.'
 }

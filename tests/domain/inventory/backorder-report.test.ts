@@ -496,6 +496,11 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
     select: {
       id: true,
       type: true,
+      // o3d-4kfh r6: the graph version is read in the SAME statement as the component list, so an
+      // allocation can stamp a version the components it expanded actually belong to. Under READ
+      // COMMITTED a second query would take a fresh snapshot and could certify a recipe that was
+      // never read — which is why this belongs in the assertion rather than being incidental.
+      fulfillmentGraphVersion: true,
       productComponents: {
         select: {
           componentId: true,

@@ -25,6 +25,7 @@ import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
 import {
   autoAllocateOrder, getOrderAllocations, getOrderShipments,
   deallocateOrder, confirmAllocations, updateAllocation, addAllocation,
+  discardCancelledOrderShipments,
   updateShipmentStatus, updateShipmentTracking,
   type AllocationRow, type FulfillmentRequirementRow, type ShipmentRow,
 } from '@/app/actions/allocation'
@@ -654,11 +655,14 @@ const SHIPMENT_FLOW: Record<string, { label: string; target: string }> = {
 
 
 function ShipmentsPanel({
-  shipments, carriers, deliveryTrackingEnabled, onRefresh,
+  shipments, carriers, deliveryTrackingEnabled, orderId, orderStatus, onRefresh,
 }: {
   shipments: ShipmentRow[]
   carriers: string[]
   deliveryTrackingEnabled: boolean
+  orderId: string
+  /** o3d-4kfh r6: a CANCELLED order gets the discard repair instead of the forward actions. */
+  orderStatus: string
   onRefresh: () => void
 }) {
   const [isPending, startTransition] = useTransition()
@@ -701,6 +705,18 @@ function ShipmentsPanel({
     })
   }
 
+  // o3d-4kfh r6 (finding 4): the exit the component-graph refusal names. Dispatching a cancelled
+  // order's shipment is refused (it would ship goods for a cancelled sale) and CANCELLED has no
+  // transition to CANCELLED, so before this there was no way to clear the blocker at all.
+  function handleDiscardCancelledShipments() {
+    setError('')
+    startTransition(async () => {
+      const result = await discardCancelledOrderShipments(orderId)
+      if (result.success) onRefresh()
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
   function handleEditTracking(shipment: ShipmentRow) {
     setError('')
     setShipDialogId(shipment.id)
@@ -709,11 +725,37 @@ function ShipmentsPanel({
     setService(shipment.shippingService ?? '')
   }
 
+  const isCancelledOrder = orderStatus === 'CANCELLED'
+  const discardableCount = isCancelledOrder
+    ? shipments.filter((shipment) => shipment.status !== 'SHIPPED').length
+    : 0
+
   return (
     <div className="space-y-3">
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {discardableCount > 0 && (
+        <div className="rounded-md border border-destructive/40 px-4 py-2 flex items-center justify-between gap-3">
+          <p className="text-sm text-muted-foreground">
+            This order is cancelled but still has {discardableCount} non-dispatched shipment(s). They
+            cannot be picked, packed or dispatched, and they block component-graph edits for the
+            products on this order. Discarding deletes them; already-dispatched shipments are kept
+            (reverse those with a refund).
+          </p>
+          <Button
+            variant="outline"
+            size="sm"
+            className="h-7 text-xs text-destructive hover:text-destructive shrink-0"
+            onClick={handleDiscardCancelledShipments}
+            disabled={isPending}
+          >
+            {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
+            Discard shipments
+          </Button>
+        </div>
+      )}
       {shipments.map((s) => {
-        const nextAction = SHIPMENT_FLOW[s.status]
+        // A cancelled order's shipments have no forward action: the transition is refused server-side.
+        const nextAction = isCancelledOrder ? undefined : SHIPMENT_FLOW[s.status]
         return (
           <div key={s.id} className="rounded-md border overflow-x-auto">
             <div className="px-4 py-2 bg-muted/50 flex items-center justify-between">
@@ -896,7 +938,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
 
   // Show allocation panel when PROCESSING/ALLOCATED AND (no shipments OR unfulfilled lines remain)
   const showAllocations = ['PROCESSING', 'ALLOCATED'].includes(so.status) && (!hasShipments || hasUnfulfilledLines)
-  const showShipments = ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && hasShipments
+  // o3d-4kfh r6 (Codex finding 4): CANCELLED is in the list too, but ONLY so the operator can see
+  // and discard shipments that are still sitting on a cancelled order. A cancelled order normally
+  // has none — `cancelSalesOrderFulfillmentState` deletes them in the same transaction as the
+  // cancel — but if one is there it blocks component-graph edits, it can no longer be advanced or
+  // dispatched, and hiding it left the refusal naming a repair the operator could not reach.
+  const showShipments = ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(so.status) && hasShipments
 
   const refreshAllocations = useCallback(() => {
     getOrderAllocations(so.id).then(setAllocations)
@@ -1480,6 +1527,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           shipments={shipments}
           carriers={carriers}
           deliveryTrackingEnabled={deliveryTrackingEnabled}
+          orderId={so.id}
+          orderStatus={so.status}
           onRefresh={() => { refreshAllocations(); router.refresh() }}
         />
       )}

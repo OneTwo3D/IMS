@@ -579,6 +579,15 @@ export function evaluateInventoryInvariantRows(
   // here means a recursive walk over product_components, which the paged SQL collector below cannot
   // do without a recursive CTE. So a disproportionate committed KIT set is caught at the transition
   // seams and refused at the component editor, but is NOT reported by this census.
+  //
+  // o3d-4kfh r6: nor is proportionality itself sufficient at those seams. A UNIFORM rescale of a kit
+  // (2xA + 1xB -> 4xA + 2xB) leaves an A=2/B=1 commitment exactly proportional to the NEW recipe at
+  // coverage 0.5, so every graph-aware check passes while half a kit ships. What refuses that is the
+  // graph-version CAS (`findStaleFulfillmentGraphAllocation`): allocations stamp
+  // `Product.fulfillmentGraphVersion` and commitment/dispatch reject a stamp that no longer matches.
+  // A STALE STAMP IS ALSO NOT REPORTED BY THIS CENSUS — it surfaces only when someone tries to pick
+  // or dispatch. Adding it would need the allocation rows joined to products, which this collector
+  // does not load.
   if (rows.orderAllocations && rows.committedShipmentLines) {
     const allocationScopeKey = (row: { lineId: string; warehouseId: string; productId: string }) =>
       `${row.lineId}|${row.warehouseId}|${row.productId}`
@@ -1502,8 +1511,9 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       -- requirement graph, which is a recursive expansion this sweep does not load. The proportional
       -- half is enforced where the graph is available: validateAllocationIntegrity and (o3d-4kfh r4)
       -- EVERY shipment transition including dispatch (findUncoveredCommittedShipment), plus the
-      -- component-graph edit refusal that stops the mutation creating it in the first place. The
-      -- SCHEDULED SWEEP ITSELF REMAINS FLAT.
+      -- component-graph edit refusal that stops the mutation creating it in the first place, plus
+      -- (o3d-4kfh r6) the graph-version CAS that catches the uniform rescale proportionality cannot
+      -- see. The SCHEDULED SWEEP ITSELF REMAINS FLAT and reports neither.
       SELECT
         'allocation_committed_shipment_uncovered:' || csl."lineId" || ':' || csl."warehouseId" || ':' || csl."productId" AS "sortKey",
         'critical'::text AS severity,

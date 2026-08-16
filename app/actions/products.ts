@@ -28,6 +28,7 @@ import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForW
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import {
   ComponentGraphInFlightSalesError,
+  bumpFulfillmentGraphVersions,
   componentGraphMutationAffectsFulfillment,
   describeComponentGraphEditBlockers,
   findComponentGraphEditBlockers,
@@ -1019,6 +1020,13 @@ export async function updateProduct(
       await tx.productComponent.deleteMany({ where: { productId: id } })
     }
 
+    // o3d-4kfh r6 (Codex finding 1): bump the fulfilment graph version for this product and every
+    // KIT above it, in the SAME transaction as the type write. The guard above is best-effort and
+    // can see an empty blocker set while a concurrent allocation is still open against the OLD
+    // recipe; that allocation stamped the old version, so commitment and dispatch refuse it. A
+    // no-op for a mutation that cannot change any sales line's requirements (BOM <-> SIMPLE).
+    await bumpFulfillmentGraphVersions(tx, id, kitnessMutation)
+
     return {
       from: previousCategoryName,
       to: data.categoryName ?? null,
@@ -1435,6 +1443,9 @@ export async function saveProductComponents(
           })),
         })
       }
+      // o3d-4kfh r6: the CAS half — see the kitness path in updateProduct. A no-op on a BOM, whose
+      // component list no sales line expands.
+      await bumpFulfillmentGraphVersions(tx, productId, componentMutation)
       return null
     })
     if (conflict === 'self') return { success: false, error: 'A product cannot be a component of itself' }

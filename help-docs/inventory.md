@@ -119,11 +119,17 @@ An order blocks the edit only while its work is genuinely unfinished:
   picking or packing); or
 - it has a shipment sitting at **picking** or **packed**.
 
-Orders that are **shipped, completed, delivered or cancelled do not block**, and neither does a
-pending shipment draft. To clear a refusal: deallocate, dispatch or cancel the named orders. A
-shipment already at picking or packed has no route back to draft and there is no per-shipment cancel,
-so dispatching it (or cancelling its order, which deletes it) is the way to clear that one.
-Alternatively, clone the product and change the copy.
+Orders that are **shipped, completed or delivered do not block**, and neither does a pending shipment
+draft. To clear a refusal: deallocate, dispatch or cancel the named orders. A shipment already at
+picking or packed has no route back to draft and there is no per-shipment cancel, so dispatching it
+(or cancelling its order, which deletes it) is the way to clear that one. Alternatively, clone the
+product and change the copy.
+
+A **cancelled** order does not block on its allocations, but it does block if a picking or packed
+shipment is somehow still attached to it. Do **not** dispatch that shipment — it would ship goods for
+a cancelled sale, and IMS refuses the transition. Open the order and use **Discard shipments**, which
+deletes its remaining non-dispatched shipments (already-dispatched ones are kept; reverse those with
+a refund). The action is safe to repeat: with nothing left to discard it does nothing.
 
 **Changing a product between Kit and BOM is refused on the same terms**, in both the editor and the
 CSV import, because it changes whether fulfilment expands that product's components — including when
@@ -133,9 +139,14 @@ Two limits worth knowing:
 
 - The refusal is an early warning, not a lock. IMS's allocation and picking steps do not take the
   component-graph lock, so an edit committed at the same instant as an allocation can still slip
-  past. The check that actually stops an incomplete kit leaving the building runs at every shipment
-  transition **including dispatch**, and refuses a shipment whose components are not a complete,
-  proportional set for the current recipe.
+  past. What actually stops an incomplete kit leaving the building is a **recipe version** stamped on
+  every allocation: editing a kit's components — or its Kit/BOM type — moves the version on that
+  product and on every kit that contains it, and picking, shipment creation and dispatch all refuse
+  rows stamped with an older version. The message says so and tells you to **Re-Allocate** the order,
+  which rebuilds the rows against the current recipe. A second check at the same seams still refuses
+  a shipment whose components are not a complete, proportional set. The version is what catches an
+  edit that merely *scales* a recipe (say 2 of A + 1 of B becoming 4 of A + 2 of B): the old rows are
+  still perfectly proportional to the new recipe, so proportionality alone would let half a kit ship.
 - Reports over **completed** orders read today's recipe, not the one those orders shipped under.
 
 ### BOM (Bill of Materials)

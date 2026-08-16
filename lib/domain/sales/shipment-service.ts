@@ -389,6 +389,133 @@ export async function confirmSalesOrderShipments(
   })
 }
 
+/**
+ * Order statuses from which NO shipment may move any further (o3d-4kfh r6, Codex finding 4).
+ *
+ * CANCELLED only, and deliberately so. A cancelled order is a sale that will not happen; letting a
+ * shipment on it advance — up to and including dispatch — ships goods for it and recognises the
+ * COGS, which no later act reverses. `cancelSalesOrderFulfillmentState` deletes the order's
+ * PENDING/PICKING/PACKED shipments in the same transaction as the cancel, so this only bites when a
+ * shipment reached a cancelled order by some other route; but "should not be reachable" is not a
+ * guard, and the harm if it is reached is irreversible.
+ *
+ * SHIPPED / COMPLETED / DELIVERED are NOT included. They mean the sale happened, and an order can
+ * legitimately carry one straggling PACKED shipment while its status has already moved on (the
+ * status is written by the storefront status mapping as well as by IMS). Refusing there would
+ * strand real goods with no repair path — which is precisely the r4 mistake this round is undoing,
+ * not one to repeat in the other direction.
+ */
+const SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES = new Set(['CANCELLED'])
+
+function terminalOrderTransitionError(orderStatus: string): string {
+  return `This order is ${orderStatus} — its shipments cannot be advanced or dispatched. `
+    + 'Dispatching would ship goods for a cancelled sale and recognise COGS that nothing reverses. '
+    + 'Use "Discard shipments" on the order to delete its remaining non-dispatched shipments '
+    + '(already-dispatched ones are kept — reverse those with a refund instead).'
+}
+
+export type DiscardedCancelledShipment = {
+  id: string
+  status: string
+  warehouseId: string
+  trackingNumber: string | null
+  shippingService: string | null
+  lineCount: number
+}
+
+/**
+ * THE REPAIR PATH for a cancelled order that still carries non-dispatched shipments (o3d-4kfh r6,
+ * Codex finding 4).
+ *
+ * r5 advertised dispatch as the exit for a PICKING/PACKED shipment blocking a component-graph edit,
+ * and its test explicitly relied on dispatch not requiring an open order. On a CANCELLED order that
+ * advice was to ship goods for a cancelled sale — worse than the block it resolved — and the
+ * alternative it named (cancel the order) is not a transition CANCELLED has, so there was no exit
+ * at all. This is the exit: it removes the shipments instead of fulfilling them.
+ *
+ * PROPERTIES:
+ *   - refuses unless the order really is CANCELLED (this is not a general per-shipment cancel;
+ *     o3d-tv1q remains open);
+ *   - NEVER touches a SHIPPED shipment. Those are dispatch evidence the accounting sub-ledger and
+ *     any refund reversal resolve through; the remedy for one of those is a refund;
+ *   - IDEMPOTENT. A cancelled order with nothing left to discard writes nothing at all and returns
+ *     an empty list, so a retry, a double-click or a re-run of the same repair is a no-op;
+ *   - moves NO reservation. `reservedQty` is decremented only on the transition to SHIPPED, so a
+ *     PENDING/PICKING/PACKED shipment holds none of its own; the cancel that produced this state
+ *     already released the order's allocations.
+ *   - writes its audit row through the SAME client, BEFORE the delete, carrying each shipment's
+ *     tracking number — same reasoning as `reconcilePendingShipments`: a purchased label that IMS
+ *     no longer references has to stay correlatable.
+ *
+ * The caller MUST already hold the order's row lock (`lockSalesOrder`).
+ */
+export async function discardCancelledOrderShipmentsInTx(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  audit: { userId?: string | null } = {},
+): Promise<{ discarded: DiscardedCancelledShipment[] }> {
+  const order = await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { status: true, orderNumber: true, externalOrderNumber: true },
+  })
+  if (!order) throw new Error('Order not found')
+  if (!SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES.has(String(order.status))) {
+    throw new Error(
+      `Only a cancelled order's shipments can be discarded; this order is ${order.status}. `
+      + 'Cancel the order instead — that deletes its pending, picking and packed shipments in one '
+      + 'transaction with the reservation release.',
+    )
+  }
+
+  const doomed = await tx.shipment.findMany({
+    where: { orderId, status: { in: ['PENDING', 'PICKING', 'PACKED'] } },
+    select: {
+      id: true,
+      status: true,
+      warehouseId: true,
+      trackingNumber: true,
+      shippingService: true,
+      lines: { select: { id: true } },
+    },
+  })
+  if (doomed.length === 0) return { discarded: [] }
+
+  const discarded: DiscardedCancelledShipment[] = doomed.map((shipment) => ({
+    id: shipment.id,
+    status: String(shipment.status),
+    warehouseId: shipment.warehouseId,
+    trackingNumber: shipment.trackingNumber ?? null,
+    shippingService: shipment.shippingService ?? null,
+    lineCount: shipment.lines.length,
+  }))
+  const orderRef = order.orderNumber ?? order.externalOrderNumber ?? orderId.slice(0, 8)
+  const carryingLabels = discarded.filter((row) => row.trackingNumber).length
+
+  await tx.activityLog.create({
+    data: {
+      userId: audit.userId ?? null,
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'cancelled_order_shipments_discarded',
+      tag: 'sales',
+      level: 'WARNING',
+      description: `Discarded ${discarded.length} non-dispatched shipment(s) left on cancelled order ${orderRef}`
+        + (carryingLabels > 0
+          ? ` — ${carryingLabels} carried a tracking number that IMS no longer references, cancel the label(s) with the carrier if unused`
+          : ''),
+      metadata: {
+        discardedShipmentCount: discarded.length,
+        discardedShipments: discarded,
+        discardedTrackingNumbers: discarded
+          .map((row) => row.trackingNumber)
+          .filter((value): value is string => !!value),
+      },
+    },
+  })
+  await tx.shipment.deleteMany({ where: { id: { in: discarded.map((row) => row.id) } } })
+  return { discarded }
+}
+
 export async function transitionShipmentStatus(
   client: ShipmentServiceClient,
   input: {
@@ -444,12 +571,22 @@ export async function transitionShipmentStatus(
       // mutually exclusive. It covers the manual shipment paths too.
       const withdrawn = await tx.salesOrder.findUnique({
         where: { id: shipment.orderId },
-        select: { withdrawalApprovedAt: true },
+        select: { withdrawalApprovedAt: true, status: true },
       })
       if (withdrawn?.withdrawalApprovedAt) {
         throw new Error(
           'This order\u2019s EU withdrawal request was approved; its shipments cannot be dispatched.',
         )
+      }
+      // o3d-4kfh r6 (Codex finding 4): NOT ON A CANCELLED ORDER. Read under the same order lock the
+      // cancel takes, so a cancel committing between the caller's read and this dispatch is honoured.
+      // Returned rather than thrown so a WMS-driven dispatch gets a clean, actionable failure that
+      // names the repair path instead of an exception.
+      if (withdrawn && SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES.has(String(withdrawn.status))) {
+        return {
+          success: false as const,
+          error: terminalOrderTransitionError(String(withdrawn.status)),
+        }
       }
 
       const lockedShipment = await loadShipmentTransitionContext(tx, shipmentId)
@@ -660,6 +797,17 @@ export async function transitionShipmentStatus(
     // PENDING shipment is deliberately NOT a commitment, those paths were all entitled to ignore it
     // while it was still pending.
     await lockSalesOrder(tx, shipment.orderId)
+    // o3d-4kfh r6 (Codex finding 4): a cancelled order's shipments do not advance either. Blocking
+    // only the dispatch would leave PENDING -> PICKING -> PACKED free to run on a cancelled sale,
+    // which is how a PICKING shipment ends up on a CANCELLED order in the first place — the state
+    // the component-graph guard then blocks on with no non-harmful exit.
+    const lockedOrder = await tx.salesOrder.findUnique({
+      where: { id: shipment.orderId },
+      select: { status: true },
+    })
+    if (lockedOrder && SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES.has(String(lockedOrder.status))) {
+      throw new Error(terminalOrderTransitionError(String(lockedOrder.status)))
+    }
     await tx.$queryRaw`SELECT id FROM shipments WHERE id = ${shipmentId} FOR UPDATE`
     const locked = await tx.shipment.findUnique({
       where: { id: shipmentId },

@@ -4,6 +4,7 @@ import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   confirmSalesOrderShipments,
+  discardCancelledOrderShipmentsInTx,
   reconcileOrderAfterShipment,
   transitionShipmentStatus,
   type ShipmentServiceClient,
@@ -20,7 +21,20 @@ type Order = {
   trackingNumber?: string | null
 }
 type OrderLine = { id: string; orderId: string; productId: string; qty: number; sku: string; description: string; cogsBase?: number | null }
-type Allocation = { id?: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number }
+type Allocation = {
+  id?: string
+  orderId: string
+  lineId: string
+  productId: string
+  warehouseId: string
+  qty: number
+  /**
+   * o3d-4kfh r6: the graph version this row was expanded against. The column is NOT NULL DEFAULT 0
+   * and `state.graphVersions` defaults to 0 as well, so an ordinary fixture is matched and the CAS
+   * is inert — a fixture has to say so explicitly to make it fire.
+   */
+  fulfillmentGraphVersion?: number
+}
 type Shipment = {
   id: string
   orderId: string
@@ -57,6 +71,11 @@ type State = {
   refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
   // Kit/BOM graph: productId -> its component requirements. Absent products are treated as SIMPLE.
   kits?: Record<string, Array<{ componentId: string; qty: number; sku?: string }>>
+  /** o3d-4kfh r6: productId -> `Product.fulfillmentGraphVersion`. Absent means 0. */
+  graphVersions?: Record<string, number>
+  /** o3d-4kfh r6: in-transaction audit rows, and the order they were written in. */
+  activityLogs?: Array<Record<string, unknown>>
+  txWriteOrder?: string[]
   shipments: Shipment[]
   shipmentLines: ShipmentLine[]
   stockLevels: StockLevel[]
@@ -103,6 +122,8 @@ function baseState(overrides: Partial<State> = {}): State {
     movements: [],
     cogsEntries: [],
     settings: { invoice_trigger: 'manual' },
+    activityLogs: [],
+    txWriteOrder: [],
     ...overrides,
   }
 }
@@ -153,7 +174,17 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       findMany: async ({ where }: { where: { orderId?: string; lineId?: { in: string[] }; id?: { in: string[] } } }) => state.lines
         .filter((line) => where.orderId == null || line.orderId === where.orderId)
         .filter((line) => where.id?.in == null || where.id.in.includes(line.id))
-        .map((line) => ({ id: line.id, productId: line.productId, qty: line.qty, sku: line.sku, description: line.description })),
+        // o3d-4kfh r6: `product: { select: { fulfillmentGraphVersion } }` is a REAL part of the
+        // integrity/coverage read. A double that omitted it would leave the CAS comparing every
+        // allocation against `undefined`, which is neither a match nor a mismatch it can report.
+        .map((line) => ({
+          id: line.id,
+          productId: line.productId,
+          qty: line.qty,
+          sku: line.sku,
+          description: line.description,
+          product: { fulfillmentGraphVersion: state.graphVersions?.[line.productId] ?? 0 },
+        })),
       update: async ({ where, data }: { where: { id: string }; data: { cogsBase?: number | null } }) => {
         const line = state.lines.find((row) => row.id === where.id)
         if (line) line.cogsBase = data.cogsBase
@@ -166,6 +197,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           return {
             id,
             type: 'KIT',
+            fulfillmentGraphVersion: state.graphVersions?.[id] ?? 0,
             productComponents: components.map((component) => ({
               componentId: component.componentId,
               qty: component.qty,
@@ -173,7 +205,12 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
             })),
           }
         }
-        return { id, type: 'SIMPLE', productComponents: [] }
+        return {
+          id,
+          type: 'SIMPLE',
+          fulfillmentGraphVersion: state.graphVersions?.[id] ?? 0,
+          productComponents: [],
+        }
       }),
     },
     orderAllocation: {
@@ -182,7 +219,12 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       // scoped to one shipment's lines pass on the strength of an unrelated allocation.
       findMany: async ({ where }: { where: { orderId: string; lineId?: { in: string[] } } }) => state.allocations
         .filter((allocation) => allocation.orderId === where.orderId)
-        .filter((allocation) => where.lineId?.in == null || where.lineId.in.includes(allocation.lineId)),
+        .filter((allocation) => where.lineId?.in == null || where.lineId.in.includes(allocation.lineId))
+        // The column is NOT NULL DEFAULT 0, so a real read never returns undefined.
+        .map((allocation) => ({
+          ...allocation,
+          fulfillmentGraphVersion: allocation.fulfillmentGraphVersion ?? 0,
+        })),
       findUnique: async ({ where }: { where: { lineId_warehouseId_productId: { lineId: string; warehouseId: string; productId: string } } }) => {
         const key = where.lineId_warehouseId_productId
         return state.allocations.find((allocation) => (
@@ -198,10 +240,31 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         .map((refundLine) => ({ salesOrderLineId: refundLine.salesOrderLineId, productId: refundLine.productId, qty: refundLine.qty })),
     },
     shipment: {
-      findMany: async ({ where, select }: { where: { orderId: string; status?: string }; select?: Record<string, boolean> }) => state.shipments
+      // o3d-4kfh r6: the `{ status: { in: [...] } }` shape is real — `discardCancelledOrderShipmentsInTx`
+      // asks for exactly PENDING/PICKING/PACKED, and a double that ignored it (or answered it with
+      // every shipment) could not tell a repair that spares SHIPPED from one that deletes it.
+      findMany: async ({ where, select }: {
+        where: { orderId: string; status?: string | { in: string[] } }
+        select?: Record<string, unknown>
+      }) => state.shipments
         .filter((shipment) => shipment.orderId === where.orderId)
-        .filter((shipment) => where.status == null || shipment.status === where.status)
+        .filter((shipment) => {
+          if (where.status == null) return true
+          return typeof where.status === 'string'
+            ? shipment.status === where.status
+            : where.status.in.includes(shipment.status)
+        })
         .map((shipment) => {
+          if (select?.lines) return {
+            id: shipment.id,
+            status: shipment.status,
+            warehouseId: shipment.warehouseId,
+            trackingNumber: shipment.trackingNumber,
+            shippingService: shipment.shippingService,
+            lines: state.shipmentLines
+              .filter((line) => line.shipmentId === shipment.id)
+              .map((line) => ({ id: line.id })),
+          }
           if (select?.warehouseId) return {
             warehouseId: shipment.warehouseId,
             trackingNumber: shipment.trackingNumber,
@@ -255,13 +318,18 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         }
         return { id: shipment.id }
       },
-      deleteMany: async ({ where }: { where: { orderId: string; status: string } }) => {
-        const pendingIds = state.shipments
-          .filter((shipment) => shipment.orderId === where.orderId && shipment.status === where.status)
+      deleteMany: async ({ where }: { where: { orderId?: string; status?: string; id?: { in: string[] } } }) => {
+        state.txWriteOrder?.push('shipment.deleteMany')
+        const doomedIds = state.shipments
+          .filter((shipment) => where.orderId == null || shipment.orderId === where.orderId)
+          .filter((shipment) => where.status == null || shipment.status === where.status)
+          .filter((shipment) => where.id == null || where.id.in.includes(shipment.id))
           .map((shipment) => shipment.id)
-        state.shipments = state.shipments.filter((shipment) => !pendingIds.includes(shipment.id))
-        state.shipmentLines = state.shipmentLines.filter((line) => !pendingIds.includes(line.shipmentId))
-        return { count: pendingIds.length }
+        state.shipments = state.shipments.filter((shipment) => !doomedIds.includes(shipment.id))
+        // The FK cascade takes the lines with it; leaving orphans behind would let a deleted
+        // shipment keep showing up in every shipmentLine read.
+        state.shipmentLines = state.shipmentLines.filter((line) => !doomedIds.includes(line.shipmentId))
+        return { count: doomedIds.length }
       },
       update: async ({ where, data }: { where: { id: string }; data: Partial<Shipment> }) => {
         const shipment = state.shipments.find((row) => row.id === where.id)
@@ -389,6 +457,13 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
     cogsEntry: {
       createMany: async ({ data }: { data: State['cogsEntries'] }) => {
         state.cogsEntries.push(...data)
+      },
+    },
+    activityLog: {
+      create: async ({ data }: { data: Record<string, unknown> }) => {
+        state.activityLogs?.push(data)
+        state.txWriteOrder?.push('activityLog.create')
+        return data
       },
     },
     setting: {
@@ -1343,4 +1418,305 @@ test('o3d-4kfh r4: DISPATCH is refused when the allocation row behind a commitme
   assert.match((result as { error: string }).error, /commit 2 unit\(s\) but only 0 are allocated there/)
   assert.equal(state.shipments[0].status, 'PACKED')
   assert.equal(state.movements.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r6 (Codex finding 1) — the UNIFORM RESCALE the proportionality backstop cannot see.
+//
+// r5 stated that `validateCommittedShipmentCoverage` was the correctness boundary. It is not.
+// Interleave an allocation with the component editor:
+//
+//   allocation reads 2xA + 1xB and computes A=2 / B=1;
+//   the editor sees no committed allocation (that transaction is still open) and rescales the kit
+//   to 4xA + 2xB;
+//   the allocation commits A=2 / B=1.
+//
+// Coverage against the NEW graph is 0.5 and the expected component set at coverage 0.5 is exactly
+// A=2 / B=1 — which is what is committed. The per-leaf dispatch cap sees neither leaf exceeding
+// A=4 / B=2. Both pass, and half the current kit ships. Proportionality against a MUTABLE current
+// graph cannot distinguish this race from a legitimate partial shipment, because on the numbers it
+// is not distinguishable. Only a version that moves under a uniform rescale can.
+// ---------------------------------------------------------------------------
+
+/**
+ * A KIT line of 1 whose allocation and PACKED shipment were both written against 2xA + 1xB, and
+ * whose live recipe is now the UNIFORM double 4xA + 2xB.
+ *
+ * `graphVersion` is the product's current version; the allocation rows stamp 0 (what the allocation
+ * read). Passing 0 models "the edit never happened"; passing 1 models the race.
+ */
+function uniformlyRescaledKitState(graphVersion: number) {
+  return baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 4, sku: 'COMP-A' }, { componentId: 'comp-b', qty: 2, sku: 'COMP-B' }] },
+    graphVersions: { 'kit-1': graphVersion },
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-a', warehouseId: 'warehouse-1', qty: 2, fulfillmentGraphVersion: 0 },
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-b', warehouseId: 'warehouse-1', qty: 1, fulfillmentGraphVersion: 0 },
+    ],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [
+      { id: 'shipment-line-a', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-a', qty: 2 },
+      { id: 'shipment-line-b', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-b', qty: 1 },
+    ],
+    stockLevels: [
+      { productId: 'comp-a', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 },
+      { productId: 'comp-b', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 },
+    ],
+    costLayers: [
+      { id: 'layer-a', productId: 'comp-a', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 },
+      { id: 'layer-b', productId: 'comp-b', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 },
+    ],
+  })
+}
+
+test('o3d-4kfh r6 (finding 1): a uniform kit rescale DISPATCHES CLEANLY when only proportionality guards it', async () => {
+  // THE DEMONSTRATION, not an aspiration: with the version stamp matching (as it did before r6,
+  // when there was no stamp at all) every check IMS has passes and the goods leave. This test is
+  // what makes the refusal below meaningful — without it, "dispatch is refused" would prove nothing
+  // about WHY.
+  const state = uniformlyRescaledKitState(0)
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(
+    result.success,
+    true,
+    result.success ? undefined : `proportionality was supposed to accept this: ${result.error}`,
+  )
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+  assert.equal(state.stockLevels[0].quantity, 0, 'half a kit really did ship')
+})
+
+test('o3d-4kfh r6 (finding 1): the graph-version CAS refuses that dispatch', async () => {
+  const state = uniformlyRescaledKitState(1)
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false, 'a rescaled kit must not dispatch against rows from the old recipe')
+  assert.match(
+    (result as { error: string }).error,
+    /older version of that product's component graph/,
+  )
+  assert.match((result as { error: string }).error, /Re-allocate this order/, 'and it must name the exit')
+  assert.equal(state.shipments[0].status, 'PACKED', 'nothing transitioned')
+  assert.equal(state.movements.length, 0, 'and no stock moved')
+  assert.equal(state.stockLevels[0].quantity, 2)
+})
+
+test('o3d-4kfh r6 (finding 1): the CAS also refuses the PENDING -> PICKING commitment', async () => {
+  // The commitment seam, not just the irreversible act — a shipment must not BECOME committed
+  // against rows derived from a recipe that no longer exists.
+  const state = uniformlyRescaledKitState(1)
+  state.shipments[0].status = 'PENDING'
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-1', targetStatus: 'PICKING' }),
+    /older version of that product's component graph/,
+  )
+  assert.equal(state.shipments[0].status, 'PENDING', 'the status flip is rolled back with the transaction')
+})
+
+test('o3d-4kfh r6 (finding 1): confirmSalesOrderShipments refuses a stale set rather than drafting from it', async () => {
+  // Reached through validateAllocationIntegrity, so the operator hits this at draft time instead of
+  // the warehouse hitting it at Start Picking.
+  const state = uniformlyRescaledKitState(1)
+  state.shipments = []
+  state.shipmentLines = []
+
+  await assert.rejects(
+    () => confirmSalesOrderShipments(createClient(state), 'order-1'),
+    /older version of that product's component graph/,
+  )
+})
+
+test('o3d-4kfh r6 (finding 1): a matched stamp is inert — healthy orders still pack and dispatch', async () => {
+  // The guard must not become a dead end. Same kit, rows written against the CURRENT recipe and
+  // stamped with the CURRENT version.
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 4, sku: 'COMP-A' }, { componentId: 'comp-b', qty: 2, sku: 'COMP-B' }] },
+    graphVersions: { 'kit-1': 7 },
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-a', warehouseId: 'warehouse-1', qty: 4, fulfillmentGraphVersion: 7 },
+      { orderId: 'order-1', lineId: 'line-1', productId: 'comp-b', warehouseId: 'warehouse-1', qty: 2, fulfillmentGraphVersion: 7 },
+    ],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [
+      { id: 'shipment-line-a', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-a', qty: 4 },
+      { id: 'shipment-line-b', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-b', qty: 2 },
+    ],
+    stockLevels: [
+      { productId: 'comp-a', warehouseId: 'warehouse-1', quantity: 4, reservedQty: 4 },
+      { productId: 'comp-b', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 },
+    ],
+    costLayers: [
+      { id: 'layer-a', productId: 'comp-a', warehouseId: 'warehouse-1', remainingQty: 4, unitCostBase: 5 },
+      { id: 'layer-b', productId: 'comp-b', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 },
+    ],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true, result.success ? undefined : result.error)
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r6 (Codex finding 4) — a cancelled order's shipments neither advance nor dispatch, and
+// there is an idempotent repair that removes them.
+//
+// r5 advertised dispatch as the exit for a PICKING/PACKED shipment blocking a component-graph edit,
+// and its guard test explicitly relied on dispatch not requiring an open order. On a CANCELLED
+// order that advised shipping goods for a cancelled sale — worse than the block — and the
+// alternative it named (cancel the order) is not a transition CANCELLED has, so there was no exit
+// at all.
+// ---------------------------------------------------------------------------
+
+function cancelledOrderWithShipment(shipmentStatus: string) {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'CANCELLED' }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: shipmentStatus, trackingNumber: 'TRACK-1', shippingService: 'DPD' }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+  return state
+}
+
+test('o3d-4kfh r6 (finding 4): a CANCELLED order\'s PACKED shipment cannot be dispatched', async () => {
+  const state = cancelledOrderWithShipment('PACKED')
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false, 'dispatching would ship goods for a cancelled sale')
+  assert.match((result as { error: string }).error, /This order is CANCELLED/)
+  assert.match((result as { error: string }).error, /Discard shipments/, 'and it must name the repair path')
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.movements.length, 0, 'no stock moved')
+  assert.equal(state.stockLevels[0].quantity, 2)
+})
+
+test('o3d-4kfh r6 (finding 4): a CANCELLED order\'s PENDING shipment cannot even start picking', async () => {
+  // Blocking only the dispatch would leave PENDING -> PICKING -> PACKED free to run on a cancelled
+  // sale, which is how a PICKING shipment reaches a CANCELLED order in the first place.
+  const state = cancelledOrderWithShipment('PENDING')
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-1', targetStatus: 'PICKING' }),
+    /This order is CANCELLED/,
+  )
+  assert.equal(state.shipments[0].status, 'PENDING')
+})
+
+test('o3d-4kfh r6 (finding 4): a LIVE order is unaffected — the refusal is scoped to cancelled', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true, result.success ? undefined : result.error)
+})
+
+test('o3d-4kfh r6 (finding 4): discarding a cancelled order\'s shipments deletes the non-dispatched ones and KEEPS the shipped one', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'CANCELLED' }],
+    shipments: [
+      { id: 'ship-pending', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null },
+      { id: 'ship-picking', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PICKING', trackingNumber: 'TRACK-PICKING', shippingService: 'DPD' },
+      { id: 'ship-packed', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+      { id: 'ship-shipped', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-SHIPPED', shippingService: 'DPD' },
+    ],
+    shipmentLines: [
+      { id: 'sl-1', shipmentId: 'ship-picking', lineId: 'line-1', productId: 'product-1', qty: 1 },
+      { id: 'sl-2', shipmentId: 'ship-shipped', lineId: 'line-1', productId: 'product-1', qty: 1 },
+    ],
+  })
+  const client = createClient(state)
+
+  const result = await (client as unknown as { $transaction: (cb: (tx: unknown) => Promise<unknown>) => Promise<{ discarded: Array<{ id: string }> }> })
+    .$transaction((tx) => discardCancelledOrderShipmentsInTx(tx as never, 'order-1', { userId: 'user-1' }))
+
+  assert.deepEqual(
+    result.discarded.map((row) => row.id).sort(),
+    ['ship-packed', 'ship-pending', 'ship-picking'],
+  )
+  assert.deepEqual(
+    state.shipments.map((row) => row.id),
+    ['ship-shipped'],
+    'the dispatched shipment is evidence the sub-ledger resolves through — a refund reverses it, not this',
+  )
+  assert.deepEqual(state.shipmentLines.map((row) => row.id), ['sl-2'], 'and the cascade took the discarded lines')
+  assert.equal(state.stockLevels[0].reservedQty, 2, 'reservedQty is untouched — none of these held any')
+  assert.equal(state.activityLogs?.length, 1, 'one durable audit row')
+  const entry = state.activityLogs![0] as {
+    action: string
+    metadata: { discardedTrackingNumbers: string[] }
+  }
+  assert.equal(entry.action, 'cancelled_order_shipments_discarded')
+  assert.deepEqual(
+    entry.metadata.discardedTrackingNumbers,
+    ['TRACK-PICKING'],
+    'naming the purchased label IMS no longer references',
+  )
+  assert.deepEqual(
+    state.txWriteOrder,
+    ['activityLog.create', 'shipment.deleteMany'],
+    'the evidence is persisted BEFORE the rows it describes are destroyed',
+  )
+})
+
+test('o3d-4kfh r6 (finding 4): the discard is IDEMPOTENT — a second run writes nothing at all', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'CANCELLED' }],
+    shipments: [{ id: 'ship-packed', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [],
+  })
+  const client = createClient(state) as unknown as {
+    $transaction: (cb: (tx: unknown) => Promise<unknown>) => Promise<{ discarded: Array<{ id: string }> }>
+  }
+
+  const first = await client.$transaction((tx) => discardCancelledOrderShipmentsInTx(tx as never, 'order-1'))
+  const second = await client.$transaction((tx) => discardCancelledOrderShipmentsInTx(tx as never, 'order-1'))
+
+  assert.equal(first.discarded.length, 1)
+  assert.deepEqual(second.discarded, [], 'nothing left to discard')
+  assert.equal(state.activityLogs?.length, 1, 'and no second audit row — a retry must not create noise')
+  assert.deepEqual(state.txWriteOrder, ['activityLog.create', 'shipment.deleteMany'], 'exactly one write pair, from the first run')
+})
+
+test('o3d-4kfh r6 (finding 4): the discard REFUSES on an order that is not cancelled', async () => {
+  // This is not a general per-shipment cancel (o3d-tv1q is still open). Cancelling the order is the
+  // route for a live one, and it releases the reservations in the same transaction.
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    shipments: [{ id: 'ship-packed', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [],
+  })
+  const client = createClient(state) as unknown as {
+    $transaction: (cb: (tx: unknown) => Promise<unknown>) => Promise<unknown>
+  }
+
+  await assert.rejects(
+    () => client.$transaction((tx) => discardCancelledOrderShipmentsInTx(tx as never, 'order-1')),
+    /Only a cancelled order's shipments can be discarded/,
+  )
+  assert.deepEqual(state.shipments.map((row) => row.id), ['ship-packed'])
+  assert.equal(state.activityLogs?.length, 0)
 })
