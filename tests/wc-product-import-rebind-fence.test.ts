@@ -141,7 +141,25 @@ const txClient = {
       return create
     },
   },
-  shoppingSyncLog: { create: async ({ data }: { data: Row }) => { state.syncLogs.push(data); return data } },
+  shoppingSyncLog: {
+    // `connector` is @default("woocommerce"); production never sets it and the o3d-fjqk
+    // structure-conflict delete filters on it, so the double applies the default too.
+    create: async ({ data }: { data: Row }) => {
+      const row = { connector: 'woocommerce', ...data }
+      state.syncLogs.push(row)
+      return row
+    },
+    deleteMany: async ({ where }: { where: Row }) => {
+      const matches = (row: Row) => Object.entries(where).every(([key, value]) => {
+        if (key !== 'OR') return row[key] === value
+        return (value as Row[]).some((clause) => Object.entries(clause).every(([k, v]) => row[k] === v))
+      })
+      const kept = state.syncLogs.filter((row) => !matches(row))
+      const removed = state.syncLogs.length - kept.length
+      state.syncLogs.splice(0, state.syncLogs.length, ...kept)
+      return { count: removed }
+    },
+  },
   setting: {
     upsert: async () => ({}),
     // The snapshot read, taken before any remote call.

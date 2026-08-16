@@ -32,7 +32,13 @@ import {
   deriveLifecycleStatusFromWooStatus,
   deriveWooStatusFromLifecycleStatus,
 } from '@/lib/products/lifecycle'
-import { isComponentProductType } from '@/lib/products/type-transforms'
+import {
+  effectiveImsProductType,
+  isConnectorTypeWriteSuppressed,
+  refuseVariationAdoption,
+  summarizeWcProductStructureConflicts,
+  type WcProductStructureConflict,
+} from './product-structure-policy'
 import type { Prisma, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 
@@ -51,43 +57,31 @@ const PRODUCT_WRITE_TX_TIMEOUT_MS = 60_000
 const PRODUCT_WRITE_TX_MAX_WAIT_MS = 15_000
 
 /**
- * A connector may never downgrade an IMS product out of KIT or BOM (o3d-y89x).
+ * A connector may never silently destroy IMS-owned structure (o3d-y89x, o3d-8s89, o3d-h2cz).
  *
- * KIT/BOM composition is IMS-owned fulfilment structure. WooCommerce has no concept of it:
- * its `simple`/`variable` flag is an ABSENCE of information about composition, not an
- * assertion that the product has none. Writing the WC-derived type unconditionally — which
- * this sync did on both the parent update and the variation update — had two consequences
- * on any KIT/BOM whose SKU matches a WC product:
+ * The per-type reasoning lives in ./product-structure-policy.ts, next to the allow-list it
+ * justifies. What this file adds is the two places the policy is applied — the parent update
+ * and applyVariations — and the answer to the question the policy cannot answer on its own:
+ * what happens to the WooCommerce data the policy refuses to apply.
  *
- *   1. KIT-ness vanished with no guard at all. Every in-flight order for that kit stopped
- *      expanding into components and started requiring the parent as a fulfilment leaf,
- *      retroactively — the exact corruption the editor and the CSV import both refuse
- *      (validateProductStructureChange / o3d-4kfh, o3d-w998).
- *   2. It wrote type=SIMPLE while LEAVING the ProductComponent rows in place: a SIMPLE
- *      product with components, the state o3d-w998 stops the CSV import from creating.
- *      `validateProductStructureChange`'s `clearComponents` never runs on this path.
+ * Two outcomes, and the line between them is whether anything went UNAPPLIED:
  *
- * So the type is left alone and the rest of the payload (price, stock, name, dimensions,
- * trade fields, mapping) still applies. Refusing the whole row instead would be worse: a
- * kit whose WC twin is `simple` is an ordinary, supported catalogue shape, and it would
- * stop receiving price and status updates forever.
+ *   - A suppressed `type` write with nothing left over is a WARNING and the sync SUCCEEDS.
+ *     An IMS KIT whose WooCommerce twin is `simple` is the ordinary, correct pairing for a
+ *     bundle; refusing it would stop that product receiving price and status updates
+ *     forever, which is strictly worse than the type being out of step.
+ *   - A WooCommerce object that now exists in WooCommerce and NOWHERE in IMS is a
+ *     CONFLICT: the sync records it durably, does not mark the product SYNCED, and reports
+ *     failure so the bulk cursor does not advance past it. See recordStructureConflicts.
  *
- * Deliberately NOT symmetrical with the create branch: a brand-new IMS row has no
- * composition to protect, so a create takes the WooCommerce type as given.
- *
- * The predicate is `isComponentProductType`, the same KIT|BOM set the editor's structure
- * validator uses to decide whether components must be cleared — one definition of "this
- * type owns composition", not a second copy that can drift.
+ * Deliberately NOT symmetrical with the create branch: a brand-new IMS row has no structure
+ * to protect, so a create takes the WooCommerce type as given.
  */
-function shouldPreserveImsProductType(existing: { type: ProductType }): boolean {
-  return isComponentProductType(existing.type)
-}
 
 /**
- * Emitted once per product per sync, at WARNING, whenever the rule above suppresses a write.
- * Carries everything needed to find the pair by hand: both ids, the SKU, the IMS type kept
- * and the WC type that was refused. Silence would make the connector look like it agreed
- * with WooCommerce.
+ * Emitted once per suppressed write, at WARNING. Carries everything needed to find the pair
+ * by hand: both ids, the SKU, the IMS type kept and the WC type that was refused. Silence
+ * would make the connector look like it agreed with WooCommerce.
  */
 function warnImsProductTypePreserved(args: {
   imsProductId: string
@@ -97,13 +91,87 @@ function warnImsProductTypePreserved(args: {
   wcType: string | undefined
   suppressedType: string
 }): void {
-  console.warn('[woocommerce-product-sync] kept IMS product type; connector may not downgrade KIT/BOM', {
+  console.warn('[woocommerce-product-sync] kept IMS product type; connector may not overwrite IMS structure', {
     sku: args.sku,
     imsProductId: args.imsProductId,
     imsType: args.imsType,
     wcProductId: String(args.wcProductId),
     wcType: args.wcType ?? null,
     suppressedType: args.suppressedType,
+  })
+}
+
+/**
+ * The durable, operator-facing record of a structural conflict, and its resolution.
+ *
+ * A `console.warn` is invisible inside the app: every sync of the pair logs it again and
+ * nobody ever sees one (o3d-fjqk). This writes the conflict where the exception inbox
+ * already looks — `/sync/exceptions` reads QUARANTINED FROM_CONNECTOR Product rows — reusing
+ * the same ShoppingSyncLog + QUARANTINED shape the parked WooCommerce refunds use rather
+ * than inventing a second mechanism.
+ *
+ * Three properties matter, and each is a line of code here:
+ *
+ *   1. DEDUPLICATED. The delete runs on EVERY sync, conflict or not, so a product cannot
+ *      accumulate one open row per reconcile run. It is keyed on either side of the pairing
+ *      (the IMS row OR the WooCommerce object) so a re-pairing cannot strand the old row.
+ *      Both arms are indexed — `[connector, entityType, entityId]` and
+ *      `[connector, externalId, createdAt]` — so this stays a BitmapOr of two index scans on
+ *      a table that grows by a row per sync, rather than a scan of the whole sync log.
+ *   2. SELF-RESOLVING. Because the delete is unconditional, the sync that finally succeeds —
+ *      after an operator converts the IMS product or fixes the SKU in WooCommerce — clears
+ *      the exception as a side effect of working. There is no "acknowledge" button to click
+ *      and therefore no way to acknowledge a conflict that is still live.
+ *   3. NOT SYNCED. The SYNCED log row is written only on the clean path. A conflicted
+ *      product is not a synced product, and the caller's cursor decision reads that.
+ */
+const WC_PRODUCT_STRUCTURE_CONFLICT_STATUS = 'QUARANTINED' as const
+
+async function recordStructureConflicts(
+  tx: Prisma.TransactionClient,
+  args: {
+    productId: string
+    wcProductId: number
+    conflicts: readonly WcProductStructureConflict[],
+  },
+): Promise<void> {
+  await tx.shoppingSyncLog.deleteMany({
+    where: {
+      connector: 'woocommerce',
+      direction: 'FROM_CONNECTOR',
+      entityType: 'Product',
+      status: WC_PRODUCT_STRUCTURE_CONFLICT_STATUS,
+      OR: [{ entityId: args.productId }, { externalId: String(args.wcProductId) }],
+    },
+  })
+
+  if (args.conflicts.length === 0) {
+    await tx.shoppingSyncLog.create({
+      data: {
+        direction: 'FROM_CONNECTOR',
+        status: 'SYNCED',
+        entityType: 'Product',
+        entityId: args.productId,
+        externalId: String(args.wcProductId),
+        syncedAt: new Date(),
+      },
+    })
+    return
+  }
+
+  await tx.shoppingSyncLog.create({
+    data: {
+      direction: 'FROM_CONNECTOR',
+      status: WC_PRODUCT_STRUCTURE_CONFLICT_STATUS,
+      entityType: 'Product',
+      entityId: args.productId,
+      externalId: String(args.wcProductId),
+      errorMessage: summarizeWcProductStructureConflicts(args.conflicts),
+      // Same JSON round-trip the TO_CONNECTOR log uses: the structured detail survives for
+      // anyone reading the row directly, without the readonly tuple types fighting Prisma's
+      // InputJsonValue.
+      payload: JSON.parse(JSON.stringify({ reason: 'product_structure_conflict', conflicts: args.conflicts })),
+    },
   })
 }
 
@@ -569,7 +637,7 @@ export async function syncWcProductToIms(
     )
 
     // --- Local writes: all of them, in ONE transaction ---
-    const { syncedProductId, syncedSku, tradeChanges, wasUpdate } = await db.$transaction(
+    const { syncedProductId, syncedSku, tradeChanges, wasUpdate, structureConflicts } = await db.$transaction(
       async (tx: Prisma.TransactionClient) => {
         // Fence step 3 (o3d-mlc7): the settings lock comes FIRST, before any per-SKU lock.
         // Both families are taken inside this transaction, so a fixed order between them is
@@ -620,16 +688,22 @@ export async function syncWcProductToIms(
         let productId: string
         let productSku: string
         let changes: WcTradeFieldChange[] = []
-        /** Set when the o3d-y89x rule suppressed a type write on the parent row. */
-        let parentTypePreserved = false
+        /**
+         * The type the parent row actually carries after this transaction — the incoming
+         * WooCommerce type when the connector may write it, the existing IMS one when it may
+         * not. The variation decision below turns on THIS, not on the WooCommerce type: only
+         * a VARIABLE row may be a parent.
+         */
+        let effectiveParentType: ProductType = productType
+        const structureConflicts: WcProductStructureConflict[] = []
 
         if (existing) {
-          // o3d-y89x: KIT/BOM composition is IMS-owned; a connector may not downgrade out of
-          // it. `type` is therefore omitted from the update entirely on such a row — omitted,
-          // not set to `existing.type`, so the column is never named in the UPDATE at all —
-          // while every other field below still applies.
-          const preserveType = shouldPreserveImsProductType(existing)
-          parentTypePreserved = preserveType
+          // o3d-y89x: the row's structural identity is IMS-owned; a connector may not decide
+          // it. `type` is therefore omitted from the update entirely on a protected row —
+          // omitted, not set to `existing.type`, so the column is never named in the UPDATE at
+          // all — while every other field below still applies.
+          const preserveType = isConnectorTypeWriteSuppressed(existing.type, productType)
+          effectiveParentType = effectiveImsProductType(existing.type, productType)
           if (preserveType) {
             warnImsProductTypePreserved({
               imsProductId: existing.id,
@@ -721,28 +795,45 @@ export async function syncWcProductToIms(
 
         // --- Variations (VARIABLE products) — already fetched, just applied here ---
         //
-        // Skipped when the parent kept a KIT/BOM type it was not allowed to lose (o3d-y89x).
-        // applyVariations writes `parentId` on every child, and IMS only accepts a VARIABLE
-        // product as a parent (validateProductStructureChange). Attaching them to a row we
-        // have just decided stays a kit would swap one corruption for another — children
-        // pointing at a non-variable parent — so the children are left alone and the warning
-        // above is the operator's signal that this pairing needs a human decision.
-        if (isVariable && !parentTypePreserved) {
-          await applyVariations(tx, variations, productId, wcProduct.name, imsCategoryId)
+        // Skipped when the parent row did NOT end up VARIABLE (o3d-y89x). applyVariations
+        // writes `parentId` on every child, and IMS only accepts a VARIABLE product as a
+        // parent (validateProductStructureChange). Attaching children to a row we have just
+        // decided stays a KIT, a VARIANT or a NON_INVENTORY would swap one corruption for
+        // another — children pointing at a non-variable parent.
+        //
+        // Leaving them out is the lesser of the two, but it is NOT free: those WooCommerce
+        // variations now exist nowhere in IMS, and order import resolves lines by SKU, so
+        // each one becomes an order line with no product and no inventory allocation. That
+        // is a conflict, not a silent skip — hence the durable record below and the failure
+        // this function returns.
+        if (isVariable && effectiveParentType !== 'VARIABLE') {
+          structureConflicts.push({
+            kind: 'variations_not_imported',
+            sku: productSku,
+            imsProductId: productId,
+            imsType: effectiveParentType,
+            wcObjectId: String(wcProduct.id),
+            detail: `WooCommerce product ${wcProduct.id} ("${productSku}") is variable with `
+              + `${variations.length} variation(s), but IMS product ${productId} is ${effectiveParentType}, `
+              + 'which cannot be a variable parent. None of its variations were imported. '
+              + 'Convert the IMS product to a variable parent, or point the WooCommerce product at a different SKU.',
+          })
+        } else if (isVariable) {
+          structureConflicts.push(
+            ...await applyVariations(tx, variations, productId, wcProduct.name, imsCategoryId),
+          )
         }
 
         // --- Product options (variation attributes) ---
         await applyProductOptions(tx, productId, variationAttrs)
 
-        await tx.shoppingSyncLog.create({
-          data: {
-            direction: 'FROM_CONNECTOR',
-            status: 'SYNCED',
-            entityType: 'Product',
-            entityId: productId,
-            externalId: String(wcProduct.id),
-            syncedAt: new Date(),
-          },
+        // SYNCED on the clean path, a deduplicated exception-inbox row otherwise — and in
+        // BOTH cases any previously recorded conflict for this pairing is cleared, so a
+        // resolved conflict leaves the inbox by itself.
+        await recordStructureConflicts(tx, {
+          productId,
+          wcProductId: wcProduct.id,
+          conflicts: structureConflicts,
         })
 
         return {
@@ -750,6 +841,7 @@ export async function syncWcProductToIms(
           syncedSku: productSku,
           tradeChanges: changes,
           wasUpdate: Boolean(existing),
+          structureConflicts,
         }
       },
       { timeout: PRODUCT_WRITE_TX_TIMEOUT_MS, maxWait: PRODUCT_WRITE_TX_MAX_WAIT_MS },
@@ -777,6 +869,38 @@ export async function syncWcProductToIms(
           .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to}`)
           .join(', ')}`,
       })
+    }
+
+    // An unresolved structural conflict is NOT a successful sync (o3d-y89x / o3d-fjqk).
+    //
+    // The parent row's own fields committed above — a kit paired with a WooCommerce product
+    // must keep receiving price and status updates — but WooCommerce objects went unapplied,
+    // so this is reported as a failure. Three things follow from that, and all three are the
+    // point:
+    //
+    //   - syncAllWcProducts pushes it into `result.errors`, and the cursor is only advanced
+    //     after a fully clean run. So the reconcile does not step past a product whose
+    //     children were never imported; it re-attempts it every run until it is resolved.
+    //   - the webhook path acknowledges it (permanent) and logs at ERROR, instead of retrying
+    //     ~24 times into the dead-letter queue. It IS deterministic: re-delivering the same
+    //     payload against the same catalogue reaches the same refusal, so retrying tells
+    //     nobody anything the first attempt did not.
+    //   - the exception inbox row written inside the transaction is the operator's copy.
+    //
+    // No FAILED sync-log row is written here — the QUARANTINED row above IS the record, and
+    // a second row per run would make the inbox count the same conflict repeatedly.
+    if (structureConflicts.length > 0) {
+      const summary = summarizeWcProductStructureConflicts(structureConflicts)
+      await logActivity({
+        entityType: 'PRODUCT',
+        entityId: syncedProductId,
+        action: 'wc_product_structure_conflict',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `WooCommerce product sync could not apply structure to ${syncedSku}: ${summary}`,
+        resolveUser: false,
+      })
+      return { success: false, error: summary, permanent: true }
     }
 
     return { success: true }
@@ -910,7 +1034,15 @@ async function updateProductGuardingOwnership(
   })
 }
 
-/** Write already-fetched variations inside the caller's transaction. */
+/**
+ * Write already-fetched variations inside the caller's transaction.
+ *
+ * Returns the variations it REFUSED to apply (o3d-h2cz). Refusing is deliberately not the
+ * same as throwing: an ownership conflict aborts the whole import because it can also hit
+ * the parent row, where there is nothing to skip, whereas a structurally incompatible
+ * variation is one row out of potentially hundreds. Skipping it keeps every healthy sibling
+ * updated, and the returned conflict is what stops the sync being reported as clean.
+ */
 async function applyVariations(
   tx: Prisma.TransactionClient,
   variations: WcVariation[],
@@ -920,11 +1052,12 @@ async function applyVariations(
   // category is applied — a variant's category is never cleared by inheritance, even
   // if the parent currently resolves to no category (matches the backfill's policy).
   parentCategoryId: string | null | undefined,
-) {
+): Promise<WcProductStructureConflict[]> {
+  const conflicts: WcProductStructureConflict[] = []
   const entries = variations
     .map((v) => ({ v, sku: asTrimmedString(v.sku) }))
     .filter((entry): entry is { v: WcVariation; sku: string } => Boolean(entry.sku)) // skip variations without SKU
-  if (entries.length === 0) return
+  if (entries.length === 0) return conflicts
 
   // One lookup for all variant SKUs rather than one per variant. This runs inside a
   // transaction holding row locks, so every saved round trip shortens the lock hold.
@@ -932,6 +1065,22 @@ async function applyVariations(
     where: { sku: { in: entries.map((entry) => entry.sku) } },
   })
   const existingBySku = new Map(existingRows.map((row) => [row.sku, row]))
+
+  // Which of those candidate rows are themselves parents (o3d-h2cz). One extra query for the
+  // whole batch, and only when there is something to ask about. It cannot be answered from
+  // the rows already in hand — a row's children are different rows, with different SKUs —
+  // and it cannot be inferred from `type`, because the shape being guarded against is
+  // precisely a row whose type does not admit that it has children.
+  const candidateIds = existingRows.map((row) => row.id)
+  const childRows = candidateIds.length > 0
+    ? await tx.product.findMany({
+      where: { parentId: { in: candidateIds } },
+      select: { parentId: true },
+    })
+    : []
+  const rowsWithChildren = new Set(
+    childRows.map((row) => row.parentId).filter((id): id is string => Boolean(id)),
+  )
 
   // Every WC variation id this payload maps to each SKU (o3d-fsi). WC permits one SKU on
   // several variations of a parent, and the sync has always resolved that last-one-wins —
@@ -976,12 +1125,36 @@ async function applyVariations(
       const claimants = claimantsBySku.get(sku) ?? new Set([BigInt(v.id)])
       assertWcRowNotClaimedByAnotherWcObject(existing, claimants)
 
-      // Same rule as the parent branch (o3d-y89x): a WC variation may not flatten an IMS
-      // KIT/BOM into a VARIANT. This one is not even a conflict — a KIT or BOM sitting under
-      // a VARIABLE parent is a first-class IMS shape (a "bundle variant";
+      // A SKU match is evidence of identity, not proof of it (o3d-h2cz). The ownership check
+      // above only asks whether ANOTHER WooCommerce object owns the row and passes an unmapped
+      // one straight through — that is the initial-import takeover path. So an IMS-native row
+      // that merely shares a SKU was silently reparented and remapped, which the o3d-y89x type
+      // guard did not stop: it suppressed the `type` write and let `parentId` through.
+      const refusal = refuseVariationAdoption({
+        row: existing,
+        imsParentId,
+        rowHasChildren: rowsWithChildren.has(existing.id),
+      })
+      if (refusal) {
+        conflicts.push({
+          kind: 'variation_row_refused',
+          sku,
+          imsProductId: existing.id,
+          imsType: existing.type,
+          wcObjectId: String(v.id),
+          detail: `WooCommerce variation ${v.id} matched SKU "${sku}", but ${refusal.detail} `
+            + 'The variation was not imported.',
+        })
+        continue
+      }
+
+      // Same rule as the parent branch (o3d-y89x): a WC variation may not flatten a protected
+      // IMS type into a VARIANT. For KIT/BOM this is not even a conflict — a KIT or BOM sitting
+      // under a VARIABLE parent is a first-class IMS shape (a "bundle variant";
       // canTypeHaveVariableParent admits VARIANT, KIT and BOM), so `parentId` and everything
-      // else still apply and only the type write is dropped.
-      const preserveType = shouldPreserveImsProductType(existing)
+      // else still apply and only the type write is dropped. The types for which it WOULD be a
+      // conflict never get here — refuseVariationAdoption has already turned them away.
+      const preserveType = isConnectorTypeWriteSuppressed(existing.type, 'VARIANT')
       if (preserveType) {
         warnImsProductTypePreserved({
           imsProductId: existing.id,
@@ -1046,6 +1219,8 @@ async function applyVariations(
       existingBySku.set(sku, created)
     }
   }
+
+  return conflicts
 }
 
 /** Write the parent's variation attributes as ProductOptions, inside the caller's transaction. */

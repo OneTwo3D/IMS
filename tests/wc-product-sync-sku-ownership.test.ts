@@ -121,10 +121,22 @@ const productDelegate = {
   findUnique: async ({ where }: { where: { id: string } }) =>
     state.products.find((row) => row.id === where.id) ?? null,
   updateMany: async ({ where, data }: { where: Row; data: Row }) => updateManyMatching(where, data),
-  findMany: async ({ where }: { where?: { sku?: { in?: unknown[] } } } = {}) => {
-    const wanted = where?.sku?.in
-    if (!Array.isArray(wanted)) return state.products.map((row) => ({ ...row }))
-    return state.products.filter((row) => wanted.includes(row.sku)).map((row) => ({ ...row }))
+  // Two queries: candidate rows by SKU, and (o3d-h2cz) the children of those candidates by
+  // parentId. An unrecognised `where` throws rather than returning everything, so a query
+  // this double does not actually model can never quietly answer "yes" or "no".
+  findMany: async ({ where }: { where?: Row } = {}) => {
+    const skuIn = (where?.sku as { in?: unknown[] } | undefined)?.in
+    if (Array.isArray(skuIn)) {
+      return state.products.filter((row) => skuIn.includes(row.sku)).map((row) => ({ ...row }))
+    }
+    const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
+    if (Array.isArray(parentIn)) {
+      return state.products
+        .filter((row) => row.parentId != null && parentIn.includes(row.parentId))
+        .map((row) => ({ ...row }))
+    }
+    if (where === undefined) return state.products.map((row) => ({ ...row }))
+    throw new Error(`product.findMany double got an unmodelled where: ${JSON.stringify(where)}`)
   },
   create: async ({ data }: { data: Row }) => {
     const row = { id: `ims-${nextId++}`, ...data }
@@ -149,9 +161,23 @@ const txClient = {
     },
   },
   shoppingSyncLog: {
+    // `connector` is @default("woocommerce") and production never sets it; the delete below
+    // filters on it, so the double has to apply the default or the dedup silently no-ops.
     create: async ({ data }: { data: Row }) => {
-      state.syncLogs.push(data)
-      return data
+      const row = { connector: 'woocommerce', ...data }
+      state.syncLogs.push(row)
+      return row
+    },
+    /** The structure-conflict dedup/resolution delete (o3d-fjqk). */
+    deleteMany: async ({ where }: { where: Row }) => {
+      const matches = (row: Row) => Object.entries(where).every(([key, value]) => {
+        if (key !== 'OR') return row[key] === value
+        return (value as Row[]).some((clause) => Object.entries(clause).every(([k, v]) => row[k] === v))
+      })
+      const kept = state.syncLogs.filter((row) => !matches(row))
+      const removed = state.syncLogs.length - kept.length
+      state.syncLogs.splice(0, state.syncLogs.length, ...kept)
+      return { count: removed }
     },
   },
   setting: {
@@ -232,6 +258,9 @@ function variableProduct(overrides: Partial<Row> = {}): WcFullProduct {
 
 function imsRow(row: Row): Row {
   return {
+    // `type` is NOT NULL in the schema, and o3d-h2cz's adoption rules read it. A seed without
+    // one is a row that cannot exist, and would exercise the policy against `undefined`.
+    type: 'SIMPLE',
     description: null,
     imageUrl: null,
     weight: null,

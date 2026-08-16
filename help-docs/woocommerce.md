@@ -150,6 +150,23 @@ The **Products** tab controls bidirectional product synchronisation.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 - Variation attributes are synced for the options panel
 
+### What the connector will NOT change
+
+WooCommerce models two product shapes (`simple`, `variable`); IMS models six. A WooCommerce type is therefore an *absence* of information about everything else IMS knows, never an assertion that the product has none — so the import may set a product's type only when the existing IMS row is **SIMPLE**. On any other type the type write is dropped and everything else in the payload (name, price, images, dimensions, trade fields, category, WooCommerce mapping) still applies:
+
+| Existing IMS type | Why the connector may not change it |
+|---|---|
+| KIT / BOM | Composition is IMS-owned and WooCommerce cannot express it. Flattening to SIMPLE left the component rows in place and stopped in-flight orders expanding into components |
+| VARIABLE | Other rows carry its id as their `parentId`, and a parent must be VARIABLE. Flattening it orphans its children and leaves its option rows behind |
+| VARIANT | A variant must stay attached to a variable parent. The import writes `type` but never `parentId`, so a detach would leave a SIMPLE row still carrying a parent |
+| NON_INVENTORY | Means "not stock-tracked" (a service or fee). Converting it silently gives it stock levels, allocation and COGS |
+
+A brand-new product still takes its type from WooCommerce: a row that does not exist yet has no structure to protect.
+
+A variation is also only matched to an existing IMS row when that row is genuinely the one the WooCommerce variation owns: not mapped to a different WooCommerce object, not already a child of a *different* IMS parent, not itself a parent, and of a type that can sit under a variable parent. A bare SKU match is not enough.
+
+When a refusal means WooCommerce data goes **unimported** — a variable WooCommerce product paired with an IMS kit, or a variation whose SKU resolves to an incompatible row — the import is reported as failed, the product is not marked synced, the reconcile cursor does not advance past it, and a row appears in the [Sync Exception Inbox](sync-exceptions.md). Resolve it in IMS or in WooCommerce; the next successful sync clears the row by itself.
+
 **IMS to WooCommerce:**
 - Product name, description, regular price, sale price
 - GTIN (only if purely numeric)
