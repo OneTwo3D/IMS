@@ -32,7 +32,8 @@ import {
   deriveLifecycleStatusFromWooStatus,
   deriveWooStatusFromLifecycleStatus,
 } from '@/lib/products/lifecycle'
-import type { Prisma } from '@/app/generated/prisma/client'
+import { isComponentProductType } from '@/lib/products/type-transforms'
+import type { Prisma, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
@@ -48,6 +49,63 @@ const MANUAL_PRODUCT_SYNC_STALE_MS = 30 * 60 * 1000
  */
 const PRODUCT_WRITE_TX_TIMEOUT_MS = 60_000
 const PRODUCT_WRITE_TX_MAX_WAIT_MS = 15_000
+
+/**
+ * A connector may never downgrade an IMS product out of KIT or BOM (o3d-y89x).
+ *
+ * KIT/BOM composition is IMS-owned fulfilment structure. WooCommerce has no concept of it:
+ * its `simple`/`variable` flag is an ABSENCE of information about composition, not an
+ * assertion that the product has none. Writing the WC-derived type unconditionally — which
+ * this sync did on both the parent update and the variation update — had two consequences
+ * on any KIT/BOM whose SKU matches a WC product:
+ *
+ *   1. KIT-ness vanished with no guard at all. Every in-flight order for that kit stopped
+ *      expanding into components and started requiring the parent as a fulfilment leaf,
+ *      retroactively — the exact corruption the editor and the CSV import both refuse
+ *      (validateProductStructureChange / o3d-4kfh, o3d-w998).
+ *   2. It wrote type=SIMPLE while LEAVING the ProductComponent rows in place: a SIMPLE
+ *      product with components, the state o3d-w998 stops the CSV import from creating.
+ *      `validateProductStructureChange`'s `clearComponents` never runs on this path.
+ *
+ * So the type is left alone and the rest of the payload (price, stock, name, dimensions,
+ * trade fields, mapping) still applies. Refusing the whole row instead would be worse: a
+ * kit whose WC twin is `simple` is an ordinary, supported catalogue shape, and it would
+ * stop receiving price and status updates forever.
+ *
+ * Deliberately NOT symmetrical with the create branch: a brand-new IMS row has no
+ * composition to protect, so a create takes the WooCommerce type as given.
+ *
+ * The predicate is `isComponentProductType`, the same KIT|BOM set the editor's structure
+ * validator uses to decide whether components must be cleared — one definition of "this
+ * type owns composition", not a second copy that can drift.
+ */
+function shouldPreserveImsProductType(existing: { type: ProductType }): boolean {
+  return isComponentProductType(existing.type)
+}
+
+/**
+ * Emitted once per product per sync, at WARNING, whenever the rule above suppresses a write.
+ * Carries everything needed to find the pair by hand: both ids, the SKU, the IMS type kept
+ * and the WC type that was refused. Silence would make the connector look like it agreed
+ * with WooCommerce.
+ */
+function warnImsProductTypePreserved(args: {
+  imsProductId: string
+  sku: string
+  imsType: ProductType
+  wcProductId: number | string
+  wcType: string | undefined
+  suppressedType: string
+}): void {
+  console.warn('[woocommerce-product-sync] kept IMS product type; connector may not downgrade KIT/BOM', {
+    sku: args.sku,
+    imsProductId: args.imsProductId,
+    imsType: args.imsType,
+    wcProductId: String(args.wcProductId),
+    wcType: args.wcType ?? null,
+    suppressedType: args.suppressedType,
+  })
+}
 
 export type ManualProductSyncProgress = {
   status: 'idle' | 'running' | 'done' | 'error'
@@ -562,8 +620,27 @@ export async function syncWcProductToIms(
         let productId: string
         let productSku: string
         let changes: WcTradeFieldChange[] = []
+        /** Set when the o3d-y89x rule suppressed a type write on the parent row. */
+        let parentTypePreserved = false
 
         if (existing) {
+          // o3d-y89x: KIT/BOM composition is IMS-owned; a connector may not downgrade out of
+          // it. `type` is therefore omitted from the update entirely on such a row — omitted,
+          // not set to `existing.type`, so the column is never named in the UPDATE at all —
+          // while every other field below still applies.
+          const preserveType = shouldPreserveImsProductType(existing)
+          parentTypePreserved = preserveType
+          if (preserveType) {
+            warnImsProductTypePreserved({
+              imsProductId: existing.id,
+              sku: existing.sku,
+              imsType: existing.type,
+              wcProductId: wcProduct.id,
+              wcType: wcProduct.type,
+              suppressedType: productType,
+            })
+          }
+
           // Build update data — always sync these fields
           const updateData: Record<string, unknown> = {
             name: wcProduct.name,
@@ -575,7 +652,7 @@ export async function syncWcProductToIms(
             heightCm: heightCm ?? existing.heightCm,
             active,
             lifecycleStatus,
-            type: productType,
+            ...(preserveType ? {} : { type: productType }),
             externalProductId: BigInt(wcProduct.id),
           }
 
@@ -643,7 +720,14 @@ export async function syncWcProductToIms(
         }
 
         // --- Variations (VARIABLE products) — already fetched, just applied here ---
-        if (isVariable) {
+        //
+        // Skipped when the parent kept a KIT/BOM type it was not allowed to lose (o3d-y89x).
+        // applyVariations writes `parentId` on every child, and IMS only accepts a VARIABLE
+        // product as a parent (validateProductStructureChange). Attaching them to a row we
+        // have just decided stays a kit would swap one corruption for another — children
+        // pointing at a non-variable parent — so the children are left alone and the warning
+        // above is the operator's signal that this pairing needs a human decision.
+        if (isVariable && !parentTypePreserved) {
           await applyVariations(tx, variations, productId, wcProduct.name, imsCategoryId)
         }
 
@@ -892,6 +976,23 @@ async function applyVariations(
       const claimants = claimantsBySku.get(sku) ?? new Set([BigInt(v.id)])
       assertWcRowNotClaimedByAnotherWcObject(existing, claimants)
 
+      // Same rule as the parent branch (o3d-y89x): a WC variation may not flatten an IMS
+      // KIT/BOM into a VARIANT. This one is not even a conflict — a KIT or BOM sitting under
+      // a VARIABLE parent is a first-class IMS shape (a "bundle variant";
+      // canTypeHaveVariableParent admits VARIANT, KIT and BOM), so `parentId` and everything
+      // else still apply and only the type write is dropped.
+      const preserveType = shouldPreserveImsProductType(existing)
+      if (preserveType) {
+        warnImsProductTypePreserved({
+          imsProductId: existing.id,
+          sku: existing.sku,
+          imsType: existing.type,
+          wcProductId: v.id,
+          wcType: 'variation',
+          suppressedType: 'VARIANT',
+        })
+      }
+
       const updateData: Record<string, unknown> = {
         name: variantName,
         description: description || existing.description,
@@ -904,7 +1005,7 @@ async function applyVariations(
           deriveLifecycleStatusFromWooStatus(v.status, existing.lifecycleStatus),
         ),
         lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status, existing.lifecycleStatus),
-        type: 'VARIANT',
+        ...(preserveType ? {} : { type: 'VARIANT' }),
         parentId: imsParentId,
         externalProductId: BigInt(v.id),
       }
