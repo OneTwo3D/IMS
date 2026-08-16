@@ -50,6 +50,14 @@ const state = {
   /** How many transactions were open at once. The lock means: never more than one. */
   openTransactions: 0,
   maxConcurrentTransactions: 0,
+  /** What the (mocked) crontab reconciliation reports after a committed write. */
+  cronResult: { success: true } as { success: boolean; error?: string },
+  /** Paths revalidated after the action returned. */
+  revalidated: [] as string[],
+  /** How many settings writes had landed when the scheduler reconciliation was invoked. */
+  cronCalledAfterWrites: -1,
+  /** …and whether a transaction was still open at that moment. */
+  openTransactionsWhenCronRan: -1,
 }
 
 function reset() {
@@ -59,6 +67,10 @@ function reset() {
   state.pooledReads = []
   state.openTransactions = 0
   state.maxConcurrentTransactions = 0
+  state.cronResult = { success: true }
+  state.revalidated = []
+  state.cronCalledAfterWrites = -1
+  state.openTransactionsWhenCronRan = -1
 }
 
 const setting = {
@@ -154,8 +166,21 @@ mock.module('@/lib/auth/server', {
 })
 
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
-mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
-mock.module('@/app/actions/cron', { namedExports: { syncCrontab: async () => ({ success: true }) } })
+mock.module('next/cache', { namedExports: { revalidatePath: (path: string) => { state.revalidated.push(path) } } })
+/**
+ * INJECTABLE, not pinned to success (o3d-osl8 round 7, finding 1). A double that can only succeed
+ * cannot show what the action does when the write has committed and the scheduler has not — which
+ * was the entire defect.
+ */
+mock.module('@/app/actions/cron', {
+  namedExports: {
+    syncCrontab: async () => {
+      state.cronCalledAfterWrites = state.writes.length
+      state.openTransactionsWhenCronRan = state.openTransactions
+      return state.cronResult
+    },
+  },
+})
 
 async function savePlugins(patch: Record<string, boolean>) {
   const { saveIntegrationPluginState } = await import('@/app/actions/settings')
@@ -232,7 +257,7 @@ test('a partial enable is refused against the state the ONBOARDING step just com
   const onboarding = await saveOnboarding({
     woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false,
   })
-  assert.equal(onboarding.success, true)
+  assert.equal(onboarding.status, 'saved')
 
   const partial = await savePlugins({ xero: true })
 
@@ -277,6 +302,76 @@ test('a refused write commits NOTHING — not even the keys that were individual
   assert.equal(result.success, false)
   assert.ok(!enabled('quickbooks'))
   assert.ok(!enabled('mintsoft'), 'mintsoft was legal on its own and must not have slipped through a partial commit')
+})
+
+// ---------------------------------------------------------------------------
+// Round 7, finding 1 — a scheduler failure is NOT a rejected save.
+//
+// saveOnboardingPluginState commits every plugin flag in one locked transaction, and only THEN runs
+// syncCrontab. The old return shape reported both a validation refusal and a post-commit scheduler
+// failure as `{ success: false }`, and the wizard — its sole caller — restored the previous
+// switches for either. The database and every runtime gate used the new connector while the
+// operator was shown the old one.
+// ---------------------------------------------------------------------------
+
+test('a scheduler failure AFTER the commit is reported as committed, not as a refusal', async () => {
+  state.cronResult = { success: false, error: 'crontab write failed: no crontab for ims' }
+
+  const result = await saveOnboarding({
+    woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false,
+  })
+
+  assert.equal(result.status, 'scheduler-failed', 'not "refused" — the write is durable')
+  assert.ok(result.status === 'scheduler-failed')
+  assert.match(result.error, /crontab write failed/, 'and the scheduler reason is carried through')
+  // THE ASSERTION THAT FAILS WHEN THIS REGRESSES: the selection really is in the database, so any
+  // caller that rolls its UI back is showing something the database disagrees with.
+  assert.ok(enabled('quickbooks') && enabled('woocommerce'), 'the committed selection is stored')
+  assert.ok(!enabled('xero'))
+  assert.deepEqual(
+    result.pluginState,
+    // SIX keys, not the five the onboarding payload carries: the returned state is the one read
+    // back under the lock, so it includes the plugin this step does not offer. That is the point —
+    // it is the database's answer rather than an echo of the request.
+    { woocommerce: true, shopify: false, xero: false, quickbooks: true, mintsoft: false, shiphero: false },
+    'and the COMMITTED state is returned, so the caller need not guess from its own copy',
+  )
+})
+
+test('the committed selection is revalidated even when the scheduler fails', async () => {
+  // Skipping revalidatePath on this path made the SERVER cache agree with the rolled-back UI, so a
+  // reload did not recover the operator either.
+  state.cronResult = { success: false, error: 'crontab write failed' }
+
+  await saveOnboarding({ woocommerce: false, shopify: false, xero: true, quickbooks: false, mintsoft: false })
+
+  assert.deepEqual(state.revalidated.sort(), ['/dashboard', '/onboarding'])
+})
+
+test('a REFUSAL still commits nothing and revalidates nothing', async () => {
+  // The other side of the split. `refused` is the one outcome a caller may roll back over, so it
+  // must remain reachable and must remain truthful.
+  store.set(INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true')
+
+  const result = await saveOnboarding({
+    woocommerce: true, shopify: true, xero: false, quickbooks: false, mintsoft: false,
+  })
+
+  assert.equal(result.status, 'refused')
+  assert.ok(result.status === 'refused' && /either WooCommerce or Shopify/.test(result.error))
+  assert.ok(!enabled('woocommerce') && !enabled('shopify'), 'nothing was written')
+  assert.ok(enabled('xero'), 'and the stored selection is untouched')
+  assert.deepEqual(state.revalidated, [], 'nothing changed, so nothing is revalidated')
+})
+
+test('the scheduler is only consulted AFTER every plugin key has been written', async () => {
+  // Ordering is what makes 'scheduler-failed' honest in the other direction too: if syncCrontab ran
+  // inside (or before) the transaction, a scheduler failure could still mean nothing was written,
+  // and calling that outcome "committed" would be the same lie mirrored.
+  await saveOnboarding({ woocommerce: true, shopify: false, xero: true, quickbooks: false, mintsoft: false })
+
+  assert.equal(state.cronCalledAfterWrites, 5, 'all five plugin keys were already written when the scheduler ran')
+  assert.equal(state.openTransactionsWhenCronRan, 0, 'and the transaction had ended')
 })
 
 // ---------------------------------------------------------------------------
@@ -425,6 +520,100 @@ test('the quiesce harness takes the SAME advisory key and the SAME row locks, in
   assert.ok(rowLockAt > materialiseAt, 'and row-locks after materialising')
   assert.ok(body.includes('INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER'), 'over the same key set, in the same order')
   assert.ok(body.includes("client.query('begin')"), 'and all of it in one transaction — an advisory XACT lock outside one is released immediately')
+})
+
+// ---------------------------------------------------------------------------
+// Round 7, finding 2 — the inventory above is LEXICAL, and a lexical sweep cannot enumerate
+// GENERIC REPLAY.
+//
+// The scan above finds a writer by the fact that it NAMES a plugin key. The database restore route
+// rewrites `settings` (plugin selection rows included) and `accounting_sync_logs` without naming
+// either, because it replays whatever SQL the backup contains — so it was invisible to a sweep of
+// two files, then to a sweep of four roots, and it was never going to be found by asking for the
+// string `plugin_`.
+//
+// It is also the one path that could DEADLOCK against the orphan cancel: the cancel takes the
+// advisory lock and then the plugin `settings` rows, while a restore whose dump reaches
+// `accounting_sync_logs` before `settings` takes them the other way round — and PostgreSQL resolves
+// that by aborting one of the two.
+//
+// So this second inventory asks a different question: WHAT EXECUTES SQL IT DID NOT AUTHOR? Every
+// discovered path is classified, and a new one fails this test until it is classified deliberately.
+// ---------------------------------------------------------------------------
+
+/** A database CLI invoked as a child process — the only generic-replay shape in this repo. */
+const RUNS_A_DATABASE_CLI = /\(\s*['"`](psql|pg_restore|pg_dump)['"`]\s*,/
+/** Server-side bulk ingestion of an external file straight into the database. */
+const COPIES_EXTERNAL_DATA = /COPY[\s\S]{0,60}FROM\s+(?:STDIN|PROGRAM)/i
+
+/**
+ * Every discovered replay path, and what it is.
+ *
+ *   'replays-external-sql' — executes statements whose CONTENT comes from outside the repo (a
+ *                            backup file, an upload, a dump). MUST take the selection lock.
+ *   'dump-only'            — produces a dump and writes nothing to this database.
+ *   'inline-sql-cli'       — shells a CLI with statements authored in the file itself. Not generic
+ *                            replay: any plugin-key write there NAMES the key, so the lexical
+ *                            inventory above already covers it. These are e2e drivers against the
+ *                            stage database.
+ */
+const REPLAY_PATHS: Record<string, 'replays-external-sql' | 'dump-only' | 'inline-sql-cli'> = {
+  'app/api/backup/restore/route.ts': 'replays-external-sql',
+  'app/api/backup/create/route.ts': 'dump-only',
+  'app/api/cron/backup/route.ts': 'dump-only',
+  'e2e/helpers.ts': 'inline-sql-cli',
+  'e2e/onboarding.spec.ts': 'inline-sql-cli',
+  'e2e/stock-position-filters.spec.ts': 'inline-sql-cli',
+  'e2e/woocommerce-existing-product.spec.ts': 'inline-sql-cli',
+  'e2e/woocommerce-product-types.spec.ts': 'inline-sql-cli',
+  'e2e/woocommerce.spec.ts': 'inline-sql-cli',
+  'e2e/woocommerce-xero-bundle-refund.spec.ts': 'inline-sql-cli',
+}
+
+function replayPaths(): string[] {
+  const found: string[] = []
+  for (const root of SCANNED_ROOTS) {
+    for (const path of sourceFiles(join(REPO, root))) {
+      const src = readFileSync(path, 'utf8')
+      if (RUNS_A_DATABASE_CLI.test(src) || COPIES_EXTERNAL_DATA.test(src)) found.push(relative(REPO, path))
+    }
+  }
+  return found.sort()
+}
+
+test('every path that executes SQL it did not author is classified', () => {
+  // Pinned in BOTH directions: an unclassified new replay path fails here, and a classified one
+  // that disappears fails here too, so the classification cannot rot into a list of files that no
+  // longer exist while the scan quietly finds nothing.
+  assert.deepEqual(replayPaths(), Object.keys(REPLAY_PATHS).sort())
+})
+
+test('every EXTERNAL-SQL replay path takes the connector-selection lock first', () => {
+  const offenders: string[] = []
+  for (const path of replayPaths()) {
+    if (REPLAY_PATHS[path] !== 'replays-external-sql') continue
+    const src = readFileSync(join(REPO, path), 'utf8')
+    if (!/ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY/.test(src)) offenders.push(path)
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    'these replay arbitrary SQL over settings/accounting_sync_logs without taking the selection lock',
+  )
+})
+
+test('the restore takes the lock as the FIRST statement, inside the single transaction', async () => {
+  // Not a name check: the statement text itself, the shared constant's value, and the psql flag
+  // that makes an xact-scoped advisory lock last longer than the statement that took it.
+  const { buildRestoreSelectionLockStatement } = await import('@/app/api/backup/restore/route')
+  const statement = buildRestoreSelectionLockStatement()
+
+  assert.equal(statement, `SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY});\n`)
+  const src = readFileSync(join(REPO, 'app/api/backup/restore/route.ts'), 'utf8')
+  assert.ok(src.includes("'--single-transaction'"), 'an xact lock outside a transaction is released immediately')
+  const writeAt = src.indexOf('child.stdin.write(buildRestoreSelectionLockStatement())')
+  const pipeAt = src.indexOf('input.pipe(child.stdin)')
+  assert.ok(writeAt > 0 && pipeAt > writeAt, 'the lock statement is written before the dump is piped')
 })
 
 test('no path takes a settings row lock and THEN the selection advisory lock', () => {

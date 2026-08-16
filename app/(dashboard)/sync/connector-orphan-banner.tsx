@@ -16,6 +16,24 @@ function connectorLabel(connector: string): string {
 }
 
 /**
+ * What the banner is currently telling the operator about the last cancel attempt.
+ *
+ * A discriminated union rather than a formatted string (o3d-osl8 round 7, finding 3), because the
+ * UNKNOWN case's wording depends on something that can change AFTER the message is set: whether the
+ * refresh it asked for has actually landed. A string baked at catch time can only describe the
+ * request; this can describe the outcome.
+ */
+type CancelOutcome =
+  /** The action returned a typed `{ success: false }`. That path committed nothing, and says so. */
+  | { kind: 'refused'; message: string }
+  /**
+   * The action REJECTED. Nothing here can tell a refusal from a lost reply, so nothing here may
+   * claim either. `serverRenderedAtWhenRequested` is the render marker observed at the moment
+   * `router.refresh()` was called — the refresh is confirmed only once the prop differs from it.
+   */
+  | { kind: 'unknown'; serverRenderedAtWhenRequested: string }
+
+/**
  * audit-H4: warns when PENDING/PROCESSING accounting sync rows belong to a
  * connector that is no longer active (stranded by a connector switch). Lets the
  * operator bulk-cancel them so they stop accumulating silently.
@@ -25,6 +43,7 @@ export function ConnectorOrphanBanner({
   stranded = null,
   strandedLoadFailed = false,
   canCancel,
+  serverRenderedAt,
 }: {
   /**
    * NULLABLE on purpose. getCrossConnectorOrphanSummary() is fetched with .catch(() => null),
@@ -69,10 +88,32 @@ export function ConnectorOrphanBanner({
    * (the rows themselves stay listed either way — reading them is what `sync` is for).
    */
   canCancel: boolean
+  /**
+   * o3d-osl8 round 7, finding 3. The instant the SERVER rendered the rows below, as an opaque
+   * marker. REQUIRED, and required for the same reason `canCancel` is: a default would let a call
+   * site inherit a guess, and the only available guess ("it refreshed") is the lie this exists to
+   * stop.
+   *
+   * WHY THE CLIENT NEEDS IT AT ALL. `router.refresh()` returns void. It reports no completion, it
+   * can be served from cache, and it can fail — so after calling it a client component knows only
+   * that it ASKED. The previous message went further and told the operator the stranded rows "have
+   * been reloaded from the server", in the one branch where the cancellation may have committed:
+   * an invitation to read stale rows as authoritative and retry a destructive action against them.
+   *
+   * A new server render produces a new marker; the rows re-render with it. Comparing the current
+   * prop against the one captured when the refresh was requested is therefore an OBSERVATION that
+   * a fresh payload arrived, not an assumption. When it has not changed, the banner says so and
+   * tells the operator to reload the page themselves.
+   *
+   * It is deliberately a render marker rather than a hash of the rows: a cancellation that changed
+   * nothing legitimately leaves identical rows, and content equality would then report a completed
+   * refresh as never having happened.
+   */
+  serverRenderedAt: string
 }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
-  const [error, setError] = useState<string | null>(null)
+  const [outcome, setOutcome] = useState<CancelOutcome | null>(null)
   /**
    * o3d-sref: rows the cancel could not retire, because their claim had already been taken and a
    * request may have reached the connector. Shown HERE rather than only in the activity log — the
@@ -95,8 +136,12 @@ export function ConnectorOrphanBanner({
   })
   if (!bannerState.render) return null
 
+  // Derived at RENDER time, not at catch time: this is the whole mechanism. `refreshObserved` is
+  // false until a server render with a different marker has actually reached this component.
+  const refreshObserved = outcome?.kind === 'unknown' && serverRenderedAt !== outcome.serverRenderedAtWhenRequested
+
   function handleCancel(connector?: string) {
-    setError(null)
+    setOutcome(null)
     setNotice(null)
     startTransition(async () => {
       // CATCH, unconditionally. Even with the controls hidden for a reader who cannot cancel, the
@@ -120,7 +165,7 @@ export function ConnectorOrphanBanner({
             : null)
           router.refresh()
         } else {
-          setError(result.error ?? 'Failed to cancel orphaned rows.')
+          setOutcome({ kind: 'refused', message: result.error ?? 'Failed to cancel orphaned rows.' })
         }
       } catch {
         // THE OUTCOME IS UNKNOWN, and saying anything stronger is a lie (o3d-osl8 round 6,
@@ -137,9 +182,16 @@ export function ConnectorOrphanBanner({
         //
         // The guarantee of rollback belongs to the STRUCTURED refusals — the typed
         // `{ success: false }` results the action returns, handled above, which are only produced
-        // on paths that committed nothing. This one gets "unknown", and a refresh so the
-        // authoritative rows are on screen while the operator decides.
-        setError('The cancel request failed before it could report its outcome, so it is NOT known whether any rows were cancelled — the request may have been refused, or it may have completed and lost its reply. The stranded rows below have been reloaded from the server: check them (and the activity log) before retrying, rather than assuming this attempt did nothing.')
+        // on paths that committed nothing. This one gets "unknown".
+        //
+        // ROUND 7, FINDING 3. This branch used to add "The stranded rows below have been reloaded
+        // from the server" — and then call router.refresh(). The claim preceded the act, and the
+        // act cannot be verified from here: refresh() is void, may be served from cache, and may
+        // fail. In the very scenario where the cancellation MAY have committed, that certified
+        // stale rows as authoritative and invited a retry against them. So the marker in effect
+        // when the refresh is REQUESTED is recorded here, and the wording below is decided at
+        // render time by whether a new server payload has actually arrived.
+        setOutcome({ kind: 'unknown', serverRenderedAtWhenRequested: serverRenderedAt })
         // Immediately, not on the next navigation: the list on screen was rendered before an
         // action that may have changed it.
         router.refresh()
@@ -188,7 +240,22 @@ export function ConnectorOrphanBanner({
               does not have — ask an administrator. The rows themselves are listed below either way.
             </p>
           )}
-          {error && <p className="text-xs text-destructive">{error}</p>}
+          {outcome?.kind === 'refused' && <p className="text-xs text-destructive">{outcome.message}</p>}
+          {outcome?.kind === 'unknown' && (
+            <p className="text-xs text-destructive">
+              The cancel request failed before it could report its outcome, so it is NOT known whether any rows were
+              cancelled — the request may have been refused, or it may have completed and lost its reply.
+              {refreshObserved
+                // Observed, not assumed: a server render newer than the one in effect when the
+                // refresh was requested has reached this component, so the rows below came from it.
+                ? ' The stranded rows below have since been re-rendered by the server, so they are its current answer:'
+                  + ' check them (and the activity log) before retrying, rather than assuming this attempt did nothing.'
+                // The honest report of an unobservable completion.
+                : ' A reload of the rows below was requested but has NOT been confirmed — it reports no completion, it can'
+                  + ' be served from cache, and it can fail. Do NOT treat the rows below as authoritative: reload this page'
+                  + ' yourself, and check the activity log, before retrying.'}
+            </p>
+          )}
           {notice && <p className="text-xs font-medium">{notice}</p>}
           {/* An explicit failure state. Silence here would read as "nothing is stranded", which
               is the opposite of what a failed read means. */}

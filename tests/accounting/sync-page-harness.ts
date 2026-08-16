@@ -111,6 +111,19 @@ export const state = {
   },
   /** router.refresh() calls made by client components under test. */
   refreshes: 0,
+  /**
+   * WHAT THE REFRESH ACTUALLY DOES (o3d-osl8 round 7, finding 3).
+   *
+   * The double used to be `refresh: () => { state.refreshes += 1 }` and nothing else — it modelled
+   * the CALL and not the EFFECT. That is why a component claiming "the rows below have been
+   * reloaded from the server" passed its test while displaying exactly the pre-cancellation rows:
+   * no test could tell the difference, because no double ever produced a fresh payload.
+   *
+   * Set this to deliver one (`banner.setProps(...)` with a new server-render marker), or leave it
+   * null to model the refresh that never completes — a cached payload, a failed re-fetch, a
+   * navigation that never lands. Both are real, and a component must be honest in both.
+   */
+  onRefresh: null as (() => void) | null,
 }
 
 export function resetSyncPageState() {
@@ -122,6 +135,7 @@ export function resetSyncPageState() {
   state.salesOrderRows = []
   state.cancel = { calls: [], result: { success: true }, rejectWith: null }
   state.refreshes = 0
+  state.onRefresh = null
 }
 
 /** Wraps a read so it is recorded and its value comes from the (per-test) registry. */
@@ -150,7 +164,13 @@ export function installSyncPageMocks(options: { realPaymentMethodCombos?: boolea
   mock.module('next/navigation', {
     namedExports: {
       redirect: (url: string) => { state.redirects.push(url); throw new RedirectError(url) },
-      useRouter: () => ({ refresh: () => { state.refreshes += 1 } }),
+      useRouter: () => ({
+        refresh: () => {
+          state.refreshes += 1
+          // The EFFECT, when the test asked for one. Null models the refresh that never lands.
+          state.onRefresh?.()
+        },
+      }),
     },
   })
 

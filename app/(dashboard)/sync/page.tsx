@@ -333,6 +333,11 @@ export default async function SyncPage() {
         stranded={stranded}
         strandedLoadFailed={strandedLoadFailed}
         canCancel={canCancelOrphans}
+        // o3d-osl8 round 7, finding 3: the marker that lets the banner OBSERVE that a
+        // router.refresh() actually produced a new server payload, instead of asserting it did.
+        // Generated per render, so a cached RSC payload carries the marker of the render it was
+        // cached from and is correctly reported as "not refreshed".
+        serverRenderedAt={new Date().toISOString()}
       />
       {failedSyncSummary && <FailedSyncBanner summary={failedSyncSummary} />}
       {taxRateDrift && <TaxRateDriftBanner drift={taxRateDrift} />}

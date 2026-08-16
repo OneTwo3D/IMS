@@ -364,7 +364,9 @@ async function mountBannerFromPage() {
   const { tree } = await renderSyncPage()
   const element = elementOf(tree, 'ConnectorOrphanBanner')
   assert.ok(element, 'the page must construct the banner')
-  return mountClientComponent(element.type as (props: unknown) => unknown, element.props)
+  const props = element.props as Record<string, unknown>
+  const banner = mountClientComponent(element.type as (props: Record<string, unknown>) => unknown, props)
+  return Object.assign(banner, { props })
 }
 
 test('each per-connector control cancels THAT connector — never the unscoped operation', async () => {
@@ -476,6 +478,70 @@ test('the page derives canCancel from the session, rather than the banner assumi
   }
 })
 
+test('a THROWN failure whose refresh NEVER LANDS does not present the visible rows as authoritative', async () => {
+  // o3d-osl8 round 7, finding 3 — the defect that round 6 introduced and this file certified.
+  //
+  // The round 6 message said the stranded rows "have been reloaded from the server", and then
+  // called router.refresh(). The claim preceded the act, and the act is not observable from a
+  // client component: refresh() returns void, can be served from cache, and can fail. This test
+  // passed anyway, because the harness double INCREMENTED A COUNTER and never delivered a payload
+  // — so "reloaded" was asserted against rows that were provably the pre-cancellation ones.
+  //
+  // Here the refresh is modelled as one that never completes (state.onRefresh stays null: no new
+  // props arrive). The banner must say the reload is unconfirmed and must NOT certify the rows.
+  const banner = await mountBannerFromPage()
+  state.cancel.rejectWith = new PermissionDeniedError('Forbidden: missing permission settings', 'settings')
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
+
+  assert.equal(state.refreshes, 1, 'a refresh is still REQUESTED — the rows may have changed')
+  const { html } = banner.render()
+  assert.match(html, /NOT known whether any rows were cancelled/, 'the outcome is still reported as unknown')
+  assert.match(html, /has NOT been confirmed/, 'and the reload is reported as unconfirmed')
+  assert.match(html, /Do NOT treat the rows below as authoritative/)
+  assert.match(html, /reload this page\s+yourself/, 'with the manual action that would actually resolve it')
+  assert.ok(
+    !/have been reloaded|have since been re-rendered/.test(html),
+    'and NOTHING claims the refresh happened — that is the claim under test',
+  )
+})
+
+test('a THROWN failure whose refresh DOES land says so, once the new server payload is observed', async () => {
+  // The other half: the certification is not banned, it is EARNED. `serverRenderedAt` is the page's
+  // per-render marker; a new server payload carries a new one. Only when the component has actually
+  // been re-rendered with a different marker may it describe the rows as the server's answer.
+  const banner = await mountBannerFromPage()
+  state.cancel.rejectWith = new PermissionDeniedError('Forbidden: missing permission settings', 'settings')
+  // The refresh, modelled by its EFFECT: a fresh RSC payload, with rows that changed and a new
+  // render marker. This is what the counter-only double could never express.
+  state.onRefresh = () => banner.setProps({
+    ...banner.props,
+    serverRenderedAt: '2026-08-15T12:00:01.000Z',
+    stranded: { rows: [strandedRow({ id: 'log-9', referenceId: 'order-99' })], hasMore: false, total: 1 },
+  })
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
+
+  const { html } = banner.render()
+  assert.match(html, /NOT known whether any rows were cancelled/, 'the OUTCOME is still unknown — only the refresh is settled')
+  assert.match(html, /have since been re-rendered by the server/)
+  assert.ok(!/has NOT been confirmed/.test(html))
+  assert.match(html, /SalesOrder:order-99/, 'and the rows on screen really are the new payload, not the old one')
+})
+
+test('the refresh marker must actually differ — a payload with the SAME marker is not a refresh', async () => {
+  // Guards the mechanism against being satisfied by any re-render at all. If the comparison were
+  // dropped (or made against something that changes on every client render), the unconfirmed
+  // branch would become unreachable and the wording would silently return to a blanket claim.
+  const banner = await mountBannerFromPage()
+  state.cancel.rejectWith = new Error('transport failure')
+  state.onRefresh = () => banner.setProps({ ...banner.props })
+
+  await banner.click(banner.render().controls.find((c) => c.label === 'Cancel all orphaned rows'))
+
+  assert.match(banner.render().html, /has NOT been confirmed/)
+})
+
 test('a THROWN failure is reported as an UNKNOWN outcome, and refreshes the rows', async () => {
   // o3d-osl8 round 6, finding 3.
   //
@@ -506,7 +572,10 @@ test('a THROWN failure is reported as an UNKNOWN outcome, and refreshes the rows
     'and never as a guarantee the client cannot make — that claim is reserved for the typed refusals',
   )
   assert.match(html, /before retrying/, 'the operator is told not to retry blind')
-  assert.match(html, /reloaded from the server/, 'and that the view below is now the server\'s answer')
+  // Round 7, finding 3: this line used to require "reloaded from the server". That wording was a
+  // certification the component could not make, so what is required now is the WEAKER, true claim
+  // — a refresh was requested — with the certification itself covered by the two tests above.
+  assert.match(html, /A reload of the rows below was requested/)
   // The raw error must not be echoed: in production it reaches the client as an opaque digest.
   assert.ok(!html.includes('Forbidden'), 'and not the server error text')
 })

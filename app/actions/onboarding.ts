@@ -8,6 +8,7 @@ import { requireAdmin } from '@/lib/auth/server'
 import { getSettingValue } from '@/lib/settings-store'
 import { getIntegrationPluginState, INTEGRATION_PLUGIN_SETTING_KEYS, type IntegrationPluginState } from '@/lib/integration-plugins'
 import { isBaseCurrencyLocked } from '@/lib/base-currency'
+import type { SaveOnboardingPluginStateResult } from '@/lib/domain/onboarding/plugin-save-outcome'
 import { syncCrontab } from '@/app/actions/cron'
 
 // ---------------------------------------------------------------------------
@@ -240,16 +241,30 @@ type PluginStateInput = {
   mintsoft: boolean
 }
 
-export async function saveOnboardingPluginState(state: PluginStateInput): Promise<{ success: boolean; error?: string }> {
+/**
+ * THREE outcomes, not two (o3d-osl8 round 7, finding 1). The union and the reasoning live in
+ * lib/domain/onboarding/plugin-save-outcome.ts, next to the resolver that consumes it.
+ *
+ * WHY NOT A DURABLE OUTBOX RETRY for the scheduler half, which the repo does have
+ * (lib/domain/integrations/outbox.ts). Every outbox drain in this app is a cron route
+ * (app/api/cron/*) invoked BY the crontab this step is trying to write. An outbox row that
+ * reconciles the crontab would therefore be drained by the crontab: in the failure that matters —
+ * the managed block is absent, stale or unwritable — nothing would ever run it, and the row would
+ * sit PENDING while the UI reported the work as scheduled. That is the same class of lie this
+ * finding is about, moved into the queue. The recovery is instead an EXPLICIT operator action with
+ * an existing home: Settings → System → Scheduler, which already reports crontab drift
+ * (getCrontabStatus) and can re-run syncCrontab.
+ */
+export async function saveOnboardingPluginState(state: PluginStateInput): Promise<SaveOnboardingPluginStateResult> {
   await requireAdmin()
 
   // A cheap payload-only pre-check, so an obviously contradictory form never opens a transaction.
   // It is NOT the guarantee — `resulting`, below, is (round 6, finding 1).
   if (state.woocommerce && state.shopify) {
-    return { success: false, error: 'Choose either WooCommerce or Shopify, not both.' }
+    return { status: 'refused', error: 'Choose either WooCommerce or Shopify, not both.' }
   }
   if (state.xero && state.quickbooks) {
-    return { success: false, error: 'Choose either Xero or QuickBooks, not both.' }
+    return { status: 'refused', error: 'Choose either Xero or QuickBooks, not both.' }
   }
 
   // Lock, read, validate, write — in that order, inside one transaction (o3d-osl8 round 6,
@@ -257,7 +272,7 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
   // determined by the payload; the read still matters because the lock it comes with is what stops
   // a concurrent PARTIAL write (saveIntegrationPluginState) from landing between this validation
   // and this commit and leaving both accounting connectors enabled.
-  const conflict = await db.$transaction(async (tx) => {
+  const outcome = await db.$transaction(async (tx): Promise<{ conflict: string } | { committed: IntegrationPluginState }> => {
     const current = await lockIntegrationPluginSelection(tx)
     const resulting = {
       ...current,
@@ -268,10 +283,10 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
       mintsoft: state.mintsoft,
     }
     if (resulting.woocommerce && resulting.shopify) {
-      return 'Choose either WooCommerce or Shopify, not both.'
+      return { conflict: 'Choose either WooCommerce or Shopify, not both.' }
     }
     if (resulting.xero && resulting.quickbooks) {
-      return 'Choose either Xero or QuickBooks, not both.'
+      return { conflict: 'Choose either Xero or QuickBooks, not both.' }
     }
 
     for (const [id, enabled] of [
@@ -288,9 +303,9 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
         update: { value: String(enabled) },
       })
     }
-    return null
+    return { committed: resulting }
   })
-  if (conflict) return { success: false, error: conflict }
+  if ('conflict' in outcome) return { status: 'refused', error: outcome.conflict }
 
   await logActivity({
     entityType: 'SETTING',
@@ -300,12 +315,24 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
     metadata: state,
   })
 
-  const cronResult = await syncCrontab()
-  if (!cronResult.success) {
-    return { success: false, error: cronResult.error ?? 'Failed to apply scheduler changes' }
-  }
-
+  // UNCONDITIONAL, and before the scheduler result is inspected (round 7, finding 1). The
+  // selection is durable at this point; leaving the route cache holding the previous answer on the
+  // scheduler-failure path made the server itself agree with the rolled-back UI, which is how a
+  // stale connector survived a reload.
   revalidatePath('/onboarding')
   revalidatePath('/dashboard')
-  return { success: true }
+
+  const cronResult = await syncCrontab()
+  if (!cronResult.success) {
+    // NOT a rejected save. syncCrontab already logged its own crontab_sync ERROR; what this adds is
+    // the committed selection, so the caller can keep showing what is actually stored instead of
+    // guessing from its own optimistic copy.
+    return {
+      status: 'scheduler-failed',
+      error: cronResult.error ?? 'Failed to apply scheduler changes',
+      pluginState: outcome.committed,
+    }
+  }
+
+  return { status: 'saved' }
 }

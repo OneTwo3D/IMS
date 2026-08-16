@@ -85,7 +85,7 @@ export type MountedRender = {
   controls: Control[]
 }
 
-export type Mounted = {
+export type Mounted<P = unknown> = {
   /** Render (or re-render) with the state accumulated so far. */
   render: () => MountedRender
   /**
@@ -93,11 +93,22 @@ export type Mounted = {
    * nothing when the control is absent — a missing control is the failure mode under test.
    */
   click: (control: Control | undefined) => Promise<void>
+  /**
+   * Deliver NEW props, as a fresh server payload would (o3d-osl8 round 7, finding 3).
+   *
+   * Without this, a mounted component was pinned to the props it was constructed with, so every
+   * `router.refresh()` double in this repo could only count calls — and a component that CLAIMED
+   * the refresh had reloaded its data passed, while the rows it displayed were provably the ones
+   * rendered before the action ran. State cells survive, exactly as they do in React when a parent
+   * re-renders with new props.
+   */
+  setProps: (next: P) => void
 }
 
-export function mountClientComponent<P>(Component: (props: P) => ReactNodeish, props: P): Mounted {
+export function mountClientComponent<P>(Component: (props: P) => ReactNodeish, initialProps: P): Mounted<P> {
   const cells: unknown[] = []
   const transitions: Array<Promise<unknown>> = []
+  let props = initialProps
 
   function render(): MountedRender {
     let cursor = 0
@@ -146,5 +157,9 @@ export function mountClientComponent<P>(Component: (props: P) => ReactNodeish, p
     while (transitions.length > 0) await transitions.shift()
   }
 
-  return { render, click }
+  function setProps(next: P): void {
+    props = next
+  }
+
+  return { render, click, setProps }
 }

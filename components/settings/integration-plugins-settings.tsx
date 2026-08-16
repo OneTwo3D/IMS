@@ -30,10 +30,13 @@ export function IntegrationPluginsSettings({
   const [mintsoftEnabled, setMintsoftEnabled] = useState(initialMintsoftEnabled)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
+  /** Saved, but the scheduler is behind. Not an error — see handleSave. */
+  const [schedulerWarning, setSchedulerWarning] = useState('')
 
   function handleSave() {
     setSaved(false)
     setError('')
+    setSchedulerWarning('')
 
     startTransition(async () => {
       try {
@@ -53,14 +56,23 @@ export function IntegrationPluginsSettings({
           return
         }
 
+        // o3d-osl8 round 7, finding 1, cross-checked onto the sibling call site. The write above
+        // has COMMITTED by the time this runs, so a scheduler failure here is not a failed save
+        // either. This page never rolled its switches back (they are local state that already
+        // matches what was stored), but it did report the outcome as a bare red error with no
+        // indication that the selection had been saved — which reads as "nothing happened" and
+        // invites a retry of a save that already landed.
         const result = await syncCrontab()
-        if (!result.success) {
-          setError(result.error ?? 'Failed to apply scheduler changes')
-          return
-        }
-
         setSaved(true)
         setTimeout(() => setSaved(false), 2000)
+        if (!result.success) {
+          setSchedulerWarning(
+            `Your plugin selection was SAVED, but the scheduler could not be updated to match it: `
+            + `${result.error ?? 'Failed to apply scheduler changes'} Scheduled jobs may still be running for the `
+            + `previous selection until this is applied. Use Sync crontab on the Scheduler tab, which also reports `
+            + `whether the managed crontab block is currently in drift.`,
+          )
+        }
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to save plugin settings')
       }
@@ -132,6 +144,9 @@ export function IntegrationPluginsSettings({
         )}
         {error && <span className="text-sm text-destructive">{error}</span>}
       </div>
+      {schedulerWarning && (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">{schedulerWarning}</p>
+      )}
     </div>
   )
 }

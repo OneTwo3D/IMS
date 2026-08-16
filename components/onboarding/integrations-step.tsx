@@ -16,6 +16,10 @@ import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from 
 import { saveShoppingConnectorCredentials, saveShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import { connectAccountingConnector, saveAccountingConnectionSettings } from '@/app/actions/accounting-sync'
 import { saveOnboardingPluginState } from '@/app/actions/onboarding'
+import {
+  resolveOnboardingPluginSaveView,
+  type OnboardingPluginSaveView,
+} from '@/lib/domain/onboarding/plugin-save-outcome'
 import { WmsOnboardingConnection } from '@/components/onboarding/wms-onboarding-connection'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
@@ -70,6 +74,13 @@ export function IntegrationsStep({
 
   const [plugins, setPlugins] = useState(initialPluginState)
   const [error, setError] = useState('')
+  /**
+   * o3d-osl8 round 7, finding 1. Its own state, deliberately not `error`: the connector selection
+   * IS SAVED when this is set, and rendering it in the same red line as "your save was rejected"
+   * would tell the operator the opposite of what happened. Shown alongside the (unchanged, new)
+   * switches, with the recovery that actually applies.
+   */
+  const [schedulerWarning, setSchedulerWarning] = useState('')
   const [savingPlugins, setSavingPlugins] = useState(false)
   const [savingWc, setSavingWc] = useState(false)
   const [savingShopify, setSavingShopify] = useState(false)
@@ -184,15 +195,35 @@ export function IntegrationsStep({
     return next
   }
 
-  async function persistPlugins(nextPlugins: IntegrationPluginState, previousPlugins?: IntegrationPluginState) {
+  /**
+   * o3d-osl8 round 7, finding 1: THE ROLLBACK IS ONLY LEGAL FOR A REFUSAL.
+   *
+   * `saveOnboardingPluginState` commits every plugin flag in one locked transaction and only then
+   * reconciles the crontab. Its old `{ success: false }` covered both halves of that, and this
+   * function restored `previousPlugins` for either — so a scheduler failure left the wizard showing
+   * the OLD connector while the database, the runtime module gates and the next server render all
+   * used the NEW one. During an accounting-connector switch that is the dangerous direction: the
+   * operator believes Xero is still selected while QuickBooks is what dispatches.
+   *
+   * The decision is now `resolveOnboardingPluginSaveView`'s — pure, exhaustive over all four
+   * outcomes (including the REJECTION, which is not a refusal), and testable on its own. This
+   * function only applies what it returns.
+   */
+  function applySaveView(view: OnboardingPluginSaveView) {
+    setPlugins(view.plugins)
+    setError(view.error)
+    setSchedulerWarning(view.schedulerWarning)
+    if (view.committed) onPluginStateChange(view.plugins)
+    return view.committed
+  }
+
+  async function persistPlugins(nextPlugins: IntegrationPluginState, previousPlugins: IntegrationPluginState) {
     const result = await saveOnboardingPluginState(nextPlugins)
-    if (!result.success) {
-      setError(result.error ?? 'Failed to save plugin settings')
-      if (previousPlugins) setPlugins(previousPlugins)
-      return false
-    }
-    onPluginStateChange(nextPlugins)
-    return true
+    return applySaveView(resolveOnboardingPluginSaveView({
+      attempt: { kind: 'result', result },
+      requested: nextPlugins,
+      previous: previousPlugins,
+    }))
   }
 
   function togglePlugin(key: keyof IntegrationPluginState, value: boolean) {
@@ -200,14 +231,28 @@ export function IntegrationsStep({
     const previousPlugins = plugins
     const nextPlugins = buildNextPlugins(previousPlugins, key, value)
     setError('')
+    setSchedulerWarning('')
     setPlugins(nextPlugins)
     setSavingPlugins(true)
     void (async () => {
       try {
         await persistPlugins(nextPlugins, previousPlugins)
       } catch (e) {
-        setPlugins(previousPlugins)
-        setError(e instanceof Error ? e.message : 'Failed to save')
+        // THE OUTCOME IS UNKNOWN, so the switches are NOT rolled back (round 7, finding 1, applied
+        // to the reject path as well as the return path). A rejected server action is a permission
+        // gate throwing, a transaction aborting — or a TRANSPORT failure that lost the reply after
+        // the write committed. Restoring `previousPlugins` asserts the first two; it is a claim
+        // this component cannot make, and it is wrong exactly when it matters.
+        //
+        // Nothing is refreshed here either, deliberately: `router.refresh()` reports no completion,
+        // so an automatic re-sync of these switches would be indistinguishable from them never
+        // having moved, and the operator would have no way to tell which state is stored. The
+        // instruction is explicit instead.
+        applySaveView(resolveOnboardingPluginSaveView({
+          attempt: { kind: 'rejected', error: e },
+          requested: nextPlugins,
+          previous: previousPlugins,
+        }))
       } finally {
         setSavingPlugins(false)
       }
@@ -671,6 +716,11 @@ export function IntegrationsStep({
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {/* Amber, not destructive, and worded as "saved, but": the selection above is durable and the
+          switches show it. Only the scheduler is behind. */}
+      {schedulerWarning && (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">{schedulerWarning}</p>
+      )}
 
       {!hasShoppingConnector && !hasAccountingConnector && !wmsEnabled && (
         <p className="text-sm text-muted-foreground italic">

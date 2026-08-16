@@ -1,8 +1,10 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { EventEmitter } from 'node:events'
 import { mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
+import { PassThrough } from 'node:stream'
 import test from 'node:test'
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -1382,4 +1384,118 @@ test('non-admin restore requests still return the authorization response', async
   assert.equal(response.status, 403)
   assert.equal(body.error, 'Forbidden')
   assert.equal(calls.userFindUnique, 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-osl8 round 7, finding 2 — the restore is a GENERIC REPLAY path, and it escaped the
+// connector-selection lock inventory because that inventory was lexical.
+//
+// A restore replays whatever SQL the backup contains, in one psql transaction. It rewrites
+// `settings` — plugin selection rows included — and `accounting_sync_logs` without naming either,
+// so no amount of grepping for `plugin_` could have found it. Two consequences:
+//
+//   * it can commit a DIFFERENT accounting connector selection while cancelOrphanedAccountingSyncRows
+//     is midway through deciding, under that lock, which connector's queue to discard;
+//   * it can DEADLOCK against that cancellation, which locks the plugin settings rows first and
+//     updates accounting_sync_logs second. PostgreSQL resolves a cycle by aborting one — either the
+//     critical restore, or a cancellation that has already decided what to destroy.
+//
+// The fix is to take the same advisory lock, in the same order every other caller uses (advisory
+// lock first, rows second), as the FIRST statement psql executes inside its single transaction.
+// These tests observe the bytes that reach psql's stdin, because the ORDER is the guarantee.
+// ---------------------------------------------------------------------------
+
+async function captureRestoreStdin(sqlBody: string): Promise<{ written: string; args: string[] }> {
+  const { runRestore } = await import('../../app/api/backup/restore/route.ts')
+
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'restore-stdin-'))
+  const file = path.join(dir, 'backup.sql')
+  await writeFile(file, sqlBody)
+
+  const chunks: string[] = []
+  let args: string[] = []
+  const stdin = new PassThrough()
+  stdin.on('data', (chunk: Buffer) => chunks.push(chunk.toString('utf8')))
+
+  const child = new EventEmitter() as EventEmitter & {
+    stdin: typeof stdin
+    stderr: EventEmitter
+    kill: () => void
+  }
+  child.stdin = stdin
+  child.stderr = new EventEmitter()
+  child.kill = () => {}
+  // psql exits only once its input is closed, which is what makes "written before the pipe" an
+  // observable ordering rather than a race.
+  stdin.on('end', () => child.emit('close', 0))
+
+  try {
+    await runRestore(
+      file,
+      { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
+      {
+        spawnProcess: ((_command: string, spawnArgs: string[]) => {
+          args = spawnArgs
+          return child
+        }) as never,
+      },
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+
+  return { written: chunks.join(''), args }
+}
+
+test('the restore takes the connector-selection advisory lock before any dump byte reaches psql', async () => {
+  const dump = "UPDATE settings SET value = 'true' WHERE key = 'plugin_quickbooks_enabled';\n"
+  const { written, args } = await captureRestoreStdin(dump)
+
+  const lockAt = written.indexOf('pg_advisory_xact_lock')
+  const dumpAt = written.indexOf('UPDATE settings')
+
+  assert.ok(lockAt >= 0, 'the lock statement is sent at all')
+  assert.ok(dumpAt > lockAt, 'and it precedes the replayed SQL — a lock taken afterwards fences nothing')
+  assert.ok(
+    written.startsWith('SELECT pg_advisory_xact_lock('),
+    'it is the FIRST statement of the transaction, before any row the dump locks',
+  )
+  assert.ok(written.endsWith(dump), 'and the dump is replayed unchanged after it')
+  // An xact-scoped advisory lock outside a transaction is released the instant the statement
+  // returns, so this flag is load-bearing rather than incidental.
+  assert.ok(args.includes('--single-transaction'))
+  assert.ok(args.includes('ON_ERROR_STOP=1'))
+})
+
+test('the restore locks the SHARED constant, not a copied literal', async () => {
+  // A hand-copied number would serialize against nothing, and the symptom would be silence — the
+  // exact failure lib/db/advisory-locks.ts exists to prevent.
+  const { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } = await import('../../lib/db/advisory-locks.ts')
+  const { written } = await captureRestoreStdin('SELECT 1;\n')
+
+  assert.ok(written.startsWith(`SELECT pg_advisory_xact_lock(${ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY});`))
+})
+
+test('the restore still refuses psql metacommands before it locks anything', async () => {
+  // The lock must not have moved the validation: a file that cannot be replayed must fail without
+  // ever taking a lock the whole application contends on.
+  const { runRestore } = await import('../../app/api/backup/restore/route.ts')
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'restore-meta-'))
+  const file = path.join(dir, 'backup.sql')
+  await writeFile(file, '\\connect postgres\n')
+
+  let spawned = 0
+  try {
+    await assert.rejects(
+      () => runRestore(
+        file,
+        { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
+        { spawnProcess: ((() => { spawned += 1; throw new Error('must not spawn') })) as never },
+      ),
+      /unsupported psql metacommand/,
+    )
+  } finally {
+    await rm(dir, { recursive: true, force: true })
+  }
+  assert.equal(spawned, 0, 'nothing was spawned, so nothing was locked')
 })

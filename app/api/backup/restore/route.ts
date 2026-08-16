@@ -15,6 +15,7 @@ import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance
 import { sendEmail } from '@/lib/mailer'
 import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { db } from '@/lib/db'
+import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { getClientIp } from '@/lib/request-ip'
 import {
@@ -417,8 +418,54 @@ async function validateRestoreSqlFile(filePath: string): Promise<void> {
   }
 }
 
-async function runRestore(filePath: string, db: ReturnType<typeof getDbConfig>): Promise<void> {
+/**
+ * THE FIRST STATEMENT OF THE RESTORE TRANSACTION (o3d-osl8 round 7, finding 2).
+ *
+ * A restore replays arbitrary validated SQL over the whole database. It rewrites `settings` — plugin
+ * selection rows included — and `accounting_sync_logs`, and it does so WITHOUT naming a single
+ * plugin key, which is precisely why the lexical writer inventory in
+ * tests/accounting/plugin-selection-lock.test.ts could never have found it: a name-based sweep
+ * cannot enumerate a generic replay path.
+ *
+ * Two things go wrong without this lock.
+ *
+ *   1. NO SERIALIZATION. `cancelOrphanedAccountingSyncRows` reads the connector selection under
+ *      this lock and decides from it which queue to discard. A restore committing a DIFFERENT
+ *      selection while that decision is in flight is exactly the transition the lock exists to
+ *      stop, reached by a path that never took it.
+ *   2. DEADLOCK, in the opposite direction. The cancellation locks the plugin `settings` rows
+ *      first and updates `accounting_sync_logs` second. A restore whose SQL happens to touch
+ *      `accounting_sync_logs` before `settings` takes them in the reverse order, and PostgreSQL
+ *      resolves that by aborting one of the two — either the critical restore, or a cancellation
+ *      that has already decided what to discard.
+ *
+ * Taking the advisory lock as the first statement fixes both, and in the SAME order every other
+ * caller uses (`lockIntegrationPluginSelection`: advisory lock, then rows), so it cannot introduce a
+ * new cycle: whichever of the two transactions gets the advisory lock runs to completion while the
+ * other waits.
+ *
+ * `pg_advisory_xact_lock` is held until the transaction ends, which is why `--single-transaction`
+ * below is load-bearing rather than incidental — outside a transaction this lock would be released
+ * the moment the statement returned.
+ *
+ * WHAT THIS DOES NOT COVER, stated rather than implied: a backup whose SQL contains its own
+ * `COMMIT;` would end psql's single transaction early and release the lock with the replay still
+ * running. Plain `pg_dump` output (which is all this route accepts — see the `.sql`-only check and
+ * the metacommand validator) does not emit transaction control, and scanning for it is not
+ * available as a cheap guard because `BEGIN` legitimately appears inside PL/pgSQL function bodies.
+ * The maintenance-mode gate remains the coarse protection for that residue.
+ */
+export function buildRestoreSelectionLockStatement(): string {
+  return `SELECT pg_advisory_xact_lock(${Number(ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY)});\n`
+}
+
+export async function runRestore(
+  filePath: string,
+  db: ReturnType<typeof getDbConfig>,
+  options: { spawnProcess?: typeof spawn } = {},
+): Promise<void> {
   await validateRestoreSqlFile(filePath)
+  const spawnProcess = options.spawnProcess ?? spawn
 
   await new Promise<void>((resolve, reject) => {
     const args = [
@@ -430,7 +477,7 @@ async function runRestore(filePath: string, db: ReturnType<typeof getDbConfig>):
       '--single-transaction',
       '--set', 'ON_ERROR_STOP=1',
     ]
-    const child = spawn('psql', args, {
+    const child = spawnProcess('psql', args, {
       env: { ...process.env, PGPASSWORD: db.password },
       stdio: ['pipe', 'ignore', 'pipe'],
     })
@@ -467,6 +514,10 @@ async function runRestore(filePath: string, db: ReturnType<typeof getDbConfig>):
     child.stdin.on('error', () => {
       // handled by child close/error paths
     })
+    // Written BEFORE the pipe, so it is the first statement psql executes inside the transaction
+    // `--single-transaction` opened — ahead of any row the dump locks. Ordered writes on one
+    // writable stream, so `pipe` cannot overtake it.
+    child.stdin.write(buildRestoreSelectionLockStatement())
     input.pipe(child.stdin)
   })
 }
