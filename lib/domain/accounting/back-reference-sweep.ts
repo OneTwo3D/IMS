@@ -58,16 +58,9 @@ import {
 // interval, so a backlog of unattributable legacy rows can neither spam the activity log nor
 // re-fill the head of the scan, and it comes back on its own when the interval passes.
 //
-// TWO MORE, FOUND IN ROUND 3:
+// ONE MORE, FOUND IN ROUND 3:
 //
-// 4. THE NAMESPACE. External ids are TENANT-OWNED, and QuickBooks realm ids are integers that
-//    repeat across companies. A sweep that reasons about ids globally will take a row posted to
-//    realm A and attribute its id under realm B, where the same integer is a different document.
-//    The sweep therefore runs inside ONE namespace: `deps.provenance` is the connected
-//    "<connector>:<tenantId>", the candidate query matches the row's own stored provenance against
-//    it, and a run with no connected tenant does nothing at all.
-//
-// 5. THE CURSOR RESET. The keyset walked the population within a run but started at the head on
+// 4. THE CURSOR RESET. The keyset walked the population within a run but started at the head on
 //    every invocation, and the budget counts rows SCANNED — including rows left eligible by a
 //    failure. A persistently failing oldest `limit` rows therefore ate every run's budget and the
 //    row behind them was never reached: starvation for a third time. The cursor is now persisted
@@ -76,16 +69,26 @@ import {
 //
 // AND ONE MORE, FOUND IN ROUND 4:
 //
-// 6. RETENTION RETIRING REPAIR WORK. Round 3 replaced retention's open-ended exemption with a
+// 5. RETENTION RETIRING REPAIR WORK. Round 3 replaced retention's open-ended exemption with a
 //    compacted tombstone, and then excluded tombstones from the candidate set — which made
 //    RETENTION, a clock, the thing that decided a row would never be repaired. Compaction happens by
 //    AGE and says nothing about repairability, so an ambiguity that cleared after the horizon was
 //    never reconsidered and a back-reference that was merely failing transiently at the cutoff was
 //    never retried. That is deferred-not-retired broken by a fourth route, and keeping the claimant
 //    evidence did not compensate: evidence prevents a WRONG guess, it does not recover a missing
-//    link. A tombstone is now a full candidate for the ID/PROVENANCE write, which needs nothing the
+//    link. A tombstone is now a full candidate for the ID write, which needs nothing the
 //    compaction removed. Only the payload-dependent FOLLOW-UPS are genuinely unrecoverable, and
 //    those are discarded under an explicit terminal policy that warns before it settles the row.
+//
+// DELIBERATELY NOT IN SCOPE: connector-TENANT isolation. External ids are tenant-owned (a
+// QuickBooks realm id is an integer that repeats across companies), so a sweep running against a
+// different realm than the one a row posted to could in principle attribute the wrong document.
+// What stops that here is not a namespace on the row but the GLOBAL unique index on
+// purchase_invoices.accounting_invoice_id: a second bill can never take an id another bill holds,
+// so the worst outcome is a refused repair with a loud error rather than a wrong link. Namespacing
+// the id per connection was tried and reverted — it lets both bills exist, which moves the problem
+// to ~190 call sites that read a naked external id, on models that have no provenance column at
+// all. o3d-gt8r carries that design and its findings.
 //
 // The sweep must keep refusing to guess: failing to repair is acceptable, repairing onto
 // the wrong bill is not.
@@ -136,9 +139,9 @@ export const UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE: {
 /**
  * The TOMBSTONE an expired-but-unresolved row is compacted to (o3d-9kek r3 finding 3).
  *
- * WHAT IT KEEPS, and why each column is load-bearing: connector + provenance + type +
- * referenceType + referenceId + externalTransactionId + status. That is exactly the set the
- * PurchaseOrder resolver counts to decide "does more than one posted row claim this order's bill".
+ * WHAT IT KEEPS, and why each column is load-bearing: connector + type + referenceType +
+ * referenceId + externalTransactionId + status. That is exactly the set the PurchaseOrder resolver
+ * counts to decide "does more than one posted row claim this order's bill".
  * Keeping it is what stops retention converting an ambiguity into a confident wrong answer.
  *
  * WHAT IT DELIBERATELY DOES NOT KEEP:
@@ -162,8 +165,8 @@ export const UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE: {
  * fact that the row keeps its claimant evidence does not help: that prevents a WRONG guess, it does
  * not recover the missing link.
  *
- * So the split is by DEPENDENCY, not by row. Everything the ID/PROVENANCE write needs —
- * externalTransactionId, provenance, referenceType, referenceId — is kept, and a tombstone remains a
+ * So the split is by DEPENDENCY, not by row. Everything the ID write needs — externalTransactionId,
+ * referenceType, referenceId — is kept, and a tombstone remains a
  * full candidate for that write. Only the FOLLOW-UPS (PDF, payment, attachment) are payload-
  * dependent and therefore genuinely unrecoverable, and they are discarded under an explicit terminal
  * policy: the sweep warns, once, naming the document, and settles the row. That obeys the governing
@@ -339,20 +342,6 @@ export type BackReferenceSweepDeps = {
   /** AccountingSyncLog.connector value this sweep owns, e.g. 'xero'. */
   connector: string
   /**
-   * "<connector>:<tenantId>" for the CURRENTLY CONNECTED tenant/realm (o3d-9kek r3 finding 1), or
-   * null when that connector has no token.
-   *
-   * External bill ids are tenant-owned: QuickBooks realm ids are integers that repeat across
-   * companies, so a row posted to realm A carries an id that means something entirely different in
-   * realm B. The candidate query matches this against the row's own stored provenance, which makes
-   * foreign-realm rows structurally invisible to the sweep instead of relying on a rule a future
-   * edit can drop.
-   *
-   * NULL refuses the whole run rather than sweeping with an unknown namespace: there is no company
-   * to attribute anything to, and every write would be a guess.
-   */
-  provenance: string | null
-  /**
    * Where the last run stopped. Optional: a sweep without one still keyset-paginates WITHIN a run,
    * it just restarts at the head each time — which is the starvation described on
    * BackReferenceCandidateCursorStore, so every production binding passes one.
@@ -450,8 +439,6 @@ const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason']
  */
 export function buildBackReferenceCandidateQuery(params: {
   connector: string
-  /** The ACTIVE connection's namespace. Rows issued by any other one are not candidates. */
-  provenance: string
   after: BackReferenceCandidateCursor | null
   /** Rows whose ambiguity was reported at or after this are deferred until it passes. */
   ambiguityRecheckBefore: Date
@@ -465,11 +452,6 @@ export function buildBackReferenceCandidateQuery(params: {
   }
   const where: Record<string, unknown> = {
     connector: params.connector,
-    // THE NAMESPACE (r3 finding 1). An exact match, so a row posted to a former QuickBooks realm —
-    // or one whose issuing connection cannot be identified (NULL) — is never attributed under the
-    // current one. Its integer external id means something else here, and copying it onto a bill of
-    // this company is precisely the wrong-bill write the whole area exists to prevent.
-    provenance: params.provenance,
     status: { in: ['SYNCED', 'FAILED'] },
     externalTransactionId: { not: null },
     type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
@@ -479,7 +461,7 @@ export function buildBackReferenceCandidateQuery(params: {
     // retire unresolved repair work: an ambiguity that cleared after the retention horizon was never
     // reconsidered, and a transiently failing back-reference was never repaired, because compaction
     // is scheduled by age and says nothing about whether the row is repairable. A tombstone still
-    // carries every column the id/provenance write reads, so it stays a candidate for that write;
+    // carries every column the id write reads, so it stays a candidate for that write;
     // only its payload-dependent follow-ups are gone, and the loop handles that explicitly.
     // Nested under AND because the keyset clause below also needs the top-level OR slot.
     AND: [notRecentlyAmbiguous],
@@ -513,14 +495,6 @@ export async function repairAccountingBackReferences(
   const { connector, connectorLabel, activityActionPrefix: prefix } = deps
 
   const result: BackReferenceRepairResult = { scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0 }
-  // No live connection means no namespace to attribute within (r3 finding 1). Sweeping anyway
-  // would take external ids issued by whatever company was connected before and write them onto
-  // bills as if they belonged to the current one.
-  const provenance = deps.provenance
-  if (!provenance) {
-    console.warn(`${prefix}: back-reference sweep skipped — no connected tenant/realm to attribute external ids to`)
-    return result
-  }
   // One cutoff for the whole run, so every page of the scan agrees on which deferred rows
   // are due — a per-page `new Date()` would let a row fall on both sides of the boundary.
   const ambiguityRecheckBefore = new Date(now().getTime() - BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS)
@@ -611,7 +585,7 @@ export async function repairAccountingBackReferences(
    * THE TERMINAL POLICY for a tombstone's follow-ups (r4 finding 3).
    *
    * Retention compacts an expired-but-unresolved row to attribution only, which keeps everything the
-   * id/provenance write needs and drops the payload the FOLLOW-UPS are built from. The id is still
+   * id write needs and drops the payload the FOLLOW-UPS are built from. The id is still
    * repaired — that is the correction r4 forced, and it is why a tombstone is still a candidate —
    * but the PDF, payment or attachment that never ran cannot be reconstructed from `{}` and never
    * will be. That is a real loss, and it is announced rather than absorbed: an operator can re-drive
@@ -682,7 +656,7 @@ export async function repairAccountingBackReferences(
   while (result.scanned < limit) {
     const take = Math.min(pageSize, limit - result.scanned)
     const page = await deps.db.accountingSyncLog.findMany(
-      buildBackReferenceCandidateQuery({ connector, provenance, after, ambiguityRecheckBefore, take }),
+      buildBackReferenceCandidateQuery({ connector, after, ambiguityRecheckBefore, take }),
     )
     if (page.length === 0) {
       if (wrapped) break
@@ -710,7 +684,6 @@ export async function repairAccountingBackReferences(
         const invoiceNumber = typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : undefined
         const params = {
           connector,
-          provenance,
           type: row.type,
           referenceType: row.referenceType,
           referenceId: row.referenceId,
@@ -728,7 +701,6 @@ export async function repairAccountingBackReferences(
           try {
             attribution = await resolvePurchaseOrderBackReference(deps.db, {
               connector,
-              provenance,
               purchaseOrderId: row.referenceId,
               externalId: row.externalTransactionId,
             })

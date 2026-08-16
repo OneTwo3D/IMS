@@ -25,6 +25,26 @@
 -- Postgres does not treat NULLs as equal, so this is precisely a partial unique index over the
 -- bills that HAVE an external id: any number of bills may be unlinked.
 --
+-- GLOBAL, ON THE VALUE ALONE — AND THAT IS A DELIBERATE TRADE. The known objection: an external id
+-- is tenant-owned, and QuickBooks realm ids are integers that repeat across companies. Disconnect
+-- keeps historical bill ids (they are financial evidence: the only local record of which ledger
+-- document a bill became) while clearing the realm pin, so after a reconnect to a DIFFERENT company
+-- a new bill can post successfully to the ledger and then fail this constraint because a retired
+-- realm's bill already holds that integer.
+--
+-- That is a BLOCKED WRITE WITH A LOUD ERROR, not silent corruption, and it is the correct trade.
+-- The alternative — pairing the id with the connection that issued it and making the PAIR unique —
+-- was implemented and reverted, because it PERMITS the collision: both bills then exist, and the
+-- roughly 190 call sites that read a naked accounting_invoice_id cannot tell them apart. Worse,
+-- sales_orders, sales_order_refunds and supplier_credit_notes have no provenance column to consult
+-- even in principle, so no reader-side rule can be written for them at all. Failing to repair is
+-- acceptable; repairing (or paying, or updating) the wrong bill is not.
+--
+-- The application's error for this constraint says so in the operator's terms — that the id is
+-- already held locally and that a connector reconnect to a different company is the likeliest cause
+-- (see applyBackReference in lib/domain/accounting/back-reference.ts). o3d-gt8r carries the
+-- connector-tenant isolation work that would have to land before namespacing this is safe.
+--
 -- No backfill. IMS is not in productive use, and a duplicate present at migration time is exactly
 -- the corruption described above — this statement will fail loudly, which is the correct outcome:
 -- the duplicates must be resolved by a human against the ledger (which of the two documents is

@@ -14,7 +14,6 @@ import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { connectorFetch } from '@/lib/security/connector-fetch'
-import { assertTenantSwitchIsSafe, recordConnectedTenantId } from '@/lib/domain/accounting/tenant-switch-guard'
 
 const QBO_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2'
 const QBO_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer'
@@ -269,42 +268,6 @@ export async function exchangeCodeForTokens(
       }
     }
 
-    // THE REALM-SWITCH GUARD (o3d-9kek r4 finding 1). The pin above is cleared by disconnect — that
-    // is what makes a deliberate move possible — so it cannot answer "who did we used to be" at the
-    // one moment that matters. This can, and it refuses the switch outright while any local document
-    // still carries an id this realm did not issue.
-    //
-    // It is here rather than spread across the ~190 readers of a naked accountingInvoiceId because
-    // those readers cannot be fixed by a rule: SalesOrder, SalesOrderRefund and SupplierCreditNote
-    // have no provenance column to check at all. Refusing to CREATE the confusable state covers all
-    // of them, and every reader written after this one. See o3d-5hku for the consumer audit this
-    // does not do — until that lands, this guard is the only thing standing between a realm switch
-    // and a payment settling the wrong bill.
-    //
-    // Before the token exchange on purpose: a refused switch must leave no token, no pin and no
-    // trace behind.
-    const switchDecision = await assertTenantSwitchIsSafe(db, {
-      connector: QBO_CONNECTOR,
-      connectorLabel: 'QuickBooks',
-      tenantNoun: 'company',
-      incomingTenantId: realmId,
-    })
-    if (!switchDecision.ok) {
-      await logActivity({
-        entityType: 'SYSTEM',
-        tag: 'sync',
-        action: 'quickbooks_realm_switch_refused',
-        level: 'ERROR',
-        description: switchDecision.error,
-        metadata: {
-          previousRealmId: switchDecision.previousTenantId,
-          incomingRealmId: realmId,
-          ...switchDecision.evidence,
-        },
-      })
-      return { success: false, error: switchDecision.error }
-    }
-
     const basicAuth = buildBasicAuth(clientId, clientSecret)
     const tokenRes = await connectorFetch(QBO_TOKEN_URL, {
       method: 'POST',
@@ -355,9 +318,6 @@ export async function exchangeCodeForTokens(
       tenantName: companyName,
     })
     await pinRealmId(realmId)
-    // Survives disconnect, unlike the pin — that is what lets the guard above recognise the NEXT
-    // connect as a switch rather than as a first connection (o3d-9kek r4 finding 1).
-    await recordConnectedTenantId(db, QBO_CONNECTOR, realmId)
 
     // Store realmId as company_id setting
     await db.setting.upsert({
@@ -446,7 +406,7 @@ export async function refreshToken(): Promise<{ accessToken: string; realmId: st
 /**
  * Disconnect from QuickBooks — clears stored token and revokes refresh token.
  *
- * THE REALM/TENANT-SWITCH LIFECYCLE (o3d-9kek r3 finding 1), which this function defines.
+ * WHAT IT KEEPS, AND THE REALM-SWITCH HAZARD THAT LEAVES OPEN (o3d-gt8r).
  *
  * Disconnect deliberately does NOT clear the external ids on documents — purchase_invoices
  * .accounting_invoice_id, sales_orders.accounting_invoice_id and the rest. They are financial
@@ -454,34 +414,24 @@ export async function refreshToken(): Promise<{ accessToken: string; realmId: st
  * anchor every later correction and payment posts against. Cached LOOKUP ids (contacts, items) are
  * different — they are a performance cache with an authoritative source, so they are cleared.
  *
- * That retention is exactly why the ids are namespaced. Each stored bill id carries the
- * "<connector>:<tenantId>" of the connection that issued it, and uniqueness is enforced over the
- * PAIR, so:
+ * The pin (the *_EXPECTED_* setting) IS cleared here, because an explicit disconnect is how an
+ * operator declares they intend to move: re-authorising to a different company while still
+ * connected is refused, and only a disconnect makes the move possible.
  *
- *   1. DISCONNECT — token and pin go, ids stay. Nothing can be attributed: with no active
- *      provenance the repair sweep does nothing at all and the back-reference writers refuse.
- *   2. RECONNECT TO THE SAME tenant/realm — the provenance matches again and everything resumes
- *      exactly where it was. Nothing was destroyed to make the switch possible.
- *   3. RECONNECT TO A DIFFERENT ONE — REFUSED while any old id remains. See below.
+ * So reconnecting to a DIFFERENT company is permitted, and the retained ids then belong to a
+ * company we are no longer talking to. QuickBooks realm ids are integers that repeat across
+ * companies, so the new realm can reissue an integer an old bill still holds. What happens then is
+ * bounded by the GLOBAL unique index on purchase_invoices.accounting_invoice_id: the new bill posts
+ * to QuickBooks successfully and its LOCAL back-reference write is REFUSED, loudly, naming the
+ * realm switch as the likely cause. The remote document exists and the local link does not, which
+ * needs a human — but no payment, update or reconciliation is ever aimed at the wrong document.
  *
- * The pin (the *_EXPECTED_* setting) is what makes step 3 deliberate rather than accidental:
- * re-authorising to a different company while still connected is refused, and only an explicit
- * disconnect clears the pin.
- *
- * STEP 3 USED TO SAY SOMETHING FALSE, and o3d-9kek r4 finding 1 is the correction. It claimed the
- * old realm's history "stays readable and stays inert" once the namespaces diverge, on the strength
- * of the (id, provenance) pair being unique. The pair IS unique. The history is NOT inert:
- * payment-poller.ts selects bills by `accountingInvoiceId != null` alone and never looks at
- * accountingInvoiceProvenance, so a paid realm-B bill whose integer id collides with a retired
- * realm-A bill marks the A bill paid — and roughly 190 other call sites read a naked external id
- * the same way, on models (SalesOrder, SalesOrderRefund, SupplierCreditNote) that have no
- * provenance column to consult even in principle.
- *
- * Worse, the compound index CREATED that exposure: under the previous GLOBAL unique index realm B's
- * colliding id could not be written at all — legitimate work was blocked, but nothing was ever
- * confusable. So the namespace change is only safe alongside a guard that stops the confusable
- * state existing, and exchangeCodeForTokens now REFUSES a connect to a different realm while ids
- * this realm did not issue are still stored. The full consumer audit is o3d-5hku.
+ * That is the deliberate trade. Namespacing the id per realm so both could be stored was
+ * implemented and reverted: it permits the collision, and roughly 190 call sites read a naked
+ * external id — payment-poller.ts selects bills by `accountingInvoiceId != null` alone — on models
+ * (SalesOrder, SalesOrderRefund, SupplierCreditNote) that have no provenance column to consult even
+ * in principle. o3d-gt8r carries that design, the findings against it, and the consumer audit any
+ * real multi-tenant support has to land first.
  */
 export async function disconnect(): Promise<void> {
   // Attempt to revoke the refresh token (best-effort)
@@ -512,12 +462,6 @@ export async function disconnect(): Promise<void> {
   await db.$transaction([
     db.accountingToken.deleteMany({ where: { connector: QBO_CONNECTOR } }),
     db.setting.deleteMany({ where: { key: QBO_EXPECTED_REALM_KEY } }),
-    // DELIBERATELY ABSENT: lastConnectedTenantSettingKey('quickbooks'). Do not add it here. The pin
-    // above is cleared because an explicit disconnect is how an operator declares they intend to
-    // move; the last-connected marker is what lets the NEXT connect recognise that move as a switch
-    // and refuse it while this realm's ids are still stored (o3d-9kek r4 finding 1). Deleting it
-    // would make every reconnect look like a first connection and silently reopen the window.
-
     // Clear cached contact + item IDs so stale QuickBooks IDs aren't reused after
     // reconnecting to a different company or switching connectors.
     db.customer.updateMany({

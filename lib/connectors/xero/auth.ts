@@ -474,11 +474,10 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
  * invoice. Checked: payment-poller.ts, payment-reconcile.ts and the sync-processor's update paths
  * all key on ids that came back from Xero within the current tenant.
  *
- * TWO RESIDUALS, tracked in o3d-9t29 rather than fixed here: selectTenantConnection falls back to
+ * ONE RESIDUAL, tracked in o3d-gt8r rather than fixed here: selectTenantConnection falls back to
  * `connections[0]` when the pin is absent, so a post-disconnect reconnect can silently land on a
- * different organisation (orphaning, not corruption); and this connector still samples
- * activeAccountingIdProvenance AFTER posting, so a mid-entry re-auth can mis-stamp a row's
- * provenance — the QuickBooks half of that is fixed by lib/domain/accounting/issuer-provenance.ts.
+ * different organisation. Orphaning, not corruption — every stored id would simply resolve to
+ * nothing in the new org — but it happens without asking.
  */
 export async function disconnect(): Promise<void> {
   await db.$transaction([

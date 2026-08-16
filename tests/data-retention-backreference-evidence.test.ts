@@ -206,8 +206,8 @@ test('[o3d-9kek r3 f3] the tombstone keeps the attribution and drops the persona
   assert.equal(compact.data.errorMessage, null)
   assert.ok(compact.data.backReferenceEvidenceCompactedAt instanceof Date)
 
-  // WHAT IS KEPT, asserted by exclusion: the write touches NOTHING else, so connector,
-  // provenance, type, referenceType, referenceId, externalTransactionId and status all survive.
+  // WHAT IS KEPT, asserted by exclusion: the write touches NOTHING else, so connector, type,
+  // referenceType, referenceId, externalTransactionId and status all survive.
   // Those are exactly what the PurchaseOrder resolver counts, which is what stops retention
   // turning "two claimants, refuse" into "one claimant, confidently wrong".
   assert.deepEqual(Object.keys(compact.data).sort(), ['backReferenceEvidenceCompactedAt', 'errorMessage', 'payload'])

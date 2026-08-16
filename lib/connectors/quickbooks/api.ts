@@ -7,7 +7,6 @@
 
 import { db } from '@/lib/db'
 import { connectorFetch } from '@/lib/security/connector-fetch'
-import { noteIssuerProvenance } from '@/lib/domain/accounting/issuer-provenance'
 import { getAccessToken } from './auth'
 import { getQuickBooksSettings } from './settings'
 
@@ -101,18 +100,6 @@ function parseQboError(body: unknown): string {
 }
 
 async function performRequest(auth: { accessToken: string; realmId: string }, init: RequestInit, url: string) {
-  // o3d-9kek r4 finding 2: record the realm this request is ACTUALLY going to, at the point of use.
-  //
-  // Every QuickBooks request — document post, contact/account lookup, PDF download, attachment
-  // upload — funnels through here holding the auth snapshot it will use, which is the only place
-  // that knows the answer without guessing. The sync processor previously asked "which realm is
-  // connected?" AFTER the post returned, so a disconnect/re-auth in between stamped one realm's
-  // external id with another realm's provenance. Recording it here, on the snapshot the URL was
-  // built from, is what makes the stored provenance mean what it says.
-  //
-  // A no-op outside captureIssuerProvenance, so read paths and background lookups pay nothing.
-  noteIssuerProvenance(`${QBO_CONNECTOR}:${auth.realmId}`)
-
   let lastRateLimitMs = 0
 
   for (let attempt = 0; attempt <= QBO_MAX_RETRIES; attempt++) {

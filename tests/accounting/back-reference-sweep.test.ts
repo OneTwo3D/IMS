@@ -14,10 +14,6 @@ import {
   type BackReferenceSweepClient,
 } from '@/lib/domain/accounting/back-reference-sweep'
 
-/** The tenant/realm namespaces these tests reason in (o3d-9kek r3 finding 1). */
-const XERO_A = 'xero:tenant-A'
-const XERO_B = 'xero:tenant-B'
-
 // ---------------------------------------------------------------------------
 // o3d-9kek — the repair sweep starved newer rows and inferred PO ambiguity from the
 // capped candidate page.
@@ -33,8 +29,6 @@ const XERO_B = 'xero:tenant-B'
 type SyncRow = {
   id: string
   connector: string
-  /** The connection that ISSUED externalTransactionId (o3d-9kek r3 finding 1). */
-  provenance: string | null
   type: string
   referenceType: string
   referenceId: string
@@ -52,17 +46,16 @@ type BillRow = {
   id: string
   poId: string
   accountingInvoiceId: string | null
-  accountingInvoiceProvenance: string
   createdAt: Date
 }
 type OrderRow = { id: string; accountingInvoiceId: string | null; invoiceNumber?: string | null; invoicedAt?: Date | null }
 
 const SYNC_COLUMNS = new Set([
-  'id', 'connector', 'provenance', 'type', 'referenceType', 'referenceId', 'externalTransactionId',
+  'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId',
   'status', 'payload', 'createdAt', 'backReferenceCheckedAt', 'backReferenceAmbiguousLoggedAt',
   'backReferenceEvidenceCompactedAt',
 ])
-const BILL_COLUMNS = new Set(['id', 'poId', 'accountingInvoiceId', 'accountingInvoiceProvenance', 'createdAt'])
+const BILL_COLUMNS = new Set(['id', 'poId', 'accountingInvoiceId', 'createdAt'])
 
 const COMPARABLE_OPERATORS = ['in', 'notIn', 'not', 'gt', 'gte', 'lt', 'lte', 'equals']
 
@@ -126,16 +119,13 @@ type Store = {
 function enforceExternalIdUniqueness(bills: BillRow[], data: Record<string, unknown>, writtenBillIds: string[]): void {
   const externalId = data.accountingInvoiceId
   if (typeof externalId !== 'string' || externalId === '') return
-  // Over the (id, provenance) PAIR, as the database index is since r3 finding 1 — an external id
-  // is tenant-owned, so the same QuickBooks integer in two realms is not a duplicate.
-  const provenance = typeof data.accountingInvoiceProvenance === 'string' ? data.accountingInvoiceProvenance : ''
-  const holder = bills.find((bill) => bill.accountingInvoiceId === externalId
-    && bill.accountingInvoiceProvenance === provenance
-    && !writtenBillIds.includes(bill.id))
+  // On the VALUE ALONE, as the database index is. Namespacing it per connection in the double
+  // would let a collision through here and hide the fact that production refuses it.
+  const holder = bills.find((bill) => bill.accountingInvoiceId === externalId && !writtenBillIds.includes(bill.id))
   if (!holder) return
-  throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`,`accounting_invoice_provenance`)'), {
+  throw Object.assign(new Error('Unique constraint failed on the fields: (`accounting_invoice_id`)'), {
     code: 'P2002',
-    meta: { target: ['accounting_invoice_id', 'accounting_invoice_provenance'] },
+    meta: { target: ['accounting_invoice_id'] },
   })
 }
 
@@ -220,7 +210,7 @@ function makeHarness(store: Store): Harness {
     purchaseInvoice: {
       async findUnique(args: { where: { id: string } }) {
         const bill = store.bills.find((candidate) => candidate.id === args.where.id)
-        return bill ? { accountingInvoiceId: bill.accountingInvoiceId, accountingInvoiceProvenance: bill.accountingInvoiceProvenance } : null
+        return bill ? { accountingInvoiceId: bill.accountingInvoiceId } : null
       },
       async findFirst(args: { where: Record<string, unknown> }) {
         const bill = store.bills
@@ -280,13 +270,12 @@ function makeHarness(store: Store): Harness {
   return harness
 }
 
-function sweepDeps(harness: Harness, now?: () => Date, overrides: { provenance?: string | null; cursorStore?: BackReferenceCandidateCursorStore } = {}) {
+function sweepDeps(harness: Harness, now?: () => Date, overrides: { cursorStore?: BackReferenceCandidateCursorStore } = {}) {
   return {
     db: harness.client,
     connector: 'xero',
     connectorLabel: 'Xero',
     activityActionPrefix: 'xero',
-    provenance: 'provenance' in overrides ? overrides.provenance : XERO_A,
     cursorStore: overrides.cursorStore,
     now,
     // Models the PRODUCTION contract: never throws, and reports whether the entry was PERSISTED.
@@ -311,7 +300,6 @@ function salesInvoiceRow(index: number, overrides: Partial<SyncRow> = {}): SyncR
   return {
     id: `log-${String(index).padStart(4, '0')}`,
     connector: 'xero',
-    provenance: XERO_A,
     type: 'SALES_INVOICE',
     referenceType: 'SalesOrder',
     referenceId: `so-${index}`,
@@ -339,11 +327,8 @@ test('the candidate query excludes already-checked rows and keyset-paginates pas
       { backReferenceAmbiguousLoggedAt: { lt: recheckBefore } },
     ],
   }
-  const first = buildBackReferenceCandidateQuery({ connector: 'xero', provenance: XERO_A, after: null, ambiguityRecheckBefore: recheckBefore, take: 50 })
+  const first = buildBackReferenceCandidateQuery({ connector: 'xero', after: null, ambiguityRecheckBefore: recheckBefore, take: 50 })
   assert.equal(first.where.connector, 'xero')
-  // THE NAMESPACE (r3 finding 1): an exact match, so a row issued by a former tenant/realm is not
-  // a candidate at all. A `{ in: [...] }` or an omission here is the collision this fixes.
-  assert.equal(first.where.provenance, XERO_A)
   // A TOMBSTONE IS STILL A CANDIDATE (r4 finding 3). r3 filtered these out, which handed RETENTION
   // — a clock — the power to decide a row would never be repaired: compaction runs on age and says
   // nothing about repairability, so an ambiguity that cleared after the horizon, or a
@@ -360,7 +345,7 @@ test('the candidate query excludes already-checked rows and keyset-paginates pas
   assert.deepEqual(first.orderBy, [{ createdAt: 'asc' }, { id: 'asc' }])
 
   const cursor = { createdAt: at(7), id: 'log-0007' }
-  const next = buildBackReferenceCandidateQuery({ connector: 'xero', provenance: XERO_A, after: cursor, ambiguityRecheckBefore: recheckBefore, take: 50 })
+  const next = buildBackReferenceCandidateQuery({ connector: 'xero', after: cursor, ambiguityRecheckBefore: recheckBefore, take: 50 })
   assert.deepEqual(next.where.AND, [
     deferralClause,
     {
@@ -498,7 +483,7 @@ function poRow(index: number, poId: string, overrides: Partial<SyncRow> = {}): S
 test('ambiguity is detected when a second sync row for the same PO lies beyond the page', async () => {
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1')],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
 
@@ -522,10 +507,10 @@ test('ambiguity is detected when one sync row maps to a PO with several unlinked
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1')],
     bills: [
-      { id: 'bill-old', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) },
+      { id: 'bill-old', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) },
       // Created while sync was disabled: newest, and the old code's "newest unlinked bill"
       // heuristic would have written the other bill's external id onto it.
-      { id: 'bill-new', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(9) },
+      { id: 'bill-new', poId: 'po-1', accountingInvoiceId: null, createdAt: at(9) },
     ],
     orders: [],
   })
@@ -545,7 +530,7 @@ test('a CANCELLED sibling row does not make a PO ambiguous', async () => {
   // audit-46ry: a cancelled row is deliberately abandoned and competes for nothing.
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1', { status: 'CANCELLED' })],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
 
@@ -559,11 +544,11 @@ test('the unambiguous single-bill PO row is still repaired, onto that exact bill
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1')],
     bills: [
-      { id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) },
+      { id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) },
       // A linked bill on the same PO is not a competitor — it already has its id.
-      { id: 'bill-0', poId: 'po-1', accountingInvoiceId: 'XBILL-0', accountingInvoiceProvenance: XERO_A, createdAt: at(0) },
+      { id: 'bill-0', poId: 'po-1', accountingInvoiceId: 'XBILL-0', createdAt: at(0) },
       // ...nor is another PO's bill.
-      { id: 'bill-other', poId: 'po-2', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(2) },
+      { id: 'bill-other', poId: 'po-2', accountingInvoiceId: null, createdAt: at(2) },
     ],
     orders: [],
   })
@@ -583,7 +568,7 @@ test('the unambiguous single-bill PO row is still repaired, onto that exact bill
 test('an ambiguous PO row is warned about once per interval, not on every cron cycle', async () => {
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1')],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
   let clock = new Date(Date.UTC(2026, 1, 1))
@@ -626,8 +611,8 @@ test('[o3d-9kek f1] a legacy row already linked to one bill does not stamp its i
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1')],
     bills: [
-      { id: 'bill-a', poId: 'po-1', accountingInvoiceId: 'XBILL-1', accountingInvoiceProvenance: XERO_A, createdAt: at(1) },
-      { id: 'bill-b', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(9) },
+      { id: 'bill-a', poId: 'po-1', accountingInvoiceId: 'XBILL-1', createdAt: at(1) },
+      { id: 'bill-b', poId: 'po-1', accountingInvoiceId: null, createdAt: at(9) },
     ],
     orders: [],
   })
@@ -654,7 +639,7 @@ test('[o3d-9kek f2] an ambiguous row stays eligible and is repaired once the amb
   // cancelled.
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1')],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
   const clock = fakeClock()
@@ -677,8 +662,8 @@ test('[o3d-9kek f2] MULTIPLE_UNLINKED_BILLS also stays eligible, and repairs whe
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1')],
     bills: [
-      { id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) },
-      { id: 'bill-2', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(9) },
+      { id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) },
+      { id: 'bill-2', poId: 'po-1', accountingInvoiceId: null, createdAt: at(9) },
     ],
     orders: [],
   })
@@ -707,8 +692,8 @@ test('[o3d-9kek f2] a backlog of unattributable rows does not starve a newer bro
   const bills: BillRow[] = []
   for (let index = 1; index <= 10; index++) {
     syncRows.push(poRow(index, `po-${index}`))
-    bills.push({ id: `bill-${index}a`, poId: `po-${index}`, accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(index) })
-    bills.push({ id: `bill-${index}b`, poId: `po-${index}`, accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(index + 1) })
+    bills.push({ id: `bill-${index}a`, poId: `po-${index}`, accountingInvoiceId: null, createdAt: at(index) })
+    bills.push({ id: `bill-${index}b`, poId: `po-${index}`, accountingInvoiceId: null, createdAt: at(index + 1) })
   }
   syncRows.push(salesInvoiceRow(50))
   const harness = makeHarness({ syncRows, bills, orders: [{ id: 'so-50', accountingInvoiceId: null }] })
@@ -739,7 +724,7 @@ test('[o3d-9kek f2] a sibling that never posted carries no external id and manuf
       poRow(2, 'po-1', { status: 'FAILED', externalTransactionId: null }),
       poRow(3, 'po-1', { status: 'PENDING', externalTransactionId: null }),
     ],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
 
@@ -755,7 +740,7 @@ test('[o3d-9kek f3] a bill linked between the probe and the apply keeps the winn
   // valid id with the legacy row's.
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1')],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
   let reads = 0
@@ -783,7 +768,7 @@ test('[o3d-9kek f3] a bill linked between the probe and the apply keeps the winn
 test('[o3d-9kek f3] the PO repair resolves and writes inside one transaction, under a per-PO lock', async () => {
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1')],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
 
@@ -809,7 +794,7 @@ test('[o3d-9kek r2 f2] evidence deleted mid-attribution is refused, not treated 
   // justify it — and no later reader could tell it had been guessed.
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1')],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
   // Fires between the bill read and the sync-row count, i.e. exactly inside the window.
@@ -838,8 +823,8 @@ test('[o3d-9kek r2 f1] a sibling bill claiming the id mid-apply is reported, not
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1')],
     bills: [
-      { id: 'bill-a', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) },
-      { id: 'bill-b', poId: 'po-1', accountingInvoiceId: 'XBILL-old', accountingInvoiceProvenance: XERO_A, createdAt: at(9) },
+      { id: 'bill-a', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) },
+      { id: 'bill-b', poId: 'po-1', accountingInvoiceId: 'XBILL-old', createdAt: at(9) },
     ],
     orders: [],
   })
@@ -869,8 +854,8 @@ test('[o3d-9kek r2 f1] an id held by ANOTHER PO\'s bill is reported, and no seco
     syncRows: [poRow(1, 'po-1')],
     bills: [
       // The holder sits on a different order, so the PO-scoped guard never looked at it.
-      { id: 'bill-elsewhere', poId: 'po-2', accountingInvoiceId: 'XBILL-1', accountingInvoiceProvenance: XERO_A, createdAt: at(1) },
-      { id: 'bill-here', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(9) },
+      { id: 'bill-elsewhere', poId: 'po-2', accountingInvoiceId: 'XBILL-1', createdAt: at(1) },
+      { id: 'bill-here', poId: 'po-1', accountingInvoiceId: null, createdAt: at(9) },
     ],
     orders: [],
   })
@@ -896,7 +881,7 @@ test('[o3d-9kek r2 f3] a warning that was NOT persisted does not buy 24 hours of
   // attempt for a day, including one that would have succeeded because the ambiguity cleared.
   const harness = makeHarness({
     syncRows: [poRow(1, 'po-1'), poRow(2, 'po-1')],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
   const clock = fakeClock()
@@ -1041,39 +1026,6 @@ test('[o3d-9kek r3 f4] an unreadable cursor degrades to a head scan, not to no s
   assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-1')
 })
 
-test('[o3d-9kek r3 f1] a row issued by a FORMER tenant/realm is not swept', async () => {
-  // The row posted to tenant B carries an id that means something else — or nothing — in tenant A.
-  // Repairing it under A writes A's bill a link to B's document.
-  const harness = makeHarness({
-    syncRows: [salesInvoiceRow(1, { provenance: XERO_B }), salesInvoiceRow(2, { provenance: null })],
-    bills: [],
-    orders: [
-      { id: 'so-1', accountingInvoiceId: null },
-      { id: 'so-2', accountingInvoiceId: null },
-    ],
-  })
-
-  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
-  assert.equal(run.scanned, 0)
-  assert.equal(harness.store.orders[0].accountingInvoiceId, null)
-  // NULL provenance too: an id whose issuing connection cannot be identified has no namespace to
-  // be attributed in, and guessing one is the wrong-bill write.
-  assert.equal(harness.store.orders[1].accountingInvoiceId, null)
-})
-
-test('[o3d-9kek r3 f1] with no connected tenant the sweep does nothing at all', async () => {
-  const harness = makeHarness({
-    syncRows: [salesInvoiceRow(1)],
-    bills: [],
-    orders: [{ id: 'so-1', accountingInvoiceId: null }],
-  })
-
-  const run = await repairAccountingBackReferences(sweepDeps(harness, undefined, { provenance: null }), { limit: 10 })
-  assert.equal(run.scanned, 0)
-  assert.equal(harness.calls.candidateQueries, 0, 'it must not even ask — there is no namespace to ask within')
-  assert.equal(harness.store.orders[0].accountingInvoiceId, null)
-})
-
 // ---------------------------------------------------------------------------
 // o3d-9kek r4 finding 3 — a retention TOMBSTONE must stay a repair candidate.
 //
@@ -1083,8 +1035,8 @@ test('[o3d-9kek r3 f1] with no connected tenant the sweep does nothing at all', 
 // to be failing at the cutoff. Keeping the claimant evidence stops a WRONG guess; it does nothing
 // to recover the missing link, and "deferred, not retired" was the property being broken.
 //
-// The split is by DEPENDENCY. The id/provenance write reads externalTransactionId, provenance,
-// referenceType and referenceId — all of which survive compaction, so it still runs. The follow-ups
+// The split is by DEPENDENCY. The id write reads externalTransactionId, referenceType and
+// referenceId — all of which survive compaction, so it still runs. The follow-ups
 // are built from the payload, which does not, so they are discarded under a stated terminal policy.
 // ---------------------------------------------------------------------------
 
@@ -1165,7 +1117,7 @@ test('[o3d-9kek r4 f3] a TOMBSTONE with an unresolved PO ambiguity is still defe
       poRow(1, 'po-1', { payload: {}, backReferenceEvidenceCompactedAt: at(500) }),
       poRow(2, 'po-1'),
     ],
-    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: at(1) }],
     orders: [],
   })
 

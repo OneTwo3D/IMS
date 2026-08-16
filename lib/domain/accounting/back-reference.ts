@@ -25,18 +25,6 @@ export type BackReferenceParams = {
    * only meaningful within one connector (o3d-9kek).
    */
   connector: string
-  /**
-   * THE NAMESPACE this external id belongs to: "<connector>:<tenantId>" for the connection that
-   * issued it (o3d-9kek r3 finding 1) — the same string as Product.accountingItemProvenance,
-   * from the same AccountingToken row, with QuickBooks's realmId in the tenantId column.
-   *
-   * Required, and never defaulted, because an external bill id is TENANT-OWNED. QuickBooks realm
-   * ids are integers that repeat across companies, so "who else holds this id" and "is this bill
-   * already linked" are only answerable within one realm. Answering them globally — which is what
-   * this module did when the unique index was value-only — makes a retired realm's bill block a
-   * live one, and makes one realm's id look like a valid link in another.
-   */
-  provenance: string
   type: AccountingSyncType
   referenceType: string
   referenceId: string
@@ -87,10 +75,7 @@ export type BackReferenceDeps = {
      * (o3d-9kek finding 3). Same compare-and-swap idiom as accounting-event-mirror's void.
      */
     updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }): Promise<{ count: number }>
-    findUnique(args: {
-      where: { id: string }
-      select: { accountingInvoiceId: true; accountingInvoiceProvenance: true }
-    }): Promise<{ accountingInvoiceId: string | null; accountingInvoiceProvenance: string } | null>
+    findUnique(args: { where: { id: string }; select: { accountingInvoiceId: true } }): Promise<{ accountingInvoiceId: string | null } | null>
   }
   supplierCreditNote: {
     update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>
@@ -185,8 +170,8 @@ export type AmbiguousPurchaseOrderAttribution = {
  * An unnamed target is treated as ours (fail closed): refusing a write we could have made is the
  * acceptable failure, making one we should not have is not.
  *
- * The index is now the (id, provenance) PAIR, so Prisma may report either both column names or the
- * index name — both contain `accounting_invoice_id`, which is what this matches on.
+ * Prisma may report the column name or the index name; both contain `accounting_invoice_id`, which
+ * is what this matches on.
  */
 export function isExternalBillIdConflict(error: unknown): boolean {
   if (typeof error !== 'object' || error === null) return false
@@ -242,7 +227,7 @@ const PURCHASE_ORDER_ATTRIBUTION_LIVE_STATUSES = ['PENDING', 'PROCESSING', 'SYNC
  */
 export async function resolvePurchaseOrderBackReference(
   deps: PurchaseOrderAttributionDeps,
-  params: { connector: string; provenance: string; purchaseOrderId: string; externalId: string },
+  params: { connector: string; purchaseOrderId: string; externalId: string },
 ): Promise<PurchaseOrderAttribution> {
   // FIRST, before any uniqueness reasoning: WHO, ANYWHERE, already holds this external id?
   //
@@ -259,13 +244,15 @@ export async function resolvePurchaseOrderBackReference(
   //     is the correct one and this row's reference is wrong, or an earlier guess mis-attributed
   //     it. Both need a human; neither is repaired by writing a second copy.
   //
-  // WITHIN THE NAMESPACE, and only within it (o3d-9kek r3 finding 1). The holder question is
-  // "which bill of THIS connection holds this id" — a bill still carrying a retired realm's id
-  // that happens to be the same integer is not a holder, not a conflict, and must not block a
-  // live link. That is the whole point of pairing the id with its provenance.
+  // GLOBALLY, not per-connection. The unique index is on the VALUE alone, so this single lookup
+  // finds the holder whoever it is. That is deliberately strict: a QuickBooks realm switch can
+  // leave a retired company's bill holding an integer the new company has since reissued, and this
+  // will then report a conflict and refuse. A blocked write with a loud error is the correct trade
+  // — see applyBackReference's bill-keyed message, and o3d-gt8r for the connector-tenant isolation
+  // work that would let two realms coexist safely.
   if (params.externalId) {
     const holder = await deps.purchaseInvoice.findFirst({
-      where: { accountingInvoiceId: params.externalId, accountingInvoiceProvenance: params.provenance },
+      where: { accountingInvoiceId: params.externalId },
       select: { id: true, poId: true },
     })
     if (holder) {
@@ -294,13 +281,6 @@ export async function resolvePurchaseOrderBackReference(
   const syncRowCount = await deps.accountingSyncLog.count({
     where: {
       connector: params.connector,
-      // Competitors are counted FAIL-CLOSED across the namespace boundary (o3d-9kek r3 finding 1):
-      // rows of the active connection, plus rows whose issuing connection can no longer be
-      // identified. A NULL-provenance row posted SOMETHING, and if that something was this realm's
-      // bill then ignoring it would turn a genuine two-claimant ambiguity into a confident wrong
-      // answer. Rows belonging to a DIFFERENT known realm are excluded: their external ids mean
-      // something else entirely, so they compete for nothing here.
-      OR: [{ provenance: params.provenance }, { provenance: null }],
       type: 'PURCHASE_INVOICE',
       referenceType: 'PurchaseOrder',
       referenceId: params.purchaseOrderId,
@@ -371,7 +351,7 @@ export function syncTypeWritesBackReference(type: AccountingSyncType, referenceT
  */
 async function resolveAndApplyPurchaseOrderBackReference(
   tx: BackReferenceDeps,
-  params: { connector: string; provenance: string; purchaseOrderId: string; externalId: string },
+  params: { connector: string; purchaseOrderId: string; externalId: string },
 ): Promise<BackReferenceApplyOutcome> {
   const attribution = await resolvePurchaseOrderBackReference(tx, params)
   if (attribution.outcome === 'ambiguous') return { outcome: 'ambiguous', attribution }
@@ -382,11 +362,7 @@ async function resolveAndApplyPurchaseOrderBackReference(
 
   const written = await tx.purchaseInvoice.updateMany({
     where: { id: attribution.purchaseInvoiceId, accountingInvoiceId: null },
-    // The id and the namespace it belongs to are written TOGETHER, in one statement. Writing the
-    // id and stamping its provenance separately would leave a window in which the row is a
-    // sentinel-namespace ('') link, and the unique index would then be enforcing the wrong
-    // namespace for as long as that window lasts.
-    data: { accountingInvoiceId: params.externalId, accountingInvoiceProvenance: params.provenance },
+    data: { accountingInvoiceId: params.externalId },
   })
   if (written.count !== 1) return { outcome: 'contended', purchaseInvoiceId: attribution.purchaseInvoiceId }
   return { outcome: 'applied', referenceType: 'PurchaseInvoice', referenceId: attribution.purchaseInvoiceId }
@@ -398,12 +374,8 @@ async function resolveAndApplyPurchaseOrderBackReference(
  * swallowed the error and left the document silently orphaned.
  */
 export async function applyBackReference(deps: BackReferenceDeps, params: BackReferenceParams): Promise<BackReferenceApplyOutcome> {
-  const { connector, provenance, type, referenceType, referenceId, externalId, invoiceNumber } = params
+  const { connector, type, referenceType, referenceId, externalId, invoiceNumber } = params
   if (!externalId) return { outcome: 'nothing-to-apply' }
-  // No live connection, no namespace, no write (o3d-9kek r3 finding 1). Stamping an id with the ''
-  // sentinel would put it in the shared legacy namespace, where it can collide with — or be
-  // mistaken for — a different company's document. Refusing is the acceptable failure.
-  if (!provenance) return { outcome: 'nothing-to-apply' }
 
   if (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') {
     await deps.salesOrder.update({
@@ -424,19 +396,31 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
     // write is allowed to overwrite a legacy guess. It is still subject to the unique index, and
     // a violation here is a real signal rather than a race — the id is on some OTHER bill. That
     // happens when the ledger merged two of our documents (the o3d-6l3 ACCPAY upsert-on-
-    // InvoiceNumber defect) or when an earlier guess mis-attributed it. Rethrown with the
-    // explanation, so the sync row carries it: retries exhaust to FAILED and a human sees why,
-    // instead of a second bill silently claiming the same remote document.
+    // InvoiceNumber defect), when an earlier guess mis-attributed it, or — the case the index is
+    // deliberately strict about — when the connector was reconnected to a DIFFERENT company and
+    // reissued an id a retired company's bill still holds. Rethrown with the explanation, so the
+    // sync row carries it: retries exhaust to FAILED and a human sees why, instead of a second bill
+    // silently claiming the same remote document.
+    //
+    // The index is on the VALUE alone, deliberately (o3d-9kek). Namespacing it per connection would
+    // let both bills exist, and roughly 190 call sites read a naked accountingInvoiceId — so the
+    // collision would move from a blocked write to two documents a payment or an update can confuse,
+    // on models (SalesOrder, SalesOrderRefund, SupplierCreditNote) that have no provenance column to
+    // consult even in principle. A blocked write with a loud error is the acceptable failure; a
+    // silent wrong document is not. See o3d-gt8r.
     try {
       await deps.purchaseInvoice.update({
         where: { id: referenceId },
-        data: { accountingInvoiceId: externalId, accountingInvoiceProvenance: provenance },
+        data: { accountingInvoiceId: externalId },
       })
     } catch (error) {
       if (!isExternalBillIdConflict(error)) throw error
       throw new Error(
-        `Refusing to link PurchaseInvoice ${referenceId} to ${connector} bill ${externalId} (${provenance}): another bill already carries that external id. `
-        + 'Two local bills pointing at one ledger document make every later correction rewrite the wrong one — resolve it manually.',
+        `Refusing to link PurchaseInvoice ${referenceId} to ${connector} bill ${externalId}: that external id is ALREADY HELD LOCALLY by `
+        + 'another purchase invoice, and one ledger document cannot belong to two local bills — every later correction would rewrite the '
+        + 'wrong one. The likeliest cause is that this connector was reconnected to a different company/organisation which has reissued an '
+        + 'id a bill from the previous one still holds; the next likeliest is that an earlier repair mis-attributed it. Check which bill '
+        + `currently carries ${externalId} and resolve it by hand — nothing here will overwrite it.`,
         { cause: error },
       )
     }
@@ -446,7 +430,7 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
     // play. Attribute it only when the whole population for that PO leaves exactly one
     // possibility; otherwise refuse and let the caller log it for manual attribution.
     // (New rows are keyed on the bill since o3d-9oq — this path is for legacy rows.)
-    const resolveAndApply = { connector, provenance, purchaseOrderId: referenceId, externalId }
+    const resolveAndApply = { connector, purchaseOrderId: referenceId, externalId }
     if (typeof deps.$transaction === 'function') {
       try {
         return await deps.$transaction(async (tx) => {
@@ -493,7 +477,7 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
  * needed. Returns false for types that don't write a back-reference.
  */
 export async function backReferenceIsMissing(deps: BackReferenceDeps, params: BackReferenceParams): Promise<boolean> {
-  const { type, referenceType, referenceId, externalId, provenance } = params
+  const { type, referenceType, referenceId, externalId } = params
   if (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') {
     const so = await deps.salesOrder.findUnique({ where: { id: referenceId }, select: { accountingInvoiceId: true } })
     return so != null && !so.accountingInvoiceId
@@ -503,16 +487,8 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
     return refund != null && !refund.accountingCreditNoteId
   }
   if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseInvoice') {
-    const inv = await deps.purchaseInvoice.findUnique({
-      where: { id: referenceId },
-      select: { accountingInvoiceId: true, accountingInvoiceProvenance: true },
-    })
-    if (inv == null) return false
-    // Linked IN THIS NAMESPACE, or not linked at all (o3d-9kek r3 finding 1). A bill still
-    // carrying a retired realm's id has no link to the company we are now talking to, so the
-    // back-reference for this connection genuinely is missing — and the authoritative bill-keyed
-    // write below is allowed to replace it.
-    return !(inv.accountingInvoiceId && inv.accountingInvoiceProvenance === provenance)
+    const inv = await deps.purchaseInvoice.findUnique({ where: { id: referenceId }, select: { accountingInvoiceId: true } })
+    return inv != null && !inv.accountingInvoiceId
   }
   if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseOrder') {
     // o3d-9kek finding 1: THIS row's id being already on a bill of the PO settles it. Asking
@@ -520,7 +496,7 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
     // long ago, and the unlinked bill it then saw belonged to something else entirely.
     if (externalId) {
       const alreadyLinked = await deps.purchaseInvoice.findFirst({
-        where: { poId: referenceId, accountingInvoiceId: externalId, accountingInvoiceProvenance: provenance },
+        where: { poId: referenceId, accountingInvoiceId: externalId },
         select: { id: true },
       })
       if (alreadyLinked) return false

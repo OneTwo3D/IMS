@@ -22,11 +22,6 @@ import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/acc
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import { applyBackReference } from '@/lib/domain/accounting/back-reference'
 import {
-  captureIssuerProvenance,
-  issuedProvenanceOrNull,
-  issuerProvenanceRefusal,
-} from '@/lib/domain/accounting/issuer-provenance'
-import {
   DEFAULT_BACK_REFERENCE_SWEEP_LIMIT,
   createBackReferenceSweepCursorStore,
   repairAccountingBackReferences,
@@ -343,56 +338,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       // Idempotency guard: if a previous run already posted to QBO but failed
       // during follow-up work, don't re-post. Skip straight to follow-ups.
       if (entry.externalTransactionId) {
-        // THIS BRANCH IS A NAMESPACE DECISION, NOT A NO-OP (o3d-9kek r4 finding 2). It used to take
-        // whatever integer sat in externalTransactionId and hand it to updateBackReference, which
-        // then stamped it with the CURRENTLY connected realm. For a row issued before the provenance
-        // column existed (NULL), or by a realm we are no longer talking to, that is a silent
-        // re-attribution: a realm-A bill id written onto a realm-B document, and — because the
-        // follow-ups carry the same id in `accountingInvoiceId` — a payment or attachment posted
-        // against realm B's document of the same number.
-        //
-        // The id's issuer is a fact about the past. It is either recorded on the row or it is
-        // unknown, and unknown never becomes "the realm connected now".
-        const activeProvenance = await activeAccountingIdProvenance(QBO_CONNECTOR)
-        if (!accountingIdProvenanceMatches(entry.provenance, activeProvenance)) {
-          // Two different situations, deliberately handled differently. NOT CONNECTED is transient:
-          // the row keeps its id, goes back to PENDING without burning a retry, and resolves itself
-          // the moment a connection exists. A row whose issuer is UNKNOWN or FOREIGN is not
-          // transient — no amount of retrying establishes who issued it — so it is retained as
-          // FAILED work with the reason on the row, which is where an operator can act on it.
-          const notConnected = activeProvenance === null && entry.provenance !== null
-          const errorMessage = notConnected
-            ? `Holding QuickBooks entry ${entry.id}: it carries external id ${entry.externalTransactionId} issued by `
-              + `${entry.provenance}, and no QuickBooks company is connected to confirm that is still the right one.`
-            : `Refusing to attribute QuickBooks external id ${entry.externalTransactionId} to ${activeProvenance ?? 'no connected company'}: `
-              + `the connection that issued it is ${entry.provenance === null ? 'unknown (recorded before ids were namespaced)' : entry.provenance}. `
-              + 'QuickBooks ids are company-owned integers, so writing this one under a different company would link the wrong document. '
-              + 'Reconnect the issuing company, or resolve this row by hand.'
-          await db.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: { status: notConnected ? 'PENDING' : 'FAILED', errorMessage, processingStartedAt: null },
-          })
-          if (!notConnected) {
-            await logActivity({
-              entityType: 'SYSTEM',
-              action: 'quickbooks_external_id_provenance_refused',
-              tag: 'sync',
-              level: 'ERROR',
-              description: errorMessage,
-              metadata: {
-                syncLogId: entry.id,
-                type: entry.type,
-                referenceType: entry.referenceType,
-                referenceId: entry.referenceId,
-                externalId: entry.externalTransactionId,
-                storedProvenance: entry.provenance,
-                activeProvenance,
-              },
-            })
-          }
-          result.failed++
-          continue
-        }
         await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
             where: { id: entry.id },
@@ -413,23 +358,13 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             externalId: entry.externalTransactionId,
           })
         })
-        // entry.provenance, NEVER a fresh sample: it was just proved equal to the active one, and
-        // passing the STORED value is what keeps that true if the connection changes underneath us
-        // between here and the write.
-        await updateBackReference(entry.provenance, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+        await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
         await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
         result.succeeded++
         continue
       }
 
-      // The realm every request inside processEntry actually used, recorded AT REQUEST TIME by the
-      // HTTP client rather than sampled afterwards (o3d-9kek r4 finding 2). This value is immutable
-      // from here on and is threaded through the row's stamp and the back-reference write, so a
-      // disconnect/re-auth mid-entry can never retro-attribute the id it produced.
-      const { result: syncResult, issuer } = await captureIssuerProvenance(() =>
-        processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimedAt),
-      )
-      const issuerProvenance = issuedProvenanceOrNull(issuer)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimedAt)
 
       if (syncResult.skipped) {
         // processEntry already terminalised this row (its order was cancelled — o3d-5rs/o3d-ejg).
@@ -438,75 +373,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
-        // o3d-9kek r3 finding 1: stamp the row with the connection that ISSUED this external id.
-        // External ids are tenant-owned — QuickBooks realm ids are integers that repeat across
-        // companies — so a repair sweep running under a different realm must be able to see that
-        // this row is not its business.
-        //
-        // r4 finding 2: `issuerProvenance` comes from the auth snapshot the REQUESTS were made
-        // with, captured while they were in flight. The previous version sampled
-        // activeAccountingIdProvenance HERE, after the post had already returned, so a
-        // disconnect/re-auth in between stamped a realm-A id as realm B and every guard built on
-        // provenance then reasoned correctly about a lie.
-        const provenance = issuerProvenance
-        if (syncResult.externalId && provenance === null) {
-          // The document IS in QuickBooks and we cannot say which company's it is. Both halves
-          // matter, so both are recorded: the id is persisted (losing it would orphan a real ledger
-          // document and invite a duplicate post), and the row is retained as FAILED with a NULL
-          // provenance — which is exactly "issuer unknown" and is the one state the repair sweep
-          // will never attribute under some other realm.
-          //
-          // Marking it SYNCED instead — what an earlier revision did whenever the sample came back
-          // null — left a row with an external id, no provenance and backReferenceCheckedAt NULL,
-          // which the sweep's exact-provenance match PERMANENTLY excludes. The swallowing catch in
-          // updateBackReference promises "the repair sweep will retry it"; for that row the promise
-          // was false and nothing was ever going to fix it. FAILED and loud is the honest state.
-          const errorMessage = `QuickBooks entry ${entry.id} posted successfully (external id ${syncResult.externalId}) but `
-            + `${issuerProvenanceRefusal(issuer)}. The id is recorded WITHOUT a company, so nothing will link it automatically; `
-            + 'confirm which company holds the document and resolve this row by hand.'
-          await db.$transaction(async (tx) => {
-            await tx.accountingSyncLog.update({
-              where: { id: entry.id },
-              data: {
-                status: 'FAILED',
-                externalTransactionId: syncResult.externalId,
-                provenance: null,
-                errorMessage,
-                processingStartedAt: null,
-              },
-            })
-            // The remote document exists, so the mirror says POSTED even though our row says FAILED.
-            // They are answering different questions: what is in the ledger, and whether we managed
-            // to attribute it.
-            await updateMirroredEventForSyncLog(tx, {
-              syncLogId: entry.id,
-              type: entry.type,
-              referenceType: entry.referenceType,
-              referenceId: entry.referenceId,
-              payload,
-              status: 'POSTED',
-              externalId: syncResult.externalId,
-            })
-          })
-          await logActivity({
-            entityType: 'SYSTEM',
-            action: 'quickbooks_issuer_provenance_unavailable',
-            tag: 'sync',
-            level: 'ERROR',
-            description: errorMessage,
-            metadata: {
-              syncLogId: entry.id,
-              type: entry.type,
-              referenceType: entry.referenceType,
-              referenceId: entry.referenceId,
-              externalId: syncResult.externalId,
-              issuerOutcome: issuer.outcome,
-              observedProvenance: issuer.outcome === 'conflicting' ? issuer.observed : undefined,
-            },
-          })
-          result.failed++
-          continue
-        }
         // Persist external ID and SYNCED status BEFORE any follow-up work.
         // If follow-ups fail, the next retry will see externalTransactionId
         // and skip the QBO write (idempotency guard above).
@@ -516,7 +382,6 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             data: {
               status: 'SYNCED',
               externalTransactionId: syncResult.externalId ?? null,
-              provenance,
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
@@ -537,11 +402,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // These are best-effort: if they fail, the external post is already
         // safely recorded and won't be replayed.
         try {
-          // The SAME immutable value that was just written to the row — not another sample.
-          // updateBackReference used to call activeAccountingIdProvenance itself, which opened a
-          // second, independent realm-switch window between stamping the row and stamping the
-          // document (o3d-9kek r4 finding 2).
-          await updateBackReference(provenance, entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
+          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
         } catch (followUpError) {
           // ERROR, not WARNING: the external post is committed and this entry is about to be
@@ -964,19 +825,6 @@ async function processEntry(
 }
 
 async function updateBackReference(
-  /**
-   * The connection that ISSUED `externalId`, supplied by the caller and never re-derived here
-   * (o3d-9kek r4 finding 2).
-   *
-   * This function used to call activeAccountingIdProvenance itself. That made it a SECOND sample of
-   * a value the caller had already taken, so an entry could stamp its sync row with realm A and,
-   * milliseconds later, stamp its document with realm B — two records of one post disagreeing about
-   * which company it went to, with nothing to reconcile them afterwards. A parameter cannot drift:
-   * the id and its namespace now come from one measurement, taken while the request was in flight.
-   *
-   * NULL means the issuer is unknown, which is a refusal, not a default to "whoever is connected".
-   */
-  provenance: string | null,
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
@@ -984,31 +832,14 @@ async function updateBackReference(
   invoiceNumber?: string,
 ): Promise<void> {
   if (!externalId) return
-  // o3d-9kek r3 finding 1: bill ids are REALM-owned. QuickBooks realm ids are integers that repeat
-  // across companies, so the id is stored with the connection that issued it and uniqueness is
-  // enforced over the pair. With no known issuing realm there is no namespace to write into —
-  // refuse, and let the repair sweep link it once the issuer is connected again.
-  if (!provenance) {
-    await logActivity({
-      entityType: 'SYSTEM',
-      action: 'quickbooks_backreference_no_realm',
-      tag: 'sync',
-      level: 'WARNING',
-      description: `Did not write the QuickBooks back-reference for ${referenceType} ${referenceId}: no connected QuickBooks company to `
-        + `attribute external id ${externalId} to. The id is on the sync row and the repair sweep links it once a company is connected.`,
-      metadata: { type, referenceType, referenceId, externalId },
-    })
-    return
-  }
 
   try {
-    // EVERY type goes through the shared writer, exactly as Xero's does. Hand-rolled per-type
-    // updates here were how the two connectors drifted: the bill-keyed branch wrote
-    // accountingInvoiceId with a bare `update`, which since o3d-9kek r3 finding 1 would have
-    // stored the id WITHOUT the realm that issued it — landing it in the '' sentinel namespace,
-    // where a genuinely different company's bill can collide with it. The namespace and the id
-    // must be written together, and there is exactly one place that does that.
-    const applied = await applyBackReference(db, { connector: QBO_CONNECTOR, provenance, type, referenceType, referenceId, externalId, invoiceNumber })
+    // EVERY type goes through the shared writer, exactly as Xero's does (o3d-9kek). Hand-rolled
+    // per-type updates here were how the two connectors drifted: this function kept its own copy of
+    // the PurchaseOrder "newest unlinked bill" guess and its own bare `update` for the bill-keyed
+    // case, so the resolver's refusal to guess, the compare-and-swap and the unique-index handling
+    // all had to be reimplemented — or, in practice, were not. There is exactly one writer now.
+    const applied = await applyBackReference(db, { connector: QBO_CONNECTOR, type, referenceType, referenceId, externalId, invoiceNumber })
     // o3d-9kek: a legacy PurchaseOrder-keyed row names the ORDER, not the bill. It used to write
     // the external id onto "the newest bill with no id yet" — which stamps the wrong bill the
     // moment a PO has two, and a wrong id is worse than a missing one because it looks correct
@@ -1196,7 +1027,7 @@ async function enqueueFollowUps(
 export type { BackReferenceRepairResult }
 
 /**
- * audit-H3 repair sweep, QuickBooks binding (o3d-9kek r3 finding 2).
+ * audit-H3 repair sweep, QuickBooks binding (o3d-9kek).
  *
  * WHY THIS EXISTS NOW. updateBackReference above swallows its write failures — including the
  * load-bearing P2002 from the bill's unique index — and both it and the PO-ambiguity path told the
@@ -1206,9 +1037,9 @@ export type { BackReferenceRepairResult }
  * message an operator read was false. Telling someone a retry will happen when nothing retries is
  * worse than saying nothing.
  *
- * The implementation is connector-agnostic on purpose — same starvation fix, same namespace
- * scoping, same refusal to guess which bill a PO-keyed row belongs to — so the two connectors
- * cannot drift on this the way they just did.
+ * The implementation is connector-agnostic on purpose — same starvation fix, same refusal to guess
+ * which bill a PO-keyed row belongs to — so the two connectors cannot drift on this the way they
+ * just did.
  */
 export async function repairQuickBooksBackReferences(limit = DEFAULT_BACK_REFERENCE_SWEEP_LIMIT): Promise<BackReferenceRepairResult> {
   return repairAccountingBackReferences({
@@ -1216,10 +1047,6 @@ export async function repairQuickBooksBackReferences(limit = DEFAULT_BACK_REFERE
     connector: QBO_CONNECTOR,
     connectorLabel: 'QuickBooks',
     activityActionPrefix: 'quickbooks',
-    // The realm whose external ids this run may attribute (r3 finding 1). NULL — no connected
-    // company — makes the sweep do nothing, which is correct: a QuickBooks bill id is an integer
-    // that means something different in every realm.
-    provenance: await activeAccountingIdProvenance(QBO_CONNECTOR),
     // Resume behind the rows the last run could not settle (r3 finding 4).
     cursorStore: createBackReferenceSweepCursorStore(db, QBO_CONNECTOR),
     // logActivityPersisted, NOT logActivity: the sweep defers an ambiguous row for 24 hours on the

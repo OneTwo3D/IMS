@@ -1,0 +1,61 @@
+-- o3d-9kek r3 finding 3: unresolved back-reference evidence must have a BOUNDED LIFECYCLE instead
+-- of an open-ended exemption from retention.
+--
+-- Retention exempted every UNRESOLVED back-reference row from deletion, on the argument that the
+-- sweep stamps everything it settles so the exempt set drains. It does not drain: a permanently
+-- ambiguous row is never stamped BY DESIGN, a disconnected connector's rows are never swept at
+-- all, and (until this branch) no QuickBooks sweep ran, so every QuickBooks invoice/bill row stayed
+-- unstamped forever. Full payload rows — customer names, emails, addresses, financial lines — could
+-- therefore outlive a configured retention policy without limit. A retention policy that silently
+-- fails to delete is worse than one that deletes too much.
+--
+-- The replacement keeps the ATTRIBUTION and drops the CONTENT. At the retention cutoff an
+-- unresolved row is compacted, not deleted: payload and errorMessage are cleared, and the columns
+-- that make the evidence meaningful — connector, type, referenceType, referenceId,
+-- externalTransactionId, status — are kept. That is what stops the failure the exemption existed
+-- for: deleting a COMPETING SIBLING converts an ambiguity the sweep was refusing to guess at into
+-- an apparent certainty (one unlinked bill, one surviving claimant), which nothing downstream can
+-- detect because the surviving state is genuinely indistinguishable from an unambiguous one.
+--
+-- The marker makes the compaction idempotent and the daily pass cheap — like o3d-ahk's webhook
+-- inbox tombstones, only the newly-eligible slice is rewritten.
+--
+-- It does NOT remove the row from the sweep's candidate set (r4 finding 3). An earlier revision
+-- said it did, and that permanently retired unresolved repair work: an ambiguity that clears after
+-- the retention horizon would never be reconsidered, and a transiently failing back-reference would
+-- never be repaired. A tombstone still carries everything the ID write needs — external id,
+-- referenceType, referenceId — so it stays a candidate for exactly that. What is lost with the
+-- payload is only the payload-dependent FOLLOW-UPS (PDF, payment, attachment), which the sweep now
+-- discards under an explicit terminal policy and warns about, rather than silently abandoning the
+-- whole row.
+--
+-- ---------------------------------------------------------------------------------------------
+-- ONE EXPLICIT TRANSACTION (r4 finding 4). Prisma 7.8's migration runner does NOT auto-wrap a
+-- migration file (see 20260721150000_refund_park_unique_index, which documents the same thing), so
+-- a multi-statement migration that changes an invariant can be interrupted half-applied. This file
+-- currently holds a single ADD COLUMN and would be atomic anyway; the BEGIN/COMMIT is kept so that
+-- any statement added here later inherits the guarantee instead of quietly not having it.
+--
+-- Nullable, no default, no backfill: every existing row starts NULL, i.e. "not compacted", which is
+-- exactly true. Adding a nullable column without a default is metadata-only on Postgres — no table
+-- rewrite.
+--
+-- ---------------------------------------------------------------------------------------------
+-- WHAT IS DELIBERATELY *NOT* HERE. An earlier revision of this migration also added
+-- purchase_invoices.accounting_invoice_provenance + a compound unique index over
+-- (accounting_invoice_id, accounting_invoice_provenance) replacing the global one from
+-- 20260815140000, and accounting_sync_logs.provenance. That namespaced an external id per
+-- connector-tenant so two QuickBooks realms could each hold the same integer id.
+--
+-- It was reverted. Namespacing lets BOTH local bills exist, and roughly 190 call sites read a naked
+-- accountingInvoiceId — on models (sales_orders, sales_order_refunds, supplier_credit_notes) that
+-- have no provenance column to consult even in principle — so the compound index moved the failure
+-- from a blocked write to two documents a payment or an update can silently confuse. The GLOBAL
+-- index from 20260815140000 stands: after a realm switch a colliding new bill fails its local
+-- back-reference with a loud error naming the switch, which is the acceptable failure.
+-- o3d-gt8r carries that design and the findings against it.
+BEGIN;
+
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "backReferenceEvidenceCompactedAt" TIMESTAMP(3);
+
+COMMIT;

@@ -552,12 +552,11 @@ ever links does not go quiet. Reasons you may see:
 | `EXTERNAL_ID_LINKED_ELSEWHERE` | Another bill — on another PO — already carries this Xero bill id |
 | `EXTERNAL_ID_CLAIMED_CONCURRENTLY` | Another bill claimed the id while this repair was being written |
 
-Two bills can never carry the same bill id **within one connected company**: the database enforces
-it with a unique index over the id *and* the connection that issued it. That matters because bill
-updates post to `/Invoices/{id}`, so a duplicated id would make every later correction to one bill
-silently rewrite the other's document in the ledger. If a link is refused for one of the conflict
-reasons above, resolve it by hand — IMS will not clear or move an existing link on its own, because
-nothing in IMS records whether that link was posted authoritatively or guessed.
+Two bills can never carry the same bill id: the database enforces it with a unique index on the id.
+That matters because bill updates post to `/Invoices/{id}`, so a duplicated id would make every later
+correction to one bill silently rewrite the other's document in the ledger. If a link is refused for
+one of the conflict reasons above, resolve it by hand — IMS will not clear or move an existing link
+on its own, because nothing in IMS records whether that link was posted authoritatively or guessed.
 
 **Rows past their retention window.** Data retention clears the stored payload of an unresolved sync
 row once it is older than the sync-log retention period, keeping only the identifying record. Such a
@@ -568,21 +567,29 @@ PDF or payment and re-drive it manually.
 
 ## Connecting a different company
 
-Each stored external id records the company that issued it. Xero organisation ids and document ids
-are GUIDs, so an id from a previous organisation can never be mistaken for one of the new
-organisation's documents — it simply resolves to nothing.
+**IMS is built for one accounting company at a time.** Connecting a different one is possible, but
+the external ids already stored against your orders, bills and credit notes stay behind, and they
+belong to the company that issued them.
 
-**QuickBooks is different, and IMS refuses the switch.** QuickBooks document ids are per-company
-integers, so company B routinely issues the same id company A did. If IMS still holds any external
-id issued by another company, connecting a new QuickBooks company is **refused** with a message
-naming what it found. To proceed, either reconnect the company that issued those ids, or clear the
-existing accounting links first — they are financial records, so export them before you do. The
-refusal is also written to the activity log as `quickbooks_realm_switch_refused`.
+For **Xero** that is harmless in practice: organisation ids and document ids are GUIDs, so an id
+from a previous organisation can never be mistaken for one of the new organisation's documents — it
+simply resolves to nothing, and the failure is a loud "not found" rather than a wrong document.
 
-**Why the connection is part of the rule.** External ids are owned by the company that issued them.
-QuickBooks realm ids in particular are plain integers and repeat across companies, so the same
-number can legitimately be two different bills in two different companies. Every stored external id
-therefore carries the tenant/realm it came from.
+For **QuickBooks** it is not harmless, because document ids are per-company integers: company B
+routinely issues the same id company A did. IMS keeps the rule that one ledger document belongs to
+exactly one local bill, enforced by the database, so if the new company issues an id an old bill
+still holds, **the new bill's link is refused** with an error saying the id is already held locally
+and naming a company reconnect as the likely cause. The document really is in QuickBooks; only the
+local link is missing, and someone has to resolve it by hand.
+
+That is deliberate. Letting both bills hold the same integer would be worse: the many places that
+read a stored external id — payment matching, reconciliation, document updates, attachments — cannot
+tell two companies' ids apart, and sales orders and credit notes do not record an issuing company at
+all. A refused link is visible and fixable; a payment settling the wrong bill is neither.
+
+**Practically:** if you need to move a QuickBooks connection to a different company, treat it as a
+migration, not a reconnect. Export the existing links first (they are financial records), then clear
+them deliberately before connecting the new company.
 
 ### Disconnecting and reconnecting
 
@@ -591,11 +598,7 @@ external ids on your orders, bills and credit notes. Those are the only local re
 document each one became, and every later correction or payment posts against them.
 
 - **Reconnect to the same company** — everything resumes where it was.
-- **Reconnect to a different company** — the old ids belong to a different company's namespace.
-  They are kept and stay readable, but they are inert: they are not treated as links for the new
-  company, they do not block a new bill that happens to be issued the same number, and sync rows
-  from the old company are not touched by the repair sweep. Documents linked in the old company
-  read as unlinked in the new one and can post afresh.
+- **Reconnect to a different company** — see above.
 
 Re-authorising to a *different* company while still connected is refused; only an explicit
 disconnect clears the pin.
