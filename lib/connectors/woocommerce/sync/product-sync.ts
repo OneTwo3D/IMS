@@ -19,6 +19,7 @@ import {
 } from '../sync-lock'
 import {
   assertWcRowNotClaimedByAnotherWcObject,
+  WcProductTransformBlockedError,
   WcSettingsVersionChangedError,
   WcSkuOwnershipConflictError,
 } from './product-sync-errors'
@@ -35,16 +36,19 @@ import {
 import {
   connectorVariationAdoptionChangesStructure,
   decideConnectorParentWrite,
+  describeParentShapeNotApplied,
   isConnectorTypeWriteSuppressed,
   refuseVariationAdoption,
   summarizeWcProductStructureConflicts,
   type ConnectorParentWriteDecision,
+  type VariationAdoptionRefusal,
   type WcProductStructureConflict,
 } from './product-structure-policy'
 import {
   getProductTransformBlockers,
   hasProductTransformBlockers,
   summarizeTransformBlockers,
+  PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE,
 } from '@/lib/products/type-transforms'
 import { bumpFulfillmentGraphVersions } from '@/lib/products/component-graph-edit-guard'
 import type { Prisma, ProductType } from '@/app/generated/prisma/client'
@@ -758,6 +762,163 @@ export async function syncWcProductToIms(
             }
           }
 
+          // Trade fields — hs-code-woo (WC pa_*) is authoritative: overwrite IMS when WC supplies
+          // a differing value so re-classifications propagate; preserve IMS when WC omits it.
+          // Independent of the structural decision, so it is resolved once even if the write
+          // below has to be decided a second time.
+          changes = resolveWcTradeFieldUpdates(
+            {
+              hsCode: existing.hsCode,
+              countryOfOrigin: existing.countryOfOrigin,
+              customsDescription: existing.customsDescription,
+            },
+            { hsCode: hsCodeAttr, countryOfOrigin: originIso, customsDescription: customsDescriptionAttr },
+          )
+
+          /**
+           * The parent row's UPDATE, as a function of the structural decision (o3d-y89x r3).
+           *
+           * Built here rather than inline because the decision can be reached TWICE: once from
+           * the pre-write blocker check, and again if the conditional write below discovers a
+           * blocker that appeared in between. Deriving the write from the decision both times is
+           * what makes the late refusal produce the identical row the early one would have —
+           * rather than a second, hand-maintained "what do we write when it is blocked?" path.
+           */
+          const buildParentUpdateData = (decision: ConnectorParentWriteDecision): Record<string, unknown> => {
+            const updateData: Record<string, unknown> = {
+              name: wcProduct.name,
+              description: description || existing.description,
+              imageUrl: imageUrl ?? existing.imageUrl,
+              weight: weight ?? existing.weight,
+              depthCm: depthCm ?? existing.depthCm,
+              widthCm: widthCm ?? existing.widthCm,
+              heightCm: heightCm ?? existing.heightCm,
+              active,
+              lifecycleStatus,
+              ...(decision.suppressTypeWrite ? {} : { type: productType }),
+              externalProductId: BigInt(wcProduct.id),
+            }
+
+            // Prices — only when IMS and WooCommerce AGREE on the row's shape. A variable parent
+            // shows min-max from its variants and carries none of its own; a standalone product
+            // carries exactly these. On a disagreement neither arm is right, so the columns are
+            // left untouched rather than cleared by WooCommerce's refused belief.
+            if (decision.wooShapeAgrees) {
+              if (productType !== 'VARIABLE') {
+                if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
+                if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
+              } else {
+                updateData.salesPriceBase = null
+                updateData.salePriceBase = null
+              }
+            }
+
+            // GTIN — only set if IMS field is currently null/empty
+            if (gtin && !existing.barcode) updateData.barcode = gtin
+
+            for (const change of changes) {
+              updateData[change.field] = change.to
+            }
+
+            // Category — link to mirrored IMS category for the deepest WC category
+            // referenced by this product. If WC dropped all categories, clear the link.
+            if (imsCategoryId !== undefined) updateData.categoryId = imsCategoryId
+
+            return updateData
+          }
+
+          /**
+           * Write the parent row under BOTH conditions the decision depends on: the ownership
+           * predicate, and — when this write really moves `type` — the editor's live-row
+           * predicate, evaluated by Postgres in the same statement (o3d-y89x r3, Codex finding 2).
+           *
+           * WHAT THIS CLOSES. The check above is a SELECT; a stock receipt or an open document
+           * committing between it and the UPDATE was previously invisible, and the connector
+           * transformed a row the editor would have refused. Now that interleaving makes the
+           * UPDATE match zero rows, and the transform is re-decided WITH the blocker instead of
+           * committed without it — the same refusal, message and quarantine the pre-check
+           * produces, just discovered later.
+           *
+           * WHAT REMAINS OPEN, precisely:
+           *
+           *   - OPEN STOCK TRANSFER LINES. `StockTransferLine` carries no FK to Product by
+           *     design, so that arm cannot be expressed as a predicate on this row and stays
+           *     check-only. A transfer line created in the gap is still missed.
+           *   - A blocker whose creating transaction commits AFTER this UPDATE statement takes
+           *     its snapshot but BEFORE this transaction commits. Neither side sees the other,
+           *     which is write skew; closing it needs SERIALIZABLE isolation with retry, or a
+           *     lock the blocker writers actually take. They take none — the per-SKU advisory
+           *     lock covers only the `Product.sku` writers — so this connector is now exactly as
+           *     safe as `updateProduct`, and no safer. That residual is the editor's too.
+           *   - Blockers created by UPDATING an existing row rather than inserting one (a sales
+           *     order re-opening, a StockLevel going 0 -> 5) are covered by the predicate the
+           *     same way inserts are, since it re-evaluates at write time — but only up to the
+           *     same snapshot boundary as above.
+           */
+          const writeParentRow = async (decision: ConnectorParentWriteDecision) => {
+            const updateData = buildParentUpdateData(decision)
+            // o3d-4kfh r7 (Codex finding 2): CAPTURED BEFORE THE WRITE. `existing` is the
+            // pre-update snapshot, and the mutation is defined by the pair (what it was, what it
+            // is becoming) — reading `existing.type` after the update makes the answer depend on
+            // whether the write path happened to mutate the object in place, which is not a
+            // property to rely on.
+            const kitnessMutation = {
+              kind: 'kitness' as const,
+              currentType: existing.type,
+              // Read from `updateData.type`, NOT from the locally computed `productType`, so this
+              // composes with o3d-y89x, which stops the connector DOWNGRADING an IMS KIT/BOM.
+              // When that guard leaves the existing type in place, `nextType === existing.type`,
+              // `componentGraphMutationAffectsFulfillment` is false and the bump is a no-op that
+              // reads nothing. With the allow-list as it stands that is EVERY connector write —
+              // see the note on the bump below.
+              nextType: (updateData.type as ProductType | undefined) ?? existing.type,
+            }
+            await updateProductGuardingOwnership(tx, existing, parentClaimants, updateData, {
+              requireTransformable: decision.writeTransformsRow,
+            })
+            // A CONNECTOR TYPE WRITE IS A COMPONENT-GRAPH MUTATION LIKE ANY OTHER, AND MUST MOVE
+            // THE VERSION.
+            //
+            // `OrderAllocation.fulfillmentGraphVersion` is what tells commitment and dispatch that
+            // a row was expanded from a recipe that no longer exists. Every other writer of a
+            // product's KIT-ness — the editor (app/actions/products.ts) and the CSV import
+            // (app/actions/import.ts) — bumps it, for this product and every KIT above it, in the
+            // same transaction as the write.
+            //
+            // WITH THE o3d-y89x ALLOW-LIST IN PLACE THIS IS CURRENTLY ALWAYS A NO-OP, AND IS KEPT
+            // DELIBERATELY. `productType` is only ever SIMPLE or VARIABLE and the only existing
+            // type the connector may overwrite is SIMPLE, so every pair it can still write is
+            // leaf-to-leaf and `componentGraphMutationAffectsFulfillment` is false. Widening
+            // `CONNECTOR_TRANSFORMABLE_TYPES` by one entry brings the flip back, and a graph write
+            // with no bump is exactly the silent corruption o3d-4kfh closed — so the wiring stays,
+            // and tests/products/component-graph-edit-guard.test.ts pins it as a mutation site.
+            //
+            // No in-flight blocker check here on purpose: the connector is not an interactive
+            // editor and has no operator to refuse to. Refusing would strand the import (and its
+            // retries) behind sales work it cannot influence; the CAS handles the consequence
+            // correctly by refusing the affected orders' commitments with an actionable
+            // "re-allocate" instead.
+            await bumpFulfillmentGraphVersions(tx, existing.id, kitnessMutation)
+          }
+
+          try {
+            await writeParentRow(parentWrite)
+          } catch (e) {
+            if (!(e instanceof WcProductTransformBlockedError)) throw e
+            // The blocker appeared between the check and the write. Decide again WITH it — the
+            // identical second pass the pre-check takes — so the outcome does not depend on WHEN
+            // the blocker arrived. `writeTransformsRow` is false on the new decision (the type
+            // write is now suppressed), so the retry no longer asks for the transform and cannot
+            // loop; the non-structural fields still apply, exactly as they do when the blocker was
+            // there all along.
+            parentWrite = decideConnectorParentWrite({
+              row: existing,
+              incoming: productType,
+              transformBlockerSummary: e.summary,
+            })
+            await writeParentRow(parentWrite)
+          }
+
           if (parentWrite.suppressTypeWrite) {
             warnImsProductTypePreserved({
               imsProductId: existing.id,
@@ -769,89 +930,6 @@ export async function syncWcProductToIms(
             })
           }
 
-          // Build update data — always sync these fields
-          const updateData: Record<string, unknown> = {
-            name: wcProduct.name,
-            description: description || existing.description,
-            imageUrl: imageUrl ?? existing.imageUrl,
-            weight: weight ?? existing.weight,
-            depthCm: depthCm ?? existing.depthCm,
-            widthCm: widthCm ?? existing.widthCm,
-            heightCm: heightCm ?? existing.heightCm,
-            active,
-            lifecycleStatus,
-            ...(parentWrite.suppressTypeWrite ? {} : { type: productType }),
-            externalProductId: BigInt(wcProduct.id),
-          }
-
-          // Prices — only when IMS and WooCommerce AGREE on the row's shape. A variable parent
-          // shows min-max from its variants and carries none of its own; a standalone product
-          // carries exactly these. On a disagreement neither arm is right, so the columns are
-          // left untouched rather than cleared by WooCommerce's refused belief.
-          if (parentWrite.appliesWooPriceShape) {
-            if (productType !== 'VARIABLE') {
-              if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
-              if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
-            } else {
-              updateData.salesPriceBase = null
-              updateData.salePriceBase = null
-            }
-          }
-
-          // GTIN — only set if IMS field is currently null/empty
-          if (gtin && !existing.barcode) updateData.barcode = gtin
-
-          // Trade fields — hs-code-woo (WC pa_*) is authoritative: overwrite IMS when WC supplies
-          // a differing value so re-classifications propagate; preserve IMS when WC omits it.
-          changes = resolveWcTradeFieldUpdates(
-            {
-              hsCode: existing.hsCode,
-              countryOfOrigin: existing.countryOfOrigin,
-              customsDescription: existing.customsDescription,
-            },
-            { hsCode: hsCodeAttr, countryOfOrigin: originIso, customsDescription: customsDescriptionAttr },
-          )
-          for (const change of changes) {
-            updateData[change.field] = change.to
-          }
-
-          // Category — link to mirrored IMS category for the deepest WC category
-          // referenced by this product. If WC dropped all categories, clear the link.
-          if (imsCategoryId !== undefined) updateData.categoryId = imsCategoryId
-
-          // o3d-4kfh r7 (Codex finding 2): CAPTURED BEFORE THE WRITE. `existing` is the pre-update
-          // snapshot, and the mutation is defined by the pair (what it was, what it is becoming) —
-          // reading `existing.type` after the update makes the answer depend on whether the write
-          // path happened to mutate the object in place, which is not a property to rely on.
-          const kitnessMutation = {
-            kind: 'kitness' as const,
-            currentType: existing.type,
-            // Read from `updateData.type`, NOT from the locally computed `productType`, so this
-            // composes with #617 (branch o3d-y89x-wc-type-guard), which stops the connector
-            // DOWNGRADING an IMS KIT/BOM. When that guard leaves the existing type in place,
-            // `nextType === existing.type`, `componentGraphMutationAffectsFulfillment` is false and
-            // the bump below is a no-op that reads nothing. What remains after #617 is the
-            // LEGITIMATE connector type change, and that is exactly what has to bump.
-            nextType: (updateData.type as ProductType | undefined) ?? existing.type,
-          }
-          await updateProductGuardingOwnership(tx, existing, parentClaimants, updateData)
-          // A CONNECTOR TYPE WRITE IS A COMPONENT-GRAPH MUTATION LIKE ANY OTHER, AND MUST MOVE THE
-          // VERSION.
-          //
-          // `OrderAllocation.fulfillmentGraphVersion` is what tells commitment and dispatch that a
-          // row was expanded from a recipe that no longer exists. Every other writer of a product's
-          // KIT-ness — the editor (app/actions/products.ts) and the CSV import (app/actions/import.ts)
-          // — bumps it, for this product and every KIT above it, in the same transaction as the
-          // write. This path did not, so a KIT adopted by SKU that the connector re-typed left every
-          // allocation stamp and every ancestor version untouched: the rows were silently
-          // reinterpreted against a different graph while still matching, which is precisely the
-          // state the stamp exists to make impossible to reach.
-          //
-          // No in-flight blocker check here on purpose: the connector is not an interactive editor
-          // and has no operator to refuse to. Refusing would strand the import (and its retries)
-          // behind sales work it cannot influence; the CAS handles the consequence correctly by
-          // refusing the affected orders' commitments with an actionable "re-allocate" instead.
-          await bumpFulfillmentGraphVersions(tx, existing.id, kitnessMutation)
           // `sku` is never in updateData — the row is resolved BY sku — so the pre-update values
           // are still current, and re-reading only to learn what we already know costs a round trip.
           productId = existing.id
@@ -897,18 +975,51 @@ export async function syncWcProductToIms(
         // each one becomes an order line with no product and no inventory allocation. That
         // is a conflict, not a silent skip — hence the durable record below and the failure
         // this function returns.
-        if (isVariable && parentWrite.parentRoleRefusal) {
+        //
+        // ONE PREDICATE, BOTH DIRECTIONS (o3d-y89x r3, Codex finding 1). This used to read
+        // `isVariable && parentWrite.parentRoleRefusal`, which asks "did the INCOMING payload
+        // want a parent it could not have?" — and so could only ever see one of the two ways
+        // the systems disagree. The other way round, an IMS VARIABLE row paired with a
+        // WooCommerce `simple` product, took the `else` arm, wrote neither the type (the
+        // allow-list protects VARIABLE) nor the price (`wooShapeAgrees` is false, correctly),
+        // left the IMS variants standing, and was recorded as a clean SYNCED sync that advanced
+        // the cursor. Reading BOTH off `wooShapeAgrees` is what makes the two cases one rule:
+        // disagreement about "is this row a variable parent" is exactly the set of states in
+        // which parent-level WooCommerce data went unapplied.
+        //
+        // Note what still takes the quiet path, and must: an IMS KIT or BOM paired with a
+        // WooCommerce `simple` product AGREES — neither side claims a parent, WooCommerce never
+        // contradicted the composition, and nothing went unapplied. That is the ordinary bundle
+        // pairing, and turning it into an inbox row would bury the real conflicts under it.
+        if (!parentWrite.wooShapeAgrees) {
           const refusal = parentWrite.parentRoleRefusal
-          structureConflicts.push({
-            kind: 'variations_not_imported',
-            sku: productSku,
-            imsProductId: productId,
-            imsType: parentWrite.effectiveType,
-            wcObjectId: String(wcProduct.id),
-            detail: `WooCommerce product ${wcProduct.id} ("${productSku}") is variable with `
-              + `${variations.length} variation(s), but ${refusal.detail} `
-              + `None of its variations were imported. ${refusal.remedy}`,
-          })
+          structureConflicts.push(
+            isVariable && refusal
+              ? {
+                kind: 'variations_not_imported',
+                sku: productSku,
+                imsProductId: productId,
+                imsType: parentWrite.effectiveType,
+                wcObjectId: String(wcProduct.id),
+                detail: `WooCommerce product ${wcProduct.id} ("${productSku}") is variable with `
+                  + `${variations.length} variation(s), but ${refusal.detail} `
+                  + `None of its variations were imported. ${refusal.remedy}`,
+              }
+              : {
+                kind: 'parent_shape_not_applied',
+                sku: productSku,
+                imsProductId: productId,
+                imsType: parentWrite.effectiveType,
+                wcObjectId: String(wcProduct.id),
+                detail: describeParentShapeNotApplied({
+                  wcProductId: String(wcProduct.id),
+                  sku: productSku,
+                  imsProductId: productId,
+                  imsType: parentWrite.effectiveType,
+                  parentRoleRefusal: refusal,
+                }),
+              },
+          )
         } else if (isVariable) {
           structureConflicts.push(
             ...await applyVariations(tx, variations, productId, wcProduct.name, imsCategoryId),
@@ -1088,11 +1199,22 @@ async function updateProductGuardingOwnership(
   row: { id: string; sku: string; externalProductId?: bigint | number | string | null },
   claimants: ReadonlySet<bigint>,
   data: Record<string, unknown>,
+  /**
+   * Set when this write actually TRANSFORMS the row — moves `type`, or `parentId`, the pair
+   * `validateProductStructureChange` refuses on a live row (o3d-y89x r3, Codex finding 2).
+   *
+   * The blocker predicate then rides in the same statement as the ownership predicate, so the
+   * answer is Postgres', taken at the instant of the write, rather than ours from a SELECT that
+   * has since gone stale. Deliberately OFF for a non-transforming write: an ordinary re-sync of
+   * a product that has stock and open orders is not a transform and must keep applying.
+   */
+  options: { requireTransformable?: boolean } = {},
 ): Promise<void> {
   const { count } = await tx.product.updateMany({
     where: {
       id: row.id,
       OR: [{ externalProductId: null }, { externalProductId: { in: [...claimants] } }],
+      ...(options.requireTransformable ? PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE : {}),
     },
     data,
   })
@@ -1120,6 +1242,18 @@ async function updateProductGuardingOwnership(
   }
 
   assertWcRowNotClaimedByAnotherWcObject(current, claimants)
+
+  // Ownership is intact, so if the write ALSO asked to be transformable, the blocker predicate
+  // is the remaining candidate — a blocker committed between the check and this statement.
+  // Diagnosed after ownership on purpose: ownership is the older and more serious condition,
+  // and reporting "the product went live" for a row another WooCommerce object has stolen would
+  // send the operator after the wrong thing.
+  if (options.requireTransformable) {
+    const summary = await connectorTransformBlockerSummary(tx, row.id)
+    if (summary) {
+      throw new WcProductTransformBlockedError({ imsProductId: row.id, sku: row.sku, summary })
+    }
+  }
 
   // Re-read says the row is writable, yet the conditional update matched nothing — it was
   // reassigned and reassigned back, or another predicate moved. Refuse rather than retry in a
@@ -1228,6 +1362,7 @@ async function applyVariations(
       // one straight through — that is the initial-import takeover path. So an IMS-native row
       // that merely shares a SKU was silently reparented and remapped, which the o3d-y89x type
       // guard did not stop: it suppressed the `type` write and let `parentId` through.
+      const adoptionTransformsRow = connectorVariationAdoptionChangesStructure({ row: existing, imsParentId })
       let refusal = refuseVariationAdoption({
         row: existing,
         imsParentId,
@@ -1239,10 +1374,7 @@ async function applyVariations(
       // or open documents. Asked LAST and only when the adoption really would transform the
       // row, so the steady-state re-sync of an existing variation pays nothing and a row
       // already refused above is never queried at all.
-      if (
-        refusal === null
-        && connectorVariationAdoptionChangesStructure({ row: existing, imsParentId })
-      ) {
+      if (refusal === null && adoptionTransformsRow) {
         const transformBlockerSummary = await connectorTransformBlockerSummary(tx, existing.id)
         if (transformBlockerSummary) {
           refusal = refuseVariationAdoption({
@@ -1253,16 +1385,19 @@ async function applyVariations(
           })
         }
       }
+      /** One shape for both the early refusal and the one the write itself discovers. */
+      const refusalConflict = (reason: VariationAdoptionRefusal): WcProductStructureConflict => ({
+        kind: 'variation_row_refused',
+        sku,
+        imsProductId: existing.id,
+        imsType: existing.type,
+        wcObjectId: String(v.id),
+        detail: `WooCommerce variation ${v.id} matched SKU "${sku}", but ${reason.detail} `
+          + 'The variation was not imported.',
+      })
+
       if (refusal) {
-        conflicts.push({
-          kind: 'variation_row_refused',
-          sku,
-          imsProductId: existing.id,
-          imsType: existing.type,
-          wcObjectId: String(v.id),
-          detail: `WooCommerce variation ${v.id} matched SKU "${sku}", but ${refusal.detail} `
-            + 'The variation was not imported.',
-        })
+        conflicts.push(refusalConflict(refusal))
         continue
       }
 
@@ -1316,7 +1451,37 @@ async function applyVariations(
         currentType: existing.type,
         nextType: (updateData.type as ProductType | undefined) ?? existing.type,
       }
-      await updateProductGuardingOwnership(tx, existing, claimants, updateData)
+      try {
+        // The adoption's live-row condition, re-asserted by the write itself (o3d-y89x r3,
+        // Codex finding 2). Adoption sets `parentId` and — for a SIMPLE row — `type`, the exact
+        // pair the editor refuses on a live row, so the same predicate that guards the parent
+        // branch guards this one. Requested only when the adoption really transforms the row, so
+        // the steady-state re-sync of a 200-variation product still pays nothing.
+        await updateProductGuardingOwnership(tx, existing, claimants, updateData, {
+          requireTransformable: adoptionTransformsRow,
+        })
+      } catch (e) {
+        if (!(e instanceof WcProductTransformBlockedError)) throw e
+        // A blocker appeared between the check and the write. This path has a natural, already
+        // correct answer that the parent branch does not: a refused variation is SKIPPED and
+        // reported, one row out of potentially hundreds. So re-decide with the summary and take
+        // exactly the refusal the pre-check would have taken.
+        const late = refuseVariationAdoption({
+          row: existing,
+          imsParentId,
+          rowHasChildren: rowsWithChildren.has(existing.id),
+          transformBlockerSummary: e.summary,
+        })
+        // `late` is non-null by construction — the three structural checks passed above, so the
+        // summary is the only remaining arm — but the fallback keeps a future reordering of
+        // those checks from turning a refusal into a silent skip.
+        conflicts.push(refusalConflict(late ?? {
+          reason: 'transform_blocked',
+          detail: `IMS product ${existing.id} (SKU "${existing.sku}") became live while it was being `
+            + `adopted as a variation of ${imsParentId} (${e.summary}).`,
+        }))
+        continue
+      }
       await bumpFulfillmentGraphVersions(tx, existing.id, kitnessMutation)
       // Reflect the FULL applied update, not just the new mapping. A later sibling sharing this
       // SKU builds its `?? existing.x` fallbacks from this row; caching the pre-update values

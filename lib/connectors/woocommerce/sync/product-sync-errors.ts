@@ -237,6 +237,39 @@ export function isPermanentProductSyncConflict(error: unknown): boolean {
 }
 
 /**
+ * A transform the connector was CLEARED to make, refused by the write itself because a blocker
+ * turned up after the check (o3d-y89x r3, Codex finding 2).
+ *
+ * The connector's write is conditional: `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE` is ANDed into the
+ * same `UPDATE ... WHERE` that already guards ownership, so a stock receipt or an open document
+ * committing between `getProductTransformBlockers` and the write makes the statement match zero
+ * rows. This carries the blocker summary back out so the caller can decide again WITH it and
+ * reach the identical outcome the pre-check would have reached — same refusal, same operator
+ * message, same quarantine — instead of committing a transform the editor would refuse.
+ *
+ * NOT in {@link isPermanentProductSyncConflict}, and both callers catch it before it can escape.
+ * If one ever stops catching it, transient is the right default: a blocker clears by itself when
+ * the order ships or the stock moves, so a later retry can legitimately succeed.
+ */
+export class WcProductTransformBlockedError extends Error {
+  readonly imsProductId: string
+  readonly sku: string
+  /** The editor's own operator-facing blocker summary, read under the write's transaction. */
+  readonly summary: string
+
+  constructor(args: { imsProductId: string; sku: string; summary: string }) {
+    super(
+      `IMS product ${args.imsProductId} (SKU "${args.sku}") became live while it was being imported `
+        + `(${args.summary}); the structural write was refused by its own condition.`,
+    )
+    this.name = 'WcProductTransformBlockedError'
+    this.imsProductId = args.imsProductId
+    this.sku = args.sku
+    this.summary = args.summary
+  }
+}
+
+/**
  * Thrown when `wc_settings_version` moved between an import's remote reads and its write
  * transaction (o3d-mlc7) — proof that credentials were rebound, or the product-id cache
  * reset, while this import was in flight.

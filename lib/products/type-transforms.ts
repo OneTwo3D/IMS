@@ -1,4 +1,4 @@
-import { ProductType } from '@/app/generated/prisma/client'
+import { ProductType, type Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 
 const OPEN_SALES_ORDER_STATUSES = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] as const
@@ -100,6 +100,55 @@ export function summarizeTransformBlockers(blockers: ProductTransformBlockers): 
   if (blockers.openProductionOrders > 0) parts.push(`${blockers.openProductionOrders} open manufacturing order${blockers.openProductionOrders === 1 ? '' : 's'}`)
   if (blockers.openTransferLines > 0) parts.push(`${blockers.openTransferLines} open stock transfer line${blockers.openTransferLines === 1 ? '' : 's'}`)
   return parts.join(', ')
+}
+
+/**
+ * THE SAME BLOCKER QUESTION, AS A PREDICATE ON THE PRODUCT ROW — so a caller can require the
+ * answer to still hold AT THE INSTANT IT WRITES, not merely at the moment it asked
+ * (o3d-y89x r3, Codex finding 2).
+ *
+ * `getProductTransformBlockers` is a SELECT. Under READ COMMITTED its answer is a statement of
+ * the past by the time the caller's UPDATE runs, and nothing serializes the gap: the per-SKU
+ * advisory locks (`lib/products/sku-write-lock.ts`) are cooperative and are taken only by the
+ * `Product.sku` writers — the editor, the CSV import, the WooCommerce sync. The writers that
+ * CREATE blockers (stock receipts, allocation, sales/purchase/production/transfer documents)
+ * take none of them, so one of them can commit between the check and the write.
+ *
+ * ANDing this into that UPDATE's own `WHERE` closes the gap for what it can express, because
+ * the predicate is then evaluated by Postgres against the UPDATE statement's own snapshot
+ * rather than an earlier one. A blocker that committed in between makes the update match zero
+ * rows, and the caller fails closed instead of transforming a row the editor would refuse.
+ *
+ * EXACTLY EQUIVALENT TO THE COUNTING VERSION, for the four arms it covers:
+ *
+ *   - the three document arms are per-row existence questions in both forms;
+ *   - the STOCK arm is an aggregate (`sum(quantity) > 0`) in `getProductTransformBlockers` and a
+ *     per-row existence test here. Those agree because `quantity` and `reservedQty` are
+ *     DB-enforced non-negative (`stock_levels_quantity_nonnegative`,
+ *     `stock_levels_reserved_nonnegative`, both VALIDATED) — with no negative rows possible,
+ *     `sum > 0` and `EXISTS(row > 0)` are the same predicate. If either constraint is ever
+ *     dropped, this equivalence goes with it and the two forms will disagree.
+ *
+ * WHAT IT DELIBERATELY DOES NOT COVER: open STOCK TRANSFER lines. `StockTransferLine.productId`
+ * carries no foreign key to Product on purpose ("no FK to Product to allow orphaned lines in
+ * audit"), so there is no relation to filter through and no way to state it as a predicate on
+ * this row at all. That arm stays check-only, and callers must say so rather than claim the
+ * whole question is closed.
+ */
+export const PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE: Prisma.ProductWhereInput = {
+  stockLevels: { none: { OR: [{ quantity: { gt: 0 } }, { reservedQty: { gt: 0 } }] } },
+  salesOrderLines: { none: { order: { status: { in: [...OPEN_SALES_ORDER_STATUSES] } } } },
+  poLines: { none: { po: { status: { in: [...OPEN_PURCHASE_ORDER_STATUSES] } } } },
+  // The two arms of the production-order check, from this product's side: it is the OUTPUT of
+  // an open order, or it is a COMPONENT of a product that is.
+  productionOrdersAsOutput: { none: { status: { in: [...OPEN_PRODUCTION_ORDER_STATUSES] } } },
+  usedAsComponentIn: {
+    none: {
+      product: {
+        productionOrdersAsOutput: { some: { status: { in: [...OPEN_PRODUCTION_ORDER_STATUSES] } } },
+      },
+    },
+  },
 }
 
 /**

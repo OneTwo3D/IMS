@@ -617,16 +617,16 @@ test('o3d-4kfh r6 (finding 1): all six graph-mutation sites bump the version aft
     {
       label: 'WooCommerce parent branch (KIT-ness)',
       source: productSyncSource,
-      anchor: 'if (imsCategoryId !== undefined) updateData.categoryId = imsCategoryId',
-      length: 3200,
-      write: 'await updateProductGuardingOwnership(tx, existing, parentClaimants, updateData)',
+      anchor: 'const writeParentRow = async (decision: ConnectorParentWriteDecision) => {',
+      length: 3600,
+      write: 'await updateProductGuardingOwnership(tx, existing, parentClaimants, updateData,',
     },
     {
       label: 'WooCommerce applyVariations (KIT-ness)',
       source: productSyncSource,
       anchor: "const preserveType = isConnectorTypeWriteSuppressed(existing.type, 'VARIANT')",
-      length: 3000,
-      write: 'await updateProductGuardingOwnership(tx, existing, claimants, updateData)',
+      length: 4400,
+      write: 'await updateProductGuardingOwnership(tx, existing, claimants, updateData,',
     },
   ]
 

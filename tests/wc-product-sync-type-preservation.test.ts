@@ -126,6 +126,54 @@ function findProductBySku(sku: unknown) {
  * live row means an omitted key is untouched and a present key overwrites, which is the exact
  * distinction under test. `assertDoubleWritesTypeWhenAsked` below pins that down.
  */
+/**
+ * The RELATION-FILTER arms of `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE`, evaluated arm by arm
+ * against the SAME `state.*` arrays the blocker SELECT doubles read (o3d-y89x r3).
+ *
+ * Reading one shared state from both sides is the whole point. A double that answered the
+ * conditional write from a private map, or from the answer the SELECT gave earlier, could not
+ * express the interleaving under test — "clean when asked, blocked when written" — because the
+ * two answers could never differ. Sharing the state means a test that pushes a blocker row
+ * between the two calls makes them disagree exactly as Postgres would.
+ *
+ * Unknown relation keys THROW. If a sixth arm is ever added to the fragment, this must fail
+ * loudly rather than quietly ignore it and keep reporting the write as guarded.
+ */
+const KNOWN_BLOCKER_WHERE_KEYS = new Set([
+  'stockLevels', 'salesOrderLines', 'poLines', 'productionOrdersAsOutput', 'usedAsComponentIn',
+])
+
+function transformBlockerWhereRejects(where: Row, productId: string): boolean {
+  const relationKeys = Object.keys(where).filter((key) => key !== 'id' && key !== 'OR')
+  if (relationKeys.length === 0) return false
+  for (const key of relationKeys) {
+    if (!KNOWN_BLOCKER_WHERE_KEYS.has(key)) {
+      throw new Error(`product.updateMany double got an unmodelled relation filter: ${key}`)
+    }
+  }
+
+  if (relationKeys.includes('stockLevels')
+    && state.stockLevels.some((r) => r.productId === productId && (r.quantity > 0 || r.reservedQty > 0))) return true
+  if (relationKeys.includes('salesOrderLines')
+    && state.salesOrderLines.some((r) => r.productId === productId)) return true
+  if (relationKeys.includes('poLines')
+    && state.purchaseOrderLines.some((r) => r.productId === productId)) return true
+  if (relationKeys.includes('productionOrdersAsOutput')
+    && state.productionOrders.some((r) => r.outputProductId === productId)) return true
+  if (relationKeys.includes('usedAsComponentIn')
+    && state.components.some((c) => c.componentId === productId
+      && state.productionOrders.some((r) => r.outputProductId === c.productId))) return true
+  return false
+}
+
+/**
+ * Fired with the product id of every conditional product write, BEFORE its predicate is
+ * evaluated — i.e. strictly after the blocker SELECTs (they are all awaited while `updateData`
+ * is still being built) and strictly before the write commits. That is precisely the window
+ * o3d-y89x r3 closes, and it is the only place a test can open it.
+ */
+let beforeProductWrite: ((productId: string) => void) | null = null
+
 function updateManyMatching(where: Row, data: Row): { count: number } {
   const row = state.products.find((candidate) => candidate.id === where.id)
   if (!row) return { count: 0 }
@@ -142,6 +190,9 @@ function updateManyMatching(where: Row, data: Row): { count: number } {
     })
     if (!matches) return { count: 0 }
   }
+
+  beforeProductWrite?.(String(where.id))
+  if (transformBlockerWhereRejects(where, String(where.id))) return { count: 0 }
 
   state.updateData.push({ ...data })
   Object.assign(row, data)
@@ -425,6 +476,7 @@ function resetState() {
   state.productionOrders.length = 0
   state.stockTransferLines.length = 0
   state.blockerQueries.length = 0
+  beforeProductWrite = null
   nextId = 1
   productPages = {}
   variationPages = {
@@ -696,7 +748,7 @@ test('POLICY: decideConnectorParentWrite gates type, pricing, options and childr
   assert.equal(kitAsParent.effectiveType, 'KIT')
   assert.equal(kitAsParent.suppressTypeWrite, true)
   assert.equal(kitAsParent.canBeVariableParent, false, 'no children, no variable-only options')
-  assert.equal(kitAsParent.appliesWooPriceShape, false, 'and its IMS pricing is not erased')
+  assert.equal(kitAsParent.wooShapeAgrees, false, 'and its IMS pricing is not erased')
   assert.equal(kitAsParent.parentRoleRefusal?.reason, 'type_cannot_be_a_variable_parent')
 
   // The counterweight: a KIT paired with a WooCommerce SIMPLE product is the ORDINARY bundle
@@ -704,24 +756,24 @@ test('POLICY: decideConnectorParentWrite gates type, pricing, options and childr
   // say "not a variable parent" — so WooCommerce's price must still land.
   const kitAsSimple = decide({ type: 'KIT' }, 'SIMPLE')
   assert.equal(kitAsSimple.suppressTypeWrite, true)
-  assert.equal(kitAsSimple.appliesWooPriceShape, true, 'a bundle must keep receiving price updates')
+  assert.equal(kitAsSimple.wooShapeAgrees, true, 'a bundle must keep receiving price updates')
 
   // A VARIABLE parent paired with a WooCommerce simple product is the same disagreement in the
   // other direction: stamping a standalone product's price onto a parent that shows min-max
   // from its variants is the same mistake as erasing the kit's.
   const variableAsSimple = decide({ type: 'VARIABLE' }, 'SIMPLE')
   assert.equal(variableAsSimple.effectiveType, 'VARIABLE')
-  assert.equal(variableAsSimple.appliesWooPriceShape, false)
+  assert.equal(variableAsSimple.wooShapeAgrees, false)
 
   // Agreement, both directions.
   const steadyParent = decide({ type: 'VARIABLE' }, 'VARIABLE')
   assert.equal(steadyParent.suppressTypeWrite, false)
   assert.equal(steadyParent.canBeVariableParent, true)
-  assert.equal(steadyParent.appliesWooPriceShape, true, 'a real parent clears its own prices')
+  assert.equal(steadyParent.wooShapeAgrees, true, 'a real parent clears its own prices')
   assert.equal(steadyParent.needsTransformBlockerCheck, false, 'nothing is changing — ask nothing')
 
   const simpleAsSimple = decide({ type: 'SIMPLE' }, 'SIMPLE')
-  assert.equal(simpleAsSimple.appliesWooPriceShape, true)
+  assert.equal(simpleAsSimple.wooShapeAgrees, true)
   assert.equal(simpleAsSimple.needsTransformBlockerCheck, false)
 
   // The create branch is deliberately unguarded.
@@ -750,7 +802,7 @@ test('POLICY: a live row is not transformed, and the question is only asked when
   assert.equal(blocked.suppressTypeWrite, true, 'the row stays SIMPLE')
   assert.equal(blocked.effectiveType, 'SIMPLE')
   assert.equal(blocked.canBeVariableParent, false)
-  assert.equal(blocked.appliesWooPriceShape, false)
+  assert.equal(blocked.wooShapeAgrees, false)
   assert.equal(blocked.parentRoleRefusal?.reason, 'transform_blocked')
   assert.match(String(blocked.parentRoleRefusal?.detail), /stock on hand \(5\.00\)/)
 
@@ -775,7 +827,7 @@ test("POLICY: a row that is somebody's CHILD may not become a parent, type chang
   const invalidChain = decide({ type: 'VARIABLE', parentId: 'ims-other' }, 'VARIABLE')
   assert.equal(invalidChain.canBeVariableParent, false, 'the guard must not be skipped by a no-op type')
   assert.equal(invalidChain.parentRoleRefusal?.reason, 'row_is_a_child')
-  assert.equal(invalidChain.appliesWooPriceShape, false)
+  assert.equal(invalidChain.wooShapeAgrees, false)
   assert.equal(invalidChain.needsTransformBlockerCheck, false, 'and it costs no query to say so')
 
   // The same fact refuses the changing case too, and outranks the allow-list's reason because
@@ -913,7 +965,15 @@ test('a VARIABLE parent is NOT flattened to SIMPLE by a WooCommerce simple produ
 
   const result = await capturingWarnings(() => syncWcProductToIms(simpleProduct()))
 
-  assert.equal(result.success, true, `the rest of the payload must still apply, got: ${result.error}`)
+  // r3 (Codex finding 1) CHANGED THIS ASSERTION, and the reason is the point. This used to
+  // expect `success: true` on the grounds that "a simple product carries no variations, so
+  // nothing went unapplied". That reasoning looked only at the payload's CHILDREN, and two other
+  // pieces of WooCommerce data went unapplied right here: the type (refused, correctly) and the
+  // price (withheld, correctly, three assertions below). Meanwhile the IMS variants stayed put.
+  // Recording that state as a clean sync advanced the bulk cursor past a product the two systems
+  // still disagree about, and no repeat of the payload could ever repair it.
+  assert.equal(result.success, false, 'an unapplied shape is not a successful sync')
+  assert.equal(result.permanent, true, 'and it is deterministic — retrying the payload reaches it again')
   assert.equal(findProductBySku('KIT-SKU')?.type, 'VARIABLE', 'the connector must not flatten a parent')
   assert.ok(
     !('type' in (state.updateData[0] ?? {})),
@@ -936,10 +996,42 @@ test('a VARIABLE parent is NOT flattened to SIMPLE by a WooCommerce simple produ
   assert.equal(warnings[0].imsType, 'VARIABLE')
   assert.equal(warnings[0].suppressedType, 'SIMPLE')
 
-  // Nothing from WooCommerce went unapplied — a `simple` product carries no variations — so
-  // this is a warning, not an exception-inbox conflict.
-  assert.deepEqual(quarantinedConflicts(), [], 'no conflict row: nothing was left unimported')
+  // WooCommerce data DID go unapplied, so the operator gets an inbox row rather than a warning
+  // nobody reads — the same QUARANTINED mechanism the refused-variations direction uses.
+  const conflicts = quarantinedConflicts()
+  assert.equal(conflicts.length, 1, 'the disagreement is recorded where the operator looks')
+  assert.match(String(conflicts[0].errorMessage), /is simple, but IMS product ims-var is VARIABLE/)
+  assert.match(String(conflicts[0].errorMessage), /IMS variants remain/)
+  assert.match(
+    String(conflicts[0].errorMessage),
+    /convert the IMS product in the product editor .*, or make the WooCommerce product variable again/,
+    'and is given the two things that actually clear it',
+  )
+  assert.ok(
+    !state.syncLogs.some((log) => log.status === 'SYNCED'),
+    'and it is NOT also recorded as a successful sync',
+  )
+})
+
+test('o3d-y89x r3: the SAME rule leaves an IMS KIT paired with a WooCommerce simple product silent', async () => {
+  // THE BOUNDARY OF THE FIX ABOVE, and the case that decides whether the rule was re-derived or
+  // just widened. A KIT next to a WooCommerce `simple` product is the NORMAL bundle pairing:
+  // neither side claims to be a variable parent, so nothing WooCommerce said went unapplied —
+  // `simple` is an absence of information about composition, never a denial of it. If this ever
+  // starts quarantining, every bundle in the catalogue lands in the exception inbox on every
+  // reconcile run and the real conflicts are buried under them.
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  state.products.push(imsRow({ id: 'ims-kit', sku: 'KIT-SKU', name: 'A bundle', type: 'KIT' }))
+
+  const result = await capturingWarnings(() => syncWcProductToIms(simpleProduct()))
+
+  assert.equal(result.success, true, `a bundle pairing is steady state, got: ${result.error}`)
+  assert.equal(findProductBySku('KIT-SKU')?.type, 'KIT')
+  assert.deepEqual(quarantinedConflicts(), [], 'no inbox row for the ordinary pairing')
   assert.ok(state.syncLogs.some((log) => log.status === 'SYNCED'))
+  // And the `if` arm really did run: a bundle must keep receiving WooCommerce price updates.
+  assert.ok('salesPriceBase' in (state.updateData[0] ?? {}), 'the price still applies to a bundle')
 })
 
 test('a VARIANT is NOT flattened to SIMPLE, so it can never end up SIMPLE-with-a-parentId (o3d-8s89)', async () => {
@@ -1487,5 +1579,114 @@ test('the bulk sync does not advance its cursor past a conflicted product (o3d-y
   assert.ok(
     state.settingUpserts.includes('last_wc_product_reconcile_at'),
     'a clean run advances the cursor as before',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y89x r3 (Codex finding 2) — the live-row answer has to survive to the WRITE.
+//
+// r2 made the connector ask the editor's question (`getProductTransformBlockers`) before it
+// transforms a row, and thread `tx` through so it asked under the right connection. Both were
+// necessary; neither made the answer STICK. A SELECT under READ COMMITTED describes the past by
+// the time the UPDATE runs, and nothing serializes the gap: the per-SKU advisory locks are
+// cooperative and are taken only by the `Product.sku` writers (the editor, the CSV import, this
+// sync). The writers that CREATE blockers — stock receipts, allocation, sales/purchase/
+// production/transfer documents — take none of them, so one can commit in between and the
+// connector transforms a row the editor would have refused.
+//
+// The fix is to stop asking twice and start ASSERTING: `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE`
+// rides in the same `UPDATE ... WHERE` that already guards ownership, so Postgres evaluates the
+// blocker predicate at the instant of the write. A blocker that arrived in the gap makes the
+// statement match zero rows and the transform is re-decided WITH it.
+//
+// These tests open that exact window: `beforeProductWrite` fires after every blocker SELECT has
+// been awaited and before the write's predicate is evaluated. A double answering from a static
+// map could not express it — the check and the write would return the same answer by
+// construction, and the test would pass against the unfixed code.
+// ---------------------------------------------------------------------------
+
+test('o3d-y89x r3: a blocker created BETWEEN the check and the write refuses the parent transform', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  // Clean at the moment the connector asks — the pre-check therefore CLEARS the transform, and
+  // the sibling test above ('a SIMPLE row ... the guard must not freeze ordinary types') is the
+  // control showing this same fixture transforms to VARIABLE when nothing interferes.
+  state.products.push(imsRow({ id: 'ims-simple', sku: 'PARENT-SKU', name: 'Was simple', type: 'SIMPLE' }))
+  beforeProductWrite = (productId) => {
+    if (productId !== 'ims-simple') return
+    // An order is placed against the product between the check and the write.
+    state.salesOrderLines.push({ productId: 'ims-simple' })
+  }
+
+  const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+
+  assert.ok(
+    state.blockerQueries.includes('ims-simple'),
+    'the pre-check really did run, and really did see a clean row',
+  )
+  assert.equal(
+    findProductBySku('PARENT-SKU')?.type,
+    'SIMPLE',
+    'the transform is refused by the write itself, not committed against a stale answer',
+  )
+  assert.equal(findProductBySku('PARENT-SKU')?.name, 'Parent Widget', 'the non-structural fields still apply')
+  assert.equal(result.success, false, 'and it is reported, not swallowed')
+  assert.equal(result.permanent, true)
+
+  // The SAME refusal the pre-check produces — identical reason, identical operator message —
+  // so the outcome does not depend on WHEN the blocker arrived.
+  const conflicts = quarantinedConflicts()
+  assert.equal(conflicts.length, 1)
+  assert.match(String(conflicts[0].errorMessage), /cannot be converted from SIMPLE to a variable parent/)
+  assert.match(String(conflicts[0].errorMessage), /1 open sales order line/)
+  assert.equal(findProductBySku('VAR-1'), null, 'and no children were adopted into the refused parent')
+})
+
+test('o3d-y89x r3: a blocker created between check and write refuses the VARIATION adoption too', async () => {
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  variationPages = { '1': [wcVariation(111, 'VAR-1', 'Red')] }
+  state.products.push(imsRow({ id: 'ims-parent', sku: 'PARENT-SKU', name: 'Parent', type: 'VARIABLE' }))
+  // A clean, adoptable SIMPLE row: exactly the initial-import takeover path that must keep
+  // working, so nothing in the fixture itself refuses it.
+  state.products.push(imsRow({ id: 'ims-orphan', sku: 'VAR-1', name: 'Standalone', type: 'SIMPLE' }))
+  beforeProductWrite = (productId) => {
+    if (productId !== 'ims-orphan') return
+    state.stockLevels.push({ productId: 'ims-orphan', quantity: 4, reservedQty: 0 })
+  }
+
+  const result = await capturingWarnings(() => syncWcProductToIms(variableProduct({ variations: [111] })))
+
+  assert.ok(state.blockerQueries.includes('ims-orphan'), 'the pre-check ran on the variation row')
+  assert.equal(findProductBySku('VAR-1')?.type, 'SIMPLE', 'the row is not re-typed')
+  assert.equal(findProductBySku('VAR-1')?.parentId ?? null, null, 'and it is not reparented either')
+  assert.equal(result.success, false)
+  const conflicts = quarantinedConflicts()
+  assert.equal(conflicts.length, 1)
+  assert.match(String(conflicts[0].errorMessage), /WooCommerce variation 111 matched SKU "VAR-1"/)
+  assert.match(String(conflicts[0].errorMessage), /stock on hand \(4\.00\)/)
+  assert.match(String(conflicts[0].errorMessage), /The variation was not imported/)
+})
+
+test('o3d-y89x r3: a NON-transforming write is not made conditional — a live row still syncs', async () => {
+  // THE BOUNDARY, and the reason the predicate is gated on `writeTransformsRow` rather than
+  // ANDed unconditionally. `validateProductStructureChange` blocks a TYPE OR PARENT change on a
+  // live row; it does not block renaming one. If the connector attached the blocker predicate to
+  // every write, every product with stock or an open order would stop receiving name, price and
+  // status updates from WooCommerce entirely — a far bigger outage than the race being closed.
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  state.products.push(imsRow({ id: 'ims-simple', sku: 'KIT-SKU', name: 'Old name', type: 'SIMPLE' }))
+  state.stockLevels.push({ productId: 'ims-simple', quantity: 12, reservedQty: 3 })
+  state.salesOrderLines.push({ productId: 'ims-simple' })
+
+  const result = await capturingWarnings(() => syncWcProductToIms(simpleProduct()))
+
+  assert.equal(result.success, true, `a re-sync of a live row must still apply, got: ${result.error}`)
+  assert.equal(findProductBySku('KIT-SKU')?.name, 'Widget Bundle (from WooCommerce)')
+  assert.deepEqual(
+    state.blockerQueries,
+    [],
+    'and the steady state does not even ask — SIMPLE -> SIMPLE is not a transform',
   )
 })

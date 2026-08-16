@@ -250,10 +250,20 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
 }
 
 /**
- * o3d-y89x / o3d-fjqk: a WooCommerce product whose IMS twin owns structure WooCommerce
- * cannot express — an IMS KIT paired with a WooCommerce variable product, or a variation SKU
- * that resolves to an IMS row belonging to a different parent. The connector refuses to
- * flatten the IMS side, so the WooCommerce objects it could not apply exist nowhere in IMS.
+ * o3d-y89x / o3d-fjqk: a WooCommerce product and its IMS twin DISAGREE about the row's shape,
+ * so part of the payload could not be applied. One rule, both directions (o3d-y89x r3):
+ *
+ *   - WooCommerce says VARIABLE and the IMS row cannot be a parent (a KIT, a row that is
+ *     itself somebody's child, a live row the editor would refuse to transform): the
+ *     variations exist nowhere in IMS;
+ *   - WooCommerce says SIMPLE and the IMS row is a VARIABLE parent: its type and price go
+ *     unwritten and its IMS variants stay standing;
+ *   - or a single variation SKU resolves to an IMS row belonging to a different parent.
+ *
+ * The connector refuses to flatten the IMS side in every case, because the structure it would
+ * destroy is IMS-owned and WooCommerce never asked for it to go. An IMS KIT paired with a
+ * WooCommerce SIMPLE product is NOT here: both sides agree the row is not a parent, so nothing
+ * went unapplied and that ordinary bundle pairing stays silent.
  *
  * Written by the product sync itself, deduplicated to ONE open row per pairing, and DELETED
  * by the next sync that completes cleanly — so this list is live rather than a log, and the

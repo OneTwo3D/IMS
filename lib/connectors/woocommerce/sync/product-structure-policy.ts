@@ -147,24 +147,85 @@ export type ConnectorParentWriteDecision = {
    */
   needsTransformBlockerCheck: boolean
   /**
+   * True when the write this decision describes ACTUALLY moves `type` — the allow-list
+   * permitted the transform and no blocker was found (o3d-y89x r3).
+   *
+   * Distinct from `needsTransformBlockerCheck`, which stays true after a blocker is found (the
+   * check WAS owed; it was answered "blocked"). This one goes false, and that is what makes it
+   * the right flag to hang the conditional write on: the write reasserts "still transformable"
+   * only while it is still asking to transform.
+   */
+  writeTransformsRow: boolean
+  /**
    * True when the row may receive children and variable-only ProductOption rows. False is
    * why `parentRoleRefusal` is set.
    */
   canBeVariableParent: boolean
   /**
-   * True when the row's OWN price columns may follow WooCommerce's shape this sync.
+   * DO IMS AND WOOCOMMERCE AGREE ABOUT THIS ROW'S SHAPE? The branch's one structural
+   * predicate — stated here, derived in exactly one place, and read by everything that
+   * depends on the answer (o3d-y89x r3).
    *
-   * Those columns mean opposite things on the two shapes — a variable parent shows min–max
-   * from its variants and carries none of its own, a standalone product carries exactly these
-   * — so writing EITHER arm requires IMS and WooCommerce to agree about which shape this row
-   * has. When they disagree the row keeps what it has, because both arms are wrong in that
-   * state: erasing an IMS kit's price because WooCommerce calls the pairing variable, and
-   * stamping a simple product's price onto a variable parent because WooCommerce calls it
-   * simple, are the same mistake in opposite directions.
+   * WooCommerce models two shapes and IMS six, so there is exactly ONE structural fact
+   * WooCommerce is competent to state about an existing row: **is it a variable parent?**
+   * `variable` asserts "this row has children, here they are, and it carries no price of its
+   * own"; `simple` asserts "this row has no variations, and here is its price". Everything
+   * else IMS knows — KIT-ness, BOM-ness, whether stock is tracked at all — WooCommerce has no
+   * opinion about, because `simple` is an ABSENCE of information, never a denial.
+   *
+   * So the whole question is whether that one boolean matches, on both halves of what "being a
+   * variable parent" means here:
+   *
+   *   - WooCommerce says VARIABLE: the row must actually be able to hold the children this
+   *     payload carries — `canBeVariableParent`, which already folds in the type, the
+   *     row-is-a-child rule and the live-row gate.
+   *   - WooCommerce says SIMPLE: the row must actually NOT be a parent — `effectiveType !==
+   *     'VARIABLE'`. A row that stays VARIABLE keeps child rows and ProductOption rows that
+   *     IMS owns and this connector may not delete, and its own price columns are meaningless
+   *     (a parent shows min–max from its variants), so WooCommerce's simple price cannot be
+   *     applied either.
+   *
+   * WHAT AGREEMENT BUYS, AND WHAT DISAGREEMENT COSTS. Both consumers of this flag follow from
+   * the same sentence — *this sync applied the shape WooCommerce asserted*:
+   *
+   *   - PRICING. The row's own price columns may follow WooCommerce only on agreement.
+   *     Erasing an IMS kit's price because WooCommerce calls the pairing variable, and
+   *     stamping a simple product's price onto a variable parent because WooCommerce calls it
+   *     simple, are the same mistake in opposite directions.
+   *   - CONFLICTS. Disagreement means WooCommerce data went UNAPPLIED, which is the definition
+   *     of a structure conflict (see {@link WcProductStructureConflict}) — quarantined, failed,
+   *     cursor pinned. Agreement means it did not, and must stay silent.
+   *
+   * THE CASE THAT MAKES THE SECOND CONSUMER NECESSARY (Codex r3 finding 1). An IMS KIT paired
+   * with a WooCommerce `simple` product AGREES: neither side claims a parent, the kit's
+   * composition is IMS-only knowledge WooCommerce never contradicted, nothing went unapplied.
+   * That is the ordinary bundle pairing and it must stay quiet. An IMS VARIABLE row paired
+   * with a WooCommerce `simple` product DISAGREES by the identical rule — and used to be
+   * recorded as a clean SYNCED sync with its type unwritten, its price unwritten and its IMS
+   * variants left standing, because the conflict branch only ran when the INCOMING payload was
+   * variable. Reading the conflict off this flag instead of off the incoming type is what makes
+   * the two cases decided by one rule rather than by two separate `if`s that disagreed.
    */
-  appliesWooPriceShape: boolean
+  wooShapeAgrees: boolean
   /** Non-null exactly when `canBeVariableParent` is false. */
   parentRoleRefusal: WcVariableParentRefusal | null
+}
+
+/**
+ * The shape-agreement rule, in one place (see {@link ConnectorParentWriteDecision.wooShapeAgrees}).
+ *
+ * Kept as a named function rather than inlined twice because the create branch and the update
+ * branch both need it, and two copies of a boolean this load-bearing is how the two `if`s that
+ * disagreed came about in the first place.
+ */
+function wooAndImsAgreeOnShape(args: {
+  incoming: ProductType
+  effectiveType: ProductType
+  canBeVariableParent: boolean
+}): boolean {
+  return args.incoming === 'VARIABLE'
+    ? args.canBeVariableParent
+    : args.effectiveType !== 'VARIABLE'
 }
 
 export type ConnectorParentRow = {
@@ -223,12 +284,17 @@ export function decideConnectorParentWrite(args: {
   // The create branch stays unguarded on purpose: guarding it would leave new products
   // typeless.
   if (!row) {
+    const canBeVariableParent = incoming === 'VARIABLE'
     return {
       effectiveType: incoming,
       suppressTypeWrite: false,
       needsTransformBlockerCheck: false,
-      canBeVariableParent: incoming === 'VARIABLE',
-      appliesWooPriceShape: true,
+      writeTransformsRow: false,
+      canBeVariableParent,
+      // A created row is whatever WooCommerce says it is, so the rule below always answers
+      // true here. Computed rather than hardcoded so there is exactly one definition of
+      // agreement, and so a future create-branch guard cannot make this silently stale.
+      wooShapeAgrees: wooAndImsAgreeOnShape({ incoming, effectiveType: incoming, canBeVariableParent }),
       parentRoleRefusal: incoming === 'VARIABLE'
         ? null
         : {
@@ -285,10 +351,13 @@ export function decideConnectorParentWrite(args: {
     effectiveType,
     suppressTypeWrite,
     needsTransformBlockerCheck,
+    // The write really does move `type`: the allow-list permitted it AND no blocker was found.
+    // This is what the conditional write below has to re-assert at the instant it writes, and
+    // it is false again the moment a blocker turns up (`blockedByLiveRows` sets
+    // `suppressTypeWrite`), so a retry after a late refusal no longer asks for the transform.
+    writeTransformsRow: needsTransformBlockerCheck && !suppressTypeWrite,
     canBeVariableParent,
-    // Agreement, both directions: WooCommerce says variable AND the row really becomes that
-    // parent, or WooCommerce says simple AND the row really is a standalone product.
-    appliesWooPriceShape: incoming === 'VARIABLE' ? canBeVariableParent : effectiveType !== 'VARIABLE',
+    wooShapeAgrees: wooAndImsAgreeOnShape({ incoming, effectiveType, canBeVariableParent }),
     parentRoleRefusal,
   }
 }
@@ -438,9 +507,15 @@ export function refuseVariationAdoption(args: {
  * WooCommerce and nowhere in IMS is a divergence no later sync repairs on its own, and it
  * has downstream consequences: order import resolves lines by SKU, so an absent variation
  * imports as a line with no product and no inventory allocation.
+ *
+ * On the PARENT branch that question has exactly one answer, and it is
+ * {@link ConnectorParentWriteDecision.wooShapeAgrees}: disagreement about whether the row is a
+ * variable parent is the only way parent-level WooCommerce data goes unapplied, and it covers
+ * both directions — the payload's variations with nowhere to go, and the payload's own type and
+ * price with nothing they can be written onto.
  */
 export type WcProductStructureConflict = {
-  kind: 'variations_not_imported' | 'variation_row_refused'
+  kind: 'variations_not_imported' | 'parent_shape_not_applied' | 'variation_row_refused'
   /** The SKU the operator has to look at — the parent's, or the refused variation's. */
   sku: string
   imsProductId: string
@@ -448,6 +523,32 @@ export type WcProductStructureConflict = {
   /** The WooCommerce product or variation id involved. */
   wcObjectId: string
   detail: string
+}
+
+/**
+ * The operator-facing line for the OTHER direction of shape disagreement (o3d-y89x r3):
+ * WooCommerce says `simple`, the IMS row is (and stays) a VARIABLE parent.
+ *
+ * The remedy has to name something that actually clears it. Two things do, and the reason
+ * neither is "let the connector fix it" is the branch's whole policy: the connector cannot
+ * flatten the row, because the children and ProductOption rows it would strand are IMS-owned
+ * and WooCommerce never asked for them to be deleted — `simple` says nothing about them.
+ */
+export function describeParentShapeNotApplied(args: {
+  wcProductId: string
+  sku: string
+  imsProductId: string
+  imsType: ProductType
+  /** Set when the row ALSO could not act as a parent (already somebody's child, or live). */
+  parentRoleRefusal: WcVariableParentRefusal | null
+}): string {
+  const extra = args.parentRoleRefusal ? ` Additionally, ${args.parentRoleRefusal.detail}` : ''
+  return `WooCommerce product ${args.wcProductId} ("${args.sku}") is simple, but IMS product `
+    + `${args.imsProductId} is ${args.imsType} — a variable parent whose child rows and options IMS `
+    + 'owns, and which a connector may not delete. Its WooCommerce type and price were NOT applied '
+    + `and its IMS variants remain, so the two systems still disagree.${extra} `
+    + 'To resolve: convert the IMS product in the product editor (detaching or removing its variants '
+    + 'first), or make the WooCommerce product variable again.'
 }
 
 /** One operator-facing line per conflict; the sync's error string and the inbox row share it. */
