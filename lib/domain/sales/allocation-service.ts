@@ -1000,6 +1000,12 @@ export function findUncoveredCommittedShipment(
  * exactly why it catches this.
  *
  * Rows and products both start at 0, so nothing pre-existing reads as stale.
+ *
+ * `graphVersion` MUST be the version carried by the graph node the caller expanded (o3d-4kfh r7,
+ * Codex finding 1) — never a separately-queried `Product.fulfillmentGraphVersion`. The check's
+ * whole content is "were these rows derived from the recipe I am judging them against"; sourcing
+ * the two halves from two snapshots reintroduces the race at the checking end, where an old version
+ * certifies old rows while the quantities are compared against a new graph.
  */
 export function findStaleFulfillmentGraphAllocation(
   lines: Array<{ id: string; sku: string | null; description: string; graphVersion: number }>,
@@ -1025,6 +1031,26 @@ export function findStaleFulfillmentGraphAllocation(
  * end up asking a DIFFERENT question of a differently-filtered set than the full integrity check —
  * the two must agree about which shipments count as committed and which rows back them.
  *
+ * THE SNAPSHOT BOUNDARY (o3d-4kfh r7, Codex finding 1). There is exactly ONE read on this path that
+ * is allowed to answer "what does this line require, and which version of the graph says so", and
+ * it is `loadFulfillmentProductGraph` below. Both answers come out of the same statement per node
+ * (see `FulfillmentGraphNode.fulfillmentGraphVersion`), so the version the CAS compares against is
+ * the version of the recipe the quantities were checked against — by construction, not by luck.
+ *
+ * r6 got this half right. It stamped the ALLOCATOR from the graph node, and then let VALIDATION
+ * read `Product.fulfillmentGraphVersion` back through `salesOrderLine.product` — a THIRD snapshot,
+ * taken one statement before the graph. Under READ COMMITTED an editor committing between those two
+ * statements produced exactly the hole the stamp exists to close: the line query returns the OLD
+ * version (matching the OLD stamp on the rows, so the CAS passes) while the graph query returns the
+ * NEW recipe (against which a uniform rescale is still perfectly proportional, so
+ * `findUncoveredCommittedShipment` passes too). Both checks pass and half a kit dispatches. The
+ * `select` is gone rather than merely unused, so the stale value is not available to be read again.
+ *
+ * NOT solved here, and not claimed to be: this path still takes no lock against graph writers, so
+ * an edit committing after the graph read is invisible to the whole transaction. That is the
+ * serialization gap filed as o3d-57b0 and described in the component-graph guard's docstring; what
+ * this removes is the SECOND, avoidable window that existed inside our own read sequence.
+ *
  * Returns null when the order has no product-bearing lines in scope; nothing to check.
  */
 async function loadAllocationIntegrityRows(
@@ -1044,8 +1070,6 @@ async function loadAllocationIntegrityRows(
       qty: true,
       sku: true,
       description: true,
-      // o3d-4kfh r6: the CURRENT graph version of the line's own product, for the CAS below.
-      product: { select: { fulfillmentGraphVersion: true } },
     },
   })
   if (lines.length === 0) return null
@@ -1055,11 +1079,21 @@ async function loadAllocationIntegrityRows(
     lines.map((line) => line.productId!).filter(Boolean),
   )
   const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
+  // The CAS input, built in the SAME loop as the requirements and from the SAME graph, so the two
+  // cannot drift apart later. A line whose product is missing from the graph (deleted under us)
+  // reads 0 and therefore fails closed against any stamped row — there is no recipe left to certify.
+  const versionedLines: Array<{ id: string; sku: string | null; description: string; graphVersion: number }> = []
   for (const line of lines) {
     requirementsByLine.set(
       line.id,
       requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId!, 1, graph)),
     )
+    versionedLines.push({
+      id: line.id,
+      sku: line.sku,
+      description: line.description,
+      graphVersion: graph.get(line.productId!)?.fulfillmentGraphVersion ?? 0,
+    })
   }
 
   const [allocations, activeShipmentLines] = await Promise.all([
@@ -1092,7 +1126,7 @@ async function loadAllocationIntegrityRows(
     }),
   ])
 
-  return { lines, requirementsByLine, allocations, activeShipmentLines }
+  return { lines, versionedLines, requirementsByLine, allocations, activeShipmentLines }
 }
 
 /** The committed shipment lines re-expressed at allocation-row grain. */
@@ -1128,15 +1162,11 @@ export async function validateCommittedShipmentCoverage(
   // cheap (an integer comparison on rows already loaded). Running it before the proportionality
   // check also means the operator gets the accurate, actionable message ("re-allocate") rather than
   // a proportionality complaint about numbers that are, against the new graph, proportional.
-  const staleGraphError = findStaleFulfillmentGraphAllocation(
-    rows.lines.map((line) => ({
-      id: line.id,
-      sku: line.sku,
-      description: line.description,
-      graphVersion: line.product?.fulfillmentGraphVersion ?? 0,
-    })),
-    rows.allocations,
-  )
+  //
+  // r7: `versionedLines` — the version out of the graph read that produced `requirementsByLine`
+  // below, not a separately-read `Product` column. See the snapshot-boundary note on
+  // `loadAllocationIntegrityRows`.
+  const staleGraphError = findStaleFulfillmentGraphAllocation(rows.versionedLines, rows.allocations)
   if (staleGraphError) return staleGraphError
   return findUncoveredCommittedShipment(
     rows.requirementsByLine,
@@ -1162,22 +1192,16 @@ export async function validateAllocationIntegrity(
 ): Promise<string | null> {
   const rows = await loadAllocationIntegrityRows(client, orderId, lineIds)
   if (!rows) return null
-  const { lines, requirementsByLine, allocations, activeShipmentLines } = rows
+  const { lines, versionedLines, requirementsByLine, allocations, activeShipmentLines } = rows
 
   // o3d-4kfh r6: the graph-version CAS runs here too, not only at the commitment/dispatch seam.
   // `confirmSalesOrderShipments` builds its drafts straight from these rows, so letting a stale set
   // through here would only move the refusal to the warehouse floor at Start Picking. The manual
   // allocation editor calls this as well: a stale row cannot be repaired by editing its quantity —
   // the whole set has to be rebuilt — so refusing with "re-allocate" is the correct answer there.
-  const staleGraphError = findStaleFulfillmentGraphAllocation(
-    lines.map((line) => ({
-      id: line.id,
-      sku: line.sku,
-      description: line.description,
-      graphVersion: line.product?.fulfillmentGraphVersion ?? 0,
-    })),
-    allocations,
-  )
+  //
+  // r7: same snapshot as `requirementsByLine` — see `loadAllocationIntegrityRows`.
+  const staleGraphError = findStaleFulfillmentGraphAllocation(versionedLines, allocations)
   if (staleGraphError) return staleGraphError
 
   const committedByLine = calculateDecimalCoverageByLine(
@@ -1311,6 +1335,14 @@ function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
  * o3d-i4qd; the fix belongs in how the set is canonicalised, not in loosening this comparison.
  *
  * Decimal.eq rather than `===` because two Decimals of equal value can differ in representation.
+ *
+ * DO NOT ADD `fulfillmentGraphVersion` TO THIS COMPARISON (o3d-4kfh r7). It is the tempting fix for
+ * the stale-stamp case Codex finding 3 raised, and it is the wrong one: a stamp mismatch would then
+ * report the set as CHANGED and trigger the full destructive cycle — accounting reset, release,
+ * delete, recreate, re-reserve — on an order whose quantities did not move. That is exactly the
+ * churn o3d-i5it removed, and the reset is what lets the daily batch re-post an A2 journal. The
+ * question this function answers is "would a rewrite move anything?", and the answer is still no.
+ * The stamp is repaired by a targeted `updateMany` on the unchanged branch of `allocateSalesOrder`.
  */
 export function allocationSetsMatch(
   existing: Array<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>,
@@ -1749,7 +1781,10 @@ export async function allocateSalesOrder(
 
     const existingAllocs = await tx.orderAllocation.findMany({
       where: { orderId },
-      select: { lineId: true, productId: true, warehouseId: true, qty: true },
+      // o3d-4kfh r7 (Codex finding 3): the STAMP is selected too, so the unchanged branch below can
+      // tell "identical rows, current recipe" from "identical rows, stale recipe" — which are the
+      // same set of numbers and completely different states of the order.
+      select: { lineId: true, productId: true, warehouseId: true, qty: true, fulfillmentGraphVersion: true },
     })
 
     // o3d-i5it: when the computed set is identical to the persisted one, write NOTHING.
@@ -1924,6 +1959,47 @@ export async function allocateSalesOrder(
       pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
         cause: 'an earlier allocation change (this re-allocation computed the same set)',
       })
+
+      // o3d-4kfh r7 (Codex finding 3): AND IT RE-STAMPS.
+      //
+      // `allocationSetsMatch` compares scope and quantity, nothing else — deliberately, because
+      // that is the question o3d-i5it asks ("would a rewrite move anything?"). But a recipe change
+      // can leave the expanded set NUMERICALLY IDENTICAL: components reordered, an equivalent
+      // rewrite, a sub-kit inlined at the same factors, or simply a rescale the order has no stock
+      // to follow. The stamp still moved, so every later confirmation and shipment transition
+      // refused the order — and the refusal's advice is "re-allocate this order", which took this
+      // branch and wrote nothing. An advertised exit that silently no-ops is the same defect class
+      // as telling an operator to dispatch a cancelled order's shipment: the message names an
+      // action that cannot clear what it is offered for.
+      //
+      // WHY RE-STAMPING IS SOUND HERE, and is not "blessing rows nobody checked". This branch is
+      // reached only because the allocator has just recomputed the whole set FROM THE CURRENT
+      // GRAPH (`graph`, expanded into `nextAllocationRows` a few dozen lines above) and the result
+      // equals what is persisted. The rows therefore ARE the current graph's expansion of current
+      // demand; the stamp was simply the only part of them still describing the old one. A set the
+      // current recipe does NOT reproduce cannot get here — it takes the rewrite branch, which
+      // stamps at creation.
+      //
+      // NOT CHURN, and this is load-bearing for o3d-i5it. The update is issued only for lines whose
+      // stamp actually differs, so the ordinary unchanged run — the 15-minute sweep over permanent
+      // partial backorders — still performs no write at all: no accounting reset, no delete /
+      // recreate, no reservation movement, no storefront sync, no audit row. `syncProductIds` stays
+      // empty because nothing about the stock position moved; only the row's account of which
+      // recipe it came from did.
+      const restampByLine = new Map<string, number>()
+      for (const row of existingAllocs) {
+        const expected = graphVersionByLine.get(row.lineId) ?? 0
+        if ((row.fulfillmentGraphVersion ?? 0) === expected) continue
+        restampByLine.set(row.lineId, expected)
+      }
+      for (const [lineId, graphVersion] of restampByLine) {
+        await tx.orderAllocation.updateMany({
+          // Scoped to the line, and to the rows that are actually behind — an updateMany that
+          // rewrote already-current rows would be a write on an unchanged order.
+          where: { orderId, lineId, fulfillmentGraphVersion: { not: graphVersion } },
+          data: { fulfillmentGraphVersion: graphVersion },
+        })
+      }
     }
 
     // Promote to ALLOCATED only off the UNDER-LOCK status. Deciding on the stale pre-lock so.status

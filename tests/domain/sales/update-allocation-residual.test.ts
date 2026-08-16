@@ -32,8 +32,6 @@ type SalesOrderLineRow = {
   productId: string
   qty: number
   sku: string
-  /** o3d-4kfh r6: `Product.fulfillmentGraphVersion` of this line's product. Absent means 0. */
-  graphVersion?: number
 }
 /** A PENDING draft, with the label metadata a retirement has to report (o3d-4kfh r4). */
 type PendingShipmentRow = {
@@ -55,6 +53,33 @@ const state = {
   // anything, so every assertion about the post-edit state was made against a validator that had
   // been switched off (Codex review of o3d-4kfh).
   lines: [] as SalesOrderLineRow[],
+  /**
+   * o3d-4kfh r7 (Codex finding 1): `Product.fulfillmentGraphVersion`, keyed by productId, served
+   * from `product.findMany` — the graph read.
+   *
+   * It used to be served from `salesOrderLine.findMany` as `product: { fulfillmentGraphVersion }`,
+   * mirroring a `select` production has now dropped: validation reading the version from a
+   * different statement than the graph it validates against IS the defect r7 closes, so a double
+   * that still offered it there would have kept passing after a revert of the fix. The version and
+   * the component list must come out of the same answer here for the same reason they must in
+   * Postgres.
+   */
+  graphVersions: {} as Record<string, number>,
+  /**
+   * THE OTHER SNAPSHOT (o3d-4kfh r7). What a `salesOrderLine.findMany` with
+   * `product: { select: { fulfillmentGraphVersion } }` would have returned — i.e. the value the
+   * r6 code read, one statement EARLIER than the graph.
+   *
+   * Under READ COMMITTED those two statements can straddle a component-graph edit, and then they
+   * disagree. Setting this to a different number than `graphVersions` is how a test models that
+   * interleaving; leaving it unset makes the two agree, which is the uncontended case. The double
+   * keeps offering the field precisely so that reverting the fix makes the affected tests PASS
+   * again — a double that stopped offering it would have made the revert crash instead of
+   * demonstrating the hole.
+   */
+  lineProductGraphVersions: {} as Record<string, number>,
+  /** productId -> component list. Absent products are fulfilment leaves (o3d-4kfh r7). */
+  kits: {} as Record<string, Array<{ componentId: string; qty: number }>>,
   // Set by the concurrency test only: the snapshot the NON-transactional pre-read still sees after
   // a second editor has already committed. null = read the live rows like every other test.
   staleOuterAllocations: null as AllocationRow[] | null,
@@ -152,19 +177,33 @@ const tx = {
         qty: line.qty,
         sku: line.sku,
         description: line.sku,
-        // o3d-4kfh r6: production selects this for the graph-version CAS. Omitting it would leave
-        // the check comparing every stamp against `undefined`.
-        product: { fulfillmentGraphVersion: line.graphVersion ?? 0 },
+        // The r6 read, kept alive on purpose — see `state.lineProductGraphVersions`.
+        product: {
+          fulfillmentGraphVersion:
+            state.lineProductGraphVersions[line.productId] ?? state.graphVersions[line.productId] ?? 0,
+        },
       })),
   },
-  // Every product here is SIMPLE, so the fulfillment graph is a single self-requirement of
-  // factor 1 — but validateAllocationIntegrity really does load it, so it has to be answerable.
+  // SIMPLE unless `state.kits` says otherwise. validateAllocationIntegrity really does load the
+  // graph, so it has to be answerable — and `addAllocation` EXPANDS it, so a double that could only
+  // answer SIMPLE could never exercise the fractional-component arithmetic (o3d-4kfh r7).
   product: {
-    findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => ({
-      id,
-      type: 'SIMPLE',
-      productComponents: [],
-    })),
+    findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => {
+      const components = state.kits[id]
+      return {
+        id,
+        type: components ? 'KIT' : 'SIMPLE',
+        // o3d-4kfh r7: out of the SAME answer as `productComponents`, which is the whole point of
+        // the column living on the graph node. `NOT NULL DEFAULT 0`, so a real read never nulls.
+        fulfillmentGraphVersion: state.graphVersions[id] ?? 0,
+        productComponents: (components ?? []).map((component, index) => ({
+          componentId: component.componentId,
+          qty: component.qty,
+          component: { sku: component.componentId, type: 'SIMPLE', oversellAllowed: false },
+          sortOrder: index,
+        })),
+      }
+    }),
   },
   shipmentLine: {
     // Honours BOTH status shapes production asks for, and they are not the same question:
@@ -192,9 +231,20 @@ const tx = {
       })),
   },
   stockLevel: {
-    findMany: async ({ where }: { where: { productId: string; warehouseId: { in: string[] } } }) =>
+    // TWO real shapes: `updateAllocation` filters one product across warehouses
+    // (`productId: string`), `addAllocation` filters every expanded leaf
+    // (`productId: { in: [...] }`). A double that understood only the first would hand
+    // addAllocation an empty stock map and make it fail closed for the wrong reason.
+    findMany: async ({ where }: {
+      where: { productId: string | { in: string[] }; warehouseId: { in: string[] } }
+    }) =>
       state.stockLevels
-        .filter((row) => row.productId === where.productId && where.warehouseId.in.includes(row.warehouseId))
+        .filter((row) => (
+          typeof where.productId === 'string'
+            ? row.productId === where.productId
+            : where.productId.in.includes(row.productId)
+        ))
+        .filter((row) => where.warehouseId.in.includes(row.warehouseId))
         .map((row) => ({ ...row })),
     // Honours the guarded decrement, so a release bigger than the aggregate cannot silently "work".
     updateMany: async ({ where, data }: {
@@ -231,16 +281,42 @@ const tx = {
     // Filtered by the predicates production passes. Returning EVERY row regardless of `where`
     // would hand validateAllocationIntegrity another order's allocations as if they were this
     // order's, and hand the residual loader rows it never asked for.
-    findMany: async ({ where }: { where?: { orderId?: string; lineId?: { in: string[] } } } = {}) => state
+    findMany: async ({ where }: {
+      where?: {
+        orderId?: string
+        lineId?: string | { in: string[] }
+        warehouseId?: string
+        productId?: { in: string[] }
+      }
+    } = {}) => state
       .allocations
       .filter((row) => where?.orderId == null || row.orderId === where.orderId)
-      .filter((row) => !where?.lineId || where.lineId.in.includes(row.lineId))
+      .filter((row) => {
+        if (where?.lineId == null) return true
+        return typeof where.lineId === 'string' ? row.lineId === where.lineId : where.lineId.in.includes(row.lineId)
+      })
+      .filter((row) => where?.warehouseId == null || row.warehouseId === where.warehouseId)
+      .filter((row) => where?.productId == null || where.productId.in.includes(row.productId))
       .map((row) => ({ ...row, fulfillmentGraphVersion: row.fulfillmentGraphVersion ?? 0 })),
     update: async ({ where, data }: { where: { id: string }; data: { warehouseId?: string; qty?: unknown } }) => {
       const row = state.allocations.find((candidate) => candidate.id === where.id)
       if (!row) throw new Error('allocation not found')
       if (data.warehouseId) row.warehouseId = data.warehouseId
-      if (data.qty !== undefined) row.qty = decimalLikeToNumber(data.qty)
+      // o3d-4kfh r7: `OrderAllocation.qty` is `@db.Decimal(12,4)` and Postgres rounds half-up ON
+      // WRITE. A double that stored the caller's full precision let a test observe a row IMS could
+      // never hold, and made the whole class of "the row and reservedQty disagree by half an ulp"
+      // defects unobservable — which is exactly the defect Codex finding 4 is about.
+      if (data.qty !== undefined) row.qty = persistAllocationQty(decimalLikeToNumber(data.qty))
+      return row
+    },
+    create: async ({ data }: { data: Omit<AllocationRow, 'id' | 'qty'> & { qty: unknown; id?: string } }) => {
+      const row: AllocationRow = {
+        ...data,
+        id: data.id ?? `alloc-${state.allocations.length + 1}`,
+        qty: persistAllocationQty(decimalLikeToNumber(data.qty)),
+        fulfillmentGraphVersion: data.fulfillmentGraphVersion ?? 0,
+      }
+      state.allocations.push(row)
       return row
     },
     delete: async ({ where }: { where: { id: string } }) => {
@@ -248,8 +324,19 @@ const tx = {
       if (index >= 0) state.allocations.splice(index, 1)
       return {}
     },
-    updateMany: async () => ({ count: 0 }),
+    // resetAllocationAccountingIfStaged clears costLayerSnapshot through here. Unreachable in this
+    // file (the order is never staged — `salesOrder.findUnique` returns a null
+    // inventoryAllocatedDate) but answered honestly so it cannot quietly become a lie if a future
+    // fixture stages one.
+    updateMany: async ({ where }: { where?: { orderId?: string } } = {}) => ({
+      count: state.allocations.filter((row) => where?.orderId == null || row.orderId === where.orderId).length,
+    }),
   },
+}
+
+/** Postgres `numeric(12,4)` rounds half-up on write. The double must, or precision is untestable. */
+function persistAllocationQty(value: number): number {
+  return Math.round(value * 10_000) / 10_000
 }
 
 mock.module('@/lib/db', {
@@ -286,6 +373,9 @@ async function loadAction() {
 /** The order's own lines. Kept in step with the fixtures so the integrity check is answerable. */
 function seedLines(qty: number) {
   state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty, sku: 'SKU-1' }]
+  state.graphVersions = {}
+  state.lineProductGraphVersions = {}
+  state.kits = {}
   state.staleOuterAllocations = null
   state.pendingShipments = []
   state.activity.length = 0
@@ -875,7 +965,7 @@ test('o3d-4kfh r6: updateAllocation REFUSES a row written against an older compo
   // the current recipe — so the editor must refuse and point at Re-Allocate rather than let the
   // operator adjust numbers that mean something different from what they say.
   seedLines(10)
-  state.lines[0].graphVersion = 5
+  state.graphVersions['product-1'] = 5
   state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
   state.allocations = [
     { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10, fulfillmentGraphVersion: 4 },
@@ -900,7 +990,7 @@ test('o3d-4kfh r6: updateAllocation REFUSES a row written against an older compo
 test('o3d-4kfh r6: updateAllocation is untouched when the stamp matches', async () => {
   // The boundary: the CAS must not become a dead end for the ordinary editor.
   seedLines(10)
-  state.lines[0].graphVersion = 5
+  state.graphVersions['product-1'] = 5
   state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
   state.allocations = [
     { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10, fulfillmentGraphVersion: 5 },
@@ -913,4 +1003,113 @@ test('o3d-4kfh r6: updateAllocation is untouched when the stamp matches', async 
   assert.equal(result.success, true, result.success ? undefined : result.error)
   assert.equal(state.allocations[0].qty, 8)
   assert.equal(reservedAt('warehouse-1'), 8)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r7 (Codex finding 1) — the CAS reads the version from the SAME snapshot as the graph.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r7: the graph-version CAS compares against the GRAPH read, not a separate product read', async () => {
+  // THE RACE, modelled exactly. r6 loaded the line (with `product.fulfillmentGraphVersion`) in one
+  // statement and the component graph in the next. A component-graph edit committing between them
+  // makes those two statements disagree: the line query still returns the OLD version — which
+  // MATCHES the old stamp on the rows, so the CAS passes — while the graph query returns the NEW
+  // recipe, against which a uniform rescale is still perfectly proportional, so the coverage
+  // backstop passes too. Both checks pass on rows derived from a recipe that no longer exists.
+  //
+  // Here: the rows are stamped 4, the pre-edit line read still says 4, the graph says 5.
+  seedLines(10)
+  state.lineProductGraphVersions['product-1'] = 4 // the statement taken BEFORE the edit committed
+  state.graphVersions['product-1'] = 5            // the statement taken AFTER it committed
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10, fulfillmentGraphVersion: 4 },
+  ]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 8)
+
+  assert.equal(result.success, false, 'the stale set must be refused even though the OLD read agreed with it')
+  assert.match(String(result.error), /older version of that product's component graph/)
+  assert.match(String(result.error), /allocation 4, product 5/, 'and it reports the GRAPH version, which is the one it judged against')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r7 (Codex finding 4) — the manual writers quantise to the persisted scale.
+//
+// `OrderAllocation.qty` is `@db.Decimal(12,4)`; `StockLevel.reservedQty` carries more. The
+// allocator was fixed in r6 to decide equality, the write and the reserve against ONE canonical
+// rendering of the number. The two MANUAL writers were not, so they kept recreating exactly the
+// drift that fix removed: the row rounds, the reservation does not, and the difference sits on an
+// aggregate shared with every other order in the (product, warehouse) scope. Neither the
+// transaction's integrity check nor the residual arithmetic can see it — the first reads allocation
+// rows and never stock, the second only ever credits what is actually left.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r7: updateAllocation reserves EXACTLY what the row persists, at a x.xxxx5 boundary', async () => {
+  // Order B holds 3 in the same scope, so the drift has somewhere to steal from / leak into.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 13 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 },
+    { id: 'alloc-b', orderId: 'order-2', lineId: 'line-2', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 },
+  ]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 0.33335)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(state.allocations[0].qty, 0.3334, 'the row holds what numeric(12,4) can hold')
+  assert.equal(
+    reservedAt('warehouse-1'),
+    3.3334,
+    'and the aggregate is order B\'s untouched 3 plus EXACTLY the persisted row — not the operator\'s 0.33335',
+  )
+})
+
+test('o3d-4kfh r7: updateAllocation DELETES on a quantity that quantises to zero', async () => {
+  // 0.00004 is not "a very small allocation": it is a row Postgres stores as 0.0000, which every
+  // structural check reads as a component missing from the set, while the reservation moved by
+  // 0.00004. `newQty === 0` was the wrong test.
+  seedLines(10)
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 13 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 },
+    { id: 'alloc-b', orderId: 'order-2', lineId: 'line-2', productId: 'product-1', warehouseId: 'warehouse-1', qty: 3 },
+  ]
+  state.shipmentLines = []
+  const { updateAllocation } = await loadAction()
+
+  const result = await updateAllocation('alloc-a', 'warehouse-1', 0.00004)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(state.allocations.map((row) => row.id), ['alloc-b'], 'the row is gone, not stored as 0.0000')
+  assert.equal(reservedAt('warehouse-1'), 3, 'and order B keeps its 3 exactly')
+})
+
+test('o3d-4kfh r7: addAllocation reserves the PERSISTED component quantity, not the expanded one', async () => {
+  // A KIT whose component factor is not representable at 4dp: one kit expands to 0.33335 of
+  // component-1, which the column stores as 0.3334.
+  seedLines(10)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 0.33335 }] }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 3 }]
+  state.allocations = [
+    { id: 'alloc-b', orderId: 'order-2', lineId: 'line-2', productId: 'component-1', warehouseId: 'warehouse-1', qty: 3 },
+  ]
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, true, result.error)
+  const added = state.allocations.find((row) => row.orderId === 'order-1')
+  assert.equal(added?.qty, 0.3334, 'the component row holds what numeric(12,4) can hold')
+  assert.equal(
+    reservedAt('warehouse-1'),
+    3.3334,
+    'and the reservation moved by the persisted row, so order B\'s 3 is neither topped up nor eaten into',
+  )
 })

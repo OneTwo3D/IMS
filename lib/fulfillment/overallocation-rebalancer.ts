@@ -2,6 +2,7 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { canonicalAllocationQty } from '@/lib/domain/sales/allocation-service'
 import { reconcilePendingShipments } from '@/lib/domain/sales/pending-shipment-reconciliation'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -174,15 +175,30 @@ export async function releaseOverallocations(
           }
 
           const allocQty = Number(alloc.qty)
-          const release = Math.min(allocQty, excess)
+          const wantedRelease = Math.min(allocQty, excess)
+          if (wantedRelease <= 0) continue
+
+          // o3d-4kfh r7 (Codex finding 4): THE ROW IS QUANTISED, AND THE RESERVATION FOLLOWS THE
+          // ROW. `excess` is `reservedQty − quantity`, and `reservedQty` carries more decimal
+          // places than `OrderAllocation.qty` can hold, so `allocQty − wantedRelease` was routinely
+          // a quantity Postgres rounded on write while `reservedQty` was decremented by the
+          // unrounded figure. The difference is small and permanent, and it lands on an aggregate
+          // shared with every other order in the scope. Deriving the decrement from what the row
+          // ACTUALLY gave up — the same "one canonical representation" rule the allocator and the
+          // manual writers now follow — keeps the two books equal by construction.
+          const wholeRow = wantedRelease >= allocQty - 1e-6
+          const nextQty = wholeRow ? null : canonicalAllocationQty(allocQty - wantedRelease)
+          const release = wholeRow ? allocQty : allocQty - nextQty!.toNumber()
+          // A release the column cannot represent is not a release: the row would be rewritten to
+          // its own value and `reservedQty` decremented for a reduction that never happened.
           if (release <= 0) continue
 
-          if (release >= allocQty - 1e-6) {
+          if (wholeRow) {
             await tx.orderAllocation.delete({ where: { id: alloc.id } })
           } else {
             await tx.orderAllocation.update({
               where: { id: alloc.id },
-              data: { qty: allocQty - release },
+              data: { qty: nextQty! },
             })
           }
           await tx.stockLevel.updateMany({

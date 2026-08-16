@@ -147,8 +147,13 @@ function decimalLikeToNumber(value: number | { toNumber(): number } | undefined)
 }
 
 /** Write counters, so a test can prove o3d-i5it SKIPS the destructive cycle rather than
- *  merely ending with equal row values — a delete+recreate leaves those identical. */
-const writeCounts = { allocationCreates: 0, allocationDeletes: 0 }
+ *  merely ending with equal row values — a delete+recreate leaves those identical.
+ *
+ *  o3d-4kfh r7: `allocationUpdateManys` joins them. The unchanged path now re-stamps a stale graph
+ *  version through `updateMany`, and the o3d-i5it property being defended is "an unchanged,
+ *  fully-backed, CURRENT order writes nothing at all" — which cannot be asserted by looking at row
+ *  values, because a re-stamp to the value already there is invisible in the state. */
+const writeCounts = { allocationCreates: 0, allocationDeletes: 0, allocationUpdateManys: 0 }
 
 /**
  * o3d-4kfh r5 (Codex finding 7): the draft-retirement audit row is written THROUGH THE
@@ -163,6 +168,7 @@ const txWriteOrder: string[] = []
 function createClient(state: MemoryState): AllocationServiceClient {
   writeCounts.allocationCreates = 0
   writeCounts.allocationDeletes = 0
+  writeCounts.allocationUpdateManys = 0
   activityLogWrites.length = 0
   txWriteOrder.length = 0
   const allocations = state.allocations ?? []
@@ -298,13 +304,26 @@ function createClient(state: MemoryState): AllocationServiceClient {
       // resetAllocationAccountingIfStaged clears costLayerSnapshot through here. A double that
       // no-opped made any assertion about the snapshot vacuous in BOTH directions — it could
       // neither observe the clear happening nor the row keeping its snapshot (o3d-4kfh r2).
+      //
+      // o3d-4kfh r7: it is ALSO the graph-version re-stamp on the unchanged path, which passes
+      // `lineId` and a `fulfillmentGraphVersion: { not }` predicate. Both are honoured — a double
+      // that ignored them would report a re-stamp scoped to one stale line as having touched every
+      // row on the order, so a test could not tell a targeted repair from a blanket rewrite.
       updateMany: async ({ where, data }: {
-        where: { orderId: string }
-        data: { costLayerSnapshot?: unknown }
+        where: { orderId: string; lineId?: string; fulfillmentGraphVersion?: { not?: number } }
+        data: { costLayerSnapshot?: unknown; fulfillmentGraphVersion?: number }
       } = { where: { orderId: '' }, data: {} }) => {
-        const rows = allocations.filter((allocation) => allocation.orderId === where.orderId)
+        writeCounts.allocationUpdateManys += 1
+        const rows = allocations
+          .filter((allocation) => allocation.orderId === where.orderId)
+          .filter((allocation) => where.lineId == null || allocation.lineId === where.lineId)
+          .filter((allocation) => (
+            where.fulfillmentGraphVersion?.not == null
+            || (allocation.fulfillmentGraphVersion ?? 0) !== where.fulfillmentGraphVersion.not
+          ))
         for (const row of rows) {
           if ('costLayerSnapshot' in data) row.costLayerSnapshot = null
+          if (data.fulfillmentGraphVersion !== undefined) row.fulfillmentGraphVersion = data.fulfillmentGraphVersion
         }
         return { count: rows.length }
       },
@@ -3008,4 +3027,108 @@ test('o3d-4kfh r6: a re-allocation RE-STAMPS, which is what makes it the adverti
   assert.equal(state.allocations?.[0].qty, 4, 'rebuilt against the current recipe')
   assert.equal(state.allocations?.[0].fulfillmentGraphVersion, 4, 'and re-stamped, so the CAS now passes')
   assert.equal(state.stockLevels[0].reservedQty, 4, 'with the reservation moved to match the persisted row')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r7 (Codex finding 3) — the re-stamp on the UNCHANGED path.
+//
+// The r6 re-stamp test above only covers a recipe whose QUANTITIES moved, which takes the rewrite
+// branch. A recipe change can leave the expanded set numerically identical — components reordered,
+// an equivalent rewrite, a sub-kit inlined at the same factors, or simply a rescale the order has
+// no stock to follow — and then `allocationSetsMatch` (scope + quantity, by design) reports no
+// change and r6 left the stale stamp in place forever. Every later confirmation and shipment
+// transition refused the order while telling the operator to re-allocate it, and re-allocating did
+// nothing: an advertised exit that silently no-ops.
+// ---------------------------------------------------------------------------
+
+/** Line of 1 KIT needing 2 x component-1, already allocated exactly that, stamped `stamp`. */
+function equivalentRecipeState(productVersion: number, stamp: number): MemoryState {
+  return baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-02-01T00:00:00Z'),
+      lines: [{
+        id: 'line-1',
+        productId: 'kit-1',
+        qty: 1,
+        sku: 'KIT-1',
+        description: 'Kit 1',
+        product: { id: 'kit-1', sku: 'KIT-1', type: 'KIT', oversellAllowed: false },
+      }],
+    },
+    products: [{
+      id: 'kit-1',
+      type: 'KIT',
+      fulfillmentGraphVersion: productVersion,
+      // Same factor as the rows were built from: the edit that moved the version did not move the
+      // numbers this order expands to.
+      productComponents: [{ componentId: 'component-1', qty: 2, componentType: 'SIMPLE' }],
+    }],
+    stockLevels: [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    allocations: [{
+      orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1',
+      qty: 2, fulfillmentGraphVersion: stamp,
+    }],
+  })
+}
+
+test('o3d-4kfh r7: a re-allocation whose QUANTITIES are unchanged still repairs the stale stamp', async () => {
+  const state = equivalentRecipeState(7, 1)
+  const client = createClient(state)
+  const before = {
+    qty: state.allocations![0].qty,
+    reservedQty: state.stockLevels[0].reservedQty,
+    inventoryAllocatedDate: state.order.inventoryAllocatedDate,
+  }
+
+  const result = await allocateSalesOrder(client, { orderId: 'order-1' })
+
+  assert.equal(state.allocations?.[0].fulfillmentGraphVersion, 7, 'the stamp is repaired')
+  // The point of the repair: the refusal that sent the operator here can now actually clear.
+  assert.equal(
+    findStaleFulfillmentGraphAllocation(
+      [{ id: 'line-1', sku: 'KIT-1', description: 'Kit 1', graphVersion: 7 }],
+      (state.allocations ?? []).map((row) => ({
+        lineId: row.lineId,
+        fulfillmentGraphVersion: row.fulfillmentGraphVersion ?? 0,
+      })),
+    ),
+    null,
+    'so the CAS the operator was refused by now passes — the advertised exit is a real exit',
+  )
+  // ...and NOTHING ELSE moved. A re-stamp is not a licence to run the destructive cycle.
+  assert.equal(state.allocations?.[0].qty, before.qty, 'the quantity is untouched')
+  assert.equal(writeCounts.allocationDeletes, 0, 'no delete/recreate')
+  assert.equal(writeCounts.allocationCreates, 0)
+  assert.equal(state.stockLevels[0].reservedQty, before.reservedQty, 'no reservation movement')
+  assert.equal(
+    state.order.inventoryAllocatedDate,
+    before.inventoryAllocatedDate,
+    'and no accounting reset — clearing this would let the daily batch re-post the same A2 journal',
+  )
+  assert.deepEqual(result.syncProductIds, [], 'the stock position did not move, so nothing to push')
+  assert.equal(writeCounts.allocationUpdateManys, 1, 'exactly one write: the re-stamp itself')
+})
+
+test('o3d-4kfh r7: an unchanged run whose stamp is ALREADY current writes nothing at all', async () => {
+  // The o3d-i5it churn property, restated for the write the re-stamp adds. The 15-minute sweep
+  // rotates over permanent partial backorders; if the re-stamp fired unconditionally it would
+  // reintroduce a per-rotation write on every one of them.
+  const state = equivalentRecipeState(7, 7)
+  const client = createClient(state)
+  const before = (state.allocations ?? []).map((row) => ({ ...row }))
+
+  const result = await allocateSalesOrder(client, { orderId: 'order-1' })
+
+  assert.deepEqual(state.allocations, before, 'rows untouched')
+  assert.equal(writeCounts.allocationDeletes, 0)
+  assert.equal(writeCounts.allocationCreates, 0)
+  assert.equal(
+    writeCounts.allocationUpdateManys,
+    0,
+    'and not even a no-op updateMany — an unchanged, current, fully-backed order performs NO write',
+  )
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.deepEqual(result.syncProductIds, [])
 })

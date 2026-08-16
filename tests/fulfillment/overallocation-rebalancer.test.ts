@@ -246,10 +246,14 @@ const tx = {
       state.allocationUpdates.push(data)
       return { count: 1 }
     },
-    update: async ({ where, data }: { where: { id: string }; data: { qty: number } }) => {
+    update: async ({ where, data }: { where: { id: string }; data: { qty: unknown } }) => {
       const row = state.allocations.find((candidate) => candidate.id === where.id)
       if (!row) throw new Error('allocation not found')
-      row.qty = decimalLikeToNumber(data.qty)
+      // o3d-4kfh r7: `OrderAllocation.qty` is `@db.Decimal(12,4)` and Postgres rounds half-up on
+      // write. Storing the caller's full precision let the double show a row IMS cannot hold, which
+      // made "the row and reservedQty disagree by half an ulp" — the whole of Codex finding 4 —
+      // impossible to observe here.
+      row.qty = Math.round(decimalLikeToNumber(data.qty) * 10_000) / 10_000
       return row
     },
     delete: async ({ where }: { where: { id: string } }) => {
@@ -659,5 +663,45 @@ test('o3d-4kfh r5: a KIT leaf release retains the unrelated draft AND still disp
     state.backorderCalls,
     [{ productIds: ['kit-leaf-a'] }],
     'the repair pass is dispatched for the released leaf',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r7 (Codex finding 4) — the rebalancer is a producer of `OrderAllocation.qty` too.
+// ---------------------------------------------------------------------------
+
+test('o3d-4kfh r7: a partial release decrements reservedQty by what the ROW actually gave up', async () => {
+  // `excess` is `reservedQty − quantity`, and `reservedQty` carries more decimal places than
+  // `OrderAllocation.qty` can hold. Writing `allocQty − release` therefore rounded the row while
+  // the stock decrement used the unrounded figure, leaving the two books permanently apart on an
+  // aggregate shared with every other order in the scope.
+  //
+  // 8 allocated, 7.666655 on hand: excess 0.333345, which the 4dp column cannot express. The row
+  // can only go to 7.6667, i.e. give up 0.3333 — so 0.3333 is the only correct decrement.
+  reset()
+  state.stockLevels = [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 7.666655, reservedQty: 8 }]
+  state.allocations = [{
+    id: 'alloc-1',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 8,
+    order: order('order-1'),
+  }]
+  const { releaseOverallocations } = await loadRebalancer()
+
+  await releaseOverallocations(
+    [{ productId: 'product-1', warehouseId: 'warehouse-1' }],
+    { source: 'stock_adjustment', referenceId: 'adj-1' },
+  )
+
+  assertNoSwallowedFailure()
+  assert.equal(state.allocations[0].qty, 7.6667, 'the row holds what numeric(12,4) can hold')
+  const reserved = state.stockLevels[0].reservedQty
+  assert.ok(
+    Math.abs(reserved - state.allocations[0].qty) < 1e-9,
+    `reservedQty ${reserved} must equal the only allocation row backing it (${state.allocations[0].qty}) — `
+    + 'a difference here is stock this order neither holds nor released, sitting on a shared aggregate',
   )
 })

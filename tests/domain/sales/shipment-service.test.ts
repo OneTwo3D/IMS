@@ -71,8 +71,22 @@ type State = {
   refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
   // Kit/BOM graph: productId -> its component requirements. Absent products are treated as SIMPLE.
   kits?: Record<string, Array<{ componentId: string; qty: number; sku?: string }>>
-  /** o3d-4kfh r6: productId -> `Product.fulfillmentGraphVersion`. Absent means 0. */
+  /**
+   * o3d-4kfh r6: productId -> `Product.fulfillmentGraphVersion`, served from the GRAPH read
+   * (`product.findMany`) — the same statement as the component list, as in Postgres.
+   */
   graphVersions?: Record<string, number>
+  /**
+   * o3d-4kfh r7 (Codex finding 1): THE OTHER SNAPSHOT — what a `salesOrderLine.findMany` selecting
+   * `product: { fulfillmentGraphVersion }` returns, which is a statement EARLIER than the graph
+   * read and can therefore see a different value.
+   *
+   * Absent means "the two agree" (the uncontended case). A fixture that sets it to something else
+   * models a component-graph edit committing between the two statements, which is the race r6's
+   * validation reopened. The double still OFFERS the field so that reverting the fix makes the test
+   * pass again rather than crash.
+   */
+  lineProductGraphVersions?: Record<string, number>
   /** o3d-4kfh r6: in-transaction audit rows, and the order they were written in. */
   activityLogs?: Array<Record<string, unknown>>
   txWriteOrder?: string[]
@@ -174,16 +188,20 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       findMany: async ({ where }: { where: { orderId?: string; lineId?: { in: string[] }; id?: { in: string[] } } }) => state.lines
         .filter((line) => where.orderId == null || line.orderId === where.orderId)
         .filter((line) => where.id?.in == null || where.id.in.includes(line.id))
-        // o3d-4kfh r6: `product: { select: { fulfillmentGraphVersion } }` is a REAL part of the
-        // integrity/coverage read. A double that omitted it would leave the CAS comparing every
-        // allocation against `undefined`, which is neither a match nor a mismatch it can report.
+        // o3d-4kfh r7: production no longer SELECTS this — the CAS reads the version off the graph
+        // node instead, so that the version and the requirements come from one statement. The
+        // double keeps answering it (from `lineProductGraphVersions`, defaulting to the graph's
+        // value) purely so a revert of that fix is observable rather than a crash.
         .map((line) => ({
           id: line.id,
           productId: line.productId,
           qty: line.qty,
           sku: line.sku,
           description: line.description,
-          product: { fulfillmentGraphVersion: state.graphVersions?.[line.productId] ?? 0 },
+          product: {
+            fulfillmentGraphVersion:
+              state.lineProductGraphVersions?.[line.productId] ?? state.graphVersions?.[line.productId] ?? 0,
+          },
         })),
       update: async ({ where, data }: { where: { id: string }; data: { cogsBase?: number | null } }) => {
         const line = state.lines.find((row) => row.id === where.id)
@@ -1534,6 +1552,30 @@ test('o3d-4kfh r6 (finding 1): confirmSalesOrderShipments refuses a stale set ra
     () => confirmSalesOrderShipments(createClient(state), 'order-1'),
     /older version of that product's component graph/,
   )
+})
+
+test('o3d-4kfh r7 (finding 1): the dispatch CAS is not fooled by a pre-edit read of the product row', async () => {
+  // The r6 hole, at the seam where it does the damage. Two statements, one edit between them:
+  //
+  //   statement 1 (salesOrderLine + product.fulfillmentGraphVersion) -> 0, matching the rows' stamp
+  //   ...the editor commits 2xA+1xB -> 4xA+2xB and bumps the version to 1...
+  //   statement 2 (the component graph) -> the NEW recipe
+  //
+  // r6 compared the stamp against statement 1, so the CAS passed; the quantities were then checked
+  // against statement 2, where 2xA+1xB is a perfectly proportional half shipment, so the coverage
+  // backstop passed too. Half the current kit dispatched with every check green.
+  const state = uniformlyRescaledKitState(1)
+  state.lineProductGraphVersions = { 'kit-1': 0 }
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false, 'the graph read is the authority — a stale product read must not certify these rows')
+  assert.match((result as { error: string }).error, /older version of that product's component graph/)
+  assert.equal(state.shipments[0].status, 'PACKED', 'nothing transitioned')
+  assert.equal(state.movements.length, 0, 'and no stock moved')
 })
 
 test('o3d-4kfh r6 (finding 1): a matched stamp is inert — healthy orders still pack and dispatch', async () => {

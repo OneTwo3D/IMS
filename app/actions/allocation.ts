@@ -23,6 +23,7 @@ import {
   allocateSalesOrder,
   applyAllocationReservationDelta,
   buildAvailableStockMap,
+  canonicalAllocationQty,
   lockSalesOrder,
   lockStockLevels,
   releaseOrderAllocationsForDeallocationInTx,
@@ -519,7 +520,17 @@ export async function updateAllocation(
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
       const stockMap = buildAvailableStockMap(stockLevels).get(locked.productId) ?? new Map()
-      const requestedQty = toDecimal(newQty)
+      // o3d-4kfh r7 (Codex finding 4): QUANTISED TO THE PERSISTED SCALE BEFORE ANYTHING READS IT.
+      //
+      // `OrderAllocation.qty` is `Decimal(12,4)`, so an operator entry of 0.33335 is not a quantity
+      // IMS can hold — it is a quantity Postgres will store as 0.3334. Deciding feasibility, the
+      // committed floor, the write and the reservation delta against the unrounded value made those
+      // four disagree with each other and with the row: the row held 0.3334 while `reservedQty`
+      // received 0.33335, and the next release of that scope either failed closed or took the
+      // 0.00005 difference out of another order sharing the (product, warehouse) aggregate. That is
+      // the same drift the allocator's own `canonicalAllocationQty` call removed — one definition,
+      // used by every producer, or the fix only holds on one path.
+      const requestedQty = canonicalAllocationQty(toDecimal(newQty))
       // Both terms are RAW quantities and the dispatched part cancels: the row gives back
       // `qty − dispatched` and takes `newQty − dispatched`, so `newQty <= available + qty` is the
       // same inequality with the dispatch subtracted from both sides. It only holds while the row
@@ -602,7 +613,11 @@ export async function updateAllocation(
         qty: releaseQty,
       }], 'release')
 
-      if (newQty === 0) {
+      // o3d-4kfh r7: the DELETE test is on the quantised value, because that is the quantity the
+      // row would hold. `newQty === 0` let 0.00004 through to a row Postgres stores as 0.0000 —
+      // an allocation row claiming nothing, which every structural check then reads as a component
+      // missing from the set — while the reservation moved by 0.00004.
+      if (requestedQty.lte(0)) {
         await tx.orderAllocation.delete({ where: { id: allocationId } })
       } else {
         const mergeTarget = await tx.orderAllocation.findUnique({
@@ -639,8 +654,23 @@ export async function updateAllocation(
           productId: locked.productId,
           warehouseId: newWarehouseId,
         }
+        // o3d-4kfh r7 (Codex finding 4): the AFTER side comes from the ROW AS PERSISTED, re-read
+        // through this transaction — the same rule the allocator follows. `requestedQty` is already
+        // quantised, so the two agree; re-reading is what keeps that a property of the database
+        // rather than of our arithmetic staying in step with `numeric(12,4)` by hand. The BEFORE
+        // side is `retainedAtDestination`, which was itself read from the row.
+        const writtenDestination = await tx.orderAllocation.findUnique({
+          where: {
+            lineId_warehouseId_productId: {
+              lineId: locked.lineId,
+              warehouseId: newWarehouseId,
+              productId: locked.productId,
+            },
+          },
+          select: { qty: true },
+        })
         const reserveQty = residualAllocationQty(
-          { ...destinationScope, qty: retainedAtDestination.add(requestedQty) },
+          { ...destinationScope, qty: toDecimal(writtenDestination?.qty ?? 0) },
           dispatchedByScope,
         ).sub(residualAllocationQty(
           { ...destinationScope, qty: retainedAtDestination },
@@ -723,10 +753,33 @@ export async function addAllocation(
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
       const stockMap = buildAvailableStockMap(stockLevels)
-      const requestedQty = toDecimal(qty)
+      // o3d-4kfh r7 (Codex finding 4): quantised BEFORE feasibility, as in `updateAllocation`.
+      const requestedQty = canonicalAllocationQty(toDecimal(qty))
+      if (requestedQty.lte(0)) {
+        throw new Error('Quantity must be at least 0.0001 — allocations are stored to four decimal places')
+      }
       const avail = getFulfillmentAvailableQtyDecimal(productId, warehouseId, graph, stockMap)
       if (requestedQty.gt(avail)) throw new Error(`Only ${avail.toString()} available`)
-      const requirements = expandFulfillmentRequirementsDecimal(productId, requestedQty, graph)
+      // o3d-4kfh r7: EVERY LEAF QUANTISED, once, here — the single point the rest of this action
+      // reads. A KIT expansion multiplies by component factors, so even a whole-number kit quantity
+      // produces leaves the column cannot hold (1 x 0.33335 = 0.33335 -> 0.3334). Writing the
+      // unrounded value and reserving the unrounded value left the row and `reservedQty` 0.00005
+      // apart on a shared aggregate, which the transaction's own integrity check cannot see because
+      // it reads allocation rows and never stock.
+      //
+      // Rounded per leaf, matching what `allocateSalesOrder` does to its merged rows. It can put a
+      // fractional-KIT set marginally out of proportion; `validateAllocationIntegrity` at the end
+      // of this action reads the WRITTEN rows, so that fails the action closed rather than
+      // committing a set the checks disagree with (o3d-i4qd — the atomic per-set canonicalisation
+      // is that issue, not this one).
+      const requirements = new Map(
+        [...expandFulfillmentRequirementsDecimal(productId, requestedQty, graph)]
+          .map(([leafProductId, requiredQty]) => [leafProductId, canonicalAllocationQty(requiredQty)] as const),
+      )
+
+      // What each scope held BEFORE this action, so the reservation delta below can be the
+      // difference between two PERSISTED quantities rather than the number we hoped to add.
+      const qtyBeforeByLeaf = new Map<string, Prisma.Decimal>()
 
       for (const [leafProductId, requiredQty] of requirements) {
         const existing = await tx.orderAllocation.findUnique({
@@ -738,6 +791,7 @@ export async function addAllocation(
             },
           },
         })
+        qtyBeforeByLeaf.set(leafProductId, toDecimal(existing?.qty ?? 0))
 
         if (existing) {
           await tx.orderAllocation.update({
@@ -766,13 +820,24 @@ export async function addAllocation(
         }
       }
 
+      // o3d-4kfh r7 (Codex finding 4): THE RESERVE DELTA COMES FROM THE ROWS AS PERSISTED.
+      //
+      // Same rule as `allocateSalesOrder`: the database is the authority on what its own
+      // `numeric(12,4)` column stored, and the stored row is what every later release will read.
+      // Reserving the in-memory figure instead is what leaves `reservedQty` and `OrderAllocation`
+      // two books that disagree — and the reconciliation of that disagreement is what takes units
+      // out of another order's share of the shared (product, warehouse) aggregate.
+      const writtenRows = await tx.orderAllocation.findMany({
+        where: { lineId, warehouseId, productId: { in: [...requirements.keys()] } },
+        select: { productId: true, qty: true },
+      })
       await applyAllocationReservationDelta(
         tx,
-        [...requirements.entries()].map(([leafProductId, requiredQty]) => ({
-          productId: leafProductId,
+        writtenRows.map((row) => ({
+          productId: row.productId,
           warehouseId,
-          qty: requiredQty,
-        })),
+          qty: toDecimal(row.qty).sub(qtyBeforeByLeaf.get(row.productId) ?? toDecimal(0)),
+        })).filter((delta) => delta.qty.gt(0)),
         'reserve',
       )
 
