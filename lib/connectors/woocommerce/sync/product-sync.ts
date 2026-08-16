@@ -46,6 +46,7 @@ import {
   hasProductTransformBlockers,
   summarizeTransformBlockers,
 } from '@/lib/products/type-transforms'
+import { bumpFulfillmentGraphVersions } from '@/lib/products/component-graph-edit-guard'
 import type { Prisma, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 
@@ -818,7 +819,39 @@ export async function syncWcProductToIms(
           // referenced by this product. If WC dropped all categories, clear the link.
           if (imsCategoryId !== undefined) updateData.categoryId = imsCategoryId
 
+          // o3d-4kfh r7 (Codex finding 2): CAPTURED BEFORE THE WRITE. `existing` is the pre-update
+          // snapshot, and the mutation is defined by the pair (what it was, what it is becoming) —
+          // reading `existing.type` after the update makes the answer depend on whether the write
+          // path happened to mutate the object in place, which is not a property to rely on.
+          const kitnessMutation = {
+            kind: 'kitness' as const,
+            currentType: existing.type,
+            // Read from `updateData.type`, NOT from the locally computed `productType`, so this
+            // composes with #617 (branch o3d-y89x-wc-type-guard), which stops the connector
+            // DOWNGRADING an IMS KIT/BOM. When that guard leaves the existing type in place,
+            // `nextType === existing.type`, `componentGraphMutationAffectsFulfillment` is false and
+            // the bump below is a no-op that reads nothing. What remains after #617 is the
+            // LEGITIMATE connector type change, and that is exactly what has to bump.
+            nextType: (updateData.type as ProductType | undefined) ?? existing.type,
+          }
           await updateProductGuardingOwnership(tx, existing, parentClaimants, updateData)
+          // A CONNECTOR TYPE WRITE IS A COMPONENT-GRAPH MUTATION LIKE ANY OTHER, AND MUST MOVE THE
+          // VERSION.
+          //
+          // `OrderAllocation.fulfillmentGraphVersion` is what tells commitment and dispatch that a
+          // row was expanded from a recipe that no longer exists. Every other writer of a product's
+          // KIT-ness — the editor (app/actions/products.ts) and the CSV import (app/actions/import.ts)
+          // — bumps it, for this product and every KIT above it, in the same transaction as the
+          // write. This path did not, so a KIT adopted by SKU that the connector re-typed left every
+          // allocation stamp and every ancestor version untouched: the rows were silently
+          // reinterpreted against a different graph while still matching, which is precisely the
+          // state the stamp exists to make impossible to reach.
+          //
+          // No in-flight blocker check here on purpose: the connector is not an interactive editor
+          // and has no operator to refuse to. Refusing would strand the import (and its retries)
+          // behind sales work it cannot influence; the CAS handles the consequence correctly by
+          // refusing the affected orders' commitments with an actionable "re-allocate" instead.
+          await bumpFulfillmentGraphVersions(tx, existing.id, kitnessMutation)
           // `sku` is never in updateData — the row is resolved BY sku — so the pre-update values
           // are still current, and re-reading only to learn what we already know costs a round trip.
           productId = existing.id
@@ -1272,7 +1305,19 @@ async function applyVariations(
       if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
       if (gtin && !existing.barcode) updateData.barcode = gtin
 
+      // o3d-4kfh r7 (Codex finding 2): the VARIATION path writes a type too — `VARIANT`, over
+      // whatever the IMS row was. An IMS KIT whose SKU is adopted as a WC variation is the same
+      // corruption by the other door, so it takes the same bump. Same composition rule as the
+      // parent branch: the type is read out of `updateData`, so a preservation guard landing there
+      // turns this into a no-op rather than fighting it. Captured BEFORE the write for the same
+      // reason as the parent branch.
+      const kitnessMutation = {
+        kind: 'kitness' as const,
+        currentType: existing.type,
+        nextType: (updateData.type as ProductType | undefined) ?? existing.type,
+      }
       await updateProductGuardingOwnership(tx, existing, claimants, updateData)
+      await bumpFulfillmentGraphVersions(tx, existing.id, kitnessMutation)
       // Reflect the FULL applied update, not just the new mapping. A later sibling sharing this
       // SKU builds its `?? existing.x` fallbacks from this row; caching the pre-update values
       // would write the first sibling's fresh description/image straight back out again.

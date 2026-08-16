@@ -11,6 +11,15 @@ import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, st
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
+import {
+  calculateDecimalCoverageByLine,
+  requirementsMapToDecimalRows,
+  type DecimalFulfillmentRequirement,
+} from '@/lib/products/fulfillment-coverage'
+import {
+  expandFulfillmentRequirementsDecimal,
+  loadFulfillmentProductGraph,
+} from '@/lib/products/kit-fulfillment'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -24,6 +33,9 @@ type FindManyDelegate = {
 }
 
 export type SalesFulfillmentAnalyticsClient = {
+  // o3d-4kfh r3: the fulfillment graph loader reads this to expand a KIT line into the leaf
+  // components its shipment lines are actually denominated in.
+  product: FindManyDelegate
   salesOrder: FindManyDelegate
   salesOrderRefund: FindManyDelegate
   salesOrderRefundLine: FindManyDelegate
@@ -210,12 +222,12 @@ type ShipmentRow = {
   shippedAt: Date | null
   createdAt: Date
   updatedAt: Date
-  lines: Array<{ lineId: string; qty: DecimalInput }>
+  lines: Array<{ lineId: string; productId: string; qty: DecimalInput }>
   order: {
     id: string
     createdAt: Date
     expectedDelivery: Date | null
-    lines: Array<{ id: string; qty: DecimalInput }>
+    lines: Array<{ id: string; productId: string | null; qty: DecimalInput }>
   }
 }
 
@@ -1000,12 +1012,55 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
       shippedAt: true,
       createdAt: true,
       updatedAt: true,
-      lines: { select: { lineId: true, qty: true } },
-      order: { select: { id: true, createdAt: true, expectedDelivery: true, lines: { select: { id: true, qty: true } } } },
+      // o3d-4kfh r3: productId on BOTH sides. Without it there is no way to tell that a shipment
+      // line's quantity is in a different unit from the order line's.
+      lines: { select: { lineId: true, productId: true, qty: true } },
+      order: { select: { id: true, createdAt: true, expectedDelivery: true, lines: { select: { id: true, productId: true, qty: true } } } },
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as ShipmentRow[]
   assertSourceLimit(shipments.length, SOURCE_ROW_LIMIT, 'Fulfillment analytics source rows')
+
+  // o3d-4kfh r3: FILL RATE WAS COMPONENT UNITS OVER PARENT UNITS.
+  //
+  // `ShipmentLine.qty` is a LEAF-COMPONENT quantity; `SalesOrderLine.qty` is in parent product
+  // units. Summing both by order and dividing gave 300% fill rate for a one-kit order whose kit
+  // expands to three components — and, because `shipmentQty.lt(orderQty)` was then false, that
+  // order was never counted as partial no matter how short it actually shipped. With fractional
+  // component factors the error runs the other way and a fully shipped kit order reads as partial.
+  // Both the KPI and the "Shipped qty" total (and the CSV export that carries them) were wrong for
+  // any order containing a kit.
+  //
+  // Converted through the same fulfillment-requirement graph as the backorder reports: coverage is
+  // min over components of qty/factor, i.e. how many WHOLE ordered units the shipment lines add up
+  // to. A non-kit line is a single self-requirement of factor 1, so its arithmetic is unchanged.
+  const orderLineProductIds = [...new Set(
+    shipments.flatMap((shipment) => shipment.order.lines.map((line) => line.productId))
+      .filter((productId): productId is string => Boolean(productId)),
+  )]
+  const graph = await loadFulfillmentProductGraph(
+    client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
+    orderLineProductIds,
+  )
+  const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
+  for (const shipment of shipments) {
+    for (const line of shipment.order.lines) {
+      if (!line.productId || requirementsByLine.has(line.id)) continue
+      requirementsByLine.set(
+        line.id,
+        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
+      )
+    }
+  }
+  // Line ids are unique across orders, so one pass covers every shipment of every order.
+  const shippedCoverageByLine = calculateDecimalCoverageByLine(
+    requirementsByLine,
+    shipments.flatMap((shipment) => shipment.lines.map((line) => ({
+      lineId: line.lineId,
+      productId: line.productId,
+      qty: line.qty,
+    }))),
+  )
   const orders = new Map<string, { order: ShipmentRow['order']; shipments: ShipmentRow[] }>()
   for (const shipment of shipments) {
     const current = orders.get(shipment.orderId) ?? { order: shipment.order, shipments: [] }
@@ -1031,7 +1086,12 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
       })
     }
     const orderQty = group.order.lines.reduce((sum, line) => sum.add(toDecimal(line.qty)), new Prisma.Decimal(0))
-    const shipmentQty = group.shipments.flatMap((shipment) => shipment.lines).reduce((sum, line) => sum.add(toDecimal(line.qty)), new Prisma.Decimal(0))
+    // Both sides in ORDERED units now. A line whose product has been deleted has no requirements
+    // and so contributes nothing shipped — the same as its allocation coverage everywhere else.
+    const shipmentQty = group.order.lines.reduce(
+      (sum, line) => sum.add(shippedCoverageByLine.get(line.id) ?? new Prisma.Decimal(0)),
+      new Prisma.Decimal(0),
+    )
     orderedQty = orderedQty.add(orderQty)
     shippedQty = shippedQty.add(shipmentQty)
     if (group.shipments.length > 1 || shipmentQty.lt(orderQty)) partialOrders += 1

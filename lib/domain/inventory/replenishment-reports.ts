@@ -7,6 +7,15 @@ import { calculateDailyVelocity, saleMovementCogsBase, type VelocitySaleInput } 
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
+import {
+  calculateDecimalCoverageByLine,
+  requirementsMapToDecimalRows,
+  type DecimalFulfillmentRequirement,
+} from '@/lib/products/fulfillment-coverage'
+import {
+  expandFulfillmentRequirementsDecimal,
+  loadFulfillmentProductGraph,
+} from '@/lib/products/kit-fulfillment'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -159,13 +168,16 @@ type BackorderSalesLineRow = {
 
 type AllocationRow = {
   lineId: string
+  productId: string
+  warehouseId: string
   qty: DecimalInput
 }
 
 type ShipmentLineRow = {
   lineId: string
+  productId: string
   qty: DecimalInput
-  shipment: { status: string }
+  shipment: { status: string; warehouseId: string }
 }
 
 type ProductionOrderRow = {
@@ -1190,33 +1202,85 @@ export async function getBackorderDemandReport(
     : await Promise.all([
       client.orderAllocation.findMany({
         where: { lineId: { in: [...lineIds] } },
-        select: { lineId: true, qty: true },
+        // o3d-4kfh r3: productId + warehouseId, because both are load-bearing. The product is what
+        // makes a COMPONENT row convertible into parent-line units; the warehouse is the grain a
+        // shipment line is attributable to the allocation row it commits.
+        select: { lineId: true, productId: true, warehouseId: true, qty: true },
         take: SOURCE_ROW_LIMIT + 1,
       }) as Promise<AllocationRow[]>,
       client.shipmentLine.findMany({
         where: { lineId: { in: [...lineIds] } },
-        select: { lineId: true, qty: true, shipment: { select: { status: true } } },
+        select: { lineId: true, productId: true, qty: true, shipment: { select: { status: true, warehouseId: true } } },
         take: SOURCE_ROW_LIMIT + 1,
       }) as Promise<ShipmentLineRow[]>,
     ])
   assertSourceLimit(Math.max(allocations.length, shipmentLines.length), SOURCE_ROW_LIMIT, 'Backorder coverage source rows')
-  const allocatedByLine = new Map<string, Prisma.Decimal>()
-  for (const allocation of allocations) {
-    if (lineIds.has(allocation.lineId)) addToMap(allocatedByLine, allocation.lineId, allocation.qty)
+
+  // o3d-4kfh r3: ALLOCATION AND SHIPMENT ROWS ARE LEAF-COMPONENT QUANTITIES; THE LINE IS IN PARENT
+  // UNITS. Summing them by line and comparing against `line.qty` silently compares two different
+  // units of measure. For a 10-kit line of 2xA + 1xB, a five-kit shipment contributes 15 component
+  // units, which `Prisma.Decimal.min(orderedQty, ...)` then clamped to 10 — so the report claimed
+  // all ten kits were committed and hid a genuine five-kit backorder, suppressing replenishment
+  // demand for exactly the component-limited kits this report exists to surface.
+  //
+  // Converted through the same fulfillment-requirement graph the allocator and `backorder-report`
+  // use: coverage is min over components of qty/factor, i.e. how many WHOLE parent units the rows
+  // add up to. Non-kit lines are a single self-requirement of factor 1, so their arithmetic is
+  // unchanged.
+  const graph = await loadFulfillmentProductGraph(
+    client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
+    [...new Set(lines.map((line) => line.productId).filter((id): id is string => !!id))],
+  )
+  const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
+  for (const line of lines) {
+    if (!line.productId) continue
+    requirementsByLine.set(
+      line.id,
+      requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
+    )
   }
-  const committedByLine = new Map<string, Prisma.Decimal>()
-  for (const shipmentLine of shipmentLines) {
-    if (lineIds.has(shipmentLine.lineId) && shipmentLine.shipment.status !== 'PENDING') addToMap(committedByLine, shipmentLine.lineId, shipmentLine.qty)
+
+  const committedShipmentLines = shipmentLines.filter((shipmentLine) => (
+    lineIds.has(shipmentLine.lineId) && shipmentLine.shipment.status !== 'PENDING'
+  ))
+  const committedByLine = calculateDecimalCoverageByLine(requirementsByLine, committedShipmentLines)
+  // The rows retain their commitments (the contract in allocation-service.ts), and demand below is
+  // already net of them — so they are netted off HERE, at the (line, warehouse, product) grain the
+  // two tables share, before being converted to parent units.
+  const committedByAllocationScope = new Map<string, Prisma.Decimal>()
+  for (const shipmentLine of committedShipmentLines) {
+    const key = `${shipmentLine.lineId}|${shipmentLine.shipment.warehouseId}|${shipmentLine.productId}`
+    committedByAllocationScope.set(
+      key,
+      (committedByAllocationScope.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)),
+    )
   }
+  const openAllocations = allocations
+    .filter((allocation) => lineIds.has(allocation.lineId))
+    .map((allocation) => ({
+      lineId: allocation.lineId,
+      productId: allocation.productId,
+      qty: Prisma.Decimal.max(
+        new Prisma.Decimal(0),
+        toDecimal(allocation.qty).sub(
+          committedByAllocationScope.get(`${allocation.lineId}|${allocation.warehouseId}|${allocation.productId}`)
+            ?? new Prisma.Decimal(0),
+        ),
+      ),
+    }))
+  const openAllocatedByLine = calculateDecimalCoverageByLine(requirementsByLine, openAllocations)
+
   const inboundByProduct = inboundOpenPoByProduct(openPoLines)
   const fillDateByProduct = earliestInboundDateByProduct(openPoLines)
   const rowsByProduct = new Map<string, BackorderDemandReportRow & { orderIds: Set<string> }>()
   for (const line of lines) {
     if (!line.productId || !line.product) continue
     const orderedQty = toDecimal(line.qty)
+    // Both sides are now in PARENT-LINE units, so the clamp is a genuine over-commitment guard
+    // rather than the unit-mismatch absorber it used to be.
     const committedQty = Prisma.Decimal.min(orderedQty, committedByLine.get(line.id) ?? new Prisma.Decimal(0))
     const remainingAfterCommitted = Prisma.Decimal.max(new Prisma.Decimal(0), orderedQty.sub(committedQty))
-    const openAllocationQty = Prisma.Decimal.max(new Prisma.Decimal(0), (allocatedByLine.get(line.id) ?? new Prisma.Decimal(0)).sub(committedQty))
+    const openAllocationQty = openAllocatedByLine.get(line.id) ?? new Prisma.Decimal(0)
     const allocatedQty = Prisma.Decimal.min(remainingAfterCommitted, openAllocationQty)
     const backorderQty = remainingAfterCommitted.sub(allocatedQty)
     if (backorderQty.lte(0)) continue

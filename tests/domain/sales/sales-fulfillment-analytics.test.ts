@@ -19,6 +19,13 @@ function decimal(value: string | number): Prisma.Decimal {
 function unusedClient(): SalesFulfillmentAnalyticsClient {
   const unused = { findMany: async () => [] }
   return {
+    // Answers the fulfillment-graph load: every product is SIMPLE unless a test says otherwise, so
+    // a line is a single self-requirement of factor 1. Returning [] instead would make every
+    // product an unknown leaf and log a warning per line.
+    product: {
+      findMany: async (args?: unknown) => (args as { where: { id: { in: string[] } } }).where.id.in
+        .map((id) => ({ id, type: 'SIMPLE', productComponents: [] })),
+    },
     salesOrder: unused,
     salesOrderRefund: unused,
     salesOrderRefundLine: unused,
@@ -396,12 +403,12 @@ test('fulfillment report uses Shipment.shippedAt for on-time and elapsed metrics
         createdAt: new Date('2026-06-01T12:00:00.000Z'),
         updatedAt: new Date('2026-06-03T12:00:00.000Z'),
         shippedAt: new Date('2026-06-03T12:00:00.000Z'),
-        lines: [{ lineId: 'line-1', qty: decimal('3') }],
+        lines: [{ lineId: 'line-1', productId: 'product-1', qty: decimal('3') }],
         order: {
           id: 'order-1',
           createdAt: new Date('2026-06-01T12:00:00.000Z'),
           expectedDelivery: new Date('2026-06-04T00:00:00.000Z'),
-          lines: [{ id: 'line-1', qty: decimal('5') }],
+          lines: [{ id: 'line-1', productId: 'product-1', qty: decimal('5') }],
         },
       }],
     },
@@ -514,4 +521,62 @@ test('the order-level residual is spread across lines, not dumped on one', async
   // Two equal lines, so each takes half of the GBP4 residual on top of its own discount.
   assert.equal(report.rows.find((r) => r.label.startsWith('SKU-1'))?.discount, '8')
   assert.equal(report.rows.find((r) => r.label.startsWith('SKU-2'))?.discount, '6')
+})
+
+test('o3d-4kfh r3: fill rate counts KIT shipments in ORDERED units, not component units', async () => {
+  // ShipmentLine.qty is a leaf-component quantity; SalesOrderLine.qty is in parent units. Summing
+  // both by order and dividing gave a 300% fill rate for a one-kit order whose kit expands to three
+  // components — and, because `shipmentQty < orderQty` was then false, the order was never counted
+  // as partial however short it actually shipped.
+  //
+  // Here: 4 kits ordered, kit = 2 x COMP-A + 1 x COMP-B. Two kits are shipped (4 x A + 2 x B = 6
+  // component units). The honest answer is 2 of 4 = 50% and PARTIAL. Reading the raw component
+  // units gave 6 of 4 = 150% and "complete".
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async (args?: unknown) => (args as { where: { id: { in: string[] } } }).where.id.in
+        .map((id) => (id === 'kit-1'
+          ? {
+            id,
+            type: 'KIT',
+            productComponents: [
+              { componentId: 'comp-a', qty: decimal('2'), component: { sku: 'COMP-A', type: 'SIMPLE', oversellAllowed: false } },
+              { componentId: 'comp-b', qty: decimal('1'), component: { sku: 'COMP-B', type: 'SIMPLE', oversellAllowed: false } },
+            ],
+          }
+          : { id, type: 'SIMPLE', productComponents: [] })),
+    },
+    shipment: {
+      findMany: async () => [{
+        id: 'shipment-1',
+        orderId: 'order-1',
+        status: ShipmentStatus.SHIPPED,
+        createdAt: new Date('2026-06-01T12:00:00.000Z'),
+        updatedAt: new Date('2026-06-03T12:00:00.000Z'),
+        shippedAt: new Date('2026-06-03T12:00:00.000Z'),
+        lines: [
+          { lineId: 'line-1', productId: 'comp-a', qty: decimal('4') },
+          { lineId: 'line-1', productId: 'comp-b', qty: decimal('2') },
+        ],
+        order: {
+          id: 'order-1',
+          createdAt: new Date('2026-06-01T12:00:00.000Z'),
+          expectedDelivery: new Date('2026-06-04T00:00:00.000Z'),
+          lines: [{ id: 'line-1', productId: 'kit-1', qty: decimal('4') }],
+        },
+      }],
+    },
+  }
+
+  const report = await getFulfillmentAnalyticsReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-04' },
+    { client, now: () => new Date('2026-06-04T15:00:00.000Z') },
+  )
+
+  assert.equal(report.rows.find((row) => row.metric === 'Fill rate')?.value, '50%')
+  assert.equal(report.rows.find((row) => row.metric === 'Fill rate')?.numerator, '2')
+  assert.equal(report.rows.find((row) => row.metric === 'Fill rate')?.denominator, '4')
+  assert.equal(report.totals.shippedQty, '2', 'the "Shipped qty" total and its CSV export are in kits too')
+  assert.equal(report.rows.find((row) => row.metric === 'Partial ship rate')?.value, '100%')
 })

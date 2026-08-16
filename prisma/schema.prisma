@@ -604,6 +604,19 @@ model Product {
   name            String
   description     String?
   type            ProductType @default(SIMPLE)
+  /// o3d-4kfh r6 (Codex finding 1): the FULFILMENT GRAPH VERSION of this product — bumped whenever
+  /// anything that changes what a sales line for it is deemed to require changes: its own component
+  /// list, its own KIT-ness, or the same on any KIT descendant (the bump walks the KIT-ancestor set,
+  /// `collectFulfillmentAffectedRootProducts`).
+  ///
+  /// `OrderAllocation.fulfillmentGraphVersion` stamps the value the allocation was computed against,
+  /// and commitment/dispatch refuses when the two disagree. That is a compare-and-swap on one
+  /// integer, and it is the ONLY thing that catches a UNIFORM rescale of a kit (2xA+1xB -> 4xA+2xB):
+  /// proportionality against a mutable current graph cannot distinguish that race from a legitimate
+  /// partial shipment, because the committed set is exactly proportional to the new recipe.
+  ///
+  /// Starts at 0 for every product and every allocation row, so nothing pre-existing reads as stale.
+  fulfillmentGraphVersion Int @default(0) @map("fulfillment_graph_version")
   lifecycleStatus ProductLifecycleStatus @default(ACTIVE)
   categoryId      String?
   parentId        String?     // set for VARIANT products
@@ -3211,6 +3224,10 @@ model OrderAllocation {
   productId   String
   warehouseId String
   qty         Decimal  @db.Decimal(12, 4)
+  /// o3d-4kfh r6: `Product.fulfillmentGraphVersion` of the ORDER LINE's product, read in the same
+  /// statement as the component graph this row was expanded from. Commitment and dispatch refuse
+  /// when it no longer matches the product's current version — see the note on Product.
+  fulfillmentGraphVersion Int @default(0) @map("fulfillment_graph_version")
   costLayerSnapshot Json?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

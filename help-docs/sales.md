@@ -60,7 +60,42 @@ The smart auto-allocation algorithm minimises the number of shipments by consoli
 
 When re-allocating after a partial shipment, the algorithm only allocates the **remaining unfulfilled quantity** — items already committed to active (non-PENDING) shipments are excluded automatically.
 
+Allocation rows also record the **recipe version** of the line's product. If a kit's component list
+(or its Kit/BOM type) changes afterwards, those rows describe a recipe that no longer exists, and
+Confirm for Picking, Start Picking and dispatch all refuse them and ask you to **Re-Allocate** the
+order. See *Kit / Bundle* in the Inventory guide for what moves the version.
+
+The allocation rows themselves still **cover those commitments**: an allocation row records the order's whole claim on a warehouse — what is still to be picked plus what has already been picked, packed or dispatched from it. So a row does not shrink when a shipment goes out, and the allocation panel keeps showing the full allocated quantity. Two things are read off it: the stock still *reserved* for the order (allocated minus dispatched — dispatch is the point at which stock and reservation are actually released), and the quantity still *to ship* (allocated minus every non-PENDING shipment). Because the row keeps covering its shipments, a warehouse can only be changed, and a row only reduced, while nothing has shipped from it — dispatched quantity stays with the warehouse it shipped from.
+
 For Kit / Bundle products, allocation works from the underlying components rather than the virtual parent SKU. Bundle quantities are expanded into their component requirements, and shipment lines are created for those component rows.
+
+### Draft Shipments and Allocation Changes
+
+A shipment stays in **Pending** until someone starts picking it, and while it is Pending it is only a
+draft built from the allocation rows behind it. So whenever those rows change — a manual allocation
+edit, a re-allocation, a deallocation, or an automatic release after a stock decrease — any Pending
+draft the new allocation no longer covers is **retired** in the same step. Drafts the change still
+covers are left exactly as they are, including any tracking number and shipping service already on
+them.
+
+Retirement is recorded in the activity log with the shipment's id, warehouse, line count, quantity
+and tracking number. The record is written in the *same database transaction* as the deletion, so
+there is no window in which a draft can disappear without leaving its identity behind. If a retired
+draft already carried a tracking number, the label was bought outside IMS and IMS no longer
+references it — **cancel it with the carrier if it was not used**. Once the allocations are right
+again, run **Confirm for Picking** to rebuild the drafts.
+
+Because a retained draft is genuinely harmless, an order carrying nothing but Pending drafts is still
+eligible for automatic backorder allocation — that is what repairs a kit whose sibling component was
+trimmed by a stock decrease. An order holding a Picking, Packed or Shipped shipment is not.
+
+Shipments that are already Picking, Packed or Shipped are commitments, not drafts: they are never
+retired this way, and allocation edits that would leave them uncovered are refused instead.
+
+A re-allocation that computes exactly the same set writes nothing at all — no allocation churn, no
+reservation movement, no accounting change — but it still checks the drafts. If it finds one that an
+*earlier* change had already left unbacked, it retires it there and then, rather than leaving it for
+Start Picking to fail on.
 
 ### Allocation Panel
 
@@ -107,6 +142,14 @@ Each shipment progresses through its own lifecycle:
 ```
 PENDING --> PICKING --> PACKED --> SHIPPED
 ```
+
+A shipment can only move forward, and only while its order is live. **A cancelled order's shipments
+cannot be picked, packed or dispatched** — dispatching one would ship goods for a sale that no longer
+exists, and recognise costs that nothing reverses. Cancelling an order normally deletes its pending,
+picking and packed shipments in the same step, so this rarely arises; if one is still attached, open
+the order and use **Discard shipments**. That deletes the remaining non-dispatched shipments, keeps
+any already-dispatched one (reverse those with a refund), records what it removed — including
+tracking numbers — in the activity log, and is safe to repeat.
 
 ### Shipment Features
 
