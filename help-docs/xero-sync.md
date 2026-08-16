@@ -559,6 +559,26 @@ silently rewrite the other's document in the ledger. If a link is refused for on
 reasons above, resolve it by hand — IMS will not clear or move an existing link on its own, because
 nothing in IMS records whether that link was posted authoritatively or guessed.
 
+**Rows past their retention window.** Data retention clears the stored payload of an unresolved sync
+row once it is older than the sync-log retention period, keeping only the identifying record. Such a
+row is still repaired — the external id can still be written onto the order or bill — but its
+outstanding follow-ups (PDF, payment, attachment) can no longer be rebuilt. When that happens the
+sweep logs `*_backreference_followups_discarded` naming the document, so you can check for a missing
+PDF or payment and re-drive it manually.
+
+## Connecting a different company
+
+Each stored external id records the company that issued it. Xero organisation ids and document ids
+are GUIDs, so an id from a previous organisation can never be mistaken for one of the new
+organisation's documents — it simply resolves to nothing.
+
+**QuickBooks is different, and IMS refuses the switch.** QuickBooks document ids are per-company
+integers, so company B routinely issues the same id company A did. If IMS still holds any external
+id issued by another company, connecting a new QuickBooks company is **refused** with a message
+naming what it found. To proceed, either reconnect the company that issued those ids, or clear the
+existing accounting links first — they are financial records, so export them before you do. The
+refusal is also written to the activity log as `quickbooks_realm_switch_refused`.
+
 **Why the connection is part of the rule.** External ids are owned by the company that issued them.
 QuickBooks realm ids in particular are plain integers and repeat across companies, so the same
 number can legitimately be two different bills in two different companies. Every stored external id

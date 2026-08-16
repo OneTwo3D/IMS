@@ -74,6 +74,19 @@ import {
 //    between runs and rotates, so the next run resumes BEHIND the rows this one could not settle —
 //    which is what makes it work for exactly the rows about which nothing can be recorded.
 //
+// AND ONE MORE, FOUND IN ROUND 4:
+//
+// 6. RETENTION RETIRING REPAIR WORK. Round 3 replaced retention's open-ended exemption with a
+//    compacted tombstone, and then excluded tombstones from the candidate set — which made
+//    RETENTION, a clock, the thing that decided a row would never be repaired. Compaction happens by
+//    AGE and says nothing about repairability, so an ambiguity that cleared after the horizon was
+//    never reconsidered and a back-reference that was merely failing transiently at the cutoff was
+//    never retried. That is deferred-not-retired broken by a fourth route, and keeping the claimant
+//    evidence did not compensate: evidence prevents a WRONG guess, it does not recover a missing
+//    link. A tombstone is now a full candidate for the ID/PROVENANCE write, which needs nothing the
+//    compaction removed. Only the payload-dependent FOLLOW-UPS are genuinely unrecoverable, and
+//    those are discarded under an explicit terminal policy that warns before it settles the row.
+//
 // The sweep must keep refusing to guess: failing to repair is acceptable, repairing onto
 // the wrong bill is not.
 // ---------------------------------------------------------------------------
@@ -134,11 +147,28 @@ export const UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE: {
  *     the reason the old exemption could not simply be left alone.
  *   • `errorMessage` — free text echoing connector responses, which routinely quote the payload.
  *
- * The cost, stated rather than hidden: a tombstoned row can no longer be REPAIRED, because the
- * follow-ups (PDF, payment, attachment) cannot be rebuilt without the payload. It is evidence, not
- * work. That is the right trade at the retention horizon — a row still unresolved months later is
- * one the sweep has already refused to attribute and warned a human about daily — and it obeys the
- * governing principle: failing to repair is acceptable, repairing onto the wrong bill is not.
+ * WHAT THE TOMBSTONE IS STILL GOOD FOR, and the r4 finding 3 correction. An earlier revision said a
+ * tombstoned row "can no longer be REPAIRED… it is evidence, not work", and took it out of the
+ * sweep's candidate set entirely. That was too broad, and it broke the deferred-not-retired property
+ * this whole sweep exists to preserve:
+ *
+ *   • an AMBIGUITY that clears after the retention horizon — a competing sibling is cancelled, a
+ *     human links one of several bills — would never be reconsidered, because the row it would have
+ *     been reconsidered from had been excluded permanently;
+ *   • a back-reference that was failing TRANSIENTLY at the cutoff would never be repaired either,
+ *     for the same reason. Compaction is scheduled by AGE; it says nothing about repairability.
+ *
+ * Retention retiring unresolved repair work is the starvation bug wearing a third disguise, and the
+ * fact that the row keeps its claimant evidence does not help: that prevents a WRONG guess, it does
+ * not recover the missing link.
+ *
+ * So the split is by DEPENDENCY, not by row. Everything the ID/PROVENANCE write needs —
+ * externalTransactionId, provenance, referenceType, referenceId — is kept, and a tombstone remains a
+ * full candidate for that write. Only the FOLLOW-UPS (PDF, payment, attachment) are payload-
+ * dependent and therefore genuinely unrecoverable, and they are discarded under an explicit terminal
+ * policy: the sweep warns, once, naming the document, and settles the row. That obeys the governing
+ * principle — failing to repair is acceptable, repairing onto the wrong bill is not — without
+ * throwing away the repair that is still perfectly possible.
  */
 export function backReferenceEvidenceTombstone(now: Date): {
   payload: Record<string, never>
@@ -180,6 +210,15 @@ export type BackReferenceSweepRow = {
   createdAt: Date
   /** When this row's PO ambiguity was last reported. NULL = never. */
   backReferenceAmbiguousLoggedAt: Date | null
+  /**
+   * When retention compacted this row to an attribution-only tombstone. NULL = payload intact.
+   *
+   * Read, not filtered on (r4 finding 3): a tombstone is still a candidate for the id write and only
+   * its payload-dependent follow-ups are lost. The sweep needs to KNOW which it is holding, because
+   * `payload` on a tombstone is `{}` — indistinguishable from a genuinely empty payload — and
+   * enqueueing follow-ups from it would silently enqueue nothing while reporting success.
+   */
+  backReferenceEvidenceCompactedAt: Date | null
 }
 
 /** The columns the sweep reads. `as const` so the Prisma client's row type resolves. */
@@ -193,6 +232,7 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   payload: true,
   createdAt: true,
   backReferenceAmbiguousLoggedAt: true,
+  backReferenceEvidenceCompactedAt: true,
 } as const
 
 /**
@@ -358,6 +398,13 @@ export type BackReferenceRepairResult = {
    * WARNING behind it is throttled, this number is not.
    */
   skippedAmbiguous: number
+  /**
+   * Tombstoned rows whose id was repaired (or was already right) but whose follow-ups could not be
+   * rebuilt, because retention had compacted the payload away (r4 finding 3). Counted separately
+   * from `repaired` because it is a repair WITH a permanent loss attached, and a number that only
+   * ever went up in the `repaired` column would hide that entirely.
+   */
+  followUpsDiscarded: number
 }
 
 export type BackReferenceCandidateCursor = { createdAt: Date; id: string }
@@ -427,9 +474,13 @@ export function buildBackReferenceCandidateQuery(params: {
     externalTransactionId: { not: null },
     type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
     backReferenceCheckedAt: null,
-    // A tombstoned row (r3 finding 3) is evidence, not work: retention has cleared the payload, so
-    // its follow-ups can no longer be rebuilt and there is nothing left for a repair to do.
-    backReferenceEvidenceCompactedAt: null,
+    // NO PREDICATE ON backReferenceEvidenceCompactedAt, and that absence is deliberate (r4 finding
+    // 3). Filtering tombstones out — which an earlier revision did — let RETENTION permanently
+    // retire unresolved repair work: an ambiguity that cleared after the retention horizon was never
+    // reconsidered, and a transiently failing back-reference was never repaired, because compaction
+    // is scheduled by age and says nothing about whether the row is repairable. A tombstone still
+    // carries every column the id/provenance write reads, so it stays a candidate for that write;
+    // only its payload-dependent follow-ups are gone, and the loop handles that explicitly.
     // Nested under AND because the keyset clause below also needs the top-level OR slot.
     AND: [notRecentlyAmbiguous],
   }
@@ -461,7 +512,7 @@ export async function repairAccountingBackReferences(
   const now = deps.now ?? (() => new Date())
   const { connector, connectorLabel, activityActionPrefix: prefix } = deps
 
-  const result: BackReferenceRepairResult = { scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0 }
+  const result: BackReferenceRepairResult = { scanned: 0, checked: 0, repaired: 0, failed: 0, skippedAmbiguous: 0, followUpsDiscarded: 0 }
   // No live connection means no namespace to attribute within (r3 finding 1). Sweeping anyway
   // would take external ids issued by whatever company was connected before and write them onto
   // bills as if they belonged to the current one.
@@ -554,6 +605,53 @@ export async function repairAccountingBackReferences(
       // no longer exists cannot re-fill the head of the scan.
       console.error(`${prefix}: could not defer back-reference ambiguity`, row.id, deferralError)
     }
+  }
+
+  /**
+   * THE TERMINAL POLICY for a tombstone's follow-ups (r4 finding 3).
+   *
+   * Retention compacts an expired-but-unresolved row to attribution only, which keeps everything the
+   * id/provenance write needs and drops the payload the FOLLOW-UPS are built from. The id is still
+   * repaired — that is the correction r4 forced, and it is why a tombstone is still a candidate —
+   * but the PDF, payment or attachment that never ran cannot be reconstructed from `{}` and never
+   * will be. That is a real loss, and it is announced rather than absorbed: an operator can re-drive
+   * a payment by hand if they know one is missing, and cannot if they do not.
+   *
+   * Returns whether the warning was PERSISTED, and the caller settles the row only when it was. Same
+   * asymmetry as the ambiguity warning: repeating a warning is noise, losing it is silence — and
+   * unlike an ambiguity, this discard cannot be undone by a later run, so stamping past a failed
+   * write would destroy the work and the notice in one step.
+   */
+  const reportDiscardedFollowUps = async (
+    row: BackReferenceSweepRow,
+    phase: 'repaired' | 'already-applied',
+  ): Promise<boolean> => {
+    result.followUpsDiscarded++
+    const preamble = phase === 'repaired'
+      ? `Re-applied the ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId}, but`
+      : `The ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId} is already applied, but`
+    const persisted = await deps.logActivity({
+      entityType: 'SYSTEM',
+      action: `${prefix}_backreference_followups_discarded`,
+      tag: 'sync',
+      level: 'WARNING',
+      description: `${preamble} its outstanding follow-ups (invoice PDF, payment registration or bill attachment) can no longer be `
+        + 'enqueued: this sync row outlived the retention period unresolved, so its payload was compacted away. The document is linked '
+        + `to external id ${row.externalTransactionId}; check whether its PDF, payment or attachment is missing and re-drive it manually.`,
+      metadata: {
+        syncLogId: row.id,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        externalId: row.externalTransactionId,
+        compactedAt: row.backReferenceEvidenceCompactedAt?.toISOString() ?? null,
+        phase,
+      },
+    })
+    if (!persisted) {
+      console.error(`${prefix}: back-reference follow-up discard warning was not persisted; leaving row eligible`, row.id)
+    }
+    return persisted
   }
 
   // RESUME where the previous run stopped (r3 finding 4). A cursor that reset to null every
@@ -657,12 +755,27 @@ export async function repairAccountingBackReferences(
           }
         }
 
+        // A TOMBSTONE (r4 finding 3): retention cleared the payload, so the ID write below is still
+        // exactly as possible as it ever was, and the FOLLOW-UPS are gone for good. Everything from
+        // here on branches on that distinction rather than on the row as a whole, which is the
+        // difference between discarding unrecoverable work and retiring recoverable work.
+        const evidenceOnly = row.backReferenceEvidenceCompactedAt !== null
+
         // A row whose back-reference is already applied but is STILL FAILED is precisely the
         // "back-reference done, follow-ups not enqueued" state a previous pass can leave behind.
         // Skipping it on `!missing` meant those follow-ups were never retried — leaving the row
-        // FAILED accomplished nothing (Codex r7 #2).
-        const followUpsOnly = !missing && row.status === 'FAILED'
+        // FAILED accomplished nothing (Codex r7 #2). A tombstone is excluded because its follow-ups
+        // cannot be rebuilt at all: running the follow-ups-only pass on `{}` would enqueue nothing
+        // and then report the row reconciled, which is the silent version of the same loss.
+        const followUpsOnly = !missing && row.status === 'FAILED' && !evidenceOnly
         if (!missing && !followUpsOnly) {
+          if (evidenceOnly && row.status === 'FAILED') {
+            // Linked, but FAILED because its follow-ups never ran — and the payload that would let
+            // them run is gone. This is the terminal case, and it is settled ONLY once someone has
+            // been told, for the same reason an ambiguity is: the discard is irreversible, so
+            // stamping it after a failed warning would destroy the work and the notice together.
+            if (!(await reportDiscardedFollowUps(row, 'already-applied'))) continue
+          }
           // Linked and SYNCED: reconciled. Stamped, so it never occupies a slot again.
           await markChecked(row.id)
           continue
@@ -705,32 +818,47 @@ export async function repairAccountingBackReferences(
           }
           // The follow-ups (PDF, payment, attachment) never ran on the original failed pass —
           // enqueue them now. The connector's own idempotency makes this safe to repeat.
+          //
+          // Unless this is a tombstone, in which case they CANNOT be rebuilt (r4 finding 3): the
+          // payload they are constructed from was cleared at the retention cutoff. Calling
+          // enqueueFollowUps with `{}` would not fail — it would enqueue nothing and return
+          // normally, and the row would then be stamped reconciled with the payment or PDF silently
+          // missing. The terminal policy is stated instead of simulated: warn, naming what was
+          // discarded, and settle only if the warning landed.
           let followUpsEnqueued = true
-          try {
-            await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {
-              externalId: row.externalTransactionId,
-              invoiceNumber,
-            })
-          } catch (followUpError) {
-            followUpsEnqueued = false
-            console.error(`${prefix}: back-reference follow-up enqueue failed`, row.id, followUpError)
-            await deps.logActivity({
-              entityType: 'SYSTEM',
-              action: `${prefix}_backreference_followup_deferred`,
-              tag: 'sync',
-              level: 'WARNING',
-              description: `Applied the ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId} but could not `
-                + `enqueue its follow-ups: ${String(followUpError)}. The row stays FAILED so the next sweep retries them.`,
-              metadata: { syncLogId: row.id, referenceType: row.referenceType, referenceId: row.referenceId },
-            })
+          if (evidenceOnly) {
+            if (!(await reportDiscardedFollowUps(row, 'repaired'))) followUpsEnqueued = false
+          } else {
+            try {
+              await deps.enqueueFollowUps(row.id, row.type, row.referenceType, row.referenceId, payload, {
+                externalId: row.externalTransactionId,
+                invoiceNumber,
+              })
+            } catch (followUpError) {
+              followUpsEnqueued = false
+              console.error(`${prefix}: back-reference follow-up enqueue failed`, row.id, followUpError)
+              await deps.logActivity({
+                entityType: 'SYSTEM',
+                action: `${prefix}_backreference_followup_deferred`,
+                tag: 'sync',
+                level: 'WARNING',
+                description: `Applied the ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId} but could not `
+                  + `enqueue its follow-ups: ${String(followUpError)}. The row stays FAILED so the next sweep retries them.`,
+                metadata: { syncLogId: row.id, referenceType: row.referenceType, referenceId: row.referenceId },
+              })
+            }
           }
           // A FAILED row whose back-reference is now applied is fully reconciled — but ONLY if
           // its follow-ups were actually enqueued. Marking it SYNCED regardless retired the one
           // source that would retry them, so a transient enqueue failure lost the payment or PDF
           // permanently (Codex review, r6). Leaving it FAILED is what makes the retry durable —
           // and leaving it UNSTAMPED is what makes the next sweep look at it again.
+          //
+          // A tombstone is stamped CHECKED but never flipped to SYNCED: its id write succeeded, so
+          // there is nothing left for any future sweep to do, but its follow-ups were discarded
+          // rather than done and calling that SYNCED would erase the only trace of it (r4 finding 3).
           if (followUpsEnqueued) {
-            await markChecked(row.id, row.status === 'FAILED' ? { status: 'SYNCED', errorMessage: null } : undefined)
+            await markChecked(row.id, row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined)
           }
 
           if (followUpsOnly) {

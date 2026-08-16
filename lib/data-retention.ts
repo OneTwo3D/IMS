@@ -143,9 +143,17 @@ export async function purgeExpiredData(): Promise<{
     // belongs to one pass or the other and never both, and doing the delete first means a crash
     // between them leaves rows un-compacted (repeated next run) rather than un-deleted.
     //
-    // `backReferenceEvidenceCompactedAt: null` PERMANENTLY excludes already-compacted rows, so each
-    // daily run rewrites only the newly-eligible slice instead of the whole tombstone set — the
-    // same shape as the o3d-ahk webhook inbox compaction below.
+    // `backReferenceEvidenceCompactedAt: null` PERMANENTLY excludes already-compacted rows from THIS
+    // PASS, so each daily run rewrites only the newly-eligible slice instead of the whole tombstone
+    // set — the same shape as the o3d-ahk webhook inbox compaction below.
+    //
+    // It does NOT exclude them from the repair sweep (o3d-9kek r4 finding 3). An earlier revision
+    // did, which meant retention silently RETIRED unresolved repair work: compaction is scheduled by
+    // age and says nothing about repairability, so an ambiguity that cleared after the horizon was
+    // never reconsidered and a transiently failing back-reference was never repaired. A tombstone
+    // keeps every column the id write needs and stays a candidate for it; what is genuinely lost is
+    // only the payload-dependent follow-ups, which the sweep discards under an explicit terminal
+    // policy and warns about.
     const { count: compacted } = await db.accountingSyncLog.updateMany({
       where: {
         createdAt: { lt: cutoff },

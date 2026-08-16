@@ -2155,8 +2155,14 @@ model AccountingSyncLog {
   // TOMBSTONE because it outlived the retention period while still unresolved. Tombstones keep the
   // (connector, provenance, type, referenceType, referenceId, externalTransactionId) evidence that
   // stops an ambiguity silently becoming a certainty, but drop the payload and errorMessage, which
-  // are where the customer names, emails, addresses and financial lines live. They are not sweep
-  // candidates: without a payload the follow-ups cannot be rebuilt.
+  // are where the customer names, emails, addresses and financial lines live.
+  //
+  // r4 finding 3: a tombstone IS still a sweep candidate. The columns the id/provenance write reads
+  // all survive compaction, so an ambiguity that clears after the retention horizon — or a
+  // back-reference that was merely failing transiently at the cutoff — is still repaired. Only the
+  // payload-dependent FOLLOW-UPS (PDF, payment, attachment) are unrecoverable, and the sweep
+  // discards those under an explicit terminal policy with a warning. Excluding the whole row, which
+  // an earlier revision did, let retention permanently retire repairable work.
   backReferenceEvidenceCompactedAt DateTime?
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.

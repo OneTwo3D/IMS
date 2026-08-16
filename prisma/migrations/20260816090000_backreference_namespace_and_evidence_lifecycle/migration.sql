@@ -32,22 +32,52 @@
 -- keeps the '' sentinel, which is exactly what it means. The application treats a bill whose
 -- provenance does not match the ACTIVE connection as unlinked-in-this-namespace: it is neither a
 -- conflict for, nor a candidate of, the current connection.
+-- ORDERING AND ATOMICITY (r4 finding 4). The first revision of this file dropped the old global
+-- unique index and THEN created the compound one, with no BEGIN/COMMIT — and Prisma 7.8's runner
+-- does not auto-wrap a migration (see 20260721150000_refund_park_unique_index, which documents the
+-- same thing). An interrupted deploy, or a CREATE INDEX that fails on a pre-existing duplicate,
+-- therefore left the database with NEITHER invariant while the application kept writing bill ids:
+-- the window in which two local bills can claim one ledger document is exactly the corruption both
+-- indexes exist to forbid.
+--
+-- Two changes fix it, and both are needed:
+--
+--   • ONE EXPLICIT TRANSACTION. ADD COLUMN, CREATE INDEX and DROP INDEX are all transactional in
+--     Postgres (unlike CREATE INDEX CONCURRENTLY, which is why this is deliberately not
+--     concurrent), so either every statement below lands or none of them does. A failed CREATE
+--     rolls back to the OLD index, which is a correct — if stricter — invariant, never to none.
+--   • CREATE BEFORE DROP. The old index is global on accounting_invoice_id, so for the population
+--     this migration produces (every existing row backfilled to the same '' sentinel provenance)
+--     it strictly IMPLIES pair uniqueness. Nothing requires dropping it first: the compound index
+--     can always be built underneath it. Doing so means the moment of "no uniqueness at all" never
+--     exists even inside the transaction.
+--
+-- LOCKING. The ALTER TABLE below already takes ACCESS EXCLUSIVE on purchase_invoices and holds it
+-- to COMMIT, so concurrent writers are excluded for the whole block without a separate LOCK TABLE.
+-- It is stated explicitly rather than relied on implicitly, because if a future edit removes the
+-- ALTER, the CREATE INDEX's weaker SHARE lock would still block writes but the ADD COLUMN's
+-- guarantee would have quietly gone with it.
+BEGIN;
+
 ALTER TABLE "purchase_invoices"
   ADD COLUMN "accounting_invoice_provenance" TEXT NOT NULL DEFAULT '';
-
-DROP INDEX "purchase_invoices_accounting_invoice_id_key";
 
 -- Named explicitly: Prisma's generated name for this pair is 73 characters, past Postgres's
 -- 63-character identifier limit.
 --
 -- A duplicate present at migration time is the corruption this index exists to forbid, and the
 -- statement will fail loudly — which is correct: which of two local bills owns a ledger document
--- cannot be inferred from IMS data. To find them first:
+-- cannot be inferred from IMS data. Because this runs INSIDE the transaction and BEFORE the drop,
+-- that failure now rolls the whole migration back to the old index rather than to nothing. To find
+-- the duplicates first:
 --   SELECT accounting_invoice_id, accounting_invoice_provenance, count(*), array_agg(id)
 --     FROM purchase_invoices WHERE accounting_invoice_id IS NOT NULL
 --    GROUP BY 1, 2 HAVING count(*) > 1;
 CREATE UNIQUE INDEX "purchase_invoices_accounting_invoice_id_provenance_key"
   ON "purchase_invoices"("accounting_invoice_id", "accounting_invoice_provenance");
+
+-- Only now, with the replacement already durable in this transaction, is the old guard removed.
+DROP INDEX "purchase_invoices_accounting_invoice_id_key";
 
 -- ---------------------------------------------------------------------------------------------
 -- 2. THE SYNC ROW'S OWN NAMESPACE (r3 finding 1, the other half)
@@ -83,11 +113,25 @@ ALTER TABLE "accounting_sync_logs" ADD COLUMN "provenance" TEXT;
 -- detect because the surviving state is genuinely indistinguishable from an unambiguous one.
 --
 -- The marker makes the compaction idempotent and the daily pass cheap — like o3d-ahk's webhook
--- inbox tombstones, only the newly-eligible slice is rewritten — and it removes the row from the
--- sweep's candidate set, because without a payload its follow-ups can no longer be rebuilt.
+-- inbox tombstones, only the newly-eligible slice is rewritten.
+--
+-- It does NOT remove the row from the sweep's candidate set (r4 finding 3). An earlier revision
+-- said it did, and that permanently retired unresolved repair work: an ambiguity that clears after
+-- the retention horizon would never be reconsidered, and a transiently failing back-reference would
+-- never be repaired. A tombstone still carries everything the ID write needs — external id,
+-- provenance, referenceType, referenceId — so it stays a candidate for exactly that. What is lost
+-- with the payload is only the payload-dependent FOLLOW-UPS (PDF, payment, attachment), which the
+-- sweep now discards under an explicit terminal policy and warns about, rather than silently
+-- abandoning the whole row.
 ALTER TABLE "accounting_sync_logs" ADD COLUMN "backReferenceEvidenceCompactedAt" TIMESTAMP(3);
 
--- The sweep's candidate scan is now scoped to one connection's namespace.
+-- The sweep's candidate scan is now scoped to one connection's namespace. Unlike the bill index
+-- above this is a PERFORMANCE index, not an invariant — its name is reused, so it cannot be built
+-- before the old one is dropped, and nothing is at risk in the gap. It is inside the same
+-- transaction regardless, so a failure here rolls back the whole migration rather than leaving the
+-- scan without an index.
 DROP INDEX "accounting_sync_logs_backref_sweep_idx";
 CREATE INDEX "accounting_sync_logs_backref_sweep_idx"
   ON "accounting_sync_logs" ("connector", "provenance", "backReferenceCheckedAt", "createdAt");
+
+COMMIT;

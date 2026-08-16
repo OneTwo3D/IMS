@@ -344,8 +344,12 @@ test('the candidate query excludes already-checked rows and keyset-paginates pas
   // THE NAMESPACE (r3 finding 1): an exact match, so a row issued by a former tenant/realm is not
   // a candidate at all. A `{ in: [...] }` or an omission here is the collision this fixes.
   assert.equal(first.where.provenance, XERO_A)
-  // A tombstoned row is evidence, not work (r3 finding 3): its payload is gone.
-  assert.equal(first.where.backReferenceEvidenceCompactedAt, null)
+  // A TOMBSTONE IS STILL A CANDIDATE (r4 finding 3). r3 filtered these out, which handed RETENTION
+  // — a clock — the power to decide a row would never be repaired: compaction runs on age and says
+  // nothing about repairability, so an ambiguity that cleared after the horizon, or a
+  // back-reference that was merely failing transiently at it, was retired for good. The absence of
+  // this predicate is load-bearing, so it is asserted as an absence.
+  assert.equal('backReferenceEvidenceCompactedAt' in first.where, false)
   assert.deepEqual(first.where.status, { in: ['SYNCED', 'FAILED'] })
   assert.deepEqual(first.where.externalTransactionId, { not: null })
   assert.deepEqual(first.where.type, { in: [...BACK_REFERENCE_SWEEP_TYPES] })
@@ -1070,10 +1074,21 @@ test('[o3d-9kek r3 f1] with no connected tenant the sweep does nothing at all', 
   assert.equal(harness.store.orders[0].accountingInvoiceId, null)
 })
 
-test('[o3d-9kek r3 f3] a retention TOMBSTONE is evidence, not a repair candidate', async () => {
-  // Retention has cleared the payload, so the follow-ups can no longer be rebuilt and there is
-  // nothing a repair could complete. The row still exists so the PO resolver can see that
-  // something claimed this order's bill.
+// ---------------------------------------------------------------------------
+// o3d-9kek r4 finding 3 — a retention TOMBSTONE must stay a repair candidate.
+//
+// r3 compacted an expired-but-unresolved row to attribution only AND excluded it from the sweep.
+// The exclusion is the defect: compaction is scheduled by AGE, so it retires rows that are still
+// perfectly repairable — an ambiguity that clears next week, a back-reference whose write happened
+// to be failing at the cutoff. Keeping the claimant evidence stops a WRONG guess; it does nothing
+// to recover the missing link, and "deferred, not retired" was the property being broken.
+//
+// The split is by DEPENDENCY. The id/provenance write reads externalTransactionId, provenance,
+// referenceType and referenceId — all of which survive compaction, so it still runs. The follow-ups
+// are built from the payload, which does not, so they are discarded under a stated terminal policy.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek r4 f3] a retention TOMBSTONE is still repaired — only its follow-ups are discarded', async () => {
   const harness = makeHarness({
     syncRows: [salesInvoiceRow(1, { payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
     bills: [],
@@ -1081,8 +1096,85 @@ test('[o3d-9kek r3 f3] a retention TOMBSTONE is evidence, not a repair candidate
   })
 
   const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
-  assert.equal(run.scanned, 0)
-  assert.equal(harness.store.orders[0].accountingInvoiceId, null)
+
+  // THE REPAIR STILL HAPPENS. Under r3 this row was never even read.
+  assert.equal(run.scanned, 1)
+  assert.equal(run.repaired, 1)
+  assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-1')
+
+  // THE FOLLOW-UPS DO NOT, and are not pretended to. Calling enqueueFollowUps with a compacted `{}`
+  // payload would not throw — it would enqueue nothing and return normally — so the loss has to be
+  // reported explicitly or it is invisible.
+  assert.equal(run.followUpsDiscarded, 1)
+  assert.deepEqual(harness.followUps, [])
+  const discarded = harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded')
+  assert.ok(discarded, 'the discard is permanent, so it must be announced')
+  assert.equal(discarded.level, 'WARNING')
+  assert.match(discarded.description, /re-drive it manually/)
+
+  // Settled, because nothing further is ever possible for this row — but NOT flipped to SYNCED:
+  // its follow-ups were abandoned, not done, and SYNCED would erase the only trace of that.
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+  assert.equal(harness.store.syncRows[0].status, 'SYNCED', 'this row was already SYNCED; the sweep must not change it')
+})
+
+test('[o3d-9kek r4 f3] a TOMBSTONE whose discard warning is not persisted stays eligible', async () => {
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.failActivityFor.add('xero_backreference_followups_discarded')
+
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  // The id write is idempotent and safe, so it lands. Stamping the row is not: the discard cannot
+  // be undone, so settling it after a warning nobody received would destroy the work and the notice
+  // together. Same asymmetry as the ambiguity deferral — repeating a warning is noise, losing it is
+  // silence.
+  assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-1')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'unstamped, so the next run warns again')
+})
+
+test('[o3d-9kek r4 f3] a FAILED TOMBSTONE whose id is already applied is settled, not retried forever', async () => {
+  // The "back-reference done, follow-ups not enqueued" state, after retention. r3's follow-ups-only
+  // pass would re-enqueue from `{}` and then mark the row SYNCED — reporting a reconciliation that
+  // enqueued nothing.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', payload: {}, backReferenceEvidenceCompactedAt: at(500) })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 0, 'nothing was re-applied — the id was already there')
+  assert.equal(run.followUpsDiscarded, 1)
+  assert.deepEqual(harness.followUps, [], 'a `{}` payload cannot rebuild a PDF or a payment')
+  assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_followups_discarded'))
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+  assert.equal(harness.store.syncRows[0].status, 'FAILED', 'not SYNCED: the follow-ups were abandoned, not completed')
+})
+
+test('[o3d-9kek r4 f3] a TOMBSTONE with an unresolved PO ambiguity is still deferred, never settled', async () => {
+  // The case r3's exclusion silently retired: two posted claimants for one PO. The ambiguity can
+  // still clear — a sibling is cancelled, a human links a bill — and compaction has not changed
+  // that, so the row must come back after the recheck interval rather than leave the set for good.
+  const harness = makeHarness({
+    syncRows: [
+      poRow(1, 'po-1', { payload: {}, backReferenceEvidenceCompactedAt: at(500) }),
+      poRow(2, 'po-1'),
+    ],
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, accountingInvoiceProvenance: '', createdAt: at(1) }],
+    orders: [],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.skippedAmbiguous, 2)
+  assert.equal(harness.store.bills[0].accountingInvoiceId, null, 'refusing to guess survives compaction')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'DEFERRED, not retired')
+  assert.ok(harness.store.syncRows[0].backReferenceAmbiguousLoggedAt)
 })
 
 test('[o3d-9kek r3 f4] the Setting-backed cursor store round-trips, and treats junk as "no cursor"', async () => {
