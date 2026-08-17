@@ -434,6 +434,51 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
  * has always cleared contacts this way; Xero's did not, which was a live bug before the item column
  * gave it a second column to leak (o3d-3nc).
  */
+/**
+ * THE REALM/TENANT-SWITCH LIFECYCLE (o3d-9kek r3 finding 1), which this function defines.
+ *
+ * Disconnect deliberately does NOT clear the external ids on documents — purchase_invoices
+ * .accounting_invoice_id, sales_orders.accounting_invoice_id and the rest. They are financial
+ * evidence: the only local record of which ledger document a bill or invoice became, and the
+ * anchor every later correction and payment posts against. Cached LOOKUP ids (contacts, items) are
+ * different — they are a performance cache with an authoritative source, so they are cleared.
+ *
+ * That retention is exactly why the ids are namespaced. Each stored bill id carries the
+ * "<connector>:<tenantId>" of the connection that issued it, and uniqueness is enforced over the
+ * PAIR, so:
+ *
+ *   1. DISCONNECT — token and pin go, ids stay. Nothing can be attributed: with no active
+ *      provenance the repair sweep does nothing at all and the back-reference writers refuse.
+ *   2. RECONNECT TO THE SAME tenant/realm — the provenance matches again and everything resumes
+ *      exactly where it was. Nothing was destroyed to make the switch possible.
+ *   3. RECONNECT TO A DIFFERENT ONE — the new connection has a new provenance. Every old id is in
+ *      a foreign namespace: it is not a uniqueness conflict, it is not "already linked" (a document
+ *      linked in the old org reads as unlinked here and can post afresh), and old sync rows are
+ *      invisible to the sweep because their stored provenance no longer matches.
+ *
+ * The pin (the *_EXPECTED_* setting) is what makes step 3 deliberate rather than accidental:
+ * re-authorising to a different organisation while still connected is refused, and only an explicit
+ * disconnect clears the pin.
+ *
+ * WHY XERO DOES NOT NEED QUICKBOOKS' REALM-SWITCH GUARD (o3d-9kek r4 finding 1, verified rather than
+ * assumed). QuickBooks refuses a connect to a different realm outright, because a QuickBooks bill id
+ * is a per-company INTEGER: realm B routinely issues id "42", so a retired realm-A bill holding "42"
+ * is confused with it by every consumer that reads a naked accountingInvoiceId — and payment-poller
+ * .ts, which selects on `accountingInvoiceId != null` alone, demonstrably does exactly that.
+ *
+ * Xero ids are GUIDs, and that is what removes the exposure, not the namespace column. The poller
+ * here builds its match set FROM XERO (`invoiceById` keyed on InvoiceID, then
+ * `accountingInvoiceId: { in: [...] }`), so a retired org's GUID cannot appear in it: no two Xero
+ * organisations ever issue the same InvoiceID. A stale GUID therefore matches nothing and resolves
+ * nothing — the failure mode is a loud 404 on the next post, not a payment settling the wrong
+ * invoice. Checked: payment-poller.ts, payment-reconcile.ts and the sync-processor's update paths
+ * all key on ids that came back from Xero within the current tenant.
+ *
+ * ONE RESIDUAL, tracked in o3d-gt8r rather than fixed here: selectTenantConnection falls back to
+ * `connections[0]` when the pin is absent, so a post-disconnect reconnect can silently land on a
+ * different organisation. Orphaning, not corruption — every stored id would simply resolve to
+ * nothing in the new org — but it happens without asking.
+ */
 export async function disconnect(): Promise<void> {
   await db.$transaction([
     db.accountingToken.deleteMany({ where: { connector: XERO_CONNECTOR } }),
