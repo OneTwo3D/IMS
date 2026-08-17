@@ -717,7 +717,7 @@ test('a full NET refund of a TAXABLE order reaches refundStatus=FULL, not stuck 
   // Order: gross 120, tax 20, net 100. Refund lines are stored NET, so a full refund is net 100. Against
   // the GROSS 120 it stuck at PARTIAL forever; against the NET 100 it correctly reaches FULL.
   const state = baseState({
-    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 20, taxRateName: 'Standard' }],
+    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 0.2, taxRateName: 'Standard' }],
     taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
   })
   const result = await createSalesOrderRefund(createClient(state), {
@@ -789,7 +789,7 @@ test('a later refund on an order with a legacy/unknown-basis refund is BLOCKED f
   // ceiling can either over-refund (gross ceiling grosses the new line up) or mark FULL early (net
   // ceiling). Conversion is undecidable, so createSalesOrderRefund fails closed and refuses.
   const state = baseState({
-    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 20, taxRateName: 'Standard' }],
+    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 0.2, taxRateName: 'Standard' }],
     taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
   })
   state.refunds.push({
@@ -810,7 +810,7 @@ test('a refund line SNAPSHOTS the resolved tax identity at creation (o3d-w00)', 
   // The linked sales line carries its own rate; the snapshot must capture that connector tax type so the
   // credit note posts under it instead of re-predicting from the order default at post time.
   const state = baseState({
-    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 20, taxRateName: 'Standard' }],
+    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 0.2, taxRateName: 'Standard' }],
     taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
   })
   state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: false }

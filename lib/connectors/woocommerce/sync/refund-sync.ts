@@ -7,7 +7,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import type { WcRefund, WcRefundLineItem } from './types'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
@@ -40,6 +40,87 @@ function divideRoundedNumber(value: DecimalInput, divisor: DecimalInput, precisi
 function parseDecimalAbs(value: string | number | null | undefined) {
   const decimal = toDecimal(value ?? 0)
   return decimal.lt(0) ? decimal.neg() : decimal
+}
+
+/**
+ * o3d-w00: the basis on which a MONETARY-ONLY WooCommerce refund is converted from the gross amount
+ * the customer received to the NET amount IMS stores.
+ *
+ * Every refund row is stamped `totalsBasis: 'NET'` by the writer and the cumulative refund ceiling +
+ * FULL/PARTIAL classification compare against the order's NET total (totalBase − taxBase). So a
+ * monetary-only line MUST be genuinely net: storing a gross figure under a NET marker is precisely the
+ * net-vs-gross mix that leaves a fully-refunded taxable order stuck at PARTIALLY_REFUNDED (the gross sum
+ * never equals the net total, and the next refund trips the ceiling instead of completing the refund).
+ *
+ * The conversion basis is only knowable when the rate the credit note will RE-GROSS at is known, and
+ * that rate has to be the one this order was actually taxed at. So rather than trusting the header
+ * field blindly, it is CHECKED against the order's own tax: netTotal × rate must reproduce taxBase.
+ * When it cannot be established, fail CLOSED (park for manual resolution) — recording an unconvertible
+ * amount as if it were net silently over-credits Xero and corrupts the refund status.
+ */
+export type MonetaryRefundBasis =
+  | { ok: true; vatRate: Decimal }
+  | { ok: false; error: string }
+
+/** Absolute slack (base currency) allowed when checking the header rate against the order's own tax. */
+const MONETARY_BASIS_ABS_TOLERANCE = 0.02
+/** Relative slack on the net order total, covering WooCommerce's per-line VAT rounding on large orders. */
+const MONETARY_BASIS_REL_TOLERANCE = 0.002
+
+export function resolveMonetaryRefundVatRate(order: {
+  totalBase: DecimalInput
+  taxBase?: DecimalInput
+  taxRatePercent?: DecimalInput
+}): MonetaryRefundBasis {
+  const taxBase = toDecimal(order.taxBase ?? 0)
+  const netOrderBase = toDecimal(order.totalBase).sub(taxBase)
+
+  // No VAT on the order: gross IS net, so no rate is needed and none can be wrong. This also matches
+  // how the ceiling/status comparison degenerates for non-taxable orders (taxBase 0 => net == gross).
+  if (taxBase.abs().lte(MONETARY_BASIS_ABS_TOLERANCE)) {
+    return { ok: true, vatRate: toDecimal(0) }
+  }
+
+  // NOTE: SalesOrder.taxRatePercent is Decimal(5,4) holding a FRACTION (0.2000 = 20%), not a
+  // percentage — it is consumed as `1 + rate` everywhere else (sales-currency, order-import) and only
+  // multiplied by 100 for DISPLAY. Treating it as a percentage here divided the rate by a further 100,
+  // making the "net" figure 12.00/1.002 instead of 12.00/1.20 — i.e. still gross.
+  const rate = order.taxRatePercent == null ? null : toDecimal(order.taxRatePercent)
+  if (rate == null || !rate.isFinite() || rate.lte(0)) {
+    return {
+      ok: false,
+      error:
+        'This refund is monetary-only (not itemised) and the order carries VAT, but the order has no ' +
+        'recorded tax rate, so the refunded amount cannot be converted from gross to net. It has been ' +
+        'parked for manual resolution: record it in IMS against the specific lines / tax rates it covers.',
+    }
+  }
+  if (netOrderBase.lte(0)) {
+    return {
+      ok: false,
+      error:
+        'This refund is monetary-only (not itemised) and the order has a non-positive net total, so the ' +
+        'refunded amount cannot be converted from gross to net. It has been parked for manual resolution.',
+    }
+  }
+
+  // The header rate must reproduce the order's OWN tax, otherwise it is not the rate this order was
+  // taxed at (a mixed-rate order, or a stale/mis-scaled snapshot) and re-grossing the stored net would
+  // not return the amount the customer actually received.
+  const impliedTax = netOrderBase.mul(rate)
+  const tolerance = toDecimal(MONETARY_BASIS_ABS_TOLERANCE).add(netOrderBase.mul(MONETARY_BASIS_REL_TOLERANCE))
+  if (impliedTax.sub(taxBase).abs().gt(tolerance)) {
+    return {
+      ok: false,
+      error:
+        `This refund is monetary-only (not itemised) and the order's recorded tax rate (${rate.toString()}) ` +
+        `does not reconcile with its VAT (${taxBase.toFixed(2)} on a net total of ${netOrderBase.toFixed(2)}), ` +
+        'so the refunded amount cannot be converted from gross to net. It has been parked for manual ' +
+        'resolution: record it in IMS against the specific lines / tax rates it covers.',
+    }
+  }
+
+  return { ok: true, vatRate: rate }
 }
 
 // o3d-7yf: when a refund finally lands (a successful retry or a verified same-order dedup), RESOLVE this
@@ -156,6 +237,9 @@ export async function syncWcRefund(
         externalOrderNumber: true,
         fxRateToBase: true,
         totalBase: true,
+        // o3d-w00: taxBase is what makes the gross->net conversion basis CHECKABLE — the header rate is
+        // only trusted when it reproduces the order's own VAT (resolveMonetaryRefundVatRate).
+        taxBase: true,
         taxRatePercent: true,
         lines: { select: { id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true } },
       },
@@ -280,8 +364,28 @@ export async function syncWcRefund(
       // it back up via the snapshotted tax type. So convert the gross refund to net using the order's VAT
       // rate here; a non-taxable order (rate 0) leaves it unchanged. The gross accumulator below stays
       // GROSS, because the amount-mismatch reconciliation checks against wcRefund.amount which is gross.
-      const vatRate = toDecimal(so.taxRatePercent ?? 0).div(100)
-      const netForeign = toDecimal(refundAmountForeign).div(toDecimal(1).add(vatRate))
+      //
+      // o3d-w00: the rate comes from resolveMonetaryRefundVatRate, which treats taxRatePercent as the
+      // FRACTION it is and refuses to guess when the conversion basis cannot be established. Failing
+      // closed here is deliberate: a refund stored on an undetermined basis would still be stamped
+      // totalsBasis='NET', so a gross figure would enter the net ceiling / FULL-vs-PARTIAL comparison
+      // and both over-credit Xero and strand the order at PARTIALLY_REFUNDED.
+      const basis = resolveMonetaryRefundVatRate(so)
+      if (!basis.ok) {
+        const error =
+          basis.error + (` (WooCommerce refund ${wcRefund.id}: do NOT issue another Woo refund.)`)
+        // A deliberate, non-transient refusal — QUARANTINED so the sweep dedup skips it and the
+        // exception inbox surfaces it for an operator, exactly like the non-uniform-tax refusal.
+        await upsertRefundPark(client, {
+          soId: so.id,
+          externalId: String(wcRefund.id),
+          status: 'QUARANTINED',
+          errorMessage: error,
+          payload: wcRefund,
+        })
+        return { success: false, error }
+      }
+      const netForeign = toDecimal(refundAmountForeign).div(toDecimal(1).add(basis.vatRate))
       refundLines.push({
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',

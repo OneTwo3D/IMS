@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
-import { syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { resolveMonetaryRefundVatRate, syncWcRefund, type WcRefundSyncDependencies } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
+import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
+import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 
 function makeRefund(overrides: Partial<WcRefund> = {}): WcRefund {
   return {
@@ -45,7 +47,22 @@ function externalRefundIdUniqueError() {
   })
 }
 
-function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseWithQuarantine?: boolean } = {}) {
+/**
+ * o3d-w00: the order double MUST be schema-faithful about units, because units are the bug.
+ * SalesOrder.taxRatePercent is Decimal(5,4) holding a FRACTION (0.2000 = 20%), and totalBase/taxBase are
+ * GROSS/VAT in base currency. The previous double returned `taxRatePercent: 20` — a percentage — which
+ * exactly cancelled production's stray `/100` and made the "stored NET, not gross" assertion pass over
+ * code that was still storing gross. The default order below is internally COHERENT: net 12.50 + VAT
+ * 2.50 @ 0.20 = gross 15.00, matching the 12.50 net order line.
+ */
+type OrderDouble = { totalBase: number; taxBase: number; taxRatePercent: number | null }
+const DEFAULT_ORDER_DOUBLE: OrderDouble = { totalBase: 15, taxBase: 2.5, taxRatePercent: 0.2 }
+
+function makeDependencies(options: {
+  alwaysMissExistingRefund?: boolean
+  refuseWithQuarantine?: boolean
+  order?: Partial<OrderDouble>
+} = {}) {
   const refunds: Array<{ id: string; externalRefundId: number; orderId: string }> = []
   const syncLogs: unknown[] = []
   const activityLogs: unknown[] = []
@@ -134,8 +151,8 @@ function makeDependencies(options: { alwaysMissExistingRefund?: boolean; refuseW
             id: 'so-1',
             externalOrderNumber: 'WC-1001',
             fxRateToBase: 1,
-            totalBase: 12.5,
-            taxRatePercent: 20,
+            ...DEFAULT_ORDER_DOUBLE,
+            ...options.order,
             lines: [
               {
                 id: 'line-1',
@@ -258,6 +275,151 @@ test('a monetary-only WooCommerce refund is stored NET, not gross (o3d-w00)', as
   assert.equal(state.createRefundLines.length, 1)
   // 12.00 gross / 1.20 = 10.00 net.
   assert.equal(state.createRefundLines[0].totalForeign, 10)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-w00: monetary-only gross -> net conversion basis.
+//
+// SalesOrder.taxRatePercent is a FRACTION (Decimal(5,4), 0.2000 = 20%). Production divided it by a
+// further 100, so the "net" it stored was gross/1.002 — still gross — while the writer stamped the row
+// totalsBasis='NET'. Because the cumulative ceiling and the FULL/PARTIAL classification both compare
+// against the order's NET total, that gross figure can never sum to the net total: a full refund is
+// refused by the ceiling and the order stays PARTIALLY_REFUNDED forever.
+// ---------------------------------------------------------------------------
+
+// A £120 gross order: net 100 + VAT 20 @ 0.20.
+const TAXABLE_ORDER: Partial<OrderDouble> = { totalBase: 120, taxBase: 20, taxRatePercent: 0.2 }
+const TAXABLE_ORDER_NET_TOTAL = 100
+
+test('a monetary-only refund converts gross to net at the FRACTIONAL tax rate, not rate/100 (o3d-w00)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TAXABLE_ORDER })
+  const refund = makeRefund({ amount: '120.00', line_items: [], shipping_lines: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, true)
+  assert.equal(state.createRefundLines.length, 1)
+  // 120.00 gross / 1.20 = 100.00 net. Reading taxRatePercent as a percentage gave 120/1.002 = 119.7605.
+  assert.equal(state.createRefundLines[0].totalBase, 100, 'the stored NET total is the order net, not the gross')
+  assert.equal(state.createRefundLines[0].totalForeign, 100)
+})
+
+test('a FULL monetary-only refund of a taxable order reaches REFUNDED (o3d-w00)', async () => {
+  // The bug this issue names, end to end over the real comparison helpers: the whole gross amount comes
+  // back from WooCommerce, the net figure refund-sync hands to createRefund must clear the NET ceiling
+  // and satisfy the FULL classification. With a gross figure it did neither.
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TAXABLE_ORDER })
+  const refund = makeRefund({ amount: '120.00', line_items: [], shipping_lines: [] })
+
+  await syncWcRefund(1001, refund, state.dependencies)
+  const storedNet = state.createRefundLines[0].totalBase ?? 0
+
+  assert.equal(
+    refundWouldExceedOrderTotal(storedNet, 0, TAXABLE_ORDER_NET_TOTAL),
+    false,
+    'a full refund must not trip the cumulative NET ceiling (a gross figure does, so the refund is refused outright)',
+  )
+  assert.equal(
+    isFullRefundAmount(storedNet, TAXABLE_ORDER_NET_TOTAL),
+    true,
+    'a full refund of a taxable order classifies FULL/REFUNDED, not PARTIALLY_REFUNDED',
+  )
+})
+
+test('a genuinely PARTIAL monetary-only refund still does not reach REFUNDED, and leaves room for the rest (o3d-w00)', async () => {
+  // The other direction: half the gross back is half the net, which stays PARTIAL — and critically the
+  // remaining half must still fit under the ceiling, so the customer's second refund can complete the
+  // order. Reading the rate as a percentage stored 59.88 twice: the second refund exceeded the 100 net
+  // ceiling and was refused, which is exactly how an order gets stuck at PARTIALLY_REFUNDED.
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TAXABLE_ORDER })
+  const refund = makeRefund({ amount: '60.00', line_items: [], shipping_lines: [] })
+
+  await syncWcRefund(1001, refund, state.dependencies)
+  const storedNet = state.createRefundLines[0].totalBase ?? 0
+
+  assert.equal(storedNet, 50, '60.00 gross / 1.20 = 50.00 net')
+  assert.equal(
+    isFullRefundAmount(storedNet, TAXABLE_ORDER_NET_TOTAL),
+    false,
+    'a half refund must NOT be classified FULL',
+  )
+  assert.equal(
+    refundWouldExceedOrderTotal(storedNet, storedNet, TAXABLE_ORDER_NET_TOTAL),
+    false,
+    'the second half must still fit under the ceiling so the refund can complete',
+  )
+  assert.equal(
+    isFullRefundAmount(storedNet + storedNet, TAXABLE_ORDER_NET_TOTAL),
+    true,
+    'the two halves together reach FULL',
+  )
+})
+
+test('a monetary-only refund whose gross->net basis CANNOT be determined is refused and QUARANTINED, never concluded fully refunded (o3d-w00)', async () => {
+  // The order carries VAT but has no recorded tax rate, so the gross amount cannot be converted to net.
+  // Storing it anyway would stamp a gross figure totalsBasis='NET'. Fail closed instead.
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { totalBase: 120, taxBase: 20, taxRatePercent: null },
+  })
+  const refund = makeRefund({ id: 7101, amount: '120.00', line_items: [], shipping_lines: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false, 'refused rather than recorded on an undetermined basis')
+  assert.match(result.error ?? '', /cannot be converted from gross to net/)
+  assert.equal(state.createRefundCalls, 0, 'no refund is created')
+  const park = state.syncLogs.at(-1) as { data?: { status?: string; externalId?: string } }
+  assert.equal(park?.data?.status, 'QUARANTINED', 'parked as a deliberate refusal, not a retryable failure')
+  assert.equal(park?.data?.externalId, '7101')
+})
+
+test('a monetary-only refund is refused when the header tax rate does not reconcile with the order VAT (o3d-w00)', async () => {
+  // A rate that cannot reproduce the order's own tax (5% against 20 VAT on a 100 net order) is not the
+  // rate the credit note will re-gross at, so re-grossing the stored net would not return the amount the
+  // customer received. This check is also what independently catches a mis-scaled rate.
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { totalBase: 120, taxBase: 20, taxRatePercent: 0.05 },
+  })
+  const refund = makeRefund({ id: 7102, amount: '120.00', line_items: [], shipping_lines: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /does not reconcile with its VAT/)
+  assert.equal(state.createRefundCalls, 0)
+})
+
+test('a monetary-only refund on a NON-taxable order still stores the gross amount unchanged (o3d-w00)', async () => {
+  // The fail-closed guard must not block the case where no conversion is owed: with no VAT, net IS gross,
+  // and the ceiling/status comparison degenerates to the same basis.
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { totalBase: 100, taxBase: 0, taxRatePercent: null },
+  })
+  const refund = makeRefund({ id: 7103, amount: '100.00', line_items: [], shipping_lines: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, true, 'an untaxed order needs no rate and must not be quarantined')
+  assert.equal(state.createRefundLines[0].totalBase, 100)
+})
+
+test('resolveMonetaryRefundVatRate reads taxRatePercent as a fraction and fails closed otherwise (o3d-w00)', async () => {
+  // Unit-level pin on the basis resolver itself, so the units cannot regress behind the sync harness.
+  const taxed = resolveMonetaryRefundVatRate({ totalBase: 120, taxBase: 20, taxRatePercent: 0.2 })
+  assert.equal(taxed.ok, true)
+  assert.equal(taxed.ok === true && taxed.vatRate.toNumber(), 0.2, 'the fraction is used as-is')
+
+  // The same order with the rate expressed as a percentage is NOT silently accepted.
+  assert.equal(resolveMonetaryRefundVatRate({ totalBase: 120, taxBase: 20, taxRatePercent: 20 }).ok, false)
+  assert.equal(resolveMonetaryRefundVatRate({ totalBase: 120, taxBase: 20, taxRatePercent: null }).ok, false)
+  assert.equal(resolveMonetaryRefundVatRate({ totalBase: 120, taxBase: 20, taxRatePercent: 0 }).ok, false)
+
+  const untaxed = resolveMonetaryRefundVatRate({ totalBase: 100, taxBase: 0, taxRatePercent: null })
+  assert.equal(untaxed.ok, true)
+  assert.equal(untaxed.ok === true && untaxed.vatRate.toNumber(), 0)
 })
 
 test('syncWcRefund still rejects a genuine amount mismatch', async () => {
