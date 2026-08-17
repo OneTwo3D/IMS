@@ -2798,7 +2798,7 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       })
       if (blocker) return { error: blocker.message }
 
-      const released = await releaseOrderAllocationsInTx(tx, id)
+      const released = await releaseOrderAllocationsInTx(tx, id, { cause: 'deleting the sales order' })
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
       await tx.salesOrder.delete({ where: { id } })
       return { so, released }

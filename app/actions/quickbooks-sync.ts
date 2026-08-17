@@ -315,13 +315,19 @@ export async function triggerQuickBooksSync(): Promise<{ success: boolean; resul
     }
 
     const result = await processPendingQuickBooksSync()
-
+    // NO back-reference repair sweep here, deliberately (o3d-9kek r6). The manual sync is where an
+    // operator would most want one — it is the button they press after linking a bill by hand — but
+    // the connector-agnostic sweep is scoped by connector alone, and a QuickBooks external id only
+    // means anything inside one realm, so it could stamp a previous company's id onto a live
+    // document. The ambiguity warnings this connector writes say plainly that the link must be made
+    // by hand rather than pointing at a sweep. Precondition for binding it: o3d-s36z. See the note
+    // at the end of lib/connectors/quickbooks/sync-processor.ts.
     await logActivity({
       entityType: 'SYSTEM',
       action: 'quickbooks_manual_sync',
       tag: 'sync',
       description: `Manual QuickBooks sync: ${result.succeeded} synced, ${result.failed} failed`,
-      metadata: result,
+      metadata: { ...result },
     })
 
     revalidatePath('/sync')

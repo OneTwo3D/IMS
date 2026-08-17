@@ -38,6 +38,12 @@ export type BackorderReportLineRow = {
   } | null
 }
 
+/**
+ * An OPEN allocation row: the persisted `OrderAllocation.qty` MINUS the shipment lines it already
+ * covers (o3d-4kfh — the rows retain their commitments, see allocation-service.ts). The report
+ * compares these against demand that is itself net of those shipments, so handing it raw rows
+ * counts every committed unit twice and hides real backorders.
+ */
 export type BackorderReportAllocationRow = {
   lineId: string
   productId: string
@@ -100,11 +106,15 @@ type BackorderReportClient = {
   salesOrderLine: {
     findMany(args: unknown): Promise<BackorderReportLineRow[]>
   }
+  // The COLLECTOR reads raw persisted rows at allocation-row grain and nets them itself; the
+  // warehouse on both sides is what makes that attribution possible (o3d-4kfh).
   orderAllocation: {
-    findMany(args: unknown): Promise<BackorderReportAllocationRow[]>
+    findMany(args: unknown): Promise<Array<BackorderReportAllocationRow & { warehouseId: string }>>
   }
   shipmentLine: {
-    findMany(args: unknown): Promise<BackorderReportShipmentLineRow[]>
+    findMany(args: unknown): Promise<Array<
+      Omit<BackorderReportShipmentLineRow, 'shipment'> & { shipment: { status: string; warehouseId: string } }
+    >>
   }
   product: Parameters<typeof loadFulfillmentProductGraph>[0]['product']
 }
@@ -287,6 +297,9 @@ export async function collectBackorderReportRows(
         lineId: true,
         productId: true,
         qty: true,
+        // o3d-4kfh: the grain a shipment line is attributable to an allocation row at, needed to
+        // net the row down to the OPEN quantity `buildBackorderReport` expects.
+        warehouseId: true,
       },
     }),
     client.shipmentLine.findMany({
@@ -295,10 +308,36 @@ export async function collectBackorderReportRows(
         lineId: true,
         productId: true,
         qty: true,
-        shipment: { select: { status: true } },
+        shipment: { select: { status: true, warehouseId: true } },
       },
     }),
   ])
+
+  // o3d-4kfh: an OrderAllocation row covers its committed shipment lines as well as the
+  // outstanding demand (see the contract in allocation-service.ts). `buildBackorderReport` takes
+  // OPEN rows — it compares them against demand that already has those shipments subtracted — so
+  // the netting happens HERE, at the row grain the two tables share, rather than by handing the
+  // report raw rows and double-counting every committed unit.
+  const committedByAllocationScope = new Map<string, number>()
+  for (const shipmentLine of shipmentLines) {
+    if (shipmentLine.shipment.status === 'PENDING') continue
+    const key = `${shipmentLine.lineId}|${shipmentLine.shipment.warehouseId}|${shipmentLine.productId}`
+    committedByAllocationScope.set(
+      key,
+      (committedByAllocationScope.get(key) ?? 0) + decimalToNumber(shipmentLine.qty),
+    )
+  }
+  const openAllocations = allocations.map((allocation) => ({
+    lineId: allocation.lineId,
+    productId: allocation.productId,
+    qty: Math.max(
+      0,
+      decimalToNumber(allocation.qty)
+        - (committedByAllocationScope.get(
+          `${allocation.lineId}|${allocation.warehouseId}|${allocation.productId}`,
+        ) ?? 0),
+    ),
+  }))
 
   const productIds = lines.map((line) => line.productId).filter((id): id is string => !!id)
   const graph = await loadFulfillmentProductGraph(
@@ -317,7 +356,7 @@ export async function collectBackorderReportRows(
 
   return {
     lines,
-    allocations,
+    allocations: openAllocations,
     shipmentLines,
     requirementsByLine,
   }

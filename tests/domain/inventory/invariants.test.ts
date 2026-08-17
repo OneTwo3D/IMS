@@ -29,6 +29,7 @@ const CANONICAL_INVENTORY_INVARIANT_CODES = new Set([
   'stock_movement_missing_cost_layer',
   'stock_movement_missing_cogs_entry',
   'shipped_line_missing_cogs_snapshot',
+  'allocation_committed_shipment_uncovered',
 ])
 
 function cleanRows(): InventoryInvariantRows {
@@ -78,6 +79,21 @@ function cleanRows(): InventoryInvariantRows {
       },
     ],
     stockMovements: [],
+    // o3d-4kfh r3: the committed-coverage census is a PAIR, and a clean fixture must supply both —
+    // an allocation set with no shipment lines would read as "nothing committed", which is not the
+    // same thing as "every commitment backed" and would make the check vacuous here.
+    orderAllocations: [
+      { lineId: 'sales-line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 },
+    ],
+    committedShipmentLines: [
+      {
+        lineId: 'sales-line-1',
+        productId: 'product-1',
+        qty: 2,
+        product: { sku: 'SKU-1' },
+        shipment: { orderId: 'order-1', warehouseId: 'warehouse-1' },
+      },
+    ],
     reservationSources: [
       {
         source: 'sales_order',
@@ -1351,6 +1367,40 @@ test('inventory SQL collector keeps partially refunded orders eligible for shipp
   assert.doesNotMatch(sql, /PARTIALLY_REFUNDED/)
 })
 
+test('o3d-4kfh: the reservation census credits COMMITTED reservations on zero-demand orders', async () => {
+  // The SQL twin of the reservation-breakdown tests. A CANCELLED / fully-refunded order still holds
+  // its PICKING/PACKED commitment on reservedQty (allocation retains the committed set; only
+  // dispatch decrements the stock level), so omitting those rows made knownReservedQty short by
+  // exactly that amount and reported a correctly-held reservation as a CRITICAL mismatch.
+  //
+  // Asserted on the generated SQL because this branch has no in-process evaluator to exercise — the
+  // arithmetic is done by Postgres. Its behaviour is covered by the identical TS implementation in
+  // reservation-breakdown.test.ts, and the query is executed against a real database by the
+  // invariant report itself.
+  let capturedQuery: unknown
+  const client: InventoryInvariantSqlClient = {
+    async $queryRaw<T = unknown>(query: unknown) {
+      capturedQuery = query
+      return [] as T
+    },
+  }
+
+  await collectSqlInventoryInvariantFindingsPage(client, { limit: 10 })
+  const sql = String((capturedQuery as { sql?: string }).sql ?? '')
+
+  // ONE shipment-line CTE, split into the two readings the contract defines.
+  assert.match(sql, /WHERE s\.status::text <> 'PENDING'/)
+  assert.match(sql, /SUM\(sl\.qty\) FILTER \(WHERE s\.status::text = \?\)/)
+  // The active branch still nets DISPATCHED only — a PICKING/PACKED shipment has released nothing.
+  assert.match(sql, /SUM\(GREATEST\(oa\.qty - COALESCE\(csl\."dispatchedQty", 0\), 0\)\)/)
+  // And the zero-demand branch credits the still-committed portion, bounded by the residual.
+  assert.match(sql, /\(so\.status = 'CANCELLED' OR so\."refundStatus" = 'FULL'\)/)
+  assert.match(
+    sql,
+    /LEAST\(\s*GREATEST\(oa\.qty - COALESCE\(csl\."dispatchedQty", 0\), 0\),\s*GREATEST\(COALESCE\(csl\."committedQty", 0\) - COALESCE\(csl\."dispatchedQty", 0\), 0\)\s*\)/,
+  )
+})
+
 function findingKey(finding: InventoryInvariantFinding): string {
   return [
     finding.severity,
@@ -1537,6 +1587,15 @@ test('SQL inventory collector output matches evaluator output for seeded finding
       orderId: 'order-2',
       warehouseId: 'warehouse-1',
     },
+  })
+  // o3d-4kfh r3: a committed shipment line with NO allocation row behind it at its
+  // (line, warehouse, product) — the census case, so this code is in the canonical set above.
+  rows.committedShipmentLines!.push({
+    lineId: 'sales-line-uncovered',
+    productId: 'product-1',
+    qty: 3,
+    product: { sku: 'SKU-1' },
+    shipment: { orderId: 'order-3', warehouseId: 'warehouse-1' },
   })
 
   const expected = evaluateInventoryInvariantRows(rows)
@@ -1841,4 +1900,99 @@ test('audit-C5: no stranded-transfer findings when none are passed (clean path)'
     shippedShipmentLines: [],
   })
   assert.equal(findings.filter((f) => f.code === 'transfer_stranded_in_transit').length, 0)
+})
+
+test('o3d-4kfh r3: a committed shipment larger than its allocation row is a critical finding', () => {
+  // Finding 3's exact shape: committed 10 against a row of 5. Every consumer of the contract
+  // computes `qty - committed` and floors at zero, so the five surplus units do not overflow
+  // anywhere — they vanish, and are then taken out of whatever shared reservedQty is present at
+  // dispatch. The reservation census cannot see it because it credits only the residual that
+  // still exists.
+  const rows = cleanRows()
+  rows.orderAllocations = [
+    { lineId: 'sales-line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 5 },
+  ]
+  rows.committedShipmentLines = [
+    {
+      lineId: 'sales-line-1',
+      productId: 'product-1',
+      qty: 10,
+      product: { sku: 'SKU-1' },
+      shipment: { orderId: 'order-1', warehouseId: 'warehouse-1' },
+    },
+  ]
+
+  const findings = evaluateInventoryInvariantRows(rows)
+  const finding = findings.find((candidate) => candidate.code === 'allocation_committed_shipment_uncovered')
+
+  assert.ok(finding, 'the sweep must surface an over-commitment nothing else can detect')
+  assert.equal(finding.severity, 'critical')
+  assert.equal(finding.productId, 'product-1')
+  assert.equal(finding.warehouseId, 'warehouse-1')
+  assert.deepEqual(finding.details, {
+    lineId: 'sales-line-1',
+    sku: 'SKU-1',
+    committedQty: 10,
+    allocatedQty: 5,
+    delta: 5,
+  })
+})
+
+test('o3d-4kfh r3: a commitment in ANOTHER warehouse is not credited to the row', () => {
+  // The grain is (line, warehouse, product), not (line, product). A shipment picked from
+  // warehouse-2 is not covered by an allocation in warehouse-1 — that mismatch is precisely the
+  // deallocate/re-allocate-elsewhere corruption, and a line-level check would have missed it.
+  const rows = cleanRows()
+  rows.orderAllocations = [
+    { lineId: 'sales-line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 },
+  ]
+  rows.committedShipmentLines = [
+    {
+      lineId: 'sales-line-1',
+      productId: 'product-1',
+      qty: 2,
+      product: { sku: 'SKU-1' },
+      shipment: { orderId: 'order-1', warehouseId: 'warehouse-2' },
+    },
+  ]
+
+  const finding = evaluateInventoryInvariantRows(rows)
+    .find((candidate) => candidate.code === 'allocation_committed_shipment_uncovered')
+
+  assert.ok(finding)
+  assert.equal(finding.warehouseId, 'warehouse-2')
+  assert.deepEqual(finding.details, {
+    lineId: 'sales-line-1',
+    sku: 'SKU-1',
+    committedQty: 2,
+    allocatedQty: 0,
+    delta: 2,
+  })
+})
+
+test('o3d-4kfh r3: the committed-coverage census does not run on a half-collected row set', () => {
+  // Collected as a pair. Allocations without shipment lines would read as "nothing committed";
+  // shipment lines without allocations would report EVERY commitment as unbacked. Either half
+  // alone is worse than not running.
+  const allocationsOnly = cleanRows()
+  allocationsOnly.committedShipmentLines = undefined
+  const shipmentsOnly = cleanRows()
+  shipmentsOnly.orderAllocations = undefined
+  shipmentsOnly.committedShipmentLines = [
+    {
+      lineId: 'sales-line-1',
+      productId: 'product-1',
+      qty: 99,
+      product: { sku: 'SKU-1' },
+      shipment: { orderId: 'order-1', warehouseId: 'warehouse-1' },
+    },
+  ]
+
+  for (const rows of [allocationsOnly, shipmentsOnly]) {
+    assert.equal(
+      evaluateInventoryInvariantRows(rows)
+        .some((finding) => finding.code === 'allocation_committed_shipment_uncovered'),
+      false,
+    )
+  }
 })

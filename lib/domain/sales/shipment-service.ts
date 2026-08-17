@@ -11,6 +11,7 @@ import {
   lockSalesOrder,
   lockStockLevels,
   validateAllocationIntegrity,
+  validateCommittedShipmentCoverage,
 } from '@/lib/domain/sales/allocation-service'
 import {
   isStockMovementIdempotencyConflict,
@@ -162,9 +163,15 @@ async function validateActiveShipmentTotalsWithinOrder(
   // NB: this expands ordered/refunded qty through the CURRENT kit graph, matching the existing
   // build-time refund netting (confirmSalesOrderShipments) and the allocation path — the codebase has
   // no immutable per-order BOM snapshot, so a kit re-composed BETWEEN packing and dispatch can drift
-  // this cap. Fixing that uniformly (persist a per-order-line fulfillment snapshot, or lock kit edits
-  // while orders are in flight) is systemic and tracked separately; this guard is a strict improvement
-  // over shipping every refunded unit and shares the same live-graph assumption already in force.
+  // this cap. o3d-4kfh r4 closed the hole from BOTH ends instead of taking the snapshot: the
+  // component editor, the KIT-conversion paths and the CSV component pass now REFUSE while an
+  // affected order holds allocations or a non-PENDING shipment
+  // (`findComponentGraphEditBlockers`), and `validateCommittedShipmentCoverage` — the only check
+  // that expands the graph and demands a COMPLETE PROPORTIONAL component set — now runs at every
+  // shipment transition INCLUDING the dispatch below. This cap remains a per-leaf upper bound and
+  // cannot see a disproportionate set on its own: A=2/B=1 against a 2xA+2xB kit exceeds neither
+  // leaf. The durable per-line requirement snapshot is still the right long-term fix and is still
+  // NOT implemented.
   const productIds = [...new Set([
     ...orderLines.map((line) => line.productId).filter((id): id is string => !!id),
     ...refundLines.map((refundLine) => refundLine.productId).filter((id): id is string => !!id),
@@ -382,6 +389,133 @@ export async function confirmSalesOrderShipments(
   })
 }
 
+/**
+ * Order statuses from which NO shipment may move any further (o3d-4kfh r6, Codex finding 4).
+ *
+ * CANCELLED only, and deliberately so. A cancelled order is a sale that will not happen; letting a
+ * shipment on it advance — up to and including dispatch — ships goods for it and recognises the
+ * COGS, which no later act reverses. `cancelSalesOrderFulfillmentState` deletes the order's
+ * PENDING/PICKING/PACKED shipments in the same transaction as the cancel, so this only bites when a
+ * shipment reached a cancelled order by some other route; but "should not be reachable" is not a
+ * guard, and the harm if it is reached is irreversible.
+ *
+ * SHIPPED / COMPLETED / DELIVERED are NOT included. They mean the sale happened, and an order can
+ * legitimately carry one straggling PACKED shipment while its status has already moved on (the
+ * status is written by the storefront status mapping as well as by IMS). Refusing there would
+ * strand real goods with no repair path — which is precisely the r4 mistake this round is undoing,
+ * not one to repeat in the other direction.
+ */
+const SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES = new Set(['CANCELLED'])
+
+function terminalOrderTransitionError(orderStatus: string): string {
+  return `This order is ${orderStatus} — its shipments cannot be advanced or dispatched. `
+    + 'Dispatching would ship goods for a cancelled sale and recognise COGS that nothing reverses. '
+    + 'Use "Discard shipments" on the order to delete its remaining non-dispatched shipments '
+    + '(already-dispatched ones are kept — reverse those with a refund instead).'
+}
+
+export type DiscardedCancelledShipment = {
+  id: string
+  status: string
+  warehouseId: string
+  trackingNumber: string | null
+  shippingService: string | null
+  lineCount: number
+}
+
+/**
+ * THE REPAIR PATH for a cancelled order that still carries non-dispatched shipments (o3d-4kfh r6,
+ * Codex finding 4).
+ *
+ * r5 advertised dispatch as the exit for a PICKING/PACKED shipment blocking a component-graph edit,
+ * and its test explicitly relied on dispatch not requiring an open order. On a CANCELLED order that
+ * advice was to ship goods for a cancelled sale — worse than the block it resolved — and the
+ * alternative it named (cancel the order) is not a transition CANCELLED has, so there was no exit
+ * at all. This is the exit: it removes the shipments instead of fulfilling them.
+ *
+ * PROPERTIES:
+ *   - refuses unless the order really is CANCELLED (this is not a general per-shipment cancel;
+ *     o3d-tv1q remains open);
+ *   - NEVER touches a SHIPPED shipment. Those are dispatch evidence the accounting sub-ledger and
+ *     any refund reversal resolve through; the remedy for one of those is a refund;
+ *   - IDEMPOTENT. A cancelled order with nothing left to discard writes nothing at all and returns
+ *     an empty list, so a retry, a double-click or a re-run of the same repair is a no-op;
+ *   - moves NO reservation. `reservedQty` is decremented only on the transition to SHIPPED, so a
+ *     PENDING/PICKING/PACKED shipment holds none of its own; the cancel that produced this state
+ *     already released the order's allocations.
+ *   - writes its audit row through the SAME client, BEFORE the delete, carrying each shipment's
+ *     tracking number — same reasoning as `reconcilePendingShipments`: a purchased label that IMS
+ *     no longer references has to stay correlatable.
+ *
+ * The caller MUST already hold the order's row lock (`lockSalesOrder`).
+ */
+export async function discardCancelledOrderShipmentsInTx(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  audit: { userId?: string | null } = {},
+): Promise<{ discarded: DiscardedCancelledShipment[] }> {
+  const order = await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { status: true, orderNumber: true, externalOrderNumber: true },
+  })
+  if (!order) throw new Error('Order not found')
+  if (!SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES.has(String(order.status))) {
+    throw new Error(
+      `Only a cancelled order's shipments can be discarded; this order is ${order.status}. `
+      + 'Cancel the order instead — that deletes its pending, picking and packed shipments in one '
+      + 'transaction with the reservation release.',
+    )
+  }
+
+  const doomed = await tx.shipment.findMany({
+    where: { orderId, status: { in: ['PENDING', 'PICKING', 'PACKED'] } },
+    select: {
+      id: true,
+      status: true,
+      warehouseId: true,
+      trackingNumber: true,
+      shippingService: true,
+      lines: { select: { id: true } },
+    },
+  })
+  if (doomed.length === 0) return { discarded: [] }
+
+  const discarded: DiscardedCancelledShipment[] = doomed.map((shipment) => ({
+    id: shipment.id,
+    status: String(shipment.status),
+    warehouseId: shipment.warehouseId,
+    trackingNumber: shipment.trackingNumber ?? null,
+    shippingService: shipment.shippingService ?? null,
+    lineCount: shipment.lines.length,
+  }))
+  const orderRef = order.orderNumber ?? order.externalOrderNumber ?? orderId.slice(0, 8)
+  const carryingLabels = discarded.filter((row) => row.trackingNumber).length
+
+  await tx.activityLog.create({
+    data: {
+      userId: audit.userId ?? null,
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'cancelled_order_shipments_discarded',
+      tag: 'sales',
+      level: 'WARNING',
+      description: `Discarded ${discarded.length} non-dispatched shipment(s) left on cancelled order ${orderRef}`
+        + (carryingLabels > 0
+          ? ` — ${carryingLabels} carried a tracking number that IMS no longer references, cancel the label(s) with the carrier if unused`
+          : ''),
+      metadata: {
+        discardedShipmentCount: discarded.length,
+        discardedShipments: discarded,
+        discardedTrackingNumbers: discarded
+          .map((row) => row.trackingNumber)
+          .filter((value): value is string => !!value),
+      },
+    },
+  })
+  await tx.shipment.deleteMany({ where: { id: { in: discarded.map((row) => row.id) } } })
+  return { discarded }
+}
+
 export async function transitionShipmentStatus(
   client: ShipmentServiceClient,
   input: {
@@ -437,12 +571,22 @@ export async function transitionShipmentStatus(
       // mutually exclusive. It covers the manual shipment paths too.
       const withdrawn = await tx.salesOrder.findUnique({
         where: { id: shipment.orderId },
-        select: { withdrawalApprovedAt: true },
+        select: { withdrawalApprovedAt: true, status: true },
       })
       if (withdrawn?.withdrawalApprovedAt) {
         throw new Error(
           'This order\u2019s EU withdrawal request was approved; its shipments cannot be dispatched.',
         )
+      }
+      // o3d-4kfh r6 (Codex finding 4): NOT ON A CANCELLED ORDER. Read under the same order lock the
+      // cancel takes, so a cancel committing between the caller's read and this dispatch is honoured.
+      // Returned rather than thrown so a WMS-driven dispatch gets a clean, actionable failure that
+      // names the repair path instead of an exception.
+      if (withdrawn && SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES.has(String(withdrawn.status))) {
+        return {
+          success: false as const,
+          error: terminalOrderTransitionError(String(withdrawn.status)),
+        }
       }
 
       const lockedShipment = await loadShipmentTransitionContext(tx, shipmentId)
@@ -474,6 +618,34 @@ export async function transitionShipmentStatus(
         return {
           success: false as const,
           error: shipmentTotalError,
+        }
+      }
+
+      // o3d-4kfh r4: THE GRAPH-AWARE COMMITTED-COVERAGE CHECK RUNS AT DISPATCH TOO.
+      //
+      // In r3 this check ran ONLY at the PENDING -> PICKING seam, which is not reachable from the
+      // mutation that creates the corruption. A KIT requiring 2xA + 1xB, allocated and PICKING with
+      // A=2/B=1, re-composed to 2xA + 2xB by the component editor, crosses no PENDING seam ever
+      // again: PICKING -> PACKED skipped the check entirely, and the per-leaf cap in
+      // `validateActiveShipmentTotalsWithinOrder` above accepts A=2/B=1 because neither leaf
+      // EXCEEDS its (now larger) demand. An incomplete kit shipped, and because
+      // `calculateDecimalCoverageByLine` credits whole kits, the census reported nothing.
+      //
+      // `findUncoveredCommittedShipment` is the only check that expands the fulfilment graph and
+      // asks whether the committed components are a COMPLETE, PROPORTIONAL set. Running it here,
+      // under the order lock and immediately before the irreversible act, is what makes the
+      // proportional half reachable from every route into dispatch — including a WMS-driven one.
+      // Scoped to this shipment's own sales lines so an unrelated pre-existing problem elsewhere on
+      // the order cannot wedge a correct dispatch.
+      const dispatchCoverageError = await validateCommittedShipmentCoverage(
+        tx,
+        lockedShipment.orderId,
+        [...new Set(lockedShipment.lines.map((line) => line.lineId))],
+      )
+      if (dispatchCoverageError) {
+        return {
+          success: false as const,
+          error: dispatchCoverageError,
         }
       }
 
@@ -614,16 +786,62 @@ export async function transitionShipmentStatus(
   }
 
   const transitioned = await runInTransaction(client, async (tx) => {
+    // o3d-4kfh r3: THE ORDER LOCK, taken before the shipment row lock so this path acquires locks
+    // in the SAME order as the dispatch branch above.
+    //
+    // PENDING -> PICKING is a COMMITMENT: from that moment the shipment counts against
+    // `OrderAllocation.qty` in every consumer (the residual, confirmSalesOrderShipments, the
+    // accounting sub-ledger) and can no longer be rewritten or deleted by any path IMS has. It used
+    // to lock nothing but the shipment row, so it could commit concurrently with the deallocation,
+    // re-allocation or manual edit that removed the very rows meant to back it — and, because a
+    // PENDING shipment is deliberately NOT a commitment, those paths were all entitled to ignore it
+    // while it was still pending.
+    await lockSalesOrder(tx, shipment.orderId)
+    // o3d-4kfh r6 (Codex finding 4): a cancelled order's shipments do not advance either. Blocking
+    // only the dispatch would leave PENDING -> PICKING -> PACKED free to run on a cancelled sale,
+    // which is how a PICKING shipment ends up on a CANCELLED order in the first place — the state
+    // the component-graph guard then blocks on with no non-harmful exit.
+    const lockedOrder = await tx.salesOrder.findUnique({
+      where: { id: shipment.orderId },
+      select: { status: true },
+    })
+    if (lockedOrder && SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES.has(String(lockedOrder.status))) {
+      throw new Error(terminalOrderTransitionError(String(lockedOrder.status)))
+    }
     await tx.$queryRaw`SELECT id FROM shipments WHERE id = ${shipmentId} FOR UPDATE`
     const locked = await tx.shipment.findUnique({
       where: { id: shipmentId },
-      select: { status: true },
+      select: { status: true, orderId: true },
     })
     if (!locked) throw new Error('Shipment not found')
     if (locked.status === targetStatus) return false
     const lockedTransition = validateShipmentStatusTransition(locked.status, targetStatus)
     if (!lockedTransition.success) throw new Error(lockedTransition.error)
     await tx.shipment.update({ where: { id: shipmentId }, data })
+
+    // Verified AFTER the update on purpose: the check reads the non-PENDING set from the
+    // database, so updating first is what makes THIS shipment part of the commitment being
+    // validated. Scoped to the shipment's own sales lines so an unrelated pre-existing problem
+    // elsewhere on the order cannot block the warehouse from starting a pick.
+    //
+    // o3d-4kfh r4: EVERY transition, not just the PENDING -> PICKING one. Gating on
+    // `locked.status === PENDING` meant a shipment that was ALREADY committed could never be
+    // re-checked, so a KIT re-composed by the component editor while a shipment sat in PICKING
+    // sailed through PICKING -> PACKED and on to dispatch without the proportionality half ever
+    // running. The check is idempotent and reads only committed rows, so re-running it on a
+    // healthy order is free.
+    const lockedLines = await tx.shipmentLine.findMany({
+      where: { shipmentId },
+      select: { lineId: true },
+    })
+    const coverageError = await validateCommittedShipmentCoverage(
+      tx,
+      locked.orderId,
+      [...new Set(lockedLines.map((line) => line.lineId))],
+    )
+    // THROWN, not returned: a `return { success: false }` out of a transaction callback commits
+    // whatever it has already written, and this one has already flipped the status.
+    if (coverageError) throw new Error(coverageError)
     return true
   })
 
