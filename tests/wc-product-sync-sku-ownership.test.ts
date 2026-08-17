@@ -42,7 +42,12 @@ const state = {
   salesOrderLines: [] as Array<{ productId: string }>,
   purchaseOrderLines: [] as Array<{ productId: string }>,
   productionOrders: [] as Array<{ outputProductId: string }>,
-  stockTransferLines: [] as Array<{ productId: string }>,
+  /**
+   * Transfer lines WITH their transfer's status (o3d-y89x r6, Codex finding 2). Production filters
+   * both transfer queries on `transfer.status IN (DRAFT, IN_TRANSIT)`; a double without statuses
+   * cannot tell that filter from its absence.
+   */
+  stockTransferLines: [] as Array<{ productId: string; status: string }>,
   /**
    * o3d-4kfh r7 (Codex finding 2): `ProductComponent` rows, so the connector's graph-version bump
    * can walk the KIT ancestors the way it does in production. Without them the bump would appear to
@@ -114,10 +119,13 @@ function findProductBySku(sku: unknown) {
 }
 
 /**
- * The `_count.variants` relation count the connector's structural rules are decided from
- * (o3d-y89x r5), computed from the same `state.products` array everything else reads — and
- * attached ONLY when the query asked for it, because `imsRowHasChildren` throws on a row that
- * carries no count rather than reading "no children" out of its absence.
+ * The r5 `_count.variants` shape, still answered (o3d-y89x r6). Production now asks the child
+ * question as its own id-scoped `groupBy` (see `childParents` below) because `_count` was measured
+ * to render as a whole-catalogue aggregate; this stays so that a revert to r5 still runs here and
+ * fails on the assertion it should, not on an unmodelled shape.
+ *
+ * Attached ONLY when the query asked for it, because `imsRowHasChildren` throws on a row that
+ * carries no answer rather than reading "no children" out of its absence.
  */
 function withChildCount(row: Row, include?: Row): Row {
   if (!include || !('_count' in include)) return { ...row }
@@ -175,6 +183,28 @@ const productDelegate = {
   findUnique: async ({ where }: { where: { id: string } }) => {
     const row = state.products.find((candidate) => candidate.id === where.id)
     return row ? { ...row } : null
+  },
+  /**
+   * The child-existence statement (o3d-y89x r6):
+   * `SELECT parentId FROM products WHERE parentId IN (candidates) GROUP BY parentId`.
+   *
+   * Grouped, and scoped to the ids the caller names. It refuses anything else — an unscoped child
+   * question is exactly the r5 regression (a `_count` include renders as an uncorrelated
+   * catalogue-wide aggregate), so the double must not be able to answer one.
+   */
+  groupBy: async ({ by, where }: { by?: unknown; where?: Row } = {}) => {
+    const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
+    const grouping = Array.isArray(by) ? by.map(String) : []
+    if (!Array.isArray(parentIn) || grouping.length !== 1 || grouping[0] !== 'parentId'
+      || Object.keys(where ?? {}).length !== 1) {
+      throw new Error(`product.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
+    }
+    const candidates = parentIn.map(String)
+    return [...new Set(
+      state.products
+        .filter((row) => row.parentId != null && candidates.includes(String(row.parentId)))
+        .map((row) => String(row.parentId)),
+    )].map((parentId) => ({ parentId }))
   },
   // TWO shapes, and they are different questions. `{ id: '...' }` (+ an OR over externalProductId)
   // is the conditional ownership update. `{ id: { in: [...] } }` with an `{ increment }` op is
@@ -241,6 +271,28 @@ function blockerProductId(where: Row | undefined, delegate: string): string {
   return productId
 }
 
+/**
+ * The statuses `lib/products/type-transforms.ts` calls OPEN. Duplicated here on purpose: the
+ * transfer doubles demand this EXACT set, so if production widens or narrows it they fail loudly
+ * instead of silently agreeing with whatever production now asks (o3d-y89x r6, Codex finding 2).
+ */
+const OPEN_TRANSFER_STATUSES = ['DRAFT', 'IN_TRANSIT'] as const
+
+function requireOpenTransferFilter(where: Row | undefined, delegate: string): void {
+  const statuses = (where?.transfer as { status?: { in?: unknown[] } } | undefined)?.status?.in
+  const asked = Array.isArray(statuses) ? [...statuses].map(String).sort().join(',') : null
+  if (asked !== [...OPEN_TRANSFER_STATUSES].sort().join(',')) {
+    throw new Error(
+      `${delegate} double got an unmodelled transfer filter — it models `
+      + `transfer.status.in = [${OPEN_TRANSFER_STATUSES.join(', ')}] and got: ${JSON.stringify(where)}`,
+    )
+  }
+}
+
+function isOpenTransferLine(row: { status: string }): boolean {
+  return (OPEN_TRANSFER_STATUSES as readonly string[]).includes(row.status)
+}
+
 const txClient = {
   product: productDelegate,
   // o3d-4kfh r7: the ancestor walk `bumpFulfillmentGraphVersions` shares with the component-graph
@@ -290,19 +342,30 @@ const txClient = {
     },
   },
   stockTransferLine: {
-    count: async ({ where }: { where?: Row } = {}) =>
-      state.stockTransferLines.filter((row) => row.productId === blockerProductId(where, 'stockTransferLine.count')).length,
+    // Both arms honour `where.transfer.status` as well as the product predicate (o3d-y89x r6,
+    // Codex finding 2): a line on a RECEIVED or CANCELLED transfer is not a blocker, and a double
+    // that returned it would agree with a production query that had lost its filter.
+    count: async ({ where }: { where?: Row } = {}) => {
+      const productId = blockerProductId(where, 'stockTransferLine.count')
+      requireOpenTransferFilter(where, 'stockTransferLine.count')
+      return state.stockTransferLines
+        .filter((row) => row.productId === productId && isOpenTransferLine(row)).length
+    },
     // The transfer arm of the SET-WISE pre-commit re-assertion (o3d-y89x r5). It is its own
     // statement because `StockTransferLine` carries no FK to Product, so it cannot ride in the
     // product filter with the other four arms.
-    groupBy: async ({ by, where }: { by: string[]; where?: Row } = { by: [] }) => {
+    groupBy: async ({ by, where }: { by?: unknown; where?: Row } = {}) => {
       const ids = (where?.productId as { in?: unknown[] } | undefined)?.in
-      if (!Array.isArray(ids) || by[0] !== 'productId') {
+      const grouping = Array.isArray(by) ? by.map(String) : []
+      if (!Array.isArray(ids) || grouping.length !== 1 || grouping[0] !== 'productId') {
         throw new Error(`stockTransferLine.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
       }
+      requireOpenTransferFilter(where, 'stockTransferLine.groupBy')
       const candidates = ids.map(String)
       return [...new Set(
-        state.stockTransferLines.filter((row) => candidates.includes(row.productId)).map((row) => row.productId),
+        state.stockTransferLines
+          .filter((row) => candidates.includes(row.productId) && isOpenTransferLine(row))
+          .map((row) => row.productId),
       )].map((productId) => ({ productId }))
     },
   },

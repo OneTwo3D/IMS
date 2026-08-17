@@ -99,7 +99,39 @@ let nextId = 1
 const productDelegate = {
   findFirst: async ({ where }: { where: { sku?: unknown } }) =>
     state.products.find((row) => row.sku === where?.sku) ?? null,
-  findMany: async () => state.products.map((row) => ({ ...row })),
+  /**
+   * DOUBLE AUDIT (o3d-y89x r6): this used to return the WHOLE table for every call, ignoring
+   * `where` entirely. The only caller here is `applyVariations`' candidate lookup
+   * (`where: { sku: { in: [...] } }`), and answering it with every product meant a variation
+   * could be matched to a row whose SKU it does not share — the fence tests would still have
+   * passed. It honours the predicate now, and refuses a shape it does not model.
+   */
+  findMany: async ({ where }: { where?: Row } = {}) => {
+    const skuIn = (where?.sku as { in?: unknown[] } | undefined)?.in
+    if (Array.isArray(skuIn)) {
+      return state.products.filter((row) => skuIn.includes(row.sku)).map((row) => ({ ...row }))
+    }
+    if (where === undefined) return state.products.map((row) => ({ ...row }))
+    throw new Error(`product.findMany double got an unmodelled where: ${JSON.stringify(where)}`)
+  },
+  /**
+   * The child-existence statement (o3d-y89x r6): `WHERE parentId IN (...) GROUP BY parentId`,
+   * grouped and scoped to the ids named. Refuses anything else, so an unscoped child question
+   * cannot be answered here either.
+   */
+  groupBy: async ({ by, where }: { by?: unknown; where?: Row } = {}) => {
+    const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
+    const grouping = Array.isArray(by) ? by.map(String) : []
+    if (!Array.isArray(parentIn) || grouping.length !== 1 || grouping[0] !== 'parentId') {
+      throw new Error(`product.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
+    }
+    const candidates = parentIn.map(String)
+    return [...new Set(
+      state.products
+        .filter((row) => row.parentId != null && candidates.includes(String(row.parentId)))
+        .map((row) => String(row.parentId)),
+    )].map((parentId) => ({ parentId }))
+  },
   create: async ({ data }: { data: Row }) => {
     const row = { id: `ims-${nextId++}`, ...data }
     state.products.push(row)
@@ -111,9 +143,37 @@ const productDelegate = {
     Object.assign(row, data)
     return row
   },
-  updateMany: async ({ data }: { data: Row }) => {
-    state.products.forEach((row) => Object.assign(row, data))
-    return { count: state.products.length }
+  /**
+   * DOUBLE AUDIT (o3d-y89x r6): this used to write `data` onto EVERY product and report a count
+   * of the whole table, ignoring `where` completely. Production reaches it two ways — the
+   * ownership-guarded row update (`{ id }` plus an OR over externalProductId, where a count of 0
+   * is how it learns the row moved) and the graph-version bump (`{ id: { in: [...] } }` with an
+   * `{ increment }` op) — and a double that answers both with "yes, all of them" cannot tell a
+   * fenced import from an unfenced one. It honours the predicate now.
+   */
+  updateMany: async ({ where, data }: { where: Row; data: Row }) => {
+    const idIn = (where?.id as { in?: string[] } | undefined)?.in
+    const targets = Array.isArray(idIn)
+      ? state.products.filter((row) => idIn.includes(row.id as string))
+      : state.products.filter((row) => row.id === where?.id)
+    const or = where?.OR as Array<Row> | undefined
+    const matched = or
+      ? targets.filter((row) => or.some((clause) => {
+        if ('externalProductId' in clause && clause.externalProductId === null) {
+          return row.externalProductId == null
+        }
+        const inClause = (clause.externalProductId as { in?: bigint[] } | undefined)?.in
+        return Array.isArray(inClause) && row.externalProductId != null
+          && inClause.some((id) => id === row.externalProductId)
+      }))
+      : targets
+    for (const row of matched) {
+      for (const [field, value] of Object.entries(data)) {
+        const increment = (value as { increment?: number } | null)?.increment
+        row[field] = typeof increment === 'number' ? Number(row[field] ?? 0) + increment : value
+      }
+    }
+    return { count: matched.length }
   },
   upsert: async ({ where, create, update }: { where: { sku?: unknown }; create: Row; update: Row }) => {
     const row = state.products.find((candidate) => candidate.sku === where?.sku)

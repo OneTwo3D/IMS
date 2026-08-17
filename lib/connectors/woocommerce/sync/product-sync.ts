@@ -210,9 +210,9 @@ async function assertTransformedRowsStillTransformable(
 }
 
 /**
- * IS THIS ROW PHYSICALLY A PARENT — i.e. do other rows carry its id in `parentId`? — ASKED AS
- * PART OF READING THE ROW, NOT AS A QUERY OF ITS OWN (o3d-y89x r4/r5, Codex finding 1 / r5
- * finding 2).
+ * IS THIS ROW PHYSICALLY A PARENT — i.e. do other rows carry its id in `parentId`? — ASKED
+ * UNCONDITIONALLY, AS ONE INDEX-SCOPED STATEMENT PER BATCH OF ROWS (o3d-y89x r4/r5/r6, Codex
+ * finding 1 in r4, r5 and r6).
  *
  * It cannot be answered from the row's own columns — a row's children are different rows, with
  * different SKUs — and it must not be inferred from `type`, because the shapes it exists to
@@ -222,24 +222,53 @@ async function assertTransformedRowsStillTransformable(
  * So the question is unconditional: r4's *conditional* child query is what missed the legacy
  * row in the steady-state re-sync of a WooCommerce `simple` product.
  *
- * WHY IT IS A RELATION COUNT ON THE EXISTING LOOKUP RATHER THAN A SECOND QUERY. r4 asked it as
- * `SELECT parentId FROM products WHERE parentId IN (...)`, one statement per row it was asked
- * about. The bulk reconcile runs one transaction per catalogue product, sequentially, so that
- * is one extra round trip per existing product on every full reconcile — 5,000 products, 5,000
- * round trips — and in `applyVariations` it dragged back one row per child (a 200-variant parent
- * transferring 200 rows to compute a boolean). Prisma renders `_count` on a relation as a
- * correlated aggregate inside the SAME statement that reads the row, so the count now arrives
- * with the lookup both paths already make: zero extra statements, and one integer per row
- * instead of one row per child. `Product.parentId` is indexed (`@@index([parentId])`), which is
- * what the subquery uses.
+ * WHAT THE QUERY ACTUALLY IS, AND WHAT IT COSTS. r5 folded the question into the row lookup as
+ * Prisma's relation `_count`, on the belief that Prisma renders it as a correlated aggregate
+ * inside the same statement. IT DOES NOT. Probed against this repo's own checked-in client
+ * (Prisma 7.x, `@prisma/adapter-pg`), `include: { _count: { select: { variants: true } } }`
+ * renders as
+ *
+ *     SELECT products.*, COALESCE(aggr._aggr_count_variants, 0)
+ *       FROM products
+ *       LEFT JOIN (SELECT "parentId", COUNT(*) AS _aggr_count_variants
+ *                    FROM products WHERE 1=1 GROUP BY "parentId") aggr
+ *              ON products.id = aggr."parentId"
+ *      WHERE products.sku = $1
+ *
+ * The aggregate subquery is UNCORRELATED — the SKU predicate stays on the outer query, and
+ * Postgres cannot push a join qual into a grouped subquery — so every lookup aggregates the
+ * ENTIRE products table. `EXPLAIN (ANALYZE, BUFFERS)` on the dev catalogue (2,283 rows) gives
+ * `Seq Scan on products` + `HashAggregate` over all 2,283 rows, 119 shared buffers, 0.905 ms.
+ * One statement, catalogue-sized — and the reconcile runs one transaction per catalogue
+ * product, so that is O(N) whole-table scans over an O(N) table. It was strictly worse than
+ * the round trip it removed.
+ *
+ * So the question is its own statement again, but ONE statement per batch of rows, scoped to
+ * exactly the ids that batch has in hand:
+ *
+ *     SELECT "parentId" FROM products WHERE "parentId" IN ($1, ...) GROUP BY "parentId"
+ *
+ * On the same data: `Bitmap Index Scan on products_parentId_idx` -> `Group`, 7 shared buffers,
+ * 0.078 ms. `Product.parentId` is indexed (`@@index([parentId])`) and that index is what it
+ * uses, so its cost is bounded by the CHILDREN OF THE ROWS ASKED ABOUT and by nothing else —
+ * it does not grow with the catalogue. GROUPED, not selected raw: r4 returned one row per
+ * child (a 200-variant parent transferring 200 rows to compute a boolean), this returns at
+ * most one row per candidate. And ONE statement per batch, not per row: `applyVariations` asks
+ * about all its candidate rows together, so a 200-variation import pays one, not 200.
+ *
+ * What it does not do is ride along free. The parent branch pays one extra round trip per
+ * existing product on a full reconcile. That is the honest price of the correctness, and on
+ * the measurement above it is about 1/17th of the buffers and 1/12th of the time of the
+ * version that appeared free — before counting that the free version's cost grows with the
+ * catalogue and this one's does not.
  *
  * Shared rather than duplicated because the two rules disagreeing is the failure mode: r3 asked
  * the physical question in `refuseVariationAdoption` (a variation may not swallow a parent) and
  * the TYPE question in the parent branch's shape rule, so the identical legacy row was refused
- * by one door and flattened by the other. Both doors now read this one accessor, off a row read
- * with this one include — a row read without it THROWS rather than quietly answering "no
- * children", because "nobody asked" and "genuinely childless" are the exact pair Codex r4
- * finding 1 was about.
+ * by one door and flattened by the other. Both doors now read this one accessor, off a row
+ * carried through `withConnectorChildFlags` — a row that never went through it THROWS rather
+ * than quietly answering "no children", because "nobody asked" and "genuinely childless" are
+ * the exact pair Codex r4 finding 1 was about.
  *
  * IT IS STILL A SELECT, AND IT IS STILL NOT ATOMIC WITH THE WRITES THAT FOLLOW. Codex r4
  * suggested pinning it into the UPDATE as `variants: { none: {} }`; that is not done, and the
@@ -252,17 +281,31 @@ async function assertTransformedRowsStillTransformable(
  * sees the child and quarantines it. Nothing structural is written on that path, because the
  * paths that DO write structure are the ones this answer refuses.
  */
-const CONNECTOR_ROW_CHILD_COUNT = { _count: { select: { variants: true } } } as const
+type ConnectorRowChildFlag = { hasChildren: boolean }
 
-function imsRowHasChildren(row: { id: string; _count?: { variants?: number } }): boolean {
-  const children = row._count?.variants
-  if (typeof children !== 'number') {
+async function withConnectorChildFlags<T extends { id: string }>(
+  tx: Prisma.TransactionClient,
+  rows: readonly T[],
+): Promise<Array<T & ConnectorRowChildFlag>> {
+  if (rows.length === 0) return []
+  const parentRows = await tx.product.groupBy({
+    by: ['parentId'],
+    where: { parentId: { in: rows.map((row) => row.id) } },
+  })
+  const parents = new Set(
+    parentRows.map((row) => row.parentId).filter((id): id is string => typeof id === 'string'),
+  )
+  return rows.map((row) => ({ ...row, hasChildren: parents.has(row.id) }))
+}
+
+function imsRowHasChildren(row: { id: string; hasChildren?: boolean }): boolean {
+  if (typeof row.hasChildren !== 'boolean') {
     throw new Error(
-      `IMS product ${row.id} was read without its child count, so the connector's structural `
-      + 'rules cannot be decided for it. Read it with `include: CONNECTOR_ROW_CHILD_COUNT`.',
+      `IMS product ${row.id} was read without its child flag, so the connector's structural `
+      + 'rules cannot be decided for it. Carry it through `withConnectorChildFlags`.',
     )
   }
-  return children > 0
+  return row.hasChildren
 }
 
 /**
@@ -837,10 +880,13 @@ export async function syncWcProductToIms(
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_WRITE_LOCK_NAMESPACE}::int4, ${lockId}::int4)`
         }
 
-        // `_count.variants` rides in this lookup rather than following it: see
-        // CONNECTOR_ROW_CHILD_COUNT for why the question is unconditional and why asking it
-        // separately cost a round trip per catalogue product on every reconcile.
-        const existing = await tx.product.findFirst({ where: { sku }, include: CONNECTOR_ROW_CHILD_COUNT })
+        // The child question follows this lookup as its own index-scoped statement: see
+        // `withConnectorChildFlags` for why it is unconditional, and for the measurement that
+        // says folding it into this lookup as `_count` cost a whole-catalogue aggregate.
+        const existingRow = await tx.product.findFirst({ where: { sku } })
+        const existing = existingRow
+          ? (await withConnectorChildFlags(tx, [existingRow]))[0]
+          : null
         // Never reassign a row another WooCommerce object already maps (o3d-fsi): the
         // update branch below overwrites type/parentId/externalProductId. Checked here so a
         // conflict fails BEFORE any write, and re-checked atomically inside the update itself.
@@ -1490,14 +1536,15 @@ async function applyVariations(
   // One lookup for all variant SKUs rather than one per variant. This runs inside a
   // transaction holding row locks, so every saved round trip shortens the lock hold.
   //
-  // Which of those candidate rows are themselves parents (o3d-h2cz) comes back WITH them, through
-  // the same accessor the parent branch's shape rule uses (o3d-y89x r4/r5). It used to be a
-  // second query returning one row per child — hundreds of rows for a high-variation catalogue,
-  // read only to compute a boolean per candidate.
-  const existingRows = await tx.product.findMany({
-    where: { sku: { in: entries.map((entry) => entry.sku) } },
-    include: CONNECTOR_ROW_CHILD_COUNT,
-  })
+  // Which of those candidate rows are themselves parents (o3d-h2cz) is asked through the same
+  // accessor the parent branch's shape rule uses (o3d-y89x r4/r5/r6), and asked ONCE for the whole
+  // candidate set: `WHERE parentId IN (candidates) GROUP BY parentId` returns at most one row per
+  // candidate, off the `parentId` index. r4 asked it per row and returned one row per child —
+  // hundreds of rows for a high-variation catalogue, read only to compute a boolean per candidate.
+  const existingRows = await withConnectorChildFlags(
+    tx,
+    await tx.product.findMany({ where: { sku: { in: entries.map((entry) => entry.sku) } } }),
+  )
   const existingBySku = new Map(existingRows.map((row) => [row.sku, row]))
 
   // Every WC variation id this payload maps to each SKU (o3d-fsi). WC permits one SKU on
@@ -1700,10 +1747,10 @@ async function applyVariations(
       // WC can repeat a SKU across variations of one parent; keep the map authoritative
       // so the duplicate updates the row we just created instead of colliding on it.
       //
-      // The child count is stated, not queried: a row this transaction inserted a statement ago
+      // The child flag is stated, not queried: a row this transaction inserted a statement ago
       // has no children, and nothing may re-derive it from the type. Stating it is also what
       // keeps `imsRowHasChildren` free to throw on a row that was never asked (r5).
-      existingBySku.set(sku, { ...created, _count: { variants: 0 } })
+      existingBySku.set(sku, { ...created, hasChildren: false })
     }
   }
 

@@ -156,9 +156,19 @@ export function summarizeTransformBlockers(blockers: ProductTransformBlockers): 
  * audit"), so there is no relation to filter through and no way to state it as a predicate on
  * this row at all — a correlated raw `NOT EXISTS` could express it, but only by giving up
  * Prisma's typed `updateMany` for a hand-built dynamic `UPDATE`. That arm is therefore answered
- * by `getProductTransformBlockers` alone: one statement earlier than the other four at the
- * write, and equal to them at any pre-commit re-assertion. Callers must say so rather than
- * claim the whole question is closed.
+ * by a statement of its own, and answered ONE STATEMENT EARLIER than the other four AT BOTH
+ * BOUNDARIES — never as part of the same snapshot:
+ *
+ *   - at the WRITE, `getProductTransformBlockers` reads it before the UPDATE that carries this
+ *     predicate;
+ *   - at a PRE-COMMIT RE-ASSERTION, `findProductsWithTransformBlockers` reads it first and the
+ *     product predicate second, deliberately (the four arms the writes carried get the narrower
+ *     of the two windows).
+ *
+ * So the transfer arm always has the WIDER window of the two, and a transfer line committing
+ * between the two statements is seen by neither the transfer read nor the product predicate.
+ * That is on top of the write-skew residual above, not instead of it. Callers must say so
+ * rather than claim the whole question is closed.
  */
 export const PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE: Prisma.ProductWhereInput = {
   stockLevels: { none: { OR: [{ quantity: { gt: 0 } }, { reservedQty: { gt: 0 } }] } },

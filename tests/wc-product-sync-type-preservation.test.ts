@@ -41,7 +41,16 @@ const state = {
   salesOrderLines: [] as Array<{ productId: string }>,
   purchaseOrderLines: [] as Array<{ productId: string }>,
   productionOrders: [] as Array<{ outputProductId: string }>,
-  stockTransferLines: [] as Array<{ productId: string }>,
+  /**
+   * Transfer lines WITH their transfer's status (o3d-y89x r6, Codex finding 2).
+   *
+   * Modelled with a status because production filters on one — both transfer queries carry
+   * `transfer: { status: { in: OPEN_TRANSFER_STATUSES } }` — and a double that ignored it would
+   * leave the suite green if production dropped the filter. That is not a cosmetic gap: a
+   * RECEIVED transfer from last year would then block a transform forever, and the "blocked"
+   * tests would still pass because their lines happen to be open.
+   */
+  stockTransferLines: [] as Array<{ productId: string; status: string }>,
   /**
    * Every productId the connector asked the blocker question about, in order.
    *
@@ -69,12 +78,26 @@ const state = {
    * One label per statement issued against the `product` delegate, in order (o3d-y89x r5, Codex
    * finding 2).
    *
-   * "The child question costs no query" is a claim about how many statements a sync issues, and
-   * a behavioural test cannot see it: the connector reaches the same decision whether the count
-   * rides on the row lookup or follows it in a second round trip. This list is where the
-   * difference shows up — `findMany:children` appearing at all is the regression.
+   * "The child question is asked once per batch, index-scoped" is a claim about how many
+   * statements a sync issues and what they are scoped to, and a behavioural test cannot see it:
+   * the connector reaches the same decision whether the answer rides on the row lookup, follows
+   * it once for the whole batch, or follows it once per row. This list is where the difference
+   * shows up.
    */
   productReads: [] as string[],
+  /**
+   * The candidate id set of every child-existence statement, one entry per statement (o3d-y89x
+   * r6, Codex finding 1).
+   *
+   * The r5 regression was NOT a statement count — it was one statement whose plan aggregated the
+   * whole catalogue, because `_count` on a relation renders as an UNCORRELATED
+   * `LEFT JOIN (SELECT parentId, COUNT(*) FROM products GROUP BY parentId)`. A statement-count
+   * assertion is blind to that by construction. What distinguishes the two is SCOPE: the
+   * index-scoped form names the ids it is asking about, and the catalogue-wide form names none.
+   * So this records the ids, and the tests assert they are exactly the rows the transaction has
+   * in hand.
+   */
+  childQueryIds: [] as string[][],
 }
 
 /**
@@ -261,14 +284,18 @@ function updateManyMatching(where: Row, data: Row): { count: number } {
 }
 
 /**
- * The relation count `include: { _count: { select: { variants: true } } }` asks for, computed
- * from the SAME `state.products` array everything else reads (o3d-y89x r5, Codex finding 2).
+ * THE r5 SHAPE, STILL ANSWERED (o3d-y89x r6). Production no longer asks for
+ * `include: { _count: { select: { variants: true } } }` — it was measured to render as a
+ * whole-catalogue aggregate — but the double still answers it, from the SAME `state.products`
+ * array everything else reads, so that reverting production to r5 makes the cost tests below
+ * fail on the STATEMENT SHAPE they assert rather than on the double refusing to answer. A
+ * revert-failure produced by an unmodelled-shape throw would be proving something else.
  *
- * Attached ONLY when the caller asked for it. That is the whole point of modelling it: the
- * connector's structural rules are decided from this number, and `imsRowHasChildren` throws on a
- * row that carries no count rather than reading "no children" out of its absence. A double that
- * attached `_count` unconditionally would answer for a production query that never asked, which
- * is precisely the "nobody asked" / "genuinely childless" confusion the rule exists to prevent.
+ * Attached ONLY when the caller asked for it: the connector's structural rules are decided from
+ * this answer, and `imsRowHasChildren` throws on a row that carries neither form rather than
+ * reading "no children" out of its absence. A double that attached it unconditionally would
+ * answer for a production query that never asked, which is precisely the "nobody asked" /
+ * "genuinely childless" confusion the rule exists to prevent.
  */
 function withChildCount(row: Row, include?: Row): Row {
   if (!include || !('_count' in include)) return { ...row }
@@ -333,6 +360,32 @@ const productDelegate = {
     state.productReads.push('findUnique:id')
     return state.products.find((row) => row.id === where.id) ?? null
   },
+  /**
+   * THE CHILD-EXISTENCE STATEMENT (o3d-y89x r6, Codex finding 1):
+   * `SELECT parentId FROM products WHERE parentId IN (candidates) GROUP BY parentId`.
+   *
+   * Grouped here too, rather than returning one row per child, because "at most one row per
+   * candidate" is half of what makes it bounded — a double that returned raw child rows would
+   * answer both shapes identically and could not fail if production stopped grouping. It refuses
+   * any other `by`/`where`: an unscoped child question is the r5 regression, so the double must
+   * not be able to answer one.
+   */
+  groupBy: async ({ by, where }: { by?: unknown; where?: Row } = {}) => {
+    const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
+    const grouping = Array.isArray(by) ? by.map(String) : []
+    if (!Array.isArray(parentIn) || grouping.length !== 1 || grouping[0] !== 'parentId'
+      || Object.keys(where ?? {}).length !== 1) {
+      throw new Error(`product.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
+    }
+    const candidates = parentIn.map(String)
+    state.productReads.push('groupBy:children')
+    state.childQueryIds.push(candidates)
+    return [...new Set(
+      state.products
+        .filter((row) => row.parentId != null && candidates.includes(String(row.parentId)))
+        .map((row) => String(row.parentId)),
+    )].map((parentId) => ({ parentId }))
+  },
   updateMany: async ({ where, data }: { where: Row; data: Row }) => updateManyMatching(where, data),
   findMany: async ({ where, include }: { where?: Row; include?: Row } = {}) => findManyMatching(where, include),
   create: async ({ data }: { data: Row }) => {
@@ -366,6 +419,29 @@ function requireProductId(where: Row | undefined, delegate: string): string {
   recordCommitPhaseStatement([productId])
   beforeBlockerQuery?.(productId)
   return productId
+}
+
+/**
+ * The statuses `lib/products/type-transforms.ts` calls OPEN. Duplicated here on purpose: the
+ * doubles below demand this EXACT set, so if production ever widens or narrows it the doubles
+ * fail loudly instead of silently agreeing with whatever production now asks (o3d-y89x r6,
+ * Codex finding 2).
+ */
+const OPEN_TRANSFER_STATUSES = ['DRAFT', 'IN_TRANSIT'] as const
+
+function requireOpenTransferFilter(where: Row | undefined, delegate: string): void {
+  const statuses = (where?.transfer as { status?: { in?: unknown[] } } | undefined)?.status?.in
+  const asked = Array.isArray(statuses) ? [...statuses].map(String).sort().join(',') : null
+  if (asked !== [...OPEN_TRANSFER_STATUSES].sort().join(',')) {
+    throw new Error(
+      `${delegate} double got an unmodelled transfer filter — it models `
+      + `transfer.status.in = [${OPEN_TRANSFER_STATUSES.join(', ')}] and got: ${JSON.stringify(where)}`,
+    )
+  }
+}
+
+function isOpenTransferLine(row: { status: string }): boolean {
+  return (OPEN_TRANSFER_STATUSES as readonly string[]).includes(row.status)
 }
 
 const blockerDelegates = {
@@ -410,9 +486,14 @@ const blockerDelegates = {
     },
   },
   stockTransferLine: {
+    // Honours the status predicate as well as the product one (o3d-y89x r6, Codex finding 2): a
+    // line on a RECEIVED or CANCELLED transfer is not a blocker, and a double that returned it
+    // would agree with a production query that had lost its filter.
     count: async ({ where }: { where?: Row } = {}) => {
       const productId = requireProductId(where, 'stockTransferLine.count')
-      return state.stockTransferLines.filter((row) => row.productId === productId).length
+      requireOpenTransferFilter(where, 'stockTransferLine.count')
+      return state.stockTransferLines
+        .filter((row) => row.productId === productId && isOpenTransferLine(row)).length
     },
     /**
      * The transfer arm of the SET-WISE blocker question (o3d-y89x r5). `findProductsWithTransformBlockers`
@@ -423,19 +504,26 @@ const blockerDelegates = {
      * Grouped here too, rather than returning one entry per line: the double must be able to
      * fail if production ever stops grouping, and a double that returned raw rows would answer
      * both shapes identically.
+     *
+     * And it honours `where.transfer.status` (o3d-y89x r6, Codex finding 2). Modelling the ids
+     * but not the statuses left the transfer arm of the pre-commit re-assertion untested against
+     * the predicate it claims: deleting the open-status filter from production would have left
+     * this suite green while every historical RECEIVED transfer became a permanent blocker.
      */
-    groupBy: async ({ by, where }: { by: string[]; where?: Row } = { by: [] }) => {
+    groupBy: async ({ by, where }: { by?: unknown; where?: Row } = {}) => {
       const ids = (where?.productId as { in?: unknown[] } | undefined)?.in
-      if (!Array.isArray(ids) || by[0] !== 'productId') {
+      const grouping = Array.isArray(by) ? by.map(String) : []
+      if (!Array.isArray(ids) || grouping.length !== 1 || grouping[0] !== 'productId') {
         throw new Error(`stockTransferLine.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
       }
+      requireOpenTransferFilter(where, 'stockTransferLine.groupBy')
       const candidates = ids.map(String)
       for (const productId of candidates) state.blockerQueries.push(productId)
       recordCommitPhaseStatement(candidates)
       for (const productId of candidates) beforeBlockerQuery?.(productId)
       return [...new Set(
         state.stockTransferLines
-          .filter((row) => candidates.includes(row.productId))
+          .filter((row) => candidates.includes(row.productId) && isOpenTransferLine(row))
           .map((row) => row.productId),
       )].map((productId) => ({ productId }))
     },
@@ -619,6 +707,7 @@ function resetState() {
   state.commitPhaseBlockerStatements = 0
   state.commitPhaseBlockerIds.length = 0
   state.productReads.length = 0
+  state.childQueryIds.length = 0
   inCommitPhase = false
   beforeProductWrite = null
   beforeBlockerQuery = null
@@ -759,19 +848,40 @@ test('DOUBLE AUDIT: the set-wise blocker query filters by BOTH the id list and t
   )
 
   // The transfer arm is the one no product predicate can express, so it is its own statement.
-  state.stockTransferLines.push({ productId: 'p-3' })
-  state.stockTransferLines.push({ productId: 'p-3' })
+  const openTransfers = { transfer: { status: { in: ['DRAFT', 'IN_TRANSIT'] } } }
+  state.stockTransferLines.push({ productId: 'p-3', status: 'IN_TRANSIT' })
+  state.stockTransferLines.push({ productId: 'p-3', status: 'IN_TRANSIT' })
+  state.stockTransferLines.push({ productId: 'p-1', status: 'RECEIVED' })
   assert.deepEqual(
     await blockerDelegates.stockTransferLine.groupBy({
       by: ['productId'],
-      where: { productId: { in: ['p-1', 'p-3'] } },
+      where: { productId: { in: ['p-1', 'p-3'] }, ...openTransfers },
     }),
     [{ productId: 'p-3' }],
-    'grouped — one entry per blocked product, not one per line',
+    'grouped — one entry per blocked product, not one per line — and p-1\'s RECEIVED line is not a blocker',
   )
   await assert.rejects(
     () => blockerDelegates.stockTransferLine.groupBy({ by: ['productId'], where: {} }),
     /unmodelled query/,
+  )
+  // o3d-y89x r6, Codex finding 2: the double must also refuse a query that has LOST the status
+  // predicate, rather than answering it as though every transfer were open.
+  await assert.rejects(
+    () => blockerDelegates.stockTransferLine.groupBy({ by: ['productId'], where: { productId: { in: ['p-3'] } } }),
+    /unmodelled transfer filter/,
+  )
+  await assert.rejects(
+    () => blockerDelegates.stockTransferLine.groupBy({
+      by: ['productId'],
+      where: { productId: { in: ['p-3'] }, transfer: { status: { in: ['DRAFT', 'IN_TRANSIT', 'RECEIVED'] } } },
+    }),
+    /unmodelled transfer filter/,
+    'and a WIDENED status set too — the set is the predicate, not a hint',
+  )
+  await assert.rejects(
+    () => blockerDelegates.stockTransferLine.groupBy({ by: ['productId', 'transferId'], where: { productId: { in: ['p-3'] }, ...openTransfers } }),
+    /unmodelled query/,
+    'and the grouping key must be exactly [productId]',
   )
 })
 
@@ -823,7 +933,7 @@ test('DOUBLE AUDIT: the blocker doubles answer per product, not with a constant'
   state.salesOrderLines.push({ productId: 'live' })
   state.purchaseOrderLines.push({ productId: 'live' })
   state.productionOrders.push({ outputProductId: 'live' })
-  state.stockTransferLines.push({ productId: 'live' })
+  state.stockTransferLines.push({ productId: 'live', status: 'IN_TRANSIT' })
 
   const live = await blockerDelegates.stockLevel.aggregate({ where: { productId: 'live' } })
   assert.equal(live._sum.quantity, 5)
@@ -835,8 +945,16 @@ test('DOUBLE AUDIT: the blocker doubles answer per product, not with a constant'
   assert.equal(await blockerDelegates.salesOrderLine.count({ where: { productId: 'clean' } }), 0)
   assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: { productId: 'live' } }), 1)
   assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: { productId: 'clean' } }), 0)
-  assert.equal(await blockerDelegates.stockTransferLine.count({ where: { productId: 'live' } }), 1)
-  assert.equal(await blockerDelegates.stockTransferLine.count({ where: { productId: 'clean' } }), 0)
+  const openTransfers = { transfer: { status: { in: ['DRAFT', 'IN_TRANSIT'] } } }
+  assert.equal(await blockerDelegates.stockTransferLine.count({ where: { productId: 'live', ...openTransfers } }), 1)
+  assert.equal(await blockerDelegates.stockTransferLine.count({ where: { productId: 'clean', ...openTransfers } }), 0)
+  // ...and the status predicate is honoured, not just accepted (o3d-y89x r6, Codex finding 2).
+  state.stockTransferLines.push({ productId: 'closed', status: 'RECEIVED' })
+  assert.equal(
+    await blockerDelegates.stockTransferLine.count({ where: { productId: 'closed', ...openTransfers } }),
+    0,
+    'a RECEIVED transfer line is not an open one',
+  )
   assert.equal(
     await blockerDelegates.productionOrder.count({ where: { OR: [{ outputProductId: 'live' }, {}] } }),
     1,
@@ -849,6 +967,11 @@ test('DOUBLE AUDIT: the blocker doubles answer per product, not with a constant'
   // And an unrecognised `where` is a loud failure, not a silent "clean".
   await assert.rejects(() => blockerDelegates.salesOrderLine.count({ where: {} }), /unmodelled where/)
   await assert.rejects(() => blockerDelegates.productionOrder.count({ where: {} }), /unmodelled where/)
+  await assert.rejects(
+    () => blockerDelegates.stockTransferLine.count({ where: { productId: 'live' } }),
+    /unmodelled transfer filter/,
+    'a transfer query that lost its status predicate is refused, not answered',
+  )
 })
 
 test('DOUBLE AUDIT: the blocker doubles give DIFFERENT answers to two reads across a change', async () => {
@@ -1619,7 +1742,7 @@ test("each of the editor's five blockers refuses the transform, in the editor's 
     ['open sales order line', () => state.salesOrderLines.push({ productId: 'ims-live' }), /1 open sales order line/],
     ['open purchase order line', () => state.purchaseOrderLines.push({ productId: 'ims-live' }), /1 open purchase order line/],
     ['open manufacturing order', () => state.productionOrders.push({ outputProductId: 'ims-live' }), /1 open manufacturing order/],
-    ['open stock transfer line', () => state.stockTransferLines.push({ productId: 'ims-live' }), /1 open stock transfer line/],
+    ['open stock transfer line', () => state.stockTransferLines.push({ productId: 'ims-live', status: 'IN_TRANSIT' }), /1 open stock transfer line/],
   ]
 
   for (const [label, seed, expected] of cases) {
@@ -1642,6 +1765,41 @@ test("each of the editor's five blockers refuses the transform, in the editor's 
   assert.equal(clean.success, true, `a clean row still transforms, got: ${clean.error}`)
   assert.equal(findProductBySku('PARENT-SKU')?.type, 'VARIABLE')
   assert.equal(findProductBySku('VAR-1')?.type, 'VARIANT')
+})
+
+test('o3d-y89x r6: a CLOSED stock transfer is not a blocker, on either transfer statement', async () => {
+  // The control for the transfer arm (Codex r6 finding 2). Both places production asks it —
+  // `getProductTransformBlockers` on the write path and `findProductsWithTransformBlockers` in the
+  // pre-commit re-assertion — filter on `transfer.status IN (DRAFT, IN_TRANSIT)`. Every other
+  // transfer test seeds an OPEN line, so all of them would pass just as well against a query that
+  // had lost that filter, and a RECEIVED transfer from last year would then block the product
+  // forever. This is the case that can only pass if the predicate is really applied.
+  const syncWcProductToIms = await loadSync()
+
+  // 1. The write path: the row transforms with a closed transfer line against it.
+  resetState()
+  state.products.push(imsRow({ id: 'ims-live', sku: 'PARENT-SKU', name: 'Shipped last year', type: 'SIMPLE' }))
+  state.stockTransferLines.push({ productId: 'ims-live', status: 'RECEIVED' })
+  state.stockTransferLines.push({ productId: 'ims-live', status: 'CANCELLED' })
+
+  const clean = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
+
+  assert.equal(clean.success, true, `a closed transfer must not block, got: ${clean.error}`)
+  assert.equal(findProductBySku('PARENT-SKU')?.type, 'VARIABLE')
+
+  // 2. The pre-commit re-assertion: a closed transfer line arriving after the writes is not a
+  // late blocker either. Same seam as the open-line test below, opposite answer.
+  resetState()
+  state.products.push(imsRow({ id: 'ims-simple', sku: 'PARENT-SKU', name: 'Was simple', type: 'SIMPLE' }))
+  const variations = seedAdoptableVariations(3)
+  beforeConflictsRecorded = () => {
+    state.stockTransferLines.push({ productId: 'ims-adopt-2', status: 'RECEIVED' })
+  }
+
+  const lateClosed = await capturingWarnings(() => syncWcProductToIms(variableProduct({ variations })))
+
+  assert.equal(lateClosed.success, true, `a closed transfer must not roll the import back, got: ${lateClosed.error}`)
+  assert.equal(findProductBySku('ADOPT-2')?.parentId, 'ims-simple', 'the adoption stands')
 })
 
 test('a live SIMPLE row is not adopted as a WooCommerce variation either (o3d-y89x r2)', async () => {
@@ -2387,7 +2545,7 @@ test('o3d-y89x r5: the transfer arm is re-asserted set-wise too, not per row', a
   state.products.push(imsRow({ id: 'ims-simple', sku: 'PARENT-SKU', name: 'Was simple', type: 'SIMPLE' }))
   const variations = seedAdoptableVariations(20)
   beforeConflictsRecorded = () => {
-    state.stockTransferLines.push({ productId: 'ims-adopt-7' })
+    state.stockTransferLines.push({ productId: 'ims-adopt-7', status: 'IN_TRANSIT' })
   }
 
   const result = await capturingWarnings(() => syncWcProductToIms(variableProduct({ variations })))
@@ -2399,20 +2557,31 @@ test('o3d-y89x r5: the transfer arm is re-asserted set-wise too, not per row', a
 })
 
 // ---------------------------------------------------------------------------
-// o3d-y89x r5 (Codex finding 2) — the child question costs no query of its own.
+// o3d-y89x r6 (Codex finding 1) — the child question is ONE INDEX-SCOPED statement per batch.
 //
 // r4 made the child question unconditional, which was right: a row with children is a parent
 // whatever its type says, and the CONDITIONAL version is what missed the legacy
 // SIMPLE-with-children row in the steady-state re-sync of a WooCommerce `simple` product. What it
-// cost was a second round trip per row asked about — and the bulk reconcile opens one transaction
-// per catalogue product, sequentially, so a 5,000-product reconcile paid 5,000 of them. In
-// applyVariations it also dragged back one row per child, to compute a boolean.
+// cost was a second round trip PER ROW asked about, dragging back one row per child.
 //
-// The correctness is unchanged (the tests above still hold); the count is what these pin. It is
-// not observable from behaviour, so it is asserted on the statement log.
+// r5 folded it into the row lookup as Prisma's relation `_count` and asserted "zero extra
+// statements". The statement count was right and the cost was far worse: `_count` renders as an
+// UNCORRELATED `LEFT JOIN (SELECT parentId, COUNT(*) FROM products GROUP BY parentId)`, so every
+// lookup aggregated the WHOLE catalogue — measured at 119 shared buffers / 0.905 ms on 2,283 dev
+// rows, against 7 buffers / 0.078 ms for the scoped form. Counting statements is exactly what
+// could not see that.
+//
+// So these pin the two properties that actually bound the cost, and both are asserted on the
+// statement log because neither is observable from behaviour:
+//
+//   1. ONE child statement per BATCH of rows — not one per row (r4's regression);
+//   2. every child statement SCOPED to the ids the transaction has in hand — not to the
+//      catalogue (r5's regression).
+//
+// The correctness is unchanged; the tests above still hold it.
 // ---------------------------------------------------------------------------
 
-test('o3d-y89x r5: a steady-state simple re-sync reads the product ONCE, count included', async () => {
+test('o3d-y89x r6: a steady-state simple re-sync asks about children once, scoped to that row', async () => {
   const syncWcProductToIms = await loadSync()
   resetState()
   state.products.push(imsRow({ id: 'ims-legacy', sku: 'KIT-SKU', name: 'Old name', type: 'SIMPLE' }))
@@ -2422,15 +2591,21 @@ test('o3d-y89x r5: a steady-state simple re-sync reads the product ONCE, count i
   assert.equal(result.success, true, `expected a clean re-sync, got: ${result.error}`)
   assert.deepEqual(
     state.productReads,
-    ['findFirst:sku'],
-    'one statement reads the row AND answers whether it is physically a parent',
+    ['findFirst:sku', 'groupBy:children'],
+    'the row lookup, then ONE grouped child statement — not a per-row query and not a folded aggregate',
+  )
+  assert.deepEqual(
+    state.childQueryIds,
+    [['ims-legacy']],
+    'and it names the row it is asking about, so its cost cannot grow with the catalogue',
   )
 })
 
-test('o3d-y89x r5: the unconditional child question still catches the legacy parent, at no query cost', async () => {
-  // The r4 finding, re-run against the r5 shape: the answer must still come from the CHILD ROWS
-  // and not from the type column — and must still cost nothing. Without both halves this is
-  // either a correctness regression or the round trip back again.
+test('o3d-y89x r6: the unconditional child question still catches the legacy parent, still scoped', async () => {
+  // The r4 finding, re-run against the r6 shape: the answer must still come from the CHILD ROWS
+  // and not from the type column — and the statement that produces it must still be scoped to the
+  // one row asked about. Without both halves this is either a correctness regression or the
+  // catalogue-wide aggregate back again.
   const syncWcProductToIms = await loadSync()
   resetState()
   state.products.push(imsRow({ id: 'ims-legacy', sku: 'KIT-SKU', name: 'Flattened by the old connector', type: 'SIMPLE', salesPriceBase: 15 }))
@@ -2440,10 +2615,15 @@ test('o3d-y89x r5: the unconditional child question still catches the legacy par
 
   assert.equal(result.success, false, 'a row with children is a parent whatever its type says')
   assert.equal(Number(findProductBySku('KIT-SKU')?.salesPriceBase), 15, "WooCommerce's simple price is not applied")
-  assert.deepEqual(state.productReads, ['findFirst:sku'], 'and the answer still cost no query of its own')
+  assert.deepEqual(state.productReads, ['findFirst:sku', 'groupBy:children'])
+  assert.deepEqual(
+    state.childQueryIds,
+    [['ims-legacy']],
+    'the child rows are found through an id-scoped statement, not by aggregating the catalogue',
+  )
 })
 
-test('o3d-y89x r5: a 20-variation import asks about children in the lookups it already makes', async () => {
+test('o3d-y89x r6: a 20-variation import asks about children ONCE for all 20 candidates', async () => {
   const syncWcProductToIms = await loadSync()
   resetState()
   state.products.push(imsRow({ id: 'ims-simple', sku: 'PARENT-SKU', name: 'Was simple', type: 'SIMPLE' }))
@@ -2452,14 +2632,26 @@ test('o3d-y89x r5: a 20-variation import asks about children in the lookups it a
   const result = await capturingWarnings(() => syncWcProductToIms(variableProduct({ variations })))
 
   assert.equal(result.success, true, `expected 20 clean adoptions, got: ${result.error}`)
-  // Two lookups (the parent by SKU, the 20 candidate rows by SKU) plus the pre-commit
-  // re-assertion's one product statement. Nothing labelled `findMany:children` — the double can
-  // still answer that query, so its absence is production's choice and not the double's.
-  assert.deepEqual(state.productReads, ['findFirst:sku', 'findMany:sku', 'findMany:blocker-set'])
+  // Parent by SKU + its child statement, the 20 candidate rows by SKU + ONE child statement for
+  // all of them, then the pre-commit re-assertion's one product statement.
+  assert.deepEqual(
+    state.productReads,
+    ['findFirst:sku', 'groupBy:children', 'findMany:sku', 'groupBy:children', 'findMany:blocker-set'],
+  )
   assert.equal(
     state.productReads.filter((label) => label === 'findMany:children').length,
     0,
-    'the separate child query is gone in both paths, not just the parent one',
+    'never one child query per row — the double can still answer that shape, so its absence is production\'s choice',
+  )
+  // TWENTY candidates, ONE statement, and it names all twenty: that pair is what "bounded by the
+  // rows in hand" means. A per-row version would show 20 entries; the r5 aggregate, none.
+  assert.equal(state.childQueryIds.length, 2, 'one child statement per batch, not per row')
+  assert.deepEqual(state.childQueryIds[0], ['ims-simple'])
+  assert.equal(state.childQueryIds[1]?.length, 20)
+  assert.deepEqual(
+    [...(state.childQueryIds[1] ?? [])].sort(),
+    state.products.filter((row) => row.type === 'VARIANT').map((row) => String(row.id)).sort(),
+    'scoped to exactly the 20 candidate rows this transaction read, and to nothing else',
   )
 })
 

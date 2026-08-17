@@ -27,10 +27,13 @@ let nextId = 1
 let serializeOnAdvisoryLock = true
 
 /**
- * The `_count.variants` relation count the connector's structural rules read (o3d-y89x r5),
- * computed from the same `state.products` array and attached ONLY when the query asked for it —
- * `imsRowHasChildren` throws on a row that carries no count rather than reading "no children"
- * out of its absence, and a double that supplied one unasked would defeat that.
+ * The r5 `_count.variants` shape, still answered (o3d-y89x r6). Production asks the child question
+ * as its own id-scoped `groupBy` now — `_count` was measured to render as an uncorrelated
+ * catalogue-wide aggregate — but keeping this means a revert to r5 still runs against this suite.
+ *
+ * Computed from the same `state.products` array, and attached ONLY when the query asked for it:
+ * `imsRowHasChildren` throws on a row that carries no answer rather than reading "no children" out
+ * of its absence, and a double that supplied one unasked would defeat that.
  */
 function withChildCount(row: Row, include?: Row): Row {
   if (!include || !('_count' in include)) return { ...row }
@@ -96,6 +99,23 @@ const txClient = {
     },
     findUnique: async ({ where }: { where: { id: string } }) =>
       state.products.find((row) => row.id === where.id) ?? null,
+    /**
+     * The child-existence statement (o3d-y89x r6): `WHERE parentId IN (...) GROUP BY parentId`,
+     * grouped and scoped to the ids named, refusing anything else.
+     */
+    groupBy: async ({ by, where }: { by?: unknown; where?: Row } = {}) => {
+      const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
+      const grouping = Array.isArray(by) ? by.map(String) : []
+      if (!Array.isArray(parentIn) || grouping.length !== 1 || grouping[0] !== 'parentId') {
+        throw new Error(`product.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
+      }
+      const candidates = parentIn.map(String)
+      return [...new Set(
+        state.products
+          .filter((row) => row.parentId != null && candidates.includes(String(row.parentId)))
+          .map((row) => String(row.parentId)),
+      )].map((parentId) => ({ parentId }))
+    },
     // The ownership-guarded update (o3d-fsi): `id` plus an OR over externalProductId. A zero
     // count is how production learns the row was reassigned underneath it.
     updateMany: async ({ where, data }: { where: Row; data: Row }) => {
