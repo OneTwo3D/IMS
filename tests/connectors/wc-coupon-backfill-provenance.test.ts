@@ -36,6 +36,8 @@ function row(over: Partial<WcCouponBackfillRow> = {}): WcCouponBackfillRow {
     importedAt: new Date('2026-05-01T00:00:00.000Z'),
     alreadyBackfilled: false,
     liveInvoiceJobs: 0,
+    revenueDeferredBatchRef: null,
+    liveBatchDeferralJobs: 0,
     ...over,
   }
 }
@@ -95,7 +97,12 @@ test('the backfill script does not scope its query by SalesOrder.createdAt (o3d-
   const { join } = await import('node:path')
   const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
 
-  const query = src.slice(src.indexOf('const orders = await db.salesOrder.findMany('))
+  // Anchored on the candidate query itself, wherever it lives — it is now inside the keyset-paging
+  // helper (o3d-y14 r2 F3), and an anchor tied to the old single-statement shape would have silently
+  // matched nothing and asserted against an empty string.
+  const start = src.indexOf('db.salesOrder.findMany(')
+  assert.ok(start > 0, 'the candidate query must still be findable, or this test asserts about nothing')
+  const query = src.slice(start)
   const where = query.slice(query.indexOf('where: {'), query.indexOf('select: {'))
 
   assert.match(where, /shoppingLinks: \{ some: \{ connector: 'woocommerce' \} \}/)
@@ -219,4 +226,65 @@ test('BLOCKED is decided after provenance, so it never resurrects a post-fix row
   )
 
   assert.equal(decision.action, 'SKIP')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r2 finding 1 at the REPORTING layer — the other producer
+// ---------------------------------------------------------------------------
+
+test('an order whose daily revenue-deferral journal is still unposted is BLOCKED (o3d-y14 r2 F1)', () => {
+  // The proposal must not even OFFER this order. `applyWcCouponCorrection` declines it a second time
+  // under the lock, but that is the last line of defence: a row that reaches the reviewer looks like
+  // approved work, and the reviewer has no way to see that a worker is holding a GL journal derived
+  // from the amount they are being asked to change.
+  const decision = decideWcCouponBackfill(
+    row({ revenueDeferredBatchRef: 'A1-2026-07-01-aaaabbbb', liveBatchDeferralJobs: 1 }),
+    { importedBefore: CUTOFF },
+  )
+
+  assert.equal(decision.action, 'BLOCKED')
+  assert.equal(decision.action === 'BLOCKED' && decision.reason, 'LIVE_BATCH_QUEUED')
+  assert.match(
+    decision.action === 'BLOCKED' ? decision.detail : '',
+    /A1-2026-07-01-aaaabbbb/,
+    'and names the batch, so the operator knows what to wait for',
+  )
+})
+
+test('a POSTED deferral batch is a CANDIDATE, not a block (o3d-y14 r2 F1)', () => {
+  // The control, and the case that actually matters at volume: nearly every legacy order already has
+  // a SYNCED Group A1 journal. A block keyed on "has a batch reference" rather than on "has an
+  // unposted journal" would decline the entire population and the backfill would correct nothing.
+  const decision = decideWcCouponBackfill(
+    row({ revenueDeferredBatchRef: 'A1-2026-07-01-aaaabbbb', liveBatchDeferralJobs: 0 }),
+    { importedBefore: CUTOFF },
+  )
+
+  assert.equal(decision.action, 'CORRECT')
+})
+
+test('a live BATCH blocks even when no invoice job does (o3d-y14 r2 F1)', () => {
+  // The two counts are independent producers, and this is the shape the invoice-only fence missed:
+  // zero live invoice jobs is TRUE and still insufficient, because a Group A1 row is keyed on its
+  // batch and no order-scoped count can see it.
+  const decision = decideWcCouponBackfill(
+    row({ liveInvoiceJobs: 0, revenueDeferredBatchRef: 'A1-2026-07-01-aaaabbbb', liveBatchDeferralJobs: 2 }),
+    { importedBefore: CUTOFF },
+  )
+
+  assert.equal(decision.action === 'BLOCKED' && decision.reason, 'LIVE_BATCH_QUEUED')
+})
+
+test('the batch block is decided after provenance too, so a post-fix row stays SKIPPED (o3d-y14 r2 F1)', () => {
+  const decision = decideWcCouponBackfill(
+    row({
+      discountModel: WC_COUPON_DISCOUNT_MODEL,
+      revenueDeferredBatchRef: 'A1-2026-07-01-aaaabbbb',
+      liveBatchDeferralJobs: 1,
+    }),
+    { importedBefore: CUTOFF },
+  )
+
+  assert.equal(decision.action, 'SKIP')
+  assert.equal(decision.action === 'SKIP' && decision.reason, 'POST_FIX_IMPORT')
 })

@@ -115,6 +115,9 @@ function makeTx(hooks: { onCount?: () => Promise<void> | void } = {}) {
           id: found.id,
           discountAmount: found.discountAmount,
           discountModel: found.discountModel,
+          accountingInvoiceId: null,
+          revenueDeferredBatchRef: null,
+          unearnedRevenueAmount: null,
           ...(select?.lines ? { lines: found.lines.map((line) => ({ ...line })) } : {}),
           ...(select?.shoppingLinks ? { shoppingLinks: [{ createdAt: new Date('2026-05-01T00:00:00.000Z') }] } : {}),
         }
@@ -140,6 +143,10 @@ function makeTx(hooks: { onCount?: () => Promise<void> | void } = {}) {
           (log) => log.referenceId === where.referenceId && where.type.in.includes(log.type),
         ).length
       },
+      // The posted-invoice evidence read the correction takes under its own lock (o3d-y14 r2 F2).
+      // Empty here: this file's subject is the ENQUEUE race, and a posted document would decline
+      // the correction before the race could be reached.
+      findMany: async () => [],
       create: async ({ data }: { data: SyncLogRow }) => {
         world.events.push('producer:inserted')
         const row = { ...data, id: `log-${world.syncLogs.length + 1}` }
@@ -217,6 +224,7 @@ const ENTRY = {
   clearedBy: 10,
   partial: false,
   accountingInvoiceId: null,
+  revenueDeferredBatchRef: null,
   nearCutoff: false,
 }
 
@@ -261,7 +269,7 @@ test('a producer that SNAPSHOTTED before blocking on the lock cannot queue the s
     },
   )
 
-  assert.deepEqual(result, { outcome: 'CORRECTED' })
+  assert.equal(result.outcome, 'CORRECTED')
   await producer!
 
   assert.equal(world.orders[0].discountAmount, 0, 'the backfill corrected the order')

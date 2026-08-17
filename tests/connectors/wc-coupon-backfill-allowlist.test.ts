@@ -3,8 +3,13 @@ import test from 'node:test'
 
 import {
   WC_COUPON_CUTOFF_FLOOR,
+  WC_COUPON_ID_CHUNK_SIZE,
+  WC_COUPON_MAX_CANDIDATES,
   WC_COUPON_NEAR_CUTOFF_MS,
+  WC_COUPON_SCAN_PAGE_SIZE,
   buildWcCouponAllowlistEntry,
+  chunkWcCouponIds,
+  collectWcCouponCandidates,
   decideWcCouponBackfill,
   isNearWcCouponCutoff,
   parseWcCouponAllowlist,
@@ -132,6 +137,8 @@ test('the proposal entry carries the near-cutoff flag and the evidence it was de
     importedAt: new Date(CUTOFF.getTime() - 60_000),
     alreadyBackfilled: false,
     liveInvoiceJobs: 0,
+    revenueDeferredBatchRef: 'A1-2026-07-01-aaaabbbb',
+    liveBatchDeferralJobs: 0,
   }
   const decision = decideWcCouponBackfill(row, { importedBefore: CUTOFF })
   assert.equal(decision.action, 'CORRECT')
@@ -145,6 +152,12 @@ test('the proposal entry carries the near-cutoff flag and the evidence it was de
   assert.equal(entry.lineDiscountTotal, 10)
   assert.equal(entry.keptOrderLevel, 0)
   assert.equal(entry.accountingInvoiceId, 'INV-9', 'so the reviewer sees the ledger is already wrong')
+  assert.equal(
+    entry.revenueDeferredBatchRef,
+    'A1-2026-07-01-aaaabbbb',
+    'and the SECOND accounting artefact derived from the same amount — the daily revenue deferral ' +
+      '— which apply also compares against live state (o3d-y14 r2)',
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -164,6 +177,7 @@ function entry(over: Partial<WcCouponAllowlistEntry> = {}): WcCouponAllowlistEnt
     clearedBy: 10,
     partial: false,
     accountingInvoiceId: null,
+    revenueDeferredBatchRef: null,
     nearCutoff: false,
     ...over,
   }
@@ -227,6 +241,182 @@ test('an entry missing its evidence is refused, not defaulted', () => {
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
+})
+
+test('an entry missing its DEFERRAL evidence is refused too (o3d-y14 r2 F2)', () => {
+  // An absent `revenueDeferredBatchRef` is indistinguishable from "no batch has taken this order",
+  // and apply compares that field against live state — so defaulting it would silently assert that
+  // the reviewer saw no deferral on a row whose deferral was never shown to them.
+  const withoutBatch: Record<string, unknown> = { ...entry() }
+  delete withoutBatch.revenueDeferredBatchRef
+  const parsed = parseWcCouponAllowlist(file({ clear: [withoutBatch] }))
+
+  assert.equal(parsed.ok, false)
+  assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
+})
+
+// ---------------------------------------------------------------------------
+// Bounding the scan (o3d-y14 r2 finding 3)
+// ---------------------------------------------------------------------------
+
+test('id lists are chunked below the bind-parameter ceiling (o3d-y14 r2 F3)', () => {
+  // The report used ONE `IN (…)` over every candidate. PostgreSQL caps a statement at 65535 bound
+  // parameters, so past that the query does not run slowly — it fails, in the phase an operator has
+  // no reason to expect can fail at all.
+  const ids = Array.from({ length: 1201 }, (_, index) => `order-${index}`)
+
+  const batches = chunkWcCouponIds(ids)
+
+  assert.equal(batches.length, 3, `${ids.length} ids at ${WC_COUPON_ID_CHUNK_SIZE} per statement`)
+  assert.deepEqual(
+    batches.map((batch) => batch.length),
+    [500, 500, 201],
+  )
+  assert.deepEqual(batches.flat(), ids, 'every id appears exactly once and in order — nothing dropped')
+  assert.ok(
+    WC_COUPON_ID_CHUNK_SIZE < 65535,
+    'the chunk must stay under the protocol ceiling, or chunking achieves nothing',
+  )
+})
+
+test('chunking an empty list yields no statements at all', () => {
+  // Not cosmetic: one empty batch would issue an `IN ()` query per lookup on a run with no
+  // candidates, and `IN ()` is a syntax error rather than an empty result.
+  assert.deepEqual(chunkWcCouponIds([]), [])
+})
+
+test('the report PAGES its scan and CHUNKS every id lookup (o3d-y14 r2 F3)', async () => {
+  // Asserted against the source, like the o3d-9te candidate-query test above, because the
+  // alternative is a live database with production-scale cardinality. What matters is that no
+  // statement is built from the WHOLE candidate set: the report previously used `orderIds` directly
+  // in two `IN` lists, which is a bind-parameter count set by the catalogue.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
+
+  assert.match(src, /take: WC_COUPON_SCAN_PAGE_SIZE/, 'the candidate scan is paged')
+  assert.match(src, /id: \{ gt: afterId \}/, 'and paged by KEYSET — an offset walk re-scans what it skipped')
+  assert.match(src, /WC_COUPON_MAX_CANDIDATES/, 'and bounded by a refusal')
+  assert.match(
+    src,
+    /collectWcCouponCandidates/,
+    'and it drives the SHARED walk, so the tested loop is the one that runs',
+  )
+
+  assert.doesNotMatch(src, /\{ in: orderIds \}/, 'no statement takes the whole candidate id list')
+  assert.equal(
+    src.split('for (const batch of chunkWcCouponIds(').length - 1,
+    3,
+    'all three id-keyed lookups — the backfill marker, the invoice count and the batch count — are chunked',
+  )
+})
+
+// The walk itself, driven for real. The source assertions above prove the script uses a keyset page
+// and a ceiling; only these can prove the WALK is right — the first revision checked its ceiling
+// after the exhausted-page break, so a short final page could carry the total past it and leave, and
+// every source-shaped assertion passed on that.
+
+/** A fake catalogue of `total` ids, served in keyset pages of `pageSize`. */
+function pagedCatalogue(total: number, pageSize: number) {
+  const ids = Array.from({ length: total }, (_, index) => `order-${String(index).padStart(6, '0')}`)
+  const cursors: Array<string | null> = []
+  return {
+    cursors,
+    fetchPage: async (afterId: string | null) => {
+      cursors.push(afterId)
+      const start = afterId === null ? 0 : ids.indexOf(afterId) + 1
+      return ids.slice(start, start + pageSize).map((id) => ({ id }))
+    },
+  }
+}
+
+test('the scan walks every page and asks for each one AFTER the last id it saw (o3d-y14 r2 F3)', async () => {
+  const catalogue = pagedCatalogue(25, 10)
+
+  const scan = await collectWcCouponCandidates(catalogue.fetchPage, { pageSize: 10, max: 1000 })
+
+  assert.equal(scan.ok, true)
+  assert.equal(scan.ok && scan.rows.length, 25, 'nothing dropped between pages')
+  assert.deepEqual(
+    catalogue.cursors,
+    [null, 'order-000009', 'order-000019'],
+    'each page is fetched from the previous page\'s last id — a keyset walk, not an offset one',
+  )
+})
+
+test('a catalogue that ends exactly on a page boundary terminates (o3d-y14 r2 F3)', async () => {
+  // The boundary the `page.length < pageSize` test turns on: the walk must ask once more and stop on
+  // the empty page rather than either looping or dropping the last full page.
+  const catalogue = pagedCatalogue(20, 10)
+
+  const scan = await collectWcCouponCandidates(catalogue.fetchPage, { pageSize: 10, max: 1000 })
+
+  assert.equal(scan.ok && scan.rows.length, 20)
+  assert.equal(catalogue.cursors.length, 3, 'three fetches: two full pages and the empty one that ends it')
+})
+
+test('a candidate set past the ceiling is REFUSED, never truncated (o3d-y14 r2 F3)', async () => {
+  const catalogue = pagedCatalogue(60, 10)
+
+  const scan = await collectWcCouponCandidates(catalogue.fetchPage, { pageSize: 10, max: 25 })
+
+  assert.equal(scan.ok, false)
+  assert.equal(!scan.ok && scan.reason, 'TOO_MANY_CANDIDATES')
+  assert.equal(!scan.ok && scan.scanned, 30, 'it stops at the first page that crosses, and reports the count')
+})
+
+test('the ceiling is enforced on a SHORT final page too (o3d-y14 r2 F3)', async () => {
+  // The off-by-one this function exists to make testable. 24 rows in pages of 10: the third page is
+  // short, so a ceiling checked only after the exhausted-page break never sees the overshoot and the
+  // report comes back looking complete.
+  const catalogue = pagedCatalogue(24, 10)
+
+  const scan = await collectWcCouponCandidates(catalogue.fetchPage, { pageSize: 10, max: 20 })
+
+  assert.equal(scan.ok, false, 'a short page that crosses the ceiling still refuses')
+  assert.equal(!scan.ok && scan.scanned, 24)
+})
+
+test('a set exactly AT the ceiling is accepted — the refusal is for exceeding it (o3d-y14 r2 F3)', async () => {
+  const catalogue = pagedCatalogue(20, 10)
+
+  const scan = await collectWcCouponCandidates(catalogue.fetchPage, { pageSize: 10, max: 20 })
+
+  assert.equal(scan.ok, true)
+  assert.equal(scan.ok && scan.rows.length, 20)
+})
+
+test('a cursor that stops advancing is stopped by the ceiling, not left looping (o3d-y14 r2 F3)', async () => {
+  // The ceiling is the termination guard as well as the sanity bound: a fetcher that keeps handing
+  // back full pages must end the run rather than spin until the process is killed.
+  let calls = 0
+  const scan = await collectWcCouponCandidates(
+    async () => {
+      calls += 1
+      return Array.from({ length: 10 }, (_, index) => ({ id: `stuck-${index}` }))
+    },
+    { pageSize: 10, max: 25 },
+  )
+
+  assert.equal(scan.ok, false)
+  assert.equal(calls, 3, 'it gave up instead of looping forever')
+})
+
+test('an empty catalogue scans once and returns nothing (o3d-y14 r2 F3)', async () => {
+  const catalogue = pagedCatalogue(0, 10)
+
+  const scan = await collectWcCouponCandidates(catalogue.fetchPage, { pageSize: 10, max: 20 })
+
+  assert.deepEqual(scan.ok && scan.rows, [])
+  assert.deepEqual(catalogue.cursors, [null])
+})
+
+test('the scan page is smaller than the refusal ceiling (o3d-y14 r2 F3)', () => {
+  // The report pages by WC_COUPON_SCAN_PAGE_SIZE and refuses past WC_COUPON_MAX_CANDIDATES. If the
+  // page were the larger of the two the ceiling could be overshot by a whole page before anything
+  // noticed, which is the truncation the refusal exists to avoid.
+  assert.ok(WC_COUPON_SCAN_PAGE_SIZE > 0)
+  assert.ok(WC_COUPON_SCAN_PAGE_SIZE < WC_COUPON_MAX_CANDIDATES)
 })
 
 test('a file from another build version is refused', () => {

@@ -32,7 +32,16 @@ import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/posta
  * from one whose statuses are spelled slightly differently.
  */
 
-type SyncRow = { id: string; createdAt: Date; status: string; externalTransactionId?: string | null }
+type SyncRow = {
+  id: string
+  createdAt: Date
+  status: string
+  type?: string
+  externalTransactionId?: string | null
+  backReferenceCheckedAt?: Date | null
+  backReferenceEvidenceCompactedAt?: Date | null
+  payload?: Record<string, unknown>
+}
 
 const store = {
   settingRows: [] as Array<{ key: string; value: string }>,
@@ -47,10 +56,36 @@ function noopDelegate() {
   }
 }
 
-function matches(row: SyncRow, where: { createdAt?: { lt: Date }; status?: { notIn?: string[]; in?: string[] } }): boolean {
+type Where = {
+  createdAt?: { lt: Date }
+  status?: { notIn?: string[]; in?: string[] }
+  type?: { in: string[] }
+  externalTransactionId?: { not: null }
+  backReferenceCheckedAt?: null
+  backReferenceEvidenceCompactedAt?: null
+  NOT?: Where
+}
+
+/**
+ * Evaluates EVERY clause the two passes use, including o3d-9kek's `NOT: UNRESOLVED_…`.
+ *
+ * The earlier version of this double understood only `createdAt` and `status`. After the merge that
+ * would have been actively misleading rather than merely incomplete: the delete predicate now
+ * carries both clauses, and a double blind to one of them reports the same survivors whether that
+ * clause is present or absent — so the merge could have dropped either half and every test here
+ * would still have passed.
+ */
+function matches(row: SyncRow, where: Where): boolean {
   if (where.createdAt && !(row.createdAt.getTime() < where.createdAt.lt.getTime())) return false
   if (where.status?.notIn && where.status.notIn.includes(row.status)) return false
   if (where.status?.in && !where.status.in.includes(row.status)) return false
+  if (where.type && !where.type.in.includes(row.type ?? '')) return false
+  if (where.externalTransactionId && row.externalTransactionId == null) return false
+  if ('backReferenceCheckedAt' in where && (row.backReferenceCheckedAt ?? null) !== null) return false
+  if ('backReferenceEvidenceCompactedAt' in where && (row.backReferenceEvidenceCompactedAt ?? null) !== null) {
+    return false
+  }
+  if (where.NOT && matches(row, where.NOT)) return false
   return true
 }
 
@@ -62,11 +97,19 @@ mock.module('@/lib/db', {
       shoppingSyncLog: noopDelegate(),
       accountingSyncLog: {
         ...noopDelegate(),
-        deleteMany: async ({ where }: { where: Parameters<typeof matches>[1] }) => {
+        deleteMany: async ({ where }: { where: Where }) => {
           const survivors = store.accounting.filter((row) => !matches(row, where))
           const deleted = store.accounting.length - survivors.length
           store.accounting = survivors
           return { count: deleted }
+        },
+        // o3d-9kek's compaction pass. Modelled rather than no-opped, because "the row survives" is
+        // only half the property the o3d-y14 fence needs — the other half is that compaction does
+        // not remove it either, and a no-op double cannot tell those apart.
+        updateMany: async ({ where, data }: { where: Where; data: Record<string, unknown> }) => {
+          const hit = store.accounting.filter((row) => matches(row, where))
+          for (const row of hit) Object.assign(row, data)
+          return { count: hit.length }
         },
         count: async ({ where }: { where: { status: { in: string[] } } }) =>
           store.accounting.filter((row) => where.status.in.includes(row.status)).length,
@@ -122,6 +165,52 @@ test('settled work is still expired by age — the exemption is not a blanket on
   assert.equal(result.syncLogsDeleted, 2, 'SYNCED and CANCELLED still expire')
   assert.ok(!store.accounting.some((row) => row.id === 'synced'))
   assert.ok(!store.accounting.some((row) => row.id === 'cancelled'))
+})
+
+test('unresolved back-reference evidence is COMPACTED, not deleted — o3d-9kek survives the merge', async () => {
+  // The OTHER clause on the same predicate, from PR #616. A SYNCED row still carrying an external
+  // id the sweep has not reached a verdict on is outside the postable set, so o3d-y14's clause does
+  // nothing for it: only `NOT: UNRESOLVED_…` keeps it. Deleting a competing sibling is what turns an
+  // ambiguity the sweep was refusing to guess at into a confident wrong attribution.
+  const purgeExpiredData = await loadPurge()
+  seed()
+  store.accounting.push({
+    id: 'unlinked',
+    createdAt: OLD,
+    status: 'SYNCED',
+    type: 'SALES_INVOICE',
+    externalTransactionId: 'XERO-77',
+    backReferenceCheckedAt: null,
+    payload: { customer: 'A Person' },
+  })
+
+  const result = await purgeExpiredData()
+
+  const kept = store.accounting.find((row) => row.id === 'unlinked')
+  assert.ok(kept, 'the row survives the age-based delete')
+  assert.equal(result.backReferenceEvidenceCompacted, 1, 'and is compacted instead')
+  assert.deepEqual(kept.payload, {}, 'its content — customer details, financial lines — is cleared on schedule')
+  assert.equal(kept.externalTransactionId, 'XERO-77', 'while the attribution a later reader needs stays')
+})
+
+test('a PENDING job is retained WHOLE — compaction cannot reach it (o3d-y14 + o3d-9kek)', async () => {
+  // Where the two rules meet. A PENDING invoice job has no external id, so the back-reference
+  // predicate is structurally incapable of seeing it: without o3d-y14's status clause it is deleted
+  // by age, and the backfill's live-row count then reads zero while a worker still posts the old
+  // payload. It must also NOT be compacted — a blanked payload is not something a worker can post.
+  const purgeExpiredData = await loadPurge()
+  seed()
+  const pending = store.accounting.find((row) => row.id === 'pending')
+  assert.ok(pending)
+  pending.type = 'SALES_INVOICE'
+  pending.payload = { discountAmount: 10 }
+
+  await purgeExpiredData()
+
+  const kept = store.accounting.find((row) => row.id === 'pending')
+  assert.ok(kept, 'retained')
+  assert.deepEqual(kept.payload, { discountAmount: 10 }, 'and retained WHOLE — the payload is the work')
+  assert.equal(kept.backReferenceEvidenceCompactedAt ?? null, null)
 })
 
 test('a PROCESSING row an operator later resolves DOES expire afterwards (Codex r1 F2)', async () => {

@@ -34,7 +34,14 @@ mock.module('@/lib/domain/sales/allocation-service', {
   },
 })
 
-type SyncLogRow = { id: string; referenceType: string; referenceId: string; type: string; status: string }
+type SyncLogRow = {
+  id: string
+  referenceType: string
+  referenceId: string
+  type: string
+  status: string
+  externalTransactionId?: string | null
+}
 
 type OrderRow = {
   id: string
@@ -42,6 +49,9 @@ type OrderRow = {
   discountModel: string | null
   lines: Array<{ discountAmount: number }>
   importedAt: string | null
+  accountingInvoiceId?: string | null
+  revenueDeferredBatchRef?: string | null
+  unearnedRevenueAmount?: number | null
 }
 
 type Store = {
@@ -68,6 +78,9 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
               id: found.id,
               discountAmount: found.discountAmount,
               discountModel: found.discountModel,
+              accountingInvoiceId: found.accountingInvoiceId ?? null,
+              revenueDeferredBatchRef: found.revenueDeferredBatchRef ?? null,
+              unearnedRevenueAmount: found.unearnedRevenueAmount ?? null,
               lines: found.lines.map((line) => ({ ...line })),
               shoppingLinks: found.importedAt ? [{ createdAt: new Date(found.importedAt) }] : [],
             }
@@ -106,15 +119,54 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
       },
     },
     accountingSyncLog: {
-      count: async ({ where }: { where: { referenceType: string; referenceId: string; type: { in: string[] }; status: { in: string[] } } }) => {
-        events.push(`count:${where.referenceId}`)
+      // Honours BOTH shapes the production code uses: the order-scoped invoice count keys on a bare
+      // `referenceId`, the daily-batch count on `referenceId: { in: [...] }` with a single `type`.
+      // A double that ignored either would pass whether or not the batch producer is checked at all.
+      count: async ({
+        where,
+      }: {
+        where: {
+          referenceType: string
+          referenceId: string | { in: string[] }
+          type: { in: string[] } | string
+          status: { in: string[] }
+        }
+      }) => {
+        const refs = typeof where.referenceId === 'string' ? [where.referenceId] : where.referenceId.in
+        const types = typeof where.type === 'string' ? [where.type] : where.type.in
+        events.push(`count:${refs.join('|')}`)
         return store.syncLogs.filter(
           (log) =>
             log.referenceType === where.referenceType &&
-            log.referenceId === where.referenceId &&
-            where.type.in.includes(log.type) &&
+            refs.includes(log.referenceId) &&
+            types.includes(log.type) &&
             where.status.in.includes(log.status),
         ).length
+      },
+      // The POSTED-invoice evidence read (o3d-y14 r2 finding 2). Filters on status AND on
+      // `externalTransactionId: { not: null }`, because a SYNCED row with no id is not a document.
+      findMany: async ({
+        where,
+      }: {
+        where: {
+          referenceType: string
+          referenceId: string
+          type: { in: string[] }
+          status: { in: string[] }
+          externalTransactionId: { not: null }
+        }
+      }) => {
+        events.push(`findMany:${where.referenceId}`)
+        return store.syncLogs
+          .filter(
+            (log) =>
+              log.referenceType === where.referenceType &&
+              log.referenceId === where.referenceId &&
+              where.type.in.includes(log.type) &&
+              where.status.in.includes(log.status) &&
+              (!('externalTransactionId' in where) || !!log.externalTransactionId),
+          )
+          .map((log) => ({ externalTransactionId: log.externalTransactionId ?? null }))
       },
       update: async () => {
         throw new Error('the backfill must never mutate a queued payload (o3d-5ct)')
@@ -166,7 +218,16 @@ const entry = {
   clearedBy: 10,
   partial: false,
   accountingInvoiceId: null,
+  revenueDeferredBatchRef: null,
   nearCutoff: false,
+}
+
+/** What a CORRECTED order with nothing in the ledger reports. */
+const NO_LEDGER_DOCUMENTS = {
+  accountingInvoiceId: null,
+  postedInvoiceExternalIds: [],
+  revenueDeferredBatchRef: null,
+  unearnedRevenueAmount: null,
 }
 
 function reset() {
@@ -181,7 +242,7 @@ test('a reviewed order is corrected and STAMPED in the same write (o3d-5ct/o3d-9
 
   const result = await applyWcCouponCorrection(makeTx(store), entry)
 
-  assert.deepEqual(result, { outcome: 'CORRECTED' })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS })
   assert.equal(store.orders[0].discountAmount, 0, 'the duplicated part is cleared')
   assert.equal(
     store.orders[0].discountModel,
@@ -201,8 +262,17 @@ test('the order row lock is taken BEFORE anything is read or decided (o3d-5ct)',
   assert.deepEqual(locked, ['order-1'], 'the same row every accounting enqueue path locks')
   assert.deepEqual(
     events,
-    ['lock:order-1', 'findUnique:order-1', 'count:order-1', 'updateMany:order-1', 'activityLog:create'],
-    'reading or counting before the lock would make the live-invoice check a sample, not a decision',
+    [
+      'lock:order-1',
+      'findUnique:order-1',
+      'count:order-1',
+      // No `count:` for the batch: this order carries no revenueDeferredBatchRef, so there is no
+      // batch to look for. The posted-evidence read still happens, under the same lock.
+      'findMany:order-1',
+      'updateMany:order-1',
+      'activityLog:create',
+    ],
+    'reading or counting before the lock would make every live-work check a sample, not a decision',
   )
 })
 
@@ -264,7 +334,7 @@ test('a TERMINAL job does not block, and another order\'s job is not confused fo
 
   const result = await applyWcCouponCorrection(makeTx(store), entry)
 
-  assert.deepEqual(result, { outcome: 'CORRECTED' })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS })
 })
 
 test('the queue is never written to, only counted (o3d-5ct)', async () => {
@@ -280,6 +350,255 @@ test('the queue is never written to, only counted (o3d-5ct)', async () => {
     events.filter((event) => event.startsWith('count:')),
     ['count:order-1'],
     'the only queue interaction is a read',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// The DAILY-BATCH producer (o3d-y14 r2 finding 1)
+//
+// The invoice count above cannot see these rows at all: a Group A1 journal is keyed
+// `referenceType: 'DailyBatch'` on the BATCH's reference id, not on the order. That is the whole
+// reason the fence missed this producer, so the store below models it exactly that way.
+// ---------------------------------------------------------------------------
+
+const BATCH_REF = 'A1-2026-07-01-abcd1234'
+
+function batchStore(over: Partial<Store> = {}): Store {
+  return makeStore({
+    orders: [
+      {
+        id: 'order-1',
+        discountAmount: 10,
+        discountModel: null,
+        lines: [{ discountAmount: 10 }],
+        importedAt: IMPORTED_AT,
+        revenueDeferredBatchRef: BATCH_REF,
+        unearnedRevenueAmount: 90,
+      },
+    ],
+    ...over,
+  })
+}
+
+const batchEntry = { ...entry, revenueDeferredBatchRef: BATCH_REF }
+
+test('an order in a PENDING daily revenue-deferral batch is DECLINED (o3d-y14 r2 F1)', async () => {
+  // The batch derived `subtotal + shipping − this discount` and staged it as a GL journal a worker
+  // will post. Correcting the order now stamps it as fixed while that journal is still in flight —
+  // the identical defect the invoice fence exists for, in the producer the invoice fence never saw.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = batchStore({
+    syncLogs: [
+      { id: 'batch-1', referenceType: 'DailyBatch', referenceId: BATCH_REF, type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'PENDING' },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), batchEntry)
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'LIVE_BATCH_QUEUED')
+  assert.equal(store.orders[0].discountAmount, 10, 'untouched, so a re-run re-evaluates it')
+  assert.equal(store.orders[0].discountModel, null, 'and unstamped — nothing hides it from a later run')
+  assert.equal(store.activity.length, 0)
+})
+
+test('a PROCESSING batch journal — a worker mid-post — also declines (o3d-y14 r2 F1)', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = batchStore({
+    syncLogs: [
+      { id: 'batch-1', referenceType: 'DailyBatch', referenceId: BATCH_REF, type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'PROCESSING' },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), batchEntry)
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'LIVE_BATCH_QUEUED')
+})
+
+test('a POSTED batch journal does not block — it is reported instead (o3d-y14 r2 F1)', async () => {
+  // A SYNCED journal cannot be re-claimed, so no worker can still post it. It is not a reason to
+  // refuse; it is a reason to tell the operator the ledger now needs a manual adjustment. Proving
+  // both halves in one test is what stops "declines everything" passing for "declines the right
+  // thing" — most candidate orders have an already-posted deferral.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = batchStore({
+    syncLogs: [
+      { id: 'batch-1', referenceType: 'DailyBatch', referenceId: BATCH_REF, type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'SYNCED' },
+      // A DIFFERENT batch is live. It must not block this order — proving the count is keyed on
+      // THIS order's batch reference and not on "is any batch running".
+      { id: 'batch-other', referenceType: 'DailyBatch', referenceId: 'A1-2026-07-02-ffff0000', type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'PENDING' },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), batchEntry)
+
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.equal(store.orders[0].discountAmount, 0)
+  assert.deepEqual(
+    result.outcome === 'CORRECTED' ? result.posted : null,
+    {
+      accountingInvoiceId: null,
+      postedInvoiceExternalIds: [],
+      revenueDeferredBatchRef: BATCH_REF,
+      unearnedRevenueAmount: 90,
+    },
+    'the posted deferral is REPORTED as needing a manual adjustment, not silently ignored',
+  )
+  assert.equal(store.activity[0].metadata.revenueDeferredBatchRef, BATCH_REF)
+  assert.equal(store.activity[0].metadata.posted, true)
+})
+
+test('an order with no batch reference never queries for one (o3d-y14 r2 F1)', async () => {
+  // Cheap, but it is the difference between "keyed on the order's own batch" and "counts every
+  // DailyBatch row in the table", which would decline every order whenever any batch is pending.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({
+    syncLogs: [
+      { id: 'batch-1', referenceType: 'DailyBatch', referenceId: BATCH_REF, type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'PENDING' },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), entry)
+
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.deepEqual(
+    events.filter((event) => event.startsWith('count:')),
+    ['count:order-1'],
+    'no batch lookup at all when the order carries no batch reference',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Posting state is read LIVE, and drift is a refusal (o3d-y14 r2 finding 2)
+// ---------------------------------------------------------------------------
+
+test('an invoice posted BETWEEN review and apply is DECLINED, not silently corrected (o3d-y14 r2 F2)', async () => {
+  // The race Codex named: the row was proposed while unposted, an invoice was queued and posted
+  // before apply ran, and its job row is now SYNCED — so the live-job count permits the correction.
+  // Reporting posting state from the reviewed file would then call this order "not posted" and tell
+  // the operator no ledger correction is needed for the one order that most needs one.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({
+    orders: [
+      {
+        id: 'order-1',
+        discountAmount: 10,
+        discountModel: null,
+        lines: [{ discountAmount: 10 }],
+        importedAt: IMPORTED_AT,
+        accountingInvoiceId: 'INV-778',
+      },
+    ],
+    syncLogs: [
+      { id: 'job-1', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: 'INV-778' },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), entry)
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'POSTING_CHANGED')
+  assert.equal(store.orders[0].discountAmount, 10, 'nothing was written')
+  assert.equal(store.orders[0].discountModel, null, 'so the next report re-proposes it WITH the invoice visible')
+  assert.equal(store.activity.length, 0)
+})
+
+test('a posted-but-UNLINKED invoice is caught even though the column says nothing (o3d-y14 r2 F2)', async () => {
+  // o3d-9kek: a post can succeed and still fail to write its id back. `accountingInvoiceId` is NULL,
+  // matching the reviewed entry exactly — so a check on the column alone waves this through, and a
+  // real Xero document silently keeps understating with nobody told.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({
+    syncLogs: [
+      { id: 'job-1', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: 'INV-999' },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), entry)
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'POSTING_CHANGED')
+  assert.match(result.outcome === 'DECLINED' ? result.detail : '', /INV-999/)
+  assert.equal(store.orders[0].discountAmount, 10)
+})
+
+test('a SYNCED invoice row with NO external id is not a posted document (o3d-y14 r2 F2)', async () => {
+  // The other side of the same predicate: without an id there is no document to adjust, so refusing
+  // would strand the row forever. Without this case the test above would pass on a check that just
+  // declined on "any SYNCED row exists".
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({
+    syncLogs: [
+      { id: 'job-1', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: null },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), entry)
+
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.deepEqual(result.outcome === 'CORRECTED' ? result.posted : null, NO_LEDGER_DOCUMENTS)
+})
+
+test('a deferral batch stamped BETWEEN review and apply is DECLINED (o3d-y14 r2 F2)', async () => {
+  // The daily batch ran in the gap: this order now carries a deferral derived from the pre-correction
+  // discount, which the reviewer never saw and never agreed to leave inconsistent.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = batchStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), entry)
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'POSTING_CHANGED')
+  assert.equal(store.orders[0].discountAmount, 10)
+})
+
+test('the reported posting state is the LIVE read, not the reviewed file (o3d-y14 r2 F2)', async () => {
+  // The reviewed entry names INV-1. Live, the same order also carries a SECOND posted invoice row
+  // and a deferral batch. A report built from the entry would name only INV-1; the operator would
+  // adjust one document and never learn about the others.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({
+    orders: [
+      {
+        id: 'order-1',
+        discountAmount: 10,
+        discountModel: null,
+        lines: [{ discountAmount: 10 }],
+        importedAt: IMPORTED_AT,
+        accountingInvoiceId: 'INV-1',
+        revenueDeferredBatchRef: BATCH_REF,
+        unearnedRevenueAmount: 42.5,
+      },
+    ],
+    syncLogs: [
+      { id: 'job-1', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: 'INV-1' },
+      { id: 'job-2', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE_UPDATE', status: 'SYNCED', externalTransactionId: 'INV-1-REV2' },
+      { id: 'batch-1', referenceType: 'DailyBatch', referenceId: BATCH_REF, type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'SYNCED' },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), {
+    ...entry,
+    accountingInvoiceId: 'INV-1',
+    revenueDeferredBatchRef: BATCH_REF,
+  })
+
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.deepEqual(result.outcome === 'CORRECTED' ? result.posted : null, {
+    accountingInvoiceId: 'INV-1',
+    postedInvoiceExternalIds: ['INV-1', 'INV-1-REV2'],
+    revenueDeferredBatchRef: BATCH_REF,
+    unearnedRevenueAmount: 42.5,
+  })
+  assert.deepEqual(
+    store.activity[0].metadata.postedInvoiceExternalIds,
+    ['INV-1', 'INV-1-REV2'],
+    'the durable record of what still needs adjusting is the live one too',
   )
 })
 
@@ -372,7 +691,7 @@ test('the residual actually written comes from the LIVE evidence, not the file',
     partial: true,
   })
 
-  assert.deepEqual(result, { outcome: 'CORRECTED' })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS })
   assert.equal(store.orders[0].discountAmount, 6)
 })
 
@@ -452,7 +771,9 @@ test('stamping records the model WITHOUT touching the amount (Codex r1 F3)', asy
     clearedBy: 4,
   })
 
-  assert.deepEqual(result, { outcome: 'CORRECTED' })
+  // `posted: null`, not an empty evidence set: stamping changes no amount, so it creates no ledger
+  // inconsistency and must not add this order to the operator's manual-adjustment list.
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: null })
   assert.equal(store.orders[0].discountAmount, 6, 'the manually corrected amount SURVIVES')
   assert.equal(store.orders[0].discountModel, WC_COUPON_DISCOUNT_MODEL)
   assert.equal(store.activity[0].action, WC_COUPON_STAMP_ACTION, 'a distinct action: a human assertion, not a computation')

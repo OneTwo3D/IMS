@@ -43,11 +43,51 @@
  *   (`lockOrderForAccountingEnqueue`) — and DECLINES any order that has live invoice work, reporting
  *   it. Under that lock "this order has no unposted invoice job" is a decided fact rather than a
  *   sampled one, and no enqueue can interleave between the check and the write.
+ *
+ * EVERY PRODUCER OF A DISCOUNT-DERIVED ACCOUNTING SNAPSHOT (o3d-y14 r2 finding 1).
+ *
+ * The first version of the fence was written as "fence the invoice queue", and that framing is what
+ * let a producer through: the daily batch reads the same column, is not an invoice, and does not go
+ * anywhere near `queueXeroSync`. So the question was re-asked as "what turns this column into
+ * something an accountant will see", and answered exhaustively:
+ *
+ *   DIRECT readers of `SalesOrder.discountAmount`
+ *   1. `queueSalesInvoiceForOrder` (app/actions/sales.ts) — SALES_INVOICE / SALES_INVOICE_UPDATE.
+ *      Reads and builds the payload outside any lock. FENCED by `findStaleOrderLevelDiscount`.
+ *   2. `importWcOrder` (order-import.ts) — SALES_INVOICE on import, from the value it just wrote.
+ *      Same route, so FENCED by the same check.
+ *   3. Xero daily batch Group A1 (`runDailyBatchSync`) — DAILY_BATCH_REVENUE_DEFERRAL, and the
+ *      `unearnedRevenueAmount` stamp. Reads outside its transaction, writes via
+ *      `createPendingSyncLog`, which never touches the queue helpers. FENCED by
+ *      `assertRevenueDeferralsUnchanged`; orders with a live batch are additionally DECLINED here.
+ *   4. QuickBooks daily batch Group A1 — identical twin of (3), fenced identically.
+ *   5. `raiseChargebackForReversedOrder` (app/actions/sales.ts) — mirrors the order-level discount
+ *      into a CREDIT_NOTE line. DELIBERATELY NOT FENCED, and the reason matters: its job is to
+ *      mirror WHAT THE INVOICE POSTED, and after a correction the column no longer describes that
+ *      — permanently, not just in a race. A freshness check would therefore report drift on every
+ *      corrected order forever while fixing nothing. The real obligation is the manual ledger
+ *      adjustment this backfill already reports, and until that adjustment is made a chargeback on
+ *      such an order is one a human must raise (the path already safe-skips ambiguous cases).
+ *
+ *   DERIVED readers — they consume `unearnedRevenueAmount` / `revenueRecognizedAmount` / a stored
+ *   payload, all of which are RECORDS of a decision already taken. Group B recognition,
+ *   `recreateMissingDailyBatchLogs`, the refund unearned-revenue reversal, `INVOICE_PAYMENT`
+ *   follow-ups and the AccountingEvent mirror are all in this set. This backfill does not touch any
+ *   of those columns, so it cannot make them stale — they were computed from the pre-correction
+ *   amount and still faithfully record it. What it CAN do is leave them disagreeing with the
+ *   corrected order, which is why `revenueDeferredBatchRef` and `unearnedRevenueAmount` are read
+ *   live and reported as needing a manual adjustment, exactly like `accountingInvoiceId`.
+ *
+ *   `queueAccountingSyncTx` carries no discount fence. No order-scoped SALES_INVOICE reaches it
+ *   today (its order-scoped callers are COGS_REVERSAL and INVOICE_PAYMENT), but its type union
+ *   permits one, so a future caller would arrive unfenced. Noted rather than pre-emptively guarded,
+ *   because the guard belongs at the point a caller hoists the lock (o3d-3zgy).
  */
 import type { Prisma } from '@/app/generated/prisma/client'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
+import { liveDailyBatchDeferralWhere } from '@/lib/domain/accounting/daily-batch-discount-fence'
 
 import { resolveWcOrderLevelDiscount } from './field-mapping'
 
@@ -83,12 +123,108 @@ export const WC_COUPON_DISCOUNT_MODEL = 'LINE_ALLOCATED'
 export const LIVE_SALES_INVOICE_STATUSES = POSTABLE_ACCOUNTING_SYNC_STATUSES
 export const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const
 
+/**
+ * Terminal statuses that mean a sales invoice REACHED the ledger.
+ *
+ * Read as well as `SalesOrder.accountingInvoiceId`, because the two can disagree and the disagreement
+ * is not rare: o3d-9kek exists precisely because a row can post, receive its `externalTransactionId`,
+ * and then fail to write the id back onto the order. An order in that state has a real invoice in
+ * Xero and a NULL `accountingInvoiceId`, so an "is it posted?" question answered from the column
+ * alone answers "no" about a document that exists.
+ */
+export const POSTED_SALES_INVOICE_STATUSES = ['SYNCED'] as const
+
 function money(value: DecimalInput): number {
   return roundQuantity(toDecimal(value), 4).toNumber()
 }
 
 export function sumLineDiscounts(lines: Array<{ discountAmount: DecimalInput }>): number {
   return money(lines.reduce((sum, line) => addMoney(sum, toDecimal(line.discountAmount)), toDecimal(0)))
+}
+
+// ---------------------------------------------------------------------------
+// Bounding the scan (o3d-y14 r2 finding 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * How many candidate orders one page of the dry-run scan pulls.
+ *
+ * The scan is KEYSET-PAGED rather than loaded whole. The report is the step an operator runs first
+ * and trusts, and an unbounded `findMany` over every WooCommerce order carrying a discount — with
+ * its lines — is a query whose cost is set by the catalogue rather than by the defect. At the volume
+ * this actually runs against (a few thousand discounted orders, ~70 of them defective) paging costs
+ * a handful of extra round trips and nothing else; at ten times that it is the difference between a
+ * report and an out-of-memory process.
+ */
+export const WC_COUPON_SCAN_PAGE_SIZE = 500
+
+/**
+ * How many ids go into one `IN (…)` list.
+ *
+ * Not a memory concern — a BIND PARAMETER one. The activity-log and sync-log lookups took a single
+ * `{ in: orderIds }` over the WHOLE candidate set, and PostgreSQL's protocol caps a statement at
+ * 65535 bound parameters. Past that the query does not run slowly, it FAILS — and it fails in the
+ * report, which is the one phase an operator has no reason to expect can fail at all.
+ */
+export const WC_COUPON_ID_CHUNK_SIZE = 500
+
+/**
+ * The hard ceiling on candidates in one run.
+ *
+ * A limit that REFUSES beats a limit that TRUNCATES: a truncated report is a proposal that silently
+ * omits orders, and the operator cannot tell an order that was examined and skipped from one that
+ * was never looked at. Set far above any plausible real catalogue, so reaching it means the cutoff
+ * or the filter is wrong, not that the estate grew.
+ */
+export const WC_COUPON_MAX_CANDIDATES = 100_000
+
+export type WcCouponScanOutcome<T> =
+  | { ok: true; rows: T[] }
+  | { ok: false; reason: 'TOO_MANY_CANDIDATES'; scanned: number }
+
+/**
+ * Walk the candidate scan one keyset page at a time, and REFUSE past the ceiling.
+ *
+ * It lives here rather than inline in the script so the ceiling can be tested at all: the script's
+ * page fetcher is a Prisma query against a live database, so a loop written around it can only be
+ * asserted by reading the source — and a source assertion cannot see an off-by-one. The first
+ * revision of this loop checked the ceiling only BETWEEN full pages, so a final short page could
+ * carry the total past it and leave through the exhausted-page break; the report would then look
+ * complete while the refusal it was supposed to raise never fired. That is the exact class of bug a
+ * grep-shaped test is blind to, which is why the walk is a function with its own cases below.
+ *
+ * The ceiling doubles as the loop's termination guard: a fetcher that keeps returning full pages
+ * (a cursor that stops advancing, say) stops here rather than running forever.
+ */
+export async function collectWcCouponCandidates<T extends { id: string }>(
+  fetchPage: (afterId: string | null) => Promise<T[]>,
+  options: { pageSize?: number; max?: number } = {},
+): Promise<WcCouponScanOutcome<T>> {
+  const pageSize = options.pageSize ?? WC_COUPON_SCAN_PAGE_SIZE
+  const max = options.max ?? WC_COUPON_MAX_CANDIDATES
+  if (pageSize <= 0) throw new Error('collectWcCouponCandidates needs a positive page size')
+
+  const rows: T[] = []
+  let afterId: string | null = null
+  for (;;) {
+    const page = await fetchPage(afterId)
+    rows.push(...page)
+    // BEFORE the exhausted-page break, so a short final page cannot carry the total past the
+    // ceiling unchallenged.
+    if (rows.length > max) return { ok: false, reason: 'TOO_MANY_CANDIDATES', scanned: rows.length }
+    if (page.length < pageSize) return { ok: true, rows }
+    afterId = page[page.length - 1].id
+  }
+}
+
+/** Split ids into `IN (…)`-sized batches. Empty in, empty out — never one empty batch. */
+export function chunkWcCouponIds(ids: readonly string[], size = WC_COUPON_ID_CHUNK_SIZE): string[][] {
+  if (size <= 0) throw new Error('chunkWcCouponIds needs a positive size')
+  const batches: string[][] = []
+  for (let index = 0; index < ids.length; index += size) {
+    batches.push([...ids.slice(index, index + size)])
+  }
+  return batches
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +434,20 @@ export type WcCouponBackfillRow = {
   alreadyBackfilled: boolean
   /** Non-terminal SALES_INVOICE / SALES_INVOICE_UPDATE rows for this order (o3d-5ct). */
   liveInvoiceJobs: number
+  /**
+   * `SalesOrder.revenueDeferredBatchRef` — the daily-batch Group A1 run that computed this order's
+   * revenue deferral FROM the discount below, and stamped the result in `unearnedRevenueAmount`.
+   * NULL means no batch has taken this order yet.
+   */
+  revenueDeferredBatchRef: string | null
+  /**
+   * Non-terminal DAILY_BATCH_REVENUE_DEFERRAL rows for THAT batch reference (o3d-y14 r2 finding 1).
+   *
+   * The batch is the second producer of a discount-derived accounting snapshot, and its rows are
+   * keyed on the batch, not on the order — so an order-scoped count never sees them. A live one
+   * means a worker can still post a GL journal built from the pre-correction amount.
+   */
+  liveBatchDeferralJobs: number
 }
 
 export type WcCouponBackfillDecision =
@@ -315,7 +465,7 @@ export type WcCouponBackfillDecision =
     }
   | { action: 'SKIP'; reason: 'ALREADY_BACKFILLED' | 'POST_FIX_IMPORT' | 'NOTHING_DUPLICATED'; detail: string }
   | { action: 'UNPROVEN'; reason: WcCouponUnprovenReason; detail: string }
-  | { action: 'BLOCKED'; reason: 'LIVE_INVOICE_QUEUED'; detail: string }
+  | { action: 'BLOCKED'; reason: 'LIVE_INVOICE_QUEUED' | 'LIVE_BATCH_QUEUED'; detail: string }
 
 /**
  * What to do about ONE order.
@@ -371,6 +521,19 @@ export function decideWcCouponBackfill(
     }
   }
 
+  if (row.liveBatchDeferralJobs > 0) {
+    // o3d-y14 r2 finding 1. Same argument, DIFFERENT producer: a Group A1 revenue-deferral journal
+    // is a snapshot of `subtotal + shipping − this discount`, staged as its own DailyBatch-keyed row
+    // that no order-scoped count can see. A worker holding it will post the pre-correction figure.
+    return {
+      action: 'BLOCKED',
+      reason: 'LIVE_BATCH_QUEUED',
+      detail:
+        `${row.liveBatchDeferralJobs} unposted daily revenue-deferral journal(s) in batch ` +
+        `${row.revenueDeferredBatchRef} were derived from the old amount — re-run once the batch posts`,
+    }
+  }
+
   return {
     action: 'CORRECT',
     couponTotal: row.storedOrderDiscount,
@@ -406,6 +569,12 @@ export type WcCouponAllowlistEntry = {
   clearedBy: number
   partial: boolean
   accountingInvoiceId: string | null
+  /**
+   * `SalesOrder.revenueDeferredBatchRef` as the dry run read it. Carried for the SAME reason
+   * `accountingInvoiceId` is: it names a second accounting artefact derived from the amount being
+   * corrected, and apply refuses if it has moved since the review (o3d-y14 r2).
+   */
+  revenueDeferredBatchRef: string | null
   /** The cutoff CHOICE, not a comfortable margin, is what classified this row. Review each one. */
   nearCutoff: boolean
 }
@@ -448,7 +617,11 @@ function isEntry(value: unknown): value is WcCouponAllowlistEntry {
     typeof entry.storedOrderDiscount === 'number' &&
     typeof entry.lineDiscountTotal === 'number' &&
     typeof entry.keptOrderLevel === 'number' &&
-    (typeof entry.importedAt === 'string' || entry.importedAt === null)
+    (typeof entry.importedAt === 'string' || entry.importedAt === null) &&
+    // Required, not defaulted. An absent field would be indistinguishable from "no batch has taken
+    // this order", and apply compares it against live state — so a missing one would silently mean
+    // "the reviewer saw no deferral" about a row whose deferral was never shown to them.
+    (typeof entry.revenueDeferredBatchRef === 'string' || entry.revenueDeferredBatchRef === null)
   )
 }
 
@@ -531,6 +704,7 @@ export function buildWcCouponAllowlistEntry(
     clearedBy: decision.clearedBy,
     partial: decision.partial,
     accountingInvoiceId: row.accountingInvoiceId,
+    revenueDeferredBatchRef: row.revenueDeferredBatchRef,
     nearCutoff: isNearWcCouponCutoff(row.importedAt, cutoff),
   }
 }
@@ -539,8 +713,32 @@ export function buildWcCouponAllowlistEntry(
 // o3d-5ct — the fenced write
 // ---------------------------------------------------------------------------
 
+/**
+ * What the ACCOUNTING SYSTEM already holds for this order, read LIVE under the correction's own lock
+ * (o3d-y14 r2 finding 2).
+ *
+ * This is the operator's only handoff for the part of the job software cannot do: clearing IMS's
+ * field does not reach a document already in Xero, so every one of these needs a manual
+ * credit/adjustment. It is therefore read at APPLY time and never taken from the reviewed file. The
+ * allowlist decides WHICH ORDERS may be touched; it is not, and must not become, a source of truth
+ * about their current state — the same principle that already governs the amount.
+ */
+export type WcCouponPostedEvidence = {
+  /** `SalesOrder.accountingInvoiceId` as it stands at the moment of correction. */
+  accountingInvoiceId: string | null
+  /**
+   * External ids of SYNCED sales-invoice rows for this order. Not redundant with the column above:
+   * a post whose back-reference write failed leaves the id HERE and NULL there (o3d-9kek).
+   */
+  postedInvoiceExternalIds: string[]
+  /** The Group A1 batch that deferred this order's revenue from the pre-correction amount. */
+  revenueDeferredBatchRef: string | null
+  /** What that batch stamped. Not recomputed by this backfill, so it stays stale until adjusted. */
+  unearnedRevenueAmount: number | null
+}
+
 export type WcCouponCorrectionResult =
-  | { outcome: 'CORRECTED' }
+  | { outcome: 'CORRECTED'; posted: WcCouponPostedEvidence | null }
   | {
       outcome: 'DECLINED'
       reason:
@@ -551,6 +749,8 @@ export type WcCouponCorrectionResult =
         | 'PLAN_MISMATCH'
         | 'ALREADY_MARKED'
         | 'LIVE_INVOICE_QUEUED'
+        | 'LIVE_BATCH_QUEUED'
+        | 'POSTING_CHANGED'
       detail: string
     }
 
@@ -567,6 +767,9 @@ async function readLockedEvidence(tx: Prisma.TransactionClient, orderId: string)
       id: true,
       discountAmount: true,
       discountModel: true,
+      accountingInvoiceId: true,
+      revenueDeferredBatchRef: true,
+      unearnedRevenueAmount: true,
       lines: { select: { discountAmount: true } },
       shoppingLinks: {
         where: { connector: 'woocommerce' },
@@ -576,6 +779,54 @@ async function readLockedEvidence(tx: Prisma.TransactionClient, orderId: string)
       },
     },
   })
+}
+
+/**
+ * Everything the accounting system already holds for this order, read under the correction's lock.
+ *
+ * `order` is the row this transaction has ALREADY read under that lock — passed in rather than
+ * re-read, so the evidence reported and the evidence decided on are literally the same read.
+ */
+async function readLivePostedEvidence(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  order: {
+    accountingInvoiceId: string | null
+    revenueDeferredBatchRef: string | null
+    unearnedRevenueAmount: unknown
+  },
+): Promise<WcCouponPostedEvidence> {
+  const syncedInvoices = await tx.accountingSyncLog.findMany({
+    where: {
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+      type: { in: [...SALES_INVOICE_SYNC_TYPES] },
+      status: { in: [...POSTED_SALES_INVOICE_STATUSES] },
+      externalTransactionId: { not: null },
+    },
+    select: { externalTransactionId: true },
+  })
+  return {
+    accountingInvoiceId: order.accountingInvoiceId,
+    postedInvoiceExternalIds: syncedInvoices
+      .map((row) => row.externalTransactionId)
+      .filter((id): id is string => !!id),
+    revenueDeferredBatchRef: order.revenueDeferredBatchRef,
+    unearnedRevenueAmount:
+      order.unearnedRevenueAmount === null || order.unearnedRevenueAmount === undefined
+        ? null
+        : money(order.unearnedRevenueAmount as DecimalInput),
+  }
+}
+
+/** Does this evidence describe a document a human now has to adjust by hand? */
+export function wcCouponCorrectionNeedsLedgerAdjustment(posted: WcCouponPostedEvidence | null): boolean {
+  if (!posted) return false
+  return (
+    !!posted.accountingInvoiceId ||
+    posted.postedInvoiceExternalIds.length > 0 ||
+    !!posted.revenueDeferredBatchRef
+  )
 }
 
 /**
@@ -688,6 +939,64 @@ export async function applyWcCouponCorrection(
     }
   }
 
+  // The OTHER producer (o3d-y14 r2 finding 1). Counted here too, and under the same lock, because a
+  // Group A1 journal is keyed on its batch rather than on this order — so the count above is
+  // structurally incapable of seeing one, however correct it is about invoices.
+  const liveBatchDeferralJobs = order.revenueDeferredBatchRef
+    ? await tx.accountingSyncLog.count({ where: liveDailyBatchDeferralWhere([order.revenueDeferredBatchRef]) })
+    : 0
+  if (liveBatchDeferralJobs > 0) {
+    return {
+      outcome: 'DECLINED',
+      reason: 'LIVE_BATCH_QUEUED',
+      detail:
+        `${liveBatchDeferralJobs} unposted daily revenue-deferral journal(s) in batch ` +
+        `${order.revenueDeferredBatchRef} were derived from the old amount`,
+    }
+  }
+
+  // POSTING STATE IS READ LIVE, and drift since the review is a REFUSAL (o3d-y14 r2 finding 2).
+  //
+  // The reviewer's decision was not only "is this amount wrong" — it was "is it worth rewriting a
+  // figure whose consequences I can see". An invoice queued after the proposal and posted before
+  // this run changes that second half completely: the order acquires a ledger document that will
+  // now permanently understate, and a reviewer who approved an UNPOSTED row never agreed to that.
+  // Reporting it afterwards is not enough, because by then the correction has happened.
+  //
+  // Both signals are read, not just the column: o3d-9kek showed a post can succeed and still fail to
+  // write its id back, so a SYNCED invoice row with no `accountingInvoiceId` is a real document that
+  // the column denies. Refusing is fully recoverable — the next report re-proposes the row WITH the
+  // posting evidence attached, and the reviewer decides again knowing what it now costs.
+  const posted = await readLivePostedEvidence(tx, entry.orderId, order)
+  if (posted.accountingInvoiceId !== entry.accountingInvoiceId) {
+    return {
+      outcome: 'DECLINED',
+      reason: 'POSTING_CHANGED',
+      detail:
+        `the accounting invoice is now ${posted.accountingInvoiceId ?? 'none'}, not the ` +
+        `${entry.accountingInvoiceId ?? 'none'} this row was reviewed with`,
+    }
+  }
+  if (posted.revenueDeferredBatchRef !== entry.revenueDeferredBatchRef) {
+    return {
+      outcome: 'DECLINED',
+      reason: 'POSTING_CHANGED',
+      detail:
+        `the revenue-deferral batch is now ${posted.revenueDeferredBatchRef ?? 'none'}, not the ` +
+        `${entry.revenueDeferredBatchRef ?? 'none'} this row was reviewed with`,
+    }
+  }
+  if (!entry.accountingInvoiceId && posted.postedInvoiceExternalIds.length > 0) {
+    return {
+      outcome: 'DECLINED',
+      reason: 'POSTING_CHANGED',
+      detail:
+        `this order was reviewed as unposted, but ${posted.postedInvoiceExternalIds.length} SYNCED sales ` +
+        `invoice(s) exist for it (${posted.postedInvoiceExternalIds.join(', ')}) with no accountingInvoiceId ` +
+        'written back — the ledger document is real even though the column denies it',
+    }
+  }
+
   // Compare-and-set as well as locked. The lock covers the enqueue paths; this covers anything that
   // reaches the row without taking it, and it stamps the model in the SAME write so a row can never
   // be corrected without also being marked.
@@ -713,8 +1022,23 @@ export async function applyWcCouponCorrection(
       description:
         `o3d-y14 backfill: order-level coupon ${entry.storedOrderDiscount} ${entry.currency} reduced to ` +
         `${keptOrderLevel} (${liveLines} already carried by the line items)` +
-        (entry.accountingInvoiceId
-          ? ` — WARNING: already posted as ${entry.accountingInvoiceId}; the ledger document still understates.`
+        // Written from the LIVE evidence, not from the reviewed file. This log is the durable record
+        // of what still needs adjusting by hand, and a record of the state at REVIEW time would
+        // describe a moment that has already passed.
+        (wcCouponCorrectionNeedsLedgerAdjustment(posted)
+          ? ' — WARNING: already in the ledger as ' +
+            [
+              posted.accountingInvoiceId ? `invoice ${posted.accountingInvoiceId}` : null,
+              posted.postedInvoiceExternalIds.length
+                ? `unlinked invoice(s) ${posted.postedInvoiceExternalIds.join(', ')}`
+                : null,
+              posted.revenueDeferredBatchRef
+                ? `revenue deferral ${posted.revenueDeferredBatchRef} of ${posted.unearnedRevenueAmount}`
+                : null,
+            ]
+              .filter(Boolean)
+              .join(', ') +
+            '; those documents still understate and need a manual credit/adjustment.'
           : ''),
       metadata: {
         connector: 'woocommerce',
@@ -722,8 +1046,11 @@ export async function applyWcCouponCorrection(
         lineDiscountTotal: liveLines,
         keptOrderLevel,
         clearedBy: money(live - keptOrderLevel),
-        posted: !!entry.accountingInvoiceId,
-        accountingInvoiceId: entry.accountingInvoiceId,
+        posted: wcCouponCorrectionNeedsLedgerAdjustment(posted),
+        accountingInvoiceId: posted.accountingInvoiceId,
+        postedInvoiceExternalIds: posted.postedInvoiceExternalIds,
+        revenueDeferredBatchRef: posted.revenueDeferredBatchRef,
+        unearnedRevenueAmount: posted.unearnedRevenueAmount,
         discountModel: WC_COUPON_DISCOUNT_MODEL,
         importedAt: entry.importedAt,
         nearCutoff: entry.nearCutoff,
@@ -731,7 +1058,7 @@ export async function applyWcCouponCorrection(
     },
   })
 
-  return { outcome: 'CORRECTED' }
+  return { outcome: 'CORRECTED', posted }
 }
 
 /**
@@ -806,5 +1133,9 @@ export async function stampWcCouponDiscountModel(
     },
   })
 
-  return { outcome: 'CORRECTED' }
+  // `posted: null` — deliberately, and not "no documents exist". Stamping changes NO amount, so
+  // nothing in the ledger has been made inconsistent and there is no manual adjustment to report.
+  // Reporting posted documents here would put orders on the operator's must-fix list that this run
+  // gave them no reason to fix.
+  return { outcome: 'CORRECTED', posted: null }
 }

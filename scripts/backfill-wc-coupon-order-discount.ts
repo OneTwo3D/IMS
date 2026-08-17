@@ -33,6 +33,9 @@
  *     coupon shapes and are worth opening individually.
  *   • `accountingInvoiceId` — non-null means the ledger document ALREADY understates. Clearing the
  *     IMS field does not reach it; each needs a manual credit/adjustment in the accounting system.
+ *   • `revenueDeferredBatchRef` — non-null means a daily-batch Group A1 journal ALSO deferred this
+ *     order's revenue using the same wrong discount, and stamped the result on the order. That is a
+ *     SECOND document needing a manual adjustment, and the stamp stays stale after the correction.
  *   • Anything you are not sure about: DELETE the entry. Skipping is re-runnable; a wrong correction
  *     is not.
  *
@@ -41,9 +44,16 @@
  * amount it writes, so a row that moved between review and apply is SKIPPED, and an edited
  * `keptOrderLevel` causes a refusal rather than a write.
  *
+ * POSTING STATE IS NEVER READ FROM THE FILE. The allowlist decides WHICH ORDERS may be touched and
+ * nothing else. What the accounting system holds is re-read at apply time under the correction's own
+ * lock: a row whose posting state moved since the review is REFUSED, and the "needs a manual ledger
+ * adjustment" list printed at the end is built from that live read. A file-derived list would report
+ * an invoice posted between review and apply as unposted — telling the operator that nothing needs
+ * fixing about the one order that most does.
+ *
  * IT ONLY EVER TOUCHES SalesOrder.discountAmount + discountModel, and only on orders with a
- * WooCommerce link. It never touches the accounting queue: an order with unposted invoice work is
- * DECLINED and reported (o3d-5ct).
+ * WooCommerce link. It never touches the accounting queue: an order with unposted invoice work
+ * (o3d-5ct) or an unposted daily revenue-deferral journal is DECLINED and reported.
  *
  * --imported-before is the moment the o3d-y14 importer fix went LIVE on this instance. It is dated
  * against ShoppingOrderLink.createdAt — when IMS imported the order — and never against
@@ -55,21 +65,28 @@ import { config } from 'dotenv'
 
 import {
   WC_COUPON_BACKFILL_ACTION,
+  WC_COUPON_MAX_CANDIDATES,
+  WC_COUPON_SCAN_PAGE_SIZE,
   LIVE_SALES_INVOICE_STATUSES,
   SALES_INVOICE_SYNC_TYPES,
   applyWcCouponCorrection,
   buildWcCouponAllowlistEntry,
+  chunkWcCouponIds,
+  collectWcCouponCandidates,
   decideWcCouponBackfill,
   isNearWcCouponCutoff,
   parseWcCouponAllowlist,
   parseWcCouponCutoff,
   stampWcCouponDiscountModel,
   sumLineDiscounts,
+  wcCouponCorrectionNeedsLedgerAdjustment,
   type WcCouponAllowlist,
   type WcCouponAllowlistEntry,
   type WcCouponBackfillDecision,
   type WcCouponBackfillRow,
+  type WcCouponPostedEvidence,
 } from '../lib/connectors/woocommerce/sync/coupon-discount-backfill'
+import { liveDailyBatchDeferralWhere } from '../lib/domain/accounting/daily-batch-discount-fence'
 
 // .env MUST load before lib/db is imported: that module builds its pg Pool from
 // process.env.DATABASE_URL at IMPORT time (see scripts/backfill-refund-basis.ts).
@@ -132,12 +149,20 @@ async function apply(allowlistPath: string) {
   }
 
   let corrected = 0
-  const posted: WcCouponAllowlistEntry[] = []
+  // The posting state reported here is the one READ AT APPLY TIME, under the same lock as the
+  // correction — never `entry.accountingInvoiceId`. The allowlist is a list of WHICH ORDERS may be
+  // touched; it was written when the proposal was generated and says nothing about what the ledger
+  // holds now. An invoice queued after the review and posted before this run would be reported as
+  // "not posted" from the file, and the operator would be told no manual ledger correction is
+  // needed for the one order that most needs it (o3d-y14 r2).
+  const posted: Array<{ entry: WcCouponAllowlistEntry; evidence: WcCouponPostedEvidence }> = []
   for (const entry of allowlist.clear) {
     const result = await db.$transaction((tx) => applyWcCouponCorrection(tx, entry))
     if (result.outcome === 'CORRECTED') {
       corrected += 1
-      if (entry.accountingInvoiceId) posted.push(entry)
+      if (wcCouponCorrectionNeedsLedgerAdjustment(result.posted)) {
+        posted.push({ entry, evidence: result.posted as WcCouponPostedEvidence })
+      }
     } else {
       declined.push(`clear ${entry.orderNumber || entry.orderId}: ${result.reason} — ${result.detail}`)
     }
@@ -150,12 +175,21 @@ async function apply(allowlistPath: string) {
   )
   if (posted.length) {
     console.log(
-      `${LOG} ${posted.length} corrected order(s) are ALREADY POSTED to accounting. Their ledger ` +
-        'documents understate revenue by the cleared amount and each needs a manual credit/adjustment — ' +
-        'clearing the IMS field does not reach the posted document:',
+      `${LOG} ${posted.length} corrected order(s) ALREADY HAVE ACCOUNTING DOCUMENTS derived from the old ` +
+        'amount, read live at the moment of correction. Each still understates and needs a manual ' +
+        'credit/adjustment — clearing the IMS field does not reach a posted document:',
     )
-    for (const entry of posted) {
-      console.log(`${LOG}   posted: ${entry.orderNumber || entry.orderId} -> ${entry.accountingInvoiceId}`)
+    for (const { entry, evidence } of posted) {
+      const parts = [
+        evidence.accountingInvoiceId ? `invoice ${evidence.accountingInvoiceId}` : null,
+        evidence.postedInvoiceExternalIds.length
+          ? `posted-but-unlinked invoice(s) ${evidence.postedInvoiceExternalIds.join(', ')}`
+          : null,
+        evidence.revenueDeferredBatchRef
+          ? `revenue deferral ${evidence.revenueDeferredBatchRef} (unearned ${evidence.unearnedRevenueAmount})`
+          : null,
+      ].filter(Boolean)
+      console.log(`${LOG}   posted: ${entry.orderNumber || entry.orderId} -> ${parts.join('; ')}`)
     }
   }
   if (declined.length) {
@@ -186,57 +220,100 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
   // NO cutoff in this query. Scoping the SELECT by SalesOrder.createdAt is the o3d-9te bug: that
   // column is backdated to the Woo order date by the initial import. Provenance is decided per row,
   // from the link timestamp and the recorded discount model.
-  const orders = await db.salesOrder.findMany({
-    where: {
-      discountAmount: { gt: 0 },
-      shoppingLinks: { some: { connector: 'woocommerce' } },
-    },
-    select: {
-      id: true,
-      orderNumber: true,
-      externalOrderNumber: true,
-      currency: true,
-      discountAmount: true,
-      discountModel: true,
-      accountingInvoiceId: true,
-      lines: { select: { discountAmount: true } },
-      shoppingLinks: {
-        where: { connector: 'woocommerce' },
-        select: { createdAt: true },
-        orderBy: { createdAt: 'asc' },
-        take: 1,
+  //
+  // KEYSET-PAGED, and capped (o3d-y14 r2 finding 3). The previous shape loaded every matching order
+  // and every line in one statement, then used the whole id list in two more — which is bounded by
+  // the catalogue rather than by the work, and past ~65k ids the `IN` lists stop being slow and
+  // start being errors. Ordering is by id because that is what makes the keyset sound; the display
+  // order is restored below, where it costs nothing.
+  type ScannedOrder = Awaited<ReturnType<typeof scanPage>>[number]
+  async function scanPage(afterId: string | null) {
+    return await db.salesOrder.findMany({
+      where: {
+        discountAmount: { gt: 0 },
+        shoppingLinks: { some: { connector: 'woocommerce' } },
+        ...(afterId ? { id: { gt: afterId } } : {}),
       },
-    },
-    orderBy: { createdAt: 'asc' },
-  })
+      select: {
+        id: true,
+        orderNumber: true,
+        externalOrderNumber: true,
+        currency: true,
+        discountAmount: true,
+        discountModel: true,
+        accountingInvoiceId: true,
+        revenueDeferredBatchRef: true,
+        lines: { select: { discountAmount: true } },
+        shoppingLinks: {
+          where: { connector: 'woocommerce' },
+          select: { createdAt: true },
+          orderBy: { createdAt: 'asc' },
+          take: 1,
+        },
+      },
+      orderBy: { id: 'asc' },
+      take: WC_COUPON_SCAN_PAGE_SIZE,
+    })
+  }
+
+  const scan = await collectWcCouponCandidates<ScannedOrder>(scanPage)
+  if (!scan.ok) {
+    // REFUSE rather than truncate. A truncated proposal is indistinguishable from a complete one,
+    // and the orders it silently omitted are the ones nobody will ever look at again.
+    console.error(
+      `${LOG} REFUSING: more than ${WC_COUPON_MAX_CANDIDATES} WooCommerce orders carry an order-level ` +
+        `discount (${scan.scanned} scanned). That is far beyond any real catalogue, so the filter is wrong ` +
+        'rather than the estate large — this backfill targets a defect affecting tens of orders. Nothing ' +
+        'was written.',
+    )
+    process.exitCode = 1
+    return
+  }
+  const orders = scan.rows
+  // The scan order is by id; the reviewer reads by import date, which is the evidence they check.
+  orders.sort((a, b) => (a.shoppingLinks[0]?.createdAt?.getTime() ?? 0) - (b.shoppingLinks[0]?.createdAt?.getTime() ?? 0))
   console.log(`${LOG} ${orders.length} WooCommerce order(s) carry an order-level discount`)
 
   const orderIds = orders.map((order) => order.id)
 
-  const alreadyBackfilled = new Set(
-    (
-      await db.activityLog.findMany({
-        where: { action: WC_COUPON_BACKFILL_ACTION, entityId: { in: orderIds } },
-        select: { entityId: true },
-      })
-    )
-      .map((entry) => entry.entityId)
-      .filter((id): id is string => !!id),
-  )
+  // Chunked for the same reason the scan is paged: one `IN` list of every candidate is a statement
+  // whose parameter count is set by the catalogue.
+  const alreadyBackfilled = new Set<string>()
+  for (const batch of chunkWcCouponIds(orderIds)) {
+    const marks = await db.activityLog.findMany({
+      where: { action: WC_COUPON_BACKFILL_ACTION, entityId: { in: batch } },
+      select: { entityId: true },
+    })
+    for (const mark of marks) if (mark.entityId) alreadyBackfilled.add(mark.entityId)
+  }
 
   const liveJobCounts = new Map<string, number>()
-  if (orderIds.length) {
+  for (const batch of chunkWcCouponIds(orderIds)) {
     const grouped = await db.accountingSyncLog.groupBy({
       by: ['referenceId'],
       where: {
         referenceType: 'SalesOrder',
-        referenceId: { in: orderIds },
+        referenceId: { in: batch },
         type: { in: [...SALES_INVOICE_SYNC_TYPES] },
         status: { in: [...LIVE_SALES_INVOICE_STATUSES] },
       },
       _count: { _all: true },
     })
     for (const group of grouped) liveJobCounts.set(group.referenceId, group._count._all)
+  }
+
+  // The daily-batch producer (o3d-y14 r2 finding 1). Its rows are keyed on the BATCH, not on the
+  // order, so they are looked up by the batch reference each order carries — an order-scoped query
+  // of any shape would find none of them.
+  const batchRefs = [...new Set(orders.map((order) => order.revenueDeferredBatchRef).filter((ref): ref is string => !!ref))]
+  const liveBatchCounts = new Map<string, number>()
+  for (const batch of chunkWcCouponIds(batchRefs)) {
+    const grouped = await db.accountingSyncLog.groupBy({
+      by: ['referenceId'],
+      where: liveDailyBatchDeferralWhere(batch),
+      _count: { _all: true },
+    })
+    for (const group of grouped) liveBatchCounts.set(group.referenceId, group._count._all)
   }
 
   const rows: Array<{ row: WcCouponBackfillRow; decision: WcCouponBackfillDecision }> = []
@@ -253,6 +330,10 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
       importedAt: order.shoppingLinks[0]?.createdAt ?? null,
       alreadyBackfilled: alreadyBackfilled.has(order.id),
       liveInvoiceJobs: liveJobCounts.get(order.id) ?? 0,
+      revenueDeferredBatchRef: order.revenueDeferredBatchRef,
+      liveBatchDeferralJobs: order.revenueDeferredBatchRef
+        ? (liveBatchCounts.get(order.revenueDeferredBatchRef) ?? 0)
+        : 0,
     }
     rows.push({ row, decision: decideWcCouponBackfill(row, { importedBefore }) })
   }
@@ -286,7 +367,11 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
     )
   }
 
-  const postedCandidates = corrections.filter((entry) => entry.row.accountingInvoiceId)
+  // Both accounting artefacts, not just the invoice: an order whose revenue deferral has already
+  // been journaled has a SECOND document derived from the amount about to change (o3d-y14 r2).
+  const postedCandidates = corrections.filter(
+    (entry) => entry.row.accountingInvoiceId || entry.row.revenueDeferredBatchRef,
+  )
   const nearCutoff = corrections.filter((entry) => isNearWcCouponCutoff(entry.row.importedAt, importedBefore))
   console.log('')
   console.log(
@@ -297,12 +382,17 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
 
   if (postedCandidates.length) {
     console.log(
-      `${LOG} ${postedCandidates.length} of the candidates are ALREADY POSTED to accounting. Their ledger ` +
-        'documents understate revenue by the cleared amount and a manual credit/adjustment is needed for ' +
-        'each — clearing the IMS field does not reach the posted document.',
+      `${LOG} ${postedCandidates.length} of the candidates ALREADY HAVE ACCOUNTING DOCUMENTS derived from ` +
+        'the amount about to change. Each understates and needs a manual credit/adjustment — clearing the ' +
+        'IMS field does not reach a posted document. This is the state AT REPORT TIME; apply re-reads it ' +
+        'live and refuses any row whose posting state has moved since you reviewed it.',
     )
     for (const { row } of postedCandidates) {
-      console.log(`${LOG}   posted: ${row.orderNumber || row.orderId} -> ${row.accountingInvoiceId}`)
+      const parts = [
+        row.accountingInvoiceId ? `invoice ${row.accountingInvoiceId}` : null,
+        row.revenueDeferredBatchRef ? `revenue deferral batch ${row.revenueDeferredBatchRef}` : null,
+      ].filter(Boolean)
+      console.log(`${LOG}   posted: ${row.orderNumber || row.orderId} -> ${parts.join('; ')}`)
     }
   }
 
@@ -336,9 +426,10 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
   if (blocked.length) {
     console.log('')
     console.log(
-      `${LOG} ${blocked.length} order(s) are BLOCKED by live invoice work. A queued SALES_INVOICE ` +
-        'carries a payload snapshot the processors post from, and a worker may already hold it, so ' +
-        'this run will not propose them. Let the queue drain (or resolve the failed jobs) and re-run:',
+      `${LOG} ${blocked.length} order(s) are BLOCKED by live accounting work — a queued SALES_INVOICE, ` +
+        'or a daily revenue-deferral journal that has not posted yet. Both carry a payload snapshot the ' +
+        'processors post from, and a worker may already hold it, so this run will not propose them. Let ' +
+        'the queue and the daily batch drain (or resolve the failed jobs) and re-run:',
     )
     for (const { row, decision } of blocked) {
       console.log(`${LOG}   ${row.orderNumber || row.orderId}: ${decision.detail}`)
@@ -348,7 +439,8 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
   if (csvPath) {
     const header =
       'salesOrderId,orderNumber,externalOrderNumber,currency,storedOrderDiscount,lineDiscountTotal,' +
-      'importedAt,nearCutoff,discountModel,accountingInvoiceId,liveInvoiceJobs,action,reason,keptOrderLevel,clearedBy,detail'
+      'importedAt,nearCutoff,discountModel,accountingInvoiceId,liveInvoiceJobs,revenueDeferredBatchRef,' +
+      'liveBatchDeferralJobs,action,reason,keptOrderLevel,clearedBy,detail'
     const body = rows.map(({ row, decision }) =>
       [
         row.orderId,
@@ -362,6 +454,8 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
         row.discountModel ?? '',
         row.accountingInvoiceId ?? '',
         row.liveInvoiceJobs,
+        row.revenueDeferredBatchRef ?? '',
+        row.liveBatchDeferralJobs,
         decision.action,
         decision.action === 'CORRECT' ? (decision.partial ? 'PARTIAL' : 'FULL') : decision.reason,
         decision.action === 'CORRECT' ? decision.keptOrderLevel : '',

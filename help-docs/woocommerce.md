@@ -75,15 +75,30 @@ With the initial import complete, new and updated WooCommerce orders are importe
 
 - A new sales order is created with all line items, prices, discounts, shipping, and tax
 - **Cart coupons ride on the line items.** WooCommerce allocates coupon money *into* the lines — each line's total is already its subtotal minus that line's share — so IMS imports the coupon as a per-line discount and leaves the order-level discount field at zero. The coupon codes are still recorded on the order for display. Only money WooCommerce left unallocated (a coupon shape IMS does not model) is stored as an order-level discount, and that is logged as a warning when it happens. Storing it in both places made every downstream document — the Xero/QuickBooks invoice, the credit note, the order totals — deduct the same coupon twice. Every order imported since the fix records `LINE_ALLOCATED` in its discount model field, which is what says the order-level amount is only the unallocated residual
-- **Orders imported before that fix still carry the duplicate** and are corrected by a separate one-off backfill:
+- **Orders imported before that fix still carry the duplicate** and are corrected by a separate one-off backfill. It is a **two-phase, opt-in** workflow, because it rewrites amounts on invoices that are already in the ledger, and nothing on a row distinguishes "written by the old importer" from "corrected by hand afterwards". A machine may propose; only a person may approve:
 
   ```bash
-  npm run wc:coupon-discount:backfill                                             # report only
-  npm run wc:coupon-discount:backfill -- --csv out.csv                            # export every row and its verdict
-  npm run wc:coupon-discount:backfill -- --imported-before <ISO> --apply          # clear the duplicated part
+  # 1. PROPOSE — writes nothing
+  npm run wc:coupon-discount:backfill -- --imported-before <ISO> --allowlist-out y14.json --csv out.csv
+
+  # 2. REVIEW y14.json by hand, then sign it:
+  #      "reviewed": true, "reviewedBy": "<your name>", "reviewedAt": "<ISO>"
+
+  # 3. APPLY — consumes ONLY the reviewed file, never a fresh scan
+  npm run wc:coupon-discount:backfill -- --allowlist y14.json --apply
   ```
 
-  `--imported-before` is the moment the fix went live on this instance, and it is required to apply. It is dated against when **IMS imported** the order, never against the order date — the initial import backdates a sales order's `createdAt` to the historical WooCommerce date, so an old order imported yesterday would otherwise look like a legacy one and have a correct discount erased. Orders whose provenance cannot be established are reported as **UNPROVEN** and left exactly as they are, and orders that still have unposted invoice work are reported as **BLOCKED** and left for a later run (the queued invoice holds its own copy of the figures, which the backfill deliberately never edits). Both lists are printed and included in the CSV, and re-running the command re-evaluates them. Orders already posted to Xero/QuickBooks are listed separately: their ledger documents understate revenue and each needs a manual credit or adjustment, because clearing the IMS field does not reach a posted document
+  `--imported-before` is the moment the fix went live on this instance. It must be an unambiguous ISO instant (`2026-07-25T14:00:00Z`) — a bare date is refused, because it silently means UTC midnight and orders import at all hours. It is dated against when **IMS imported** the order, never against the order date: the initial import backdates a sales order's `createdAt` to the historical WooCommerce date, so an old order imported yesterday would otherwise look legacy and have a correct discount erased. It is **not accepted with `--apply`** — the cutoff decided what was proposed; what gets written is decided by the reviewed file alone.
+
+  Reviewing means checking each entry against the deployment record and against any manual corrections you know about. An entry whose amount is **already** correct belongs in the file's `stampOnly` list, which records that fact permanently without changing any number; anything you are unsure of should be deleted from the file, since skipping is re-runnable and a wrong correction is not. Apply re-verifies every field against the live row and re-derives the amount it writes, so a row that moved since you reviewed it is skipped and a hand-edited figure is refused rather than obeyed.
+
+  Verdicts in the report and the CSV:
+
+  - **UNPROVEN** — nothing establishes what the stored amount means, so it is left exactly as it is
+  - **BLOCKED** — the order has live accounting work: an unposted invoice job, or a daily revenue-deferral journal that has not posted yet. Both hold their own copy of the figures, which the backfill deliberately never edits. Let the queue and the daily batch drain, then re-run
+  - **SKIP** / **CORRECT** — nothing duplicated, or a proposal to clear the duplicated part
+
+  Orders that already have accounting documents are listed separately, at both phases. Their invoices understate revenue and their revenue-deferral journals defer the wrong amount, and **each needs a manual credit or adjustment** — clearing the IMS field does not reach a document that has already posted. At apply time that list is rebuilt from **live** state rather than from the reviewed file, and any order whose posting state changed since you reviewed it is refused instead of corrected, so you are never told a posted order needs nothing
 - The customer is matched by WooCommerce customer ID or email, or created if new
 - Multi-currency orders are converted to the IMS base currency using the FX rate from `frankfurter.dev` (ECB) at import time. The same rate is stamped on the order's `fxRateToBase` field and forwarded to Xero as `CurrencyRate` on the resulting invoice — so the WooCommerce store, IMS, and Xero all see the same base-currency total for the order. See `docs/xero-sync.md` § Multi-Currency FX Rates.
 - Tax rates are resolved using the tax rate mappings you configure (see Tax Rates below)
