@@ -56,6 +56,13 @@ import type { ProductType } from '@/app/generated/prisma/client'
  *     does this: a "does it have children right now?" test would be a TOCTOU the connector
  *     cannot make sound, because it takes no structural lock on the child rows.
  *
+ *     Note the direction that makes r4's child query compatible with this (see rule 3 in
+ *     `decideConnectorParentWrite`). The allow-list refuses VARIABLE unconditionally and asks
+ *     nothing; the child query is only ever used to refuse MORE — a row it reports as having
+ *     children is refused, and a row it reports as clean falls back on every other rule. A
+ *     TOCTOU that can only add refusals never permits something it should have refused, which
+ *     is the only direction that would be unsound here.
+ *
  *   VARIANT — protected. A VARIANT is by definition attached to a VARIABLE parent
  *     (`validateProductStructureChange` rejects a VARIANT with no parentId). The parent
  *     branch of the sync writes `type` but NEVER writes or clears `parentId`, so
@@ -116,7 +123,12 @@ export function effectiveImsProductType(existing: ProductType, incoming: Product
  * into the conflict line, so the two halves stay next to the rule that produced them.
  */
 export type WcVariableParentRefusal = {
-  reason: 'type_cannot_be_a_variable_parent' | 'row_is_a_child' | 'transform_blocked'
+  reason:
+    | 'type_cannot_be_a_variable_parent'
+    | 'row_is_a_child'
+    /** Other IMS rows carry this row's id in their `parentId`, but its type does not admit it. */
+    | 'row_is_an_invalid_parent'
+    | 'transform_blocked'
   detail: string
   remedy: string
 }
@@ -177,13 +189,27 @@ export type ConnectorParentWriteDecision = {
    * variable parent" means here:
    *
    *   - WooCommerce says VARIABLE: the row must actually be able to hold the children this
-   *     payload carries — `canBeVariableParent`, which already folds in the type, the
-   *     row-is-a-child rule and the live-row gate.
-   *   - WooCommerce says SIMPLE: the row must actually NOT be a parent — `effectiveType !==
-   *     'VARIABLE'`. A row that stays VARIABLE keeps child rows and ProductOption rows that
-   *     IMS owns and this connector may not delete, and its own price columns are meaningless
-   *     (a parent shows min–max from its variants), so WooCommerce's simple price cannot be
+   *     payload carries — `canBeVariableParent`, which folds in the type, the row-is-a-child
+   *     rule, the physical parent-by-children rule below and the live-row gate.
+   *   - WooCommerce says SIMPLE: the row must actually NOT be a parent. That is TWO facts, not
+   *     one: its type must not be VARIABLE, AND no other IMS row may carry its id as a
+   *     `parentId`. A row that stays VARIABLE keeps child rows and ProductOption rows that IMS
+   *     owns and this connector may not delete, and its own price columns are meaningless (a
+   *     parent shows min–max from its variants), so WooCommerce's simple price cannot be
    *     applied either.
+   *
+   * TYPE IS NOT ENOUGH, IN EITHER DIRECTION (Codex r4 finding 1). Nothing in the database
+   * enforces that only a VARIABLE row may have children — `Product.parentId` is a plain
+   * self-relation with no type constraint — and the pre-o3d-y89x connector could mint exactly
+   * the offending shape, by flattening a VARIABLE row to SIMPLE without deleting its children.
+   * Deciding the simple arm from `effectiveType` alone therefore reported AGREEMENT for such a
+   * legacy row: WooCommerce's simple price was applied, its children were left attached, the
+   * sync was recorded SYNCED and the cursor advanced — the same stale-structure failure the
+   * VARIABLE case was fixed for, reached through physical state instead of the type column.
+   * So the rule asks the PHYSICAL question (`rowIsAParent`) as well as the type one, and the
+   * variable arm asks it too: a row whose type denies the children it demonstrably has is one
+   * this connector may neither flatten nor build on, in either direction. See
+   * `row_is_an_invalid_parent` in {@link decideConnectorParentWrite}.
    *
    * WHAT AGREEMENT BUYS, AND WHAT DISAGREEMENT COSTS. Both consumers of this flag follow from
    * the same sentence — *this sync applied the shape WooCommerce asserted*:
@@ -221,11 +247,13 @@ export type ConnectorParentWriteDecision = {
 function wooAndImsAgreeOnShape(args: {
   incoming: ProductType
   effectiveType: ProductType
+  /** PHYSICAL, not typed: other IMS rows carry this row's id in their `parentId`. */
+  rowIsAParent: boolean
   canBeVariableParent: boolean
 }): boolean {
   return args.incoming === 'VARIABLE'
     ? args.canBeVariableParent
-    : args.effectiveType !== 'VARIABLE'
+    : args.effectiveType !== 'VARIABLE' && !args.rowIsAParent
 }
 
 export type ConnectorParentRow = {
@@ -257,7 +285,21 @@ export type ConnectorParentRow = {
  *      reporting a clean run. "Nothing is changing, so nothing to guard" and "the type is
  *      unchanged but the write would still deepen an invalid structure" are different
  *      statements; only the first may be quiet.
- *   3. LIVE ROWS. The editor refuses any type/parent change on a product with stock,
+ *   3. A ROW WHOSE TYPE DENIES ITS OWN CHILDREN IS NOT ACTED ON AT ALL (Codex r4 finding 1).
+ *      The mirror of rule 2, and the same class of pre-existing corruption seen from the other
+ *      end: `caller.rowHasChildren` is true while the type is not VARIABLE. Only a VARIABLE row
+ *      may be a parent (`validateProductStructureChange` refuses any other), and no database
+ *      constraint enforces it, so this shape is reachable — the pre-o3d-y89x connector minted
+ *      it by flattening a VARIABLE row to SIMPLE and leaving the children behind. Both things
+ *      the connector could do with it are wrong: treating it as the standalone product
+ *      WooCommerce called `simple` flattens what is left of an IMS parent (applying a simple
+ *      price to a row that still has variants, and calling the sync clean), and promoting it to
+ *      VARIABLE because WooCommerce called it `variable` silently adopts child rows this
+ *      payload never mentioned into a WooCommerce-owned parent. So the connector does neither:
+ *      it refuses the parent role, suppresses the type write, and reports the conflict for an
+ *      operator to repair in the editor. Answered from a CHILD-ROW QUERY, never from the type,
+ *      because the type is precisely the field that is lying.
+ *   4. LIVE ROWS. The editor refuses any type/parent change on a product with stock,
  *      reservations or open documents. The connector performs the same transformations, so it
  *      asks the same question — via the editor's own `getProductTransformBlockers`.
  *
@@ -274,10 +316,21 @@ export function decideConnectorParentWrite(args: {
   row: ConnectorParentRow | null
   /** The type mapped from the WooCommerce payload. */
   incoming: ProductType
+  /**
+   * True when other IMS rows carry `row.id` in their `parentId` — the PHYSICAL parent question,
+   * which no field of `row` can answer (a row's children are different rows).
+   *
+   * Required rather than optional on purpose: defaulting it to false would make the caller that
+   * forgot to ask indistinguishable from the row that genuinely has no children, which is the
+   * exact confusion Codex r4 finding 1 is about. Its one source is
+   * `findImsProductIdsWithChildren` in product-sync.ts, shared with `refuseVariationAdoption`
+   * so the two rules cannot drift apart.
+   */
+  rowHasChildren: boolean
   /** The editor's blocker summary for this row, or null when it is clean / not yet asked. */
   transformBlockerSummary?: string | null
 }): ConnectorParentWriteDecision {
-  const { row, incoming } = args
+  const { row, incoming, rowHasChildren } = args
   const transformBlockerSummary = args.transformBlockerSummary ?? null
 
   // A brand-new row has no structure to protect, no parent and nothing live pointing at it.
@@ -294,7 +347,14 @@ export function decideConnectorParentWrite(args: {
       // A created row is whatever WooCommerce says it is, so the rule below always answers
       // true here. Computed rather than hardcoded so there is exactly one definition of
       // agreement, and so a future create-branch guard cannot make this silently stale.
-      wooShapeAgrees: wooAndImsAgreeOnShape({ incoming, effectiveType: incoming, canBeVariableParent }),
+      // `rowIsAParent: false` is a fact, not a default: the row does not exist yet, so no other
+      // row can be carrying its id.
+      wooShapeAgrees: wooAndImsAgreeOnShape({
+        incoming,
+        effectiveType: incoming,
+        rowIsAParent: false,
+        canBeVariableParent,
+      }),
       parentRoleRefusal: incoming === 'VARIABLE'
         ? null
         : {
@@ -306,22 +366,33 @@ export function decideConnectorParentWrite(args: {
   }
 
   const rowIsAChild = row.parentId != null
+  // Rule 3: the row demonstrably HAS children while its type says it cannot. Read off the
+  // CURRENT type, not `effectiveType` — the question is whether the row as it stands is already
+  // an invalid parent, and `effectiveType` would answer it with the outcome of the very
+  // transform being decided.
+  const rowIsAnInvalidParent = rowHasChildren && row.type !== 'VARIABLE'
   const typeWouldChange = row.type !== incoming
   const refusedByAllowList = isConnectorTypeWriteSuppressed(row.type, incoming)
   const wouldMakeAChildAParent = rowIsAChild && incoming === 'VARIABLE'
+  // Promoting an already-invalid parent to VARIABLE would silently adopt the child rows it
+  // should not have into a WooCommerce-owned parent, so the type write is suppressed for the
+  // same reason a child may not become a parent: the connector was never told about those rows.
+  const wouldPromoteAnInvalidParent = rowIsAnInvalidParent && incoming === 'VARIABLE'
 
   // Only worth asking the live-row question when a transform is genuinely on the table: the
-  // allow-list and the child rule have already decided every case they cover.
-  const needsTransformBlockerCheck = typeWouldChange && !refusedByAllowList && !wouldMakeAChildAParent
+  // allow-list, the child rule and the invalid-parent rule have already decided every case they
+  // cover, and each of them refuses without needing to know whether the row is live.
+  const needsTransformBlockerCheck = typeWouldChange
+    && !refusedByAllowList && !wouldMakeAChildAParent && !wouldPromoteAnInvalidParent
   const blockedByLiveRows = needsTransformBlockerCheck && transformBlockerSummary != null
 
   const suppressTypeWrite = typeWouldChange
-    && (refusedByAllowList || wouldMakeAChildAParent || blockedByLiveRows)
+    && (refusedByAllowList || wouldMakeAChildAParent || wouldPromoteAnInvalidParent || blockedByLiveRows)
   const effectiveType = suppressTypeWrite ? row.type : incoming
 
-  // Precedence is by specificity. "It is somebody's child" is a fact about THIS row and
-  // outranks anything derived from its type — including the case where the row is already
-  // (invalidly) typed VARIABLE.
+  // Precedence is by specificity. "It is somebody's child" and "it is somebody's parent" are
+  // facts about THIS row and outrank anything derived from its type — including the case where
+  // the row is already (invalidly) typed VARIABLE.
   let parentRoleRefusal: WcVariableParentRefusal | null = null
   if (rowIsAChild) {
     parentRoleRefusal = {
@@ -329,6 +400,15 @@ export function decideConnectorParentWrite(args: {
       detail: `IMS product ${row.id} (SKU "${row.sku}") is itself a child of IMS product ${row.parentId}, `
         + 'so it cannot also be a variable parent.',
       remedy: 'Detach the IMS product from its parent, or point the WooCommerce product at a different SKU.',
+    }
+  } else if (rowIsAnInvalidParent) {
+    parentRoleRefusal = {
+      reason: 'row_is_an_invalid_parent',
+      detail: `IMS product ${row.id} (SKU "${row.sku}") is ${row.type}, but other IMS products already carry `
+        + 'its id as their parent — a shape only a VARIABLE product may have, so the row is already invalid '
+        + 'and a connector may neither flatten it nor build on it.',
+      remedy: 'Repair the IMS product in the product editor — detach or remove its child rows, or make it a '
+        + 'variable parent — then re-run the sync.',
     }
   } else if (blockedByLiveRows) {
     parentRoleRefusal = {
@@ -357,7 +437,12 @@ export function decideConnectorParentWrite(args: {
     // `suppressTypeWrite`), so a retry after a late refusal no longer asks for the transform.
     writeTransformsRow: needsTransformBlockerCheck && !suppressTypeWrite,
     canBeVariableParent,
-    wooShapeAgrees: wooAndImsAgreeOnShape({ incoming, effectiveType, canBeVariableParent }),
+    wooShapeAgrees: wooAndImsAgreeOnShape({
+      incoming,
+      effectiveType,
+      rowIsAParent: rowHasChildren,
+      canBeVariableParent,
+    }),
     parentRoleRefusal,
   }
 }
@@ -527,21 +612,36 @@ export type WcProductStructureConflict = {
 
 /**
  * The operator-facing line for the OTHER direction of shape disagreement (o3d-y89x r3):
- * WooCommerce says `simple`, the IMS row is (and stays) a VARIABLE parent.
+ * WooCommerce says `simple`, the IMS row is (and stays) a parent.
  *
  * The remedy has to name something that actually clears it. Two things do, and the reason
  * neither is "let the connector fix it" is the branch's whole policy: the connector cannot
  * flatten the row, because the children and ProductOption rows it would strand are IMS-owned
  * and WooCommerce never asked for them to be deleted — `simple` says nothing about them.
+ *
+ * Two shapes reach here and they need different words (Codex r4 finding 1). The row may be a
+ * parent BY TYPE — a healthy VARIABLE product whose WooCommerce twin has been made simple — or
+ * a parent BY CHILD ROWS while typed something that may not have them, which is a row that was
+ * already invalid before this sync ran. Calling the second one "a variable parent" would tell
+ * the operator to go and remove variants from a product the UI does not show variants for.
  */
 export function describeParentShapeNotApplied(args: {
   wcProductId: string
   sku: string
   imsProductId: string
   imsType: ProductType
-  /** Set when the row ALSO could not act as a parent (already somebody's child, or live). */
+  /**
+   * Set when the row ALSO could not act as a parent (already somebody's child, already an
+   * invalid parent, or live).
+   */
   parentRoleRefusal: WcVariableParentRefusal | null
 }): string {
+  if (args.parentRoleRefusal?.reason === 'row_is_an_invalid_parent') {
+    return `WooCommerce product ${args.wcProductId} ("${args.sku}") is simple, but `
+      + `${args.parentRoleRefusal.detail} Its WooCommerce type and price were NOT applied — a row with `
+      + 'child rows is not the standalone product WooCommerce describes, and pricing it as one would '
+      + `bury the corruption instead of surfacing it. ${args.parentRoleRefusal.remedy}`
+  }
   const extra = args.parentRoleRefusal ? ` Additionally, ${args.parentRoleRefusal.detail}` : ''
   return `WooCommerce product ${args.wcProductId} ("${args.sku}") is simple, but IMS product `
     + `${args.imsProductId} is ${args.imsType} — a variable parent whose child rows and options IMS `

@@ -20,8 +20,8 @@ import {
 import {
   assertWcRowNotClaimedByAnotherWcObject,
   WcProductTransformBlockedError,
+  WcProductWriteRaceError,
   WcSettingsVersionChangedError,
-  WcSkuOwnershipConflictError,
 } from './product-sync-errors'
 import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
@@ -135,6 +135,89 @@ async function connectorTransformBlockerSummary(
 ): Promise<string | null> {
   const blockers = await getProductTransformBlockers(productId, tx)
   return hasProductTransformBlockers(blockers) ? summarizeTransformBlockers(blockers) : null
+}
+
+/**
+ * THE BLOCKER QUESTION, ASKED ONCE MORE AS THE TRANSACTION'S LAST ACT (o3d-y89x r4, Codex
+ * finding 2).
+ *
+ * `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE` rides in each structural UPDATE, so each of those
+ * writes is refused by a blocker committed before ITS OWN snapshot. What that leaves is
+ * duration: this transaction can transform a parent row and then spend hundreds of variation
+ * writes inside the same transaction before it commits, and a blocker committing anywhere in
+ * that stretch is seen by neither the write's predicate nor the pre-check.
+ *
+ * Re-reading every transformed row here — after every write, immediately before the commit —
+ * shrinks that exposure from "the rest of the transaction" to "one statement boundary". Both
+ * arms matter:
+ *
+ *   - it covers ALL FIVE arms, including the open stock-transfer lines the predicate cannot
+ *     express at all, so the transfer arm is no longer the one weak leg;
+ *   - it fails CLOSED. There is no graceful second decision available at this point (the writes
+ *     are already in the transaction and re-deciding them would mean redoing the import), so it
+ *     throws and the whole transaction rolls back. The next attempt's pre-check finds the
+ *     blocker in the ordinary way and refuses it properly, with the operator-facing conflict.
+ *
+ * WHAT IT STILL DOES NOT DO: close the race. A blocker whose transaction commits after this
+ * read and before this transaction's COMMIT is invisible here, exactly as it is to the
+ * predicate. That is write skew and it needs a lock the blocker writers take, or SERIALIZABLE
+ * across all of them — neither exists (see PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE). This narrows
+ * the window; it does not remove it, and nothing in this file may claim otherwise.
+ *
+ * Costs nothing in the steady state: `transformed` is empty unless this transaction actually
+ * moved a row's `type` or `parentId`, which a re-sync of an established catalogue never does.
+ */
+async function assertTransformedRowsStillTransformable(
+  tx: Prisma.TransactionClient,
+  transformed: ReadonlyMap<string, string>,
+): Promise<void> {
+  for (const [imsProductId, sku] of transformed) {
+    const summary = await connectorTransformBlockerSummary(tx, imsProductId)
+    if (summary) {
+      throw new WcProductTransformBlockedError({ imsProductId, sku, summary, phase: 'commit' })
+    }
+  }
+}
+
+/**
+ * WHICH OF THESE IMS ROWS ARE PHYSICALLY PARENTS — i.e. other rows carry their id in `parentId`.
+ *
+ * The one child query, used by BOTH structural rules (o3d-y89x r4, Codex finding 1). It cannot
+ * be answered from rows already in hand — a row's children are different rows, with different
+ * SKUs — and it must not be inferred from `type`, because the shapes it exists to catch are
+ * exactly the ones whose type does not admit that they have children. Nothing in the schema
+ * enforces that only a VARIABLE row may have children, and the pre-o3d-y89x connector could
+ * mint a SIMPLE-with-children row by flattening a VARIABLE without deleting its variants.
+ *
+ * Shared rather than duplicated because the two rules disagreeing is the failure mode: r3 asked
+ * the physical question in `refuseVariationAdoption` (a variation may not swallow a parent) and
+ * the TYPE question in the parent branch's shape rule, so the identical legacy row was refused
+ * by one door and flattened by the other.
+ *
+ * Batched over the whole candidate set for the same reason as before: this runs inside a
+ * transaction holding row locks, so one query for N variation SKUs beats N queries.
+ *
+ * IT IS A SELECT, AND IT IS NOT ATOMIC WITH THE WRITES THAT FOLLOW. Codex r4 suggested pinning
+ * it into the UPDATE as `variants: { none: {} }`; that is not done, and the reason is the same
+ * one written out at length on the blocker predicate: a predicate would move the boundary by one
+ * statement, not close the race, and the three writers of `Product.parentId` (this sync, the
+ * editor, the CSV import) all take per-SKU advisory locks on the CHILD's SKU — never on this
+ * row's — so no lock serializes it either. What that residual costs is bounded and
+ * self-correcting: a child row appearing between this read and the commit means WooCommerce's
+ * simple price lands on a row that has just become a parent, and the NEXT sync of the pairing
+ * sees the child and quarantines it. Nothing structural is written on that path, because the
+ * paths that DO write structure are the ones this answer refuses.
+ */
+async function findImsProductIdsWithChildren(
+  tx: Prisma.TransactionClient,
+  candidateIds: readonly string[],
+): Promise<ReadonlySet<string>> {
+  if (candidateIds.length === 0) return new Set()
+  const childRows = await tx.product.findMany({
+    where: { parentId: { in: [...candidateIds] } },
+    select: { parentId: true },
+  })
+  return new Set(childRows.map((row) => row.parentId).filter((id): id is string => Boolean(id)))
 }
 
 /**
@@ -738,8 +821,19 @@ export async function syncWcProductToIms(
          * structure to protect) and replaced below when there is an existing row.
          */
         let parentWrite: ConnectorParentWriteDecision =
-          decideConnectorParentWrite({ row: null, incoming: productType })
+          decideConnectorParentWrite({ row: null, incoming: productType, rowHasChildren: false })
         const structureConflicts: WcProductStructureConflict[] = []
+        /**
+         * Every EXISTING row this transaction structurally transformed — moved `type`, or
+         * `parentId`, or both — by IMS product id, carrying its SKU for the message
+         * (o3d-y89x r4, Codex finding 2).
+         *
+         * Collected so the blocker question can be re-asserted once more as this transaction's
+         * last act; see `assertTransformedRowsStillTransformable`. Created rows are deliberately
+         * absent: a row this transaction inserted cannot have acquired stock or open documents
+         * from anyone else.
+         */
+        const structurallyTransformed = new Map<string, string>()
 
         if (existing) {
           // o3d-y89x: the row's structural identity is IMS-owned; a connector may not decide
@@ -748,15 +842,28 @@ export async function syncWcProductToIms(
           // all — while every other field below still applies.
           //
           // Decided in two passes so the live-row query is only paid for when a transform is
-          // actually on the table: the first pass answers from the row alone and says whether
-          // the editor's question is even relevant.
-          parentWrite = decideConnectorParentWrite({ row: existing, incoming: productType })
+          // actually on the table: the first pass answers from the row alone plus the child
+          // query, and says whether the editor's question is even relevant.
+          //
+          // The child query is NOT conditional (o3d-y89x r4, Codex finding 1). Whether this row
+          // is physically a parent decides the shape rule in BOTH directions — including the
+          // steady-state re-sync of a WooCommerce `simple` product, which is precisely where a
+          // legacy SIMPLE-with-children row was being priced and marked SYNCED. One indexed
+          // lookup per parent row is the price of the answer being about the row rather than
+          // about its type column.
+          const existingHasChildren = (await findImsProductIdsWithChildren(tx, [existing.id])).has(existing.id)
+          parentWrite = decideConnectorParentWrite({
+            row: existing,
+            incoming: productType,
+            rowHasChildren: existingHasChildren,
+          })
           if (parentWrite.needsTransformBlockerCheck) {
             const transformBlockerSummary = await connectorTransformBlockerSummary(tx, existing.id)
             if (transformBlockerSummary) {
               parentWrite = decideConnectorParentWrite({
                 row: existing,
                 incoming: productType,
+                rowHasChildren: existingHasChildren,
                 transformBlockerSummary,
               })
             }
@@ -830,30 +937,45 @@ export async function syncWcProductToIms(
           /**
            * Write the parent row under BOTH conditions the decision depends on: the ownership
            * predicate, and — when this write really moves `type` — the editor's live-row
-           * predicate, evaluated by Postgres in the same statement (o3d-y89x r3, Codex finding 2).
+           * predicate, evaluated by Postgres in the same statement (o3d-y89x r3/r4).
            *
-           * WHAT THIS CLOSES. The check above is a SELECT; a stock receipt or an open document
-           * committing between it and the UPDATE was previously invisible, and the connector
-           * transformed a row the editor would have refused. Now that interleaving makes the
-           * UPDATE match zero rows, and the transform is re-decided WITH the blocker instead of
-           * committed without it — the same refusal, message and quarantine the pre-check
-           * produces, just discovered later.
+           * WHAT THE PREDICATE ACTUALLY BUYS. The pre-check is a SELECT, so its answer is a
+           * statement about the past by the time the UPDATE runs. ANDing the predicate into the
+           * UPDATE moves the boundary to POSTGRES' snapshot for that statement: a blocker
+           * committed before it makes the UPDATE match zero rows, and the transform is
+           * re-decided WITH the blocker instead of committed without it — the same refusal,
+           * message and quarantine the pre-check produces, just discovered later. It is a
+           * fail-closed re-assertion, and that is the whole of it.
            *
-           * WHAT REMAINS OPEN, precisely:
+           * WHAT IT DOES NOT BUY, precisely — the r3 text claimed this made the connector
+           * "exactly as safe as `updateProduct`, and no safer", and that was wrong in both
+           * directions (Codex r4 finding 2):
            *
-           *   - OPEN STOCK TRANSFER LINES. `StockTransferLine` carries no FK to Product by
-           *     design, so that arm cannot be expressed as a predicate on this row and stays
-           *     check-only. A transfer line created in the gap is still missed.
-           *   - A blocker whose creating transaction commits AFTER this UPDATE statement takes
-           *     its snapshot but BEFORE this transaction commits. Neither side sees the other,
-           *     which is write skew; closing it needs SERIALIZABLE isolation with retry, or a
-           *     lock the blocker writers actually take. They take none — the per-SKU advisory
-           *     lock covers only the `Product.sku` writers — so this connector is now exactly as
-           *     safe as `updateProduct`, and no safer. That residual is the editor's too.
-           *   - Blockers created by UPDATING an existing row rather than inserting one (a sales
-           *     order re-opening, a StockLevel going 0 -> 5) are covered by the predicate the
-           *     same way inserts are, since it re-evaluates at write time — but only up to the
-           *     same snapshot boundary as above.
+           *   - IT DOES NOT CLOSE THE RACE, FOR ANY ARM. Under READ COMMITTED a blocker
+           *     transaction still uncommitted when this UPDATE takes its snapshot, but committed
+           *     before THIS transaction commits, is invisible here and this transform is
+           *     invisible to it. That is write skew. A predicate cannot see it.
+           *   - SERIALIZABLE ON THIS TRANSACTION ALONE WOULD NOT CLOSE IT EITHER. Postgres'
+           *     SSI guarantees hold only among transactions that are ALL serializable, and every
+           *     blocker writer runs READ COMMITTED, so that remedy is a change to all of them.
+           *   - A SHARED LOCK WOULD CLOSE IT, AND THERE IS NONE. The per-SKU advisory locks are
+           *     taken only by the `Product.sku` writers (this sync, the editor, the CSV import);
+           *     no stock receipt, allocation or document writer takes any lock this transaction
+           *     contends on. Inventing a product-scoped lock here would be worse than useless —
+           *     it is only sound once every blocker writer takes it too.
+           *   - OPEN STOCK TRANSFER LINES ARE NOT IN THE PREDICATE AT ALL. `StockTransferLine`
+           *     carries no FK to Product by design, so Prisma has no relation to filter through.
+           *     That arm is answered by the pre-check SELECT, one statement earlier than the
+           *     other four.
+           *
+           * SO THE RESIDUAL IS NARROWED, NOT REMOVED, and it is narrowed twice: here, to this
+           * statement's snapshot, and again by `assertTransformedRowsStillTransformable` as the
+           * transaction's last act — without which the exposure would run from this statement
+           * through potentially hundreds of variation writes to COMMIT. What survives both is
+           * genuine write skew: a blocker committing after that final re-read and before this
+           * transaction commits. The editor carries the same residual, from the same cause; the
+           * connector's is narrower by one statement on four arms and equal on the fifth.
+           * Neither is race-free and neither may claim to be.
            */
           const writeParentRow = async (decision: ConnectorParentWriteDecision) => {
             const updateData = buildParentUpdateData(decision)
@@ -876,6 +998,8 @@ export async function syncWcProductToIms(
             await updateProductGuardingOwnership(tx, existing, parentClaimants, updateData, {
               requireTransformable: decision.writeTransformsRow,
             })
+            // Recorded once the write has landed, and only when it MOVED `type` (r4).
+            if (decision.writeTransformsRow) structurallyTransformed.set(existing.id, existing.sku)
             // A CONNECTOR TYPE WRITE IS A COMPONENT-GRAPH MUTATION LIKE ANY OTHER, AND MUST MOVE
             // THE VERSION.
             //
@@ -914,6 +1038,7 @@ export async function syncWcProductToIms(
             parentWrite = decideConnectorParentWrite({
               row: existing,
               incoming: productType,
+              rowHasChildren: existingHasChildren,
               transformBlockerSummary: e.summary,
             })
             await writeParentRow(parentWrite)
@@ -1022,7 +1147,9 @@ export async function syncWcProductToIms(
           )
         } else if (isVariable) {
           structureConflicts.push(
-            ...await applyVariations(tx, variations, productId, wcProduct.name, imsCategoryId),
+            ...await applyVariations(
+              tx, variations, productId, wcProduct.name, imsCategoryId, structurallyTransformed,
+            ),
           )
         }
 
@@ -1044,6 +1171,9 @@ export async function syncWcProductToIms(
           wcProductId: wcProduct.id,
           conflicts: structureConflicts,
         })
+
+        // LAST, so it sees as much of the concurrent world as this transaction ever can.
+        await assertTransformedRowsStillTransformable(tx, structurallyTransformed)
 
         return {
           syncedProductId: productId,
@@ -1255,15 +1385,25 @@ async function updateProductGuardingOwnership(
     }
   }
 
-  // Re-read says the row is writable, yet the conditional update matched nothing — it was
-  // reassigned and reassigned back, or another predicate moved. Refuse rather than retry in a
-  // loop: the transaction rolls back and the delivery is retried from the top.
-  throw new WcSkuOwnershipConflictError({
-    sku: row.sku,
-    claimedByWcId: String(current.externalProductId ?? 'none'),
-    incomingWcId: [...claimants].map(String).join(', '),
-    imsProductId: row.id,
-  })
+  // NOTHING EXPLAINS THE ZERO ROWS ANY MORE (o3d-y89x r4, Codex finding 3).
+  //
+  // The row is here, this payload still owns it, and no blocker remains. Every predicate in the
+  // statement has been re-evaluated and they all pass now — so whatever refused the write has
+  // already cleared. A blocker that appeared for the UPDATE's snapshot and was gone by these
+  // SELECTs is enough (stock moving 0 -> 5 -> 0), as is a mapping reassigned and reassigned back.
+  //
+  // This used to fall through to `WcSkuOwnershipConflictError`, which was wrong twice: it named
+  // an ownership conflict that `assertWcRowNotClaimedByAnotherWcObject` had just DISPROVED — so
+  // the message told the operator to resolve a duplicate WooCommerce SKU that does not exist,
+  // quoting `externalProductId` as the rival claimant when it is null or one of our own ids —
+  // and o3d-gtk classifies those PERMANENT, so the webhook was acknowledged and the product
+  // stranded on a condition that had already fixed itself.
+  //
+  // A cause that can no longer be observed may not be attributed to the wrong cause, and a
+  // transient condition may not produce a terminal verdict. So this is its own transient error:
+  // the transaction still rolls back (no retry loop here — the predicates are Postgres', not
+  // ours to spin on), but the delivery is retried from the top and can legitimately succeed.
+  throw new WcProductWriteRaceError({ imsProductId: row.id, sku: row.sku })
 }
 
 /**
@@ -1284,6 +1424,15 @@ async function applyVariations(
   // category is applied — a variant's category is never cleared by inheritance, even
   // if the parent currently resolves to no category (matches the backfill's policy).
   parentCategoryId: string | null | undefined,
+  /**
+   * The caller's set of rows this transaction has structurally transformed, id -> SKU
+   * (o3d-y89x r4). Adoption moves `parentId` and, for a SIMPLE row, `type`, so every adopted
+   * EXISTING row belongs in it — that is what makes the caller's pre-commit re-assertion cover
+   * the variation door as well as the parent one. Written into rather than returned because the
+   * return value is already the conflict list, and a row must be recorded the moment its write
+   * lands, not once the loop finishes.
+   */
+  structurallyTransformed: Map<string, string>,
 ): Promise<WcProductStructureConflict[]> {
   const conflicts: WcProductStructureConflict[] = []
   const entries = variations
@@ -1298,21 +1447,10 @@ async function applyVariations(
   })
   const existingBySku = new Map(existingRows.map((row) => [row.sku, row]))
 
-  // Which of those candidate rows are themselves parents (o3d-h2cz). One extra query for the
-  // whole batch, and only when there is something to ask about. It cannot be answered from
-  // the rows already in hand — a row's children are different rows, with different SKUs —
-  // and it cannot be inferred from `type`, because the shape being guarded against is
-  // precisely a row whose type does not admit that it has children.
-  const candidateIds = existingRows.map((row) => row.id)
-  const childRows = candidateIds.length > 0
-    ? await tx.product.findMany({
-      where: { parentId: { in: candidateIds } },
-      select: { parentId: true },
-    })
-    : []
-  const rowsWithChildren = new Set(
-    childRows.map((row) => row.parentId).filter((id): id is string => Boolean(id)),
-  )
+  // Which of those candidate rows are themselves parents (o3d-h2cz), through the SAME query the
+  // parent branch's shape rule uses (o3d-y89x r4). One extra query for the whole batch, and only
+  // when there is something to ask about.
+  const rowsWithChildren = await findImsProductIdsWithChildren(tx, existingRows.map((row) => row.id))
 
   // Every WC variation id this payload maps to each SKU (o3d-fsi). WC permits one SKU on
   // several variations of a parent, and the sync has always resolved that last-one-wins —
@@ -1482,6 +1620,8 @@ async function applyVariations(
         }))
         continue
       }
+      // The adoption landed; same rule as the parent branch (r4).
+      if (adoptionTransformsRow) structurallyTransformed.set(existing.id, existing.sku)
       await bumpFulfillmentGraphVersions(tx, existing.id, kitnessMutation)
       // Reflect the FULL applied update, not just the new mapping. A later sibling sharing this
       // SKU builds its `?? existing.x` fallbacks from this row; caching the pre-update values

@@ -114,10 +114,31 @@ export function summarizeTransformBlockers(blockers: ProductTransformBlockers): 
  * CREATE blockers (stock receipts, allocation, sales/purchase/production/transfer documents)
  * take none of them, so one of them can commit between the check and the write.
  *
- * ANDing this into that UPDATE's own `WHERE` closes the gap for what it can express, because
- * the predicate is then evaluated by Postgres against the UPDATE statement's own snapshot
- * rather than an earlier one. A blocker that committed in between makes the update match zero
- * rows, and the caller fails closed instead of transforming a row the editor would refuse.
+ * WHAT ANDING THIS INTO THAT UPDATE'S OWN `WHERE` BUYS — AND WHAT IT DOES NOT (corrected in
+ * o3d-y89x r4, Codex finding 2; the r3 wording overclaimed). It MOVES THE BOUNDARY, from the
+ * caller's SELECT snapshot to the UPDATE statement's own: a blocker committed before that
+ * statement makes the update match zero rows, and the caller fails closed instead of
+ * transforming a row the editor would refuse. That is a real, fail-closed improvement and it is
+ * all it is. It does NOT make the transform race-free:
+ *
+ *   - Under READ COMMITTED a blocker transaction that is still uncommitted when this statement
+ *     takes its snapshot, and commits before the caller's transaction does, is invisible here —
+ *     and this transform is invisible to it. That is write skew, and no `WHERE` can see it.
+ *   - Raising THIS transaction to SERIALIZABLE would not close it either. Postgres' SSI
+ *     guarantees hold only among transactions that are ALL serializable, and every blocker
+ *     writer (stock receipts, allocation, sales/purchase/production/transfer documents) runs
+ *     READ COMMITTED. "Use SERIALIZABLE with retry" is therefore a change to all of them, not a
+ *     change available to one caller.
+ *   - A lock the blocker writers also took would close it. THERE IS NO SUCH LOCK: the per-SKU
+ *     advisory locks (lib/products/sku-write-lock.ts) are cooperative and taken only by the
+ *     `Product.sku` writers, and no blocker writer takes any lock a structural writer contends
+ *     on. Callers must say that plainly rather than describe this predicate as a closure.
+ *
+ * A caller that needs the window narrowed further can re-assert the FULL blocker question (this
+ * predicate's four arms plus the transfer arm below) as the last statement before it commits;
+ * that shrinks the exposure from "the rest of the transaction" to "one statement boundary", but
+ * it does not remove the write-skew residual either. The WooCommerce connector does exactly
+ * that — see `assertTransformedRowsStillTransformable` in the product sync.
  *
  * EXACTLY EQUIVALENT TO THE COUNTING VERSION, for the four arms it covers:
  *
@@ -132,8 +153,11 @@ export function summarizeTransformBlockers(blockers: ProductTransformBlockers): 
  * WHAT IT DELIBERATELY DOES NOT COVER: open STOCK TRANSFER lines. `StockTransferLine.productId`
  * carries no foreign key to Product on purpose ("no FK to Product to allow orphaned lines in
  * audit"), so there is no relation to filter through and no way to state it as a predicate on
- * this row at all. That arm stays check-only, and callers must say so rather than claim the
- * whole question is closed.
+ * this row at all — a correlated raw `NOT EXISTS` could express it, but only by giving up
+ * Prisma's typed `updateMany` for a hand-built dynamic `UPDATE`. That arm is therefore answered
+ * by `getProductTransformBlockers` alone: one statement earlier than the other four at the
+ * write, and equal to them at any pre-commit re-assertion. Callers must say so rather than
+ * claim the whole question is closed.
  */
 export const PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE: Prisma.ProductWhereInput = {
   stockLevels: { none: { OR: [{ quantity: { gt: 0 } }, { reservedQty: { gt: 0 } }] } },

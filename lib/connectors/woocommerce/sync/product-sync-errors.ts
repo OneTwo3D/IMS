@@ -237,35 +237,83 @@ export function isPermanentProductSyncConflict(error: unknown): boolean {
 }
 
 /**
- * A transform the connector was CLEARED to make, refused by the write itself because a blocker
- * turned up after the check (o3d-y89x r3, Codex finding 2).
+ * A transform the connector was CLEARED to make, refused because a blocker turned up after the
+ * check (o3d-y89x r3/r4, Codex findings 2).
  *
- * The connector's write is conditional: `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE` is ANDed into the
- * same `UPDATE ... WHERE` that already guards ownership, so a stock receipt or an open document
- * committing between `getProductTransformBlockers` and the write makes the statement match zero
- * rows. This carries the blocker summary back out so the caller can decide again WITH it and
- * reach the identical outcome the pre-check would have reached — same refusal, same operator
- * message, same quarantine — instead of committing a transform the editor would refuse.
+ * Raised at two points, distinguished by `phase`, because the two have different answers:
  *
- * NOT in {@link isPermanentProductSyncConflict}, and both callers catch it before it can escape.
- * If one ever stops catching it, transient is the right default: a blocker clears by itself when
- * the order ships or the stock moves, so a later retry can legitimately succeed.
+ *   - `'write'` — the conditional `UPDATE` matched zero rows. `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE`
+ *     is ANDed into the same statement that guards ownership, so a blocker committed before that
+ *     statement's snapshot makes it match nothing and NOTHING WAS WRITTEN. The caller catches
+ *     this, decides again WITH the summary, and reaches the identical outcome the pre-check
+ *     would have reached — same refusal, same operator message, same quarantine.
+ *   - `'commit'` — the re-assertion made as the transaction's last act, over every row this
+ *     transaction structurally transformed. By then the writes ARE in the transaction, so there
+ *     is no graceful second decision to take: the only correct answer is to abort the whole
+ *     import and let the next attempt's pre-check refuse it properly. This one is deliberately
+ *     NOT caught; it escapes to the top-level handler as a transient failure.
+ *
+ * NOT in {@link isPermanentProductSyncConflict}, and that is right for both phases: a blocker
+ * clears by itself when the order ships or the stock moves, so a later retry can succeed.
  */
 export class WcProductTransformBlockedError extends Error {
   readonly imsProductId: string
   readonly sku: string
   /** The editor's own operator-facing blocker summary, read under the write's transaction. */
   readonly summary: string
+  /** Where the blocker was found: at the conditional write, or at the pre-commit re-assertion. */
+  readonly phase: 'write' | 'commit'
 
-  constructor(args: { imsProductId: string; sku: string; summary: string }) {
+  constructor(args: { imsProductId: string; sku: string; summary: string; phase?: 'write' | 'commit' }) {
+    const phase = args.phase ?? 'write'
     super(
-      `IMS product ${args.imsProductId} (SKU "${args.sku}") became live while it was being imported `
-        + `(${args.summary}); the structural write was refused by its own condition.`,
+      phase === 'commit'
+        ? `IMS product ${args.imsProductId} (SKU "${args.sku}") became live (${args.summary}) after this `
+          + 'import had already transformed it, so the whole import was rolled back rather than committed '
+          + 'against a row the product editor would now refuse to change. It will be retried.'
+        : `IMS product ${args.imsProductId} (SKU "${args.sku}") became live while it was being imported `
+          + `(${args.summary}); the structural write was refused by its own condition.`,
     )
     this.name = 'WcProductTransformBlockedError'
     this.imsProductId = args.imsProductId
     this.sku = args.sku
     this.summary = args.summary
+    this.phase = phase
+  }
+}
+
+/**
+ * A conditional write matched zero rows and, by the time it was re-read, NO CAUSE COULD BE
+ * OBSERVED AT ALL (o3d-y89x r4, Codex finding 3).
+ *
+ * The zero-row path diagnoses in order — row deleted, ownership taken, transform blocker — and
+ * used to fall through to {@link WcSkuOwnershipConflictError} when none of them answered. That
+ * is wrong in both halves. It is factually wrong: ownership had just been re-checked and found
+ * INTACT, so the message named `externalProductId` as the claimant when that value is either
+ * null or one of this very payload's ids. And it is wrong in kind: ownership conflicts are
+ * PERMANENT (o3d-gtk), so a webhook was acknowledged and the operator sent to fix a duplicate
+ * WooCommerce SKU that does not exist — for a condition that had already cleared itself.
+ *
+ * The state this really describes is a race that resolved: a blocker that appeared for the
+ * UPDATE's snapshot and was gone again by the diagnostic SELECT (stock moving 0 → 5 → 0 is
+ * enough), or a mapping reassigned and reassigned back. A cause that can no longer be observed
+ * cannot be attributed, and the honest classification for "the condition moved under us" is
+ * TRANSIENT — an immediate retry re-reads current state and can legitimately succeed.
+ */
+export class WcProductWriteRaceError extends Error {
+  readonly imsProductId: string
+  readonly sku: string
+
+  constructor(args: { imsProductId: string; sku: string }) {
+    super(
+      `IMS product ${args.imsProductId} (SKU "${args.sku}") did not match its own write condition, but by `
+        + 'the time it was re-read the cause had gone: it is still owned by this WooCommerce object and no '
+        + 'transform blocker remains. Something changed and changed back while this import was running; '
+        + 'retrying.',
+    )
+    this.name = 'WcProductWriteRaceError'
+    this.imsProductId = args.imsProductId
+    this.sku = args.sku
   }
 }
 
