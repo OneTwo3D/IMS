@@ -112,12 +112,22 @@ export type BackReferenceTxClient = BackReferenceDeps & {
 /**
  * The seam that makes the PO-keyed resolve-then-apply ATOMIC (o3d-9kek finding 3).
  *
- * Optional on BackReferenceDeps because a caller may already BE inside a transaction (a tx
- * client has no `$transaction`). Present on the real PrismaClient, which is what both
+ * Optional on BackReferenceDeps because a caller may already BE inside a transaction and want this
+ * work to join it rather than open a second one. Present on the real PrismaClient, which is what both
  * connectors and the repair sweep pass, so the live paths are fenced. When it is absent the
  * conditional write still refuses to overwrite a linked bill — the lock removes the wasted
  * work and the log noise of two sweeps racing, the compare-and-swap is what removes the
  * DAMAGE.
+ *
+ * "ABSENT" IS SOMETHING A CALLER DOES, NOT SOMETHING PRISMA DOES (Codex r9 finding 2). An earlier
+ * revision of this comment — and of the test doubles — claimed a Prisma interactive-transaction
+ * client has no `$transaction`, on the strength of the `ITXClientDenyList` type. That is false for
+ * the installed runtime. Verified against node_modules/@prisma/client/runtime/client.js (7.7.0): the
+ * deny list is exactly `["$connect","$disconnect","$on","$use","$extends"]`, `$transaction` is NOT in
+ * it, and `_createItxClient` removes only those five, so the tx client KEEPS `$transaction` and
+ * `_transactionWithCallback` opens a nested savepoint transaction for every provider except MongoDB.
+ * So a caller that wants its own transaction joined rather than nested must strip the method itself —
+ * see `withoutNestedTransaction` and releaseAndRelinkExternalDocumentId, which does exactly that.
  */
 export type BackReferenceFenceDeps = {
   $transaction<T>(fn: (tx: BackReferenceTxClient) => Promise<T>): Promise<T>
@@ -650,10 +660,11 @@ export async function applyBackReference(deps: BackReferenceDeps, params: BackRe
         }
       }
     }
-    // Already inside somebody else's transaction (a tx client has no `$transaction`): the
-    // compare-and-swap below still refuses to overwrite a bill that gained an id, and a P2002 is
-    // deliberately PROPAGATED rather than classified — swallowing it would leave the caller's
-    // transaction aborted while telling them everything is fine.
+    // Already inside somebody else's transaction — the caller handed us a client with no
+    // `$transaction`, which is a DELIBERATE ACT on their part (see BackReferenceFenceDeps: Prisma's
+    // own tx client keeps the method). The compare-and-swap below still refuses to overwrite a bill
+    // that gained an id, and a P2002 is deliberately PROPAGATED rather than classified — swallowing
+    // it would leave the caller's transaction aborted while telling them everything is fine.
     return resolveAndApplyPurchaseOrderBackReference(deps, resolveAndApply)
   } else if (type === 'PURCHASE_CREDIT_NOTE' && referenceType === 'SupplierCreditNote') {
     try {
@@ -821,22 +832,86 @@ type ExternalDocumentIdReleaseSourceDelegate = {
 }
 
 /**
- * Everything the release touches, WITHOUT the transaction seam — i.e. what the callback of
- * `$transaction` receives. `applyBackReference` sees this as an ordinary `BackReferenceDeps` that
- * happens to have no `$transaction` of its own, which is exactly what a Prisma interactive
- * transaction client is, and is why the PO-keyed path inside takes its "already inside somebody
- * else's transaction" branch instead of opening a second one.
+ * Everything the release touches, WITHOUT the transaction seam — i.e. what it hands to
+ * `applyBackReference` from inside its own transaction, so the PO-keyed path there takes its
+ * "already inside somebody else's transaction" branch instead of opening a second one.
+ *
+ * THE ABSENCE IS MANUFACTURED, not inherited (Codex r9 finding 2). An earlier revision said this
+ * shape "is exactly what a Prisma interactive transaction client is". It is not: Prisma's tx client
+ * keeps `$transaction` (see BackReferenceFenceDeps for the runtime evidence), so this `Omit` was a
+ * type-level fiction that the value passed at runtime did not honour. Production therefore took the
+ * nested-savepoint branch while every test took this one. `withoutNestedTransaction` makes the type
+ * true of the value.
  */
 export type ExternalDocumentIdReleaseClient =
   ExternalDocumentIdClaimDeps
   & Omit<BackReferenceDeps, '$transaction' | 'accountingSyncLog'>
   & { accountingSyncLog: BackReferenceDeps['accountingSyncLog'] & ExternalDocumentIdReleaseSourceDelegate }
 
+/**
+ * The activity-log write the release makes INSIDE its transaction (Codex r9 finding 3).
+ *
+ * Deliberately the raw delegate rather than lib/activity-log: that module writes through the global
+ * `db`, so an entry written by it would commit (or fail) independently of the transaction whose
+ * effects it describes — which is the defect. The caller supplies the text; the release supplies the
+ * transaction.
+ */
+export type ExternalDocumentIdReleaseAuditClient = {
+  activityLog: { create(args: { data: Record<string, unknown> }): Promise<unknown> }
+}
+
+/**
+ * Writes the DURABLE RECORD of a completed release, inside the release's own transaction.
+ *
+ * REQUIRED, and required as an argument rather than an option, because the record is not decoration:
+ * this is the one operation in this module that deliberately clears a live accounting link, and an
+ * operator asking "who detached this document, and when?" months later has nothing else to read. A
+ * throw here rolls the release back — the audit row and the release land together or neither does.
+ */
+export type ExternalDocumentIdReleaseRecorder = (
+  tx: ExternalDocumentIdReleaseAuditClient,
+  release: { releasedFrom: string; appliedTo: { referenceType: string; referenceId: string } },
+) => Promise<void>
+
 /** The release's client, which MUST be transactional — see releaseAndRelinkExternalDocumentId. */
 export type ExternalDocumentIdReleaseDeps = ExternalDocumentIdReleaseClient & {
-  $transaction<T>(fn: (tx: ExternalDocumentIdReleaseClient & {
+  $transaction<T>(fn: (tx: ExternalDocumentIdReleaseClient & ExternalDocumentIdReleaseAuditClient & {
     $executeRaw(query: TemplateStringsArray, ...values: unknown[]): Promise<number>
+    /**
+     * PRESENT, because Prisma's interactive-transaction client has it (Codex r9 finding 2). Typing it
+     * away is what let the production behaviour and the tested behaviour diverge; declaring it means
+     * the stripping below is visible as a deliberate act instead of an assumption.
+     */
+    $transaction?: BackReferenceFenceDeps['$transaction']
   }) => Promise<T>): Promise<T>
+}
+
+/**
+ * `tx` as a client that CANNOT open a nested transaction (Codex r9 finding 2).
+ *
+ * Prisma 7.7's interactive-transaction client retains `$transaction` and supports nesting via
+ * savepoints, so handing it straight to `applyBackReference` makes that function open a SECOND
+ * transaction inside ours — with its own advisory lock re-acquisition, and, worse, with its own
+ * `catch` that classifies a unique-index violation and returns `ambiguous` normally. The release
+ * would then report `not-relinked / ambiguous` with no `conflictMessage`, having thrown away the one
+ * message that names which document holds the id. Removing the method makes the documented design
+ * (one transaction, one lock, P2002 propagating to the release's own classifier) actually happen.
+ *
+ * A Proxy rather than a spread: the real client is itself a composite Proxy, and copying its own
+ * keys is not a documented way to reproduce it. Functions are bound to the target so a method called
+ * through this view still runs against the real client.
+ */
+function withoutNestedTransaction<T extends object>(tx: T): Omit<T, '$transaction'> {
+  return new Proxy(tx, {
+    get(target, property) {
+      if (property === '$transaction') return undefined
+      const value = Reflect.get(target, property)
+      return typeof value === 'function' ? value.bind(target) : value
+    },
+    has(target, property) {
+      return property === '$transaction' ? false : Reflect.has(target, property)
+    },
+  }) as Omit<T, '$transaction'>
 }
 
 const CLAIM_DELEGATES: Record<ExternalDocumentIdHolder['model'], keyof ExternalDocumentIdClaimDeps> = {
@@ -1003,8 +1078,17 @@ function releaseSourceRefusal(
  *     row-locks it for the rest of the transaction, so a destination that has since acquired a
  *     newer, valid id is refused rather than overwritten. For a PO-keyed row the destination is not
  *     known until it is resolved, and that resolve — plus its own compare-and-swap — runs inside
- *     this transaction under the per-PurchaseOrder advisory lock, taken HERE because
- *     applyBackReference cannot open its own transaction from inside ours.
+ *     this transaction under the per-PurchaseOrder advisory lock, taken HERE and kept here by
+ *     handing applyBackReference a client with no `$transaction` (Codex r9 finding 2 — Prisma's own
+ *     tx client keeps that method and would otherwise nest a savepoint transaction inside ours).
+ *
+ * AND THE AUDIT ROW IS PART OF THE TRANSACTION (Codex r9 finding 3). The record of a destructive act
+ * must be exactly as durable as the act. Writing it afterwards through lib/activity-log — which
+ * swallows its own persistence errors and returns void — meant a successful release could leave the
+ * holder detached, the destination linked, and NOTHING anywhere saying it had happened; re-running
+ * could not recover it either, because the second run exits `already-correct` before reaching the
+ * log. `recordRelease` runs on the same client, inside the same transaction: if it throws, the
+ * release rolls back with it.
  *
  * Fails closed throughout: an unexpected state at any of those points refuses and reports, and
  * refusing to repair is acceptable in a way that repairing onto the wrong document is not.
@@ -1012,6 +1096,7 @@ function releaseSourceRefusal(
 export async function releaseAndRelinkExternalDocumentId(
   deps: ExternalDocumentIdReleaseDeps,
   params: BackReferenceParams & { syncLogId: string; confirmedHolderId: string },
+  recordRelease: ExternalDocumentIdReleaseRecorder,
 ): Promise<ExternalDocumentIdReleaseOutcome> {
   const holder = backReferenceHolder(params.type, params.referenceType)
   if (!holder || !params.externalId) return { outcome: 'not-applicable' }
@@ -1105,7 +1190,9 @@ export async function releaseAndRelinkExternalDocumentId(
       })
       if (released.count !== 1) throw new ExternalDocumentIdReleaseAbort({ outcome: 'contended', holderId: params.confirmedHolderId })
 
-      const applied = await applyBackReference(tx, params)
+      // STRIPPED, so the re-link joins this transaction instead of nesting one inside it (Codex r9
+      // finding 2). Everything else on this path keeps using `tx` directly.
+      const applied = await applyBackReference(withoutNestedTransaction(tx), params)
       if (applied.outcome !== 'applied') {
         throw new ExternalDocumentIdReleaseAbort({ outcome: 'not-relinked', applyOutcome: applied.outcome })
       }
@@ -1129,11 +1216,18 @@ export async function releaseAndRelinkExternalDocumentId(
         await tx.accountingSyncLog.update({ where: { id: params.syncLogId }, data: { errorMessage: null } })
       }
 
-      return {
-        outcome: 'relinked' as const,
+      // LAST, and inside (Codex r9 finding 3). Last because it describes a completed release, so
+      // every refusal above has already unwound without needing to unwind an audit row too; inside
+      // because a record of a destructive act that can fail on its own is not a record. A throw here
+      // takes the release down with it and the operator is told the command failed and wrote
+      // nothing — which is true, and is recoverable by re-running.
+      const release = {
         releasedFrom: params.confirmedHolderId,
         appliedTo: { referenceType: applied.referenceType, referenceId: applied.referenceId },
       }
+      await recordRelease(tx, release)
+
+      return { outcome: 'relinked' as const, ...release }
     })
   } catch (error) {
     if (error instanceof ExternalDocumentIdReleaseAbort) return error.result

@@ -42,6 +42,8 @@ type SyncRow = {
   backReferenceAmbiguousLoggedAt: Date | null
   /** Retention has reduced this row to an attribution-only tombstone (r3 finding 3). */
   backReferenceEvidenceCompactedAt: Date | null
+  /** The row's link is written but its follow-ups have not been enqueued yet (Codex r9 finding 1). */
+  backReferenceFollowUpsPendingAt: Date | null
 }
 
 type BillRow = {
@@ -57,7 +59,7 @@ type CreditNoteRow = { id: string; accountingCreditNoteId: string | null }
 const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId',
   'status', 'payload', 'createdAt', 'backReferenceCheckedAt', 'backReferenceAmbiguousLoggedAt',
-  'backReferenceEvidenceCompactedAt',
+  'backReferenceEvidenceCompactedAt', 'backReferenceFollowUpsPendingAt',
 ])
 const BILL_COLUMNS = new Set(['id', 'poId', 'accountingInvoiceId', 'createdAt'])
 
@@ -161,6 +163,12 @@ type Harness = {
    */
   failActivityFor: Set<string>
   /**
+   * Sync rows whose FOLLOW-UP OBLIGATION write fails (Codex r9 finding 1). Only that write — the
+   * marker is claimed before the repair precisely so that its own failure is survivable, and a double
+   * that failed every accountingSyncLog.update could not tell the two apart.
+   */
+  failPendingMarkerFor: Set<string>
+  /**
    * A concurrent writer, fired the instant the PO attribution has read the bills — i.e.
    * inside the resolve→apply window. Set by the finding-3 test.
    */
@@ -175,7 +183,10 @@ function makeHarness(store: Store): Harness {
   const failFollowUpsFor = new Set<string>()
   const failProbeFor = new Set<string>()
   const failActivityFor = new Set<string>()
-  const harness = { store, activities, followUps, calls, failFollowUpsFor, failProbeFor, failActivityFor, raceAfterBillRead: null } as Harness
+  const failPendingMarkerFor = new Set<string>()
+  const harness = {
+    store, activities, followUps, calls, failFollowUpsFor, failProbeFor, failActivityFor, failPendingMarkerFor, raceAfterBillRead: null,
+  } as Harness
 
   const client = {
     accountingSyncLog: {
@@ -192,6 +203,12 @@ function makeHarness(store: Store): Harness {
       async update(args: { where: { id: string }; data: Record<string, unknown> }) {
         const row = store.syncRows.find((candidate) => candidate.id === args.where.id)
         if (!row) throw new Error(`fake db: no sync row ${args.where.id}`)
+        // The obligation write specifically — the one the sweep makes BEFORE it repairs anything.
+        // Clearing the marker (`null`, part of the verdict stamp) is a different write and is not
+        // failed here.
+        if (failPendingMarkerFor.has(args.where.id) && args.data.backReferenceFollowUpsPendingAt instanceof Date) {
+          throw new Error('follow-up obligation write failed')
+        }
         Object.assign(row, args.data)
         return row
       },
@@ -344,6 +361,7 @@ function salesInvoiceRow(index: number, overrides: Partial<SyncRow> = {}): SyncR
     backReferenceCheckedAt: null,
     backReferenceAmbiguousLoggedAt: null,
     backReferenceEvidenceCompactedAt: null,
+    backReferenceFollowUpsPendingAt: null,
     ...overrides,
   }
 }
@@ -498,6 +516,107 @@ test('a deferred follow-up enqueue leaves the row FAILED and unstamped, so it is
   assert.equal(harness.store.syncRows[0].status, 'FAILED')
   assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null)
   assert.equal(harness.activities.some((entry) => entry.action === 'xero_backreference_followup_deferred'), true)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek Codex r9 finding 1 — a TRANSIENT follow-up failure on a SYNCED repair was a PERMANENT
+// verdict.
+//
+// The test above covers the FAILED shape, where `status` itself carries "follow-ups outstanding".
+// The crash-after-post shape — the one this sweep primarily exists for — does not: that row is
+// SYNCED with an external id and no back-reference. Once the sweep wrote the link, an enqueue that
+// failed transiently left the row unstamped (correct) with nothing recording the outstanding work,
+// and the NEXT sweep saw a linked SYNCED row, called it reconciled and stamped it. The payment, PDF
+// or attachment was gone and no amount of re-running brought it back.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek r9 f1] a SYNCED repair whose follow-ups fail transiently is retried, not retired', async () => {
+  const harness = makeHarness({
+    // SYNCED, external id present, back-reference missing: the process died between the post and the
+    // id write, so the follow-ups never ran either.
+    syncRows: [salesInvoiceRow(1)],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.failFollowUpsFor.add('log-0001')
+
+  const firstRun = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(firstRun.repaired, 1)
+  assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-1', 'the link half succeeded')
+  assert.equal(harness.followUps.length, 0, 'the follow-up half did not')
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'so the row is not settled')
+  assert.ok(
+    harness.store.syncRows[0].backReferenceFollowUpsPendingAt,
+    'and the outstanding work is recorded DURABLY — "still linked" is not evidence of it',
+  )
+  assert.equal(harness.store.syncRows[0].status, 'SYNCED', 'never flipped out of SYNCED: that would let the document post a second time')
+
+  harness.failFollowUpsFor.clear()
+  const secondRun = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(secondRun.checked, 1, 'the row is looked at again, and is not treated as reconciled')
+  assert.equal(secondRun.repaired, 0, 'nothing to re-apply — only the follow-ups were outstanding')
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'], 'the follow-ups finally run')
+  assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_followups_recovered'))
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'NOW it is settled')
+  assert.equal(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, null, 'and the obligation is discharged in the same write')
+})
+
+test('[o3d-9kek r9 f1] a repair whose follow-up obligation cannot be recorded writes NOTHING', async () => {
+  // The obligation is claimed BEFORE the link is written, so its own failure cannot recreate the
+  // defect one layer down: a marker written only in the enqueue's catch block would be lost by
+  // exactly the kind of transient database failure it exists to survive, and the row would again be
+  // linked with nothing saying its follow-ups never ran.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1)],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null }],
+  })
+  harness.failPendingMarkerFor.add('log-0001')
+
+  const firstRun = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(firstRun.failed, 1)
+  assert.equal(firstRun.repaired, 0)
+  assert.equal(harness.store.orders[0].accountingInvoiceId, null, 'the link is NOT written — nothing would have recorded what it owes')
+  assert.equal(harness.followUps.length, 0)
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'and the row stays eligible')
+
+  harness.failPendingMarkerFor.clear()
+  const secondRun = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(secondRun.repaired, 1, 'the whole repair simply happens on the next sweep')
+  assert.equal(harness.store.orders[0].accountingInvoiceId, 'XINV-1')
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'])
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+})
+
+test('[o3d-9kek r9 f1] a SYNCED row TOMBSTONED while it still owed follow-ups is warned about, not stamped in silence', async () => {
+  // The terminal case reached through the new marker. Retention compacted the payload away while the
+  // follow-ups were still outstanding, so they can never be rebuilt — but the discard has to be
+  // ANNOUNCED. Keyed on `status === 'FAILED'` this row said nothing at all: linked, SYNCED, stamped,
+  // and a missing payment nobody would ever hear about.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      backReferenceFollowUpsPendingAt: at(400),
+    })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 0, 'the id was already there')
+  assert.equal(run.followUpsDiscarded, 1)
+  assert.deepEqual(harness.followUps, [], 'a `{}` payload cannot rebuild a PDF or a payment')
+  const discarded = harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded')
+  assert.ok(discarded, 'the loss is permanent, so it must be announced')
+  assert.equal(discarded.level, 'WARNING')
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'and only THEN is the row settled')
+  assert.equal(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, null)
 })
 
 // ---------------------------------------------------------------------------
@@ -1225,6 +1344,7 @@ function creditNoteRow(index: number, overrides: Partial<SyncRow> = {}): SyncRow
     backReferenceCheckedAt: null,
     backReferenceAmbiguousLoggedAt: null,
     backReferenceEvidenceCompactedAt: null,
+    backReferenceFollowUpsPendingAt: null,
     ...overrides,
   }
 }

@@ -32,10 +32,14 @@
  *      that is strictly worse than the refusal you started with.
  *   3. Dry-run, which reads and reports and writes nothing:
  *        tsx scripts/release-accounting-external-id-claim.ts --sync-log <id> --holder <id>
- *   4. Re-run with --apply. The claim is cleared from the blocking record and the external id is
- *      written onto the document that actually posted it, in ONE TRANSACTION. Both halves are logged.
+ *   4. Re-run with --apply. The claim is cleared from the blocking record, the external id is written
+ *      onto the document that actually posted it, and the activity-log record of the whole thing is
+ *      written — all in ONE TRANSACTION, so either every part of it happened or none of it did.
  *
- * The release and the re-link are one atomic unit on purpose (r8 finding 1). Clearing the id and
+ * The release, the re-link AND THE AUDIT ENTRY are one atomic unit on purpose (r8 finding 1, r9
+ * finding 3 — the audit used to be written afterwards through a logger that swallows its own write
+ * failures, so a completed release could leave no durable record that anyone had ever run this).
+ * Clearing the id and
  * stopping leaves the ledger document attached to nothing at all — for QuickBooks, permanently,
  * because no repair sweep runs there — and it is not recoverable by re-running, because the holder
  * no longer holds the id and your confirmation stops matching anything. So anything short of a
@@ -58,6 +62,7 @@ import {
   backReferenceIsMissing,
   findExternalDocumentIdClaim,
   releaseAndRelinkExternalDocumentId,
+  type ExternalDocumentIdReleaseRecorder,
 } from '../lib/domain/accounting/back-reference'
 
 // .env MUST load before lib/db is imported: that module builds its pg Pool from
@@ -86,7 +91,13 @@ async function main() {
   }
 
   const { db } = await import('../lib/db/index')
-  const { logActivity } = await import('../lib/activity-log')
+  // The REDACTORS, not the writer (r9 finding 3). logActivity/logActivityPersisted write through the
+  // global `db`, so an entry made by them could not join the release's transaction — and logActivity
+  // additionally swallows its own persistence errors, which is how a destructive release could
+  // complete with no durable record that it happened. The audit row is written by the release itself,
+  // on its own transaction, and these two are the sanitising the activity log would otherwise have
+  // applied.
+  const { redactActivityLogText, sanitizeActivityLogMetadata } = await import('../lib/activity-log')
 
   const row = await db.accountingSyncLog.findUnique({
     where: { id: syncLogId },
@@ -177,33 +188,57 @@ async function main() {
     return
   }
 
-  const result = await releaseAndRelinkExternalDocumentId(db, { ...params, syncLogId: row.id, confirmedHolderId })
+  /**
+   * THE AUDIT ROW, written on the release's own transaction (r9 finding 3).
+   *
+   * This is the only operation in IMS that deliberately clears a live accounting link, and the
+   * previous version wrote this entry AFTER the transaction committed, through `logActivity` — which
+   * deliberately swallows database errors and returns void. A successful release could therefore
+   * leave the holder detached, the destination linked, and no durable record anywhere that anyone had
+   * done it. Re-running did not recover the record either: the second run answers `already-correct`
+   * and exits before it would be written. Now it lands with the release or not at all.
+   *
+   * `userId: null` on purpose: this is a shell command, there is no session to resolve, and the
+   * accountable party is the operator named in the shell history — the description says what was done
+   * and to what, which is what a later reader needs.
+   */
+  const recordRelease: ExternalDocumentIdReleaseRecorder = async (tx, release) => {
+    await tx.activityLog.create({
+      data: {
+        userId: null,
+        entityType: 'SYSTEM',
+        entityId: row.id,
+        action: 'accounting_external_id_claim_released',
+        tag: 'sync',
+        level: 'WARNING',
+        description: redactActivityLogText(
+          `Operator released the ${row.connector} external id ${row.externalTransactionId} from ${holder.model} `
+          + `${release.releasedFrom} and linked it to ${release.appliedTo.referenceType} ${release.appliedTo.referenceId}. `
+          + `${holder.model} ${release.releasedFrom} now has NO ${holder.column} — if that was not a retired-realm document, `
+          + 'this needs reversing by hand.',
+        ),
+        metadata: JSON.parse(JSON.stringify(sanitizeActivityLogMetadata({
+          syncLogId: row.id,
+          connector: row.connector,
+          externalId: row.externalTransactionId,
+          releasedModel: holder.model,
+          releasedFrom: release.releasedFrom,
+          appliedTo: release.appliedTo,
+        }))),
+      },
+    })
+  }
+
+  const result = await releaseAndRelinkExternalDocumentId(db, { ...params, syncLogId: row.id, confirmedHolderId }, recordRelease)
   console.log(`\noutcome: ${result.outcome}`)
 
   switch (result.outcome) {
     case 'relinked':
       console.log(`released ${holder.model} ${result.releasedFrom}; linked ${result.appliedTo.referenceType} ${result.appliedTo.referenceId}`)
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'accounting_external_id_claim_released',
-        tag: 'sync',
-        level: 'WARNING',
-        description: `Operator released the ${row.connector} external id ${row.externalTransactionId} from ${holder.model} `
-          + `${result.releasedFrom} and linked it to ${result.appliedTo.referenceType} ${result.appliedTo.referenceId}. `
-          + `${holder.model} ${result.releasedFrom} now has NO ${holder.column} — if that was not a retired-realm document, `
-          + 'this needs reversing by hand.',
-        metadata: {
-          syncLogId: row.id,
-          connector: row.connector,
-          externalId: row.externalTransactionId,
-          releasedModel: holder.model,
-          releasedFrom: result.releasedFrom,
-          appliedTo: result.appliedTo,
-        },
-      })
-      // NOTE: the quarantine text on the sync row is cleared by the release itself, inside the same
-      // transaction — a resolved conflict must not survive as an unresolved-looking marker, and a
-      // separate update here could fail on its own and leave exactly that.
+      // NOTE: both the audit entry and the clearing of the quarantine text on the sync row happen
+      // INSIDE the release's transaction — a resolved conflict must not survive as an
+      // unresolved-looking marker, and a record of a destructive act must not be able to fail on its
+      // own. Reaching this line means all three landed together.
       break
     case 'holder-mismatch':
       console.error(`REFUSED: ${holder.model} ${result.currentHolderId} holds the id, not the ${confirmedHolderId} you confirmed.`)

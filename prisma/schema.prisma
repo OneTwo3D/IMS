@@ -2165,6 +2165,25 @@ model AccountingSyncLog {
   // discards those under an explicit terminal policy with a warning. Excluding the whole row, which
   // an earlier revision did, let retention permanently retire repairable work.
   backReferenceEvidenceCompactedAt DateTime?
+  // o3d-9kek Codex r9 finding 1: this row's back-reference is written, but the FOLLOW-UPS it owes
+  // (invoice PDF, payment registration, bill attachment) have not been enqueued yet. Written BEFORE
+  // the repair touches anything and cleared only when the enqueue has actually succeeded.
+  //
+  // WHY A COLUMN AND NOT `status`. "Follow-ups still owed" used to be inferred from `status =
+  // FAILED`, which is true for a Xero row whose retries exhausted — but NOT for the crash-after-post
+  // row this sweep primarily exists for: that one is SYNCED with no back-reference, and once the
+  // sweep has written the link a TRANSIENT enqueue failure left nothing behind to say the follow-ups
+  // never ran. The next sweep then saw a linked SYNCED row, called it reconciled and stamped
+  // backReferenceCheckedAt, permanently discarding the payment or PDF. A transient failure is not a
+  // verdict; this column is what keeps it from becoming one.
+  //
+  // Flipping such a row to FAILED instead was rejected: queueXeroSync/queueQuickBooksSync dedupe new
+  // enqueues on `status in (PENDING, PROCESSING, SYNCED)`, so a row moved out of SYNCED stops
+  // suppressing its own re-enqueue and the document posts to the ledger a SECOND time.
+  //
+  // Not a candidate-query predicate: an unstamped row is a candidate already. It only widens the
+  // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
+  backReferenceFollowUpsPendingAt DateTime?
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.

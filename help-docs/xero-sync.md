@@ -539,6 +539,15 @@ cannot link, update or pay it. All four document types are repaired. The back-re
 `/api/cron/accounting-sync` (and on demand from **Integrations → Xero**), re-applies the id from
 the sync row, and re-enqueues the follow-ups (PDF, payment, attachment) that never ran.
 
+**A row is only finished when its follow-ups have actually run.** Writing the id back and enqueueing
+the follow-ups are two separate steps, and the second can fail on its own — a busy queue, a momentary
+database error. When it does, the row is *not* marked as reconciled: it is left open, flagged as still
+owing its follow-ups, and the next sweep retries them. That holds whether the row was `FAILED` or
+`SYNCED`; the sweep will not close a row on the strength of the id being present, because a document
+can be correctly linked and still be missing its PDF or its payment. Nothing is retried forever in
+silence, either — each failed attempt writes `xero_backreference_followup_deferred` to the activity
+log.
+
 **The sweep runs for Xero only.** There is deliberately no QuickBooks equivalent, and that is not an
 oversight to be reported. A QuickBooks document id is a per-company integer, and disconnecting clears
 the company pin, so a sweep scoped to "the QuickBooks connector" could not tell an id issued by a
@@ -613,8 +622,12 @@ live, correct link, so the decision is yours.
    It reports the blocking record, the document the id belongs to, and whether that document is
    still unlinked — if it has acquired its own id since the warning was written, `--apply` will
    refuse and say so.
-4. Re-run with `--apply`. The id is cleared from the blocking record and written onto the document
-   that actually posted it, in **one transaction**. Both halves are written to the activity log.
+4. Re-run with `--apply`. The id is cleared from the blocking record, written onto the document that
+   actually posted it, and recorded in the activity log as
+   `accounting_external_id_claim_released` — all in **one transaction**. The audit entry is part of
+   the transaction rather than something written afterwards, so a completed release can never end up
+   with no record of who detached what: if the record cannot be written, the release does not happen
+   either and you are told the command failed.
 
 The release and the re-link are one atomic operation on purpose: clearing the id and stopping would
 leave the ledger document attached to nothing at all, and on QuickBooks nothing would pick it up
@@ -710,9 +723,11 @@ A compacted row is **still a repair candidate**, and the split is by what each p
 rather than by the row as a whole. Everything the id write reads — the reference and the external
 id — survives compaction, so the sweep can still link the order or bill, including one whose
 ambiguity only cleared *after* the retention cutoff. What cannot survive is the follow-up work built
-from the payload (PDF, payment registration, bill attachment); when the sweep repairs one of these
-rows it logs `*_backreference_followups_discarded` naming the document, so you can check for a
-missing PDF or payment and re-drive it by hand. A compacted row also still counts as a claim when the
+from the payload (PDF, payment registration, bill attachment); whenever the sweep settles one of
+these rows with follow-ups still outstanding — whether it repaired the link on that pass or the link
+was already there — it logs `*_backreference_followups_discarded` naming the document, so you can
+check for a missing PDF or payment and re-drive it by hand. The row is only closed once that warning
+has been written, so the loss is never absorbed silently. A compacted row also still counts as a claim when the
 sweep decides whether a purchase order's bill is ambiguous.
 
 **Do not cancel one of these rows to tidy it away.** Cancelling is irreversible in two ways the row

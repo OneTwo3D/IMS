@@ -83,6 +83,20 @@ import {
 //    compaction removed. Only the payload-dependent FOLLOW-UPS are genuinely unrecoverable, and
 //    those are discarded under an explicit terminal policy that warns before it settles the row.
 //
+// AND ONE MORE, FOUND IN ROUND 9:
+//
+// 6. A TRANSIENT FOLLOW-UP FAILURE ON A **SYNCED** ROW. "This row still owes its follow-ups" was
+//    inferred from `status === 'FAILED'`. That is the Xero shape — the refusal propagates and the
+//    retries exhaust — but it is NOT the crash-after-post shape this sweep primarily exists for: that
+//    row is SYNCED, carries an external id, and has no back-reference because the process died
+//    between the two. Once the sweep wrote the link, a TRANSIENT enqueue failure left the row
+//    unstamped (correctly) with nothing at all recording the outstanding work; the next sweep found a
+//    linked SYNCED row, judged it reconciled and stamped it. The payment, PDF or attachment was gone,
+//    silently, and re-running changed nothing. Deferred-not-retired broken for the fifth time, and
+//    the third time in this file that "this attempt failed" was allowed to mean "this row is
+//    finished". The obligation is now a COLUMN (backReferenceFollowUpsPendingAt), written BEFORE the
+//    repair touches anything and cleared only by a successful enqueue.
+//
 // DELIBERATELY NOT IN SCOPE: connector-TENANT isolation — AND THAT IS WHY THIS SWEEP IS BOUND FOR
 // XERO ONLY (r6 finding 1).
 //
@@ -265,6 +279,15 @@ export type BackReferenceSweepRow = {
    * enqueueing follow-ups from it would silently enqueue nothing while reporting success.
    */
   backReferenceEvidenceCompactedAt: Date | null
+  /**
+   * The row's back-reference is written but its FOLLOW-UPS have not been enqueued yet. NULL = none
+   * known to be outstanding (Codex r9 finding 1).
+   *
+   * Read for exactly one reason: "does this row still owe follow-ups?" used to be `status ===
+   * 'FAILED'`, which is the Xero shape and not the crash-after-post shape. See
+   * `owesFollowUps` in the loop below.
+   */
+  backReferenceFollowUpsPendingAt: Date | null
 }
 
 /** The columns the sweep reads. `as const` so the Prisma client's row type resolves. */
@@ -279,6 +302,7 @@ export const BACK_REFERENCE_CANDIDATE_SELECT = {
   createdAt: true,
   backReferenceAmbiguousLoggedAt: true,
   backReferenceEvidenceCompactedAt: true,
+  backReferenceFollowUpsPendingAt: true,
 } as const
 
 /**
@@ -547,12 +571,47 @@ export async function repairAccountingBackReferences(
    * Record a verdict: this row needs nothing further, so it leaves the candidate set.
    * NEVER called for a transient failure, and never for an AMBIGUOUS PO row — both can
    * become repairable, and a row excluded before that happens is starved for good.
+   *
+   * Clears backReferenceFollowUpsPendingAt in the same write (Codex r9 finding 1). The obligation
+   * and the verdict are opposites — a row cannot both be settled and still owe follow-ups — so
+   * leaving the marker behind would make the two columns contradict each other on every settled row,
+   * and any future reader of "which rows still owe follow-ups" would have to know to also check
+   * whether the row had been stamped. One write, one consistent state.
    */
   const markChecked = async (id: string, extra?: Record<string, unknown>) => {
     await deps.db.accountingSyncLog.update({
       where: { id },
-      data: { backReferenceCheckedAt: now(), ...extra },
+      data: { backReferenceCheckedAt: now(), backReferenceFollowUpsPendingAt: null, ...extra },
     })
+  }
+
+  /**
+   * DECLARE THE FOLLOW-UPS OWED, BEFORE ANYTHING IS WRITTEN (Codex r9 finding 1).
+   *
+   * The obligation is recorded as an INTENT, not as a report of a failure. Writing it only in the
+   * enqueue's catch block would leave the identical hole one layer down: the marker write is itself a
+   * database call that can fail transiently, and if it does, the row is once again linked with
+   * nothing recording that its follow-ups never ran. Writing it first makes the ordering safe in the
+   * only direction that matters — a row can never reach "linked" without a durable record that
+   * follow-ups are outstanding, and the worst case is a marker on a row whose follow-ups then
+   * succeed, which costs one extra idempotent re-enqueue on a later sweep.
+   *
+   * Returns false if the marker could not be persisted, and the caller then does NOTHING ELSE to the
+   * row: nothing has been written yet, `missing` is still true, and the next sweep retries the whole
+   * repair from scratch.
+   */
+  const claimFollowUpObligation = async (row: BackReferenceSweepRow): Promise<boolean> => {
+    if (row.backReferenceFollowUpsPendingAt !== null) return true
+    try {
+      await deps.db.accountingSyncLog.update({
+        where: { id: row.id },
+        data: { backReferenceFollowUpsPendingAt: now() },
+      })
+      return true
+    } catch (pendingError) {
+      console.error(`${prefix}: could not record that follow-ups are owed; leaving the repair for the next sweep`, row.id, pendingError)
+      return false
+    }
   }
 
   /**
@@ -826,28 +885,61 @@ export async function repairAccountingBackReferences(
         // difference between discarding unrecoverable work and retiring recoverable work.
         const evidenceOnly = row.backReferenceEvidenceCompactedAt !== null
 
-        // A row whose back-reference is already applied but is STILL FAILED is precisely the
-        // "back-reference done, follow-ups not enqueued" state a previous pass can leave behind.
-        // Skipping it on `!missing` meant those follow-ups were never retried — leaving the row
-        // FAILED accomplished nothing (Codex r7 #2). A tombstone is excluded because its follow-ups
-        // cannot be rebuilt at all: running the follow-ups-only pass on `{}` would enqueue nothing
-        // and then report the row reconciled, which is the silent version of the same loss.
-        const followUpsOnly = !missing && row.status === 'FAILED' && !evidenceOnly
+        /**
+         * DOES THIS ROW STILL OWE ITS FOLLOW-UPS? (Codex r9 finding 1.)
+         *
+         * Two markers, because there are two shapes and only one of them used to be recognised:
+         *
+         *   • `status === 'FAILED'` — the XERO shape. The back-reference refusal propagates,
+         *     markSyncLogForFollowUpRetry retries, and the row exhausts to FAILED still carrying the
+         *     external id. This is also what the sweep itself leaves behind when it repairs a FAILED
+         *     row whose follow-ups then fail to enqueue. It covers rows written before this branch,
+         *     which have no pending marker at all.
+         *   • `backReferenceFollowUpsPendingAt` — the CRASH-AFTER-POST shape, and the reason the
+         *     column exists. That row is SYNCED with an external id and no back-reference, so nothing
+         *     about its status ever says "follow-ups outstanding". The sweep repaired the link and, if
+         *     the enqueue then failed TRANSIENTLY, left the row unstamped so it would be retried — but
+         *     the next pass saw a linked SYNCED row, judged it reconciled and stamped it. The
+         *     follow-ups were retired by a failure that was never a verdict.
+         *
+         * A tombstone is excluded from the follow-ups-only PASS because its follow-ups cannot be
+         * rebuilt at all: running it on `{}` would enqueue nothing and then report the row
+         * reconciled, which is the silent version of the same loss. It is NOT excluded from the
+         * question — a tombstone that owes follow-ups still gets the terminal warning below.
+         */
+        const owesFollowUps = row.status === 'FAILED' || row.backReferenceFollowUpsPendingAt !== null
+        const followUpsOnly = !missing && owesFollowUps && !evidenceOnly
         if (!missing && !followUpsOnly) {
-          if (evidenceOnly && row.status === 'FAILED') {
-            // Linked, but FAILED because its follow-ups never ran — and the payload that would let
-            // them run is gone. This is the terminal case, and it is settled ONLY once someone has
-            // been told, for the same reason an ambiguity is: the discard is irreversible, so
-            // stamping it after a failed warning would destroy the work and the notice together.
+          if (evidenceOnly && owesFollowUps) {
+            // Linked, but its follow-ups never ran — and the payload that would let them run is
+            // gone. This is the terminal case, and it is settled ONLY once someone has been told,
+            // for the same reason an ambiguity is: the discard is irreversible, so stamping it after
+            // a failed warning would destroy the work and the notice together.
+            //
+            // Reached by a SYNCED row too, via the pending marker (Codex r9 finding 1). Before that
+            // marker existed the condition was `status === 'FAILED'`, so a SYNCED row whose
+            // follow-ups were outstanding when retention compacted it was stamped in silence: the
+            // one case where the loss is BOTH permanent and unannounced.
             if (!(await reportDiscardedFollowUps(row, 'already-applied'))) continue
           }
-          // Linked and SYNCED: reconciled. Stamped, so it never occupies a slot again.
+          // Linked, nothing outstanding: reconciled. Stamped, so it never occupies a slot again.
           await markChecked(row.id)
           continue
         }
         // Counted as CHECKED either way, but a follow-ups-only pass is not a repair: nothing was
         // re-applied, so it must not inflate `repaired` (Codex review, r8).
         result.checked++
+
+        // THE OBLIGATION IS RECORDED BEFORE THE REPAIR IS ATTEMPTED (Codex r9 finding 1), and only
+        // when the follow-ups are actually rebuildable — a tombstone's are not, and marking a
+        // discard as "pending" would promise a retry that can never happen. If it cannot be
+        // persisted, nothing else is done to the row: the link is still missing, so the next sweep
+        // repeats this pass from the top rather than linking a document whose outstanding work
+        // nothing records.
+        if (!evidenceOnly && !(await claimFollowUpObligation(row))) {
+          result.failed++
+          continue
+        }
 
         // Where the write actually landed. For a PO-keyed row that is the bill the FENCED
         // attribution chose, which is the only attribution that ever reaches a write.
@@ -908,16 +1000,20 @@ export async function repairAccountingBackReferences(
                 tag: 'sync',
                 level: 'WARNING',
                 description: `Applied the ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId} but could not `
-                  + `enqueue its follow-ups: ${String(followUpError)}. The row stays FAILED so the next sweep retries them.`,
+                  + `enqueue its follow-ups: ${String(followUpError)}. The row is left unsettled and marked as still owing them, `
+                  + 'so the next sweep retries them.',
                 metadata: { syncLogId: row.id, referenceType: row.referenceType, referenceId: row.referenceId },
               })
             }
           }
-          // A FAILED row whose back-reference is now applied is fully reconciled — but ONLY if
-          // its follow-ups were actually enqueued. Marking it SYNCED regardless retired the one
-          // source that would retry them, so a transient enqueue failure lost the payment or PDF
-          // permanently (Codex review, r6). Leaving it FAILED is what makes the retry durable —
-          // and leaving it UNSTAMPED is what makes the next sweep look at it again.
+          // A row whose back-reference is now applied is fully reconciled — but ONLY if its
+          // follow-ups were actually enqueued. Stamping it regardless retired the one source that
+          // would retry them, so a transient enqueue failure lost the payment or PDF permanently
+          // (Codex review, r6). Leaving it UNSTAMPED is what makes the next sweep look at it again,
+          // and the pending marker written before the repair is what tells that sweep the follow-ups
+          // are still owed — a linked SYNCED row says nothing about them on its own, which is how
+          // exactly this failure survived into r9 finding 1 for the non-FAILED half of the
+          // population. `markChecked` clears the marker on the way out.
           //
           // A tombstone is stamped CHECKED but never flipped to SYNCED: its id write succeeded, so
           // there is nothing left for any future sweep to do, but its follow-ups were discarded
