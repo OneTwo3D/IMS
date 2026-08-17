@@ -34,10 +34,29 @@
 -- does NOT auto-wrap a migration file, so anything added here later inherits the guarantee instead of
 -- quietly not having it.
 --
+-- WHO WRITES IT. Both halves of the system, not just the repair route: the Xero and QuickBooks
+-- CONNECTORS claim it inside the same transaction that marks a row SYNCED with its external id, and
+-- the SWEEP claims it before it re-applies a link. The connector paths are where most rows go, and
+-- the first revision of this column wired only the sweep — which left the exact window the column
+-- exists to close still open on the primary path. See lib/domain/accounting/back-reference.ts,
+-- `followUpObligationClaim` / `releaseFollowUpObligation`, for the two rules (claim as an intent
+-- before the write, release only once the follow-ups actually ran).
+--
 -- Nullable, no default, no backfill: every existing row starts NULL, i.e. "no follow-ups known to be
 -- outstanding", which is exactly what can be said about rows written before this column existed —
 -- the FAILED-status inference below still covers those. Adding a nullable column without a default is
 -- metadata-only on Postgres; no table rewrite.
+--
+-- AND THERE CANNOT BE A MEANINGFUL BACKFILL, which is a limitation rather than an oversight. A
+-- pre-existing SYNCED row that is linked and unstamped is BIT-FOR-BIT IDENTICAL whether its
+-- follow-ups ran or never happened — that indistinguishability IS the defect, and it cannot be
+-- undone retroactively from the row. Stamping the whole SYNCED population as owing follow-ups would
+-- make the next sweep re-enqueue every PDF, payment registration and attachment the system has ever
+-- done; follow-up idempotency would suppress most of that, but "most" is not a standard money
+-- movement gets held to, and the money-moving planner REFUSES rather than guess when it finds
+-- several candidate tokens — so the backfill would also manufacture ambiguity that needs a human.
+-- Nothing is written and nothing is claimed for historical rows. From this migration forward the
+-- window is closed; before it, it is not.
 BEGIN;
 
 ALTER TABLE "accounting_sync_logs" ADD COLUMN "backReferenceFollowUpsPendingAt" TIMESTAMP(3);

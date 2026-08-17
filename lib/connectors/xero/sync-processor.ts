@@ -17,7 +17,7 @@ import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
-import { applyBackReference } from '@/lib/domain/accounting/back-reference'
+import { applyBackReference, followUpObligationClaim, releaseFollowUpObligation } from '@/lib/domain/accounting/back-reference'
 import {
   DEFAULT_BACK_REFERENCE_SWEEP_LIMIT,
   createBackReferenceSweepCursorStore,
@@ -748,6 +748,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // Claimed IN this transaction, so the row can never be SYNCED-with-an-id and silent
+              // about the follow-ups it still owes (r10 finding 1).
+              ...followUpObligationClaim(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -763,7 +766,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
+          // NOT released: the follow-ups did not run. The row goes back to PENDING (or FAILED at
+          // MAX_RETRIES) still carrying the obligation, so whichever gets there first — this
+          // processor's own retry or the repair sweep — knows the work is outstanding.
           await markSyncLogForFollowUpRetry(entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
           result.failed++
@@ -791,6 +798,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // Same transaction as the external id itself (r10 finding 1): the two facts that make
+              // the crash-after-post state recoverable become durable together or not at all.
+              ...followUpObligationClaim(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -807,6 +817,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
+          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           await markSyncLogForFollowUpRetry(entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
@@ -1001,6 +1012,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // r10 finding 1. The outbox path is the one MOST rows take, and it is also the one
+              // that skips a SYNCED row outright next run — so a crash here left nothing to notice.
+              ...followUpObligationClaim(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -1016,6 +1030,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
             const nextRetry = await markSyncLogForFollowUpRetry(entry, followUpError, tx)
@@ -1055,6 +1070,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // THE LINE r10 finding 1 NAMED. This is where most successfully posted rows go.
+              ...followUpObligationClaim(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -1071,6 +1088,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
+          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
             const nextRetry = await markSyncLogForFollowUpRetry(entry, followUpError, tx)

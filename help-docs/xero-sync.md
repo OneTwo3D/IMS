@@ -548,6 +548,15 @@ can be correctly linked and still be missing its PDF or its payment. Nothing is 
 silence, either — each failed attempt writes `xero_backreference_followup_deferred` to the activity
 log.
 
+**The sync itself records what it still owes, not just the sweep.** A linked, `SYNCED` row says
+nothing on its own about whether its PDF, payment or attachment ever ran — so the sync writes that
+down at the moment it is true, in the very same database write that marks the row synced with its
+external id. It is cleared only once the follow-ups have actually been queued. That is what makes a
+process restart in the middle of a sync recoverable: whatever was interrupted, the row still says the
+follow-ups are outstanding and the next sweep runs them. Rows that were synced *before* this was
+introduced cannot be assessed retrospectively — a completed row and an interrupted one look identical
+afterwards — so nothing was back-filled; the protection applies from that point on.
+
 **The sweep runs for Xero only.** There is deliberately no QuickBooks equivalent, and that is not an
 oversight to be reported. A QuickBooks document id is a per-company integer, and disconnecting clears
 the company pin, so a sweep scoped to "the QuickBooks connector" could not tell an id issued by a
@@ -558,6 +567,10 @@ back-reference that fails to write is therefore **not retried by anything**: the
 activity log (`quickbooks_backreference_failed` or `quickbooks_backreference_ambiguous`) says so, and
 the link has to be made by hand. The external id is on the sync row, so nothing is lost — only
 automatic. See *Connecting a different company* below for why the company boundary is the blocker.
+(QuickBooks *does* record outstanding follow-ups the same way Xero does — that costs nothing and
+crosses no company boundary — so the work is recoverable the day a QuickBooks sweep becomes safe to
+run. Until then it is a record, not a repair: a QuickBooks follow-up that fails still has to be
+re-driven by hand, and `quickbooks_followup_error` in the activity log is the notice that it does.)
 
 **When the id itself is the blocker.** One case cannot be resolved by linking the document by hand:
 the write was refused because *another local record already holds that id* — typically a bill from a

@@ -4,6 +4,7 @@ import {
   BACK_REFERENCE_TYPES,
   applyBackReference,
   backReferenceIsMissing,
+  followUpObligationClaim,
   isExternalDocumentIdConflict,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
@@ -603,9 +604,12 @@ export async function repairAccountingBackReferences(
   const claimFollowUpObligation = async (row: BackReferenceSweepRow): Promise<boolean> => {
     if (row.backReferenceFollowUpsPendingAt !== null) return true
     try {
+      // The SAME fragment the connectors merge into their SYNCED write (r10 finding 1). They can
+      // claim it for free because they have a transaction to ride; the sweep has none, so it pays
+      // for a write of its own — but the value written is one definition, not two.
       await deps.db.accountingSyncLog.update({
         where: { id: row.id },
-        data: { backReferenceFollowUpsPendingAt: now() },
+        data: followUpObligationClaim(now()),
       })
       return true
     } catch (pendingError) {

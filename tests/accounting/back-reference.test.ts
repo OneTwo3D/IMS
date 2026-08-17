@@ -6,10 +6,12 @@ import {
   applyBackReference,
   backReferenceHolder,
   backReferenceIsMissing,
+  followUpObligationClaim,
   isExternalBillIdConflict,
   isExternalCreditNoteIdConflict,
   isExternalDocumentIdConflict,
   releaseAndRelinkExternalDocumentId,
+  releaseFollowUpObligation,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
   type BackReferenceDeps,
@@ -1255,6 +1257,78 @@ test('[o3d-9kek r7 f1] releasing the confirmed holder links the id to the docume
   assert.equal(claimCalls.transactions, 1)
   assert.equal(claimCalls.rollbacks, 0)
   assert.equal(source?.errorMessage, null)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek Codex r10 finding 1 — the shared obligation helpers, on their own.
+//
+// The connectors' behaviour is asserted end-to-end in tests/accounting/followup-obligation-writers;
+// these two pin the CONTRACT that makes the shape safe to reuse, so a future third caller inherits
+// it instead of reinventing it.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek r10 f1] the claim is a data fragment, so it can only be merged into an existing write', () => {
+  // Not a function that performs a write. That is the whole point: merged into the update that marks
+  // a row SYNCED, the claim cannot fail separately from the transition it describes, so there is no
+  // ordering in which a row becomes SYNCED-with-an-id while nothing records what it still owes.
+  const now = new Date('2026-08-17T09:00:00Z')
+  assert.deepEqual(followUpObligationClaim(now), { backReferenceFollowUpsPendingAt: now })
+  assert.ok(followUpObligationClaim().backReferenceFollowUpsPendingAt instanceof Date, 'and it defaults to now')
+})
+
+test('[o3d-9kek r10 f1] a release that fails REPORTS rather than throws, leaving the work recorded as owed', async () => {
+  // By the time this runs the follow-ups have already been enqueued, so a throw here would drive the
+  // caller's follow-up-failure path and re-run work that succeeded. Failing to clear the marker
+  // costs one idempotent re-enqueue on a later sweep; failing the entry costs a duplicate.
+  const writes: Array<Record<string, unknown>> = []
+  const ok = await releaseFollowUpObligation({
+    accountingSyncLog: {
+      async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+        writes.push(args.data)
+        return {}
+      },
+    },
+  }, { syncLogId: 'log-1', connector: 'xero' })
+  assert.equal(ok, true)
+  assert.deepEqual(writes, [{ backReferenceFollowUpsPendingAt: null }], 'and it clears ONLY the obligation')
+
+  const failing = await releaseFollowUpObligation({
+    accountingSyncLog: {
+      async update() { throw new Error('transient') },
+    },
+  }, { syncLogId: 'log-1', connector: 'xero' })
+  assert.equal(failing, false, 'reported, not thrown')
+})
+
+test('[o3d-9kek r10 f1] the release writes a link but does NOT discharge the follow-up obligation', async () => {
+  // The release is the THIRD path that writes a back-reference, after the two connectors and the
+  // sweep — and unlike them it enqueues no follow-ups at all. Its precondition guarantees the source
+  // row owes some: the write it is repairing was REFUSED by the unique index, so on Xero the refusal
+  // propagated and the follow-ups never ran, and on QuickBooks the row was quarantined mid-way.
+  //
+  // So the correct behaviour here is to touch neither the obligation marker nor the sweep's verdict
+  // marker, leaving the row a repair candidate that still says what it owes. Asserted on the WRITES,
+  // not on the resulting row: "the marker survived" would also be true of a function that set it and
+  // cleared it again, and it is the absence of any write to it that is the property.
+  const { claimDeps, claimCalls } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', createdAt: 1 },
+    ],
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' }, recordRelease)
+
+  assert.equal(result.outcome, 'relinked')
+  assert.deepEqual(
+    claimCalls.sourceUpdates,
+    [{ errorMessage: null }],
+    'clearing the resolved quarantine is the ONLY thing the release may write to the sync row',
+  )
+  for (const update of claimCalls.sourceUpdates) {
+    assert.equal('backReferenceFollowUpsPendingAt' in update, false, 'the follow-ups it did not run are still owed')
+    assert.equal('backReferenceCheckedAt' in update, false, 'and the row must stay a candidate so the sweep runs them')
+  }
 })
 
 // ---------------------------------------------------------------------------

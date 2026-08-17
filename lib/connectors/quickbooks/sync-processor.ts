@@ -24,7 +24,9 @@ import {
   applyBackReference,
   backReferenceHolder,
   findExternalDocumentIdClaim,
+  followUpObligationClaim,
   isExternalDocumentIdConflict,
+  releaseFollowUpObligation,
 } from '@/lib/domain/accounting/back-reference'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
@@ -345,6 +347,10 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // Claimed in the SYNCED transaction, exactly as Xero does (r10 finding 1). See the
+              // block above enqueueFollowUps at the end of this file for why the marker is set here
+              // even though the QuickBooks sweep is still unwired.
+              ...followUpObligationClaim(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -359,6 +365,10 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         })
         await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
         await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+        // Only reached when the enqueue did NOT throw. This branch has no catch of its own — an
+        // exception propagates to the outer handler, which retries the row — so the obligation
+        // simply stays claimed, which is the correct state for work that has not run.
+        await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
         result.succeeded++
         continue
       }
@@ -384,6 +394,10 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // The external id and the record that follow-ups are owed become durable in ONE
+              // write (r10 finding 1) — the comment above is exactly why they have to: everything
+              // after this transaction can die without the row ever being re-posted.
+              ...followUpObligationClaim(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -403,11 +417,17 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         try {
           await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
+          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
         } catch (followUpError) {
           // ERROR, not WARNING: the external post is committed and this entry is about to be
           // marked succeeded, so nothing will drive these follow-ups again. A payment or PDF
           // that never got enqueued is silently missing until someone notices, and at WARNING
           // nobody does (Codex review, r6).
+          //
+          // The obligation is deliberately NOT released here (r10 finding 1). This branch marks the
+          // entry succeeded regardless, so the row is about to look identical to one whose
+          // follow-ups ran — the marker is the only thing left that says otherwise, and it is what
+          // lets the QuickBooks sweep pick the work up once o3d-s36z unblocks it.
           await logActivity({
             entityType: 'SYSTEM',
             action: 'quickbooks_followup_error',
@@ -1143,4 +1163,19 @@ async function enqueueFollowUps(
 // above say so in as many words instead of promising a sweep. Whoever closes o3d-s36z should re-add
 // the binding here — the connector-agnostic sweep module needs no changes for it, only a trustworthy
 // realm boundary underneath.
+//
+// THE FOLLOW-UP OBLIGATION MARKER IS STILL CLAIMED HERE, AND THAT IS NOT A CONTRADICTION (r10
+// finding 1). Recording that work is owed and repairing it are two different acts, and only the
+// second one is what o3d-s36z gates. The marker writes nothing to any accounting document and
+// crosses no realm boundary — it is a timestamp on the sync row that already carries the external
+// id — so none of the reasoning above applies to it.
+//
+// Claiming it now was the choice over deferring it because the alternative is not "no marker", it
+// is "a window that stays silent". A QuickBooks row that dies between its SYNCED write and its
+// enqueue is indistinguishable afterwards from one that completed, and nothing can recover that
+// distinction later: it has to be recorded at the moment it is true or not at all. Adding it when
+// the sweep is wired would leave every row written before then permanently unrecoverable, for the
+// same reason there is no backfill for rows written before the column existed. Xero having the
+// marker and QuickBooks not having it would also be a difference nobody chose — the two connectors
+// drifted once already, on precisely this function's back-reference logic.
 // ---------------------------------------------------------------------------

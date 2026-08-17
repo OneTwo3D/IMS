@@ -619,6 +619,50 @@ test('[o3d-9kek r9 f1] a SYNCED row TOMBSTONED while it still owed follow-ups is
   assert.equal(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, null)
 })
 
+test('[o3d-9kek r10 f1] a CONNECTOR that died between the link and the enqueue is repaired by the sweep', async () => {
+  // The other end of r10 finding 1. The connectors now claim the obligation in the same write that
+  // marks a row SYNCED, so a process death between updateBackReference and enqueueFollowUps leaves
+  // this exact row: SYNCED, LINKED, and marked as still owing its follow-ups.
+  //
+  // Every other signal on it says "reconciled" — which is why the marker had to exist and why the
+  // connectors had to be the ones to write it. Nothing about a linked SYNCED row can be inferred
+  // after the fact; if the writer had not recorded it at the moment it was true, this sweep would
+  // stamp the row checked and the payment, PDF or attachment would be gone for good.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { backReferenceFollowUpsPendingAt: at(400) })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 0, 'nothing to re-apply — the connector had already written the link')
+  assert.equal(run.checked, 1, 'but the row is NOT treated as reconciled')
+  assert.deepEqual(harness.followUps.map((entry) => entry.entryId), ['log-0001'], 'the follow-ups the crash lost are re-enqueued')
+  assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_followups_recovered'))
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'and only now is it settled')
+  assert.equal(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, null, 'with the obligation discharged in the same write')
+})
+
+test('[o3d-9kek r10 f1] a linked SYNCED row with NO obligation marker is still settled without re-enqueueing', async () => {
+  // The control for the test above, and the reason the marker cannot simply be "on for every SYNCED
+  // row": the ordinary case — connector ran, follow-ups ran, obligation released — must remain a
+  // one-line verdict. If it re-enqueued here, every successfully synced document in the system
+  // would get a second PDF, payment registration or attachment on its first sweep.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1)],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: 'XINV-1' }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.checked, 0)
+  assert.equal(run.repaired, 0)
+  assert.deepEqual(harness.followUps, [], 'nothing is owed, so nothing is re-run')
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+})
+
 // ---------------------------------------------------------------------------
 // Defect 2 — PO attribution decided globally, not within the page.
 // ---------------------------------------------------------------------------

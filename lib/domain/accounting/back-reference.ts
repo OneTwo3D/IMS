@@ -497,6 +497,84 @@ export function syncTypeWritesBackReference(type: AccountingSyncType, referenceT
   return BACK_REFERENCE_PAIRS.some((pair) => pair.type === type && pair.referenceTypes.includes(referenceType))
 }
 
+// ---------------------------------------------------------------------------
+// THE FOLLOW-UP OBLIGATION (o3d-9kek Codex r9 finding 1, r10 finding 1)
+//
+// Every connector posts a document, marks its sync row SYNCED with the external id, and THEN — as
+// two separate awaits, outside that transaction on purpose, because the id must be durable before
+// anything can fail — writes the back-reference and enqueues the follow-ups (invoice PDF, payment
+// registration, bill attachment). If the process dies in between, the row is SYNCED, linked, and
+// its follow-ups never ran. Nothing about that row says so: SYNCED means "posted", and a present
+// back-reference means "linked". The work is owed and no state records that it is owed, so the
+// repair sweep sees a reconciled row, stamps it checked, and the payment or PDF is gone silently.
+//
+// `backReferenceFollowUpsPendingAt` is that record. r9 added it and wired it into the SWEEP only;
+// the sweep is the repair route and the connectors are where most rows actually go, so r10 wired it
+// here — ONCE, shared, rather than a copy per connector. Copies are exactly how the two connectors
+// drifted before (see the QuickBooks writer's own comment about its hand-rolled back-reference).
+//
+// TWO RULES, and they are what make the marker worth having:
+//
+//   1. CLAIMED AS AN INTENT, BEFORE THE LINK IS WRITTEN — never recorded in a catch afterwards. A
+//      marker written only when the enqueue fails is itself a database write that can fail
+//      transiently, and if it does, the row is linked again with nothing recording what it owes.
+//      That is the same hole one layer down. On the connector paths the claim is FREE: it merges
+//      into the update that flips the row to SYNCED, so there is no window at all between "SYNCED
+//      with an id" and "recorded as owing follow-ups", and no extra call that can fail on its own.
+//   2. RELEASED ONLY ONCE THE FOLLOW-UPS ACTUALLY RAN. The failure is asymmetric on purpose: a
+//      marker left behind on a row whose follow-ups succeeded costs ONE idempotent re-enqueue on a
+//      later sweep, while a marker cleared too early costs the payment.
+// ---------------------------------------------------------------------------
+
+/** The minimal Prisma surface the obligation release touches. Structural, so a test double fits. */
+export type FollowUpObligationClient = {
+  accountingSyncLog: {
+    update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>
+  }
+}
+
+/**
+ * The claim, as a data fragment to MERGE INTO the write that marks the row SYNCED — not as a call
+ * of its own. Rule 1 above: made atomic with the SYNCED transition it is describing, so no ordering
+ * and no failure of this marker can leave a posted row unrecorded.
+ */
+export function followUpObligationClaim(now: Date = new Date()): { backReferenceFollowUpsPendingAt: Date } {
+  return { backReferenceFollowUpsPendingAt: now }
+}
+
+/**
+ * Discharge the obligation: the back-reference is written and the follow-ups are enqueued.
+ *
+ * SWALLOWS its failure and reports it as a boolean, and never throws. The follow-ups have already
+ * run by the time this is called, so a failure here is not a reason to retry them — driving the
+ * caller's follow-up-failure path would re-post work that succeeded. Leaving the marker set is the
+ * safe direction: the next sweep finds a linked row that still says it owes follow-ups and
+ * re-enqueues them idempotently. Noise, not loss.
+ *
+ * It is a separate write because it has to be: the SYNCED transition commits BEFORE the follow-ups
+ * run (that ordering is the connectors' idempotency guard against double-posting), so there is no
+ * later transaction on this row to fold it into.
+ */
+export async function releaseFollowUpObligation(
+  client: FollowUpObligationClient,
+  params: { syncLogId: string; connector: string },
+): Promise<boolean> {
+  try {
+    await client.accountingSyncLog.update({
+      where: { id: params.syncLogId },
+      data: { backReferenceFollowUpsPendingAt: null },
+    })
+    return true
+  } catch (error) {
+    console.error(
+      `${params.connector}: follow-ups ran but the obligation marker could not be cleared; a later sweep will re-enqueue them`,
+      params.syncLogId,
+      error,
+    )
+    return false
+  }
+}
+
 /**
  * Resolve a PO-keyed row to its bill and write the id in ONE step (o3d-9kek finding 3).
  *
