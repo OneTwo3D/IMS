@@ -114,6 +114,30 @@ function findProductBySku(sku: unknown) {
 }
 
 /**
+ * The `_count.variants` relation count the connector's structural rules are decided from
+ * (o3d-y89x r5), computed from the same `state.products` array everything else reads — and
+ * attached ONLY when the query asked for it, because `imsRowHasChildren` throws on a row that
+ * carries no count rather than reading "no children" out of its absence.
+ */
+function withChildCount(row: Row, include?: Row): Row {
+  if (!include || !('_count' in include)) return { ...row }
+  return { ...row, _count: { variants: state.products.filter((child) => child.parentId === row.id).length } }
+}
+
+/**
+ * The four arms `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE` expresses, read off the same seeded rows
+ * as the per-product blocker doubles below. Every product in this suite is clean, but answering
+ * from the shared state rather than with a constant is what lets a future ownership test seed a
+ * live row and see the pre-commit re-assertion refuse the transform.
+ */
+function hasAnyBlocker(productId: string): boolean {
+  return state.stockLevels.some((row) => row.productId === productId && (row.quantity > 0 || row.reservedQty > 0))
+    || state.salesOrderLines.some((row) => row.productId === productId)
+    || state.purchaseOrderLines.some((row) => row.productId === productId)
+    || state.productionOrders.some((row) => row.outputProductId === productId)
+}
+
+/**
  * Emulates the conditional ownership update: `id` plus an OR over externalProductId.
  * Returning { count: 0 } when the predicate does not match is what the production code
  * reads as "someone reassigned this row underneath us".
@@ -144,9 +168,9 @@ const productDelegate = {
   // so a later `Object.assign` in the update path mutated the caller's "pre-update snapshot" too —
   // `existing.type` read AFTER the write returned the NEW type, and a test could not distinguish
   // "the code captured the old value" from "the code read a value that had already moved".
-  findFirst: async ({ where }: { where: { sku?: unknown } }) => {
+  findFirst: async ({ where, include }: { where: { sku?: unknown }; include?: Row }) => {
     const row = findProductBySku(where?.sku)
-    return row ? { ...row } : null
+    return row ? withChildCount(row, include) : null
   },
   findUnique: async ({ where }: { where: { id: string } }) => {
     const row = state.products.find((candidate) => candidate.id === where.id)
@@ -174,19 +198,22 @@ const productDelegate = {
     }
     return updateManyMatching(where, data)
   },
-  // THREE queries: candidate rows by SKU, (o3d-h2cz) the children of those candidates by parentId,
-  // and the whole table. An unrecognised `where` THROWS rather than returning everything, so a
-  // query this double does not actually model can never quietly answer "yes" or "no".
-  findMany: async ({ where }: { where?: Row } = {}) => {
+  // THREE queries: candidate rows by SKU, the pre-commit blocker re-assertion over the ids this
+  // transaction transformed (o3d-y89x r5), and the whole table. An unrecognised `where` THROWS
+  // rather than returning everything, so a query this double does not actually model can never
+  // quietly answer "yes" or "no" — and in particular the re-assertion cannot report a transformed
+  // row as clean by accident.
+  findMany: async ({ where, include }: { where?: Row; include?: Row } = {}) => {
     const skuIn = (where?.sku as { in?: unknown[] } | undefined)?.in
     if (Array.isArray(skuIn)) {
-      return state.products.filter((row) => skuIn.includes(row.sku)).map((row) => ({ ...row }))
+      return state.products.filter((row) => skuIn.includes(row.sku)).map((row) => withChildCount(row, include))
     }
-    const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
-    if (Array.isArray(parentIn)) {
+    const idIn = (where?.id as { in?: unknown[] } | undefined)?.in
+    if (Array.isArray(idIn)) {
+      const candidates = idIn.map(String)
       return state.products
-        .filter((row) => row.parentId != null && parentIn.includes(row.parentId))
-        .map((row) => ({ ...row }))
+        .filter((row) => candidates.includes(String(row.id)) && !hasAnyBlocker(String(row.id)))
+        .map((row) => ({ id: row.id }))
     }
     if (where === undefined) return state.products.map((row) => ({ ...row }))
     throw new Error(`product.findMany double got an unmodelled where: ${JSON.stringify(where)}`)
@@ -265,6 +292,19 @@ const txClient = {
   stockTransferLine: {
     count: async ({ where }: { where?: Row } = {}) =>
       state.stockTransferLines.filter((row) => row.productId === blockerProductId(where, 'stockTransferLine.count')).length,
+    // The transfer arm of the SET-WISE pre-commit re-assertion (o3d-y89x r5). It is its own
+    // statement because `StockTransferLine` carries no FK to Product, so it cannot ride in the
+    // product filter with the other four arms.
+    groupBy: async ({ by, where }: { by: string[]; where?: Row } = { by: [] }) => {
+      const ids = (where?.productId as { in?: unknown[] } | undefined)?.in
+      if (!Array.isArray(ids) || by[0] !== 'productId') {
+        throw new Error(`stockTransferLine.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
+      }
+      const candidates = ids.map(String)
+      return [...new Set(
+        state.stockTransferLines.filter((row) => candidates.includes(row.productId)).map((row) => row.productId),
+      )].map((productId) => ({ productId }))
+    },
   },
   productOption: {
     upsert: async ({ create }: { create: Row }) => {

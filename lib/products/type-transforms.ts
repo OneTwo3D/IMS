@@ -135,10 +135,11 @@ export function summarizeTransformBlockers(blockers: ProductTransformBlockers): 
  *     on. Callers must say that plainly rather than describe this predicate as a closure.
  *
  * A caller that needs the window narrowed further can re-assert the FULL blocker question (this
- * predicate's four arms plus the transfer arm below) as the last statement before it commits;
- * that shrinks the exposure from "the rest of the transaction" to "one statement boundary", but
- * it does not remove the write-skew residual either. The WooCommerce connector does exactly
- * that — see `assertTransformedRowsStillTransformable` in the product sync.
+ * predicate's four arms plus the transfer arm below) immediately before it commits. That bounds
+ * the exposure at the width of the re-assertion itself instead of the rest of the transaction —
+ * TWO statements if it is asked set-wise (`findProductsWithTransformBlockers`), 5N if it is asked
+ * row by row. It does not remove the write-skew residual either way. The WooCommerce connector
+ * asks it set-wise — see `assertTransformedRowsStillTransformable` in the product sync.
  *
  * EXACTLY EQUIVALENT TO THE COUNTING VERSION, for the four arms it covers:
  *
@@ -245,6 +246,79 @@ export async function getProductTransformBlockers(
     openProductionOrders,
     openTransferLines,
   }
+}
+
+/**
+ * THE SAME QUESTION OVER A SET OF ROWS, IN A FIXED NUMBER OF STATEMENTS (o3d-y89x r5, Codex
+ * finding 1).
+ *
+ * `getProductTransformBlockers` answers for ONE product in five statements. A caller
+ * re-asserting the question over N rows by calling it N times issues 5N statements — and the
+ * row it checks FIRST then stays exposed across the remaining 5(N-1), so the window grows with
+ * the row count. That is exactly what a pre-commit re-assertion exists to bound, so asking it
+ * row by row is self-defeating at any interesting N.
+ *
+ * This answers the whole set in TWO statements, whatever N is:
+ *
+ *   1. the transfer arm — `StockTransferLine.productId` carries no FK to Product, so no
+ *      predicate on the product row can express it (see the fragment above). Grouped by product,
+ *      so it returns at most one row per candidate rather than one per line.
+ *   2. the four arms `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE` CAN express, as a filter on the
+ *      product rows themselves. This is the identical exported fragment the conditional UPDATEs
+ *      carry, so the re-assertion cannot drift from the predicate it re-asserts. Any candidate
+ *      id the statement does not return has at least one of those four blockers.
+ *
+ * WHAT THAT GUARANTEES, EXACTLY AND NO MORE. Two statements means TWO snapshots, not one:
+ *
+ *   - a blocker committing between the two is seen by the second and not by the first, so the
+ *     transfer arm is answered as of one statement earlier than the other four;
+ *   - a blocker committing after BOTH and before the caller's COMMIT is seen by neither. That is
+ *     the write-skew residual documented on the fragment above, unchanged and not closable by
+ *     any single caller;
+ *   - it is a SELECT pair, not a lock. Nothing here prevents a blocker from arriving.
+ *
+ * What it removes is only the GROWTH: the window is two statements wide for one transformed row
+ * and two statements wide for two hundred. Callers may say that and may not say more.
+ *
+ * A candidate id that no longer exists comes back as blocked, because arm 2 cannot return a row
+ * that is not there. That is the fail-closed direction and in practice unreachable for this
+ * caller: it re-asserts over rows it has already UPDATE-ed in the same transaction, whose row
+ * locks it still holds.
+ *
+ * It returns WHICH rows are blocked, never WHY. The "why" is one row's operator-facing summary,
+ * and callers get it from `getProductTransformBlockers` for the rows this flags — on a path that
+ * is already failing, where an extra statement costs nothing and widens no window.
+ */
+export async function findProductsWithTransformBlockers(
+  productIds: readonly string[],
+  client: Pick<ProductStructureClient, 'product' | 'stockTransferLine'> = db,
+): Promise<ReadonlySet<string>> {
+  const ids = [...new Set(productIds)]
+  if (ids.length === 0) return new Set()
+
+  const openTransferLines = await client.stockTransferLine.groupBy({
+    by: ['productId'],
+    where: {
+      productId: { in: ids },
+      transfer: { status: { in: [...OPEN_TRANSFER_STATUSES] } },
+    },
+  })
+  const blocked = new Set<string>(openTransferLines.map((row) => row.productId))
+
+  // Read LAST on purpose: these four arms are the ones the writes themselves carried, so
+  // re-reading them as the final statement gives them the narrowest of the two windows. (On the
+  // write path the split runs the other way round — the transfer arm is read one statement
+  // EARLIER than the predicate — for the same reason: there, the predicate rides in the write.)
+  const stillTransformable = await client.product.findMany({
+    where: { id: { in: ids }, ...PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE },
+    select: { id: true },
+  })
+  const clean = new Set(stillTransformable.map((row) => row.id))
+  for (const id of ids) {
+    if (!clean.has(id)) blocked.add(id)
+  }
+
+  return blocked
 }
 
 export async function validateProductStructureChange(

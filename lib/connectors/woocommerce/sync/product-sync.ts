@@ -45,6 +45,7 @@ import {
   type WcProductStructureConflict,
 } from './product-structure-policy'
 import {
+  findProductsWithTransformBlockers,
   getProductTransformBlockers,
   hasProductTransformBlockers,
   summarizeTransformBlockers,
@@ -138,8 +139,8 @@ async function connectorTransformBlockerSummary(
 }
 
 /**
- * THE BLOCKER QUESTION, ASKED ONCE MORE AS THE TRANSACTION'S LAST ACT (o3d-y89x r4, Codex
- * finding 2).
+ * THE BLOCKER QUESTION, ASKED ONCE MORE OVER THE WHOLE SET AS THE TRANSACTION'S LAST ACT
+ * (o3d-y89x r4/r5, Codex findings 2 and 1).
  *
  * `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE` rides in each structural UPDATE, so each of those
  * writes is refused by a blocker committed before ITS OWN snapshot. What that leaves is
@@ -147,22 +148,41 @@ async function connectorTransformBlockerSummary(
  * writes inside the same transaction before it commits, and a blocker committing anywhere in
  * that stretch is seen by neither the write's predicate nor the pre-check.
  *
- * Re-reading every transformed row here — after every write, immediately before the commit —
- * shrinks that exposure from "the rest of the transaction" to "one statement boundary". Both
- * arms matter:
+ * WHAT THIS ACTUALLY GUARANTEES, STATED TO MATCH THE CODE. The r4 wording claimed the
+ * re-assertion shrank the exposure "to one statement boundary". For a single transformed row
+ * that was true; for a multi-row transform it was FALSE, and this is the third time on this
+ * branch that a stated guarantee outran the code. Asked row by row, the re-assertion is 5N
+ * statements and the row it checks first stays exposed across the remaining 5(N-1) — so the
+ * window was proportional to the number of transformed rows, which for a first-time adoption of
+ * a 200-variation parent is ~1,000 statements, not one. What is true now:
  *
- *   - it covers ALL FIVE arms, including the open stock-transfer lines the predicate cannot
- *     express at all, so the transfer arm is no longer the one weak leg;
+ *   - every transformed row is re-read in the SAME TWO statements, whichever row it is and
+ *     however many there are (`findProductsWithTransformBlockers`): one grouped read of the open
+ *     transfer lines, then one read of the four arms `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE`
+ *     expresses, filtered over the whole id set. The window is therefore CONSTANT — two
+ *     statements — not proportional to N;
+ *   - two statements are two snapshots, not one. A blocker committing between them is seen by
+ *     the second and not the first, so the transfer arm is answered as of one statement earlier
+ *     than the other four;
+ *   - it covers ALL FIVE arms, including the open stock-transfer lines the write predicate
+ *     cannot express at all, so the transfer arm is no longer the one weak leg;
  *   - it fails CLOSED. There is no graceful second decision available at this point (the writes
  *     are already in the transaction and re-deciding them would mean redoing the import), so it
  *     throws and the whole transaction rolls back. The next attempt's pre-check finds the
  *     blocker in the ordinary way and refuses it properly, with the operator-facing conflict.
  *
- * WHAT IT STILL DOES NOT DO: close the race. A blocker whose transaction commits after this
- * read and before this transaction's COMMIT is invisible here, exactly as it is to the
+ * WHAT IT STILL DOES NOT DO: close the race. A blocker whose transaction commits after these
+ * two reads and before this transaction's COMMIT is invisible here, exactly as it is to the
  * predicate. That is write skew and it needs a lock the blocker writers take, or SERIALIZABLE
- * across all of them — neither exists (see PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE). This narrows
+ * across all of them — neither exists (see PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE). This bounds
  * the window; it does not remove it, and nothing in this file may claim otherwise.
+ *
+ * The blocked row's operator-facing WHY is read afterwards, one row at a time, because the set
+ * query returns membership only. That read is on a path that has already decided to abort, so
+ * it widens nothing. If it finds the row clean again — the blocker cleared between the two
+ * statements — this still throws: the set query is the decision and a re-read that disagrees is
+ * not a licence to commit. The error stays transient, so the retry re-decides against whatever
+ * is true then.
  *
  * Costs nothing in the steady state: `transformed` is empty unless this transaction actually
  * moved a row's `type` or `parentId`, which a re-sync of an established catalogue never does.
@@ -171,53 +191,78 @@ async function assertTransformedRowsStillTransformable(
   tx: Prisma.TransactionClient,
   transformed: ReadonlyMap<string, string>,
 ): Promise<void> {
-  for (const [imsProductId, sku] of transformed) {
-    const summary = await connectorTransformBlockerSummary(tx, imsProductId)
-    if (summary) {
-      throw new WcProductTransformBlockedError({ imsProductId, sku, summary, phase: 'commit' })
-    }
-  }
+  if (transformed.size === 0) return
+
+  const blocked = await findProductsWithTransformBlockers([...transformed.keys()], tx)
+  if (blocked.size === 0) return
+
+  // Report the first row in INSERTION order — the parent before the variations it adopted — so
+  // repeated attempts name the same row rather than whichever one a Set happened to yield first.
+  const imsProductId = [...transformed.keys()].find((id) => blocked.has(id))!
+  const sku = transformed.get(imsProductId)!
+  throw new WcProductTransformBlockedError({
+    imsProductId,
+    sku,
+    summary: await connectorTransformBlockerSummary(tx, imsProductId)
+      ?? 'a transform blocker was present at the pre-commit re-read and had already cleared when it was itemised',
+    phase: 'commit',
+  })
 }
 
 /**
- * WHICH OF THESE IMS ROWS ARE PHYSICALLY PARENTS — i.e. other rows carry their id in `parentId`.
+ * IS THIS ROW PHYSICALLY A PARENT — i.e. do other rows carry its id in `parentId`? — ASKED AS
+ * PART OF READING THE ROW, NOT AS A QUERY OF ITS OWN (o3d-y89x r4/r5, Codex finding 1 / r5
+ * finding 2).
  *
- * The one child query, used by BOTH structural rules (o3d-y89x r4, Codex finding 1). It cannot
- * be answered from rows already in hand — a row's children are different rows, with different
- * SKUs — and it must not be inferred from `type`, because the shapes it exists to catch are
- * exactly the ones whose type does not admit that they have children. Nothing in the schema
- * enforces that only a VARIABLE row may have children, and the pre-o3d-y89x connector could
- * mint a SIMPLE-with-children row by flattening a VARIABLE without deleting its variants.
+ * It cannot be answered from the row's own columns — a row's children are different rows, with
+ * different SKUs — and it must not be inferred from `type`, because the shapes it exists to
+ * catch are exactly the ones whose type does not admit that they have children. Nothing in the
+ * schema enforces that only a VARIABLE row may have children, and the pre-o3d-y89x connector
+ * could mint a SIMPLE-with-children row by flattening a VARIABLE without deleting its variants.
+ * So the question is unconditional: r4's *conditional* child query is what missed the legacy
+ * row in the steady-state re-sync of a WooCommerce `simple` product.
+ *
+ * WHY IT IS A RELATION COUNT ON THE EXISTING LOOKUP RATHER THAN A SECOND QUERY. r4 asked it as
+ * `SELECT parentId FROM products WHERE parentId IN (...)`, one statement per row it was asked
+ * about. The bulk reconcile runs one transaction per catalogue product, sequentially, so that
+ * is one extra round trip per existing product on every full reconcile — 5,000 products, 5,000
+ * round trips — and in `applyVariations` it dragged back one row per child (a 200-variant parent
+ * transferring 200 rows to compute a boolean). Prisma renders `_count` on a relation as a
+ * correlated aggregate inside the SAME statement that reads the row, so the count now arrives
+ * with the lookup both paths already make: zero extra statements, and one integer per row
+ * instead of one row per child. `Product.parentId` is indexed (`@@index([parentId])`), which is
+ * what the subquery uses.
  *
  * Shared rather than duplicated because the two rules disagreeing is the failure mode: r3 asked
  * the physical question in `refuseVariationAdoption` (a variation may not swallow a parent) and
  * the TYPE question in the parent branch's shape rule, so the identical legacy row was refused
- * by one door and flattened by the other.
+ * by one door and flattened by the other. Both doors now read this one accessor, off a row read
+ * with this one include — a row read without it THROWS rather than quietly answering "no
+ * children", because "nobody asked" and "genuinely childless" are the exact pair Codex r4
+ * finding 1 was about.
  *
- * Batched over the whole candidate set for the same reason as before: this runs inside a
- * transaction holding row locks, so one query for N variation SKUs beats N queries.
- *
- * IT IS A SELECT, AND IT IS NOT ATOMIC WITH THE WRITES THAT FOLLOW. Codex r4 suggested pinning
- * it into the UPDATE as `variants: { none: {} }`; that is not done, and the reason is the same
- * one written out at length on the blocker predicate: a predicate would move the boundary by one
- * statement, not close the race, and the three writers of `Product.parentId` (this sync, the
- * editor, the CSV import) all take per-SKU advisory locks on the CHILD's SKU — never on this
- * row's — so no lock serializes it either. What that residual costs is bounded and
+ * IT IS STILL A SELECT, AND IT IS STILL NOT ATOMIC WITH THE WRITES THAT FOLLOW. Codex r4
+ * suggested pinning it into the UPDATE as `variants: { none: {} }`; that is not done, and the
+ * reason is the same one written out at length on the blocker predicate: a predicate would move
+ * the boundary by one statement, not close the race, and the three writers of `Product.parentId`
+ * (this sync, the editor, the CSV import) all take per-SKU advisory locks on the CHILD's SKU —
+ * never on this row's — so no lock serializes it either. What that residual costs is bounded and
  * self-correcting: a child row appearing between this read and the commit means WooCommerce's
  * simple price lands on a row that has just become a parent, and the NEXT sync of the pairing
  * sees the child and quarantines it. Nothing structural is written on that path, because the
  * paths that DO write structure are the ones this answer refuses.
  */
-async function findImsProductIdsWithChildren(
-  tx: Prisma.TransactionClient,
-  candidateIds: readonly string[],
-): Promise<ReadonlySet<string>> {
-  if (candidateIds.length === 0) return new Set()
-  const childRows = await tx.product.findMany({
-    where: { parentId: { in: [...candidateIds] } },
-    select: { parentId: true },
-  })
-  return new Set(childRows.map((row) => row.parentId).filter((id): id is string => Boolean(id)))
+const CONNECTOR_ROW_CHILD_COUNT = { _count: { select: { variants: true } } } as const
+
+function imsRowHasChildren(row: { id: string; _count?: { variants?: number } }): boolean {
+  const children = row._count?.variants
+  if (typeof children !== 'number') {
+    throw new Error(
+      `IMS product ${row.id} was read without its child count, so the connector's structural `
+      + 'rules cannot be decided for it. Read it with `include: CONNECTOR_ROW_CHILD_COUNT`.',
+    )
+  }
+  return children > 0
 }
 
 /**
@@ -792,7 +837,10 @@ export async function syncWcProductToIms(
           await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_WRITE_LOCK_NAMESPACE}::int4, ${lockId}::int4)`
         }
 
-        const existing = await tx.product.findFirst({ where: { sku } })
+        // `_count.variants` rides in this lookup rather than following it: see
+        // CONNECTOR_ROW_CHILD_COUNT for why the question is unconditional and why asking it
+        // separately cost a round trip per catalogue product on every reconcile.
+        const existing = await tx.product.findFirst({ where: { sku }, include: CONNECTOR_ROW_CHILD_COUNT })
         // Never reassign a row another WooCommerce object already maps (o3d-fsi): the
         // update branch below overwrites type/parentId/externalProductId. Checked here so a
         // conflict fails BEFORE any write, and re-checked atomically inside the update itself.
@@ -845,13 +893,12 @@ export async function syncWcProductToIms(
           // actually on the table: the first pass answers from the row alone plus the child
           // query, and says whether the editor's question is even relevant.
           //
-          // The child query is NOT conditional (o3d-y89x r4, Codex finding 1). Whether this row
-          // is physically a parent decides the shape rule in BOTH directions — including the
+          // The child question is NOT conditional (o3d-y89x r4, Codex finding 1). Whether this
+          // row is physically a parent decides the shape rule in BOTH directions — including the
           // steady-state re-sync of a WooCommerce `simple` product, which is precisely where a
-          // legacy SIMPLE-with-children row was being priced and marked SYNCED. One indexed
-          // lookup per parent row is the price of the answer being about the row rather than
-          // about its type column.
-          const existingHasChildren = (await findImsProductIdsWithChildren(tx, [existing.id])).has(existing.id)
+          // legacy SIMPLE-with-children row was being priced and marked SYNCED. It costs no
+          // query at all: the count came back with the row above (r5).
+          const existingHasChildren = imsRowHasChildren(existing)
           parentWrite = decideConnectorParentWrite({
             row: existing,
             incoming: productType,
@@ -1442,15 +1489,16 @@ async function applyVariations(
 
   // One lookup for all variant SKUs rather than one per variant. This runs inside a
   // transaction holding row locks, so every saved round trip shortens the lock hold.
+  //
+  // Which of those candidate rows are themselves parents (o3d-h2cz) comes back WITH them, through
+  // the same accessor the parent branch's shape rule uses (o3d-y89x r4/r5). It used to be a
+  // second query returning one row per child — hundreds of rows for a high-variation catalogue,
+  // read only to compute a boolean per candidate.
   const existingRows = await tx.product.findMany({
     where: { sku: { in: entries.map((entry) => entry.sku) } },
+    include: CONNECTOR_ROW_CHILD_COUNT,
   })
   const existingBySku = new Map(existingRows.map((row) => [row.sku, row]))
-
-  // Which of those candidate rows are themselves parents (o3d-h2cz), through the SAME query the
-  // parent branch's shape rule uses (o3d-y89x r4). One extra query for the whole batch, and only
-  // when there is something to ask about.
-  const rowsWithChildren = await findImsProductIdsWithChildren(tx, existingRows.map((row) => row.id))
 
   // Every WC variation id this payload maps to each SKU (o3d-fsi). WC permits one SKU on
   // several variations of a parent, and the sync has always resolved that last-one-wins —
@@ -1504,7 +1552,7 @@ async function applyVariations(
       let refusal = refuseVariationAdoption({
         row: existing,
         imsParentId,
-        rowHasChildren: rowsWithChildren.has(existing.id),
+        rowHasChildren: imsRowHasChildren(existing),
       })
       // The editor's live-row gate, on the connector's other transforming path (o3d-y89x r2).
       // Adoption writes `parentId` and — for a SIMPLE row — `type`, which is exactly the pair
@@ -1518,7 +1566,7 @@ async function applyVariations(
           refusal = refuseVariationAdoption({
             row: existing,
             imsParentId,
-            rowHasChildren: rowsWithChildren.has(existing.id),
+            rowHasChildren: imsRowHasChildren(existing),
             transformBlockerSummary,
           })
         }
@@ -1607,7 +1655,7 @@ async function applyVariations(
         const late = refuseVariationAdoption({
           row: existing,
           imsParentId,
-          rowHasChildren: rowsWithChildren.has(existing.id),
+          rowHasChildren: imsRowHasChildren(existing),
           transformBlockerSummary: e.summary,
         })
         // `late` is non-null by construction — the three structural checks passed above, so the
@@ -1651,7 +1699,11 @@ async function applyVariations(
       })
       // WC can repeat a SKU across variations of one parent; keep the map authoritative
       // so the duplicate updates the row we just created instead of colliding on it.
-      existingBySku.set(sku, created)
+      //
+      // The child count is stated, not queried: a row this transaction inserted a statement ago
+      // has no children, and nothing may re-derive it from the type. Stating it is also what
+      // keeps `imsRowHasChildren` free to throw on a row that was never asked (r5).
+      existingBySku.set(sku, { ...created, _count: { variants: 0 } })
     }
   }
 

@@ -322,9 +322,9 @@ export function decideConnectorParentWrite(args: {
    *
    * Required rather than optional on purpose: defaulting it to false would make the caller that
    * forgot to ask indistinguishable from the row that genuinely has no children, which is the
-   * exact confusion Codex r4 finding 1 is about. Its one source is
-   * `findImsProductIdsWithChildren` in product-sync.ts, shared with `refuseVariationAdoption`
-   * so the two rules cannot drift apart.
+   * exact confusion Codex r4 finding 1 is about. Its one source is `imsRowHasChildren` in
+   * product-sync.ts — a relation count read with the row itself, shared with
+   * `refuseVariationAdoption` so the two rules cannot drift apart.
    */
   rowHasChildren: boolean
   /** The editor's blocker summary for this row, or null when it is clean / not yet asked. */

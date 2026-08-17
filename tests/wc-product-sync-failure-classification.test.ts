@@ -26,6 +26,17 @@ let nextId = 1
 /** Emulate pg_advisory_xact_lock: transactions holding the same key run one at a time. */
 let serializeOnAdvisoryLock = true
 
+/**
+ * The `_count.variants` relation count the connector's structural rules read (o3d-y89x r5),
+ * computed from the same `state.products` array and attached ONLY when the query asked for it —
+ * `imsRowHasChildren` throws on a row that carries no count rather than reading "no children"
+ * out of its absence, and a double that supplied one unasked would defeat that.
+ */
+function withChildCount(row: Row, include?: Row): Row {
+  if (!include || !('_count' in include)) return { ...row }
+  return { ...row, _count: { variants: state.products.filter((child) => child.parentId === row.id).length } }
+}
+
 const UNIQUE_COLUMNS: Array<{ field: string; constraint: string; quoted: boolean }> = [
   { field: 'sku', constraint: 'products_sku_key', quoted: false },
   { field: 'barcode', constraint: 'products_barcode_key', quoted: false },
@@ -79,8 +90,10 @@ mock.module('@/lib/trade/hs-classification-trigger', {
 
 const txClient = {
   product: {
-    findFirst: async ({ where }: { where: { sku?: unknown } }) =>
-      state.products.find((row) => row.sku === where?.sku) ?? null,
+    findFirst: async ({ where, include }: { where: { sku?: unknown }; include?: Row }) => {
+      const row = state.products.find((candidate) => candidate.sku === where?.sku) ?? null
+      return row === null ? null : withChildCount(row, include)
+    },
     findUnique: async ({ where }: { where: { id: string } }) =>
       state.products.find((row) => row.id === where.id) ?? null,
     // The ownership-guarded update (o3d-fsi): `id` plus an OR over externalProductId. A zero
@@ -106,19 +119,20 @@ const txClient = {
       Object.assign(row, data)
       return { count: 1 }
     },
-    // Two queries: candidate rows by SKU, and (o3d-h2cz) the children of those candidates by
-    // parentId. An unrecognised `where` throws rather than returning everything, so a query
-    // this double does not model can never quietly answer "yes" or "no".
-    findMany: async ({ where }: { where?: Row } = {}) => {
+    // Two queries: candidate rows by SKU (o3d-h2cz), and the pre-commit blocker re-assertion over
+    // the ids this transaction transformed (o3d-y89x r5). An unrecognised `where` throws rather
+    // than returning everything, so a query this double does not model can never quietly answer
+    // "yes" or "no". Nothing in this suite is live, so every named id comes back clean — stated
+    // by returning the rows rather than by ignoring the filter.
+    findMany: async ({ where, include }: { where?: Row; include?: Row } = {}) => {
       const skuIn = (where?.sku as { in?: unknown[] } | undefined)?.in
       if (Array.isArray(skuIn)) {
-        return state.products.filter((row) => skuIn.includes(row.sku)).map((row) => ({ ...row }))
+        return state.products.filter((row) => skuIn.includes(row.sku)).map((row) => withChildCount(row, include))
       }
-      const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
-      if (Array.isArray(parentIn)) {
-        return state.products
-          .filter((row) => row.parentId != null && parentIn.includes(row.parentId))
-          .map((row) => ({ ...row }))
+      const idIn = (where?.id as { in?: unknown[] } | undefined)?.in
+      if (Array.isArray(idIn)) {
+        const candidates = idIn.map(String)
+        return state.products.filter((row) => candidates.includes(String(row.id))).map((row) => ({ id: row.id }))
       }
       if (where === undefined) return state.products.map((row) => ({ ...row }))
       throw new Error(`product.findMany double got an unmodelled where: ${JSON.stringify(where)}`)
