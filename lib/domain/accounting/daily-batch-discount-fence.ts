@@ -101,6 +101,26 @@ type DeferralInputs = {
 }
 
 /**
+ * How many ids go into one Prisma `{ in: [...] }` re-read (o3d-y14 r3 finding 4).
+ *
+ * The same 500 the backfill's own id lookups use (`WC_COUPON_ID_CHUNK_SIZE`), and for the same
+ * reason: Prisma spends one bind parameter per member, and PostgreSQL's protocol caps a statement
+ * at 65535 of them. Not imported from there — the fence must not depend on a one-shot corrective
+ * script — but deliberately the same number, so the two behave alike under the same pressure.
+ */
+export const DEFERRAL_ID_CHUNK_SIZE = 500
+
+/** Split ids into `{ in: [...] }`-sized batches. Empty in, empty out — never one empty batch. */
+export function chunkOrderIds(ids: readonly string[], size = DEFERRAL_ID_CHUNK_SIZE): string[][] {
+  if (size <= 0) throw new Error('chunkOrderIds needs a positive size')
+  const batches: string[][] = []
+  for (let index = 0; index < ids.length; index += size) {
+    batches.push([...ids.slice(index, index + size)])
+  }
+  return batches
+}
+
+/**
  * The A1 per-order amount. ONE implementation, called by the fence and (via the connectors) by the
  * batch itself, so "what the deferral is" cannot mean two different things on the two sides of the
  * comparison — a fence that re-derives with slightly different arithmetic reports drift that is not
@@ -123,9 +143,25 @@ export function revenueDeferralAmount(order: DeferralInputs): number {
  * committed first and this comparison sees it, or it waits behind this transaction and then sees a
  * live DAILY_BATCH_REVENUE_DEFERRAL row and declines. There is no interleaving left.
  *
- * Rows are locked in ONE statement ordered by id — the same shape as `lockStockLevels` and
- * `lockCostLayers` — so two connectors' batches running concurrently take them in the same order
- * and cannot deadlock against each other.
+ * Rows are locked in ONE statement ordered by id — the same shape as `lockCostLayers` in both
+ * connectors' daily syncs — so two connectors' batches running concurrently take them in the same
+ * order and cannot deadlock against each other.
+ *
+ * THE ID LIST IS ONE BIND PARAMETER, NOT ONE PER ORDER (o3d-y14 r3 finding 4). The first revision
+ * expanded the ids with `Prisma.join`, which spends a bind parameter per member. Group A1 selects
+ * every eligible order with no `take`, and QuickBooks — unlike Xero — has no bounded window through
+ * which a backlog can drain, so past PostgreSQL's 65535-parameter ceiling the fence itself would
+ * throw and the batch would fail before staging anything. A batch that cannot run is not a safe
+ * batch; it is the same outage the fence exists to avoid, arriving through the fence.
+ *
+ * `id = ANY($1::text[])` binds the whole set as ONE array parameter, which is already the house
+ * shape for bulk `FOR UPDATE` locks here (`cost_layers` in both daily syncs, `wms_asn_line_maps` in
+ * the WMS booked-in and stock-sync paths). Chunking the LOCK was the other option and is worse:
+ * with N chunked statements the set becomes locked progressively rather than in one statement, so
+ * between chunk k and chunk k+1 a writer can still commit against a row in a later chunk — the
+ * re-read below would catch that as drift and refuse, but only by turning a fence into a
+ * false-refusal generator on a busy instance. One statement keeps "the whole member set is locked
+ * before anything is compared" literally true, which is the property the comparison rests on.
  *
  * IT DOES NOT REGISTER IN `ordersLockedByTx`. That registry is `lockSalesOrder`'s, and only the
  * single-row helper writes to it — the bulk lockers (`lockStockLevels`, the refund service's cost
@@ -143,14 +179,27 @@ export async function assertRevenueDeferralsUnchanged(
 
   const orderIds = [...new Set(deferrals.map((deferral) => deferral.orderId))].sort()
   await tx.$queryRaw(
-    Prisma.sql`SELECT id FROM "sales_orders" WHERE id IN (${Prisma.join(orderIds)}) ORDER BY id FOR UPDATE`,
+    Prisma.sql`SELECT id FROM "sales_orders" WHERE id = ANY(${orderIds}::text[]) ORDER BY id FOR UPDATE`,
   )
 
-  const live = await tx.salesOrder.findMany({
-    where: { id: { in: orderIds } },
-    select: DEFERRAL_INPUT_SELECT,
-  })
-  const liveById = new Map(live.map((order) => [order.id, order as DeferralInputs]))
+  // The RE-READ is chunked, and only the re-read. Prisma expands `{ in: [...] }` into one bind
+  // parameter per id, so an unbounded batch would hit the same ceiling here that the lock above no
+  // longer hits — one statement over 65535+ orders is an error, not a slow query.
+  //
+  // CHUNKING IT COSTS THE LOCKING GUARANTEE NOTHING, because the lock is not what is chunked. Every
+  // member row is already held `FOR UPDATE` by the statement above before the first chunk is read,
+  // and those locks are held until this transaction ends — so no row can change between chunk 1 and
+  // chunk N, and the values read across chunks are as consistent as a single statement's would be.
+  // The reason the lock itself must stay one statement is the opposite of this: locks acquired
+  // progressively leave a window, reads taken under locks already held do not.
+  const liveById = new Map<string, DeferralInputs>()
+  for (const batch of chunkOrderIds(orderIds)) {
+    const live = await tx.salesOrder.findMany({
+      where: { id: { in: batch } },
+      select: DEFERRAL_INPUT_SELECT,
+    })
+    for (const order of live) liveById.set(order.id, order as DeferralInputs)
+  }
 
   const stale: StaleRevenueDeferral[] = []
   for (const deferral of deferrals) {

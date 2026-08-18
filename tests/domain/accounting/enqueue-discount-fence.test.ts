@@ -225,6 +225,7 @@ const ENTRY = {
   partial: false,
   accountingInvoiceId: null,
   revenueDeferredBatchRef: null,
+  postedInvoiceExternalIds: [] as string[],
   nearCutoff: false,
 }
 

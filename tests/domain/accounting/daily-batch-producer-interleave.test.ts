@@ -120,8 +120,20 @@ function makeTx(hooks: { onBackfillCount?: () => Promise<void> | void } = {}) {
   Object.assign(tx, {
     // The fence's bulk lock. Routed through the SAME mutex the backfill takes, because the whole
     // claim under test is that the two serialise on one row.
-    $queryRaw: async () => {
-      await acquire(tx, ORDER_ID)
+    //
+    // IT READS THE STATEMENT rather than assuming it. The previous revision acquired the mutex for
+    // ANY raw query, which made "the fence locked the member rows" true of a statement with no
+    // `FOR UPDATE` at all — so the interleaving below would have passed on a fence that took no
+    // lock, which is precisely the defect this file exists to catch. Now only a `FOR UPDATE`
+    // statement locks, and only over the ids it actually binds.
+    $queryRaw: async (query: unknown) => {
+      const statement = (query ?? {}) as { values?: unknown[] }
+      const text = String((query as { text?: unknown } | null)?.text ?? '')
+      const bound = (statement.values ?? []).flatMap((value) => (Array.isArray(value) ? value : [value]))
+      if (!/FOR UPDATE/i.test(text)) return []
+      for (const id of bound.filter((value): value is string => typeof value === 'string').sort()) {
+        await acquire(tx, id)
+      }
       return []
     },
     salesOrder: {
@@ -211,6 +223,7 @@ const ENTRY = {
   clearedBy: 10,
   partial: false,
   accountingInvoiceId: null,
+  postedInvoiceExternalIds: [] as string[],
   revenueDeferredBatchRef: null,
   nearCutoff: false,
 }

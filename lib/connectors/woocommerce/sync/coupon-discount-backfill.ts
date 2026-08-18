@@ -62,12 +62,19 @@
  *      `assertRevenueDeferralsUnchanged`; orders with a live batch are additionally DECLINED here.
  *   4. QuickBooks daily batch Group A1 — identical twin of (3), fenced identically.
  *   5. `raiseChargebackForReversedOrder` (app/actions/sales.ts) — mirrors the order-level discount
- *      into a CREDIT_NOTE line. DELIBERATELY NOT FENCED, and the reason matters: its job is to
- *      mirror WHAT THE INVOICE POSTED, and after a correction the column no longer describes that
- *      — permanently, not just in a race. A freshness check would therefore report drift on every
- *      corrected order forever while fixing nothing. The real obligation is the manual ledger
- *      adjustment this backfill already reports, and until that adjustment is made a chargeback on
- *      such an order is one a human must raise (the path already safe-skips ambiguous cases).
+ *      into a CREDIT_NOTE line. NOT a freshness fence, and that distinction is the whole of
+ *      o3d-y14 r3 finding 1. An earlier round left this path alone on the argument that its job is
+ *      to mirror WHAT THE INVOICE POSTED, so a drift check would report the same drift forever on
+ *      every corrected order. The argument was right about the check and wrong about the
+ *      consequence: the path did not read what the invoice posted, it read the LIVE COLUMN — so
+ *      after a correction it silently omitted the invoice's discount leg and over-reversed AR and
+ *      revenue by the cleared amount. It now RECOVERS the posted figure from the mirrored
+ *      `AccountingEvent` for the document (`resolvePostedOrderDiscount`), and refuses to
+ *      auto-raise a credit note when that figure disagrees with the order or cannot be read at
+ *      all, naming both figures in the manual-handling alert. Refusing rather than reversing the
+ *      recovered figure is deliberate: the manual ledger adjustment this backfill reports happens
+ *      in the accounting system, so IMS cannot tell whether the document still holds the figure it
+ *      posted with.
  *
  *   DERIVED readers — they consume `unearnedRevenueAmount` / `revenueRecognizedAmount` / a stored
  *   payload, all of which are RECORDS of a decision already taken. Group B recognition,
@@ -133,6 +140,19 @@ export const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'
  * alone answers "no" about a document that exists.
  */
 export const POSTED_SALES_INVOICE_STATUSES = ['SYNCED'] as const
+
+/**
+ * The canonical form of "which ledger documents exist for this order", used on BOTH sides of the
+ * review→apply comparison (o3d-y14 r3 finding 2).
+ *
+ * Sorted and de-duplicated, because the comparison is between two SETS read at different times by
+ * different queries, and neither Prisma nor PostgreSQL promises a stable order for either. An
+ * unsorted comparison would refuse rows for a row-order difference — which reads to an operator
+ * exactly like a real posting change, and is unfixable by re-running.
+ */
+export function sortedPostedInvoiceIds(ids: readonly (string | null | undefined)[]): string[] {
+  return [...new Set(ids.filter((id): id is string => !!id))].sort()
+}
 
 function money(value: DecimalInput): number {
   return roundQuantity(toDecimal(value), 4).toNumber()
@@ -428,6 +448,16 @@ export type WcCouponBackfillRow = {
   /** Sum of `SalesOrderLine.discountAmount` — the coupon money the lines already carry. */
   lineDiscountTotal: number
   accountingInvoiceId: string | null
+  /**
+   * External ids of SYNCED sales-invoice jobs for this order (o3d-y14 r3 finding 2).
+   *
+   * NOT redundant with `accountingInvoiceId`, and the difference is the whole point: o3d-9kek is a
+   * post that succeeded and then failed to write its id back, leaving a REAL Xero document here and
+   * NULL in the column. Apply refuses a row whose posting state moved since review, so if the
+   * report did not carry these ids the o3d-9kek shape would be re-proposed with the same evidence
+   * forever and refused every time — a row that can never be applied and never be seen to be stuck.
+   */
+  postedInvoiceExternalIds: string[]
   discountModel: string | null
   importedAt: Date | null
   /** An earlier run already corrected this order (the ActivityLog marker). */
@@ -570,6 +600,16 @@ export type WcCouponAllowlistEntry = {
   partial: boolean
   accountingInvoiceId: string | null
   /**
+   * The SYNCED sales-invoice external ids the dry run read, sorted (o3d-y14 r3 finding 2).
+   *
+   * This is what makes the o3d-9kek state REVIEWABLE rather than permanently stuck. The reviewer
+   * sees "this order has a posted invoice that the column denies", decides with that in front of
+   * them, and apply compares this reviewed set against the live one: unchanged means the reviewer
+   * saw what is there and the correction proceeds (reporting the manual ledger adjustment);
+   * changed means a document appeared or vanished since, which is a refusal exactly as before.
+   */
+  postedInvoiceExternalIds: string[]
+  /**
    * `SalesOrder.revenueDeferredBatchRef` as the dry run read it. Carried for the SAME reason
    * `accountingInvoiceId` is: it names a second accounting artefact derived from the amount being
    * corrected, and apply refuses if it has moved since the review (o3d-y14 r2).
@@ -591,7 +631,14 @@ export type WcCouponAllowlistEntry = {
  *                 is excluded by evidence rather than by anyone remembering to exclude it.
  */
 export type WcCouponAllowlist = {
-  version: 1
+  /**
+   * BUMPED TO 2 by o3d-y14 r3 finding 2: entries now carry `postedInvoiceExternalIds`, which apply
+   * compares against live state. A version-1 file has no such field, and defaulting it to `[]`
+   * would assert on the reviewer's behalf that they saw no unlinked posted invoice — about the one
+   * row where that is most likely to be false. So a v1 file is REFUSED with a version message and
+   * the operator re-runs the report, which is a dry run and costs nothing.
+   */
+  version: 2
   /** When the dry run produced the proposal. */
   generatedAt: string
   /** The cutoff the proposal was generated under, carried for the audit trail. */
@@ -621,7 +668,11 @@ function isEntry(value: unknown): value is WcCouponAllowlistEntry {
     // Required, not defaulted. An absent field would be indistinguishable from "no batch has taken
     // this order", and apply compares it against live state — so a missing one would silently mean
     // "the reviewer saw no deferral" about a row whose deferral was never shown to them.
-    (typeof entry.revenueDeferredBatchRef === 'string' || entry.revenueDeferredBatchRef === null)
+    (typeof entry.revenueDeferredBatchRef === 'string' || entry.revenueDeferredBatchRef === null) &&
+    // Same argument, and the same failure it would hide: an absent list would read as "the reviewer
+    // saw no posted-but-unlinked invoice" (o3d-y14 r3 finding 2).
+    Array.isArray(entry.postedInvoiceExternalIds) &&
+    entry.postedInvoiceExternalIds.every((id) => typeof id === 'string')
   )
 }
 
@@ -634,11 +685,15 @@ export function parseWcCouponAllowlist(value: unknown): WcCouponAllowlistParse {
     return { ok: false, reason: 'MALFORMED', detail: 'the allowlist is not a JSON object' }
   }
   const raw = value as Record<string, unknown>
-  if (raw.version !== 1) {
+  if (raw.version !== 2) {
     return {
       ok: false,
       reason: 'UNSUPPORTED_VERSION',
-      detail: `version ${JSON.stringify(raw.version)} was not written by this build`,
+      detail:
+        `version ${JSON.stringify(raw.version)} was not written by this build (expected 2). ` +
+        'Re-run the dry run to regenerate the proposal — a version-1 file predates the ' +
+        'posted-but-unlinked invoice evidence apply now compares against live state, so its ' +
+        'review cannot describe what apply must check (o3d-y14 r3).',
     }
   }
   const clear = raw.clear
@@ -674,7 +729,7 @@ export function parseWcCouponAllowlist(value: unknown): WcCouponAllowlistParse {
   return {
     ok: true,
     allowlist: {
-      version: 1,
+      version: 2,
       generatedAt: typeof raw.generatedAt === 'string' ? raw.generatedAt : '',
       cutoff: typeof raw.cutoff === 'string' ? raw.cutoff : '',
       reviewed: true,
@@ -704,6 +759,7 @@ export function buildWcCouponAllowlistEntry(
     clearedBy: decision.clearedBy,
     partial: decision.partial,
     accountingInvoiceId: row.accountingInvoiceId,
+    postedInvoiceExternalIds: sortedPostedInvoiceIds(row.postedInvoiceExternalIds),
     revenueDeferredBatchRef: row.revenueDeferredBatchRef,
     nearCutoff: isNearWcCouponCutoff(row.importedAt, cutoff),
   }
@@ -986,14 +1042,30 @@ export async function applyWcCouponCorrection(
         `${entry.revenueDeferredBatchRef ?? 'none'} this row was reviewed with`,
     }
   }
-  if (!entry.accountingInvoiceId && posted.postedInvoiceExternalIds.length > 0) {
+  // THE UNLINKED-INVOICE EVIDENCE IS COMPARED AS A SET, not asserted to be empty (o3d-y14 r3
+  // finding 2). The first revision refused whenever an unposted-looking row turned out to have a
+  // SYNCED invoice — which is right about the race, and wrong about the o3d-9kek STATE. In that
+  // state the invoice posted and its id was never written back, so `accountingInvoiceId` is
+  // permanently NULL and the report (which read only that column) re-proposed the row with exactly
+  // the evidence that had already been refused. The row could never be applied and never be seen to
+  // be stuck; the operator's only route was a separate back-reference repair they had no reason to
+  // know was required.
+  //
+  // Carrying the ids through the proposal makes the state REVIEWABLE instead. The reviewer is shown
+  // the posted-but-unlinked document, decides with it in front of them, and this compares the set
+  // they saw against the set that exists now: unchanged means their decision still describes this
+  // order, and the correction proceeds with the manual ledger adjustment reported. A document that
+  // appeared or vanished since is still a refusal, which is what the check was for.
+  const livePostedIds = sortedPostedInvoiceIds(posted.postedInvoiceExternalIds)
+  const reviewedPostedIds = sortedPostedInvoiceIds(entry.postedInvoiceExternalIds)
+  if (livePostedIds.join('|') !== reviewedPostedIds.join('|')) {
     return {
       outcome: 'DECLINED',
       reason: 'POSTING_CHANGED',
       detail:
-        `this order was reviewed as unposted, but ${posted.postedInvoiceExternalIds.length} SYNCED sales ` +
-        `invoice(s) exist for it (${posted.postedInvoiceExternalIds.join(', ')}) with no accountingInvoiceId ` +
-        'written back — the ledger document is real even though the column denies it',
+        `the SYNCED sales invoice(s) for this order are now [${livePostedIds.join(', ')}], not the ` +
+        `[${reviewedPostedIds.join(', ')}] this row was reviewed with — a ledger document is real ` +
+        'even when accountingInvoiceId denies it (o3d-9kek). Re-run the report to review it again.',
     }
   }
 
@@ -1098,6 +1170,37 @@ export async function stampWcCouponDiscountModel(
       detail: `discountAmount is ${live}, not the ${entry.storedOrderDiscount} that was reviewed as correct`,
     }
   }
+  // THE WHOLE EVIDENCE SET, not just the amount (o3d-y14 r3 finding 3).
+  //
+  // The first revision compared `discountAmount` alone, on the reasoning that a stamp writes no
+  // money so there is nothing to get wrong. That is backwards: the stamp is the MOST irreversible
+  // write this script makes. A correction leaves the row re-proposable — a later report sees the
+  // amount and re-derives it — but a stamp is precisely the evidence that excludes the row from
+  // every future run, so a stamp placed on the wrong row can never be undone by re-running.
+  //
+  // And the reviewer's assertion is "this amount is ALREADY only the residual", which is a
+  // statement about the amount RELATIVE TO THE LINES: an order whose lines changed between review
+  // and apply can hold the same order-level figure and no longer be residual-only. The import
+  // timestamp is the provenance the assertion was dated against. Both are compared here for exactly
+  // the reasons `applyWcCouponCorrection` compares them, and a stamp is refused on either drift.
+  const liveLines = sumLineDiscounts(order.lines)
+  if (liveLines !== entry.lineDiscountTotal) {
+    return {
+      outcome: 'DECLINED',
+      reason: 'LINES_CHANGED',
+      detail:
+        `the line items now carry ${liveLines}, not the ${entry.lineDiscountTotal} this row was ` +
+        'reviewed as already-correct against',
+    }
+  }
+  const liveImportedAt = order.shoppingLinks[0]?.createdAt?.toISOString() ?? null
+  if (liveImportedAt !== entry.importedAt) {
+    return {
+      outcome: 'DECLINED',
+      reason: 'IMPORT_CHANGED',
+      detail: `imported ${liveImportedAt ?? 'never'}, not ${entry.importedAt ?? 'never'} as reviewed`,
+    }
+  }
 
   const written = await tx.salesOrder.updateMany({
     where: { id: entry.orderId, discountAmount: entry.storedOrderDiscount, discountModel: null },
@@ -1125,7 +1228,7 @@ export async function stampWcCouponDiscountModel(
       metadata: {
         connector: 'woocommerce',
         storedOrderDiscount: live,
-        lineDiscountTotal: sumLineDiscounts(order.lines),
+        lineDiscountTotal: liveLines,
         discountModel: WC_COUPON_DISCOUNT_MODEL,
         importedAt: entry.importedAt,
         amountChanged: false,

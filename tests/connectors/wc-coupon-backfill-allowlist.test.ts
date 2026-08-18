@@ -133,6 +133,7 @@ test('the proposal entry carries the near-cutoff flag and the evidence it was de
     storedOrderDiscount: 10,
     lineDiscountTotal: 10,
     accountingInvoiceId: 'INV-9',
+    postedInvoiceExternalIds: ['INV-9-UNLINKED'],
     discountModel: null,
     importedAt: new Date(CUTOFF.getTime() - 60_000),
     alreadyBackfilled: false,
@@ -177,6 +178,7 @@ function entry(over: Partial<WcCouponAllowlistEntry> = {}): WcCouponAllowlistEnt
     clearedBy: 10,
     partial: false,
     accountingInvoiceId: null,
+    postedInvoiceExternalIds: [],
     revenueDeferredBatchRef: null,
     nearCutoff: false,
     ...over,
@@ -185,7 +187,7 @@ function entry(over: Partial<WcCouponAllowlistEntry> = {}): WcCouponAllowlistEnt
 
 function file(over: Record<string, unknown> = {}) {
   return {
-    version: 1,
+    version: 2,
     generatedAt: '2026-08-16T09:00:00.000Z',
     cutoff: CUTOFF.toISOString(),
     reviewed: true,
@@ -306,8 +308,9 @@ test('the report PAGES its scan and CHUNKS every id lookup (o3d-y14 r2 F3)', asy
   assert.doesNotMatch(src, /\{ in: orderIds \}/, 'no statement takes the whole candidate id list')
   assert.equal(
     src.split('for (const batch of chunkWcCouponIds(').length - 1,
-    3,
-    'all three id-keyed lookups — the backfill marker, the invoice count and the batch count — are chunked',
+    4,
+    'all four id-keyed lookups — the backfill marker, the invoice count, the POSTED-invoice external ' +
+      'ids (o3d-y14 r3 F2) and the batch count — are chunked',
   )
 })
 
@@ -420,14 +423,14 @@ test('the scan page is smaller than the refusal ceiling (o3d-y14 r2 F3)', () => 
 })
 
 test('a file from another build version is refused', () => {
-  const parsed = parseWcCouponAllowlist(file({ version: 2 }))
+  const parsed = parseWcCouponAllowlist(file({ version: 3 }))
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'UNSUPPORTED_VERSION')
 })
 
 test('a file with no lists at all is refused rather than treated as empty', () => {
-  const parsed = parseWcCouponAllowlist({ version: 1, reviewed: true, reviewedBy: 'Jan' })
+  const parsed = parseWcCouponAllowlist({ version: 2, reviewed: true, reviewedBy: 'Jan' })
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
@@ -478,4 +481,75 @@ test('stamping runs BEFORE clearing, so protected rows are protected first (Code
 
   assert.ok(stampAt > 0 && clearAt > 0)
   assert.ok(stampAt < clearAt, 'a half-finished run must leave the never-re-derive rows already stamped')
+})
+
+test('the report READS the posted-but-unlinked invoice evidence apply compares against (o3d-y14 r3 F2)', async () => {
+  // Source-asserted for the same reason the paging assertions above are: the report's queries run
+  // against a live database. What matters is that the evidence apply refuses on is evidence the
+  // REPORT can show — otherwise the o3d-9kek row is re-proposed with the same incomplete evidence
+  // on every run and refused every time, which is a row that can never be applied and never be seen
+  // to be stuck.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
+
+  assert.match(src, /POSTED_SALES_INVOICE_STATUSES/, 'the report reads SYNCED sales-invoice rows')
+  assert.match(
+    src,
+    /externalTransactionId: \{ not: null \}/,
+    'and only those carrying an external id — a SYNCED row without one is not a document',
+  )
+  assert.match(
+    src,
+    /postedInvoiceExternalIds: sortedPostedInvoiceIds\(/,
+    'and the ids reach the row the proposal is built from, sorted as apply compares them',
+  )
+})
+
+test('the entry carries the posted-but-unlinked ids the reviewer was shown (o3d-y14 r3 F2)', () => {
+  const row: WcCouponBackfillRow = {
+    orderId: 'order-1',
+    orderNumber: 'WC-1001',
+    externalOrderNumber: '1001',
+    currency: 'GBP',
+    storedOrderDiscount: 10,
+    lineDiscountTotal: 10,
+    accountingInvoiceId: null,
+    // Deliberately unsorted and duplicated: the proposal must carry the canonical form, because
+    // apply compares this against a separately-ordered live read.
+    postedInvoiceExternalIds: ['INV-B', 'INV-A', 'INV-B'],
+    discountModel: null,
+    importedAt: new Date(CUTOFF.getTime() - 60_000),
+    alreadyBackfilled: false,
+    liveInvoiceJobs: 0,
+    revenueDeferredBatchRef: null,
+    liveBatchDeferralJobs: 0,
+  }
+  const decision = decideWcCouponBackfill(row, { importedBefore: CUTOFF })
+  assert.equal(decision.action, 'CORRECT')
+  if (decision.action !== 'CORRECT') return
+
+  const built = buildWcCouponAllowlistEntry(row, decision, CUTOFF)
+
+  assert.deepEqual(built.postedInvoiceExternalIds, ['INV-A', 'INV-B'])
+})
+
+test('an allowlist entry without the posted-invoice evidence is MALFORMED, never defaulted (o3d-y14 r3 F2)', () => {
+  // Defaulting an absent list to `[]` would assert on the reviewer's behalf that they saw no
+  // unlinked posted invoice — about the one row where that is most likely to be false.
+  const { postedInvoiceExternalIds: _dropped, ...withoutEvidence } = entry()
+  const parsed = parseWcCouponAllowlist(file({ clear: [withoutEvidence] }))
+
+  assert.equal(parsed.ok, false)
+  assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
+})
+
+test('a version-1 file is refused with an instruction to re-run the report (o3d-y14 r3 F2)', () => {
+  // The upgrade path for a proposal generated before the evidence existed. Refusing on the version
+  // is what stops a v1 entry being read as "reviewed, and no posted invoice was seen".
+  const parsed = parseWcCouponAllowlist(file({ version: 1 }))
+
+  assert.equal(parsed.ok, false)
+  assert.equal(!parsed.ok && parsed.reason, 'UNSUPPORTED_VERSION')
+  assert.match(!parsed.ok ? parsed.detail : '', /Re-run the dry run/)
 })

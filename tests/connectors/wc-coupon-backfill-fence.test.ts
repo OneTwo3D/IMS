@@ -218,6 +218,7 @@ const entry = {
   clearedBy: 10,
   partial: false,
   accountingInvoiceId: null,
+  postedInvoiceExternalIds: [] as string[],
   revenueDeferredBatchRef: null,
   nearCutoff: false,
 }
@@ -585,6 +586,9 @@ test('the reported posting state is the LIVE read, not the reviewed file (o3d-y1
   const result = await applyWcCouponCorrection(makeTx(store), {
     ...entry,
     accountingInvoiceId: 'INV-1',
+    // The reviewer saw BOTH posted documents; apply compares that reviewed set against the live one
+    // (o3d-y14 r3 F2), so an unchanged set is not a reason to refuse.
+    postedInvoiceExternalIds: ['INV-1', 'INV-1-REV2'],
     revenueDeferredBatchRef: BATCH_REF,
   })
 
@@ -818,4 +822,184 @@ test('stamping takes the same row lock as the correction', async () => {
 
   assert.deepEqual(locked, ['order-1'])
   assert.equal(events[0], 'lock:order-1')
+})
+
+// ---------------------------------------------------------------------------
+// stampOnly re-verifies the WHOLE evidence set (o3d-y14 r3 finding 3)
+//
+// The stamp is the single most irreversible write this script makes. A correction leaves the row
+// re-proposable, because a later report reads the amount and re-derives it; a stamp is precisely
+// what excludes the row from every future run, so a stamp on the wrong row is permanent. And the
+// assertion being recorded — "this amount is ALREADY only the residual" — is a claim about the
+// amount RELATIVE TO THE LINES, so the amount matching on its own does not establish it.
+// ---------------------------------------------------------------------------
+
+test('stamping is refused when the LINE discounts moved since the review (o3d-y14 r3 F3)', async () => {
+  // The gap the amount check cannot see: `discountAmount` is still the 6 the reviewer approved, but
+  // the lines now carry 6 instead of 4, so the residual they asserted (2) is no longer what this row
+  // holds. Stamping here records a false assertion that no later run can revisit.
+  const { stampWcCouponDiscountModel } = await load()
+  reset()
+  const store = makeStore({
+    orders: [{ id: 'order-1', discountAmount: 6, discountModel: null, lines: [{ discountAmount: 6 }], importedAt: IMPORTED_AT }],
+  })
+
+  const result = await stampWcCouponDiscountModel(makeTx(store), {
+    ...entry,
+    storedOrderDiscount: 6,
+    lineDiscountTotal: 4,
+    keptOrderLevel: 2,
+    clearedBy: 4,
+  })
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'LINES_CHANGED')
+  assert.match(result.outcome === 'DECLINED' ? result.detail : '', /now carry 6/)
+  assert.equal(store.orders[0].discountModel, null, 'nothing is stamped, so the next report re-proposes it')
+  assert.equal(store.orders[0].discountAmount, 6, 'and nothing monetary is touched either')
+  assert.equal(store.activity.length, 0)
+})
+
+test('stamping is refused when the IMPORT timestamp moved since the review (o3d-y14 r3 F3)', async () => {
+  // The import timestamp is the provenance the reviewer dated the assertion against. A re-link or
+  // re-import makes their dating describe a different row.
+  const { stampWcCouponDiscountModel } = await load()
+  reset()
+  const store = makeStore({
+    orders: [
+      {
+        id: 'order-1',
+        discountAmount: 10,
+        discountModel: null,
+        lines: [{ discountAmount: 10 }],
+        importedAt: '2026-06-01T00:00:00.000Z',
+      },
+    ],
+  })
+
+  const result = await stampWcCouponDiscountModel(makeTx(store), entry)
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'IMPORT_CHANGED')
+  assert.equal(store.orders[0].discountModel, null)
+  assert.equal(store.activity.length, 0)
+})
+
+test('stamping still succeeds when the whole evidence set matches (o3d-y14 r3 F3 control)', async () => {
+  // Without this, the two refusals above would pass on a stamp path that refuses everything — which
+  // would silently disable the "already correct" half of the workflow and push those rows back
+  // towards the destructive one.
+  const { stampWcCouponDiscountModel, WC_COUPON_DISCOUNT_MODEL } = await load()
+  reset()
+  const store = makeStore({
+    orders: [{ id: 'order-1', discountAmount: 6, discountModel: null, lines: [{ discountAmount: 4 }], importedAt: IMPORTED_AT }],
+  })
+
+  const result = await stampWcCouponDiscountModel(makeTx(store), {
+    ...entry,
+    storedOrderDiscount: 6,
+    lineDiscountTotal: 4,
+    keptOrderLevel: 2,
+    clearedBy: 4,
+  })
+
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.equal(store.orders[0].discountModel, WC_COUPON_DISCOUNT_MODEL)
+  assert.equal(store.orders[0].discountAmount, 6)
+  assert.equal(store.activity[0].metadata.lineDiscountTotal, 4, 'the LIVE line total is what is recorded')
+})
+
+// ---------------------------------------------------------------------------
+// The posted-but-unlinked state is REVIEWABLE (o3d-y14 r3 finding 2)
+//
+// o3d-9kek: a post succeeds and its back-reference write fails, leaving a real Xero document and a
+// NULL accountingInvoiceId. The previous revision refused any such row and the report — which read
+// only the column — re-proposed it with identical evidence on every run. The row could never be
+// applied and never be seen to be stuck, and the operator's only route was a separate repair they
+// had no reason to know existed.
+// ---------------------------------------------------------------------------
+
+const UNLINKED_SYNCED_INVOICE = {
+  id: 'job-1',
+  referenceType: 'SalesOrder',
+  referenceId: 'order-1',
+  type: 'SALES_INVOICE',
+  status: 'SYNCED',
+  externalTransactionId: 'INV-999',
+}
+
+test('an unlinked posted invoice the reviewer SAW is applied, not refused forever (o3d-y14 r3 F2)', async () => {
+  // The recovery path, end to end: the first run refused because the report had not shown the
+  // document; the re-run reports it, the reviewer approves the row WITH it, and this is that apply.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({ syncLogs: [UNLINKED_SYNCED_INVOICE] })
+
+  const result = await applyWcCouponCorrection(makeTx(store), {
+    ...entry,
+    postedInvoiceExternalIds: ['INV-999'],
+  })
+
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.equal(store.orders[0].discountAmount, 0)
+  assert.deepEqual(result.outcome === 'CORRECTED' ? result.posted : null, {
+    accountingInvoiceId: null,
+    postedInvoiceExternalIds: ['INV-999'],
+    revenueDeferredBatchRef: null,
+    unearnedRevenueAmount: null,
+  })
+  assert.equal(
+    store.activity[0].metadata.posted,
+    true,
+    'and it is still on the manual-adjustment list — approving it is not pretending the document is fine',
+  )
+})
+
+test('the SAME row reviewed as unposted is still refused (o3d-y14 r3 F2)', async () => {
+  // The half that must not be lost: a document that appeared between review and apply is exactly
+  // the race the check was added for. Only an UNCHANGED set is waved through.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({ syncLogs: [UNLINKED_SYNCED_INVOICE] })
+
+  const result = await applyWcCouponCorrection(makeTx(store), entry)
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'POSTING_CHANGED')
+  assert.match(result.outcome === 'DECLINED' ? result.detail : '', /INV-999/)
+  assert.equal(store.orders[0].discountAmount, 10, 'and re-running the report re-proposes it WITH the invoice')
+})
+
+test('an invoice that VANISHED since the review is refused too (o3d-y14 r3 F2)', async () => {
+  // The other direction, which a "reviewed set is a subset of live" check would wave through: the
+  // reviewer approved a row whose ledger document they could see, and it is no longer there.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), {
+    ...entry,
+    postedInvoiceExternalIds: ['INV-999'],
+  })
+
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'POSTING_CHANGED')
+  assert.equal(store.orders[0].discountModel, null)
+})
+
+test('the comparison is by SET, so query row order cannot cause a false refusal (o3d-y14 r3 F2)', async () => {
+  // Neither Prisma nor PostgreSQL promises an order for either read. An ordered comparison would
+  // refuse for a row-order difference, which reads to an operator exactly like a real posting change
+  // and cannot be fixed by re-running.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({
+    syncLogs: [
+      { ...UNLINKED_SYNCED_INVOICE, id: 'job-b', externalTransactionId: 'INV-B' },
+      { ...UNLINKED_SYNCED_INVOICE, id: 'job-a', externalTransactionId: 'INV-A' },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), {
+    ...entry,
+    postedInvoiceExternalIds: ['INV-A', 'INV-B'],
+  })
+
+  assert.equal(result.outcome, 'CORRECTED')
 })

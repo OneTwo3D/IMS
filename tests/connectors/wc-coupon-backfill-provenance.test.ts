@@ -32,6 +32,7 @@ function row(over: Partial<WcCouponBackfillRow> = {}): WcCouponBackfillRow {
     storedOrderDiscount: 10,
     lineDiscountTotal: 10,
     accountingInvoiceId: null,
+    postedInvoiceExternalIds: [],
     discountModel: null,
     importedAt: new Date('2026-05-01T00:00:00.000Z'),
     alreadyBackfilled: false,
