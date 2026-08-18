@@ -423,7 +423,7 @@ export function ExceptionsClient({ data }: Props) {
                       >
                         <RotateCcw className="h-3 w-3 mr-1" />Retry
                       </Button>
-                      {confirmingIsolate === row.eligibleVersion && row.orders.length > 0 ? (
+                      {confirmingIsolate === row.eligibleVersion && row.eligibleCount > 0 ? (
                         <>
                           <Button
                             type="button"
@@ -438,7 +438,7 @@ export function ExceptionsClient({ data }: Props) {
                               )
                             }}
                           >
-                            Confirm — isolate {row.orders.length}
+                            Confirm — isolate {row.eligibleCount}
                           </Button>
                           <Button type="button" variant="ghost" size="sm" disabled={isPending} onClick={() => setConfirmingIsolate(null)}>
                             Cancel
@@ -451,9 +451,9 @@ export function ExceptionsClient({ data }: Props) {
                           size="sm"
                           disabled={isPending}
                           onClick={() => setConfirmingIsolate(row.eligibleVersion)}
-                          title={row.orders.length === 0 ? 'Nothing eligible to isolate' : undefined}
+                          title={row.eligibleCount === 0 ? 'Nothing eligible to isolate' : undefined}
                         >
-                          Isolate {row.orders.length}…
+                          Isolate {row.eligibleCount}…
                         </Button>
                       )}
                     </TableCell>
@@ -469,10 +469,10 @@ export function ExceptionsClient({ data }: Props) {
                       <div className="rounded-md border border-dashed bg-muted/20 p-2">
                         <p className="text-xs font-medium mb-1">
                           {confirmingIsolate === row.eligibleVersion
-                            ? `These ${row.orders.length} order(s) will be quarantined:`
-                            : `Orders Isolate would quarantine (${row.orders.length} of ${row.linkCount} in the cohort still eligible):`}
+                            ? `These ${row.eligibleCount} order(s) will be quarantined:`
+                            : `Orders Isolate would quarantine (${row.eligibleCount} of ${row.linkCount} in the cohort still eligible):`}
                         </p>
-                        {row.orders.length > 0 ? (
+                        {row.eligibleCount > 0 ? (
                           <>
                             <ul className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground max-h-48 overflow-y-auto">
                               {row.orders.map((order) => (
@@ -485,6 +485,11 @@ export function ExceptionsClient({ data }: Props) {
                               ))}
                             </ul>
 
+                            {row.eligibleCount > row.orders.length ? (
+                              <p className="text-xs text-amber-600 mt-1">
+                                Listing the first {row.orders.length} — Isolate quarantines all {row.eligibleCount}.
+                              </p>
+                            ) : null}
                           </>
                         ) : (
                           <p className="text-xs text-muted-foreground">

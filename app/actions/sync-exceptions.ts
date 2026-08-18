@@ -38,6 +38,15 @@ import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 const SECTION_LIMIT = 50
 
 /**
+ * How many of a drift cohort's orders the page RENDERS.
+ *
+ * Only a rendering bound — the digest Isolate is bound to always covers the
+ * complete eligible set, and the page states the true count whenever this cap
+ * bites, so a truncated list can never be mistaken for the blast radius.
+ */
+const DRIFT_COHORT_PREVIEW_LIMIT = 200
+
+/**
  * Rolls the isolate transaction back with a message fit to show an operator.
  *
  * Thrown from INSIDE the transaction on purpose: these are the conditions that
@@ -143,13 +152,14 @@ export type UnresolvedDriftRow = {
   firstSeenAt: string | null
   reason: string | null
   /**
-   * Every order Isolate would quarantine (o3d-51du) — the complete set, not a
-   * sample. A capped preview under a bulk destructive action is the original
-   * defect in miniature: review 50, quarantine 500.
+   * The orders Isolate would quarantine, capped for rendering
+   * (DRIFT_COHORT_PREVIEW_LIMIT). `eligibleCount` is the true size — when the
+   * two differ the page says so, because the action takes ALL of them.
    */
   orders: { linkId: string; orderNumber: string | null; externalOrderNumber: string | null }[]
-  /** Digest of the ELIGIBLE set above — what Isolate actually writes (o3d-0gzr). */
+  /** Digest of the COMPLETE eligible set — what Isolate actually writes (o3d-0gzr). */
   eligibleVersion: string
+  eligibleCount: number
 }
 
 export type ExceptionInboxSummary = {
@@ -457,14 +467,25 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // happened to record on an earlier pass.
   const driftCohortOrders = new Map<string, { linkId: string; orderNumber: string | null; externalOrderNumber: string | null }[]>()
   const driftCohortDigests = new Map<string, string>()
+  const driftCohortEligible = new Map<string, number>()
   for (const incident of driftIncidents) {
-    // EVERY eligible link, uncapped (o3d-0gzr r2). A capped preview under a
-    // destructive bulk action is the original defect wearing a smaller hat:
-    // review 50, quarantine 500. If a cohort is large the list is long, which
-    // is the honest outcome — the operator is being asked to authorise all of
-    // it.
-    const links = await db.wmsOrderPushLink.findMany({
+    // The digest covers the WHOLE eligible set; the rendered list is bounded
+    // (o3d-0gzr r3). These are different jobs. Binding must be complete or the
+    // action is not bound to what it does; rendering must be bounded or the very
+    // failure this page exists to recover from — a connector-wide outage, so
+    // potentially every open order — makes the page that recovers it unusable.
+    // So: ids for the digest (cheap, unbounded), rows for display (capped, and
+    // the page says when it capped).
+    const eligibleIds = await db.wmsOrderPushLink.findMany({
       where: isolatableLinkWhere(incident),
+      select: { id: true },
+      orderBy: { pushedAt: 'asc' },
+    })
+    driftCohortDigests.set(incident.connector, eligibleCohortDigest(eligibleIds.map((row) => row.id)))
+    driftCohortEligible.set(incident.connector, eligibleIds.length)
+
+    const links = await db.wmsOrderPushLink.findMany({
+      where: { id: { in: eligibleIds.slice(0, DRIFT_COHORT_PREVIEW_LIMIT).map((row) => row.id) } },
       select: { id: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
       orderBy: { pushedAt: 'asc' },
     })
@@ -476,10 +497,6 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         externalOrderNumber: link.externalOrderNumber,
       })),
     )
-    // The token the button carries is a digest of THIS set — the one on screen
-    // — not of the cohort the sweep stored. Those differ whenever eligibility
-    // has moved, and it is this set the write acts on.
-    driftCohortDigests.set(incident.connector, eligibleCohortDigest(links.map((link) => link.id)))
   }
 
   const data: Omit<ExceptionInboxData, 'summary'> = {
@@ -559,6 +576,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       // What Isolate is bound to. `version` still guards the stored incident;
       // this guards the actual write set.
       eligibleVersion: driftCohortDigests.get(incident.connector) ?? eligibleCohortDigest([]),
+      eligibleCount: driftCohortEligible.get(incident.connector) ?? 0,
     })),
   }
 
@@ -1050,14 +1068,31 @@ export async function isolateUnresolvedDriftCohort(connector: string, version: s
           if (eligibleCohortDigest(eligibleNow.map((row) => row.id)) !== eligibleVersion) {
             throw new DriftIsolationAborted('These orders changed since the page loaded — reload and review the current set before isolating.')
           }
+          // An empty eligible set is not "isolate nothing", it is "isolate
+          // whatever the predicate matches by the time the write runs"
+          // (o3d-0gzr r3). The action is directly invocable, so refuse it here
+          // rather than relying on the UI not to offer it.
+          if (eligibleNow.length === 0) {
+            throw new DriftIsolationAborted('Those orders have already resolved, shipped or been isolated — nothing left to do.')
+          }
+          const reviewedIds = eligibleNow.map((row) => row.id)
+          // Write the ids we MATERIALISED, not the predicate again (o3d-0gzr r3).
+          // Re-running the predicate looks equivalent and is not: these are two
+          // statements in a READ COMMITTED transaction, so they see different
+          // snapshots, and a link that becomes eligible in between would be
+          // quarantined without ever appearing in the digest or on the page.
+          // Naming the ids removes the second evaluation entirely.
           const updated = await tx.wmsOrderPushLink.updateMany({
-            // The eligibility predicate is repeated HERE, not just read earlier:
-            // between the read and the write an order can ship, and the compare
-            // is what stops it being quarantined anyway.
-            where: isolatableLinkWhere(incident),
+            where: { ...isolatableLinkWhere(incident), id: { in: reviewedIds } },
             data: { dispatchUnresolvedAt: isolatedAt, dispatchUnresolvedError: reason },
           })
-          if (updated.count > 0) {
+          // ...and the set must not have SHRUNK under us either: fewer rows than
+          // reviewed means something changed mid-write, which is a re-review,
+          // not a partial success.
+          if (updated.count !== reviewedIds.length) {
+            throw new DriftIsolationAborted('These orders changed while the isolation was being applied — reload and review the current set.')
+          }
+          {
             // Compare-and-set: only retract the incident we actually acted on. A
             // sweep that wrote a NEWER one while we worked keeps its offer.
             const retracted = await tx.setting.deleteMany({ where: { key: unresolvedDriftStateKey(connector), value: raw } })

@@ -138,11 +138,16 @@ export const DRIFT_INCIDENT_MAX_AGE_MS = 60 * 60 * 1000
 /**
  * How far ahead of us a confirmation may be stamped before we stop believing it.
  *
- * Tolerates ordinary clock jitter between the sweep host and whoever serves the
- * action; anything further ahead is treated as no evidence at all rather than as
- * the freshest possible evidence.
+ * Generous on purpose (o3d-0gzr r3). This guard exists so a future stamp cannot
+ * read as maximally fresh and keep a dead incident actionable — but it is the
+ * SAME guard that, set tight, would suppress a live incident forever on a host
+ * running steadily fast, denying the only route out of a stuck watermark. A
+ * fail-closed rule that can permanently disable the recovery path trades one
+ * failure for a worse one. Five minutes absorbs any clock difference a working
+ * deployment produces, while a stamp that far ahead is a broken clock rather
+ * than evidence.
  */
-export const DRIFT_INCIDENT_MAX_CLOCK_SKEW_MS = 60 * 1000
+export const DRIFT_INCIDENT_MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
 
 export function toIncident(
   connector: string,
@@ -150,14 +155,21 @@ export function toIncident(
   raw?: string | null,
   now: Date = new Date(),
   /**
-   * When the STORE last changed, per the database (o3d-0gzr r2).
+   * When the store row last changed (`Setting.updatedAt`).
    *
-   * Preferred over the sweep's own `lastSeenAt` stamp because it is written by
-   * one clock — the database's — for both the sweep and whoever serves this
-   * action. Judging freshness by the sweep host's clock meant a host running
-   * fast produced future stamps; failing those closed then turned a persistent
-   * skew into permanent suppression of the operator's only escape hatch. With
-   * a single clock there is no skew to fail either way on.
+   * Preferred over the sweep's own `lastSeenAt` because it advances on every
+   * write, including one whose JSON happens to compare equal — so a stable
+   * cohort cannot expire while the sweep is still confirming it.
+   *
+   * NOT a database clock, despite the name (o3d-0gzr r3). Prisma's `@updatedAt`
+   * is ORM-level: the value is generated on the writing HOST, and the `now` we
+   * compare it against comes from whichever host serves this action. So this
+   * narrows the skew problem to sweep-host-vs-web-host rather than eliminating
+   * it. On this deployment those are the same process, which is why it is
+   * acceptable; the tolerance below is what keeps it from becoming a denial of
+   * the operator's only escape hatch if they ever diverge. Making it genuinely
+   * single-clock needs a database default or trigger on that column, and the
+   * comparison done in SQL.
    */
   confirmedAt?: Date | null,
 ): UnresolvedDriftIncident | null {
