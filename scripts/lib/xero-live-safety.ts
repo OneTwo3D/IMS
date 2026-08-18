@@ -22,10 +22,16 @@
  *                     the review: a uuid says WHICH object a human approved, never WHAT they
  *                     approved doing to it.
  *   5. COMPLETENESS   a read that could not be proven complete is an error, never an empty result.
+ *                     A walk that cannot ADVANCE has not FINISHED: a server that re-serves page 1
+ *                     proves only that `page` is not working, and an unpaged Xero GET is silently
+ *                     truncated to the oldest 100 rows.
  *   6. REVALIDATION   each object is re-read immediately before it is mutated and must be
- *                     byte-for-byte the object that was planned.
- *   7. OUTCOME        a run with any failure exits non-zero and does not report success, and a run
- *                     that THREW after writing says how much it had already destroyed.
+ *                     byte-for-byte the object that was planned — INCLUDING UpdatedDateUTC, the
+ *                     catch-all version, which is a REQUIRED field of the expectation precisely so
+ *                     that no call site can drop it by omission.
+ *   7. OUTCOME        a run with any failure exits non-zero and does not report success; a run that
+ *                     THREW after writing says how much it had already destroyed; and a write whose
+ *                     outcome cannot be determined is reported as UNKNOWN, never as nothing.
  */
 import { createHash } from 'node:crypto'
 
@@ -51,6 +57,11 @@ export class AmbiguousSelectionError extends SafetyViolationError {}
 export class ManifestViolationError extends SafetyViolationError {}
 /** A live object no longer matches the plan that was reviewed. */
 export class PlanDivergedError extends SafetyViolationError {}
+/**
+ * A write left this process and its outcome could not be determined. It is a SafetyViolationError
+ * because the run must stop: after this, nothing in the process knows what the ledger contains.
+ */
+export class WriteOutcomeUnknownError extends SafetyViolationError {}
 
 // ---------------------------------------------------------------------------
 // 3. SELECTION — the exact fixture naming grammar
@@ -128,7 +139,63 @@ export function assertNoNearMisses(
 // 1. TRANSPORT — the write gate
 // ---------------------------------------------------------------------------
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
-export type XeroResult<T> = { ok: boolean; status: number; data?: T; error?: string }
+
+/**
+ * Did a NON-GET request change the live ledger?
+ *
+ * `not-committed` is a claim ABOUT THE LEDGER, not a description of what this process received,
+ * and the two are not the same thing. A request whose response was lost — a gateway timeout, a
+ * dropped connection, a 502 from something in front of Xero — may have been applied in full. Xero
+ * has no idempotency key on these endpoints and no "did you get this?" query, so nothing in this
+ * process can tell an unapplied write from an applied one whose answer never arrived.
+ *
+ * Reporting that as nothing-written is the worst lie this tooling can tell on an irreversible
+ * operation: the banner says the run was a no-op, so nobody goes and looks, and the next run
+ * re-reads the object as untouched and voids it again — or, worse, treats the residue as evidence
+ * that the object was never ours.
+ *
+ * So only an answer FROM XERO'S APPLICATION that rejects the request may be called not-committed.
+ * Anything that leaves the outcome genuinely open is `unknown`, and `unknown` is a reportable
+ * outcome: it aborts the run, names the object, and makes the banner say PARTIALLY APPLIED.
+ */
+export type WriteCommitState = 'committed' | 'not-committed' | 'unknown'
+export type WriteCommit = { state: WriteCommitState; reason: string }
+
+/**
+ * The statuses that prove Xero itself refused the request before applying it: a validation
+ * failure, a bad or unscoped token, a missing object, a wrong verb, a rate-limit refusal. Each is
+ * an answer from the application, not from something standing in front of it.
+ *
+ * The list is deliberately an ALLOW-list. A status nobody thought about — a 3xx, a 418, a 520 from
+ * a CDN — falls through to `unknown`, which costs an operator one manual check. The other default
+ * costs a silent lie about a live ledger.
+ */
+const REJECTED_WITHOUT_APPLYING = new Set([400, 401, 403, 404, 405, 409, 412, 415, 422, 429])
+
+export function classifyWriteOutcome(args: { status?: number; transportError?: string }): WriteCommit {
+  const { status, transportError } = args
+  if (transportError !== undefined) {
+    return {
+      state: 'unknown',
+      reason: `the request left this process and no usable response came back (${transportError}); Xero may have applied it`,
+    }
+  }
+  if (status !== undefined && status >= 200 && status < 300) {
+    return { state: 'committed', reason: `Xero answered HTTP ${status}` }
+  }
+  if (status !== undefined && REJECTED_WITHOUT_APPLYING.has(status)) {
+    return { state: 'not-committed', reason: `Xero refused the request with HTTP ${status}` }
+  }
+  return {
+    state: 'unknown',
+    reason:
+      `HTTP ${status ?? '(none)'} is not an answer from Xero's application layer, so the write may have been ` +
+      `applied before the response was lost`,
+  }
+}
+
+/** `commit` is populated for every non-GET and is absent on reads, which cannot commit anything. */
+export type XeroResult<T> = { ok: boolean; status: number; data?: T; error?: string; commit?: WriteCommit }
 export type TransportToken = { accessToken: string; tenantId: string }
 
 export type XeroTransport = {
@@ -189,17 +256,29 @@ export function createXeroTransport(options: TransportOptions = {}): XeroTranspo
     callCount++
     lastCallAt = now()
 
-    const res = await fetchImpl(`${baseUrl}/${path}`, {
-      method,
-      headers: {
-        'Authorization': `Bearer ${token.accessToken}`,
-        'Xero-Tenant-Id': token.tenantId,
-        'Accept': 'application/json',
-        ...(headersFor?.(path) ?? {}),
-        ...(body ? { 'Content-Type': 'application/json' } : {}),
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-    })
+    let res: Response
+    try {
+      res = await fetchImpl(`${baseUrl}/${path}`, {
+        method,
+        headers: {
+          'Authorization': `Bearer ${token.accessToken}`,
+          'Xero-Tenant-Id': token.tenantId,
+          'Accept': 'application/json',
+          ...(headersFor?.(path) ?? {}),
+          ...(body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        ...(body ? { body: JSON.stringify(body) } : {}),
+      })
+    } catch (e) {
+      // A GET that never got an answer is just a failed read, and every caller already refuses to
+      // treat a failed read as data — so it keeps throwing. A WRITE that never got an answer is a
+      // different fact about the world: the bytes left this process, and Xero may have applied
+      // them. That cannot surface as `{ ok: false }`, because every caller reads `ok: false` as
+      // "nothing happened".
+      if (method === 'GET') throw e
+      const message = e instanceof Error ? e.message : String(e)
+      return { ok: false, status: 0, error: message, commit: classifyWriteOutcome({ transportError: message }) }
+    }
 
     if (res.status === 429) {
       const retryAfter = Number(res.headers.get('Retry-After') ?? '0')
@@ -218,15 +297,35 @@ export function createXeroTransport(options: TransportOptions = {}): XeroTranspo
       return request<T>(token, method, path, body, rateLimitRetries + 1)
     }
 
-    const text = await res.text()
-    if (!res.ok) return { ok: false, status: res.status, error: text.slice(0, 300) }
-    if (!text) return { ok: true, status: res.status }
+    // The commit state is a function of the STATUS alone, so it is settled before the body is
+    // read: a write that Xero answered 2xx has landed whether or not we can parse what came back.
+    const commit = method === 'GET' ? undefined : classifyWriteOutcome({ status: res.status })
+
+    let text: string
     try {
-      return { ok: true, status: res.status, data: JSON.parse(text) as T }
+      text = await res.text()
+    } catch (e) {
+      if (method === 'GET') throw e
+      const message = e instanceof Error ? e.message : String(e)
+      // The status already told us whether it committed; losing the body does not undo that.
+      return { ok: commit!.state === 'committed', status: res.status, error: `response body unreadable: ${message}`, commit }
+    }
+
+    if (!res.ok) return { ok: false, status: res.status, error: text.slice(0, 300), commit }
+    if (!text) return { ok: true, status: res.status, commit }
+    try {
+      return { ok: true, status: res.status, data: JSON.parse(text) as T, commit }
     } catch {
-      // A 200 that is not JSON is not a successful read. Returning ok:true here is how a garbage
-      // response becomes "the collection is empty", which is how absence gets manufactured.
-      return { ok: false, status: res.status, error: `Non-JSON response: ${text.slice(0, 200)}` }
+      // A 200 that is not JSON is not a successful READ. Returning ok:true for a GET here is how a
+      // garbage response becomes "the collection is empty", which is how absence gets manufactured.
+      //
+      // A WRITE is the opposite case and must not be folded into it. Xero answered 2xx, so the
+      // change is in the ledger; only the echoed object is unreadable. Reporting that as
+      // `ok: false` is the same lie as reporting a lost response as nothing-written, so the write
+      // keeps its committed state and merely carries the unreadable body as an error string.
+      const error = `Non-JSON response: ${text.slice(0, 200)}`
+      if (commit) return { ok: commit.state === 'committed', status: res.status, error, commit }
+      return { ok: false, status: res.status, error }
     }
   }
 
@@ -269,11 +368,17 @@ export type Reader = <T>(path: string) => Promise<XeroResult<T>>
  *
  * Three distinct endings, and only one of them is "done":
  *
- *   • an EMPTY `key` array         — the collection is exhausted. This is the only success.
- *   • a page of only already-seen ids — Xero ignored `page` and answered with the whole collection
- *     (it drops unknown query params rather than rejecting them). Page 1 therefore already WAS the
- *     whole collection, so this is also complete — but it has to be recognised, or the walk spins
- *     to the ceiling.
+ *   • an EMPTY `key` array         — the collection is exhausted. This is the ONLY success, and it
+ *     is the only ending in which the server has told us there is nothing more.
+ *   • a page of only already-seen ids — the walk cannot ADVANCE. `page` is being ignored (Xero
+ *     drops unknown query params rather than rejecting them), so every request re-serves the same
+ *     rows. This was previously treated as completeness, on the reasoning that page 1 must
+ *     therefore have been the whole collection. It is the reverse: an UNPAGED Xero GET is silently
+ *     truncated to the oldest 100 rows, so a server stuck on page 1 is exactly the shape of a
+ *     collection we have only seen the beginning of. Treating a repeat as proof of enumeration
+ *     turns "paging is broken" into "there is nothing else" — the same inversion as reading an
+ *     unparseable body as an empty one. It is INCOMPLETE, and it has to be recognised as such or
+ *     the walk also spins to the ceiling.
  *   • anything else                — a non-2xx page, a 2xx whose body is not a Xero collection
  *     envelope carrying `key` as an ARRAY, or the page ceiling. NOT complete, so it throws. The
  *     previous implementation `break`-ed on a failed page and returned the partial accumulation as
@@ -318,6 +423,81 @@ export function parseCollectionPage<T>(data: unknown, key: string): CollectionPa
   return { ok: true, rows: rows as T[] }
 }
 
+/**
+ * One page of a walk, classified. THE decision, in one place, because it had two homes and the
+ * same defect appeared in both: this file's pager and the manual-journal sweep in
+ * audit-xero-live-contamination.ts, which each decided independently what "the walk is finished"
+ * means. Fixing one and leaving the other is how the 429 defect survived three copies of the same
+ * client, and how the repeated-page inversion survived two fixes to `pagingComplete`.
+ *
+ * The callers still differ in what they DO about an incomplete walk — the pager throws, the
+ * journal sweep marks the enumeration incomplete and falls through to per-id confirmation — but
+ * neither of them gets to decide what completeness IS.
+ */
+export type PageStep<T> =
+  /** New rows. The walk advanced; ask for the next page. */
+  | { kind: 'rows'; rows: T[] }
+  /** An empty collection array. The ONLY ending that means the collection was fully enumerated. */
+  | { kind: 'exhausted' }
+  /** The walk stopped without being finished. `reason` is written to be read by an operator. */
+  | { kind: 'incomplete'; reason: string }
+
+export function classifyPage<T>(args: {
+  res: { ok: boolean; status: number; error?: string; data?: unknown }
+  path: string
+  key: string
+  page: number
+  idOf: (row: T) => string
+  seen: ReadonlySet<string>
+}): PageStep<T> {
+  const { res, path, key, page, idOf, seen } = args
+  if (!res.ok) {
+    return {
+      kind: 'incomplete',
+      reason: `${path} page ${page} failed (HTTP ${res.status}${res.error ? `: ${res.error}` : ''})`,
+    }
+  }
+  // A 2xx is not by itself a read. The body has to be a collection envelope carrying `key` as an
+  // array before "the array is empty" is allowed to mean the collection is exhausted.
+  const parsed = parseCollectionPage<T>(res.data, key)
+  if (!parsed.ok) {
+    return {
+      kind: 'incomplete',
+      reason:
+        `${path} page ${page} answered HTTP ${res.status} but ${parsed.reason}. A response that cannot be ` +
+        `parsed says nothing about the collection — it is NOT an empty one`,
+    }
+  }
+  if (parsed.rows.length === 0) return { kind: 'exhausted' }
+
+  // Deduplicated against what the walk has already collected AND within the page itself: a page
+  // that repeats an id twice must not put it in the result twice.
+  const fresh: T[] = []
+  const freshIds = new Set<string>()
+  for (const row of parsed.rows) {
+    const id = idOf(row)
+    if (seen.has(id) || freshIds.has(id)) continue
+    freshIds.add(id)
+    fresh.push(row)
+  }
+  if (fresh.length === 0) {
+    // Every id on this page has been seen before, so the walk cannot advance. What that proves is
+    // that `page` is not being honoured — NOT that the collection ended. An unpaged Xero GET is
+    // silently truncated to the oldest 100 rows, so "the server keeps answering with the same
+    // rows" is precisely the shape of a collection whose tail we have never been shown. The
+    // previous version returned what it had and called it complete, which would have let a server
+    // stuck on page 1 be read as a fully enumerated ledger.
+    return {
+      kind: 'incomplete',
+      reason:
+        `${path} page ${page} returned only rows already seen on page ${page - 1}. \`page\` is being ignored, ` +
+        `so the walk cannot advance — and an unpaged Xero collection is silently truncated to the oldest 100 ` +
+        `rows, so this is evidence of a TRUNCATED read, not of a complete one`,
+    }
+  }
+  return { kind: 'rows', rows: fresh }
+}
+
 export async function pageAllComplete<T>(args: {
   read: Reader
   path: string
@@ -333,38 +513,17 @@ export async function pageAllComplete<T>(args: {
   for (let page = 1; page <= maxPages; page++) {
     const sep = path.includes('?') ? '&' : '?'
     const res = await read<Record<string, T[]>>(`${path}${sep}page=${page}`)
-    if (!res.ok) {
+    const step = classifyPage<T>({ res, path, key, page, idOf, seen })
+    if (step.kind === 'incomplete') {
+      log(`  ! ${step.reason}`)
       throw new ReadIncompleteError(
-        `ABORT: ${path} page ${page} failed (HTTP ${res.status}${res.error ? `: ${res.error}` : ''}). ` +
-          `The read is incomplete, so no plan built from it can be trusted. Nothing was written.`,
+        `ABORT: ${step.reason}. The read is incomplete, so no plan built from it can be trusted. Nothing was written.`,
       )
     }
-    // A 2xx is not by itself a read. The body has to be a collection envelope carrying `key` as an
-    // array before "the array is empty" is allowed to mean the collection is exhausted.
-    const parsed = parseCollectionPage<T>(res.data, key)
-    if (!parsed.ok) {
-      throw new ReadIncompleteError(
-        `ABORT: ${path} page ${page} answered HTTP ${res.status} but ${parsed.reason}. A response that cannot ` +
-          `be parsed says nothing about the collection — it is NOT an empty one. The read is incomplete, so no ` +
-          `plan built from it can be trusted. Nothing was written.`,
-      )
-    }
-    const list = parsed.rows
-    if (list.length === 0) return out
-
-    let fresh = 0
-    for (const row of list) {
-      const id = idOf(row)
-      if (seen.has(id)) continue
-      seen.add(id)
+    if (step.kind === 'exhausted') return out
+    for (const row of step.rows) {
+      seen.add(idOf(row))
       out.push(row)
-      fresh++
-    }
-    if (fresh === 0) {
-      // Every id on this page was already seen: `page` is not being honoured, and page 1 was the
-      // entire collection.
-      log(`  (${path}: page ${page} repeated page ${page - 1} — Xero is ignoring \`page\`; the first response was complete)`)
-      return out
     }
   }
 
@@ -669,11 +828,113 @@ export type RevalidationExpectation = {
    * removed by somebody else.
    */
   releasedBlockers?: string[]
-  updatedDateUtc?: string
+  /**
+   * The catch-all. REQUIRED — deliberately not optional — because the defect this replaces was a
+   * call site that simply left `updatedDateUtc` out, and an optional field that is absent looks
+   * exactly like a field that matched. Making it required means the only way to skip the version
+   * check is to write down which exemption you are claiming, in code, where a reviewer sees it.
+   */
+  version: VersionExpectation
+}
+
+/**
+ * What the object's version — Xero's UpdatedDateUTC — must look like at the moment of the write.
+ *
+ * UpdatedDateUTC is the catch-all: it moves for every change, including the ones status, contact
+ * and blockers cannot express (a line item edited, an account or tax rate changed, a reference or
+ * due date altered, a tracking category attached). Checking status/contact/blockers and not this
+ * is checking the changes we thought of and waving through the ones we did not.
+ */
+export type VersionExpectation =
+  /**
+   * Nothing in this run has written to the object, so its version must be BYTE-IDENTICAL to the
+   * one that was planned and reviewed. This is the normal case and it is the strong one.
+   */
+  | { policy: 'unchanged'; updatedDateUtc: string }
+  /**
+   * THIS RUN wrote to the object — it released an allocation or a refund off it in an earlier
+   * step — so Xero has necessarily re-stamped it and byte-equality is impossible. Byte-equality
+   * cannot be demanded; silence must not be the alternative. Under this policy the version must
+   * still be READABLE and must not have gone BACKWARDS, and the exemption is only offered when the
+   * run's own journal of SUCCEEDED writes says this run is why the object could have moved.
+   *
+   * Be clear about what this does NOT prove: forward movement caused by somebody else, in a
+   * dimension no other column covers, is indistinguishable from our own. That residue is the
+   * reason the runner counts these objects and prints the count in the banner — a waived catch-all
+   * is a thing the operator should be told about, not a thing the code quietly decides.
+   */
+  | { policy: 'moved-by-this-run'; plannedUpdatedDateUtc: string; because: string[] }
+
+/**
+ * Xero returns timestamps in two shapes on the same API — `/Date(1613486114757+0000)/` on the
+ * collection endpoints and an ISO string with no zone on others — so ordering them by string
+ * comparison is wrong for one of them and silently wrong for both when they are mixed.
+ * Unparseable is `null`, and every caller treats null as "cannot be checked", never as "fine".
+ */
+export function parseXeroTimestamp(value?: string | null): number | null {
+  if (!value) return null
+  const trimmed = value.trim()
+  const dotNet = /^\/Date\((-?\d+)(?:[+-]\d{4})?\)\/$/.exec(trimmed)
+  if (dotNet) return Number(dotNet[1])
+  // An ISO stamp with no zone is UTC — Xero's field is literally named UpdatedDateUTC — so it is
+  // pinned to UTC rather than left to the local timezone of whatever machine runs the script.
+  const zoned = /(?:Z|[+-]\d{2}:?\d{2})$/.test(trimmed) ? trimmed : `${trimmed}Z`
+  const parsed = Date.parse(zoned)
+  return Number.isFinite(parsed) ? parsed : null
 }
 
 function normaliseBlockers(b?: string[]): string {
   return [...(b ?? [])].sort().join(' ')
+}
+
+/**
+ * The version half of `assertUnchanged`, kept separate only because it is the part that was
+ * missing. Every path returns a DIFFERENCE or nothing; there is no path that returns "could not
+ * check" as if it were "checked and fine", which is what an optional field bought us before.
+ */
+function versionDiffs(expected: VersionExpectation | undefined, liveVersion?: string): string[] {
+  if (!expected) {
+    // Unreachable through the type system — `version` is required — and handled anyway. The whole
+    // defect was a missing field being read as a satisfied one, and the type checker is not the
+    // only way a call site can arrive here.
+    return [
+      'this call site supplied no version expectation at all, so the catch-all was never checked. ' +
+      'That is the defect itself, not a state to proceed from',
+    ]
+  }
+  if (!liveVersion) {
+    return [
+      'the re-read carries no UpdatedDateUTC, so the version this write was authorised against ' +
+      'cannot be checked at all — an unreadable version is not a matching one',
+    ]
+  }
+  if (expected.policy === 'unchanged') {
+    if (!expected.updatedDateUtc) {
+      return [
+        'the reviewed plan carries no UpdatedDateUTC for this object, so there is no version to ' +
+        'hold the write to. Re-run the read-only audit and review a plan that has one',
+      ]
+    }
+    return expected.updatedDateUtc === liveVersion
+      ? []
+      : [`updatedDateUTC ${expected.updatedDateUtc} -> ${liveVersion}`]
+  }
+  const planned = parseXeroTimestamp(expected.plannedUpdatedDateUtc)
+  const live = parseXeroTimestamp(liveVersion)
+  if (planned === null || live === null) {
+    return [
+      `updatedDateUTC ${JSON.stringify(expected.plannedUpdatedDateUtc)} -> ${JSON.stringify(liveVersion)}: ` +
+      'one of these is not a timestamp this code can read, so it cannot be shown that the object only ' +
+      'moved forwards',
+    ]
+  }
+  if (live < planned) {
+    return [
+      `updatedDateUTC went BACKWARDS, ${expected.plannedUpdatedDateUtc} -> ${liveVersion}. The object ` +
+      'being re-read is not the object that was planned',
+    ]
+  }
+  return []
 }
 
 /** Releasing every blocker off a PAID document leaves it AUTHORISED; nothing else moves. */
@@ -748,9 +1009,11 @@ export function assertUnchanged(expected: RevalidationExpectation, live: Revalid
       )
     }
   }
-  if (expected.updatedDateUtc && live.updatedDateUtc && live.updatedDateUtc !== expected.updatedDateUtc) {
-    diffs.push(`updatedDateUTC ${expected.updatedDateUtc} -> ${live.updatedDateUtc}`)
-  }
+  // The catch-all, checked HERE — at the write — because that is the only moment at which it
+  // counts. The version was bound to the reviewed state one round ago and then dropped from the
+  // final revalidation, which left the manifest check enforcing it minutes earlier while the
+  // irreversible write enforced nothing.
+  diffs.push(...versionDiffs(expected.version, live.updatedDateUtc))
   if (diffs.length === 0) return
   throw new PlanDivergedError(
     `ABORT: ${expected.id} changed between the reviewed plan and this write:\n  ${diffs.join('\n  ')}\n` +
@@ -783,6 +1046,11 @@ export type RunOutcome = { label: string; exitCode: number }
  * the operator has to be told so in the same breath as the error — otherwise the last thing on
  * screen is a stack-shaped message about one credit note and no indication that eighty invoices
  * are already voided.
+ *
+ * `unknownWrites` is the third state, and it is the one that used to be unrepresentable: a request
+ * that left this process and never came back. An abort after zero KNOWN writes is only a clean
+ * refusal if there are no unknown ones — otherwise "nothing was written" is a claim about a live
+ * ledger that nothing in this process is entitled to make.
  */
 export function runOutcome(args: {
   apply: boolean
@@ -790,17 +1058,35 @@ export function runOutcome(args: {
   incomplete?: boolean
   aborted?: boolean
   writesMade?: number
+  /**
+   * Writes that LEFT THIS PROCESS and whose outcome could not be determined. They are not
+   * failures and they are not successes; the one thing they may never do is disappear into
+   * "nothing was written". A run with any of these is PARTIALLY APPLIED even if every write it
+   * can account for succeeded.
+   */
+  unknownWrites?: number
 }): RunOutcome {
-  const { apply, failed, incomplete = false, aborted = false, writesMade = 0 } = args
+  const { apply, failed, incomplete = false, aborted = false, writesMade = 0, unknownWrites = 0 } = args
+  const unknownSuffix = unknownWrites > 0 ? `${unknownWrites} WRITE(S) OF UNKNOWN OUTCOME` : ''
   if (!apply) {
-    if (aborted) return { label: 'DRY RUN — ABORTED', exitCode: 1 }
+    // A dry run cannot write at all — the transport throws on any non-GET without --apply — so an
+    // unknown write here means the write gate itself has been bypassed. It is reported, loudly,
+    // rather than being unrepresentable.
+    if (aborted) return { label: unknownSuffix ? `DRY RUN — ABORTED WITH ${unknownSuffix}` : 'DRY RUN — ABORTED', exitCode: 1 }
+    if (unknownSuffix) return { label: `DRY RUN — INCOMPLETE, ${unknownSuffix}`, exitCode: 1 }
     return { label: failed || incomplete ? 'DRY RUN — INCOMPLETE' : 'DRY RUN', exitCode: failed || incomplete ? 1 : 0 }
   }
   if (aborted) {
-    return writesMade > 0
-      ? { label: `PARTIALLY APPLIED — ABORTED AFTER ${writesMade} IRREVERSIBLE WRITE(S)`, exitCode: 1 }
-      : { label: 'ABORTED — NOTHING WAS WRITTEN', exitCode: 1 }
+    if (writesMade > 0 && unknownSuffix) {
+      return { label: `PARTIALLY APPLIED — ABORTED AFTER ${writesMade} IRREVERSIBLE WRITE(S) AND ${unknownSuffix}`, exitCode: 1 }
+    }
+    if (writesMade > 0) return { label: `PARTIALLY APPLIED — ABORTED AFTER ${writesMade} IRREVERSIBLE WRITE(S)`, exitCode: 1 }
+    // The lie this closes: a write that committed remotely and lost its response used to leave
+    // `writesMade` at zero, so the last thing on screen said the run was a no-op.
+    if (unknownSuffix) return { label: `PARTIALLY APPLIED — ABORTED WITH ${unknownSuffix}`, exitCode: 1 }
+    return { label: 'ABORTED — NOTHING WAS WRITTEN', exitCode: 1 }
   }
+  if (unknownSuffix) return { label: `PARTIALLY APPLIED — ${failed} FAILURE(S) AND ${unknownSuffix}`, exitCode: 1 }
   if (failed || incomplete) return { label: `PARTIALLY APPLIED — ${failed} FAILURE(S)`, exitCode: 1 }
   return { label: 'APPLIED', exitCode: 0 }
 }
@@ -821,15 +1107,31 @@ export function runOutcome(args: {
  * guards decide what it permits.
  */
 export type MutationRecord = { kind: string; label: string }
+/** A write that may or may not have changed the ledger, and the reason nobody can say which. */
+export type UnknownWriteRecord = MutationRecord & { reason: string }
 
 export class MutationJournal {
   private readonly writes: MutationRecord[] = []
+  private readonly unknown: UnknownWriteRecord[] = []
   private readonly releases = new Map<string, Set<string>>()
   private readonly failures: string[] = []
 
   /** An irreversible write that SUCCEEDED. Never call this for an attempt. */
   recordWrite(kind: string, label: string): void {
     this.writes.push({ kind, label })
+  }
+
+  /**
+   * A write whose outcome could not be determined: it left this process and no answer from Xero's
+   * application layer came back. It is recorded SEPARATELY from both successes and failures, and
+   * it is never silently folded into either — a run that has one of these has an unknown ledger,
+   * and the operator is the only thing that can resolve it.
+   *
+   * It deliberately does NOT feed `releasedFor`/`causedRelease`: "we might have deleted that
+   * allocation" cannot license a later step to accept a document that moved.
+   */
+  recordUnknown(kind: string, label: string, reason: string): void {
+    this.unknown.push({ kind, label, reason })
   }
 
   /**
@@ -857,8 +1159,52 @@ export class MutationJournal {
 
   get writeCount(): number { return this.writes.length }
   get writeRecords(): readonly MutationRecord[] { return this.writes }
+  get unknownCount(): number { return this.unknown.length }
+  get unknownRecords(): readonly UnknownWriteRecord[] { return this.unknown }
   get failureCount(): number { return this.failures.length }
   get failureMessages(): readonly string[] { return this.failures }
+}
+
+/**
+ * The ONLY way a write result is allowed to become a fact about the ledger.
+ *
+ * Every call site used to read `res.ok` and branch two ways — succeeded, or failed and therefore
+ * did nothing. There is a third case, and it is the one that matters on an irreversible operation:
+ * the request left this process and no answer came back, so the object may be voided and may not
+ * be, and no amount of re-reading `res` will settle it. Routing every write through here means a
+ * call site cannot express the two-way version any more.
+ *
+ * Returns true when Xero committed the write and false when Xero refused it. It does not return
+ * for the third case: the run cannot go on reasoning about a ledger it can no longer describe, so
+ * it aborts — and because the abort carries `recordUnknown`, the banner says PARTIALLY APPLIED and
+ * names the object instead of claiming nothing was written.
+ */
+export function settleWrite(args: {
+  res: XeroResult<unknown>
+  journal: MutationJournal
+  kind: string
+  label: string
+}): boolean {
+  const { res, journal, kind, label } = args
+  const commit = res.commit ?? {
+    state: 'unknown' as const,
+    reason: 'the transport returned no commit classification for a write, so its outcome is not established',
+  }
+  if (commit.state === 'unknown') {
+    journal.recordUnknown(kind, label, commit.reason)
+    throw new WriteOutcomeUnknownError(
+      `ABORT: ${kind} — ${label}: ${commit.reason}.\n` +
+        `THIS WRITE MAY HAVE COMMITTED. It is not being reported as a failure, because "it failed" would mean ` +
+        `the ledger is unchanged and nothing here knows that.\n` +
+        `Before re-running: read this object in Xero, or re-run the read-only footprint audit, and establish ` +
+        `what actually happened to it. A re-run started from the old plan would otherwise treat it as untouched.`,
+    )
+  }
+  if (commit.state === 'committed') {
+    journal.recordWrite(kind, label)
+    return true
+  }
+  return false
 }
 
 // ---------------------------------------------------------------------------

@@ -28,6 +28,8 @@ import {
   allowedStatusesAfterRun,
   AmbiguousSelectionError,
   assertExpectedTenant,
+  classifyPage,
+  classifyWriteOutcome,
   assertManifestTenant,
   assertNoNearMisses,
   assertPlanAuthorizedByManifest,
@@ -49,14 +51,17 @@ import {
   parseCollectionPage,
   parseRetirementAuthorization,
   parseWriteManifest,
+  parseXeroTimestamp,
   PlanDivergedError,
   ReadIncompleteError,
   resolveById,
   RETIREMENT_AUTHORIZATION_TOKEN,
   RetirementRefusedError,
   runOutcome,
+  settleWrite,
   statusesAfterReleasingBlockers,
   TenantMismatchError,
+  WriteOutcomeUnknownError,
   WriteWithoutApplyError,
   type PlannedObject,
   type RetirementGuardInput,
@@ -96,13 +101,11 @@ function pageServer(opts: {
   key: string
   pages: Array<Array<{ id: string }>>
   failOnPage?: number
-  ignorePageParam?: boolean
 }) {
   return fakeFetch((url) => {
     const page = Number(new URL(url, 'https://x/').searchParams.get('page') ?? '1')
     if (opts.failOnPage === page) return response(503, 'upstream unavailable')
-    const idx = opts.ignorePageParam ? 0 : page - 1
-    return response(200, { [opts.key]: opts.pages[idx] ?? [] })
+    return response(200, { [opts.key]: opts.pages[page - 1] ?? [] })
   })
 }
 
@@ -343,13 +346,72 @@ describe('pagination completeness', () => {
     assert.deepEqual(rows.map(idOf), ['a', 'b', 'c'])
   })
 
-  test('an ignored `page` parameter terminates without spinning to the ceiling', async () => {
-    // Xero drops unknown query params rather than rejecting them, so an endpoint that does not page
-    // answers every request with the whole collection.
-    const { impl, calls } = pageServer({ key: 'Items', pages: [[{ id: 'a' }, { id: 'b' }]], ignorePageParam: true })
-    const rows = await pageAllComplete<{ id: string }>({ read: reader(impl), path: 'Items', key: 'Items', idOf })
-    assert.deepEqual(rows.map(idOf), ['a', 'b'])
-    assert.equal(calls.length, 2, 'page 1 then one probe page is enough to prove completeness')
+  test('a REPEATED page is an incomplete read, not a complete one', async () => {
+    // Finding 3, round 3. Xero drops unknown query params rather than rejecting them, so an
+    // endpoint that is not paging answers every request with the same rows — and an unpaged Xero
+    // GET is silently truncated to the oldest 100. The previous version read that as "page 1 was
+    // the whole collection", which is the inversion: a server stuck on page 1 would have been
+    // reported as a fully enumerated ledger.
+    //
+    // The double has to be able to WITHHOLD rows, or it cannot tell the two readings apart: a fake
+    // that repeats a page containing everything it has is consistent with both.
+    const collection = [{ id: 'a' }, { id: 'b' }, { id: 'c' }, { id: 'd' }, { id: 'e' }]
+    const SERVER_PAGE_SIZE = 2
+    assert.ok(
+      collection.length > SERVER_PAGE_SIZE,
+      'the double must WITHHOLD rows, or a repeated page is consistent with completeness and the test proves nothing',
+    )
+    // Ignores `page` entirely and always answers with the oldest two — what an unpaged Xero GET
+    // does at 100.
+    const { impl, calls } = fakeFetch(() => response(200, { Items: collection.slice(0, SERVER_PAGE_SIZE) }))
+
+    await assert.rejects(
+      () => pageAllComplete<{ id: string }>({ read: reader(impl), path: 'Items', key: 'Items', idOf }),
+      (e: Error) =>
+        e instanceof ReadIncompleteError
+        && /already seen on page 1/.test(e.message)
+        && /TRUNCATED/.test(e.message),
+    )
+    // Two calls: page 1, then the page that proves the walk cannot advance. Not a spin to the ceiling.
+    assert.equal(calls.length, 2)
+  })
+
+  test('the shared page classifier is what BOTH walkers ask, so the repeat cannot be complete in one of them', () => {
+    // The journal sweep in audit-xero-live-contamination.ts cannot throw — its ids fall through to
+    // per-id confirmation — so it reads the same classification and sets `pagingComplete` from it.
+    // When each walker decided for itself, the same defect lived in both.
+    const seen = new Set(['mj-1'])
+    const repeat = classifyPage<{ id: string }>({
+      res: { ok: true, status: 200, data: { ManualJournals: [{ id: 'mj-1' }] } },
+      path: 'ManualJournals', key: 'ManualJournals', page: 2, idOf: (r) => r.id, seen,
+    })
+    assert.equal(repeat.kind, 'incomplete')
+    assert.match(repeat.kind === 'incomplete' ? repeat.reason : '', /cannot advance/)
+
+    // The one ending that IS completeness, and the one that is simply progress.
+    assert.deepEqual(
+      classifyPage<{ id: string }>({
+        res: { ok: true, status: 200, data: { ManualJournals: [] } },
+        path: 'ManualJournals', key: 'ManualJournals', page: 3, idOf: (r) => r.id, seen,
+      }),
+      { kind: 'exhausted' },
+    )
+    assert.deepEqual(
+      classifyPage<{ id: string }>({
+        res: { ok: true, status: 200, data: { ManualJournals: [{ id: 'mj-1' }, { id: 'mj-2' }] } },
+        path: 'ManualJournals', key: 'ManualJournals', page: 2, idOf: (r) => r.id, seen,
+      }),
+      { kind: 'rows', rows: [{ id: 'mj-2' }] },
+      'a page that is partly new still advances, and only the new rows come back',
+    )
+    assert.deepEqual(
+      classifyPage<{ id: string }>({
+        res: { ok: true, status: 200, data: { ManualJournals: [{ id: 'mj-2' }, { id: 'mj-2' }] } },
+        path: 'ManualJournals', key: 'ManualJournals', page: 2, idOf: (r) => r.id, seen,
+      }),
+      { kind: 'rows', rows: [{ id: 'mj-2' }] },
+      'and an id repeated INSIDE one page is enumerated once, not twice',
+    )
   })
 
   test('an empty first page is a complete, empty result', async () => {
@@ -371,7 +433,7 @@ describe('re-validating an object immediately before mutating it', () => {
     allowedStatuses: ['AUTHORISED'],
     contactName: 'E2E E2E-FC-mrmdzzhzhgdf',
     blockers: [],
-    updatedDateUtc: '/Date(1000)/',
+    version: { policy: 'unchanged' as const, updatedDateUtc: '/Date(1000)/' },
   }
 
   test('an unchanged object passes', () => {
@@ -397,8 +459,10 @@ describe('re-validating an object immediately before mutating it', () => {
 
   test('a status that moved outside the allowed set is refused', () => {
     assert.throws(
-      () => assertUnchanged(planned, { id: 'inv-1', status: 'PAID', contactName: planned.contactName, blockers: [] }),
-      PlanDivergedError,
+      () => assertUnchanged(planned, {
+        id: 'inv-1', status: 'PAID', contactName: planned.contactName, blockers: [], updatedDateUtc: '/Date(1000)/',
+      }),
+      (e: Error) => e instanceof PlanDivergedError && /status PAID is not one of/.test(e.message),
     )
   })
 
@@ -407,7 +471,7 @@ describe('re-validating an object immediately before mutating it', () => {
       () => assertUnchanged(planned, {
         id: 'inv-1', status: 'AUTHORISED', contactName: planned.contactName, blockers: [], updatedDateUtc: '/Date(2000)/',
       }),
-      PlanDivergedError,
+      (e: Error) => e instanceof PlanDivergedError && /updatedDateUTC/.test(e.message),
     )
   })
 
@@ -419,10 +483,15 @@ describe('re-validating an object immediately before mutating it', () => {
     // write. That is precisely the divergence worth stopping for.
     assert.throws(
       () => assertUnchanged(
-        { id: 'cn-1', allowedStatuses: statusesAfterReleasingBlockers('SUBMITTED'), contactName: 'E2E E2E-FC-a1' },
-        { id: 'cn-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1' },
+        {
+          id: 'cn-1',
+          allowedStatuses: statusesAfterReleasingBlockers('SUBMITTED'),
+          contactName: 'E2E E2E-FC-a1',
+          version: { policy: 'unchanged', updatedDateUtc: '/Date(1000)/' },
+        },
+        { id: 'cn-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', updatedDateUtc: '/Date(1000)/' },
       ),
-      PlanDivergedError,
+      (e: Error) => e instanceof PlanDivergedError && /status AUTHORISED is not one of/.test(e.message),
     )
   })
 
@@ -434,13 +503,17 @@ describe('re-validating an object immediately before mutating it', () => {
       blockers: ['payment:p1', 'creditnote:c1'],
       blockerPolicy: 'released' as const,
       releasedBlockers: ['payment:p1', 'creditnote:c1'],
+      // This run moved the document, so the version cannot be required to be byte-identical.
+      version: { policy: 'moved-by-this-run' as const, plannedUpdatedDateUtc: '/Date(1000)/', because: ['payment:p1'] },
     }
     // step 1 released them, and recorded that it did — fine.
-    assert.doesNotThrow(() => assertUnchanged(expectation, { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [] }))
+    assert.doesNotThrow(() => assertUnchanged(expectation, {
+      id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(1500)/',
+    }))
     // someone else attached a new payment — stop.
     assert.throws(
       () => assertUnchanged(expectation, {
-        id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: ['payment:p1', 'payment:p9'],
+        id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: ['payment:p1', 'payment:p9'], updatedDateUtc: '/Date(1500)/',
       }),
       (e: Error) => e instanceof PlanDivergedError && /payment:p9/.test(e.message),
     )
@@ -449,10 +522,14 @@ describe('re-validating an object immediately before mutating it', () => {
   test('under the exact policy any blocker change is refused', () => {
     assert.throws(
       () => assertUnchanged(
-        { id: 'cn-1', allowedStatuses: ['AUTHORISED'], contactName: 'E2E E2E-FC-a1', blockers: ['allocation:a1'], blockerPolicy: 'exact' },
-        { id: 'cn-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [] },
+        {
+          id: 'cn-1', allowedStatuses: ['AUTHORISED'], contactName: 'E2E E2E-FC-a1',
+          blockers: ['allocation:a1'], blockerPolicy: 'exact',
+          version: { policy: 'unchanged', updatedDateUtc: '/Date(1000)/' },
+        },
+        { id: 'cn-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(1000)/' },
       ),
-      PlanDivergedError,
+      (e: Error) => e instanceof PlanDivergedError && /blockers/.test(e.message),
     )
   })
 
@@ -460,6 +537,113 @@ describe('re-validating an object immediately before mutating it', () => {
     assert.doesNotThrow(() => assertStillFixtureContact('inv-1', 'E2E E2E-FC-mrmdzzhzhgdf'))
     assert.throws(() => assertStillFixtureContact('inv-1', 'E2E Consulting Ltd'), PlanDivergedError)
     assert.throws(() => assertStillFixtureContact('inv-1', undefined), PlanDivergedError)
+  })
+})
+
+// ===========================================================================
+/**
+ * Finding 1, round 3. The manifest check binds the reviewed STATE — including UpdatedDateUTC, the
+ * catch-all for everything status/contact/blockers cannot express — but it runs once, against the
+ * plan, minutes before the first write. The check that stands between the plan and the
+ * irreversible write is this one, and it had dropped the version field.
+ *
+ * The double these tests need has to be able to produce an object that differs in NOTHING BUT the
+ * version: a fake that changes status or contact alongside it would be caught by a check that was
+ * never missing, and would pass whether or not the version is enforced.
+ */
+describe('the catch-all version is enforced AT THE WRITE, not only at the manifest check', () => {
+  /** As reviewed, as planned, and — everywhere but the version — as it still is. */
+  const reviewed = {
+    id: 'cn-1',
+    allowedStatuses: ['SUBMITTED'],
+    contactName: 'E2E E2E-FC-a1',
+    blockers: [],
+    blockerPolicy: 'exact' as const,
+    version: { policy: 'unchanged' as const, updatedDateUtc: '/Date(1000)/' },
+  }
+  /** The same object after a change no other column can express: a line, an account, a due date. */
+  const changedOnlyInVersion = {
+    id: 'cn-1', status: 'SUBMITTED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(1060000)/',
+  }
+
+  test('an object that changed in NOTHING BUT UpdatedDateUTC is refused at the write', () => {
+    // Every named field matches. Status, contact and blockers all agree, so the write would have
+    // gone out — and a void cannot be undone.
+    assert.deepEqual(
+      { status: changedOnlyInVersion.status, contact: changedOnlyInVersion.contactName, blockers: changedOnlyInVersion.blockers },
+      { status: 'SUBMITTED', contact: 'E2E E2E-FC-a1', blockers: [] },
+      'the double must differ ONLY in the version, or it proves nothing about the version check',
+    )
+    assert.throws(
+      () => assertUnchanged(reviewed, changedOnlyInVersion),
+      (e: Error) => e instanceof PlanDivergedError && /updatedDateUTC \/Date\(1000\)\/ -> \/Date\(1060000\)\//.test(e.message),
+    )
+  })
+
+  test('a re-read with NO version at all is a divergence, not a pass', () => {
+    // The shape of the defect, in miniature: an absent field used to be indistinguishable from a
+    // field that matched, in both directions — a caller that omitted it and a response that lacked
+    // it were both silence.
+    assert.throws(
+      () => assertUnchanged(reviewed, { id: 'cn-1', status: 'SUBMITTED', contactName: 'E2E E2E-FC-a1', blockers: [] }),
+      (e: Error) => e instanceof PlanDivergedError && /carries no UpdatedDateUTC/.test(e.message),
+    )
+  })
+
+  test('a plan with no version cannot authorise a write either', () => {
+    assert.throws(
+      () => assertUnchanged(
+        { ...reviewed, version: { policy: 'unchanged', updatedDateUtc: '' } },
+        changedOnlyInVersion,
+      ),
+      (e: Error) => e instanceof PlanDivergedError && /no UpdatedDateUTC for this object/.test(e.message),
+    )
+  })
+
+  test('the exemption exists ONLY for objects this run itself moved, and it is narrow', () => {
+    const movedByUs = {
+      ...reviewed,
+      blockerPolicy: 'released' as const,
+      blockers: ['allocation:inv-9'],
+      releasedBlockers: ['allocation:inv-9'],
+      version: { policy: 'moved-by-this-run' as const, plannedUpdatedDateUtc: '/Date(1000)/', because: ['allocation:inv-9'] },
+    }
+    // Forward: our own DELETE re-stamped it. Byte-equality is arithmetically impossible here.
+    assert.doesNotThrow(() => assertUnchanged(movedByUs, { ...changedOnlyInVersion, blockers: [] }))
+    // Backwards: whatever is being re-read, it is not the object that was planned.
+    assert.throws(
+      () => assertUnchanged(movedByUs, { ...changedOnlyInVersion, blockers: [], updatedDateUtc: '/Date(900)/' }),
+      (e: Error) => e instanceof PlanDivergedError && /BACKWARDS/.test(e.message),
+    )
+    // Unreadable: "I cannot compare these" is never allowed to resolve to "they are fine".
+    assert.throws(
+      () => assertUnchanged(movedByUs, { ...changedOnlyInVersion, blockers: [], updatedDateUtc: 'sometime last Tuesday' }),
+      (e: Error) => e instanceof PlanDivergedError && /not a timestamp this code can read/.test(e.message),
+    )
+  })
+
+  test('the version cannot be dropped by omission — the compiler refuses it, and so does the guard', () => {
+    // The defect was not a wrong comparison; it was a call site that said nothing. An optional
+    // field cannot express "you must decide", so the field is required and this is a type error.
+    // If `version` is ever made optional again, this @ts-expect-error becomes unused and the
+    // repo-wide `tsc --noEmit` fails on it. The runtime refuses the same omission, because a type
+    // checker is not the only way a call site arrives here.
+    assert.throws(() => assertUnchanged(
+      // @ts-expect-error `version` is required: a call site may not simply leave the catch-all out
+      { id: 'cn-1', allowedStatuses: ['SUBMITTED'], contactName: 'E2E E2E-FC-a1' },
+      { id: 'cn-1', status: 'SUBMITTED', contactName: 'E2E E2E-FC-a1', updatedDateUtc: '/Date(1000)/' },
+    ), PlanDivergedError)
+  })
+
+  test('the two timestamp shapes Xero actually sends both parse, and rubbish does not', () => {
+    // Ordering these by string comparison is wrong for one shape and silently wrong when mixed.
+    assert.equal(parseXeroTimestamp('/Date(1613486114757+0000)/'), 1613486114757)
+    assert.equal(parseXeroTimestamp('/Date(1613486114757)/'), 1613486114757)
+    assert.equal(parseXeroTimestamp('2026-08-10T12:34:56.789'), Date.parse('2026-08-10T12:34:56.789Z'))
+    assert.equal(parseXeroTimestamp('2026-08-10T12:34:56Z'), Date.parse('2026-08-10T12:34:56Z'))
+    for (const junk of [undefined, null, '', 'yesterday', '/Date(nope)/']) {
+      assert.equal(parseXeroTimestamp(junk), null, `${JSON.stringify(junk)} must not parse as a version`)
+    }
   })
 })
 
@@ -859,6 +1043,16 @@ describe('"this run caused it" is not the same as "it happened"', () => {
     contactName: 'E2E E2E-FC-a1',
     blockers: ['creditnote:cn-1'],
   }
+  /**
+   * The version expectation the runner would build for this object, from the same journal fact
+   * that widens the status set. Nothing released off it => the catch-all is exact; this run
+   * released something => it may only have moved forwards. There is no third form in which the
+   * version simply is not checked.
+   */
+  const versionFor = (journal: MutationJournal, key: string) =>
+    journal.causedRelease(key)
+      ? { policy: 'moved-by-this-run' as const, plannedUpdatedDateUtc: '/Date(1000)/', because: journal.releasedFor(key) }
+      : { policy: 'unchanged' as const, updatedDateUtc: '/Date(1000)/' }
 
   test('a PAID -> AUTHORISED move is accepted only when this run recorded the release that caused it', () => {
     const journal = new MutationJournal()
@@ -872,8 +1066,9 @@ describe('"this run caused it" is not the same as "it happened"', () => {
           allowedStatuses: allowedStatusesAfterRun('PAID', journal.causedRelease('invoice:inv-1')),
           blockerPolicy: 'released',
           releasedBlockers: journal.releasedFor('invoice:inv-1'),
+          version: versionFor(journal, 'invoice:inv-1'),
         },
-        { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [] },
+        { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(1000)/' },
       ),
       (e: Error) => e instanceof PlanDivergedError && /status AUTHORISED is not one of \[PAID\]/.test(e.message),
     )
@@ -887,8 +1082,9 @@ describe('"this run caused it" is not the same as "it happened"', () => {
         allowedStatuses: allowedStatusesAfterRun('PAID', journal.causedRelease('invoice:inv-1')),
         blockerPolicy: 'released',
         releasedBlockers: journal.releasedFor('invoice:inv-1'),
+        version: versionFor(journal, 'invoice:inv-1'),
       },
-      { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [] },
+      { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(2000)/' },
     ))
   })
 
@@ -906,8 +1102,9 @@ describe('"this run caused it" is not the same as "it happened"', () => {
           blockers: ['creditnote:cn-1', 'payment:p7'],
           blockerPolicy: 'released',
           releasedBlockers: journal.releasedFor('invoice:inv-1'),
+          version: versionFor(journal, 'invoice:inv-1'),
         },
-        { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [] },
+        { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(2000)/' },
       ),
       (e: Error) => e instanceof PlanDivergedError
         && /released by something other than this run: payment:p7/.test(e.message),
@@ -932,6 +1129,152 @@ describe('"this run caused it" is not the same as "it happened"', () => {
     assert.deepEqual(journal.releasedFor('creditnote:cn-1'), ['allocation:inv-1'])
     assert.deepEqual(journal.releasedFor('invoice:inv-1'), ['creditnote:cn-1'])
     assert.equal(journal.causedRelease('invoice:inv-2'), false)
+  })
+})
+
+// ===========================================================================
+/**
+ * Finding 2, round 3. A write that COMMITTED REMOTELY and lost its response was reported as
+ * nothing-written — the worst available lie about a live ledger, because the operator is told the
+ * run was a no-op and the next run treats the object as untouched.
+ *
+ * The double has to be able to represent that, which means the write must genuinely LAND in it
+ * before the answer goes missing. A fake that just returns an error has not expressed the scenario
+ * at all: it is indistinguishable from a write Xero refused, which is the very confusion under
+ * test.
+ */
+describe('a write that may have committed is never reported as not-committed', () => {
+  /** A Xero that APPLIES the write and only then loses the connection, or answers through a proxy. */
+  function committingServer(answer: 'connection-lost' | number) {
+    const applied: string[] = []
+    const impl = (async (url: unknown, init: unknown) => {
+      const i = (init ?? {}) as RequestInit
+      // The ledger changes FIRST. Everything after this point is only about what we get to know.
+      applied.push(`${String(i.method ?? 'GET')} ${String(url)}`)
+      if (answer === 'connection-lost') throw new TypeError('fetch failed: socket hang up')
+      return response(answer, answer >= 500 ? 'gateway timeout' : JSON.stringify({ Invoices: [{ InvoiceID: 'inv-1' }] }))
+    }) as unknown as typeof fetch
+    return { impl, applied }
+  }
+
+  const writer = (impl: typeof fetch) => createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+
+  test('a POST whose connection dies AFTER the void landed is UNKNOWN, not a failure', async () => {
+    const { impl, applied } = committingServer('connection-lost')
+    const res = await writer(impl).request(TOKEN, 'POST', 'Invoices/inv-1', { Status: 'VOIDED' })
+
+    // The double really did apply it — this is the scenario, not a rejected request.
+    assert.deepEqual(applied, ['POST https://api.xero.com/api.xro/2.0/Invoices/inv-1'])
+    assert.equal(res.commit?.state, 'unknown')
+    assert.match(res.commit?.reason ?? '', /no usable response came back/)
+    assert.notEqual(res.commit?.state, 'not-committed', 'a lost response is not evidence that nothing happened')
+  })
+
+  test('the run stops, records the object, and the banner says PARTIALLY APPLIED', async () => {
+    const { impl } = committingServer('connection-lost')
+    const res = await writer(impl).request(TOKEN, 'POST', 'Invoices/inv-1', { Status: 'VOIDED' })
+    const journal = new MutationJournal()
+
+    assert.throws(
+      () => settleWrite({ res, journal, kind: 'invoice voided', label: 'INV-0042' }),
+      (e: Error) => e instanceof WriteOutcomeUnknownError && /MAY HAVE COMMITTED/.test(e.message) && /INV-0042/.test(e.message),
+    )
+    assert.equal(journal.writeCount, 0, 'an unknown outcome is not a confirmed write')
+    assert.equal(journal.unknownCount, 1)
+    assert.deepEqual(journal.unknownRecords.map((u) => u.label), ['INV-0042'])
+
+    // Zero CONFIRMED writes — and this must still not read as "nothing was written".
+    const outcome = runOutcome({ apply: true, failed: 0, aborted: true, writesMade: 0, unknownWrites: journal.unknownCount })
+    assert.equal(outcome.exitCode, 1)
+    assert.match(outcome.label, /^PARTIALLY APPLIED/)
+    assert.match(outcome.label, /1 WRITE\(S\) OF UNKNOWN OUTCOME/)
+    assert.doesNotMatch(outcome.label, /NOTHING WAS WRITTEN/)
+  })
+
+  test('an unknown write licenses nothing later: it is not a recorded release', () => {
+    const journal = new MutationJournal()
+    journal.recordUnknown('allocation deleted', 'CN-001 -> invoice inv-1', 'connection lost')
+    // "We might have deleted that allocation" cannot explain a document that has moved.
+    assert.equal(journal.causedRelease('creditnote:cn-1'), false)
+    assert.deepEqual(journal.releasedFor('creditnote:cn-1'), [])
+    assert.deepEqual(allowedStatusesAfterRun('PAID', journal.causedRelease('creditnote:cn-1')), ['PAID'])
+  })
+
+  test('a gateway 5xx is UNKNOWN — it is not an answer from Xero', async () => {
+    for (const status of [500, 502, 503, 504]) {
+      const { impl, applied } = committingServer(status)
+      const res = await writer(impl).request(TOKEN, 'DELETE', 'Items/item-1')
+      assert.equal(applied.length, 1, 'the request reached the ledger')
+      assert.equal(res.commit?.state, 'unknown', `HTTP ${status} must not be read as "nothing happened"`)
+    }
+  })
+
+  test('only Xero REFUSING the request counts as not-committed', () => {
+    for (const status of [400, 401, 403, 404, 405, 409, 412, 415, 422, 429]) {
+      assert.equal(classifyWriteOutcome({ status }).state, 'not-committed', `HTTP ${status}`)
+    }
+    for (const status of [200, 201, 204]) {
+      assert.equal(classifyWriteOutcome({ status }).state, 'committed', `HTTP ${status}`)
+    }
+    // Anything nobody thought about falls to the safe side: one manual check beats a silent lie.
+    for (const status of [0, 302, 418, 520, undefined]) {
+      assert.equal(classifyWriteOutcome({ status }).state, 'unknown', `HTTP ${status}`)
+    }
+  })
+
+  test('a 2xx write whose body is not JSON has still COMMITTED', async () => {
+    // The mirror of the read rule. For a GET, an unparseable 200 is a failed read — that is how a
+    // garbage response becomes "the collection is empty". For a WRITE it is the opposite: Xero
+    // said 2xx, so the void is in the ledger and only the echo is unreadable. Calling that
+    // `ok: false` is the same lie in the other direction.
+    const { impl } = fakeFetch(() => response(200, '<html>proxy says hello</html>'))
+    const res = await writer(impl).request(TOKEN, 'POST', 'Invoices/inv-1', { Status: 'VOIDED' })
+    assert.equal(res.commit?.state, 'committed')
+    assert.equal(res.ok, true)
+
+    const journal = new MutationJournal()
+    assert.equal(settleWrite({ res, journal, kind: 'invoice voided', label: 'INV-0042' }), true)
+    assert.equal(journal.writeCount, 1)
+
+    // ... and the same body on a GET is still a failed read.
+    const readRes = await reader(impl)('Invoices')
+    assert.equal(readRes.ok, false)
+    assert.equal(readRes.commit, undefined, 'a read cannot commit anything, so it has no commit state')
+  })
+
+  test('a read that loses its connection still throws — only writes need the third answer', async () => {
+    const { impl } = committingServer('connection-lost')
+    await assert.rejects(() => reader(impl)('Invoices'), /socket hang up/)
+  })
+
+  test('settleWrite is the only way a result becomes a fact, and it records each side once', () => {
+    const journal = new MutationJournal()
+    const committed: XeroResult<unknown> = { ok: true, status: 200, commit: { state: 'committed', reason: 'Xero answered HTTP 200' } }
+    const refused: XeroResult<unknown> = { ok: false, status: 400, error: 'ValidationException', commit: { state: 'not-committed', reason: 'Xero refused the request with HTTP 400' } }
+
+    assert.equal(settleWrite({ res: committed, journal, kind: 'item deleted', label: 'E2E-FC-A-SMOKE' }), true)
+    assert.equal(settleWrite({ res: refused, journal, kind: 'item deleted', label: 'E2E-FC-B-SMOKE' }), false)
+    assert.equal(journal.writeCount, 1)
+    assert.equal(journal.unknownCount, 0)
+    assert.deepEqual(journal.writeRecords.map((w) => w.label), ['E2E-FC-A-SMOKE'])
+  })
+
+  test('a result carrying NO commit classification is unknown, not assumed harmless', () => {
+    // Belt and braces: if a write ever reaches settleWrite without having been classified, the
+    // default is the one that costs an operator a look, not the one that costs a silent lie.
+    const journal = new MutationJournal()
+    assert.throws(
+      () => settleWrite({ res: { ok: false, status: 500 }, journal, kind: 'invoice voided', label: 'INV-1' }),
+      WriteOutcomeUnknownError,
+    )
+    assert.equal(journal.unknownCount, 1)
+  })
+
+  test('a run that finishes with an unknown write is never APPLIED', () => {
+    const outcome = runOutcome({ apply: true, failed: 0, aborted: false, writesMade: 40, unknownWrites: 1 })
+    assert.equal(outcome.exitCode, 1)
+    assert.match(outcome.label, /^PARTIALLY APPLIED/)
+    assert.match(outcome.label, /1 WRITE\(S\) OF UNKNOWN OUTCOME/)
   })
 })
 
@@ -1202,4 +1545,53 @@ describe('the audit scripts have no private Xero client to re-introduce the defe
       )
     })
   }
+})
+
+// ===========================================================================
+/**
+ * The two defects fixed this round were both defects of DISTRIBUTION: one decision, taken in more
+ * than one place, agreeing in some of them and not the others. The repeated-page reading lived in
+ * the pager and in the manual-journal sweep; the write outcome was read off `res.ok` at six
+ * separate call sites. These are cheap structural guards that the decisions still have one home.
+ */
+describe('the safety decisions have exactly one home each', () => {
+  const sourceOf = (relative: string) =>
+    readFileSync(join(process.cwd(), relative), 'utf8')
+      // Strip comments: both files explain these rules in prose, and a guard that matches its own
+      // explanation is a guard that fails for the wrong reason.
+      .replace(/\/\*[\s\S]*?\*\//g, '')
+      .replace(/^\s*\/\/.*$/gm, '')
+
+  test('the manual-journal sweep asks the shared classifier what a finished walk is', () => {
+    const code = sourceOf('scripts/audit-xero-live-contamination.ts')
+    assert.match(code, /classifyPage</, 'the sweep must not re-derive completeness for itself')
+    const completions = code.match(/pagingComplete = true/g) ?? []
+    assert.equal(completions.length, 1, 'there is exactly one way for this enumeration to be complete')
+    assert.match(
+      code,
+      /step\.kind === 'exhausted'\) \{ pagingComplete = true/,
+      'and it is an EMPTY page — never a repeated one, which is the claim the 251 unknown journals turn on',
+    )
+  })
+
+  test('every write in the remover is settled, and none is recorded as a success by hand', () => {
+    const code = sourceOf('scripts/remove-xero-live-e2e-footprint.ts')
+    const writes = code.match(/transport\.request\(token, '(?:POST|PUT|PATCH|DELETE)'/g) ?? []
+    const settled = code.match(/settleWrite\(\{/g) ?? []
+    assert.ok(writes.length >= 5, `expected the five mutating steps, found ${writes.length}`)
+    assert.equal(settled.length, writes.length, 'a write that does not go through settleWrite has only two answers')
+    assert.doesNotMatch(
+      code,
+      /journal\.recordWrite\(/,
+      'recording a success by hand skips the classification and re-opens "committed remotely, reported as nothing"',
+    )
+  })
+
+  test('every re-read in the remover states a version policy', () => {
+    const code = sourceOf('scripts/remove-xero-live-e2e-footprint.ts')
+    const revalidations = code.match(/assertUnchanged\(/g) ?? []
+    const versions = code.match(/version: /g) ?? []
+    assert.ok(revalidations.length >= 5, `expected one per mutating step, found ${revalidations.length}`)
+    assert.equal(versions.length, revalidations.length, 'the catch-all is not optional at any call site')
+  })
 })

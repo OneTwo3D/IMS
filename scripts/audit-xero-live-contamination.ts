@@ -89,10 +89,10 @@ import { createDecipheriv, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 
 import {
+  classifyPage,
   createXeroTransport,
   isConclusive,
   pageAllComplete,
-  parseCollectionPage,
   resolveById,
   type Resolution,
 } from './lib/xero-live-safety'
@@ -939,37 +939,28 @@ async function sweepJournals(
       token,
       `ManualJournals?page=${page}`,
     )
-    if (!res.ok) {
-      console.log(`  ! manual journal page ${page} failed (HTTP ${res.status}): ${res.error} — enumeration is INCOMPLETE`)
+    // What counts as a finished walk is decided ONCE, in the shared library, and this sweep does
+    // not get its own opinion about it. It used to have one, and that is how the same
+    // repeated-page inversion could be present here and in the pager at the same time: a page of
+    // rows we had already seen was read as "page 1 was the whole collection" in both places. The
+    // callers differ only in what they DO — the pager throws, this one marks the enumeration
+    // incomplete and falls through to per-id confirmation, which is the only read that can return
+    // a 404.
+    const step = classifyPage<XeroManualJournal>({
+      res, path: 'ManualJournals', key: 'ManualJournals', page, seen: seenPageIds,
+      idOf: (mj) => mj.ManualJournalID,
+    })
+    if (step.kind === 'incomplete') {
+      console.log(`  ! ${step.reason} — enumeration is INCOMPLETE`)
       break
     }
-    // A 2xx whose body we cannot read is NOT an empty page. `res.data?.ManualJournals ?? []`
-    // could not tell `{"ManualJournals":[]}` — the enumeration genuinely finishing — from an
-    // unparseable body, and the difference is published: the empty branch sets pagingComplete,
-    // which is this script's claim to have seen the whole collection. That claim is the entire
-    // reason the 251 journals were reported the way they were.
-    const parsed = parseCollectionPage<XeroManualJournal>(res.data, 'ManualJournals')
-    if (!parsed.ok) {
-      console.log(`  ! manual journal page ${page} answered HTTP ${res.status} but ${parsed.reason} — enumeration is INCOMPLETE`)
-      break
-    }
-    const batch = parsed.rows
     // Only an EMPTY page ends the walk. A short page does not: the page size is not a guarantee,
     // and treating "fewer than 100" as terminal is what dropped the older pages.
-    if (!batch.length) { pagingComplete = true; break }
-    let fresh = 0
-    for (const mj of batch) {
-      if (seenPageIds.has(mj.ManualJournalID)) continue
+    if (step.kind === 'exhausted') { pagingComplete = true; break }
+    for (const mj of step.rows) {
       seenPageIds.add(mj.ManualJournalID)
-      fresh++
       if (byId.has(mj.ManualJournalID)) seen.set(mj.ManualJournalID, mj)
       else unknownInWindow.push(mj)
-    }
-    if (fresh === 0) {
-      // Xero ignored `page` and re-served the same collection: page 1 already was the whole set.
-      console.log(`  (ManualJournals: page ${page} repeated page ${page - 1} — \`page\` is being ignored; the first response was complete)`)
-      pagingComplete = true
-      break
     }
     if (page === JOURNAL_PAGE_CEILING) {
       console.log(`  ! manual journals hit the ${JOURNAL_PAGE_CEILING}-page ceiling — enumeration is INCOMPLETE`)

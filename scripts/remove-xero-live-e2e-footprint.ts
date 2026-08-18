@@ -26,7 +26,11 @@
  *                        must be identical to the plan — status, contact, blockers, UpdatedDateUTC.
  *                        The failure this closes is a document re-contacted to a GENUINE customer
  *                        between plan and write: still in a valid status, so Xero accepts the void.
- *                        That is a wrong write, not a rejected one.
+ *                        That is a wrong write, not a rejected one. The version is a REQUIRED field
+ *                        of that expectation, never an optional one: it is the catch-all for the
+ *                        changes the named fields cannot express, and an optional field a call site
+ *                        omits is indistinguishable from one that matched. The only alternative to
+ *                        an exact version is a NAMED exemption, which the run counts and prints.
  *   ONLY THIS RUN'S OWN CHANGES ARE FORGIVEN.  Step 1 legitimately moves a PAID document to
  *                        AUTHORISED, so later steps have to tolerate that transition — but only on
  *                        the documents where THIS RUN recorded the successful delete. The same
@@ -36,6 +40,12 @@
  *                        including when the run THROWS after writing. An abort that prints only an
  *                        error message leaves the operator with no idea that eighty invoices are
  *                        already irreversibly voided.
+ *   NOTHING IS CALLED "NOT WRITTEN" UNLESS XERO SAID SO.  Every write goes through `settleWrite`,
+ *                        which knows three answers rather than two. A request whose response was
+ *                        lost — a gateway timeout, a dropped connection — MAY have been applied,
+ *                        so it is recorded as UNKNOWN, it stops the run, and the banner says
+ *                        PARTIALLY APPLIED and names the object. "The run was a no-op" is the
+ *                        worst thing this tooling can say about a ledger it might have changed.
  *
  * WHAT "DELETE" CAN AND CANNOT MEAN HERE
  * --------------------------------------
@@ -95,8 +105,10 @@ import {
   parseWriteManifest,
   runOutcome,
   SafetyViolationError,
+  settleWrite,
   type PlannedObject,
   type TransportToken,
+  type VersionExpectation,
   type WriteManifest,
 } from './lib/xero-live-safety'
 
@@ -323,7 +335,16 @@ type Item = { ItemID: string; Code: string; UpdatedDateUTC?: string }
 
 const TERMINAL = new Set(['VOIDED', 'DELETED'])
 
-const stats = { allocationsDeleted: 0, refundsDeleted: 0, creditNotesVoided: 0, invoicesVoided: 0, contactsArchived: 0, itemsDeleted: 0, skipped: 0, failed: 0 }
+const stats = {
+  allocationsDeleted: 0, refundsDeleted: 0, creditNotesVoided: 0, invoicesVoided: 0,
+  contactsArchived: 0, itemsDeleted: 0, skipped: 0, failed: 0,
+  /**
+   * Objects written under a RELAXED version check — ones this run had itself already modified, so
+   * their UpdatedDateUTC could not be required to equal the reviewed one. Counted and printed
+   * because a waived catch-all is something the operator is entitled to know the size of.
+   */
+  versionRelaxed: 0,
+}
 const failures: string[] = []
 
 /**
@@ -374,6 +395,35 @@ async function reread<T>(token: Token, path: string, key: string): Promise<T | n
   const res = await transport.request<Record<string, T[]>>(token, 'GET', path)
   if (!res.ok) return null
   return res.data?.[key]?.[0] ?? null
+}
+
+/**
+ * The version this object must be at when we write to it.
+ *
+ * Two cases, and the code has to say which one it is claiming — the field is required, so there is
+ * no third case where the check simply is not there:
+ *
+ *   • THIS RUN HAS NOT TOUCHED IT. Byte-identical to the reviewed plan, full stop. This is every
+ *     object in steps 3, 4 and 5, and every credit note in step 2 that had no allocations.
+ *   • THIS RUN RELEASED A BLOCKER OFF IT in step 1. Xero re-stamps UpdatedDateUTC when it does
+ *     that, so byte-equality is arithmetically impossible and demanding it would abort every real
+ *     apply. The version must still be readable and must not have gone backwards, and the object
+ *     is counted so the banner can say how many writes went out under the weaker check.
+ *
+ * `journal.causedRelease` is the gate, and it is fed only by DELETEs that Xero CONFIRMED. An
+ * attempted release, or one whose response was lost, licenses nothing — the run aborts on the
+ * latter long before it reaches here.
+ */
+function versionFor(subjectKey: string, plannedUpdatedDateUtc?: string): VersionExpectation {
+  if (!journal.causedRelease(subjectKey)) {
+    return { policy: 'unchanged', updatedDateUtc: plannedUpdatedDateUtc ?? '' }
+  }
+  stats.versionRelaxed++
+  return {
+    policy: 'moved-by-this-run',
+    plannedUpdatedDateUtc: plannedUpdatedDateUtc ?? '',
+    because: journal.releasedFor(subjectKey),
+  }
 }
 
 async function main() {
@@ -522,7 +572,8 @@ async function main() {
             contactName: planned.Contact?.Name,
             blockers: cnBlockers(planned),
             blockerPolicy: 'exact',
-            updatedDateUtc: planned.UpdatedDateUTC,
+            // Nothing in this run has written to this document yet, so the catch-all is exact.
+            version: { policy: 'unchanged', updatedDateUtc: planned.UpdatedDateUTC ?? '' },
           },
           fresh ? { id: fresh.CreditNoteID, status: fresh.Status, contactName: fresh.Contact?.Name, blockers: cnBlockers(fresh), updatedDateUtc: fresh.UpdatedDateUTC } : null,
         )
@@ -538,9 +589,10 @@ async function main() {
         act(`delete allocation ${alloc.AllocationID} (${alloc.Amount}) on ${live.CreditNoteNumber} -> invoice ${alloc.Invoice?.InvoiceID}`)
         if (!APPLY) { stats.allocationsDeleted++; continue }
         const res = await transport.request(token, 'DELETE', `CreditNotes/${live.CreditNoteID}/Allocations/${alloc.AllocationID}`)
-        if (res.ok) {
+        // settleWrite, not `res.ok`: a DELETE whose response was lost may have released the
+        // allocation, and "it failed" would license step 2 to expect a blocker that is gone.
+        if (settleWrite({ res, journal, kind: 'allocation deleted', label: `${live.CreditNoteNumber} -> invoice ${alloc.Invoice?.InvoiceID ?? '?'}` })) {
           stats.allocationsDeleted++
-          journal.recordWrite('allocation deleted', `${live.CreditNoteNumber} -> invoice ${alloc.Invoice?.InvoiceID ?? '?'}`)
           // Recorded against BOTH sides: deleting the allocation releases the credit note and the
           // invoice at once, and each of them may legitimately move PAID -> AUTHORISED as a result.
           // This — a succeeded DELETE, in this process — is the ONLY thing that later licenses
@@ -558,9 +610,8 @@ async function main() {
         act(`delete refund payment ${payment.PaymentID} (${payment.Amount}) on ${live.CreditNoteNumber}`)
         if (!APPLY) { stats.refundsDeleted++; continue }
         const res = await transport.request(token, 'POST', `Payments/${payment.PaymentID}`, { Status: 'DELETED' })
-        if (res.ok) {
+        if (settleWrite({ res, journal, kind: 'refund deleted', label: `${payment.PaymentID} on ${live.CreditNoteNumber}` })) {
           stats.refundsDeleted++
-          journal.recordWrite('refund deleted', `${payment.PaymentID} on ${live.CreditNoteNumber}`)
           journal.recordRelease(cnKey(live.CreditNoteID), `refund:${payment.PaymentID}`)
         } else { stats.failed++; failures.push(`refund ${payment.PaymentID} on ${live.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
       }
@@ -590,8 +641,11 @@ async function main() {
             blockers: cnBlockers(planned),
             blockerPolicy: 'released',
             releasedBlockers: released,
+            // The catch-all, at the write. Exact unless step 1 released something off this exact
+            // document — the same journal fact that widens the status set, applied to the version.
+            version: versionFor(cnKey(planned.CreditNoteID), planned.UpdatedDateUTC),
           },
-          fresh ? { id: fresh.CreditNoteID, status: fresh.Status, contactName: fresh.Contact?.Name, blockers: cnBlockers(fresh) } : null,
+          fresh ? { id: fresh.CreditNoteID, status: fresh.Status, contactName: fresh.Contact?.Name, blockers: cnBlockers(fresh), updatedDateUtc: fresh.UpdatedDateUTC } : null,
         )
         current = fresh!
       }
@@ -599,9 +653,12 @@ async function main() {
       act(`${target === 'DELETED' ? 'delete' : 'void'} credit note ${current.CreditNoteNumber} (${current.Status}, ${current.Total})`)
       if (!APPLY) { stats.creditNotesVoided++; continue }
       const res = await transport.request(token, 'POST', `CreditNotes/${current.CreditNoteID}`, { Status: target })
-      if (res.ok) {
+      if (settleWrite({
+        res, journal,
+        kind: target === 'DELETED' ? 'credit note deleted' : 'credit note voided',
+        label: current.CreditNoteNumber ?? current.CreditNoteID,
+      })) {
         stats.creditNotesVoided++
-        journal.recordWrite(target === 'DELETED' ? 'credit note deleted' : 'credit note voided', current.CreditNoteNumber ?? current.CreditNoteID)
       } else { stats.failed++; failures.push(`credit note ${current.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
     }
   }
@@ -629,8 +686,11 @@ async function main() {
             blockers: invBlockers(planned),
             blockerPolicy: 'released',
             releasedBlockers: released,
+            // Exact unless step 1 deleted an allocation that pointed AT this invoice. Most
+            // invoices in a run never get one, so most of these are the strong check.
+            version: versionFor(invKey(planned.InvoiceID), planned.UpdatedDateUTC),
           },
-          fresh ? { id: fresh.InvoiceID, status: fresh.Status, contactName: fresh.Contact?.Name, blockers: invBlockers(fresh) } : null,
+          fresh ? { id: fresh.InvoiceID, status: fresh.Status, contactName: fresh.Contact?.Name, blockers: invBlockers(fresh), updatedDateUtc: fresh.UpdatedDateUTC } : null,
         )
         current = fresh!
       }
@@ -638,9 +698,12 @@ async function main() {
       act(`${target === 'DELETED' ? 'delete' : 'void'} invoice ${current.InvoiceNumber} (${current.Status}, ${current.Total})`)
       if (!APPLY) { stats.invoicesVoided++; continue }
       const res = await transport.request(token, 'POST', `Invoices/${current.InvoiceID}`, { Status: target })
-      if (res.ok) {
+      if (settleWrite({
+        res, journal,
+        kind: target === 'DELETED' ? 'invoice deleted' : 'invoice voided',
+        label: current.InvoiceNumber ?? current.InvoiceID,
+      })) {
         stats.invoicesVoided++
-        journal.recordWrite(target === 'DELETED' ? 'invoice deleted' : 'invoice voided', current.InvoiceNumber ?? current.InvoiceID)
       } else { stats.failed++; failures.push(`invoice ${current.InvoiceNumber}: HTTP ${res.status} ${res.error}`) }
     }
   }
@@ -659,7 +722,8 @@ async function main() {
             id: planned.ContactID,
             allowedStatuses: [planned.ContactStatus],
             contactName: planned.Name,
-            updatedDateUtc: planned.UpdatedDateUTC,
+            // No step touches contacts before this one, so the catch-all is exact.
+            version: { policy: 'unchanged', updatedDateUtc: planned.UpdatedDateUTC ?? '' },
           },
           fresh ? { id: fresh.ContactID, status: fresh.ContactStatus, contactName: fresh.Name, updatedDateUtc: fresh.UpdatedDateUTC } : null,
         )
@@ -668,9 +732,8 @@ async function main() {
       act(`archive contact ${current.Name}`)
       if (!APPLY) { stats.contactsArchived++; continue }
       const res = await transport.request(token, 'POST', `Contacts/${current.ContactID}`, { ContactStatus: 'ARCHIVED' })
-      if (res.ok) {
+      if (settleWrite({ res, journal, kind: 'contact archived', label: current.Name })) {
         stats.contactsArchived++
-        journal.recordWrite('contact archived', current.Name)
       } else { stats.failed++; failures.push(`contact ${current.Name}: HTTP ${res.status} ${res.error}`) }
     }
   }
@@ -687,13 +750,24 @@ async function main() {
               `planned full-chain fixture code ${JSON.stringify(planned.Code)}. Nothing further was written.`,
           )
         }
+        // An item deletion is irreversible too, and the code is the only field the check above can
+        // see. Everything else about an item — its accounts, its tax rates, whether a real document
+        // now references it — moves UpdatedDateUTC and nothing else, which is exactly what the
+        // catch-all is for. Items have no status or contact, so those sides are empty on both.
+        assertUnchanged(
+          {
+            id: planned.ItemID,
+            allowedStatuses: [''],
+            version: { policy: 'unchanged', updatedDateUtc: planned.UpdatedDateUTC ?? '' },
+          },
+          { id: fresh.ItemID, status: '', updatedDateUtc: fresh.UpdatedDateUTC },
+        )
       }
       act(`delete item ${planned.Code}`)
       if (!APPLY) { stats.itemsDeleted++; continue }
       const res = await transport.request(token, 'DELETE', `Items/${planned.ItemID}`)
-      if (res.ok) {
+      if (settleWrite({ res, journal, kind: 'item deleted', label: planned.Code })) {
         stats.itemsDeleted++
-        journal.recordWrite('item deleted', planned.Code)
       } else {
         // Expected for any item still referenced by a (now voided) document. It is still a failure
         // to complete the plan, so it counts and the run exits non-zero.
@@ -721,13 +795,18 @@ function report(aborted: boolean, error?: unknown): number {
     failed: stats.failed,
     aborted,
     writesMade: journal.writeCount,
+    unknownWrites: journal.unknownCount,
   })
   console.log(`\n=== ${outcome.label} ===`)
   if (aborted) {
     console.log(`  ABORTED: ${error instanceof Error ? error.message : String(error)}`)
     console.log(journal.writeCount > 0
       ? `  ${journal.writeCount} irreversible write(s) had ALREADY SUCCEEDED before the run stopped. They cannot be undone.`
-      : '  Nothing had been written when the run stopped.')
+      : journal.unknownCount > 0
+        // "Nothing was written" is a claim about the live ledger, and with an unresolved request
+        // outstanding it is a claim this process is not entitled to make.
+        ? '  No write was CONFIRMED before the run stopped — but see the unknown outcome(s) below; the ledger may have changed.'
+        : '  Nothing had been written when the run stopped.')
   }
   console.log(`  allocations deleted: ${stats.allocationsDeleted}`)
   console.log(`  refund payments deleted: ${stats.refundsDeleted}`)
@@ -737,6 +816,20 @@ function report(aborted: boolean, error?: unknown): number {
   console.log(`  items deleted:       ${stats.itemsDeleted}`)
   console.log(`  skipped (already terminal): ${stats.skipped}`)
   console.log(`  failed:              ${stats.failed}`)
+  console.log(`  UNKNOWN OUTCOME:     ${journal.unknownCount}`)
+  if (stats.versionRelaxed > 0) {
+    console.log(`  written under a relaxed UpdatedDateUTC check (this run had already moved them): ${stats.versionRelaxed}`)
+  }
+  if (journal.unknownCount > 0) {
+    console.log('\nWRITES WHOSE OUTCOME IS UNKNOWN — these may or may not be in the ledger:')
+    for (const u of journal.unknownRecords) console.log(`  - ${u.kind}: ${u.label} (${u.reason})`)
+    console.log(
+      '\n  Recover by READING, not by re-running: open each object above in Xero, or re-run\n' +
+      '  scripts/audit-xero-live-e2e-footprint.ts, and compare its status against the plan in\n' +
+      `  ${PLAN_OUT}. Only once every one of them is accounted for is a new manifest — and a new\n` +
+      '  --apply — safe. Re-running against the OLD manifest would plan from a state nobody confirmed.',
+    )
+  }
   if (failures.length) {
     console.log('\nfailures:')
     for (const f of failures.slice(0, 40)) console.log(`  - ${f}`)
