@@ -109,6 +109,89 @@
  * different door. `isWordChar` now accepts every code unit ≥ 0x80, so this scanner's idea of one
  * identifier is PostgreSQL's, and no accented character can manufacture a prefix.
  *
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ * ROUND 12 — THE CHARACTER CLASSES THEMSELVES, AUDITED AGAINST A LIVE POSTGRESQL
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * Round 11 fixed the `E`-prefix class soundly by carrying position. Round 12 found two MORE
+ * accepted bypasses that had nothing to do with position — `$é$` and a bare `\r` — which makes
+ * four consecutive rounds, each defeating this scanner by a different construct. The pattern is
+ * not "one more missed case": it is that the scanner's CHARACTER CLASSES were written from
+ * memory of PostgreSQL's grammar rather than checked against it. So this round stopped guessing
+ * and MEASURED every class that decides where a literal or a comment ends, by running each
+ * payload through a real `psql` 17.11 and asking whether a top-level `COMMIT` actually executed
+ * (a stray one outside a transaction says so itself: `WARNING: there is no transaction in
+ * progress`). The comparison, and its three surprises, are recorded here so the next round starts
+ * from measurements instead of repeating them.
+ *
+ *   CLASS                     PostgreSQL (scan.l)              THIS SCANNER          VERDICT
+ *   ───────────────────────────────────────────────────────────────────────────────────────────
+ *   dolq_start                [A-Za-z\200-\377_]               [A-Za-z_]             FIXED ↓
+ *   dolq_cont                 [A-Za-z\200-\377_0-9]            [A-Za-z0-9_]          FIXED ↓
+ *   newline (ends a comment)  [\n\r]                           [\n]                  FIXED ↓
+ *   space                     [ \t\n\r\f\v]                    [ \t\r]               FIXED ↓
+ *   ident_start / ident_cont  [A-Za-z\200-\377_](0-9\$)        ≥0x80 accepted        matches
+ *   xestart                   [eE]{quote}, ONE lexeme          adjacency (round 11)  matches
+ *   xcstart / xcstop / nested  `\/\*{op_chars}*` / `\*+\/`      char-pair + depth     matches
+ *   quotecontinue             {quote}{ws_with_newline}{quote}  two separate literals equivalent
+ *   COPY end-of-data          `\.` alone, or `\.` then CR      `trimEnd() == '\.'`   FIXED ↓
+ *
+ * THE THREE SURPRISES, all of which contradicted what this file would otherwise have assumed:
+ *
+ *      (Block-comment delimiters are spelled `\/\*` and `\*\/` throughout this comment, for the
+ *      obvious reason.)
+ *
+ *   1. `\/\*\/\*` DOES nest to depth two. `xcstart` is `\/\*{op_chars}*` and both `*` and `/` are
+ *      op_chars, so it looked as though PostgreSQL would swallow `\/\*\/\*` as ONE comment-open
+ *      and close it on the first `\*\/`, leaving this scanner one level deep and swallowing real
+ *      SQL — the bypass direction. Measured: `SELECT 1; \/\*\/\* x \*\/ COMMIT; \*\/` does NOT
+ *      commit. Every block-comment variant tried (`\/\*\*\/`, `\/\*\/`, `\/\*+ hint \*\/`,
+ *      `\/\* x \*\*\*\/`, nested) agrees with this scanner. NOTHING WAS CHANGED HERE, on
+ *      evidence rather than on assumption.
+ *
+ *   2. A METACOMMAND DOES NOT END AT A BARE `\r`, even though a line COMMENT does. The two are
+ *      different mechanisms: the lexer's `newline` class is `[\n\r]`, but psql's line reader
+ *      (`pg_get_line`) splits on `\n` alone. Measured: `\echo AAA\rSELECT 2;` prints
+ *      `AAA SELECT 2;` — the CR was argument whitespace, not a terminator. So the metacommand
+ *      scan below still runs to the next `\n`, and `\r` was NOT added to it. Had this been
+ *      "fixed" for symmetry with the comment rule, a metacommand line would have ended early and
+ *      the remainder would have been lexed as SQL that psql never executes.
+ *
+ *   3. COPY DATA IS LINE-ORIENTED ON `\n` ONLY, and its end-of-data marker is exact. Measured:
+ *      `\. ` (one trailing space) is NOT a terminator — psql reads on to EOF — and neither is
+ *      `\.<CR>JUNK`; but `\.` followed by CR is. `trimEnd()` accepted all of them.
+ *
+ * WHAT CHANGED, and why each change is in the direction the header's rule permits:
+ *
+ *   • DOLLAR-QUOTE TAGS ARE NOW PostgreSQL's CLASSES EXACTLY, high bytes included. This one
+ *     WIDENS what gets swallowed (a dollar body is skipped wholesale), so by the rule above it
+ *     has to be exact — and it is, both against `scan.l` and against psql. It also had to change:
+ *     FAILING to recognise a tag is not the safe direction here, which is the trap in the
+ *     round-12 payload `SELECT $é$ '$é$; COMMIT; -- ' ;`. Not recognising `$é$` did not make the
+ *     scanner read the body as harmless SQL — it made the `'` inside the body OPEN A STRING that
+ *     ran on and swallowed the genuinely top-level `COMMIT` after it. A missed quoting construct
+ *     desynchronises the scanner in whichever direction the file's author chooses, so "we simply
+ *     won't recognise it" is never a fallback. REFUSING is the fallback, which is why an
+ *     unresolvably long tag is now rejected rather than skipped.
+ *
+ *   • THE 128-CHARACTER TAG WINDOW IS GONE. It was a guess about how much input to hold back, and
+ *     it was WRONG IN THE ACCEPTING DIRECTION: a tag longer than the window that straddled a
+ *     chunk boundary was abandoned mid-tag and its body re-lexed as SQL, exactly as in the
+ *     accented case. Production reads 64 KiB chunks, so this was reachable on any dump with a
+ *     >128-character dollar tag. It is replaced by a scan over the real tag classes that holds
+ *     only while the tag is genuinely unfinished, with a bound that REFUSES rather than guesses.
+ *     Found by parameterising the fixtures over chunk size; a single whole-string scan accepts
+ *     this payload and a single whole-string scan is what the old tests did.
+ *
+ *   • `\r` IS A NEWLINE WHERE PostgreSQL SAYS IT IS — it ends a line comment — and CRLF counts as
+ *     one line, not two. This only NARROWS what is swallowed, so it may be (and is) loose.
+ *
+ *   • `atLineStart` IS DELIBERATELY *NOT* SET BY A BARE `\r`, though psql does recognise a
+ *     metacommand there. Modelling psql's argument parsing exactly is a widening decision this
+ *     file would then have to prove; refusing every backslash after a bare CR needs no proof and
+ *     costs only a CR-only dump containing `\restrict`, which pg_dump does not emit. CRLF is
+ *     unaffected: the `\n` still opens a line.
+ *
  * ═══ WHAT THIS CATCHES ═══
  *   • transaction control as a top-level statement, in any case and any whitespace/comment layout,
  *     including several on one line and one split across lines;
@@ -206,6 +289,16 @@ const ALLOWED_SET_CONFIG_TARGET = 'SEARCH_PATH'
 const MAX_STATEMENT_WORDS = 32
 const MAX_STATEMENT_LITERALS = 4
 const MAX_LITERAL_CHARS = 64
+/**
+ * How long a dollar-quote tag may be before the scanner gives up and refuses the file (round 12).
+ *
+ * PostgreSQL imposes no limit, but `carry` holds an unfinished tag across chunks, so SOME bound is
+ * needed or a crafted file could buffer without end. The bound only applies to a tag still
+ * unfinished at the end of the available input; a long tag that arrives complete is accepted
+ * normally. It replaces a 128-character window that silently ABANDONED the tag instead of
+ * refusing, which was itself a bypass at chunk sizes that straddled a long tag.
+ */
+const MAX_DOLLAR_TAG_CHARS = 256
 
 export class RestoreSqlRejected extends Error {
   readonly line: number
@@ -289,6 +382,25 @@ export function createRestoreSqlScanner() {
    */
   function isWordChar(c: string): boolean {
     return /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) >= 0x80
+  }
+
+  /**
+   * PostgreSQL's `dolq_start` — `[A-Za-z\200-\377_]`. NOT the same class as `ident_start`: a
+   * dollar-quote tag may not begin with a digit (`$1$` is the parameter `$1` followed by a stray
+   * `$`, which psql confirms), and `$` itself is excluded because it terminates the tag.
+   */
+  function isDollarTagStart(c: string): boolean {
+    return /[A-Za-z_]/.test(c) || c.charCodeAt(0) >= 0x80
+  }
+
+  /**
+   * PostgreSQL's `dolq_cont` — `[A-Za-z\200-\377_0-9]`. Digits are allowed after the first
+   * character; `$` still is not. The high-byte range is the half round 12 was missing: without it
+   * `$é$` was not read as a delimiter at all, and the `'` inside its body opened a string that
+   * swallowed the following top-level `COMMIT`.
+   */
+  function isDollarTagCont(c: string): boolean {
+    return /[A-Za-z0-9_]/.test(c) || c.charCodeAt(0) >= 0x80
   }
 
   /** `endAbs` is the absolute offset one past this token's last character. */
@@ -413,6 +525,30 @@ export function createRestoreSqlScanner() {
     while (i < limit) {
       const c = text[i]
 
+      // PostgreSQL's `newline` class is `[\n\r]` and `non_newline` is `[^\n\r]`, so a bare CR ends
+      // a `--` line comment exactly as LF does (round 12). Only LF did, and `-- x\rCOMMIT;` was
+      // therefore swallowed whole while psql executed the COMMIT.
+      //
+      // COPY data is excluded on purpose and is NOT a symmetry gap: psql reads COPY data with
+      // `pg_get_line`, which splits on `\n` alone, so a CR there is ordinary data. Measured, not
+      // assumed — see the round-12 notes in the header.
+      if (c === '\r' && state.kind !== 'copy-data') {
+        // A CR at the very end of the input may be the first half of a CRLF; hold it back so the
+        // pair is always counted as one line rather than two.
+        if (i + 1 >= limit) { hold(i); return }
+        line += 1
+        if (state.kind === 'line-comment') state = { kind: 'sql' }
+        if (text[i + 1] === '\n') {
+          // CRLF: the LF is what psql's line reader splits on, so this does open a new line.
+          atLineStart = true
+          i += 2
+        } else {
+          // A bare CR deliberately does NOT open a line for metacommand purposes. See round 12.
+          i += 1
+        }
+        continue
+      }
+
       if (c === '\n') {
         line += 1
         atLineStart = true
@@ -434,7 +570,12 @@ export function createRestoreSqlScanner() {
             hold(i)
             return
           }
-          if (lineText.trimEnd() === '\\.') {
+          // psql's end-of-data marker is the line `\.`, optionally with a trailing CR (a CRLF
+          // dump). It is EXACT: measured against psql 17.11, `\. ` with one trailing space is not
+          // a terminator and neither is `\.<CR>JUNK` — psql reads on to EOF in both cases.
+          // `trimEnd()` accepted all of them, which ended the data block early and lexed the rest
+          // of the data as SQL.
+          if (lineText === '\\.' || lineText === '\\.\r') {
             state = { kind: 'sql' }
             resetStatement()
           }
@@ -544,7 +685,11 @@ export function createRestoreSqlScanner() {
         }
 
         case 'sql': {
-          if (c === ' ' || c === '\t' || c === '\r') { i += 1; continue }
+          // PostgreSQL's `space` is `[ \t\n\r\f\v]`. CR and LF are handled above; form feed and
+          // vertical tab were previously falling through to the token push at the bottom of this
+          // case, which is harmless (a token breaks prefix adjacency exactly as whitespace does)
+          // but is not what PostgreSQL calls them.
+          if (c === ' ' || c === '\t' || c === '\f' || c === '\v') { i += 1; continue }
 
           // A psql metacommand is only a metacommand at the start of a line, in SQL context.
           if (c === '\\') {
@@ -617,18 +762,38 @@ export function createRestoreSqlScanner() {
           }
 
           if (c === '$') {
-            // A dollar quote opens as `$tag$`; `$1` is a parameter and `$` alone is not special.
-            const rest = text.slice(i)
-            const match = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(rest)
-            if (match) {
-              state = { kind: 'dollar', tag: match[0] }
-              pushToken('C:$', base + i + match[0].length)
-              i += match[0].length
+            // A dollar quote opens as `$tag$`, where the tag is `dolq_start dolq_cont*` or empty;
+            // `$1` is a parameter and a bare `$` is not special. Scanned against PostgreSQL's own
+            // classes rather than matched with an ASCII regex — see round 12 in the header.
+            let j = i + 1
+            if (j < limit && isDollarTagStart(text[j])) {
+              j += 1
+              while (j < limit && isDollarTagCont(text[j])) j += 1
+            }
+            if (j >= limit) {
+              // The tag runs to the end of the input we have, so it may continue into the next
+              // chunk. Hold it back rather than guess — but only within a bound, because `carry`
+              // is the one place input accumulates. Beyond the bound the construct is
+              // unresolvable, and an unresolvable construct is REFUSED, never skipped: skipping a
+              // tag re-lexes its body as SQL, which is how the round-12 payload hid its COMMIT.
+              if (j - i > MAX_DOLLAR_TAG_CHARS) {
+                reject(
+                  'Restore file contains a dollar-quote tag too long for this check to resolve, so '
+                  + 'the end of the quoted block cannot be located and the file cannot be checked '
+                  + 'for transaction control',
+                )
+              }
+              hold(i)
+              return
+            }
+            if (text[j] === '$') {
+              state = { kind: 'dollar', tag: text.slice(i, j + 1) }
+              pushToken('C:$', base + j + 1)
+              i = j + 1
               continue
             }
-            // Could be a tag straddling the chunk boundary — only if there is no newline after it,
-            // since a dollar-quote tag cannot contain one.
-            if (!rest.includes('\n') && rest.length < 128) { hold(i); return }
+            // Not a delimiter. PostgreSQL's `dolqfailed` rule throws back everything but the
+            // leading `$` and treats that as an ordinary character, so this does the same.
             pushToken('C:$', base + i + 1)
             i += 1
             continue

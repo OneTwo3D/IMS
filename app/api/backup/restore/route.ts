@@ -569,13 +569,42 @@ export type RestoreLockContext = {
  * writes, and the round-10 recovery was weaker than it read — which is worse than an outright gap,
  * because the next person to touch this path would have trusted it.
  *
- * WHAT IS THEREFORE CLAIMED HERE, and nothing beyond it:
+ * ROUND 12, FINDING 4 — AND THE SECOND CONSECUTIVE ROUND IN WHICH THIS CLAIM WAS WRONG.
+ *
+ * Round 11 rewrote the sentence above after measuring the flag's readers, and it was STILL false:
+ * it said "inbound connector webhooks" are fenced. They are not. Only the WooCommerce ones are.
+ *
+ * The measurement was taken the wrong way round. Enumerating `getMaintenanceModeResponse` callers
+ * answers "what consults the flag?", which can only ever confirm the things that do — it cannot
+ * name an entry point that does not, because such a route contains nothing to grep for. The
+ * inventory has to start from the ROUTES and classify each one. Doing that:
+ *
+ *   app/api/webhooks/shopping/[connector]/[resource]  → FENCED only for `woocommerce`. The route
+ *       itself never reads the flag; `handleShoppingWebhook` dispatches on the connector and only
+ *       `handleWcWebhook` checks it (first thing it does, before any write). A `shopify` delivery
+ *       to the same route reaches `lib/connectors/shopify` unfenced — currently a 501 stub, so it
+ *       is not a live writer, but it is not fenced either and will not become fenced by itself.
+ *   app/api/webhooks/mintsoft/asn-booked-in            → NOT FENCED. Persists via
+ *       `persistMintsoftWebhookEvent` with no maintenance check anywhere on the path.
+ *   app/api/webhooks/shiphero/[event]                  → NOT FENCED. Persists via
+ *       `persistShipheroWebhookEvent` with no maintenance check anywhere on the path.
+ *   app/api/accounting/callback                        → NOT FENCED. An inbound OAuth callback
+ *       that writes credentials and activity rows.
+ *
+ * So two inbound webhook entry points write to the database throughout a held restore. That is
+ * recorded as a GAP rather than closed here: fencing them is a change to live connector ingress
+ * with its own durability question (a fenced WooCommerce delivery is retried by WooCommerce; a
+ * dropped Mintsoft ASN may not be), and it does not belong in a restore-atomicity change. What
+ * does belong here is that the operator is not told they are stopped when they are not.
+ *
+ * WHAT IS THEREFORE CLAIMED, and nothing beyond it:
  *   • HELD: the accounting connector-selection advisory lock, on a leaked session. That serializes
  *     the writers inventoried in tests/accounting/plugin-selection-lock.test.ts and no others.
- *   • FENCED: scheduled jobs and inbound connector webhooks, by maintenance mode.
- *   • NOT FENCED: interactive writes from the dashboard, other API routes, and anything holding a
- *     direct database connection. The operator has to take the application out of service to stop
- *     those; the message below says so in those words rather than implying it is already down.
+ *   • FENCED: scheduled jobs (`app/api/cron/*`), and WooCommerce webhooks only.
+ *   • NOT FENCED: the Mintsoft and ShipHero webhook routes, the accounting OAuth callback,
+ *     interactive writes from the dashboard, other API routes, and anything holding a direct
+ *     database connection. The operator has to take the application out of service to stop those;
+ *     the message below says so in those words rather than implying it is already down.
  *
  * AND THE RECOVERY IS NOT "RESTART". Restarting drops the holder's session, which RELEASES the
  * advisory lock — the one protection that is real — while the restore backend may still be
@@ -592,6 +621,20 @@ export const MAINTENANCE_MODE_REACH = {
   fenced: ['app/api/cron/*', 'lib/connectors/woocommerce/webhooks.ts'] as const,
   /** Everything else, stated so it cannot be quietly assumed. */
   notFenced: ['app/actions/* (interactive server actions)', 'all other app/api/* routes'] as const,
+  /**
+   * INBOUND WEBHOOK ENTRY POINTS, classified individually (round 12, finding 4).
+   *
+   * Kept separate from `fenced`/`notFenced` because those are stated as path GLOBS, and a glob is
+   * exactly what hid this: `app/api/webhooks/shopping/[connector]/[resource]` is fenced for one
+   * connector and not for another, which no glob can express. Enumerated from the route files, so
+   * a new webhook route that is not listed here fails the test that pins this.
+   */
+  inboundWebhooks: [
+    { route: 'app/api/webhooks/shopping/[connector]/[resource]', fenced: 'woocommerce-only' },
+    { route: 'app/api/webhooks/mintsoft/asn-booked-in', fenced: 'no' },
+    { route: 'app/api/webhooks/shiphero/[event]', fenced: 'no' },
+    { route: 'app/api/accounting/callback', fenced: 'no' },
+  ] as const,
   /** There is no UI for the flag: clearing it after a held restore is a database operation. */
   hasOperatorControl: false,
 } as const
@@ -981,9 +1024,11 @@ export async function runRestore(
           + `${outcome.error ? ` (${outcome.error})` : ''}. Backend pid ${identified.identity.pid}, `
           + `started ${identified.identity.backendStart}, may still be writing. `
           + 'The connector-selection lock is being HELD, not released, so connector-selection '
-          + 'changes and orphaned-sync cancellation cannot interleave with it. Scheduled jobs and '
-          + 'inbound webhooks are stopped by maintenance mode. INTERACTIVE WRITES FROM THE '
-          + 'DASHBOARD ARE NOT STOPPED BY ANYTHING — take the application out of service. Do NOT '
+          + 'changes and orphaned-sync cancellation cannot interleave with it. Scheduled jobs '
+          + '(app/api/cron/*) and WooCommerce webhooks are stopped by maintenance mode. THE '
+          + 'MINTSOFT AND SHIPHERO WEBHOOK ROUTES, THE ACCOUNTING OAUTH CALLBACK AND ALL '
+          + 'INTERACTIVE WRITES FROM THE DASHBOARD ARE NOT STOPPED BY ANYTHING — take the '
+          + 'application out of service to stop those. Do NOT '
           + 'restart yet: restarting releases the held lock. Confirm in pg_stat_activity that pid '
           + `${identified.identity.pid} with backend_start ${identified.identity.backendStart} is gone `
           + '(terminate it if not), then restart, then clear maintenance mode — it is the '
@@ -1274,16 +1319,35 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       // flag stays on — but ONLY those two things are held off by it (MAINTENANCE_MODE_REACH), and
       // the error the operator receives says so rather than implying the application is down.
       const backendUnconfirmed = error instanceof RestoreBackendNotConfirmedError
-      const message = redactRestoreErrorMessage(error instanceof Error ? error.message : String(error), resolvedDeps.env)
-      await resolvedDeps.log({
-        entityType: 'SYSTEM',
-        tag: 'system',
-        action: 'backup_restored',
-        level: 'ERROR',
-        metadata: backendUnconfirmed ? { error: message, backendUnconfirmed: true, maintenanceModeHeld: true } : { error: message },
-        description: `Failed to restore backup: ${message}`,
-      })
+
+      // ROUND 12, FINDING 3. THE DECISION TO HOLD THE GATE IS MADE BEFORE ANY FALLIBLE AWAIT.
+      //
+      // This assignment used to sit AFTER the failure audit below. The audit is a write to the
+      // database — the same database whose restore has just failed with a backend that may still
+      // be attached to it — so it is one of the LIKELIEST things to reject on this exact path. If
+      // it did, control left the catch for the `finally` with `holdMaintenance` still false, and
+      // the gate was switched off while the restore backend was unconfirmed: the one deliberate
+      // protection this branch exists to apply, discarded because a log line could not be written.
+      //
+      // A protective decision must never be downstream of the thing it is protecting against.
       if (backendUnconfirmed) holdMaintenance = true
+
+      const message = redactRestoreErrorMessage(error instanceof Error ? error.message : String(error), resolvedDeps.env)
+      try {
+        await resolvedDeps.log({
+          entityType: 'SYSTEM',
+          tag: 'system',
+          action: 'backup_restored',
+          level: 'ERROR',
+          metadata: backendUnconfirmed ? { error: message, backendUnconfirmed: true, maintenanceModeHeld: true } : { error: message },
+          description: `Failed to restore backup: ${message}`,
+        })
+      } catch {
+        // BEST-EFFORT ON THIS PATH ONLY. A rejected audit write must not replace the caller's
+        // diagnosis with a generic 500 (which is what an exception escaping this catch produced),
+        // and must not change what happens to maintenance mode. The restore failure is the fact
+        // worth reporting; the record of it failing to be recorded is not worth losing it over.
+      }
       return NextResponse.json({ error: `Restore failed: ${message.slice(0, 200)}` }, { status: 500 })
     } finally {
       // Unconditional EXCEPT for the unconfirmed-backend case: a failed `enableMaintenance` may

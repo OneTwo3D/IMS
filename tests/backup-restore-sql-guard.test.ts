@@ -85,6 +85,73 @@ function chunkedVerdict(sql: string, size = 1): string {
   }
 }
 
+// ---------------------------------------------------------------------------
+// ROUND 12 — THE HARNESS ITSELF WAS THE REASON THESE KEPT GETTING THROUGH.
+//
+// Four rounds in a row found a fresh bypass of this lexer, and every one of them was ACCEPTED by
+// the tests above before it was reported. That is a statement about the fixtures, not about the
+// payloads: the fixtures fed each input exactly twice — whole, and one character at a time — and
+// both of those happen to be the framings a streaming lexer is LEAST likely to get wrong.
+//
+// The two failure modes are different, and it is worth being exact about which harness gap each
+// one exposes, because only one of them is fixed by more framings:
+//
+//   • `$é$` and the bare `\r` are accepted UNANIMOUSLY — whole, at size 1, and at every size in
+//     between. No amount of chunking finds them. What finds them is comparing the verdict against
+//     what PostgreSQL ACTUALLY DOES, which is why the fixtures below carry a measured `pgCommits`
+//     rather than an expectation written from the grammar.
+//
+//   • The long dollar tag is a genuine framing DISAGREEMENT: reverting the fix accepts it at chunk
+//     sizes 1-104 and refuses it whole. The old two-framing comparison would have caught that —
+//     but only if someone had already written a 200-character dollar tag into the corpus. It
+//     never was, because the payload has to be guessed before the framing matters.
+//
+// So the framing is now EXHAUSTIVE rather than sampled, and the assertion is unanimity: one
+// verdict across every possible split, not agreement between two of them. That turns "someone
+// must guess both the payload and the chunk size" into "any framing-dependent construct fails on
+// whatever payload does reach the corpus" — a real narrowing of the gap, and not a claim to have
+// closed it, since the unanimous cases above show framing is not where these mostly live.
+// ---------------------------------------------------------------------------
+
+/**
+ * The verdict at EVERY chunk size from 1 to the whole input, plus the whole input in one push.
+ *
+ * Returns the single agreed verdict, or throws with the disagreement — a scanner whose answer
+ * depends on how the file happened to be read is broken whichever answer is the right one, and the
+ * disagreement is the interesting failure, so it is reported rather than collapsed.
+ */
+function unanimousVerdict(sql: string): string {
+  const byVerdict = new Map<string, number[]>()
+  const record = (v: string, size: number) => {
+    const sizes = byVerdict.get(v)
+    if (sizes === undefined) byVerdict.set(v, [size])
+    else if (sizes.length < 6) sizes.push(size)
+  }
+  record(verdict(sql), 0)
+  for (let size = 1; size <= sql.length; size += 1) record(chunkedVerdict(sql, size), size)
+  if (byVerdict.size === 1) return [...byVerdict.keys()][0]
+  const detail = [...byVerdict.entries()]
+    .map(([v, sizes]) => `  at chunk sizes ${sizes.join(',')}${sizes.length >= 6 ? ',…' : ''} (0 = whole): ${v}`)
+    .join('\n')
+  throw new assert.AssertionError({
+    message: `the verdict depends on chunk size for ${JSON.stringify(sql.slice(0, 60))}\n${detail}`,
+  })
+}
+
+/** LF is what pg_dump emits; CRLF and bare CR are what a file that has been through Windows is. */
+const asCrlf = (sql: string) => sql.replace(/\n/g, '\r\n')
+const asCr = (sql: string) => sql.replace(/\n/g, '\r')
+
+/**
+ * A payload with its MEASURED PostgreSQL behaviour.
+ *
+ * `pgCommits` is not an opinion about the grammar: each of these was run through a live
+ * `psql` 17.11 and classified by whether a top-level `COMMIT` actually executed, which a stray one
+ * announces itself (`WARNING: there is no transaction in progress`). Four rounds of arguing from
+ * a remembered `scan.l` produced four bypasses, so the ground truth here is the server's.
+ */
+type Measured = { name: string; sql: string; pgCommits: boolean }
+
 test('a realistic pg_dump file is ACCEPTED, including every place BEGIN/COMMIT legitimately appears', () => {
   assert.equal(verdict(REALISTIC_DUMP), 'accepted')
 })
@@ -424,4 +491,207 @@ test('the U& refusal is deliberately LOOSE, because its outcome is a refusal', (
   assert.match(verdict("SELECT u\n&\n'x';"), /Unicode-escape/)
   // ...but an identifier merely ENDING in `u` is still not the prefix.
   assert.equal(verdict("SELECT menu & 'x'; SELECT 1;"), 'accepted')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-osl8 ROUND 12 — THE CHARACTER CLASSES, AUDITED AGAINST A LIVE POSTGRESQL.
+//
+// Rounds 9, 10 and 11 each fixed a rule about WHERE a construct ends. Round 12's two findings are
+// about WHICH CHARACTERS a construct is made of, which is the layer underneath: `$é$` is a
+// dollar-quote delimiter and a bare `\r` ends a line comment, and this scanner believed neither.
+//
+// The tests below assert against MEASURED PostgreSQL behaviour rather than against a reading of
+// the grammar. Every `pgCommits: true` case was confirmed to execute a top-level COMMIT under
+// psql 17.11, and every `pgCommits: false` case was confirmed not to; the scanner must refuse the
+// first kind and is free to accept the second.
+// ---------------------------------------------------------------------------
+
+/**
+ * WHY A MISSED QUOTING CONSTRUCT IS NOT THE SAFE DIRECTION.
+ *
+ * The instinct is that failing to recognise `$é$` just means the body gets read as SQL, and SQL
+ * that does not parse gets refused. That is not what happens. The body is chosen by whoever wrote
+ * the file, so it contains a single `'` — and the scanner, not being in a dollar-quote, opens a
+ * STRING there. That string runs past the end of the real dollar-quoted literal and swallows the
+ * genuinely top-level `COMMIT` that follows it.
+ *
+ * This is the shape of all four rounds' payloads, and it is why "the scanner will just not
+ * recognise it" is never an argument for leaving a class wrong.
+ */
+const NON_ASCII_DOLLAR_TAG = "SELECT $\u00e9$ '$\u00e9$; COMMIT; -- ' ;\nSELECT 1;\n"
+
+test('a non-ASCII dollar-quote tag cannot hide a top-level COMMIT', () => {
+  // PostgreSQL's `dolq_start`/`dolq_cont` are [A-Za-z\200-\377_] and [A-Za-z\200-\377_0-9]: EVERY
+  // high byte is a tag character. This scanner matched an ASCII-only regex, so `$é$` was not a
+  // delimiter to it, and the `'` inside the body opened a string that swallowed the COMMIT.
+  // Measured under psql 17.11: this payload DOES execute a top-level COMMIT.
+  assert.match(unanimousVerdict(NON_ASCII_DOLLAR_TAG), /transaction control/)
+
+  // Every position a high byte can occupy in a tag, since the two classes are different.
+  assert.match(unanimousVerdict("SELECT $a\u00e9b$ '$a\u00e9b$; COMMIT; -- ' ;\n"), /transaction control/, 'high byte in dolq_cont')
+  assert.match(unanimousVerdict("SELECT $\u00f1$ '$\u00f1$; COMMIT; -- ' ;\n"), /transaction control/, 'a different high byte')
+  assert.match(unanimousVerdict("SELECT $\u{1d51e}$ '$\u{1d51e}$; COMMIT; -- ' ;\n"), /transaction control/, 'astral char = two code units, both >= 0x80')
+
+  // ...and a non-ASCII tag in ORDINARY use is still a dollar-quoted body, so the fix recognises
+  // the construct rather than merely refusing anything with a high byte near a `$`.
+  assert.equal(unanimousVerdict('CREATE FUNCTION f() RETURNS void AS $caf\u00e9$ SELECT 1; $caf\u00e9$;\nSELECT 1;\n'), 'accepted')
+  assert.match(
+    verdict('CREATE FUNCTION f() RETURNS void AS $caf\u00e9$ SELECT 1; $caf\u00e9$;\nCOMMIT;\n'),
+    /transaction control/,
+    'and the scan resynchronises after it',
+  )
+  // A `BEGIN`/`COMMIT` inside such a body is still function source, not transaction control.
+  assert.equal(verdict('CREATE FUNCTION f() RETURNS trigger AS $caf\u00e9$\nBEGIN\n  COMMIT;\nEND;\n$caf\u00e9$;\n'), 'accepted')
+})
+
+test('the dollar-quote tag classes match PostgreSQL exactly, in both directions', () => {
+  // Each of these was measured under psql 17.11. `$1$` is NOT a tag — `$1` is a parameter — so
+  // PostgreSQL puts the COMMIT inside the following plain literal and never executes it; the
+  // scanner is therefore right to accept. Getting that one wrong in the other direction would
+  // refuse dumps for no reason.
+  const measured: Measured[] = [
+    { name: 'empty tag', sql: "SELECT $$ '$$; COMMIT; -- ' ;\n", pgCommits: true },
+    { name: 'ascii tag', sql: "SELECT $tag$ '$tag$; COMMIT; -- ' ;\n", pgCommits: true },
+    { name: 'underscore start', sql: "SELECT $_q$ '$_q$; COMMIT; -- ' ;\n", pgCommits: true },
+    { name: 'digit in dolq_cont', sql: "SELECT $a1$ '$a1$; COMMIT; -- ' ;\n", pgCommits: true },
+    { name: 'high byte in dolq_start', sql: "SELECT $\u00e9$ '$\u00e9$; COMMIT; -- ' ;\n", pgCommits: true },
+    // `$` is in `ident_cont` but NOT in `dolq_cont`, so `$a$b$` is the tag `$a$` and then `b$`.
+    { name: '$ is not a tag char', sql: "SELECT $a$b$ '$a$b$; COMMIT; -- ' ;\n", pgCommits: true },
+    // dolq_start excludes digits, so this is the parameter `$1` and the COMMIT ends up in a string.
+    { name: 'digit START is a parameter', sql: "SELECT $1$ '$1$; COMMIT; -- ' ;\n", pgCommits: false },
+    // A hyphen is in neither class, so `$a-b$` is not a delimiter either.
+    { name: 'hyphen is not a tag char', sql: "SELECT $a-b$ '$a-b$; COMMIT; -- ' ;\n", pgCommits: false },
+  ]
+  for (const { name, sql, pgCommits } of measured) {
+    const v = unanimousVerdict(sql)
+    if (pgCommits) assert.match(v, /transaction control/, `PostgreSQL commits here, so the scanner must SEE that COMMIT — not merely refuse the file for some other reason: ${name}`)
+    else assert.equal(v, 'accepted', `PostgreSQL hides the COMMIT here, so refusing it is a false reject: ${name}`)
+  }
+})
+
+test('a dollar-quote tag longer than the scanner can hold is REFUSED, not abandoned mid-tag', () => {
+  // THE BYPASS THE OLD HARNESS COULD NOT EXPRESS. The scanner used to hold back a straddling tag
+  // only while the remaining text was under 128 characters; past that it gave up, emitted the `$`
+  // as an ordinary character and carried on — abandoning the tag, which is the same
+  // desynchronisation as not recognising `$é$`.
+  //
+  // Reverting the fix accepts this at chunk sizes 1-104 and refuses it whole, so it is a framing
+  // DISAGREEMENT rather than a uniform miss — the kind `unanimousVerdict` reports by construction.
+  // Production reads 64 KiB chunks, which puts it squarely in the accepting band whenever such a
+  // tag straddles a read boundary. Measured under psql 17.11: a 200-character tag is a perfectly
+  // ordinary dollar quote and this payload DOES execute a top-level COMMIT.
+  const tag = `$${'z'.repeat(200)}$`
+  assert.match(unanimousVerdict(`SELECT ${tag} '${tag}; COMMIT; -- ' ;\n`), /transaction control/)
+
+  // The bound refuses rather than guesses: a tag that never terminates cannot be resolved, so the
+  // file is refused with a diagnosis instead of being scanned in the wrong state.
+  assert.match(verdict(`SELECT $${'z'.repeat(400)}`), /dollar-quote tag too long/)
+
+  // ...and a long tag that DOES terminate is still an ordinary dollar quote, at every framing.
+  assert.equal(unanimousVerdict(`SELECT ${tag} SELECT 1; ${tag};\nSELECT 2;\n`), 'accepted')
+})
+
+test('a bare CR ends a line comment, exactly as PostgreSQL says it does', () => {
+  // PostgreSQL's `newline` class is [\n\r] and `non_newline` is [^\n\r], so `--` runs to EITHER.
+  // Only LF ended a line comment here, so the comment swallowed the rest of a CR-terminated file
+  // while psql ended it at the CR and executed the COMMIT. Measured under psql 17.11: this commits.
+  assert.match(unanimousVerdict('SELECT 1; -- comment\rCOMMIT;\r'), /transaction control/)
+  assert.match(unanimousVerdict('SELECT 1; -- comment\rCOMMIT;\n'), /transaction control/)
+  // CRLF worked only by accident — the LF arrived immediately after the CR — so it is pinned too.
+  assert.match(unanimousVerdict('SELECT 1; -- comment\r\nCOMMIT;\r\n'), /transaction control/)
+  // A CR-only file with no comment at all: the statement split must still be found.
+  assert.match(unanimousVerdict('SELECT 1;\rCOMMIT;\r'), /transaction control/)
+
+  // A COMMIT that is genuinely still inside the comment stays hidden, so this narrows the comment
+  // rather than abandoning it. Form feed and vertical tab are `space` in PostgreSQL, NOT `newline`.
+  assert.equal(unanimousVerdict('SELECT 1; -- comment\fCOMMIT;\n'), 'accepted')
+  assert.equal(unanimousVerdict('SELECT 1; -- comment\vCOMMIT;\n'), 'accepted')
+  assert.equal(unanimousVerdict('SELECT 1; -- comment COMMIT;\nSELECT 2;\n'), 'accepted')
+})
+
+test('a CR inside a literal is content, not a terminator', () => {
+  // The other direction of the same change: making CR a newline must not make it end a string.
+  assert.match(unanimousVerdict("SELECT 'a\rb'; COMMIT;\n"), /transaction control/)
+  assert.equal(unanimousVerdict("SELECT 'a\rb'; SELECT 2;\n"), 'accepted')
+  assert.equal(unanimousVerdict('SELECT $q$a\rb$q$; SELECT 2;\n'), 'accepted')
+  assert.equal(unanimousVerdict('SELECT "a\rb" FROM t; SELECT 2;\n'), 'accepted')
+  // ...and it must not end a BLOCK comment either, which has no newline rule at all.
+  assert.equal(unanimousVerdict('SELECT 1; /* a\rCOMMIT; */ SELECT 2;\n'), 'accepted')
+})
+
+test('a whole dump keeps its verdict under every line-ending convention', () => {
+  // Parameterising over line endings rather than testing one payload per ending: the point is that
+  // the convention is not supposed to be able to change an answer, so it is asserted as a property.
+  const cases: [string, string][] = [
+    ['accepted', 'SELECT 1;\nSELECT 2;\n'],
+    ['accepted', 'SELECT 1;\n-- COMMIT; in a comment\nSELECT 2;\n'],
+    ['refused', 'SELECT 1;\nCOMMIT;\n'],
+    ['refused', 'SELECT 1;\n-- c\nCOMMIT;\n'],
+    ['refused', 'CREATE FUNCTION f() RETURNS void AS $a$ SELECT 1; $a$;\nCOMMIT;\n'],
+    ['accepted', 'CREATE FUNCTION f() RETURNS void AS $a$\nBEGIN\nCOMMIT;\nEND;\n$a$;\n'],
+  ]
+  for (const [expected, lf] of cases) {
+    for (const [ending, sql] of [['LF', lf], ['CRLF', asCrlf(lf)], ['CR', asCr(lf)]] as const) {
+      const v = unanimousVerdict(sql)
+      const got = v === 'accepted' ? 'accepted' : 'refused'
+      assert.equal(got, expected, `${ending} changed the verdict for ${JSON.stringify(lf.slice(0, 40))}: ${v}`)
+    }
+  }
+})
+
+test('a CRLF pg_dump is accepted; a CR-only one is refused for its metacommands, deliberately', () => {
+  // pg_dump emits LF, but a dump that has been through a Windows editor arrives as CRLF and must
+  // still restore — CRLF is the case a naive "CR is a newline" change would break, because the
+  // `\restrict` line then ends in a CR the metacommand pattern has to tolerate.
+  assert.equal(verdict(asCrlf(REALISTIC_DUMP)), 'accepted')
+  assert.equal(chunkedVerdict(asCrlf(REALISTIC_DUMP)), 'accepted')
+
+  // A CR-ONLY file is refused, and this is a CHOICE rather than an oversight. psql does recognise
+  // a metacommand after a bare CR, but modelling its argument parsing exactly is a widening
+  // decision; refusing every backslash after a bare CR needs no proof and costs only a CR-only
+  // dump containing `\restrict`, which pg_dump does not emit. Asserted so the choice is visible
+  // and a future round does not "fix" it without noticing the widening.
+  assert.match(verdict(asCr(REALISTIC_DUMP)), /backslash/)
+
+  // ...and a CR-only file with no metacommands is scanned normally, so the refusal above is about
+  // the backslash rule and not about CR-only input as such.
+  assert.equal(unanimousVerdict(asCr('SELECT 1;\nSELECT 2;\n')), 'accepted')
+})
+
+test("the COPY end-of-data marker is psql's, exactly", () => {
+  // Measured under psql 17.11: `\.` alone ends the data, and `\.` followed by CR does; `\. ` with
+  // one trailing space does NOT (psql reads on to EOF), and neither does `\.<CR>JUNK`. The
+  // previous rule was `trimEnd() === '\\.'`, which ended the block on all of them and then lexed
+  // the remaining DATA as SQL.
+  const copy = (term: string) => `COPY t (a) FROM stdin;\nrow1\n${term}\nCOMMIT;\n`
+  assert.match(verdict(copy('\\.')), /transaction control/, 'the block ends, so the COMMIT after it is top level')
+  assert.match(verdict(copy('\\.\r')), /transaction control/, 'CRLF dumps end their data block too')
+  assert.match(verdict(copy('\\. ')), /unterminated COPY/, 'a trailing space is not psql\'s marker')
+  assert.match(verdict(copy('\\.\rJUNK')), /unterminated COPY/, 'nor is a CR with anything after it')
+  assert.match(verdict(copy(' \\.')), /unterminated COPY/, 'nor is an indented one')
+  // COPY data is still \n-oriented: a bare CR inside it is data, not a line break.
+  assert.equal(verdict('COPY t (a) FROM stdin;\nrow\rwith a CR\n\\.\nSELECT 1;\n'), 'accepted')
+})
+
+test('EVERY payload from rounds 9-12 has ONE verdict across ALL chunk sizes', () => {
+  // The property that the individual tests above are instances of, applied to the whole corpus.
+  // This is the assertion the harness was missing: `chunkedVerdict` compared TWO framings, and the
+  // round-12 long-tag bypass lives strictly between them. Any construct whose recognition depends
+  // on how much input happens to be buffered fails here regardless of which answer it settles on.
+  const corpus = [
+    REALISTIC_DUMP,
+    NON_ASCII_DOLLAR_TAG,
+    'SELECT 1;\nCOMMIT;\n',
+    '\\restrict abc123\nSELECT 1;\n',
+    'CREATE FUNCTION f() RETURNS void AS $tag$ COMMIT; $tag$;\n',
+    'COPY t FROM stdin;\nCOMMIT;\n\\.\nSELECT 1;\n',
+    "SELECT 'a\\'; -- '; COMMIT;\n",
+    "SELECT e 'a\\'; COMMIT; --' ;\n",
+    "SELECT x\u00e9e'a\\'; COMMIT; --' ;\n",
+    'SELECT 1; -- comment\rCOMMIT;\r',
+    `SELECT $${'z'.repeat(200)}$ '$${'z'.repeat(200)}$; COMMIT; -- ' ;\n`,
+    "SELECT U&'\\0041';",
+    'SET standard_conforming_strings = off;\n',
+  ]
+  for (const sql of corpus) unanimousVerdict(sql)
 })

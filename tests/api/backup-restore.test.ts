@@ -1369,6 +1369,65 @@ test('an unconfirmed restore backend leaves MAINTENANCE MODE ON as well as the l
   }
 })
 
+test('an audit-log failure cannot switch maintenance mode off while the backend is unconfirmed', async () => {
+  // ROUND 12, FINDING 3. `holdMaintenance = true` used to be set AFTER the failure audit was
+  // awaited. The audit is a write to the very database whose restore has just failed with a
+  // backend that may still be attached to it, so it is one of the LIKELIEST things to reject on
+  // this path — and when it did, control left the catch for the `finally` with the flag still
+  // false and `disableMaintenance()` ran. A logging error discarded the one deliberate protection
+  // this branch exists to apply.
+  //
+  // Two assertions, because the old code failed both: the gate stays held, AND the caller still
+  // gets the restore's own diagnosis rather than the audit error escaping as a generic crash.
+  const { RestoreBackendNotConfirmedError } = await import('../../app/api/backup/restore/route.ts')
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-auditfail-test-'))
+  try {
+    const form = new FormData()
+    form.set('confirmationPhrase', 'RESTORE')
+    form.set('restoreToken', 'ABCDEF12')
+    form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+    appendUploadManifest(form)
+
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+        ALLOW_DATABASE_RESTORE_UPLOAD: 'true',
+      },
+      log: async (entry) => {
+        // The initiation log succeeds; the FAILURE log is the one that rejects, which is the
+        // realistic ordering — by then the restore has already gone wrong.
+        if (entry.level === 'ERROR') throw new Error('activity log write failed: connection terminated')
+      },
+      runRestoreFile: async () => {
+        calls.runRestore += 1
+        throw new RestoreBackendNotConfirmedError('backend pid 4242 could NOT be confirmed gone')
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: { origin: 'https://ims.example.test', 'x-real-ip': '203.0.113.25', 'content-length': '100' },
+      body: form,
+    }))
+
+    assert.equal(
+      calls.disableMaintenance,
+      0,
+      'THE ASSERTION. A failed log write must not readmit cron and the WooCommerce webhook path '
+        + 'while the restore backend is unconfirmed.',
+    )
+    assert.equal(calls.enableMaintenance, 1)
+    assert.equal(response.status, 500, 'the audit failure does not replace the response')
+    const body = await response.json() as { error?: string }
+    assert.match(String(body.error), /could NOT be confirmed gone/, 'and the operator still gets the RESTORE error, not the log error')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('maintenance-start failure still runs disable-maintenance cleanup and removes the temporary file', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-maintenance-failure-test-'))
   try {
@@ -2345,7 +2404,13 @@ test('the unconfirmed-restore message describes only the protection that exists'
 
   // WHAT IS TRUE.
   assert.match(message, /connector-selection lock is being HELD/)
-  assert.match(message, /Scheduled jobs and inbound webhooks are stopped by maintenance mode/)
+  // ROUND 12, FINDING 4. This assertion previously PINNED THE FALSE CLAIM — "Scheduled jobs and
+  // inbound webhooks are stopped by maintenance mode" — which is how a wrong sentence survived a
+  // round that was specifically about measuring this message. A test that asserts the wording is
+  // only as good as the measurement behind the wording, so the classification itself is now
+  // measured from the route files in 'the webhook fencing claim is measured FROM THE ROUTES'.
+  assert.match(message, /Scheduled jobs \(app\/api\/cron\/\*\) and WooCommerce webhooks are stopped by maintenance mode/)
+  assert.match(message, /MINTSOFT AND SHIPHERO WEBHOOK ROUTES[\s\S]*?NOT STOPPED BY ANYTHING/)
   assert.match(message, /INTERACTIVE WRITES FROM THE DASHBOARD ARE NOT STOPPED BY ANYTHING/)
   assert.match(message, /Backend pid 4242, started 2026-08-18 09:00:00\.123456\+00/, 'the operator is told what to look for')
 
@@ -2356,4 +2421,66 @@ test('the unconfirmed-restore message describes only the protection that exists'
   assert.match(message, /Do NOT restart yet: restarting releases the held lock/)
   assert.match(message, /clear maintenance mode/, 'and the flag it leaves behind has a named recovery')
   assert.match(message, /system_maintenance_mode/)
+})
+
+test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag readers', async () => {
+  // ROUND 12, FINDING 4 — and the second consecutive round in which this claim was false.
+  //
+  // Round 11 measured `getMaintenanceModeResponse` callers and concluded "inbound connector
+  // webhooks are fenced". That measurement CANNOT produce that conclusion. Enumerating the
+  // callers answers "what consults the flag?"; it can only ever confirm the routes that do,
+  // because a route that does not contains nothing to grep for. The unfenced Mintsoft and ShipHero
+  // webhook entry points were invisible to it by construction, and the operator message told
+  // whoever read it that they were stopped.
+  //
+  // So this test starts from the ROUTE FILES and classifies every one of them. A new webhook route
+  // fails here until it is classified, which is the property the reader-enumeration lacked.
+  const { MAINTENANCE_MODE_REACH } = await import('../../app/api/backup/restore/route.ts')
+  const repo = process.cwd()
+  const { readFile } = await import('node:fs/promises')
+
+  const webhookRoutes = (await filesUnder(path.join(repo, 'app', 'api')))
+    .map((file) => path.relative(repo, file))
+    .filter((rel) => rel.endsWith('route.ts'))
+    .filter((rel) => /webhook|callback/i.test(rel))
+    // The cron sweepers are scheduled jobs that DRAIN webhook rows, not inbound entry points, and
+    // they are already covered by the `app/api/cron/*` fence.
+    .filter((rel) => !rel.startsWith('app/api/cron/'))
+    .map((rel) => rel.replace(/\/route\.ts$/, ''))
+    .sort()
+
+  assert.deepEqual(
+    webhookRoutes,
+    [...MAINTENANCE_MODE_REACH.inboundWebhooks].map((w) => w.route).sort(),
+    'every inbound webhook/callback route must be classified in MAINTENANCE_MODE_REACH.inboundWebhooks',
+  )
+
+  // ...and the classification has to match what the route actually does. `fenced: 'no'` means the
+  // whole reachable path from the route file consults the flag NOWHERE.
+  const consults = async (rel: string) => /getMaintenanceModeResponse\(|getMaintenanceModeState\(/.test(await readFile(path.join(repo, rel, 'route.ts'), 'utf8'))
+  for (const { route, fenced } of MAINTENANCE_MODE_REACH.inboundWebhooks) {
+    assert.equal(
+      await consults(route),
+      false,
+      `${route}: no webhook route consults the flag directly — the WooCommerce fence is inside the handler it dispatches to, which is exactly why a per-route glob could not express this`,
+    )
+    assert.ok(fenced === 'no' || fenced === 'woocommerce-only', `${route}: unexpected classification ${fenced}`)
+  }
+
+  // The shopping route is the one that is fenced for ONE connector and not another. Pinned by
+  // reading the dispatch, because that asymmetry is what the round-11 claim flattened.
+  const shopping = await readFile(path.join(repo, 'lib', 'shopping.ts'), 'utf8')
+  assert.match(shopping, /case 'woocommerce':[\s\S]{0,200}handleWcWebhook/, 'woocommerce dispatches to the fenced handler')
+  assert.match(shopping, /case 'shopify':[\s\S]{0,200}handleWebhook/, 'shopify does not')
+  const wc = await readFile(path.join(repo, 'lib', 'connectors', 'woocommerce', 'webhooks.ts'), 'utf8')
+  assert.match(wc, /getMaintenanceModeResponse\('webhook'\)/, 'and the WooCommerce fence is real')
+
+  // THE POINT OF ALL OF IT: the operator message must not claim more than the above.
+  const routeSrc = await readFile(path.join(repo, 'app', 'api', 'backup', 'restore', 'route.ts'), 'utf8')
+  assert.ok(
+    !/inbound webhooks are stopped by maintenance mode/i.test(routeSrc),
+    'the false claim ("inbound webhooks are stopped") must not come back',
+  )
+  assert.match(routeSrc, /WooCommerce webhooks are stopped by maintenance mode/, 'it says WooCommerce specifically')
+  assert.match(routeSrc, /MINTSOFT AND SHIPHERO WEBHOOK ROUTES[\s\S]{0,120}NOT STOPPED BY ANYTHING/, 'and names what is NOT stopped')
 })
