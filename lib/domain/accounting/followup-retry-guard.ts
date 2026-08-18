@@ -18,8 +18,9 @@ import {
  *
  * WHAT IS ALREADY SAFE, and must keep working:
  *
- *   - a single FAILED row in its scope. The retry preserves the row id and payload, so the
- *     token is bit-identical to the one the failed attempt used and the remote deduplicates.
+ *   - a single FAILED row in its scope. The retry preserves the row id and payload, so it posts
+ *     under the SAME token the failed attempt used — the one token that, if it committed, the
+ *     remote can still recognise as a repeat.
  *   - several FAILED rows that SHARE one token — the ordinary QuickBooks shape, where repeated
  *     receipts all carry `invoice-payment:payment:<paymentId>`. Whichever committed, committed
  *     under that token. Refusing these on row count alone is the mistake o3d-h2wx already
@@ -28,6 +29,27 @@ import {
  *
  * So the refusal is narrow by construction: money-moving, same target document, more than one
  * distinct token.
+ *
+ * WHAT THIS DOES NOT CLOSE, stated plainly because the same-token cases above are ALLOWED and it
+ * would be easy to read that as proof they are safe. Re-posting under the original token is only
+ * protective while the remote still remembers it. QuickBooks replays by `requestid`; XERO
+ * retains an Idempotency-Key for a short documented window (minutes), and a manual retry is by
+ * nature minutes to days after the failure. So a lone FAILED Xero payment whose call COMMITTED
+ * but whose response was lost — which FAILED never rules out (o3d-ju8t) — can still be
+ * double-posted by an operator retrying it, and this guard allows that because there is nothing
+ * ambiguous about it.
+ *
+ * That hazard is IDENTICAL in the automatic enqueue path, which pins the same token for the same
+ * reason; it is not introduced or widened here, and closing it needs positive evidence of what
+ * reached the ledger (a settlement probe), not a broader refusal — refusing every money-moving
+ * retry would leave no manual route at all. Tracked as o3d-wc1d; do not "fix" it by tightening
+ * this predicate.
+ *
+ * NOR IS THE RETRY THE ONLY WAY BACK TO THE LEDGER. `decideInvoicePaymentRegistration` filters
+ * FAILED and CANCELLED rows out of the "already registered" set on the opposite reading — that
+ * they hold nothing — so re-recording a receipt beside a FAILED attempt queues a fresh row under
+ * a NEW token and reaches the same double payment without touching this guard at all (o3d-crdo).
+ * Guarding the retry alone does not make the system safe; it makes this route safe.
  *
  * Ambiguity means more than one distinct token among rows that could have posted -- and no
  * status is safe to drop from that set. See the note above the contender filter.
