@@ -1524,7 +1524,7 @@ type QuarantineHarness = {
   quarantined: string[]
   cleared: string[]
   drifts: Array<{ linkCount: number; touched: number }>
-  drift: { consecutive: number; cohortKey: string | null; stableFor: number }
+  drift: import('../lib/domain/wms/dispatch-sweep.ts').WmsUnresolvedDriftState
   saved: Array<{ watermark?: string; lastReconcile?: string }>
 }
 
@@ -1937,4 +1937,60 @@ test('[o3d-bjc.9] a PARTS-path outage is not excused by a healthy non-split cont
   )
   assert.equal(result.unresolvedSystemic, true)
   assert.deepEqual(h.quarantined, [])
+})
+
+test('[o3d-bjc.12] a drift pass persists the evidence an operator needs', async () => {
+  // The sweep will not isolate this cohort itself — but a decision nobody can
+  // see is not a decision offered. It records WHO is stuck, since when, and
+  // what the WMS actually said.
+  const h = harness()
+  const links = [1, 2, 3, 4].map(unresolvableLink)
+  await runWmsDispatchSweepCore(quarantineDeps(links, h), { now: NOW })
+  assert.equal(h.drift.cohortKey, 'L-1,L-2,L-3,L-4')
+  assert.deepEqual(h.drift.linkIds, ['L-1', 'L-2', 'L-3', 'L-4'],
+    'the ids are what "isolate these" acts on')
+  assert.equal(h.drift.firstSeenAt, NOW.toISOString())
+  assert.equal(h.drift.lastSeenAt, NOW.toISOString(), 'and re-confirmed, so the offer does not expire under a live drift')
+  assert.equal(h.drift.touched, 4)
+  assert.ok(h.drift.reason, 'and what the failure said, so the offer shows the defect')
+})
+
+test('[o3d-bjc.12] firstSeenAt survives while the cohort does, and resets when it changes', async () => {
+  // "Unreadable since 09:12" is the whole difference between a blip and
+  // something that needs a human. A per-pass timestamp would say "since 30
+  // seconds ago" forever.
+  const h = harness()
+  const links = [1, 2, 3, 4].map(unresolvableLink)
+  await runWmsDispatchSweepCore(quarantineDeps(links, h), { now: NOW })
+  const first = h.drift.firstSeenAt
+  const later = new Date(NOW.getTime() + 600_000)
+  await runWmsDispatchSweepCore(quarantineDeps(links, h), { now: later })
+  assert.equal(h.drift.firstSeenAt, first, 'same cohort keeps its origin')
+
+  // A DIFFERENT cohort is a different incident.
+  const moved = [1, 2, 3, 5].map(unresolvableLink)
+  await runWmsDispatchSweepCore(quarantineDeps(moved, h), { now: later })
+  assert.equal(h.drift.firstSeenAt, later.toISOString())
+})
+
+test('[o3d-bjc.12] a clean pass retracts the incident, not just the counter', async () => {
+  const h = harness()
+  h.drift = {
+    consecutive: 6, cohortKey: 'L-1,L-2,L-3', stableFor: 6,
+    firstSeenAt: '2026-07-15T09:00:00.000Z', linkIds: ['L-1', 'L-2', 'L-3'], touched: 3, reason: 'stale',
+  }
+  const link = unresolvableLink(1)
+  await runWmsDispatchSweepCore(
+    quarantineDeps([link], h, {
+      fetchDelta: async () => [status({
+        externalOrderId: 'M-1', externalOrderNumber: 'WC-1001',
+        status: 'DESPATCHED', dispatched: true, tracking: [tracking({ trackingNumber: 'TRK' })],
+      })],
+    }),
+    { now: NOW },
+  )
+  assert.equal(h.drift.cohortKey, null)
+  assert.deepEqual(h.drift.linkIds, [], 'the offer must not outlive the condition')
+  assert.equal(h.drift.firstSeenAt, null)
+  assert.equal(h.drift.lastSeenAt, null)
 })

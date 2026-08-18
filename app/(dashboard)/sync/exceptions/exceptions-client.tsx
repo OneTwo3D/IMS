@@ -23,7 +23,9 @@ import {
   replayDeadReceiptEvent,
   replayDeadWebhookEvent,
   replayOutboxException,
+  isolateUnresolvedDriftCohort,
   replayStuckDispatch,
+  retryUnresolvedDriftCohort,
   repushMissingWmsOrder,
   retryRefundSyncPark,
   type ExceptionInboxData,
@@ -347,6 +349,80 @@ export function ExceptionsClient({ data }: Props) {
                       onClick={() => runAction(() => replayStuckDispatch(row.orderId), 'Dispatch reconciliation re-queued for the next sweep.')}
                     >
                       <RotateCcw className="h-3 w-3 mr-1" />Replay
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.unresolvedDrift.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`WMS records unreadable — connector-wide (${data.summary.unresolvedDrift})`}
+            detail={
+              'The dispatch sweep could not read these orders from the WMS, and could not tell whether the '
+              + 'ORDERS are broken or the CONNECTOR is: nothing else was readable to compare against. It will '
+              + 'not isolate them on a guess — that would take the whole tenant out of sync for a fault one fix '
+              + 'would clear — so inbound sync is held back until this is resolved. Fix the cause in the WMS '
+              + 'then Retry; or, if these specific orders are genuinely broken, Isolate them so everything else '
+              + 'resumes and each one appears above as a replayable row.'
+            }
+            shown={data.unresolvedDrift.length}
+            total={data.summary.unresolvedDrift}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[820px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Connector</TableHead>
+                <TableHead>Orders</TableHead>
+                <TableHead>Unreadable since</TableHead>
+                <TableHead>Passes</TableHead>
+                <TableHead>What the WMS said</TableHead>
+                <TableHead className="text-right">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.unresolvedDrift.map((row) => (
+                <TableRow key={row.connector}>
+                  <TableCell className="text-xs font-medium">{row.connector}</TableCell>
+                  <TableCell className="text-xs">
+                    {row.linkCount}
+                    {row.touched > 0 ? <span className="text-muted-foreground"> of {row.touched} checked</span> : null}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {row.firstSeenAt ? formatDateTime(row.firstSeenAt) : '—'}
+                  </TableCell>
+                  <TableCell className="text-xs">{row.consecutivePasses}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.reason ?? ''}>
+                    {row.reason ?? '—'}
+                  </TableCell>
+                  <TableCell className="text-right space-x-2">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isPending}
+                      onClick={() => runAction(
+                        () => retryUnresolvedDriftCohort(row.connector, row.version),
+                        'Cleared — the next sweep will re-check these orders.',
+                      )}
+                    >
+                      <RotateCcw className="h-3 w-3 mr-1" />Retry
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isPending}
+                      onClick={() => runAction(
+                        () => isolateUnresolvedDriftCohort(row.connector, row.version),
+                        'Isolated — inbound sync resumes, and each order is now replayable above.',
+                      )}
+                    >
+                      Isolate {row.linkCount}
                     </Button>
                   </TableCell>
                 </TableRow>
