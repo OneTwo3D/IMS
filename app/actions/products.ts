@@ -24,6 +24,20 @@ import {
 import { detectComponentCycle } from '@/lib/products/component-cycle'
 import { blocksClearingInvalidOrigin } from '@/lib/products/country-of-origin'
 import { productSchema } from '@/lib/products/product-schema'
+import { ProductSkuTakenError, ProductStructureChangedError, lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
+import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+import {
+  ComponentGraphInFlightSalesError,
+  bumpFulfillmentGraphVersions,
+  componentGraphMutationAffectsFulfillment,
+  describeComponentGraphEditBlockers,
+  findComponentGraphEditBlockers,
+} from '@/lib/products/component-graph-edit-guard'
+import {
+  RESERVATION_RELEASING_SHIPMENT_STATUS,
+  residualAllocationQty,
+  sumDispatchedQtyByAllocationScope,
+} from '@/lib/domain/inventory/reservation-residual'
 import {
   cleanProductCategoryName,
   listProductCategoryNodes,
@@ -698,7 +712,20 @@ export async function createProduct(
     return { errors: structureValidation.fieldErrors, message: structureValidation.message }
   }
 
-  const created = await db.$transaction(async (tx) => {
+  let created
+  try {
+    created = await db.$transaction(async (tx) => {
+    // o3d-42hw: join the per-SKU write protocol. The uniqueness check above ran OUTSIDE any
+    // transaction, so a WooCommerce import committing this SKU in between raised a P2002 on
+    // Product.sku — safe today only because o3d-gtk keeps that transient, at the cost of a
+    // wasted retry cycle, and the reason it cannot be classified permanent.
+    await lockProductSkusForWrite(tx, [data.sku])
+
+    // Re-checked under the lock: the check before the transaction is now only a fast path
+    // for the common case, and cannot be the thing the create relies on.
+    const raced = await tx.product.findUnique({ where: { sku: data.sku }, select: { id: true } })
+    if (raced) throw new ProductSkuTakenError(data.sku)
+
     const categoryId = await resolveProductCategoryIdByName(data.categoryName, { client: tx })
     return tx.product.create({
       data: {
@@ -737,7 +764,13 @@ export async function createProduct(
         leadTimeDays: parseLeadTimeOverride(data.leadTimeDays),
       },
     })
-  })
+    })
+  } catch (error) {
+    // The lock turned a P2002 race into a clean, reportable outcome — surface it exactly as
+    // the pre-transaction check does, so the form behaves identically either way.
+    if (error instanceof ProductSkuTakenError) return { errors: { sku: ['SKU already exists'] } }
+    throw error
+  }
 
   await logActivity({
     entityType: 'PRODUCT',
@@ -854,7 +887,47 @@ export async function updateProduct(
     }
   }
 
-  const updatedCategoryChange = await db.$transaction(async (tx) => {
+  let updatedCategoryChange
+  try {
+    updatedCategoryChange = await db.$transaction(async (tx) => {
+    // o3d-42hw. BOTH skus: a rename frees the old one and claims the new one, so a writer
+    // racing on either must serialize with this.
+    //
+    // The catch is that WHICH locks to take depends on the current sku, and reading it is
+    // itself unprotected — a concurrent rename between that read and the acquisition leaves
+    // us holding the lock for a sku this product no longer has. Acquiring in ascending id
+    // order is what keeps the multi-lock case deadlock-free, so the read cannot simply move
+    // after the first acquisition. Instead the choice is VERIFIED once the locks are held:
+    // if the sku moved, the lock set is wrong and this attempt is abandoned rather than
+    // proceeding on a guess.
+    const skuBefore = await tx.product.findUnique({ where: { id }, select: { sku: true } })
+    await lockProductSkusForWrite(tx, [data.sku, ...(skuBefore?.sku ? [skuBefore.sku] : [])])
+
+    const skuUnderLock = await tx.product.findUnique({ where: { id }, select: { sku: true } })
+    if ((skuUnderLock?.sku ?? null) !== (skuBefore?.sku ?? null)) {
+      throw new ProductStructureChangedError('Another writer renamed this product while it was being saved.')
+    }
+
+    // Re-checked under the lock. The pre-transaction check is a fast path for the common
+    // case; on its own it let a concurrent create take this SKU in between.
+    const skuTaken = await tx.product.findFirst({
+      where: { sku: data.sku, NOT: { id } },
+      select: { id: true },
+    })
+    if (skuTaken) throw new ProductSkuTakenError(data.sku)
+
+    // Re-validated under the lock, against `tx`. This is the worse half of the defect: the
+    // validation ran before the transaction and `type` / `parentId` were then written
+    // UNCONDITIONALLY, so a WooCommerce import committing in between was overwritten with
+    // structure decided against a state that no longer existed.
+    const revalidated = await validateProductStructureChange({
+      productId: id,
+      type: data.type,
+      parentId: data.parentId,
+      client: tx,
+    })
+    if (!revalidated.ok) throw new ProductStructureChangedError(revalidated.message ?? 'Product structure changed')
+
     const previous = await tx.product.findUnique({
       where: { id },
       select: {
@@ -865,6 +938,37 @@ export async function updateProduct(
     const previousCategoryName = previous?.category?.name ?? null
     const categoryId = await resolveProductCategoryIdByName(data.categoryName, { client: tx })
 
+    // o3d-4kfh r5 (Codex finding 1): GUARD EVERY KIT-NESS CHANGE, AND DO IT BEFORE THE TYPE MOVES.
+    //
+    // r4 guarded only `clearComponents` — true solely when a component-bearing type becomes a
+    // non-component one — and it ran AFTER `tx.product.update` had already written the new type.
+    // KIT <-> BOM satisfies neither: both bear components, so `clearComponents` is false and no
+    // check ran at all. Flipping a NESTED inner KIT to BOM turns recursively-expanded components
+    // into a fulfilment leaf, instantly reinterpreting every existing allocation and PICKING
+    // shipment for every KIT above it against a different graph — and `validateProductStructureChange`
+    // cannot see it, because it counts open sales order lines on THIS product and a nested inner kit
+    // has none. Running after the write also meant the invalid state had already been committed to
+    // before any later transition could refuse it.
+    //
+    // KIT -> KIT (a rename, a price change) is NOT a KIT-ness change and must not be guarded, or
+    // every ordinary edit to a kit would be refused while any order is in flight.
+    const kitnessMutation = {
+      kind: 'kitness' as const,
+      currentType: revalidated.current?.type ?? data.type,
+      nextType: data.type,
+    }
+    if (componentGraphMutationAffectsFulfillment(kitnessMutation)) {
+      // Best-effort and NOT atomic — this path deliberately holds only its per-SKU lock, not the
+      // coarse component-graph advisory one (taking it here would invert the lock order; see
+      // lib/db/advisory-locks.ts), and the allocation/commitment writers take neither. See the guard
+      // module docstring: `validateCommittedShipmentCoverage` at every shipment transition including
+      // dispatch is the atomic backstop, and the CAS is filed as o3d-57b0.
+      const blockers = await findComponentGraphEditBlockers(tx, id, kitnessMutation)
+      if (blockers.length > 0) {
+        throw new ComponentGraphInFlightSalesError(describeComponentGraphEditBlockers(blockers))
+      }
+    }
+
     await tx.product.update({
       where: { id },
       data: {
@@ -873,7 +977,7 @@ export async function updateProduct(
         categoryId,
         description: data.description || null,
         type: data.type,
-        parentId: structureValidation.normalizedParentId,
+        parentId: revalidated.normalizedParentId,
         preferredSupplierId: data.preferredSupplierId || null,
         preferredSupplierLocked: data.preferredSupplierLocked,
         preferredSupplierUpdatedAt:
@@ -904,19 +1008,46 @@ export async function updateProduct(
         // Only touch the manual lead-time override when the form actually submitted the
         // field (blank → clear → null). A caller that omits it leaves the override as-is.
         ...(formData.has('leadTimeDays') ? { leadTimeDays: parseLeadTimeOverride(data.leadTimeDays) } : {}),
-        ...(structureValidation.clearExternalMapping ? { externalProductId: null } : {}),
+        ...(revalidated.clearExternalMapping ? { externalProductId: null } : {}),
       },
     })
 
-    if (structureValidation.clearComponents) {
+    if (revalidated.clearComponents) {
+      // Converting a component-bearing type to a non-component one deletes its components. When
+      // that loses KIT-ness the `kitnessMutation` guard above already refused, BEFORE the type was
+      // written; BOM -> SIMPLE reaches here unguarded on purpose, because fulfilment never expanded
+      // that BOM's components and deleting them changes no sales line's requirements.
       await tx.productComponent.deleteMany({ where: { productId: id } })
     }
+
+    // o3d-4kfh r6 (Codex finding 1): bump the fulfilment graph version for this product and every
+    // KIT above it, in the SAME transaction as the type write. The guard above is best-effort and
+    // can see an empty blocker set while a concurrent allocation is still open against the OLD
+    // recipe; that allocation stamped the old version, so commitment and dispatch refuse it. A
+    // no-op for a mutation that cannot change any sales line's requirements (BOM <-> SIMPLE).
+    await bumpFulfillmentGraphVersions(tx, id, kitnessMutation)
 
     return {
       from: previousCategoryName,
       to: data.categoryName ?? null,
     }
-  })
+    })
+  } catch (error) {
+    // Reported the same way the pre-transaction checks report, so the form behaves
+    // identically whether the conflict is caught before the lock or under it.
+    if (error instanceof ProductSkuTakenError) {
+      return { errors: { sku: ['SKU already in use by another product'] } }
+    }
+    // Before the ProductStructureChangedError branch: this is not a stale-read conflict and
+    // reloading will not help, so it must not be told to reload.
+    if (error instanceof ComponentGraphInFlightSalesError) {
+      return { message: error.message }
+    }
+    if (error instanceof ProductStructureChangedError) {
+      return { message: `${error.message} Reload the product and try again.` }
+    }
+    throw error
+  }
 
   await logActivity({
     entityType: 'PRODUCT',
@@ -1220,11 +1351,13 @@ export async function saveProductComponents(
   try {
     await requirePermission('inventory.edit')
 
-    const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId))
-    if (cycle.kind === 'self') {
+    // Preflight only — the authoritative check runs under the graph lock below. Kept so the
+    // common rejection still returns a clean message without opening a transaction.
+    const preflight = await detectComponentCycle(productId, components.map((c) => c.componentId))
+    if (preflight.kind === 'self') {
       return { success: false, error: 'A product cannot be a component of itself' }
     }
-    if (cycle.kind === 'cycle') {
+    if (preflight.kind === 'cycle') {
       return { success: false, error: 'Circular reference detected — a component eventually references this product' }
     }
 
@@ -1240,16 +1373,94 @@ export async function saveProductComponents(
       select: { id: true, reference: true },
     })
 
-    await db.productComponent.deleteMany({ where: { productId } })
-    if (components.length > 0) {
-      await db.productComponent.createMany({
-        data: components.map((c, i) => ({
-          productId,
-          componentId: c.componentId,
-          qty: c.qty,
-          sortOrder: i,
-        })),
-      })
+    // o3d-t0zq. Two defects here, both closed by the same transaction.
+    //
+    // ATOMICITY: the delete and the create were separate top-level statements, so a reader
+    // landing between them saw a KIT with NO components — and a failure between them left it
+    // that way permanently.
+    //
+    // SERIALIZATION: the cycle check above ran outside any transaction or lock, so two
+    // concurrent saves could each validate and then both commit a cycle. The graph lock makes
+    // check-and-write atomic with respect to the graph being checked; see its docstring for
+    // why a per-product lock cannot do this.
+    const conflict = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
+
+      // BOTH families, graph first — the same order the CSV component pass uses, which is what
+      // keeps them deadlock-free. The graph lock alone is not enough: it serializes this
+      // against other COMPONENT writers, but the editor and the CSV conversion paths take only
+      // the PER-SKU lock, so they never contend with it. Without this, an editor could commit
+      // type=SIMPLE and delete the components between the type read below and the create,
+      // leaving a SIMPLE product with components (Codex review).
+      await lockProductSkusForWrite(tx, [_sku])
+
+      // Re-checked under the lock, against tx — the preflight above read a graph another
+      // writer may since have changed.
+      const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId), tx)
+      if (cycle.kind === 'self') return 'self' as const
+      if (cycle.kind === 'cycle') return 'cycle' as const
+
+      // This never checked the product's own type at all, so it would happily write components
+      // onto a SIMPLE product — the state o3d-w998 stops the CSV import creating.
+      const current = await tx.product.findUnique({ where: { id: productId }, select: { sku: true, type: true } })
+      if (!current) return 'missing' as const
+      // The lock set was chosen from `_sku`, read before this transaction. If the product has
+      // been renamed since, the lock is held for a sku it no longer has — locked, but against
+      // the wrong thing.
+      if (current.sku !== _sku) return 'moved' as const
+      if (current.type !== 'KIT' && current.type !== 'BOM') return 'not-component-bearing' as const
+
+      // o3d-4kfh r5: REFUSE EARLY WHILE SALES WORK IS IN FLIGHT AGAINST THIS GRAPH.
+      //
+      // Every fulfilment consumer expands the CURRENT component graph, so re-composing a KIT that
+      // an order has already allocated or picked retroactively changes what that order requires —
+      // and no FLAT check can see it: the committed-coverage backstop compares per
+      // (line, warehouse, product), the dispatch cap only rejects leaves that EXCEED demand, and
+      // whole-kit coverage credits the half-kit that ships.
+      //
+      // BEST-EFFORT, NOT ATOMIC (r5 Codex finding 2). This transaction holds the component-graph
+      // advisory lock, but `allocateSalesOrder`, `confirmSalesOrderShipments` and PENDING -> PICKING
+      // take no such lock, so under MVCC an allocation can be committing against the OLD graph in
+      // parallel with this check and this edit. The atomic guarantee is
+      // `validateCommittedShipmentCoverage`, which runs under the sales order's row lock at every
+      // shipment transition including dispatch. A graph-version CAS is filed as o3d-57b0.
+      //
+      // `kind: 'components'` — this path never changes the type, so on a BOM it is a no-op by
+      // construction: fulfilment never reads a BOM's component list (r5 Codex finding 6), and a
+      // manufacturing recipe edit must not be refused for a sales reason.
+      const componentMutation = { kind: 'components' as const, currentType: current.type }
+      const blockers = await findComponentGraphEditBlockers(tx, productId, componentMutation)
+      if (blockers.length > 0) return { kind: 'in-flight-sales' as const, blockers }
+
+      await tx.productComponent.deleteMany({ where: { productId } })
+      if (components.length > 0) {
+        await tx.productComponent.createMany({
+          data: components.map((c, i) => ({
+            productId,
+            componentId: c.componentId,
+            qty: c.qty,
+            sortOrder: i,
+          })),
+        })
+      }
+      // o3d-4kfh r6: the CAS half — see the kitness path in updateProduct. A no-op on a BOM, whose
+      // component list no sales line expands.
+      await bumpFulfillmentGraphVersions(tx, productId, componentMutation)
+      return null
+    })
+    if (conflict === 'self') return { success: false, error: 'A product cannot be a component of itself' }
+    if (conflict === 'cycle') {
+      return { success: false, error: 'Circular reference detected — a component eventually references this product' }
+    }
+    if (conflict === 'missing') return { success: false, error: 'Product not found' }
+    if (conflict === 'moved') {
+      return { success: false, error: 'This product was renamed while saving — reload and try again' }
+    }
+    if (conflict === 'not-component-bearing') {
+      return { success: false, error: 'This product is no longer a kit or BOM, so it cannot have components' }
+    }
+    if (conflict && typeof conflict === 'object' && conflict.kind === 'in-flight-sales') {
+      return { success: false, error: describeComponentGraphEditBlockers(conflict.blockers) }
     }
     const warnings = await findMatchingProductComponentConfigurations(productId, components)
     await logActivity({
@@ -1473,7 +1684,14 @@ export async function generateVariantsFromOptions(
       continue
     }
 
-    const createdVariant = await db.product.create({
+    // o3d-42hw: each variant create takes its own SKU lock and re-checks under it. The
+    // existingSkus set was built before this loop, so a WooCommerce import creating this
+    // variant SKU in between raised a P2002 that aborted the whole generation run.
+    const createdVariant = await db.$transaction(async (tx) => {
+      await lockProductSkusForWrite(tx, [sku])
+      const taken = await tx.product.findUnique({ where: { sku }, select: { id: true } })
+      if (taken) return null
+      return tx.product.create({
       data: {
         sku,
         name,
@@ -1492,7 +1710,14 @@ export async function generateVariantsFromOptions(
         countryOfOrigin:    toIsoCountryCode(product.countryOfOrigin) ?? undefined,
         customsDescription: product.customsDescription ?? undefined,
       },
+      })
     })
+    // Another writer got there first. Counted as skipped, exactly as a SKU already present
+    // in `existingSkus` is — the outcome an operator sees is the same either way.
+    if (!createdVariant) {
+      skipped++
+      continue
+    }
     createdVariantIds.push(createdVariant.id)
     created++
   }
@@ -1735,6 +1960,9 @@ export async function getAllocationDetails(productId: string, warehouseId: strin
         },
       },
       select: {
+        // o3d-4kfh: lineId is half the grain a dispatch is attributed at — a shipment line carries
+        // (lineId, productId) and its shipment the warehouseId — so it is needed to net below.
+        lineId: true,
         qty: true,
         order: { select: { id: true, externalOrderNumber: true, status: true } },
       },
@@ -1775,14 +2003,48 @@ export async function getAllocationDetails(productId: string, warehouseId: strin
     }),
   ])
 
+  // o3d-4kfh: this popup explains a stock level's RESERVED quantity, so it must report the LIVE
+  // reservation — `OrderAllocation.qty` is the order's whole claim, retained through dispatch. A
+  // partially shipped order commonly stays ALLOCATED, so a row of 10 with 5 already dispatched was
+  // reported as 10 reserved when only 5 of it still contributes to reservedQty.
+  const dispatchedByScope = sumDispatchedQtyByAllocationScope(
+    salesAllocs.length === 0
+      ? []
+      : (await db.shipmentLine.findMany({
+        where: {
+          productId,
+          lineId: { in: [...new Set(salesAllocs.map((alloc) => alloc.lineId))] },
+          shipment: { warehouseId, status: RESERVATION_RELEASING_SHIPMENT_STATUS },
+        },
+        select: {
+          lineId: true,
+          productId: true,
+          qty: true,
+          shipment: { select: { warehouseId: true } },
+        },
+      })).map((line) => ({
+        lineId: line.lineId,
+        productId: line.productId,
+        warehouseId: line.shipment.warehouseId,
+        qty: line.qty,
+      })),
+  )
+
   const results: AllocationDetail[] = []
 
   for (const alloc of salesAllocs) {
+    const liveQty = residualAllocationQty(
+      { lineId: alloc.lineId, productId, warehouseId, qty: alloc.qty },
+      dispatchedByScope,
+    ).toNumber()
+    // A fully dispatched row holds no reservation at all; listing it as a 0 would imply the
+    // reserved balance has a source it does not have.
+    if (liveQty <= 0) continue
     results.push({
       type: 'sales_order',
       id: alloc.order.id,
       reference: alloc.order.externalOrderNumber ?? alloc.order.id.slice(0, 8),
-      qty: Number(alloc.qty),
+      qty: liveQty,
       status: alloc.order.status,
     })
   }

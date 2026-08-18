@@ -98,10 +98,22 @@ function findProductBySku(sku: unknown) {
 
 const productDelegate = {
   findFirst: async ({ where }: { where: { sku?: unknown } }) => findProductBySku(where?.sku),
-  findMany: async ({ where }: { where?: { sku?: { in?: unknown[] } } } = {}) => {
-    const wanted = where?.sku?.in
-    if (!Array.isArray(wanted)) return state.products.map((row) => ({ ...row }))
-    return state.products.filter((row) => wanted.includes(row.sku)).map((row) => ({ ...row }))
+  // Two queries: candidate rows by SKU, and (o3d-h2cz) the children of those candidates by
+  // parentId. An unrecognised `where` throws rather than returning everything, so a query
+  // this double does not model can never quietly answer "yes" or "no".
+  findMany: async ({ where }: { where?: Row } = {}) => {
+    const skuIn = (where?.sku as { in?: unknown[] } | undefined)?.in
+    if (Array.isArray(skuIn)) {
+      return state.products.filter((row) => skuIn.includes(row.sku)).map((row) => ({ ...row }))
+    }
+    const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
+    if (Array.isArray(parentIn)) {
+      return state.products
+        .filter((row) => row.parentId != null && parentIn.includes(row.parentId))
+        .map((row) => ({ ...row }))
+    }
+    if (where === undefined) return state.products.map((row) => ({ ...row }))
+    throw new Error(`product.findMany double got an unmodelled where: ${JSON.stringify(where)}`)
   },
   create: async ({ data }: { data: Row }) => {
     const row = { id: `ims-${nextId++}`, ...data }
@@ -145,9 +157,23 @@ const productOptionDelegate = {
 }
 
 const shoppingSyncLogDelegate = {
+  // `connector` is @default("woocommerce"); production never sets it and the delete below
+  // filters on it, so the double applies the default too.
   create: async ({ data }: { data: Row }) => {
-    state.syncLogs.push(data)
-    return data
+    const row = { connector: 'woocommerce', ...data }
+    state.syncLogs.push(row)
+    return row
+  },
+  /** o3d-fjqk structure-conflict dedup/resolution delete. */
+  deleteMany: async ({ where }: { where: Row }) => {
+    const matches = (row: Row) => Object.entries(where).every(([key, value]) => {
+      if (key !== 'OR') return row[key] === value
+      return (value as Row[]).some((clause) => Object.entries(clause).every(([k, v]) => row[k] === v))
+    })
+    const kept = state.syncLogs.filter((row) => !matches(row))
+    const removed = state.syncLogs.length - kept.length
+    state.syncLogs.splice(0, state.syncLogs.length, ...kept)
+    return { count: removed }
   },
 }
 
@@ -155,7 +181,17 @@ const txClient = {
   product: productDelegate,
   productOption: productOptionDelegate,
   shoppingSyncLog: shoppingSyncLogDelegate,
-  setting: { upsert: async () => ({}), findUnique: async () => null },
+  // The credential-rebind fence (o3d-mlc7) snapshots settings before any remote read and
+  // re-reads the version inside the write transaction. Neither is what this suite is about,
+  // so the version is held CONSTANT: findMany returns no rows (version defaults to '0') and
+  // findUnique agrees, which is the "nothing was rebound" case. Without these the fence
+  // throws a TypeError before the sync starts — and because tests 1 and 2 assert FAILURE,
+  // they would have kept passing while testing nothing at all.
+  setting: {
+    upsert: async () => ({}),
+    findMany: async () => [],
+    findUnique: async () => null,
+  },
   $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
     state.advisoryLocks.push(String(values[values.length - 1] ?? strings.join('')))
     return 1

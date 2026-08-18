@@ -62,6 +62,30 @@ export const WC_SYNC_ADVISORY_LOCK_KEY = 918_273_645
 export const SWEEP_CURSOR_LOCK_KEY = 918_273_912
 
 /**
+ * ONE lock for the whole ProductComponent graph (o3d-t0zq).
+ *
+ * Deliberately coarse, and the coarseness IS the correctness argument. A component cycle is a
+ * property of the graph, not of any one product, so a per-product or even per-edge lock cannot
+ * serialize the writers that form one: two writers adding B->C and D->A hold DISJOINT lock
+ * sets, never block each other, and together close A->B->C->D->A while each one's own cycle
+ * check passed. Only a lock covering every component write makes the check-then-write
+ * atomic with respect to the graph it is checking.
+ *
+ * Affordable precisely because component edits are rare and low-throughput — a kit or BOM
+ * definition changes when a human edits it or a CSV import carries a components column, not on
+ * any hot path. Held for one row's transaction, not a whole import.
+ *
+ * SCOPE, precisely. Taken by the writers that CREATE edges — saveProductComponents and the CSV
+ * component pass — because only those can form a cycle. The delete-only writers (the editor's
+ * and the CSV rename's clearComponents, and the admin reset) deliberately do NOT take it:
+ * removing edges cannot create a cycle, and adding it AFTER their per-SKU lock would invert the
+ * order and create a deadlock. The cost of that omission is that a concurrent delete can make
+ * the walk below transiently reject a write that would have been fine — a false rejection, not
+ * a false acceptance.
+ */
+export const COMPONENT_GRAPH_WRITE_LOCK_KEY = 918_274_101
+
+/**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
  * declared here — the test fails on any module that writes its own key literal.
  */
@@ -70,6 +94,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   PAYMENT_WRITE_LOCK_KEY,
   WC_SYNC_ADVISORY_LOCK_KEY,
   SWEEP_CURSOR_LOCK_KEY,
+  COMPONENT_GRAPH_WRITE_LOCK_KEY,
 } as const
 
 /**
@@ -99,9 +124,31 @@ export const DISPATCH_SWEEP_LOCK_NAMESPACE = 0x77_6d_73_64 // 'wmsd'
 /** Per-refund dedup of the reservation-release warning. */
 export const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
 
+/**
+ * Per-PurchaseOrder serialization of the legacy PO-keyed back-reference resolve-then-apply
+ * (o3d-9kek).
+ *
+ * A PURCHASE_INVOICE sync row enqueued before o3d-9oq names the ORDER, not the bill, so
+ * writing its external id back means first DEDUCING which bill it belongs to — and the
+ * deduction is only valid for as long as the population it read stays put. Two repair sweeps,
+ * or a sweep racing a connector's own writer, would each resolve the one unlinked bill and
+ * each write to it; the second write replaces a valid external id with the other row's.
+ *
+ * Keyed on the PurchaseOrder because that is the scope the deduction reads: every bill on the
+ * order and every live sync row for it. The lock is held to commit of the transaction that
+ * does both, so nothing can move between them.
+ *
+ * COOPERATIVE, and deliberately narrow: the authoritative bill-keyed writer does NOT take it,
+ * because it knows its bill and must be free to overwrite a legacy guess. What protects
+ * against that writer is the compare-and-swap in the apply itself (`updateMany` predicated on
+ * the bill still having no id), not this lock.
+ */
+export const BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE = 411_220_868
+
 
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
+  BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
 } as const

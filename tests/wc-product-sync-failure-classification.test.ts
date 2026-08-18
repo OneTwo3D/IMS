@@ -26,6 +26,20 @@ let nextId = 1
 /** Emulate pg_advisory_xact_lock: transactions holding the same key run one at a time. */
 let serializeOnAdvisoryLock = true
 
+/**
+ * The r5 `_count.variants` shape, still answered (o3d-y89x r6). Production asks the child question
+ * as its own id-scoped `groupBy` now — `_count` was measured to render as an uncorrelated
+ * catalogue-wide aggregate — but keeping this means a revert to r5 still runs against this suite.
+ *
+ * Computed from the same `state.products` array, and attached ONLY when the query asked for it:
+ * `imsRowHasChildren` throws on a row that carries no answer rather than reading "no children" out
+ * of its absence, and a double that supplied one unasked would defeat that.
+ */
+function withChildCount(row: Row, include?: Row): Row {
+  if (!include || !('_count' in include)) return { ...row }
+  return { ...row, _count: { variants: state.products.filter((child) => child.parentId === row.id).length } }
+}
+
 const UNIQUE_COLUMNS: Array<{ field: string; constraint: string; quoted: boolean }> = [
   { field: 'sku', constraint: 'products_sku_key', quoted: false },
   { field: 'barcode', constraint: 'products_barcode_key', quoted: false },
@@ -79,10 +93,29 @@ mock.module('@/lib/trade/hs-classification-trigger', {
 
 const txClient = {
   product: {
-    findFirst: async ({ where }: { where: { sku?: unknown } }) =>
-      state.products.find((row) => row.sku === where?.sku) ?? null,
+    findFirst: async ({ where, include }: { where: { sku?: unknown }; include?: Row }) => {
+      const row = state.products.find((candidate) => candidate.sku === where?.sku) ?? null
+      return row === null ? null : withChildCount(row, include)
+    },
     findUnique: async ({ where }: { where: { id: string } }) =>
       state.products.find((row) => row.id === where.id) ?? null,
+    /**
+     * The child-existence statement (o3d-y89x r6): `WHERE parentId IN (...) GROUP BY parentId`,
+     * grouped and scoped to the ids named, refusing anything else.
+     */
+    groupBy: async ({ by, where }: { by?: unknown; where?: Row } = {}) => {
+      const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
+      const grouping = Array.isArray(by) ? by.map(String) : []
+      if (!Array.isArray(parentIn) || grouping.length !== 1 || grouping[0] !== 'parentId') {
+        throw new Error(`product.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
+      }
+      const candidates = parentIn.map(String)
+      return [...new Set(
+        state.products
+          .filter((row) => row.parentId != null && candidates.includes(String(row.parentId)))
+          .map((row) => String(row.parentId)),
+      )].map((parentId) => ({ parentId }))
+    },
     // The ownership-guarded update (o3d-fsi): `id` plus an OR over externalProductId. A zero
     // count is how production learns the row was reassigned underneath it.
     updateMany: async ({ where, data }: { where: Row; data: Row }) => {
@@ -106,10 +139,23 @@ const txClient = {
       Object.assign(row, data)
       return { count: 1 }
     },
-    findMany: async ({ where }: { where?: { sku?: { in?: unknown[] } } } = {}) => {
-      const wanted = where?.sku?.in
-      if (!Array.isArray(wanted)) return state.products.map((row) => ({ ...row }))
-      return state.products.filter((row) => wanted.includes(row.sku)).map((row) => ({ ...row }))
+    // Two queries: candidate rows by SKU (o3d-h2cz), and the pre-commit blocker re-assertion over
+    // the ids this transaction transformed (o3d-y89x r5). An unrecognised `where` throws rather
+    // than returning everything, so a query this double does not model can never quietly answer
+    // "yes" or "no". Nothing in this suite is live, so every named id comes back clean — stated
+    // by returning the rows rather than by ignoring the filter.
+    findMany: async ({ where, include }: { where?: Row; include?: Row } = {}) => {
+      const skuIn = (where?.sku as { in?: unknown[] } | undefined)?.in
+      if (Array.isArray(skuIn)) {
+        return state.products.filter((row) => skuIn.includes(row.sku)).map((row) => withChildCount(row, include))
+      }
+      const idIn = (where?.id as { in?: unknown[] } | undefined)?.in
+      if (Array.isArray(idIn)) {
+        const candidates = idIn.map(String)
+        return state.products.filter((row) => candidates.includes(String(row.id))).map((row) => ({ id: row.id }))
+      }
+      if (where === undefined) return state.products.map((row) => ({ ...row }))
+      throw new Error(`product.findMany double got an unmodelled where: ${JSON.stringify(where)}`)
     },
     create: async ({ data }: { data: Row }) => {
       assertUnique(data)
@@ -129,12 +175,33 @@ const txClient = {
   },
   productOption: { upsert: async () => ({}) },
   shoppingSyncLog: {
+    // `connector` is @default("woocommerce"); production never sets it and the delete below
+    // filters on it, so the double applies the default too.
     create: async ({ data }: { data: Row }) => {
-      state.syncLogs.push(data)
-      return data
+      const row = { connector: 'woocommerce', ...data }
+      state.syncLogs.push(row)
+      return row
+    },
+    /** o3d-fjqk structure-conflict dedup/resolution delete. */
+    deleteMany: async ({ where }: { where: Row }) => {
+      const matches = (row: Row) => Object.entries(where).every(([key, value]) => {
+        if (key !== 'OR') return row[key] === value
+        return (value as Row[]).some((clause) => Object.entries(clause).every(([k, v]) => row[k] === v))
+      })
+      const kept = state.syncLogs.filter((row) => !matches(row))
+      const removed = state.syncLogs.length - kept.length
+      state.syncLogs.splice(0, state.syncLogs.length, ...kept)
+      return { count: removed }
     },
   },
-  setting: { upsert: async () => ({}), findUnique: async () => null },
+  setting: {
+    upsert: async () => ({}),
+    // The credential-rebind fence (o3d-mlc7) snapshots settings before any remote read.
+    // No rows => credentials null and version '0', which findUnique agrees with, so the
+    // fence is a no-op here and these suites keep testing what they say they test.
+    findMany: async () => [],
+    findUnique: async () => null,
+  },
   $executeRaw: async () => 1,
 }
 
@@ -307,8 +374,13 @@ test('create race: two workers importing the same SKU serialize on the advisory 
   assert.equal(state.products.length, 1, 'exactly one product row for one SKU')
   assert.equal(state.createCalls, 1, 'the second worker must take the UPDATE branch, not a second create')
   assert.equal(state.updateCalls, 1, 'and its payload must actually be applied')
-  assert.equal(state.lockOrder.length, 2, 'both write transactions take the per-SKU advisory lock')
-  assert.equal(state.lockOrder[0], state.lockOrder[1], 'and they contend on the SAME key')
+  // The credential-rebind fence (o3d-mlc7) also takes WC_SYNC_ADVISORY_LOCK_KEY — once to
+  // snapshot settings, once inside the write transaction — so filter to the per-SKU keys
+  // this assertion is actually about. That the settings lock is taken, and taken first, is
+  // covered by tests/wc-product-import-rebind-fence.test.ts.
+  const perSkuLockOrder = state.lockOrder.filter((key) => key !== String(918_273_645))
+  assert.equal(perSkuLockOrder.length, 2, 'both write transactions take the per-SKU advisory lock')
+  assert.equal(perSkuLockOrder[0], perSkuLockOrder[1], 'and they contend on the SAME key')
 })
 
 test('create race: a SKU P2002 that slips past the lock is TRANSIENT, and the retry UPDATES rather than discarding (o3d-gtk)', async () => {

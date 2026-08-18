@@ -19,7 +19,14 @@ export type WcCategoryMirror = {
 }
 
 const TREE_CACHE_TTL_MS = 5 * 60 * 1000
-let cached: { fetchedAt: number; mirror: WcCategoryMirror } | null = null
+/**
+ * Keyed on the WooCommerce settings VERSION as well as the time (o3d-mlc7). A rebind or
+ * product-id cache reset bumps that version, and without it this cache would keep serving
+ * the previous store's category tree for up to the TTL — so an import running under
+ * store-B credentials would resolve store-A categories and link them onto store-B
+ * products. Same class of leak as the mapping writes the fence protects, one layer up.
+ */
+let cached: { fetchedAt: number; mirror: WcCategoryMirror; settingsVersion: string | null } | null = null
 
 export function clearWcCategoryMirrorCache(): void {
   cached = null
@@ -74,8 +81,13 @@ function chainFor(id: number, byId: Map<number, WcCategory>): WcCategory[] {
  */
 export async function ensureWcCategoryTreeMirrored(
   creds?: ConnectorCredentials | null,
+  settingsVersion: string | null = null,
 ): Promise<WcCategoryMirror | null> {
-  if (cached && Date.now() - cached.fetchedAt < TREE_CACHE_TTL_MS) {
+  if (
+    cached
+    && Date.now() - cached.fetchedAt < TREE_CACHE_TTL_MS
+    && cached.settingsVersion === settingsVersion
+  ) {
     return cached.mirror
   }
   const fetched = await fetchWcCategoryTree(creds)
@@ -108,7 +120,7 @@ export async function ensureWcCategoryTreeMirrored(
   }
 
   const mirror: WcCategoryMirror = { wcToIms, wcDepth }
-  cached = { fetchedAt: Date.now(), mirror }
+  cached = { fetchedAt: Date.now(), mirror, settingsVersion }
   return mirror
 }
 

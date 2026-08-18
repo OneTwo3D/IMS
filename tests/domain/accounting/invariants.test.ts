@@ -713,3 +713,131 @@ test('scjz.75: does not flag a non-terminal (still-shipping) order even if sums 
   const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
   assert.ok(!codes.includes('sales_order_recognized_revenue_deferral_mismatch'))
 })
+
+// --- o3d-0qoo: persisted daily-batch referenceIds ---
+
+const A1_REF = 'A1-2026-01-01-abcd1234'
+const A2_REF = 'A2-2026-01-01-0badf00d'
+const B_REF = 'B-2026-01-02-beefcafe'
+
+const SYNC_EVIDENCE_CODES = [
+  'shipment_posted_without_sync_evidence',
+  'sales_order_revenue_deferral_without_sync_evidence',
+  'sales_order_inventory_allocation_without_sync_evidence',
+]
+
+/**
+ * cleanRows(), but each row carries the exact referenceId its batch wrote and the
+ * stage stamps land just after UTC midnight on the day AFTER the batch date —
+ * exactly what a run that crosses midnight leaves behind (batch date captured once
+ * at run start, stamps written with later new Date() calls). Deriving the reference
+ * from the stamp here looks for a batch that does not exist.
+ */
+function midnightCrossingRows(): AccountingInvariantRows {
+  const rows = cleanRows()
+  const a1Stamp = new Date('2026-01-02T00:00:03.000Z')
+  const a2Stamp = new Date('2026-01-02T00:00:07.000Z')
+  const bStamp = new Date('2026-01-03T00:00:04.000Z')
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    revenueDeferredDate: a1Stamp,
+    revenueDeferredBatchRef: A1_REF,
+    inventoryAllocatedDate: a2Stamp,
+    inventoryAllocatedBatchRef: A2_REF,
+    shipments: rows.salesOrders[0].shipments.map((shipment) => ({ ...shipment, shipmentJournalDate: bStamp })),
+  }
+  rows.postedShipments[0] = {
+    ...rows.postedShipments[0],
+    shipmentJournalDate: bStamp,
+    shipmentJournalBatchRef: B_REF,
+    order: {
+      ...rows.postedShipments[0].order,
+      revenueDeferredDate: a1Stamp,
+      inventoryAllocatedDate: a2Stamp,
+    },
+  }
+  rows.syncLogs = withDailyBatchReferenceIds(rows.syncLogs, A1_REF, A2_REF, B_REF)
+  return rows
+}
+
+function withDailyBatchReferenceIds(
+  syncLogs: AccountingInvariantRows['syncLogs'],
+  a1: string,
+  a2: string,
+  b: string,
+): AccountingInvariantRows['syncLogs'] {
+  return syncLogs.map((log) => (
+    log.type === 'DAILY_BATCH_REVENUE_DEFERRAL'
+      ? { ...log, referenceId: a1 }
+      : log.type === 'DAILY_BATCH_INVENTORY_ALLOC'
+        ? { ...log, referenceId: a2 }
+        : log.type === 'DAILY_BATCH_GROUP_B'
+          ? { ...log, referenceId: b }
+          : log
+  ))
+}
+
+test('o3d-0qoo: persisted batch refs match the log a midnight-crossing batch wrote', () => {
+  const codes = evaluateAccountingInvariantRows(midnightCrossingRows()).map((finding) => finding.code)
+  for (const code of SYNC_EVIDENCE_CODES) {
+    assert.ok(!codes.includes(code), `${code} must not fire when the persisted ref names a live log`)
+  }
+})
+
+test('o3d-0qoo: legacy rows without a persisted ref still match via the derived date key', () => {
+  const rows = cleanRows()
+  // Pre-migration shape: stamps only, no persisted refs — and live Xero logs still
+  // digest-suffixed, so the derived bare key only matches through the digest bridge.
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    revenueDeferredBatchRef: null,
+    inventoryAllocatedBatchRef: null,
+  }
+  rows.postedShipments[0] = { ...rows.postedShipments[0], shipmentJournalBatchRef: null }
+  rows.syncLogs = withDailyBatchReferenceIds(rows.syncLogs, A1_REF, A2_REF, B_REF)
+
+  const codes = evaluateAccountingInvariantRows(rows).map((finding) => finding.code)
+  for (const code of SYNC_EVIDENCE_CODES) {
+    assert.ok(!codes.includes(code), `${code} must not fire for a legacy row whose derived key matches`)
+  }
+})
+
+test('o3d-0qoo: a Xero digest-suffixed persisted ref is matched exactly', () => {
+  const rows = cleanRows()
+  // Stamps and batch dates agree here; the point is that the digest-shaped ref is
+  // matched as written, with no stripping and no date arithmetic.
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    revenueDeferredBatchRef: A1_REF,
+    inventoryAllocatedBatchRef: A2_REF,
+  }
+  rows.postedShipments[0] = { ...rows.postedShipments[0], shipmentJournalBatchRef: B_REF }
+  rows.syncLogs = withDailyBatchReferenceIds(rows.syncLogs, A1_REF, A2_REF, B_REF)
+
+  const codes = evaluateAccountingInvariantRows(rows).map((finding) => finding.code)
+  for (const code of SYNC_EVIDENCE_CODES) {
+    assert.ok(!codes.includes(code), `${code} must not fire when the persisted digest ref matches exactly`)
+  }
+})
+
+test('o3d-0qoo: a persisted batch ref whose log is absent still reports missing sync evidence', () => {
+  const rows = midnightCrossingRows()
+  // The A1 batch this row names is gone; a DIFFERENT A1 batch ran on the stamp's
+  // date. Deriving from the stamp (plus the digest bridge) would accept that decoy
+  // and make the finding vacuous — the persisted ref must not match it.
+  rows.syncLogs = rows.syncLogs.map((log) => (
+    log.type === 'DAILY_BATCH_REVENUE_DEFERRAL' ? { ...log, referenceId: 'A1-2026-01-02-99999999' } : log
+  ))
+  // ...and the Group-B batch left no live log at all.
+  rows.syncLogs = rows.syncLogs.filter((log) => log.type !== 'DAILY_BATCH_GROUP_B')
+
+  const findings = evaluateAccountingInvariantRows(rows)
+  const a1Finding = findings.find((finding) => finding.code === 'sales_order_revenue_deferral_without_sync_evidence')
+  assert.ok(a1Finding, 'expected the A1 sync-evidence finding to still be reported')
+  assert.equal((a1Finding!.details as { expectedReferenceId: string }).expectedReferenceId, A1_REF)
+  assert.equal((a1Finding!.details as { referenceSource: string }).referenceSource, 'persisted')
+
+  const bFinding = findings.find((finding) => finding.code === 'shipment_posted_without_sync_evidence')
+  assert.ok(bFinding, 'expected the Group-B sync-evidence finding to still be reported')
+  assert.equal((bFinding!.details as { expectedReferenceId: string }).expectedReferenceId, B_REF)
+})

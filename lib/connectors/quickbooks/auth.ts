@@ -405,6 +405,33 @@ export async function refreshToken(): Promise<{ accessToken: string; realmId: st
 
 /**
  * Disconnect from QuickBooks — clears stored token and revokes refresh token.
+ *
+ * WHAT IT KEEPS, AND THE REALM-SWITCH HAZARD THAT LEAVES OPEN (o3d-gt8r).
+ *
+ * Disconnect deliberately does NOT clear the external ids on documents — purchase_invoices
+ * .accounting_invoice_id, sales_orders.accounting_invoice_id and the rest. They are financial
+ * evidence: the only local record of which ledger document a bill or invoice became, and the
+ * anchor every later correction and payment posts against. Cached LOOKUP ids (contacts, items) are
+ * different — they are a performance cache with an authoritative source, so they are cleared.
+ *
+ * The pin (the *_EXPECTED_* setting) IS cleared here, because an explicit disconnect is how an
+ * operator declares they intend to move: re-authorising to a different company while still
+ * connected is refused, and only a disconnect makes the move possible.
+ *
+ * So reconnecting to a DIFFERENT company is permitted, and the retained ids then belong to a
+ * company we are no longer talking to. QuickBooks realm ids are integers that repeat across
+ * companies, so the new realm can reissue an integer an old bill still holds. What happens then is
+ * bounded by the GLOBAL unique index on purchase_invoices.accounting_invoice_id: the new bill posts
+ * to QuickBooks successfully and its LOCAL back-reference write is REFUSED, loudly, naming the
+ * realm switch as the likely cause. The remote document exists and the local link does not, which
+ * needs a human — but no payment, update or reconciliation is ever aimed at the wrong document.
+ *
+ * That is the deliberate trade. Namespacing the id per realm so both could be stored was
+ * implemented and reverted: it permits the collision, and roughly 190 call sites read a naked
+ * external id — payment-poller.ts selects bills by `accountingInvoiceId != null` alone — on models
+ * (SalesOrder, SalesOrderRefund, SupplierCreditNote) that have no provenance column to consult even
+ * in principle. o3d-gt8r carries that design, the findings against it, and the consumer audit any
+ * real multi-tenant support has to land first.
  */
 export async function disconnect(): Promise<void> {
   // Attempt to revoke the refresh token (best-effort)

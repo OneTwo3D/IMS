@@ -19,6 +19,20 @@ import {
 } from '@/lib/products/categories'
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
+import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+import {
+  bumpFulfillmentGraphVersions,
+  componentGraphMutationAffectsFulfillment,
+  findComponentGraphEditBlockers,
+} from '@/lib/products/component-graph-edit-guard'
+
+/**
+ * Product types that can own ProductComponent rows. The CSV import queues a row for the
+ * component pass on the type it read BEFORE the row's lock, so the pass re-checks against
+ * this under its own lock (o3d-w998).
+ */
+const COMPONENT_BEARING_TYPES = new Set<string>(['KIT', 'BOM'])
 import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
@@ -237,7 +251,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
   const supplierIdByName = new Map(suppliers.map((supplier) => [supplier.name.trim().toLocaleLowerCase('en-US'), supplier.id]))
 
   // Track rows with components to process in second pass
-  const componentRows: { lineNum: number; sku: string; components: string }[] = []
+  // o3d-w998: the immutable product id is captured AT ENQUEUE, not resolved from `skuToId`
+  // during pass 2. That map is mutated by every rename in pass 1, so a SKU freed by one row
+  // and reassigned to a different product by a later row resolved to the WRONG product —
+  // which then passed both the sku and type checks, and had its component list replaced.
+  const componentRows: { lineNum: number; sku: string; productId: string; components: string }[] = []
   const touchedProducts: Array<{ id: string; lifecycleStatus: ProductLifecycleStatus }> = []
   const categoryIdCache = new Map<string, string>()
   type ProductCategoryResolverClient = Pick<Prisma.TransactionClient, 'productCategory'> | Pick<typeof db, 'productCategory'>
@@ -319,7 +337,21 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
     const csvOriginIso = csvOriginRaw ? normalizeCsvCountryOfOrigin(csvOriginRaw) : null
 
     const lifecycleStatusRaw = row['lifecycleStatus']?.trim() || row['lifecyclestatus']?.trim() || null
-    const lifecycleStatus = lifecycleStatusRaw === 'DRAFT' || lifecycleStatusRaw === 'ACTIVE' || lifecycleStatusRaw === 'EOL' || lifecycleStatusRaw === 'ARCHIVED'
+    // o3d-w998: an UNRECOGNISED lifecycle cell used to fall through to the PRE-LOCK snapshot
+    // value — and because `lifecycleStatusRaw` is truthy, the write guard below then wrote
+    // it. So a malformed cell silently overwrote a concurrent archive with a stale status,
+    // and the bad value itself was never reported. It is now an error for that field: the
+    // row keeps importing, but its lifecycle is left alone rather than reset from a snapshot.
+    const lifecycleStatusValid = lifecycleStatusRaw === null
+      || lifecycleStatusRaw === 'DRAFT' || lifecycleStatusRaw === 'ACTIVE'
+      || lifecycleStatusRaw === 'EOL' || lifecycleStatusRaw === 'ARCHIVED'
+    if (!lifecycleStatusValid) {
+      result.errors.push(
+        `Row ${lineNum} (${sku}): unrecognised lifecycleStatus "${lifecycleStatusRaw}" — the product's current `
+        + 'lifecycle was left unchanged',
+      )
+    }
+    const lifecycleStatus = lifecycleStatusValid && lifecycleStatusRaw !== null
       ? lifecycleStatusRaw as ProductLifecycleStatus
       : hasCsvValue(row, 'active')
         ? deriveLifecycleStatusFromLegacyActive((row['active'] ?? 'TRUE').trim().toUpperCase() !== 'FALSE')
@@ -393,7 +425,9 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           updateData.preferredSupplierUpdatedAt = preferredSupplierId ? new Date() : null
         }
         if (preferredSupplierLocked !== undefined) updateData.preferredSupplierLocked = preferredSupplierLocked
-        if (lifecycleStatusRaw || hasCsvValue(row, 'active')) {
+        // An invalid cell no longer counts as "the CSV asked for a lifecycle change" — writing
+        // the snapshot value on its behalf is exactly how a concurrent archive got reverted.
+        if ((lifecycleStatusRaw && lifecycleStatusValid) || hasCsvValue(row, 'active')) {
           updateData.active = deriveLegacyActiveFromLifecycleStatus(lifecycleStatus)
           updateData.lifecycleStatus = lifecycleStatus
         }
@@ -428,9 +462,78 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           updateData.categoryId = effectiveCategoryId
         }
 
+        // Declared out here because the in-run cache below reads it, outside this block.
+        // Carried as the transaction's RETURN value rather than a closure assignment, which
+        // TypeScript cannot narrow through.
+        type EffectiveStructure = { type: ProductType; parentId: string | null }
+        type RenameOutcome = { conflict: 'moved' | 'taken' | 'structure' | 'in-flight-sales' } | { conflict: null; structure: EffectiveStructure }
+        let effectiveStructure: EffectiveStructure | null = null
         if (!preview) {
           let resolvedCategoryId: string | null = null
-          await db.$transaction(async (tx) => {
+          const outcome: RenameOutcome = await db.$transaction(async (tx) => {
+            // o3d-42hw: this row can RENAME an existing product, which frees one sku and
+            // claims another, so it belongs in the write protocol exactly as the create does.
+            // Both skus are locked; the helper collapses them when the sku is unchanged.
+            await lockProductSkusForWrite(tx, [sku, existingProduct.sku])
+
+            // Re-read under the locks. `existingProduct` is a PRE-LOCK snapshot, and this row
+            // depends on it twice over: to choose the lock set, and — because an omitted CSV
+            // column means "preserve current" — to supply the defaults below.
+            const current = await tx.product.findUnique({
+              where: { id: existingProduct.id },
+              select: { sku: true, type: true, parentId: true },
+            })
+            if (!current) return { conflict: 'moved' as const }
+
+            // The lock set was chosen for the snapshot's sku. It still covers this product
+            // when a concurrent writer merely performed the rename this row wanted anyway —
+            // both skus are held either way — so that case proceeds rather than dropping the
+            // row's other updates. Any other move means the locks are against the wrong thing.
+            if (current.sku !== existingProduct.sku && current.sku !== sku) return { conflict: 'moved' as const }
+
+            // The destination sku may have been taken since the pre-transaction check.
+            if (sku !== existingProduct.sku) {
+              const taken = await tx.product.findFirst({
+                where: { sku, NOT: { id: existingProduct.id } },
+                select: { id: true },
+              })
+              if (taken) return { conflict: 'taken' as const }
+            }
+
+            // Re-validated under the locks, against tx: `structureValidation` was decided
+            // before this transaction, and type/parentId are written unconditionally below.
+            //
+            // The DEFAULTS come from `current`, not the snapshot. An omitted column means
+            // "preserve what the product has", so defaulting to a stale value models a
+            // transformation the row never asked for: a product that went SIMPLE -> KIT
+            // before these locks were taken would be validated as a KIT -> SIMPLE conversion,
+            // and since updateData omits `type` the write leaves it KIT while the resulting
+            // clearComponents / clearExternalMapping delete its components and drop its
+            // external mapping (Codex review, r2).
+            const revalidated = await validateProductStructureChange({
+              productId: existingProduct.id,
+              type: (updateData.type as ProductType | undefined) ?? current.type,
+              parentId: (updateData.parentId as string | null | undefined) ?? current.parentId,
+              client: tx,
+            })
+            if (!revalidated.ok) return { conflict: 'structure' as const }
+
+            // o3d-4kfh r5 (Codex finding 1): the KIT-ness guard runs BEFORE the type is written,
+            // and on EVERY KIT-ness change — not only the `clearComponents` ones. KIT <-> BOM keeps
+            // components (so clearComponents is false) while flipping whether fulfilment expands
+            // them, which is exactly the reinterpretation this refuses. Same reasoning as the
+            // editor; see app/actions/products.ts and the guard module for why this is best-effort
+            // rather than atomic (o3d-57b0).
+            const kitnessMutation = {
+              kind: 'kitness' as const,
+              currentType: current.type,
+              nextType: (updateData.type as ProductType | undefined) ?? current.type,
+            }
+            if (componentGraphMutationAffectsFulfillment(kitnessMutation)) {
+              const inFlight = await findComponentGraphEditBlockers(tx, existingProduct.id, kitnessMutation)
+              if (inFlight.length > 0) return { conflict: 'in-flight-sales' as const }
+            }
+
             if (categoryName) {
               resolvedCategoryId = await resolveImportedCategoryId(categoryName, tx)
             }
@@ -440,14 +543,53 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 ...updateData,
                 ...(categoryName ? { categoryId: resolvedCategoryId } : {}),
                 ...(sku !== existingProduct.sku ? { sku } : {}),
-                parentId: structureValidation.normalizedParentId,
-                ...(structureValidation.clearExternalMapping ? { externalProductId: null } : {}),
+                parentId: revalidated.normalizedParentId,
+                ...(revalidated.clearExternalMapping ? { externalProductId: null } : {}),
               },
             })
-            if (structureValidation.clearComponents) {
+            if (revalidated.clearComponents) {
+              // Losing KIT-ness was already refused above, before the type moved. BOM -> SIMPLE
+              // reaches here unguarded on purpose: fulfilment never expanded that BOM's components.
               await tx.productComponent.deleteMany({ where: { productId: existingProduct.id } })
             }
+            // o3d-4kfh r6: bump the graph version for this product and every KIT above it, in the
+            // same transaction as the type write. An allocation that read the OLD recipe stamped the
+            // old version, so commitment and dispatch now refuse it even when the guard above saw an
+            // empty blocker set because that allocation's transaction was still open.
+            await bumpFulfillmentGraphVersions(tx, existingProduct.id, kitnessMutation)
+            // The structure this row ACTUALLY committed, for the in-run cache below. The
+            // locked defaults can preserve a concurrent type/parent, so the pre-lock values
+            // no longer describe the row (Codex review, r3).
+            return {
+              conflict: null,
+              structure: {
+                type: (updateData.type as ProductType | undefined) ?? current.type,
+                parentId: revalidated.normalizedParentId,
+              },
+            }
           })
+          // Returned, never thrown: this loop has no per-row catch, so a throw would discard
+          // every remaining row over one contended product.
+          if (outcome.conflict === 'in-flight-sales') {
+            result.errors.push(
+              `Row ${lineNum} (${sku}): this product's type could not be changed because sales orders are `
+              + 'still in flight against its component graph (holding allocations, or picking/packed '
+              + 'shipments) — changing whether it is a kit changes what those orders are deemed to require, '
+              + 'so the row was skipped. Dispatch, deallocate or cancel those orders and re-run; already '
+              + 'shipped, completed, delivered or cancelled orders do not block',
+            )
+            result.skipped++
+            continue
+          }
+          if (outcome.conflict) {
+            result.errors.push(
+              `Row ${lineNum} (${sku}): another writer changed this product while the import was running `
+              + `(${outcome.conflict}) — re-run to pick it up`,
+            )
+            result.skipped++
+            continue
+          }
+          effectiveStructure = outcome.structure
           rememberImportedCategoryId(categoryName, resolvedCategoryId)
           if (categoryName) effectiveCategoryId = resolvedCategoryId
         }
@@ -468,8 +610,12 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           sku,
           barcode: barcode ?? previousBarcode,
           mpn: mpn ?? existingProduct.mpn,
-          type: ((updateData.type as ProductType | undefined) ?? existingProduct.type),
-          parentId: structureValidation.normalizedParentId,
+          // Prefer what the locked transaction actually committed. Caching the pre-lock
+          // values let a LATER row for this same product preflight against structure that
+          // was never written (Codex review, r3). Preview has no transaction, so it keeps
+          // the projected values.
+          type: effectiveStructure?.type ?? ((updateData.type as ProductType | undefined) ?? existingProduct.type),
+          parentId: effectiveStructure ? effectiveStructure.parentId : structureValidation.normalizedParentId,
           categoryId: effectiveCategoryId,
           lifecycleStatus,
         })
@@ -540,6 +686,43 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               lifecycleStatus,
             }
           : await db.$transaction(async (tx) => {
+              // o3d-42hw: join the per-SKU write protocol. The uniqueness decision that led
+              // here was made against a snapshot taken before this transaction, so a
+              // WooCommerce import or a manual create landing in between raised a P2002 that
+              // aborted the row — and, inside an interactive transaction, the transaction
+              // with it (o3d-md4q).
+              // o3d-1a84: the PARENT's sku too. The structure validation above ran before this
+              // transaction and only the new child was locked, so the WooCommerce sync could
+              // change the parent from VARIABLE to SIMPLE in between and this would commit a
+              // child pointing at a parent that can no longer have children. Both skus go
+              // through the one helper so they are acquired in the single ascending id order.
+              //
+              // THIS CLOSES ONE ORDERING, NOT BOTH. If the CSV wins the lock and commits the
+              // child, the WooCommerce sync then acquires the same lock and writes type=SIMPLE
+              // without checking for existing children, recreating the same forbidden state
+              // from the other side. The lock makes the two writers serialize; it cannot make
+              // the second one care. That half needs the WC sync to consult the editor's
+              // transform blockers, which it currently bypasses entirely — o3d-0hhu.
+              const parentIdToWrite = structureValidation.normalizedParentId
+              const parentSkuToLock = parentIdToWrite ? productById.get(parentIdToWrite)?.sku ?? null : null
+              await lockProductSkusForWrite(tx, parentSkuToLock ? [sku, parentSkuToLock] : [sku])
+
+              const taken = await tx.product.findUnique({ where: { sku }, select: { id: true } })
+              // Returned, not thrown: this loop has no per-row catch, so a throw would abort
+              // the whole import over one contended row.
+              if (taken) return null
+
+              if (parentIdToWrite) {
+                const parent = await tx.product.findUnique({
+                  where: { id: parentIdToWrite },
+                  select: { sku: true, type: true },
+                })
+                // The lock set was chosen from a pre-transaction snapshot of the parent, so a
+                // rename since then means we hold the lock for a sku it no longer has.
+                if (!parent || parent.sku !== parentSkuToLock) return 'parent-moved' as const
+                if (parent.type !== ProductType.VARIABLE) return 'parent-not-variable' as const
+              }
+
               const createCategoryId = await resolveImportedCategoryId(categoryName, tx)
               return tx.product.create({
                 data: {
@@ -549,6 +732,22 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 },
               })
             })
+        if (created === 'parent-moved' || created === 'parent-not-variable') {
+          result.errors.push(
+            created === 'parent-not-variable'
+              ? `Row ${lineNum} (${sku}): its parent stopped being a variable product while the import was running — not created`
+              : `Row ${lineNum} (${sku}): its parent was renamed while the import was running — re-run to pick it up`,
+          )
+          result.skipped++
+          continue
+        }
+        if (!created) {
+          result.errors.push(
+            `Row ${lineNum} (${sku}): another writer created this SKU while the import was running — re-run to pick it up`,
+          )
+          result.skipped++
+          continue
+        }
         rememberImportedCategoryId(categoryName, created.categoryId)
         skuToId.set(sku, created.id)
         if (barcode) {
@@ -575,8 +774,16 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
       // Track components for second pass
       const componentsStr = (row['components'] ?? '').trim()
-      if (componentsStr && (type === 'KIT' || type === 'BOM')) {
-        componentRows.push({ lineNum, sku, components: componentsStr })
+      // Gated on the COMMITTED type, which the locked transaction has just written into
+      // productById, rather than the pre-lock `type`. Pass 2 re-checks under its own lock
+      // regardless, so this is not what makes it safe — it stops the common case queueing a
+      // row only to reject it later with a conflict the operator did not cause (o3d-w998).
+      const committedType = productById.get(skuToId.get(sku) ?? '')?.type ?? type
+      if (componentsStr && COMPONENT_BEARING_TYPES.has(committedType)) {
+        const componentProductId = skuToId.get(sku)
+        if (componentProductId) {
+          componentRows.push({ lineNum, sku, productId: componentProductId, components: componentsStr })
+        }
       }
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e)
@@ -587,8 +794,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
   // Pass 2: Set up components for KIT/BOM products
   for (const cr of componentRows) {
-    const productId = skuToId.get(cr.sku)
-    if (!productId) continue
+    const productId = cr.productId
 
     // Parse "SKU1:qty;SKU2:qty" format
     const parts = cr.components.split(';').map((s) => s.trim()).filter(Boolean)
@@ -618,19 +824,70 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
     }
 
     if (components.length > 0) {
-      const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId))
-      if (cycle.kind === 'self') {
+      // Preflight only. The authoritative check runs under the graph lock inside the write
+      // transaction below — this one reads a graph another writer may change before we commit.
+      const preflight = await detectComponentCycle(productId, components.map((c) => c.componentId))
+      if (preflight.kind === 'self') {
         result.errors.push(`Row ${cr.lineNum}: ${cr.sku} cannot be a component of itself`)
         continue
       }
-      if (cycle.kind === 'cycle') {
+      if (preflight.kind === 'cycle') {
         result.errors.push(`Row ${cr.lineNum}: circular BOM reference detected for ${cr.sku}`)
         continue
       }
 
       try {
         if (!preview) {
-          await db.$transaction(async (tx) => {
+          // o3d-w998: this pass runs LONG after the row that queued it, in its own
+          // transaction, and the decision to queue it was made on `type` — which falls back
+          // to the PRE-LOCK snapshot when the CSV omits the column (`rawType ||
+          // existingProduct?.type`). A product converted KIT/BOM -> SIMPLE in between would
+          // have had its components deleted and rewritten here even though it no longer
+          // accepts any.
+          //
+          // So the lock is taken HERE and the type re-read under it. Same protocol and
+          // namespace as every other Product writer (o3d-42hw), so this contends with the
+          // editor and the WooCommerce sync rather than racing them.
+          const wrote = await db.$transaction(async (tx) => {
+            // o3d-t0zq: the GRAPH lock, before the per-SKU one. A cycle is a property of the
+            // graph rather than of any product, so a per-product lock cannot serialize the
+            // writers that form one — two writers adding B->C and D->A hold disjoint per-SKU
+            // sets, never block, and together close A->B->C->D->A with both cycle checks
+            // having passed. Fixed order relative to the per-SKU lock below keeps the two
+            // families deadlock-free.
+            await tx.$executeRaw`SELECT pg_advisory_xact_lock(${COMPONENT_GRAPH_WRITE_LOCK_KEY})`
+            await lockProductSkusForWrite(tx, [cr.sku])
+            const current = await tx.product.findUnique({
+              where: { id: productId },
+              select: { sku: true, type: true },
+            })
+            // The lock is on cr.sku, but the product is addressed by the id `skuToId` held at
+            // the END of pass 1 — a rename since then means we hold the lock for a sku this
+            // product no longer has, so it protects nothing. Same lock-set verification the
+            // rename path needs (o3d-42hw).
+            if (!current || current.sku !== cr.sku) return false
+            if (!COMPONENT_BEARING_TYPES.has(current.type)) return false
+
+            // Re-checked under the graph lock, against tx. The preflight above proved nothing
+            // about the graph this transaction is committing into.
+            const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId), tx)
+            if (cycle.kind !== 'ok') return false
+
+            // o3d-4kfh r5: same in-flight sales refusal as the editor. A bulk CSV pass is not a
+            // licence to retroactively rewrite what an already-allocated or already-picking order
+            // requires — the corruption it produces (an incomplete kit dispatched, credited as a
+            // partial kit, reported by nothing) is identical however the graph was edited. Reported
+            // per row rather than aborting the import, so the remaining rows still land.
+            //
+            // `kind: 'components'` with the type read under the lock: on a BOM this is a no-op, so a
+            // CSV that maintains manufacturing recipes is no longer refused for a sales reason.
+            const componentMutation = {
+              kind: 'components' as const,
+              currentType: current.type,
+            }
+            const inFlight = await findComponentGraphEditBlockers(tx, productId, componentMutation)
+            if (inFlight.length > 0) return 'in-flight-sales' as const
+
             await tx.productComponent.deleteMany({ where: { productId } })
             await tx.productComponent.createMany({
               data: components.map((c, i) => ({
@@ -640,7 +897,30 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 sortOrder: i,
               })),
             })
+            // o3d-4kfh r6: the CAS half of the same protection — see the kitness path above. A no-op
+            // on a BOM, whose component list no sales line expands.
+            await bumpFulfillmentGraphVersions(tx, productId, componentMutation)
+            return true
           })
+          if (wrote === 'in-flight-sales') {
+            result.errors.push(
+              `Row ${cr.lineNum}: ${cr.sku} has sales orders still in flight against its component graph `
+              + '(holding allocations, or picking/packed shipments) — components were not written, because '
+              + 'changing them would retroactively change what those orders require. Dispatch, deallocate '
+              + 'or cancel those orders and re-run; already shipped, completed, delivered or cancelled '
+              + 'orders do not block',
+            )
+            continue
+          }
+          if (!wrote) {
+            // Reported, not silent: the operator supplied components for this row and none
+            // were written. Returning rather than throwing keeps the remaining rows going.
+            result.errors.push(
+              `Row ${cr.lineNum}: ${cr.sku} no longer accepts components (its type changed while the import `
+              + 'was running) — components were not written',
+            )
+            continue
+          }
           const product = touchedProducts.find((entry) => entry.id === productId)
           if (!product) {
             const lifecycleRow = await db.product.findUnique({

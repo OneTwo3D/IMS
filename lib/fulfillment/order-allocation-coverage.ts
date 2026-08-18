@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import type { Prisma } from '@/app/generated/prisma/client'
 import {
   calculateCoverageByLine,
   requirementsMapToRows,
@@ -44,6 +45,13 @@ const QUANTITY_TOLERANCE = 1e-6
 export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
   candidates: T[],
   lineNeedsAllocation?: (line: CoverageOrderLine, requirements: FulfillmentRequirement[]) => boolean,
+  /**
+   * Client to read coverage against. Defaults to the module-level `db`, which is what the
+   * sweep and the backorder allocator use. A caller deciding something under an order lock
+   * must pass `tx` — reading through `db` would see pre-lock state and decide against a
+   * snapshot the lock exists to rule out (o3d-c9mi).
+   */
+  client: Prisma.TransactionClient | typeof db = db,
 ): Promise<T[]> {
   if (candidates.length === 0) return []
 
@@ -56,7 +64,13 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
       ),
     ),
   ]
-  const graph = await loadFulfillmentProductGraph(db, lineProductIds)
+  // Through the SAME client as everything below. Loading the graph on the global `db` while
+  // the caller holds an interactive transaction takes a SECOND pooled connection — twenty
+  // concurrent callers exhaust the pool and each waits for a connection the others hold. It
+  // also mixes snapshots: a KIT definition committed after this read makes existing
+  // allocations look complete against the old graph while being short against the new one,
+  // so the shortfall is never recorded (Codex review, o3d-c9mi r3).
+  const graph = await loadFulfillmentProductGraph(client, lineProductIds)
   const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
   for (const order of candidates) {
     for (const line of order.lines) {
@@ -70,7 +84,7 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
 
   // Coverage from OrderAllocation only (component units for KIT lines). Shipped orders are excluded by
   // the caller, so there are no committed shipment rows to add here.
-  const allocRows = await db.orderAllocation.findMany({
+  const allocRows = await client.orderAllocation.findMany({
     where: { orderId: { in: candidates.map((o) => o.id) } },
     select: { orderId: true, lineId: true, productId: true, qty: true },
   })
@@ -102,7 +116,7 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
   // Aggregating under the refund's OWN orderId makes a bad link inert instead of contagious.
   const refundedByOrderLine = new Map<string, number>()
   const refundKey = (orderId: string, lineId: string) => `${orderId}\u0000${lineId}`
-  const refundLines = await db.salesOrderRefundLine.findMany({
+  const refundLines = await client.salesOrderRefundLine.findMany({
     where: { refund: { orderId: { in: candidates.map((o) => o.id) } } },
     select: { salesOrderLineId: true, qty: true, refund: { select: { orderId: true } } },
   })

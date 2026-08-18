@@ -150,6 +150,38 @@ The **Products** tab controls bidirectional product synchronisation.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 - Variation attributes are synced for the options panel
 
+### What the connector will NOT change
+
+WooCommerce models two product shapes (`simple`, `variable`); IMS models six. A WooCommerce type is therefore an *absence* of information about everything else IMS knows, never an assertion that the product has none — so the import may set a product's type only when the existing IMS row is **SIMPLE**. On any other type the type write is dropped and everything else in the payload (name, price, images, dimensions, trade fields, category, WooCommerce mapping) still applies:
+
+| Existing IMS type | Why the connector may not change it |
+|---|---|
+| KIT / BOM | Composition is IMS-owned and WooCommerce cannot express it. Flattening to SIMPLE left the component rows in place and stopped in-flight orders expanding into components |
+| VARIABLE | Other rows carry its id as their `parentId`, and a parent must be VARIABLE. Flattening it orphans its children and leaves its option rows behind |
+| VARIANT | A variant must stay attached to a variable parent. The import writes `type` but never `parentId`, so a detach would leave a SIMPLE row still carrying a parent |
+| NON_INVENTORY | Means "not stock-tracked" (a service or fee). Converting it silently gives it stock levels, allocation and COGS |
+
+A brand-new product still takes its type from WooCommerce: a row that does not exist yet has no structure to protect.
+
+Two further refusals apply to rows the table above allows the connector to change:
+
+- **A product that is in use is not restructured.** Before turning a SIMPLE row into a variable parent, or into a variation of one, the import runs the same checks the product editor runs: a product carrying stock, reserved stock, or open sales / purchase / manufacturing / stock-transfer documents is left exactly as it is. The exception row names what is blocking it — "stock on hand (5.00)", "1 open sales order line" — so the fix is the same one the editor would ask for. The structural write itself re-asserts that condition, so an order placed or stock received *while the import was running* still refuses the change rather than sneaking past a check that had already been answered.
+- **A product that is already somebody's variation never becomes a parent.** If the IMS row carries a parent of its own, no variations are attached to it, whatever its type currently says.
+- **A product that already has child rows is neither flattened nor promoted.** Only a variable product may have children, but nothing in the database enforces that, and older versions of this connector could leave a flattened product with its variants still attached. The import asks whether other IMS rows point at this one — it does not take the type's word for it — and if they do while the type says otherwise, it changes nothing: it will not price the row as a standalone product (which would bury the problem), and it will not turn it into a variable parent (which would silently adopt rows WooCommerce never mentioned). Repair it in the product editor — detach or remove the child rows, or make it a variable parent — and the next sync goes through.
+
+When a refusal applies, the row is left **structurally and commercially** untouched: its type, its own regular/sale price and its variation options all stay as they are. Only the fields WooCommerce genuinely owns — name, description, images, dimensions, trade fields, category, status, WooCommerce mapping — are still written.
+
+A variation is also only matched to an existing IMS row when that row is genuinely the one the WooCommerce variation owns: not mapped to a different WooCommerce object, not already a child of a *different* IMS parent, not itself a parent, of a type that can sit under a variable parent, and not carrying stock or open documents. A bare SKU match is not enough.
+
+When a refusal means WooCommerce data goes **unimported**, the import is reported as failed, the product is not marked synced, the reconcile cursor does not advance past it, and a row appears in the [Sync Exception Inbox](sync-exceptions.md). Resolve it in IMS or in WooCommerce; the next successful sync clears the row by itself. There are four ways to reach that state, and they are one rule — *the two systems disagree about whether the row is a variable parent*, asked of the row's **type and its actual child rows**, not of its type alone:
+
+- a **variable** WooCommerce product paired with an IMS row that cannot be a parent (a kit, a row that is already somebody's variation, a row that already has child rows its type does not allow, or a row carrying stock or open documents) — none of its variations are imported;
+- a **simple** WooCommerce product paired with an IMS **VARIABLE** row — its type and its price are not applied, and the IMS variants stay where they are. The connector will not delete IMS children that WooCommerce never asked it to remove;
+- a **simple** WooCommerce product paired with an IMS row that has child rows while its type says it cannot — the same disagreement, reached through a row that is already invalid. Its type and price are not applied either;
+- a single variation whose SKU resolves to an incompatible IMS row.
+
+A kit or BOM paired with a **simple** WooCommerce product is **not** one of these. That is the ordinary bundle pairing: neither side claims the row is a parent, WooCommerce simply has nothing to say about composition, and nothing goes unimported — so the sync is clean and the product keeps receiving its price and status updates.
+
 **IMS to WooCommerce:**
 - Product name, description, regular price, sale price
 - GTIN (only if purely numeric)

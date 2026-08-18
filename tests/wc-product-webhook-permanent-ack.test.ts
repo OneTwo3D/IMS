@@ -91,7 +91,13 @@ test('a PERMANENT mapping conflict is acknowledged and logged as rejected, not r
   assert.equal(rejected.level, 'ERROR', 'nothing will import this product until the duplicate is resolved')
   assert.equal(rejected.metadata?.permanent, true)
   assert.equal(rejected.metadata?.sku, 'WIDGET-1')
-  assert.match(String(rejected.description), /permanent mapping conflict/i)
+  // Two kinds of permanent conflict reach this branch — a mapping collision (o3d-gtk/o3d-fsi)
+  // and a structure refusal (o3d-y89x) — so the operator-facing line must name both remedies
+  // rather than sending them hunting a duplicate SKU that may not exist.
+  assert.match(String(rejected.description), /permanent mapping or structure conflict/i)
+  assert.match(String(rejected.description), /\/sync\/exceptions/, 'and points at the inbox')
+  assert.equal(rejected.metadata?.error, 'Unique constraint failed on the fields: (`barcode`)',
+    'the specific conflict still travels in the metadata')
 
   assert.equal(
     activityLog.some((entry) => entry.action === 'wc_product_webhook'),

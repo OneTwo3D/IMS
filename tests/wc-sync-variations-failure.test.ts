@@ -24,9 +24,10 @@ const syncLogs: Array<Record<string, unknown>> = []
 // create-path (null) vs update-path (an existing row).
 let existingProduct: unknown = null
 
+const dbMock: Record<string, unknown> = {}
 mock.module('@/lib/db', {
   namedExports: {
-    db: {
+    db: Object.assign(dbMock, {
       product: {
         findFirst: async () => existingProduct,
         create: async () => ({ id: 'ims-parent-1' }),
@@ -39,8 +40,25 @@ mock.module('@/lib/db', {
         },
       },
       productOption: { upsert: async () => ({}) },
-      setting: { upsert: async () => ({}), findUnique: async () => null },
-    },
+      setting: {
+        upsert: async () => ({}),
+        // The credential-rebind fence (o3d-mlc7) snapshots settings before any remote read.
+        // No rows => credentials null and version '0', which findUnique agrees with, so the
+        // fence is a no-op here and this suite keeps testing what it says it tests.
+        findMany: async () => [],
+        findUnique: async () => null,
+      },
+      // The fence's snapshot runs in its own transaction, BEFORE the variations fetch this
+      // suite makes fail. Without it the sync dies on a TypeError instead — which still
+      // looks like "the sync failed", so the suite would have kept passing while no longer
+      // exercising the variations failure at all.
+      $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(dbMock),
+      $executeRaw: async () => 1,
+      $queryRaw: async (_strings: TemplateStringsArray, ...values: unknown[]) => {
+        const skus = (values[0] ?? []) as string[]
+        return [...new Set(skus)].map((sku, index) => ({ lock_id: index + 1, sku }))
+      },
+    }),
   },
 })
 
