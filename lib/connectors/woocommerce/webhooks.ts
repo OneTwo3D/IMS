@@ -396,18 +396,25 @@ async function handleProductWebhook(payload: unknown) {
         update: { value: new Date().toISOString() },
       })
     } else if (result.permanent) {
-      // A deterministic mapping conflict: the GTIN, the WC id, or the SKU itself already belongs
-      // to a different IMS product (o3d-gtk, o3d-fsi). Re-delivering this payload reaches the
-      // identical conclusion, so the delivery is ACKNOWLEDGED rather than retried ~24 times into
-      // the dead-letter queue — and logged at ERROR, because nothing will import this product
-      // until an operator resolves the duplicate. `error` carries which claim collided.
+      // A deterministic conflict, of one of two kinds:
+      //   - MAPPING (o3d-gtk, o3d-fsi): the GTIN, the WC id, or the SKU itself already belongs to
+      //     a different IMS product.
+      //   - STRUCTURE (o3d-y89x): applying this payload would have destroyed IMS-owned structure,
+      //     so WooCommerce objects went unimported. That one also leaves a row on
+      //     /sync/exceptions with the specific SKUs.
+      // Either way, re-delivering this payload reaches the identical conclusion, so the delivery
+      // is ACKNOWLEDGED rather than retried ~24 times into the dead-letter queue — and logged at
+      // ERROR, because nothing will import this product until an operator acts. The description
+      // names both remedies rather than only the duplicate one, which would send an operator
+      // hunting a duplicate SKU that does not exist; `error` carries the specific conflict.
       await logActivity({
         entityType: 'SYNC',
         action: 'wc_product_webhook_rejected',
         tag: 'sync',
         level: 'ERROR',
-        description: `WooCommerce product webhook for ${productPayload.sku} hit a permanent mapping conflict; `
-          + 'acknowledged rather than retried — resolve the duplicate SKU / barcode / WooCommerce id in IMS',
+        description: `WooCommerce product webhook for ${productPayload.sku} hit a permanent mapping or structure conflict; `
+          + 'acknowledged rather than retried — resolve the duplicate SKU / barcode / WooCommerce id in IMS, '
+          + 'or the product-structure conflict listed on /sync/exceptions',
         metadata: {
           externalId: productPayload.id,
           sku: productPayload.sku,

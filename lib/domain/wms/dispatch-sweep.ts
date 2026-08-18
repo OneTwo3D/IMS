@@ -7,6 +7,7 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { isWmsUnresolvableRecordError } from '@/lib/connectors/wms/errors'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
+import { unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import { applyExternalFulfillmentUpdate } from '@/lib/fulfillment/external-fulfillment'
 import { notify } from '@/lib/notifications'
 import { getSettingValue } from '@/lib/settings-store'
@@ -82,7 +83,40 @@ export function formatCursorInTimeZone(instant: Date, timeZone?: string | null):
 }
 
 /** Lifecycle statuses where the IMS order has already left the dispatch-poll set. */
-const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] as const
+/**
+ * Statuses past the point a dispatch sweep cares about. Exported (o3d-bjc.12)
+ * because the operator's isolate action must apply the SAME eligibility the
+ * sweep does — a link that shipped since the incident was recorded is no longer
+ * a dispatch candidate and must not be quarantined as if it were.
+ */
+export const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] as const
+
+/**
+ * What makes a link a dispatch candidate — the ONE definition (o3d-0gzr).
+ *
+ * The operator-facing isolate path has to quarantine exactly the set the sweep
+ * would have, so it must ask the same question. It used to ask a hand-copied
+ * version of it: equal at the time, and free to drift apart afterwards, since
+ * nothing failed if one side gained a state the other did not. Both sides now
+ * call this, so a change to eligibility is a change to both by construction.
+ */
+export function dispatchCandidateWhere(connectorId: string) {
+  return {
+    connector: connectorId,
+    // MERGED links are repointed-to-survivor orders that still need despatch
+    // tracking; the push-sweep skips them (SYNCED-only) so they aren't re-pushed.
+    state: { in: ['SYNCED' as const, 'MERGED' as const] },
+    externalOrderNumber: { not: null },
+    // 6oyu.2: dead-lettered links stop re-erroring every sweep; an operator
+    // replays them from the exception inbox once the cause is fixed.
+    dispatchDeadLetteredAt: null,
+    // o3d-bjc.9: a QUARANTINED link is out of the sweep for the same reason a
+    // dead-lettered one is — its record cannot be read, so re-polling it every
+    // tick only pins the watermark. It comes back when an operator acts.
+    dispatchUnresolvedAt: null,
+    order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+  }
+}
 
 /**
  * 6oyu.2: consecutive per-order reconcile failures before the link is
@@ -92,6 +126,36 @@ const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'
  * surfaces in the exception inbox instead.
  */
 export const DISPATCH_MAX_CONSECUTIVE_FAILURES = 5
+
+/**
+ * o3d-bjc.12: what the sweep knows about an ongoing drift, persisted so an
+ * OPERATOR can act on it.
+ *
+ * The sweep will not mass-quarantine a cohort it cannot prove is record-local —
+ * that decision belongs to a human — but a decision nobody can see is not a
+ * decision offered. This is the evidence behind the offer: who is stuck, since
+ * when, how long it has been going on, and what the failure actually said.
+ */
+export type WmsUnresolvedDriftState = {
+  consecutive: number
+  cohortKey: string | null
+  stableFor: number
+  /** When this cohort was FIRST seen (ISO). Null while there is no drift. */
+  firstSeenAt?: string | null
+  /** The links in the cohort, so the operator's "isolate these" acts on THIS set. */
+  linkIds?: string[]
+  /** How many links the pass decided an outcome for — the ratio's denominator. */
+  touched?: number
+  /** A sample of what the WMS actually said, so the offer shows the defect. */
+  reason?: string | null
+  /**
+   * When the sweep last RE-CONFIRMED this drift (ISO). The operator-facing offer
+   * expires on it: a clear that fails to persist would otherwise leave an
+   * incident inviting someone to quarantine orders the sweep has since read
+   * perfectly well.
+   */
+  lastSeenAt?: string | null
+}
 
 /** Pure dead-letter decision so the threshold semantics are unit-testable. */
 export function shouldDeadLetterDispatch(failureCount: number, deadLetteredAt: Date | null): boolean {
@@ -377,8 +441,8 @@ export type WmsDispatchSweepDeps = {
     resolved: number
     representative: number
   }>
-  getUnresolvedDriftState?(): Promise<{ consecutive: number; cohortKey: string | null; stableFor: number }>
-  saveUnresolvedDriftState?(state: { consecutive: number; cohortKey: string | null; stableFor: number }): Promise<boolean>
+  getUnresolvedDriftState?(): Promise<WmsUnresolvedDriftState>
+  saveUnresolvedDriftState?(state: WmsUnresolvedDriftState): Promise<boolean>
   /**
    * Alert admins ONCE about connector-wide unresolved drift (deduplicated).
    * `consecutivePasses` escalates a drift that is not clearing — which is what
@@ -1371,6 +1435,16 @@ export async function runWmsDispatchSweepCore(
       consecutive: unresolvedSystemic ? prior.consecutive + 1 : 0,
       cohortKey,
       stableFor,
+      // o3d-bjc.12: the evidence an operator needs to decide. firstSeenAt
+      // survives while the cohort does — "unreadable since 09:12" is the whole
+      // difference between a blip and something that needs a human.
+      firstSeenAt: unresolvedSystemic
+        ? (cohortUnchanged ? prior.firstSeenAt ?? now.toISOString() : now.toISOString())
+        : null,
+      linkIds: unresolvedSystemic ? unresolvedLinks.map((entry) => entry.candidate.linkId) : [],
+      lastSeenAt: unresolvedSystemic ? now.toISOString() : null,
+      touched: unresolvedSystemic ? linksDecided : 0,
+      reason: unresolvedSystemic ? unresolvedLinks[0]?.reason ?? null : null,
     })) ?? true
     if (!committed) {
       // An observability write failing must NEVER reclassify drift into broken
@@ -1435,7 +1509,12 @@ export async function runWmsDispatchSweepCore(
     // its own count, and its own cohort.
     const prior = (await deps.getUnresolvedDriftState?.()) ?? { consecutive: 0, cohortKey: null, stableFor: 0 }
     if (prior.consecutive > 0 || prior.cohortKey !== null) {
-      await deps.saveUnresolvedDriftState({ consecutive: 0, cohortKey: null, stableFor: 0 })
+      // Cleared, which also RETRACTS the operator-facing incident: the offer to
+      // isolate must not outlive the condition it was offered for.
+      await deps.saveUnresolvedDriftState({
+        consecutive: 0, cohortKey: null, stableFor: 0,
+        firstSeenAt: null, linkIds: [], touched: 0, reason: null, lastSeenAt: null,
+      })
     }
   }
 
@@ -1524,25 +1603,11 @@ export type WmsDispatchSweepResult = {
 export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector: WmsConnector): WmsDispatchSweepDeps {
   // Per-connector so one WMS drifting cannot suppress (or unsuppress) another's
   // quarantine bound.
-  const unresolvedStreakKey = `wms_dispatch_unresolved_streak:${connectorId}`
+  const unresolvedStreakKey = unresolvedDriftStateKey(connectorId)
   return {
     async listCandidates(limit) {
       const rows = await db.wmsOrderPushLink.findMany({
-        where: {
-          connector: connectorId,
-          // MERGED links are repointed-to-survivor orders that still need despatch
-          // tracking; the push-sweep skips them (SYNCED-only) so they aren't re-pushed.
-          state: { in: ['SYNCED', 'MERGED'] },
-          externalOrderNumber: { not: null },
-          // 6oyu.2: dead-lettered links stop re-erroring every sweep; an operator
-          // replays them from the exception inbox once the cause is fixed.
-          dispatchDeadLetteredAt: null,
-          // o3d-bjc.9: a QUARANTINED link is out of the sweep for the same reason a
-          // dead-lettered one is — its record cannot be read, so re-polling it every
-          // tick only pins the watermark. It comes back when an operator acts.
-          dispatchUnresolvedAt: null,
-          order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
-        },
+        where: dispatchCandidateWhere(connectorId),
         select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
         take: limit,
         orderBy: { pushedAt: 'asc' },
@@ -1984,11 +2049,19 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       const empty = { consecutive: 0, cohortKey: null as string | null, stableFor: 0 }
       if (!row?.value) return empty
       try {
-        const parsed = JSON.parse(row.value) as Partial<{ consecutive: number; cohortKey: string; stableFor: number }>
+        const parsed = JSON.parse(row.value) as Partial<WmsUnresolvedDriftState>
         return {
           consecutive: Number.isFinite(parsed.consecutive) ? Math.max(0, Number(parsed.consecutive)) : 0,
           cohortKey: typeof parsed.cohortKey === 'string' ? parsed.cohortKey : null,
           stableFor: Number.isFinite(parsed.stableFor) ? Math.max(0, Number(parsed.stableFor)) : 0,
+          // o3d-bjc.12: the operator-facing evidence rides in the same row.
+          firstSeenAt: typeof parsed.firstSeenAt === 'string' ? parsed.firstSeenAt : null,
+          linkIds: Array.isArray(parsed.linkIds)
+            ? parsed.linkIds.filter((id): id is string => typeof id === 'string')
+            : [],
+          touched: Number.isFinite(parsed.touched) ? Math.max(0, Number(parsed.touched)) : 0,
+          reason: typeof parsed.reason === 'string' ? parsed.reason : null,
+          lastSeenAt: typeof parsed.lastSeenAt === 'string' ? parsed.lastSeenAt : null,
         }
       } catch {
         // Unreadable state is NO state: start over rather than infer a cohort

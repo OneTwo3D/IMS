@@ -42,12 +42,20 @@ type SourceOrderRow = {
   refundStatus: string
   revenueDeferredDate: Date | string | null
   inventoryAllocatedDate: Date | string | null
+  // o3d-0qoo: the exact A1/A2 batch referenceIds stamped on the row in the same
+  // transaction as the stage stamps. Optional so pure-evaluator fixtures compile;
+  // the Prisma select always provides them. Null/absent = pre-migration row, which
+  // has nothing but the stamp and so falls back to the derived key.
+  revenueDeferredBatchRef?: string | null
+  inventoryAllocatedBatchRef?: string | null
 }
 
 type SourceShipmentRow = {
   id: string
   orderId: string
   shipmentJournalDate: Date | string | null
+  // o3d-0qoo: the exact Group-B batch referenceId (pairs with shipmentJournalDate).
+  shipmentJournalBatchRef?: string | null
 }
 
 type SourceRefundRow = {
@@ -186,6 +194,36 @@ function dateKey(value: Date | string | null | undefined): string | null {
   const date = typeof value === 'string' ? new Date(value) : value
   if (Number.isNaN(date.getTime())) return null
   return date.toISOString().slice(0, 10)
+}
+
+/**
+ * The DailyBatch sourceEntityId to reconcile a staged row against, in BOTH
+ * directions (forward: does an event exist for this source? reverse: does this
+ * event have a source?). Both must use this one key or a single journal can
+ * produce a `source_*_without_event` and an `event_without_source` at once.
+ *
+ * o3d-0qoo: prefer the referenceId persisted on the row. AccountingEvent.sourceEntityId
+ * is copied verbatim from AccountingSyncLog.referenceId by accounting-event-mirror,
+ * so the persisted ref is exactly the string the mirrored event carries. That fixes
+ * two distinct mismatches at once:
+ *  - the midnight crossing (batch date captured once at run start, stage stamps written
+ *    with later new Date() calls, so the derived date can be the following day);
+ *  - Xero's digest suffix — this module has no digest stripping at all, so a derived
+ *    bare `A1-<date>` NEVER equalled the mirrored `A1-<date>-<8 hex>`, and every Xero
+ *    daily batch double-reported (both directions) even without a midnight crossing.
+ *
+ * The derive-from-stamp fallback stays for pre-migration rows, which carry no ref and
+ * never will; on Xero those keep double-reporting exactly as they did before.
+ */
+function dailyBatchSourceEntityId(
+  group: 'A1' | 'A2' | 'B',
+  persistedReferenceId: string | null | undefined,
+  stagedAt: Date | string | null,
+): string | null {
+  const persisted = persistedReferenceId?.trim()
+  if (persisted) return persisted
+  const key = dateKey(stagedAt)
+  return key ? `${group}-${key}` : null
 }
 
 function eventKey(input: {
@@ -398,9 +436,9 @@ export function evaluateAccountingReconciliationRows(
 
   for (const order of rows.salesOrders) {
     const label = orderLabel(order)
-    const a1Date = dateKey(order.revenueDeferredDate)
-    if (a1Date) {
-      const sourceEntityId = `A1-${a1Date}`
+    const a1SourceEntityId = dailyBatchSourceEntityId('A1', order.revenueDeferredBatchRef, order.revenueDeferredDate)
+    if (a1SourceEntityId) {
+      const sourceEntityId = a1SourceEntityId
       sourceKeys.add(sourceKey('DAILY_BATCH_REVENUE_DEFERRAL', 'DailyBatch', sourceEntityId))
       addExpectedSourceEventFinding(findings, rows, {
         code: 'source_order_revenue_deferral_without_event',
@@ -413,9 +451,9 @@ export function evaluateAccountingReconciliationRows(
       })
     }
 
-    const a2Date = dateKey(order.inventoryAllocatedDate)
-    if (a2Date) {
-      const sourceEntityId = `A2-${a2Date}`
+    const a2SourceEntityId = dailyBatchSourceEntityId('A2', order.inventoryAllocatedBatchRef, order.inventoryAllocatedDate)
+    if (a2SourceEntityId) {
+      const sourceEntityId = a2SourceEntityId
       sourceKeys.add(sourceKey('DAILY_BATCH_INVENTORY_ALLOC', 'DailyBatch', sourceEntityId))
       addExpectedSourceEventFinding(findings, rows, {
         code: 'source_order_inventory_allocation_without_event',
@@ -429,7 +467,7 @@ export function evaluateAccountingReconciliationRows(
     }
 
     const orderRefunds = refundsByOrderId.get(order.id) ?? []
-    const hasPostedAccountingState = Boolean(a1Date || a2Date || postedShipmentOrderIds.has(order.id))
+    const hasPostedAccountingState = Boolean(a1SourceEntityId || a2SourceEntityId || postedShipmentOrderIds.has(order.id))
     if (order.status === 'CANCELLED' && hasPostedAccountingState) {
       const hasReversalEvidence = orderRefunds.some((refund) => hasRefundReversalEvidence(rows, refund))
       if (!hasReversalEvidence) {
@@ -496,9 +534,8 @@ export function evaluateAccountingReconciliationRows(
   }
 
   for (const shipment of rows.shipments) {
-    const bDate = dateKey(shipment.shipmentJournalDate)
-    if (!bDate) continue
-    const sourceEntityId = `B-${bDate}`
+    const sourceEntityId = dailyBatchSourceEntityId('B', shipment.shipmentJournalBatchRef, shipment.shipmentJournalDate)
+    if (!sourceEntityId) continue
     sourceKeys.add(sourceKey('DAILY_BATCH_GROUP_B', 'DailyBatch', sourceEntityId))
     addExpectedSourceEventFinding(findings, rows, {
       code: 'source_shipment_without_event',
@@ -672,6 +709,10 @@ export async function collectAccountingReconciliationRows(
         refundStatus: true,
         revenueDeferredDate: true,
         inventoryAllocatedDate: true,
+        // o3d-0qoo: the source key is built from these when present; omitting them
+        // silently demotes every row to the derive-from-stamp fallback.
+        revenueDeferredBatchRef: true,
+        inventoryAllocatedBatchRef: true,
       },
     }),
     client.shipment.findMany({
@@ -682,6 +723,7 @@ export async function collectAccountingReconciliationRows(
         id: true,
         orderId: true,
         shipmentJournalDate: true,
+        shipmentJournalBatchRef: true,
       },
     }),
     client.salesOrderRefund.findMany({

@@ -21,6 +21,11 @@ import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { lockProductSkusForWrite } from '@/lib/products/sku-write-lock'
 import { COMPONENT_GRAPH_WRITE_LOCK_KEY } from '@/lib/db/advisory-locks'
+import {
+  bumpFulfillmentGraphVersions,
+  componentGraphMutationAffectsFulfillment,
+  findComponentGraphEditBlockers,
+} from '@/lib/products/component-graph-edit-guard'
 
 /**
  * Product types that can own ProductComponent rows. The CSV import queues a row for the
@@ -461,7 +466,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
         // Carried as the transaction's RETURN value rather than a closure assignment, which
         // TypeScript cannot narrow through.
         type EffectiveStructure = { type: ProductType; parentId: string | null }
-        type RenameOutcome = { conflict: 'moved' | 'taken' | 'structure' } | { conflict: null; structure: EffectiveStructure }
+        type RenameOutcome = { conflict: 'moved' | 'taken' | 'structure' | 'in-flight-sales' } | { conflict: null; structure: EffectiveStructure }
         let effectiveStructure: EffectiveStructure | null = null
         if (!preview) {
           let resolvedCategoryId: string | null = null
@@ -513,6 +518,22 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             })
             if (!revalidated.ok) return { conflict: 'structure' as const }
 
+            // o3d-4kfh r5 (Codex finding 1): the KIT-ness guard runs BEFORE the type is written,
+            // and on EVERY KIT-ness change — not only the `clearComponents` ones. KIT <-> BOM keeps
+            // components (so clearComponents is false) while flipping whether fulfilment expands
+            // them, which is exactly the reinterpretation this refuses. Same reasoning as the
+            // editor; see app/actions/products.ts and the guard module for why this is best-effort
+            // rather than atomic (o3d-57b0).
+            const kitnessMutation = {
+              kind: 'kitness' as const,
+              currentType: current.type,
+              nextType: (updateData.type as ProductType | undefined) ?? current.type,
+            }
+            if (componentGraphMutationAffectsFulfillment(kitnessMutation)) {
+              const inFlight = await findComponentGraphEditBlockers(tx, existingProduct.id, kitnessMutation)
+              if (inFlight.length > 0) return { conflict: 'in-flight-sales' as const }
+            }
+
             if (categoryName) {
               resolvedCategoryId = await resolveImportedCategoryId(categoryName, tx)
             }
@@ -527,8 +548,15 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               },
             })
             if (revalidated.clearComponents) {
+              // Losing KIT-ness was already refused above, before the type moved. BOM -> SIMPLE
+              // reaches here unguarded on purpose: fulfilment never expanded that BOM's components.
               await tx.productComponent.deleteMany({ where: { productId: existingProduct.id } })
             }
+            // o3d-4kfh r6: bump the graph version for this product and every KIT above it, in the
+            // same transaction as the type write. An allocation that read the OLD recipe stamped the
+            // old version, so commitment and dispatch now refuse it even when the guard above saw an
+            // empty blocker set because that allocation's transaction was still open.
+            await bumpFulfillmentGraphVersions(tx, existingProduct.id, kitnessMutation)
             // The structure this row ACTUALLY committed, for the in-run cache below. The
             // locked defaults can preserve a concurrent type/parent, so the pre-lock values
             // no longer describe the row (Codex review, r3).
@@ -542,6 +570,17 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           })
           // Returned, never thrown: this loop has no per-row catch, so a throw would discard
           // every remaining row over one contended product.
+          if (outcome.conflict === 'in-flight-sales') {
+            result.errors.push(
+              `Row ${lineNum} (${sku}): this product's type could not be changed because sales orders are `
+              + 'still in flight against its component graph (holding allocations, or picking/packed '
+              + 'shipments) — changing whether it is a kit changes what those orders are deemed to require, '
+              + 'so the row was skipped. Dispatch, deallocate or cancel those orders and re-run; already '
+              + 'shipped, completed, delivered or cancelled orders do not block',
+            )
+            result.skipped++
+            continue
+          }
           if (outcome.conflict) {
             result.errors.push(
               `Row ${lineNum} (${sku}): another writer changed this product while the import was running `
@@ -652,11 +691,37 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               // WooCommerce import or a manual create landing in between raised a P2002 that
               // aborted the row — and, inside an interactive transaction, the transaction
               // with it (o3d-md4q).
-              await lockProductSkusForWrite(tx, [sku])
+              // o3d-1a84: the PARENT's sku too. The structure validation above ran before this
+              // transaction and only the new child was locked, so the WooCommerce sync could
+              // change the parent from VARIABLE to SIMPLE in between and this would commit a
+              // child pointing at a parent that can no longer have children. Both skus go
+              // through the one helper so they are acquired in the single ascending id order.
+              //
+              // THIS CLOSES ONE ORDERING, NOT BOTH. If the CSV wins the lock and commits the
+              // child, the WooCommerce sync then acquires the same lock and writes type=SIMPLE
+              // without checking for existing children, recreating the same forbidden state
+              // from the other side. The lock makes the two writers serialize; it cannot make
+              // the second one care. That half needs the WC sync to consult the editor's
+              // transform blockers, which it currently bypasses entirely — o3d-0hhu.
+              const parentIdToWrite = structureValidation.normalizedParentId
+              const parentSkuToLock = parentIdToWrite ? productById.get(parentIdToWrite)?.sku ?? null : null
+              await lockProductSkusForWrite(tx, parentSkuToLock ? [sku, parentSkuToLock] : [sku])
+
               const taken = await tx.product.findUnique({ where: { sku }, select: { id: true } })
               // Returned, not thrown: this loop has no per-row catch, so a throw would abort
               // the whole import over one contended row.
               if (taken) return null
+
+              if (parentIdToWrite) {
+                const parent = await tx.product.findUnique({
+                  where: { id: parentIdToWrite },
+                  select: { sku: true, type: true },
+                })
+                // The lock set was chosen from a pre-transaction snapshot of the parent, so a
+                // rename since then means we hold the lock for a sku it no longer has.
+                if (!parent || parent.sku !== parentSkuToLock) return 'parent-moved' as const
+                if (parent.type !== ProductType.VARIABLE) return 'parent-not-variable' as const
+              }
 
               const createCategoryId = await resolveImportedCategoryId(categoryName, tx)
               return tx.product.create({
@@ -667,6 +732,15 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 },
               })
             })
+        if (created === 'parent-moved' || created === 'parent-not-variable') {
+          result.errors.push(
+            created === 'parent-not-variable'
+              ? `Row ${lineNum} (${sku}): its parent stopped being a variable product while the import was running — not created`
+              : `Row ${lineNum} (${sku}): its parent was renamed while the import was running — re-run to pick it up`,
+          )
+          result.skipped++
+          continue
+        }
         if (!created) {
           result.errors.push(
             `Row ${lineNum} (${sku}): another writer created this SKU while the import was running — re-run to pick it up`,
@@ -799,6 +873,21 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
             const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId), tx)
             if (cycle.kind !== 'ok') return false
 
+            // o3d-4kfh r5: same in-flight sales refusal as the editor. A bulk CSV pass is not a
+            // licence to retroactively rewrite what an already-allocated or already-picking order
+            // requires — the corruption it produces (an incomplete kit dispatched, credited as a
+            // partial kit, reported by nothing) is identical however the graph was edited. Reported
+            // per row rather than aborting the import, so the remaining rows still land.
+            //
+            // `kind: 'components'` with the type read under the lock: on a BOM this is a no-op, so a
+            // CSV that maintains manufacturing recipes is no longer refused for a sales reason.
+            const componentMutation = {
+              kind: 'components' as const,
+              currentType: current.type,
+            }
+            const inFlight = await findComponentGraphEditBlockers(tx, productId, componentMutation)
+            if (inFlight.length > 0) return 'in-flight-sales' as const
+
             await tx.productComponent.deleteMany({ where: { productId } })
             await tx.productComponent.createMany({
               data: components.map((c, i) => ({
@@ -808,8 +897,21 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
                 sortOrder: i,
               })),
             })
+            // o3d-4kfh r6: the CAS half of the same protection — see the kitness path above. A no-op
+            // on a BOM, whose component list no sales line expands.
+            await bumpFulfillmentGraphVersions(tx, productId, componentMutation)
             return true
           })
+          if (wrote === 'in-flight-sales') {
+            result.errors.push(
+              `Row ${cr.lineNum}: ${cr.sku} has sales orders still in flight against its component graph `
+              + '(holding allocations, or picking/packed shipments) — components were not written, because '
+              + 'changing them would retroactively change what those orders require. Dispatch, deallocate '
+              + 'or cancel those orders and re-run; already shipped, completed, delivered or cancelled '
+              + 'orders do not block',
+            )
+            continue
+          }
           if (!wrote) {
             // Reported, not silent: the operator supplied components for this row and none
             // were written. Returning rather than throwing keeps the remaining rows going.

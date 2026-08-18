@@ -52,6 +52,8 @@ test(
             const blocker = await findSalesOrderDeleteBlocker(tx, order.id, {
               revenueDeferredDate: null,
               inventoryAllocatedDate: null,
+              revenueDeferredBatchRef: null,
+              inventoryAllocatedBatchRef: null,
             })
             if (blocker) return 'refused' as const
             await tx.salesOrder.delete({ where: { id: order.id } })

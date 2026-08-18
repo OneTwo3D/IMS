@@ -833,3 +833,109 @@ test('accounting reconciliation row collection selects required datasets', async
   assert.equal((calls.accountingSyncLog as { take: number }).take, 10000)
   assert.equal((calls.accountingEvent as { take: number }).take, 10000)
 })
+
+// --- o3d-0qoo: persisted daily-batch referenceIds ---
+
+const A1_REF = 'A1-2026-04-24-abcd1234'
+const A2_REF = 'A2-2026-04-24-0badf00d'
+const B_REF = 'B-2026-04-25-beefcafe'
+
+const DAILY_BATCH_SOURCE_CODES = [
+  'source_order_revenue_deferral_without_event',
+  'source_order_inventory_allocation_without_event',
+  'source_shipment_without_event',
+]
+
+/**
+ * cleanRows() in the live Xero shape: every daily-batch referenceId (and therefore
+ * every mirrored sourceEntityId, which accounting-event-mirror copies verbatim)
+ * carries the `-<8 hex>` digest suffix. `midnightCrossing` additionally moves the
+ * stage stamps past UTC midnight into the day after the batch date.
+ */
+function persistedRefRows(options: { midnightCrossing?: boolean } = {}): AccountingReconciliationRows {
+  const rows = cleanRows()
+  const a1Stamp = options.midnightCrossing ? new Date('2026-04-25T00:00:03.000Z') : A1_DATE
+  const a2Stamp = options.midnightCrossing ? new Date('2026-04-25T00:00:07.000Z') : A2_DATE
+  const bStamp = options.midnightCrossing ? new Date('2026-04-26T00:00:04.000Z') : B_DATE
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    revenueDeferredDate: a1Stamp,
+    revenueDeferredBatchRef: A1_REF,
+    inventoryAllocatedDate: a2Stamp,
+    inventoryAllocatedBatchRef: A2_REF,
+  }
+  rows.shipments[0] = {
+    ...rows.shipments[0],
+    shipmentJournalDate: bStamp,
+    shipmentJournalBatchRef: B_REF,
+  }
+  rows.syncLogs = rows.syncLogs.map((log) => (
+    log.type === 'DAILY_BATCH_REVENUE_DEFERRAL'
+      ? { ...log, referenceId: A1_REF }
+      : log.type === 'DAILY_BATCH_INVENTORY_ALLOC'
+        ? { ...log, referenceId: A2_REF }
+        : log.type === 'DAILY_BATCH_GROUP_B'
+          ? { ...log, referenceId: B_REF }
+          : log
+  ))
+  rows.accountingEvents = rows.accountingEvents.map((event) => (
+    event.type === 'DAILY_BATCH_REVENUE_DEFERRAL'
+      ? { ...event, sourceEntityId: A1_REF }
+      : event.type === 'DAILY_BATCH_INVENTORY_ALLOC'
+        ? { ...event, sourceEntityId: A2_REF }
+        : event.type === 'DAILY_BATCH_GROUP_B'
+          ? { ...event, sourceEntityId: B_REF }
+          : event
+  ))
+  return rows
+}
+
+test('o3d-0qoo: persisted batch refs match the event a midnight-crossing batch mirrored', () => {
+  const codes = evaluateAccountingReconciliationRows(persistedRefRows({ midnightCrossing: true }))
+    .map((finding) => finding.code)
+  for (const code of [...DAILY_BATCH_SOURCE_CODES, 'event_without_source']) {
+    assert.ok(!codes.includes(code), `${code} must not fire when the persisted ref names the mirrored event`)
+  }
+})
+
+test('o3d-0qoo: legacy rows without a persisted ref still derive the source key from the stamp', () => {
+  const rows = cleanRows()
+  // Pre-migration shape: stamps only. Bare QuickBooks-style references on both
+  // sides, so the derived key still ties the source to its event exactly as before.
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    revenueDeferredBatchRef: null,
+    inventoryAllocatedBatchRef: null,
+  }
+  rows.shipments[0] = { ...rows.shipments[0], shipmentJournalBatchRef: null }
+
+  assert.deepEqual(evaluateAccountingReconciliationRows(rows), [])
+})
+
+test('o3d-0qoo: a Xero digest ref no longer double-mismatches in both directions', () => {
+  // Before the persisted ref existed this module derived a bare `A1-<date>` and
+  // compared it to the mirrored `A1-<date>-<digest>` with no digest stripping, so a
+  // single healthy Xero batch reported BOTH a source_*_without_event and an
+  // event_without_source — with the stamps and the batch date in perfect agreement.
+  const findings = evaluateAccountingReconciliationRows(persistedRefRows())
+  const codes = findings.map((finding) => finding.code)
+  for (const code of DAILY_BATCH_SOURCE_CODES) {
+    assert.ok(!codes.includes(code), `${code} must not fire for a digest-shaped persisted ref`)
+  }
+  assert.ok(!codes.includes('event_without_source'),
+    'the same journal must not be reported as an orphan event in the reverse direction')
+  assert.deepEqual(findings, [])
+})
+
+test('o3d-0qoo: a persisted batch ref with no mirrored event still reports the missing event', () => {
+  const rows = persistedRefRows()
+  rows.accountingEvents = rows.accountingEvents.filter((event) => event.type !== 'DAILY_BATCH_REVENUE_DEFERRAL')
+
+  const finding = evaluateAccountingReconciliationRows(rows)
+    .find((entry) => entry.code === 'source_order_revenue_deferral_without_event')
+
+  assert.ok(finding, 'expected the missing-event finding to still be reported')
+  assert.equal(finding!.orderId, 'order-1')
+  // Reported against the reference the batch actually wrote, not a derived guess.
+  assert.equal((finding!.details as { sourceEntityId: string }).sourceEntityId, A1_REF)
+})

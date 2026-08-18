@@ -42,8 +42,15 @@ type SalesOrderAccountingRow = {
   // null — i.e. a payment reversal cleared it). The DB loader always selects it.
   paidAt?: Date | string | null
   revenueDeferredDate: Date | string | null
+  // o3d-0qoo: the exact A1 batch referenceId stamped on this row in the same
+  // transaction as revenueDeferredDate. Optional for the same reason as paidAt
+  // (pure-evaluator fixtures); the DB loader always selects it. Absent/null means
+  // a pre-migration row, which can only be matched by deriving from the stamp.
+  revenueDeferredBatchRef?: string | null
   unearnedRevenueAmount: DecimalLike
   inventoryAllocatedDate: Date | string | null
+  // o3d-0qoo: the exact A2 batch referenceId (pairs with inventoryAllocatedDate).
+  inventoryAllocatedBatchRef?: string | null
   allocationBatchAmount: DecimalLike
   shipments: Array<{
     id: string
@@ -75,6 +82,8 @@ type ShipmentAccountingRow = {
   orderId: string
   status: string
   shipmentJournalDate: Date | string | null
+  // o3d-0qoo: the exact Group-B batch referenceId (pairs with shipmentJournalDate).
+  shipmentJournalBatchRef?: string | null
   revenueRecognizedAmount: DecimalLike
   cogsBatchAmount: DecimalLike
   order: {
@@ -218,21 +227,37 @@ const DAILY_BATCH_LOG_TYPES = new Set([
   'DAILY_BATCH_GROUP_B',
 ])
 
-function buildLiveSyncLogIndex(syncLogs: AccountingSyncLogRow[]): Set<string> {
-  const index = new Set<string>()
+// o3d-0qoo: two indexes, because the two lookup paths need different strictness.
+//  - `exact`: every live log under the referenceId as written. A row that carries a
+//    persisted batch ref is matched here and ONLY here — the ref is the literal
+//    referenceId the batch wrote, so any bridging would widen the match beyond the
+//    single journal it names.
+//  - `digestBridged`: `exact` plus the digest-stripped aliases (scjz.37). Only the
+//    legacy derive-from-stamp path uses it, since a bare derived key is all a
+//    pre-migration row has to offer against a digest-suffixed Xero log.
+type LiveSyncLogIndex = {
+  exact: Set<string>
+  digestBridged: Set<string>
+}
+
+function buildLiveSyncLogIndex(syncLogs: AccountingSyncLogRow[]): LiveSyncLogIndex {
+  const exact = new Set<string>()
+  const digestBridged = new Set<string>()
   for (const log of syncLogs) {
     if (!LIVE_SYNC_STATUSES.has(log.status)) continue
-    index.add(liveSyncLogIndexKey(log.type, log.referenceId, log.referenceType))
+    const key = liveSyncLogIndexKey(log.type, log.referenceId, log.referenceType)
+    exact.add(key)
+    digestBridged.add(key)
     // Also index the digest-stripped key so a digest-suffixed Xero daily-batch
     // log matches the bare `<group>-<date>` the invariant expects.
     if (DAILY_BATCH_LOG_TYPES.has(log.type)) {
       const bare = stripDailyBatchDigest(log.referenceId)
       if (bare !== log.referenceId) {
-        index.add(liveSyncLogIndexKey(log.type, bare, log.referenceType))
+        digestBridged.add(liveSyncLogIndexKey(log.type, bare, log.referenceType))
       }
     }
   }
-  return index
+  return { exact, digestBridged }
 }
 
 // referenceType is required: an earlier version made it optional and, when
@@ -250,9 +275,43 @@ function hasLiveSyncLog(
   return syncLogIndex.has(liveSyncLogIndexKey(type, referenceId, referenceType))
 }
 
+// Legacy fallback ONLY (o3d-0qoo). Kept because pre-migration rows carry no
+// persisted batch ref and never will — they have nothing but the stage stamp.
+// It is wrong whenever a batch crossed UTC midnight: both daily syncs capture the
+// batch date once at run start and write the stage stamps with later new Date()
+// calls, so a batch keyed `A1-2026-01-01` can leave a stamp of 2026-01-02T00:0x:xxZ.
 function expectedDailyBatchReference(prefix: 'A1' | 'A2' | 'B', stagedAt: Date | string | null): string | null {
   const key = dateKey(stagedAt)
   return key ? `${prefix}-${key}` : null
+}
+
+// o3d-0qoo: the persisted referenceId wins whenever the row has one — it IS the
+// referenceId the batch wrote, so it survives a midnight crossing and needs no
+// digest bridging. Only a row without one falls back to deriving from the stamp,
+// which is why the derive helper and the digest bridge both stay.
+function dailyBatchSyncEvidence(
+  syncLogIndex: LiveSyncLogIndex,
+  group: 'A1' | 'A2' | 'B',
+  logType: string,
+  persistedReferenceId: string | null | undefined,
+  stagedAt: Date | string | null,
+): { expectedReferenceId: string | null; referenceSource: 'persisted' | 'derived'; hasSyncEvidence: boolean } {
+  const persisted = persistedReferenceId?.trim()
+  if (persisted) {
+    return {
+      expectedReferenceId: persisted,
+      referenceSource: 'persisted',
+      hasSyncEvidence: hasLiveSyncLog(syncLogIndex.exact, logType, persisted, 'DailyBatch'),
+    }
+  }
+  const derived = expectedDailyBatchReference(group, stagedAt)
+  return {
+    expectedReferenceId: derived,
+    referenceSource: 'derived',
+    hasSyncEvidence: derived
+      ? hasLiveSyncLog(syncLogIndex.digestBridged, logType, derived, 'DailyBatch')
+      : false,
+  }
 }
 
 export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): AccountingInvariantFinding[] {
@@ -260,10 +319,13 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
   const syncLogIndex = buildLiveSyncLogIndex(rows.syncLogs)
 
   for (const shipment of rows.postedShipments) {
-    const expectedReferenceId = expectedDailyBatchReference('B', shipment.shipmentJournalDate)
-    const hasSyncEvidence = expectedReferenceId
-      ? hasLiveSyncLog(syncLogIndex, 'DAILY_BATCH_GROUP_B', expectedReferenceId, 'DailyBatch')
-      : false
+    const { expectedReferenceId, referenceSource, hasSyncEvidence } = dailyBatchSyncEvidence(
+      syncLogIndex,
+      'B',
+      'DAILY_BATCH_GROUP_B',
+      shipment.shipmentJournalBatchRef,
+      shipment.shipmentJournalDate,
+    )
 
     if (!hasSyncEvidence) {
       findings.push({
@@ -276,6 +338,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
           shipmentStatus: shipment.status,
           shipmentJournalDate: shipment.shipmentJournalDate,
           expectedReferenceId,
+          referenceSource,
           orderNumber: shipment.order.orderNumber,
         },
       })
@@ -481,10 +544,13 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     }
 
     if (hasA1) {
-      const expectedReferenceId = expectedDailyBatchReference('A1', order.revenueDeferredDate)
-      const hasSyncEvidence = expectedReferenceId
-        ? hasLiveSyncLog(syncLogIndex, 'DAILY_BATCH_REVENUE_DEFERRAL', expectedReferenceId, 'DailyBatch')
-        : false
+      const { expectedReferenceId, referenceSource, hasSyncEvidence } = dailyBatchSyncEvidence(
+        syncLogIndex,
+        'A1',
+        'DAILY_BATCH_REVENUE_DEFERRAL',
+        order.revenueDeferredBatchRef,
+        order.revenueDeferredDate,
+      )
 
       if (!hasSyncEvidence) {
         findings.push({
@@ -496,6 +562,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
             status: order.status,
             revenueDeferredDate: order.revenueDeferredDate,
             expectedReferenceId,
+            referenceSource,
             unearnedRevenueAmount: decimalToNumber(order.unearnedRevenueAmount),
           },
         })
@@ -503,10 +570,13 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     }
 
     if (hasA2) {
-      const expectedReferenceId = expectedDailyBatchReference('A2', order.inventoryAllocatedDate)
-      const hasSyncEvidence = expectedReferenceId
-        ? hasLiveSyncLog(syncLogIndex, 'DAILY_BATCH_INVENTORY_ALLOC', expectedReferenceId, 'DailyBatch')
-        : false
+      const { expectedReferenceId, referenceSource, hasSyncEvidence } = dailyBatchSyncEvidence(
+        syncLogIndex,
+        'A2',
+        'DAILY_BATCH_INVENTORY_ALLOC',
+        order.inventoryAllocatedBatchRef,
+        order.inventoryAllocatedDate,
+      )
 
       if (!hasSyncEvidence) {
         findings.push({
@@ -518,6 +588,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
             status: order.status,
             inventoryAllocatedDate: order.inventoryAllocatedDate,
             expectedReferenceId,
+            referenceSource,
             allocationBatchAmount: decimalToNumber(order.allocationBatchAmount),
           },
         })
@@ -620,10 +691,12 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       }
 
       const hasCreditNoteEvidence = Boolean(refund.accountingCreditNoteId) ||
-        hasLiveSyncLog(syncLogIndex, 'CREDIT_NOTE', refund.id, 'SalesOrderRefund') ||
+        hasLiveSyncLog(syncLogIndex.exact, 'CREDIT_NOTE', refund.id, 'SalesOrderRefund') ||
         refundRetryTypes.has('CREDIT_NOTE')
-      const hasReversalEvidence = hasLiveSyncLog(syncLogIndex, 'COGS_REVERSAL', refund.id, 'SalesOrderRefund') ||
-        hasLiveSyncLog(syncLogIndex, 'UNEARNED_REV_REVERSAL', refund.id, 'SalesOrderRefund') ||
+      // Refund lookups key on the refund id, which is never digest-suffixed, so they
+      // use the exact index (the bridge is daily-batch-only anyway).
+      const hasReversalEvidence = hasLiveSyncLog(syncLogIndex.exact, 'COGS_REVERSAL', refund.id, 'SalesOrderRefund') ||
+        hasLiveSyncLog(syncLogIndex.exact, 'UNEARNED_REV_REVERSAL', refund.id, 'SalesOrderRefund') ||
         [...refundRetryTypes].some((type) => REFUND_REVERSAL_TYPES.has(type))
 
       if (
@@ -763,8 +836,12 @@ export async function collectAccountingInvariantRows(
         status: true,
         paidAt: true,
         revenueDeferredDate: true,
+        // o3d-0qoo: the persisted batch refs are what the evidence check matches on;
+        // omitting them silently demotes every row to the derive-from-stamp fallback.
+        revenueDeferredBatchRef: true,
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
+        inventoryAllocatedBatchRef: true,
         allocationBatchAmount: true,
         shipments: {
           select: {
@@ -800,6 +877,7 @@ export async function collectAccountingInvariantRows(
         orderId: true,
         status: true,
         shipmentJournalDate: true,
+        shipmentJournalBatchRef: true,
         revenueRecognizedAmount: true,
         cogsBatchAmount: true,
         order: {
