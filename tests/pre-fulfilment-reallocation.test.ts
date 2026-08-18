@@ -647,6 +647,29 @@ test('LEAVING PICKING is not the shortfall clearing — an order still short is 
   }
 })
 
+test('the handed-back set is the sweep\'s OWN eligible set, and stays that way (o3d-z82a)', async () => {
+  // "Handed back" is only a resolution because a NAMED mechanism picks the order up. If the two
+  // lists drift, this silently becomes the thing it replaced: an order discharged into nothing,
+  // on the strength of a status. Pinned by text rather than by import, because pulling the sweep
+  // module in here would put @/lib/shopping on the WooCommerce importer's import graph.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const read = async (file: string) => readFile(path.join(process.cwd(), file), 'utf8')
+
+  const statuses = (source: string, marker: string) => {
+    const at = source.indexOf(marker)
+    assert.notEqual(at, -1, `${marker} must exist`)
+    const body = source.slice(at, source.indexOf(']', at))
+    return (body.match(/'[A-Z_]+'/g) ?? []).map((quoted) => quoted.slice(1, -1)).sort()
+  }
+
+  const mine = statuses(await read('lib/fulfillment/pre-fulfilment-reallocation.ts'), 'const AUTOMATICALLY_REVISITED_STATUSES = new Set([')
+  const theirs = statuses(await read('lib/fulfillment/reallocation-sweep.ts'), 'const REALLOCATION_ELIGIBLE_STATUSES = [')
+
+  assert.deepEqual(mine, theirs, 'the handoff target must be exactly what the sweep selects')
+  assert.deepEqual(mine, ['ALLOCATED', 'PROCESSING'])
+})
+
 test('a CANCELLED order has no demand to cover, so nothing is recorded (o3d-z82a)', async () => {
   // The one case where silence is right, and it is a statement about DEMAND rather than about
   // which status was left. cancelSalesOrderFulfillmentState releases the reservations and DELETES
