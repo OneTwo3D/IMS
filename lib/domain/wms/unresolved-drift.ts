@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 import { db } from '@/lib/db'
-import { POST_DISPATCH_STATUSES, type WmsUnresolvedDriftState } from '@/lib/domain/wms/dispatch-sweep'
+import { dispatchCandidateWhere, type WmsUnresolvedDriftState } from '@/lib/domain/wms/dispatch-sweep'
 
 /**
  * o3d-bjc.12: the operator's side of an indeterminate unresolved cohort.
@@ -64,11 +64,27 @@ export type UnresolvedDriftIncident = {
  * covers. The raw value is still compared inside the transaction, where the
  * lock makes it a genuine compare-and-set.
  */
-export function driftDecisionVersion(input: { connector: string; cohortKey: string | null; linkIds: string[] }): string {
+export function driftDecisionVersion(input: {
+  connector: string
+  cohortKey: string | null
+  linkIds: string[]
+  firstSeenAt: string | null
+}): string {
   const material = JSON.stringify({
     connector: input.connector,
     cohortKey: input.cohortKey ?? '',
     linkIds: [...input.linkIds].sort(),
+    // ABA (o3d-0gzr). Membership alone cannot tell "the cohort never changed"
+    // from "it changed away and back": A -> B -> A rehashes to A's version, so a
+    // page rendered against the FIRST occurrence could isolate the second one —
+    // a different incident, with its own start time and its own reason.
+    //
+    // firstSeenAt is the discriminator we already keep: the sweep preserves it
+    // while a cohort is stable and resets it whenever membership changes, which
+    // is exactly the "generation" this needs. Counter-only ticks leave it alone,
+    // so an open page still survives them, which was the point of hashing
+    // membership rather than the raw row.
+    firstSeenAt: input.firstSeenAt ?? '',
   })
   return createHash('sha256').update(material).digest('hex').slice(0, 16)
 }
@@ -110,6 +126,15 @@ function parseState(raw: string | null | undefined): WmsUnresolvedDriftState | n
  */
 export const DRIFT_INCIDENT_MAX_AGE_MS = 60 * 60 * 1000
 
+/**
+ * How far ahead of us a confirmation may be stamped before we stop believing it.
+ *
+ * Tolerates ordinary clock jitter between the sweep host and whoever serves the
+ * action; anything further ahead is treated as no evidence at all rather than as
+ * the freshest possible evidence.
+ */
+export const DRIFT_INCIDENT_MAX_CLOCK_SKEW_MS = 60 * 1000
+
 export function toIncident(
   connector: string,
   state: WmsUnresolvedDriftState | null,
@@ -121,7 +146,17 @@ export function toIncident(
   // drifting (and the retraction did not persist) or it stopped running. Either
   // way it is not evidence any more.
   const lastSeen = state.lastSeenAt ? Date.parse(state.lastSeenAt) : NaN
-  if (!Number.isFinite(lastSeen) || now.getTime() - lastSeen > DRIFT_INCIDENT_MAX_AGE_MS) return null
+  if (!Number.isFinite(lastSeen)) return null
+  const age = now.getTime() - lastSeen
+  // A FUTURE confirmation is not a fresh one (o3d-0gzr). The sweep and whoever
+  // serves this action need not be the same host, and if the sweep's clock runs
+  // ahead the age goes negative — which the "> MAX_AGE" test reads as very
+  // recent, keeping a dead incident actionable for the skew PLUS the hour. An
+  // unreadable timestamp already fails closed; a future one has to as well, or
+  // the expiry is only enforced for clocks that happen to agree. Small
+  // allowance so ordinary NTP jitter does not retract a live offer; beyond it
+  // the timestamp is not evidence and the sweep's next pass will rewrite it.
+  if (age < -DRIFT_INCIDENT_MAX_CLOCK_SKEW_MS || age > DRIFT_INCIDENT_MAX_AGE_MS) return null
   const linkIds = state.linkIds ?? []
   // A live incident is one with a cohort. `consecutive` alone is not enough:
   // the sweep zeroes it the moment a pass reads record-local, and an offer to
@@ -136,7 +171,7 @@ export function toIncident(
     firstSeenAt: state.firstSeenAt ?? null,
     reason: state.reason ?? null,
     linkIds,
-    version: driftDecisionVersion({ connector, cohortKey: state.cohortKey, linkIds }),
+    version: driftDecisionVersion({ connector, cohortKey: state.cohortKey, linkIds, firstSeenAt: state.firstSeenAt ?? null }),
   }
 }
 
@@ -170,13 +205,8 @@ export function isolatableLinkWhere(incident: UnresolvedDriftIncident) {
   // no longer a dispatch candidate, and quarantining it would invent an
   // exception for an order nobody is waiting on.
   return {
+    ...dispatchCandidateWhere(incident.connector),
     id: { in: incident.linkIds },
-    connector: incident.connector,
-    state: { in: ['SYNCED' as const, 'MERGED' as const] },
-    externalOrderNumber: { not: null },
-    dispatchUnresolvedAt: null,
-    dispatchDeadLetteredAt: null,
-    order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
   }
 }
 

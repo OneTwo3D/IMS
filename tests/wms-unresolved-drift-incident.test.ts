@@ -92,13 +92,13 @@ test('[o3d-bjc.12] the action token follows the COHORT, not the counters', async
   assert.notEqual(moved?.version, original?.version)
   // Order of the ids is not membership.
   assert.equal(
-    driftDecisionVersion({ connector: 'mintsoft', cohortKey: 'k', linkIds: ['b', 'a'] }),
-    driftDecisionVersion({ connector: 'mintsoft', cohortKey: 'k', linkIds: ['a', 'b'] }),
+    driftDecisionVersion({ connector: 'mintsoft', cohortKey: 'k', linkIds: ['b', 'a'], firstSeenAt: null }),
+    driftDecisionVersion({ connector: 'mintsoft', cohortKey: 'k', linkIds: ['a', 'b'], firstSeenAt: null }),
   )
   // ...and the same cohort on a different connector is a different decision.
   assert.notEqual(
-    driftDecisionVersion({ connector: 'mintsoft', cohortKey: 'k', linkIds: ['a'] }),
-    driftDecisionVersion({ connector: 'shiphero', cohortKey: 'k', linkIds: ['a'] }),
+    driftDecisionVersion({ connector: 'mintsoft', cohortKey: 'k', linkIds: ['a'], firstSeenAt: null }),
+    driftDecisionVersion({ connector: 'shiphero', cohortKey: 'k', linkIds: ['a'], firstSeenAt: null }),
   )
 })
 
@@ -113,4 +113,70 @@ test('[o3d-bjc.12] an incident nothing re-confirms EXPIRES', async () => {
   assert.ok(toIncident('mintsoft', fresh, undefined, NOW))
   // A row with no confirmation at all is not evidence either.
   assert.equal(toIncident('mintsoft', { ...LIVE, lastSeenAt: null }, undefined, NOW), null)
+})
+
+/* ------------------------------------------------------------------ *
+ * o3d-0gzr / o3d-51du — the post-merge Codex findings on o3d-bjc.12.
+ * ------------------------------------------------------------------ */
+
+test('[o3d-0gzr] a cohort that changes away and BACK is a different decision (ABA)', () => {
+  // Hashing membership alone cannot distinguish "never changed" from
+  // "changed and changed back": A -> B -> A rehashes to A. A page rendered
+  // against the first occurrence would then isolate the second one — a
+  // different incident, with its own start time and reason. firstSeenAt is the
+  // generation marker that separates them.
+  const first = toIncident('mintsoft', { ...LIVE, firstSeenAt: '2026-07-26T08:00:00.000Z' }, undefined, NOW)
+  const readBack = toIncident('mintsoft', { ...LIVE, firstSeenAt: '2026-07-26T09:00:00.000Z' }, undefined, NOW)
+  assert.ok(first && readBack)
+  assert.equal(first.linkIds.join(), readBack.linkIds.join(), 'same membership — this is the ABA case')
+  assert.notEqual(first.version, readBack.version, 'a re-formed cohort must not reuse the old decision token')
+})
+
+test('[o3d-0gzr] counter-only ticks still do NOT invalidate an open page', () => {
+  // The ABA fix must not cost what the digest was designed to buy: an operator
+  // reading the page must survive the sweep rewriting counters underneath them.
+  const original = toIncident('mintsoft', LIVE, undefined, NOW)
+  const ticked = toIncident(
+    'mintsoft',
+    { ...LIVE, consecutive: 11, stableFor: 11, touched: 99, lastSeenAt: NOW.toISOString() },
+    undefined,
+    NOW,
+  )
+  assert.equal(ticked?.version, original?.version)
+})
+
+test('[o3d-0gzr] a FUTURE confirmation fails closed, not open', async () => {
+  const { DRIFT_INCIDENT_MAX_CLOCK_SKEW_MS } = await import('../lib/domain/wms/unresolved-drift.ts')
+  // The sweep and the host serving this action need not share a clock. If the
+  // sweep's runs ahead, `now - lastSeen` goes NEGATIVE — which a bare
+  // "> MAX_AGE" test reads as maximally fresh, keeping a dead incident
+  // actionable for the skew plus the whole expiry window.
+  const wayAhead = {
+    ...LIVE,
+    lastSeenAt: new Date(NOW.getTime() + DRIFT_INCIDENT_MAX_CLOCK_SKEW_MS + 60_000).toISOString(),
+  }
+  assert.equal(toIncident('mintsoft', wayAhead, undefined, NOW), null, 'a future stamp is not evidence')
+  // Ordinary jitter must NOT retract a live offer.
+  const slightlyAhead = { ...LIVE, lastSeenAt: new Date(NOW.getTime() + 5_000).toISOString() }
+  assert.ok(toIncident('mintsoft', slightlyAhead, undefined, NOW), 'NTP jitter must not kill a real incident')
+})
+
+test('[o3d-0gzr] isolate eligibility IS the sweep predicate, not a copy of it', async () => {
+  const { isolatableLinkWhere } = await import('../lib/domain/wms/unresolved-drift.ts')
+  const { dispatchCandidateWhere } = await import('../lib/domain/wms/dispatch-sweep.ts')
+  const incident = toIncident('mintsoft', LIVE, undefined, NOW)
+  assert.ok(incident)
+  const shared = dispatchCandidateWhere('mintsoft')
+  const isolate = isolatableLinkWhere(incident)
+  // Structural, not a source-text scan: every key the sweep filters on must be
+  // present here with the SAME value, so the two cannot drift apart silently.
+  for (const [key, value] of Object.entries(shared)) {
+    assert.deepEqual(
+      (isolate as Record<string, unknown>)[key],
+      value,
+      `isolate must filter on ${key} exactly as the sweep does`,
+    )
+  }
+  // ...and it additionally narrows to the reviewed cohort.
+  assert.deepEqual(isolate.id, { in: incident.linkIds })
 })
