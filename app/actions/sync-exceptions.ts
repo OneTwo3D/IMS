@@ -55,6 +55,8 @@ import {
   type RefundParkView,
   type WcOrderRefundEvidence,
 } from '@/lib/domain/sales/refund-park-recovery'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { createPrismaDispatchDeps, reconcileOneOrder } from '@/lib/domain/wms/dispatch-sweep'
@@ -148,6 +150,16 @@ export type RefundSyncParkRow = {
   wcOrderId: string | null
   errorMessage: string | null
   createdAt: string
+  /**
+   * o3d-w00 (Codex r1 #3): everything the Record-manually completion path needs, so a QUARANTINED park
+   * has a route to resolution instead of only a Retry that re-runs the decision that refused it. Null
+   * `refundGrossForeign` means the park predates the payload being kept (or is not a refusal park) —
+   * the operator then takes the amount from the storefront refund itself.
+   */
+  manuallyRecordable: boolean
+  currency: string | null
+  refundGrossForeign: string | null
+  orderLines: { id: string; description: string; sku: string | null; netTotalForeign: string; taxRateName: string | null }[]
 }
 
 export type StuckDispatchRow = {
@@ -528,6 +540,19 @@ export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary>
   return loadExceptionCounts()
 }
 
+/**
+ * o3d-w00 (Codex r1 #3): the gross amount of the parked WooCommerce refund, read out of the stored
+ * payload. Shown to the operator in the Record-manually dialog as the figure their NET allocation has to
+ * add up to (once re-grossed). Returns null for a park with no payload rather than guessing a number.
+ */
+function readParkedRefundGross(payload: unknown): string | null {
+  if (payload == null || typeof payload !== 'object') return null
+  const amount = (payload as { amount?: unknown }).amount
+  if (typeof amount === 'string' && amount.trim()) return amount.trim()
+  if (typeof amount === 'number' && Number.isFinite(amount)) return String(amount)
+  return null
+}
+
 export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   await requirePermission('sync')
 
@@ -595,6 +620,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         externalId: true,
         errorMessage: true,
         createdAt: true,
+        // o3d-w00 (Codex r1 #3): the parked WcRefund. Its gross `amount` is what the operator has to
+        // allocate across the order lines in the Record-manually path.
+        payload: true,
       },
     }),
     loadStuckDispatches(),
@@ -619,13 +647,30 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   ])
 
   const refundOrderIds = refundLogs.map((log) => log.entityId).filter((id): id is string => Boolean(id))
+  // o3d-w00 (Codex r1 #3): the QUARANTINED rows are the ones with no automatic route out, so they carry
+  // their order's LINES — the Record-manually dialog allocates the refunded amount across them, and a
+  // refund attributed to real lines is exactly what both refusals (undeterminable basis, non-uniform
+  // tax) are waiting for. Lines are net (tax-exclusive), matching what the dialog asks the operator for.
   const refundOrders = refundOrderIds.length > 0
     ? await db.salesOrder.findMany({
         where: { id: { in: refundOrderIds } },
-        select: { id: true, orderNumber: true },
+        select: {
+          id: true,
+          orderNumber: true,
+          currency: true,
+          lines: {
+            select: {
+              id: true,
+              description: true,
+              sku: true,
+              totalForeign: true,
+              taxRate: { select: { name: true } },
+            },
+          },
+        },
       })
     : []
-  const refundOrderNumberById = new Map(refundOrders.map((order) => [order.id, order.orderNumber]))
+  const refundOrderById = new Map(refundOrders.map((order) => [order.id, order]))
   // o3d-54p: which WooCommerce order each parked order is linked to. Read for the whole page in one
   // query rather than per row.
   const refundOrderLinks = refundOrderIds.length > 0
@@ -716,16 +761,33 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     ]
       .sort((left, right) => (right.deadLetteredAt ?? '').localeCompare(left.deadLetteredAt ?? ''))
       .slice(0, SECTION_LIMIT),
-    refundSyncParks: refundLogs.map((log) => ({
-      id: log.id,
-      status: log.status,
-      externalRefundId: log.externalId,
-      orderId: log.entityId,
-      orderNumber: log.entityId ? refundOrderNumberById.get(log.entityId) ?? null : null,
-      wcOrderId: log.entityId ? wcOrderIdByOrderId.get(log.entityId) ?? null : null,
-      errorMessage: log.errorMessage,
-      createdAt: log.createdAt.toISOString(),
-    })),
+    refundSyncParks: refundLogs.map((log) => {
+      const order = log.entityId ? refundOrderById.get(log.entityId) : undefined
+      const payloadAmount = readParkedRefundGross(log.payload)
+      return {
+        id: log.id,
+        status: log.status,
+        externalRefundId: log.externalId,
+        orderId: log.entityId,
+        orderNumber: order?.orderNumber ?? null,
+        wcOrderId: log.entityId ? wcOrderIdByOrderId.get(log.entityId) ?? null : null,
+        errorMessage: log.errorMessage,
+        createdAt: log.createdAt.toISOString(),
+        // Only a QUARANTINED park is a deliberate, non-retryable refusal. PENDING/FAILED rows are
+        // ordinary retryable failures whose remedy is Retry (usually after fixing the amount in the
+        // storefront) — offering a manual credit note for those would invite a duplicate.
+        manuallyRecordable: log.status === 'QUARANTINED' && Boolean(log.entityId) && Boolean(log.externalId),
+        currency: order?.currency ?? null,
+        refundGrossForeign: payloadAmount,
+        orderLines: (order?.lines ?? []).map((line) => ({
+          id: line.id,
+          description: line.description,
+          sku: line.sku,
+          netTotalForeign: String(line.totalForeign),
+          taxRateName: line.taxRate?.name ?? null,
+        })),
+      }
+    }),
     stuckDispatches,
     pennyMismatches: mismatchLinks.map((link) => ({
       orderId: link.orderId,
@@ -873,7 +935,9 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     const session = await requireFreshPermission('sync')
     const row = await db.shoppingSyncLog.findFirst({
       where: { id, ...REFUND_PARK_WHERE },
-      select: { id: true, entityId: true, externalId: true },
+      // o3d-w00 (Codex r1 #3): status + errorMessage are read so a quarantine that this retry
+      // temporarily downgraded can be RESTORED if the re-fetch never got as far as re-deciding it.
+      select: { id: true, entityId: true, externalId: true, status: true, errorMessage: true },
     })
     if (!row || !row.entityId) {
       return { success: false, error: 'The sync log row is no longer pending (already resolved or removed).' }
@@ -959,6 +1023,27 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
       if (staleIds.length > 0) {
         await db.shoppingSyncLog.deleteMany({ where: { id: { in: staleIds } } })
       }
+
+      // o3d-w00 (Codex r1 #3): put the quarantine BACK if the re-fetch never re-decided this refund.
+      // The transition above is only safe because the sync normally re-parks the row (as QUARANTINED
+      // again, or SYNCED); when the WooCommerce fetch itself fails, or the refund is absent from the
+      // response, nothing rewrites it and the row is stranded as PENDING — carrying the original
+      // deliberate-refusal message, but no longer offering the ONE action that can resolve it
+      // (Record manually is scoped to QUARANTINED, because hand-recording a retryable park would race
+      // its retry into a duplicate credit note). Detected by the row being untouched: still PENDING,
+      // still carrying the same error text it had before the transition.
+      if (row.status === 'QUARANTINED') {
+        await db.shoppingSyncLog.updateMany({
+          where: {
+            ...REFUND_PARK_WHERE,
+            externalId: row.externalId,
+            entityId: row.entityId,
+            status: 'PENDING',
+            errorMessage: row.errorMessage,
+          },
+          data: { status: 'QUARANTINED' },
+        })
+      }
     }
 
     await logActivity({
@@ -974,6 +1059,168 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     })
     revalidatePath('/sync/exceptions')
     return { success: true, synced: Boolean(refundLanded) }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+
+/**
+ * o3d-w00 (Codex r1 #3): COMPLETE a quarantined WooCommerce refund by recording it by hand.
+ *
+ * A QUARANTINED refund park is a deliberate, non-transient refusal: either the monetary-only gross→net
+ * basis could not be established, or the order is not uniformly taxed so an unattributed monetary amount
+ * could not be posted under one VAT identity. The money has ALREADY been returned in WooCommerce and no
+ * credit note exists. Retry cannot help — it re-runs the identical decision against the identical order —
+ * so before this action the park had no end state at all: it kept counting in the exception inbox and
+ * kept blocking order deletion / store rebinding forever, and a human who reconciled it in the ledger had
+ * no way to say so.
+ *
+ * What makes this resolvable rather than merely dismissible: the operator supplies the ONE thing IMS
+ * cannot derive — which order lines the refunded money covered, and how much (NET) of it each line took.
+ * With that, the credit note is raised through the ordinary refund path, LINE-LINKED, so every refund
+ * line carries its own line's VAT identity; the non-uniform-tax refusal does not apply to a line-linked
+ * refund, and no header rate has to be guessed. The refund is stamped with the WooCommerce refund id, so
+ * a later redelivery of the same refund dedups against it instead of raising a second credit note.
+ *
+ * Deliberately NOT a "dismiss" button. Marking the park resolved without a credit note would leave the
+ * order's ledger short by the refunded amount, which is precisely the silent over-credit this epic exists
+ * to prevent. If the amounts cannot be attributed, the honest outcome is that the row stays open.
+ *
+ * Permissions: `sync` to act on the inbox AND fresh `sales.refund` to raise the credit note — ADMIN and
+ * MANAGER hold both, so an operator who can reach this screen can complete it. (FINANCE holds
+ * `sales.refund` but not `sync`, so it never sees the inbox; that separation is intentional.)
+ */
+export async function recordRefundParkManually(
+  parkId: string,
+  allocations: { lineId: string; netAmountForeign: number }[],
+  reason: string,
+): Promise<MutationResult> {
+  try {
+    await requirePermission('sync')
+    const session = await requireFreshPermission('sales.refund')
+
+    if (!reason.trim()) {
+      return { success: false, error: 'A reason is required — it is the audit record for a hand-recorded refund.' }
+    }
+    const cleaned = allocations
+      .filter((allocation) => Number.isFinite(allocation.netAmountForeign) && allocation.netAmountForeign > 0)
+      .map((allocation) => ({ lineId: allocation.lineId, netAmountForeign: allocation.netAmountForeign }))
+    if (cleaned.length === 0) {
+      return { success: false, error: 'Allocate the refunded amount across at least one order line (NET, tax-exclusive).' }
+    }
+
+    // Scoped to a QUARANTINED park: PENDING/FAILED rows are ordinary retryable failures whose remedy is
+    // Retry, and hand-recording one would race the retry into a duplicate credit note.
+    const park = await db.shoppingSyncLog.findFirst({
+      where: { id: parkId, ...REFUND_PARK_WHERE, status: 'QUARANTINED' },
+      select: { id: true, entityId: true, externalId: true },
+    })
+    if (!park?.entityId || !park.externalId) {
+      return { success: false, error: 'This refund is no longer quarantined (already resolved, retried, or removed).' }
+    }
+    const externalRefundId = Number(park.externalId)
+    if (!Number.isSafeInteger(externalRefundId) || externalRefundId <= 0) {
+      return { success: false, error: `The parked row has no usable WooCommerce refund id (${park.externalId}).` }
+    }
+
+    // externalRefundId is GLOBALLY unique. If the refund has meanwhile landed — here or on another order
+    // — raising a second credit note for it would double-credit, so fail closed instead.
+    const alreadyLanded = await db.salesOrderRefund.findFirst({
+      where: { externalRefundId },
+      select: { orderId: true, creditNoteNumber: true },
+    })
+    if (alreadyLanded) {
+      return {
+        success: false,
+        error: alreadyLanded.orderId === park.entityId
+          ? `Refund ${park.externalId} has already been recorded (credit note ${alreadyLanded.creditNoteNumber ?? 'pending'}). Retry this row to close it.`
+          : `Refund ${park.externalId} already exists on a different order (${alreadyLanded.orderId}); it cannot be recorded here.`,
+      }
+    }
+
+    const order = await db.salesOrder.findUnique({
+      where: { id: park.entityId },
+      select: {
+        id: true,
+        fxRateToBase: true,
+        lines: { select: { id: true, productId: true, description: true } },
+      },
+    })
+    if (!order) {
+      return { success: false, error: 'The order this refund belongs to no longer exists.' }
+    }
+    const orderLineById = new Map(order.lines.map((line) => [line.id, line]))
+    const unknown = cleaned.find((allocation) => !orderLineById.has(allocation.lineId))
+    if (unknown) {
+      return { success: false, error: `Line ${unknown.lineId} is not on this order.` }
+    }
+
+    const fxRate = toDecimal(order.fxRateToBase).gt(0) ? toDecimal(order.fxRateToBase) : toDecimal(1)
+    const refundLines = cleaned.map((allocation) => {
+      const line = orderLineById.get(allocation.lineId)!
+      const net = toDecimal(allocation.netAmountForeign)
+      return {
+        // The link is the whole point: a line-linked refund line carries its OWN line's VAT identity,
+        // which is what both quarantine refusals were missing.
+        lineId: line.id,
+        productId: line.productId,
+        description: line.description,
+        // qty 0 — a monetary refund returns no goods. createSalesOrderRefund keeps amount-only lines
+        // (its filter is qty > 0 OR totalBase > 0) and derives a 0 unit price for them.
+        qty: 0,
+        totalForeign: roundQuantity(net, 4).toNumber(),
+        totalBase: roundQuantity(net.div(fxRate), 4).toNumber(),
+        lineKind: 'sale' as const,
+      }
+    })
+
+    const { createRefund } = await import('@/app/actions/sales')
+    const result = await createRefund(
+      order.id,
+      refundLines,
+      reason.trim(),
+      // No return warehouse: nothing physically came back, and a hand-recorded monetary refund must not
+      // invent an inventory movement.
+      undefined,
+      { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId },
+    )
+    if (!result.success) {
+      // The park stays QUARANTINED and visible — the operator can fix the allocation and try again.
+      return { success: false, error: result.error ?? 'The refund could not be recorded.' }
+    }
+
+    // The credit note exists and owns the WooCommerce refund id, so the park's premise (an unresolved
+    // storefront refund) is no longer true. Resolve EVERY actionable park for this refund + order, not
+    // just the clicked one, so repeated deliveries do not leave stale rows behind.
+    await db.shoppingSyncLog.updateMany({
+      where: { ...REFUND_PARK_WHERE, externalId: park.externalId, entityId: park.entityId },
+      data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: null },
+    })
+
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: order.id,
+      tag: 'sync',
+      action: 'wc_refund_park_recorded_manually',
+      level: 'WARNING',
+      description:
+        `WooCommerce refund ${park.externalId} could not be converted automatically and was recorded by hand ` +
+        `against ${refundLines.length} order line(s): ${reason.trim()}`,
+      // The evidence: exactly which lines the operator attributed the money to, and how much.
+      metadata: {
+        shoppingSyncLogId: park.id,
+        externalRefundId,
+        userId: session.user.id,
+        allocations: refundLines.map((line) => ({ lineId: line.lineId, totalForeign: line.totalForeign, totalBase: line.totalBase })),
+      },
+      resolveUser: false,
+    })
+    revalidatePath('/sync/exceptions')
+    revalidatePath(`/sales/${order.id}`)
+    return { success: true }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure

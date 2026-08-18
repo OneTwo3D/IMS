@@ -55,8 +55,83 @@ function externalRefundIdUniqueError() {
  * code that was still storing gross. The default order below is internally COHERENT: net 12.50 + VAT
  * 2.50 @ 0.20 = gross 15.00, matching the 12.50 net order line.
  */
-type OrderDouble = { totalBase: number; taxBase: number; taxRatePercent: number | null }
-const DEFAULT_ORDER_DOUBLE: OrderDouble = { totalBase: 15, taxBase: 2.5, taxRatePercent: 0.2 }
+type OrderLineDouble = {
+  id: string
+  productId: string | null
+  externalLineItemId: number | null
+  description: string
+  qty: number
+  totalBase: number
+  // o3d-w00 (Codex r1 #1/#2): the per-line tax fields production now reads. A double that OMITS them
+  // makes both the zero-rated test ("every line agrees there is no VAT") and the tolerance sizing
+  // ("one penny-rounded VAT figure per component") pass vacuously, so they are part of the shape.
+  taxBase: number
+  taxRate: { rate: number; reverseCharge: boolean } | null
+}
+type OrderDouble = {
+  totalBase: number
+  taxBase: number
+  taxRatePercent: number | null
+  shippingBase: number
+  lines: OrderLineDouble[]
+}
+const DEFAULT_ORDER_LINE: OrderLineDouble = {
+  id: 'line-1',
+  productId: 'product-1',
+  externalLineItemId: 501,
+  description: 'Widget',
+  qty: 1,
+  totalBase: 12.5,
+  taxBase: 2.5,
+  taxRate: { rate: 0.2, reverseCharge: false },
+}
+const DEFAULT_ORDER_DOUBLE: OrderDouble = {
+  totalBase: 15,
+  taxBase: 2.5,
+  taxRatePercent: 0.2,
+  shippingBase: 0,
+  lines: [DEFAULT_ORDER_LINE],
+}
+
+/**
+ * An order double built the way a real imported order is: `grossTotal` is the 2-decimal amount the
+ * customer actually paid (WooCommerce's order total), and `taxBase` is the sum of the per-line VAT
+ * figures WooCommerce rounded to the penny. The order's NET total is the difference, so the gap the
+ * guard reconciles — delta = net x rate - taxBase — is produced the way it is in production, by taxBase
+ * drifting off net x rate, NOT by inventing sub-penny grosses that no store ever charges.
+ *
+ * At 20% a 0.0001 step in taxBase moves delta by 0.00012, which is what makes the tolerance edges below
+ * land on exact decimal values rather than approximately.
+ */
+function makeOrder(input: {
+  grossTotal: number
+  taxBase: number
+  rate: number
+  lineCount?: number
+  shippingBase?: number
+  reverseCharge?: boolean
+}): OrderDouble {
+  const lineCount = input.lineCount ?? 1
+  const netTotal = Number((input.grossTotal - input.taxBase).toFixed(4))
+  const netPerLine = Number((netTotal / lineCount).toFixed(4))
+  const taxPerLine = Number((input.taxBase / lineCount).toFixed(4))
+  return {
+    totalBase: input.grossTotal,
+    taxBase: input.taxBase,
+    taxRatePercent: input.rate > 0 ? input.rate : null,
+    shippingBase: input.shippingBase ?? 0,
+    lines: Array.from({ length: lineCount }, (_unused, index) => ({
+      id: `line-${index + 1}`,
+      productId: `product-${index + 1}`,
+      externalLineItemId: 501 + index,
+      description: `Widget ${index + 1}`,
+      qty: 1,
+      totalBase: netPerLine,
+      taxBase: taxPerLine,
+      taxRate: { rate: input.rate, reverseCharge: input.reverseCharge ?? false },
+    })),
+  }
+}
 
 function makeDependencies(options: {
   alwaysMissExistingRefund?: boolean
@@ -153,16 +228,6 @@ function makeDependencies(options: {
             fxRateToBase: 1,
             ...DEFAULT_ORDER_DOUBLE,
             ...options.order,
-            lines: [
-              {
-                id: 'line-1',
-                productId: 'product-1',
-                externalLineItemId: 501,
-                description: 'Widget',
-                qty: 1,
-                totalBase: 12.5,
-              },
-            ],
           }
         },
       },
@@ -288,7 +353,7 @@ test('a monetary-only WooCommerce refund is stored NET, not gross (o3d-w00)', as
 // ---------------------------------------------------------------------------
 
 // A £120 gross order: net 100 + VAT 20 @ 0.20.
-const TAXABLE_ORDER: Partial<OrderDouble> = { totalBase: 120, taxBase: 20, taxRatePercent: 0.2 }
+const TAXABLE_ORDER: Partial<OrderDouble> = makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 })
 const TAXABLE_ORDER_NET_TOTAL = 100
 
 test('a monetary-only refund converts gross to net at the FRACTIONAL tax rate, not rate/100 (o3d-w00)', async () => {
@@ -360,7 +425,7 @@ test('a monetary-only refund whose gross->net basis CANNOT be determined is refu
   // Storing it anyway would stamp a gross figure totalsBasis='NET'. Fail closed instead.
   const state = makeDependencies({
     alwaysMissExistingRefund: true,
-    order: { totalBase: 120, taxBase: 20, taxRatePercent: null },
+    order: { ...makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 }), taxRatePercent: null },
   })
   const refund = makeRefund({ id: 7101, amount: '120.00', line_items: [], shipping_lines: [] })
 
@@ -380,7 +445,7 @@ test('a monetary-only refund is refused when the header tax rate does not reconc
   // customer received. This check is also what independently catches a mis-scaled rate.
   const state = makeDependencies({
     alwaysMissExistingRefund: true,
-    order: { totalBase: 120, taxBase: 20, taxRatePercent: 0.05 },
+    order: { ...makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 }), taxRatePercent: 0.05 },
   })
   const refund = makeRefund({ id: 7102, amount: '120.00', line_items: [], shipping_lines: [] })
 
@@ -396,7 +461,7 @@ test('a monetary-only refund on a NON-taxable order still stores the gross amoun
   // and the ceiling/status comparison degenerates to the same basis.
   const state = makeDependencies({
     alwaysMissExistingRefund: true,
-    order: { totalBase: 100, taxBase: 0, taxRatePercent: null },
+    order: makeOrder({ grossTotal: 100, taxBase: 0, rate: 0 }),
   })
   const refund = makeRefund({ id: 7103, amount: '100.00', line_items: [], shipping_lines: [] })
 
@@ -420,6 +485,243 @@ test('resolveMonetaryRefundVatRate reads taxRatePercent as a fraction and fails 
   const untaxed = resolveMonetaryRefundVatRate({ totalBase: 100, taxBase: 0, taxRatePercent: null })
   assert.equal(untaxed.ok, true)
   assert.equal(untaxed.ok === true && untaxed.vatRate.toNumber(), 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-w00 Codex r1 #1: zero-rated must be decided by something that SAYS it is zero-rated, never by the
+// tax figure being small. The shortcut used to be `abs(taxBase) <= 0.02`, so a real £0.02 of VAT was
+// treated as no VAT at all — and its gross refund was then stored under totalsBasis='NET', which is the
+// original bug with a smaller number on it.
+// ---------------------------------------------------------------------------
+
+test('a REAL but tiny VAT figure is taxable, not zero-rated — at 0.02, 0.01 and 0.0001 (o3d-w00 Codex r1 #1)', () => {
+  // Each of these sat inside the old |taxBase| <= 0.02 shortcut, which returned rate 0 ("gross IS net").
+  // 2p, 1p and a hundredth of a penny of genuine VAT, each on a coherent 20% order.
+  for (const [grossTotal, taxBase] of [[0.12, 0.02], [0.06, 0.01], [0.0006, 0.0001]] as const) {
+    const basis = resolveMonetaryRefundVatRate(makeOrder({ grossTotal, taxBase, rate: 0.2 }))
+    assert.equal(basis.ok, true, `${taxBase} of VAT should resolve`)
+    assert.equal(
+      basis.ok === true && basis.vatRate.toNumber(),
+      0.2,
+      `${taxBase} is real VAT and must convert at 20%, not be called zero-rated`,
+    )
+  }
+})
+
+test('a tiny VAT figure with NO recorded rate is refused, not silently zero-rated (o3d-w00 Codex r1 #1)', () => {
+  // The dangerous half of the old shortcut: 2p of genuine VAT and no rate to convert it with. Assuming
+  // zero-rated stored the gross amount as NET; the answer is to refuse.
+  const basis = resolveMonetaryRefundVatRate({ ...makeOrder({ grossTotal: 0.12, taxBase: 0.02, rate: 0.2 }), taxRatePercent: null })
+  assert.equal(basis.ok, false)
+  assert.match(basis.ok === false ? basis.error : '', /no recorded tax rate/)
+})
+
+test('zero-rated is read off the order lines, so a zero HEADER VAT does not override a taxed line (o3d-w00 Codex r1 #1)', () => {
+  // Header says no tax and no rate, but a line carries VAT — the signals disagree, so nothing here
+  // "says" zero-rated. Fail closed rather than pick the convenient reading.
+  const taxedLines = makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 }).lines
+  const basis = resolveMonetaryRefundVatRate({ totalBase: 100, taxBase: 0, taxRatePercent: null, shippingBase: 0, lines: taxedLines })
+  assert.equal(basis.ok, false, 'a line carrying VAT is not a zero-rated order')
+})
+
+test('a genuinely zero-rated order still needs no conversion (o3d-w00)', () => {
+  const basis = resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 100, taxBase: 0, rate: 0 }))
+  assert.equal(basis.ok, true)
+  assert.equal(basis.ok === true && basis.vatRate.toNumber(), 0)
+})
+
+test('a fully reverse-charged order is zero-rated on the FLAG, not on the rate value (o3d-w00 Codex r1 #1)', () => {
+  // Under reverse charge the seller charges no VAT, so gross IS net — even if the rate row it points at
+  // still carries a face value of 20%. The explicit flag is the signal that says so; without it this
+  // order would be refused for a rate that cannot reproduce its (zero) tax.
+  const order = makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2, reverseCharge: true })
+  const reverseCharged = {
+    ...order,
+    taxBase: 0,
+    totalBase: 100,
+    lines: order.lines.map((line) => ({ ...line, taxBase: 0 })),
+  }
+  const basis = resolveMonetaryRefundVatRate(reverseCharged)
+  assert.equal(basis.ok, true)
+  assert.equal(basis.ok === true && basis.vatRate.toNumber(), 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-w00 Codex r1 #2: the reconciliation tolerance. It used to be 0.02 + 0.2% of net, which on a
+// £10,000 net order accepted ±£20.02 — wide enough to admit the very mis-scaling the guard exists to
+// catch. It is now the minimum of three DERIVED bounds: this order's actual penny-rounding exposure
+// (0.005 per component), the cumulative-refund ceiling (REFUND_TOTAL_EPSILON x (1+rate)), and the FULL
+// classification ((1 - FULL_REFUND_RATIO) x net x (1+rate)).
+// ---------------------------------------------------------------------------
+
+test('the tolerance no longer admits the mis-scaled rate the old one did (o3d-w00 Codex r1 #2)', () => {
+  // Codex's case: £10,000 net / £2,000 VAT. 19.8% and 20.2% both fitted inside the old £20.02 tolerance,
+  // and a full refund converted at them came out £16.69 over the ceiling / £16.64 short of FULL.
+  for (const rate of [0.198, 0.202]) {
+    const basis = resolveMonetaryRefundVatRate({ ...makeOrder({ grossTotal: 12000, taxBase: 2000, rate: 0.2, lineCount: 13 }), taxRatePercent: rate })
+    assert.equal(basis.ok, false, `a header rate of ${rate} against 20% of recorded VAT must be refused`)
+  }
+  // On that 13-component order the rounding exposure would be £0.0652, but the cumulative-refund ceiling
+  // caps it at 0.011 x 1.2 = £0.0132. So the smallest mis-scaling now rejected is a rate off by
+  // 0.0132/10000 = 0.00000132 — 19.999868% instead of 20% — where the old tolerance was £20.02.
+  assert.equal(
+    resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 12000, taxBase: 1999.989, rate: 0.2, lineCount: 13 })).ok,
+    true,
+    'delta of exactly 0.0132 is the largest accepted',
+  )
+  assert.equal(
+    resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 12000, taxBase: 1999.9889, rate: 0.2, lineCount: 13 })).ok,
+    false,
+    'delta of 0.01332 — one 0.0001 step of taxBase further — is refused',
+  )
+})
+
+test('the tolerance is sized to this order’s own penny rounding, in BOTH directions (o3d-w00 Codex r1 #2)', () => {
+  // ONE taxable component: WooCommerce rounded exactly one VAT figure to the penny, so the largest
+  // legitimate gap is half a penny (plus 0.0002 for the two Decimal(18,4) conversions under net).
+  // Tolerance = 0.005 x 1 + 0.0002 = 0.0052. On a £120.00 gross order, taxBase 19.9957 gives delta
+  // +0.00516 and 19.9956 gives +0.00528; 20.0043 / 20.0044 are the same two steps the other way.
+  for (const [inside, outside] of [[19.9957, 19.9956], [20.0043, 20.0044]] as const) {
+    assert.equal(
+      resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 120, taxBase: inside, rate: 0.2 })).ok,
+      true,
+      `taxBase ${inside}: within one component's penny rounding is legitimate`,
+    )
+    assert.equal(
+      resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 120, taxBase: outside, rate: 0.2 })).ok,
+      false,
+      `taxBase ${outside}: beyond one component's penny rounding is not`,
+    )
+  }
+})
+
+test('more penny-rounded components buy more tolerance, until the refund ceiling caps it (o3d-w00 Codex r1 #2)', () => {
+  // 2 components => 0.005 x 2 + 0.0002 = 0.0102, under the ceiling cap of 0.011 x 1.2 = 0.0132.
+  // taxBase 19.9915 is delta 0.0102 exactly; 19.9914 is 0.01032. The 1-component order above refused
+  // both of these, so the component count is what changed the answer.
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 120, taxBase: 19.9915, rate: 0.2, lineCount: 2 })).ok, true)
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 120, taxBase: 19.9914, rate: 0.2, lineCount: 2 })).ok, false)
+  // 3 components would allow 0.0152 on rounding alone, but the ceiling cap binds first at 0.0132: past
+  // that, a full monetary refund converted at the accepted rate could exceed the order's net total.
+  // taxBase 19.989 is delta 0.0132 exactly; 19.9889 is 0.01332 — and 40 components cannot buy it back.
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 120, taxBase: 19.989, rate: 0.2, lineCount: 3 })).ok, true)
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 120, taxBase: 19.9889, rate: 0.2, lineCount: 3 })).ok, false)
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 120, taxBase: 19.9889, rate: 0.2, lineCount: 40 })).ok, false)
+})
+
+test('shipping counts as a penny-rounded component when it was charged (o3d-w00 Codex r1 #2)', () => {
+  // The same drift is legitimate with a shipping charge (2 components) and is not without one — so the
+  // component count is doing real work rather than being decorative.
+  // taxBase 19.99375 on a £120.00 gross order is delta 0.0075: past one component's 0.0052, inside two
+  // components' 0.0102.
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 120, taxBase: 19.99375, rate: 0.2 })).ok, false)
+  assert.equal(
+    resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 120, taxBase: 19.99375, rate: 0.2, shippingBase: 10 })).ok,
+    true,
+  )
+})
+
+test('the FULL-classification bound is what caps a SMALL order (o3d-w00 Codex r1 #2)', () => {
+  // On £5 net, (1 - 0.999) x 5 x 1.2 = 0.006 is tighter than both the 3-component rounding exposure
+  // (0.0152) and the ceiling cap (0.0132). Beyond it a full monetary refund would land under 99.9% of
+  // the net total and the order would stay PARTIALLY_REFUNDED — the exact symptom o3d-w00 is about.
+  // £6.00 gross / £5.00 net. taxBase 0.995 is delta +0.006 exactly; 0.9949 is +0.00612.
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 6, taxBase: 0.995, rate: 0.2, lineCount: 3 })).ok, true)
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 6, taxBase: 0.9949, rate: 0.2, lineCount: 3 })).ok, false)
+  // The cap is (1 - 0.999) x NET x 1.2, and net moves with taxBase, so the other side lands one step
+  // earlier: taxBase 1.0049 is delta -0.00588 against a cap of 0.00599; 1.005 is -0.006 against 0.005994.
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 6, taxBase: 1.0049, rate: 0.2, lineCount: 3 })).ok, true)
+  assert.equal(resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 6, taxBase: 1.005, rate: 0.2, lineCount: 3 })).ok, false)
+})
+
+test('every basis the guard accepts survives BOTH downstream refund thresholds (o3d-w00 Codex r1 #2)', async () => {
+  // Codex's closing ask: prove the accepted band is COMPATIBLE with the ceiling and the FULL test, not
+  // merely narrower than before. Each shape sits at exactly its tolerance edge, in both directions, and
+  // the refund is the whole gross the customer paid — the case that has to reach REFUNDED.
+  const shapes = [
+    // 1 component, +/-0.00516 — the rounding-exposure edge
+    { grossTotal: 120, taxBase: 19.9957, rate: 0.2, lineCount: 1 },
+    { grossTotal: 120, taxBase: 20.0043, rate: 0.2, lineCount: 1 },
+    // 3 components, +/-0.0132 — the cumulative-refund ceiling cap
+    { grossTotal: 120, taxBase: 19.989, rate: 0.2, lineCount: 3 },
+    { grossTotal: 120, taxBase: 20.011, rate: 0.2, lineCount: 3 },
+    // a small order, +/-0.006 — the FULL-classification cap
+    { grossTotal: 6, taxBase: 0.995, rate: 0.2, lineCount: 3 },
+    { grossTotal: 6, taxBase: 1.0049, rate: 0.2, lineCount: 3 },
+    // Codex's high-value order at the cap
+    { grossTotal: 12000, taxBase: 1999.989, rate: 0.2, lineCount: 13 },
+    { grossTotal: 12000, taxBase: 2000.011, rate: 0.2, lineCount: 13 },
+  ]
+  for (const shape of shapes) {
+    const order = makeOrder(shape)
+    assert.equal(resolveMonetaryRefundVatRate(order).ok, true, `${JSON.stringify(shape)} should be accepted`)
+
+    const state = makeDependencies({ alwaysMissExistingRefund: true, order })
+    await syncWcRefund(
+      1001,
+      makeRefund({ id: 7200, amount: order.totalBase.toFixed(2), line_items: [], shipping_lines: [] }),
+      state.dependencies,
+    )
+    const storedNet = state.createRefundLines[0]?.totalBase ?? 0
+    const netOrderTotal = order.totalBase - order.taxBase
+
+    assert.equal(
+      refundWouldExceedOrderTotal(storedNet, 0, netOrderTotal),
+      false,
+      `${JSON.stringify(shape)}: a full refund on an accepted basis must not trip the cumulative NET ceiling`,
+    )
+    assert.equal(
+      isFullRefundAmount(storedNet, netOrderTotal),
+      true,
+      `${JSON.stringify(shape)}: a full refund on an accepted basis must classify FULL, not stay PARTIAL`,
+    )
+  }
+
+  // And the converse, which is what the old tolerance got wrong: a rate it ADMITTED breaks both
+  // thresholds. £10,000 net / £2,000 VAT with a header of 19.8% fitted inside the old ±£20.02, and the
+  // £12,000 full refund it produced is £9,983.36 net — £16.64 short of FULL, so the order stays
+  // PARTIALLY_REFUNDED. At 20.2% it is £10,016.69, which the ceiling refuses outright.
+  for (const [rate, storedNet] of [[0.198, 12000 / 1.198], [0.202, 12000 / 1.202]] as const) {
+    assert.equal(
+      resolveMonetaryRefundVatRate({ ...makeOrder({ grossTotal: 12000, taxBase: 2000, rate: 0.2, lineCount: 13 }), taxRatePercent: rate }).ok,
+      false,
+      `a header of ${rate} must be refused`,
+    )
+    const brokenDownstream =
+      refundWouldExceedOrderTotal(storedNet, 0, 10000) || !isFullRefundAmount(storedNet, 10000)
+    assert.equal(brokenDownstream, true, `${rate} is exactly the drift that breaks the refund thresholds`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-w00 Codex r1 #3: the quarantine has to point at something an operator can actually do.
+// ---------------------------------------------------------------------------
+
+test('an undeterminable-basis quarantine names the completion path that exists (o3d-w00 Codex r1 #3)', async () => {
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: { ...makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 }), taxRatePercent: null },
+  })
+  const result = await syncWcRefund(1001, makeRefund({ id: 7104, amount: '120.00', line_items: [], shipping_lines: [] }), state.dependencies)
+
+  assert.equal(result.success, false)
+  const message = result.error ?? ''
+  // The remedy is the Record-manually action on the exception inbox — recordRefundParkManually — and it
+  // takes a NET allocation across the order's lines. Naming anything else would be naming a screen that
+  // does not exist, which is the defect Codex reported.
+  assert.match(message, /Sync → Exceptions/)
+  assert.match(message, /Record manually/)
+  assert.match(message, /NET \(tax-exclusive\) amounts/)
+  // And it must say plainly that retrying is NOT the way out, because retry re-runs the same refusal.
+  assert.match(message, /Retry cannot clear it/)
+  // The gross figure the operator has to account for is in the message, and so is the warning that the
+  // money has already gone.
+  assert.match(message, /120\.00 gross/)
+  assert.match(message, /do NOT issue another WooCommerce refund/)
+  const park = state.syncLogs.at(-1) as { data?: { status?: string; payload?: unknown } }
+  assert.equal(park?.data?.status, 'QUARANTINED')
+  // The payload is retained: the Record-manually dialog shows the operator the gross amount from it.
+  assert.ok(park?.data?.payload, 'the parked WooCommerce refund payload is kept for the manual recording')
 })
 
 test('syncWcRefund still rejects a genuine amount mismatch', async () => {

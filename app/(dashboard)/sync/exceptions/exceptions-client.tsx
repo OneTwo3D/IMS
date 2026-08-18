@@ -3,11 +3,13 @@
 import { Fragment, useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, RotateCcw, Split, XCircle } from 'lucide-react'
+import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, PencilLine, RotateCcw, Split, XCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { Card } from '@/components/ui/card'
+import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
 import {
   Table,
   TableBody,
@@ -32,6 +34,7 @@ import {
   replayStuckDispatch,
   retryUnresolvedDriftCohort,
   repushMissingWmsOrder,
+  recordRefundParkManually,
   retryRefundSyncPark,
   recoverRefundSyncPark,
   type ExceptionInboxData,
@@ -67,6 +70,8 @@ export function ExceptionsClient({ data }: Props) {
   // o3d-54p: which refund park (if any) has its recovery panel open. One at a time, and NEVER
   // pre-armed: the panel opens with no outcome chosen, so a stray click cannot assert anything.
   const [recoveringParkId, setRecoveringParkId] = useState<string | null>(null)
+  // o3d-w00 (Codex r1 #3): the park currently being hand-recorded, or null.
+  const [recordingPark, setRecordingPark] = useState<RefundSyncParkRow | null>(null)
 
   async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
     const result = await run()
@@ -102,6 +107,21 @@ export function ExceptionsClient({ data }: Props) {
   return (
     <div className="space-y-4">
       {stepUpDialog}
+      {recordingPark ? (
+        <RecordRefundManuallyDialog
+          row={recordingPark}
+          isPending={isPending}
+          onClose={() => setRecordingPark(null)}
+          onSubmit={(allocations, reason) => {
+            const park = recordingPark
+            runAction(
+              () => recordRefundParkManually(park.id, allocations, reason),
+              'Refund recorded manually — the credit note was raised and the row is resolved.',
+            )
+            setRecordingPark(null)
+          }}
+        />
+      ) : null}
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-xl font-semibold flex items-center gap-2">
@@ -347,7 +367,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WooCommerce refunds — parked (${data.summary.refundSyncParks})`}
-            detail="Refunds that could not be applied (usually an amount mismatch). The refund/restock/credit-note has NOT posted. Retry re-fetches the order's refunds fresh from WooCommerce."
+            detail="Refunds that could not be applied. The refund/restock/credit-note has NOT posted, but the money HAS left WooCommerce. Retry re-fetches the order's refunds fresh from WooCommerce — use it for an amount mismatch fixed at the store. A QUARANTINED row was refused deliberately (its VAT could not be determined) and retry cannot clear it: record it manually against the order lines it covers."
             shown={data.refundSyncParks.length}
             total={data.summary.refundSyncParks}
           />
@@ -388,7 +408,10 @@ export function ExceptionsClient({ data }: Props) {
                         onClick={() => runAction(async () => {
                           const result = await retryRefundSyncPark(row.id)
                           if ('success' in result && result.success && !result.synced) {
-                            return { success: false, error: 'Retried, but the refund still did not apply — the amount mismatch likely persists in WooCommerce.' }
+                            // o3d-w00: a QUARANTINED park is refused for a reason that is NOT an
+                            // amount mismatch (undeterminable VAT basis, non-uniform tax), so naming
+                            // one cause here would send the operator to the wrong remedy.
+                            return { success: false, error: 'Retried, but the refund still did not apply — see the row\'s error.' }
                           }
                           return result
                         }, 'Refund re-synced and applied.')}
@@ -411,6 +434,18 @@ export function ExceptionsClient({ data }: Props) {
                       >
                         <Split className="h-3 w-3 mr-1" />Wrong order
                       </Button>
+                      {/* o3d-w00 (Codex r1 #3): the only route out of a QUARANTINED park. */}
+                      {row.manuallyRecordable ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={isPending}
+                          onClick={() => setRecordingPark(row)}
+                        >
+                          <PencilLine className="h-3 w-3 mr-1" />Record manually
+                        </Button>
+                      ) : null}
                     </TableCell>
                   </TableRow>
                   {recoveringParkId === row.id ? (
@@ -978,5 +1013,110 @@ function RecoverRefundParkPanel({
         <Button type="button" size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
       </div>
     </div>
+  )
+}
+
+/**
+ * o3d-w00 (Codex r1 #3): the completion path for a QUARANTINED refund park.
+ *
+ * The refund was refused because IMS could not work out how to record it — an undeterminable gross→net
+ * basis, or an order that is not uniformly taxed. Retry re-runs that same decision, so it can never
+ * clear. What IMS is missing is the one thing only a person knows: which order lines the refunded money
+ * covered. Entering that here raises the credit note against those lines (each carrying its own VAT
+ * rate) and resolves the row.
+ *
+ * Amounts are NET (tax-exclusive), matching how every refund line is stored; the gross figure from
+ * WooCommerce is shown alongside so the operator can check their split against it.
+ */
+function RecordRefundManuallyDialog({
+  row,
+  isPending,
+  onSubmit,
+  onClose,
+}: {
+  row: RefundSyncParkRow
+  isPending: boolean
+  onSubmit: (allocations: { lineId: string; netAmountForeign: number }[], reason: string) => void
+  onClose: () => void
+}) {
+  const [reason, setReason] = useState('')
+  const [amounts, setAmounts] = useState<Record<string, string>>({})
+  const allocated = Object.values(amounts).reduce((sum, value) => sum + (Number(value) || 0), 0)
+
+  return (
+    <Dialog open onOpenChange={() => { if (!isPending) onClose() }}>
+      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Record WooCommerce refund {row.externalRefundId} manually</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <p className="text-xs text-muted-foreground">
+            This refund could not be converted automatically, so no credit note exists — but the money has already
+            been returned to the customer in WooCommerce. Split it across the order lines it actually covered.
+            Enter <strong>NET (tax-exclusive)</strong> amounts; each line is re-grossed at its own VAT rate.
+            {row.refundGrossForeign
+              ? <> The customer received <strong>{row.refundGrossForeign} {row.currency ?? ''}</strong> gross.</>
+              : null}
+          </p>
+          <div className="space-y-1.5">
+            <Label htmlFor="record-refund-reason">Reason / reference *</Label>
+            <Input
+              id="record-refund-reason"
+              value={reason}
+              onChange={(event) => setReason(event.target.value)}
+              placeholder="e.g. WC refund 7101 — 2 units returned at 20%, shipping at 0%"
+              className="h-9 text-sm"
+            />
+          </div>
+          <Table containerClassName="rounded-md border" className="min-w-[520px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Order line</TableHead>
+                <TableHead>VAT rate</TableHead>
+                <TableHead className="text-right">Line net</TableHead>
+                <TableHead className="text-right w-32">Refund net</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {row.orderLines.map((line) => (
+                <TableRow key={line.id}>
+                  <TableCell className="text-xs">{line.sku ? `${line.sku} — ` : ''}{line.description}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{line.taxRateName ?? 'none'}</TableCell>
+                  <TableCell className="text-right text-xs font-mono">{line.netTotalForeign}</TableCell>
+                  <TableCell>
+                    <Input
+                      type="number"
+                      min={0}
+                      step="0.01"
+                      value={amounts[line.id] ?? ''}
+                      onChange={(event) => setAmounts((previous) => ({ ...previous, [line.id]: event.target.value }))}
+                      className="h-7 text-sm text-right w-28 ml-auto font-mono"
+                    />
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+          <div className="flex justify-end text-sm font-medium">
+            Allocated (net): <span className="ml-2 font-mono">{allocated.toFixed(2)}</span>
+          </div>
+        </div>
+        <DialogFooter>
+          <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+          <Button
+            type="button"
+            disabled={isPending || allocated <= 0 || !reason.trim()}
+            onClick={() => onSubmit(
+              row.orderLines
+                .map((line) => ({ lineId: line.id, netAmountForeign: Number(amounts[line.id]) || 0 }))
+                .filter((allocation) => allocation.netAmountForeign > 0),
+              reason,
+            )}
+          >
+            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Record refund
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }

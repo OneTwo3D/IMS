@@ -17,6 +17,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
+import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { scheduleRefundReservationReleaseOutbox, scheduleRefundUnmatchedWarningOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { calculateCoverageByLine, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
@@ -3138,12 +3139,21 @@ export async function createSalesOrderRefund(
       (refundLine) => refundLine.lineId == null && refundLine.lineKind !== 'shipping' && refundLine.lineKind !== 'discount',
     )
     if (hasUnlinkedSaleLine && !orderUniformlyTaxed) {
+      // o3d-w00 (Codex r1 #3): name a remedy the operator can actually carry out. For a refund that
+      // arrived from a storefront (externalRefundId set) that is the exception inbox's Record-manually
+      // action, which allocates the amount across the order's own lines — line-linked, so this very
+      // refusal no longer applies — and stamps the external id so a redelivery dedups. For a refund an
+      // operator is typing in by hand there is no park to resolve: they simply pick the lines in the
+      // refund dialog instead of leaving the amount unattributed.
       return {
         error:
           'This refund is monetary-only (not itemised) but the order is not uniformly taxed, so its VAT ' +
-          'cannot be determined automatically. It has been parked for manual resolution: do NOT issue ' +
-          'another refund — record it in the IMS against the specific lines / tax rates it covers' +
-          (input.externalRefundId != null ? `, quoting refund id ${input.externalRefundId}.` : '.'),
+          'cannot be determined automatically and no credit note has been raised. ' +
+          (input.externalRefundId != null
+            ? `The money has ALREADY been returned in the storefront (refund ${input.externalRefundId}) — do NOT ` +
+              'issue another storefront refund. ' + REFUND_PARK_MANUAL_RESOLUTION_HINT
+            : 'Record it against the specific order lines it covers instead of as an unattributed amount, ' +
+              'so each line carries its own VAT rate.'),
         quarantine: true as const,
       } as const
     }

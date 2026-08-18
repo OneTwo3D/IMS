@@ -9,6 +9,9 @@ import { wcFetch } from '../api'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
+import { REFUND_TOTAL_EPSILON } from '@/lib/domain/sales/o2c-guards'
+import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
+import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
 import type { WcRefund, WcRefundLineItem } from './types'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
@@ -42,6 +45,15 @@ function parseDecimalAbs(value: string | number | null | undefined) {
   return decimal.lt(0) ? decimal.neg() : decimal
 }
 
+function undeterminableBasisMessage(cause: string): string {
+  return (
+    `This refund is monetary-only (not itemised) and ${cause}, so the refunded amount cannot be converted ` +
+    'from gross to net and no credit note has been raised. The money has ALREADY been returned in ' +
+    'WooCommerce — do NOT issue another WooCommerce refund. ' +
+    REFUND_PARK_MANUAL_RESOLUTION_HINT
+  )
+}
+
 /**
  * o3d-w00: the basis on which a MONETARY-ONLY WooCommerce refund is converted from the gross amount
  * the customer received to the NET amount IMS stores.
@@ -62,22 +74,76 @@ export type MonetaryRefundBasis =
   | { ok: true; vatRate: Decimal }
   | { ok: false; error: string }
 
-/** Absolute slack (base currency) allowed when checking the header rate against the order's own tax. */
-const MONETARY_BASIS_ABS_TOLERANCE = 0.02
-/** Relative slack on the net order total, covering WooCommerce's per-line VAT rounding on large orders. */
-const MONETARY_BASIS_REL_TOLERANCE = 0.002
-
-export function resolveMonetaryRefundVatRate(order: {
+/**
+ * The order shape the basis is resolved from. `lines` and `shippingBase` are what make the tolerance
+ * (below) a measured quantity rather than a guess, and what let "zero-rated" be read off the order's
+ * own tax lines instead of inferred from the size of a number.
+ */
+export type MonetaryRefundBasisOrder = {
   totalBase: DecimalInput
   taxBase?: DecimalInput
   taxRatePercent?: DecimalInput
-}): MonetaryRefundBasis {
+  shippingBase?: DecimalInput
+  lines?: readonly {
+    taxBase?: DecimalInput
+    taxRate?: { rate?: DecimalInput; reverseCharge?: boolean | null } | null
+  }[]
+}
+
+/** The scale SalesOrder.taxBase / SalesOrderLine.taxBase are stored at (Decimal(18,4)). */
+const TAX_BASE_SCALE = 4
+
+/**
+ * Half the currency minor unit. WooCommerce rounds EVERY taxable component's VAT to the penny
+ * independently (`total_tax` per line, per shipping line, per fee), so each component contributes at
+ * most this much to the gap between the order's recorded VAT and netTotal × rate. This — not a round
+ * number, and not a percentage of the order — is what legitimate rounding actually looks like.
+ */
+const MONEY_ROUNDING_HALF_UNIT = 0.005
+/** Two Decimal(18,4) conversions (totalBase and taxBase) sit underneath netOrderBase. */
+const BASE_CONVERSION_SLACK = 0.0002
+
+function minDecimal(first: Decimal, ...rest: Decimal[]): Decimal {
+  return rest.reduce((smallest, value) => (value.lt(smallest) ? value : smallest), first)
+}
+
+/**
+ * How many independently-rounded VAT figures the order's tax is the sum of: one per order line (WC fee
+ * lines are imported as order lines too) plus one for shipping when it was charged. Defaults to 1 — the
+ * TIGHTEST tolerance — when the caller does not supply lines, so an unknown order can never buy slack.
+ */
+function countTaxableComponents(order: MonetaryRefundBasisOrder): number {
+  const lineCount = order.lines?.length ?? 0
+  const shippingCount = toDecimal(order.shippingBase ?? 0).abs().gt(0) ? 1 : 0
+  return Math.max(1, lineCount + shippingCount)
+}
+
+export function resolveMonetaryRefundVatRate(order: MonetaryRefundBasisOrder): MonetaryRefundBasis {
   const taxBase = toDecimal(order.taxBase ?? 0)
   const netOrderBase = toDecimal(order.totalBase).sub(taxBase)
+  const rate = order.taxRatePercent == null ? null : toDecimal(order.taxRatePercent)
+  const lines = order.lines ?? []
 
-  // No VAT on the order: gross IS net, so no rate is needed and none can be wrong. This also matches
-  // how the ceiling/status comparison degenerates for non-taxable orders (taxBase 0 => net == gross).
-  if (taxBase.abs().lte(MONETARY_BASIS_ABS_TOLERANCE)) {
+  // ---------------------------------------------------------------------------------------------
+  // Zero-rated. Codex r1 #1: this used to be `abs(taxBase) <= 0.02` — an absolute epsilon on a MONEY
+  // value, which swallowed genuinely taxable orders whose VAT happens to be small (£0.10 net + £0.02
+  // VAT was "zero-rated", so its £0.12 gross refund was stored gross under totalsBasis='NET' — the
+  // very bug this function exists to stop). Zero-rating is a property of the RATE, not of the
+  // magnitude of the tax figure, so it is now read off signals that SAY so and must all agree:
+  //   - the order's recorded VAT is exactly zero at the scale it is stored at (not "small"), AND
+  //   - the order's rate says no tax — absent, zero, or every line reverse-charged (an explicit flag:
+  //     under RC the seller charges no VAT, so gross IS net regardless of the rate's face value), AND
+  //   - every order line agrees: no VAT recorded on it, and its own rate is zero or reverse-charged.
+  // Anything else — including one penny of real VAT — falls through to the rate check below, and is
+  // REFUSED if no rate reproduces it. Refusing is the fail-closed answer the whole fix is built on.
+  // ---------------------------------------------------------------------------------------------
+  const recordedTaxIsZero = roundQuantity(taxBase, TAX_BASE_SCALE).isZero()
+  const everyLineReverseCharged = lines.length > 0 && lines.every((line) => line.taxRate?.reverseCharge === true)
+  const rateSaysNoTax = rate == null || !rate.isFinite() || rate.lte(0) || everyLineReverseCharged
+  const linesSayNoTax = lines.every((line) =>
+    roundQuantity(toDecimal(line.taxBase ?? 0), TAX_BASE_SCALE).isZero() &&
+    (toDecimal(line.taxRate?.rate ?? 0).lte(0) || line.taxRate?.reverseCharge === true))
+  if (recordedTaxIsZero && rateSaysNoTax && linesSayNoTax) {
     return { ok: true, vatRate: toDecimal(0) }
   }
 
@@ -85,38 +151,72 @@ export function resolveMonetaryRefundVatRate(order: {
   // percentage — it is consumed as `1 + rate` everywhere else (sales-currency, order-import) and only
   // multiplied by 100 for DISPLAY. Treating it as a percentage here divided the rate by a further 100,
   // making the "net" figure 12.00/1.002 instead of 12.00/1.20 — i.e. still gross.
-  const rate = order.taxRatePercent == null ? null : toDecimal(order.taxRatePercent)
   if (rate == null || !rate.isFinite() || rate.lte(0)) {
     return {
       ok: false,
-      error:
-        'This refund is monetary-only (not itemised) and the order carries VAT, but the order has no ' +
-        'recorded tax rate, so the refunded amount cannot be converted from gross to net. It has been ' +
-        'parked for manual resolution: record it in IMS against the specific lines / tax rates it covers.',
+      error: undeterminableBasisMessage(
+        'the order carries VAT but has no recorded tax rate',
+      ),
     }
   }
   if (netOrderBase.lte(0)) {
     return {
       ok: false,
-      error:
-        'This refund is monetary-only (not itemised) and the order has a non-positive net total, so the ' +
-        'refunded amount cannot be converted from gross to net. It has been parked for manual resolution.',
+      error: undeterminableBasisMessage('the order has a non-positive net total'),
     }
   }
 
+  // ---------------------------------------------------------------------------------------------
   // The header rate must reproduce the order's OWN tax, otherwise it is not the rate this order was
   // taxed at (a mixed-rate order, or a stale/mis-scaled snapshot) and re-grossing the stored net would
   // not return the amount the customer actually received.
+  //
+  // Codex r1 #2: the tolerance used to be `0.02 + 0.2% of net`, which on a £10,000 net order accepted
+  // ±£20.02 — wide enough to admit a header of 19.8% or 20.2% against £2,000 of recorded VAT, i.e. the
+  // exact mis-scaling this guard exists to catch. It is now the MINIMUM of three DERIVED bounds:
+  //
+  //   1. Rounding exposure — 0.005 per independently-rounded VAT component, + 0.0002 for the two
+  //      Decimal(18,4) conversions under netOrderBase. This is the largest gap plain per-penny
+  //      rounding can produce, and it grows with the NUMBER of rounded figures, not with order value.
+  //   2. The cumulative-refund ceiling — an accepted rate converts a full gross refund to
+  //      net + δ/(1+rate); `refundWouldExceedOrderTotal` allows only REFUND_TOTAL_EPSILON (£0.011) of
+  //      slack over the net order total, so δ may never exceed 0.011 × (1 + rate).
+  //   3. The FULL classification — `isFullRefundAmount` needs ≥ 99.9% of the net total, so on the
+  //      short side δ may never exceed (1 − FULL_REFUND_RATIO) × net × (1 + rate). This binds below
+  //      about £11 of net, where the fixed £0.011 is the looser of the two.
+  //
+  // (2) and (3) are the hard cap: no basis this function accepts can, by itself, push a full monetary
+  // refund over the ceiling or leave it short of FULL. Where genuine per-line rounding is larger than
+  // that cap (≈3+ taxable components all rounding maximally the same way) NO single header rate can
+  // convert the refund safely, so it is refused and quarantined rather than accepted on a basis the
+  // downstream thresholds cannot carry.
+  //
+  // Worked, on a 13-component order (12 lines + shipping) at 20%:
+  //   accepted   — the largest discrepancy admitted is £0.0132 (bound 2), i.e. a recorded rate within
+  //                ±0.0132/net of the truth; on £250 net that is 19.9947%…20.0053%.
+  //   rejected   — anything larger. On Codex's £10,000 net / £2,000 VAT order the old tolerance was
+  //                £20.02 and admitted 19.8% and 20.2%; the new one is £0.0132, so the smallest
+  //                mis-scaling now rejected is a rate off by 0.00000132 (19.999868%), and a ×100 or
+  //                ÷100 mis-scale (δ ≈ 19.8 × net, or 0.99 × taxBase) is rejected on any order down to
+  //                a penny of value.
+  // ---------------------------------------------------------------------------------------------
+  const grossMultiplier = toDecimal(1).add(rate)
+  const roundingExposure = toDecimal(MONEY_ROUNDING_HALF_UNIT)
+    .mul(countTaxableComponents(order))
+    .add(BASE_CONVERSION_SLACK)
+  const overRefundCap = toDecimal(REFUND_TOTAL_EPSILON).mul(grossMultiplier)
+  const fullClassificationCap = toDecimal(1).sub(toDecimal(FULL_REFUND_RATIO)).mul(netOrderBase).mul(grossMultiplier)
+  const tolerance = minDecimal(roundingExposure, overRefundCap, fullClassificationCap)
+
   const impliedTax = netOrderBase.mul(rate)
-  const tolerance = toDecimal(MONETARY_BASIS_ABS_TOLERANCE).add(netOrderBase.mul(MONETARY_BASIS_REL_TOLERANCE))
   if (impliedTax.sub(taxBase).abs().gt(tolerance)) {
     return {
       ok: false,
-      error:
-        `This refund is monetary-only (not itemised) and the order's recorded tax rate (${rate.toString()}) ` +
-        `does not reconcile with its VAT (${taxBase.toFixed(2)} on a net total of ${netOrderBase.toFixed(2)}), ` +
-        'so the refunded amount cannot be converted from gross to net. It has been parked for manual ' +
-        'resolution: record it in IMS against the specific lines / tax rates it covers.',
+      error: undeterminableBasisMessage(
+        `the order's recorded tax rate (${rate.toString()}) does not reconcile with its VAT ` +
+        `(${taxBase.toFixed(2)} on a net total of ${netOrderBase.toFixed(2)}, which implies ` +
+        `${impliedTax.toFixed(4)} — outside the ${tolerance.toFixed(4)} this order's rounding allows)`,
+      ),
     }
   }
 
@@ -241,7 +341,18 @@ export async function syncWcRefund(
         // only trusted when it reproduces the order's own VAT (resolveMonetaryRefundVatRate).
         taxBase: true,
         taxRatePercent: true,
-        lines: { select: { id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true } },
+        // o3d-w00 (Codex r1 #2): shippingBase and the per-line tax fields size the reconciliation
+        // tolerance to this order's ACTUAL rounding exposure (one penny-rounded VAT figure per line plus
+        // one for shipping) instead of to a percentage of its value, and let "zero-rated" be read off the
+        // lines' own rates / reverse-charge flags instead of inferred from a small tax figure.
+        shippingBase: true,
+        lines: {
+          select: {
+            id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true,
+            taxBase: true,
+            taxRate: { select: { rate: true, reverseCharge: true } },
+          },
+        },
       },
     })
     if (!so) return { success: false, error: `IMS order not found for WC order ${externalOrderId}` }
@@ -373,7 +484,8 @@ export async function syncWcRefund(
       const basis = resolveMonetaryRefundVatRate(so)
       if (!basis.ok) {
         const error =
-          basis.error + (` (WooCommerce refund ${wcRefund.id}: do NOT issue another Woo refund.)`)
+          `WooCommerce refund ${wcRefund.id} (${refundAmountForeign.toDecimalPlaces(2).toFixed(2)} gross): ` +
+          basis.error
         // A deliberate, non-transient refusal — QUARANTINED so the sweep dedup skips it and the
         // exception inbox surfaces it for an operator, exactly like the non-uniform-tax refusal.
         await upsertRefundPark(client, {
