@@ -140,7 +140,7 @@ test('the proposal entry carries the near-cutoff flag and the evidence it was de
     liveInvoiceJobs: 0,
     revenueDeferredBatchRef: 'A1-2026-07-01-aaaabbbb',
     liveBatchDeferralJobs: 0,
-    refunds: { disposition: 'FULL', refundIds: ['refund-2', 'refund-1'], postedCreditNoteExternalIds: ['CN-7'] },
+    refunds: { disposition: 'FULL', refundIds: ['refund-2', 'refund-1'], postedCreditNoteExternalIds: ['CN-7'], unresolvedRefundParkExternalIds: [] },
   }
   const decision = decideWcCouponBackfill(row, { importedBefore: CUTOFF })
   assert.equal(decision.action, 'CORRECT')
@@ -162,7 +162,7 @@ test('the proposal entry carries the near-cutoff flag and the evidence it was de
   )
   assert.deepEqual(
     entry.refunds,
-    { disposition: 'FULL', refundIds: ['refund-1', 'refund-2'], postedCreditNoteExternalIds: ['CN-7'] },
+    { disposition: 'FULL', refundIds: ['refund-1', 'refund-2'], postedCreditNoteExternalIds: ['CN-7'], unresolvedRefundParkExternalIds: [] },
     'and the REFUND position, canonicalised — it decides whether the handoff may prescribe any ' +
       'remedy at all, and apply refuses the row if it has moved since (o3d-y14 r6 F1)',
   )
@@ -187,7 +187,7 @@ function entry(over: Partial<WcCouponAllowlistEntry> = {}): WcCouponAllowlistEnt
     accountingInvoiceId: null,
     postedInvoiceExternalIds: [],
     revenueDeferredBatchRef: null,
-    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
     nearCutoff: false,
     ...over,
   }
@@ -195,7 +195,7 @@ function entry(over: Partial<WcCouponAllowlistEntry> = {}): WcCouponAllowlistEnt
 
 function file(over: Record<string, unknown> = {}) {
   return {
-    version: 3,
+    version: 4,
     generatedAt: '2026-08-16T09:00:00.000Z',
     cutoff: CUTOFF.toISOString(),
     reviewed: true,
@@ -316,10 +316,10 @@ test('the report PAGES its scan and CHUNKS every id lookup (o3d-y14 r2 F3)', asy
   assert.doesNotMatch(src, /\{ in: orderIds \}/, 'no statement takes the whole candidate id list')
   assert.equal(
     src.split('for (const batch of chunkWcCouponIds(').length - 1,
-    6,
-    'all six id-keyed lookups — the backfill marker, the invoice count, the POSTED-invoice external ' +
-      'ids (o3d-y14 r3 F2), the batch count, and the REFUND rows and their SYNCED credit notes ' +
-      '(o3d-y14 r6 F1) — are chunked',
+    7,
+    'all seven id-keyed lookups — the backfill marker, the invoice count, the POSTED-invoice external ' +
+      'ids (o3d-y14 r3 F2), the batch count, the REFUND rows and their SYNCED credit notes ' +
+      '(o3d-y14 r6 F1), and the unresolved refund PARKS (o3d-y14 r7 F1) — are chunked',
   )
   assert.doesNotMatch(
     src,
@@ -437,14 +437,14 @@ test('the scan page is smaller than the refusal ceiling (o3d-y14 r2 F3)', () => 
 })
 
 test('a file from another build version is refused', () => {
-  const parsed = parseWcCouponAllowlist(file({ version: 4 }))
+  const parsed = parseWcCouponAllowlist(file({ version: 5 }))
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'UNSUPPORTED_VERSION')
 })
 
 test('a file with no lists at all is refused rather than treated as empty', () => {
-  const parsed = parseWcCouponAllowlist({ version: 3, reviewed: true, reviewedBy: 'Jan' })
+  const parsed = parseWcCouponAllowlist({ version: 4, reviewed: true, reviewedBy: 'Jan' })
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
@@ -566,7 +566,7 @@ test('the entry carries the posted-but-unlinked ids the reviewer was shown (o3d-
     liveInvoiceJobs: 0,
     revenueDeferredBatchRef: null,
     liveBatchDeferralJobs: 0,
-    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
   }
   const decision = decideWcCouponBackfill(row, { importedBefore: CUTOFF })
   assert.equal(decision.action, 'CORRECT')
@@ -598,13 +598,40 @@ test('an allowlist entry without the REFUND evidence is MALFORMED, never default
   assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
 })
 
-test('an entry whose refund disposition is not one this build knows is MALFORMED (o3d-y14 r6 F1)', () => {
+test('an entry without the PARKED refund evidence is MALFORMED, never defaulted (o3d-y14 r7 F1)', () => {
+  // The fourth signal, and the same argument as the other three: an absent list would read as "the
+  // reviewer saw no refund that IMS failed to record", and those are the orders whose money has
+  // already left the business — the ones a remedy must never reach.
+  const withParks = entry()
+  const { unresolvedRefundParkExternalIds: _dropped, ...refundsWithoutParks } = withParks.refunds
   const parsed = parseWcCouponAllowlist(
-    file({ clear: [entry({ refunds: { disposition: 'PARTIALLY', refundIds: [], postedCreditNoteExternalIds: [] } } as never)] }),
+    file({ clear: [{ ...withParks, refunds: refundsWithoutParks }] }),
   )
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
+})
+
+test('an entry whose refund disposition is not one this build knows is MALFORMED (o3d-y14 r6 F1)', () => {
+  const parsed = parseWcCouponAllowlist(
+    file({ clear: [entry({ refunds: { disposition: 'PARTIALLY', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] } } as never)] }),
+  )
+
+  assert.equal(parsed.ok, false)
+  assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
+})
+
+test('a version-3 file is refused — it predates the PARKED refund evidence (o3d-y14 r7 F1)', () => {
+  // The upgrade path for a proposal generated before the parks were read. A v3 entry carries the
+  // three refund signals and not the fourth, and reading the fourth's absence as "no refund arrived
+  // that IMS could not record" is exactly the finding: those are the orders whose money has already
+  // left the business, and the ones the full "raise a further invoice" remedy would reach.
+  const parsed = parseWcCouponAllowlist(file({ version: 3 }))
+
+  assert.equal(parsed.ok, false)
+  assert.equal(!parsed.ok && parsed.reason, 'UNSUPPORTED_VERSION')
+  assert.match(!parsed.ok ? parsed.detail : '', /PARKED refund evidence/)
+  assert.match(!parsed.ok ? parsed.detail : '', /Re-run the dry run/)
 })
 
 test('a version-2 file is refused — it predates the refund evidence (o3d-y14 r6 F1)', () => {
@@ -614,7 +641,7 @@ test('a version-2 file is refused — it predates the refund evidence (o3d-y14 r
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'UNSUPPORTED_VERSION')
-  assert.match(!parsed.ok ? parsed.detail : '', /REFUND evidence/)
+  assert.match(!parsed.ok ? parsed.detail : '', /predates the refund evidence entirely/)
   assert.match(!parsed.ok ? parsed.detail : '', /Re-run the dry run/)
 })
 

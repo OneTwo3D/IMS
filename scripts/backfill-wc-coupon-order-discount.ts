@@ -47,15 +47,35 @@
  *     journal is deliberately left alone: IMS recognises back out the SAME stamped
  *     `unearnedRevenueAmount`, so the deferral/recognition pair still nets to zero and adjusting one
  *     half of it by hand would strand the difference in unearned revenue forever.
- *   • `refunds` — the refund position (o3d-y14 r6). `disposition` other than NONE, any `refundIds`,
- *     or any `postedCreditNoteExternalIds` means value has already been credited back on this order,
- *     and the LEDGER HANDOFF for it prescribes NO remedy at all: an invoice discrepancy on a
- *     refunded order may already have been credited away with the invoice, so "raise a further
- *     invoice for the difference" would re-bill a customer who has been refunded, and "raise a
- *     credit note" would refund the same money twice. Those entries are still correctable — the
- *     duplicated coupon is duplicated either way — but the accounting follow-up is a manual netting
- *     job, not a step this report can write for you. Apply compares this position against live state
- *     and refuses if it has moved.
+ *   • `refunds` — the refund position (o3d-y14 r6, r7). FOUR signals, and any one of them means
+ *     value has already been credited back on this order: `disposition` other than NONE, any
+ *     `refundIds`, any `postedCreditNoteExternalIds`, and any `unresolvedRefundParkExternalIds` — a
+ *     WooCommerce refund that ARRIVED and could not be recorded (o3d-y14 r7 finding 1). That last
+ *     one writes no refund row, no status and no credit note, so an order carrying only a park looks
+ *     unrefunded in every other field while the money has already left the business; a quarantined
+ *     refund in particular is one IMS refused to post because it could not do so safely, which makes
+ *     it the shape a wrong remedy is most likely to reach.
+ *
+ *     WHAT THE HANDOFF DOES WITH IT. Where the posted credit notes REVERSE THE WHOLE ORDER by
+ *     mirroring its invoice — a FULL disposition, every refund a chargeback, each named by one
+ *     credit note that is in the ledger, NET totals, and no park — the position is NETTED and a
+ *     remedy IS prescribed, in whichever direction the net actually points (o3d-y14 r7 finding 4).
+ *     In every other shape no remedy is prescribed at all: the discrepancy may already have been
+ *     credited away with the invoice, so "raise a further invoice for the difference" would re-bill
+ *     a refunded customer and "raise a credit note" would refund the same money twice. Those
+ *     entries are still correctable — the duplicated coupon is duplicated either way — but the
+ *     accounting follow-up is a manual netting job, and the report prints every credit-note leg it
+ *     COULD derive so the netting starts from figures rather than from documents. Apply compares
+ *     this whole position against live state and refuses if it has moved.
+ *
+ *   • A REMEDY CAN BE WITHDRAWN AFTER THE FACT (o3d-y14 r7 finding 2). Every remedy printed at the
+ *     end of an apply run is re-validated against the live refund position immediately before it is
+ *     printed, because a refund can be recorded in the moments after a correction commits and leave
+ *     a directional instruction on the screen that is no longer true. A withdrawn remedy keeps its
+ *     FACTS and loses its instruction, and is listed with the declines. Every surviving remedy also
+ *     names the exact refund position it depends on and tells you to re-check it before posting —
+ *     that check is not optional, and it is the only thing that closes the window between this
+ *     report being printed and you acting on it.
  *   • Anything you are not sure about: DELETE the entry. Skipping is re-runnable; a wrong correction
  *     is not.
  *
@@ -110,6 +130,7 @@ import {
   LIVE_SALES_INVOICE_STATUSES,
   POSTED_SALES_INVOICE_STATUSES,
   SALES_INVOICE_SYNC_TYPES,
+  WC_COUPON_REFUND_PARK_WHERE,
   applyWcCouponCorrection,
   buildWcCouponAllowlistEntry,
   chunkWcCouponIds,
@@ -119,6 +140,7 @@ import {
   normalizeWcCouponRefundDisposition,
   parseWcCouponAllowlist,
   parseWcCouponCutoff,
+  revalidateWcCouponHandoff,
   sortedPostedInvoiceIds,
   sortedWcCouponRefundEvidence,
   stampWcCouponDiscountModel,
@@ -231,10 +253,37 @@ async function apply(allowlistPath: string) {
     }
   }
 
+  // REVALIDATED BEFORE ANY OF IT IS PRINTED (o3d-y14 r7 finding 2).
+  //
+  // Each handoff above was derived inside its own correction transaction, behind the order lock. The
+  // lock proves the refund position at the moment that order's amount was rewritten and nothing
+  // more: a refund can take the same lock the instant that transaction commits — before the NEXT
+  // order is even corrected, let alone before this loop prints — and leave a live directional
+  // instruction on the screen against a customer who has just been refunded. The correction itself
+  // stands either way (the coupon was duplicated whatever happened afterwards); what is withdrawn is
+  // the REMEDY. The residual window between this read and the operator reading the line is closed by
+  // the precondition `wcCouponRemedySteps` prints on every remedy.
+  let superseded = 0
+  for (let index = 0; index < handoffs.length; index += 1) {
+    const { entry, handoff } = handoffs[index]
+    const revalidated = await revalidateWcCouponHandoff(db, entry.orderId, handoff)
+    if (revalidated.outcome === 'SUPERSEDED') {
+      superseded += 1
+      handoffs[index] = { entry, handoff: revalidated.handoff }
+      declined.push(
+        `handoff ${entry.orderNumber || entry.orderId}: REMEDY WITHDRAWN — ${revalidated.detail}`,
+      )
+    }
+  }
+
   console.log('')
   console.log(
     `${LOG} stamped ${stamped} order(s) as already-correct; corrected ${corrected} order(s). ` +
-      'No queued or posted accounting payload was modified.',
+      'No queued or posted accounting payload was modified.' +
+      (superseded
+        ? ` ${superseded} handoff(s) had their REMEDY WITHDRAWN because a refund was recorded after ` +
+          'the correction committed — re-run the report for those.'
+        : ''),
   )
 
   const actionable = handoffs.filter(({ handoff }) => handoff.needsAccountingAction)
@@ -414,6 +463,23 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
       ])
     }
   }
+  // UNRESOLVED REFUND PARKS (o3d-y14 r7 finding 1). Read in the REPORT for exactly the reason the
+  // refund rows and posted credit notes are: apply refuses a row whose refund position has moved
+  // since the review, so a position the report cannot show is one the reviewer can never approve.
+  // The predicate is `WC_COUPON_REFUND_PARK_WHERE` — the partial unique index's own — so the set
+  // shown here is the set apply compares against, not a looser approximation of it.
+  const refundParks = new Map<string, string[]>()
+  for (const batch of chunkWcCouponIds(orderIds)) {
+    const parks = await db.shoppingSyncLog.findMany({
+      where: { ...WC_COUPON_REFUND_PARK_WHERE, entityId: { in: batch } },
+      select: { entityId: true, externalId: true },
+    })
+    for (const park of parks) {
+      if (!park.entityId || !park.externalId) continue
+      refundParks.set(park.entityId, [...(refundParks.get(park.entityId) ?? []), park.externalId])
+    }
+  }
+
   const refundIdToOrderId = new Map<string, string>()
   for (const [orderId, rows] of refundRows) for (const row of rows) refundIdToOrderId.set(row.id, orderId)
   const syncedCreditNoteIds = new Map<string, string[]>()
@@ -478,6 +544,9 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
           ...(refundRows.get(order.id) ?? []).map((refund) => refund.accountingCreditNoteId),
           ...(syncedCreditNoteIds.get(order.id) ?? []),
         ].filter((id): id is string => !!id),
+        // r7 finding 1. A refund that ARRIVED and could not be recorded produces none of the three
+        // signals above, so without this the order reads as unrefunded and gets the full remedy.
+        unresolvedRefundParkExternalIds: refundParks.get(order.id) ?? [],
       }),
     }
     rows.push({ row, decision: decideWcCouponBackfill(row, { importedBefore }) })
@@ -619,7 +688,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
     const header =
       'salesOrderId,orderNumber,externalOrderNumber,currency,storedOrderDiscount,lineDiscountTotal,' +
       'importedAt,nearCutoff,discountModel,accountingInvoiceId,postedInvoiceExternalIds,liveInvoiceJobs,revenueDeferredBatchRef,' +
-      'liveBatchDeferralJobs,refundStatus,refundIds,postedCreditNoteExternalIds,action,reason,keptOrderLevel,clearedBy,detail'
+      'liveBatchDeferralJobs,refundStatus,refundIds,postedCreditNoteExternalIds,unresolvedRefundParks,action,reason,keptOrderLevel,clearedBy,detail'
     const body = rows.map(({ row, decision }) =>
       [
         row.orderId,
@@ -643,6 +712,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
         // must not be the CSV separator.
         row.refunds.refundIds.join(' '),
         row.refunds.postedCreditNoteExternalIds.join(' '),
+        row.refunds.unresolvedRefundParkExternalIds.join(' '),
         decision.action,
         decision.action === 'CORRECT' ? (decision.partial ? 'PARTIAL' : 'FULL') : decision.reason,
         decision.action === 'CORRECT' ? decision.keptOrderLevel : '',
@@ -656,7 +726,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
 
   if (allowlistOut) {
     const proposal: WcCouponAllowlist = {
-      version: 3,
+      version: 4,
       generatedAt: new Date().toISOString(),
       cutoff: importedBefore ? importedBefore.toISOString() : '',
       // UNSIGNED. Apply refuses this file until a human sets these three.

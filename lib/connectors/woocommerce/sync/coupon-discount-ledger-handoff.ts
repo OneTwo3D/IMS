@@ -3,6 +3,11 @@ import {
   type PostedInvoiceEventClient,
   type PostedInvoiceOrderDiscount,
 } from '@/lib/domain/accounting/posted-order-discount'
+import {
+  readCreditNoteOrderDiscount,
+  type CreditNoteOrderDiscountClient,
+  type CreditNoteOrderDiscountReversal,
+} from '@/lib/domain/accounting/credit-note-order-discount'
 
 /**
  * o3d-y14 r5 finding 1 — WHAT THE OPERATOR IS ACTUALLY TOLD TO DO IN THE ACCOUNTING SYSTEM.
@@ -52,27 +57,53 @@ import {
  * prescribes too. Only NO_INVOICE_IN_LEDGER survives contact with a refund unchanged, and only
  * because it prescribes nothing to begin with.
  *
- * SO WHY NOT JUST NET THEM AND PRESCRIBE THE REMAINDER? Because the net is NOT DERIVABLE here, and
- * the reason is structural rather than an omission:
+ * SO WHY NOT JUST NET THEM AND PRESCRIBE THE REMAINDER? For most of these orders the net genuinely
+ * cannot be established — but r6 said so for the WRONG REASON, and the wrong reason suppressed a
+ * class of orders where the answer IS available (r7 finding 4).
  *
- *   • A credit note carries no document-level order-discount adjustment in either connector.
- *     `CreditNoteData` (lib/connectors/types.ts) has no discount field at all, and neither
- *     `pushCreditNote` (xero/credit-notes.ts) nor its QuickBooks counterpart looks for one — so
- *     there is no `discount.accountCode` discriminator to replay the way `readPostedDocumentDiscount`
- *     replays the invoice's.
- *   • The refund service instead MIRRORS the invoice's order-discount line as an ordinary NEGATIVE
- *     LINE (`buildChargebackRefundLines`, `lineKind: 'discount'`), and the mirrored payload keeps
- *     only description / quantity / unitAmount / accountCode — `lineKind` is dropped by
- *     `normalizeDocumentLine`, and the account code falls back to the sales account when no discount
- *     account is configured. Picking that line back out of the payload means guessing from a sign
- *     and a free-text description.
+ * r6's ground was that the credit note's discount leg cannot be identified because "the refund
+ * service mirrors the invoice's discount line as an ordinary NEGATIVE LINE whose kind is not
+ * preserved in what IMS recorded". The first half is true; the second is false. It conflated the
+ * enqueued PAYLOAD — where `normalizeDocumentLine` really does drop the kind — with the ROW IMS
+ * stored. `SalesOrderRefundLine.lineKind` is a persisted column, written `'discount'` at refund
+ * creation by `buildChargebackRefundLines`, and read back by both replay paths; legacy NULLs are
+ * reconstructed deterministically by production's own retry loader. Neither credit-note adapter has
+ * an omission rule to replay either — both map every stored line to a document line one-for-one —
+ * so the persisted rows ARE what the credit note carried. See
+ * `lib/domain/accounting/credit-note-order-discount.ts`, which is that derivation and shares its
+ * kind rule with `reconstructReplayLine` so the two cannot drift.
  *
- * A guess there decides whether a customer is billed again, so this REFUSES: on any order with
- * refund evidence, the invoice finding is still reported — it is a fact, and the operator needs it —
- * but NO REMEDY IS PRESCRIBED, and the instruction is to establish the net across the invoice and
- * every credit note by reading them. The refusal costs a handful of orders a manual check; the
- * alternative posts real money in the wrong direction. Refund evidence travels through the proposal
- * and is re-verified live at apply time, exactly like the posting evidence beside it.
+ * SO THE NET IS DERIVED WHERE IT IS SOUND, AND ONLY THERE. When the posted credit notes REVERSE THE
+ * WHOLE ORDER by mirroring its invoice — a FULL disposition, every refund a `chargeback`, every one
+ * of them named by a credit note that is in the ledger and by no other, NET totals, and no
+ * unrecorded refund park — the net is exactly
+ *
+ *     net = (what the invoice's order-discount line posted) - (what the credit notes reversed of it)
+ *
+ * and the corrected residual does not enter it at all: both documents are wrong by the same
+ * mis-stated figure, so what survives is the difference between them. Positive means the customer
+ * still owes that much; negative means they are owed it; zero means the two errors cancelled and
+ * there is nothing to do — which is the case r6 could only reach by asking a human to check.
+ *
+ * EVERY OTHER SHAPE STILL REFUSES, and now says WHICH condition failed rather than asserting a
+ * blanket impossibility: a WooCommerce-mirrored refund (`refund-sync.ts` emits only `'sale'` and
+ * `'shipping'` kinds, because it reverses what WooCommerce refunded rather than what the invoice
+ * charged, so the ABSENCE of a discount leg there is not a zero); a PARTIAL position, which needs an
+ * apportionment nothing recorded provides; legacy GROSS totals; a leg whose currency cannot be
+ * pinned; a credit note in the ledger that no refund row accounts for; and a refund that arrived and
+ * could not be recorded at all. In every one of those the invoice finding is still reported — it is
+ * a fact, and the operator needs it — the per-credit-note legs that COULD be derived are printed
+ * beside it, and NO REMEDY IS PRESCRIBED.
+ *
+ * AND NO REMEDY REACHES AN OPERATOR EXCEPT AS A `WcCouponRemedy` (r7 finding 3). Three consecutive
+ * rounds shipped a remedy pointing the wrong way, each time in prose that a case-by-case reading had
+ * missed — r6's own refusal text still ended "settle THAT figure as an ordinary receivable", which
+ * is a direction, and the wrong one whenever the customer is the party owed. So the instrument
+ * sentences are no longer written in the case renderers at all: `wcCouponRemedySteps` is their only
+ * producer, it is reachable only from a `WcCouponRemedy` value the classifier returned, and
+ * `WcCouponLedgerHandoff.remedy` is NULL for every suppressed case. The property that no other line
+ * carries an instruction is asserted over the whole case x refund-shape matrix rather than case by
+ * case, which is what the last three rounds' review-by-inspection kept missing.
  *
  * THE REVENUE-DEFERRAL JOURNAL IS A SEPARATE DOCUMENT WITH A SEPARATE — AND EMPTY — REMEDY.
  * Group A1 posts a manual journal deferring `subtotalBase + shippingBase − discountBase`, stamps the
@@ -99,9 +130,9 @@ import {
  */
 
 /**
- * WHAT HAS ALREADY BEEN CREDITED BACK TO THIS CUSTOMER (o3d-y14 r6 finding 1).
+ * WHAT HAS ALREADY BEEN CREDITED BACK TO THIS CUSTOMER (o3d-y14 r6 finding 1, r7 finding 1).
  *
- * Three signals, taken as a UNION rather than one preferred field, because each can be true while
+ * FOUR signals, taken as a UNION rather than one preferred field, because each can be true while
  * the others are silent:
  *
  *   `disposition`  `SalesOrder.refundStatus`. The order's own summary of its refund position, and
@@ -113,8 +144,20 @@ import {
  *                  credit notes that reached the ledger: `SalesOrderRefund.accountingCreditNoteId`
  *                  UNION the SYNCED CREDIT_NOTE sync rows, for the same o3d-9kek reason the invoice
  *                  side reads both — a post can succeed and never write its id back.
+ *   `unresolvedRefundParkExternalIds`
+ *                  r7 finding 1, and the signal whose ABSENCE was the worst of the four. A
+ *                  WooCommerce refund that arrived and could NOT be recorded is durably PARKED as a
+ *                  `ShoppingSyncLog` row (`refund-sync.ts`: connector woocommerce, FROM_CONNECTOR,
+ *                  entityType SalesOrder, an entityId, and status PENDING / FAILED / QUARANTINED —
+ *                  exactly the predicate of the `shopping_sync_logs_active_refund_park_uq` index).
+ *                  It creates NO refund row, NO status change and NO credit note, so all three
+ *                  signals above read "not refunded" for it — while the money has already left the
+ *                  business. A monetary-only refund on a non-uniformly-taxed order is quarantined
+ *                  precisely because IMS could not post it safely; those are the orders where a
+ *                  wrong remedy is MOST likely, and the union used to hand them the full
+ *                  "raise a further invoice" text.
  *
- * Absence of all three is read as "no refund", which is the same standard the invoice side applies
+ * Absence of all four is read as "no refund", which is the same standard the invoice side applies
  * to its own evidence. It is not proof — but every branch that acts on it prescribes LESS, never
  * more, than the unrefunded case.
  */
@@ -125,6 +168,11 @@ export type WcCouponRefundEvidence = {
   refundIds: string[]
   /** Credit notes for those refunds that are in the ledger, sorted. */
   postedCreditNoteExternalIds: string[]
+  /**
+   * External WooCommerce refund ids that are PARKED unresolved against this order (r7 finding 1):
+   * refunds that arrived and could not be recorded. Sorted.
+   */
+  unresolvedRefundParkExternalIds: string[]
 }
 
 /** The ledger evidence the backfill reads live under the correction's lock. */
@@ -146,6 +194,7 @@ export const WC_COUPON_NO_REFUNDS: WcCouponRefundEvidence = {
   disposition: 'NONE',
   refundIds: [],
   postedCreditNoteExternalIds: [],
+  unresolvedRefundParkExternalIds: [],
 }
 
 /** Has ANY value been credited back against this order? Any one signal is enough. */
@@ -153,7 +202,11 @@ export function isWcCouponOrderRefunded(refunds: WcCouponRefundEvidence): boolea
   return (
     refunds.disposition !== 'NONE' ||
     refunds.refundIds.length > 0 ||
-    refunds.postedCreditNoteExternalIds.length > 0
+    refunds.postedCreditNoteExternalIds.length > 0 ||
+    // r7 finding 1. A parked refund is a refund that HAPPENED — the money left — and produced none
+    // of the three signals above. Reading it as "not refunded" is the assertion that hands an
+    // already-refunded customer a further invoice.
+    refunds.unresolvedRefundParkExternalIds.length > 0
   )
 }
 
@@ -195,8 +248,22 @@ export type WcCouponLedgerHandoff = {
    * order carries a finding and no remedy, months after the run.
    */
   refunds: WcCouponRefundEvidence
-  /** True when the order's documents were credited against, so no remedy may be prescribed. */
+  /** True when the order's documents were credited against. */
   refunded: boolean
+  /**
+   * WHAT THE POSTED CREDIT NOTES REVERSED of the order-level discount (r7 finding 4). `ok` only
+   * where the whole position nets; the per-credit-note legs are carried either way, because a leg
+   * IMS could derive is a fact the operator would otherwise have to go and find.
+   */
+  reversal: CreditNoteOrderDiscountReversal
+  /**
+   * THE ONE THING AN OPERATOR IS TO PERFORM, or NULL (r7 finding 3).
+   *
+   * Every instrument sentence in `lines` comes from `wcCouponRemedySteps(remedy)`; when this is
+   * NULL no such sentence is in there. That is the property, and it is asserted over the whole
+   * matrix rather than case by case — three rounds of case-by-case review each let one through.
+   */
+  remedy: WcCouponRemedy | null
   /** True when SOMETHING has to be done in the accounting system for this order. */
   needsAccountingAction: boolean
   /** Operator-facing text, one entry per line, already ordered. */
@@ -280,7 +347,63 @@ function systemName(externalSystem: string | null): string {
   return 'the accounting system'
 }
 
-/** "delete the line" and "set it to 4" are different instructions; a residual of 0 is not a special case. */
+// ---------------------------------------------------------------------------
+// THE REMEDY — the ONE place an instrument may be named (o3d-y14 r7 finding 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * A remedy an operator is to PERFORM, as a value rather than as prose.
+ *
+ * WHY IT IS A VALUE. Rounds 4, 5 and 6 each shipped a remedy that pointed the wrong way, and each
+ * time the wrong direction was written into one case's paragraph, in a file where five cases each
+ * wrote their own. Review by inspection kept catching four of the five. Making the remedy a value
+ * moves the question from "does this paragraph say the right thing" — asked once per case, per
+ * round — to "did the classifier return a remedy, and does its direction match its case" — which is
+ * asked over the whole matrix by one test.
+ *
+ * WHAT IT BUYS, concretely: `WcCouponLedgerHandoff.remedy` is NULL for every suppressed case, and
+ * `wcCouponRemedySteps` is the only function in this module that emits an instrument sentence. A
+ * refusal path therefore CANNOT prescribe by accident — it has nothing to prescribe with. That is
+ * the property r6's refusal text violated when it ended "settle THAT figure as an ordinary
+ * receivable" while declaring that no remedy was prescribed.
+ */
+export type WcCouponRemedy = {
+  /**
+   * `INCREASE_RECEIVABLE`  the customer was charged too little and still owes it. Instruments that
+   *                        move a balance UP only: edit the invoice up, or raise a further invoice.
+   * `DECREASE_RECEIVABLE`  the customer was charged too much. Instruments that move it DOWN only.
+   * `READ_THEN_CHOOSE`     the document cannot be read from here, so the operator reads it and the
+   *                        instrument follows from what they find. Still a remedy — it names
+   *                        instruments — so it travels as one rather than as loose prose.
+   */
+  kind: 'INCREASE_RECEIVABLE' | 'DECREASE_RECEIVABLE' | 'READ_THEN_CHOOSE'
+  /** The figure to act on. NULL for READ_THEN_CHOOSE, whose figure is what the operator reads. */
+  amount: number | null
+  currency: string
+  externalSystem: string | null
+  documentRef: string | null
+  /** What the corrected order retains — the edit target, and the figure the ladder branches on. */
+  keptOrderLevel: number
+  /**
+   * ONLY the further-instrument option, never "edit the existing document" (r7 finding 3). Set on a
+   * netted refunded position: that invoice has a credit note allocated to it, so Xero will not let
+   * it be edited and QuickBooks' edit would silently unbalance the allocation.
+   */
+  documentIsAllocated: boolean
+  /**
+   * THE REFUND POSITION THIS REMEDY IS ONLY VALID AGAINST (r7 finding 2).
+   *
+   * Carried on the remedy itself, and printed by `wcCouponRemedySteps` as its first line, because
+   * the thing that invalidates a remedy here is a refund arriving AFTER the correction committed —
+   * after every lock this backfill can take has been released, and possibly after the run has
+   * exited. Nothing in software can hold that window shut; what it can do is make the precondition
+   * travel with the instruction, so no operator can read the instruction without it.
+   */
+  validAgainst: WcCouponRefundEvidence
+  /** When the position above was read. */
+  derivedAt: string
+}
+
 function editTarget(kept: number, currency: string, lineName: string): string {
   return kept === 0
     ? `delete its ${lineName} line outright`
@@ -301,28 +424,111 @@ function editInvoiceStep(externalSystem: string | null, documentRef: string, kep
   )
 }
 
-function extraInvoiceStep(externalSystem: string | null, amount: number, currency: string): string {
+function extraInvoiceStep(externalSystem: string | null, amount: number, currency: string, first: boolean): string {
   const coding =
     externalSystem === 'quickbooks'
       ? 'the income account and tax code the original used'
       : 'the revenue account and tax rate the original used'
   return (
-    `• Otherwise raise a further invoice to the same contact for ${amount} ${currency}, on ${coding}, ` +
-    'dated in an open period.'
+    `• ${first ? 'Raise' : 'Otherwise raise'} a further invoice to the same contact for ${amount} ` +
+    `${currency}, on ${coding}, dated in an open period.`
   )
 }
 
-function creditNoteStep(externalSystem: string | null, documentRef: string, amount: number, currency: string): string {
+function creditNoteStep(externalSystem: string | null, documentRef: string | null, amount: number, currency: string): string {
+  const against = documentRef ? ` and apply it to ${documentRef}` : ''
   if (externalSystem === 'quickbooks') {
     return (
       `• Raise a credit memo for ${amount} ${currency} on the income account and tax code that ` +
-      `invoice used, and apply it to ${documentRef}.`
+      `invoice used${against}.`
     )
   }
-  return (
-    `• Raise a credit note for ${amount} ${currency} on the revenue account and tax rate that invoice ` +
-    `used and allocate it to ${documentRef} — Invoice ▸ Options ▸ Add Credit Note pre-fills it.`
-  )
+  return documentRef
+    ? `• Raise a credit note for ${amount} ${currency} on the revenue account and tax rate that invoice ` +
+        `used and allocate it to ${documentRef} — Invoice ▸ Options ▸ Add Credit Note pre-fills it.`
+    : `• Raise a credit note for ${amount} ${currency} on the revenue account and tax rate that invoice used.`
+}
+
+/** Describe a refund position compactly, for the precondition line on a remedy. */
+function describeRefundPrecondition(refunds: WcCouponRefundEvidence): string {
+  if (!isWcCouponOrderRefunded(refunds)) return 'NOTHING refunded against this order'
+  const parts = [
+    `refundStatus ${refunds.disposition}`,
+    refunds.refundIds.length ? `refund(s) ${refunds.refundIds.join(', ')}` : null,
+    refunds.postedCreditNoteExternalIds.length
+      ? `credit note(s) ${refunds.postedCreditNoteExternalIds.join(', ')}`
+      : null,
+    refunds.unresolvedRefundParkExternalIds.length
+      ? `unrecorded WooCommerce refund(s) ${refunds.unresolvedRefundParkExternalIds.join(', ')}`
+      : null,
+  ].filter(Boolean)
+  return parts.join(', ')
+}
+
+/**
+ * RENDER A REMEDY. The only producer of an instrument sentence in this module.
+ *
+ * The precondition comes FIRST and is not optional, for r7 finding 2: this backfill's lock proves
+ * the refund position at the moment the amount was rewritten and cannot prove anything about the
+ * moment a human reads the console. A refund committed a minute after the correction leaves a live
+ * instruction to bill a customer who has just been refunded, and the only defence available on the
+ * far side of a committed transaction is to tell the operator what the instruction depends on.
+ */
+export function wcCouponRemedySteps(remedy: WcCouponRemedy): string[] {
+  const { currency, amount, keptOrderLevel: kept } = remedy
+  const steps: string[] = [
+    `REMEDY (${systemName(remedy.externalSystem)}) — VALID ONLY WHILE this order's refund position is ` +
+      `${describeRefundPrecondition(remedy.validAgainst)}, as read ${remedy.derivedAt}. RE-CHECK THAT ` +
+      'IMMEDIATELY BEFORE POSTING: a refund recorded since voids this remedy, and re-running the report ' +
+      'reproduces the position.',
+  ]
+
+  switch (remedy.kind) {
+    case 'INCREASE_RECEIVABLE':
+      steps.push(
+        `The balance has to go UP by ${amount} ${currency}, so a credit note is the wrong instrument. ` +
+          (remedy.documentIsAllocated ? 'A credit note is allocated to that invoice, so it cannot be edited:' : 'Do ONE of:'),
+      )
+      if (!remedy.documentIsAllocated && remedy.documentRef) {
+        steps.push(editInvoiceStep(remedy.externalSystem, remedy.documentRef, kept, currency))
+      }
+      steps.push(extraInvoiceStep(remedy.externalSystem, amount ?? 0, currency, remedy.documentIsAllocated))
+      return steps
+
+    case 'DECREASE_RECEIVABLE':
+      steps.push(
+        `The balance has to come DOWN by ${amount} ${currency}. ` +
+          (remedy.documentIsAllocated ? 'Do:' : 'Do ONE of:'),
+      )
+      steps.push(creditNoteStep(remedy.externalSystem, remedy.documentRef, amount ?? 0, currency))
+      if (!remedy.documentIsAllocated && remedy.documentRef) {
+        steps.push(editInvoiceStep(remedy.externalSystem, remedy.documentRef, kept, currency))
+      }
+      return steps
+
+    case 'READ_THEN_CHOOSE':
+      steps.push(
+        'Open the document and read its order-level discount line, then:',
+        // Branched on the residual, because with a residual of 0 "it discounts LESS than that" names
+        // a state that cannot exist, and an instruction for an impossible case teaches the operator
+        // to skim the ones that can.
+        ...(kept === 0
+          ? [
+              '• it carries no order-level discount line at all — nothing to do;',
+              '• it carries one — the document charged that much too little: delete that line, or ' +
+                'raise a further invoice for it. Never a credit note.',
+            ]
+          : [
+              `• it reads ${kept} ${currency} — nothing to do;`,
+              `• it discounts MORE than ${kept} ${currency} — the document charged the difference too ` +
+                'little: edit it down to that figure, or raise a further invoice for the difference. ' +
+                'Never a credit note;',
+              `• it discounts LESS than ${kept} ${currency} — the document charged the difference too ` +
+                'much: credit the difference.',
+            ]),
+      )
+      return steps
+  }
 }
 
 /** "3 refunds, credit notes CN-1, CN-2" — the evidence the refusal below rests on, named. */
@@ -341,56 +547,163 @@ function describeRefundEvidence(refunds: WcCouponRefundEvidence): string {
       ? `credit note(s) ${refunds.postedCreditNoteExternalIds.join(', ')} in the ledger`
       : 'no credit note of theirs recorded in the ledger',
   ]
+  // r7 finding 1. Named SEPARATELY and last, because it is the one signal that is not a statement
+  // about IMS's records at all: it says money left the business and IMS could not record it.
+  if (refunds.unresolvedRefundParkExternalIds.length) {
+    parts.push(
+      `and WooCommerce refund(s) ${refunds.unresolvedRefundParkExternalIds.join(', ')} ARRIVED AND ` +
+        'COULD NOT BE RECORDED (parked unresolved) — that money has already left the business and no ' +
+        'refund row or credit note here accounts for it',
+    )
+  }
   return `this order is ${disposition} (${parts.join(', ')})`
 }
 
 /**
- * WHY IMS STOPS HERE, and what the operator does instead. Identical for every case, because the
- * reason is a property of the DOCUMENTS rather than of the discrepancy — see the module header.
+ * WHAT THE OPERATOR DOES INSTEAD, when the net could not be established (r7 finding 3).
+ *
+ * NOT A REMEDY, and now it contains nothing that could be mistaken for one. The previous revision
+ * ended "if something is genuinely outstanding, settle THAT figure as an ordinary receivable" — a
+ * DIRECTION, and the wrong one for an over-refund or any net balance owed TO the customer, in the
+ * middle of a paragraph headed "NO REMEDY IS PRESCRIBED". It also told the operator to open "every
+ * credit note above" in the case where there is no posted credit note at all, which names a document
+ * that does not exist and leaves the actual refund unestablishable from the ones it does name.
  */
-function refundNetPositionSteps(documentRef: string | null): string[] {
-  return [
-    'IMS CANNOT NET THE TWO FOR YOU: a credit note carries no order-level discount adjustment in ' +
-      'either connector (CreditNoteData has no such field, and neither credit-note adapter posts ' +
-      "one), and the refund service mirrors the invoice's discount line as an ordinary NEGATIVE " +
-      'LINE whose kind is not preserved in what IMS recorded. So what a credit note reversed of ' +
-      'this discount cannot be replayed the way the invoice can, and a guess here moves real money.',
-    'ESTABLISH THE NET BY HAND before anything is posted:',
-    `• open ${documentRef ?? 'the sales invoice'} and every credit note above, and read what this ` +
-      'customer was actually charged and actually refunded;',
-    '• if they already net to nothing, there is NOTHING TO DO — this run only removed the duplicate ' +
-      'from IMS;',
-    '• if something is genuinely outstanding, settle THAT figure as an ordinary receivable, with ' +
-      'both documents in front of you — never the figure above;',
+function refundNetPositionSteps(
+  documentRef: string | null,
+  refunds: WcCouponRefundEvidence,
+  reversal: CreditNoteOrderDiscountReversal,
+): string[] {
+  const steps: string[] = []
+
+  // The per-credit-note legs that COULD be derived, printed as facts. r6 said this was impossible;
+  // it is not, and where it is available it is exactly the number the operator was being sent to
+  // find by hand.
+  for (const leg of reversal.legs) {
+    steps.push(`• ${leg.detail}.`)
+  }
+  steps.push(`IMS CANNOT NET THE TWO FOR YOU here: ${reversal.detail}.`)
+  steps.push('ESTABLISH THE NET BY HAND before anything is posted:')
+
+  if (refunds.postedCreditNoteExternalIds.length) {
+    steps.push(
+      `• open ${documentRef ?? 'the sales invoice'} and credit note(s) ` +
+        `${refunds.postedCreditNoteExternalIds.join(', ')}, and read what this customer was actually ` +
+        'charged and actually refunded;',
+    )
+  } else {
+    steps.push(
+      '• THERE IS NO POSTED CREDIT NOTE TO OPEN. IMS records ' +
+        (refunds.refundIds.length ? `refund(s) ${refunds.refundIds.join(', ')}` : 'a refund position') +
+        (refunds.unresolvedRefundParkExternalIds.length
+          ? ` and unrecorded WooCommerce refund(s) ${refunds.unresolvedRefundParkExternalIds.join(', ')}`
+          : '') +
+        ' against this order, and no credit note of theirs is in the ledger — so what was refunded ' +
+        'CANNOT be established from the accounting system. Establish it from the WooCommerce order ' +
+        'and the payment provider first, and only then compare it against ' +
+        `${documentRef ?? 'the sales invoice'};`,
+    )
+  }
+
+  steps.push(
+    '• if the two already net to nothing, there is NOTHING TO DO — this run only removed the ' +
+      'duplicate from IMS;',
+    '• if they do not, record WHICH WAY the difference goes — whether this customer still owes ' +
+      'money or is owed it — before anything else. IMS is deliberately naming no instrument for ' +
+      'either direction: the figure reported above is the invoice side ALONE, and the direction is ' +
+      'exactly what it cannot tell you;',
     '• if the two cannot be reconciled, leave the ledger alone and escalate. Re-running the report ' +
       'reproduces this handoff, so nothing is lost by stopping here.',
-  ]
+  )
+  return steps
 }
 
+/** What a case renders: its facts, and AT MOST one remedy. */
+type WcCouponHandoffRender = { lines: string[]; remedy: WcCouponRemedy | null }
+
 /**
- * The invoice-side text for an order that has been credited against (r6 finding 1).
+ * The invoice-side text for an order that has been credited against (r6 finding 1, r7 finding 4).
  *
  * The FINDING is still reported per case — it is a fact about the invoice and the operator needs it
- * to read the documents at all — but every case ends in a refusal, and each names the instrument
- * that would be wrong FOR IT rather than sharing one generic warning.
+ * to read the documents at all. A remedy is returned ONLY where the whole position nets: see the
+ * module header for the conditions, all of which are established by
+ * `readCreditNoteOrderDiscount` rather than assumed here.
  */
 function wcCouponRefundedInvoiceLines(
   invoice: WcCouponInvoiceHandoff,
-  context: { currency: string; keptOrderLevel: number; refunds: WcCouponRefundEvidence },
-): string[] {
-  const { currency, refunds } = context
+  context: {
+    currency: string
+    keptOrderLevel: number
+    refunds: WcCouponRefundEvidence
+    reversal: CreditNoteOrderDiscountReversal
+    derivedAt: string
+  },
+): WcCouponHandoffRender {
+  const { currency, refunds, reversal } = context
   const kept = money(context.keptOrderLevel)
   const refundLine = describeRefundEvidence(refunds)
 
+  // THE NETTED CASE (r7 finding 4). Available only where the posted invoice figure is known AND the
+  // posted credit notes reverse the whole order by mirroring it. `net` is the difference between the
+  // two documents' order-discount legs; the corrected residual does not enter it, because both
+  // documents are wrong by the same mis-stated figure and what survives is what they differ by.
+  if (reversal.ok && invoice.case !== 'NO_INVOICE_IN_LEDGER' && invoice.case !== 'DOCUMENT_UNVERIFIED') {
+    const net = money(invoice.postedDiscount - reversal.amount)
+    const facts = [
+      `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency}, ` +
+        `and ${reversal.detail}.`,
+      `${refundLine}, and THE POSITION NETS: ${invoice.postedDiscount} - ${reversal.amount} = ${net} ` +
+        `${currency}.`,
+    ]
+    if (net === 0) {
+      return {
+        lines: [
+          ...facts,
+          'THE TWO ERRORS CANCEL: the credit note reversed the same mis-stated discount the invoice ' +
+            'charged, so this customer is square. NO ACCOUNTING ACTION for this order — this run only ' +
+            'removed the duplicate from IMS.',
+        ],
+        remedy: null,
+      }
+    }
+    const owed = net > 0
+    return {
+      lines: [
+        ...facts,
+        owed
+          ? `THE CUSTOMER STILL OWES ${net} ${currency}: the invoice under-charged them by more than ` +
+            'the credit note gave back.'
+          : `THE CUSTOMER IS OWED ${Math.abs(net)} ${currency}: the credit note gave back more than ` +
+            'the invoice charged them.',
+      ],
+      remedy: {
+        kind: owed ? 'INCREASE_RECEIVABLE' : 'DECREASE_RECEIVABLE',
+        amount: Math.abs(net),
+        currency,
+        externalSystem: invoice.externalSystem,
+        documentRef: invoice.documentRef,
+        keptOrderLevel: kept,
+        // A credit note is allocated to that invoice, so editing it is not on the table.
+        documentIsAllocated: true,
+        validAgainst: refunds,
+        derivedAt: context.derivedAt,
+      },
+    }
+  }
+
   switch (invoice.case) {
     case 'NO_INVOICE_IN_LEDGER':
-      return [
-        'no sales invoice for this order is in the ledger — nothing to do on the invoice side.',
-        `${refundLine}. NO REMEDY IS PRESCRIBED: with no invoice to compare them against, what those ` +
-          'credit notes carry decides nothing this run can act on. If one of them reverses an ' +
-          'order-level discount, it reversed a figure that was never charged — read it and settle ' +
-          'that with the customer account, do not post anything on the strength of this report.',
-      ]
+      return {
+        lines: [
+          'no sales invoice for this order is in the ledger — nothing to do on the invoice side.',
+          `${refundLine}. NO REMEDY IS PRESCRIBED: with no invoice to compare them against, what those ` +
+            'credit notes carry decides nothing this run can act on. If one of them reverses an ' +
+            'order-level discount, it reversed a figure that was never charged — read it and settle ' +
+            'that with the customer account, and post nothing on the strength of this report.',
+          ...refundNetPositionSteps(null, refunds, reversal),
+        ],
+        remedy: null,
+      }
 
     case 'DOCUMENT_AGREES': {
       const why =
@@ -398,76 +711,111 @@ function wcCouponRefundedInvoiceLines(
           ? ' The payload carried no discount account code, so Xero appended no "Order discount" line ' +
             'and that invoice already charges the full goods less the per-line coupon.'
           : ''
-      return [
-        `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency}, ` +
-          `which is exactly what the corrected order retains.${why}`,
-        `NOTHING IS OWED ON THE INVOICE — but ${refundLine}, so this is NOT the "ledger is already ` +
-          'right" case: the credit note(s) were raised from the PRE-CORRECTION figure and IMS cannot ' +
-          'read what order-level discount they carry. Do NOT raise a credit note or an adjustment ' +
-          'against the invoice; it needs nothing. Check the credit note side instead.',
-        ...refundNetPositionSteps(invoice.documentRef),
-      ]
+      return {
+        lines: [
+          `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency}, ` +
+            `which is exactly what the corrected order retains.${why}`,
+          `NOTHING IS OWED ON THE INVOICE — but ${refundLine}, so this is NOT the "ledger is already ` +
+            'right" case: the credit note(s) were raised from the PRE-CORRECTION figure and what they ' +
+            'carry could not be established here. Do NOT raise a credit note or an adjustment ' +
+            'against the invoice; it needs nothing. Check the credit note side instead.',
+          ...refundNetPositionSteps(invoice.documentRef, refunds, reversal),
+        ],
+        remedy: null,
+      }
     }
 
     case 'DOCUMENT_DISCOUNTS_MORE':
-      return [
-        `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency} ` +
-          `but the corrected order retains ${kept} ${currency}: that document charged ` +
-          `${invoice.difference} ${currency} TOO LITTLE.`,
-        `NO REMEDY IS PRESCRIBED: ${refundLine}, and that shortfall may already have been credited ` +
-          'away with the invoice itself.',
-        `Do NOT raise a further invoice for ${invoice.difference} ${currency}, and do NOT edit this ` +
-          `invoice up to ${kept} ${currency}. Either one RECREATES A RECEIVABLE against a customer ` +
-          'who has already been refunded: the credit note that reversed this invoice was computed ' +
-          'from the same pre-correction figure, so on a full refund the two errors cancel and the ' +
-          'net owed is nothing.',
-        ...refundNetPositionSteps(invoice.documentRef),
-      ]
+      return {
+        lines: [
+          `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency} ` +
+            `but the corrected order retains ${kept} ${currency}: that document charged ` +
+            `${invoice.difference} ${currency} TOO LITTLE.`,
+          `NO REMEDY IS PRESCRIBED: ${refundLine}, and that shortfall may already have been credited ` +
+            'away with the invoice itself.',
+          `Do NOT raise a further invoice for ${invoice.difference} ${currency}, and do NOT edit this ` +
+            `invoice up to ${kept} ${currency}. Either one RECREATES A RECEIVABLE against a customer ` +
+            'who has already been refunded: the credit note that reversed this invoice was computed ' +
+            'from the same pre-correction figure, so on a full refund the two errors cancel and the ' +
+            'net owed is nothing.',
+          ...refundNetPositionSteps(invoice.documentRef, refunds, reversal),
+        ],
+        remedy: null,
+      }
 
     case 'DOCUMENT_DISCOUNTS_LESS':
-      return [
-        `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency} ` +
-          `but the corrected order retains ${kept} ${currency}: that document charged ` +
-          `${invoice.difference} ${currency} TOO MUCH.`,
-        `NO REMEDY IS PRESCRIBED: ${refundLine}, so the over-charge may already have been credited ` +
-          'back.',
-        `Do NOT raise a credit note for ${invoice.difference} ${currency}. Crediting an invoice that ` +
-          'has already been credited away refunds the same money a second time, and Xero will let ' +
-          'you allocate it.',
-        ...refundNetPositionSteps(invoice.documentRef),
-      ]
+      return {
+        lines: [
+          `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency} ` +
+            `but the corrected order retains ${kept} ${currency}: that document charged ` +
+            `${invoice.difference} ${currency} TOO MUCH.`,
+          `NO REMEDY IS PRESCRIBED: ${refundLine}, so the over-charge may already have been credited ` +
+            'back.',
+          `Do NOT raise a credit note for ${invoice.difference} ${currency}. Crediting an invoice that ` +
+            'has already been credited away refunds the same money a second time, and Xero will let ' +
+            'you allocate it.',
+          ...refundNetPositionSteps(invoice.documentRef, refunds, reversal),
+        ],
+        remedy: null,
+      }
 
     case 'DOCUMENT_UNVERIFIED':
-      return [
-        `${invoice.documentRef ?? 'a document'} may exist for this order and IMS CANNOT establish what ` +
-          `order-level discount it carries: ${invoice.detail}.`,
-        `NO REMEDY IS PRESCRIBED, and ${refundLine} — so there are TWO unknowns here, not one. The ` +
-          'read-it-off-the-document ladder printed for an unrefunded order deliberately is NOT ' +
-          'printed here: each of its branches ends in an instrument, and on a refunded order ' +
-          'neither instrument can be chosen from the invoice alone.',
-        ...refundNetPositionSteps(invoice.documentRef),
-      ]
+      return {
+        lines: [
+          `${invoice.documentRef ?? 'a document'} may exist for this order and IMS CANNOT establish what ` +
+            `order-level discount it carries: ${invoice.detail}.`,
+          `NO REMEDY IS PRESCRIBED, and ${refundLine} — so there are TWO unknowns here, not one. The ` +
+            'read-it-off-the-document ladder printed for an unrefunded order deliberately is NOT ' +
+            'printed here: each of its branches ends in an instrument, and on a refunded order ' +
+            'neither instrument can be chosen from the invoice alone.',
+          ...refundNetPositionSteps(invoice.documentRef, refunds, reversal),
+        ],
+        remedy: null,
+      }
   }
 }
 
-/** The operator text for the invoice side. One case, one job, no case sharing another's wording. */
-export function wcCouponInvoiceHandoffLines(
+/**
+ * The operator text for the invoice side, and the remedy that goes with it (at most one).
+ *
+ * ONE CASE, ONE JOB. No case shares another's wording, and no case writes its own instrument
+ * sentence — those come from `wcCouponRemedySteps` alone (r7 finding 3).
+ */
+export function wcCouponInvoiceHandoffRender(
   invoice: WcCouponInvoiceHandoff,
-  context: { currency: string; keptOrderLevel: number; refunds: WcCouponRefundEvidence },
-): string[] {
-  const { currency } = context
+  context: {
+    currency: string
+    keptOrderLevel: number
+    refunds: WcCouponRefundEvidence
+    reversal: CreditNoteOrderDiscountReversal
+    derivedAt: string
+  },
+): WcCouponHandoffRender {
+  const { currency, refunds } = context
   const kept = money(context.keptOrderLevel)
 
   // r6 finding 1. The five cases below compare ONE document against the corrected order; on an
-  // order with credit notes against it that comparison is half a position, and every remedy it
-  // names moves money in a direction nobody here can justify.
-  if (isWcCouponOrderRefunded(context.refunds)) {
+  // order with credit notes against it that comparison is half a position, and only the netted
+  // branch above can say which way the remaining half points.
+  if (isWcCouponOrderRefunded(refunds)) {
     return wcCouponRefundedInvoiceLines(invoice, context)
+  }
+
+  const remedyBase = {
+    currency,
+    externalSystem: 'externalSystem' in invoice ? invoice.externalSystem : null,
+    keptOrderLevel: kept,
+    documentIsAllocated: false,
+    validAgainst: refunds,
+    derivedAt: context.derivedAt,
   }
 
   switch (invoice.case) {
     case 'NO_INVOICE_IN_LEDGER':
-      return ['no sales invoice for this order is in the ledger — nothing to do on the invoice side.']
+      return {
+        lines: ['no sales invoice for this order is in the ledger — nothing to do on the invoice side.'],
+        remedy: null,
+      }
 
     case 'DOCUMENT_AGREES': {
       const why =
@@ -475,63 +823,86 @@ export function wcCouponInvoiceHandoffLines(
           ? ' The payload carried no discount account code, so Xero appended no "Order discount" line ' +
             'and that invoice already charges the full goods less the per-line coupon.'
           : ''
-      return [
-        `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency}, ` +
-          `which is exactly what the corrected order retains.${why}`,
-        `NO ACCOUNTING ACTION for this order. Do NOT raise a credit note or an adjustment against it — ` +
-          'the ledger is already right and this run only removed the duplicate from IMS.',
-      ]
+      return {
+        lines: [
+          `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency}, ` +
+            `which is exactly what the corrected order retains.${why}`,
+          `NO ACCOUNTING ACTION for this order. Do NOT raise a credit note or an adjustment against it — ` +
+            'the ledger is already right and this run only removed the duplicate from IMS.',
+        ],
+        remedy: null,
+      }
     }
 
     case 'DOCUMENT_DISCOUNTS_MORE':
-      return [
-        `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency} ` +
-          `but the corrected order retains ${kept} ${currency}: that document charged ` +
-          `${invoice.difference} ${currency} TOO LITTLE.`,
-        `REMEDY (${systemName(invoice.externalSystem)}) — the balance has to go UP, so a credit note is ` +
-          'the wrong instrument. Do ONE of:',
-        editInvoiceStep(invoice.externalSystem, invoice.documentRef, kept, currency),
-        extraInvoiceStep(invoice.externalSystem, invoice.difference, currency),
-      ]
+      return {
+        lines: [
+          `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency} ` +
+            `but the corrected order retains ${kept} ${currency}: that document charged ` +
+            `${invoice.difference} ${currency} TOO LITTLE.`,
+        ],
+        remedy: {
+          ...remedyBase,
+          kind: 'INCREASE_RECEIVABLE',
+          amount: invoice.difference,
+          documentRef: invoice.documentRef,
+        },
+      }
 
     case 'DOCUMENT_DISCOUNTS_LESS':
-      return [
-        `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency} ` +
-          `but the corrected order retains ${kept} ${currency}: that document charged ` +
-          `${invoice.difference} ${currency} TOO MUCH.`,
-        `REMEDY (${systemName(invoice.externalSystem)}) — the balance has to come DOWN. Do ONE of:`,
-        creditNoteStep(invoice.externalSystem, invoice.documentRef, invoice.difference, currency),
-        editInvoiceStep(invoice.externalSystem, invoice.documentRef, kept, currency),
-      ]
+      return {
+        lines: [
+          `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency} ` +
+            `but the corrected order retains ${kept} ${currency}: that document charged ` +
+            `${invoice.difference} ${currency} TOO MUCH.`,
+        ],
+        remedy: {
+          ...remedyBase,
+          kind: 'DECREASE_RECEIVABLE',
+          amount: invoice.difference,
+          documentRef: invoice.documentRef,
+        },
+      }
 
     case 'DOCUMENT_UNVERIFIED':
-      return [
-        `${invoice.documentRef ?? 'a document'} may exist for this order and IMS CANNOT establish what ` +
-          `order-level discount it carries: ${invoice.detail}.`,
-        'NO REMEDY IS PRESCRIBED — acting on an assumption here is what produces a wrong ledger entry. ' +
-          'Open the document and read its order-level discount line, then:',
-        // Branched on the residual, because with a residual of 0 "it discounts LESS than that" names
-        // a state that cannot exist, and an instruction for an impossible case teaches the operator
-        // to skim the ones that can.
-        ...(kept === 0
-          ? [
-              '• it carries no order-level discount line at all — nothing to do;',
-              '• it carries one — the document charged that much too little: delete that line, or ' +
-                'raise a further invoice for it. Never a credit note.',
-            ]
-          : [
-              `• it reads ${kept} ${currency} — nothing to do;`,
-              `• it discounts MORE than ${kept} ${currency} — the document charged the difference too ` +
-                'little: edit it down to that figure, or raise a further invoice for the difference. ' +
-                'Never a credit note;',
-              `• it discounts LESS than ${kept} ${currency} — the document charged the difference too ` +
-                'much: credit the difference.',
-            ]),
-      ]
+      return {
+        lines: [
+          `${invoice.documentRef ?? 'a document'} may exist for this order and IMS CANNOT establish what ` +
+            `order-level discount it carries: ${invoice.detail}.`,
+          'NO FIGURE IS PRESCRIBED — acting on an assumption here is what produces a wrong ledger entry.',
+        ],
+        remedy: { ...remedyBase, kind: 'READ_THEN_CHOOSE', amount: null, documentRef: invoice.documentRef },
+      }
   }
 }
 
-/** The operator text for the Group A1 revenue-deferral journal. Deliberately a NO-OP instruction. */
+/** Backwards-compatible line-only view. The remedy travels on the handoff. */
+export function wcCouponInvoiceHandoffLines(
+  invoice: WcCouponInvoiceHandoff,
+  context: {
+    currency: string
+    keptOrderLevel: number
+    refunds: WcCouponRefundEvidence
+    reversal?: CreditNoteOrderDiscountReversal
+    derivedAt?: string
+  },
+): string[] {
+  const render = wcCouponInvoiceHandoffRender(invoice, {
+    ...context,
+    reversal: context.reversal ?? NO_CREDIT_NOTE_REVERSAL,
+    derivedAt: context.derivedAt ?? new Date().toISOString(),
+  })
+  return [...render.lines, ...(render.remedy ? wcCouponRemedySteps(render.remedy) : [])]
+}
+
+/** The reversal a caller passes when it has not read one (an order with no refunds at all). */
+export const NO_CREDIT_NOTE_REVERSAL: CreditNoteOrderDiscountReversal = {
+  ok: false,
+  legs: [],
+  detail: 'the credit-note side was not read for this order',
+}
+
+
 export function wcCouponDeferralHandoffLines(deferral: {
   batchRef: string
   unearnedRevenueAmount: number | null
@@ -554,13 +925,17 @@ export function wcCouponDeferralHandoffLines(deferral: {
  * `client` may be the correction's own transaction — and at apply time it is, so the documents named
  * are the ones that existed at the moment the amount was rewritten.
  */
+export type WcCouponHandoffClient = PostedInvoiceEventClient & CreditNoteOrderDiscountClient
+
 export async function buildWcCouponLedgerHandoff(
-  client: PostedInvoiceEventClient,
+  client: WcCouponHandoffClient,
   input: {
     orderId: string
     currency: string
     keptOrderLevel: number
     evidence: WcCouponLedgerEvidence
+    /** When the evidence was read. Defaults to now; passed by tests so output is deterministic. */
+    derivedAt?: Date
   },
 ): Promise<WcCouponLedgerHandoff> {
   const document = await readPostedInvoiceOrderDiscount(client, { id: input.orderId, currency: input.currency })
@@ -579,12 +954,28 @@ export async function buildWcCouponLedgerHandoff(
   const refunds = input.evidence.refunds
   const refunded = isWcCouponOrderRefunded(refunds)
 
+  // READ ONLY WHEN THERE IS SOMETHING TO READ. An unrefunded order — which is nearly all of them —
+  // issues no query at all, and its reversal is the "not read" value rather than a derived zero.
+  const reversal = refunded
+    ? await readCreditNoteOrderDiscount(client, {
+        disposition: refunds.disposition,
+        refundIds: refunds.refundIds,
+        postedCreditNoteExternalIds: refunds.postedCreditNoteExternalIds,
+        unresolvedRefundParkExternalIds: refunds.unresolvedRefundParkExternalIds,
+      })
+    : NO_CREDIT_NOTE_REVERSAL
+
+  const render = wcCouponInvoiceHandoffRender(invoice, {
+    currency: input.currency,
+    keptOrderLevel: input.keptOrderLevel,
+    refunds,
+    reversal,
+    derivedAt: (input.derivedAt ?? new Date()).toISOString(),
+  })
+
   const lines = [
-    ...wcCouponInvoiceHandoffLines(invoice, {
-      currency: input.currency,
-      keptOrderLevel: input.keptOrderLevel,
-      refunds,
-    }),
+    ...render.lines,
+    ...(render.remedy ? wcCouponRemedySteps(render.remedy) : []),
     ...(deferral ? wcCouponDeferralHandoffLines(deferral) : []),
   ]
 
@@ -592,18 +983,27 @@ export async function buildWcCouponLedgerHandoff(
   // accounting artefact is a deferral journal therefore needs NO accounting action, and must not be
   // put on a must-fix list that gives the operator nothing to do.
   //
-  // A REFUNDED ORDER IS DIFFERENT (r6 finding 1): no remedy is prescribed for it, but the position
-  // still has to be READ by a human, so it is on the list — with one exception that is not an
-  // invention of work. When there is no invoice in the ledger AND no credit note of its refunds is
-  // there either, nothing derived from the pre-correction amount is in the accounting system at all,
-  // and DOCUMENT_AGREES/MORE/LESS/UNVERIFIED are all unreachable in that state. Calling that
-  // actionable would put an order on the must-fix list whose entire instruction is "there is nothing
-  // to look at" — the r5 defect in a new place.
+  // A REFUNDED ORDER IS DIFFERENT (r6 finding 1): the position still has to be READ by a human even
+  // where no remedy is prescribed, so it is on the list — with two exceptions that are not an
+  // invention of work. When there is nothing derived from the pre-correction amount in the
+  // accounting system at all (no invoice, no credit note, and no unrecorded refund park), there is
+  // literally nothing to look at. And when the position NETTED TO ZERO (r7 finding 4) the answer is
+  // known and it is "nothing" — putting that on the must-fix list would be the r5 defect in a new
+  // place, which is exactly what r6 had to do because it could not derive the net.
+  // NETTED TO NOTHING is a statement about the NETTED branch, not about "no remedy and a readable
+  // credit-note side". An UNVERIFIED invoice with a perfectly derivable credit-note side also has
+  // `remedy === null` and `reversal.ok`, and it is the opposite of settled — half its position is
+  // unreadable. Naming the three cases the netting is reachable from is what keeps the two apart.
+  const NETTABLE_CASES = ['DOCUMENT_AGREES', 'DOCUMENT_DISCOUNTS_MORE', 'DOCUMENT_DISCOUNTS_LESS']
+  const nettedToNothing = render.remedy === null && reversal.ok && NETTABLE_CASES.includes(invoice.case)
   const needsAccountingAction = refunded
-    ? invoice.case !== 'NO_INVOICE_IN_LEDGER' || refunds.postedCreditNoteExternalIds.length > 0
+    ? !nettedToNothing &&
+      (invoice.case !== 'NO_INVOICE_IN_LEDGER' ||
+        refunds.postedCreditNoteExternalIds.length > 0 ||
+        refunds.unresolvedRefundParkExternalIds.length > 0)
     : invoice.case === 'DOCUMENT_DISCOUNTS_MORE' ||
       invoice.case === 'DOCUMENT_DISCOUNTS_LESS' ||
       invoice.case === 'DOCUMENT_UNVERIFIED'
 
-  return { invoice, deferral, refunds, refunded, needsAccountingAction, lines }
+  return { invoice, deferral, refunds, refunded, reversal, remedy: render.remedy, needsAccountingAction, lines }
 }

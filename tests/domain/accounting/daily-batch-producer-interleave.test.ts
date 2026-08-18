@@ -200,6 +200,19 @@ function makeTx(hooks: { onBackfillCount?: () => Promise<void> | void } = {}) {
         return { id: `log-${world.syncLogs.length}` }
       },
     },
+    // The refund-park read (r7 F1). These tests are about the batch-producer race, not
+    // about parks, so the honest answer is "this order has none" — but the double THROWS on
+    // any predicate it was not taught, so a production query that changes shape surfaces
+    // here instead of silently matching everything.
+    shoppingSyncLog: {
+      findMany: async ({ where }: { where: Record<string, unknown> }) => {
+        const taught = new Set(['connector', 'direction', 'entityType', 'status', 'entityId', 'externalId'])
+        for (const key of Object.keys(where)) {
+          if (!taught.has(key)) throw new Error(`shoppingSyncLog double was not taught the predicate ${key}`)
+        }
+        return []
+      },
+    },
     activityLog: { create: async () => ({ id: 'activity-1' }) },
   })
   return tx
@@ -229,7 +242,7 @@ const ENTRY = {
   postedInvoiceExternalIds: [] as string[],
   // o3d-y14 r6 finding 1: the refund position the reviewer saw, which apply compares against live
   // state before it will prescribe anything about this order's documents.
-  refunds: { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[] },
+  refunds: { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[], unresolvedRefundParkExternalIds: [] as string[] },
   revenueDeferredBatchRef: null,
   nearCutoff: false,
 }

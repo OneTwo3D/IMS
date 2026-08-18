@@ -73,11 +73,45 @@ type EventRow = {
   linesJson: unknown
 }
 
+/** o3d-y14 r7 finding 1 — a WooCommerce refund that ARRIVED and could not be recorded. */
+type ParkRow = {
+  connector: string
+  direction: string
+  entityType: string
+  status: string
+  entityId: string | null
+  externalId: string | null
+}
+
+/** o3d-y14 r7 finding 4 — the persisted refund lines the credit-note derivation reads. */
+type RefundRow = {
+  id: string
+  chargeback: boolean
+  totalsBasis: string | null
+  accountingCreditNoteId: string | null
+  lines: Array<{ salesOrderLineId: string | null; totalBase: number; totalForeign: number; lineKind: string | null }>
+}
+
 type Store = {
   orders: OrderRow[]
   syncLogs: SyncLogRow[]
   events?: EventRow[]
-  activity: Array<{ action: string; entityId: string | null; metadata: Record<string, unknown> }>
+  parks?: ParkRow[]
+  refundRows?: RefundRow[]
+  activity: Array<{ action: string; entityId: string | null; description?: string; metadata: Record<string, unknown> }>
+}
+
+/** A PENDING/FAILED/QUARANTINED refund park on `order-1`, matching the partial unique index exactly. */
+function park(over: Partial<ParkRow> = {}): ParkRow {
+  return {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    entityType: 'SalesOrder',
+    status: 'QUARANTINED',
+    entityId: 'order-1',
+    externalId: '9001',
+    ...over,
+  }
 }
 
 /**
@@ -141,6 +175,44 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
         // silently acquired a restatement record would be indistinguishable from a correction.
         if ('discountRestatement' in data) target.discountRestatement = data.discountRestatement
         return { count: 1 }
+      },
+    },
+    // r7 finding 1 — the PARK read, under the same lock. The double HONOURS the whole predicate
+    // (connector, direction, entityType, status set, both id fields) because the production query
+    // copies the partial unique index's predicate exactly, and a double that matched on entityId
+    // alone would pass a version that counted an unrelated failed ORDER IMPORT as a refund.
+    shoppingSyncLog: {
+      findMany: async ({
+        where,
+      }: {
+        where: {
+          connector: string
+          direction: string
+          entityType: string
+          status: { in: string[] }
+          externalId: { not: null }
+          entityId: string
+        }
+      }) => {
+        events.push(`park:findMany:${where.entityId}`)
+        return (store.parks ?? [])
+          .filter(
+            (row) =>
+              row.connector === where.connector &&
+              row.direction === where.direction &&
+              row.entityType === where.entityType &&
+              where.status.in.includes(row.status) &&
+              row.externalId !== null &&
+              row.entityId === where.entityId,
+          )
+          .map((row) => ({ externalId: row.externalId }))
+      },
+    },
+    // r7 finding 4 — the persisted refund lines the credit-note discount derivation reads back.
+    salesOrderRefund: {
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) => {
+        events.push(`refundLines:findMany:${where.id.in.join('|')}`)
+        return (store.refundRows ?? []).filter((row) => where.id.in.includes(row.id))
       },
     },
     accountingSyncLog: {
@@ -244,7 +316,7 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
       },
     },
     activityLog: {
-      create: async ({ data }: { data: { action: string; entityId: string | null; metadata: Record<string, unknown> } }) => {
+      create: async ({ data }: { data: { action: string; entityId: string | null; description?: string; metadata: Record<string, unknown> } }) => {
         events.push('activityLog:create')
         store.activity.push(data)
         return data
@@ -287,7 +359,7 @@ const entry = {
   revenueDeferredBatchRef: null,
   // o3d-y14 r6 finding 1. The reviewed refund position; apply refuses the row if the live one has
   // moved, so a fixture that omitted it would not describe an entry apply can accept.
-  refunds: { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[] },
+  refunds: { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[], unresolvedRefundParkExternalIds: [] as string[] },
   nearCutoff: false,
 }
 
@@ -297,7 +369,7 @@ const NO_LEDGER_DOCUMENTS = {
   postedInvoiceExternalIds: [],
   revenueDeferredBatchRef: null,
   unearnedRevenueAmount: null,
-  refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
+  refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
 }
 
 function reset() {
@@ -428,6 +500,10 @@ test('the order row lock is taken BEFORE anything is read or decided (o3d-5ct)',
       // No `count:` for the batch: this order carries no revenueDeferredBatchRef, so there is no
       // batch to look for. The posted-evidence read still happens, under the same lock.
       'findMany:SalesOrder:order-1',
+      // r7 finding 1: the PARK read is under the lock too, and UNCONDITIONAL — a park is exactly the
+      // shape that exists when there is no SalesOrderRefund row, so skipping it when the refund list
+      // is empty is what let a parked refund read as an unrefunded order.
+      'park:findMany:order-1',
       'updateMany:order-1',
       'activityLog:create',
     ],
@@ -602,7 +678,7 @@ test('a POSTED batch journal does not block — it is reported instead (o3d-y14 
       postedInvoiceExternalIds: [],
       revenueDeferredBatchRef: BATCH_REF,
       unearnedRevenueAmount: 90,
-      refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
+      refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
     },
     'the posted deferral is REPORTED as needing a manual adjustment, not silently ignored',
   )
@@ -757,7 +833,7 @@ test('the reported posting state is the LIVE read, not the reviewed file (o3d-y1
     postedInvoiceExternalIds: ['INV-1', 'INV-1-REV2'],
     revenueDeferredBatchRef: BATCH_REF,
     unearnedRevenueAmount: 42.5,
-    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
   })
   assert.deepEqual(
     store.activity[0].metadata.postedInvoiceExternalIds,
@@ -1116,7 +1192,7 @@ test('a posted credit note the refund row denies is still read (o3d-y14 r6 F1)',
 
   const result = await applyWcCouponCorrection(makeTx(store), {
     ...entry,
-    refunds: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'] },
+    refunds: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'], unresolvedRefundParkExternalIds: [] },
   })
 
   assert.equal(result.outcome, 'CORRECTED')
@@ -1124,6 +1200,7 @@ test('a posted credit note the refund row denies is still read (o3d-y14 r6 F1)',
     disposition: 'FULL',
     refundIds: ['refund-1'],
     postedCreditNoteExternalIds: ['CN-501'],
+  unresolvedRefundParkExternalIds: [],
   })
   assert.equal(store.activity[0].metadata.refunded, true)
   assert.match(
@@ -1147,7 +1224,7 @@ test('a credit note with NO invoice evidence still produces a handoff (o3d-y14 r
 
   const result = await applyWcCouponCorrection(makeTx(store), {
     ...entry,
-    refunds: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'] },
+    refunds: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'], unresolvedRefundParkExternalIds: [] },
   })
 
   assert.equal(result.outcome, 'CORRECTED')
@@ -1193,7 +1270,7 @@ test('an unlinked posted invoice the reviewer SAW is applied, not refused foreve
     postedInvoiceExternalIds: ['INV-999'],
     revenueDeferredBatchRef: null,
     unearnedRevenueAmount: null,
-    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
   })
   assert.equal(
     store.activity[0].metadata.posted,
@@ -1251,4 +1328,282 @@ test('the comparison is by SET, so query row order cannot cause a false refusal 
   })
 
   assert.equal(result.outcome, 'CORRECTED')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r7 finding 1 — a PARKED WooCommerce refund, read by the LIVE collector
+//
+// A refund that arrived and could NOT be recorded writes no SalesOrderRefund, changes no
+// refundStatus and posts no credit note, so every one of r6's three signals reads "not refunded" —
+// while the money has already left the business. These orders are exactly where a wrong remedy is
+// most likely (a quarantined refund is one IMS refused to post because it could not do so safely),
+// and they used to receive the full "raise a further invoice" text.
+//
+// EVERY TEST HERE GOES THROUGH `applyWcCouponCorrection`, i.e. through the live collector, because
+// the defect was in the collector and not in the classifier: r6's classifier tests injected evidence
+// directly and would have passed unchanged with parks never read at all.
+// ---------------------------------------------------------------------------
+
+/**
+ * An order whose invoice IS in the ledger and DOES carry the duplicate — the only shape that
+ * produces a remedy at all, and therefore the only one on which "the remedy was suppressed" or
+ * "the remedy was withdrawn" can be asserted at all.
+ */
+function invoicedStore(over: Partial<Store> = {}): Store {
+  const store = makeStore(over)
+  store.orders[0].accountingInvoiceId = 'INV-778'
+  store.events = [
+    {
+      sourceEntityType: 'SalesOrder',
+      sourceEntityId: 'order-1',
+      type: 'SALES_INVOICE',
+      status: 'POSTED',
+      currency: 'GBP',
+      externalSystem: 'xero',
+      externalId: 'INV-778',
+      businessDate: '2026-05-02',
+      createdAt: '2026-05-02T09:00:00.000Z',
+      linesJson: {
+        kind: 'accounting-document',
+        schemaVersion: 1,
+        documentType: 'SALES_INVOICE',
+        currency: 'GBP',
+        lines: [{ description: 'Widget', quantity: 2, unitAmount: 50, accountCode: '200' }],
+        discount: { amount: 10, accountCode: '260' },
+      },
+      ...(over.events?.[0] ?? {}),
+    },
+  ]
+  return store
+}
+
+const invoicedEntry = { ...entry, accountingInvoiceId: 'INV-778' }
+
+const PARKED = { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[], unresolvedRefundParkExternalIds: ['9001'] }
+
+test('a QUARANTINED refund park makes the order REFUNDED, with no refund row at all (o3d-y14 r7 F1)', async () => {
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = invoicedStore({ parks: [park({ status: 'QUARANTINED' })] })
+
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, refunds: PARKED })
+
+  assert.equal(result.outcome, 'CORRECTED', 'the AMOUNT is still corrected — the coupon was duplicated either way')
+  assert.deepEqual(result.outcome === 'CORRECTED' ? result.posted?.refunds.unresolvedRefundParkExternalIds : null, ['9001'])
+  assert.equal(result.outcome === 'CORRECTED' && result.handoff?.refunded, true)
+  assert.equal(result.outcome === 'CORRECTED' && result.handoff?.remedy, null)
+  assert.deepEqual(store.activity[0].metadata.unresolvedRefundParkExternalIds, ['9001'])
+  const lines = (store.activity[0].metadata.handoffLines as string[]).join('\n')
+  assert.match(lines, /NO REMEDY IS PRESCRIBED/)
+  assert.match(lines, /9001 ARRIVED AND COULD NOT BE RECORDED/)
+  assert.doesNotMatch(lines, /Otherwise raise a further invoice/)
+  assert.match(store.activity[0].description ?? '', /unrecorded WooCommerce refund\(s\) 9001/)
+})
+
+for (const status of ['PENDING', 'FAILED'] as const) {
+  test(`a ${status} refund park counts as a refund too (o3d-y14 r7 F1)`, async () => {
+    // All three actionable statuses mean the same thing for this decision — the refund is
+    // UNRESOLVED and IMS holds no row for it. QUARANTINED is merely the longest-lived of them.
+    const { applyWcCouponCorrection } = await load()
+    reset()
+    const store = invoicedStore({ parks: [park({ status })] })
+
+    const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, refunds: PARKED })
+
+    assert.equal(result.outcome === 'CORRECTED' && result.handoff?.refunded, true)
+    assert.equal(result.outcome === 'CORRECTED' && result.handoff?.remedy, null)
+  })
+}
+
+test('a PARKED refund and NO refund produce DIFFERENT handoffs through the collector (o3d-y14 r7 F1)', async () => {
+  // The fixture pair the finding turns on, at the level the defect lived. Identical stores except
+  // for one row in `shopping_sync_logs`; if the two rendered the same classification the tests above
+  // would prove nothing.
+  const { applyWcCouponCorrection } = await load()
+
+  reset()
+  const parkedStore = invoicedStore({ parks: [park()] })
+  const parked = await applyWcCouponCorrection(makeTx(parkedStore), { ...invoicedEntry, refunds: PARKED })
+
+  reset()
+  const cleanStore = invoicedStore()
+  const clean = await applyWcCouponCorrection(makeTx(cleanStore), invoicedEntry)
+
+  assert.equal(parked.outcome, 'CORRECTED')
+  assert.equal(clean.outcome, 'CORRECTED')
+  const parkedHandoff = parked.outcome === 'CORRECTED' ? parked.handoff : null
+  const cleanHandoff = clean.outcome === 'CORRECTED' ? clean.handoff : null
+  assert.notEqual(parkedHandoff?.refunded, cleanHandoff?.refunded)
+  assert.notDeepEqual(parkedHandoff?.lines, cleanHandoff?.lines)
+  assert.equal(parkedHandoff?.remedy, null)
+  assert.equal(cleanHandoff?.remedy?.kind, 'INCREASE_RECEIVABLE', 'the unrefunded remedy is untouched')
+})
+
+test('a park on ANOTHER order is not this order\'s refund (o3d-y14 r7 F1)', async () => {
+  // The index is keyed on (connector, externalId), so a park for a refund id can legitimately exist
+  // against a different order. Counting it here would suppress a correct remedy forever.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = invoicedStore({ parks: [park({ entityId: 'order-2' })] })
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.equal(result.outcome === 'CORRECTED' && result.handoff?.refunded, false)
+  assert.equal(result.outcome === 'CORRECTED' && result.handoff?.remedy?.kind, 'INCREASE_RECEIVABLE')
+})
+
+test('a park that RESOLVED to SYNCED is no longer a refund signal (o3d-y14 r7 F1)', async () => {
+  // `resolveActionableParks` flips a park to SYNCED once the refund lands. Counting SYNCED rows
+  // would mean every order that ever had a retried refund stayed suppressed for good — and the
+  // refund it became is picked up as a SalesOrderRefund row instead.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = invoicedStore({ parks: [park({ status: 'SYNCED' })] })
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+
+  assert.equal(result.outcome === 'CORRECTED' && result.handoff?.refunded, false)
+})
+
+test('an order-import failure log is not mistaken for a refund park (o3d-y14 r7 F1)', async () => {
+  // `order-import.ts` writes FAILED rows with the same connector/direction/entityType and NO
+  // entityId. The production predicate copies the partial unique index exactly — `entityId IS NOT
+  // NULL` included — for precisely this reason.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = invoicedStore({ parks: [park({ status: 'FAILED', entityId: null })] })
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+
+  assert.equal(result.outcome === 'CORRECTED' && result.handoff?.refunded, false)
+})
+
+test('a park that appeared SINCE the review is REFUSED, not silently re-classified (o3d-y14 r7 F1)', async () => {
+  // Same argument as the refund-row drift check: the reviewer approved a row whose instruction was
+  // "raise a further invoice", and on the parked version of that row the honest instruction is that
+  // no remedy may be prescribed. Those are different decisions, so the reviewer makes the second.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = invoicedStore({ parks: [park()] })
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+
+  assert.equal(result.outcome, 'DECLINED')
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'POSTING_CHANGED')
+  assert.match(result.outcome === 'DECLINED' ? result.detail : '', /unrecorded WooCommerce refund\(s\) \[9001\]/)
+  assert.equal(store.orders[0].discountAmount, 10, 'and nothing was written')
+  assert.equal(store.activity.length, 0)
+})
+
+test('a park that RESOLVED since the review is a change too (o3d-y14 r7 F1)', async () => {
+  // The other direction. The reviewer saw an unrecorded refund; it has since landed as a real row
+  // they never saw, and what the ledger holds for it is a different question from the one they
+  // answered.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, refunds: PARKED })
+
+  assert.equal(result.outcome, 'DECLINED')
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'POSTING_CHANGED')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r7 finding 2 — a remedy that was true at commit and is not true now
+// ---------------------------------------------------------------------------
+
+test('a refund recorded AFTER the correction committed WITHDRAWS the remedy (o3d-y14 r7 F2)', async () => {
+  // THE FINDING. The correction's lock is decisive for the moment the amount is rewritten and for
+  // nothing after it. A refund taking the same lock the instant that transaction commits — before
+  // the next order is even corrected, let alone before anything is printed — leaves "raise a further
+  // invoice for 10 GBP" on the screen against a customer who has just been refunded.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  assert.equal(result.outcome, 'CORRECTED')
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  assert.equal(handoff?.remedy?.kind, 'INCREASE_RECEIVABLE')
+  assert.match(handoff?.lines.join('\n') ?? '', /raise a further invoice to the same contact for 10 GBP/)
+
+  // ... and now a refund lands, after the commit.
+  store.orders[0].refundStatus = 'FULL'
+  store.orders[0].refunds = [{ id: 'refund-1', accountingCreditNoteId: 'CN-501' }]
+  store.syncLogs.push(UNLINKED_SYNCED_CREDIT_NOTE)
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(revalidated.handoff.remedy, null)
+  assert.equal(revalidated.handoff.needsAccountingAction, true)
+  const text = revalidated.handoff.lines.join('\n')
+  assert.doesNotMatch(text, /raise a further invoice to the same contact for 10 GBP/)
+  assert.match(text, /THE REMEDY PRINTED FOR THIS ORDER IS WITHDRAWN/)
+  assert.match(text, /moved\s+AFTER the correction committed/)
+  assert.match(text, /Post NOTHING on the strength of it/)
+  assert.match(text, /invoice INV-778 carries an order-level discount of 10 GBP/, 'the FACTS survive')
+})
+
+test('a park that lands after the correction withdraws the remedy too (o3d-y14 r7 F1 + F2)', async () => {
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  store.parks = [park()]
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(revalidated.handoff.remedy, null)
+})
+
+test('an UNCHANGED position leaves the remedy exactly as it was (o3d-y14 r7 F2)', async () => {
+  // The property that makes the withdrawal meaningful: if it fired regardless, "the remedy was
+  // withdrawn" would carry no information and operators would learn to ignore it.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'CURRENT')
+  assert.deepEqual(revalidated.handoff.lines, handoff!.lines)
+  assert.equal(revalidated.handoff.remedy?.kind, 'INCREASE_RECEIVABLE')
+})
+
+test('an order that VANISHED after the correction withdraws the remedy rather than vouching for it', async () => {
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  store.orders = []
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(revalidated.handoff.remedy, null)
+})
+
+test('the apply script REVALIDATES every handoff before it prints any of them (o3d-y14 r7 F2)', async () => {
+  // A source assertion, because the ordering is the whole point: the previous shape corrected every
+  // order first and printed at the end, so a refund landing during the loop was never looked for.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
+
+  const revalidateAt = src.indexOf('revalidateWcCouponHandoff(db')
+  const printAt = src.indexOf('printHandoff(entry, handoff)')
+  assert.ok(revalidateAt > 0, 'the apply path revalidates')
+  assert.ok(printAt > revalidateAt, 'and it does so BEFORE anything is printed')
+  assert.match(src, /REMEDY WITHDRAWN/, 'and a withdrawal is reported, not silently swallowed')
 })

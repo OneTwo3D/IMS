@@ -65,7 +65,7 @@ type EventRow = {
  * SALES_INVOICE_UPDATE — and those two produce OPPOSITE instructions here ("nothing to do" versus
  * "no remedy is prescribed"), which is most of what this file asserts.
  */
-function makeEventClient(rows: EventRow[]) {
+function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = []) {
   return {
     accountingEvent: {
       count: async ({
@@ -109,7 +109,44 @@ function makeEventClient(rows: EventRow[]) {
         })
       },
     },
+    // o3d-y14 r7 finding 4: the credit-note side. The double HONOURS `where.id.in` for the same
+    // reason the event one honours its filters — a derivation that read every refund in the store
+    // regardless of which ids the evidence named would pass while production netted the wrong set.
+    salesOrderRefund: {
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
+        refundRows.filter((row) => where.id.in.includes(row.id)),
+    },
   } as never
+}
+
+/**
+ * A persisted refund, as `readCreditNoteOrderDiscount` reads it.
+ *
+ * `chargeback: true` + `totalsBasis: 'NET'` + a credit note in the ledger is the ONE shape whose
+ * discount leg is derivable; every fixture that departs from it below departs on exactly one field,
+ * so what each refusal is about is a property of the code rather than of the fixture.
+ */
+type RefundRow = {
+  id: string
+  chargeback: boolean
+  totalsBasis: string | null
+  accountingCreditNoteId: string | null
+  lines: Array<{ salesOrderLineId: string | null; totalBase: number; totalForeign: number; lineKind: string | null }>
+}
+
+/** A chargeback that MIRRORED the invoice: full goods, and the invoice's discount as a negative leg. */
+function mirroringChargeback(over: Partial<RefundRow> = {}): RefundRow {
+  return {
+    id: 'refund-1',
+    chargeback: true,
+    totalsBasis: 'NET',
+    accountingCreditNoteId: 'CN-501',
+    lines: [
+      { salesOrderLineId: 'line-1', totalBase: 100, totalForeign: 100, lineKind: 'sale' },
+      { salesOrderLineId: null, totalBase: -10, totalForeign: -10, lineKind: 'discount' },
+    ],
+    ...over,
+  }
 }
 
 function documentPayload(over: Record<string, unknown> = {}) {
@@ -152,13 +189,14 @@ type LedgerEvidence = import('@/lib/connectors/woocommerce/sync/coupon-discount-
 
 type RefundEvidence = import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff').WcCouponRefundEvidence
 
-const NO_REFUNDS: RefundEvidence = { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] }
+const NO_REFUNDS: RefundEvidence = { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] }
 
 /** A full refund with its credit note in the ledger: the position the r6 finding is about. */
 const FULLY_REFUNDED: RefundEvidence = {
   disposition: 'FULL',
   refundIds: ['refund-1'],
   postedCreditNoteExternalIds: ['CN-501'],
+unresolvedRefundParkExternalIds: [],
 }
 
 const LINKED_INVOICE: LedgerEvidence = {
@@ -171,15 +209,22 @@ const LINKED_INVOICE: LedgerEvidence = {
 /** The SAME order, the SAME invoice, refunded. Only the refund evidence differs. */
 const LINKED_INVOICE_REFUNDED: LedgerEvidence = { ...LINKED_INVOICE, refunds: FULLY_REFUNDED }
 
-async function handoffFor(rows: EventRow[], keptOrderLevel: number, evidence: LedgerEvidence = LINKED_INVOICE) {
+async function handoffFor(
+  rows: EventRow[],
+  keptOrderLevel: number,
+  evidence: LedgerEvidence = LINKED_INVOICE,
+  refundRows: RefundRow[] = [],
+) {
   const { buildWcCouponLedgerHandoff } = await import(
     '@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
   )
-  return await buildWcCouponLedgerHandoff(makeEventClient(rows), {
+  return await buildWcCouponLedgerHandoff(makeEventClient(rows, refundRows), {
     orderId: 'order-1',
     currency: 'GBP',
     keptOrderLevel,
     evidence,
+    // Fixed, so the precondition line a remedy carries is deterministic.
+    derivedAt: new Date('2026-08-01T00:00:00.000Z'),
   })
 }
 
@@ -291,9 +336,15 @@ test('an unsettled invoice UPDATE prescribes NO remedy (o3d-y14 r4 F2)', async (
   assert.equal(handoff.invoice.case, 'DOCUMENT_UNVERIFIED')
   assert.equal(handoff.needsAccountingAction, true, 'a document nobody can read still needs a human')
   const text = handoff.lines.join('\n')
-  assert.match(text, /NO REMEDY IS PRESCRIBED/)
+  // r7 finding 3: this case says NO FIGURE, not "NO REMEDY IS PRESCRIBED" — because it DOES
+  // prescribe, conditionally, and the ladder below names instruments. Calling that "no remedy" was
+  // part of how a directional instruction kept surviving a refusal heading. The phrase is now
+  // reserved for paths whose `remedy` is genuinely NULL, which the matrix test below asserts.
+  assert.equal(handoff.remedy?.kind, 'READ_THEN_CHOOSE')
+  assert.match(text, /NO FIGURE IS PRESCRIBED/)
+  assert.doesNotMatch(text, /NO REMEDY IS PRESCRIBED/)
   assert.match(text, /Never a credit note/, 'the operator is told the direction rule, not a guess')
-  assert.doesNotMatch(text, /Raise a credit note for/, 'and no instrument is actually prescribed')
+  assert.doesNotMatch(text, /Raise a credit note for/, 'and no unconditional instrument is prescribed')
 })
 
 test('a linked invoice with no mirrored event is UNVERIFIED, never assumed correct', async () => {
@@ -379,7 +430,7 @@ test('a PARTIAL refund suppresses the remedy too — the apportionment is not de
   // note reversed depends on what it credited, and nothing IMS recorded says.
   const handoff = await handoffFor([postedInvoice()], 0, {
     ...LINKED_INVOICE,
-    refunds: { disposition: 'PARTIAL', refundIds: ['refund-9'], postedCreditNoteExternalIds: [] },
+    refunds: { disposition: 'PARTIAL', refundIds: ['refund-9'], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
   })
 
   assert.equal(handoff.refunded, true)
@@ -394,7 +445,7 @@ test('a refund row alone is enough, even with refundStatus NONE (o3d-y14 r6 F1)'
   // only the column would let a real credit note through as "not refunded".
   const handoff = await handoffFor([postedInvoice()], 0, {
     ...LINKED_INVOICE,
-    refunds: { disposition: 'NONE', refundIds: ['refund-2'], postedCreditNoteExternalIds: [] },
+    refunds: { disposition: 'NONE', refundIds: ['refund-2'], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
   })
 
   assert.equal(handoff.refunded, true)
@@ -406,7 +457,7 @@ test('a posted credit note alone is enough, with no refund row and no status (o3
   // silent about it.
   const handoff = await handoffFor([postedInvoice()], 0, {
     ...LINKED_INVOICE,
-    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: ['CN-777'] },
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: ['CN-777'], unresolvedRefundParkExternalIds: [] },
   })
 
   assert.equal(handoff.refunded, true)
@@ -466,7 +517,7 @@ test('NO_INVOICE_IN_LEDGER with a credit note is reported, but still prescribes 
     accountingInvoiceId: null,
     postedInvoiceExternalIds: [],
     revenueDeferredBatchRef: null,
-    refunds: { disposition: 'FULL', refundIds: ['refund-3'], postedCreditNoteExternalIds: ['CN-900'] },
+    refunds: { disposition: 'FULL', refundIds: ['refund-3'], postedCreditNoteExternalIds: ['CN-900'], unresolvedRefundParkExternalIds: [] },
   })
 
   assert.equal(handoff.invoice.case, 'NO_INVOICE_IN_LEDGER')
@@ -484,7 +535,7 @@ test('a refunded order with NOTHING in the ledger is not put on the must-fix lis
     accountingInvoiceId: null,
     postedInvoiceExternalIds: [],
     revenueDeferredBatchRef: null,
-    refunds: { disposition: 'FULL', refundIds: ['refund-4'], postedCreditNoteExternalIds: [] },
+    refunds: { disposition: 'FULL', refundIds: ['refund-4'], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
   })
 
   assert.equal(handoff.invoice.case, 'NO_INVOICE_IN_LEDGER')
@@ -578,11 +629,17 @@ const ENTRY = {
   accountingInvoiceId: 'INV-778' as string | null,
   postedInvoiceExternalIds: [] as string[],
   revenueDeferredBatchRef: null as string | null,
-  refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] } as RefundEvidence,
+  refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] } as RefundEvidence,
   nearCutoff: false,
 }
 
-function makeTx(store: { orders: OrderRow[]; eventRows: EventRow[]; activity: Array<{ description: string; metadata: Record<string, unknown> }> }) {
+function makeTx(store: {
+  orders: OrderRow[]
+  eventRows: EventRow[]
+  activity: Array<{ description: string; metadata: Record<string, unknown> }>
+  parks?: Array<{ entityId: string; externalId: string }>
+  refundRows?: RefundRow[]
+}) {
   const eventClient = makeEventClient(store.eventRows) as unknown as {
     accountingEvent: Record<string, (args: never) => Promise<unknown>>
   }
@@ -629,6 +686,16 @@ function makeTx(store: { orders: OrderRow[]; eventRows: EventRow[]; activity: Ar
       count: async () => 0,
       findMany: async () => [],
     },
+    // r7 finding 1: the PARK read the correction now does under its own lock. Honours entityId, so
+    // a park belonging to another order can never be counted for this one.
+    shoppingSyncLog: {
+      findMany: async ({ where }: { where: { entityId: string } }) =>
+        (store.parks ?? []).filter((park) => park.entityId === where.entityId),
+    },
+    salesOrderRefund: {
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
+        (store.refundRows ?? []).filter((row) => where.id.in.includes(row.id)),
+    },
     accountingEvent: eventClient.accountingEvent,
     activityLog: {
       create: async ({ data }: { data: { description: string; metadata: Record<string, unknown> } }) => {
@@ -639,8 +706,13 @@ function makeTx(store: { orders: OrderRow[]; eventRows: EventRow[]; activity: Ar
   } as never
 }
 
-function correctionStore(eventRows: EventRow[], order: Partial<OrderRow> = {}) {
+function correctionStore(
+  eventRows: EventRow[],
+  order: Partial<OrderRow> = {},
+  extra: { parks?: Array<{ entityId: string; externalId: string }>; refundRows?: RefundRow[] } = {},
+) {
   return {
+    ...extra,
     orders: [
       {
         id: 'order-1',
@@ -695,7 +767,7 @@ test('the durable record of a REFUNDED order carries the refusal, not a remedy (
 
   const result = await applyWcCouponCorrection(
     makeTx(store),
-    { ...ENTRY, refunds: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'] } },
+    { ...ENTRY, refunds: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'], unresolvedRefundParkExternalIds: [] } },
   )
 
   assert.equal(result.outcome, 'CORRECTED', 'the AMOUNT is still corrected — the coupon is duplicated either way')
@@ -750,4 +822,378 @@ test('and it records ACCOUNTING ACTION REQUIRED for one that did (o3d-y14 r5 F1)
     /Otherwise raise a further invoice to the same contact for 10 GBP/,
     'the remedy itself survives in the log, where the description only carries the headline',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r7 finding 4 — the net IS derivable where the credit notes MIRROR the invoice
+// ---------------------------------------------------------------------------
+
+/** The refund evidence for a fully-reversed order: one chargeback, its credit note in the ledger. */
+const FULLY_REVERSED: RefundEvidence = {
+  disposition: 'FULL',
+  refundIds: ['refund-1'],
+  postedCreditNoteExternalIds: ['CN-501'],
+  unresolvedRefundParkExternalIds: [],
+}
+
+const FULLY_REVERSED_INVOICE: LedgerEvidence = { ...LINKED_INVOICE, refunds: FULLY_REVERSED }
+
+/** A mirroring chargeback whose discount leg reversed `reversed`. */
+function chargebackReversing(reversed: number): RefundRow {
+  return mirroringChargeback({
+    lines: [
+      { salesOrderLineId: 'line-1', totalBase: 100, totalForeign: 100, lineKind: 'sale' },
+      ...(reversed
+        ? [{ salesOrderLineId: null, totalBase: -reversed, totalForeign: -reversed, lineKind: 'discount' }]
+        : []),
+    ],
+  })
+}
+
+test('a credit note that reversed the SAME wrong discount nets to ZERO — and needs nothing (o3d-y14 r7 F4)', async () => {
+  // THE CASE r6 COULD ONLY REACH BY ASKING A HUMAN. The invoice discounted 10 where the corrected
+  // order retains 0, and the chargeback that reversed it mirrored the same 10. Both documents are
+  // wrong by the same figure, so what survives is 10 - 10 = 0: this customer is square, and r6 put
+  // the order on the must-fix list to have a person establish exactly that by hand.
+  const handoff = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])
+
+  assert.equal(handoff.refunded, true)
+  assert.equal(handoff.reversal.ok, true)
+  assert.equal(handoff.remedy, null, 'nothing to do is not a remedy')
+  assert.equal(handoff.needsAccountingAction, false)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /THE POSITION NETS: 10 - 10 = 0 GBP/)
+  assert.match(text, /THE TWO ERRORS CANCEL/)
+  assert.doesNotMatch(text, /raise a further invoice/)
+})
+
+test('a credit note that reversed LESS leaves the customer owing, and says so (o3d-y14 r7 F4)', async () => {
+  // The chargeback ran after some of the correction had reached it: the invoice discounted 10, the
+  // credit note reversed only 6. The customer paid 90 and got 94 back... no: they were UNDER-charged
+  // by more than they were UNDER-credited, so 4 is still owed TO the business.
+  const handoff = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(6)])
+
+  assert.equal(handoff.remedy?.kind, 'INCREASE_RECEIVABLE')
+  assert.equal(handoff.remedy?.amount, 4)
+  assert.equal(handoff.needsAccountingAction, true)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /THE CUSTOMER STILL OWES 4 GBP/)
+  assert.match(text, /Raise a further invoice to the same contact for 4 GBP/)
+  // A credit note is allocated to that invoice, so Xero will not let it be edited — offering the
+  // edit would send the operator to an operation the UI refuses.
+  assert.doesNotMatch(text, /Remove & Redo/)
+  assert.doesNotMatch(text, /re-approve/)
+})
+
+test('a credit note that reversed MORE leaves the customer OWED — the other direction (o3d-y14 r7 F4)', async () => {
+  // THE DIRECTION THAT HAS BEEN WRONG THREE ROUNDS RUNNING. The credit note reversed 14 of a
+  // discount the invoice only charged 10 of, so the business took 4 too much off this customer and
+  // owes it back. r6's own refusal text told the operator to "settle THAT figure as an ordinary
+  // receivable" — which bills them for money they are owed.
+  const handoff = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(14)])
+
+  assert.equal(handoff.remedy?.kind, 'DECREASE_RECEIVABLE')
+  assert.equal(handoff.remedy?.amount, 4)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /THE CUSTOMER IS OWED 4 GBP/)
+  assert.match(text, /Raise a credit note for 4 GBP/)
+  assert.doesNotMatch(text, /raise a further invoice/i)
+  assert.doesNotMatch(text, /receivable/i, 'the word that pointed the wrong way is not here at all')
+})
+
+test('the two netted directions are OPPOSITE, on one field of the fixture (o3d-y14 r7 F4)', async () => {
+  // The pair the finding turns on. Same invoice, same evidence, same everything except how much the
+  // credit note reversed — and if they rendered the same instruction, every assertion above would be
+  // passing on a coincidence.
+  const owes = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(6)])
+  const owed = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(14)])
+
+  assert.notDeepEqual(owes.lines, owed.lines)
+  assert.notEqual(owes.remedy?.kind, owed.remedy?.kind)
+  assert.equal(owes.remedy?.amount, owed.remedy?.amount, 'the same magnitude — only the direction differs')
+})
+
+test('a WooCommerce-mirrored refund still suppresses every remedy (o3d-y14 r7 F4)', async () => {
+  // The dominant shape on these orders, and the one r6's blanket refusal was actually right about:
+  // `refund-sync.ts` emits no discount leg at all, so the absence proves nothing and there is no
+  // subtraction to make. What CHANGES is the reason given — a named condition instead of a false
+  // claim that IMS recorded nothing.
+  const handoff = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [
+    mirroringChargeback({ chargeback: false }),
+  ])
+
+  assert.equal(handoff.reversal.ok, false)
+  assert.equal(handoff.remedy, null)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /NO REMEDY IS PRESCRIBED/)
+  assert.match(text, /not built by mirroring the invoice/)
+  assert.doesNotMatch(text, /kind is not preserved/, 'the false r6 justification is gone')
+})
+
+test('the derivable and non-derivable refunded orders render DIFFERENT text (o3d-y14 r7 F4)', async () => {
+  const derivable = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])
+  const not = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [
+    mirroringChargeback({ chargeback: false }),
+  ])
+
+  assert.notDeepEqual(derivable.lines, not.lines)
+  assert.notEqual(derivable.needsAccountingAction, not.needsAccountingAction)
+  assert.notEqual(derivable.reversal.ok, not.reversal.ok)
+})
+
+test('an UNVERIFIED invoice is never netted, however derivable the credit-note side is', async () => {
+  // Half a position is not a position. The credit notes derive perfectly here; the invoice does not,
+  // so there is no subtraction to do and no remedy to prescribe.
+  const handoff = await handoffFor(
+    [postedInvoice(), postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null })],
+    0,
+    FULLY_REVERSED_INVOICE,
+    [chargebackReversing(10)],
+  )
+
+  assert.equal(handoff.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.equal(handoff.reversal.ok, true, 'the credit-note side really is derivable')
+  assert.equal(handoff.remedy, null, 'and it still prescribes nothing')
+  // AND IT IS NOT "SETTLED". `remedy === null` plus a readable credit-note side is exactly the
+  // shape of the netted-to-zero case, and reading this one as that would take an order whose
+  // invoice nobody can read OFF the must-fix list — the r5 defect in a new place.
+  assert.equal(handoff.needsAccountingAction, true)
+})
+
+test('a NO_INVOICE refunded order with a readable credit-note side is not "settled" either', async () => {
+  const handoff = await handoffFor([], 0, { ...LINKED_INVOICE, accountingInvoiceId: null, refunds: FULLY_REVERSED }, [
+    chargebackReversing(10),
+  ])
+
+  assert.equal(handoff.invoice.case, 'NO_INVOICE_IN_LEDGER')
+  assert.equal(handoff.remedy, null)
+  assert.equal(handoff.needsAccountingAction, true, 'a credit note is a ledger document derived from the old amount')
+})
+
+test('an order with NO refunds never reads the credit-note side at all', async () => {
+  let asked = 0
+  const { buildWcCouponLedgerHandoff } = await import(
+    '@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
+  )
+  const client = {
+    ...(makeEventClient([postedInvoice()]) as never as Record<string, unknown>),
+    salesOrderRefund: {
+      findMany: async () => {
+        asked += 1
+        return []
+      },
+    },
+  } as never
+
+  const handoff = await buildWcCouponLedgerHandoff(client, {
+    orderId: 'order-1',
+    currency: 'GBP',
+    keptOrderLevel: 0,
+    evidence: LINKED_INVOICE,
+  })
+
+  assert.equal(asked, 0, 'nearly every order is unrefunded; it must cost them nothing')
+  assert.equal(handoff.remedy?.kind, 'INCREASE_RECEIVABLE')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r7 finding 1 — a PARKED refund is a refund
+// ---------------------------------------------------------------------------
+
+const PARKED_ONLY: RefundEvidence = {
+  disposition: 'NONE',
+  refundIds: [],
+  postedCreditNoteExternalIds: [],
+  unresolvedRefundParkExternalIds: ['9001'],
+}
+
+test('a PARKED WooCommerce refund suppresses the remedy on its own (o3d-y14 r7 F1)', async () => {
+  // THE FINDING. A refund that arrived and could not be recorded writes no SalesOrderRefund, no
+  // status change and no credit note — so all three r6 signals read "not refunded" and the order
+  // used to receive the full "raise a further invoice" remedy. The money has already left.
+  const handoff = await handoffFor([postedInvoice()], 0, { ...LINKED_INVOICE, refunds: PARKED_ONLY })
+
+  assert.equal(handoff.refunded, true)
+  assert.equal(handoff.remedy, null)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /NO REMEDY IS PRESCRIBED/)
+  assert.match(text, /9001 ARRIVED AND COULD NOT BE RECORDED/)
+  assert.doesNotMatch(text, /Otherwise raise a further invoice/)
+})
+
+test('a parked refund and NO refund are DIFFERENT classifications (o3d-y14 r7 F1)', async () => {
+  // The fixture pair the finding turns on: identical in every field but the park list. If the two
+  // rendered the same handoff this file would prove nothing about parks at all.
+  const parked = await handoffFor([postedInvoice()], 0, { ...LINKED_INVOICE, refunds: PARKED_ONLY })
+  const clean = await handoffFor([postedInvoice()], 0, LINKED_INVOICE)
+
+  assert.notDeepEqual(parked.lines, clean.lines)
+  assert.notEqual(parked.refunded, clean.refunded)
+  assert.equal(parked.remedy, null)
+  assert.equal(clean.remedy?.kind, 'INCREASE_RECEIVABLE')
+})
+
+test('a parked refund is named in the operator text where a recorded one would be', async () => {
+  // It is reported LAST and separately, because it is not a statement about IMS's records: it says
+  // money left the business and IMS holds nothing for it.
+  for (const externalId of ['9001', '9002', '9003']) {
+    const handoff = await handoffFor([postedInvoice()], 0, {
+      ...LINKED_INVOICE,
+      refunds: { ...PARKED_ONLY, unresolvedRefundParkExternalIds: [externalId] },
+    })
+    assert.match(handoff.lines.join('\n'), new RegExp(`refund\\(s\\) ${externalId} ARRIVED`))
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r7 finding 3 — NO REMEDY REACHES AN OPERATOR EXCEPT THROUGH THE CLASSIFIER
+// ---------------------------------------------------------------------------
+
+/**
+ * Phrases that tell an operator to MOVE MONEY. Anything here, in a line that is not part of a
+ * rendered `WcCouponRemedy`, is a remedy that escaped the classifier — which is what r7 finding 3
+ * is, and what rounds 4, 5 and 6 each shipped a fresh instance of.
+ */
+const INSTRUMENT =
+  /raise a further invoice|raise a credit note|raise a credit memo|credit the difference|receivable|Add Credit Note|Remove & Redo|Receive Payment screen|delete that line|edit it down|re-approve|delete its |set its .* line to/i
+
+/**
+ * A clause that FORBIDS rather than instructs. "Do NOT raise a credit note" is not a remedy.
+ *
+ * AND IT MUST COME FIRST. A prohibition that appears AFTER the instrument does not govern it: r6's
+ * defect line — "settle THAT figure as an ordinary receivable, with both documents in front of you —
+ * never the figure above" — carries both, and the "never" forbids a different thing entirely. A
+ * lexicon test that merely asked whether the two co-occur passed that line unchanged, so the rule is
+ * positional.
+ */
+const PROHIBITION = /\bdo not\b|\bnever\b|NO REMEDY IS PRESCRIBED|RECREATES|refunds the same money|the wrong instrument/i
+
+/** Does a prohibition GOVERN the first instrument in this line — i.e. precede it? */
+function instrumentIsForbidden(line: string): boolean {
+  const instrument = line.search(INSTRUMENT)
+  const prohibition = line.search(PROHIBITION)
+  return prohibition >= 0 && prohibition < instrument
+}
+
+/** Every shape the handoff can take, as (name, builder) — enumerated so none can be forgotten. */
+const MATRIX: Array<[string, () => Promise<{ lines: string[]; remedy: unknown }>]> = [
+  ['unrefunded / no invoice', () => handoffFor([], 0, { ...LINKED_INVOICE, accountingInvoiceId: null })],
+  ['unrefunded / agrees', () => handoffFor([invoiceWithNoDiscountAccount()], 0)],
+  ['unrefunded / discounts more', () => handoffFor([postedInvoice()], 0)],
+  ['unrefunded / discounts less', () => handoffFor([invoiceWithNoDiscountAccount()], 4)],
+  [
+    'unrefunded / unverified',
+    () =>
+      handoffFor(
+        [postedInvoice(), postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null })],
+        4,
+      ),
+  ],
+  ['refunded / no invoice', () => handoffFor([], 0, { ...LINKED_INVOICE, accountingInvoiceId: null, refunds: FULLY_REVERSED })],
+  ['refunded / agrees', () => handoffFor([invoiceWithNoDiscountAccount()], 0, FULLY_REVERSED_INVOICE)],
+  ['refunded / discounts more', () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE)],
+  ['refunded / discounts less', () => handoffFor([invoiceWithNoDiscountAccount()], 4, FULLY_REVERSED_INVOICE)],
+  [
+    'refunded / unverified',
+    () =>
+      handoffFor(
+        [postedInvoice(), postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null })],
+        4,
+        FULLY_REVERSED_INVOICE,
+      ),
+  ],
+  ['parked refund only', () => handoffFor([postedInvoice()], 0, { ...LINKED_INVOICE, refunds: PARKED_ONLY })],
+  [
+    'partial refund',
+    () =>
+      handoffFor([postedInvoice()], 0, {
+        ...LINKED_INVOICE,
+        refunds: { disposition: 'PARTIAL', refundIds: ['refund-9'], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
+      }),
+  ],
+  ['netted / settled', () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])],
+  ['netted / customer owes', () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(6)])],
+  ['netted / customer owed', () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(14)])],
+]
+
+test('NO instrument reaches an operator except through a WcCouponRemedy (o3d-y14 r7 F3)', async () => {
+  // THE PROPERTY, asserted over the whole matrix rather than case by case. Three rounds of
+  // case-by-case review each let exactly one wrong-direction instruction through; this cannot be
+  // satisfied by fixing the case that was found, because it checks every case at once.
+  const { wcCouponRemedySteps } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+
+  for (const [name, build] of MATRIX) {
+    const handoff = await build()
+    const remedyLines = new Set(
+      handoff.remedy ? wcCouponRemedySteps(handoff.remedy as never) : [],
+    )
+    // Every remedy step the classifier produced is actually IN the output — otherwise "the remedy
+    // is a value" would be true and irrelevant.
+    for (const step of remedyLines) {
+      assert.ok(handoff.lines.includes(step), `${name}: a remedy step was built and never printed`)
+    }
+    for (const line of handoff.lines) {
+      if (remedyLines.has(line)) continue
+      if (!INSTRUMENT.test(line)) continue
+      assert.ok(
+        instrumentIsForbidden(line),
+        `${name}: an instrument reached the operator outside the remedy, and nothing before it ` +
+          `forbids it:\n  ${line}`,
+      )
+    }
+  }
+})
+
+test('"NO REMEDY IS PRESCRIBED" is only ever said when there is none (o3d-y14 r7 F3)', async () => {
+  // r6 printed that heading and then prescribed a receivable four lines later. Making the claim
+  // checkable against the value is what stops the two drifting apart again.
+  for (const [name, build] of MATRIX) {
+    const handoff = await build()
+    const claims = handoff.lines.some((line) => /NO REMEDY IS PRESCRIBED/.test(line))
+    if (claims) assert.equal(handoff.remedy, null, `${name}: claimed no remedy while carrying one`)
+  }
+})
+
+test('the suppressed fallback names no receivable and no instrument at all (o3d-y14 r7 F3)', async () => {
+  // The exact defect: "if something is genuinely outstanding, settle THAT figure as an ordinary
+  // receivable" — a DIRECTION, and the wrong one whenever the customer is the party owed, printed
+  // under a "NO REMEDY IS PRESCRIBED" heading.
+  const handoff = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE)
+
+  assert.equal(handoff.remedy, null)
+  const text = handoff.lines.join('\n')
+  assert.doesNotMatch(text, /ordinary receivable/)
+  assert.doesNotMatch(text, /settle THAT figure/)
+  assert.match(text, /record WHICH WAY the difference goes/)
+  assert.match(text, /whether this customer still owes\s+money or is owed it/)
+  assert.match(text, /naming no instrument for\s+either direction/)
+})
+
+test('with NO posted credit note the fallback does not send the operator to open one (o3d-y14 r7 F3)', async () => {
+  // The refund-row-only case. The old text said "open the invoice and every credit note above" —
+  // naming a document that does not exist, and leaving the refund unestablishable from the ones it
+  // does name.
+  const handoff = await handoffFor([postedInvoice()], 0, {
+    ...LINKED_INVOICE,
+    refunds: { disposition: 'PARTIAL', refundIds: ['refund-9'], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
+  })
+
+  const text = handoff.lines.join('\n')
+  assert.match(text, /THERE IS NO POSTED CREDIT NOTE TO OPEN/)
+  assert.match(text, /Establish it from the WooCommerce order\s+and the payment provider first/)
+  assert.doesNotMatch(text, /every credit note above/)
+})
+
+test('every remedy carries the refund position it depends on, and says to re-check it (o3d-y14 r7 F2)', async () => {
+  // r7 finding 2: the correction's lock proves the position at the moment the amount was rewritten
+  // and nothing about the moment a human reads the line. The precondition is printed FIRST and by
+  // the same function that prints the instrument, so no remedy can be rendered without it.
+  for (const [name, build] of MATRIX) {
+    const handoff = await build()
+    if (!handoff.remedy) continue
+    const first = handoff.lines.find((line) => /^REMEDY \(/.test(line))
+    assert.ok(first, `${name}: a remedy with no precondition line`)
+    assert.match(first, /VALID ONLY WHILE this order's refund position is/, name)
+    assert.match(first, /RE-CHECK THAT IMMEDIATELY BEFORE POSTING/, name)
+  }
 })

@@ -38,7 +38,7 @@ function row(over: Partial<WcCouponBackfillRow> = {}): WcCouponBackfillRow {
     alreadyBackfilled: false,
     liveInvoiceJobs: 0,
     revenueDeferredBatchRef: null,
-    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
     liveBatchDeferralJobs: 0,
     ...over,
   }

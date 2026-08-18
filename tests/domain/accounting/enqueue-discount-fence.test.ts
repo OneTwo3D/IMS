@@ -163,6 +163,19 @@ function makeTx(hooks: { onCount?: () => Promise<void> | void } = {}) {
         return data
       },
     },
+    // The refund-park read (r7 F1). This suite is about the enqueue fence, not parks, so
+    // the honest answer is "none" — but the double THROWS on any predicate it was not
+    // taught, so a production query that changes shape surfaces here rather than silently
+    // matching everything.
+    shoppingSyncLog: {
+      findMany: async ({ where }: { where: Record<string, unknown> }) => {
+        const taught = new Set(['connector', 'direction', 'entityType', 'status', 'entityId', 'externalId'])
+        for (const key of Object.keys(where)) {
+          if (!taught.has(key)) throw new Error(`shoppingSyncLog double was not taught the predicate ${key}`)
+        }
+        return []
+      },
+    },
     shipment: { findUnique: async () => null },
   })
   return tx
@@ -231,7 +244,7 @@ const ENTRY = {
   postedInvoiceExternalIds: [] as string[],
   // o3d-y14 r6 finding 1: the refund position the reviewer saw, which apply compares against live
   // state before it will prescribe anything about this order's documents.
-  refunds: { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[] },
+  refunds: { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[], unresolvedRefundParkExternalIds: [] as string[] },
   nearCutoff: false,
 }
 

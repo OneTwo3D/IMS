@@ -108,6 +108,7 @@ import { resolveWcOrderLevelDiscount } from './field-mapping'
 import {
   buildWcCouponLedgerHandoff,
   isWcCouponOrderRefunded,
+  wcCouponRemedySteps,
   type WcCouponLedgerHandoff,
   type WcCouponRefundEvidence,
 } from './coupon-discount-ledger-handoff'
@@ -188,6 +189,7 @@ export function sortedWcCouponRefundEvidence(refunds: WcCouponRefundEvidence): W
     disposition: refunds.disposition,
     refundIds: sortedPostedInvoiceIds(refunds.refundIds),
     postedCreditNoteExternalIds: sortedPostedInvoiceIds(refunds.postedCreditNoteExternalIds),
+    unresolvedRefundParkExternalIds: sortedPostedInvoiceIds(refunds.unresolvedRefundParkExternalIds ?? []),
   }
 }
 
@@ -198,7 +200,12 @@ export function sameWcCouponRefundEvidence(left: WcCouponRefundEvidence, right: 
   return (
     a.disposition === b.disposition &&
     a.refundIds.join('|') === b.refundIds.join('|') &&
-    a.postedCreditNoteExternalIds.join('|') === b.postedCreditNoteExternalIds.join('|')
+    a.postedCreditNoteExternalIds.join('|') === b.postedCreditNoteExternalIds.join('|') &&
+    // r7 finding 1. A park that appeared since the review changes the SAME decision the other three
+    // signals change — from "raise a further invoice" to "prescribe nothing" — so it is compared on
+    // exactly the same terms, and a park that RESOLVED since is a change too: the refund it stood
+    // for has now landed as a real row the reviewer never saw.
+    a.unresolvedRefundParkExternalIds.join('|') === b.unresolvedRefundParkExternalIds.join('|')
   )
 }
 
@@ -207,7 +214,8 @@ export function describeWcCouponRefundEvidence(refunds: WcCouponRefundEvidence):
   const canonical = sortedWcCouponRefundEvidence(refunds)
   return (
     `refundStatus=${canonical.disposition}, refund(s) [${canonical.refundIds.join(', ')}], ` +
-    `credit note(s) [${canonical.postedCreditNoteExternalIds.join(', ')}]`
+    `credit note(s) [${canonical.postedCreditNoteExternalIds.join(', ')}], ` +
+    `unrecorded WooCommerce refund(s) [${canonical.unresolvedRefundParkExternalIds.join(', ')}]`
   )
 }
 
@@ -731,8 +739,14 @@ export type WcCouponAllowlist = {
    * reviewer's behalf that no credit note stands against the order — and that is the assertion that
    * lets a remedy re-bill a customer who has already been refunded, so it is the one default this
    * file must never take. A v2 file is refused and the report re-run.
+   *
+   * BUMPED TO 4 by o3d-y14 r7 finding 1, on the same argument once more: entries now carry the
+   * UNRESOLVED REFUND PARKS — WooCommerce refunds that arrived and could not be recorded, which
+   * produce no refund row, no status change and no credit note. A version-3 file has none, and
+   * defaulting it to "there are no parks" is exactly the assertion that let a parked refund be
+   * classified as an unrefunded order and handed the full "raise a further invoice" remedy.
    */
-  version: 3
+  version: 4
   /** When the dry run produced the proposal. */
   generatedAt: string
   /** The cutoff the proposal was generated under, carried for the audit trail. */
@@ -782,7 +796,12 @@ function isRefundEvidence(value: unknown): value is WcCouponRefundEvidence {
     Array.isArray(refunds.refundIds) &&
     refunds.refundIds.every((id) => typeof id === 'string') &&
     Array.isArray(refunds.postedCreditNoteExternalIds) &&
-    refunds.postedCreditNoteExternalIds.every((id) => typeof id === 'string')
+    refunds.postedCreditNoteExternalIds.every((id) => typeof id === 'string') &&
+    // r7 finding 1. Required, not defaulted, on the same argument as the other three: an absent list
+    // would read as "the reviewer saw no unrecorded refund against this order", and an unrecorded
+    // refund is the one whose money has already left the business.
+    Array.isArray(refunds.unresolvedRefundParkExternalIds) &&
+    refunds.unresolvedRefundParkExternalIds.every((id) => typeof id === 'string')
   )
 }
 
@@ -795,16 +814,16 @@ export function parseWcCouponAllowlist(value: unknown): WcCouponAllowlistParse {
     return { ok: false, reason: 'MALFORMED', detail: 'the allowlist is not a JSON object' }
   }
   const raw = value as Record<string, unknown>
-  if (raw.version !== 3) {
+  if (raw.version !== 4) {
     return {
       ok: false,
       reason: 'UNSUPPORTED_VERSION',
       detail:
-        `version ${JSON.stringify(raw.version)} was not written by this build (expected 3). ` +
-        'Re-run the dry run to regenerate the proposal — a version-2 file predates the REFUND ' +
-        'evidence apply now compares against live state (o3d-y14 r6), and a version-1 file predates ' +
-        'the posted-but-unlinked invoice evidence as well (o3d-y14 r3). Neither review can describe ' +
-        'what apply must check.',
+        `version ${JSON.stringify(raw.version)} was not written by this build (expected 4). ` +
+        'Re-run the dry run to regenerate the proposal — a version-3 file predates the PARKED refund ' +
+        'evidence apply now compares against live state (o3d-y14 r7), a version-2 file predates the ' +
+        'refund evidence entirely (o3d-y14 r6), and a version-1 file predates the posted-but-unlinked ' +
+        'invoice evidence as well (o3d-y14 r3). None of those reviews can describe what apply must check.',
     }
   }
   const clear = raw.clear
@@ -840,7 +859,7 @@ export function parseWcCouponAllowlist(value: unknown): WcCouponAllowlistParse {
   return {
     ok: true,
     allowlist: {
-      version: 3,
+      version: 4,
       generatedAt: typeof raw.generatedAt === 'string' ? raw.generatedAt : '',
       cutoff: typeof raw.cutoff === 'string' ? raw.cutoff : '',
       reviewed: true,
@@ -1009,7 +1028,7 @@ async function readLivePostedEvidence(
       order.unearnedRevenueAmount === null || order.unearnedRevenueAmount === undefined
         ? null
         : money(order.unearnedRevenueAmount as DecimalInput),
-    refunds: await readLiveRefundEvidence(tx, order),
+    refunds: await readLiveRefundEvidence(tx, orderId, order),
   }
 }
 
@@ -1022,6 +1041,7 @@ async function readLivePostedEvidence(
  */
 async function readLiveRefundEvidence(
   tx: Prisma.TransactionClient,
+  orderId: string,
   order: {
     refundStatus: unknown
     refunds: Array<{ id: string; accountingCreditNoteId: string | null }>
@@ -1030,8 +1050,16 @@ async function readLiveRefundEvidence(
   const rows = order.refunds
   const refundIds = [...new Set(rows.map((refund) => refund.id))].sort()
   const disposition = normalizeWcCouponRefundDisposition(order.refundStatus)
+  // THE PARKS ARE READ UNCONDITIONALLY (r7 finding 1), and BEFORE the early return below — a park
+  // is precisely the shape that exists when there is no SalesOrderRefund row, so short-circuiting on
+  // "no refund rows" is what made a parked refund read as an unrefunded order. It is also read under
+  // this same lock, which makes it decisive rather than a sample: `upsertRefundPark` takes
+  // `SELECT ... FOR UPDATE` on this very order row before it writes, so a park either commits before
+  // us and is seen, or after us, against an order whose handoff already records what it was derived
+  // from.
+  const parks = await readWcCouponRefundParks(tx, orderId)
   if (refundIds.length === 0) {
-    return { disposition, refundIds, postedCreditNoteExternalIds: [] }
+    return { disposition, refundIds, postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: parks }
   }
   // BOTH sources, exactly as the invoice side reads both: the back-reference column can be NULL on
   // a credit note that really did post (o3d-9kek), and a SYNCED row with an external id is that
@@ -1053,8 +1081,55 @@ async function readLiveRefundEvidence(
       ...rows.map((refund) => refund.accountingCreditNoteId),
       ...syncedCreditNotes.map((row) => row.externalTransactionId),
     ]),
+    unresolvedRefundParkExternalIds: parks,
   }
 }
+
+/**
+ * WOOCOMMERCE REFUNDS THAT ARRIVED AND COULD NOT BE RECORDED (o3d-y14 r7 finding 1).
+ *
+ * THE PREDICATE IS THE INDEX'S. `shopping_sync_logs_active_refund_park_uq` (migration
+ * 20260721150000) is a partial unique index on exactly `connector = 'woocommerce' AND direction =
+ * 'FROM_CONNECTOR' AND entityType = 'SalesOrder' AND status IN (PENDING, FAILED, QUARANTINED) AND
+ * externalId IS NOT NULL AND entityId IS NOT NULL`, and `upsertRefundPark` matches it deliberately
+ * "EXACTLY so this can never pick up an order-import failure log (same connector/type but no
+ * entityId)". Copying that predicate rather than inventing a looser one is what keeps this from
+ * counting an unrelated failed order import as a refund.
+ *
+ * WHY ALL THREE STATUSES, and not just QUARANTINED. Each means the refund is UNRESOLVED, and
+ * unresolved is the whole point — the money left WooCommerce and IMS holds no refund row for it:
+ *
+ *   QUARANTINED  a deliberate refusal (a monetary-only refund on a non-uniformly-taxed order, o3d-iup).
+ *                Operator-gated, so it can sit there indefinitely — the longest-lived of the three.
+ *   FAILED       a refund whose sync failed and is still being retried.
+ *   PENDING      one recorded as parked and not yet resolved.
+ *
+ * A refund that later LANDS resolves its park to SYNCED (`resolveActionableParks`), and SYNCED is
+ * excluded here — so a resolved park correctly stops being a signal, and the SalesOrderRefund row it
+ * became is picked up by the signal beside this one instead.
+ */
+export async function readWcCouponRefundParks(
+  client: Pick<Prisma.TransactionClient, 'shoppingSyncLog'>,
+  orderId: string,
+): Promise<string[]> {
+  const parks = await client.shoppingSyncLog.findMany({
+    where: { ...WC_COUPON_REFUND_PARK_WHERE, entityId: orderId },
+    select: { externalId: true },
+  })
+  return sortedPostedInvoiceIds(parks.map((park) => park.externalId))
+}
+
+/**
+ * The park predicate, shared by the report (which reads them in bulk) and the apply-time read above,
+ * so the reviewer is shown the same set apply compares against.
+ */
+export const WC_COUPON_REFUND_PARK_WHERE = {
+  connector: 'woocommerce',
+  direction: 'FROM_CONNECTOR',
+  entityType: 'SalesOrder',
+  status: { in: ['PENDING', 'FAILED', 'QUARANTINED'] },
+  externalId: { not: null },
+} as const satisfies Prisma.ShoppingSyncLogWhereInput
 
 /**
  * Does this evidence describe ANY accounting document derived from the pre-correction amount?
@@ -1380,6 +1455,12 @@ export async function applyWcCouponCorrection(
               posted.refunds.postedCreditNoteExternalIds.length
                 ? `credit note(s) ${posted.refunds.postedCreditNoteExternalIds.join(', ')}`
                 : null,
+              // r7 finding 1: not a ledger document, but the reason there may not be one — a refund
+              // that arrived and could not be recorded. It belongs in the durable record for the
+              // same reason the credit notes do: it is why this row carries no remedy.
+              posted.refunds.unresolvedRefundParkExternalIds.length
+                ? `unrecorded WooCommerce refund(s) ${posted.refunds.unresolvedRefundParkExternalIds.join(', ')}`
+                : null,
             ]
               .filter(Boolean)
               .join(', ') +
@@ -1408,7 +1489,22 @@ export async function applyWcCouponCorrection(
         refundDisposition: posted.refunds.disposition,
         refundIds: posted.refunds.refundIds,
         postedCreditNoteExternalIds: posted.refunds.postedCreditNoteExternalIds,
+        unresolvedRefundParkExternalIds: posted.refunds.unresolvedRefundParkExternalIds,
         refunded: handoff ? handoff.refunded : isWcCouponOrderRefunded(posted.refunds),
+        // r7 findings 3 and 4. The DIRECTION of what was prescribed, as a field, so "which way did
+        // this row point" is answerable from the log without re-reading English — and NULL is the
+        // durable statement that nothing was prescribed at all. `creditNoteReversal` records what
+        // the credit notes were derived to have reversed, or why that could not be established.
+        remedyKind: handoff?.remedy ? handoff.remedy.kind : null,
+        remedyAmount: handoff?.remedy ? handoff.remedy.amount : null,
+        creditNoteReversal: handoff
+          ? {
+              ok: handoff.reversal.ok,
+              amount: handoff.reversal.ok ? handoff.reversal.amount : null,
+              detail: handoff.reversal.detail,
+              legs: handoff.reversal.legs,
+            }
+          : null,
         needsAccountingAction: handoff ? handoff.needsAccountingAction : false,
         handoffLines: handoff ? handoff.lines : null,
         discountModel: WC_COUPON_DISCOUNT_MODEL,
@@ -1419,6 +1515,94 @@ export async function applyWcCouponCorrection(
   })
 
   return { outcome: 'CORRECTED', posted, handoff }
+}
+
+/**
+ * o3d-y14 r7 finding 2 — A REMEDY THAT WAS TRUE AT COMMIT AND IS NOT TRUE NOW.
+ *
+ * THE DEFECT. `applyWcCouponCorrection` derives its handoff inside the correction transaction,
+ * behind `lockSalesOrder`, and that lock is decisive for the moment the amount is rewritten: a
+ * refund either commits before it and is seen, or after it. r6 called that "the best the transaction
+ * boundary allows" and shipped it — but what the boundary protects is the RECORD, and what an
+ * operator acts on is a LIVE DIRECTIONAL INSTRUCTION printed to a console and worked through by a
+ * human minutes or hours later. A refund taking the same lock the instant after our transaction
+ * commits leaves "raise a further invoice for 10 GBP" on the screen against a customer who has just
+ * been refunded, and nothing revalidates it — not even before it is printed, because every
+ * correction runs before anything is printed at all.
+ *
+ * WHAT THIS DOES, AND WHAT IT HONESTLY CANNOT. It re-reads the refund position OUTSIDE the
+ * correction's transaction, immediately before the handoff is shown, and INVALIDATES any remedy
+ * whose position has moved. That narrows the window from "the whole run" to "between this read and
+ * that line reaching the operator's eye", which is as far as software on this side of a committed
+ * transaction can go. The remainder is closed by `WcCouponRemedy`'s own precondition line, which
+ * `wcCouponRemedySteps` prints FIRST and which no remedy can be rendered without: the operator is
+ * told the exact position the instruction depends on and to re-check it before posting.
+ *
+ * SUPERSEDING IS NOT A REFUSAL. The amount has already been corrected and that correction is right
+ * either way — the coupon was duplicated whatever happened afterwards. What is withdrawn is the
+ * REMEDY, and re-running the report reproduces the whole handoff against the new position.
+ */
+export type WcCouponHandoffRevalidation =
+  | { outcome: 'CURRENT'; handoff: WcCouponLedgerHandoff }
+  | { outcome: 'SUPERSEDED'; handoff: WcCouponLedgerHandoff; detail: string }
+
+export async function revalidateWcCouponHandoff(
+  client: Pick<Prisma.TransactionClient, 'salesOrder' | 'accountingSyncLog' | 'shoppingSyncLog'>,
+  orderId: string,
+  handoff: WcCouponLedgerHandoff,
+): Promise<WcCouponHandoffRevalidation> {
+  const order = await client.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { refundStatus: true, refunds: { select: { id: true, accountingCreditNoteId: true } } },
+  })
+  if (!order) {
+    return {
+      outcome: 'SUPERSEDED',
+      handoff: withdrawRemedy(
+        handoff,
+        'the order could not be re-read after the correction committed, so the refund position this ' +
+          'remedy depends on cannot be confirmed',
+      ),
+      detail: 'order could not be re-read',
+    }
+  }
+
+  const live = await readLiveRefundEvidence(client as Prisma.TransactionClient, orderId, order)
+  if (sameWcCouponRefundEvidence(live, handoff.refunds)) {
+    return { outcome: 'CURRENT', handoff }
+  }
+  const detail =
+    `the refund position for this order is now ${describeWcCouponRefundEvidence(live)}, not the ` +
+    `${describeWcCouponRefundEvidence(handoff.refunds)} this handoff was derived from — it moved ` +
+    'AFTER the correction committed, so any remedy derived from the earlier position is withdrawn'
+  return { outcome: 'SUPERSEDED', handoff: withdrawRemedy(handoff, detail), detail }
+}
+
+/**
+ * Strip the remedy and say why, keeping every FACT the handoff established.
+ *
+ * The facts are still true — what the invoice carries is a property of the invoice — and the
+ * operator needs them to read the documents at all. Only the instruction is withdrawn, and
+ * `needsAccountingAction` is forced TRUE because a position nobody can currently vouch for is
+ * exactly a position a human has to look at.
+ */
+function withdrawRemedy(handoff: WcCouponLedgerHandoff, detail: string): WcCouponLedgerHandoff {
+  if (!handoff.remedy) {
+    return handoff.needsAccountingAction
+      ? handoff
+      : { ...handoff, needsAccountingAction: true, lines: [...handoff.lines, `SUPERSEDED: ${detail}.`] }
+  }
+  const remedyLines = new Set(wcCouponRemedySteps(handoff.remedy))
+  return {
+    ...handoff,
+    remedy: null,
+    needsAccountingAction: true,
+    lines: [
+      ...handoff.lines.filter((line) => !remedyLines.has(line)),
+      `THE REMEDY PRINTED FOR THIS ORDER IS WITHDRAWN: ${detail}. Post NOTHING on the strength of it. ` +
+        'Re-run the report to re-derive the position.',
+    ],
+  }
 }
 
 /**
