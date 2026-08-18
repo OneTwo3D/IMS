@@ -131,6 +131,7 @@ beforeEach(() => {
   activity = []
   delete process.env.XERO_ALLOWED_TENANT_IDS
   delete process.env.XERO_ALLOWED_TENANT_NAMES
+  delete process.env.XERO_BLOCKED_TENANT_IDS
   // XERO_TENANT_ID is READ as of o3d-9tbz. It has to be cleared here like the others, or a value left
   // in the developer's own environment silently narrows the allow-list for every test in this file.
   delete process.env.XERO_TENANT_ID
@@ -484,4 +485,154 @@ test('a contradictory configuration is reported by isConnected too, not just by 
   assert.equal(status.connected, false)
   assert.equal(status.hasStoredToken, true)
   assert.match(status.blockedReason ?? '', /contradict each other/)
+})
+
+
+// --- XERO_BLOCKED_TENANT_IDS, end to end ---------------------------------------
+//
+// The rig's answer to the rotating Demo tenantId (r2 finding 1). Xero re-issues the Demo company's
+// tenantId at every ~28-day reset, so an id ALLOW-list has to be re-edited every cycle; the LIVE
+// organisation's id is the stable one, and blocking it is identity-strength rather than name-strength.
+
+test('BLOCKING the live org stops the incident at the callback and connects to Demo instead', async () => {
+  // The incident's own state: fresh database, no pin, LIVE first in the consent.
+  freshDatabase()
+  connectionsBody = [LIVE, DEMO]
+  process.env.XERO_BLOCKED_TENANT_IDS = LIVE.tenantId
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, true)
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId, 'the org that is not blocked, not connections[0]')
+  assert.equal(settings.xero_expected_tenant_id, DEMO.tenantId)
+})
+
+test('the deny-list needs no edit when the Demo company comes back with a NEW tenantId', async () => {
+  // The reason the runbook reached for names in the first place. Same .env line, next cycle.
+  freshDatabase()
+  const rotated = { ...DEMO, id: 'c-demo-2', tenantId: '5c949ed5-demo-cycle-2' }
+  connectionsBody = [LIVE, rotated]
+  process.env.XERO_BLOCKED_TENANT_IDS = LIVE.tenantId
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, true)
+  assert.equal(tokenRow?.tenantId, rotated.tenantId)
+})
+
+test('a BLOCKED stored token halts every sync — the restored-dump half of the incident', async () => {
+  pinnedTo(LIVE)
+  process.env.XERO_BLOCKED_TENANT_IDS = LIVE.tenantId
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null, 'genuinely stopped, not merely warned')
+  assert.match(notifications[0].message, /XERO_BLOCKED_TENANT_IDS/)
+  assert.ok(activity.some((entry) => entry.action === 'xero_stored_tenant_refused'))
+})
+
+test('a consent that offers only blocked organisations is refused with nothing stored', async () => {
+  freshDatabase()
+  connectionsBody = [LIVE]
+  process.env.XERO_BLOCKED_TENANT_IDS = LIVE.tenantId
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, false)
+  assert.equal(tokenRow, null)
+  assert.equal(organisationCalls, 0, 'not even a read against the live organisation')
+  assert.match(result.error ?? '', /XERO_BLOCKED_TENANT_IDS/)
+})
+
+
+// --- a name is not an identity, end to end -------------------------------------
+
+test('two organisations sharing a NAME refuse the callback, and nothing is stored', async () => {
+  freshDatabase()
+  connectionsBody = [DEMO, { ...DEMO, id: 'c-other', tenantId: 'aa000000-other-demo' }]
+  process.env.XERO_ALLOWED_TENANT_NAMES = 'Demo Company (UK)'
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, false)
+  assert.equal(tokenRow, null)
+  assert.equal(organisationCalls, 0)
+  assert.match(result.error ?? '', /does not identify/)
+  assert.ok(activity.some((entry) => entry.action === 'xero_connect_refused'))
+})
+
+test('an organisation RENAMED to the allow-listed name does not get past the id list', async () => {
+  // Under the old union this connected: the name admitted an organisation the ids excluded.
+  freshDatabase()
+  connectionsBody = [{ ...LIVE, tenantName: 'Demo Company (UK)' }]
+  process.env.XERO_ALLOWED_TENANT_IDS = DEMO.tenantId
+  process.env.XERO_ALLOWED_TENANT_NAMES = 'Demo Company (UK)'
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, false)
+  assert.equal(tokenRow, null)
+  assert.equal(organisationCalls, 0)
+})
+
+test('an id and that same organisation NAME connect — two spellings are not a contradiction', async () => {
+  // r2 finding 2. This pair used to be refused as a conflict.
+  freshDatabase()
+  connectionsBody = [LIVE, DEMO]
+  process.env.XERO_TENANT_ID = DEMO.tenantId
+  process.env.XERO_ALLOWED_TENANT_NAMES = 'Demo Company (UK)'
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, true)
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId)
+})
+
+test('an id and a name selecting DIFFERENT organisations still refuses, quoting both', async () => {
+  freshDatabase()
+  connectionsBody = [LIVE, DEMO]
+  process.env.XERO_ALLOWED_TENANT_IDS = DEMO.tenantId
+  process.env.XERO_ALLOWED_TENANT_NAMES = 'OneTwo3D Ltd'
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, false)
+  assert.equal(tokenRow, null)
+  assert.match(result.error ?? '', /contradict each other/)
+  assert.match(result.error ?? '', /no organisation satisfies both/)
+})
+
+test('a NAME-ONLY guard is recorded as weaker than it looks — once, not once per sync', async () => {
+  // Not a refusal: refusing would switch off the only tenant control the rig has today. But an operator
+  // who believes a name pins the ledger is in the position this whole branch exists to end.
+  const soleDemo = { ...DEMO, id: 'c-warn', tenantId: '5c949ed5-demo-warn' }
+  pinnedTo(soleDemo)
+  process.env.XERO_ALLOWED_TENANT_NAMES = 'Demo Company (UK)'
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal((await getAccessToken())?.tenantId, soleDemo.tenantId, 'still permitted')
+  const warnings = activity.filter((entry) => entry.action === 'xero_tenant_guard_name_only')
+  assert.equal(warnings.length, 1)
+  assert.match(warnings[0].description, /XERO_BLOCKED_TENANT_IDS=/)
+
+  await getAccessToken()
+  await getAccessToken()
+  assert.equal(activity.filter((e) => e.action === 'xero_tenant_guard_name_only').length, 1, 'not per tick')
+})
+
+test('adding an id-based control clears the name-only warning', async () => {
+  const soleDemo = { ...DEMO, id: 'c-warn2', tenantId: '5c949ed5-demo-warn2' }
+  pinnedTo(soleDemo)
+  process.env.XERO_ALLOWED_TENANT_NAMES = 'Demo Company (UK)'
+  process.env.XERO_BLOCKED_TENANT_IDS = LIVE.tenantId
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal((await getAccessToken())?.tenantId, soleDemo.tenantId)
+  assert.equal(activity.filter((e) => e.action === 'xero_tenant_guard_name_only').length, 0)
 })

@@ -17,7 +17,8 @@ import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clearXeroReferenceCache } from './api'
 import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from './scopes'
 import {
-  isXeroTenantAllowed, readXeroTenantAllowList, selectXeroTenant, storedTenantRefusalMessage,
+  isXeroTenantAllowed, nameOnlyGuardWarning, readXeroTenantAllowList, selectXeroTenant,
+  storedTenantRefusalMessage, type XeroTenantAllowList,
 } from './tenant-guard'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
@@ -175,6 +176,39 @@ async function logTenantRefusal(reason: string, message: string): Promise<void> 
 let allowListWarnedTenantId: string | null = null
 
 /**
+ * The same once-only discipline for the WEAK-GUARD warning (o3d-9tbz r2).
+ *
+ * A server restricted by organisation NAME alone has no identity anchor — Xero names are neither unique
+ * nor fixed — and that is worth saying, but it is a standing condition rather than an event, so saying it
+ * on every sync tick would bury the notifications that mean something.
+ */
+let nameOnlyWarnedTenantId: string | null = null
+
+/**
+ * Say once that a NAME-only tenant guard is weaker than it looks (o3d-9tbz r2).
+ *
+ * Not a refusal: refusing would switch off the only tenant control the e2e rig currently has, and a
+ * control nobody can use protects nothing. The warning names XERO_BLOCKED_TENANT_IDS, which is the one
+ * remedy that survives the Demo company's ~28-day tenantId rotation without any maintenance.
+ */
+async function warnNameOnlyGuard(allowList: XeroTenantAllowList, tenantId: string): Promise<void> {
+  if (!allowList.nameOnlyGuard || nameOnlyWarnedTenantId === tenantId) return
+  nameOnlyWarnedTenantId = tenantId
+  try {
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'sync',
+      action: 'xero_tenant_guard_name_only',
+      level: 'WARNING',
+      description: nameOnlyGuardWarning(allowList),
+      metadata: { connector: XERO_CONNECTOR, tenantId },
+    })
+  } catch {
+    // Best-effort only — a logging failure must not stop a sync that is otherwise permitted.
+  }
+}
+
+/**
  * The env allow-list, enforced against the STORED token rather than the callback (o3d-9tbz).
  *
  * The callback check alone would not have stopped the o3d-t74p incident past its first minute: the
@@ -187,6 +221,7 @@ async function storedTenantAllowed(token: StoredAccountingToken): Promise<boolea
   const summary = { tenantId: token.tenantId, tenantName: token.tenantName }
   if (isXeroTenantAllowed(summary, allowList)) {
     allowListWarnedTenantId = null
+    await warnNameOnlyGuard(allowList, token.tenantId)
     return true
   }
 
@@ -389,16 +424,15 @@ export async function exchangeCodeForTokens(
     const connections: XeroConnection[] = Array.isArray(connectionsBody) ? connectionsBody as XeroConnection[] : []
 
     const expectedTenantId = await getExpectedTenantId()
-    const choice = selectXeroTenant({
-      connections,
-      expectedTenantId,
-      allowList: readXeroTenantAllowList(),
-    })
+    const allowList = readXeroTenantAllowList()
+    const choice = selectXeroTenant({ connections, expectedTenantId, allowList })
     if (!choice.ok) {
       await logTenantRefusal(choice.reason, choice.error)
       return { success: false, error: choice.error }
     }
     const conn = choice.connection
+    // The moment the operator is actually watching, and the moment a name-only guard binds a ledger.
+    await warnNameOnlyGuard(allowList, conn.tenantId)
 
     const [organisationBaseCurrency, imsBaseCurrency] = await Promise.all([
       fetchOrganisationBaseCurrency(tokenData.access_token, conn.tenantId),

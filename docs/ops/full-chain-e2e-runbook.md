@@ -172,18 +172,35 @@ it will **not** restore stage on the new owner's behalf.
   is caught, not hidden. This trafficless store only delivers when WP-Cron is nudged (the
   harness does this); a single order commonly arrives as **two** `order.updated` deliveries.
 - Xero's **redirect URI** for the rig's app must be registered in the Xero developer portal.
-- **The rig's `.env` must pin the Demo org by allow-list** (o3d-9tbz):
-  `XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)` (or `XERO_ALLOWED_TENANT_IDS=<demo tenantId>`).
+- **The rig's `.env` must fence the live Xero organisation out by ID** (o3d-9tbz):
+
+  ```
+  XERO_BLOCKED_TENANT_IDS=<the LIVE organisation's tenantId>
+  XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)     # optional, and NOT sufficient on its own
+  ```
+
   The database pin (`xero_expected_tenant_id`) does not survive a rebuilt or restored database, and it
   was its absence that let this rig connect to the LIVE organisation and post 150 invoices into it
-  (o3d-t74p). With the allow-list set, a consent that offers the live org is refused with nothing
-  stored, and a restored production database is refused at every sync instead of at no point at all.
-  Prefer the NAME here: the Demo company is re-created with a **new tenantId** at every ~28-day reset,
-  so an id-based allow-list has to be updated each cycle while the name does not.
+  (o3d-t74p). Env is the only tenant control a database reset cannot erase: with it set, a consent that
+  offers the live org is refused with nothing stored, and a restored production database is refused at
+  every sync instead of at no point at all.
+
+  **Block the live id rather than allow-listing the Demo id.** The Demo company is re-created with a
+  **new tenantId** at every ~28-day reset, so `XERO_ALLOWED_TENANT_IDS=<demo tenantId>` has to be
+  re-edited every cycle — a control that annoying gets switched off, which protects nothing. The live
+  organisation's id never changes, so blocking it is both maintenance-free *and* identity-strength.
+
+  `XERO_ALLOWED_TENANT_NAMES` is a convenience that **narrows** the consent to Demo; it is **not** an
+  identity and must not be the rig's only tenant control. A Xero organisation name is neither unique nor
+  fixed — anyone administering an organisation can rename it — so a name-only guard is defeated by a
+  rename, and IMS logs `xero_tenant_guard_name_only` in the activity log while it stays that way.
 - The **Demo company resets ~every 28 days**, which drops the OAuth grant. After a reset:
-  re-consent the connection (Settings → Accounting → Xero → Connect) and re-run the **Demo
-  provisioner** so the accounts/currencies/bank accounts/VAT rates the specs expect exist
-  again (o3d-lgo.9).
+  1. **Disconnect Xero on `/sync`.** The database pin still names the *retired* Demo tenantId, so
+     reconnecting without this is refused with `pinned to Xero tenantId …, which this consent did not
+     include`. Disconnecting clears the pin; `XERO_BLOCKED_TENANT_IDS` needs no edit.
+  2. Re-consent the connection (Settings → Accounting → Xero → Connect).
+  3. Re-run the **Demo provisioner** so the accounts/currencies/bank accounts/VAT rates the specs
+     expect exist again (o3d-lgo.9).
 
 ## Rate budget
 

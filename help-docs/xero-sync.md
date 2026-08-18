@@ -44,20 +44,79 @@ So:
 ### The organisation allow-list (`XERO_ALLOWED_TENANT_IDS`)
 
 The pin above lives in the **database**. A fresh database has none — a new instance, a reset, a restored
-dump — which is precisely the state the incident happened in. Two environment variables give the same
+dump — which is precisely the state the incident happened in. Three environment variables give the same
 protection at a level a database reset cannot erase:
 
 ```
 XERO_ALLOWED_TENANT_IDS=5c949ed5-…,e7fb4378-…
+XERO_BLOCKED_TENANT_IDS=e7fb4378-…
 XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)
 ```
 
-- Comma-separated. The two lists are a **union**: an organisation is allowed if its id is in one *or* its
-  name is in the other. Names match case-insensitively and ignore extra spacing; an organisation whose
-  name contains a comma can only be listed by id.
 - **Blank or absent means no restriction.** The control is opt-in, so an empty line in `.env` cannot
   accidentally disable every Xero connection.
-- Changing either value needs an **IMS restart**.
+- Changing any of them needs an **IMS restart**.
+
+#### A tenant id is an identity. An organisation name is not.
+
+The three keys are deliberately **not** equivalent, and this is the most important thing on this page.
+
+A Xero **tenantId** is issued by Xero, is unique, and nobody in your organisation can change it. A Xero
+**organisation name** is a label: it is not unique — `Demo Company (UK)` is what Xero calls *every*
+demo company there is — and anyone administering an organisation can rename it from Xero's own settings
+screen at any time. A check that a rename can satisfy is not an identity check, and the whole point of
+this page is that a test rig once wrote 150 invoices into a live ledger.
+
+So the keys compose as a chain of **filters** over the organisations on the consent. Every key that is
+set can *remove* candidates; none of them can *add* one:
+
+| Key | What it is | What it does |
+|-----|-----------|--------------|
+| `XERO_BLOCKED_TENANT_IDS` | identity | Refused everywhere, checked first. |
+| `XERO_ALLOWED_TENANT_IDS` (and the deprecated `XERO_TENANT_ID`) | identity | The only key that **allows** an organisation. |
+| `XERO_ALLOWED_TENANT_NAMES` | **not** an identity | Only **narrows** what the ids already chose. |
+
+Consequences worth knowing before you configure this:
+
+- Ids and names are **not a union**. `XERO_ALLOWED_TENANT_IDS=5c949ed5-…` together with
+  `XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)` allows one organisation — the one that is *both*. An
+  organisation renamed to `Demo Company (UK)` does not get in on the strength of its new name.
+- A name that matches **two** organisations on one consent is **refused**, not used to choose between
+  them. It has just demonstrated, on that very consent, that it identifies neither.
+- Naming the same organisation two ways is **not** a contradiction. `XERO_TENANT_ID=5c949ed5-…` plus
+  that organisation's own name is one instruction spelled twice, and connects. Only an *empty
+  intersection* — each key selecting a different organisation out of the same consent — is refused as a
+  contradiction, and the message names what each key selected.
+- Names ignore extra spacing and case. An organisation whose name contains a comma cannot be expressed
+  in `XERO_ALLOWED_TENANT_NAMES` at all — use its id.
+- **Do not use a name as your only tenant control.** IMS records
+  `xero_tenant_guard_name_only` in the activity log when you do, because that configuration has no
+  anchor a rename cannot move.
+
+#### When the connected organisation's id keeps changing (`XERO_BLOCKED_TENANT_IDS`)
+
+Xero re-creates its **Demo company with a new tenantId** at every ~28-day reset, and any test
+organisation you rebuild behaves the same way. An id *allow*-list then has to be re-edited every cycle,
+which is exactly how a safety control ends up switched off.
+
+Block the **live** organisation instead. Its id is the stable one:
+
+```
+XERO_BLOCKED_TENANT_IDS=e7fb4378-…      # the live organisation, forever
+XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)   # optional, narrows the consent to Demo
+```
+
+This is identity-strength, needs no maintenance across rotations, and covers **both** paths: a consent
+that offers the live organisation cannot bind it, and a production database restored onto the rig with a
+live token in it is refused at every sync.
+
+After a reset the database pin still names the *retired* tenantId, so the first reconnect is refused
+with `this instance is pinned to Xero tenantId …, which this consent did not include`. **Disconnect Xero
+on `/sync` first** — that clears the pin — then connect again.
+
+Listing the same id on both `XERO_ALLOWED_TENANT_IDS` and `XERO_BLOCKED_TENANT_IDS` is refused as a
+contradiction rather than silently resolved: it is two deliberate instructions that cannot both be
+obeyed, and IMS will not pick one for you.
 
 What it does when set:
 
@@ -72,11 +131,14 @@ What it does when set:
 3. **Over the database pin** — the environment wins. A pin restored from another environment cannot
    smuggle its organisation past the allow-list.
 
-**Set it on every non-production instance** (e2e, staging, any restored copy) to the test organisation.
-Production may set it to the live organisation or leave it unset.
+**Set an id-based control on every non-production instance** (e2e, staging, any restored copy) — either
+`XERO_ALLOWED_TENANT_IDS` naming the test organisation, or `XERO_BLOCKED_TENANT_IDS` naming the live one.
+Production may set `XERO_ALLOWED_TENANT_IDS` to the live organisation or leave it unset.
 
 Refusals are recorded in the **Activity log** (`xero_connect_refused`, `xero_stored_tenant_refused`), so
-a refusal that happened while nobody was watching the browser is still discoverable.
+a refusal that happened while nobody was watching the browser is still discoverable. A name-only
+configuration is recorded there too, as `xero_tenant_guard_name_only` — once per connected organisation
+rather than once per sync — because it is permitted but weaker than it looks.
 
 #### If you already set `XERO_TENANT_ID`
 
@@ -100,10 +162,12 @@ XERO_TENANT_ID=5c949ed5-…
 XERO_ALLOWED_TENANT_IDS=5c949ed5-…
 ```
 
-Do not leave both in place with different values. Two tenant settings that disagree are refused
-outright — every Xero connection and every sync stops with a message naming both values — rather than
-IMS silently preferring one of two instructions you gave on purpose. Setting both to the *same* single
-organisation is fine, so you can migrate without a gap.
+Do not leave both `XERO_TENANT_ID` and `XERO_ALLOWED_TENANT_IDS` in place with different values. Two
+*identity* settings that disagree are refused outright — every Xero connection and every sync stops with
+a message naming both values — rather than IMS silently preferring one of two instructions you gave on
+purpose. Setting both to the *same* single organisation is fine, so you can migrate without a gap, and
+`XERO_TENANT_ID` alongside `XERO_ALLOWED_TENANT_NAMES` is fine too: a name narrows what the id chose
+rather than competing with it.
 
 **QuickBooks** does not have this control. It does not share the same defect — Intuit sends the company
 (`realmId`) in the callback itself, so there is no list to pick from and nothing is chosen silently —

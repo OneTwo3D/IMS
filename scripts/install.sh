@@ -671,10 +671,15 @@ XERO_TOKEN_PATH=${DATA_DIR}/xero/token.json
 # XERO_TENANT_ID is DEPRECATED and no longer written by the installer (o3d-9tbz). It is
 # still read, as a single-organisation form of XERO_ALLOWED_TENANT_IDS, so that existing
 # installs that set it are protected — new installs should use the allow-list below.
-# Allow-list of Xero organisations this instance may use (o3d-9tbz). Comma-separated,
-# ids and names unioned, blank = unrestricted. Set it on every non-production install:
-# it is the only tenant control that survives a database reset.
+# Which Xero organisations this instance may use (o3d-9tbz). Comma-separated, blank =
+# unrestricted. Set an ID-based control on every non-production install: it is the only
+# tenant control that survives a database reset. A tenantId is an identity; an
+# organisation NAME is not (Xero names are neither unique nor fixed), so
+# XERO_ALLOWED_TENANT_NAMES only NARROWS the ids and must not be the only control.
+# On a test rig, XERO_BLOCKED_TENANT_IDS=<the live org's id> is the one that needs no
+# maintenance when the test organisation is re-created with a new tenantId.
 # XERO_ALLOWED_TENANT_IDS=
+# XERO_BLOCKED_TENANT_IDS=
 # XERO_ALLOWED_TENANT_NAMES=
 
 CRON_SECRET=${CRON_SECRET}
