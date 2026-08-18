@@ -1,20 +1,45 @@
 /**
- * o3d-t74p / o3d-s36z — retire the LIVE-tenant Xero ids stranded in the e2e database.
+ * o3d-t74p / o3d-s36z — retire the stranded Xero external ids in the e2e database.
+ * (Named for the LIVE tenant it was built to target. That attribution turned out to be wrong —
+ * see the warning immediately below. The filename is kept so the PR/issue history still resolves.)
  *
- * The e2e instance posted 553 objects into the LIVE Xero organisation, then had its token
- * re-pointed at Demo Company (UK). The remote objects stayed; so did every id pointing at them.
- * The e2e database therefore holds 553 externalTransactionIds and 142 document back-references
- * that address objects in an organisation this instance is no longer connected to, and nothing
- * stamps a tenant onto those rows to say so (that is o3d-s36z).
+ * !!! READ THIS BEFORE RUNNING — THE ORIGINAL PREMISE WAS DISPROVED (2026-08-10) !!!
  *
- * Today they are inert only by luck: Xero ids are UUIDs, so a call 404s rather than hitting an
- * unrelated document. But both consumers key purely on the id being present —
- *   • repairXeroBackReferences selects `externalTransactionId: { not: null }`
- *     (lib/connectors/xero/sync-processor.ts:1623)
+ * This script was written on the belief that the 553 ids in the CSV address objects in the LIVE
+ * organisation. THEY DO NOT. The org-side audit (audit-xero-live-e2e-footprint.ts, run against
+ * One Two Enterprises Ltd dd2af957-3438-4010-8e85-7841c33c8328) resolved every one of them: all
+ * 553 return 404 and the overlap with the org's actual E2E footprint is 0 of 553. They are
+ * DEMO-tenant ids, from the periods the instance was pointed at Demo Company (UK).
+ *
+ * That inverts the argument for running this. The instance is connected to Demo RIGHT NOW, so
+ * these ids are not stranded pointers to an unreachable org — they are plausibly CURRENT and
+ * VALID references into the tenant the instance is actually using. Nulling them would not be
+ * retiring dead ids; it would be deleting live back-references, after which the sweep re-creates
+ * links and the pollers stop reconciling the documents they belong to.
+ *
+ * So this script is NOT the cleanup for o3d-t74p. The live-org cleanup is
+ * remove-xero-live-e2e-footprint.ts, indexed from the ORG (contact/item prefixes), because the
+ * sync log indexes the wrong tenant entirely. This file is kept for two reasons only: it is the
+ * evidence trail for how the id set was scoped, and it remains the tool to use IF a future
+ * decision is that e2e's Demo-tenant history should be dropped wholesale. Confirm which tenant
+ * the ids belong to before passing --apply, because the CSV name says "live" and it is wrong.
+ *
+ * o3d-s36z (nothing stamps a tenant onto these rows, so nothing can tell which org an id belongs
+ * to) is the underlying defect and is UNCHANGED — this incident is precisely its consequence.
+ *
+ * Both consumers key purely on the id being present, so clearing an id does remove the row from
+ * both paths by construction:
+ *   • the back-reference sweep selects `externalTransactionId: { not: null }`
+ *     (lib/domain/accounting/back-reference.ts:402 — moved out of sync-processor.ts and now shared
+ *     with QuickBooks; repairXeroBackReferences is a thin wrapper at sync-processor.ts:1650)
  *   • the payment pollers match documents by `accountingInvoiceId: { in: [...] }`
  *     (lib/connectors/xero/payment-poller.ts:101,177,248)
- * — so if e2e were ever reconnected to live, every one of these ids would be treated as current
- * again. Clearing them removes the rows from both paths by construction.
+ *
+ * NOTE the sweep has since grown per-row lifecycle columns on accounting_sync_logs
+ * (backReferenceCheckedAt, backReferenceFollowUpsPendingAt, backReferenceEvidenceCompactedAt).
+ * This script does not clear them. A row whose id is nulled while it still carries a pending
+ * follow-up obligation keeps that marker with nothing left to drive it — harmless in e2e, but it
+ * is why this must not be pointed at any database that matters.
  *
  * The ids are NOT lost: /root/xero-live-e2e-contamination-20260804.csv is the archive, and it is
  * the only remaining link for the 106 sales-invoice rows whose local order no longer exists.

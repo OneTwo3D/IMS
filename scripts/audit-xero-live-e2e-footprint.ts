@@ -35,8 +35,14 @@ const OUT_PATH = arg('out', `./xero-live-e2e-footprint-${new Date().toISOString(
 const CSV_PATH = arg('csv', '/root/xero-live-e2e-contamination-20260804.csv')!
 const MAX_CALLS = Number(arg('max-calls', '400'))
 
-/** The e2e fixtures stamp every contact and SKU with these. They are the only durable handle. */
-const CONTACT_PREFIX = 'E2E'
+/**
+ * The e2e fixtures stamp every contact and SKU with these. They are the only durable handle.
+ * The trailing space on the contact prefix is deliberate and must match
+ * remove-xero-live-e2e-footprint.ts exactly: this script produces the worklist that one executes,
+ * so a wider handle here would put genuine business contacts in front of an irreversible void.
+ * All 111 contacts in the footprint are "E2E E2E-FC-<id>", so the space costs nothing.
+ */
+const CONTACT_PREFIX = 'E2E '
 const ITEM_PREFIX = 'E2E-'
 const WINDOW_FROM = '2026-07-15'
 const WINDOW_TO = '2026-07-27'

@@ -3,8 +3,15 @@
  *
  * This is the ONLY script in this set that writes. Everything it touches is selected by the
  * fixtures' own marks — the `E2E ` contact-name prefix and the `E2E-` item-code prefix — and every
- * object is RE-FETCHED and RE-CHECKED against those marks immediately before it is mutated. A
- * worklist row is never trusted on its own: the check is against what Xero says right now.
+ * object is re-checked against those marks immediately before it is mutated.
+ *
+ * WHAT THAT CHECK IS AND IS NOT. The mark is re-read from THIS RUN'S OWN FETCH, not from a stored
+ * worklist file, so a stale CSV can never drive a write. It is NOT a per-object re-fetch: the
+ * invoice and credit-note lists are read once at the start of the run and every step iterates that
+ * snapshot. A document that changed in Xero after the snapshot — voided by hand, re-contacted,
+ * paid — is therefore acted on as it looked at fetch time. The window is minutes and the failure
+ * mode is a rejected write rather than a wrong one (Xero refuses an invalid transition), which is
+ * why this is acceptable here; do not read it as a live re-validation, because it is not one.
  *
  * WHAT "DELETE" CAN AND CANNOT MEAN HERE
  * --------------------------------------
@@ -57,7 +64,13 @@ const WRITE_SCOPES = [
   'accounting.settings',
 ].join(' ')
 
-const CONTACT_PREFIX = 'E2E'
+/**
+ * The trailing space is load-bearing. Every one of the 111 contacts in the footprint is
+ * "E2E E2E-FC-<id>", so requiring it loses nothing — while bare "E2E" would also match a genuine
+ * business contact such as "E2ENetworks Ltd" and sweep it into a void that CANNOT BE UNDONE.
+ * On an irreversible write against a real ledger the narrower handle is the only defensible one.
+ */
+const CONTACT_PREFIX = 'E2E '
 const ITEM_PREFIX = 'E2E-'
 /** The organisation this cleanup is for. A different tenant is a hard stop, never a prompt. */
 const EXPECTED_TENANT_ID = 'dd2af957-3438-4010-8e85-7841c33c8328'
