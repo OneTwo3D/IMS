@@ -1051,12 +1051,35 @@ test('the restore holds the lock in a SESSION THE DUMP CANNOT REACH, and with no
   const src = raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
 
   assert.ok(
-    /createRestoreSelectionLockHolder[\s\S]{0,1200}pg_try_advisory_lock/.test(src),
+    /createRestoreSelectionLockHolder[\s\S]{0,2000}pg_try_advisory_lock/.test(src),
     'the holder takes a SESSION advisory lock on a connection of its own',
   )
   assert.ok(
     src.includes('pg_advisory_unlock'),
     'and releases it explicitly, rather than relying on a transaction ending',
+  )
+
+  // ROUND 10, FINDING 2. The release is now CONDITIONAL: a restore whose backend could not be
+  // confirmed gone must keep the lock rather than hand it to a writer while the replay may still be
+  // running. Asserted here because this file owns the question "can this lock lapse while external
+  // SQL is still executing", which is the same question rounds 7, 8 and 9 each answered wrongly.
+  assert.ok(
+    /retainLock/.test(src),
+    'the work can tell the holder to KEEP the lock',
+  )
+  assert.ok(
+    /if \(retained !== null\)[\s\S]{0,400}else \{[\s\S]{0,400}pg_advisory_unlock/.test(src),
+    'and the unlock is inside the ELSE of that decision — a retained lock is not released, and the '
+      + 'session is not ended either, since ending it releases the lock as a side effect',
+  )
+  assert.ok(
+    /pg_terminate_backend\(pid\) AS terminated/.test(src),
+    'termination SELECTS pg_terminate_backend\'s boolean rather than counting rows: a signal that '
+      + 'returned false used to be reported as a terminated backend',
+  )
+  assert.ok(
+    /confirmed: true[\s\S]{0,200}rows\.length === 0|listed\.rows\.length === 0[\s\S]{0,120}confirmed: true/.test(src),
+    'and "confirmed" means the catalogue no longer lists the backend, not that a signal was sent',
   )
   assert.ok(
     !src.includes('pg_advisory_xact_lock'),

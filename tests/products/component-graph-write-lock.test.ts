@@ -124,7 +124,10 @@ async function componentWriteBody(file: string, anchor: string): Promise<string>
   const source = await readFile(file, 'utf8')
   const at = source.indexOf(anchor)
   assert.notEqual(at, -1, `${path.basename(file)} must still contain ${anchor}`)
-  return source.slice(at, at + 2200)
+  // Widened as the body grew (o3d-4kfh r4 added the in-flight sales guard). The window has to
+  // reach the createMany, or the "all present" assertion below silently degrades into a claim
+  // about a truncated slice.
+  return source.slice(at, at + 3600)
 }
 
 test('saveProductComponents writes atomically, under the graph lock (o3d-t0zq)', async () => {

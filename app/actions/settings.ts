@@ -69,6 +69,12 @@ export type ReasonFormState = {
   message?: string
   success?: boolean
   item?: AdjustmentReason
+  /**
+   * COMMITTED, but a step after the commit did not complete (o3d-osl8 round 10, finding 3). Additive
+   * so no screen has to change to stop reporting a stored value as unsaved; a screen with somewhere
+   * to put it can render it.
+   */
+  warning?: string
 }
 
 export type ReasonInput = {
@@ -92,10 +98,17 @@ export async function createAdjustmentReason(
       data: { name, accountCode: accountCode || null, sortOrder, active },
       select: { id: true, name: true, accountCode: true, sortOrder: true, active: true },
     })
-    await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created adjustment reason: ${name}` })
-    revalidatePath('/settings', 'layout')
+    // EVERYTHING BELOW IS POST-COMMIT (o3d-osl8 round 10, finding 3). The row is durable; the audit
+    // entry and the cache revalidation are not part of that write, and either of them throwing used
+    // to land in the catch below and report "Failed to create reason." over a reason that exists.
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created adjustment reason: ${name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the new adjustment reason')
+    if (postCommit.status === 'failed') return { success: true, item, warning: postCommit.error }
     return { success: true, item }
-  } catch {
+  } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create adjustment reason: ${name}` })
     return { message: 'Failed to create reason.' }
   }
@@ -117,23 +130,32 @@ export async function updateAdjustmentReason(
       data: { name, accountCode: accountCode || null, sortOrder, active },
       select: { id: true, name: true, accountCode: true, sortOrder: true, active: true },
     })
-    await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'updated', description: `Updated adjustment reason: ${name}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'updated', description: `Updated adjustment reason: ${name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the adjustment reason change')
+    if (postCommit.status === 'failed') return { success: true, item, warning: postCommit.error }
     return { success: true, item }
-  } catch {
+  } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update adjustment reason: ${name}` })
     return { message: 'Failed to update reason.' }
   }
 }
 
-export async function deleteAdjustmentReason(id: string): Promise<{ error?: string }> {
+export async function deleteAdjustmentReason(id: string): Promise<{ error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     await db.adjustmentReason.delete({ where: { id } })
-    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted adjustment reason' })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted adjustment reason' })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the adjustment reason deletion')
+    // The row is GONE. Reporting an error here would invite a retry of a delete that succeeded.
+    if (postCommit.status === 'failed') return { warning: postCommit.error }
     return {}
-  } catch {
+  } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete adjustment reason' })
     return { error: 'Failed to delete reason.' }
   }
@@ -249,7 +271,7 @@ export async function createTaxRate(input: {
   reverseCharge?: boolean
   reportingCategory?: string | null
   components?: TaxRateComponentInput[]
-}): Promise<{ success: boolean; error?: string }> {
+}): Promise<{ success: boolean; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     // o3d-r30: same write-time TaxType validation as updateTaxRate — createTaxRate is also a
@@ -298,22 +320,34 @@ export async function createTaxRate(input: {
         },
       },
     })
-    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
-    await maybeQueueTaxRateSync({
-      id: created.id,
-      name: created.name,
-      accountingTaxType: created.accountingTaxType,
-      components: created.components.map((component) => ({
-        name: component.name,
-        rate: Number(component.rate),
-        compoundOnPrevious: component.compoundOnPrevious,
-        accountingTaxType: component.accountingTaxType,
-        active: component.active,
-      })),
-    })
-    revalidatePath('/settings', 'layout')
+    // EVERYTHING BELOW IS POST-COMMIT (o3d-osl8 round 10, finding 3 — the SECOND site of this shape,
+    // and the one the round-9 structural test could not see, because it recognised a commit by two
+    // hand-listed call spellings and this one commits through a bare Prisma create).
+    // `maybeQueueTaxRateSync` reaches the accounting connector, so it is the most likely of the
+    // three to fail — and its failure used to report `success: false` over a rate that EXISTS,
+    // inviting the operator to create it a second time.
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
+      await maybeQueueTaxRateSync({
+        id: created.id,
+        name: created.name,
+        accountingTaxType: created.accountingTaxType,
+        components: created.components.map((component) => ({
+          name: component.name,
+          rate: Number(component.rate),
+          compoundOnPrevious: component.compoundOnPrevious,
+          accountingTaxType: component.accountingTaxType,
+          active: component.active,
+        })),
+      })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to complete follow-up work after the tax rate was created')
+    if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
     return { success: true }
   } catch (e) {
+    // FIRST: the guard above deliberately RETHROWS Next's control-flow exceptions, and this catch
+    // would otherwise swallow the redirect it took care to preserve.
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create tax rate: ${input.name}` })
     return { success: false, error: String(e) }
   }
@@ -472,6 +506,7 @@ export async function autoLinkXeroTaxRates(): Promise<{
   unmatched: string[]
   xeroRatesCount: number
   error?: string
+  warning?: string
 }> {
   await requirePermission('settings.company')
   try {
@@ -505,22 +540,28 @@ export async function autoLinkXeroTaxRates(): Promise<{
       linked++
     }
 
-    await logActivity({
-      entityType: 'SETTING',
-      tag: 'settings',
-      action: 'xero_tax_rates_linked',
-      description: `Auto-linked ${linked} IMS tax rate(s) to Xero tax types (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
-      metadata: { linked, alreadyLinked, unmatched, xeroRatesCount: result.taxRates.length },
-    })
-    revalidatePath('/settings/accounting')
+    // POST-COMMIT. The mappings are already written, one row at a time — reporting `success: false`
+    // here would claim NONE of them landed, and the screen's recovery is to run the link again.
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'xero_tax_rates_linked',
+        description: `Auto-linked ${linked} IMS tax rate(s) to Xero tax types (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
+        metadata: { linked, alreadyLinked, unmatched, xeroRatesCount: result.taxRates.length },
+      })
+      revalidatePath('/settings/accounting')
+    }, 'Failed to record the auto-link')
     return {
       success: true,
       linked,
       alreadyLinked,
       unmatched,
       xeroRatesCount: result.taxRates.length,
+      ...(postCommit.status === 'failed' ? { warning: postCommit.error } : {}),
     }
   } catch (e) {
+    unstable_rethrow(e)
     return { success: false, linked: 0, alreadyLinked: 0, unmatched: [], xeroRatesCount: 0, error: String(e) }
   }
 }
@@ -532,6 +573,7 @@ export async function autoLinkQuickBooksTaxRates(): Promise<{
   unmatched: string[]
   quickBooksRatesCount: number
   error?: string
+  warning?: string
 }> {
   await requirePermission('settings.company')
   try {
@@ -562,22 +604,26 @@ export async function autoLinkQuickBooksTaxRates(): Promise<{
       linked++
     }
 
-    await logActivity({
-      entityType: 'SETTING',
-      tag: 'settings',
-      action: 'quickbooks_tax_rates_linked',
-      description: `Auto-linked ${linked} IMS tax rate(s) to QuickBooks tax codes (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
-      metadata: { linked, alreadyLinked, unmatched, quickBooksRatesCount: qboRates.length },
-    })
-    revalidatePath('/settings/accounting')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'quickbooks_tax_rates_linked',
+        description: `Auto-linked ${linked} IMS tax rate(s) to QuickBooks tax codes (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
+        metadata: { linked, alreadyLinked, unmatched, quickBooksRatesCount: qboRates.length },
+      })
+      revalidatePath('/settings/accounting')
+    }, 'Failed to record the auto-link')
     return {
       success: true,
       linked,
       alreadyLinked,
       unmatched,
       quickBooksRatesCount: qboRates.length,
+      ...(postCommit.status === 'failed' ? { warning: postCommit.error } : {}),
     }
   } catch (e) {
+    unstable_rethrow(e)
     return { success: false, linked: 0, alreadyLinked: 0, unmatched: [], quickBooksRatesCount: 0, error: String(e) }
   }
 }
@@ -714,16 +760,28 @@ export async function generateMissingXeroTaxRates(
       }
     }
 
-    await logActivity({
-      entityType: 'SETTING',
-      tag: 'settings',
-      action: 'xero_tax_rates_generated',
-      description: `Generated ${created} tax rate(s) in Xero and mapped them (${failed.length} failed)`,
-      metadata: { created, failed, requested: taxRateIds.length },
-    })
-    revalidatePath('/settings/accounting')
-    return { success: true, created, failed, externalRatesCount: result.taxRates.length, supported: true }
+    // POST-COMMIT, and the stakes are higher here than anywhere else in this file: the rates have
+    // been created IN XERO and mapped locally. `success: false` would say none of that happened.
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'xero_tax_rates_generated',
+        description: `Generated ${created} tax rate(s) in Xero and mapped them (${failed.length} failed)`,
+        metadata: { created, failed, requested: taxRateIds.length },
+      })
+      revalidatePath('/settings/accounting')
+    }, 'Failed to record the generated tax rates')
+    return {
+      success: true,
+      created,
+      failed,
+      externalRatesCount: result.taxRates.length,
+      supported: true,
+      ...(postCommit.status === 'failed' ? { warning: postCommit.error } : {}),
+    }
   } catch (e) {
+    unstable_rethrow(e)
     return { success: false, created: 0, failed: [], externalRatesCount: 0, supported: true, error: String(e) }
   }
 }
@@ -1061,7 +1119,7 @@ export async function createPurchaseUnit(input: {
   abbreviation: string
   conversionFactor: number
   stockUnitName: string
-}): Promise<{ success: boolean; error?: string }> {
+}): Promise<{ success: boolean; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     if (!input.name.trim()) return { success: false, error: 'Name is required' }
@@ -1075,10 +1133,14 @@ export async function createPurchaseUnit(input: {
         stockUnitName: input.stockUnitName || 'pcs',
       },
     })
-    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created purchase unit: ${input.name}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created purchase unit: ${input.name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the new purchase unit')
+    if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
     return { success: true }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create purchase unit: ${input.name}` })
     return { success: false, error: String(e) }
   }
@@ -1104,7 +1166,7 @@ export async function updatePurchaseUnit(id: string, input: {
   conversionFactor?: number
   stockUnitName?: string
   active?: boolean
-}): Promise<{ success: boolean; error?: string }> {
+}): Promise<{ success: boolean; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     await db.purchaseUnit.update({
@@ -1117,10 +1179,14 @@ export async function updatePurchaseUnit(id: string, input: {
         ...(input.active !== undefined && { active: input.active }),
       },
     })
-    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated purchase unit: ${input.name ?? id}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated purchase unit: ${input.name ?? id}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the purchase unit change')
+    if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
     return { success: true }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update purchase unit: ${input.name ?? id}` })
     return { success: false, error: String(e) }
   }
@@ -1201,7 +1267,7 @@ export type WarehouseInput = z.infer<typeof warehouseSchema>
 
 export async function createWarehouse(
   input: WarehouseInput
-): Promise<{ success: boolean; item?: WarehouseRow; error?: string }> {
+): Promise<{ success: boolean; item?: WarehouseRow; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   const parsed = warehouseSchema.safeParse(input)
   if (!parsed.success) {
@@ -1246,10 +1312,14 @@ export async function createWarehouse(
       },
       select: warehouseFields,
     })
-    await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created warehouse: ${data.code} — ${data.name}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created warehouse: ${data.code} — ${data.name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the new warehouse')
+    if (postCommit.status === 'failed') return { success: true, item, warning: postCommit.error }
     return { success: true, item }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create warehouse: ${data.code}` })
     return { success: false, error: String(e) }
   }
@@ -1258,7 +1328,7 @@ export async function createWarehouse(
 export async function updateWarehouse(
   id: string,
   input: WarehouseInput
-): Promise<{ success: boolean; item?: WarehouseRow; error?: string }> {
+): Promise<{ success: boolean; item?: WarehouseRow; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   const parsed = warehouseSchema.safeParse(input)
   if (!parsed.success) {
@@ -1304,10 +1374,14 @@ export async function updateWarehouse(
       },
       select: warehouseFields,
     })
-    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated warehouse: ${data.code} — ${data.name}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated warehouse: ${data.code} — ${data.name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the warehouse change')
+    if (postCommit.status === 'failed') return { success: true, item, warning: postCommit.error }
     return { success: true, item }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update warehouse: ${data.code}` })
     return { success: false, error: String(e) }
   }
@@ -1315,7 +1389,7 @@ export async function updateWarehouse(
 
 export async function deleteWarehouse(
   id: string
-): Promise<{ success: boolean; deactivated?: boolean; error?: string }> {
+): Promise<{ success: boolean; deactivated?: boolean; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     // Check for references that prevent hard delete
@@ -1332,16 +1406,27 @@ export async function deleteWarehouse(
     if (hasData) {
       // Deactivate instead of delete
       await db.warehouse.update({ where: { id }, data: { active: false } })
-      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: 'Deactivated warehouse (has associated data)' })
-      revalidatePath('/settings', 'layout')
+      // BOTH branches commit, so both have a post-commit tail. A rule that only looked after the
+      // LAST commit in a function would have seen the delete branch and missed this one.
+      const deactivatedPostCommit = await runPostCommit(async () => {
+        await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: 'Deactivated warehouse (has associated data)' })
+        revalidatePath('/settings', 'layout')
+      }, 'Failed to record the warehouse deactivation')
+      if (deactivatedPostCommit.status === 'failed') {
+        return { success: true, deactivated: true, warning: deactivatedPostCommit.error }
+      }
       return { success: true, deactivated: true }
     }
 
     await db.warehouse.delete({ where: { id } })
-    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted warehouse' })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted warehouse' })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the warehouse deletion')
+    if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
     return { success: true }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete warehouse' })
     return { success: false, error: String(e) }
   }

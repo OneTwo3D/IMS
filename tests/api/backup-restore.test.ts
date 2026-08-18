@@ -1319,6 +1319,56 @@ test('failed production upload restore redacts database password, disables maint
   }
 })
 
+test('an unconfirmed restore backend leaves MAINTENANCE MODE ON as well as the lock held', async () => {
+  // ROUND 10, FINDING 2, second half. Switching maintenance mode back off is the same shape of
+  // mistake as releasing the lock, one layer up: it readmits every writer in the application on the
+  // strength of an assumption that the restore has stopped. When the backend could not be confirmed
+  // gone, the honest state is "still down".
+  const { RestoreBackendNotConfirmedError } = await import('../../app/api/backup/restore/route.ts')
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-unconfirmed-test-'))
+  try {
+    const form = new FormData()
+    form.set('confirmationPhrase', 'RESTORE')
+    form.set('restoreToken', 'ABCDEF12')
+    form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+    appendUploadManifest(form)
+
+    const { deps, calls, activityLogs } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+        ALLOW_DATABASE_RESTORE_UPLOAD: 'true',
+      },
+      runRestoreFile: async () => {
+        calls.runRestore += 1
+        throw new RestoreBackendNotConfirmedError(
+          'Restore timed out and its database backend could NOT be confirmed gone. The '
+          + 'connector-selection lock is being HELD, not released. Maintenance mode stays ON.',
+        )
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: { origin: 'https://ims.example.test', 'x-real-ip': '203.0.113.25', 'content-length': '100' },
+      body: form,
+    }))
+
+    assert.equal(response.status, 500)
+    assert.equal(calls.enableMaintenance, 1)
+    assert.equal(calls.disableMaintenance, 0, 'THE ASSERTION. The gate stays on while the database may still be being written.')
+
+    const failureLog = activityLogs.find((entry) => entry.action === 'backup_restored' && entry.level === 'ERROR')
+    assert.ok(failureLog, 'the failure is still audited')
+    assert.equal((failureLog.metadata as { maintenanceModeHeld?: unknown }).maintenanceModeHeld, true)
+    assert.equal((failureLog.metadata as { backendUnconfirmed?: unknown }).backendUnconfirmed, true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('maintenance-start failure still runs disable-maintenance cleanup and removes the temporary file', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-maintenance-failure-test-'))
   try {
@@ -1423,21 +1473,86 @@ type RestoreRun = {
   env: Record<string, string | undefined>
   /** The rejection, if `runRestore` rejected. Captured rather than thrown so the ORDER stays observable. */
   error?: Error
+  /** Reasons the holder was told to KEEP the lock. Empty on every healthy path. */
+  retainedReasons: string[]
+  /** Whether the modelled backend was still in `pg_stat_activity` when the run finished. */
+  backendStillListed: boolean
+  /** Every statement the holder's session issued. */
+  lockQueries: Array<{ text: string; values?: unknown[] }>
 }
 
 /**
- * Drive `runRestore` with a fake psql AND a fake lock holder, recording the order of both.
+ * A DATABASE BACKEND WITH A LIFETIME OF ITS OWN (o3d-osl8 round 10, finding 2).
  *
- * The holder double is the important half. A double that merely *ran* the work could not
- * distinguish "the lock is held for the whole restore" from "the lock was taken at some point",
- * which is the difference findings 2 and 3 are about — so it records entry and exit around the work
- * it wraps, and the work itself records when psql was spawned and when psql exited.
+ * The round-9 double answered `terminateRestoreBackends` with the number 1 — which is to say it
+ * modelled termination as a value returned by a function call, and could therefore only ever
+ * confirm the design it was written for. The whole of finding 2 is that a backend does NOT die when
+ * `pg_terminate_backend` returns: the signal is delivered, the backend keeps executing the current
+ * statement, and the catalogue keeps listing it. A double that cannot represent that gap cannot
+ * observe the bug.
+ *
+ * This one is a state machine:
+ *   • `signalsToExit` — how many signals before `pg_stat_activity` stops listing it. `Infinity` is a
+ *     backend that outlives every signal, which is the case that must NOT release the lock.
+ *   • `refuseSignal` — `pg_terminate_backend` returns FALSE (no permission, wrong pid kind). The
+ *     row still comes back, which is exactly how "1 backend terminated" used to be reported.
+ * It also records `end()`, so a session that was deliberately kept open is distinguishable from one
+ * that was closed — the difference between the lock being held and the lock being gone.
+ */
+type BackendModel = { signalsToExit: number; refuseSignal?: boolean }
+
+function fakeRestoreDatabase(events: string[], backend: BackendModel | null) {
+  let live: BackendModel | null = backend ? { ...backend } : null
+  const queries: Array<{ text: string; values?: unknown[] }> = []
+  return {
+    queries,
+    get backendStillListed() { return live !== null },
+    client: {
+      async connect() { events.push('lock-connect') },
+      async query(text: string, values?: unknown[]) {
+        queries.push({ text, values })
+        if (text.includes('pg_try_advisory_lock')) { events.push('lock-acquired'); return { rows: [{ locked: true }] } }
+        if (text.includes('pg_advisory_unlock')) { events.push('lock-released'); return { rows: [{}] } }
+        if (text.includes('pg_terminate_backend')) {
+          events.push(`terminate-backends(${String(values?.[0])})`)
+          if (live === null) return { rows: [] }
+          const terminated = live.refuseSignal !== true
+          if (terminated) {
+            live.signalsToExit -= 1
+            if (live.signalsToExit <= 0) live = null
+          }
+          // The rows are what the catalogue listed AT SIGNAL TIME — a backend that is still there
+          // when it is signalled comes back in the result whether or not it then dies.
+          return { rows: [{ pid: 4242, terminated }] }
+        }
+        return { rows: [] }
+      },
+      async end() { events.push('lock-session-ended') },
+    },
+  }
+}
+
+/**
+ * Drive `runRestore` with a fake psql AND THE REAL LOCK HOLDER over a fake database.
+ *
+ * The holder is no longer stubbed. A stub could only assert that the work ran between two events it
+ * pushed itself; the real holder over `fakeRestoreDatabase` exercises the acquisition query, the
+ * termination-and-confirmation poll, and the `finally` that decides whether to unlock — which is
+ * where finding 2 lives. The events below therefore come from the production code path.
  */
 async function captureRestore(
   sqlBody: string,
-  options: { autoExit?: boolean; exitCode?: number; psqlTimeoutMs?: number; killGraceMs?: number } = {},
+  options: {
+    autoExit?: boolean
+    exitCode?: number
+    psqlTimeoutMs?: number
+    killGraceMs?: number
+    /** The server-side half. Defaults to one backend that goes away on its first signal. */
+    backend?: BackendModel | null
+    backendExitConfirmMs?: number
+  } = {},
 ): Promise<RestoreRun> {
-  const { runRestore } = await import('../../app/api/backup/restore/route.ts')
+  const { runRestore, createRestoreSelectionLockHolder } = await import('../../app/api/backup/restore/route.ts')
 
   const dir = await mkdtemp(path.join(os.tmpdir(), 'restore-stdin-'))
   const file = path.join(dir, 'backup.sql')
@@ -1467,6 +1582,17 @@ async function captureRestore(
     })
   }
 
+  const database = fakeRestoreDatabase(events, options.backend === undefined ? { signalsToExit: 1 } : options.backend)
+  let clock = 0
+  const retainedReasons: string[] = []
+  const holder = createRestoreSelectionLockHolder({
+    createClient: () => database.client,
+    now: () => clock,
+    delay: async (ms: number) => { clock += ms },
+    backendExitConfirmMs: options.backendExitConfirmMs ?? 1_000,
+    onLockRetained: (reason: string) => { events.push('lock-RETAINED'); retainedReasons.push(reason) },
+  })
+
   let error: Error | undefined
   try {
     await runRestore(
@@ -1476,19 +1602,7 @@ async function captureRestore(
         psqlTimeoutMs: options.psqlTimeoutMs,
         killGraceMs: options.killGraceMs,
         applicationName: 'ims_restore_test',
-        withSelectionLock: async (work) => {
-          events.push('lock-acquired')
-          try {
-            return await work({
-              terminateRestoreBackends: async (name: string) => {
-                events.push(`terminate-backends(${name})`)
-                return 1
-              },
-            })
-          } finally {
-            events.push('lock-released')
-          }
-        },
+        withSelectionLock: holder,
         spawnProcess: ((_command: string, spawnArgs: string[], spawnOptions: { env: Record<string, string | undefined> }) => {
           events.push('psql-spawned')
           args = spawnArgs
@@ -1503,7 +1617,16 @@ async function captureRestore(
     await rm(dir, { recursive: true, force: true })
   }
 
-  return { events, written: chunks.join(''), args, env, error }
+  return {
+    events,
+    written: chunks.join(''),
+    args,
+    env,
+    error,
+    retainedReasons,
+    backendStillListed: database.backendStillListed,
+    lockQueries: database.queries,
+  }
 }
 
 test('the selection lock is held, by a session of its own, for the WHOLE restore', async () => {
@@ -1512,7 +1635,7 @@ test('the selection lock is held, by a session of its own, for the WHOLE restore
 
   assert.deepEqual(
     events,
-    ['lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released'],
+    ['lock-connect', 'lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released', 'lock-session-ended'],
     'acquired before psql is even spawned, released only after it has exited',
   )
   // THE ROUND-8 ASSERTION. The dump reaches psql UNCHANGED and nothing precedes it: the lock is not
@@ -1557,7 +1680,13 @@ test('a dump that COMMITS mid-stream is REFUSED, before anything is spawned or l
         file,
         { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
         {
-          withSelectionLock: async (work) => { locked += 1; return work({ terminateRestoreBackends: async () => 0 }) },
+          withSelectionLock: async (work) => {
+            locked += 1
+            return work({
+              terminateAndConfirmRestoreBackends: async () => ({ confirmed: true, found: 0, remaining: 0 }),
+              retainLock: () => { throw new Error('the lock must not be retained on this path') },
+            })
+          },
           spawnProcess: ((() => { spawned += 1; throw new Error('must not spawn') })) as never,
         },
       ),
@@ -1713,14 +1842,97 @@ test('a psql that overruns its ceiling is killed AND its backend terminated befo
   assert.deepEqual(
     run.events,
     [
+      'lock-connect',
       'lock-acquired',
       'psql-spawned',
       'psql-killed(SIGKILL)',
       'terminate-backends(ims_restore_test)',
+      // ROUND 10: the SECOND read is the confirmation. The first one only proves a signal was sent,
+      // and the round-9 code released the lock on the strength of that alone.
+      'terminate-backends(ims_restore_test)',
       'lock-released',
+      'lock-session-ended',
     ],
-    'SIGKILL, then the backend terminated from the holder session, and only THEN the lock released',
+    'SIGKILL, then the backend signalled AND confirmed gone from the holder session, and only THEN '
+      + 'the lock released',
   )
+  assert.equal(run.backendStillListed, false, 'the catalogue no longer lists it — that is what "terminated" means here')
+  assert.deepEqual(run.retainedReasons, [], 'a confirmed exit releases the lock normally')
+})
+
+test('a backend that OUTLIVES its signal keeps the lock held rather than releasing on an assumption', async () => {
+  // ROUND 10, FINDING 2. `pg_terminate_backend` sends SIGTERM and returns; the backend dies when it
+  // next reaches an interrupt point, which for the long DDL statement a restore times out on is
+  // exactly the case. Round 9 discarded the boolean, counted the ROWS, and rejected — so the
+  // holder's `finally` released the connector-selection lock while a restore backend was still
+  // replaying over the same `settings` rows a connector-selection change reads. That is the state
+  // the lock exists to prevent, and it looked protected.
+  const run = await captureRestore('SELECT 1;\n', {
+    autoExit: false,
+    psqlTimeoutMs: 5,
+    killGraceMs: 1_000,
+    backend: { signalsToExit: Number.POSITIVE_INFINITY },
+    backendExitConfirmMs: 1_000,
+  })
+
+  assert.equal(run.error?.name, 'RestoreBackendNotConfirmedError', 'the failure is TYPED — the caller has to treat it differently')
+  assert.match(run.error?.message ?? '', /could NOT be confirmed gone/)
+  assert.match(run.error?.message ?? '', /lock is being HELD/)
+  assert.match(run.error?.message ?? '', /Maintenance mode stays ON/)
+
+  assert.equal(run.backendStillListed, true, 'the double models what the fix is about: the backend is still there')
+  assert.ok(!run.events.includes('lock-released'), 'THE ASSERTION. The lock was never released.')
+  assert.ok(
+    !run.events.includes('lock-session-ended'),
+    'and the session was not closed either — ending it would release the advisory lock as a side effect',
+  )
+  assert.equal(run.events.at(-1), 'lock-RETAINED', 'the holder was told to keep it, loudly')
+  assert.equal(run.retainedReasons.length, 1)
+  assert.ok(
+    run.events.filter((e) => e.startsWith('terminate-backends')).length > 1,
+    'it polled rather than accepting the first answer',
+  )
+})
+
+test('pg_terminate_backend returning FALSE is not a termination', async () => {
+  // The other half of finding 2: the round-9 query discarded the boolean and returned `rows.length`,
+  // so a signal that was REFUSED — no permission, or a pid that is not a backend — came back as
+  // "1 backend terminated" and released the lock.
+  const run = await captureRestore('SELECT 1;\n', {
+    autoExit: false,
+    psqlTimeoutMs: 5,
+    killGraceMs: 1_000,
+    backend: { signalsToExit: 1, refuseSignal: true },
+    backendExitConfirmMs: 1_000,
+  })
+
+  assert.equal(run.error?.name, 'RestoreBackendNotConfirmedError')
+  assert.match(run.error?.message ?? '', /refused the signal/)
+  assert.ok(!run.events.includes('lock-released'), 'a refused signal releases nothing')
+  assert.equal(run.backendStillListed, true)
+  assert.ok(
+    run.lockQueries.some((q) => /pg_terminate_backend\(pid\) AS terminated/.test(q.text)),
+    'the boolean is SELECTED rather than discarded, which is what makes the refusal visible at all',
+  )
+})
+
+test('a backend that needs several signals is waited for, and the lock outlives the wait', async () => {
+  // Confirmation is a poll, so the slow-but-eventually-dead case must end in a normal release —
+  // otherwise the fix would trade a silent corruption for a permanently wedged application.
+  const run = await captureRestore('SELECT 1;\n', {
+    autoExit: false,
+    psqlTimeoutMs: 5,
+    killGraceMs: 1_000,
+    backend: { signalsToExit: 3 },
+    backendExitConfirmMs: 10_000,
+  })
+
+  assert.match(run.error?.message ?? '', /Restore timed out \(terminated 1 database backend\)/)
+  assert.equal(run.events.filter((e) => e.startsWith('terminate-backends')).length, 4, 'three signals, then the read that finds nothing')
+  assert.deepEqual(run.retainedReasons, [])
+  assert.equal(run.events.at(-2), 'lock-released')
+  assert.equal(run.events.at(-1), 'lock-session-ended')
+  assert.equal(run.backendStillListed, false)
 })
 
 test('the timeout path waits for psql to actually exit before terminating and releasing', async () => {
@@ -1756,7 +1968,11 @@ test('the timeout path waits for psql to actually exit before terminating and re
             events.push('lock-acquired')
             try {
               return await work({
-                terminateRestoreBackends: async (name: string) => { events.push(`terminate(${name})`); return 0 },
+                terminateAndConfirmRestoreBackends: async (name: string) => {
+                  events.push(`terminate(${name})`)
+                  return { confirmed: true, found: 0, remaining: 0 }
+                },
+                retainLock: () => { throw new Error('the lock must not be retained on this path') },
               })
             } finally {
               events.push('lock-released')
@@ -1784,7 +2000,9 @@ test('the timeout path waits for psql to actually exit before terminating and re
 test('a non-zero psql exit still reports its stderr, and still releases the lock afterwards', async () => {
   const run = await captureRestore('SELECT 1;\n', { exitCode: 3 })
   assert.match(run.error?.message ?? '', /psql exited with code 3/)
-  assert.deepEqual(run.events, ['lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released'])
+  assert.deepEqual(run.events, [
+    'lock-connect', 'lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released', 'lock-session-ended',
+  ])
 })
 
 test('the restore still refuses psql metacommands before it locks anything', async () => {
@@ -1804,7 +2022,13 @@ test('the restore still refuses psql metacommands before it locks anything', asy
         file,
         { host: 'db', port: '5432', user: 'app', password: 'pw', database: 'ims' },
         {
-          withSelectionLock: async (work) => { locked += 1; return work({ terminateRestoreBackends: async () => 0 }) },
+          withSelectionLock: async (work) => {
+            locked += 1
+            return work({
+              terminateAndConfirmRestoreBackends: async () => ({ confirmed: true, found: 0, remaining: 0 }),
+              retainLock: () => { throw new Error('the lock must not be retained on this path') },
+            })
+          },
           spawnProcess: ((() => { spawned += 1; throw new Error('must not spawn') })) as never,
         },
       ),

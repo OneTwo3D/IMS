@@ -4,6 +4,8 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { mergeStuckDispatchRows } from '@/lib/domain/wms/exception-inbox'
+import { isolatableLinkWhere, loadUnresolvedDriftIncidents, readRawDriftState, unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
+import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
@@ -20,6 +22,7 @@ import {
 import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 
@@ -101,6 +104,19 @@ export type StuckDispatchRow = {
   kind: 'dead-letter' | 'unresolved'
 }
 
+export type ProductStructureConflictRow = {
+  id: string
+  /** The IMS product the WooCommerce object was paired with. */
+  productId: string | null
+  sku: string | null
+  productName: string | null
+  productType: string | null
+  /** The WooCommerce product id. */
+  externalProductId: string | null
+  detail: string | null
+  foundAt: string
+}
+
 export type OrderReconcileDriftRow = {
   orderId: string
   orderNumber: string | null
@@ -108,6 +124,27 @@ export type OrderReconcileDriftRow = {
   category: string
   detail: string | null
   foundAt: string | null
+}
+
+/**
+ * o3d-bjc.12: a CONNECTOR-level exception, not an order-level one.
+ *
+ * The dispatch sweep will not mass-quarantine a cohort it cannot prove is
+ * record-local — with no healthy control, "these records are broken" and "this
+ * connector is broken" look identical, and guessing takes a tenant out of sync
+ * for a fault one fix would clear. It holds the cursor and alerts instead. This
+ * row is how that decision reaches a human who CAN tell the difference.
+ */
+export type UnresolvedDriftRow = {
+  connector: string
+  /** Binds a click to the cohort the page actually showed (o3d-bjc.12). */
+  version: string
+  linkCount: number
+  touched: number
+  consecutivePasses: number
+  stableFor: number
+  firstSeenAt: string | null
+  reason: string | null
 }
 
 export type ExceptionInboxSummary = {
@@ -118,6 +155,8 @@ export type ExceptionInboxSummary = {
   stuckDispatches: number
   pennyMismatches: number
   orderReconcileDrift: number
+  productStructureConflicts: number
+  unresolvedDrift: number
   total: number
 }
 
@@ -130,6 +169,8 @@ export type ExceptionInboxData = {
   stuckDispatches: StuckDispatchRow[]
   pennyMismatches: PennyMismatchRow[]
   orderReconcileDrift: OrderReconcileDriftRow[]
+  productStructureConflicts: ProductStructureConflictRow[]
+  unresolvedDrift: UnresolvedDriftRow[]
 }
 
 // Codex r4: only PERMANENT_FAILED rows are actionable exceptions — a
@@ -235,6 +276,70 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
 }
 
 /**
+ * o3d-y89x / o3d-fjqk: a WooCommerce product and its IMS twin DISAGREE about the row's shape,
+ * so part of the payload could not be applied. One rule, both directions (o3d-y89x r3):
+ *
+ *   - WooCommerce says VARIABLE and the IMS row cannot be a parent (a KIT, a row that is
+ *     itself somebody's child, a live row the editor would refuse to transform): the
+ *     variations exist nowhere in IMS;
+ *   - WooCommerce says SIMPLE and the IMS row is a VARIABLE parent: its type and price go
+ *     unwritten and its IMS variants stay standing;
+ *   - or a single variation SKU resolves to an IMS row belonging to a different parent.
+ *
+ * The connector refuses to flatten the IMS side in every case, because the structure it would
+ * destroy is IMS-owned and WooCommerce never asked for it to go. An IMS KIT paired with a
+ * WooCommerce SIMPLE product is NOT here: both sides agree the row is not a parent, so nothing
+ * went unapplied and that ordinary bundle pairing stays silent.
+ *
+ * Written by the product sync itself, deduplicated to ONE open row per pairing, and DELETED
+ * by the next sync that completes cleanly — so this list is live rather than a log, and the
+ * rows need no acknowledge action: resolving the conflict is what removes them. The product
+ * reconcile cursor does not advance past a conflicted product, so the retry is automatic.
+ */
+const PRODUCT_STRUCTURE_CONFLICT_WHERE = {
+  connector: 'woocommerce',
+  direction: 'FROM_CONNECTOR' as const,
+  entityType: 'Product',
+  status: 'QUARANTINED' as const,
+}
+
+function countProductStructureConflicts(): Promise<number> {
+  return db.shoppingSyncLog.count({ where: PRODUCT_STRUCTURE_CONFLICT_WHERE })
+}
+
+async function loadProductStructureConflicts(): Promise<ProductStructureConflictRow[]> {
+  const rows = await db.shoppingSyncLog.findMany({
+    where: PRODUCT_STRUCTURE_CONFLICT_WHERE,
+    orderBy: { createdAt: 'desc' },
+    take: SECTION_LIMIT,
+    select: { id: true, entityId: true, externalId: true, errorMessage: true, createdAt: true },
+  })
+
+  const productIds = rows.map((row) => row.entityId).filter((id): id is string => Boolean(id))
+  const products = productIds.length > 0
+    ? await db.product.findMany({
+        where: { id: { in: productIds } },
+        select: { id: true, sku: true, name: true, type: true },
+      })
+    : []
+  const productById = new Map(products.map((product) => [product.id, product]))
+
+  return rows.map((row) => {
+    const product = row.entityId ? productById.get(row.entityId) : undefined
+    return {
+      id: row.id,
+      productId: row.entityId,
+      sku: product?.sku ?? null,
+      productName: product?.name ?? null,
+      productType: product?.type ?? null,
+      externalProductId: row.externalId,
+      detail: row.errorMessage,
+      foundAt: row.createdAt.toISOString(),
+    }
+  })
+}
+
+/**
  * q66in.4.4: drift findings are DURABLE wms_order_discrepancies rows — the
  * capped sweep upserts them and resolves a row only when that specific order
  * re-verifies clean, so a newer (necessarily partial) run never clears truth.
@@ -271,7 +376,7 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
 
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
 async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
     db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
@@ -280,6 +385,11 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     db.wmsOrderPushLink.count({ where: { totalMismatchPence: { not: null } } }),
     countStuckDispatches(),
     countOrderReconcileDrift(),
+    countProductStructureConflicts(),
+    // Only the ACTIVE connector: a disabled one's leftover incident is not
+    // blocking anything, and showing it would invite an isolate on stale
+    // evidence (o3d-bjc.12).
+    getEnabledWmsConnectorId().then((id) => (id ? loadUnresolvedDriftIncidents([id]) : [])),
   ])
 
   const deadReceiptEvents = deadReceipts + deadWebhooks
@@ -291,7 +401,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     stuckDispatches,
     pennyMismatches,
     orderReconcileDrift,
-    total: wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks + stuckDispatches + pennyMismatches + orderReconcileDrift,
+    productStructureConflicts,
+    unresolvedDrift: driftIncidents.length,
+    total: wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks + stuckDispatches
+      + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length,
   }
 }
 
@@ -310,7 +423,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   await requirePermission('sync')
 
   const counts = await loadExceptionCounts()
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: 'DEAD_LETTER' },
       orderBy: { lastAttemptAt: 'desc' },
@@ -389,6 +502,11 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       },
     }),
     loadOrderReconcileDrift(),
+    loadProductStructureConflicts(),
+    // Only the ACTIVE connector: a disabled one's leftover incident is not
+    // blocking anything, and showing it would invite an isolate on stale
+    // evidence (o3d-bjc.12).
+    getEnabledWmsConnectorId().then((id) => (id ? loadUnresolvedDriftIncidents([id]) : [])),
   ])
 
   const refundOrderIds = refundLogs.map((log) => log.entityId).filter((id): id is string => Boolean(id))
@@ -460,6 +578,17 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       externalOrderNumber: link.externalOrderNumber,
     })),
     orderReconcileDrift,
+    productStructureConflicts,
+    unresolvedDrift: driftIncidents.map((incident) => ({
+      connector: incident.connector,
+      version: incident.version,
+      linkCount: incident.linkCount,
+      touched: incident.touched,
+      consecutivePasses: incident.consecutivePasses,
+      stableFor: incident.stableFor,
+      firstSeenAt: incident.firstSeenAt,
+      reason: incident.reason,
+    })),
   }
 
   return {
@@ -867,4 +996,153 @@ export async function clearPennyMismatchFlag(orderId: string): Promise<{ success
   })
   revalidatePath('/sync/exceptions')
   return { success: true }
+}
+
+/**
+ * o3d-bjc.12: isolate the orders in an indeterminate drift cohort.
+ *
+ * THE OPERATOR'S CALL, deliberately. The sweep refuses to take it: with no
+ * healthy control to compare against, "these records are broken" and "this
+ * connector is broken" are indistinguishable, and guessing wrong quarantines a
+ * whole tenant for a fault one fix would have cleared. A human who has looked at
+ * the WMS can tell, and this is how they say so.
+ *
+ * It applies the SAME quarantine the sweep would have: the links leave the
+ * candidate set (so the delta watermark is released for everyone else) and each
+ * one appears in this inbox as an ordinary replayable row.
+ */
+export async function isolateUnresolvedDriftCohort(connector: string, version: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    // The ACTIVE connector, not merely a registered one (o3d-bjc.12). A
+    // connector that has since been switched off leaves its last incident
+    // behind; acting on that would quarantine dormant links on evidence nothing
+    // is refreshing.
+    const enabledConnector = await getEnabledWmsConnectorId()
+    if (!enabledConnector || connector !== enabledConnector) {
+      return { success: false, error: 'That WMS connector is not enabled — its incident is no longer being updated by any sweep.' }
+    }
+    // The SAME lock the sweep takes (o3d-bjc.12). Without it this reads cohort A
+    // while a sweep commits cohort B, then deletes B's incident — isolating one
+    // set of orders and silently retracting the offer for another.
+    const outcome = await withDispatchSweepLockOrSkip(connector, async (): Promise<MutationResult> => {
+      const raw = await readRawDriftState(connector)
+      const [incident] = await loadUnresolvedDriftIncidents([connector])
+      if (!incident || !raw) {
+        return { success: false, error: 'That connector is no longer reporting an unresolved cohort — nothing to isolate.' }
+      }
+      // The decision was taken against what the PAGE showed. A sweep can replace
+      // the cohort between render and click, and isolating whatever happens to
+      // be current would quarantine orders nobody reviewed.
+      if (incident.version !== version) {
+        return { success: false, error: 'These orders changed since the page loaded — reload and review the current set before isolating.' }
+      }
+      const isolatedAt = new Date()
+      const reason = `Isolated by an operator: ${incident.linkCount} order(s) unreadable on ${connector} since `
+        + `${incident.firstSeenAt ?? 'an earlier pass'}${incident.reason ? ` — ${incident.reason}` : ''}`
+
+      // ONE transaction: quarantining the links and retracting the incident are
+      // the same decision. Split across two commits, a failure between them
+      // leaves orders quarantined while the action reports failure and the
+      // stale offer stays on screen.
+      const isolated = await db.$transaction(async (tx) => {
+        const updated = await tx.wmsOrderPushLink.updateMany({
+          // The eligibility predicate is repeated HERE, not just read earlier:
+          // between the read and the write an order can ship, and the compare
+          // is what stops it being quarantined anyway.
+          where: isolatableLinkWhere(incident),
+          data: { dispatchUnresolvedAt: isolatedAt, dispatchUnresolvedError: reason },
+        })
+        if (updated.count > 0) {
+          // Compare-and-set: only retract the incident we actually acted on. A
+          // sweep that wrote a NEWER one while we worked keeps its offer.
+          await tx.setting.deleteMany({ where: { key: unresolvedDriftStateKey(connector), value: raw } })
+        }
+        return updated.count
+      })
+
+      if (isolated === 0) {
+        return { success: false, error: 'Those orders have already resolved, shipped or been isolated — nothing left to do.' }
+      }
+      await logActivity({
+        entityType: 'SYSTEM',
+        tag: 'sync',
+        action: 'wms_dispatch_drift_isolated',
+        description: `Operator isolated ${isolated} unreadable ${connector} order(s) from the dispatch sweep`,
+        metadata: { connector, requested: incident.linkCount, isolated, userId: session.user.id, reason },
+        level: 'WARNING',
+        resolveUser: false,
+      })
+      revalidatePath('/sync/exceptions')
+      return { success: true }
+    })
+    if ('lockSkipped' in outcome) {
+      return { success: false, error: 'A dispatch sweep is running right now — try again in a moment.' }
+    }
+    return outcome
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * o3d-bjc.12: drop the drift state so the next sweep re-evaluates from scratch.
+ *
+ * For the other half of the decision — "I fixed the connector". It clears the
+ * incident and the escalation counter WITHOUT touching any link, so nothing is
+ * isolated and the next pass either finds everything readable (and the cursor
+ * moves) or raises the incident again with a fresh first-seen.
+ */
+export async function retryUnresolvedDriftCohort(connector: string, version: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    // The ACTIVE connector, not merely a registered one (o3d-bjc.12). A
+    // connector that has since been switched off leaves its last incident
+    // behind; acting on that would quarantine dormant links on evidence nothing
+    // is refreshing.
+    const enabledConnector = await getEnabledWmsConnectorId()
+    if (!enabledConnector || connector !== enabledConnector) {
+      return { success: false, error: 'That WMS connector is not enabled — its incident is no longer being updated by any sweep.' }
+    }
+    const outcome = await withDispatchSweepLockOrSkip(connector, async (): Promise<MutationResult> => {
+      const raw = await readRawDriftState(connector)
+      if (!raw) {
+        return { success: false, error: 'That connector is no longer reporting an unresolved cohort.' }
+      }
+      const [current] = await loadUnresolvedDriftIncidents([connector])
+      if (!current || current.version !== version) {
+        return { success: false, error: 'The incident changed since the page loaded — reload and check the new one.' }
+      }
+      // Compare-and-set for the same reason as isolate: a sweep that raised a
+      // NEWER incident while we worked must keep it, or the operator would be
+      // told "cleared" about evidence they never saw.
+      const deleted = await db.setting.deleteMany({
+        where: { key: unresolvedDriftStateKey(connector), value: raw },
+      })
+      if (deleted.count === 0) {
+        return { success: false, error: 'The incident changed while you were looking at it — reload and check the new one.' }
+      }
+      await logActivity({
+        entityType: 'SYSTEM',
+        tag: 'sync',
+        action: 'wms_dispatch_drift_retry',
+        description: `Operator cleared the ${connector} unresolved-drift incident for re-evaluation`,
+        metadata: { connector, userId: session.user.id },
+        level: 'INFO',
+        resolveUser: false,
+      })
+      revalidatePath('/sync/exceptions')
+      return { success: true }
+    })
+    if ('lockSkipped' in outcome) {
+      return { success: false, error: 'A dispatch sweep is running right now — try again in a moment.' }
+    }
+    return outcome
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
 }

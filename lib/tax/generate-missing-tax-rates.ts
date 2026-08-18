@@ -82,6 +82,12 @@ export type MissingTaxRateGenerateResult = {
   externalRatesCount: number
   supported: boolean
   error?: string
+  /**
+   * COMMITTED, but a step after the commit did not complete (o3d-osl8 round 10, finding 3). The
+   * rates exist in the accounting system and the local mappings are written; only the audit entry
+   * or the cache revalidation is behind. Never rendered as a failed generation.
+   */
+  warning?: string
 }
 
 export type MissingTaxRatePlan = {

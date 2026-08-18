@@ -604,6 +604,19 @@ model Product {
   name            String
   description     String?
   type            ProductType @default(SIMPLE)
+  /// o3d-4kfh r6 (Codex finding 1): the FULFILMENT GRAPH VERSION of this product — bumped whenever
+  /// anything that changes what a sales line for it is deemed to require changes: its own component
+  /// list, its own KIT-ness, or the same on any KIT descendant (the bump walks the KIT-ancestor set,
+  /// `collectFulfillmentAffectedRootProducts`).
+  ///
+  /// `OrderAllocation.fulfillmentGraphVersion` stamps the value the allocation was computed against,
+  /// and commitment/dispatch refuses when the two disagree. That is a compare-and-swap on one
+  /// integer, and it is the ONLY thing that catches a UNIFORM rescale of a kit (2xA+1xB -> 4xA+2xB):
+  /// proportionality against a mutable current graph cannot distinguish that race from a legitimate
+  /// partial shipment, because the committed set is exactly proportional to the new recipe.
+  ///
+  /// Starts at 0 for every product and every allocation row, so nothing pre-existing reads as stale.
+  fulfillmentGraphVersion Int @default(0) @map("fulfillment_graph_version")
   lifecycleStatus ProductLifecycleStatus @default(ACTIVE)
   categoryId      String?
   parentId        String?     // set for VARIANT products
@@ -1390,7 +1403,28 @@ model PurchaseInvoice {
   fxRateToBase     Decimal   @db.Decimal(18, 8)
   notes           String?
   supplierInvoiceUrl String? // path to uploaded supplier PDF
-  accountingInvoiceId String?  @map("accounting_invoice_id")
+  // o3d-9kek: ONE external bill ↔ ONE local bill, enforced by the database.
+  //
+  // Two bills carrying the same external id is the catastrophic failure this whole area exists
+  // to prevent: PURCHASE_INVOICE_UPDATE posts to /Invoices/{accountingInvoiceId}, so every later
+  // correction to one bill silently rewrites the other's document in the ledger (see the o3d-9oq
+  // note in app/actions/purchase-orders.ts). Until now nothing forbade it, so the invariant was
+  // only ever upheld by protocol — a guard on one code path, in a separate statement from the
+  // write, which no protocol can make atomic and a future writer can forget.
+  //
+  // GLOBAL, on the VALUE alone, and that is a deliberate trade rather than an oversight. Making it
+  // per-connection — (id, provenance), which was tried and reverted — would let a QuickBooks realm
+  // switch store the same integer twice, once per company. The write would then succeed and the
+  // collision would move to the ~190 call sites that read a naked accountingInvoiceId, on models
+  // (SalesOrder, SalesOrderRefund, SupplierCreditNote) that have no provenance column to consult
+  // even in principle. Globally unique, the same situation is a BLOCKED WRITE with a loud error
+  // naming a realm switch as the likely cause (see applyBackReference). Failing to repair is
+  // acceptable; repairing onto the wrong bill is not. o3d-gt8r carries the tenant-isolation work
+  // that would be needed before namespacing this is safe.
+  //
+  // Postgres does not treat NULLs as equal, so this is precisely a partial unique index over the
+  // bills that HAVE an external id: any number of bills may be unlinked.
+  accountingInvoiceId String?  @unique @map("accounting_invoice_id")
   paidAt          DateTime?
   paymentAccountId   String?   // connector account id (e.g. Xero bank AccountID) used to pay this bill
   paymentAccountName String?   // snapshot of the bank account name at payment time
@@ -1487,7 +1521,16 @@ model SupplierCreditNote {
   // allowances), so a manual credit can't silently suppress return credit.
   isReturnGenerated     Boolean                  @default(false)
   // Accounting-connector credit-note id (Xero ACCPAYCREDIT), set once POSTED.
-  accountingCreditNoteId String?                 @map("accounting_credit_note_id")
+  //
+  // o3d-9kek r6: ONE external credit note ↔ ONE local credit note, globally unique on the value.
+  // This is the one of the four where the constraint has live work to do TODAY: Xero's
+  // POST /CreditNotes is create-or-update on CreditNoteNumber (the o3d-6l3 ACCPAY defect, one
+  // document type over), and buildSupplierCreditNotePayload falls back to the PURCHASE ORDER
+  // REFERENCE when the operator leaves the number blank — so two manual credit notes on one PO can
+  // post the same number, the second silently REPLACING the first in the ledger and returning its
+  // id. Without this index that lands as two local rows pointing at one ledger document; with it,
+  // the second link is refused loudly. The number-collision defect itself is o3d-tfri.
+  accountingCreditNoteId String?                 @unique @map("accounting_credit_note_id")
   recordedAt            DateTime                 @default(now())
   postedAt              DateTime?
   createdBy             String?
@@ -1623,7 +1666,18 @@ model SalesOrder {
   invoiceNumber     String?    // generated invoice reference
   invoicedAt        DateTime?
   paymentDueAt      DateTime?
-  accountingInvoiceId     String?    @map("accounting_invoice_id") // Accounting invoice ID after sync
+  // o3d-9kek r6: ONE external invoice ↔ ONE local order, enforced by the database — the same
+  // invariant as PurchaseInvoice.accountingInvoiceId, and for a sharper reason. Payment polling
+  // selects EVERY order carrying a matching external id and marks each one paid, advances its
+  // lifecycle and can auto-allocate it, so two orders sharing one InvoiceID means one customer
+  // payment settles two orders; SALES_INVOICE_UPDATE then posts every later correction against a
+  // document that belongs to both. Nothing in IMS legitimately shares one external invoice between
+  // orders (no consolidated invoicing; a re-invoice becomes SALES_INVOICE_UPDATE, which does not
+  // write this column; cloneSalesOrder deliberately does not copy it).
+  //
+  // Global and on the VALUE alone, deliberately — see PurchaseInvoice.accountingInvoiceId. NULLs are
+  // not equal in Postgres, so any number of orders may be unlinked.
+  accountingInvoiceId     String?    @unique @map("accounting_invoice_id") // Accounting invoice ID after sync
   paidAt            DateTime?
   orderNumber       String?    // IMS order number (prefix + WC number, or manual)
   paymentMethod     String?    // e.g. "stripe", "paypal", "bacs" — populated by any shopping channel
@@ -1710,7 +1764,11 @@ model SalesOrderRefund {
   id              String     @id @default(cuid())
   orderId         String
   creditNoteNumber String?   // e.g. "CN-2025-00001"
-  accountingCreditNoteId String?   @map("accounting_credit_note_id") // Accounting credit note ID after sync
+  // o3d-9kek r6: ONE external credit note ↔ ONE local refund. Each refund mints its own sequential
+  // creditNoteNumber and gets its own CREDIT_NOTE sync row, and the external-refund/chargeback
+  // replay paths return the EXISTING refund rather than creating a second one — so no split or
+  // partial refund legitimately shares a credit note. Global, on the value alone, NULLs unconstrained.
+  accountingCreditNoteId String?   @unique @map("accounting_credit_note_id") // Accounting credit note ID after sync
   externalRefundId Int?
   returnWarehouseId String?
   reason          String?
@@ -2084,6 +2142,61 @@ model AccountingSyncLog {
   processingStartedAt   DateTime?
   syncedAt              DateTime?
   createdAt             DateTime             @default(now())
+  // o3d-9kek: when the back-reference repair sweep last REACHED A VERDICT on this row
+  // (its document is linked, or the row can never be attributed automatically). NULL =
+  // never examined. The sweep's candidate filter is `backReferenceCheckedAt: null`, so a
+  // row it has settled leaves the candidate set for good instead of being re-selected and
+  // re-probed on every cron cycle — which is what let 200 ordinary historical rows fill
+  // the bounded page and starve every newer broken row behind them.
+  //
+  // Deliberately NOT stamped on a transient failure (probe threw, repair threw, follow-up
+  // enqueue deferred), NOR on an ambiguous legacy PurchaseOrder-keyed row: a competing sibling
+  // can be cancelled or post, several unlinked bills can shrink to one, and the manual link the
+  // warning asks for changes the answer. Those rows must stay eligible so the next sweep
+  // retries them.
+  backReferenceCheckedAt DateTime?
+  // o3d-9kek: when the sweep last REPORTED that this row's bill cannot be attributed. A
+  // DEFERRAL, not a verdict: the candidate query skips the row until one recheck interval has
+  // passed, then looks again. Ambiguous rows must stay eligible (the ambiguity can clear), but
+  // fully eligible meant re-probing and re-warning on every cron cycle, and a backlog of them
+  // would re-fill the head of the scan and starve newer rows — the same starvation, one column
+  // over. The repeat warning carries the previous timestamp so a row nobody ever links by hand
+  // cannot go quiet.
+  backReferenceAmbiguousLoggedAt DateTime?
+  // o3d-9kek r3 finding 3: when this row's full payload was compacted to an attribution-only
+  // TOMBSTONE because it outlived the retention period while still unresolved. Tombstones keep the
+  // (connector, type, status, referenceType, referenceId, externalTransactionId) evidence that stops
+  // an ambiguity silently becoming a certainty, but drop the payload and errorMessage, which are
+  // where the customer names, emails, addresses and financial lines live. (An earlier revision of
+  // this comment listed a `provenance` column: that was part of the per-realm namespacing work,
+  // which was tried and REVERTED — this model has no such column. See o3d-gt8r / o3d-s36z.)
+  //
+  // r4 finding 3: a tombstone IS still a sweep candidate. The columns the id write reads
+  // all survive compaction, so an ambiguity that clears after the retention horizon — or a
+  // back-reference that was merely failing transiently at the cutoff — is still repaired. Only the
+  // payload-dependent FOLLOW-UPS (PDF, payment, attachment) are unrecoverable, and the sweep
+  // discards those under an explicit terminal policy with a warning. Excluding the whole row, which
+  // an earlier revision did, let retention permanently retire repairable work.
+  backReferenceEvidenceCompactedAt DateTime?
+  // o3d-9kek Codex r9 finding 1: this row's back-reference is written, but the FOLLOW-UPS it owes
+  // (invoice PDF, payment registration, bill attachment) have not been enqueued yet. Written BEFORE
+  // the repair touches anything and cleared only when the enqueue has actually succeeded.
+  //
+  // WHY A COLUMN AND NOT `status`. "Follow-ups still owed" used to be inferred from `status =
+  // FAILED`, which is true for a Xero row whose retries exhausted — but NOT for the crash-after-post
+  // row this sweep primarily exists for: that one is SYNCED with no back-reference, and once the
+  // sweep has written the link a TRANSIENT enqueue failure left nothing behind to say the follow-ups
+  // never ran. The next sweep then saw a linked SYNCED row, called it reconciled and stamped
+  // backReferenceCheckedAt, permanently discarding the payment or PDF. A transient failure is not a
+  // verdict; this column is what keeps it from becoming one.
+  //
+  // Flipping such a row to FAILED instead was rejected: queueXeroSync/queueQuickBooksSync dedupe new
+  // enqueues on `status in (PENDING, PROCESSING, SYNCED)`, so a row moved out of SYNCED stops
+  // suppressing its own re-enqueue and the document posts to the ledger a SECOND time.
+  //
+  // Not a candidate-query predicate: an unstamped row is a candidate already. It only widens the
+  // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
+  backReferenceFollowUpsPendingAt DateTime?
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
@@ -2091,6 +2204,8 @@ model AccountingSyncLog {
   @@index([connector, referenceType, referenceId])
   @@index([connector, status, createdAt])
   @@index([connector, status, processingStartedAt])
+  // The sweep's candidate scan: one connector, never-checked rows, oldest first.
+  @@index([connector, backReferenceCheckedAt, createdAt], map: "accounting_sync_logs_backref_sweep_idx")
   @@map("accounting_sync_logs")
 }
 
@@ -3211,6 +3326,10 @@ model OrderAllocation {
   productId   String
   warehouseId String
   qty         Decimal  @db.Decimal(12, 4)
+  /// o3d-4kfh r6: `Product.fulfillmentGraphVersion` of the ORDER LINE's product, read in the same
+  /// statement as the component graph this row was expanded from. Commitment and dispatch refuse
+  /// when it no longer matches the product's current version — see the note on Product.
+  fulfillmentGraphVersion Int @default(0) @map("fulfillment_graph_version")
   costLayerSnapshot Json?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt

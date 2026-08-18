@@ -9,6 +9,8 @@ import { getSettingValue } from '@/lib/settings-store'
 import { getIntegrationPluginState, INTEGRATION_PLUGIN_SETTING_KEYS, type IntegrationPluginState } from '@/lib/integration-plugins'
 import { isBaseCurrencyLocked } from '@/lib/base-currency'
 import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
+import { runPostCommit } from '@/lib/domain/post-commit'
+import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
 import { reconcileCrontab } from '@/lib/crontab-reconcile'
 
 // ---------------------------------------------------------------------------
@@ -169,7 +171,16 @@ export async function shouldShowOnboardingBanner(): Promise<boolean> {
 // Mutations
 // ---------------------------------------------------------------------------
 
-export async function setOnboardingStep(stepKey: string): Promise<void> {
+/**
+ * NOTE THE RETURN TYPE (o3d-osl8 round 10, finding 3, module axis).
+ *
+ * It used to be `Promise<void>`, and that was the same defect round 9 fixed in `setSetting`: the
+ * upsert commits, then `logActivity` and `revalidatePath` are awaited, and either of them rejecting
+ * REJECTED a call whose write is durable. The wizard awaits this inside a click handler with no
+ * catch, so the rejection surfaces as an unhandled error while the stored step has already moved.
+ * The structural rule missed it only because this MODULE was outside the inventory.
+ */
+export async function setOnboardingStep(stepKey: string): Promise<SettingSaveResult> {
   await requireAdmin()
   const nextStep = normalizeStoredStepKey(stepKey) ?? DEFAULT_ONBOARDING_STEP_KEY
   await db.setting.upsert({
@@ -177,16 +188,20 @@ export async function setOnboardingStep(stepKey: string): Promise<void> {
     create: { key: 'onboarding_current_step', value: nextStep },
     update: { value: nextStep },
   })
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: `Updated onboarding step to ${nextStep}`,
-  })
-  revalidatePath('/onboarding')
+  const postCommit = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: `Updated onboarding step to ${nextStep}`,
+    })
+    revalidatePath('/onboarding')
+  }, 'Failed to record the onboarding step change')
+  if (postCommit.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: postCommit.error }
+  return { status: 'saved' }
 }
 
-export async function completeOnboarding(): Promise<{ success: boolean; error?: string }> {
+export async function completeOnboarding(): Promise<{ success: boolean; error?: string; warning?: string }> {
   await requireAdmin()
   const state = await loadOnboardingFacts()
   if (!state.companyConfigured) {
@@ -206,31 +221,43 @@ export async function completeOnboarding(): Promise<{ success: boolean; error?: 
     create: { key: 'onboarding_dismissed', value: 'false' },
     update: { value: 'false' },
   })
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: 'Completed onboarding wizard',
-  })
-  revalidatePath('/dashboard')
-  revalidatePath('/onboarding')
+  // POST-COMMIT. Onboarding IS complete at this point; a rejection here left the operator looking
+  // at "Failed to complete onboarding" on a wizard that had already finished, with no way forward.
+  const postCommit = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: 'Completed onboarding wizard',
+    })
+    revalidatePath('/dashboard')
+    revalidatePath('/onboarding')
+  }, 'Failed to record the completed onboarding')
+  if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
   return { success: true }
 }
 
-export async function dismissOnboarding(): Promise<void> {
+export async function dismissOnboarding(): Promise<SettingSaveResult> {
   await requireAdmin()
   await db.setting.upsert({
     where: { key: 'onboarding_dismissed' },
     create: { key: 'onboarding_dismissed', value: 'true' },
     update: { value: 'true' },
   })
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: 'Dismissed onboarding banner',
-  })
-  revalidatePath('/dashboard')
+  // The banner's dismiss button awaits this inside a `startTransition` with no catch: a rejection
+  // after the commit threw out of the transition AND left the banner on screen, over a preference
+  // that is stored.
+  const postCommit = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: 'Dismissed onboarding banner',
+    })
+    revalidatePath('/dashboard')
+  }, 'Failed to record the onboarding dismissal')
+  if (postCommit.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: postCommit.error }
+  return { status: 'saved' }
 }
 
 type PluginStateInput = {

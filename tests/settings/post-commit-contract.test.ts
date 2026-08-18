@@ -22,12 +22,33 @@ const REPO = process.cwd()
 //   • STRUCTURALLY, over the source of the settings writers — a post-commit `await` written outside
 //     the guard fails the last test in this file, whoever adds it and whichever screen it is for.
 //
+// ROUND 10, FINDING 3 — THE DETECTOR'S SHAPE ASSUMPTION WAS THE BUG, NOT A MISSING SITE.
+//
+// Round 9's version recognised a commit as one of TWO literal strings, `db.$transaction(` and
+// `db.setting.upsert(`. `createTaxRate` commits through `db.taxRate.create` and then awaits
+// `logActivity` and `maybeQueueTaxRateSync` outside the guard, so it was not in the inventory at
+// all — and the inventory test PASSED, asserting a five-writer list that was simply the list of
+// writers using the two spellings it knew. That is the third incomplete inventory in a row, and the
+// pattern is the same each time: the rule was widened by adding the site that had just been found.
+//
+// So this round widened the SHAPE instead, on all three axes it was narrow in:
+//   • the COMMIT: any direct Prisma mutation (`create`/`createMany`/`update`/`updateMany`/`upsert`/
+//     `delete`/`deleteMany`) or raw execute, not two hand-listed spellings. Eleven more writers in
+//     app/actions/settings.ts appeared, ten of them offending;
+//   • the MODULE list: app/actions/onboarding.ts writes `settings` rows from the setup wizard and
+//     was outside it. Three more writers, all three offending;
+//   • WHICH commit starts the tail: it was "after the LAST commit in the function", which cannot see
+//     a branch that commits and returns before a later one — `deleteWarehouse` deactivates in one
+//     branch and deletes in the other. It is now "after the FIRST", because work between two
+//     commits is still post-commit for the first of them.
+//
 // WHAT THE STRUCTURAL CHECK COVERS AND WHAT IT CANNOT — stated here rather than as a footnote,
 // because implying completeness is the specific mistake being corrected:
-//   1. It covers the two modules that own user-facing settings writes: app/actions/settings.ts and
-//      app/actions/cron.ts. It does NOT scan the whole repo, because "a post-commit step" is not a
-//      syntactic category anywhere else — every `await` after every write in the application would
-//      match, and a check that flags everything is a check nobody keeps.
+//   1. It covers the three modules that own user-facing settings writes: app/actions/settings.ts,
+//      app/actions/cron.ts and app/actions/onboarding.ts. It does NOT scan the whole repo, because
+//      "a post-commit step" is not a syntactic category anywhere else — every `await` after every
+//      write in the application would match, and a check that flags everything is a check nobody
+//      keeps. A user-facing writer added to a FOURTH module is still invisible until it is listed.
 //   2. It recognises a post-commit step by NAME (`logActivity`, `revalidatePath`,
 //      `reconcileCrontab`, `syncCrontab`). A new kind of post-commit work under a new name — an
 //      email, a cache purge, a webhook — is invisible to it until the name is added below.
@@ -140,16 +161,70 @@ test('the classification lives in ONE module — the outcome types own no catch 
 // ---------------------------------------------------------------------------
 
 /** Modules that own user-facing settings writes. See limit (1) at the top of this file. */
-const SETTINGS_WRITER_MODULES = ['app/actions/settings.ts', 'app/actions/cron.ts']
+const SETTINGS_WRITER_MODULES = ['app/actions/settings.ts', 'app/actions/cron.ts', 'app/actions/onboarding.ts']
 
 /** Work that belongs AFTER a commit and must therefore be inside the guard. See limit (2). */
 const POST_COMMIT_CALLS = ['logActivity(', 'revalidatePath(', 'reconcileCrontab(', 'syncCrontab(', 'maybeQueueTaxRateSync(']
 
-/** The commit itself. A function without one has no post-commit tail to guard. */
-const COMMIT_CALLS = ['db.$transaction(', 'db.setting.upsert(']
+/**
+ * THE COMMIT, AS A SHAPE (round 10, finding 3).
+ *
+ * Round 9 listed two literal call spellings and therefore had no opinion about `db.taxRate.create`,
+ * `db.warehouse.delete` or any of the other nine direct Prisma mutations in these modules. Every
+ * one of them commits on its own — Prisma runs a bare mutation in its own transaction — so every
+ * one of them has a post-commit tail. Matching the FORM rather than the names is what stops the
+ * next writer from being invisible for the same reason.
+ *
+ * `$transaction` is listed separately because it is the interactive form, whose callback is where a
+ * multi-statement commit lives.
+ */
+const COMMIT_CALL_RE = /\b(?:db|prisma)\.\$transaction\(|\b(?:db|prisma)\.[a-zA-Z]\w*\.(?:create|createMany|createManyAndReturn|update|updateMany|upsert|delete|deleteMany)\(|\b(?:db|prisma)\.\$execute(?:Raw|RawUnsafe)[(`]/g
 
 /** The guards. Anything inside one of their callbacks is, by construction, classified. */
 const GUARD_CALLS = ['runPostCommit(', 'completePluginSelectionSave(']
+
+/**
+ * Blank out comment CONTENT, preserving every newline and every offset.
+ *
+ * ROUND 10. The scan searched the RAW source, so a comment that merely MENTIONED a commit call —
+ * `db.$transaction(` inside a note explaining this very rule — registered as a commit whose bracket
+ * span then ran to the end of the function and swallowed every post-commit call inside it. A check
+ * that can be switched off by writing prose about it is not a check. Offsets are preserved rather
+ * than removed so the reported line numbers still point at the real source.
+ */
+function withoutComments(src: string): string {
+  let out = ''
+  let i = 0
+  while (i < src.length) {
+    const c = src[i]
+    if (c === "'" || c === '"' || c === '`') {
+      const quote = c
+      let j = i + 1
+      while (j < src.length && src[j] !== quote) j += src[j] === '\\' ? 2 : 1
+      const end = Math.min(j + 1, src.length)
+      out += src.slice(i, end)
+      i = end
+      continue
+    }
+    if (c === '/' && src[i + 1] === '/') {
+      const nl = src.indexOf('\n', i)
+      const end = nl === -1 ? src.length : nl
+      out += ' '.repeat(end - i)
+      i = end
+      continue
+    }
+    if (c === '/' && src[i + 1] === '*') {
+      const close = src.indexOf('*/', i + 2)
+      const end = close === -1 ? src.length : close + 2
+      out += src.slice(i, end).replace(/[^\n]/g, ' ')
+      i = end
+      continue
+    }
+    out += c
+    i += 1
+  }
+  return out
+}
 
 type WriterFn = { name: string; body: string }
 
@@ -198,6 +273,17 @@ function callSpan(src: string, open: number): [number, number] {
   return [open, src.length]
 }
 
+/** Every call matching a REGEX, as spans. The commit shape is a form, not a list of names. */
+function spansOfPattern(body: string, pattern: RegExp): Array<[number, number]> {
+  const spans: Array<[number, number]> = []
+  const re = new RegExp(pattern.source, 'g')
+  let match: RegExpExecArray | null
+  while ((match = re.exec(body)) !== null) {
+    spans.push(callSpan(body, match.index + match[0].length - 1))
+  }
+  return spans
+}
+
 function spansOf(body: string, needles: string[]): Array<[number, number]> {
   const spans: Array<[number, number]> = []
   for (const needle of needles) {
@@ -215,8 +301,8 @@ function spansOf(body: string, needles: string[]): Array<[number, number]> {
 function committingWriters(): Array<{ module: string; name: string; body: string }> {
   const writers: Array<{ module: string; name: string; body: string }> = []
   for (const rel of SETTINGS_WRITER_MODULES) {
-    for (const fn of exportedFunctions(readFileSync(join(REPO, rel), 'utf8'))) {
-      if (COMMIT_CALLS.some((needle) => fn.body.includes(needle))) {
+    for (const fn of exportedFunctions(withoutComments(readFileSync(join(REPO, rel), 'utf8')))) {
+      if (spansOfPattern(fn.body, COMMIT_CALL_RE).length > 0) {
         writers.push({ module: rel, name: fn.name, body: fn.body })
       }
     }
@@ -236,11 +322,15 @@ function catchSpans(body: string): Array<[number, number]> {
 }
 
 /** Post-commit calls that are neither inside the commit itself nor inside a guard. */
-function unguardedPostCommitCalls(body: string): string[] {
-  const commitSpans = spansOf(body, COMMIT_CALLS)
+function unguardedPostCommitCalls(source: string): string[] {
+  const body = withoutComments(source)
+  const commitSpans = spansOfPattern(body, COMMIT_CALL_RE)
   const guardSpans = [...spansOf(body, GUARD_CALLS), ...catchSpans(body)]
-  const lastCommitEnd = commitSpans.reduce((max, [, end]) => Math.max(max, end), -1)
-  if (lastCommitEnd === -1) return []
+  // THE FIRST commit, not the last (round 10, finding 3). Work between two commits is post-commit
+  // for the first of them, and a function that commits in one branch and returns — `deleteWarehouse`
+  // deactivating instead of deleting — has its whole tail before the "last" commit.
+  const firstCommitEnd = commitSpans.reduce((min, [, end]) => (min === -1 ? end : Math.min(min, end)), -1)
+  if (firstCommitEnd === -1) return []
 
   const offenders: string[] = []
   for (const needle of POST_COMMIT_CALLS) {
@@ -252,7 +342,7 @@ function unguardedPostCommitCalls(body: string): string[] {
       const insideCommit = commitSpans.some(([start, end]) => at > start && at < end)
       const insideGuard = guardSpans.some(([start, end]) => at > start && at < end)
       // Before the LAST commit it is pre-commit work, which may fail the action freely.
-      if (at < lastCommitEnd || insideCommit || insideGuard) continue
+      if (at < firstCommitEnd || insideCommit || insideGuard) continue
       const line = body.slice(0, at).split('\n').length
       offenders.push(`line ${line}: ${body.split('\n')[line - 1].trim()}`)
     }
@@ -263,14 +353,36 @@ function unguardedPostCommitCalls(body: string): string[] {
 test('every committing settings writer is discovered — an empty scan proves nothing', () => {
   // Pinned in BOTH directions: a new committing writer appears here and must be considered, and one
   // that DISAPPEARS is equally visible, so the guard below cannot rot into a check over nothing.
+  //
+  // ROUND 10: this list was FIVE entries, and it passed, because the detector only recognised two
+  // literal commit spellings — so the assertion was "the writers that use `db.$transaction` or
+  // `db.setting.upsert` are these five", not "the committing writers are these five". Sixteen more
+  // were invisible, thirteen of them offending. A pinned list is only worth what the scan that
+  // produces it is worth, which is why the widening above matters more than the entries below.
   assert.deepEqual(
     committingWriters().map((w) => `${w.module}#${w.name}`).sort(),
     [
       'app/actions/cron.ts#saveCronJobSettings',
+      'app/actions/onboarding.ts#completeOnboarding',
+      'app/actions/onboarding.ts#dismissOnboarding',
+      'app/actions/onboarding.ts#saveOnboardingPluginState',
+      'app/actions/onboarding.ts#setOnboardingStep',
+      'app/actions/settings.ts#autoLinkQuickBooksTaxRates',
+      'app/actions/settings.ts#autoLinkXeroTaxRates',
+      'app/actions/settings.ts#createAdjustmentReason',
+      'app/actions/settings.ts#createPurchaseUnit',
+      'app/actions/settings.ts#createTaxRate',
+      'app/actions/settings.ts#createWarehouse',
+      'app/actions/settings.ts#deleteAdjustmentReason',
+      'app/actions/settings.ts#deleteWarehouse',
+      'app/actions/settings.ts#generateMissingXeroTaxRates',
       'app/actions/settings.ts#saveIntegrationPluginState',
       'app/actions/settings.ts#savePublicAppUrl',
       'app/actions/settings.ts#setSettings',
+      'app/actions/settings.ts#updateAdjustmentReason',
+      'app/actions/settings.ts#updatePurchaseUnit',
       'app/actions/settings.ts#updateTaxRate',
+      'app/actions/settings.ts#updateWarehouse',
     ],
   )
 })
@@ -303,10 +415,26 @@ test('...and the guard is actually being used, so the check above is not vacuous
     guarded.map((w) => `${w.module}#${w.name}`).sort(),
     [
       'app/actions/cron.ts#saveCronJobSettings',
+      'app/actions/onboarding.ts#completeOnboarding',
+      'app/actions/onboarding.ts#dismissOnboarding',
+      'app/actions/onboarding.ts#saveOnboardingPluginState',
+      'app/actions/onboarding.ts#setOnboardingStep',
+      'app/actions/settings.ts#autoLinkQuickBooksTaxRates',
+      'app/actions/settings.ts#autoLinkXeroTaxRates',
+      'app/actions/settings.ts#createAdjustmentReason',
+      'app/actions/settings.ts#createPurchaseUnit',
+      'app/actions/settings.ts#createTaxRate',
+      'app/actions/settings.ts#createWarehouse',
+      'app/actions/settings.ts#deleteAdjustmentReason',
+      'app/actions/settings.ts#deleteWarehouse',
+      'app/actions/settings.ts#generateMissingXeroTaxRates',
       'app/actions/settings.ts#saveIntegrationPluginState',
       'app/actions/settings.ts#savePublicAppUrl',
       'app/actions/settings.ts#setSettings',
+      'app/actions/settings.ts#updateAdjustmentReason',
+      'app/actions/settings.ts#updatePurchaseUnit',
       'app/actions/settings.ts#updateTaxRate',
+      'app/actions/settings.ts#updateWarehouse',
     ],
     'every committing writer still has post-commit work, and all of it is inside the guard',
   )
@@ -340,6 +468,61 @@ test('...and the guard is actually being used, so the check above is not vacuous
     '}',
   ].join('\n')
   assert.equal(unguardedPostCommitCalls(revertedTaxRate).length, 3, 'nesting does not hide a post-commit step')
+
+  // ROUND 10, FINDING 3 — FED THE EXACT CODE THE ROUND-9 DETECTOR COULD NOT SEE. `createTaxRate`
+  // commits with `db.taxRate.create` and awaited three post-commit steps outside the guard; the
+  // two-spelling COMMIT list meant this function was not even in the inventory, so the offender
+  // scan ran over it and found nothing because it never looked.
+  const revertedCreateTaxRate = [
+    'export async function createTaxRate(input: { name: string }) {',
+    '  try {',
+    '    const created = await db.taxRate.create({ data: { name: input.name } })',
+    '    await logActivity({ entityType: \'SETTING\' })',
+    '    await maybeQueueTaxRateSync({ id: created.id })',
+    "    revalidatePath('/settings', 'layout')",
+    '    return { success: true }',
+    '  } catch (e) {',
+    '    return { success: false, error: String(e) }',
+    '  }',
+    '}',
+  ].join('\n')
+  assert.equal(
+    unguardedPostCommitCalls(revertedCreateTaxRate).length,
+    3,
+    'a bare Prisma create commits on its own, so everything after it is post-commit',
+  )
+
+  // ...and the same for a writer that commits in ONE BRANCH and returns, which the "after the LAST
+  // commit" rule could not see at all.
+  const revertedDeleteWarehouse = [
+    'export async function deleteWarehouse(id: string) {',
+    '  if (hasData) {',
+    '    await db.warehouse.update({ where: { id }, data: { active: false } })',
+    '    await logActivity({ entityType: \'SETTING\' })',
+    '    return { success: true, deactivated: true }',
+    '  }',
+    '  await db.warehouse.delete({ where: { id } })',
+    "  revalidatePath('/settings', 'layout')",
+    '  return { success: true }',
+    '}',
+  ].join('\n')
+  assert.equal(
+    unguardedPostCommitCalls(revertedDeleteWarehouse).length,
+    2,
+    'the branch that commits and returns first has a post-commit tail of its own',
+  )
+
+  // ...and a COMMENT that names a commit call cannot switch the rule off. The scan used to search
+  // the raw source, so prose describing the rule registered as a commit whose bracket span ran to
+  // the end of the function and swallowed everything after it — including this file's own examples.
+  const commentDefeat = [
+    'export async function setSetting(key: string, value: string) {',
+    '  await db.setting.upsert({ where: { key }, create: {}, update: {} })',
+    '  // the rule looks for db.$transaction( and db.setting.upsert(',
+    '  await logActivity({ entityType: \'SETTING\' })',
+    '}',
+  ].join('\n')
+  assert.equal(unguardedPostCommitCalls(commentDefeat).length, 1, 'a comment about the rule is not a commit')
 
   // ...and it does NOT flag the same calls when they are inside the guard's callback.
   const guardedShape = [

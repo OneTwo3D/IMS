@@ -437,14 +437,75 @@ const RESTORE_SELECTION_LOCK_POLL_MS = 250
 const RESTORE_PSQL_KILL_GRACE_MS = 30_000
 /** Keeps the holder session from being reaped by an `idle_session_timeout` or an idle TCP path. */
 const RESTORE_LOCK_KEEPALIVE_MS = 30_000
+/**
+ * How long the holder waits for `pg_stat_activity` to stop listing this run's backend after it has
+ * been signalled. Longer than the psql kill grace on purpose: this is the observation the lock's
+ * release depends on, and giving up early is the failure mode being fixed.
+ */
+const RESTORE_BACKEND_EXIT_CONFIRM_MS = 60_000
+const RESTORE_BACKEND_EXIT_POLL_MS = 250
+
+/**
+ * WHAT `pg_terminate_backend` ACTUALLY TELLS YOU (o3d-osl8 round 10, finding 2).
+ *
+ * Round 9's version ran the termination query and returned `rows.length`. Two things are wrong with
+ * that, and both of them read as success:
+ *
+ *   1. IT DISCARDED THE ANSWER. `pg_terminate_backend(pid)` returns a BOOLEAN — false when the
+ *      signal could not be sent (no permission, the pid is gone, it is not a backend). A row came
+ *      back either way, so one row that returned `false` was reported as "1 backend terminated".
+ *   2. THE SIGNAL IS NOT THE DEATH. `pg_terminate_backend` sends SIGTERM and returns; the backend
+ *      dies when it next reaches an interrupt point, which for a long DDL statement inside a
+ *      restore is exactly the case we are here for. Returning as soon as it is signalled is the
+ *      same assumption the SIGKILL path made about psql, one layer down.
+ *
+ * So confirmation is a POLL, not a return value: signal, then re-read `pg_stat_activity` for this
+ * run's `application_name` until nothing answers to it, or until the deadline. `confirmed` is true
+ * only when the backend is GONE from the catalogue — the one observation that makes "the restore
+ * has stopped writing" a fact rather than an inference. (`pg_terminate_backend(pid, timeout)` would
+ * do the waiting server-side, but it is PostgreSQL 14+; the poll works on every version this
+ * application supports and is what the caller has to be able to trust.)
+ */
+export type RestoreBackendTerminationResult = {
+  /** True ONLY when pg_stat_activity no longer lists a backend for this run. */
+  confirmed: boolean
+  /** How many backends were ever seen for this run. */
+  found: number
+  /** Still listed when we gave up. Zero whenever `confirmed`. */
+  remaining: number
+  /** Why confirmation failed, when it did. */
+  error?: string
+}
 
 /** What the holder lends the work it wraps. */
 export type RestoreLockContext = {
   /**
-   * Terminate any backend still executing this restore, identified by `application_name`.
-   * Returns how many were terminated. Used only on the timeout path.
+   * Terminate any backend still executing this restore, identified by `application_name`, and WAIT
+   * until the catalogue agrees it is gone. Used only on the timeout path.
    */
-  terminateRestoreBackends: (applicationName: string) => Promise<number>
+  terminateAndConfirmRestoreBackends: (applicationName: string) => Promise<RestoreBackendTerminationResult>
+  /**
+   * KEEP THE LOCK. Called when the restore backend could not be confirmed dead: releasing then
+   * would hand the connector-selection lock to a writer while a restore may still be replaying over
+   * the same rows, which is the exact state the lock exists to prevent — and it would look
+   * protected. The holder's session, its keepalive and the advisory lock are all deliberately
+   * leaked; an operator restart is the recovery, and that is the loud failure this is choosing.
+   */
+  retainLock: (reason: string) => void
+}
+
+/**
+ * The restore timed out AND its database backend could not be confirmed gone.
+ *
+ * Typed, because the caller has to treat it differently from every other restore failure: the
+ * database may still be being written to, so maintenance mode STAYS ON rather than being switched
+ * back off by the endpoint's `finally`.
+ */
+export class RestoreBackendNotConfirmedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RestoreBackendNotConfirmedError'
+  }
 }
 
 /** Runs `work` while the connector-selection lock is held by a session `work` does not control. */
@@ -523,6 +584,10 @@ export function createRestoreSelectionLockHolder(options: {
   now?: () => number
   delay?: (ms: number) => Promise<void>
   maxWaitMs?: number
+  /** How long to wait for the catalogue to stop listing a signalled restore backend. */
+  backendExitConfirmMs?: number
+  /** Called when the lock is deliberately NOT released. Loud by default; injectable for tests. */
+  onLockRetained?: (reason: string) => void
 } = {}): RestoreSelectionLockHolder {
   const createClient = options.createClient ?? (() => new pg.Client({
     connectionString: process.env.DATABASE_URL,
@@ -531,11 +596,14 @@ export function createRestoreSelectionLockHolder(options: {
   const now = options.now ?? Date.now
   const delay = options.delay ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms) }))
   const maxWaitMs = options.maxWaitMs ?? RESTORE_SELECTION_LOCK_MAX_WAIT_MS
+  const backendExitConfirmMs = options.backendExitConfirmMs ?? RESTORE_BACKEND_EXIT_CONFIRM_MS
+  const onLockRetained = options.onLockRetained ?? ((reason: string) => { console.error(`[restore] ${reason}`) })
 
   return async <T>(work: (ctx: RestoreLockContext) => Promise<T>): Promise<T> => {
     const client = createClient()
     await client.connect()
     let acquired = false
+    let retained: string | null = null
     let keepalive: ReturnType<typeof setInterval> | undefined
     try {
       const deadline = now() + maxWaitMs
@@ -559,26 +627,59 @@ export function createRestoreSelectionLockHolder(options: {
       keepalive.unref?.()
 
       return await work({
-        terminateRestoreBackends: async (applicationName: string) => {
-          const terminated = await client.query(
-            'SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = $1 AND pid <> pg_backend_pid()',
-            [applicationName],
-          )
-          return terminated.rows.length
+        terminateAndConfirmRestoreBackends: async (applicationName: string) => {
+          const deadline = now() + backendExitConfirmMs
+          let found = 0
+          let signalRefused = 0
+          for (;;) {
+            // Signalling and listing are ONE query on purpose: the rows it returns are the backends
+            // that were still there at the moment they were signalled, so `remaining` cannot be
+            // read from a snapshot taken before the signal.
+            const listed = await client.query(
+              'SELECT pid, pg_terminate_backend(pid) AS terminated FROM pg_stat_activity '
+              + 'WHERE application_name = $1 AND pid <> pg_backend_pid()',
+              [applicationName],
+            )
+            found = Math.max(found, listed.rows.length)
+            // GONE FROM THE CATALOGUE. The only observation that proves the writing has stopped.
+            if (listed.rows.length === 0) return { confirmed: true, found, remaining: 0 }
+            signalRefused += listed.rows.filter((row) => row.terminated === false).length
+            if (now() >= deadline) {
+              return {
+                confirmed: false,
+                found,
+                remaining: listed.rows.length,
+                error: signalRefused > 0
+                  ? 'pg_terminate_backend refused the signal for at least one backend'
+                  : 'the backend was signalled but is still listed in pg_stat_activity',
+              }
+            }
+            await delay(RESTORE_BACKEND_EXIT_POLL_MS)
+          }
         },
+        retainLock: (reason: string) => { retained = reason },
       })
     } finally {
-      if (keepalive) clearInterval(keepalive)
-      // Explicit unlock first so the lock is gone before the socket teardown races; ending the
-      // session releases it anyway, which is the belt to this brace.
-      if (acquired) {
-        try {
-          await client.query('SELECT pg_advisory_unlock($1)', [ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY])
-        } catch {
-          // The session is about to end, which releases the lock regardless.
+      if (retained !== null) {
+        // DELIBERATELY LEAKED. No unlock, no `client.end()` (which would release the lock as a side
+        // effect of the session dying), and the keepalive keeps running so the session is not
+        // reaped. A restore backend that may still be writing must not be overlapped by a writer
+        // that thinks the coast is clear; holding a lock nobody releases makes that impossible and
+        // makes the fault visible, whereas releasing it makes the fault silent.
+        onLockRetained(retained)
+      } else {
+        if (keepalive) clearInterval(keepalive)
+        // Explicit unlock first so the lock is gone before the socket teardown races; ending the
+        // session releases it anyway, which is the belt to this brace.
+        if (acquired) {
+          try {
+            await client.query('SELECT pg_advisory_unlock($1)', [ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY])
+          } catch {
+            // The session is about to end, which releases the lock regardless.
+          }
         }
+        await client.end().catch(() => {})
       }
-      await client.end().catch(() => {})
     }
   }
 }
@@ -688,14 +789,29 @@ export async function runRestore(
       // writing" true rather than assumed. `--single-transaction` means the terminated backend
       // rolls back everything it had applied.
       //
-      // If even this fails (the holder session is unusable, say), we still reject and release. That
-      // residue is stated rather than hidden: from here on the maintenance-mode gate is the only
-      // protection, exactly as it is for a holder whose connection dropped.
-      const terminated = await lock.terminateRestoreBackends(applicationName).catch(() => -1)
+      // ROUND 10, FINDING 2. Round 9 called the termination query and threw on the next line, so
+      // the holder's `finally` released the lock having only established that a signal was SENT.
+      // The confirmation is now a poll of `pg_stat_activity`, and the branch below is the whole
+      // point of it: if the backend cannot be confirmed gone, the lock is NOT released.
+      const outcome = await lock.terminateAndConfirmRestoreBackends(applicationName).catch((error: unknown) => ({
+        confirmed: false as const,
+        found: -1,
+        remaining: -1,
+        error: error instanceof Error ? error.message : String(error),
+      }))
+
+      if (!outcome.confirmed) {
+        const reason = 'Restore timed out and its database backend could NOT be confirmed gone'
+          + `${outcome.error ? ` (${outcome.error})` : ''}. The connector-selection lock is being HELD, `
+          + 'not released, because a still-live restore backend may be writing the same rows a '
+          + 'connector-selection change would read. Maintenance mode stays ON. Restart the '
+          + 'application once the database is known to be quiet.'
+        lock.retainLock(reason)
+        throw new RestoreBackendNotConfirmedError(reason)
+      }
+
       throw new Error(
-        terminated === -1
-          ? 'Restore timed out; the database backend could not be confirmed terminated'
-          : `Restore timed out (terminated ${terminated} database backend${terminated === 1 ? '' : 's'})`,
+        `Restore timed out (terminated ${outcome.found} database backend${outcome.found === 1 ? '' : 's'})`,
       )
     }
     if (result.error) throw result.error
@@ -933,6 +1049,8 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
     }
 
     const restoreDbConfig = getDbConfig(resolvedDeps.env)
+    /** Set when the restore backend could not be confirmed gone — the gate then stays on. */
+    let holdMaintenance = false
 
     try {
       const sourceBackupSha256 = await sha256OfFile(restorePath)
@@ -967,18 +1085,26 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       })
       return NextResponse.json({ success: true })
     } catch (error) {
+      // ROUND 10, FINDING 2, second half. Switching maintenance mode back off is the same shape of
+      // mistake as releasing the lock: it reopens the application to writers on the strength of an
+      // assumption that the restore has stopped. When the backend could not be confirmed gone, the
+      // one honest state is "still down", so the gate STAYS ON and the operator is told why.
+      const backendUnconfirmed = error instanceof RestoreBackendNotConfirmedError
       const message = redactRestoreErrorMessage(error instanceof Error ? error.message : String(error), resolvedDeps.env)
       await resolvedDeps.log({
         entityType: 'SYSTEM',
         tag: 'system',
         action: 'backup_restored',
         level: 'ERROR',
-        metadata: { error: message },
+        metadata: backendUnconfirmed ? { error: message, backendUnconfirmed: true, maintenanceModeHeld: true } : { error: message },
         description: `Failed to restore backup: ${message}`,
       })
+      if (backendUnconfirmed) holdMaintenance = true
       return NextResponse.json({ error: `Restore failed: ${message.slice(0, 200)}` }, { status: 500 })
     } finally {
-      await resolvedDeps.disableMaintenance()
+      // Unconditional EXCEPT for the unconfirmed-backend case: a failed `enableMaintenance` may
+      // still have applied, so the cleanup runs anyway.
+      if (!holdMaintenance) await resolvedDeps.disableMaintenance()
       await cleanup()
     }
   }

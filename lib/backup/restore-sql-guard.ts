@@ -20,6 +20,47 @@
  * most real dumps. So the input is lexed: the scanner tracks quoting state across lines and only
  * inspects the FIRST WORD OF A STATEMENT at top level.
  *
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ * ROUND 10 — THE DESYNCHRONISATION CLASS, AND WHY IT IS NOW CLOSED BY CONSTRUCTION
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * A lexer that is one character out of step with PostgreSQL is WORSE than no lexer: it reports
+ * "no transaction control" over a file whose `COMMIT` it simply could not see. Round 10's review
+ * found the first instance (`SET SESSION standard_conforming_strings = off`, which the round-9 check
+ * did not match because it only compared word 1 against the GUC name). Enumerating its siblings
+ * found FIVE more accepted bypasses, of two different kinds:
+ *
+ *   A. THE ESCAPING-MODE FAMILY. Turning `standard_conforming_strings` off makes a backslash an
+ *      escape inside EVERY plain `'…'` literal, which moves where that literal ENDS. Round 9
+ *      defended this by trying to spot the statement that does it. That defence can never be
+ *      complete, because the setting can be changed by:
+ *         SET SESSION … / SET LOCAL … / SET … TO off / SET "standard_conforming_strings" = off
+ *         RESET standard_conforming_strings / RESET ALL / SET … = DEFAULT
+ *         SELECT set_config('standard_conforming_strings', 'off', false)   ← a FUNCTION call
+ *         SELECT set_config('standard_' || 'conforming_strings', 'off', false)  ← computed name
+ *         a DO block, a CALL, or ANY function whose body runs one of the above
+ *      The last three are not lexically visible at all. Detecting the statement is the wrong shape
+ *      of answer.
+ *
+ *      SO THE SCANNER NO LONGER DEPENDS ON THE SETTING. The two modes differ in exactly one place:
+ *      a run of backslashes of ODD length immediately before a `'` inside a plain literal ends that
+ *      literal when the setting is ON and does not when it is OFF. (`\\` pairs and `\x` for any
+ *      other x close at the same quote under both modes, so neither is ambiguous.) That one
+ *      construct is now REFUSED. Every other input lexes identically under both settings, so it no
+ *      longer matters how — or whether — the setting was changed: by a statement the scanner can
+ *      read, by one it cannot, or by the server's own default. The explicit `SET` check is kept as
+ *      defence in depth and generalised to every spelling, but the guarantee no longer rests on it.
+ *
+ *   B. THE STRING-PREFIX FAMILY. `E'…'` uses backslash escapes and `'…'` does not, so the scanner
+ *      has to know which it is looking at. Round 9 decided that from the LAST CHARACTER before the
+ *      quote, so any identifier ending in `e` was read as an escape-string prefix — and
+ *      `SELECT name'a\'; COMMIT; --' ;` was accepted, with the `COMMIT` swallowed as string
+ *      content. That payload needs NO setting change: it works against a stock dump. A prefix is
+ *      now recognised from the TOKEN before the quote (a standalone `E`, or `U` followed by `&`),
+ *      never from a character that happens to end a longer word.
+ *
+ * The scan is therefore mode-independent, and the residue below is stated in those terms.
+ *
  * ═══ WHAT THIS CATCHES ═══
  *   • transaction control as a top-level statement, in any case and any whitespace/comment layout,
  *     including several on one line and one split across lines;
@@ -27,8 +68,11 @@
  *     replay to another database entirely, outside the transaction AND outside the lock;
  *   • a dump that ends mid-string, mid-dollar-quote, mid-comment or mid-COPY block, i.e. one whose
  *     structure the scanner could not fully account for;
- *   • `standard_conforming_strings` being turned OFF, and `U&'...'` strings — both change what a
- *     backslash means inside a literal, so the scanner could no longer be sure where a string ends.
+ *   • any literal whose END depends on `standard_conforming_strings`, and `U&'…'` strings, whose
+ *     escape character is configurable — both refused as ambiguous rather than guessed;
+ *   • any statement that names `standard_conforming_strings` (as a word, a quoted identifier or a
+ *     string literal) other than the one safe form `SET [SESSION|LOCAL] standard_conforming_strings
+ *     = on`, `RESET ALL`, and any `set_config(…)` other than the `search_path` call pg_dump emits.
  *
  * ═══ WHAT THIS CANNOT CATCH — stated, not footnoted ═══
  *   1. TRANSACTION CONTROL EXECUTED INDIRECTLY: `CALL some_proc()` where the procedure body runs
@@ -38,17 +82,26 @@
  *      `COMMIT` inside one raises `invalid_transaction_termination` rather than committing. So this
  *      class ERRORS — which `ON_ERROR_STOP=1` turns into a clean rollback — instead of splitting
  *      the transaction. It is a limit of the scan, not a hole in the atomicity guarantee.
- *   2. STATEMENTS THAT CANNOT RUN INSIDE A TRANSACTION BLOCK at all (`CREATE DATABASE`, `VACUUM`,
+ *   2. A GUC CHANGED FROM INSIDE A FUNCTION BODY, `DO` block or `CALL`. Still invisible — but no
+ *      longer load-bearing, per (A) above: the only setting that changed this lexer's answer no
+ *      longer changes it.
+ *   3. STATEMENTS THAT CANNOT RUN INSIDE A TRANSACTION BLOCK at all (`CREATE DATABASE`, `VACUUM`,
  *      `CREATE INDEX CONCURRENTLY`). They are not transaction control, so they pass the scan, and
  *      they then fail at execution — again a clean rollback, not a partial apply.
- *   3. WHETHER THE DUMP IS THE RIGHT DUMP, or whether its contents are safe. That is the manifest
+ *   4. WHETHER THE DUMP IS THE RIGHT DUMP, or whether its contents are safe. That is the manifest
  *      check's job (lib/backup-manifest.ts), not this one.
- *   4. A restore killed BETWEEN transactions cannot exist once this passes, but a restore killed
+ *   5. A restore killed BETWEEN transactions cannot exist once this passes, but a restore killed
  *      mid-transaction still rolls back — that is PostgreSQL's guarantee, and it is why the psql
  *      timeout path terminates the backend rather than merely killing the client.
+ *   6. FALSE REJECTS IT KNOWINGLY ACCEPTS, because refusing on ambiguity is the stated principle:
+ *      a `CREATE FUNCTION … BEGIN ATOMIC … END;` body (PG14+ SQL-standard bodies are not
+ *      dollar-quoted, so their inner `END;` reads as top-level transaction control), and a literal
+ *      containing `\'`. Neither appears in a plain `pg_dump` of this application. Both refuse the
+ *      file rather than passing it, which is the direction a wrong answer has to fail in.
  *
  * AMBIGUITY IS REFUSED, NOT ACCEPTED. Every case where the scanner cannot prove what it is looking
- * at — an unterminated construct, a string-escaping mode it does not model — rejects the file.
+ * at — an unterminated construct, a string whose end depends on a setting, a prefix it cannot
+ * attribute — rejects the file.
  */
 
 const TRANSACTION_CONTROL = new Set([
@@ -94,6 +147,18 @@ const CONDITIONAL_CONTROL: Record<string, string> = {
  */
 const ALLOWED_METACOMMAND = /^\\(?:un)?restrict[ \t]+[A-Za-z0-9]+[ \t]*\r?$/
 
+/** The one GUC whose value used to change this lexer's answer. See family (A) in the header. */
+const LEXICAL_MODE_GUC = 'STANDARD_CONFORMING_STRINGS'
+/** Values of it that leave the standard (and this scanner's) reading of a literal in force. */
+const LEXICAL_MODE_ON_VALUES = new Set(['ON', 'TRUE', '1'])
+/** The only `set_config` call a plain pg_dump emits; every other use of it is refused. */
+const ALLOWED_SET_CONFIG_TARGET = 'SEARCH_PATH'
+
+/** How much of a statement is retained for the checks above. Bounded so a 1 GB file cannot buffer. */
+const MAX_STATEMENT_WORDS = 32
+const MAX_STATEMENT_LITERALS = 4
+const MAX_LITERAL_CHARS = 64
+
 export class RestoreSqlRejected extends Error {
   readonly line: number
   constructor(message: string, line: number) {
@@ -112,6 +177,9 @@ type State =
   | { kind: 'dollar'; tag: string }
   | { kind: 'copy-data' }
 
+/** A captured literal or quoted identifier. `truncated` matters: a clipped value proves nothing. */
+type CapturedText = { value: string; truncated: boolean }
+
 /**
  * A streaming lexer. Feed it the file in chunks of any size (a chunk may split any construct,
  * including a dollar-quote tag), then call `end()`.
@@ -124,14 +192,24 @@ export function createRestoreSqlScanner() {
   /** The leading words of the current statement, capped. Word 0 decides transaction control. */
   let statementWords: string[] = []
   /** String literals in the current statement, capped — `SET x = 'off'` needs the value. */
-  let statementLiterals: string[] = []
-  /** Set while a literal's contents are being captured into `statementLiterals`. */
-  let capturingLiteral: string | null = null
-  /** The current statement's text, capped — only used to spot `COPY … FROM stdin`. */
-  let statementHead = ''
-  /** The last two non-space chars, for `E'…'` and `U&'…'` detection. */
-  let prevSignificant = ''
-  let prevSignificant2 = ''
+  let statementLiterals: CapturedText[] = []
+  /** Quoted identifiers in the current statement — `SET "standard_conforming_strings" = off`. */
+  let statementIdents: CapturedText[] = []
+  /** Set while a literal's or identifier's contents are being captured. */
+  let capturing: CapturedText | null = null
+  /** Streaming `COPY … FROM stdin` detection — not a capped substring, so a wide table still works. */
+  let copyFromStdin = false
+  let previousWord = ''
+  /**
+   * The last two SIGNIFICANT TOKENS, as `W:<upper word>` or `C:<char>`.
+   *
+   * TOKENS, not characters (round 10, family (B) in the header). A string prefix is a token: `E'…'`
+   * is the one-character token `E` followed by a quote. Deciding it from the last CHARACTER read
+   * `name'…'` as an escape-string and let a top-level `COMMIT` be swallowed as string content.
+   * Carried across chunk boundaries, which a regex over a chunk cannot be.
+   */
+  let prevToken = ''
+  let prevToken2 = ''
   /** Buffer carried between chunks so a construct split across chunks still lexes. */
   let carry = ''
   /** True at the very start of a line (for metacommand and `\.` detection). */
@@ -145,31 +223,95 @@ export function createRestoreSqlScanner() {
     return /[A-Za-z0-9_$]/.test(c)
   }
 
+  function pushToken(token: string) {
+    prevToken2 = prevToken
+    prevToken = token
+  }
+
+  function capture(text: string) {
+    if (capturing === null) return
+    if (capturing.value.length >= MAX_LITERAL_CHARS) { capturing.truncated = true; return }
+    capturing.value += text
+  }
+
+  function endCapture(into: CapturedText[]) {
+    if (capturing === null) return
+    if (into.length < MAX_STATEMENT_LITERALS) into.push(capturing)
+    capturing = null
+  }
+
   function resetStatement() {
     atStatementStart = true
     statementWords = []
     statementLiterals = []
-    capturingLiteral = null
-    statementHead = ''
+    statementIdents = []
+    capturing = null
+    copyFromStdin = false
+    previousWord = ''
+  }
+
+  /** Does this statement name `standard_conforming_strings` anywhere the scanner can see? */
+  function mentionsLexicalModeGuc(): boolean {
+    if (statementWords.includes(LEXICAL_MODE_GUC)) return true
+    return [...statementLiterals, ...statementIdents]
+      .some((c) => !c.truncated && c.value.toUpperCase() === LEXICAL_MODE_GUC)
+  }
+
+  /**
+   * The ONE accepted spelling: `SET [SESSION|LOCAL] standard_conforming_strings [=|TO] on`, with
+   * `on` also spelled `true`, `1` or quoted. Every plain pg_dump emits it, so it cannot be refused;
+   * everything else that names the GUC — including `= DEFAULT`, which resolves to a server default
+   * this scanner cannot read — is refused rather than interpreted.
+   */
+  function isLexicalModeReaffirmed(): boolean {
+    if (statementIdents.length > 0) return false
+    const words = [...statementWords]
+    if (words[0] !== 'SET') return false
+    if (words[1] === 'SESSION' || words[1] === 'LOCAL') words.splice(1, 1)
+    if (words[1] !== LEXICAL_MODE_GUC) return false
+    if (words[2] === 'TO') words.splice(2, 1)
+    if (statementLiterals.length > 1) return false
+    if (statementLiterals.length === 1) {
+      const literal = statementLiterals[0]
+      return words.length === 2 && !literal.truncated && LEXICAL_MODE_ON_VALUES.has(literal.value.toUpperCase())
+    }
+    return words.length === 3 && LEXICAL_MODE_ON_VALUES.has(words[2])
   }
 
   function finishStatement() {
-    // `standard_conforming_strings = off` makes a backslash an escape inside EVERY literal, which
-    // changes where literals end — i.e. it invalidates the lexing this whole guard rests on. Checked
-    // at statement level rather than by a regex over the raw text, because a chunk boundary can fall
-    // anywhere and a per-chunk regex silently misses the split case.
-    if (statementWords[0] === 'SET' && statementWords[1] === 'STANDARD_CONFORMING_STRINGS') {
-      const values = [...statementWords.slice(2), ...statementLiterals.map((v) => v.toUpperCase())]
-      if (values.some((v) => v === 'OFF' || v === 'FALSE' || v === '0')) {
+    // DEFENCE IN DEPTH, NOT THE GUARANTEE (round 10). Since a literal whose end depends on this
+    // setting is refused outright, a missed spelling here can no longer desynchronise the lexer.
+    // It is still refused, because a dump that wants the escaping mode changed is not a dump this
+    // route should be replaying, and because a diagnosis naming the cause beats one that does not.
+    if (mentionsLexicalModeGuc() && !isLexicalModeReaffirmed()) {
+      reject(
+        'Restore file changes standard_conforming_strings, which decides how string literals are '
+        + 'terminated; only `SET standard_conforming_strings = on` is accepted',
+      )
+    }
+    if (statementWords[0] === 'RESET' && statementWords[1] === 'ALL') {
+      reject(
+        'Restore file resets every session setting (RESET ALL), which can change how string '
+        + 'literals are terminated; this file cannot be checked for transaction control',
+      )
+    }
+    if (statementWords.includes('SET_CONFIG')) {
+      // `SELECT pg_catalog.set_config('search_path', '', false);` is pg_dump's own. Any other
+      // set_config — including one whose target is computed at run time and therefore unreadable
+      // here — is refused rather than parsed.
+      const target = statementLiterals[0]
+      const allowed = statementWords[0] === 'SELECT'
+        && target !== undefined
+        && !target.truncated
+        && target.value.toUpperCase() === ALLOWED_SET_CONFIG_TARGET
+      if (!allowed) {
         reject(
-          'Restore file disables standard_conforming_strings, which changes how string literals are '
-          + 'terminated; this file cannot be checked for transaction control',
+          'Restore file calls set_config() for something other than search_path; it can change a '
+          + 'session setting this check depends on and will not be replayed',
         )
       }
     }
-    if (statementWords[0] === 'COPY' && /\bFROM\s+STDIN\b/i.test(statementHead)) {
-      state = { kind: 'copy-data' }
-    }
+    if (copyFromStdin) state = { kind: 'copy-data' }
     resetStatement()
   }
 
@@ -248,29 +390,50 @@ export function createRestoreSqlScanner() {
         }
 
         case 'single': {
-          if (state.escapes && c === '\\') {
+          if (c === '\\') {
             if (i + 1 >= limit) { carry = text.slice(i); return }
-            i += 2
+            if (state.escapes) {
+              // An `E'…'` literal: backslash escapes are the standard reading, in every mode.
+              capture(text.slice(i, i + 2))
+              i += 2
+              continue
+            }
+            // A PLAIN literal, where the reading DEPENDS ON standard_conforming_strings.
+            //   `\\`  — an escaped backslash (off) or two backslashes (on). Either way the literal
+            //           continues past both, so the two modes agree and this is not ambiguous.
+            //   `\x`  — an escape for some other character (off) or a backslash then x (on). Again
+            //           the literal ends at the same quote under both.
+            //   `\'`  — an escaped QUOTE (off) or a backslash followed by the literal's TERMINATOR
+            //           (on). The two modes disagree about where this literal ends, and therefore
+            //           about which of the following bytes are SQL. Refused: this is the exact
+            //           ambiguity every `standard_conforming_strings` payload is built on, and
+            //           refusing it is what makes this scan independent of the setting's value.
+            if (text[i + 1] === '\\') { capture('\\\\'); i += 2; continue }
+            if (text[i + 1] === "'") {
+              reject(
+                'Restore file contains a backslash-escaped quote inside a plain string literal, '
+                + 'where the literal ends depends on standard_conforming_strings; this file cannot '
+                + 'be checked for transaction control',
+              )
+            }
+            capture('\\')
+            i += 1
             continue
           }
           if (c === "'") {
             if (i + 1 >= limit) { carry = text.slice(i); return }
             if (text[i + 1] === "'") {
-              if (capturingLiteral !== null && capturingLiteral.length < 32) capturingLiteral += "'"
+              capture("'")
               i += 2
               continue
             }
             state = { kind: 'sql' }
-            if (capturingLiteral !== null) {
-              if (statementLiterals.length < 4) statementLiterals.push(capturingLiteral)
-              capturingLiteral = null
-            }
-            prevSignificant2 = prevSignificant
-            prevSignificant = "'"
+            endCapture(statementLiterals)
+            pushToken("C:'")
             i += 1
             continue
           }
-          if (capturingLiteral !== null && capturingLiteral.length < 32) capturingLiteral += c
+          capture(c)
           i += 1
           continue
         }
@@ -278,13 +441,14 @@ export function createRestoreSqlScanner() {
         case 'double': {
           if (c === '"') {
             if (i + 1 >= limit) { carry = text.slice(i); return }
-            if (text[i + 1] === '"') { i += 2; continue }
+            if (text[i + 1] === '"') { capture('"'); i += 2; continue }
             state = { kind: 'sql' }
-            prevSignificant2 = prevSignificant
-            prevSignificant = '"'
+            endCapture(statementIdents)
+            pushToken('C:"')
             i += 1
             continue
           }
+          capture(c)
           i += 1
           continue
         }
@@ -295,8 +459,7 @@ export function createRestoreSqlScanner() {
             if (i + close.length > limit) { carry = text.slice(i); return }
             if (text.startsWith(close, i)) {
               state = { kind: 'sql' }
-              prevSignificant2 = prevSignificant
-              prevSignificant = '$'
+              pushToken('C:$')
               i += close.length
               continue
             }
@@ -332,38 +495,41 @@ export function createRestoreSqlScanner() {
 
           if (c === ';') {
             finishStatement()
-            prevSignificant2 = prevSignificant
-            prevSignificant = ';'
+            pushToken('C:;')
             i += 1
             continue
           }
 
           if (c === "'") {
             // `U&'…'` chooses its own escape character (UESCAPE, default backslash), so the scanner
-            // cannot know where such a literal ends. Refused rather than guessed. Detected from the
-            // two preceding significant characters, which survive a chunk boundary — a regex over
-            // the raw chunk does not.
-            if (prevSignificant === '&' && (prevSignificant2 === 'U' || prevSignificant2 === 'u')) {
+            // cannot know what it is reading. Refused rather than guessed. Recognised from the two
+            // preceding TOKENS — a standalone `U` then `&` — so an identifier that merely ENDS in
+            // `u` is not mistaken for the prefix, and so a chunk boundary cannot hide it.
+            if (prevToken === 'C:&' && prevToken2 === 'W:U') {
               reject(
                 "Restore file contains a Unicode-escape string literal (U&'…'), whose escape "
                 + 'character is configurable; this file cannot be checked for transaction control',
               )
             }
-            // `E'…'` uses backslash escapes; a bare literal does not (standard_conforming_strings,
-            // which finishStatement asserts stays on). Getting this wrong shifts every subsequent
-            // string boundary.
-            const escapes = prevSignificant === 'E' || prevSignificant === 'e'
+            // `E'…'` uses backslash escapes; a plain literal's backslashes are settled by the rule
+            // in the `single` case above. Round 10: this is the PREVIOUS TOKEN, not the previous
+            // character — `name'…'` and `date'…'` are typed literals, not escape-strings, and
+            // reading them as escape-strings swallowed a top-level COMMIT.
+            const escapes = prevToken === 'W:E'
             state = { kind: 'single', escapes }
-            // Capture the contents only where a value is load-bearing, so a 10MB literal is not
-            // buffered: the SET statement above is the only case.
-            capturingLiteral = statementWords[0] === 'SET' ? '' : null
-            prevSignificant2 = prevSignificant
-            prevSignificant = "'"
+            capturing = { value: '', truncated: false }
+            pushToken("C:'")
             i += 1
             continue
           }
 
-          if (c === '"') { state = { kind: 'double' }; prevSignificant2 = prevSignificant; prevSignificant = '"'; i += 1; continue }
+          if (c === '"') {
+            state = { kind: 'double' }
+            capturing = { value: '', truncated: false }
+            pushToken('C:"')
+            i += 1
+            continue
+          }
 
           if (c === '$') {
             // A dollar quote opens as `$tag$`; `$1` is a parameter and `$` alone is not special.
@@ -372,15 +538,13 @@ export function createRestoreSqlScanner() {
             if (match) {
               state = { kind: 'dollar', tag: match[0] }
               i += match[0].length
-              prevSignificant2 = prevSignificant
-              prevSignificant = '$'
+              pushToken('C:$')
               continue
             }
             // Could be a tag straddling the chunk boundary — only if there is no newline after it,
             // since a dollar-quote tag cannot contain one.
             if (!rest.includes('\n') && rest.length < 128) { carry = rest; return }
-            prevSignificant2 = prevSignificant
-            prevSignificant = '$'
+            pushToken('C:$')
             i += 1
             continue
           }
@@ -390,19 +554,21 @@ export function createRestoreSqlScanner() {
             while (j < limit && isWordChar(text[j])) j += 1
             if (j === limit) { carry = text.slice(i); return }
             const word = text.slice(i, j)
+            const upper = word.toUpperCase()
             if (atStatementStart) atStatementStart = false
-            if (statementWords.length < 8) statementWords.push(word.toUpperCase())
+            if (statementWords.length < MAX_STATEMENT_WORDS) statementWords.push(upper)
             if (statementWords.length <= 2) checkTransactionControl()
-            if (statementHead.length < 512) statementHead += ` ${word}`
-            prevSignificant2 = prevSignificant
-            prevSignificant = word[word.length - 1]
+            // Streaming, so a COPY with more column names than any fixed-size buffer would hold
+            // still enters data mode. Getting this wrong lexes tab-separated DATA as SQL, which is
+            // the same desynchronisation by another route.
+            if (statementWords[0] === 'COPY' && upper === 'STDIN' && previousWord === 'FROM') copyFromStdin = true
+            previousWord = upper
+            pushToken(`W:${upper}`)
             i = j
             continue
           }
 
-          if (statementHead.length < 512) statementHead += c
-          prevSignificant2 = prevSignificant
-          prevSignificant = c
+          pushToken(`C:${c}`)
           i += 1
           continue
         }

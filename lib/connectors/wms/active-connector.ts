@@ -18,3 +18,19 @@ export async function getActiveWmsConnectorId(): Promise<WmsConnectorId | null> 
   if (enabled) return enabled
   return WMS_CONNECTOR_IDS[0] ?? null
 }
+
+/**
+ * The ENABLED WMS connector, with no legacy fallback — exactly what
+ * runWmsDispatchSweep resolves (o3d-bjc.12).
+ *
+ * getActiveWmsConnectorId() falls back to the first registered connector so the
+ * historical single-connector deployments keep routing somewhere. That fallback
+ * is wrong for anything that asks "is a sweep maintaining this?": with every
+ * plugin disabled the sweep does not run, so its leftover state is not evidence
+ * — and offering to bulk-quarantine links on it would exclude orders that come
+ * straight back the moment the connector is re-enabled.
+ */
+export async function getEnabledWmsConnectorId(): Promise<WmsConnectorId | null> {
+  const state = await getIntegrationPluginState()
+  return WMS_CONNECTOR_IDS.find((id) => state[id]) ?? null
+}

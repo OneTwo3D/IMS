@@ -148,9 +148,31 @@ export const DISPATCH_SWEEP_LOCK_NAMESPACE = 0x77_6d_73_64 // 'wmsd'
 /** Per-refund dedup of the reservation-release warning. */
 export const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
 
+/**
+ * Per-PurchaseOrder serialization of the legacy PO-keyed back-reference resolve-then-apply
+ * (o3d-9kek).
+ *
+ * A PURCHASE_INVOICE sync row enqueued before o3d-9oq names the ORDER, not the bill, so
+ * writing its external id back means first DEDUCING which bill it belongs to — and the
+ * deduction is only valid for as long as the population it read stays put. Two repair sweeps,
+ * or a sweep racing a connector's own writer, would each resolve the one unlinked bill and
+ * each write to it; the second write replaces a valid external id with the other row's.
+ *
+ * Keyed on the PurchaseOrder because that is the scope the deduction reads: every bill on the
+ * order and every live sync row for it. The lock is held to commit of the transaction that
+ * does both, so nothing can move between them.
+ *
+ * COOPERATIVE, and deliberately narrow: the authoritative bill-keyed writer does NOT take it,
+ * because it knows its bill and must be free to overwrite a legacy guess. What protects
+ * against that writer is the compare-and-swap in the apply itself (`updateMany` predicated on
+ * the bill still having no id), not this lock.
+ */
+export const BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE = 411_220_868
+
 
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
+  BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
 } as const

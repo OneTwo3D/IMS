@@ -187,6 +187,13 @@ test('a chunk boundary cannot change the verdict', () => {
     'COPY t FROM stdin;\nCOMMIT;\n\\.\nSELECT 1;\n',
     'SET standard_conforming_strings = off;\n',
     "SELECT U&'\\0041';",
+    // ROUND 10. Each of these was ACCEPTED whole AND one character at a time before the fix, so
+    // chunk parity here is the assertion that the fix is in the lexer's state and not in a regex
+    // that happens to see the whole file.
+    "SET SESSION standard_conforming_strings = off;\nSELECT 'a\\'; -- '; COMMIT;\n",
+    "SELECT 'a\\'; -- '; COMMIT;\n",
+    "SELECT name'a\\'; COMMIT; --' ;\n",
+    "SELECT set_config('standard_conforming_strings', 'off', false);\n",
   ]) {
     assert.equal(chunkedVerdict(sql), verdict(sql), `chunking changed the verdict for ${JSON.stringify(sql.slice(0, 40))}`)
   }
@@ -213,4 +220,139 @@ test('a file with no trailing newline is not refused for that alone', () => {
 test('a dollar-quoted body ends only at its OWN tag', () => {
   assert.equal(verdict('CREATE FUNCTION f() RETURNS void AS $a$ SELECT $b$ inner $b$; $a$;\nSELECT 1;\n'), 'accepted')
   assert.match(verdict('CREATE FUNCTION f() RETURNS void AS $a$ SELECT 1; $a$;\nCOMMIT;\n'), /transaction control/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-osl8 ROUND 10, FINDING 1 — the lexer could be knocked out of step, and then it reported
+// "no transaction control" over a file whose COMMIT it simply could not see.
+//
+// The review found ONE spelling (`SET SESSION`). Enumerating its siblings found five more accepted
+// bypasses, and the last of them needs no setting change at all. The tests below are grouped by the
+// CLASS each one belongs to, because fixing them one payload at a time is what produced a guard
+// that could be defeated by the next spelling.
+// ---------------------------------------------------------------------------
+
+/** The payload from the review, reduced to its two halves. */
+const ESCAPED_QUOTE_HIDING_COMMIT = "SELECT 'a\\'; -- '; COMMIT;\nSELECT 1;\n"
+
+test('the reported bypass is refused: SET SESSION + an escaped quote that hides a top-level COMMIT', () => {
+  // PostgreSQL reads `'a\'; -- '` as ONE literal when standard_conforming_strings is off, so the
+  // `COMMIT;` after it is a top-level statement and the replay is no longer one transaction. The
+  // round-9 scanner read the literal as ending at the quote after the backslash and swallowed the
+  // COMMIT as line-comment content — the exact shape of desynchronisation this guard exists to
+  // avoid, since a partial restore is the outcome it is protecting against.
+  const payload = 'SET SESSION standard_conforming_strings = off;\n' + ESCAPED_QUOTE_HIDING_COMMIT
+  assert.notEqual(verdict(payload), 'accepted')
+  assert.equal(chunkedVerdict(payload), verdict(payload))
+})
+
+test('every spelling that can turn standard_conforming_strings off is refused, not just the one', () => {
+  // A guard that matched `SET <name>` and nothing else was defeated by `SET SESSION <name>`. These
+  // are its siblings; each was ACCEPTED before this round.
+  for (const statement of [
+    'SET SESSION standard_conforming_strings = off;',
+    'SET LOCAL standard_conforming_strings = off;',
+    'SET standard_conforming_strings TO off;',
+    'SET standard_conforming_strings = DEFAULT;',      // resolves to a server default we cannot read
+    'SET "standard_conforming_strings" = off;',         // quoted identifier
+    'set session STANDARD_CONFORMING_STRINGS = FALSE;', // case
+    'RESET standard_conforming_strings;',
+    'RESET ALL;',
+    "SELECT set_config('standard_conforming_strings', 'off', false);",
+    "SELECT pg_catalog.set_config('standard_conforming_strings', 'off', false);",
+    "SELECT set_config('standard_' || 'conforming_strings', 'off', false);", // name computed at run time
+  ]) {
+    const sql = `${statement}\nSELECT 1;\n`
+    assert.notEqual(verdict(sql), 'accepted', `should refuse: ${statement}`)
+    assert.equal(chunkedVerdict(sql), verdict(sql), `chunking changed the verdict for ${statement}`)
+  }
+})
+
+test('...while the ON form every pg_dump emits is still accepted, in its spellings too', () => {
+  // Refusing this would refuse every backup this application produces — the failure mode round 9
+  // found in the PREVIOUS validator, and the reason a guard has to be tested in both directions.
+  for (const statement of [
+    'SET standard_conforming_strings = on;',
+    'SET SESSION standard_conforming_strings = on;',
+    'SET LOCAL standard_conforming_strings = on;',
+    'SET standard_conforming_strings TO on;',
+    "SET standard_conforming_strings = 'on';",
+    'SET standard_conforming_strings = true;',
+    'SET standard_conforming_strings = 1;',
+  ]) {
+    assert.equal(verdict(`${statement}\nSELECT 1;\n`), 'accepted', `should accept: ${statement}`)
+  }
+})
+
+test('THE CLASS IS CLOSED BY CONSTRUCTION: the verdict no longer depends on the setting at all', () => {
+  // This is the assertion that matters more than any individual spelling above. The setting can
+  // also be changed from inside a function body, a DO block or a CALL — none of which any lexer can
+  // read — so a guard built on detecting the statement can never be complete.
+  //
+  // The two modes differ in exactly ONE construct: a backslash run of odd length immediately before
+  // a quote inside a plain literal ends that literal when the setting is on and does not when it is
+  // off. That construct is refused, so every other input lexes identically under both settings and
+  // it stops mattering HOW the setting was changed. Here that is shown by removing the `SET`
+  // entirely: the payload is refused on its own account.
+  assert.match(verdict(ESCAPED_QUOTE_HIDING_COMMIT), /backslash-escaped quote/)
+  assert.equal(chunkedVerdict(ESCAPED_QUOTE_HIDING_COMMIT), verdict(ESCAPED_QUOTE_HIDING_COMMIT))
+
+  // ...and the same payload behind an indirection no lexer can follow is refused for the same
+  // reason, which is the point: the indirection is now irrelevant.
+  assert.match(
+    verdict('CALL some_procedure_that_sets_the_guc();\n' + ESCAPED_QUOTE_HIDING_COMMIT),
+    /backslash-escaped quote/,
+  )
+  assert.match(
+    verdict('DO $$ BEGIN EXECUTE \'SET standard_conforming_strings = off\'; END $$;\n' + ESCAPED_QUOTE_HIDING_COMMIT),
+    /backslash-escaped quote/,
+  )
+
+  // The backslash forms whose reading does NOT depend on the setting stay accepted, so the refusal
+  // is aimed at the ambiguity rather than at backslashes.
+  assert.equal(verdict("SELECT 'a\\\\b'; SELECT 1;"), 'accepted', 'an escaped backslash closes at the same quote in both modes')
+  assert.equal(verdict("SELECT 'a\\nb'; SELECT 1;"), 'accepted', 'and so does a backslash before any non-quote')
+  assert.match(verdict("SELECT 'a\\\\b'; COMMIT;"), /transaction control/, 'and the scan still runs afterwards')
+})
+
+test('a string prefix is the previous TOKEN, not the previous character', () => {
+  // THE SIXTH BYPASS, and the worst of them: it needs NO setting change and works against a stock
+  // dump. Round 9 decided "is this an E'…' escape-string?" from the last character before the
+  // quote, so `name'…'`, `date'…'` and `true'…'` — ordinary typed literals — were lexed as
+  // escape-strings, and `SELECT name'a\'; COMMIT; --' ;` was ACCEPTED with the COMMIT swallowed.
+  assert.notEqual(verdict("SELECT name'a\\'; COMMIT; --' ;\nSELECT 1;\n"), 'accepted')
+  assert.notEqual(verdict("SELECT date'a\\'; COMMIT; --' ;\nSELECT 1;\n"), 'accepted')
+
+  // A real E-string still uses backslash escapes...
+  assert.equal(verdict("SELECT E'it\\'s fine'; SELECT 2;"), 'accepted')
+  // ...and a typed literal with no ambiguity in it is still ordinary SQL.
+  assert.equal(verdict("SELECT date'2020-01-01'; SELECT 1;"), 'accepted')
+  assert.match(verdict("SELECT date'2020-01-01'; COMMIT;"), /transaction control/)
+
+  // The same rule on the other prefix: `U&'…'` is refused because its escape character is
+  // configurable, but an identifier merely ENDING in `u` is not that prefix.
+  assert.match(verdict("SELECT U&'\\0041';"), /Unicode-escape/)
+  assert.equal(verdict("SELECT menu & 'x'; SELECT 1;"), 'accepted')
+})
+
+test("pg_dump's own set_config call is accepted and every other one is refused", () => {
+  // Plain pg_dump emits `SELECT pg_catalog.set_config('search_path', '', false);` many times, so a
+  // blanket refusal of set_config would refuse every real dump. Everything else it can be pointed
+  // at — including a target computed at run time — is refused instead of parsed.
+  assert.equal(verdict("SELECT pg_catalog.set_config('search_path', '', false);\nSELECT 1;\n"), 'accepted')
+  assert.match(verdict("SELECT set_config('search_path', '', false);\nCOMMIT;\n"), /transaction control/)
+  assert.match(verdict("SELECT set_config('backslash_quote', 'off', false);\n"), /set_config/)
+})
+
+test('a COPY wider than any fixed-size buffer still enters DATA mode', () => {
+  // The round-9 code decided "is this COPY … FROM stdin?" from the first 512 characters of the
+  // statement. A table with enough columns pushes `FROM stdin` past that, and then the tab-separated
+  // DATA is lexed as SQL — a quote in a value puts the scanner in a string state PostgreSQL is not
+  // in, which is the same desynchronisation by another route. Detection is now streaming.
+  const columns = Array.from({ length: 200 }, (_, i) => `column_number_${i}`).join(', ')
+  const sql = `COPY public.wide (${columns}) FROM stdin;\nvalue\tit's data\tCOMMIT;\n\\.\nSELECT 1;\n`
+  assert.equal(verdict(sql), 'accepted')
+  assert.equal(chunkedVerdict(sql), 'accepted')
+  // ...and the block still genuinely ends at `\.`
+  assert.match(verdict(sql.replace('SELECT 1;', 'COMMIT;')), /transaction control/)
 })

@@ -1,0 +1,226 @@
+import assert from 'node:assert/strict'
+import test, { mock } from 'node:test'
+
+// ---------------------------------------------------------------------------
+// o3d-9kek r2 finding 2 — retention deletes accounting_sync_logs by AGE, on its own schedule,
+// while the back-reference sweep reads its candidate page outside the transaction that later
+// acts on it. Deleting an UNRESOLVED row in that window does not merely lose an audit trail:
+//
+//   • deleting the row being repaired leaves the sweep holding an external id whose evidence is
+//     gone (the resolver now refuses that — "exactly one live sync row");
+//   • deleting a COMPETING SIBLING is worse, because it is undetectable. One unlinked bill and
+//     one surviving claimant is genuinely indistinguishable from an unambiguous attribution, so
+//     the sweep stops refusing and stamps a bill whose competitor no longer exists.
+//
+// The predicate is therefore asserted BEHAVIOURALLY — the where clause is evaluated against rows
+// — rather than by comparing its shape, so a version of production that kept the constant but
+// stopped applying it, or applied it with the wrong polarity, fails here.
+// ---------------------------------------------------------------------------
+
+type DeleteArgs = { where: Record<string, unknown> }
+type UpdateArgs = { where: Record<string, unknown>; data: Record<string, unknown> }
+
+const capture: {
+  settingRows: Array<{ key: string; value: string }>
+  accountingDelete?: DeleteArgs
+  accountingCompact?: UpdateArgs
+} = {
+  settingRows: [],
+  accountingDelete: undefined,
+  accountingCompact: undefined,
+}
+
+function noopDelegate() {
+  return {
+    deleteMany: async () => ({ count: 0 }),
+    updateMany: async () => ({ count: 0 }),
+    findMany: async () => [],
+  }
+}
+
+mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {}, logActivityPersisted: async () => true } })
+mock.module('@/lib/db', {
+  namedExports: {
+    db: {
+      setting: { findMany: async () => capture.settingRows },
+      shoppingSyncLog: noopDelegate(),
+      accountingSyncLog: {
+        ...noopDelegate(),
+        deleteMany: async (args: DeleteArgs) => {
+          capture.accountingDelete = args
+          return { count: 0 }
+        },
+        updateMany: async (args: UpdateArgs) => {
+          capture.accountingCompact = args
+          return { count: 0 }
+        },
+      },
+      stockMovement: noopDelegate(),
+      cogsEntry: noopDelegate(),
+      costLayer: noopDelegate(),
+      salesOrder: noopDelegate(),
+      purchaseOrder: noopDelegate(),
+      customer: noopDelegate(),
+      shoppingWebhookEvent: noopDelegate(),
+    },
+  },
+})
+
+type Row = Record<string, unknown>
+
+/** Enough of Prisma's where semantics for this predicate — including NOT(AND(...)). */
+function matches(row: Row, where: Record<string, unknown>): boolean {
+  for (const [key, condition] of Object.entries(where)) {
+    if (key === 'NOT') {
+      if (matches(row, condition as Record<string, unknown>)) return false
+      continue
+    }
+    const value = row[key] ?? null
+    if (condition === null) {
+      if (value !== null) return false
+      continue
+    }
+    if (typeof condition === 'object' && !(condition instanceof Date)) {
+      const operators = condition as Record<string, unknown>
+      const unsupported = Object.keys(operators).filter((op) => !['in', 'not', 'lt'].includes(op))
+      if (unsupported.length > 0) throw new Error(`unsupported operator(s) ${unsupported.join(', ')} on "${key}"`)
+      if ('in' in operators && !(operators.in as unknown[]).includes(value)) return false
+      if ('not' in operators) {
+        if (operators.not === null) { if (value === null) return false } else if (value === operators.not) return false
+      }
+      if ('lt' in operators) {
+        if (!(value instanceof Date) || !(operators.lt instanceof Date) || value.getTime() >= operators.lt.getTime()) return false
+      }
+      continue
+    }
+    if (value !== condition) return false
+  }
+  return true
+}
+
+const OLD = new Date('2020-01-01T00:00:00Z')
+const NOW = new Date()
+
+function row(overrides: Row = {}): Row {
+  return {
+    id: 'log-1',
+    createdAt: OLD,
+    type: 'PURCHASE_INVOICE',
+    status: 'SYNCED',
+    externalTransactionId: 'XBILL-1',
+    backReferenceCheckedAt: null,
+    backReferenceEvidenceCompactedAt: null,
+    ...overrides,
+  }
+}
+
+/** Out of line so the assignment does not narrow the captures to `undefined`. */
+function resetCaptures(): void {
+  capture.accountingDelete = undefined
+  capture.accountingCompact = undefined
+}
+
+async function runRetention(): Promise<{ deleteWhere: Record<string, unknown>; compact: UpdateArgs }> {
+  const { purgeExpiredData } = await import('@/lib/data-retention')
+  capture.settingRows = [{ key: 'retention_sync_logs_months', value: '6' }]
+  resetCaptures()
+  await purgeExpiredData()
+  assert.ok(capture.accountingDelete, 'retention must still delete expired accounting sync logs')
+  assert.ok(capture.accountingCompact, 'retention must COMPACT the rows it refuses to delete — an exemption alone is unbounded')
+  return { deleteWhere: capture.accountingDelete.where, compact: capture.accountingCompact }
+}
+
+async function captureDeletePredicate(): Promise<Record<string, unknown>> {
+  return (await runRetention()).deleteWhere
+}
+
+test('[o3d-9kek r2 f2] retention keeps UNRESOLVED back-reference evidence past the cutoff', async () => {
+  const where = await captureDeletePredicate()
+
+  // The row under repair, and — the case that actually corrupts data — its competing sibling.
+  // Deleting either one silently converts a refusal into a confident wrong answer.
+  assert.equal(matches(row({ id: 'legacy' }), where), false)
+  assert.equal(matches(row({ id: 'sibling', externalTransactionId: 'XBILL-2' }), where), false)
+  // FAILED rows are candidates too (they may still owe their follow-ups).
+  assert.equal(matches(row({ status: 'FAILED' }), where), false)
+  // ...and so are the sales-side types the sweep repairs.
+  assert.equal(matches(row({ type: 'SALES_INVOICE' }), where), false)
+  assert.equal(matches(row({ type: 'CREDIT_NOTE' }), where), false)
+  // r6 finding 2: AND supplier credit notes. This type was missing from the shared list, so the
+  // only row that knew an external ACCPAYCREDIT existed with no local link was DELETED by age —
+  // taking the evidence with it, and with nothing to repair from afterwards.
+  assert.equal(matches(row({ type: 'PURCHASE_CREDIT_NOTE', externalTransactionId: 'XCN-1' }), where), false)
+})
+
+test('[o3d-9kek r2 f2] retention still deletes everything the sweep has SETTLED or never owned', async () => {
+  const where = await captureDeletePredicate()
+
+  // The exemption is bounded by the sweep's own verdict marker: once a row is settled, the
+  // attribution lives on the document (which is never retention-deleted, and now unique), so the
+  // log is free to expire. Without this the exemption would grow without limit.
+  assert.equal(matches(row({ backReferenceCheckedAt: new Date('2021-01-01') }), where), true)
+  // Never posted — it is not evidence of anything in the ledger.
+  assert.equal(matches(row({ externalTransactionId: null }), where), true)
+  // Deliberately abandoned (audit-46ry), and types that carry no back-reference at all.
+  assert.equal(matches(row({ status: 'CANCELLED' }), where), true)
+  assert.equal(matches(row({ type: 'COGS_JOURNAL' }), where), true)
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT' }), where), true)
+  // Age is still the primary rule: nothing inside the retention window is deleted.
+  assert.equal(matches(row({ createdAt: NOW }), where), false)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-9kek r3 finding 3 — the exemption above was called "bounded" because the sweep stamps every
+// row it settles. It is not: a permanently ambiguous row is never stamped BY DESIGN, a
+// disconnected connector's rows are never swept at all, and no QuickBooks sweep runs (deliberately
+// — r6 finding 1), so every QuickBooks invoice/bill row stays unstamped forever. Full payloads — customer
+// names, emails, addresses, financial lines — could therefore outlive the configured retention
+// period without limit. A retention policy that silently fails to delete is worse than one that
+// deletes too much.
+//
+// The row is now COMPACTED rather than exempted: attribution kept, content dropped.
+// ---------------------------------------------------------------------------
+
+test('[o3d-9kek r3 f3] expired unresolved evidence is COMPACTED, not kept whole forever', async () => {
+  const { compact } = await runRetention()
+
+  // Exactly the rows the delete refuses — the same predicate, so the two can never disagree about
+  // a row and leave it both undeleted and uncompacted.
+  assert.equal(matches(row({ id: 'legacy' }), compact.where), true)
+  assert.equal(matches(row({ id: 'sibling', externalTransactionId: 'XBILL-2' }), compact.where), true)
+  assert.equal(matches(row({ status: 'FAILED' }), compact.where), true)
+  assert.equal(matches(row({ type: 'SALES_INVOICE' }), compact.where), true)
+  // r6 finding 2: a supplier credit note is compacted like any other unresolved row. Before it was
+  // added to the shared type list this row was DELETED here instead — the one case where "not
+  // compacted" and "not exempt" coincide, which is exactly how it went unnoticed.
+  assert.equal(matches(row({ type: 'PURCHASE_CREDIT_NOTE', externalTransactionId: 'XCN-1' }), compact.where), true)
+
+  // Not inside the retention window — content is retained until the period the settings UI promises.
+  assert.equal(matches(row({ createdAt: NOW }), compact.where), false)
+  // Not a settled row: that one is DELETED, not compacted.
+  assert.equal(matches(row({ backReferenceCheckedAt: new Date('2021-01-01') }), compact.where), false)
+  // Not an already-compacted row: without this the daily pass would rewrite the whole tombstone
+  // set every day, and the marker would keep moving forward for rows nothing had changed.
+  assert.equal(matches(row({ backReferenceEvidenceCompactedAt: new Date('2021-01-01') }), compact.where), false)
+})
+
+test('[o3d-9kek r3 f3] the tombstone keeps the attribution and drops the personal data', async () => {
+  const { compact } = await runRetention()
+
+  // WHAT IS DROPPED. payload is the document as sent — customer and supplier names, email and
+  // delivery addresses, line descriptions and amounts. errorMessage echoes connector responses,
+  // which quote the same. These are the reason an open-ended exemption was not acceptable.
+  assert.deepEqual(compact.data.payload, {})
+  assert.equal(compact.data.errorMessage, null)
+  assert.ok(compact.data.backReferenceEvidenceCompactedAt instanceof Date)
+
+  // WHAT IS KEPT, asserted by exclusion: the write touches NOTHING else, so connector, type,
+  // referenceType, referenceId, externalTransactionId and status all survive.
+  // Those are exactly what the PurchaseOrder resolver counts, which is what stops retention
+  // turning "two claimants, refuse" into "one claimant, confidently wrong".
+  assert.deepEqual(Object.keys(compact.data).sort(), ['backReferenceEvidenceCompactedAt', 'errorMessage', 'payload'])
+  // In particular it must not settle the row behind the operator's back: a compacted row is
+  // evidence, not a verdict, and stamping it checked would also make it deletable next run.
+  assert.equal('backReferenceCheckedAt' in compact.data, false)
+  assert.equal('status' in compact.data, false)
+})
