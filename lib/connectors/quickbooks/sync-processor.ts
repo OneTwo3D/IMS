@@ -19,7 +19,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
-import { settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
@@ -687,10 +687,15 @@ async function processEntry(
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const bankAccountId = payload.bankAccountId as string | undefined
       const amount = payload.amount as number | undefined
-      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
+      // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
+      // this document is already settled has to look for the settlement THIS call will create, and
+      // the only way that can never drift is for both to ask one function. See moneyPostDate.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this INVOICE_PAYMENT: ${posting.reason}` }
+      const paymentDate = posting.date
       // Resolve customer ref: prefer payload, fall back to order's customer.
       // RESIDUAL (o3d-gfh): payload.customerRef is a naked id stamped at ENQUEUE time and is NOT
       // provenance-checked here — the payment row carries no provenance to check it against. A payment
@@ -759,10 +764,15 @@ async function processEntry(
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const bankAccountId = payload.bankAccountId as string | undefined
       const amount = payload.amount as number | undefined
-      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for BILL_PAYMENT' }
       }
+      // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
+      // this document is already settled has to look for the settlement THIS call will create, and
+      // the only way that can never drift is for both to ask one function. See moneyPostDate.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this BILL_PAYMENT: ${posting.reason}` }
+      const paymentDate = posting.date
       // Resolve vendor ref: prefer payload, fall back to PO's supplier.
       // Same residual as INVOICE_PAYMENT above — payload.vendorRef is unchecked; see o3d-gfh.
       let vendorRefId = payload.vendorRef as string | undefined

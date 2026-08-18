@@ -26,7 +26,7 @@ import {
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
-import { settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
@@ -1398,10 +1398,15 @@ async function processEntry(
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const bankAccountId = payload.bankAccountId as string | undefined
       const amount = payload.amount as number | undefined
-      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
+      // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
+      // this document is already settled has to look for the settlement THIS call will create, and
+      // the only way that can never drift is for both to ask one function. See moneyPostDate.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this INVOICE_PAYMENT: ${posting.reason}` }
+      const paymentDate = posting.date
       const account = await db.accountingAccount.findFirst({
         where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
         select: { externalAccountId: true },
@@ -1512,10 +1517,15 @@ async function processEntry(
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const bankAccountId = payload.bankAccountId as string | undefined
       const amount = payload.amount as number | undefined
-      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for BILL_PAYMENT' }
       }
+      // o3d-0m56 round 6, finding 1: the date is not computed here. The probe that decides whether
+      // this document is already settled has to look for the settlement THIS call will create, and
+      // the only way that can never drift is for both to ask one function. See moneyPostDate.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this BILL_PAYMENT: ${posting.reason}` }
+      const paymentDate = posting.date
       // Resolve bank account — accept either Xero AccountID (preferred) or a legacy account code.
       const account = await db.accountingAccount.findFirst({
         where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
@@ -1601,10 +1611,15 @@ async function processEntry(
       const creditNoteId = payload.creditNoteId as string | undefined
       const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
       const amount = payload.amount as number | undefined
-      const allocationDate = (payload.date as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!creditNoteId || !accountingInvoiceId || amount == null) {
         return { success: false, error: 'Missing creditNoteId, accountingInvoiceId, or amount for PURCHASE_CREDIT_NOTE_ALLOCATION' }
       }
+      // o3d-0m56 round 6, finding 1: an allocation dates itself from `date`, NOT `paymentDate` —
+      // the difference between this branch and the two payment branches above is exactly what a
+      // single shared "mirror" of both got wrong. moneyPostDateToSend knows which is which.
+      const posting = moneyPostDateToSend(type, payload, new Date())
+      if (!posting.ok) return { success: false, error: `Cannot date this allocation: ${posting.reason}` }
+      const allocationDate = posting.date
       // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
       // entry may have posted before — a committed call whose response was lost is FAILED, and
       // the row returns to PENDING for several more attempts. Everything that happens earlier

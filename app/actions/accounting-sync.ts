@@ -607,7 +607,7 @@ export async function reconcileSettledAccountingSyncRow(
     // let one slow remote block every payment enqueue in the system.
     const probe = await probeLedgerSettlement(connector, { type: row.type, payload: row.payload })
     const settlement = classifyLedgerSettlement(
-      describeAttempt(row.payload, settlementMarkerFor(effectiveTokenFor(connector, row))),
+      describeAttempt(row.type, row.payload, settlementMarkerFor(effectiveTokenFor(connector, row))),
       probe,
     )
     const decision = decideSettledRowReconciliation({ row, settlement, isMoneyMoving: isMoneyMovingSyncType })

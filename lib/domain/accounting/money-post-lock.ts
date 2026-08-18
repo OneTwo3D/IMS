@@ -34,16 +34,18 @@
  * waiters. A crashed holder releases automatically — PostgreSQL drops session advisory locks when
  * the connection closes — which is why this is a lock and not a lease row with an expiry to tune.
  *
- * SCOPE, and its residual: the same (connector, type, referenceType, referenceId) tuple the rest
- * of this design uses, so the population the lock serializes is exactly the population
- * `authoriseMoneyPost` judges as contenders. Two rows in DIFFERENT scopes naming the same external
- * document are serialized by neither — they are not contenders either, and closing that needs the
- * sibling query keyed on the document rather than the scope (tracked separately).
+ * KEYED ON THE DOCUMENT, NOT THE SCOPE (round 6, Codex CRITICAL #2). It used to be keyed on
+ * (connector, type, referenceType, referenceId) — where the row lives in IMS — which meant two
+ * rows in different scopes naming the same external document took two different locks and could
+ * post to it at the same time. That was carried as a "known residual" for two rounds; it is a
+ * double payment. The key is now the document the post will settle, which is also the population
+ * `authoriseMoneyPost` judges as contenders and the document the probe reads. See
+ * money-post-document.ts for why the scope key is not additionally taken here.
  */
 
 import { ACCOUNTING_MONEY_POST_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
-import { followUpScopeLockId, type FollowUpScope } from './followup-scope-lock'
+import { moneyPostDocumentLockId, type MoneyPostDocument } from './money-post-document'
 
 /**
  * What `run` may ask the lock while it holds it.
@@ -62,7 +64,7 @@ export type HeldMoneyPostLock = {
 export type MoneyPostLockOutcome<T> = { locked: true; result: T } | { locked: false }
 
 export type MoneyPostLock = <T>(
-  scope: FollowUpScope,
+  document: MoneyPostDocument,
   run: (lock: HeldMoneyPostLock) => Promise<T>,
 ) => Promise<MoneyPostLockOutcome<T>>
 
@@ -73,9 +75,9 @@ export type MoneyPostLock = <T>(
  * ledger probe — and the post itself must be INSIDE `run`. Anything left outside is back in the
  * window this exists to close.
  */
-export const withMoneyPostLock: MoneyPostLock = async (scope, run) => {
+export const withMoneyPostLock: MoneyPostLock = async (document, run) => {
   const lock = await acquirePinnedAdvisoryLockOrNull(
-    followUpScopeLockId(scope),
+    moneyPostDocumentLockId(document),
     ACCOUNTING_MONEY_POST_LOCK_NAMESPACE,
   )
   if (!lock) return { locked: false }

@@ -265,7 +265,7 @@ export function planManualRetry(params: {
   // Each row is judged by ITS OWN mark: the token a row posted under is what it would have written
   // into the ledger, so a rival attempt is recognised by its own reference, not by this one's.
   const verdictFor = (row: RetryCandidateRow): SettlementVerdict =>
-    classifyLedgerSettlement(describeAttempt(row.payload, settlementMarkerFor(row.effectiveToken)), ledger)
+    classifyLedgerSettlement(describeAttempt(type, row.payload, settlementMarkerFor(row.effectiveToken)), ledger)
 
   const contenders = siblings
     // A sibling missing a field its connector requires was rejected BEFORE any HTTP call, so it

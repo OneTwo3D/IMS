@@ -14,6 +14,7 @@
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { settlementDocumentId, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
 import type { MoneyPostLock } from '@/lib/domain/accounting/money-post-lock'
 
 export type SettlementProbeTarget = {
@@ -55,6 +56,14 @@ export function normaliseXeroSettlementDate(value: unknown): string | null {
   return new Date(ms).toISOString().slice(0, 10)
 }
 
+/**
+ * A collection Xero reports on an invoice for money taken off it by something that is NOT a
+ * payment. Each entry says how much of that document was APPLIED here, which is all this probe
+ * needs from it: never a candidate settlement (IMS posts payments, not these), only an
+ * explanation for an `AmountCredited`/`AmountDue` movement the payments do not account for.
+ */
+type XeroAppliedCollection = Array<{ AppliedAmount?: number }>
+
 /** The document a settlement probe reads, per money-moving type. */
 type XeroPaymentsResponse = {
   Invoices?: Array<{
@@ -65,14 +74,46 @@ type XeroPaymentsResponse = {
      * `probeXeroSettlement`.
      */
     AmountPaid?: number
+    /**
+     * Money taken off this document by CREDIT NOTES, prepayments and overpayments. It is NOT part
+     * of `AmountPaid` — that is the whole of Codex round 6 finding 3 — so an invoice settled
+     * entirely by an allocation reports `AmountPaid: 0` with an empty `Payments` collection, and
+     * a probe reading only those two answered "positively nothing settles this document".
+     */
+    AmountCredited?: number
+    /** The document's face value and what is still owed on it — the shape-independent cross-check. */
+    Total?: number
+    AmountDue?: number
     Payments?: Array<{ PaymentID?: string; Date?: string; Amount?: number; Reference?: string }>
+    CreditNotes?: XeroAppliedCollection
+    Prepayments?: XeroAppliedCollection
+    Overpayments?: XeroAppliedCollection
   }>
 }
 type XeroCreditNoteResponse = {
   CreditNotes?: Array<{
     CreditNoteID?: string
+    /** The credit's face value and what is left of it — how much of it has been allocated. */
+    Total?: number
+    RemainingCredit?: number
     Allocations?: Array<{ Amount?: number; Date?: string; Invoice?: { InvoiceID?: string } }>
   }>
+}
+
+/**
+ * Sum a collection's `AppliedAmount`s, or null the moment one of them cannot be read.
+ *
+ * An absent collection sums to ZERO rather than to null: "Xero sent no credit notes" has to be
+ * able to mean "there are none", or every ordinary invoice would refuse. What stops that reading
+ * being a hole is that the arithmetic it feeds is directional — an absent collection explains
+ * nothing, so an `AmountCredited` it should have accounted for shows up as an unexplained
+ * shortfall and refuses.
+ */
+function sumApplied(collection: XeroAppliedCollection | undefined): number | null {
+  return (collection ?? []).reduce<number | null>(
+    (sum, entry) => (sum === null || num(entry.AppliedAmount) === null ? null : sum + (entry.AppliedAmount as number)),
+    0,
+  )
 }
 
 /** The shape of the connector read each probe needs, so both can be driven without a network. */
@@ -95,13 +136,44 @@ export async function probeXeroSettlement(
     if (!res.ok) return { ok: false, reason: res.error ?? `HTTP ${res.status}` }
     const note = res.data?.CreditNotes?.[0]
     if (!note) return { ok: false, reason: 'Xero returned no credit note for that id' }
+    const allocations = note.Allocations ?? []
     // Only allocations against THIS bill: the same credit note legitimately offsets others.
-    const records: LedgerSettlementRecord[] = (note.Allocations ?? [])
+    const records: LedgerSettlementRecord[] = allocations
       .filter((a) => str(a.Invoice?.InvoiceID).toLowerCase() === invoiceId.toLowerCase())
       // No reference field exists on a Xero credit-note allocation, so this type has no mark to
       // match and falls back to amount and date alone. Stated rather than left to be inferred from
       // a missing property.
       .map((a) => ({ amount: num(a.Amount), date: normaliseXeroSettlementDate(a.Date), reference: null }))
+
+    // COMPLETENESS, CHECKED RATHER THAN ASSUMED (Codex round 6, finding 3). This branch had NO
+    // cross-check at all, so `Allocations` absent and `Allocations` empty were the same value —
+    // and the difference between them is the difference between "this credit has been applied to
+    // nothing" and "Xero did not send us the collection". A fully applied credit note read as the
+    // first is a positive CLEAR, and the fence allocates it to the bill a second time.
+    //
+    // `Total - RemainingCredit` is Xero's OWN account of how much of this credit has been used, by
+    // any means, so it is the thing the returned collection has to add up to. ALL allocations
+    // count here, not only this bill's: the credit legitimately offsets other documents, and it is
+    // the COLLECTION's completeness being tested, not this bill's share of it.
+    const creditTotal = num(note.Total)
+    const remaining = num(note.RemainingCredit)
+    const applied = creditTotal !== null && remaining !== null ? creditTotal - remaining : null
+    const allocated = allocations.reduce<number | null>(
+      (sum, a) => (sum === null || num(a.Amount) === null ? null : sum + (a.Amount as number)),
+      0,
+    )
+    if (applied !== null && applied > XERO_AMOUNT_EPSILON
+      && (allocated === null || applied - allocated > XERO_AMOUNT_EPSILON)) {
+      return {
+        ok: false,
+        reason: `Xero reports ${applied.toFixed(2)} of this credit note already applied but returned `
+          + (allocated === null
+            ? 'an allocation whose amount could not be read'
+            : allocations.length === 0
+              ? 'no allocations'
+              : `allocations totalling ${allocated.toFixed(2)}`),
+      }
+    }
     return { ok: true, records }
   }
 
@@ -140,6 +212,58 @@ export async function probeXeroSettlement(
         reason: `Xero reports ${amountPaid.toFixed(2)} paid against this document but returned `
           + `${records.length === 0 ? 'no payments' : `payments totalling ${seen.toFixed(2)}`}`,
       }
+    }
+  }
+
+  // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING (Codex round 6, finding 3) — the same arithmetic
+  // the QuickBooks probe already does, for the same reason, because `AmountPaid` is not the whole
+  // of what settles a Xero document.
+  //
+  // WHAT XERO CAN AND CANNOT SEE FROM HERE. A credit note allocated to this invoice reduces
+  // `AmountCredited`, NOT `AmountPaid`, and does not appear in `Payments` at all. So an invoice a
+  // human has settled entirely with a credit note reads as `AmountPaid: 0, Payments: []` — the
+  // strongest answer this probe can give, "positively nothing settles this document", and false.
+  // Prepayment and overpayment allocations are the same shape.
+  //
+  // So the question asked here is arithmetic, not vocabulary: `Total - AmountDue` is Xero's own
+  // account of how much of this document has been settled BY ANY MEANS, and every penny of it has
+  // to be explained by something this probe actually read — a payment, or an applied credit /
+  // prepayment / overpayment. Whatever is left over is money off the document by a shape IMS
+  // cannot see, and a `clear` built on the payment list alone would be a claim that list cannot
+  // support.
+  //
+  // WHAT THIS COSTS, STATED. An invoice whose credit is reported in `AmountCredited` while the
+  // `CreditNotes` collection is missing or short can no longer be posted to automatically; the row
+  // fails visibly and a human resolves it. A credit that IS itemised explains itself and changes
+  // no verdict, so the ordinary part-credited invoice still pays automatically — which is the
+  // difference between reading the collections and simply refusing on `AmountCredited > 0`.
+  const total = num(invoice.Total)
+  const amountDue = num(invoice.AmountDue)
+  const amountCredited = num(invoice.AmountCredited)
+  const settled = total !== null && amountDue !== null
+    ? total - amountDue
+    // Fallback for a response that omits the totals: the two component fields, which is still
+    // strictly more than `AmountPaid` alone was.
+    : amountPaid !== null && amountCredited !== null ? amountPaid + amountCredited : null
+  const applied = [sumApplied(invoice.CreditNotes), sumApplied(invoice.Prepayments), sumApplied(invoice.Overpayments)]
+    .reduce<number | null>((sum, part) => (sum === null || part === null ? null : sum + part), 0)
+  // Null the moment any read settlement is unmeasurable: an unknown addend makes the whole sum
+  // unknown, and an unknown sum must not be allowed to "explain" anything.
+  const explained = records.reduce<number | null>(
+    (sum, record) => (sum === null || record.amount === null ? null : sum + record.amount),
+    applied,
+  )
+  if (settled !== null && settled > XERO_AMOUNT_EPSILON
+    && (explained === null || settled - explained > XERO_AMOUNT_EPSILON)) {
+    return {
+      ok: false,
+      reason: `Xero reports ${settled.toFixed(2)} already settled against this document but `
+        + (explained === null
+          ? 'IMS could not measure what it holds against it'
+          : `only ${explained.toFixed(2)} of it is accounted for by settlements IMS can read`)
+        + (amountCredited !== null && amountCredited > XERO_AMOUNT_EPSILON
+          ? ` (${amountCredited.toFixed(2)} of it credited, not paid)`
+          : ''),
     }
   }
   return { ok: true, records }
@@ -414,11 +538,13 @@ export async function probeLedgerSettlement(
 
 /**
  * The document a probe answers about, so several rows targeting the same one share a single read.
- * Includes the TYPE because the two connectors read a bill and an invoice from different endpoints.
+ *
+ * Delegates to the SAME key the money-post lock is taken on (round 6, Codex CRITICAL #2): the
+ * document the exclusion covers and the document the probe reads must not be able to be two
+ * different things.
  */
 export function settlementProbeKey(target: SettlementProbeTarget): string {
-  const payload = asRecord(target.payload)
-  return [target.type, str(payload.accountingInvoiceId), str(payload.creditNoteId)].join(' ')
+  return settlementDocumentKey(target.type, target.payload)
 }
 
 /**
@@ -448,7 +574,7 @@ export async function ledgerClearsFollowUpRevival(params: {
   const { classifyLedgerSettlement, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
   const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.syncLogId ?? '', payload: params.payload }))
-  const verdict = classifyLedgerSettlement(describeAttempt(params.payload, marker), probe)
+  const verdict = classifyLedgerSettlement(describeAttempt(params.type, params.payload, marker), probe)
   if (verdict.outcome === 'clear') return { clear: true }
   return {
     clear: false,
@@ -504,10 +630,16 @@ export type MoneyPostFenceParams = {
         where: {
           connector: string
           type: AccountingSyncType
-          referenceType: string
-          referenceId: string
           remoteAttemptedAt: { not: null }
           id: { not: string }
+          /**
+           * BOTH KEYS, IN A DEFINED ORDER (round 6, Codex CRITICAL #2): the local scope this row
+           * sits in, then the external document it names. See the query below.
+           */
+          OR: Array<
+            | { referenceType: string; referenceId: string }
+            | { payload: { path: string[]; equals: string } }
+          >
         }
         select: { id: true; payload: true }
       }) => Promise<Array<{ id: string; payload: unknown }>>
@@ -540,19 +672,34 @@ export async function authoriseMoneyPost(
   })
   // This ROW may be new — but the DOCUMENT may not be (Codex round 3). A receipt recorded beside an
   // older failed attempt queues a brand-new row, and that row's first post would otherwise go out on
-  // the strength of a reading taken before it was even created. So: every OTHER row in this scope
-  // that has ever been sent, whatever became of it.
+  // the strength of a reading taken before it was even created. So: every OTHER row that has ever
+  // been sent and could have settled this document, whatever became of it.
   //
-  // Fetched even when this row is a repeat, because a rival attempt is a hazard to it too, and it
-  // is one indexed read on a path that is about to make a network call anyway.
+  // KEYED ON THE DOCUMENT AS WELL AS THE SCOPE (round 6, Codex CRITICAL #2). Round 5 asked only
+  // about `(referenceType, referenceId)` — where the row lives in IMS. A rival row for the SAME
+  // `accountingInvoiceId` filed under another scope (a re-raised purchase invoice, a payment row
+  // re-created against a replacement order, a bill payment queued against the PO in one release
+  // and the invoice in the next) was invisible to it, and invisible to the lock for the same
+  // reason. The probe reads the document, so the rival's committed payment IS in the reading —
+  // but it carries the RIVAL's mark, and the amount-and-date fallback loses it the moment the two
+  // receipts differ. Nothing then refuses, and the document is paid twice.
+  //
+  // Both arms, in a defined order. The scope arm is first and is unconditional: it is indexed, and
+  // it keeps a row with NO recorded anchor a contender of its own scope, which is what
+  // `attemptCouldBeTheSameDocument` has always treated as "possibly this document". The document
+  // arm is added only when this row names one — with no id there is nothing to match, and the
+  // probe below refuses such a post outright anyway.
+  const documentId = settlementDocumentId(params.payload)
   const attemptedSiblings = await params.db.accountingSyncLog.findMany({
     where: {
       connector: params.connector,
       type: params.type as AccountingSyncType,
-      referenceType: params.referenceType,
-      referenceId: params.referenceId,
       remoteAttemptedAt: { not: null },
       id: { not: params.entryId },
+      OR: [
+        { referenceType: params.referenceType, referenceId: params.referenceId },
+        ...(documentId ? [{ payload: { path: ['accountingInvoiceId'], equals: documentId } }] : []),
+      ],
     },
     select: { id: true, payload: true },
   })
@@ -629,7 +776,7 @@ export async function authoriseMoneyPost(
    */
   if (contenders.length === 0) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.entryId, payload: params.payload }))
-    const attempt = describeAttempt(params.payload, marker, { postingOn: plannedAttemptDate(params.payload, now()) })
+    const attempt = describeAttempt(params.type, params.payload, marker, { postingOn: plannedAttemptDate(params.type, params.payload, now()) })
     const verdict = classifyLedgerSettlement(attempt, probe)
     if (verdict.outcome === 'present') {
       return {
@@ -664,7 +811,7 @@ export async function authoriseMoneyPost(
 
   for (const contender of contenders) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, contender))
-    const verdict = classifyLedgerSettlement(describeAttempt(contender.payload, marker), probe)
+    const verdict = classifyLedgerSettlement(describeAttempt(params.type, contender.payload, marker), probe)
     if (verdict.outcome === 'clear') continue
     if (verdict.outcome === 'present') {
       return {
@@ -688,24 +835,71 @@ export async function authoriseMoneyPost(
 export type MoneyPostOutcome = { success: boolean; externalId?: string; error?: string }
 
 /**
- * A money POST made while its exclusion was gone. One line, one stable prefix, every field needed
- * to find the document — this is the record that turns "we may have paid twice" from something
- * discovered at reconciliation into something searchable from the minute it happened.
+ * A money POST made while its exclusion was gone. Every field needed to find the document — this
+ * is the record that turns "we may have paid twice" from something discovered at reconciliation
+ * into something searchable from the minute it happened.
+ *
+ * DURABLE, NOT LOG-ONLY (round 6, Codex HIGH #4). Round 5 wrote this to stderr and called it
+ * "announced". Stderr is a stream: whoever is watching at that second sees it and nobody else
+ * ever does, so an operator looking at the accounting sync history — or any alerting that reads
+ * IMS's own records rather than a container's log driver — finds a payment that simply succeeded,
+ * with nothing anywhere saying it went out unprotected. On a double-payment path that is the
+ * difference between a searchable incident and a rumour.
+ *
+ * So it is also written to the ACTIVITY LOG, at ERROR, against the sync row. Not to the sync row
+ * itself: a successful post is immediately followed by `status: SYNCED, errorMessage: null` in
+ * both processors, so anything this wrote there would be erased by the write that reports the
+ * success. `logActivity` never throws and swallows its own failures, which is what makes it safe
+ * to call on the way out of a post that has already moved money — the incident must not turn a
+ * committed payment into an exception.
  *
  * Deliberately NOT a re-probe. Reading the ledger again here could not be conclusive: a rival
  * post inside the same window may not be readable yet, and one that lands a second later would be
  * missed anyway. An inconclusive check that reads like a verdict is worse than a plain alarm.
  */
-function reportLostMoneyPostExclusion(
-  params: { connector: string; entryId: string; type: string; referenceType: string; referenceId: string },
+async function reportLostMoneyPostExclusion(
+  params: { connector: string; entryId: string; type: string; referenceType: string; referenceId: string; payload?: unknown },
   outcome: 'committed' | 'failed' | 'threw',
-): void {
+  externalId?: string,
+): Promise<void> {
+  const description = `Money post made without its exclusion: the advisory lock's connection died `
+    + `while the ${params.type} call to ${params.connector} was in flight, so another entry may have `
+    + `posted to this document at the same time (outcome=${outcome}). Check the accounting connector `
+    + `for a duplicate settlement.`
   console.error(
     `[money-post] EXCLUSION LOST during the post — the advisory lock's connection died while the call `
     + `was in flight, so another entry may have posted to this document at the same time. `
     + `connector=${params.connector} type=${params.type} scope=${params.referenceType}:${params.referenceId} `
     + `entry=${params.entryId} outcome=${outcome}. Check the accounting connector for a duplicate settlement.`,
   )
+  try {
+    const { logActivity } = await import('@/lib/activity-log')
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: params.entryId,
+      action: 'money_post_exclusion_lost',
+      tag: 'accounting',
+      level: 'ERROR',
+      description,
+      // No session to resolve on a connector worker, and resolving one would be the only part of
+      // this call that can be slow on a path that has just moved money.
+      resolveUser: false,
+      metadata: {
+        connector: params.connector,
+        type: params.type,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        documentKey: settlementDocumentKey(params.type, params.payload),
+        entryId: params.entryId,
+        outcome,
+        externalId: externalId ?? null,
+      },
+    })
+  } catch (error) {
+    // The console line above is still out. An activity-log failure must not be the thing that
+    // turns a committed payment into an exception.
+    console.error('[money-post] could not record the lost-exclusion incident:', error)
+  }
 }
 
 /**
@@ -740,11 +934,15 @@ export async function postMoneyUnderLedgerFence(
 
   const lock = params.lock
     ?? (await import('@/lib/domain/accounting/money-post-lock')).withMoneyPostLock
+  // THE DOCUMENT, not the scope (round 6, Codex CRITICAL #2). `referenceType`/`referenceId` are
+  // carried for the incident report, but the key the exclusion is taken on is the external
+  // document this post will settle — see money-post-document.ts.
   const outcome = await lock({
     connector: params.connector,
     type: params.type,
     referenceType: params.referenceType,
     referenceId: params.referenceId,
+    documentKey: settlementDocumentKey(params.type, params.payload),
   }, async (held): Promise<MoneyPostOutcome> => {
     const authorised = await authoriseMoneyPost(params)
     if (!authorised.proceed) return { success: false, error: authorised.error }
@@ -757,7 +955,7 @@ export async function postMoneyUnderLedgerFence(
     try {
       outcome = await post()
     } catch (error) {
-      if (held.lost) reportLostMoneyPostExclusion(params, 'threw')
+      if (held.lost) await reportLostMoneyPostExclusion(params, 'threw')
       throw error
     }
     if (!held.lost) return outcome
@@ -778,7 +976,7 @@ export async function postMoneyUnderLedgerFence(
     // What is irreducible: if another worker took the freed lock and posted in the same window,
     // the document really is paid twice. That is now announced at the moment it becomes possible,
     // by the process that did it, naming the document — not discovered at reconciliation.
-    reportLostMoneyPostExclusion(params, outcome.success ? 'committed' : 'failed')
+    await reportLostMoneyPostExclusion(params, outcome.success ? 'committed' : 'failed', outcome.externalId)
     if (outcome.success) return outcome
     return {
       success: false,

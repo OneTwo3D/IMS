@@ -45,6 +45,14 @@ mock.module('@/lib/connectors/quickbooks/api', {
   },
 })
 
+/** Where the lost-exclusion incident is asserted to be DURABLE (round 6, HIGH 4). */
+const activityEntries: Array<Record<string, unknown>> = []
+mock.module('@/lib/activity-log', {
+  namedExports: {
+    logActivity: async (params: Record<string, unknown>) => { activityEntries.push(params) },
+  },
+})
+
 const load = async () => (await import('@/lib/connectors/accounting-settlement-probe')).authoriseMoneyPost
 const loadFence = async () => (await import('@/lib/connectors/accounting-settlement-probe')).postMoneyUnderLedgerFence
 
@@ -62,10 +70,12 @@ function lockDouble() {
   // PostgreSQL has already freed it and another worker may be posting to this document.
   let lost = false
   const lock = async <T>(
-    scope: { connector: string; type: string; referenceType: string; referenceId: string },
+    document: { connector: string; type: string; referenceType: string; referenceId: string; documentKey: string },
     run: (held: { assertHeld: (context?: string) => void; readonly lost: boolean }) => Promise<T>,
   ): Promise<{ locked: true; result: T } | { locked: false }> => {
-    const key = [scope.connector, scope.type, scope.referenceType, scope.referenceId].join(' ')
+    // Keyed on the DOCUMENT (round 6, CRITICAL 2). Keying this double on the scope would have made
+    // every cross-scope serialization test pass against a lock that does not serialize them.
+    const key = [document.connector, document.documentKey].join(' ')
     if (held.has(key)) {
       contended.push(key)
       return { locked: false }
@@ -119,13 +129,23 @@ function dbDouble(rows: Row[]) {
       accountingSyncLog: {
         findMany: async ({ where }: { where: Record<string, unknown>; select: { id: true; payload: true } }) => {
           counts.push(where)
-          // Implemented, not stubbed to []: a scope query that silently answered "nothing" would
-          // make the sibling check vacuous, which is the whole point of the check.
-          return rows.filter((r) =>
-            (r.scope ?? SCOPE) === `${where.type} ${where.referenceType} ${where.referenceId}`
-            && r.remoteAttemptedAt !== null
-            && r.id !== (where.id as { not: string }).not)
-            .map((r) => ({ id: r.id, payload: r.payload ?? DEFAULT_PAYLOAD }))
+          // Implemented, not stubbed to []: a query that silently answered "nothing" would make the
+          // sibling check vacuous, which is the whole point of the check. BOTH arms of the OR are
+          // evaluated — a double that only understood the scope arm would make the cross-scope
+          // contender (round 6, CRITICAL 2) untestable, which is how it stayed a residual.
+          const arms = where.OR as Array<Record<string, never>>
+          return rows.filter((r) => {
+            if (r.remoteAttemptedAt === null) return false
+            if (r.id === (where.id as { not: string }).not) return false
+            return arms.some((arm: Record<string, unknown>) => {
+              if ('referenceType' in arm) {
+                return (r.scope ?? SCOPE) === `${where.type} ${arm.referenceType} ${arm.referenceId}`
+              }
+              const json = arm.payload as { path: string[]; equals: string }
+              const payload = (r.payload ?? DEFAULT_PAYLOAD) as Record<string, unknown>
+              return payload[json.path[0]!] === json.equals
+            })
+          }).map((r) => ({ id: r.id, payload: r.payload ?? DEFAULT_PAYLOAD }))
         },
         updateMany: async ({ where, data }: { where: { id: string; remoteAttemptedAt: null }; data: { remoteAttemptedAt: Date } }) => {
           // The double enforces the CONDITION, because the whole point of the conditional write is
@@ -307,15 +327,21 @@ test('a FRESH row in a scope where something has ALREADY been sent is checked to
   assert.deepEqual(counts[0]!.id, { not: 'log-new' }, 'about the OTHER rows, not this one')
 })
 
-test('a fresh row in a scope nothing has been sent from posts once the ledger says so (o3d-0m56)', async () => {
-  // The scope rule is unchanged: a sibling in ANOTHER scope, and an unattempted one in this
-  // scope, are still not evidence and still do not make this row a repeat. What changed is that
-  // "not a repeat" no longer means "do not look".
+test('a fresh row against a document nothing has been sent to posts once the ledger says so (o3d-0m56)', async () => {
+  // What is NOT evidence, after round 6: an attempt against ANOTHER DOCUMENT (wherever it is
+  // filed), and an unattempted row against this one. Another SCOPE is no longer on that list —
+  // see the cross-scope test below — so the sibling here is given an invoice of its own, which is
+  // what "unrelated" has to mean now.
   xeroCalls.length = 0
   xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
   const { db } = dbDouble([
     { id: 'log-new', remoteAttemptedAt: null },
-    { id: 'log-other-scope', remoteAttemptedAt: new Date(), scope: 'INVOICE_PAYMENT SalesOrder so-2' },
+    {
+      id: 'log-other-document',
+      remoteAttemptedAt: new Date(),
+      scope: 'INVOICE_PAYMENT SalesOrder so-2',
+      payload: { accountingInvoiceId: 'inv-2', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' },
+    },
     { id: 'log-unattempted', remoteAttemptedAt: null },
   ])
 
@@ -729,11 +755,13 @@ test('the fence releases the lock even when the post throws (o3d-0m56 r4)', asyn
 test('rows for DIFFERENT documents do not serialize against each other (o3d-0m56 r4)', async () => {
   // The cost has to stay proportionate: the lock is per document, so two unrelated payments run
   // concurrently. A lock coarse enough to serialize the whole connector would be a throughput
-  // bug wearing a safety badge.
+  // bug wearing a safety badge. A DIFFERENT SCOPE is no longer what makes them different (round
+  // 6) — a different invoice is.
   xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [] }] }
+  const otherDocument = { accountingInvoiceId: 'inv-2', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' }
   const { db } = dbDouble([
     { id: 'log-a', remoteAttemptedAt: null },
-    { id: 'log-b', remoteAttemptedAt: null, scope: 'INVOICE_PAYMENT SalesOrder so-2' },
+    { id: 'log-b', remoteAttemptedAt: null, scope: 'INVOICE_PAYMENT SalesOrder so-2', payload: otherDocument },
   ])
   const { lock, contended, whenAcquired } = lockDouble()
   const fence = await loadFence()
@@ -750,7 +778,7 @@ test('rows for DIFFERENT documents do not serialize against each other (o3d-0m56
     return { success: true }
   })
   await acquiredP
-  const second = await fence({ ...payment, entryId: 'log-b', referenceId: 'so-2', db, lock }, async () => {
+  const second = await fence({ ...payment, entryId: 'log-b', referenceId: 'so-2', payload: otherDocument, db, lock }, async () => {
     posts.push('log-b')
     return { success: true }
   })
@@ -894,4 +922,294 @@ test('a lock lost between the reading and the post stops the post (o3d-0m56 r4)'
   )
   assert.deepEqual(posts, [], 'the post must not run once the exclusion is gone')
   assert.equal(held.size, 0)
+})
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-0m56 round 6 (Codex) — the three doubles this round has to express.
+ * ------------------------------------------------------------------------------------------- */
+
+test('a bill payment is judged on the date the PROCESSOR will send, not the payload\'s other date field (o3d-0m56 r6, CRITICAL 1)', async () => {
+  // THE MIRROR THAT DRIFTED. Round 5 predicted the post's date with `paymentDate ?? date` for
+  // every type. Both payment branches read ONLY `paymentDate`, so a bill payment carrying the
+  // BILL's `date` and no `paymentDate` was predicted to post on 2026-07-04 when the processor
+  // will in fact post TODAY. The probe went looking for a settlement on a day the post will never
+  // create, found none, and authorised a second payment onto a bill a human settled this morning.
+  xeroCalls.length = 0
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: 'bill-1',
+      Total: 10,
+      AmountDue: 0,
+      AmountPaid: 10,
+      Payments: [{ PaymentID: 'PAY-TODAY', Date: '2026-08-18', Amount: 10 }],
+    }],
+  }
+  // No `paymentDate`; a `date` that is NOT what this branch sends.
+  const billPayload = { accountingInvoiceId: 'bill-1', bankAccountId: 'bank-1', amount: 10, date: '2026-07-04' }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: billPayload, scope: 'BILL_PAYMENT PurchaseInvoice pi-1' }])
+
+  const verdict = await (await load())({
+    connector: 'xero',
+    type: 'BILL_PAYMENT',
+    referenceType: 'PurchaseInvoice',
+    referenceId: 'pi-1',
+    entryId: 'log-1',
+    payload: billPayload,
+    db,
+    now: POSTING_TODAY,
+  })
+
+  assert.equal(verdict.proceed, false, 'the bill is already settled for the day this post will carry')
+  assert.match(verdict.proceed === false ? verdict.error : '', /PAY-TODAY/)
+})
+
+test('an allocation is judged on `date`, not on a stray `paymentDate` (o3d-0m56 r6, CRITICAL 1)', async () => {
+  // The same drift the other way round, which is why the difference between the branches has to
+  // be REPRESENTED rather than averaged: Xero's allocation branch dates itself from `date` and
+  // ignores `paymentDate` entirely, so a payload carrying only the latter posts for TODAY.
+  xeroCalls.length = 0
+  xeroResponse = {
+    CreditNotes: [{
+      CreditNoteID: 'cn-1',
+      Total: 10,
+      RemainingCredit: 0,
+      Allocations: [{ Amount: 10, Date: '2026-08-18', Invoice: { InvoiceID: 'bill-1' } }],
+    }],
+  }
+  const allocation = { creditNoteId: 'cn-1', accountingInvoiceId: 'bill-1', amount: 10, paymentDate: '2026-07-04' }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: allocation, scope: 'PURCHASE_CREDIT_NOTE_ALLOCATION SupplierCreditNote scn-1' }])
+
+  const verdict = await (await load())({
+    connector: 'xero',
+    type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+    referenceType: 'SupplierCreditNote',
+    referenceId: 'scn-1',
+    entryId: 'log-1',
+    payload: allocation,
+    db,
+    now: POSTING_TODAY,
+  })
+
+  assert.deepEqual(xeroCalls, ['CreditNotes/cn-1'])
+  assert.equal(verdict.proceed, false, 'this credit is already allocated to this bill for that day')
+})
+
+test('a rival in ANOTHER SCOPE naming the same document is a contender (o3d-0m56 r6, CRITICAL 2)', async () => {
+  // THE HOLE CARRIED AS A RESIDUAL FOR TWO ROUNDS. The sibling query asked only about
+  // (referenceType, referenceId) — where the row lives in IMS. A bill payment queued against the
+  // PurchaseOrder in one release and re-queued against the PurchaseInvoice in the next is TWO
+  // scopes and ONE bill: the older row was invisible, this row looked virgin, and its own mark and
+  // its own numbers match nothing, so it was cleared to pay a bill that is already paid.
+  const { settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
+  xeroCalls.length = 0
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: 'bill-1',
+      Total: 25,
+      AmountDue: 13.5,
+      AmountPaid: 11.5,
+      // Committed by log-old, then corrected in Xero — only the mark still says whose it is.
+      Payments: [{ PaymentID: 'PAY-OLD', Date: '2026-08-04', Amount: 11.5, Reference: settlementMarkerFor('log-old') }],
+    }],
+  }
+  const newPayload = { accountingInvoiceId: 'bill-1', bankAccountId: 'bank-1', amount: 25, paymentDate: '2026-09-20' }
+  const { db, counts } = dbDouble([
+    { id: 'log-new', remoteAttemptedAt: null, payload: newPayload, scope: 'BILL_PAYMENT PurchaseInvoice pi-1' },
+    {
+      id: 'log-old',
+      remoteAttemptedAt: new Date('2026-08-01T00:00:00Z'),
+      // A DIFFERENT scope entirely — and the same bill.
+      scope: 'BILL_PAYMENT PurchaseOrder po-1',
+      payload: { accountingInvoiceId: 'bill-1', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' },
+    },
+  ])
+
+  const verdict = await (await load())({
+    connector: 'xero',
+    type: 'BILL_PAYMENT',
+    referenceType: 'PurchaseInvoice',
+    referenceId: 'pi-1',
+    entryId: 'log-new',
+    payload: newPayload,
+    db,
+  })
+
+  assert.equal(verdict.proceed, false, 'the rival settled this bill; sending again pays it twice')
+  assert.match(verdict.proceed === false ? verdict.error : '', /log-old/)
+  const where = counts[0] as { OR: Array<Record<string, unknown>> }
+  assert.equal(where.OR.length, 2, 'both keys are taken')
+  assert.deepEqual(where.OR[0], { referenceType: 'PurchaseInvoice', referenceId: 'pi-1' }, 'scope arm first')
+  assert.deepEqual(where.OR[1], { payload: { path: ['accountingInvoiceId'], equals: 'bill-1' } }, 'document arm second')
+})
+
+test('two rows in DIFFERENT scopes naming one document take the SAME lock (o3d-0m56 r6, CRITICAL 2)', async () => {
+  // The other half of the same hole: even with the sibling query fixed, two rows in different
+  // scopes each probing an empty ledger and each posting is a double payment, and a scope-keyed
+  // lock serialized neither of them.
+  xeroResponse = { Invoices: [{ InvoiceID: 'bill-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
+  const billPayload = { accountingInvoiceId: 'bill-1', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' }
+  const { db } = dbDouble([
+    { id: 'log-a', remoteAttemptedAt: null, payload: billPayload, scope: 'BILL_PAYMENT PurchaseOrder po-1' },
+    { id: 'log-b', remoteAttemptedAt: null, payload: billPayload, scope: 'BILL_PAYMENT PurchaseInvoice pi-1' },
+  ])
+  const { lock, contended, whenAcquired } = lockDouble()
+  const fence = await loadFence()
+  const posts: string[] = []
+  let release!: () => void
+  const gate = new Promise<void>((resolve) => { release = resolve })
+  let acquired!: () => void
+  const acquiredP = new Promise<void>((resolve) => { acquired = resolve })
+  whenAcquired(() => acquired())
+
+  const bill = { connector: 'xero' as const, type: 'BILL_PAYMENT', payload: billPayload, db, lock }
+  const first = fence({ ...bill, referenceType: 'PurchaseOrder', referenceId: 'po-1', entryId: 'log-a' }, async () => {
+    posts.push('log-a')
+    await gate
+    return { success: true, externalId: 'PAY-A' }
+  })
+  await acquiredP
+  const second = await fence({ ...bill, referenceType: 'PurchaseInvoice', referenceId: 'pi-1', entryId: 'log-b' }, async () => {
+    posts.push('log-b')
+    return { success: true, externalId: 'PAY-B' }
+  })
+  release()
+  await first
+
+  assert.deepEqual(posts, ['log-a'], 'one bill, one probe→post span at a time, whatever scope the row is filed under')
+  assert.equal(second.success, false)
+  assert.equal(contended.length, 1, 'and the loser was refused by the lock, not by luck')
+})
+
+test('a Xero credit note Xero says is APPLIED is not reported as unallocated (o3d-0m56 r6, HIGH 3)', async () => {
+  // `Allocations` absent and `Allocations` empty are the same value in JavaScript, and this branch
+  // had no cross-check at all — so a credit note Xero reports as fully applied came back as
+  // "positively nothing settles this bill", which the classifier reads as CLEAR and the fence acts
+  // on by allocating it a second time.
+  xeroCalls.length = 0
+  xeroResponse = { CreditNotes: [{ CreditNoteID: 'cn-1', Total: 10, RemainingCredit: 0 }] }
+  const allocation = { creditNoteId: 'cn-1', accountingInvoiceId: 'bill-1', amount: 10, date: '2026-08-18' }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: allocation, scope: 'PURCHASE_CREDIT_NOTE_ALLOCATION SupplierCreditNote scn-1' }])
+
+  const verdict = await (await load())({
+    connector: 'xero',
+    type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+    referenceType: 'SupplierCreditNote',
+    referenceId: 'scn-1',
+    entryId: 'log-1',
+    payload: allocation,
+    db,
+    now: POSTING_TODAY,
+  })
+
+  assert.equal(verdict.proceed, false)
+  assert.match(verdict.proceed === false ? verdict.error : '', /could not establish/)
+})
+
+test('a Xero invoice settled by a CREDIT the payments do not explain stops the post (o3d-0m56 r6, HIGH 3)', async () => {
+  // A credit-note allocation reduces `AmountCredited`, never `AmountPaid`, and never appears in
+  // `Payments`. An invoice a human settled with a credit note therefore reads as
+  // `AmountPaid: 0, Payments: []` — the strongest answer the probe can give, and false.
+  xeroCalls.length = 0
+  xeroResponse = {
+    Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 0, AmountPaid: 0, AmountCredited: 10, Payments: [] }],
+  }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+
+  const verdict = await (await load())({ ...payment, entryId: 'log-1', db, now: POSTING_TODAY })
+
+  assert.equal(verdict.proceed, false, 'money has come off this invoice that no readable payment explains')
+  assert.match(verdict.proceed === false ? verdict.error : '', /credited, not paid/)
+})
+
+test('a lost exclusion leaves a DURABLE incident, not just a stderr line (o3d-0m56 r6, HIGH 4)', async () => {
+  // Round 5 wrote this to stderr and called it announced. Stderr is a stream: whoever is watching
+  // at that second sees it and nobody else ever does. The sync row cannot carry it either — the
+  // success write sets `errorMessage: null` immediately afterwards — so the incident goes to the
+  // activity log, at ERROR, naming the document.
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+  const { lock, loseIt } = lockDouble()
+  const { restore } = captureErrors()
+  activityEntries.length = 0
+  try {
+    const outcome = await (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => {
+      loseIt()
+      return { success: true, externalId: 'PAY-A' }
+    })
+    assert.deepEqual(outcome, { success: true, externalId: 'PAY-A' })
+  } finally {
+    restore()
+  }
+
+  assert.equal(activityEntries.length, 1, 'a post made without its exclusion must survive the process that made it')
+  const entry = activityEntries[0] as Record<string, unknown>
+  assert.equal(entry.level, 'ERROR')
+  assert.equal(entry.action, 'money_post_exclusion_lost')
+  assert.equal(entry.entityType, 'SYNC')
+  assert.equal(entry.entityId, 'log-1')
+  const metadata = entry.metadata as Record<string, unknown>
+  assert.equal(metadata.documentKey, 'INVOICE_PAYMENT inv-1 ', 'and name the document, or it cannot be reconciled')
+  assert.equal(metadata.externalId, 'PAY-A', 'and the payment id a reversal would need')
+  assert.equal(metadata.outcome, 'committed')
+})
+
+test('a FAILED and a THROWN post with a lost lock are durable too (o3d-0m56 r6, HIGH 4)', async () => {
+  // Both non-happy paths, because a record written only where the code returns normally is exactly
+  // how an incident goes missing on the path that needs it most.
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
+  for (const [label, post] of [
+    ['failed', async () => ({ success: false, error: 'HTTP 504' })],
+    ['threw', async () => { throw new Error('socket hang up') }],
+  ] as const) {
+    const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+    const { lock, loseIt } = lockDouble()
+    const { restore } = captureErrors()
+    activityEntries.length = 0
+    try {
+      const run = (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => {
+        loseIt()
+        return post()
+      })
+      if (label === 'threw') await assert.rejects(run, /socket hang up/)
+      else await run
+    } finally {
+      restore()
+    }
+    assert.equal(activityEntries.length, 1, `${label}: the incident must be durable here too`)
+    assert.equal((activityEntries[0] as Record<string, unknown>).action, 'money_post_exclusion_lost', label)
+    assert.equal(((activityEntries[0] as Record<string, unknown>).metadata as Record<string, unknown>).outcome, label, label)
+  }
+})
+
+test('a post whose lock survives writes no incident (o3d-0m56 r6, HIGH 4)', async () => {
+  // An incident channel that fires on the ordinary case is noise, and noise is not detection.
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+  const { lock } = lockDouble()
+  activityEntries.length = 0
+  await (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => ({ success: true, externalId: 'PAY-A' }))
+  assert.deepEqual(activityEntries, [])
+})
+
+test('the fence has an index for the attempted-rows lookup it now makes (o3d-0m56 r6)', async () => {
+  // The document arm of the sibling query is a JSON predicate no index serves, and it runs inside
+  // the money-post lock. What keeps it cheap is that `remoteAttemptedAt` is written by exactly one
+  // place — the fence, immediately before a remote money call — so a PARTIAL index on it is the
+  // set of payments this business has ever made, not the whole sync log.
+  const sql = await readFile(
+    path.join(process.cwd(), 'prisma/migrations/20260818140000_money_post_attempted_document_index/migration.sql'),
+    'utf8',
+  )
+  assert.match(sql, /CREATE INDEX IF NOT EXISTS "accounting_sync_logs_money_attempted_idx"/)
+  assert.match(sql, /ON "accounting_sync_logs" \("connector", "type"\)/)
+  assert.match(sql, /WHERE "remoteAttemptedAt" IS NOT NULL/, 'partial, or it indexes every sync row ever written')
+})
+
+test('no other copy of the money-post date rule survives (o3d-0m56 r6, CRITICAL 1)', async () => {
+  // Finding 1 was a SECOND copy of one rule. The registration path in app/actions/sales.ts held a
+  // third, and a fourth would be found the same way it was: by a payment nobody can explain.
+  const source = await readFile(path.join(process.cwd(), 'app/actions/sales.ts'), 'utf8')
+  assert.equal(/payload\.paymentDate\.slice\(0, 10\)/.test(source), false,
+    'the registration path must date attempts from the shared function')
+  assert.ok(source.includes("pinnedAttemptDate('INVOICE_PAYMENT'"))
 })

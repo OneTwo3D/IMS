@@ -401,3 +401,141 @@ test('the probe key separates documents (o3d-0m56)', () => {
   )
   assert.equal(key('INVOICE_PAYMENT', { accountingInvoiceId: 'a' }), key('INVOICE_PAYMENT', { accountingInvoiceId: ' a ' }))
 })
+
+/* ------------------------------------------------------------------------------------------- *
+ * o3d-0m56 round 6, finding 3 — what Xero CAN and CANNOT see, and the arithmetic that says so.
+ * ------------------------------------------------------------------------------------------- */
+
+test('xero: a credit note Xero reports as APPLIED must not read as unallocated (o3d-0m56 r6, HIGH 3)', async () => {
+  // `Allocations` absent and `Allocations` empty are one value in JavaScript, and this branch had
+  // no cross-check at all. `Total - RemainingCredit` is Xero's own account of how much of the
+  // credit has been used, so the collection has to add up to it or the picture is incomplete.
+  const { get } = xeroDouble({ 'CreditNotes/cn-1': { CreditNotes: [{ CreditNoteID: 'cn-1', Total: 40, RemainingCredit: 0 }] } })
+  const probe = await probeXeroSettlement(
+    { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { creditNoteId: 'cn-1', accountingInvoiceId: 'bill-1' } },
+    get,
+  )
+  assert.equal(probe.ok, false)
+  assert.match(probe.ok === false ? probe.reason : '', /40\.00 of this credit note already applied but returned no allocations/)
+})
+
+test('xero: allocations to OTHER documents still count towards the credit note\'s own total (o3d-0m56 r6)', async () => {
+  // The discriminating half. A credit legitimately offsets several bills, so the completeness test
+  // is about the COLLECTION, not about this bill's share of it — otherwise every partly-shared
+  // credit note would refuse for ever.
+  const { get } = xeroDouble({
+    'CreditNotes/cn-1': {
+      CreditNotes: [{
+        CreditNoteID: 'cn-1',
+        Total: 40,
+        RemainingCredit: 0,
+        Allocations: [
+          { Amount: 10, Date: '2026-08-01', Invoice: { InvoiceID: 'bill-1' } },
+          { Amount: 30, Date: '2026-08-02', Invoice: { InvoiceID: 'bill-9' } },
+        ],
+      }],
+    },
+  })
+  const probe = await probeXeroSettlement(
+    { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { creditNoteId: 'cn-1', accountingInvoiceId: 'bill-1' } },
+    get,
+  )
+  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', reference: null }] })
+})
+
+test('xero: an allocation whose amount cannot be read fails the credit note probe (o3d-0m56 r6)', async () => {
+  const { get } = xeroDouble({
+    'CreditNotes/cn-1': {
+      CreditNotes: [{
+        CreditNoteID: 'cn-1',
+        Total: 40,
+        RemainingCredit: 0,
+        Allocations: [{ Date: '2026-08-01', Invoice: { InvoiceID: 'bill-9' } }],
+      }],
+    },
+  })
+  const probe = await probeXeroSettlement(
+    { type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { creditNoteId: 'cn-1', accountingInvoiceId: 'bill-1' } },
+    get,
+  )
+  assert.equal(probe.ok, false)
+  assert.match(probe.ok === false ? probe.reason : '', /allocation whose amount could not be read/)
+})
+
+test('xero: an unapplied credit note with no allocations is a clean, empty answer (o3d-0m56 r6)', async () => {
+  const { get } = xeroDouble({ 'CreditNotes/cn-1': { CreditNotes: [{ CreditNoteID: 'cn-1', Total: 40, RemainingCredit: 40, Allocations: [] }] } })
+  assert.deepEqual(
+    await probeXeroSettlement({ type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', payload: { creditNoteId: 'cn-1', accountingInvoiceId: 'bill-1' } }, get),
+    { ok: true, records: [] },
+  )
+})
+
+test('xero: an invoice settled by a CREDIT is not reported as positively empty (o3d-0m56 r6, HIGH 3)', async () => {
+  // A credit-note allocation reduces `AmountCredited`, NOT `AmountPaid`, and appears in no
+  // `Payments` collection. Reading only those two, a fully credited invoice answers "positively
+  // nothing settles this document" — the strongest answer available, and wrong.
+  const { get } = xeroDouble({
+    'Invoices/inv-1': { Invoices: [{ InvoiceID: 'inv-1', Total: 120, AmountDue: 0, AmountPaid: 0, AmountCredited: 120, Payments: [] }] },
+  })
+  const probe = await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get)
+  assert.equal(probe.ok, false)
+  assert.match(probe.ok === false ? probe.reason : '', /120\.00 already settled against this document/)
+  assert.match(probe.ok === false ? probe.reason : '', /120\.00 of it credited, not paid/)
+})
+
+test('xero: a credit the response ITEMISES explains itself and changes no verdict (o3d-0m56 r6)', async () => {
+  // The discriminating half, and the reason this reads the collections instead of refusing on
+  // `AmountCredited > 0`: a part-credited invoice whose credit is accounted for still pays
+  // automatically. Prepayment and overpayment allocations are the same shape.
+  const { get } = xeroDouble({
+    'Invoices/inv-1': {
+      Invoices: [{
+        InvoiceID: 'inv-1',
+        Total: 120,
+        AmountDue: 60,
+        AmountPaid: 20,
+        AmountCredited: 30,
+        Payments: [{ PaymentID: 'PAY-1', Date: '2026-08-01', Amount: 20 }],
+        CreditNotes: [{ AppliedAmount: 30 }],
+        Prepayments: [{ AppliedAmount: 10 }],
+      }],
+    },
+  })
+  assert.deepEqual(
+    await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get),
+    { ok: true, records: [{ amount: 20, date: '2026-08-01', id: 'PAY-1', reference: null }] },
+  )
+})
+
+test('xero: an applied amount that cannot be READ is not an explanation (o3d-0m56 r6)', async () => {
+  // An unknown addend makes the whole sum unknown, and an unknown sum must not be allowed to
+  // explain money that has come off a document.
+  const { get } = xeroDouble({
+    'Invoices/inv-1': {
+      Invoices: [{
+        InvoiceID: 'inv-1',
+        Total: 120,
+        AmountDue: 90,
+        AmountPaid: 0,
+        AmountCredited: 30,
+        Payments: [],
+        CreditNotes: [{}],
+      }],
+    },
+  })
+  const probe = await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get)
+  assert.equal(probe.ok, false)
+  assert.match(probe.ok === false ? probe.reason : '', /could not measure what it holds against it/)
+})
+
+test('xero: an ordinary unsettled invoice is still a positive, empty answer (o3d-0m56 r6)', async () => {
+  // The arithmetic must not turn every first payment into a refusal — an untouched invoice has
+  // nothing to explain.
+  const { get } = xeroDouble({
+    'Invoices/inv-1': { Invoices: [{ InvoiceID: 'inv-1', Total: 120, AmountDue: 120, AmountPaid: 0, AmountCredited: 0, Payments: [] }] },
+  })
+  assert.deepEqual(
+    await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get),
+    { ok: true, records: [] },
+  )
+})

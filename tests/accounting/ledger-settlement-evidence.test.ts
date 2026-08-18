@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict'
+import { readFile } from 'node:fs/promises'
+import path from 'node:path'
 import test from 'node:test'
 
 import {
   classifyLedgerSettlement,
   describeAttempt,
+  moneyPostDateFieldFor,
+  moneyPostDateToSend,
+  pinnedAttemptDate,
   plannedAttemptDate,
   settlementMarkerFor,
   type LedgerSettlementRecord,
@@ -76,52 +81,107 @@ test('a ledger record IMS cannot measure is UNKNOWN (o3d-0m56)', () => {
 })
 
 test('the attempt is described from the payload the connector actually sends (o3d-0m56)', () => {
-  assert.deepEqual(describeAttempt({ amount: 12.5, paymentDate: '2026-08-01' }), { amount: 12.5, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 12.5, paymentDate: '2026-08-01' }), { amount: 12.5, date: '2026-08-01', marker: null })
   // Allocations carry `date`, payments carry `paymentDate`; both are sliced to 10 characters
-  // exactly as the processors slice them.
-  assert.deepEqual(describeAttempt({ amount: 1, date: '2026-08-01T09:30:00Z' }), { amount: 1, date: '2026-08-01', marker: null })
+  // exactly as the processors slice them — and each type reads ONLY its own field.
+  assert.deepEqual(describeAttempt('PURCHASE_CREDIT_NOTE_ALLOCATION', { amount: 1, date: '2026-08-01T09:30:00Z' }), { amount: 1, date: '2026-08-01', marker: null })
   // A zero amount is a real request — the connectors reject an amount only when it is null.
-  assert.deepEqual(describeAttempt({ amount: 0, paymentDate: '2026-08-01' }), { amount: 0, date: '2026-08-01', marker: null })
-  assert.deepEqual(describeAttempt({ paymentDate: '2026-08-01' }), { amount: null, date: '2026-08-01', marker: null })
-  assert.deepEqual(describeAttempt({ amount: 1 }), { amount: 1, date: null, marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 0, paymentDate: '2026-08-01' }), { amount: 0, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { paymentDate: '2026-08-01' }), { amount: null, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), { amount: 1, date: null, marker: null })
   // A blank or truncated date is not a date. Slicing it anyway would produce a value that can
   // never match a real settlement, which reads as "clear" for the wrong reason.
-  assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '' }), { amount: 1, date: null, marker: null })
-  assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '2026-08' }), { amount: 1, date: null, marker: null })
-  assert.deepEqual(describeAttempt(null), { amount: null, date: null, marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '' }), { amount: 1, date: null, marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08' }), { amount: 1, date: null, marker: null })
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', null), { amount: null, date: null, marker: null })
+})
+
+/* --- round 6, finding 1: the date convention is PER TYPE, and there is only one of it --- */
+
+test('each money type dates itself from ITS OWN field, never the other one (o3d-0m56 r6, CRITICAL 1)', () => {
+  const now = new Date('2026-08-18T09:00:00Z')
+  // THE DRIFT. Round 5's "mirror" read `paymentDate ?? date` for every type, which is neither
+  // processor. A bill payment carrying the BILL's `date` and no `paymentDate` was predicted to
+  // post on that day; the processor posts TODAY. The probe then looked for a settlement on a day
+  // the post will never create, found none, and authorised a second payment.
+  for (const type of ['INVOICE_PAYMENT', 'BILL_PAYMENT']) {
+    assert.equal(plannedAttemptDate(type, { amount: 10, date: '2026-07-04' }, now), '2026-08-18',
+      `${type} does not read \`date\``)
+    assert.equal(pinnedAttemptDate(type, { amount: 10, date: '2026-07-04' }), null,
+      `${type} pins nothing when only \`date\` is set`)
+  }
+  // And the same drift the other way round: an allocation dates itself from `date`, so a stray
+  // `paymentDate` on its payload is not what Xero will receive.
+  assert.equal(plannedAttemptDate('PURCHASE_CREDIT_NOTE_ALLOCATION', { amount: 10, paymentDate: '2026-07-04' }, now), '2026-08-18')
+  assert.equal(plannedAttemptDate('PURCHASE_CREDIT_NOTE_ALLOCATION', { amount: 10, date: '2026-07-04' }, now), '2026-07-04')
+  assert.equal(pinnedAttemptDate('PURCHASE_CREDIT_NOTE_ALLOCATION', { amount: 10, paymentDate: '2026-07-04' }), null)
+})
+
+test('the date table covers every money-moving type, and nothing else (o3d-0m56 r6)', async () => {
+  // A fourth money type added without a line in the table must fail VISIBLY at the post rather
+  // than silently inherit a convention that may not be its own.
+  const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
+  for (const type of ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION']) {
+    assert.ok(isMoneyMovingSyncType(type), `${type} must still be money-moving`)
+    assert.notEqual(moneyPostDateFieldFor(type), null, `${type} must say which field dates it`)
+  }
+  assert.equal(moneyPostDateFieldFor('SALES_INVOICE'), null)
+  const unmapped = moneyPostDateToSend('SOME_NEW_MONEY_TYPE', { amount: 1 }, new Date('2026-08-18T09:00:00Z'))
+  assert.equal(unmapped.ok, false, 'an unmapped type cannot be dated, so it cannot be sent')
+})
+
+test('the processors take their post date from this module, not from their own expression (o3d-0m56 r6, CRITICAL 1)', async () => {
+  // The only thing that makes drift IMPOSSIBLE rather than unlikely: there is no second copy to
+  // drift from. A branch that recomputes `(payload.paymentDate as string)?.slice(...)` is a copy,
+  // however faithful it looks on the day it is written.
+  for (const file of ['lib/connectors/xero/sync-processor.ts', 'lib/connectors/quickbooks/sync-processor.ts']) {
+    const source = await readFile(path.join(process.cwd(), file), 'utf8')
+    assert.equal(/\(payload\.paymentDate as string\)\?\.slice/.test(source), false,
+      `${file} must not compute a payment date of its own`)
+    assert.equal(/\(payload\.date as string\)\?\.slice\(0, 10\) \|\| new Date\(\)/.test(source), false,
+      `${file} must not compute an allocation date of its own`)
+    assert.ok(source.includes('moneyPostDateToSend('), `${file} must date its money posts from the shared function`)
+  }
 })
 
 // --- the date an UNSENT attempt will carry (Codex round 5, finding 1) ---
 
 test('the date an attempt has not yet sent is the date the processor will send (o3d-0m56 r5)', () => {
   const now = new Date('2026-08-18T09:00:00Z')
-  // Both processors compute `(payload.paymentDate ?? payload.date)?.slice(0, 10) || today`, so a
-  // row that pins one keeps it and a row that pins none will carry today — which is a fact about
-  // the imminent POST, not a guess, and is what makes such a row describable at all.
-  assert.equal(plannedAttemptDate({ amount: 1, paymentDate: '2026-08-01T00:00:00Z' }, now), '2026-08-01')
-  assert.equal(plannedAttemptDate({ amount: 1, date: '2026-07-04' }, now), '2026-07-04')
-  assert.equal(plannedAttemptDate({ amount: 1 }, now), '2026-08-18')
-  assert.equal(plannedAttemptDate({ amount: 1, paymentDate: '' }, now), '2026-08-18')
-  assert.equal(plannedAttemptDate(null, now), '2026-08-18')
+  // `moneyPostDateToSend` IS what the processors put on the wire, so a row that pins a date keeps
+  // it and a row that pins none will carry today — a fact about the imminent POST, not a guess,
+  // and what makes such a row describable at all.
+  assert.equal(plannedAttemptDate('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08-01T00:00:00Z' }, now), '2026-08-01')
+  assert.equal(plannedAttemptDate('PURCHASE_CREDIT_NOTE_ALLOCATION', { amount: 1, date: '2026-07-04' }, now), '2026-07-04')
+  assert.equal(plannedAttemptDate('INVOICE_PAYMENT', { amount: 1 }, now), '2026-08-18')
+  assert.equal(plannedAttemptDate('INVOICE_PAYMENT', { amount: 1, paymentDate: '' }, now), '2026-08-18')
+  assert.equal(plannedAttemptDate('INVOICE_PAYMENT', null, now), '2026-08-18')
   // A date field that is SET but unreadable is not "no date": the processors send it verbatim, so
-  // the post will carry something this module cannot predict. Predicting today anyway would
-  // describe an attempt that cannot exist, and a description that can never match is a false
-  // clear with extra steps.
-  assert.equal(plannedAttemptDate({ amount: 1, paymentDate: '2026-08' }, now), null)
-  assert.equal(plannedAttemptDate({ amount: 1, paymentDate: 20260818 }, now), null)
+  // the post will carry something the LEDGER will normalise to a value this module cannot
+  // predict. Predicting today anyway would describe an attempt that cannot exist, and a
+  // description that can never match is a false clear with extra steps.
+  assert.equal(plannedAttemptDate('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08' }, now), null)
+  assert.equal(plannedAttemptDate('INVOICE_PAYMENT', { amount: 1, paymentDate: 20260818 }, now), null)
+  // ...and a non-string is refused OUTRIGHT rather than dated, because the processor could only
+  // have thrown on it. An array is the one non-string with a `.slice`, so it used to be sent as a
+  // JSON list where a date belongs.
+  assert.equal(moneyPostDateToSend('INVOICE_PAYMENT', { amount: 1, paymentDate: 20260818 }, now).ok, false)
+  assert.equal(moneyPostDateToSend('INVOICE_PAYMENT', { amount: 1, paymentDate: ['2026-08-18'] }, now).ok, false)
+  // ...while the value that IS sent verbatim is reported verbatim: the two questions are separate.
+  assert.deepEqual(moneyPostDateToSend('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08' }, now), { ok: true, date: '2026-08' })
 })
 
 test('describeAttempt fills a missing date ONLY from postingOn (o3d-0m56 r5)', () => {
   // The option exists so the caller has to say "this attempt has not happened yet". A pinned date
   // is never overridden, because a past attempt's day is unreconstructable and substituting
   // today's would go looking for a settlement that was never created.
-  assert.deepEqual(describeAttempt({ amount: 1 }, null, { postingOn: '2026-08-18' }),
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }, null, { postingOn: '2026-08-18' }),
     { amount: 1, date: '2026-08-18', marker: null })
-  assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '2026-08-01' }, null, { postingOn: '2026-08-18' }),
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1, paymentDate: '2026-08-01' }, null, { postingOn: '2026-08-18' }),
     { amount: 1, date: '2026-08-01', marker: null })
-  assert.deepEqual(describeAttempt({ amount: 1 }, null, { postingOn: null }),
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }, null, { postingOn: null }),
     { amount: 1, date: null, marker: null })
-  assert.deepEqual(describeAttempt({ amount: 1 }), { amount: 1, date: null, marker: null },
+  assert.deepEqual(describeAttempt('INVOICE_PAYMENT', { amount: 1 }), { amount: 1, date: null, marker: null },
     'and a caller that does not opt in still gets the honest null')
 })
 

@@ -66,7 +66,7 @@ import {
 } from '@/lib/domain/accounting/invoice-payment-registration'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
-import { settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import { pinnedAttemptDate, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
 import {
   aggregatePaymentSyncRows,
@@ -733,9 +733,11 @@ async function loadInvoicePaymentSyncRows(
       amount: typeof payload.amount === 'number' ? payload.amount : null,
       // ...and the date it sent, because amount alone cannot tell one receipt from another
       // (o3d-0m56). Both together are what identifies this attempt's payment in the ledger.
-      paymentDate: typeof payload.paymentDate === 'string' && payload.paymentDate.length >= 10
-        ? payload.paymentDate.slice(0, 10)
-        : null,
+      //
+      // Round 6, finding 1: taken from the SAME function the processors date their posts with,
+      // not from a fourth copy of `payload.paymentDate?.slice(0, 10)`. Copies of this rule are
+      // what let the probe go looking for a settlement on a day no post would ever create.
+      paymentDate: pinnedAttemptDate('INVOICE_PAYMENT', r.payload),
       // Judged by the SAME rule the retry guard uses, so the two paths cannot disagree about
       // which failed attempts could have reached the ledger.
       couldHaveReachedLedger: attemptCouldHaveReachedTheLedger('INVOICE_PAYMENT', r.payload),

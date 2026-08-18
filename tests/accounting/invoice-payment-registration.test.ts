@@ -265,8 +265,12 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
   // refused; without the postability flag, a row that provably never posted strands one.
   const loader = source.slice(source.indexOf('async function loadInvoicePaymentSyncRows'))
   const loaderBody = loader.slice(0, loader.indexOf('\n}\n'))
-  assert.match(loaderBody, /paymentDate: typeof payload\.paymentDate === 'string'/,
-    'the attempt date must be carried from the payload')
+  // Round 6, finding 1: carried from the SHARED date rule, not from a local copy of
+  // `payload.paymentDate?.slice(0, 10)`. A copy here is a copy that can drift from what the
+  // processor will actually send, which is how the probe came to look for settlements on days no
+  // post would ever create.
+  assert.match(loaderBody, /paymentDate: pinnedAttemptDate\('INVOICE_PAYMENT', r\.payload\)/,
+    'the attempt date must be carried from the shared money-post date rule')
   assert.match(loaderBody, /couldHaveReachedLedger: attemptCouldHaveReachedTheLedger\('INVOICE_PAYMENT', r\.payload\)/,
     'and postability judged by the SAME rule the retry guard uses')
 

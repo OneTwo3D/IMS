@@ -120,56 +120,136 @@ function asRecord(payload: unknown): Record<string, unknown> {
     : {}
 }
 
+/* ------------------------------------------------------------------------------------------- *
+ * THE DATE A MONEY POST CARRIES — ONE definition, called by the processors AND by this module.
+ * ------------------------------------------------------------------------------------------- */
+
 /**
- * The date the connectors actually send.
+ * Which payload field a money post takes its date from — and it is NOT the same field for every
+ * type, which is the entire reason this table exists (Codex round 6, finding 1).
  *
- * Both read `paymentDate` (payments) or `date` (allocations) and `.slice(0, 10)` it, falling back
- * to `new Date()` when it is absent. That fallback is why an absent date yields null here rather
- * than today's date: the attempt was dated when it RAN, which may have been days ago, so today is
- * not evidence of anything.
+ *   INVOICE_PAYMENT / BILL_PAYMENT           `paymentDate`   (both connectors)
+ *   PURCHASE_CREDIT_NOTE_ALLOCATION          `date`          (Xero only; QuickBooks has no branch)
+ *
+ * Round 5 wrote a "mirror" that read `paymentDate ?? date` for every type. That is not either
+ * processor: it AVERAGES two conventions, and an average is wrong for both wherever they differ.
+ * A bill payment carrying a `date` (the bill's own date, months old) was predicted to post on
+ * that day when the processor would in fact post TODAY — so the probe looked for a settlement on
+ * a day the post will never create, found none, and authorised a second payment onto an invoice
+ * a human had already settled today. A mirror that drifts reintroduces exactly the bug it was
+ * written to close, which is why there is no longer a mirror: there is one function, and the
+ * processors call it.
+ *
+ * A type missing from this table is UNSENDABLE rather than defaulted. A fourth money-moving type
+ * added without a line here fails visibly at the post instead of silently inheriting a
+ * convention that may not be its own, and `tests/accounting/ledger-settlement-evidence` asserts
+ * the table covers every type `isMoneyMovingSyncType` admits.
  */
-function attemptDate(payload: Record<string, unknown>): string | null {
-  for (const field of ['paymentDate', 'date'] as const) {
-    const value = payload[field]
-    if (typeof value === 'string' && value.trim().length >= 10) return value.slice(0, 10)
+const MONEY_POST_DATE_FIELD: Readonly<Record<string, 'paymentDate' | 'date'>> = {
+  INVOICE_PAYMENT: 'paymentDate',
+  BILL_PAYMENT: 'paymentDate',
+  PURCHASE_CREDIT_NOTE_ALLOCATION: 'date',
+}
+
+/** Exported for the test that keeps the table in step with the money-moving type set. */
+export function moneyPostDateFieldFor(type: string): 'paymentDate' | 'date' | null {
+  return MONEY_POST_DATE_FIELD[type] ?? null
+}
+
+export type MoneyPostDate =
+  /** The payload pins this, and it is the string that will go on the wire verbatim. */
+  | { kind: 'pinned'; date: string }
+  /** The payload pins nothing, so the post is dated from the wall clock AT POST TIME. */
+  | { kind: 'wall-clock' }
+  /** No post can be built from this payload at all — see below. */
+  | { kind: 'unsendable'; reason: string }
+
+/**
+ * What a money post of `type` will date itself, decided from the payload alone.
+ *
+ * Reproduces `(payload[field] as string)?.slice(0, 10) || today` because that expression WAS the
+ * processors, and every one of its corners is load-bearing:
+ *
+ *  - absent/null  →  `?.` short-circuits, `|| today` fires. `wall-clock`.
+ *  - `''`         →  slices to `''`, which is falsy, so `|| today` fires too. `wall-clock`.
+ *  - `'2026-08'`  →  slices to `'2026-08'`, which is TRUTHY, so it is sent verbatim. `pinned`,
+ *                    and the caller — not this function — decides what can be compared with it.
+ *  - a non-string →  `.slice` is not a function and the branch throws before any HTTP call. That
+ *                    throw is reported as `unsendable` instead, which fails the row cleanly rather
+ *                    than as an unhandled exception, and posts exactly as little money: none.
+ *                    (An ARRAY is the one non-string with a `.slice`, so it used to be sent as a
+ *                    JSON list where a date belongs. It is now refused with everything else.)
+ */
+export function moneyPostDate(type: string, payload: unknown): MoneyPostDate {
+  const field = moneyPostDateFieldFor(type)
+  if (!field) {
+    return { kind: 'unsendable', reason: `IMS does not know which payload field dates a ${type} post` }
   }
-  return null
+  const raw = asRecord(payload)[field]
+  if (raw === undefined || raw === null) return { kind: 'wall-clock' }
+  if (typeof raw !== 'string') {
+    return { kind: 'unsendable', reason: `${field} is ${Array.isArray(raw) ? 'a list' : typeof raw}, not a date` }
+  }
+  const sent = raw.slice(0, 10)
+  return sent === '' ? { kind: 'wall-clock' } : { kind: 'pinned', date: sent }
+}
+
+/**
+ * THE VALUE THE PROCESSORS SEND. Both connectors' money branches call this and put `date` on the
+ * wire; nothing else in either processor computes a payment date. That is what makes drift
+ * impossible rather than merely unlikely — the probe is not claiming to match the processors, it
+ * is asking the same function the same question.
+ */
+export function moneyPostDateToSend(
+  type: string,
+  payload: unknown,
+  now: Date,
+): { ok: true; date: string } | { ok: false; reason: string } {
+  const planned = moneyPostDate(type, payload)
+  if (planned.kind === 'unsendable') return { ok: false, reason: planned.reason }
+  return { ok: true, date: planned.kind === 'pinned' ? planned.date : now.toISOString().slice(0, 10) }
+}
+
+/**
+ * The sent value, but only when the LEDGER will hold it in a form this module can compare.
+ *
+ * Knowing exactly what goes on the wire is not the same as knowing what comes back. `'2026-08'`
+ * is sent verbatim and Xero stores whatever it makes of it, so comparing the string we sent
+ * against the date it reports is a match that can never happen — a false CLEAR with extra steps.
+ * Null instead, which reads as `attempt-undescribable`, and the fence answers that by refusing on
+ * whatever the ledger visibly holds.
+ */
+function comparableSettlementDate(sent: string): string | null {
+  return /^\d{4}-\d{2}-\d{2}$/.test(sent) ? sent : null
+}
+
+/**
+ * The date an attempt ALREADY MADE carries, or null when the row does not pin one.
+ *
+ * Null for `wall-clock` on purpose: the attempt was dated when it RAN, which may have been days
+ * ago, so today is not evidence of anything.
+ */
+export function pinnedAttemptDate(type: string, payload: unknown): string | null {
+  const posted = moneyPostDate(type, payload)
+  return posted.kind === 'pinned' ? comparableSettlementDate(posted.date) : null
 }
 
 /**
  * The date an attempt that has NEVER BEEN SENT will carry when it is sent NOW.
  *
- * Mirrors both processors exactly — `(payload.paymentDate ?? payload.date)?.slice(0, 10) ||
- * new Date()` — because the value this returns is a claim about what the imminent POST will put
- * in the ledger, and a claim that does not match the post is worse than no claim.
- *
  * ONLY legitimate for an attempt that has not happened yet (Codex round 5, finding 1). For an
- * attempt already made, the day it ran is unreconstructable and `attemptDate`'s null — which
+ * attempt already made, the day it ran is unreconstructable and `pinnedAttemptDate`'s null — which
  * yields `attempt-undescribable` — is the honest answer; substituting today would invent a
  * description of a payment that was actually dated last Tuesday, and then fail to find it.
  */
-export function plannedAttemptDate(payload: unknown, now: Date): string | null {
-  const record = asRecord(payload)
-  const pinned = attemptDate(record)
-  if (pinned) return pinned
-  // A date field that is PRESENT but unreadable is not the same as no date field. The processors
-  // send whatever is there verbatim (`(payload.paymentDate as string)?.slice(0, 10) || today`), so
-  // `2026-08` posts as `2026-08` and a non-string throws before the call. Neither is today, so
-  // predicting today would describe an attempt that cannot exist — a description that can never
-  // match anything is a false clear with extra steps. Null keeps such a row undescribable, which
-  // the fence answers by refusing on whatever the ledger visibly holds.
-  return unreadableDateField(record) ? null : now.toISOString().slice(0, 10)
-}
-
-/** True when a date field is set to something `attemptDate` could not read. */
-function unreadableDateField(record: Record<string, unknown>): boolean {
-  return ['paymentDate', 'date'].some((field) => {
-    const value = record[field]
-    return value !== undefined && value !== null && value !== ''
-  })
+export function plannedAttemptDate(type: string, payload: unknown, now: Date): string | null {
+  const sending = moneyPostDateToSend(type, payload, now)
+  return sending.ok ? comparableSettlementDate(sending.date) : null
 }
 
 export function describeAttempt(
+  /** Which money-moving type this row is: the date convention is per type, never per payload. */
+  type: string,
   payload: unknown,
   marker?: string | null,
   /**
@@ -183,7 +263,7 @@ export function describeAttempt(
   const amount = record.amount
   return {
     amount: typeof amount === 'number' && Number.isFinite(amount) ? amount : null,
-    date: attemptDate(record) ?? options?.postingOn ?? null,
+    date: pinnedAttemptDate(type, payload) ?? options?.postingOn ?? null,
     marker: marker ?? null,
   }
 }
