@@ -3033,7 +3033,7 @@ export async function updateInvoice(
     if (!input.lines.length) return { success: false, error: 'Bill must have at least one line' }
 
     const invoice = await db.purchaseInvoice.findUnique({
-      where: { id: invoiceId, paidAt: null },
+      where: { id: invoiceId },
       select: {
         id: true,
         poId: true,
@@ -3477,7 +3477,7 @@ export async function markBillPaid(
     // clearable by hand, or the poller reverses on a partially-paid bill — BILL_PAYMENT needs the same
     // unresolved-attempt check decideInvoicePaymentRegistration now performs.
     const paidUpdate = await db.purchaseInvoice.updateMany({
-      where: { id: invoiceId },
+      where: { id: invoiceId, paidAt: null },
       data: {
         paidAt: paymentDate,
         paymentAccountId: input.bankAccountId,

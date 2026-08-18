@@ -456,8 +456,15 @@ Every refusal is written to the activity log as a warning naming the rows involv
 appears beside the retry result as *refused*. **A refusal is not a failure of the retry** — it is
 IMS declining to move money twice on your behalf.
 
-The same check now runs on the automatic path: when the connector re-queues a failed payment by
-itself, it reads the ledger first and leaves the row alone if the payment is already there.
+**The same check runs at the moment of sending, not only when you click.** A failed payment does not
+go straight to a permanent failure — it is re-attempted automatically several times first. Every one
+of those attempts, and every automatic re-queue, reads the ledger the same way: IMS records when a
+row first sent a payment, and from then on it will not send that row again until the ledger says the
+payment is not already there. The refusal appears as the row's error message.
+
+The practical consequence: a payment IMS cannot prove is absent ends up FAILED with an explanation,
+rather than being sent again in the background. That is the intended outcome — reversing a duplicate
+payment in Xero is manual work, and nobody is told it happened.
 
 Recording a **second receipt** against an order with an unresolved failed attempt is refused on the
 same grounds, with a warning on the order: the receipt stays recorded in IMS, and nothing is sent

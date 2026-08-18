@@ -12,12 +12,7 @@ import {
   selectRevivableCandidates,
   type RetryCandidateRow,
 } from '@/lib/domain/accounting/followup-retry-guard'
-import {
-  classifyLedgerSettlement,
-  describeAttempt,
-  type LedgerSettlementProbe,
-  type SettlementVerdict,
-} from '@/lib/domain/accounting/ledger-settlement-evidence'
+import type { LedgerSettlementProbe } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { probeLedgerSettlement, settlementProbeKey } from '@/lib/connectors/accounting-settlement-probe'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import {
@@ -393,7 +388,7 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
     // unreachable remote block the accounting queue for as long as its timeout. One probe per
     // target DOCUMENT, shared by every row that names it.
     const probes = new Map<string, LedgerSettlementProbe>()
-    const settlementByCandidate = new Map<string, SettlementVerdict>()
+    const ledgerByCandidate = new Map<string, LedgerSettlementProbe>()
     for (const candidate of candidates) {
       // Only money moves twice. A duplicate PDF or email is not a financial error, and probing
       // for one would put an API call behind every routine retry.
@@ -404,7 +399,7 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
         probe = await probeLedgerSettlement('quickbooks', candidate)
         probes.set(key, probe)
       }
-      settlementByCandidate.set(candidate.id, classifyLedgerSettlement(describeAttempt(candidate.payload), probe))
+      ledgerByCandidate.set(candidate.id, probe)
     }
 
     let reset = 0
@@ -481,13 +476,13 @@ export async function retryFailedQuickBooksSync(entryId?: string): Promise<{ suc
               status: 'FAILED', // the candidate query selects only FAILED rows
             },
             siblings,
-            // Never `clear` by default. Unreachable today — the loop above probes for exactly
-            // the types the guard checks a verdict for, both through isMoneyMovingSyncType — so
-            // no mutation can make this branch fire, and it is deliberate defence rather than
-            // tested behaviour: a money row with no verdict recorded means the probe did not
-            // run, and that is not permission.
-            settlement: settlementByCandidate.get(candidate.id)
-              ?? { outcome: 'unknown', reason: 'no settlement check was made for this row' },
+            // Never an empty ledger by default. Unreachable today — the loop above probes for
+            // exactly the types the guard reads a ledger for, both through isMoneyMovingSyncType
+            // — so no mutation can make this branch fire, and it is deliberate defence rather
+            // than tested behaviour: a money row with no reading means the probe did not run,
+            // and that is not permission.
+            ledger: ledgerByCandidate.get(candidate.id)
+              ?? { ok: false, reason: 'no settlement check was made for this row' },
           })
           if (plan.action === 'refuse') refused.push({ id: candidate.id, reason: plan.reason, tokenCount: plan.tokenCount })
           else allowed.push(candidate)

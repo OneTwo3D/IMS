@@ -3,7 +3,12 @@ import {
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
 } from './followup-idempotency'
-import type { SettlementVerdict } from './ledger-settlement-evidence'
+import {
+  classifyLedgerSettlement,
+  describeAttempt,
+  type LedgerSettlementProbe,
+  type SettlementVerdict,
+} from './ledger-settlement-evidence'
 
 /**
  * o3d-0m56 — an operator action that looks safe must not be able to post a payment twice.
@@ -229,18 +234,27 @@ function couldBeTheSameDocument(left: unknown, right: unknown): boolean {
  * database and cannot drift from the automatic path's definition of ambiguity.
  *
  * `siblings` is every row in the target's scope AT ANY STATUS, including the target itself.
- * `settlement` is what the connector's ledger says about the target's own attempt; it is
- * required rather than optional so a caller cannot reach "allow" by forgetting to ask.
+ * `ledger` is one read of the target document, shared by the whole scope: the planner judges the
+ * row being retried AND every rival attempt against it, because "which of these committed?" cannot
+ * be answered from the row alone.
  */
 export function planManualRetry(params: {
   type: string
   reference: string
   target: RetryCandidateRow
   siblings: RetryCandidateRow[]
-  settlement: SettlementVerdict
+  /**
+   * What the connector's ledger holds against this document, as read once for the whole scope.
+   * Required rather than optional so a caller cannot reach `allow` by forgetting to ask — and it
+   * is the RECORDS, not a pre-computed verdict, because the planner has to judge every contender
+   * against them, not only the row being retried.
+   */
+  ledger: LedgerSettlementProbe
 }): ManualRetryPlan {
-  const { type, reference, target, siblings, settlement } = params
+  const { type, reference, target, siblings, ledger } = params
   const moneyMoving = isMoneyMovingSyncType(type)
+  const verdictFor = (row: RetryCandidateRow): SettlementVerdict =>
+    classifyLedgerSettlement(describeAttempt(row.payload), ledger)
 
   const contenders = siblings
     // A sibling missing a field its connector requires was rejected BEFORE any HTTP call, so it
@@ -252,13 +266,26 @@ export function planManualRetry(params: {
   const tokens = new Set(contenders.map((row) => row.effectiveToken))
 
   if (moneyMoving && tokens.size > 1) {
-    return {
-      action: 'refuse',
-      tokenCount: tokens.size,
-      reason: `${tokens.size} attempts for ${reference} were made under different idempotency `
-        + 'keys. Any one of them may have reached the ledger, and a manual retry is too late for '
-        + 'the remote to deduplicate it, so retrying could post a second payment. Check the '
-        + 'ledger for an existing payment against this document before acting.',
+    // AMBIGUITY IS ABOUT WHICH ONE COMMITTED — so if the ledger positively shows that NONE of them
+    // did, there is nothing to be ambiguous about and the scope is recoverable (Codex round 2).
+    // Without this, two attempts that both provably failed made the document permanently
+    // un-retryable, with no per-row resolution action to escape through.
+    //
+    // Two conditions, and the second is not obvious: a SYNCED contender is positive evidence that
+    // a payment DID go out under its token. If the ledger does not show it, the payment was
+    // reversed or deleted there — and re-posting the other token would restore money a human took
+    // out deliberately. That is not a recovery, so it still refuses.
+    const unresolved = contenders.filter((row) => verdictFor(row).outcome !== 'clear')
+    const settledContender = contenders.some((row) => row.status === 'SYNCED')
+    if (unresolved.length > 0 || settledContender) {
+      return {
+        action: 'refuse',
+        tokenCount: tokens.size,
+        reason: `${tokens.size} attempts for ${reference} were made under different idempotency `
+          + 'keys. Any one of them may have reached the ledger, and a manual retry is too late for '
+          + 'the remote to deduplicate it, so retrying could post a second payment. Check the '
+          + 'ledger for an existing payment against this document before acting.',
+      }
     }
   }
 
@@ -287,6 +314,14 @@ export function planManualRetry(params: {
 
   // Rule 3. Unambiguous is not the same as safe: the remote's deduplication window has closed by
   // the time anyone clicks retry, so the ledger itself has to say this attempt is not in it.
+  //
+  // A target whose own body is too incomplete for its connector to have built a request is exempt:
+  // it provably never posted, so there is nothing to duplicate, and refusing it for want of
+  // evidence about a call that was never made would be a refusal with no hazard behind it. It will
+  // simply fail the same way again, which is visible and harmless.
+  if (!couldHaveReachedTheLedger(type, target.payload)) return { action: 'allow' }
+
+  const settlement = verdictFor(target)
   if (settlement.outcome === 'present') {
     return {
       action: 'refuse',

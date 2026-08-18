@@ -196,20 +196,35 @@ function seed(connector: string) {
 
 const statusOf = (id: string) => state.rows.find((r) => r.id === id)?.status
 
+/**
+ * Make the two-token scope on so-1 genuinely ambiguous: the ledger holds a payment matching what
+ * BOTH attempts sent, so one of them committed and nobody can say which. Set explicitly per test
+ * rather than in the seed, because an ambiguous scope whose attempts are all provably ABSENT from
+ * the ledger is deliberately recoverable now, and conflating the two would hide that.
+ */
+const ledgerHoldsTheAttemptOn = (invoiceId: string) =>
+  state.probes.set(`INVOICE_PAYMENT ${invoiceId} `, {
+    ok: true,
+    records: [{ amount: 10, date: '2026-08-01', id: 'PAY-A' }],
+  })
+
 const ACTIONS = [
   { connector: 'xero', module: '@/app/actions/xero-sync', fn: 'retryFailedXeroSync', refusalAction: 'xero_manual_retry_refused' },
   { connector: 'quickbooks', module: '@/app/actions/quickbooks-sync', fn: 'retryFailedQuickBooksSync', refusalAction: 'quickbooks_manual_retry_refused' },
 ] as const
 
-for (const action of ACTIONS) {
-  async function load(): Promise<(entryId?: string) => Promise<{ success: boolean; reset: number; refused?: number; error?: string }>> {
-    const mod = await import(action.module) as Record<string, unknown>
-    return mod[action.fn] as never
-  }
+type RetryFn = (entryId?: string) => Promise<{ success: boolean; reset: number; refused?: number; error?: string }>
 
+async function load(action: (typeof ACTIONS)[number]): Promise<RetryFn> {
+  const mod = await import(action.module) as Record<string, unknown>
+  return mod[action.fn] as never
+}
+
+for (const action of ACTIONS) {
   test(`${action.connector}: the per-row retry REFUSES an ambiguous scope and leaves the row FAILED (o3d-0m56)`, async () => {
     seed(action.connector)
-    const retry = await load()
+    ledgerHoldsTheAttemptOn('inv-1')
+    const retry = await load(action)
 
     const result = await retry('a1')
 
@@ -230,7 +245,7 @@ for (const action of ACTIONS) {
     // row count would refuse every single-row retry there is. It is allowed because the ledger
     // was ASKED and answered — not because one row looks harmless.
     seed(action.connector)
-    const retry = await load()
+    const retry = await load(action)
 
     const result = await retry('b1')
 
@@ -250,7 +265,7 @@ for (const action of ACTIONS) {
       ok: true,
       records: [{ amount: 10, date: '2026-08-01', id: 'PAY-1' }],
     })
-    const retry = await load()
+    const retry = await load(action)
 
     const result = await retry('b1')
 
@@ -267,7 +282,7 @@ for (const action of ACTIONS) {
     // permission to post again.
     seed(action.connector)
     state.probes.set('INVOICE_PAYMENT inv-2 ', { ok: false, reason: 'HTTP 503' })
-    const retry = await load()
+    const retry = await load(action)
 
     const result = await retry('b1')
 
@@ -289,7 +304,7 @@ for (const action of ACTIONS) {
         { amount: 25, date: '2026-08-01', id: 'PAY-OTHER' },
       ],
     })
-    const retry = await load()
+    const retry = await load(action)
 
     assert.equal((await retry('b1')).reset, 1)
     assert.equal(statusOf('b1'), 'PENDING')
@@ -301,7 +316,8 @@ for (const action of ACTIONS) {
     // it whole — AND revive at most one row per document, which is what the production unique
     // index allows (Codex finding 4).
     seed(action.connector)
-    const retry = await load()
+    ledgerHoldsTheAttemptOn('inv-1')
+    const retry = await load(action)
 
     const result = await retry()
 
@@ -337,7 +353,7 @@ for (const action of ACTIONS) {
       const target = state.rows.find((r) => r.id === id)!
       target.payload = payload('inv-1', shared)
     }
-    const retry = await load()
+    const retry = await load(action)
 
     const result = await retry()
 
@@ -365,7 +381,7 @@ for (const action of ACTIONS) {
       id: 'b2', connector: action.connector, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder',
       referenceId: 'so-2', status: 'PENDING', payload: payload('inv-2', shared),
     }))
-    const retry = await load()
+    const retry = await load(action)
 
     const result = await retry('b1')
 
@@ -380,7 +396,7 @@ for (const action of ACTIONS) {
     // unfenced statement; a row queued in between could reach FAILED unseen and both tokens post.
     // Read, plan and reset now share one transaction that holds the scope's advisory lock.
     seed(action.connector)
-    const retry = await load()
+    const retry = await load(action)
 
     await retry('b1')
 
@@ -397,7 +413,7 @@ for (const action of ACTIONS) {
     // The refusal has to stay narrow, and so does its cost: a duplicate PDF is not a financial
     // error, and putting an API call and a lock behind every routine retry would be a new problem.
     seed(action.connector)
-    const retry = await load()
+    const retry = await load(action)
 
     const result = await retry('c1')
 
@@ -430,7 +446,30 @@ test('quickbooks: rows sharing the generic idempotency key are NOT ambiguous (o3
   for (const id of ['a1', 'a2']) {
     state.rows.find((r) => r.id === id)!.payload = payload('inv-1', { _idempotencyKey: 'invoice-payment:payment:p1' })
   }
+  // ...against a ledger that DOES hold the attempt, so the two tokens are genuinely ambiguous and
+  // the refusal is about the derivation rather than about an empty ledger.
+  ledgerHoldsTheAttemptOn('inv-1')
   const { retryFailedXeroSync } = await import('@/app/actions/xero-sync')
   assert.equal((await retryFailedXeroSync('a1')).success, false, 'Xero never sent that key')
   assert.equal(statusOf('a1'), 'FAILED')
 })
+
+for (const action of ACTIONS) {
+  test(`${action.connector}: two tokens the ledger holds NEITHER of are recoverable (o3d-0m56)`, async () => {
+    // Codex round 2, medium. Before this, two failed attempts under different tokens made the
+    // document permanently un-retryable even when the ledger positively showed that neither had
+    // landed — and there is no per-row resolution action to escape through. Exactly one row is
+    // revived; the other is deferred, not lost.
+    seed(action.connector)
+    const retry = await load(action)
+
+    const result = await retry('a1')
+
+    assert.equal(result.success, true)
+    assert.equal(result.reset, 1)
+    assert.equal(statusOf('a1'), 'PENDING')
+    assert.equal(statusOf('a2'), 'FAILED', 'its rival waits rather than going live beside it')
+    assert.deepEqual(state.probeCalls, [`${action.connector} INVOICE_PAYMENT inv-1 `],
+      'one reading of the document answers for every attempt against it')
+  })
+}

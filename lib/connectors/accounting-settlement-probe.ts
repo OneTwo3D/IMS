@@ -248,3 +248,72 @@ export async function ledgerClearsFollowUpRevival(params: {
       : verdict.reason,
   }
 }
+
+/**
+ * o3d-0m56 round 2 (Codex) — THE CHECK THAT ACTUALLY AUTHORISES A MONEY POST.
+ *
+ * Everything above runs at RETRY or ENQUEUE time, which is early enough to tell an operator why
+ * their click was refused and far too early to be the thing money depends on. Two gaps proved it:
+ *
+ *   - A failed money row does not go straight to FAILED. It returns to PENDING for up to five
+ *     attempts, and each of those attempts posts again with no ledger read at all — the revival
+ *     guard only ever saw terminal rows.
+ *   - A verdict taken before a lock is a verdict about the past. Between reading the ledger and
+ *     writing PENDING, something else can post the very attempt that was just declared absent.
+ *
+ * Both close the same way: the reading that permits a POST is taken in the same code path as the
+ * POST, immediately before it. `remoteAttemptedAt` is what makes that possible — it is set once,
+ * before the first call, and survives every retryCount reset, so a row can always answer "have I
+ * been sent before?". A first attempt is free; every repeat pays for a GET.
+ *
+ * Returns the refusal as an ERROR rather than a silent skip: the caller reports it exactly like a
+ * remote rejection, so the row retries a bounded number of times and then ends FAILED — visible,
+ * and (correctly) un-revivable while the ledger still holds the payment.
+ */
+export async function authoriseMoneyPost(params: {
+  connector: 'xero' | 'quickbooks'
+  entryId: string
+  type: string
+  payload: unknown
+  /** Injected so the guard is testable without a database. */
+  db: {
+    accountingSyncLog: {
+      updateMany: (args: { where: { id: string; remoteAttemptedAt: null }; data: { remoteAttemptedAt: Date } }) => Promise<{ count: number }>
+    }
+  }
+  now?: () => Date
+}): Promise<{ proceed: true } | { proceed: false; error: string }> {
+  const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
+  if (!isMoneyMovingSyncType(params.type)) return { proceed: true }
+
+  // ONE conditional write decides it, with no read first — and the absence of the read is the
+  // point. "Has this been sent before?" asked as a SELECT is a question about the past: two
+  // workers can both read `remoteAttemptedAt: null` and both conclude they are the first. Claiming
+  // the stamp is the same question asked as a WRITE, which exactly one caller can win.
+  //
+  // count 1 — this call claimed the first attempt. Nothing can have been posted from this row
+  //           before, so there is nothing to duplicate and nothing to check.
+  // count 0 — the stamp is already set (a previous attempt), or the row is GONE (retention, a
+  //           connector switch), or another worker claimed it a moment ago. All three mean the
+  //           same thing here: IMS cannot say this row has never been sent, and unknown must
+  //           never read as "first time".
+  const claimed = await params.db.accountingSyncLog.updateMany({
+    where: { id: params.entryId, remoteAttemptedAt: null },
+    data: { remoteAttemptedAt: (params.now ?? (() => new Date()))() },
+  })
+  if (claimed.count > 0) return { proceed: true }
+
+  const { classifyLedgerSettlement, describeAttempt } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
+  const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
+  const verdict = classifyLedgerSettlement(describeAttempt(params.payload), probe)
+  if (verdict.outcome === 'clear') return { proceed: true }
+  return {
+    proceed: false,
+    error: verdict.outcome === 'present'
+      ? `Not sent: the accounting connector already holds a settlement of ${verdict.detail} against this `
+        + 'document, matching an earlier attempt from this entry. Sending it again would pay it twice. '
+        + 'Check the ledger and resolve this entry by hand.'
+      : `Not sent: this entry has been attempted before and IMS could not establish whether that attempt `
+        + `reached the ledger (${verdict.reason}). Re-posting could pay the document twice.`,
+  }
+}

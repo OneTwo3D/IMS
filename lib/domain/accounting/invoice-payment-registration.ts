@@ -129,6 +129,50 @@ export function decideInvoicePaymentRegistration(input: {
   // Making the index receipt-scoped, so part payments can each register, is o3d-cjt8: it needs a
   // migration and a look at existing rows, and until then a refusal an operator can read beats an insert
   // that throws.
+  const blocker = invoicePaymentRowSetBlocker(input)
+  if (blocker.blocked) {
+    return {
+      register: false,
+      refusal: blocker.refusal,
+      alreadyRegistered: blocker.alreadyRegistered,
+      ledgerTotal: input.ledgerTotal,
+      detail: blocker.detail,
+    }
+  }
+
+  // Nothing is registered, so this receipt stands alone — and if it alone exceeds the invoice, the ledger
+  // would reject it. The live case for this is a gross receipt against an imported tax-inclusive invoice,
+  // which posts at NET (o3d-cyn): refusing names the numbers, where letting it through produces a Xero
+  // rejection an operator has to decode.
+  if (input.paymentAmount > input.ledgerTotal + 0.005) {
+    return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered: 0, ledgerTotal: input.ledgerTotal }
+  }
+  return { register: true, bankAccountId: input.bankAccountId }
+}
+
+export type InvoicePaymentRowSetBlocker =
+  | { blocked: false }
+  | {
+      blocked: true
+      refusal: 'LEDGER_HAS_LIVE_PAYMENT' | 'UNRESOLVED_PAYMENT_ATTEMPT'
+      alreadyRegistered?: number
+      detail?: string
+    }
+
+/**
+ * The two rules that depend on the ORDER'S OTHER SYNC ROWS rather than on this receipt's own size.
+ *
+ * Split out because they have to be evaluated TWICE (o3d-0m56, Codex round 2): once to decide, and
+ * again inside the transaction that writes, under the scope lock, because the row set can change
+ * between the two and a verdict about the past cannot authorise a payment in the present. The
+ * amount checks do not need re-running — the invoice total does not move — and re-running them
+ * from a caller that only has the row set would refuse everything.
+ */
+export function invoicePaymentRowSetBlocker(input: {
+  paymentId: string
+  existing: ExistingInvoicePaymentSync[]
+  ledgerSettlements: LedgerSettlementRecord[] | null
+}): InvoicePaymentRowSetBlocker {
   const live = input.existing.filter(
     (r) => r.status !== 'FAILED' && r.status !== 'CANCELLED'
     // Our OWN row, if this ever runs twice for one receipt: the idempotency key already makes the second
@@ -138,13 +182,12 @@ export function decideInvoicePaymentRegistration(input: {
   if (live.length > 0) {
     const known = live.filter((r) => typeof r.amount === 'number')
     return {
-      register: false,
+      blocked: true,
       refusal: 'LEDGER_HAS_LIVE_PAYMENT',
       // Absent when a row records no amount: unknown must not read as zero in the operator's message.
       alreadyRegistered: known.length === live.length
         ? known.reduce((sum, r) => sum + (r.amount as number), 0)
         : undefined,
-      ledgerTotal: input.ledgerTotal,
     }
   }
 
@@ -162,9 +205,8 @@ export function decideInvoicePaymentRegistration(input: {
   if (unresolved.length > 0) {
     if (input.ledgerSettlements === null) {
       return {
-        register: false,
+        blocked: true,
         refusal: 'UNRESOLVED_PAYMENT_ATTEMPT',
-        ledgerTotal: input.ledgerTotal,
         detail: 'the accounting connector could not be asked what it already holds',
       }
     }
@@ -175,22 +217,13 @@ export function decideInvoicePaymentRegistration(input: {
       )
       if (verdict.outcome === 'clear') continue
       return {
-        register: false,
+        blocked: true,
         refusal: 'UNRESOLVED_PAYMENT_ATTEMPT',
-        ledgerTotal: input.ledgerTotal,
         detail: verdict.outcome === 'present'
           ? `the ledger already holds ${verdict.detail}, which matches an earlier ${attempt.status} attempt`
           : verdict.reason,
       }
     }
   }
-
-  // Nothing is registered, so this receipt stands alone — and if it alone exceeds the invoice, the ledger
-  // would reject it. The live case for this is a gross receipt against an imported tax-inclusive invoice,
-  // which posts at NET (o3d-cyn): refusing names the numbers, where letting it through produces a Xero
-  // rejection an operator has to decode.
-  if (input.paymentAmount > input.ledgerTotal + 0.005) {
-    return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered: 0, ledgerTotal: input.ledgerTotal }
-  }
-  return { register: true, bankAccountId: input.bankAccountId }
+  return { blocked: false }
 }

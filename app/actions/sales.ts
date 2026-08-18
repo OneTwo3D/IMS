@@ -61,8 +61,10 @@ import {
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import {
   decideInvoicePaymentRegistration,
+  invoicePaymentRowSetBlocker,
   unresolvedInvoicePaymentAttempts,
 } from '@/lib/domain/accounting/invoice-payment-registration'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { attemptCouldHaveReachedTheLedger } from '@/lib/domain/accounting/followup-retry-guard'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
 import {
@@ -702,9 +704,17 @@ type InvoicePaymentSyncRow = PaymentSyncRow & {
   couldHaveReachedLedger: boolean
 }
 
-async function loadInvoicePaymentSyncRows(orderId: string, connector: string | null): Promise<InvoicePaymentSyncRow[]> {
+async function loadInvoicePaymentSyncRows(
+  orderId: string,
+  connector: string | null,
+  /**
+   * The client to read through. Defaults to the global one; the registration path passes its
+   * TRANSACTION so the re-check happens under the same locks as the write it authorises (o3d-0m56).
+   */
+  client: { accountingSyncLog: { findMany: typeof db.accountingSyncLog.findMany } } = db,
+): Promise<InvoicePaymentSyncRow[]> {
   if (!connector) return []
-  const rows = await db.accountingSyncLog.findMany({
+  const rows = await client.accountingSyncLog.findMany({
     where: { connector, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: orderId },
     select: { status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true },
     orderBy: { createdAt: 'desc' },
@@ -3235,7 +3245,37 @@ async function registerInvoicePaymentWithLedger(params: {
     const outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, params.orderId)
       const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
-      if (!stillRecorded) return 'receipt-deleted' as const
+      if (!stillRecorded) return { outcome: 'receipt-deleted' as const }
+
+      // o3d-0m56 (Codex round 2): the decision above was taken against a row snapshot AND a ledger
+      // reading that both predate this transaction. Between them, another registration can have been
+      // queued, or an earlier attempt can have become unresolved — and neither would be visible to a
+      // verdict computed minutes ago. So the SAME rule is re-run here, under this scope's lock, and
+      // only the answer reached inside the transaction may authorise the write.
+      //
+      // The ledger records are deliberately NOT re-read: that is a network call, and holding an
+      // accounting lock across one would let a slow remote block every payment enqueue in the system.
+      // What changes fast is the local row set, which is what this re-reads.
+      if (probeConnector) {
+        await lockFollowUpScope(tx, {
+          connector: probeConnector,
+          type: 'INVOICE_PAYMENT',
+          referenceType: 'SalesOrder',
+          referenceId: params.orderId,
+        })
+        const current = await loadInvoicePaymentSyncRows(params.orderId, probeConnector, tx)
+        // Only the ROW-SET rules are re-checked: the invoice total has not moved, and the size
+        // checks were already made against the real figures.
+        const blocker = invoicePaymentRowSetBlocker({
+          paymentId: params.paymentId,
+          existing: current,
+          ledgerSettlements,
+        })
+        if (blocker.blocked) {
+          return { outcome: 'context-changed-guard' as const, refusal: blocker.refusal, detail: blocker.detail }
+        }
+      }
+
       const queued = await queueAccountingSyncTx(tx, {
         type: 'INVOICE_PAYMENT',
         referenceType: 'SalesOrder',
@@ -3255,14 +3295,27 @@ async function registerInvoicePaymentWithLedger(params: {
         // Exactly once per recorded receipt, however many times this runs.
         idempotencyKey: `invoice-payment:payment:${params.paymentId}`,
       })
-      return queued ? ('queued' as const) : ('context-changed' as const)
+      return { outcome: queued ? ('queued' as const) : ('context-changed' as const) }
     }, STOCK_TX_OPTIONS)
 
     // queueAccountingSyncTx RE-READS the posting context and returns false when it has since changed —
     // the connector switched off, or INVOICE_PAYMENT posting disabled, between the check above and the
     // write. Ignoring that boolean left the receipt accepted locally with no sync row, no warning and
     // nothing to retry: the silent loss this whole issue is about (Codex, PR #582 round 8).
-    if (outcome === 'context-changed') {
+    if (outcome.outcome === 'context-changed-guard') {
+      await warn('invoice_payment_not_registered',
+        `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but the ` +
+        `order's payment registrations changed while this one was being queued, so it was not sent — ` +
+        `sending it now could pay the invoice twice. Check the order's sync rows and the ledger, then ` +
+        `register it by hand if it is genuinely owed.`,
+        {
+          amount: params.amount, currency: params.currency,
+          refusal: outcome.outcome === 'context-changed-guard' ? outcome.refusal : 'REGISTRATION_CONTEXT_CHANGED',
+          detail: outcome.outcome === 'context-changed-guard' ? outcome.detail : undefined,
+        })
+      return
+    }
+    if (outcome.outcome === 'context-changed') {
       await warn('invoice_payment_not_registered',
         `Recorded ${params.currency} ${params.amount.toFixed(2)} against ${params.orderReference}, but ` +
         `accounting sync for payments was switched off while it was being queued, so nothing was sent. ` +

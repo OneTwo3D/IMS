@@ -25,7 +25,7 @@ import {
   type BackReferenceRepairResult,
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
-import { ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
+import { authoriseMoneyPost, ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
@@ -1407,6 +1407,14 @@ async function processEntry(
       if (!account) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
       }
+      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
+      // committed call whose response was lost is FAILED, and the row returns to PENDING for
+      // several more attempts. Everything that happens earlier (the retry guard, the revival
+      // guard) is operator feedback; this is the reading the POST itself depends on.
+      const authorised = await authoriseMoneyPost({
+        connector: XERO_CONNECTOR, entryId, type, payload, db,
+      })
+      if (!authorised.proceed) return { success: false, error: authorised.error }
       try {
         const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
           Invoice: { InvoiceID: accountingInvoiceId },
@@ -1507,6 +1515,14 @@ async function processEntry(
       if (!account) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
       }
+      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
+      // committed call whose response was lost is FAILED, and the row returns to PENDING for
+      // several more attempts. Everything that happens earlier (the retry guard, the revival
+      // guard) is operator feedback; this is the reading the POST itself depends on.
+      const authorised = await authoriseMoneyPost({
+        connector: XERO_CONNECTOR, entryId, type, payload, db,
+      })
+      if (!authorised.proceed) return { success: false, error: authorised.error }
       try {
         const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
           Invoice: { InvoiceID: accountingInvoiceId },
@@ -1574,6 +1590,14 @@ async function processEntry(
       if (!creditNoteId || !accountingInvoiceId || amount == null) {
         return { success: false, error: 'Missing creditNoteId, accountingInvoiceId, or amount for PURCHASE_CREDIT_NOTE_ALLOCATION' }
       }
+      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
+      // committed call whose response was lost is FAILED, and the row returns to PENDING for
+      // several more attempts. Everything that happens earlier (the retry guard, the revival
+      // guard) is operator feedback; this is the reading the POST itself depends on.
+      const authorised = await authoriseMoneyPost({
+        connector: XERO_CONNECTOR, entryId, type, payload, db,
+      })
+      if (!authorised.proceed) return { success: false, error: authorised.error }
       const result = await allocatePurchaseCreditNote(
         { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
         { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },

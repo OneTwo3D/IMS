@@ -18,7 +18,7 @@ import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} fro
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
-import { ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
+import { authoriseMoneyPost, ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
@@ -714,6 +714,14 @@ async function processEntry(
       if (!accountRef) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
+      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
+      // committed call whose response was lost is FAILED, and the row returns to PENDING for
+      // several more attempts. Everything that happens earlier (the retry guard, the revival
+      // guard) is operator feedback; this is the reading the POST itself depends on.
+      const authorised = await authoriseMoneyPost({
+        connector: QBO_CONNECTOR, entryId, type, payload, db,
+      })
+      if (!authorised.proceed) return { success: false, error: authorised.error }
       try {
         // o3d-b3gw: idempotent, like every other document this connector posts. Without a
         // stable Request-Id, a payment that QuickBooks COMMITS but whose response is lost — or
@@ -764,6 +772,14 @@ async function processEntry(
       if (!accountRef) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
+      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
+      // committed call whose response was lost is FAILED, and the row returns to PENDING for
+      // several more attempts. Everything that happens earlier (the retry guard, the revival
+      // guard) is operator feedback; this is the reading the POST itself depends on.
+      const authorised = await authoriseMoneyPost({
+        connector: QBO_CONNECTOR, entryId, type, payload, db,
+      })
+      if (!authorised.proceed) return { success: false, error: authorised.error }
       try {
         // o3d-b3gw: same reasoning as the customer payment above — a lost response must not
         // become a second bill payment.

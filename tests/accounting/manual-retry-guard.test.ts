@@ -11,18 +11,18 @@ import {
   revivesAtMostOnePerScope,
   selectRevivableCandidates,
 } from '@/lib/domain/accounting/followup-retry-guard'
-import type { SettlementVerdict } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import type { LedgerSettlementProbe } from '@/lib/domain/accounting/ledger-settlement-evidence'
 
 /**
  * Most of this file is about the token/ambiguity rules, which are independent of the ledger, so
- * they run against a ledger that has been ASKED and answered "not here". `settlement` is a
- * required argument of the real planner precisely so no caller can reach `allow` by omission;
- * the tests that matter for it pass their own verdict explicitly.
+ * they run against a ledger that has been ASKED and holds nothing. `ledger` is a required argument
+ * of the real planner precisely so no caller can reach `allow` by omission; the tests that matter
+ * for it pass their own reading explicitly.
  */
-const CLEAR: SettlementVerdict = { outcome: 'clear' }
+const EMPTY_LEDGER: LedgerSettlementProbe = { ok: true, records: [] }
 const plan = (
-  args: Omit<Parameters<typeof planManualRetry>[0], 'settlement'> & { settlement?: SettlementVerdict },
-) => planManualRetry({ settlement: CLEAR, ...args })
+  args: Omit<Parameters<typeof planManualRetry>[0], 'ledger'> & { ledger?: LedgerSettlementProbe },
+) => planManualRetry({ ledger: EMPTY_LEDGER, ...args })
 
 /**
  * o3d-0m56: the manual retry must refuse what the automatic enqueue refuses.
@@ -39,8 +39,13 @@ const plan = (
 
 const scopeArgs = { type: 'INVOICE_PAYMENT', reference: 'SalesOrder so-1' }
 
-/** A body complete enough that the connector would actually attempt the remote call. */
-const postable = (accountingInvoiceId: string) => ({ accountingInvoiceId, bankAccountId: 'bank-1', amount: 10 })
+/**
+ * A body complete enough that the connector would actually attempt the remote call — INCLUDING the
+ * date, because amount and date together are what identify this attempt's settlement in the ledger.
+ * A row that pins neither can never be cleared, which is a refusal, not an allow.
+ */
+const postable = (accountingInvoiceId: string) =>
+  ({ accountingInvoiceId, bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' })
 
 test('a single failed row retries freely — its token is preserved (o3d-0m56)', () => {
   // The row id and payload survive the retry, so the token is bit-identical to the one the
@@ -61,18 +66,69 @@ test('rows SHARING one token retry freely (o3d-0m56)', () => {
   assert.deepEqual(plan({ ...scopeArgs, target: rows[0]!, siblings: rows }), { action: 'allow' })
 })
 
-test('DISTINCT tokens for the same document refuse (o3d-0m56)', () => {
-  // The only unsafe case: row A may have committed under token A, and retrying B posts under a
-  // token the ledger has never seen.
+test('DISTINCT tokens for the same document refuse while ANY of them is unresolved (o3d-0m56)', () => {
+  // Row A may have committed under token A, and retrying B posts under a token the ledger has
+  // never seen. What makes it unsafe is not the count of tokens but that the outcome of at least
+  // one of them is unknown — so the refusal is pinned against a ledger that CANNOT answer, which
+  // is the state a real ambiguous scope is in.
   const rows = [
     { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9') },
     { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9') },
   ]
-  const verdict = plan({ ...scopeArgs, target: rows[0]!, siblings: rows })
+  const verdict = plan({
+    ...scopeArgs, target: rows[0]!, siblings: rows,
+    ledger: { ok: false, reason: 'HTTP 503' },
+  })
   assert.equal(verdict.action, 'refuse')
   assert.equal(verdict.action === 'refuse' ? verdict.tokenCount : 0, 2)
   assert.match(verdict.action === 'refuse' ? verdict.reason : '', /could post a second payment/)
   assert.match(verdict.action === 'refuse' ? verdict.reason : '', /SalesOrder so-1/, 'the refusal must name the reference')
+
+  // ...and equally when the ledger CAN answer and holds one of them: that is the attempt that
+  // committed, and the other token would put a second payment beside it.
+  const held = plan({
+    ...scopeArgs, target: rows[0]!, siblings: rows,
+    ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-1' }] },
+  })
+  assert.equal(held.action, 'refuse')
+})
+
+test('DISTINCT tokens are RECOVERABLE when the ledger holds none of them (o3d-0m56)', () => {
+  // Codex round 2, medium. Ambiguity is about WHICH attempt committed. If the ledger positively
+  // shows that none of them did, there is nothing to be ambiguous about — and refusing anyway
+  // made the document permanently un-retryable, because there is no per-row resolution action to
+  // escape through. Exactly one row is then revived; selectRevivableCandidates picks which.
+  const rows = [
+    { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'FAILED' },
+    { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' },
+  ]
+  assert.deepEqual(plan({ ...scopeArgs, target: rows[0]!, siblings: rows }), { action: 'allow' })
+
+  // ...and it is the RIVAL's reading that matters, not only the target's. A ledger holding the
+  // OTHER attempt (a different amount, so the target's own reading is clear) must still refuse:
+  // that attempt landed, and re-posting under this token would put a second payment beside it.
+  const rivalLanded = [
+    { id: 'log-a', effectiveToken: 'log-a', payload: { ...postable('inv-9'), amount: 25 }, status: 'FAILED' },
+    { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' },
+  ]
+  assert.equal(
+    plan({
+      ...scopeArgs, target: rivalLanded[1]!, siblings: rivalLanded,
+      ledger: { ok: true, records: [{ amount: 25, date: '2026-08-01', id: 'PAY-RIVAL' }] },
+    }).action,
+    'refuse',
+    'the target being absent from the ledger says nothing about its rival',
+  )
+
+  // NOT when one of them is SYNCED, and this is the subtle half. A SYNCED row is positive
+  // evidence that a payment went out under its token; the ledger not showing it means it was
+  // reversed or deleted there, and re-posting the other token would restore money a human took
+  // out deliberately.
+  const withSettled = [
+    { ...rows[0]!, status: 'SYNCED' },
+    rows[1]!,
+  ]
+  assert.equal(plan({ ...scopeArgs, target: rows[1]!, siblings: withSettled }).action, 'refuse')
 })
 
 test('attempts against a DIFFERENT document do not trigger a refusal (o3d-0m56)', () => {
@@ -247,13 +303,16 @@ test('BILL_PAYMENT is money-moving too (o3d-0m56)', async () => {
     assert.equal(isMoneyMovingSyncType(type), false, `${type} does not`)
   }
 
-  const body = { accountingInvoiceId: 'bill-1', bankAccountId: 'bank-1', amount: 10 }
+  const body = { accountingInvoiceId: 'bill-1', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' }
   const rows = [
     { id: 'log-a', effectiveToken: 'log-a', payload: body },
     { id: 'log-b', effectiveToken: 'log-b', payload: body },
   ]
   assert.equal(
-    plan({ type: 'BILL_PAYMENT', reference: 'PurchaseInvoice pi-1', target: rows[0]!, siblings: rows }).action,
+    plan({
+      type: 'BILL_PAYMENT', reference: 'PurchaseInvoice pi-1', target: rows[0]!, siblings: rows,
+      ledger: { ok: false, reason: 'HTTP 503' },
+    }).action,
     'refuse',
     'two bill payments under distinct tokens must refuse, exactly as invoice payments do',
   )
@@ -264,12 +323,15 @@ test('a sibling that provably never posted cannot strand a valid payment (o3d-0m
   // no token worth defending. Counting it stranded the good payment through the only manual
   // route available. Structure is the sound signal here — o3d-h2wx established that the error
   // MESSAGE is not, since both connectors overwrite it with the remote system's own text.
-  const good = { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 10 }
+  const good = postable('inv-9')
   const rows = [
     { id: 'log-good', effectiveToken: 'log-good', payload: good },
     // No bankAccountId: the connector refuses this before building a request.
-    { id: 'log-broken', effectiveToken: 'log-broken', payload: { accountingInvoiceId: 'inv-9', amount: 10 } },
+    { id: 'log-broken', effectiveToken: 'log-broken', payload: { accountingInvoiceId: 'inv-9', amount: 10, paymentDate: '2026-08-01' } },
   ]
+  // Pinned against an UNREADABLE ledger, which is the state that would otherwise refuse: the
+  // broken sibling is excluded structurally, so there is one token left and nothing to be
+  // ambiguous about. (The target's own reading still has to clear it — see below.)
   assert.deepEqual(
     plan({ ...scopeArgs, target: rows[0]!, siblings: rows }),
     { action: 'allow' },
@@ -277,12 +339,29 @@ test('a sibling that provably never posted cannot strand a valid payment (o3d-0m
   )
 
   // An amount of ZERO is a real request, not a missing field — the connectors reject an amount
-  // only when null/undefined, so a zero-amount sibling still counts.
+  // only when null/undefined, so a zero-amount sibling still counts as a rival token.
   const zero = [
     { id: 'log-good', effectiveToken: 'log-good', payload: good },
-    { id: 'log-zero', effectiveToken: 'log-zero', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 0 } },
+    { id: 'log-zero', effectiveToken: 'log-zero', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 0, paymentDate: '2026-08-01' } },
   ]
-  assert.equal(plan({ ...scopeArgs, target: zero[0]!, siblings: zero }).action, 'refuse')
+  assert.equal(
+    plan({ ...scopeArgs, target: zero[0]!, siblings: zero, ledger: { ok: false, reason: 'HTTP 503' } }).action,
+    'refuse',
+  )
+})
+
+test('a target that provably never posted is retryable without ledger evidence (o3d-0m56)', () => {
+  // Its body is too incomplete for the connector to have built a request, so there is nothing to
+  // duplicate and nothing to prove. Refusing it for want of evidence about a call that was never
+  // made is a refusal with no hazard behind it; it will simply fail the same way again.
+  const broken = {
+    id: 'log-broken', effectiveToken: 'log-broken', status: 'FAILED',
+    payload: { accountingInvoiceId: 'inv-9', amount: 10 },
+  }
+  assert.deepEqual(
+    plan({ ...scopeArgs, target: broken, siblings: [broken], ledger: { ok: false, reason: 'HTTP 503' } }),
+    { action: 'allow' },
+  )
 })
 
 for (const action of ACTIONS) {
@@ -415,11 +494,37 @@ test('a SETTLED sibling still counts, because settled does not mean unposted (o3
     const settled = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status }
     const target = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
     assert.equal(
-      plan({ ...scopeArgs, target, siblings: [settled, target] }).action,
+      // Against a ledger that cannot answer — the state in which every one of these statuses is a
+      // rival attempt of unknown outcome. What must NOT happen is a status being dropped from the
+      // token set before the question is even asked.
+      plan({ ...scopeArgs, target, siblings: [settled, target], ledger: { ok: false, reason: 'HTTP 503' } }).action,
       'refuse',
       `a ${status} sibling under a different token may be money already posted`,
     )
   }
+
+  // And when the ledger CAN answer and holds nothing, the SYNCED case is the one that still
+  // refuses: a row that reached the ledger and is no longer visible there was reversed, not
+  // imagined. The rest become recoverable — see the DISTINCT-tokens recovery test.
+  for (const status of ['CANCELLED', 'FAILED']) {
+    const other = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status }
+    const target = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
+    assert.equal(plan({ ...scopeArgs, target, siblings: [other, target] }).action, 'allow', status)
+  }
+  // PENDING and PROCESSING still refuse, but for the OTHER reason: they hold the scope's single
+  // live slot. Pinned by message, because "refused" alone would not show which rule fired and the
+  // two are not interchangeable — one is about evidence, the other about ordering.
+  for (const status of ['PENDING', 'PROCESSING']) {
+    const inFlight = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status }
+    const target = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
+    const verdict = plan({ ...scopeArgs, target, siblings: [inFlight, target] })
+    assert.equal(verdict.action, 'refuse', status)
+    assert.match(verdict.action === 'refuse' ? verdict.reason : '', /already queued or has posted/, status)
+  }
+  const synced = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'SYNCED' }
+  const target = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
+  assert.equal(plan({ ...scopeArgs, target, siblings: [synced, target] }).action, 'refuse',
+    'a settled sibling the ledger no longer shows means a REVERSAL, not a free slot')
 })
 
 test('the refusal says the remote will NOT save us (o3d-0m56)', () => {
@@ -479,15 +584,18 @@ test('a LONE money row is refused unless the ledger says the attempt is not ther
   const only = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'FAILED' }
   const args = { ...scopeArgs, target: only, siblings: [only] }
 
-  assert.deepEqual(plan({ ...args, settlement: { outcome: 'clear' } }), { action: 'allow' },
+  assert.deepEqual(plan({ ...args, ledger: { ok: true, records: [] } }), { action: 'allow' },
     'a ledger that has been asked and answered "not here" is what makes a retry safe')
 
-  const present = plan({ ...args, settlement: { outcome: 'present', detail: '10.00 dated 2026-08-01 (PAY-1)' } })
+  const present = plan({
+    ...args,
+    ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-1' }] },
+  })
   assert.equal(present.action, 'refuse')
   assert.match(present.action === 'refuse' ? present.reason : '', /already holds a settlement of 10\.00 dated 2026-08-01/)
   assert.match(present.action === 'refuse' ? present.reason : '', /could post a second payment/)
 
-  const unknown = plan({ ...args, settlement: { outcome: 'unknown', reason: 'HTTP 503' } })
+  const unknown = plan({ ...args, ledger: { ok: false, reason: 'HTTP 503' } })
   assert.equal(unknown.action, 'refuse', 'unknown is not clear — fail closed')
   assert.match(unknown.action === 'refuse' ? unknown.reason : '', /could not establish/)
   assert.match(unknown.action === 'refuse' ? unknown.reason : '', /HTTP 503/, 'and say why')
@@ -501,7 +609,7 @@ test('the settlement verdict does not touch NON-money types (o3d-0m56)', () => {
     assert.deepEqual(
       plan({
         type, reference: 'SalesOrder so-1', target: only, siblings: [only],
-        settlement: { outcome: 'unknown', reason: 'never asked' },
+        ledger: { ok: false, reason: 'never asked' },
       }),
       { action: 'allow' },
       `${type} must not be refused for want of ledger evidence`,
@@ -539,7 +647,8 @@ test('BILL_PAYMENT is fenced by the MONEY argument, not the index (o3d-0m56)', (
   assert.equal(revivesAtMostOnePerScope('BILL_PAYMENT'), true, 'and the guard must cover it anyway')
 
   const shared = 'bill-payment:1'
-  const bill = (accountingInvoiceId: string) => ({ accountingInvoiceId, bankAccountId: 'bank-1', amount: 10 })
+  const bill = (accountingInvoiceId: string) =>
+    ({ accountingInvoiceId, bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' })
   const target = { id: 'log-b', effectiveToken: shared, payload: bill('bill-1'), status: 'FAILED' }
   const live = { id: 'log-a', effectiveToken: shared, payload: bill('bill-1'), status: 'PENDING' }
   assert.equal(

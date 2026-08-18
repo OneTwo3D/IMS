@@ -1,0 +1,18 @@
+-- o3d-0m56: when this sync row first made a REMOTE money call.
+--
+-- A FAILED status does not mean the ledger never saw the request: a call that committed and then
+-- lost its response lands as a failure too. Every path that re-posts a money row therefore has to
+-- establish what the ledger actually holds first — but "is this a re-post?" was not a question the
+-- row could answer. retryCount is reset to 0 by both the manual retry and the automatic revival, so
+-- it forgets, and the payload says nothing about attempts.
+--
+-- This column is set once, immediately BEFORE the first remote money call, and never cleared. It is
+-- what makes the check at the posting site itself possible: with it set, no INVOICE_PAYMENT,
+-- BILL_PAYMENT or PURCHASE_CREDIT_NOTE_ALLOCATION is sent again without a positive reading of the
+-- target document.
+--
+-- NULLABLE on purpose. NULL means "no remote call has been attempted from this row", which is
+-- exactly right for every existing row too: a row that already posted successfully is SYNCED and
+-- will not be posted again, and a historical FAILED row conservatively reads as never-attempted
+-- only until its next attempt, which stamps it. Backfilling a value would be inventing a fact.
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "remoteAttemptedAt" TIMESTAMP(3);

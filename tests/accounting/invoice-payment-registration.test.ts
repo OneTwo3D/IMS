@@ -5,6 +5,7 @@ import test from 'node:test'
 
 import {
   decideInvoicePaymentRegistration,
+  invoicePaymentRowSetBlocker,
   unresolvedInvoicePaymentAttempts,
   type ExistingInvoicePaymentSync,
 } from '@/lib/domain/accounting/invoice-payment-registration'
@@ -294,4 +295,63 @@ test('the BILL side is closed by a different mechanism, and it must stay closed 
     'a bill may only be marked paid while it is unpaid')
   assert.match(source.slice(0, at), /if \(invoice\.paidAt\) return \{ success: false/,
     'and the early refusal must stay too')
+})
+
+test('the row-set rules are re-runnable on their own, for the check inside the write (o3d-0m56)', () => {
+  // Codex round 2. The decision above is taken against a row snapshot and a ledger reading that both
+  // predate the transaction that writes. Between them another registration can be queued, or an
+  // earlier attempt can turn unresolved — so the row-set half of the rule runs AGAIN inside that
+  // transaction, under the scope lock. It is the same code, not a second copy of the rule.
+  assert.deepEqual(
+    invoicePaymentRowSetBlocker({ paymentId: 'pay-new', existing: [], ledgerSettlements: null }),
+    { blocked: false },
+  )
+  const live = invoicePaymentRowSetBlocker({
+    paymentId: 'pay-new',
+    existing: [{ status: 'PENDING', amount: 100, paymentId: 'pay-other' }],
+    ledgerSettlements: null,
+  })
+  assert.equal(live.blocked && live.refusal, 'LEDGER_HAS_LIVE_PAYMENT')
+  assert.equal(live.blocked && live.alreadyRegistered, 100)
+
+  const unresolvedNow = invoicePaymentRowSetBlocker({
+    paymentId: 'pay-new',
+    existing: [unresolved()],
+    ledgerSettlements: [{ amount: 100, date: '2026-08-01' }],
+  })
+  assert.equal(unresolvedNow.blocked && unresolvedNow.refusal, 'UNRESOLVED_PAYMENT_ATTEMPT')
+
+  // It must NOT judge size: the caller inside the transaction has the row set and nothing else, and
+  // a re-run that refused on amount would refuse every receipt.
+  assert.deepEqual(
+    invoicePaymentRowSetBlocker({ paymentId: 'pay-new', existing: [], ledgerSettlements: [] }),
+    { blocked: false },
+  )
+})
+
+test('sales.ts re-checks the row set INSIDE the write transaction, under the scope lock (o3d-0m56)', async () => {
+  // Wiring, pinned by source because registerInvoicePaymentWithLedger is module-private: the point
+  // is not that the rule exists but that it is evaluated again in the transaction that writes.
+  const source = await readFile(path.join(process.cwd(), 'app/actions/sales.ts'), 'utf8')
+  // Anchored INSIDE registerInvoicePaymentWithLedger: `db.$transaction(async (tx) =>` appears many
+  // times in this file, and the first one belongs to order deletion.
+  const fnAt = source.indexOf('async function registerInvoicePaymentWithLedger')
+  assert.notEqual(fnAt, -1, 'the registration path must still exist')
+  const at = source.indexOf('const outcome = await db.$transaction(async (tx) => {', fnAt)
+  assert.notEqual(at, -1)
+  const body = source.slice(at, source.indexOf('}, STOCK_TX_OPTIONS)', at))
+
+  const lockAt = body.indexOf('await lockFollowUpScope(tx, {')
+  const readAt = body.indexOf('loadInvoicePaymentSyncRows(params.orderId, probeConnector, tx)')
+  const checkAt = body.indexOf('invoicePaymentRowSetBlocker({')
+  const queueAt = body.indexOf('queueAccountingSyncTx(tx, {')
+  assert.ok(lockAt !== -1, 'the scope lock must be taken inside the transaction')
+  assert.ok(readAt > lockAt, 'the rows must be re-read UNDER the lock, not before it')
+  assert.ok(checkAt > readAt && queueAt > checkAt, 'and re-judged before the write')
+  assert.match(body.slice(checkAt, checkAt + 400), /if \(blocker\.blocked\) \{[\s\S]*?return \{ outcome: 'context-changed-guard'/,
+    'a blocked re-check must abandon the enqueue')
+
+  // The ledger is deliberately NOT re-read here — a network call inside the lock would let a slow
+  // remote block every payment enqueue in the system.
+  assert.ok(!/probeLedgerSettlement/.test(body), 'no network call inside the locked transaction')
 })
