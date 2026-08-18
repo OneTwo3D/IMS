@@ -77,6 +77,16 @@ export type AttemptDescription = {
   marker: string | null
 }
 
+/**
+ * Why a settlement question could not be answered. See `SettlementVerdict`'s `unknown` arm.
+ *
+ *  - `probe-unreadable`      the connector could not be asked at all.
+ *  - `record-unmeasurable`   the ledger reported a settlement whose amount or date is unreadable,
+ *                            so it cannot be ruled out as this attempt.
+ *  - `attempt-undescribable` OUR row does not record what its attempt sent.
+ */
+export type SettlementUnknownCause = 'probe-unreadable' | 'record-unmeasurable' | 'attempt-undescribable'
+
 export type SettlementVerdict =
   /** Positively established: the ledger holds no settlement matching this attempt. */
   | { outcome: 'clear' }
@@ -86,8 +96,20 @@ export type SettlementVerdict =
    * rather than merely that one existed.
    */
   | { outcome: 'present'; detail: string; matchedId: string | null }
-  /** Not established either way. Treated exactly as `present` by every caller. */
-  | { outcome: 'unknown'; reason: string }
+  /**
+   * Not established either way. Treated exactly as `present` by every caller that is judging an
+   * attempt which may already have been sent.
+   *
+   * `cause` says WHICH of the three unknowns it is, because they are not interchangeable to a
+   * caller deciding a FIRST post. `probe-unreadable` and `record-unmeasurable` are statements
+   * about the LEDGER — something may be there and we cannot see it. `attempt-undescribable` is a
+   * statement about OUR OWN ROW — the payload does not pin an amount and a date, so there is
+   * nothing to look for. A first attempt in a scope nothing has ever been sent from can safely
+   * ignore the third (it has no lost attempt to be uncertain about) and must not ignore the
+   * other two. Without the discriminator that distinction can only be made by matching on
+   * `reason`, which is prose.
+   */
+  | { outcome: 'unknown'; reason: string; cause: SettlementUnknownCause }
 
 /** Money compares to the half-penny, the same tolerance the registration guard uses. */
 const AMOUNT_EPSILON = 0.005
@@ -139,6 +161,7 @@ export function classifyLedgerSettlement(
   if (!probe.ok) {
     return {
       outcome: 'unknown',
+      cause: 'probe-unreadable',
       reason: `the accounting connector could not be asked what it already holds (${probe.reason})`,
     }
   }
@@ -162,6 +185,7 @@ export function classifyLedgerSettlement(
   if (attempt.amount === null || attempt.date === null) {
     return {
       outcome: 'unknown',
+      cause: 'attempt-undescribable',
       reason: 'this row does not record the amount and date its attempt sent, so a matching '
         + 'settlement in the ledger cannot be identified',
     }
@@ -171,6 +195,7 @@ export function classifyLedgerSettlement(
     if (record.amount === null || record.date === null) {
       return {
         outcome: 'unknown',
+        cause: 'record-unmeasurable',
         reason: 'the accounting connector returned a settlement whose amount or date could not be '
           + 'read, so it cannot be ruled out as this attempt',
       }

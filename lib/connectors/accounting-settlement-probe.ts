@@ -14,6 +14,7 @@
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
+import type { MoneyPostLock } from '@/lib/domain/accounting/money-post-lock'
 
 export type SettlementProbeTarget = {
   type: string
@@ -58,6 +59,12 @@ export function normaliseXeroSettlementDate(value: unknown): string | null {
 type XeroPaymentsResponse = {
   Invoices?: Array<{
     InvoiceID?: string
+    /**
+     * Xero's own total of the payments applied to this document. Read as a CROSS-CHECK on the
+     * collection below, never as a record in its own right — see the completeness note in
+     * `probeXeroSettlement`.
+     */
+    AmountPaid?: number
     Payments?: Array<{ PaymentID?: string; Date?: string; Amount?: number; Reference?: string }>
   }>
 }
@@ -114,11 +121,96 @@ export async function probeXeroSettlement(
     // done to the amount or the date.
     reference: str(p.Reference) || null,
   }))
+  // COMPLETENESS, CHECKED RATHER THAN ASSUMED (Codex round 4, finding 1 generalised). `Payments`
+  // being absent and `Payments` being empty are the same value in JavaScript, and the difference
+  // between them is the difference between "nothing settles this document" and "we asked the
+  // wrong endpoint". `AmountPaid` is Xero's OWN total of the same collection, so the two must
+  // agree; when the collection is short of it, the probe has an incomplete picture and says so
+  // rather than reporting a clear built from it.
+  //
+  // Directional on purpose — only a SHORTFALL escalates. A record whose amount is unreadable
+  // already yields `unknown` in the classifier, so it is excluded here rather than counted as
+  // zero (which would fake a shortfall).
+  const amountPaid = num(invoice.AmountPaid)
+  if (amountPaid !== null && records.every((r) => r.amount !== null)) {
+    const seen = records.reduce((total, r) => total + (r.amount ?? 0), 0)
+    if (amountPaid - seen > XERO_AMOUNT_EPSILON) {
+      return {
+        ok: false,
+        reason: `Xero reports ${amountPaid.toFixed(2)} paid against this document but returned `
+          + `${records.length === 0 ? 'no payments' : `payments totalling ${seen.toFixed(2)}`}`,
+      }
+    }
+  }
   return { ok: true, records }
 }
 
+/** Money compares to the half-penny here too — the same tolerance the classifier uses. */
+const XERO_AMOUNT_EPSILON = 0.005
+
 type QboLinkedTxn = { TxnId?: string; TxnType?: string }
 type QboPaymentLine = { Amount?: number; LinkedTxn?: QboLinkedTxn[] }
+type QboDocumentBody = {
+  LinkedTxn?: QboLinkedTxn[]
+  /** The document's face value and what is still owed on it — the shape-independent cross-check. */
+  TotalAmt?: number
+  Balance?: number
+}
+
+/**
+ * WHAT QUICKBOOKS ACTUALLY WRITES INTO `LinkedTxn.TxnType` (Codex round 4, finding 1).
+ *
+ * The entity you POST is `BillPayment`. The link QuickBooks then records on the Bill is NOT
+ * `BillPayment` — it is `BillPaymentCheck` or `BillPaymentCreditCard`, named after the PayType.
+ * IMS posts `PayType: 'Check'`, so every bill payment this system has ever made is recorded as
+ * `BillPaymentCheck`, and a probe matching on `BillPayment` found NONE of them. It reported
+ * `records: []`, the classifier read that as `clear`, and the fence treated "I looked and there
+ * is nothing" as permission to pay the bill again. A probe that cannot see a real settlement is
+ * worse than no probe at all, because the fence claims a coverage it does not have.
+ *
+ * Hence three rules, not one:
+ *
+ *  1. PAYMENT links — the shape IMS itself posts — are enumerated and READ. Both bill-payment
+ *     spellings, plus the bare entity name defensively, because a name that has changed once can
+ *     change again and the cost of accepting an extra alias is nil.
+ *  2. Links that are KNOWN not to be that shape are ignored, and which ones they are is written
+ *     down (below) instead of being left to a silent `filter`.
+ *  3. Anything else FAILS THE PROBE. An unclassified link type is exactly the state this bug was
+ *     in for a whole release: a settlement the probe cannot account for, silently dropped. It is
+ *     now an `unknown`, which every caller treats as a refusal.
+ */
+const QBO_PAYMENT_LINK_TYPES: Record<'Bill' | 'Invoice', ReadonlySet<string>> = {
+  // Read from /billpayment/{id} whichever of the three names the link carries.
+  Bill: new Set(['BillPaymentCheck', 'BillPaymentCreditCard', 'BillPayment']),
+  // Customer payments keep the plain entity name on the invoice's link.
+  Invoice: new Set(['Payment']),
+}
+
+/**
+ * Links that take money off the document by some means IMS does not post, and links that take no
+ * money off it at all. Both are ignored; they are listed together because what matters here is
+ * only "recognised", and split by comment so the coverage statement stays honest.
+ *
+ * OUT OF COVERAGE, DELIBERATELY: the settlements in the first group are not the shape any IMS
+ * attempt creates, so none of them can BE the attempt this probe is asked about. They are not
+ * treated as evidence for or against it. The residual is stated rather than closed: a human who
+ * settles a bill with a vendor credit or a journal entry instead of a bill payment is invisible
+ * to this probe, and the document's own balance check below is what notices that something has
+ * happened that no link explains.
+ */
+const QBO_KNOWN_OTHER_LINK_TYPES: ReadonlySet<string> = new Set([
+  // Settle the document, by a shape IMS never posts.
+  'CreditMemo', 'VendorCredit', 'Deposit', 'JournalEntry', 'Refund', 'RefundReceipt',
+  'Check', 'Expense', 'Purchase', 'Transfer', 'CreditCardCredit', 'CreditCardPayment',
+  // The other document kind's payment link, seen on a document it does not settle.
+  'Payment', 'BillPayment', 'BillPaymentCheck', 'BillPaymentCreditCard',
+  // Carry no money off the document at all: what it was raised FROM, and what was billed ONTO it.
+  'Estimate', 'PurchaseOrder', 'SalesReceipt', 'TimeActivity', 'ReimburseCharge', 'Charge',
+  'Invoice', 'Bill', 'InventoryQuantityAdjustment',
+])
+
+/** Money compares to the half-penny, as everywhere else on this path. */
+const QBO_AMOUNT_EPSILON = 0.005
 
 /**
  * The amount a QuickBooks payment applied to ONE document.
@@ -158,19 +250,35 @@ export async function probeQuickBooksSettlement(
   const isBill = target.type === 'BILL_PAYMENT'
   const documentPath = isBill ? 'bill' : 'invoice'
   const documentKey = isBill ? 'Bill' : 'Invoice'
-  const settlementType = isBill ? 'BillPayment' : 'Payment'
   const settlementPath = isBill ? 'billpayment' : 'payment'
+  // The entity NAME a payment is read back under, which is not the same string as the LINK type
+  // the document carries — see QBO_PAYMENT_LINK_TYPES.
+  const settlementKey = isBill ? 'BillPayment' : 'Payment'
   const linkedType = isBill ? 'Bill' : 'Invoice'
+  const paymentLinkTypes = QBO_PAYMENT_LINK_TYPES[documentKey]
 
-  const doc = await qboGet<Record<string, { LinkedTxn?: QboLinkedTxn[] } | undefined>>(
+  const doc = await qboGet<Record<string, QboDocumentBody | undefined>>(
     `${documentPath}/${encodeURIComponent(documentId)}`,
   )
   if (!doc.ok) return { ok: false, reason: doc.error ?? `HTTP ${doc.status}` }
   const body = doc.data?.[documentKey]
   if (!body) return { ok: false, reason: `QuickBooks returned no ${documentKey.toLowerCase()} for that id` }
 
-  const settlementIds = (body.LinkedTxn ?? [])
-    .filter((t) => str(t.TxnType) === settlementType)
+  const links = body.LinkedTxn ?? []
+  // Rule 3 first, so an unclassified link cannot be quietly outvoted by classified ones.
+  const unclassified = [...new Set(links.map((t) => str(t.TxnType)).filter(
+    (type) => type !== '' && !paymentLinkTypes.has(type) && !QBO_KNOWN_OTHER_LINK_TYPES.has(type),
+  ))]
+  if (unclassified.length > 0) {
+    return {
+      ok: false,
+      reason: `QuickBooks linked ${unclassified.join(', ')} to this ${documentKey.toLowerCase()} and this `
+        + 'probe cannot tell whether that settles it',
+    }
+  }
+
+  const settlementIds = links
+    .filter((t) => paymentLinkTypes.has(str(t.TxnType)))
     .map((t) => str(t.TxnId))
     .filter(Boolean)
 
@@ -181,9 +289,9 @@ export async function probeQuickBooksSettlement(
     )
     // A settlement we know EXISTS but cannot read is the most dangerous shape of all: dropping it
     // would leave a clear verdict built from an incomplete list.
-    if (!res.ok) return { ok: false, reason: `could not read ${settlementType} ${id}: ${res.error ?? `HTTP ${res.status}`}` }
-    const settlement = res.data?.[settlementType]
-    if (!settlement) return { ok: false, reason: `QuickBooks returned no ${settlementType} ${id}` }
+    if (!res.ok) return { ok: false, reason: `could not read ${settlementKey} ${id}: ${res.error ?? `HTTP ${res.status}`}` }
+    const settlement = res.data?.[settlementKey]
+    if (!settlement) return { ok: false, reason: `QuickBooks returned no ${settlementKey} ${id}` }
     const date = str(settlement.TxnDate)
     records.push({
       amount: qboAmountAppliedTo(settlement.Line, documentId, linkedType),
@@ -192,6 +300,27 @@ export async function probeQuickBooksSettlement(
       // PrivateNote is where IMS writes its mark on this connector.
       reference: str(settlement.PrivateNote) || null,
     })
+  }
+
+  // THE SHAPE-INDEPENDENT BACKSTOP. Everything above depends on a list of type names being right,
+  // and the bug this replaces was a list of type names being wrong. `TotalAmt` and `Balance` are
+  // not names — they are the document's own account of how much of it has been settled, by any
+  // means whatsoever. When money has come off this document and NOTHING is linked to it, no list
+  // could have found what did that, so the probe must not report a picture it knows is short.
+  //
+  // Deliberately narrow: it fires only when there is no link at all to account for the movement.
+  // A credit memo, a vendor credit or a journal entry DOES appear as a link, is recognised above,
+  // and legitimately explains a reduced balance on a document IMS still has a payment to make
+  // against — refusing those would make every partially-credited document permanently unpayable
+  // through IMS, which is a self-inflicted outage rather than a safety property.
+  const total = num(body.TotalAmt)
+  const balance = num(body.Balance)
+  if (total !== null && balance !== null && total - balance > QBO_AMOUNT_EPSILON && links.length === 0) {
+    return {
+      ok: false,
+      reason: `QuickBooks reports ${(total - balance).toFixed(2)} already applied to this `
+        + `${documentKey.toLowerCase()} but links no transaction that accounts for it`,
+    }
   }
   return { ok: true, records }
 }
@@ -279,8 +408,12 @@ export async function ledgerClearsFollowUpRevival(params: {
  * Both close the same way: the reading that permits a POST is taken in the same code path as the
  * POST, immediately before it. `remoteAttemptedAt` is what makes that possible — it is set once,
  * before the first call, and survives every retryCount reset, so a row can always answer "have I
- * been sent before?". A first attempt against a document nothing else has been sent to is free;
- * everything else pays for a GET.
+ * been sent before?".
+ *
+ * Round 4 removed the last exemption. A first attempt in a scope nothing has been sent from used
+ * to skip the ledger read entirely; it no longer does, because the settlement such a row cannot
+ * know about is the one a HUMAN entered, and that is the case a first attempt is least equipped
+ * to reason about and most likely to pay twice. Every money post now pays for one GET.
  *
  * "Everything else" is wider than this row's own history, and that is round 3: the fence judges
  * this attempt AND every rival attempt in the same scope, each against its own mark. A rival's
@@ -291,7 +424,7 @@ export async function ledgerClearsFollowUpRevival(params: {
  * remote rejection, so the row retries a bounded number of times and then ends FAILED — visible,
  * and (correctly) un-revivable while the ledger still holds the payment.
  */
-export async function authoriseMoneyPost(params: {
+export type MoneyPostFenceParams = {
   connector: 'xero' | 'quickbooks'
   entryId: string
   type: string
@@ -316,7 +449,11 @@ export async function authoriseMoneyPost(params: {
     }
   }
   now?: () => Date
-}): Promise<{ proceed: true } | { proceed: false; error: string }> {
+}
+
+export async function authoriseMoneyPost(
+  params: MoneyPostFenceParams,
+): Promise<{ proceed: true } | { proceed: false; error: string }> {
   const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
   if (!isMoneyMovingSyncType(params.type)) return { proceed: true }
 
@@ -353,10 +490,6 @@ export async function authoriseMoneyPost(params: {
     },
     select: { id: true, payload: true },
   })
-  // A first attempt from a row whose document nothing has ever been sent to cannot duplicate
-  // anything. That is the only free pass, and it is the common case.
-  if (claimed.count > 0 && attemptedSiblings.length === 0) return { proceed: true }
-
   const { classifyLedgerSettlement, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   const { effectiveTokenFor, attemptCouldHaveReachedTheLedger, attemptCouldBeTheSameDocument } = await import('@/lib/domain/accounting/followup-retry-guard')
 
@@ -389,12 +522,52 @@ export async function authoriseMoneyPost(params: {
     // a ledger reading that says nothing about it.
     .filter((row) => attemptCouldBeTheSameDocument(row.payload, params.payload))
 
-  // Nothing that could have settled this document has ever been sent, or been sendable at all, so
-  // there is nothing for a ledger read to rule out. Skipped rather than taken and ignored: it is a
-  // network call on the money path, and it must not be spent to reach a foregone conclusion.
-  if (contenders.length === 0) return { proceed: true }
-
   const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
+
+  /**
+   * THE FIRST ROW IN A VIRGIN SCOPE — no longer a free pass (Codex round 4, finding 3).
+   *
+   * It used to return before the probe, on the reasoning that a row nothing has been sent from
+   * cannot duplicate an attempt of OURS. That is true and it is not the hazard. The hazard is a
+   * settlement A HUMAN made: an operator who records the payment in Xero by hand and then marks
+   * the invoice paid in IMS queues a brand-new row against a document that is already settled,
+   * and a first attempt is precisely the case that cannot know about it from its own history.
+   * The probe CAN see it. Being told to ignore what the probe can see, on a money path, is not a
+   * defensible saving — and the saving was one GET.
+   *
+   * Judged with this row's own MARKER as well as its numbers, because a marker match is possible
+   * here even though this row has never posted: a revival that carried a pinned
+   * `_idempotencyKey` over from a row retention has since deleted posts under the SAME mark, and
+   * that vanished predecessor leaves no sibling to be found.
+   *
+   * The one place `unknown` does not refuse, stated plainly rather than left to be discovered:
+   * when the unknown is `attempt-undescribable` — our own payload does not pin an amount and a
+   * date. That is a fact about this row, not about the ledger; the processors default a missing
+   * date to the day they run, so such a row can never be described. Refusing on it would make
+   * every payment enqueued without a pinned date permanently unsendable while telling us nothing
+   * about whether the document is settled. Both LEDGER unknowns — the probe could not answer, or
+   * it returned a settlement it could not measure — still refuse.
+   */
+  if (contenders.length === 0) {
+    const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.entryId, payload: params.payload }))
+    const verdict = classifyLedgerSettlement(describeAttempt(params.payload, marker), probe)
+    if (verdict.outcome === 'present') {
+      return {
+        proceed: false,
+        error: `Not sent: the accounting connector already holds a settlement of ${verdict.detail} against `
+          + 'this document, and IMS has never sent one for it — so it was recorded outside IMS. '
+          + 'Sending this would pay it twice. Check the ledger and resolve this entry by hand.',
+      }
+    }
+    if (verdict.outcome === 'unknown' && verdict.cause !== 'attempt-undescribable') {
+      return {
+        proceed: false,
+        error: `Not sent: IMS could not establish what the accounting connector already holds against `
+          + `this document (${verdict.reason}). Posting on a reading that failed could pay it twice.`,
+      }
+    }
+    return { proceed: true }
+  }
 
   for (const contender of contenders) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, contender))
@@ -416,4 +589,64 @@ export async function authoriseMoneyPost(params: {
     }
   }
   return { proceed: true }
+}
+
+/** What a money branch returns to its processor. Structurally the two connectors' `EntryResult`. */
+export type MoneyPostOutcome = { success: boolean; externalId?: string; error?: string }
+
+/**
+ * o3d-0m56 round 4, Codex CRITICAL #2 — THE ONLY WAY A MONEY POST SHOULD BE SPELT.
+ *
+ * `authoriseMoneyPost` answers "is this document already settled?" and the caller then posts. On
+ * its own that is a decision and a write with a network round trip between them, and nothing
+ * serialized them against a competing row for the same document: two rows could each probe, each
+ * see nothing, and each post. The read was in the right place and still left the window it was
+ * invented to close.
+ *
+ * This wrapper puts the stamp, the sibling read, the probe AND the post inside one per-document
+ * lock, so the whole sequence is indivisible to any other worker. The post is a callback rather
+ * than something the caller runs afterwards precisely so that it CANNOT be left outside: there is
+ * no shape of this API in which a caller acquires protection and then posts without it.
+ *
+ * A caller that cannot take the lock does not wait — see money-post-lock.ts. It returns a normal
+ * retryable failure, which is the same shape as a remote rejection, so the row is re-attempted
+ * later and re-probes then, by which time the holder's payment is readable.
+ *
+ * `lock` is injectable so the fence is testable without PostgreSQL; nothing in production passes
+ * it.
+ */
+export async function postMoneyUnderLedgerFence(
+  params: MoneyPostFenceParams & { lock?: MoneyPostLock },
+  post: () => Promise<MoneyPostOutcome>,
+): Promise<MoneyPostOutcome> {
+  const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
+  // Non-money types take neither the lock nor the fence, exactly as before: the ordinary queue
+  // traffic must not queue behind a payment.
+  if (!isMoneyMovingSyncType(params.type)) return post()
+
+  const lock = params.lock
+    ?? (await import('@/lib/domain/accounting/money-post-lock')).withMoneyPostLock
+  const outcome = await lock({
+    connector: params.connector,
+    type: params.type,
+    referenceType: params.referenceType,
+    referenceId: params.referenceId,
+  }, async (held): Promise<MoneyPostOutcome> => {
+    const authorised = await authoriseMoneyPost(params)
+    if (!authorised.proceed) return { success: false, error: authorised.error }
+    // THE LAST THING CHECKED BEFORE THE CALL. PostgreSQL frees a session advisory lock the instant
+    // its connection dies, so a pinned connection that failed during the ledger read means the
+    // exclusion this verdict was taken under is already gone and another worker may be posting to
+    // this document now. Throwing here is correct — the reading is void, not merely stale.
+    held.assertHeld('posting money to the accounting connector')
+    return post()
+  })
+  if (!outcome.locked) {
+    return {
+      success: false,
+      error: 'Not sent: another entry for this document is posting to the accounting connector right '
+        + 'now. This entry will retry once that attempt is readable in the ledger.',
+    }
+  }
+  return outcome.result
 }

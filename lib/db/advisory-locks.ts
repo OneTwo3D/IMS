@@ -185,10 +185,29 @@ export const BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE = 411_220_868
  */
 export const ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE = 411_220_869
 
+/**
+ * Per-(connector, type, reference) serialization of the money POST itself (o3d-0m56 round 4).
+ *
+ * A SEPARATE domain from the scope lock above, and the separation is the point. That one is
+ * transaction-scoped and held by short database writes; this one is SESSION-scoped and held
+ * across two HTTP calls to Xero or QuickBooks — the ledger read that authorises the post and the
+ * post. Folding them together would put every enqueue transaction for a document behind a remote
+ * round trip, which is longer than Prisma's transaction timeout: the enqueue would not merely
+ * wait, it would abort.
+ *
+ * Kept distinct also means no transaction ever waits on this lock, so a caller that holds it and
+ * then needs a pooled connection of its own cannot deadlock against a queue of waiters. Taken
+ * with `pg_try_advisory_lock` — a caller that cannot have it refuses the post and lets the row
+ * retry, because a concurrent post to the same document is precisely the payment it might be
+ * about to duplicate, and waiting for it only to refuse afterwards buys nothing.
+ */
+export const ACCOUNTING_MONEY_POST_LOCK_NAMESPACE = 411_220_870
+
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
   BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
   ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE,
+  ACCOUNTING_MONEY_POST_LOCK_NAMESPACE,
 } as const

@@ -157,16 +157,110 @@ test('quickbooks: a linked settlement it cannot read fails the whole probe (o3d-
   assert.match(probe.ok === false ? probe.reason : '', /Payment 55/)
 })
 
-test('quickbooks: a bill payment reads bill → billpayment (o3d-0m56)', async () => {
+/**
+ * o3d-0m56 round 4, Codex CRITICAL #1 — THE LINK TYPE QUICKBOOKS ACTUALLY WRITES.
+ *
+ * The entity is `BillPayment`; the link recorded on the Bill is named after the PayType, so IMS's
+ * own `PayType: 'Check'` posts land as `BillPaymentCheck`. The probe matched `BillPayment` and
+ * therefore matched NONE of the bill payments this system has ever made — it returned an empty
+ * record list, which the classifier reads as `clear`, which the fence reads as permission to pay
+ * the bill again. The fixture below used the wrong spelling too, so the test passed on a shape
+ * QuickBooks does not produce.
+ */
+test('quickbooks: a REAL bill payment is recorded as BillPaymentCheck, and is found (o3d-0m56)', async () => {
   const { get, calls } = qboDouble({
-    'bill/bill-1': { Bill: { LinkedTxn: [{ TxnId: '77', TxnType: 'BillPayment' }] } },
+    'bill/bill-1': { Bill: { TotalAmt: 10, Balance: 0, LinkedTxn: [{ TxnId: '77', TxnType: 'BillPaymentCheck' }] } },
     'billpayment/77': {
-      BillPayment: { TxnDate: '2026-08-01', Line: [{ Amount: 10, LinkedTxn: [{ TxnId: 'bill-1', TxnType: 'Bill' }] }] },
+      BillPayment: { TxnDate: '2026-08-01', PrivateNote: 'IMS-abc123abc123', Line: [{ Amount: 10, LinkedTxn: [{ TxnId: 'bill-1', TxnType: 'Bill' }] }] },
     },
   })
   const probe = await probeQuickBooksSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get)
-  assert.deepEqual(calls, [{ path: 'bill/bill-1' }, { path: 'billpayment/77' }])
-  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '77', reference: null }] })
+  assert.deepEqual(calls, [{ path: 'bill/bill-1' }, { path: 'billpayment/77' }],
+    'the link says BillPaymentCheck; the entity is still read from /billpayment')
+  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '77', reference: 'IMS-abc123abc123' }] })
+})
+
+test('quickbooks: a credit-card bill payment is found too, and the bare entity name still works (o3d-0m56)', async () => {
+  for (const linkType of ['BillPaymentCreditCard', 'BillPayment']) {
+    const { get } = qboDouble({
+      'bill/bill-1': { Bill: { TotalAmt: 10, Balance: 0, LinkedTxn: [{ TxnId: '77', TxnType: linkType }] } },
+      'billpayment/77': {
+        BillPayment: { TxnDate: '2026-08-01', Line: [{ Amount: 10, LinkedTxn: [{ TxnId: 'bill-1', TxnType: 'Bill' }] }] },
+      },
+    })
+    const probe = await probeQuickBooksSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get)
+    assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '77', reference: null }] }, linkType)
+  }
+})
+
+test('quickbooks: a link type nobody has classified fails the probe (o3d-0m56)', async () => {
+  // The structural answer to "a payment shape was missed, twice". An unrecognised link is a
+  // settlement the probe cannot account for, and dropping it silently is exactly how a blind
+  // probe reports a clear. It is now an `unknown`, which every caller refuses on.
+  const { get } = qboDouble({
+    'bill/bill-1': { Bill: { TotalAmt: 10, Balance: 10, LinkedTxn: [{ TxnId: '99', TxnType: 'BillPaymentSomethingNew' }] } },
+  })
+  const probe = await probeQuickBooksSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get)
+  assert.equal(probe.ok, false)
+  assert.match(probe.ok === false ? probe.reason : '', /BillPaymentSomethingNew/,
+    'and it must name the type, or nobody can classify it')
+})
+
+test('quickbooks: recognised non-payment links are ignored, not refused (o3d-0m56)', async () => {
+  // The other half of the rule. A bill raised from a purchase order, partly offset by a vendor
+  // credit, is ordinary — refusing those would make every partially-credited document
+  // permanently unpayable through IMS, which is a self-inflicted outage, not a safety property.
+  const { get, calls } = qboDouble({
+    'bill/bill-1': {
+      Bill: {
+        TotalAmt: 100,
+        Balance: 40,
+        LinkedTxn: [{ TxnId: '5', TxnType: 'PurchaseOrder' }, { TxnId: '6', TxnType: 'VendorCredit' }],
+      },
+    },
+  })
+  const probe = await probeQuickBooksSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get)
+  assert.deepEqual(probe, { ok: true, records: [] })
+  assert.deepEqual(calls, [{ path: 'bill/bill-1' }], 'and neither is fetched — they are not the shape IMS posts')
+})
+
+test('quickbooks: money off the document that NO link explains fails the probe (o3d-0m56)', async () => {
+  // The shape-independent backstop. Everything above depends on a list of type names being right,
+  // and the bug this replaces was a list of type names being wrong. TotalAmt and Balance are the
+  // document's own account of how much of it has been settled, by any means at all.
+  const { get } = qboDouble({
+    'bill/bill-1': { Bill: { TotalAmt: 100, Balance: 40, LinkedTxn: [] } },
+  })
+  const probe = await probeQuickBooksSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get)
+  assert.equal(probe.ok, false)
+  assert.match(probe.ok === false ? probe.reason : '', /60\.00 already applied/)
+})
+
+test('xero: a Payments collection short of AmountPaid fails the probe (o3d-0m56)', async () => {
+  // The same class of bug on the other connector, checked with data rather than an assumption:
+  // AmountPaid is Xero's own total of the very collection being read, so the two must agree. An
+  // omitted or truncated collection is indistinguishable from "no payments" without it.
+  const { get } = xeroDouble({
+    'Invoices/inv-1': { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 25, Payments: [] }] },
+  })
+  const probe = await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get)
+  assert.equal(probe.ok, false)
+  assert.match(probe.ok === false ? probe.reason : '', /25\.00 paid.*no payments/)
+})
+
+test('xero: AmountPaid agreeing with the collection is not a refusal (o3d-0m56)', async () => {
+  const { get } = xeroDouble({
+    'Invoices/inv-1': {
+      Invoices: [{
+        InvoiceID: 'inv-1',
+        AmountPaid: 30,
+        Payments: [{ PaymentID: 'P1', Date: '2026-08-01', Amount: 10 }, { PaymentID: 'P2', Date: '2026-08-02', Amount: 20 }],
+      }],
+    },
+  })
+  const probe = await probeXeroSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get)
+  assert.equal(probe.ok, true)
+  assert.equal(probe.ok === true ? probe.records.length : 0, 2)
 })
 
 test('a row with no document id, and a type QuickBooks cannot answer, both fail closed (o3d-0m56)', async () => {

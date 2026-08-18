@@ -18,7 +18,7 @@ import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} fro
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
-import { authoriseMoneyPost, ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
+import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
@@ -716,40 +716,43 @@ async function processEntry(
       if (!accountRef) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
-      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
-      // committed call whose response was lost is FAILED, and the row returns to PENDING for
-      // several more attempts. Everything that happens earlier (the retry guard, the revival
-      // guard) is operator feedback; this is the reading the POST itself depends on.
-      const authorised = await authoriseMoneyPost({
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
         connector: QBO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
-      })
-      if (!authorised.proceed) return { success: false, error: authorised.error }
-      try {
-        // o3d-b3gw: idempotent, like every other document this connector posts. Without a
-        // stable Request-Id, a payment that QuickBooks COMMITS but whose response is lost — or
-        // whose local "mark SYNCED" write then fails — is retried and creates a SECOND payment
-        // against the same invoice. That over-settles it and needs a manual reversal.
-        const paymentRes = await qboPostIdempotent<{ Payment: { Id: string } }>('payment', {
-          CustomerRef: { value: customerRefId },
-          TotalAmt: amount,
-          // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
-          // amount or date has since been corrected. PrivateNote is not customer-visible, and it
-          // is derived from the same source the Request-Id is built from.
-          PrivateNote: settlementMarkerFor(getIdempotencySource(entryId, type, referenceId, payload)),
-          TxnDate: paymentDate,
-          DepositToAccountRef: accountRef,
-          Line: [{
-            Amount: amount,
-            LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Invoice' }],
-          }],
-        }, requestId)
-        if (!paymentRes.ok) {
-          return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks payment' }
+      }, async () => {
+        try {
+          // o3d-b3gw: idempotent, like every other document this connector posts. Without a
+          // stable Request-Id, a payment that QuickBooks COMMITS but whose response is lost — or
+          // whose local "mark SYNCED" write then fails — is retried and creates a SECOND payment
+          // against the same invoice. That over-settles it and needs a manual reversal.
+          const paymentRes = await qboPostIdempotent<{ Payment: { Id: string } }>('payment', {
+            CustomerRef: { value: customerRefId },
+            TotalAmt: amount,
+            // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
+            // amount or date has since been corrected. PrivateNote is not customer-visible, and it
+            // is derived from the same source the Request-Id is built from.
+            PrivateNote: settlementMarkerFor(getIdempotencySource(entryId, type, referenceId, payload)),
+            TxnDate: paymentDate,
+            DepositToAccountRef: accountRef,
+            Line: [{
+              Amount: amount,
+              LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Invoice' }],
+            }],
+          }, requestId)
+          if (!paymentRes.ok) {
+            return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks payment' }
+          }
+          return { success: true, externalId: paymentRes.data?.Payment?.Id }
+        } catch (e) {
+          return { success: false, error: String(e) }
         }
-        return { success: true, externalId: paymentRes.data?.Payment?.Id }
-      } catch (e) {
-        return { success: false, error: String(e) }
-      }
+      })
     }
 
     case 'BILL_PAYMENT': {
@@ -778,37 +781,42 @@ async function processEntry(
       if (!accountRef) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced QuickBooks chart of accounts` }
       }
-      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
-      // committed call whose response was lost is FAILED, and the row returns to PENDING for
-      // several more attempts. Everything that happens earlier (the retry guard, the revival
-      // guard) is operator feedback; this is the reading the POST itself depends on.
-      const authorised = await authoriseMoneyPost({
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
         connector: QBO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
-      })
-      if (!authorised.proceed) return { success: false, error: authorised.error }
-      try {
-        // o3d-b3gw: same reasoning as the customer payment above — a lost response must not
-        // become a second bill payment.
-        const paymentRes = await qboPostIdempotent<{ BillPayment: { Id: string } }>('billpayment', {
-          VendorRef: { value: vendorRefId },
-          TotalAmt: amount,
-          // See INVOICE_PAYMENT above — the same mark, from the same source as the Request-Id.
-          PrivateNote: settlementMarkerFor(getIdempotencySource(entryId, type, referenceId, payload)),
-          TxnDate: paymentDate,
-          PayType: 'Check',
-          CheckPayment: { BankAccountRef: accountRef },
-          Line: [{
-            Amount: amount,
-            LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Bill' }],
-          }],
-        }, requestId)
-        if (!paymentRes.ok) {
-          return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks bill payment' }
+      }, async () => {
+        try {
+          // o3d-b3gw: same reasoning as the customer payment above — a lost response must not
+          // become a second bill payment.
+          const paymentRes = await qboPostIdempotent<{ BillPayment: { Id: string } }>('billpayment', {
+            VendorRef: { value: vendorRefId },
+            TotalAmt: amount,
+            // See INVOICE_PAYMENT above — the same mark, from the same source as the Request-Id.
+            PrivateNote: settlementMarkerFor(getIdempotencySource(entryId, type, referenceId, payload)),
+            TxnDate: paymentDate,
+            // o3d-0m56 round 4: this PayType is why the probe must look for `BillPaymentCheck` —
+            // that, not `BillPayment`, is the TxnType QuickBooks records on the bill it settles.
+            PayType: 'Check',
+            CheckPayment: { BankAccountRef: accountRef },
+            Line: [{
+              Amount: amount,
+              LinkedTxn: [{ TxnId: accountingInvoiceId, TxnType: 'Bill' }],
+            }],
+          }, requestId)
+          if (!paymentRes.ok) {
+            return { success: false, error: paymentRes.error ?? 'Failed to post QuickBooks bill payment' }
+          }
+          return { success: true, externalId: paymentRes.data?.BillPayment?.Id }
+        } catch (e) {
+          return { success: false, error: String(e) }
         }
-        return { success: true, externalId: paymentRes.data?.BillPayment?.Id }
-      } catch (e) {
-        return { success: false, error: String(e) }
-      }
+      })
     }
 
     case 'BILL_ATTACHMENT': {

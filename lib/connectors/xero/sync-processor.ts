@@ -25,7 +25,7 @@ import {
   type BackReferenceRepairResult,
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
-import { authoriseMoneyPost, ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
+import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
@@ -1409,33 +1409,36 @@ async function processEntry(
       if (!account) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
       }
-      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
-      // committed call whose response was lost is FAILED, and the row returns to PENDING for
-      // several more attempts. Everything that happens earlier (the retry guard, the revival
-      // guard) is operator feedback; this is the reading the POST itself depends on.
-      const authorised = await authoriseMoneyPost({
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
-      })
-      if (!authorised.proceed) return { success: false, error: authorised.error }
-      try {
-        const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
-          Invoice: { InvoiceID: accountingInvoiceId },
-          Account: { AccountID: account.externalAccountId },
-          Date: paymentDate,
-          Amount: amount,
-          // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
-          // amount or date has since been corrected in Xero. Derived from the same token the
-          // Idempotency-Key is built from, so every attempt of this settlement carries one mark.
-          Reference: settlementMarkerFor(followUpIdempotencySource(entryId, payload)),
-        }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment') })
-        if (!paymentRes.ok) {
-          return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+      }, async () => {
+        try {
+          const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
+            Invoice: { InvoiceID: accountingInvoiceId },
+            Account: { AccountID: account.externalAccountId },
+            Date: paymentDate,
+            Amount: amount,
+            // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
+            // amount or date has since been corrected in Xero. Derived from the same token the
+            // Idempotency-Key is built from, so every attempt of this settlement carries one mark.
+            Reference: settlementMarkerFor(followUpIdempotencySource(entryId, payload)),
+          }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment') })
+          if (!paymentRes.ok) {
+            return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+          }
+          const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
+          return { success: true, externalId: paymentId }
+        } catch (e) {
+          return { success: false, error: String(e) }
         }
-        const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
-        return { success: true, externalId: paymentId }
-      } catch (e) {
-        return { success: false, error: String(e) }
-      }
+      })
     }
 
     case 'BILL_ATTACHMENT': {
@@ -1521,33 +1524,36 @@ async function processEntry(
       if (!account) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
       }
-      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
-      // committed call whose response was lost is FAILED, and the row returns to PENDING for
-      // several more attempts. Everything that happens earlier (the retry guard, the revival
-      // guard) is operator feedback; this is the reading the POST itself depends on.
-      const authorised = await authoriseMoneyPost({
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
-      })
-      if (!authorised.proceed) return { success: false, error: authorised.error }
-      try {
-        const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
-          Invoice: { InvoiceID: accountingInvoiceId },
-          Account: { AccountID: account.externalAccountId },
-          Date: paymentDate,
-          Amount: amount,
-          // The operator's reference is KEPT and the mark appended, never replaced: it is what they
-          // will look for on the bank reconciliation. See INVOICE_PAYMENT above for the mark.
-          Reference: [payload.reference as string | undefined, settlementMarkerFor(followUpIdempotencySource(entryId, payload))]
-            .filter(Boolean).join(' '),
-        }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'bill-payment') })
-        if (!paymentRes.ok) {
-          return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+      }, async () => {
+        try {
+          const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
+            Invoice: { InvoiceID: accountingInvoiceId },
+            Account: { AccountID: account.externalAccountId },
+            Date: paymentDate,
+            Amount: amount,
+            // The operator's reference is KEPT and the mark appended, never replaced: it is what they
+            // will look for on the bank reconciliation. See INVOICE_PAYMENT above for the mark.
+            Reference: [payload.reference as string | undefined, settlementMarkerFor(followUpIdempotencySource(entryId, payload))]
+              .filter(Boolean).join(' '),
+          }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'bill-payment') })
+          if (!paymentRes.ok) {
+            return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+          }
+          const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
+          return { success: true, externalId: paymentId }
+        } catch (e) {
+          return { success: false, error: String(e) }
         }
-        const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
-        return { success: true, externalId: paymentId }
-      } catch (e) {
-        return { success: false, error: String(e) }
-      }
+      })
     }
 
     case 'CREDIT_NOTE': {
@@ -1599,21 +1605,24 @@ async function processEntry(
       if (!creditNoteId || !accountingInvoiceId || amount == null) {
         return { success: false, error: 'Missing creditNoteId, accountingInvoiceId, or amount for PURCHASE_CREDIT_NOTE_ALLOCATION' }
       }
-      // o3d-0m56: the LAST check before money moves. This entry may have posted before — a
-      // committed call whose response was lost is FAILED, and the row returns to PENDING for
-      // several more attempts. Everything that happens earlier (the retry guard, the revival
-      // guard) is operator feedback; this is the reading the POST itself depends on.
-      const authorised = await authoriseMoneyPost({
+      // o3d-0m56: the LAST check before money moves, AND the lock the post is made under. This
+      // entry may have posted before — a committed call whose response was lost is FAILED, and
+      // the row returns to PENDING for several more attempts. Everything that happens earlier
+      // (the retry guard, the revival guard) is operator feedback; this is the reading the POST
+      // itself depends on. Round 4: the read and the post are inside one per-document lock, so a
+      // competing row cannot slip its own post between them — the post is the callback for
+      // exactly that reason.
+      return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+      }, async () => {
+        const result = await allocatePurchaseCreditNote(
+          { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
+          { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },
+        )
+        // No externalId to back-reference — the allocation is a sub-resource of the
+        // credit note, not a standalone document.
+        return { success: result.success, error: result.error }
       })
-      if (!authorised.proceed) return { success: false, error: authorised.error }
-      const result = await allocatePurchaseCreditNote(
-        { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
-        { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },
-      )
-      // No externalId to back-reference — the allocation is a sub-resource of the
-      // credit note, not a standalone document.
-      return { success: result.success, error: result.error }
     }
 
     case 'COGS_JOURNAL':
