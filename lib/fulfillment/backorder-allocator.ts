@@ -64,16 +64,26 @@ export async function allocateBackordersForProducts(
   const expanded = [...expandedSet]
   const directIdsSet = new Set(directIds)
 
-  // Exclude orders that already have any Shipment row. confirmAllocations
-  // creates PENDING ShipmentLines tied to specific warehouses/qtys; calling
-  // autoAllocateOrder here rebuilds OrderAllocation without touching those
-  // ShipmentLines, so the later dispatch would decrement stock against
-  // stale shipment rows. Let manual intervention handle those cases.
+  // Exclude orders that hold a COMMITTED (non-PENDING) shipment. Rebuilding OrderAllocation
+  // underneath a picked, packed or shipped commitment is the original hazard: the dispatch would
+  // decrement stock against rows that no longer match it.
+  //
+  // o3d-4kfh r5 (Codex finding 4): PENDING DRAFTS NO LONGER EXCLUDE THE ORDER. They used to —
+  // `shipments: { none: {} }` — because `autoAllocateOrder` rebuilt the rows without touching the
+  // draft ShipmentLines. `reconcilePendingShipments` closed that at the source: the rewrite retires
+  // exactly the drafts it unbacks and leaves the rest, tracking metadata included.
+  //
+  // Keeping the blanket exclusion after that actively broke the repair path it was written to
+  // protect. The overallocation rebalancer releases ONE (product, warehouse) row at a time, so
+  // trimming leaf A of an A+B kit leaves sibling B disproportionate, and THIS pass is what rebuilds
+  // it. Since the reconciler now RETAINS an unrelated still-backed PENDING draft, that retained
+  // draft made this filter skip the order entirely — B's reservation stranded, surfacing only as an
+  // integrity failure at confirm-for-picking, invisible to the flat census.
   const candidates = await db.salesOrder.findMany({
     where: {
       status: { in: [...BACKORDER_ELIGIBLE_STATUSES] },
       lines: { some: { productId: { in: expanded } } },
-      shipments: { none: {} },
+      shipments: { none: { status: { not: 'PENDING' } } },
     },
     select: {
       id: true,
@@ -123,7 +133,10 @@ export async function allocateBackordersForProducts(
       const res = await autoAllocateOrder(order.id, {
         internalBypassToken: INTERNAL_ACTION_BYPASS,
         deferStockSync: true,
-        refuseIfShipmentsExist: true,
+        // o3d-4kfh r5: matches the candidate filter above — the under-lock re-check must ask the
+        // SAME question, or an order selected because its only shipment is a draft would be refused
+        // the moment the lock is granted and the strand would survive the fix.
+        refuseIfCommittedShipmentsExist: true,
         // o3d-6ab: candidates were selected by status OUTSIDE the order lock. Re-assert it under the
         // lock so an order that moved to ON_HOLD (or past PROCESSING) in that window is skipped rather
         // than silently re-reserved. A skip returns no error, so it is counted as neither done nor failed.

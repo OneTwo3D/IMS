@@ -56,8 +56,23 @@ export function sanitizeActivityLogMetadata(value: unknown, key?: string): unkno
 /**
  * Log an activity. Always await to avoid concurrent-query warnings.
  * Silently swallows errors to never break the caller.
+ *
+ * Which means AWAITING IT PROVES NOTHING about whether the entry was written. Callers that make a
+ * DECISION on the strength of having warned somebody — suppressing a repeat, deferring a repair,
+ * marking something reported — must use logActivityPersisted below instead, because a transient
+ * write failure here is indistinguishable from success (o3d-9kek r2 finding 3).
  */
-export async function logActivity(params: LogParams) {
+export async function logActivity(params: LogParams): Promise<void> {
+  await logActivityPersisted(params)
+}
+
+/**
+ * logActivity, but REPORTS whether the entry actually reached the activity log.
+ *
+ * Same swallow-and-continue behaviour — it never throws — so it is a drop-in for logActivity; the
+ * difference is that `false` lets the caller decline to act as though the operator has been told.
+ */
+export async function logActivityPersisted(params: LogParams): Promise<boolean> {
   try {
     let userId = params.userId ?? null
     if (!userId && params.resolveUser !== false) {
@@ -77,8 +92,10 @@ export async function logActivity(params: LogParams) {
         metadata: params.metadata ? JSON.parse(JSON.stringify(sanitizeActivityLogMetadata(params.metadata))) : undefined,
       },
     })
+    return true
   } catch (e) {
     // Never let logging break the caller
     console.error('[activity-log] Failed to write:', e)
+    return false
   }
 }

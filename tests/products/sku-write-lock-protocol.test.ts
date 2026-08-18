@@ -115,7 +115,10 @@ test('the CSV rename path re-validates structure under its locks (o3d-42hw)', as
   const source = await readFile(IMPORT_ACTIONS, 'utf8')
   const renameAt = source.indexOf('lockProductSkusForWrite(tx, [sku, existingProduct.sku])')
   assert.notEqual(renameAt, -1, 'the CSV rename must lock BOTH the old and the new sku')
-  const body = source.slice(renameAt, renameAt + 3400)
+  // o3d-4kfh r5: widened because the KIT-ness guard now sits between the re-validation and the
+  // write. The window must still END inside this transaction, or the assertions below could be
+  // satisfied by an unrelated later block.
+  const body = source.slice(renameAt, renameAt + 4600)
 
   assert.match(body, /validateProductStructureChange\(/, 'the rename must re-validate under the locks')
   assert.match(body, /client: tx/, 'the re-validation must run against tx, or it re-reads pre-lock state')
@@ -269,4 +272,61 @@ test('the in-run cache records what the locked transaction COMMITTED (o3d-42hw)'
   // Preview runs no transaction, so it legitimately keeps the projected values — the
   // fallbacks must survive.
   assert.match(cache, /structureValidation\.normalizedParentId/, 'preview must still fall back to the projection')
+})
+
+// --- the re-validation must read the LOCKED state, all of it (o3d-y89x r2) ---
+
+test('the re-validation reads its live-row blockers from `client`, not the ambient db (o3d-y89x r2)', async () => {
+  // The o3d-42hw fix threaded `client: tx` so the re-validation would read the state its locks
+  // are holding — but `getProductTransformBlockers` ignored the argument and used the
+  // module-level `db` regardless. So the re-validation checked the ROW under `tx` and the five
+  // "is this product live?" queries on a DIFFERENT connection: outside the locks it had just
+  // taken, against a snapshot that could already have moved. The half that mattered most was
+  // the half still reading pre-lock state.
+  //
+  // Proved by making the two clients DISAGREE, in both directions. A test that only made `tx`
+  // live would also pass against the old code whenever the ambient db happened to agree.
+  const { mock } = await import('node:test')
+
+  const blockerClient = (opts: { stockQty: number }) => ({
+    stockLevel: { aggregate: async () => ({ _sum: { quantity: opts.stockQty, reservedQty: 0 } }) },
+    salesOrderLine: { count: async () => 0 },
+    purchaseOrderLine: { count: async () => 0 },
+    productionOrder: { count: async () => 0 },
+    stockTransferLine: { count: async () => 0 },
+    product: {
+      findUnique: async ({ where }: { where: { id: string } }) =>
+        where.id === 'p-1' ? { id: 'p-1', sku: 'S-1', type: 'SIMPLE', parentId: null } : null,
+    },
+  })
+
+  // The AMBIENT db says the product is live. Anything that reads it instead of `client` fails
+  // the clean case below.
+  mock.module('@/lib/db', { namedExports: { db: blockerClient({ stockQty: 99 }) } })
+  const { validateProductStructureChange } = await import('@/lib/products/type-transforms')
+
+  const underCleanLock = await validateProductStructureChange({
+    productId: 'p-1',
+    type: 'KIT',
+    parentId: null,
+    client: blockerClient({ stockQty: 0 }) as never,
+  })
+  assert.equal(
+    underCleanLock.ok,
+    true,
+    'the locked transaction sees no stock, so the transform is allowed — the ambient db must not veto it',
+  )
+
+  const underLiveLock = await validateProductStructureChange({
+    productId: 'p-1',
+    type: 'KIT',
+    parentId: null,
+    client: blockerClient({ stockQty: 7 }) as never,
+  })
+  assert.equal(underLiveLock.ok, false, 'and stock visible under the lock DOES block it')
+  assert.match(
+    String(underLiveLock.ok === false ? underLiveLock.message : ''),
+    /stock on hand \(7\.00\)/,
+    'reported with the quantity the LOCKED read returned, not the ambient one',
+  )
 })

@@ -28,6 +28,32 @@ const state = {
   syncLogs: [] as Row[],
   /** Advisory-lock IDs handed to pg_advisory_xact_lock, in acquisition order. */
   advisoryLocks: [] as number[],
+  /**
+   * What makes a product LIVE (o3d-y89x r2). The connector now runs the editor's
+   * `getProductTransformBlockers` before it transforms a row, so this suite's transaction
+   * double has to answer those five queries.
+   *
+   * Modelled as seedable, per-product rows rather than hardcoded zeroes even though every
+   * product in THIS suite is clean: a double that answered "clean" unconditionally would let
+   * a future ownership test seed a live row and never notice the transform being refused,
+   * which is the failure mode the whole file exists to catch.
+   */
+  stockLevels: [] as Array<{ productId: string; quantity: number; reservedQty: number }>,
+  salesOrderLines: [] as Array<{ productId: string }>,
+  purchaseOrderLines: [] as Array<{ productId: string }>,
+  productionOrders: [] as Array<{ outputProductId: string }>,
+  /**
+   * Transfer lines WITH their transfer's status (o3d-y89x r6, Codex finding 2). Production filters
+   * both transfer queries on `transfer.status IN (DRAFT, IN_TRANSIT)`; a double without statuses
+   * cannot tell that filter from its absence.
+   */
+  stockTransferLines: [] as Array<{ productId: string; status: string }>,
+  /**
+   * o3d-4kfh r7 (Codex finding 2): `ProductComponent` rows, so the connector's graph-version bump
+   * can walk the KIT ancestors the way it does in production. Without them the bump would appear to
+   * work on the edited product alone and a nested-kit regression would be invisible.
+   */
+  components: [] as Array<{ productId: string; componentId: string }>,
 }
 
 function snapshot() {
@@ -35,6 +61,7 @@ function snapshot() {
     products: state.products.map((row) => ({ ...row })),
     options: state.options.map((row) => ({ ...row })),
     syncLogs: state.syncLogs.map((row) => ({ ...row })),
+    components: state.components.map((row) => ({ ...row })),
   }
 }
 
@@ -42,6 +69,7 @@ function restore(snap: ReturnType<typeof snapshot>) {
   state.products.splice(0, state.products.length, ...snap.products)
   state.options.splice(0, state.options.length, ...snap.options)
   state.syncLogs.splice(0, state.syncLogs.length, ...snap.syncLogs)
+  state.components.splice(0, state.components.length, ...snap.components)
 }
 
 let nextId = 1
@@ -91,6 +119,33 @@ function findProductBySku(sku: unknown) {
 }
 
 /**
+ * The r5 `_count.variants` shape, still answered (o3d-y89x r6). Production now asks the child
+ * question as its own id-scoped `groupBy` (see `childParents` below) because `_count` was measured
+ * to render as a whole-catalogue aggregate; this stays so that a revert to r5 still runs here and
+ * fails on the assertion it should, not on an unmodelled shape.
+ *
+ * Attached ONLY when the query asked for it, because `imsRowHasChildren` throws on a row that
+ * carries no answer rather than reading "no children" out of its absence.
+ */
+function withChildCount(row: Row, include?: Row): Row {
+  if (!include || !('_count' in include)) return { ...row }
+  return { ...row, _count: { variants: state.products.filter((child) => child.parentId === row.id).length } }
+}
+
+/**
+ * The four arms `PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE` expresses, read off the same seeded rows
+ * as the per-product blocker doubles below. Every product in this suite is clean, but answering
+ * from the shared state rather than with a constant is what lets a future ownership test seed a
+ * live row and see the pre-commit re-assertion refuse the transform.
+ */
+function hasAnyBlocker(productId: string): boolean {
+  return state.stockLevels.some((row) => row.productId === productId && (row.quantity > 0 || row.reservedQty > 0))
+    || state.salesOrderLines.some((row) => row.productId === productId)
+    || state.purchaseOrderLines.some((row) => row.productId === productId)
+    || state.productionOrders.some((row) => row.outputProductId === productId)
+}
+
+/**
  * Emulates the conditional ownership update: `id` plus an OR over externalProductId.
  * Returning { count: 0 } when the predicate does not match is what the production code
  * reads as "someone reassigned this row underneath us".
@@ -117,14 +172,81 @@ function updateManyMatching(where: Row, data: Row): { count: number } {
 }
 
 const productDelegate = {
-  findFirst: async ({ where }: { where: { sku?: unknown } }) => findProductBySku(where?.sku),
-  findUnique: async ({ where }: { where: { id: string } }) =>
-    state.products.find((row) => row.id === where.id) ?? null,
-  updateMany: async ({ where, data }: { where: Row; data: Row }) => updateManyMatching(where, data),
-  findMany: async ({ where }: { where?: { sku?: { in?: unknown[] } } } = {}) => {
-    const wanted = where?.sku?.in
-    if (!Array.isArray(wanted)) return state.products.map((row) => ({ ...row }))
-    return state.products.filter((row) => wanted.includes(row.sku)).map((row) => ({ ...row }))
+  // o3d-4kfh r7: DETACHED COPIES, as Prisma returns. These used to hand back the live state object,
+  // so a later `Object.assign` in the update path mutated the caller's "pre-update snapshot" too —
+  // `existing.type` read AFTER the write returned the NEW type, and a test could not distinguish
+  // "the code captured the old value" from "the code read a value that had already moved".
+  findFirst: async ({ where, include }: { where: { sku?: unknown }; include?: Row }) => {
+    const row = findProductBySku(where?.sku)
+    return row ? withChildCount(row, include) : null
+  },
+  findUnique: async ({ where }: { where: { id: string } }) => {
+    const row = state.products.find((candidate) => candidate.id === where.id)
+    return row ? { ...row } : null
+  },
+  /**
+   * The child-existence statement (o3d-y89x r6):
+   * `SELECT parentId FROM products WHERE parentId IN (candidates) GROUP BY parentId`.
+   *
+   * Grouped, and scoped to the ids the caller names. It refuses anything else — an unscoped child
+   * question is exactly the r5 regression (a `_count` include renders as an uncorrelated
+   * catalogue-wide aggregate), so the double must not be able to answer one.
+   */
+  groupBy: async ({ by, where }: { by?: unknown; where?: Row } = {}) => {
+    const parentIn = (where?.parentId as { in?: unknown[] } | undefined)?.in
+    const grouping = Array.isArray(by) ? by.map(String) : []
+    if (!Array.isArray(parentIn) || grouping.length !== 1 || grouping[0] !== 'parentId'
+      || Object.keys(where ?? {}).length !== 1) {
+      throw new Error(`product.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
+    }
+    const candidates = parentIn.map(String)
+    return [...new Set(
+      state.products
+        .filter((row) => row.parentId != null && candidates.includes(String(row.parentId)))
+        .map((row) => String(row.parentId)),
+    )].map((parentId) => ({ parentId }))
+  },
+  // TWO shapes, and they are different questions. `{ id: '...' }` (+ an OR over externalProductId)
+  // is the conditional ownership update. `{ id: { in: [...] } }` with an `{ increment }` op is
+  // `bumpFulfillmentGraphVersions` (o3d-4kfh r7) — which `updateManyMatching` silently matched
+  // NOTHING for, because it compares `row.id === where.id` and `where.id` is an object there. A
+  // double that answers a real call with a silent `{ count: 0 }` cannot tell a working bump from an
+  // absent one.
+  updateMany: async ({ where, data }: { where: Row; data: Row }) => {
+    const idIn = (where.id as { in?: string[] } | undefined)?.in
+    if (Array.isArray(idIn)) {
+      const rows = state.products.filter((row) => idIn.includes(row.id as string))
+      for (const row of rows) {
+        for (const [field, value] of Object.entries(data)) {
+          const increment = (value as { increment?: number } | null)?.increment
+          row[field] = typeof increment === 'number'
+            ? Number(row[field] ?? 0) + increment
+            : value
+        }
+      }
+      return { count: rows.length }
+    }
+    return updateManyMatching(where, data)
+  },
+  // THREE queries: candidate rows by SKU, the pre-commit blocker re-assertion over the ids this
+  // transaction transformed (o3d-y89x r5), and the whole table. An unrecognised `where` THROWS
+  // rather than returning everything, so a query this double does not actually model can never
+  // quietly answer "yes" or "no" — and in particular the re-assertion cannot report a transformed
+  // row as clean by accident.
+  findMany: async ({ where, include }: { where?: Row; include?: Row } = {}) => {
+    const skuIn = (where?.sku as { in?: unknown[] } | undefined)?.in
+    if (Array.isArray(skuIn)) {
+      return state.products.filter((row) => skuIn.includes(row.sku)).map((row) => withChildCount(row, include))
+    }
+    const idIn = (where?.id as { in?: unknown[] } | undefined)?.in
+    if (Array.isArray(idIn)) {
+      const candidates = idIn.map(String)
+      return state.products
+        .filter((row) => candidates.includes(String(row.id)) && !hasAnyBlocker(String(row.id)))
+        .map((row) => ({ id: row.id }))
+    }
+    if (where === undefined) return state.products.map((row) => ({ ...row }))
+    throw new Error(`product.findMany double got an unmodelled where: ${JSON.stringify(where)}`)
   },
   create: async ({ data }: { data: Row }) => {
     const row = { id: `ims-${nextId++}`, ...data }
@@ -140,8 +262,113 @@ const productDelegate = {
   upsert: async () => ({}),
 }
 
+/** The five queries `getProductTransformBlockers` makes, each honouring its own `where`. */
+function blockerProductId(where: Row | undefined, delegate: string): string {
+  const productId = where?.productId
+  if (typeof productId !== 'string') {
+    throw new Error(`${delegate} double got an unmodelled where: ${JSON.stringify(where)}`)
+  }
+  return productId
+}
+
+/**
+ * The statuses `lib/products/type-transforms.ts` calls OPEN. Duplicated here on purpose: the
+ * transfer doubles demand this EXACT set, so if production widens or narrows it they fail loudly
+ * instead of silently agreeing with whatever production now asks (o3d-y89x r6, Codex finding 2).
+ */
+const OPEN_TRANSFER_STATUSES = ['DRAFT', 'IN_TRANSIT'] as const
+
+function requireOpenTransferFilter(where: Row | undefined, delegate: string): void {
+  const statuses = (where?.transfer as { status?: { in?: unknown[] } } | undefined)?.status?.in
+  const asked = Array.isArray(statuses) ? [...statuses].map(String).sort().join(',') : null
+  if (asked !== [...OPEN_TRANSFER_STATUSES].sort().join(',')) {
+    throw new Error(
+      `${delegate} double got an unmodelled transfer filter — it models `
+      + `transfer.status.in = [${OPEN_TRANSFER_STATUSES.join(', ')}] and got: ${JSON.stringify(where)}`,
+    )
+  }
+}
+
+function isOpenTransferLine(row: { status: string }): boolean {
+  return (OPEN_TRANSFER_STATUSES as readonly string[]).includes(row.status)
+}
+
 const txClient = {
   product: productDelegate,
+  // o3d-4kfh r7: the ancestor walk `bumpFulfillmentGraphVersions` shares with the component-graph
+  // guard. Honours the `componentId: { in }` predicate and reports each parent's TYPE, because a
+  // BOM parent is a fulfilment leaf and must not be walked through.
+  productComponent: {
+    findMany: async ({ where }: { where: { componentId: { in: string[] } } }) => state.components
+      .filter((row) => where.componentId.in.includes(row.componentId))
+      .map((row) => ({
+        productId: row.productId,
+        product: { type: state.products.find((p) => p.id === row.productId)?.type ?? 'SIMPLE' },
+      })),
+  },
+  stockLevel: {
+    aggregate: async ({ where }: { where?: Row } = {}) => {
+      const productId = blockerProductId(where, 'stockLevel.aggregate')
+      const rows = state.stockLevels.filter((row) => row.productId === productId)
+      return {
+        _sum: {
+          quantity: rows.reduce((sum, row) => sum + row.quantity, 0),
+          reservedQty: rows.reduce((sum, row) => sum + row.reservedQty, 0),
+        },
+      }
+    },
+  },
+  // TWO callers, deliberately kept apart. `count` is one of the editor's five live-row blockers,
+  // which o3d-y89x r2 made the connector run before it transforms a row. `findMany` is only
+  // reached by `findComponentGraphEditBlockers`, which the connector path does NOT call — present
+  // and honest so a change that starts calling it fails loudly on the fixture rather than throwing
+  // an unrelated TypeError.
+  salesOrderLine: {
+    count: async ({ where }: { where?: Row } = {}) =>
+      state.salesOrderLines.filter((row) => row.productId === blockerProductId(where, 'salesOrderLine.count')).length,
+    findMany: async () => [],
+  },
+  purchaseOrderLine: {
+    count: async ({ where }: { where?: Row } = {}) =>
+      state.purchaseOrderLines.filter((row) => row.productId === blockerProductId(where, 'purchaseOrderLine.count')).length,
+  },
+  productionOrder: {
+    count: async ({ where }: { where?: Row } = {}) => {
+      const outputProductId = (where?.OR as Array<Row> | undefined)?.[0]?.outputProductId
+      if (typeof outputProductId !== 'string') {
+        throw new Error(`productionOrder.count double got an unmodelled where: ${JSON.stringify(where)}`)
+      }
+      return state.productionOrders.filter((row) => row.outputProductId === outputProductId).length
+    },
+  },
+  stockTransferLine: {
+    // Both arms honour `where.transfer.status` as well as the product predicate (o3d-y89x r6,
+    // Codex finding 2): a line on a RECEIVED or CANCELLED transfer is not a blocker, and a double
+    // that returned it would agree with a production query that had lost its filter.
+    count: async ({ where }: { where?: Row } = {}) => {
+      const productId = blockerProductId(where, 'stockTransferLine.count')
+      requireOpenTransferFilter(where, 'stockTransferLine.count')
+      return state.stockTransferLines
+        .filter((row) => row.productId === productId && isOpenTransferLine(row)).length
+    },
+    // The transfer arm of the SET-WISE pre-commit re-assertion (o3d-y89x r5). It is its own
+    // statement because `StockTransferLine` carries no FK to Product, so it cannot ride in the
+    // product filter with the other four arms.
+    groupBy: async ({ by, where }: { by?: unknown; where?: Row } = {}) => {
+      const ids = (where?.productId as { in?: unknown[] } | undefined)?.in
+      const grouping = Array.isArray(by) ? by.map(String) : []
+      if (!Array.isArray(ids) || grouping.length !== 1 || grouping[0] !== 'productId') {
+        throw new Error(`stockTransferLine.groupBy double got an unmodelled query: ${JSON.stringify({ by, where })}`)
+      }
+      requireOpenTransferFilter(where, 'stockTransferLine.groupBy')
+      const candidates = ids.map(String)
+      return [...new Set(
+        state.stockTransferLines
+          .filter((row) => candidates.includes(row.productId) && isOpenTransferLine(row))
+          .map((row) => row.productId),
+      )].map((productId) => ({ productId }))
+    },
+  },
   productOption: {
     upsert: async ({ create }: { create: Row }) => {
       state.options.push({ ...create })
@@ -149,9 +376,23 @@ const txClient = {
     },
   },
   shoppingSyncLog: {
+    // `connector` is @default("woocommerce") and production never sets it; the delete below
+    // filters on it, so the double has to apply the default or the dedup silently no-ops.
     create: async ({ data }: { data: Row }) => {
-      state.syncLogs.push(data)
-      return data
+      const row = { connector: 'woocommerce', ...data }
+      state.syncLogs.push(row)
+      return row
+    },
+    /** The structure-conflict dedup/resolution delete (o3d-fjqk). */
+    deleteMany: async ({ where }: { where: Row }) => {
+      const matches = (row: Row) => Object.entries(where).every(([key, value]) => {
+        if (key !== 'OR') return row[key] === value
+        return (value as Row[]).some((clause) => Object.entries(clause).every(([k, v]) => row[k] === v))
+      })
+      const kept = state.syncLogs.filter((row) => !matches(row))
+      const removed = state.syncLogs.length - kept.length
+      state.syncLogs.splice(0, state.syncLogs.length, ...kept)
+      return { count: removed }
     },
   },
   setting: {
@@ -232,6 +473,9 @@ function variableProduct(overrides: Partial<Row> = {}): WcFullProduct {
 
 function imsRow(row: Row): Row {
   return {
+    // `type` is NOT NULL in the schema, and o3d-h2cz's adoption rules read it. A seed without
+    // one is a row that cannot exist, and would exercise the policy against `undefined`.
+    type: 'SIMPLE',
     description: null,
     imageUrl: null,
     weight: null,
@@ -253,6 +497,12 @@ function resetState() {
   state.options.length = 0
   state.syncLogs.length = 0
   state.advisoryLocks.length = 0
+  state.stockLevels.length = 0
+  state.salesOrderLines.length = 0
+  state.purchaseOrderLines.length = 0
+  state.productionOrders.length = 0
+  state.stockTransferLines.length = 0
+  state.components.length = 0
   nextId = 1
   variationTotalPages = 1
   hashOverrides = {}
@@ -655,4 +905,178 @@ test('a later duplicate sibling sees the FIRST sibling\'s applied fields, not st
     'Fresh description from WooCommerce',
     'the second sibling must not write the pre-import description back',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-4kfh r7 (Codex finding 2) — the connector is a component-graph writer, and must bump.
+//
+// `OrderAllocation.fulfillmentGraphVersion` is what tells commitment and dispatch that a row was
+// expanded from a recipe that no longer exists. The editor and the CSV import bump it — for the
+// edited product AND every KIT above it — in the same transaction as the type write. This path did
+// not, so an IMS KIT adopted by SKU could be re-typed with every allocation stamp and every ancestor
+// version left untouched: the rows were reinterpreted against a different graph while still
+// MATCHING, which is precisely the state the stamp exists to make unreachable.
+//
+// HOW #617 CHANGED WHAT THESE CAN OBSERVE (o3d-y89x, this branch). #615 was written expecting a
+// residue: "with #617 in, a preserved type makes `nextType === existing.type` and the bump is a
+// no-op; what REMAINS is the legitimate type change, which must still bump." There is no such
+// remainder, and the two original tests asserted one. Enumerate the connector's reachable pairs:
+//
+//   - `productType` is `wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'`. The connector never
+//     computes KIT or BOM, from either door.
+//   - `CONNECTOR_TRANSFORMABLE_TYPES` is `{ SIMPLE }`. The only existing type it may write over is
+//     SIMPLE; KIT, BOM, VARIABLE, VARIANT and NON_INVENTORY keep what they have.
+//
+// So every type change the connector can still make is SIMPLE -> VARIABLE (parent branch) or
+// SIMPLE -> VARIANT (applyVariations), and `componentGraphMutationAffectsFulfillment` is FALSE for
+// both: KIT-ness flips only when exactly one side is KIT, and neither side ever is. The connector
+// therefore cannot reach a bumping mutation at all while #617 stands — not "rarely", never.
+//
+// That does NOT make the wiring pointless, and the two properties are split accordingly:
+//
+//   1. THE OBSERVABLE HALF, below: a KIT is not flattened by either door, and BECAUSE it was not,
+//      no version moves — not the KIT's and not its ancestor's. A spurious bump is not harmless
+//      (it refuses in-flight commitments that were never wrong), so "nothing changed, nothing
+//      moved" is a real assertion, not the absence of one.
+//   2. THE ANCESTOR WALK, which the connector's own client must still be able to serve if the
+//      allow-list is ever widened — pinned directly at the seam in the last test here, and pinned
+//      as WIRING (write, then bump, against `tx`) by the five-site ordering test in
+//      tests/products/component-graph-edit-guard.test.ts, which now counts this file's two call
+//      sites. Without that pair, the three runtime tests below would all still pass with
+//      `bumpFulfillmentGraphVersions` deleted from product-sync.ts entirely.
+// ---------------------------------------------------------------------------
+
+function simpleProduct(overrides: Partial<Row> = {}): WcFullProduct {
+  return {
+    id: 77,
+    sku: 'KIT-SKU',
+    name: 'Adopted Kit',
+    type: 'simple',
+    status: 'publish',
+    description: '',
+    short_description: '',
+    regular_price: '10.00',
+    sale_price: '',
+    weight: '',
+    dimensions: { length: '', width: '', height: '' },
+    images: [],
+    attributes: [],
+    categories: [],
+    meta_data: [],
+    variations: [],
+    ...overrides,
+  } as unknown as WcFullProduct
+}
+
+function versionOf(sku: string): number {
+  return Number(findProductBySku(sku)?.fulfillmentGraphVersion ?? 0)
+}
+
+test('o3d-4kfh r7 + o3d-y89x: the connector does not flatten a nested KIT, so no ancestor version moves', async () => {
+  // The scenario #615 wrote as "the connector re-types it and the versions move". #617 removes the
+  // first half, so the second half must NOT happen: the recipe did not change, and refusing every
+  // in-flight commitment on this kit and its parent would be a fabricated invalidation.
+  //
+  // The fixture is deliberately NESTED. A bump that walked only the edited row would still leave
+  // PARENT-KIT at 8 and pass a flat version of this test; the ancestor assertion is what makes a
+  // future "bump unconditionally" regression visible one level up as well.
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  variationPages = { '1': [] }
+
+  // PARENT-KIT (a KIT) contains KIT-SKU (a KIT). WooCommerce claims KIT-SKU is a simple product —
+  // which is the NORMAL pairing for a bundle, not a disagreement (see the conflict rule in
+  // product-structure-policy.ts), so this stays a quiet, successful sync.
+  state.products.push(imsRow({ id: 'ims-kit', sku: 'KIT-SKU', name: 'Adopted Kit', type: 'KIT', fulfillmentGraphVersion: 3 }))
+  state.products.push(imsRow({ id: 'ims-parent', sku: 'PARENT-KIT', name: 'Parent Kit', type: 'KIT', fulfillmentGraphVersion: 8 }))
+  state.components.push({ productId: 'ims-parent', componentId: 'ims-kit' })
+
+  const result = await syncWcProductToIms(simpleProduct({ name: 'Renamed Kit' }))
+
+  assert.equal(result.success, true, `expected success, got: ${result.error}`)
+  assert.equal(findProductBySku('KIT-SKU')?.type, 'KIT', 'the KIT is not flattened by the connector')
+  assert.equal(findProductBySku('KIT-SKU')?.name, 'Renamed Kit', 'and the rest of the import still applied')
+  assert.equal(versionOf('KIT-SKU'), 3, 'nothing about the recipe changed, so the stamp must not move')
+  assert.equal(
+    versionOf('PARENT-KIT'),
+    8,
+    'and the KIT above it is not invalidated either — its expansion is exactly what it was',
+  )
+})
+
+test('o3d-4kfh r7: an ordinary connector update that changes no KIT-ness bumps nothing', async () => {
+  // The boundary. Bumping on every import would refuse commitments across the catalogue every time
+  // the reconcile sweep ran, which is a worse failure than the one being fixed.
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  variationPages = { '1': [] }
+  state.products.push(imsRow({ id: 'ims-simple', sku: 'KIT-SKU', name: 'Plain', type: 'SIMPLE', fulfillmentGraphVersion: 3 }))
+
+  const result = await syncWcProductToIms(simpleProduct({ name: 'Renamed' }))
+
+  assert.equal(result.success, true, `expected success, got: ${result.error}`)
+  assert.equal(findProductBySku('KIT-SKU')?.name, 'Renamed', 'the import still applied')
+  assert.equal(versionOf('KIT-SKU'), 3, 'and the version did not move')
+})
+
+test('o3d-4kfh r7 + o3d-y89x: the VARIATION door does not overwrite a KIT either, so nothing bumps there', async () => {
+  // The other door. `applyVariations` writes `VARIANT` over whatever the SKU matched, and #615 read
+  // that as the same corruption needing the same bump. #617 suppresses the type write instead — a
+  // KIT under a VARIABLE parent is a first-class IMS shape ("bundle variant"), so the row is still
+  // ADOPTED (parentId and every other field apply); only its type survives untouched. Nothing about
+  // its recipe moved, so neither version may.
+  const syncWcProductToIms = await loadSync()
+  resetState()
+  variationPages = { '1': [wcVariation(111, 'VAR-1', 'Red')] }
+
+  state.products.push(imsRow({ id: 'ims-parent-wc', sku: 'PARENT-SKU', name: 'Parent Widget', type: 'VARIABLE', fulfillmentGraphVersion: 0 }))
+  state.products.push(imsRow({ id: 'ims-var-kit', sku: 'VAR-1', name: 'Adopted Kit', type: 'KIT', fulfillmentGraphVersion: 2 }))
+  state.products.push(imsRow({ id: 'ims-ancestor', sku: 'ANCESTOR-KIT', name: 'Ancestor', type: 'KIT', fulfillmentGraphVersion: 5 }))
+  state.components.push({ productId: 'ims-ancestor', componentId: 'ims-var-kit' })
+
+  const result = await syncWcProductToIms(variableProduct({ variations: [111] }))
+
+  assert.equal(result.success, true, `expected success, got: ${result.error}`)
+  assert.equal(findProductBySku('VAR-1')?.type, 'KIT', 'the type write is suppressed, not applied')
+  assert.equal(
+    findProductBySku('VAR-1')?.parentId,
+    'ims-parent-wc',
+    'but the adoption itself still happened — this is a refusal of one COLUMN, not of the row',
+  )
+  assert.equal(versionOf('VAR-1'), 2, 'no KIT-ness changed, so no stamp moves')
+  assert.equal(versionOf('ANCESTOR-KIT'), 5, 'and the ancestor walk has nothing to invalidate')
+})
+
+test('o3d-4kfh r7: handed a real KIT-ness flip, the connector\'s own transaction client walks the KIT ancestors', async () => {
+  // WHY THIS EXISTS. The three tests above all assert that nothing bumps, so all three would pass
+  // with `bumpFulfillmentGraphVersions` deleted from product-sync.ts. That is a direct consequence
+  // of #617, not a defect in them — but it means the ancestor walk has no runtime witness on this
+  // path any more, and the call would look like dead code to the next reader.
+  //
+  // So the walk is pinned where it can still be observed: against THIS suite's transaction double,
+  // which is the object the connector actually receives. It proves the client satisfies the walk's
+  // query contract — `productComponent.findMany` with `componentId: { in }`, and a
+  // `product.updateMany` with `{ id: { in } }` + `{ increment }`, the shape the pre-merge double
+  // silently matched nothing for. If the allow-list is ever widened so the connector can flip
+  // KIT-ness again, the machinery it would call is known to work.
+  const { bumpFulfillmentGraphVersions } = await import('../lib/products/component-graph-edit-guard.ts')
+  resetState()
+
+  state.products.push(imsRow({ id: 'ims-kit', sku: 'KIT-SKU', type: 'KIT', fulfillmentGraphVersion: 3 }))
+  state.products.push(imsRow({ id: 'ims-parent', sku: 'PARENT-KIT', type: 'KIT', fulfillmentGraphVersion: 8 }))
+  // A BOM above the KIT: a fulfilment leaf, never walked through, so its version must stay put.
+  state.products.push(imsRow({ id: 'ims-bom', sku: 'BOM-PARENT', type: 'BOM', fulfillmentGraphVersion: 4 }))
+  state.components.push({ productId: 'ims-parent', componentId: 'ims-kit' })
+  state.components.push({ productId: 'ims-bom', componentId: 'ims-kit' })
+
+  const bumped = await bumpFulfillmentGraphVersions(
+    txClient as never,
+    'ims-kit',
+    { kind: 'kitness', currentType: 'KIT', nextType: 'SIMPLE' },
+  )
+
+  assert.deepEqual([...bumped].sort(), ['ims-kit', 'ims-parent'])
+  assert.equal(versionOf('KIT-SKU'), 4, 'the flipped product')
+  assert.equal(versionOf('PARENT-KIT'), 9, 'and the KIT above it')
+  assert.equal(versionOf('BOM-PARENT'), 4, 'but not the BOM above it — a BOM is a fulfilment leaf')
 })
