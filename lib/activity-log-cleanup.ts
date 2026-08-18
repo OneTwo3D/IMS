@@ -14,8 +14,15 @@ const DEFAULTS: Record<string, number> = {
  * silently discharges the obligation, and the resolver then reads "no marker" as "already
  * resolved" and can never write the shortfall record (o3d-z82a, Codex review).
  *
- * Anything added here must be a row that something else is responsible for CLEARING. A marker
- * that is resolved is deleted by the resolver, so this exempts only ones still outstanding.
+ * Anything added here must be a row that something else is responsible for CLEARING, and that
+ * responsibility has to be a MECHANISM, not a hope. For the direct-create marker it is
+ * `sweepUnresolvedDirectCreateMarkers`, run from the reallocation-sweep cron: every marker older
+ * than the import's grace window is answered under the order lock and deleted on EVERY outcome —
+ * covered, no demand, handed back to the sweep, recorded as a shortfall, or an order that no
+ * longer exists. An earlier revision claimed this exemption was bounded when the only other
+ * resolver was a WooCommerce redelivery of that same order, which for most orders never arrives;
+ * markers whose own import failed to resolve them accumulated with nothing to clear them (Codex
+ * review r4).
  *
  * The predicate is `<> ALL`, NOT `<> ANY`. `action <> ANY(ARRAY['a','b'])` is true when the
  * action differs from AT LEAST ONE element, so `'a' <> 'b'` alone satisfies it and a row whose

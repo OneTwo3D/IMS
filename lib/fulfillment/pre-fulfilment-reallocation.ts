@@ -223,8 +223,9 @@ export async function recordShortfallUnderLock(params: {
 }): Promise<{ recorded: boolean }> {
   const { tx, orderId, previousStatus, targetStatus } = params
   if (!entersFulfilment(previousStatus, targetStatus)) return { recorded: false }
-  return writeShortfallRecord(tx, orderId, {
-    reachedStatus: targetStatus,
+  const { order, short } = await readCoverageUnderLock(tx, orderId)
+  if (!order || !short) return { recorded: false }
+  return writeShortfallRecord(tx, order, {
     how: `crossed ${previousStatus} -> ${targetStatus}`,
     metadata: { previousStatus, targetStatus },
   })
@@ -262,45 +263,128 @@ export function directCreateMarker(orderId: string, createdStatus: string): Pris
 }
 
 /**
- * Is there an outstanding marker for this order? A LOCK-FREE pre-check, so the common case never
- * pays for the resolve.
+ * The o3d-9lx sweep's own eligible set, mirrored from REALLOCATION_ELIGIBLE_STATUSES in
+ * lib/fulfillment/reallocation-sweep.ts.
  *
- * Almost no order has one: only a WooCommerce import mapped to PICKING/PACKING writes one, and
- * the create path clears it moments later. Every other import, and every redelivery of every
- * order ever imported, would otherwise open an interactive transaction and take an exclusive
- * `SELECT ... FOR UPDATE` on the sales order purely to discover there is nothing to do — on the
- * hot webhook path, contending with allocation and dispatch for that row.
- *
- * Racing the marker's creation costs nothing. A marker written after this read is resolved by
- * the create path's own call; if that fails, the marker survives (that is its whole purpose) and
- * the next redelivery picks it up. Missing it here defers the resolve, it never discharges it.
- *
- * Indexed by `@@index([entityType, entityId])` on activity_logs.
+ * An order sitting in one of these is not "out of reach" at all: the sweep re-selects it on
+ * every rotation, and if it later crosses back INTO fulfilment that crossing is a status
+ * transition, which `recordShortfallUnderLock` already covers. So the direct-create obligation
+ * has a real owner again — this is a HANDOFF to a named mechanism, not the assumption that
+ * leaving a status made the question go away.
  */
-export async function hasDirectCreateMarker(
-  client: Prisma.TransactionClient | typeof db,
-  orderId: string,
-): Promise<boolean> {
-  const marker = await client.activityLog.findFirst({
-    where: { entityType: 'SALES_ORDER', entityId: orderId, action: DIRECT_CREATE_PENDING_ACTION },
-    select: { id: true },
-  })
-  return marker !== null
+const AUTOMATICALLY_REVISITED_STATUSES = new Set(['PROCESSING', 'ALLOCATED'])
+
+/**
+ * Statuses in which there is NO DEMAND left to cover.
+ *
+ * CANCELLED alone. `cancelSalesOrderFulfillmentState` releases every reservation and DELETES
+ * every OrderAllocation row, so a cancelled order reads as maximally short while in fact owing
+ * nothing at all. This is a statement about DEMAND, and it is the only reason "the order left
+ * PICKING" may ever end in silence.
+ *
+ * SHIPPED / COMPLETED / DELIVERED are deliberately NOT here, and that is the correction (Codex
+ * review r4). Dispatch decrements reservedQty but RETAINS the OrderAllocation rows, so
+ * `OrderAllocation.qty` still equals outstanding demand plus every committed non-PENDING
+ * shipment line. An order that shipped everything it was allocated therefore reads as COVERED on
+ * its own and needs no special case; an order that still reads SHORT after shipping SHIPPED
+ * SHORT — which is precisely the fact this whole feature exists to record, and which the earlier
+ * "has it left fulfilment?" test discarded.
+ */
+const NO_DEMAND_STATUSES = new Set(['CANCELLED'])
+
+/**
+ * What is true about this order's demand RIGHT NOW — the question every caller actually has.
+ *
+ *   order-missing  the order is gone; there is nothing to describe.
+ *   no-demand      there is nothing to cover (CANCELLED).
+ *   covered        OrderAllocation covers net demand. Includes a fully shipped order, whose
+ *                  allocation rows are retained, and a fully refunded one.
+ *   handed-back    short, but the order is back in the sweep's eligible set, which will
+ *                  revisit it — and a later crossing into fulfilment is recorded by the
+ *                  transition path.
+ *   uncovered      short, and NOTHING will cover it automatically. The recordable case.
+ */
+export type DemandVerdict = 'order-missing' | 'no-demand' | 'covered' | 'handed-back' | 'uncovered'
+
+type LockedOrder = {
+  id: string
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  status: string
+  refundStatus: string | null
+  lines: Array<{ id: string; qty: unknown; productId: string | null }>
 }
 
 /**
- * Resolve the marker: verify coverage under the order lock, record a shortfall if there is one,
- * and clear the marker either way.
+ * ONE read of the order, serving both the status question and the coverage question.
  *
- * The marker — not the order's current status — is the provenance AND the idempotency key. No
- * marker means already resolved, so this is safe to call repeatedly; and the created status is
- * read back from the marker rather than inferred. It is re-read HERE, under the caller's lock:
- * `hasDirectCreateMarker` is an optimisation outside the lock and is never the decision.
+ * It used to be two `findUnique` calls with different selects — which meant every test double
+ * had to discriminate them by whether `status` appeared in the select, and a double that got
+ * that wrong answered the wrong question silently. One read, one shape, nothing to discriminate.
+ */
+async function readCoverageUnderLock(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<{ order: LockedOrder | null; short: boolean }> {
+  const order = (await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      id: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      status: true,
+      // The coverage selector treats FULL as unconditional zero demand, matching
+      // allocateSalesOrder. Omitting it would make a fully-refunded order look short forever.
+      refundStatus: true,
+      lines: { select: { id: true, qty: true, productId: true } },
+    },
+  })) as LockedOrder | null
+  if (!order) return { order: null, short: false }
+  const short = (await selectOrdersNeedingAllocation([order], undefined, tx)).length > 0
+  return { order, short }
+}
+
+/**
+ * Is the demand covered, and if not, will anything cover it? Decided from the ORDER's own state
+ * under the caller's lock — never from the fact that a status was left or a marker row vanished.
+ */
+export async function assessDemandCoverage(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<{ verdict: DemandVerdict; order: LockedOrder | null }> {
+  const { order, short } = await readCoverageUnderLock(tx, orderId)
+  if (!order) return { verdict: 'order-missing', order: null }
+  if (NO_DEMAND_STATUSES.has(order.status)) return { verdict: 'no-demand', order }
+  if (!short) return { verdict: 'covered', order }
+  if (AUTOMATICALLY_REVISITED_STATUSES.has(order.status)) return { verdict: 'handed-back', order }
+  return { verdict: 'uncovered', order }
+}
+
+/**
+ * Resolve the marker: answer the coverage question under the order lock, record a shortfall when
+ * the demand is genuinely uncovered, and clear the marker.
+ *
+ * THE MARKER IS THE PROVENANCE AND THE IDEMPOTENCY KEY. No marker means already resolved, so
+ * this is safe to call repeatedly, and the created status is read back from the marker rather
+ * than inferred from the order's current one.
+ *
+ * WHAT COUNTS AS RESOLUTION (Codex review r4). Not "the order left PICKING/PACKING" — an order
+ * leaves that status cancelled, dispatched short, or moved back, and only one of those three is
+ * the shortfall being covered. The obligation is discharged only against `assessDemandCoverage`:
+ * the demand is covered, or there is no demand, or something else now owns covering it. Every
+ * other outcome is the record being written. In particular a SHIPPED order that still reads
+ * short shipped short, and now gets the record the previous "it has left fulfilment, the
+ * question is moot" rule silently threw away.
+ *
+ * IT ALWAYS TERMINATES. Every branch clears the marker, including one whose metadata cannot be
+ * read — the created status is then reported as unknown rather than left as a row nothing will
+ * ever clear. That is what makes the retention exemption in lib/activity-log-cleanup.ts bounded
+ * rather than an unbounded leak.
  */
 export async function resolveDirectCreateMarker(params: {
   tx: Prisma.TransactionClient
   orderId: string
-}): Promise<{ recorded: boolean; resolved: boolean }> {
+}): Promise<{ recorded: boolean; resolved: boolean; verdict: DemandVerdict | 'no-marker' }> {
   const { tx, orderId } = params
 
   const marker = await tx.activityLog.findFirst({
@@ -308,32 +392,24 @@ export async function resolveDirectCreateMarker(params: {
     select: { id: true, metadata: true },
     orderBy: { createdAt: 'asc' },
   })
-  if (!marker) return { recorded: false, resolved: false }
+  // Already resolved — by this order's own import, or by a concurrent resolver that got the lock
+  // first. Either way the question has been answered once, which is all it needs.
+  if (!marker) return { recorded: false, resolved: false, verdict: 'no-marker' }
 
   const metadata = marker.metadata as { createdAtStatus?: unknown } | null
   const createdStatus = typeof metadata?.createdAtStatus === 'string' ? metadata.createdAtStatus : null
-  if (!createdStatus) return { recorded: false, resolved: false }
 
-  // Creation STATUS is durable; creation-time COVERAGE is not. Coverage is read now, so a
-  // resolve deferred past the order leaving fulfilment would describe a different world: a
-  // fully covered order created at PICKING, whose first resolve timed out and which was then
-  // CANCELLED, has its allocations deleted — and the deferred read would see zero coverage and
-  // write an authoritative record claiming it was created under-allocated (Codex review).
-  //
-  // Once the order has left fulfilment the question is moot either way: cancelled needs no
-  // allocation, and shipped already consumed what it had. So clear the marker and record
-  // nothing, rather than assert something about a moment we can no longer observe.
-  const current = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
-  if (!current || !isFulfilmentStatus(current.status)) {
-    await tx.activityLog.deleteMany({ where: { id: marker.id } })
-    return { recorded: false, resolved: true }
+  const { verdict, order } = await assessDemandCoverage(tx, orderId)
+
+  let recorded = false
+  if (verdict === 'uncovered' && order) {
+    ({ recorded } = await writeShortfallRecord(tx, order, {
+      how: createdStatus
+        ? `was created directly at ${createdStatus}`
+        : 'was created directly into fulfilment',
+      metadata: { previousStatus: null, createdAtStatus: createdStatus, currentStatus: order.status },
+    }))
   }
-
-  const result = await writeShortfallRecord(tx, orderId, {
-    reachedStatus: createdStatus,
-    how: `was created directly at ${createdStatus}`,
-    metadata: { previousStatus: null, createdAtStatus: createdStatus },
-  })
 
   // Cleared in the SAME transaction as the record, so if the record could not be written the
   // marker survives with it and the two can never disagree.
@@ -342,12 +418,97 @@ export async function resolveDirectCreateMarker(params: {
   // roll back the shortfall record we just wrote, losing BOTH (Codex review). Clearing a marker
   // that is already gone is exactly the no-op it should be.
   await tx.activityLog.deleteMany({ where: { id: marker.id } })
-  return { recorded: result.recorded, resolved: true }
+  return { recorded, resolved: true, verdict }
 }
 
 /**
- * Shared by both entry points: read the order under the caller's lock, decide coverage against
- * the same client, and write the record in the SAME transaction.
+ * How long a marker belongs to the import that wrote it before anything else may decide it.
+ *
+ * This is a SCHEDULING gate, not a verdict. Between the create transaction committing and the
+ * importer's own `autoAllocateOrder` finishing, the order genuinely has no allocations yet — and
+ * a resolver that looked then would read "short", record a shortfall for an order about to be
+ * allocated, and discharge the marker so the real answer could never be written (Codex review
+ * r4). The importer's allocation takes the same `FOR UPDATE` row lock this sweep does, so once
+ * that allocation has STARTED the two are already serialised; the window this closes is only the
+ * gap before it starts, and the grace is several times the import's own 20s transaction budget.
+ *
+ * Past it, an import that never allocated is an import that DIED, and "uncovered" is then the
+ * true answer rather than a premature one.
+ */
+export const DIRECT_CREATE_RESOLVE_GRACE_SECONDS = 120
+
+/** Bound the work per tick, like every other sweep here. */
+const DIRECT_CREATE_SWEEP_LIMIT = 200
+
+export type DirectCreateMarkerSweepResult = {
+  scanned: number
+  recorded: number
+  resolved: number
+  errors: number
+}
+
+/**
+ * THE BOUNDED RESOLUTION MECHANISM for direct-create markers (o3d-z82a, Codex review r4).
+ *
+ * The marker is exempt from activity-log retention because deleting it would silently discharge
+ * an open obligation. That exemption is only defensible if something is guaranteed to CLEAR the
+ * marker; before this, the only other resolver was a WooCommerce redelivery of that same order,
+ * which for most orders never arrives — so an import whose own resolve failed left a row nothing
+ * would ever touch again, and the exemption accumulated without limit.
+ *
+ * It also replaces the redelivery resolve outright, which is why the hot webhook path now pays
+ * NOTHING for this feature: an import that did not write a marker does not look for one, and a
+ * redelivery never looks at all. The lock-free pre-check it used to need is gone with it, along
+ * with the race that pre-check could not close.
+ */
+export async function sweepUnresolvedDirectCreateMarkers(
+  options: { limit?: number; graceSeconds?: number } = {},
+): Promise<DirectCreateMarkerSweepResult> {
+  const limit = options.limit ?? DIRECT_CREATE_SWEEP_LIMIT
+  const graceSeconds = options.graceSeconds ?? DIRECT_CREATE_RESOLVE_GRACE_SECONDS
+
+  // Aged on the DATABASE clock, not this process's. One row per order (an order can only be
+  // created once, but GROUP BY makes a duplicate marker one unit of work rather than two).
+  const rows = await db.$queryRaw<Array<{ entityId: string }>>`
+    SELECT "entityId"
+    FROM "activity_logs"
+    WHERE "entityType" = 'SALES_ORDER'
+      AND action = ${DIRECT_CREATE_PENDING_ACTION}
+      AND "createdAt" < NOW() - make_interval(secs => CAST(${graceSeconds} AS double precision))
+    GROUP BY "entityId"
+    ORDER BY MIN("createdAt") ASC
+    LIMIT ${limit}
+  `
+
+  const result: DirectCreateMarkerSweepResult = { scanned: rows.length, recorded: 0, resolved: 0, errors: 0 }
+  if (rows.length === 0) return result
+
+  // Dynamic, matching the allocator import above: the lock helper lives in the allocation
+  // service, and pulling it in statically would put that whole module on the import path of
+  // every caller of this file, including the WooCommerce order importer.
+  const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+
+  for (const row of rows) {
+    try {
+      const outcome = await db.$transaction(async (tx) => {
+        await lockSalesOrder(tx, row.entityId)
+        return resolveDirectCreateMarker({ tx, orderId: row.entityId })
+      }, { maxWait: 5_000, timeout: 20_000 })
+      if (outcome.resolved) result.resolved += 1
+      if (outcome.recorded) result.recorded += 1
+    } catch (error) {
+      // One poison order must not stop the rest of the page; it is retried next tick.
+      result.errors += 1
+      console.error(`[direct-create-sweep] could not resolve the marker for ${row.entityId}:`, error)
+    }
+  }
+
+  return result
+}
+
+/**
+ * Shared by both entry points: write the record in the SAME transaction as the decision, against
+ * the order the caller already read under its lock.
  *
  * Never logActivity — it swallows its own insert failures by design ("never break the caller"),
  * so routing the authoritative record through it meant claiming `recorded: true` for a row that
@@ -356,26 +517,9 @@ export async function resolveDirectCreateMarker(params: {
  */
 async function writeShortfallRecord(
   tx: Prisma.TransactionClient,
-  orderId: string,
-  context: { reachedStatus: string; how: string; metadata: Record<string, unknown> },
+  order: LockedOrder,
+  context: { how: string; metadata: Record<string, unknown> },
 ): Promise<{ recorded: boolean }> {
-  const order = (await tx.salesOrder.findUnique({
-    where: { id: orderId },
-    select: {
-      id: true,
-      orderNumber: true,
-      externalOrderNumber: true,
-      refundStatus: true,
-      lines: { select: { id: true, qty: true, productId: true } },
-    },
-  })) as
-    | { id: string; orderNumber: string | null; externalOrderNumber: string | null; refundStatus: string | null; lines: Array<{ id: string; qty: unknown; productId: string | null }> }
-    | null
-  if (!order) return { recorded: false }
-
-  const short = await selectOrdersNeedingAllocation([order], undefined, tx)
-  if (short.length === 0) return { recorded: false }
-
   await tx.activityLog.create({
     data: {
       entityType: 'SALES_ORDER',

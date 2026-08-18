@@ -15,7 +15,7 @@ import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { directCreateMarker, hasDirectCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
+import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import { addMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -361,26 +361,32 @@ async function updateExistingWcOrderFromPayload(
 }
 
 /**
- * Resolve the direct-create marker: verify coverage under the order lock, record a shortfall if
- * there is one, and clear the marker.
+ * Resolve the direct-create marker THIS import just wrote: answer the coverage question under
+ * the order lock, record a shortfall if the demand is genuinely uncovered, and clear the marker.
  *
- * NON-FATAL BY DESIGN. The order and its allocation are already committed by the time this
- * runs, so failing the import undoes nothing — it only produces a retry that returns from the
+ * CALLED ONLY BY THE PATH THAT CREATED THE MARKER, and only after that path's own
+ * `autoAllocateOrder` has finished. That ordering is the correctness argument: before the
+ * allocation runs the order has no allocation rows at all, so anything that answered the
+ * coverage question in that window would read "short", record a shortfall for an order about to
+ * be covered, and clear the marker so the true answer could never be written. The redelivery
+ * path used to do exactly that (Codex review r4); marker recovery now belongs to
+ * `sweepUnresolvedDirectCreateMarkers`, which waits out the import's grace window first.
+ *
+ * It is also why the hot webhook path pays nothing: an import that wrote no marker never calls
+ * this, and a redelivery never calls it at all — cheaper than the lock-free pre-check this
+ * replaces, which still cost one indexed query on every import of every order.
+ *
+ * NON-FATAL BY DESIGN. The order and its allocation are already committed by the time this runs,
+ * so failing the import undoes nothing — it only produces a retry that returns from the
  * already-imported branch without repairing anything. The MARKER is what makes that safe: it is
  * written atomically with the order, so if this never succeeds the marker still stands as a
- * visible WARNING that coverage was never verified. Swallowing here loses nothing; the signal
- * is already durable.
+ * visible WARNING that coverage was never verified, and the sweep picks it up.
  *
  * A longer budget than Prisma's 5s default, matching the transition path: the coverage check
  * loads the fulfilment product graph and a KIT-heavy order can genuinely take longer.
  */
 async function resolveDirectCreateShortfall(orderId: string): Promise<void> {
   try {
-    // Lock-free pre-check FIRST. Almost no order has a marker, and without this every import
-    // and every redelivery would open a transaction and take an exclusive row lock on the sales
-    // order just to find nothing to do. Re-read under the lock below, so this only ever skips
-    // work — see hasDirectCreateMarker for why losing a race here discharges nothing.
-    if (!(await hasDirectCreateMarker(db, orderId))) return
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
       await resolveDirectCreateMarker({ tx, orderId })
@@ -406,11 +412,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     if (existing) {
       await updateExistingWcOrderFromPayload(existing.id, wcOrder)
       if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, existing.id)
-      // o3d-z82a: a redelivery finishes verification an earlier attempt failed to complete.
-      // Keyed on the MARKER, so it is a cheap indexed miss for every ordinary redelivery and,
-      // crucially, does not depend on the order's current status — which by now may be
-      // anything, and never told us where the order STARTED.
-      await resolveDirectCreateShortfall(existing.id)
+      // o3d-z82a: deliberately NO marker resolution here. A redelivery can arrive while the
+      // import that created the order is still between its create transaction and its
+      // allocation, and resolving then answers the coverage question against an order that has
+      // no allocations YET — recording a shortfall that was about to be covered and discharging
+      // the marker permanently (Codex review r4). An unresolved marker is recovered by
+      // sweepUnresolvedDirectCreateMarkers instead, which waits out the import's grace window.
+      // It also keeps this, the hot path, free of the feature entirely.
       return { success: true, orderId: existing.id }
     }
 
@@ -834,8 +842,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // crossing does not happen. Here the order is already committed by the time this runs, so
     // failing the import undoes nothing — this is non-fatal, and what carries the obligation
     // forward is the MARKER, which was written atomically with the order and survives as a
-    // visible WARNING until some later attempt resolves it.
-    await resolveDirectCreateShortfall(so.id)
+    // visible WARNING until the sweep resolves it.
+    //
+    // Guarded by the SAME condition that wrote the marker, so an import that wrote none does no
+    // work at all rather than querying to discover that. It runs AFTER the allocation above:
+    // resolving before it would read an order that has no allocation rows yet.
+    if (isFulfilmentStatus(lifecycleStatus)) {
+      await resolveDirectCreateShortfall(so.id)
+    }
 
     // Queue accounting sales invoice — only for PROCESSING orders and when
     // accounting is not explicitly skipped (e.g. initial import).

@@ -57,6 +57,23 @@ mock.module('@/app/actions/allocation', {
   },
 })
 
+/** Every `$queryRaw` the sweep issues, so its ageing predicate can be asserted rather than assumed. */
+const rawQueries: Array<{ sql: string; values: unknown[] }> = []
+/** Orders the sweep's candidate query should return, i.e. markers already past the grace window. */
+const agedMarkerOrderIds: string[] = []
+/** Orders whose row lock was taken, in order. */
+const lockedOrders: string[] = []
+/** Per-order transaction clients the sweep should be handed. */
+const sweepTxByOrder = new Map<string, unknown>()
+/** Orders whose resolve transaction should blow up. */
+const sweepTxThrows = new Set<string>()
+
+mock.module('@/lib/domain/sales/allocation-service', {
+  namedExports: {
+    lockSalesOrder: async (_tx: unknown, orderId: string) => { lockedOrders.push(orderId) },
+  },
+})
+
 mock.module('@/lib/db', {
   namedExports: {
     db: {
@@ -64,19 +81,35 @@ mock.module('@/lib/db', {
         findUnique: async ({ where }: { where: { id: string } }) =>
           state.orders.find((order) => order.id === where.id) ?? null,
       },
+      $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        rawQueries.push({ sql: strings.join('?'), values })
+        return agedMarkerOrderIds.map((entityId) => ({ entityId }))
+      },
+      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+        // One client per order, in the order the sweep asks for them.
+        const orderId = agedMarkerOrderIds[sweepTxHandouts++]
+        if (sweepTxThrows.has(orderId)) throw new Error(`lock timeout on ${orderId}`)
+        return fn(sweepTxByOrder.get(orderId) ?? {})
+      },
     },
   },
 })
+let sweepTxHandouts = 0
 
 async function loadHelper() {
   return import('@/lib/fulfillment/pre-fulfilment-reallocation')
 }
 
-function seedOrder(id: string, shipments = 0) {
+function seedOrder(id: string, shipments = 0, status = 'PICKING') {
   state.orders.push({
     id,
     orderNumber: `SO-${id}`,
     externalOrderNumber: null,
+    // ONE shape, carrying everything either question needs. The recorder used to read the order
+    // twice with different selects, which forced every double to guess which read it was serving
+    // from the presence of `status` in the select — a double that guessed wrong answered the
+    // wrong question in silence.
+    status,
     refundStatus: null,
     lines: [{ id: `${id}-l1`, qty: 5, productId: 'p1' }],
     _count: { shipments },
@@ -84,6 +117,12 @@ function seedOrder(id: string, shipments = 0) {
 }
 
 function reset() {
+  rawQueries.length = 0
+  agedMarkerOrderIds.length = 0
+  lockedOrders.length = 0
+  sweepTxByOrder.clear()
+  sweepTxThrows.clear()
+  sweepTxHandouts = 0
   state.orders.length = 0
   state.activity.length = 0
   state.allocateCalls.length = 0
@@ -425,17 +464,21 @@ test('the coverage selector reads EVERYTHING through one client (o3d-c9mi)', asy
 })
 
 /**
- * A transaction stub for the marker-based recorder. It serves the MARKER lookup, the order
- * read, the record insert and the marker delete — so a stub missing any of them would make the
- * corresponding guard untestable.
+ * A transaction stub for the marker-based recorder.
+ *
+ * It serves the MARKER lookup, the ORDER read, the record insert and the marker delete. There is
+ * deliberately nothing to discriminate any more: the recorder reads the order ONCE, so this stub
+ * returns one shape and cannot answer the wrong question by mistake. The previous version keyed
+ * off whether `status` appeared in the select, which quietly stopped being true the moment the
+ * two reads were merged.
  */
 function markerTx(
   orderId: string,
   written: Row[],
   marker: { id: string; metadata: unknown } | null = { id: 'm1', metadata: { orderId, createdAtStatus: 'PICKING' } },
-  currentStatus = 'PICKING',
 ) {
   const deleted: string[] = []
+  const selects: Array<Record<string, unknown>> = []
   const tx = {
     activityLog: {
       findFirst: async () => marker,
@@ -443,13 +486,13 @@ function markerTx(
       deleteMany: async ({ where }: { where: { id: string } }) => { deleted.push(where.id); return { count: 1 } },
     },
     salesOrder: {
-      findUnique: async ({ select }: { select?: Record<string, unknown> }) =>
-        select && 'status' in select
-          ? { status: currentStatus }
-          : state.orders.find((o) => o.id === orderId) ?? null,
+      findUnique: async ({ select }: { select?: Record<string, unknown> }) => {
+        selects.push(select ?? {})
+        return state.orders.find((o) => o.id === orderId) ?? null
+      },
     },
   } as never
-  return { tx, deleted }
+  return { tx, deleted, selects }
 }
 
 test('the marker carries the CREATION status, not the current one (o3d-z82a)', async () => {
@@ -460,7 +503,7 @@ test('the marker carries the CREATION status, not the current one (o3d-z82a)', a
   // and lose its record permanently.
   const { directCreateMarker, resolveDirectCreateMarker } = await loadHelper()
   reset()
-  seedOrder('o30')
+  seedOrder('o30', 0, 'PACKING')
   state.short.add('o30')
 
   const marker = directCreateMarker('o30', 'PICKING')
@@ -468,15 +511,39 @@ test('the marker carries the CREATION status, not the current one (o3d-z82a)', a
   assert.deepEqual(marker.metadata, { orderId: 'o30', createdAtStatus: 'PICKING' })
   assert.equal(marker.level, 'WARNING', 'an unresolved marker must itself be visible')
 
-  // Still in fulfilment: the record is written, and says PICKING regardless of any later move.
+  // Still uncovered: the record is written, and says PICKING regardless of any later move.
   const written: Row[] = []
-  const { tx, deleted } = markerTx('o30', written, { id: 'm1', metadata: marker.metadata }, 'PACKING')
+  const { tx, deleted } = markerTx('o30', written, { id: 'm1', metadata: marker.metadata })
   const result = await resolveDirectCreateMarker({ tx, orderId: 'o30' })
 
-  assert.deepEqual(result, { recorded: true, resolved: true })
+  assert.deepEqual(result, { recorded: true, resolved: true, verdict: 'uncovered' })
   assert.match(String(written[0]?.description), /was created directly at PICKING/)
-  assert.deepEqual(written[0]?.metadata, { orderId: 'o30', previousStatus: null, createdAtStatus: 'PICKING' })
+  assert.deepEqual(written[0]?.metadata, {
+    orderId: 'o30',
+    previousStatus: null,
+    createdAtStatus: 'PICKING',
+    currentStatus: 'PACKING',
+  })
   assert.deepEqual(deleted, ['m1'], 'the marker must be cleared in the same transaction')
+})
+
+test('the order is read ONCE, so no double has to guess which read it is serving (o3d-z82a)', async () => {
+  // Two findUnique calls with different selects is what forced `markerTx` to discriminate on
+  // whether `status` was in the select. That discrimination is invisible when it breaks: merge
+  // the reads and a stub built for the old shape keeps answering, with the wrong row.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o34', 0, 'PICKING')
+  state.short.add('o34')
+  const written: Row[] = []
+  const { tx, selects } = markerTx('o34', written)
+
+  await resolveDirectCreateMarker({ tx, orderId: 'o34' })
+
+  assert.equal(selects.length, 1, 'exactly one order read under the lock')
+  for (const field of ['status', 'lines', 'refundStatus', 'orderNumber', 'externalOrderNumber']) {
+    assert.ok(field in selects[0], `the single read must carry ${field}`)
+  }
 })
 
 test('no marker means already resolved, so this is safe to call repeatedly (o3d-z82a)', async () => {
@@ -490,9 +557,32 @@ test('no marker means already resolved, so this is safe to call repeatedly (o3d-
   const written: Row[] = []
   const { tx, deleted } = markerTx('o31', written, null)
 
-  assert.deepEqual(await resolveDirectCreateMarker({ tx, orderId: 'o31' }), { recorded: false, resolved: false })
+  assert.deepEqual(
+    await resolveDirectCreateMarker({ tx, orderId: 'o31' }),
+    { recorded: false, resolved: false, verdict: 'no-marker' },
+  )
   assert.equal(written.length, 0)
   assert.equal(deleted.length, 0)
+})
+
+test('a marker resolved concurrently under the lock is a clean no-op, not a second record (o3d-z82a)', async () => {
+  // The sweep selects a marker, then blocks on the order lock while the import that created it
+  // resolves the marker and commits. When the sweep finally gets the lock the row is gone. It
+  // must not read that as "nothing was ever resolved" and it must not write a second record for
+  // an order whose question has already been answered once.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o35', 0, 'PICKING')
+  state.short.add('o35') // still short — so a second record WOULD be written if the guard failed
+  const written: Row[] = []
+  const { tx, deleted, selects } = markerTx('o35', written, null)
+
+  const result = await resolveDirectCreateMarker({ tx, orderId: 'o35' })
+
+  assert.deepEqual(result, { recorded: false, resolved: false, verdict: 'no-marker' })
+  assert.equal(written.length, 0, 'the question was already answered; do not answer it twice')
+  assert.equal(deleted.length, 0)
+  assert.equal(selects.length, 0, 'and it must not even pay for the coverage read')
 })
 
 test('a covered order clears its marker without recording a shortfall (o3d-z82a)', async () => {
@@ -502,25 +592,250 @@ test('a covered order clears its marker without recording a shortfall (o3d-z82a)
   const written: Row[] = []
   const { tx, deleted } = markerTx('o32', written)
 
-  assert.deepEqual(await resolveDirectCreateMarker({ tx, orderId: 'o32' }), { recorded: false, resolved: true })
+  assert.deepEqual(
+    await resolveDirectCreateMarker({ tx, orderId: 'o32' }),
+    { recorded: false, resolved: true, verdict: 'covered' },
+  )
   assert.equal(written.length, 0, 'a covered order is not a shortfall')
   assert.deepEqual(deleted, ['m1'], 'but its marker must still be cleared — coverage WAS verified')
 })
 
-test('a marker with no readable created status is left alone (o3d-z82a)', async () => {
-  // Better to leave a visible unresolved marker than to guess a status and write a false record.
+test('a marker with no readable created status is still resolved, with the status unknown (o3d-z82a)', async () => {
+  // It used to be left alone "so the problem stays visible". Nothing looked at it: the row was
+  // exempt from retention and no mechanism cleared it, so "visible" meant an activity_logs row
+  // accumulating forever. What we do NOT know is which status it was created at; that it entered
+  // fulfilment uncovered is known, and is the part worth recording.
   const { resolveDirectCreateMarker } = await loadHelper()
   reset()
-  seedOrder('o33')
+  seedOrder('o33', 0, 'PICKING')
   state.short.add('o33')
   const written: Row[] = []
   const { tx, deleted } = markerTx('o33', written, { id: 'm1', metadata: { orderId: 'o33' } })
 
-  assert.deepEqual(await resolveDirectCreateMarker({ tx, orderId: 'o33' }), { recorded: false, resolved: false })
-  assert.equal(written.length, 0)
-  assert.equal(deleted.length, 0, 'the marker must survive so the problem stays visible')
+  assert.deepEqual(
+    await resolveDirectCreateMarker({ tx, orderId: 'o33' }),
+    { recorded: true, resolved: true, verdict: 'uncovered' },
+  )
+  assert.match(String(written[0]?.description), /was created directly into fulfilment/)
+  assert.equal((written[0]?.metadata as Row).createdAtStatus, null, 'reported as unknown, never guessed')
+  assert.deepEqual(deleted, ['m1'], 'and it must terminate, or the retention exemption is unbounded')
 })
 
+test('LEAVING PICKING is not the shortfall clearing — an order still short is recorded (o3d-z82a)', async () => {
+  // THE CORRECTION. The old rule discharged the marker whenever the order was no longer in
+  // PICKING/PACKING, on the reasoning that "shipped already consumed what it had". It has not:
+  // dispatch decrements reservedQty but RETAINS the OrderAllocation rows, so OrderAllocation.qty
+  // still equals outstanding demand plus every committed shipment line. An order that shipped
+  // everything it was allocated therefore reads as covered by itself — and one that still reads
+  // SHORT after leaving shipped short, or was put on hold short, which is exactly the fact this
+  // feature exists to record and the old rule silently threw away.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  for (const status of ['SHIPPED', 'COMPLETED', 'DELIVERED', 'ON_HOLD']) {
+    reset()
+    seedOrder('o41', 0, status)
+    state.short.add('o41')
+    const written: Row[] = []
+    const { tx, deleted } = markerTx('o41', written)
+
+    assert.deepEqual(
+      await resolveDirectCreateMarker({ tx, orderId: 'o41' }),
+      { recorded: true, resolved: true, verdict: 'uncovered' },
+      `${status} — the demand is still uncovered and nothing will cover it`,
+    )
+    assert.equal((written[0]?.metadata as Row).currentStatus, status, 'the record says where it ended up')
+    assert.deepEqual(deleted, ['m1'])
+  }
+})
+
+test('a CANCELLED order has no demand to cover, so nothing is recorded (o3d-z82a)', async () => {
+  // The one case where silence is right, and it is a statement about DEMAND rather than about
+  // which status was left. cancelSalesOrderFulfillmentState releases the reservations and DELETES
+  // every OrderAllocation row, so a cancelled order reads as maximally short while owing nothing.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o42', 0, 'CANCELLED')
+  state.short.add('o42')
+  const written: Row[] = []
+  const { tx, deleted } = markerTx('o42', written)
+
+  assert.deepEqual(
+    await resolveDirectCreateMarker({ tx, orderId: 'o42' }),
+    { recorded: false, resolved: true, verdict: 'no-demand' },
+  )
+  assert.equal(written.length, 0, 'no fabricated shortfall for an order that owes nothing')
+  assert.deepEqual(deleted, ['m1'], 'but the marker must still be cleared, not left dangling')
+})
+
+test('an order back in the sweep\'s set is handed over, not recorded (o3d-z82a)', async () => {
+  // PROCESSING and ALLOCATED are the reallocation sweep's own eligible statuses, so the order WILL
+  // be revisited — and if it crosses into fulfilment again that crossing is a status transition,
+  // which recordShortfallUnderLock covers. This is a handoff to a named mechanism, which is what
+  // makes it a resolution rather than the assumption that leaving a status ended the question.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  for (const status of ['PROCESSING', 'ALLOCATED']) {
+    reset()
+    seedOrder('o43', 0, status)
+    state.short.add('o43')
+    const written: Row[] = []
+    const { tx, deleted } = markerTx('o43', written)
+
+    assert.deepEqual(
+      await resolveDirectCreateMarker({ tx, orderId: 'o43' }),
+      { recorded: false, resolved: true, verdict: 'handed-back' },
+      `${status} is inside the sweep's reach`,
+    )
+    assert.equal(written.length, 0)
+    assert.deepEqual(deleted, ['m1'])
+  }
+})
+
+test('an order that no longer exists resolves its marker instead of stranding it (o3d-z82a)', async () => {
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset() // nothing seeded
+  const written: Row[] = []
+  const { tx, deleted } = markerTx('gone-o44', written)
+
+  assert.deepEqual(
+    await resolveDirectCreateMarker({ tx, orderId: 'gone-o44' }),
+    { recorded: false, resolved: true, verdict: 'order-missing' },
+  )
+  assert.equal(written.length, 0, 'nothing to describe')
+  assert.deepEqual(deleted, ['m1'])
+})
+
+test('EVERY outcome clears the marker — that is what bounds the retention exemption (o3d-z82a)', async () => {
+  // The activity-log retention exemption is only defensible if something is guaranteed to clear
+  // these rows. A single verdict that returned without deleting would be an unbounded leak of
+  // exempt rows, and it would look exactly like the old "left alone" branch: harmless per row,
+  // permanent in aggregate.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  const cases: Array<[string, string, boolean]> = [
+    ['PICKING', 'uncovered', true],
+    ['CANCELLED', 'no-demand', true],
+    ['PROCESSING', 'handed-back', true],
+    ['SHIPPED', 'uncovered', true],
+  ]
+  for (const [status, verdict] of cases) {
+    reset()
+    seedOrder('o45', 0, status)
+    state.short.add('o45')
+    const written: Row[] = []
+    const { tx, deleted } = markerTx('o45', written)
+    const result = await resolveDirectCreateMarker({ tx, orderId: 'o45' })
+    assert.equal(result.verdict, verdict, status)
+    assert.equal(result.resolved, true, `${status} must terminate`)
+    assert.deepEqual(deleted, ['m1'], `${status} must clear the marker`)
+  }
+  // And the covered case, which has no shortfall to record.
+  reset()
+  seedOrder('o46', 0, 'PICKING')
+  const written: Row[] = []
+  const { tx, deleted } = markerTx('o46', written)
+  const covered = await resolveDirectCreateMarker({ tx, orderId: 'o46' })
+  assert.equal(covered.verdict, 'covered')
+  assert.deepEqual(deleted, ['m1'])
+})
+
+test('the sweep only takes markers past the import\'s grace window, aged on the DB clock (o3d-z82a)', async () => {
+  // The window is a SCHEDULING gate, not a verdict. Between the create transaction committing and
+  // the importer's own autoAllocateOrder finishing, the order has no allocation rows at all — a
+  // resolver that looked then would read "short", record a shortfall for an order about to be
+  // covered, and discharge the marker so the true answer could never be written. Aged with
+  // NOW() in the statement, so a skewed application clock cannot shorten it.
+  const { sweepUnresolvedDirectCreateMarkers, DIRECT_CREATE_RESOLVE_GRACE_SECONDS } = await loadHelper()
+  reset()
+
+  const result = await sweepUnresolvedDirectCreateMarkers()
+
+  assert.deepEqual(result, { scanned: 0, recorded: 0, resolved: 0, errors: 0 })
+  assert.equal(rawQueries.length, 1, 'one indexed candidate query')
+  const { sql, values } = rawQueries[0]
+  assert.match(sql, /NOW\(\) - make_interval/, 'the cutoff must come from the database clock')
+  assert.match(sql, /action = /, 'scoped to the marker action')
+  assert.match(sql, /"entityType" = 'SALES_ORDER'/)
+  assert.match(sql, /ORDER BY MIN\("createdAt"\) ASC/, 'oldest first, so nothing starves')
+  assert.match(sql, /LIMIT /, 'bounded per tick')
+  assert.ok(values.includes(DIRECT_CREATE_RESOLVE_GRACE_SECONDS), 'the grace window is the bound parameter')
+  assert.ok(DIRECT_CREATE_RESOLVE_GRACE_SECONDS > 20, 'it must exceed the import\'s own 20s transaction budget')
+  assert.equal(lockedOrders.length, 0, 'and nothing is locked when there is nothing to resolve')
+})
+
+test('the sweep\'s candidate query is backed by a partial index on the marker action (o3d-z82a)', async () => {
+  // activity_logs is indexed on (entityType, entityId), (createdAt), (tag), (level) and
+  // (level, createdAt). The sweep knows no entityId, so without a partial index on the marker
+  // action this query scans 30-90 days of every action IMS takes, four times an hour, to find a
+  // set that is almost always empty.
+  //
+  // The predicate is a SQL literal — it cannot reference the constant — so a rename would leave
+  // the sweep working while silently reverting to that scan. Assert the pairing, not the index.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const { DIRECT_CREATE_PENDING_ACTION } = await loadHelper()
+  const migration = await readFile(
+    path.join(process.cwd(), 'prisma/migrations/20260818090000_direct_create_marker_sweep_index/migration.sql'),
+    'utf8',
+  )
+
+  assert.match(migration, /CREATE INDEX "activity_logs_direct_create_marker_idx"/)
+  assert.match(migration, /ON "activity_logs" \("createdAt", "entityId"\)/, 'ordered for the ageing scan and the GROUP BY')
+  assert.ok(
+    migration.includes(`WHERE action = '${DIRECT_CREATE_PENDING_ACTION}'`),
+    'the partial predicate must be the SAME action string the sweep queries for',
+  )
+})
+
+test('the sweep resolves each aged marker under its own order lock (o3d-z82a)', async () => {
+  const { sweepUnresolvedDirectCreateMarkers } = await loadHelper()
+  reset()
+  seedOrder('sw1', 0, 'PICKING')
+  seedOrder('sw2', 0, 'PICKING')
+  state.short.add('sw1') // uncovered — recorded
+  // sw2 is covered — resolved, not recorded
+  agedMarkerOrderIds.push('sw1', 'sw2')
+  const writtenA: Row[] = []
+  const writtenB: Row[] = []
+  sweepTxByOrder.set('sw1', markerTx('sw1', writtenA).tx)
+  sweepTxByOrder.set('sw2', markerTx('sw2', writtenB).tx)
+
+  const result = await sweepUnresolvedDirectCreateMarkers()
+
+  assert.deepEqual(result, { scanned: 2, recorded: 1, resolved: 2, errors: 0 })
+  assert.deepEqual(lockedOrders, ['sw1', 'sw2'], 'each resolve holds that order\'s row lock')
+  assert.equal(writtenA.length, 1)
+  assert.equal(writtenB.length, 0)
+})
+
+test('one unresolvable marker does not stop the rest of the page (o3d-z82a)', async () => {
+  // A marker whose order lock cannot be taken is retried next tick; starving the page behind it
+  // would be a second way for the retention exemption to grow without bound.
+  const { sweepUnresolvedDirectCreateMarkers } = await loadHelper()
+  reset()
+  seedOrder('sw4', 0, 'PICKING')
+  state.short.add('sw4')
+  agedMarkerOrderIds.push('sw3', 'sw4')
+  sweepTxThrows.add('sw3')
+  const written: Row[] = []
+  sweepTxByOrder.set('sw4', markerTx('sw4', written).tx)
+
+  const result = await sweepUnresolvedDirectCreateMarkers()
+
+  assert.deepEqual(result, { scanned: 2, recorded: 1, resolved: 1, errors: 1 })
+  assert.equal(written.length, 1, 'the order behind the failure is still resolved')
+})
+
+test('the marker sweep is wired into the reallocation-sweep cron (o3d-z82a)', async () => {
+  // It is the ONLY thing that clears a marker whose own import failed to resolve it, so an
+  // unwired sweep is the retention exemption growing without bound again.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'app/api/cron/reallocation-sweep/route.ts'), 'utf8')
+
+  assert.match(source, /sweepUnresolvedDirectCreateMarkers/, 'the route must run the marker sweep')
+  const allocAt = source.indexOf('await sweepUnallocatedProcessingOrders()')
+  const markerAt = source.indexOf('await sweepUnresolvedDirectCreateMarkers()')
+  assert.ok(allocAt !== -1 && markerAt !== -1 && allocAt < markerAt, 'after the allocation pass')
+  assert.match(source, /directCreateMarkers/, 'and its counts must be reported')
+})
 
 test('both entry points share one shortfall writer (o3d-z82a)', async () => {
   // Two writers of the same action string would drift; an operator searching for
@@ -567,18 +882,41 @@ test('the marker is written in the SAME transaction as the order (o3d-z82a)', as
   assert.ok(!/directCreateMarker\(created\.id, imsStatus\)/.test(source), 'not the raw mapping status')
 })
 
-test('the resolver is non-fatal, and keyed on the marker not the status (o3d-z82a)', async () => {
+test('the create path resolves AFTER its own allocation, and only if it wrote a marker (o3d-z82a)', async () => {
+  // ORDERING IS THE CORRECTNESS ARGUMENT. Before autoAllocateOrder runs, the order has no
+  // allocation rows at all, so resolving there reads "short" for an order that is about to be
+  // covered, writes a false record and discharges the marker permanently.
+  //
+  // The guard is also the whole hot-path cost: an import that wrote no marker does no work,
+  // rather than issuing an indexed query to discover it has none.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
+
+  const allocateAt = source.indexOf('const allocation = await autoAllocateOrder(so.id')
+  const resolveAt = source.indexOf('await resolveDirectCreateShortfall(so.id)')
+  assert.ok(allocateAt !== -1, 'the importer still makes its own allocation attempt')
+  assert.ok(resolveAt !== -1, 'the create path resolves its own marker')
+  assert.ok(allocateAt < resolveAt, 'and it must resolve AFTER allocating, never before')
+
+  const guard = source.slice(source.lastIndexOf('if (', resolveAt), resolveAt)
+  assert.match(guard, /isFulfilmentStatus\(lifecycleStatus\)/, 'gated by the same condition that wrote the marker')
+
+  assert.ok(!source.includes('reconcileAllocationBeforeFulfilment'), 'the importer must NOT re-run allocation')
+})
+
+test('the resolver is non-fatal and holds the order lock (o3d-z82a)', async () => {
   // The order and its allocation are already committed when the resolver runs, so failing the
   // import undoes nothing — it only produces a retry that returns from the already-imported
   // branch without repairing anything. The marker is what makes swallowing safe: it survives as
-  // a visible WARNING that coverage was never verified.
+  // a visible WARNING that coverage was never verified, and the sweep picks it up.
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
   const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
 
   const at = source.indexOf('async function resolveDirectCreateShortfall(')
   assert.notEqual(at, -1, 'the resolver helper must exist')
-  const helper = source.slice(at, at + 1000)
+  const helper = source.slice(at, at + 700)
   assert.match(helper, /catch \(error\)/, 'it must not fail the import, and must report rather than pass silently')
   assert.match(helper, /lockSalesOrder\(tx, orderId\)/, 'the resolve must hold the order lock')
   assert.match(helper, /timeout: 20_000/, "the coverage check needs more than Prisma's 5s default")
@@ -587,40 +925,29 @@ test('the resolver is non-fatal, and keyed on the marker not the status (o3d-z82
   // was the unsound inference this replaced.
   assert.match(helper, /resolveDirectCreateShortfall\(orderId: string\)/, 'no status parameter')
   assert.ok(!/resolveDirectCreateShortfall\([^)]*createdStatus/.test(source), 'no status may be threaded in')
-
-  // Both call sites — the create path and the redelivery path.
-  const redeliveryAt = source.indexOf('await updateExistingWcOrderFromPayload(existing.id, wcOrder)')
-  const redelivery = source.slice(redeliveryAt, redeliveryAt + 900)
-  assert.match(redelivery, /await resolveDirectCreateShortfall\(existing\.id\)/, 'a redelivery must finish an unresolved marker')
-  const callAt = redelivery.indexOf('resolveDirectCreateShortfall')
-  const returnAt = redelivery.indexOf('return { success: true, orderId: existing.id }')
-  assert.ok(callAt !== -1 && returnAt !== -1 && callAt < returnAt, 'it must run BEFORE the early return')
-
-  assert.ok(!source.includes('reconcileAllocationBeforeFulfilment'), 'the importer must NOT re-run allocation')
 })
 
-test('an order that has LEFT fulfilment is cleared without a record (o3d-z82a)', async () => {
-  // Creation status is durable; creation-time COVERAGE is not — it is read at resolve time. A
-  // fully covered order created at PICKING whose first resolve timed out, and which was then
-  // CANCELLED (deleting its allocations), would have the deferred read see zero coverage and
-  // write an authoritative record claiming it was created under-allocated. That is a fabricated
-  // historical claim about a moment we can no longer observe.
-  const { resolveDirectCreateMarker } = await loadHelper()
-  for (const status of ['CANCELLED', 'SHIPPED', 'COMPLETED']) {
-    reset()
-    seedOrder('o40')
-    state.short.add('o40') // reads as short NOW, because allocations are gone
-    const written: Row[] = []
-    const { tx, deleted } = markerTx('o40', written, undefined, status)
+test('a REDELIVERY never resolves a marker (o3d-z82a)', async () => {
+  // A redelivery can arrive while the import that created the order is still between its create
+  // transaction and its allocation. Resolving there answers the coverage question against an
+  // order with no allocations YET: it records a shortfall that was about to be covered and
+  // discharges the marker, so the real answer can never be written. A lock-free pre-check cannot
+  // close that — losing the race is not what causes it; WINNING it is.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
 
-    assert.deepEqual(
-      await resolveDirectCreateMarker({ tx, orderId: 'o40' }),
-      { recorded: false, resolved: true },
-      `${status} — the question is moot, so record nothing`,
-    )
-    assert.equal(written.length, 0, 'no fabricated shortfall')
-    assert.deepEqual(deleted, ['m1'], 'but the marker must still be cleared, not left dangling')
-  }
+  const redeliveryAt = source.indexOf('await updateExistingWcOrderFromPayload(existing.id, wcOrder)')
+  assert.notEqual(redeliveryAt, -1)
+  const redelivery = source.slice(redeliveryAt, source.indexOf('return { success: true, orderId: existing.id }', redeliveryAt))
+  assert.ok(
+    !redelivery.includes('await resolveDirectCreateShortfall(existing.id)'),
+    'the hot redelivery path must not resolve markers',
+  )
+  assert.ok(
+    !source.includes('hasDirectCreateMarker'),
+    'and the pre-check that existed to make that resolve cheap is gone with it',
+  )
 })
 
 test('clearing the marker cannot roll back the record it was written with (o3d-z82a)', async () => {
@@ -652,6 +979,19 @@ test('retention cleanup cannot age out an unresolved marker (o3d-z82a)', async (
   assert.ok(source.indexOf('RETAINED_ACTIONS', at) !== -1, 'the exemption must apply to the deleting statement')
 })
 
+test('the retention exemption names the mechanism that bounds it (o3d-z82a)', async () => {
+  // An exemption with no resolver is an unbounded leak, and it was claimed to be bounded twice
+  // before it was. The comment has to name the thing that clears these rows, and that thing has
+  // to exist and be exported.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const cleanup = await readFile(path.join(process.cwd(), 'lib/activity-log-cleanup.ts'), 'utf8')
+  assert.match(cleanup, /sweepUnresolvedDirectCreateMarkers/, 'the bound must be named where the exemption is granted')
+
+  const helper = await readFile(path.join(process.cwd(), 'lib/fulfillment/pre-fulfilment-reallocation.ts'), 'utf8')
+  assert.match(helper, /export async function sweepUnresolvedDirectCreateMarkers\(/, 'and it must exist')
+})
+
 test('the retention exemption uses ALL, not ANY (o3d-z82a)', async () => {
   // `action <> ANY(ARRAY['a','b'])` is true when the action differs from AT LEAST ONE element,
   // so 'a' <> 'b' alone satisfies it and an exempt row is deleted anyway. With a single entry
@@ -667,58 +1007,4 @@ test('the retention exemption uses ALL, not ANY (o3d-z82a)', async () => {
   const statement = source.slice(sqlAt, source.indexOf('RETURNING', sqlAt))
   assert.match(statement, /action <> ALL\(\$\{RETAINED_ACTIONS\}::text\[\]\)/, 'must be <> ALL')
   assert.ok(!/<> ANY\(/.test(statement), '<> ANY is wrong as soon as there is a second entry')
-})
-
-test('the resolve is gated by a LOCK-FREE marker pre-check (o3d-z82a)', async () => {
-  // Almost no order has a marker: only a WooCommerce import mapped to PICKING/PACKING writes
-  // one, and the create path clears it moments later. Without this gate EVERY import and EVERY
-  // redelivery of every order ever imported opened an interactive transaction and took an
-  // exclusive `SELECT ... FOR UPDATE` on the sales order purely to discover there was nothing to
-  // do — on the hot webhook path, contending with allocation and dispatch for that row.
-  const { hasDirectCreateMarker } = await loadHelper()
-
-  const queries: Array<Record<string, unknown>> = []
-  const client = {
-    activityLog: {
-      findFirst: async ({ where, select }: { where: Record<string, unknown>; select: Record<string, unknown> }) => {
-        queries.push({ where, select })
-        return (where.entityId === 'has-one') ? { id: 'm1' } : null
-      },
-    },
-  } as never
-
-  assert.equal(await hasDirectCreateMarker(client, 'has-one'), true)
-  assert.equal(await hasDirectCreateMarker(client, 'has-none'), false)
-  // Indexed lookup only — it must not load the marker's metadata, and it must be scoped to the
-  // marker action or it would match any activity row the order has.
-  assert.deepEqual(queries[0]?.select, { id: true })
-  assert.deepEqual(queries[0]?.where, {
-    entityType: 'SALES_ORDER',
-    entityId: 'has-one',
-    action: 'fulfilment_entry_pending_verification',
-  })
-})
-
-test('the pre-check runs BEFORE the lock, and is never the decision (o3d-z82a)', async () => {
-  // Ordering is the whole point: a pre-check after the transaction opens saves nothing. And the
-  // marker is re-read INSIDE the lock, so racing its creation only defers a resolve — the create
-  // path resolves its own marker, and if that fails the marker survives for the next redelivery.
-  const { readFile } = await import('node:fs/promises')
-  const path = await import('node:path')
-  const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
-
-  const at = source.indexOf('async function resolveDirectCreateShortfall(')
-  const helper = source.slice(at, at + 1200)
-  const checkAt = helper.indexOf('hasDirectCreateMarker(db, orderId)')
-  const txAt = helper.indexOf('db.$transaction')
-  assert.ok(checkAt !== -1, 'the lock-free pre-check must exist')
-  assert.ok(txAt !== -1 && checkAt < txAt, 'it must short-circuit BEFORE the transaction and the lock')
-
-  const guard = await readFile(path.join(process.cwd(), 'lib/fulfillment/pre-fulfilment-reallocation.ts'), 'utf8')
-  const resolveAt = guard.indexOf('export async function resolveDirectCreateMarker(')
-  assert.match(
-    guard.slice(resolveAt, resolveAt + 900),
-    /const marker = await tx\.activityLog\.findFirst\(/,
-    'the authoritative read must still happen under the caller\'s transaction',
-  )
 })
