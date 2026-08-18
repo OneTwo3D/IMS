@@ -407,6 +407,8 @@ Key variables in the `.env` file:
 | `OUTBOX_RETRY_JITTER_MS` | Maximum tail jitter added to retryable IntegrationOutbox failures. Default `30000` (30 seconds); a 5% base-delay floor applies even when set to `0`. |
 | `XERO_CLIENT_ID` | Xero OAuth client ID |
 | `XERO_CLIENT_SECRET` | Xero OAuth client secret |
+| `XERO_ALLOWED_TENANT_IDS` | Comma-separated allow-list of Xero tenant ids (organisation ids) this instance may connect to. Blank/absent means unrestricted. When set, a consent offering no allowed organisation is refused at the callback with nothing stored, and a stored token for a disallowed organisation halts every Xero sync. Requires a restart. |
+| `XERO_ALLOWED_TENANT_NAMES` | The same allow-list expressed as organisation names, matched case-insensitively and unioned with `XERO_ALLOWED_TENANT_IDS`. An organisation whose name contains a comma can only be allow-listed by id. Set one of these on every non-production instance — it is the only tenant control that survives a database reset. |
 | `FX_BASE_CURRENCY` | Installer/default base currency seed for first-run setup. In normal use, the live system base currency is set once in **Settings > Company**. |
 | `PDF_TEMP_DIR` | Temporary directory for PDF generation |
 | `BACKUP_DIR` | Local backup storage directory |

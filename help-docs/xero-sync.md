@@ -14,6 +14,75 @@ One Two Inventory integrates with Xero to keep your accounting records in sync. 
 
 Before connection or sync can be enabled, the Xero organisation base currency must match the IMS base currency configured in **Settings > Company**.
 
+### Which organisation this instance may connect to
+
+**IMS will not guess which Xero organisation to invoice into.** If the person authorising the
+connection has access to more than one organisation — very common for an accountant, a bookkeeper, or
+anyone who also has the Xero Demo company — the consent hands IMS a *list*, and picking one silently is
+how test data ends up in a real ledger. It has happened: a test instance connected to the live
+organisation and posted 150 invoices, 111 contacts, 217 items and 14 payments into it before anyone
+noticed.
+
+So:
+
+- **One organisation on the consent** — the ordinary case — connects exactly as before. Nothing changes.
+- **More than one, and this instance has never been connected** — the connection is **refused**, nothing
+  is stored, and the message names every organisation offered with its tenant id, e.g.
+
+  > Refused: this instance has no pinned Xero organisation and the consent returned 2 organisations, so
+  > IMS will not guess which ledger to invoice into. Offered: Demo Company (UK) [tenantId 5c949ed5-…],
+  > OneTwo3D Ltd [tenantId e7fb4378-…]. Nothing was stored. Choose explicitly: set
+  > `XERO_ALLOWED_TENANT_IDS` to exactly one of the tenantIds above in the server `.env`, restart IMS and
+  > connect again — or remove IMS's access to the other organisations in Xero (My Xero → Connected apps)
+  > so that a single organisation is offered.
+
+  Either route works. The allow-list is the durable one; removing the app's access to the other
+  organisations in Xero is the quicker one if you only ever want the single organisation.
+- **Once connected**, IMS pins that organisation and every later reconnect must match it, exactly as
+  before. Disconnecting clears the pin.
+
+### The organisation allow-list (`XERO_ALLOWED_TENANT_IDS`)
+
+The pin above lives in the **database**. A fresh database has none — a new instance, a reset, a restored
+dump — which is precisely the state the incident happened in. Two environment variables give the same
+protection at a level a database reset cannot erase:
+
+```
+XERO_ALLOWED_TENANT_IDS=5c949ed5-…,e7fb4378-…
+XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)
+```
+
+- Comma-separated. The two lists are a **union**: an organisation is allowed if its id is in one *or* its
+  name is in the other. Names match case-insensitively and ignore extra spacing; an organisation whose
+  name contains a comma can only be listed by id.
+- **Blank or absent means no restriction.** The control is opt-in, so an empty line in `.env` cannot
+  accidentally disable every Xero connection.
+- Changing either value needs an **IMS restart**.
+
+What it does when set:
+
+1. **At connection time** — a consent offering no allowed organisation is refused, nothing is stored,
+   and no Xero data is read or written. If the allow-list names exactly one of the organisations
+   offered, that one is used even without a pin, so a rig can be connected safely without anyone having
+   to pick from a list.
+2. **Every time the stored token is used** — a stored connection to a disallowed organisation stops
+   every Xero sync with a notification naming the organisation. This is what catches a **production
+   database restored onto a test instance**: the token comes with the dump, no consent screen is ever
+   shown, and without this check the instance would carry on syncing into the live ledger.
+3. **Over the database pin** — the environment wins. A pin restored from another environment cannot
+   smuggle its organisation past the allow-list.
+
+**Set it on every non-production instance** (e2e, staging, any restored copy) to the test organisation.
+Production may set it to the live organisation or leave it unset.
+
+Refusals are recorded in the **Activity log** (`xero_connect_refused`, `xero_stored_tenant_refused`), so
+a refusal that happened while nobody was watching the browser is still discoverable.
+
+**QuickBooks** does not have this control. It does not share the same defect — Intuit sends the company
+(`realmId`) in the callback itself, so there is no list to pick from and nothing is chosen silently —
+but it also has no environment allow-list, so a restored database with a QuickBooks token in it is not
+stopped the way a Xero one is.
+
 ### How to get your Xero Client ID and Secret
 
 The Client ID and Client Secret come from a **Xero app** you create in the Xero Developer portal:

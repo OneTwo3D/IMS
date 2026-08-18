@@ -669,6 +669,11 @@ XERO_CLIENT_ID=${XERO_CLIENT_ID}
 XERO_CLIENT_SECRET=${XERO_CLIENT_SECRET}
 XERO_TENANT_ID=
 XERO_TOKEN_PATH=${DATA_DIR}/xero/token.json
+# Allow-list of Xero organisations this instance may use (o3d-9tbz). Comma-separated,
+# ids and names unioned, blank = unrestricted. Set it on every non-production install:
+# it is the only tenant control that survives a database reset.
+# XERO_ALLOWED_TENANT_IDS=
+# XERO_ALLOWED_TENANT_NAMES=
 
 CRON_SECRET=${CRON_SECRET}
 NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}

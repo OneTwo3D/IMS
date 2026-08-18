@@ -504,6 +504,8 @@ Copy `.env.example` to `.env` and configure. Uses **NextAuth.js v5** variable na
 | `XERO_CLIENT_ID` | No | Xero OAuth app client ID | From Xero Developer Portal (app.xero.com) |
 | `XERO_CLIENT_SECRET` | No | Xero OAuth app client secret | From Xero Developer Portal |
 | `XERO_TENANT_ID` | No | Xero tenant/organisation ID (auto-populated after first OAuth) | Retrieved after OAuth flow |
+| `XERO_ALLOWED_TENANT_IDS` | No | Comma-separated allow-list of Xero tenant ids this instance may connect to or keep a stored token for. Blank = unrestricted. | `5c949ed5-…` |
+| `XERO_ALLOWED_TENANT_NAMES` | No | Same allow-list by organisation name (case-insensitive, union with the ids). Set one of these on every non-production instance. | `Demo Company (UK)` |
 
 > Xero OAuth tokens are **not** stored in a file. There is no `XERO_TOKEN_PATH`: the access/refresh
 > tokens are persisted **encrypted in Postgres** (settings/connector rows, decrypted with

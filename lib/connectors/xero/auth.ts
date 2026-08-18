@@ -16,6 +16,9 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clearXeroReferenceCache } from './api'
 import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from './scopes'
+import {
+  isXeroTenantAllowed, readXeroTenantAllowList, selectXeroTenant, storedTenantRefusalMessage,
+} from './tenant-guard'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_CONNECTOR = 'xero'
@@ -145,9 +148,85 @@ async function pinTenantId(tenantId: string): Promise<void> {
   })
 }
 
-function selectTenantConnection(connections: XeroConnection[], expectedTenantId: string | null) {
-  if (!expectedTenantId) return connections[0] ?? null
-  return connections.find((conn) => conn.tenantId === expectedTenantId) ?? null
+/**
+ * Refusals are recorded as well as returned (o3d-9tbz). The incident this guards against was silent for
+ * days; the redirect back to /sync carries the message, but only to whoever happens to be looking at the
+ * browser at that moment. Best-effort: a logging failure must not turn a refusal into a 500.
+ */
+async function logTenantRefusal(reason: string, message: string): Promise<void> {
+  try {
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'sync',
+      action: 'xero_connect_refused',
+      level: 'ERROR',
+      description: message,
+      metadata: { connector: XERO_CONNECTOR, reason },
+    })
+  } catch {
+    // Best-effort only.
+  }
+}
+
+/**
+ * Only warn once per offending tenant, so a blocked instance does not mint a notification per sync tick.
+ * Reset on the first allowed read, so a later violation is announced again.
+ */
+let allowListWarnedTenantId: string | null = null
+
+/**
+ * The env allow-list, enforced against the STORED token rather than the callback (o3d-9tbz).
+ *
+ * The callback check alone would not have stopped the o3d-t74p incident past its first minute: the
+ * connection was established once and then every sync for days ran off the stored token. It is also the
+ * only thing that catches a database restored from another environment with its Xero token still in it,
+ * where no callback ever runs.
+ */
+async function storedTenantAllowed(token: StoredAccountingToken): Promise<boolean> {
+  const allowList = readXeroTenantAllowList()
+  const summary = { tenantId: token.tenantId, tenantName: token.tenantName }
+  if (isXeroTenantAllowed(summary, allowList)) {
+    allowListWarnedTenantId = null
+    return true
+  }
+
+  const message = storedTenantRefusalMessage(summary, allowList)
+  if (allowListWarnedTenantId !== token.tenantId) {
+    allowListWarnedTenantId = token.tenantId
+    try {
+      await logActivity({
+        entityType: 'SYSTEM',
+        tag: 'sync',
+        action: 'xero_stored_tenant_refused',
+        level: 'ERROR',
+        description: message,
+        metadata: { connector: XERO_CONNECTOR, tenantId: token.tenantId },
+      })
+      await notify({ type: 'error', title: 'Xero connection blocked', message, actionUrl: '/sync' })
+    } catch {
+      // Best-effort only — the refusal itself stands either way.
+    }
+  }
+  return false
+}
+
+/**
+ * Why the stored connection is unusable, when the reason is the env allow-list — or null.
+ *
+ * Every Xero call reports a missing token as "Not connected to Xero", which for an allow-list block is
+ * true but useless: the operator sees a disconnection they cannot explain and a Test Connection that
+ * complains about base currency. The api layer substitutes this message so the reason travels with the
+ * failure instead of only into the notification.
+ */
+export async function getStoredTenantBlockReason(): Promise<string | null> {
+  const row = await db.accountingToken.findUnique({
+    where: { connector: XERO_CONNECTOR },
+    select: { tenantId: true, tenantName: true },
+  })
+  if (!row) return null
+  const allowList = readXeroTenantAllowList()
+  if (isXeroTenantAllowed(row, allowList)) return null
+  return storedTenantRefusalMessage(row, allowList)
 }
 
 async function fetchOrganisationBaseCurrency(accessToken: string, tenantId: string): Promise<string | null> {
@@ -193,6 +272,7 @@ async function logRefreshFailure(reason: string): Promise<void> {
 export async function getAccessToken(): Promise<{ accessToken: string; tenantId: string } | null> {
   const token = await readStoredToken()
   if (!token) return null
+  if (!(await storedTenantAllowed(token))) return null
 
   if (token.expiresAt < new Date(Date.now() + REFRESH_EARLY_MS)) {
     const refreshed = await refreshToken()
@@ -302,21 +382,23 @@ export async function exchangeCodeForTokens(
       return { success: false, error: `Failed to fetch Xero connections (HTTP ${connRes.status}): ${connErr}` }
     }
 
-    const connections: XeroConnection[] = await connRes.json()
-    if (!connections.length) {
-      return { success: false, error: 'No Xero organisations found for this app' }
-    }
+    // A revoked authorisation answers 200 with an EMPTY ARRAY rather than an error, so "no organisations"
+    // is a body shape, not a status code. Anything that is not an array is treated the same way: an
+    // unexpected body must not reach .filter() as a crash.
+    const connectionsBody: unknown = await connRes.json()
+    const connections: XeroConnection[] = Array.isArray(connectionsBody) ? connectionsBody as XeroConnection[] : []
 
     const expectedTenantId = await getExpectedTenantId()
-    const conn = selectTenantConnection(connections, expectedTenantId)
-    if (!conn) {
-      return {
-        success: false,
-        error: expectedTenantId
-          ? `Connected Xero organisation does not match the pinned tenant (${expectedTenantId}). Reconnect to the expected organisation or clear the tenant binding before switching.`
-          : 'Unable to resolve a Xero organisation for this app.',
-      }
+    const choice = selectXeroTenant({
+      connections,
+      expectedTenantId,
+      allowList: readXeroTenantAllowList(),
+    })
+    if (!choice.ok) {
+      await logTenantRefusal(choice.reason, choice.error)
+      return { success: false, error: choice.error }
     }
+    const conn = choice.connection
 
     const [organisationBaseCurrency, imsBaseCurrency] = await Promise.all([
       fetchOrganisationBaseCurrency(tokenData.access_token, conn.tenantId),
@@ -359,6 +441,7 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
   refreshInFlight = (async () => {
     const token = await readStoredToken()
     if (!token?.refreshToken) return null
+    if (!(await storedTenantAllowed(token))) return null
 
     if (token.expiresAt >= new Date(Date.now() + REFRESH_EARLY_MS)) {
       return { accessToken: token.accessToken, tenantId: token.tenantId }

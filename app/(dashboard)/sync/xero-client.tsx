@@ -131,6 +131,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [clientSecret, setClientSecret] = useState(init.client_secret ?? init.xero_client_secret ?? init.quickbooks_client_secret ?? '')
   const [msg, setMsg] = useState<string | null>(null)
   const [connectMsg, setConnectMsg] = useState<string | null>(null)
+  const [connectMsgTone, setConnectMsgTone] = useState<'info' | 'error'>('info')
   const [syncMsg, setSyncMsg] = useState<string | null>(null)
   const [accountsMsg, setAccountsMsg] = useState<string | null>(null)
   const [accountsMsgLevel, setAccountsMsgLevel] = useState<'info' | 'warning' | 'error'>('info')
@@ -176,9 +177,11 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     if (success) {
       setConnected(true)
       setTenantName(success)
+      setConnectMsgTone('info')
       setConnectMsg(`Connected to ${success}`)
       window.history.replaceState({}, '', `/sync?connector=${connectorId}`)
     } else if (error) {
+      setConnectMsgTone('error')
       setConnectMsg(`${connectorLabel} error: ${error}`)
       window.history.replaceState({}, '', `/sync?connector=${connectorId}`)
     }
@@ -222,6 +225,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   }
 
   async function handleSaveConnection() {
+    setConnectMsgTone('info')
     setConnectMsg(null)
     setSavingConnection(true)
     const result = await withStepUp(() => saveAccountingConnectionSettings(clientId, clientSecret))
@@ -230,12 +234,14 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       setConnectMsg(result.message ?? 'Connection settings saved.')
       router.refresh()
     } else {
+      setConnectMsgTone('error')
       setConnectMsg(`Failed: ${result.error}`)
     }
   }
 
   async function handleConnect() {
-    if (!clientId || !clientSecret) { setConnectMsg('Enter Client ID and Client Secret.'); return }
+    if (!clientId || !clientSecret) { setConnectMsgTone('error'); setConnectMsg('Enter Client ID and Client Secret.'); return }
+    setConnectMsgTone('info')
     setConnectMsg(null)
     setConnecting(true)
     const result = await withStepUp(() => connectAccountingConnector(clientId, clientSecret, window.location.origin))
@@ -244,11 +250,13 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       setConnectMsg(`Redirecting to ${connectorLabel}…`)
       window.location.href = result.redirectUrl
     } else {
+      setConnectMsgTone('error')
       setConnectMsg(`Failed: ${result.error}`)
     }
   }
 
   async function handleTestConnection() {
+    setConnectMsgTone('info')
     setConnectMsg(null)
     setTestingConnection(true)
     try {
@@ -257,6 +265,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         setConnectMsg(result.message ?? `${connectorLabel} connection test passed.`)
         router.refresh()
       } else {
+        setConnectMsgTone('error')
         setConnectMsg(`Failed: ${result.error ?? `${connectorLabel} connection test failed.`}`)
       }
     } finally {
@@ -266,6 +275,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 
   async function handleDisconnect() {
     if (!confirm(`Disconnect from ${connectorLabel}? Pending sync entries will not be processed until reconnected.`)) return
+    setConnectMsgTone('info')
     setConnectMsg(null)
     setConnecting(true)
     const result = await disconnectAccountingConnector()
@@ -276,6 +286,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       setConnectMsg(`Disconnected from ${connectorLabel}.`)
       router.refresh()
     } else {
+      setConnectMsgTone('error')
       setConnectMsg(`Error: ${result.error}`)
     }
   }
@@ -492,8 +503,16 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                 {`Connect to ${connectorLabel}`}
               </Button>
             )}
-            {connectMsg && <span className="text-xs text-muted-foreground">{connectMsg}</span>}
           </div>
+          {connectMsg && (
+            // A refusal from the callback (o3d-9tbz) is a paragraph, not a word: it names every
+            // organisation the consent offered, with ids, and what to do next. Rendered on its own line
+            // and allowed to wrap — squeezed into the button row it was unreadable, and an operator who
+            // cannot read the remedy has not been given one.
+            <p className={`text-xs break-words whitespace-pre-line max-w-3xl ${connectMsgTone === 'error' ? 'text-destructive' : 'text-muted-foreground'}`}>
+              {connectMsg}
+            </p>
+          )}
           {connectionTest.status !== 'never' && (
             <p className={`text-xs ${connectionTest.status === 'success' ? 'text-green-600' : 'text-destructive'}`}>
               Last connection test: {connectionTest.status === 'success' ? 'passed' : 'failed'}

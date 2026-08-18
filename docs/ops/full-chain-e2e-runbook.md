@@ -172,6 +172,14 @@ it will **not** restore stage on the new owner's behalf.
   is caught, not hidden. This trafficless store only delivers when WP-Cron is nudged (the
   harness does this); a single order commonly arrives as **two** `order.updated` deliveries.
 - Xero's **redirect URI** for the rig's app must be registered in the Xero developer portal.
+- **The rig's `.env` must pin the Demo org by allow-list** (o3d-9tbz):
+  `XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)` (or `XERO_ALLOWED_TENANT_IDS=<demo tenantId>`).
+  The database pin (`xero_expected_tenant_id`) does not survive a rebuilt or restored database, and it
+  was its absence that let this rig connect to the LIVE organisation and post 150 invoices into it
+  (o3d-t74p). With the allow-list set, a consent that offers the live org is refused with nothing
+  stored, and a restored production database is refused at every sync instead of at no point at all.
+  Prefer the NAME here: the Demo company is re-created with a **new tenantId** at every ~28-day reset,
+  so an id-based allow-list has to be updated each cycle while the name does not.
 - The **Demo company resets ~every 28 days**, which drops the OAuth grant. After a reset:
   re-consent the connection (Settings → Accounting → Xero → Connect) and re-run the **Demo
   provisioner** so the accounts/currencies/bank accounts/VAT rates the specs expect exist
