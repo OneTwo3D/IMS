@@ -84,6 +84,15 @@ export function driftDecisionVersion(input: {
     // is exactly the "generation" this needs. Counter-only ticks leave it alone,
     // so an open page still survives them, which was the point of hashing
     // membership rather than the raw row.
+    //
+    // KNOWN RESIDUAL (o3d-0gzr r2): this holds only for membership changes that
+    // PERSIST. If the sweep fails to write the intermediate B, the store stays
+    // at A with A's original firstSeenAt, and A -> B -> A is invisible here. It
+    // is not the blast-radius guard it might look like — `eligibleCohortDigest`
+    // is, and that one is computed from the links actually about to be written.
+    // What survives this hole is narrower: an operator could authorise a set on
+    // the strength of a REASON belonging to the earlier occurrence. Closing it
+    // properly needs a generation counter the sweep bumps transactionally.
     firstSeenAt: input.firstSeenAt ?? '',
   })
   return createHash('sha256').update(material).digest('hex').slice(0, 16)
@@ -140,12 +149,23 @@ export function toIncident(
   state: WmsUnresolvedDriftState | null,
   raw?: string | null,
   now: Date = new Date(),
+  /**
+   * When the STORE last changed, per the database (o3d-0gzr r2).
+   *
+   * Preferred over the sweep's own `lastSeenAt` stamp because it is written by
+   * one clock — the database's — for both the sweep and whoever serves this
+   * action. Judging freshness by the sweep host's clock meant a host running
+   * fast produced future stamps; failing those closed then turned a persistent
+   * skew into permanent suppression of the operator's only escape hatch. With
+   * a single clock there is no skew to fail either way on.
+   */
+  confirmedAt?: Date | null,
 ): UnresolvedDriftIncident | null {
   if (!state) return null
   // Stale: the sweep has not re-confirmed this in an hour, so either it stopped
   // drifting (and the retraction did not persist) or it stopped running. Either
   // way it is not evidence any more.
-  const lastSeen = state.lastSeenAt ? Date.parse(state.lastSeenAt) : NaN
+  const lastSeen = confirmedAt ? confirmedAt.getTime() : (state.lastSeenAt ? Date.parse(state.lastSeenAt) : NaN)
   if (!Number.isFinite(lastSeen)) return null
   const age = now.getTime() - lastSeen
   // A FUTURE confirmation is not a fresh one (o3d-0gzr). The sweep and whoever
@@ -181,12 +201,15 @@ export async function loadUnresolvedDriftIncidents(
 ): Promise<UnresolvedDriftIncident[]> {
   if (connectors.length === 0) return []
   const keys = connectors.map(unresolvedDriftStateKey)
-  const rows = await db.setting.findMany({ where: { key: { in: keys } }, select: { key: true, value: true } })
-  const byKey = new Map(rows.map((row) => [row.key, row.value]))
+  const rows = await db.setting.findMany({
+    where: { key: { in: keys } },
+    select: { key: true, value: true, updatedAt: true },
+  })
+  const byKey = new Map(rows.map((row) => [row.key, row]))
   return connectors
     .map((connector) => {
-      const raw = byKey.get(unresolvedDriftStateKey(connector)) ?? null
-      return toIncident(connector, parseState(raw), raw, now)
+      const row = byKey.get(unresolvedDriftStateKey(connector)) ?? null
+      return toIncident(connector, parseState(row?.value), row?.value ?? null, now, row?.updatedAt ?? null)
     })
     .filter((incident): incident is UnresolvedDriftIncident => incident !== null)
 }
@@ -225,4 +248,22 @@ export async function readRawDriftState(connector: string): Promise<string | nul
     select: { value: true },
   })
   return row?.value ?? null
+}
+
+
+/**
+ * A digest of the links that would ACTUALLY be quarantined right now.
+ *
+ * `driftDecisionVersion` hashes the cohort the sweep STORED, which is not the
+ * same thing (o3d-0gzr r2). The store is a record of what an earlier pass could
+ * not read; eligibility is re-evaluated at write time, and an order can become
+ * eligible — or stop being — in between without the stored cohort changing at
+ * all. Binding a destructive action to the stored set therefore binds it to
+ * something adjacent to, but not identical with, what it does.
+ *
+ * This hashes the resolved set instead, so the page shows exactly what the
+ * write will take, and the write refuses if that set has moved since.
+ */
+export function eligibleCohortDigest(linkIds: readonly string[]): string {
+  return createHash('sha256').update(JSON.stringify([...linkIds].sort())).digest('hex').slice(0, 16)
 }

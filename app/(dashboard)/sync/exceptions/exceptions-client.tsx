@@ -50,6 +50,12 @@ export function ExceptionsClient({ data }: Props) {
   // o3d-51du: a bulk quarantine is not a one-click action. The first click arms
   // it and puts the affected orders under an explicit "these will be
   // quarantined" heading; only the second one writes.
+  //
+  // Keyed by the ELIGIBLE-set digest, not the connector (o3d-0gzr r2).
+  // router.refresh() deliberately preserves useState, so a connector-keyed flag
+  // stayed armed across a refresh — and the confirm button then rendered,
+  // already armed, against whatever cohort came back. Keying it to the exact set
+  // means any change to that set disarms it by construction.
   const [confirmingIsolate, setConfirmingIsolate] = useState<string | null>(null)
 
   async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
@@ -417,7 +423,7 @@ export function ExceptionsClient({ data }: Props) {
                       >
                         <RotateCcw className="h-3 w-3 mr-1" />Retry
                       </Button>
-                      {confirmingIsolate === row.connector ? (
+                      {confirmingIsolate === row.eligibleVersion && row.orders.length > 0 ? (
                         <>
                           <Button
                             type="button"
@@ -427,12 +433,12 @@ export function ExceptionsClient({ data }: Props) {
                             onClick={() => {
                               setConfirmingIsolate(null)
                               runAction(
-                                () => isolateUnresolvedDriftCohort(row.connector, row.version),
+                                () => isolateUnresolvedDriftCohort(row.connector, row.version, row.eligibleVersion),
                                 'Isolated — inbound sync resumes, and each order is now replayable above.',
                               )
                             }}
                           >
-                            Confirm — isolate {row.linkCount}
+                            Confirm — isolate {row.orders.length}
                           </Button>
                           <Button type="button" variant="ghost" size="sm" disabled={isPending} onClick={() => setConfirmingIsolate(null)}>
                             Cancel
@@ -444,9 +450,10 @@ export function ExceptionsClient({ data }: Props) {
                           variant="outline"
                           size="sm"
                           disabled={isPending}
-                          onClick={() => setConfirmingIsolate(row.connector)}
+                          onClick={() => setConfirmingIsolate(row.eligibleVersion)}
+                          title={row.orders.length === 0 ? 'Nothing eligible to isolate' : undefined}
                         >
-                          Isolate {row.linkCount}…
+                          Isolate {row.orders.length}…
                         </Button>
                       )}
                     </TableCell>
@@ -461,13 +468,13 @@ export function ExceptionsClient({ data }: Props) {
                     <TableCell colSpan={6} className="pt-0 pb-3">
                       <div className="rounded-md border border-dashed bg-muted/20 p-2">
                         <p className="text-xs font-medium mb-1">
-                          {confirmingIsolate === row.connector
-                            ? `These ${row.linkCount} order(s) will be quarantined:`
-                            : `Orders in this cohort (${row.linkCount}):`}
+                          {confirmingIsolate === row.eligibleVersion
+                            ? `These ${row.orders.length} order(s) will be quarantined:`
+                            : `Orders Isolate would quarantine (${row.orders.length} of ${row.linkCount} in the cohort still eligible):`}
                         </p>
                         {row.orders.length > 0 ? (
                           <>
-                            <ul className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                            <ul className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground max-h-48 overflow-y-auto">
                               {row.orders.map((order) => (
                                 <li key={order.linkId} className="font-mono">
                                   {order.orderNumber ?? '(no number)'}
@@ -477,11 +484,7 @@ export function ExceptionsClient({ data }: Props) {
                                 </li>
                               ))}
                             </ul>
-                            {row.ordersTruncated ? (
-                              <p className="text-xs text-amber-600 mt-1">
-                                Showing {row.orders.length} of {row.linkCount} — Isolate applies to all {row.linkCount}.
-                              </p>
-                            ) : null}
+
                           </>
                         ) : (
                           <p className="text-xs text-muted-foreground">

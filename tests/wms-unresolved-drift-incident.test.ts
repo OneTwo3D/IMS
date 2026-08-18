@@ -180,3 +180,34 @@ test('[o3d-0gzr] isolate eligibility IS the sweep predicate, not a copy of it', 
   // ...and it additionally narrows to the reviewed cohort.
   assert.deepEqual(isolate.id, { in: incident.linkIds })
 })
+
+test('[o3d-0gzr r2] freshness comes from the DATABASE clock when we have it', async () => {
+  const { DRIFT_INCIDENT_MAX_AGE_MS } = await import('../lib/domain/wms/unresolved-drift.ts')
+  // The sweep's own lastSeenAt is written by whichever host ran the sweep.
+  // Judging by it made a fast host produce future stamps; failing those closed
+  // then turned persistent skew into permanent suppression of the escape hatch.
+  // The Setting row's updatedAt is one clock for everyone, so prefer it.
+  const skewedIntoTheFuture = { ...LIVE, lastSeenAt: new Date(NOW.getTime() + 45 * 60_000).toISOString() }
+  const confirmedRecently = new Date(NOW.getTime() - 60_000)
+  assert.ok(
+    toIncident('mintsoft', skewedIntoTheFuture, undefined, NOW, confirmedRecently),
+    'a skewed sweep stamp must not suppress an incident the database says is fresh',
+  )
+  // ...and the database clock is what expires it, too.
+  const confirmedLongAgo = new Date(NOW.getTime() - DRIFT_INCIDENT_MAX_AGE_MS - 1000)
+  assert.equal(
+    toIncident('mintsoft', { ...LIVE, lastSeenAt: NOW.toISOString() }, undefined, NOW, confirmedLongAgo),
+    null,
+    'a recent sweep stamp must not resurrect a row the database says is stale',
+  )
+})
+
+test('[o3d-0gzr r2] the eligible digest tracks the SET, not its order or size alone', async () => {
+  const { eligibleCohortDigest } = await import('../lib/domain/wms/unresolved-drift.ts')
+  assert.equal(eligibleCohortDigest(['b', 'a']), eligibleCohortDigest(['a', 'b']), 'order is not identity')
+  assert.notEqual(eligibleCohortDigest(['a', 'b']), eligibleCohortDigest(['a', 'c']), 'membership is')
+  // Same size, wholly different set — the case a count-based guard misses.
+  assert.notEqual(eligibleCohortDigest(['a', 'b']), eligibleCohortDigest(['c', 'd']))
+  // An empty eligible set is its own distinct value, not a wildcard.
+  assert.notEqual(eligibleCohortDigest([]), eligibleCohortDigest(['a']))
+})

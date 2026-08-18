@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { mergeStuckDispatchRows } from '@/lib/domain/wms/exception-inbox'
-import { isolatableLinkWhere, loadUnresolvedDriftIncidents, readRawDriftState, unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
+import { eligibleCohortDigest, isolatableLinkWhere, loadUnresolvedDriftIncidents, readRawDriftState, unresolvedDriftStateKey } from '@/lib/domain/wms/unresolved-drift'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugins'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
 import { logActivity } from '@/lib/activity-log'
@@ -36,14 +36,6 @@ import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 // preserved — a replay re-attempts the SAME work, never forges a new attempt.
 
 const SECTION_LIMIT = 50
-
-/**
- * How many of a drift cohort's orders the inbox lists.
- *
- * Isolate acts on the WHOLE cohort, so when this truncates the page says so —
- * an operator must never read a capped list as the complete blast radius.
- */
-const DRIFT_COHORT_PREVIEW_LIMIT = 50
 
 /**
  * Rolls the isolate transaction back with a message fit to show an operator.
@@ -151,14 +143,13 @@ export type UnresolvedDriftRow = {
   firstSeenAt: string | null
   reason: string | null
   /**
-   * The orders Isolate would quarantine (o3d-51du).
-   *
-   * Capped at DRIFT_COHORT_PREVIEW_LIMIT; `ordersTruncated` says so, because a
-   * capped list read as the whole blast radius is exactly the misunderstanding
-   * this exists to prevent.
+   * Every order Isolate would quarantine (o3d-51du) — the complete set, not a
+   * sample. A capped preview under a bulk destructive action is the original
+   * defect in miniature: review 50, quarantine 500.
    */
   orders: { linkId: string; orderNumber: string | null; externalOrderNumber: string | null }[]
-  ordersTruncated: boolean
+  /** Digest of the ELIGIBLE set above — what Isolate actually writes (o3d-0gzr). */
+  eligibleVersion: string
 }
 
 export type ExceptionInboxSummary = {
@@ -465,12 +456,17 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // through, so the list is what WOULD be quarantined rather than what the sweep
   // happened to record on an earlier pass.
   const driftCohortOrders = new Map<string, { linkId: string; orderNumber: string | null; externalOrderNumber: string | null }[]>()
+  const driftCohortDigests = new Map<string, string>()
   for (const incident of driftIncidents) {
+    // EVERY eligible link, uncapped (o3d-0gzr r2). A capped preview under a
+    // destructive bulk action is the original defect wearing a smaller hat:
+    // review 50, quarantine 500. If a cohort is large the list is long, which
+    // is the honest outcome — the operator is being asked to authorise all of
+    // it.
     const links = await db.wmsOrderPushLink.findMany({
       where: isolatableLinkWhere(incident),
       select: { id: true, externalOrderNumber: true, order: { select: { orderNumber: true } } },
       orderBy: { pushedAt: 'asc' },
-      take: DRIFT_COHORT_PREVIEW_LIMIT,
     })
     driftCohortOrders.set(
       incident.connector,
@@ -480,6 +476,10 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         externalOrderNumber: link.externalOrderNumber,
       })),
     )
+    // The token the button carries is a digest of THIS set — the one on screen
+    // — not of the cohort the sweep stored. Those differ whenever eligibility
+    // has moved, and it is this set the write acts on.
+    driftCohortDigests.set(incident.connector, eligibleCohortDigest(links.map((link) => link.id)))
   }
 
   const data: Omit<ExceptionInboxData, 'summary'> = {
@@ -556,7 +556,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       // showed only a count. Isolate is a bulk quarantine; the orders it will
       // take have to be on screen before it is clicked.
       orders: driftCohortOrders.get(incident.connector) ?? [],
-      ordersTruncated: (driftCohortOrders.get(incident.connector)?.length ?? 0) < incident.linkCount,
+      // What Isolate is bound to. `version` still guards the stored incident;
+      // this guards the actual write set.
+      eligibleVersion: driftCohortDigests.get(incident.connector) ?? eligibleCohortDigest([]),
     })),
   }
 
@@ -980,7 +982,7 @@ export async function clearPennyMismatchFlag(orderId: string): Promise<{ success
  * candidate set (so the delta watermark is released for everyone else) and each
  * one appears in this inbox as an ordinary replayable row.
  */
-export async function isolateUnresolvedDriftCohort(connector: string, version: string): Promise<MutationResult> {
+export async function isolateUnresolvedDriftCohort(connector: string, version: string, eligibleVersion: string): Promise<MutationResult> {
   try {
     const session = await requireFreshPermission('sync')
     // The ACTIVE connector, not merely a registered one (o3d-bjc.12). A
@@ -1025,16 +1027,28 @@ export async function isolateUnresolvedDriftCohort(connector: string, version: s
       let isolated: number
       try {
         isolated = await db.$transaction(async (tx) => {
-          // Enablement is part of the WRITE, not a precondition checked earlier
-          // (o3d-0gzr). The sweep lock does not serialize a plugin being switched
-          // off, so the only place this can be settled is inside the same
-          // transaction as the quarantine.
-          const pluginRow = await tx.setting.findUnique({
-            where: { key: INTEGRATION_PLUGIN_SETTING_KEYS[connector as keyof typeof INTEGRATION_PLUGIN_SETTING_KEYS] },
-            select: { value: true },
-          })
-          if (pluginRow?.value !== 'true') {
+          // Enablement is part of the WRITE (o3d-0gzr), and reading it is not
+          // enough (r2): under READ COMMITTED a plain SELECT takes no lock, so a
+          // disable can commit between this read and our own commit and nothing
+          // ever conflicts. Lock the row FOR UPDATE — a concurrent disable then
+          // blocks until this transaction ends, and sees the quarantine.
+          const pluginKey = INTEGRATION_PLUGIN_SETTING_KEYS[connector as keyof typeof INTEGRATION_PLUGIN_SETTING_KEYS]
+          const pluginRows = await tx.$queryRaw<{ value: string }[]>`
+            SELECT value FROM settings WHERE key = ${pluginKey} FOR UPDATE
+          `
+          if (pluginRows[0]?.value !== 'true') {
             throw new DriftIsolationAborted('That WMS connector was switched off while this page was open — nothing was isolated.')
+          }
+          // The set the operator reviewed must still be the set we are about to
+          // write (o3d-0gzr r2). `version` guards the STORED cohort; eligibility
+          // is re-evaluated here and can have moved without the store changing,
+          // which would quarantine an order nobody saw.
+          const eligibleNow = await tx.wmsOrderPushLink.findMany({
+            where: isolatableLinkWhere(incident),
+            select: { id: true },
+          })
+          if (eligibleCohortDigest(eligibleNow.map((row) => row.id)) !== eligibleVersion) {
+            throw new DriftIsolationAborted('These orders changed since the page loaded — reload and review the current set before isolating.')
           }
           const updated = await tx.wmsOrderPushLink.updateMany({
             // The eligibility predicate is repeated HERE, not just read earlier:
