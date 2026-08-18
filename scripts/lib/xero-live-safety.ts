@@ -16,13 +16,18 @@
  *                     anything that merely looks E2E-ish aborts the run instead of being included
  *                     or silently dropped.
  *   4. MANIFEST       every object about to be mutated must appear in a separately reviewed,
- *                     tenant-stamped id manifest. An object that is live-selected but absent from
- *                     the manifest is fatal.
+ *                     tenant-stamped manifest AND still be in the state that manifest records.
+ *                     An object that is live-selected but absent from the manifest is fatal, and
+ *                     so is one whose status, contact, blockers or UpdatedDateUTC have moved since
+ *                     the review: a uuid says WHICH object a human approved, never WHAT they
+ *                     approved doing to it.
  *   5. COMPLETENESS   a read that could not be proven complete is an error, never an empty result.
  *   6. REVALIDATION   each object is re-read immediately before it is mutated and must be
  *                     byte-for-byte the object that was planned.
- *   7. OUTCOME        a run with any failure exits non-zero and does not report success.
+ *   7. OUTCOME        a run with any failure exits non-zero and does not report success, and a run
+ *                     that THREW after writing says how much it had already destroyed.
  */
+import { createHash } from 'node:crypto'
 
 // ---------------------------------------------------------------------------
 // Errors. All safety aborts share a base class so a caller can tell a refusal
@@ -42,7 +47,7 @@ export class TenantMismatchError extends SafetyViolationError {}
 export class ReadIncompleteError extends SafetyViolationError {}
 /** Something that looks like a fixture but does not match the grammar exactly. */
 export class AmbiguousSelectionError extends SafetyViolationError {}
-/** A planned object is not covered by the reviewed manifest. */
+/** A planned object is not covered by the reviewed manifest, or has moved since it was reviewed. */
 export class ManifestViolationError extends SafetyViolationError {}
 /** A live object no longer matches the plan that was reviewed. */
 export class PlanDivergedError extends SafetyViolationError {}
@@ -264,20 +269,55 @@ export type Reader = <T>(path: string) => Promise<XeroResult<T>>
  *
  * Three distinct endings, and only one of them is "done":
  *
- *   • an EMPTY page                — the collection is exhausted. This is the only success.
+ *   • an EMPTY `key` array         — the collection is exhausted. This is the only success.
  *   • a page of only already-seen ids — Xero ignored `page` and answered with the whole collection
  *     (it drops unknown query params rather than rejecting them). Page 1 therefore already WAS the
  *     whole collection, so this is also complete — but it has to be recognised, or the walk spins
  *     to the ceiling.
- *   • anything else                — a non-2xx page, or the page ceiling. NOT complete, so it
- *     throws. The previous implementation `break`-ed on a failed page and returned the partial
- *     accumulation as if it were the whole set, which is what let a failed read become a partial
- *     irreversible apply.
+ *   • anything else                — a non-2xx page, a 2xx whose body is not a Xero collection
+ *     envelope carrying `key` as an ARRAY, or the page ceiling. NOT complete, so it throws. The
+ *     previous implementation `break`-ed on a failed page and returned the partial accumulation as
+ *     if it were the whole set, which is what let a failed read become a partial irreversible
+ *     apply.
+ *
+ * The body-shape check is the same defect as the failed page wearing different clothes. `res.data?.
+ * [key] ?? []` cannot tell `{"Invoices":[]}` — Xero saying the collection is exhausted — from a
+ * 200 carrying an HTML error page, a proxy's `{"message":"..."}`, an empty body, or a response
+ * whose collection key we spelled wrong. All four used to read as "nothing there", and "nothing
+ * there" is what stops the walk, truncates the manifest, and leaves live objects behind while the
+ * run reports success. A response we cannot parse says NOTHING about the collection.
  *
  * It deliberately does NOT stop on a short-but-non-empty page: the page size is not a guarantee,
  * and treating "fewer than 100" as terminal is the same class of mistake as trusting an ignored
  * filter. That assumption is exactly what makes the manual-journal `NOT_FOUND` unsound.
  */
+/**
+ * Turn a 2xx page into either the collection it claims to be, or a REASON it is not one.
+ *
+ * Shared, because the "empty means exhausted" defect had two homes: this file's pager and the
+ * manual-journal sweep in audit-xero-live-contamination.ts, which set `pagingComplete = true` on a
+ * body it could not read. Fixing one and leaving the other is how the 429 defect survived three
+ * copies of the same client. The callers differ in what they DO about it — the pager throws, the
+ * journal sweep marks the enumeration incomplete and falls through to per-id confirmation — but
+ * neither may treat an unreadable body as an answer.
+ */
+export type CollectionPage<T> = { ok: true; rows: T[] } | { ok: false; reason: string }
+
+export function parseCollectionPage<T>(data: unknown, key: string): CollectionPage<T> {
+  if (data === null || data === undefined || typeof data !== 'object' || Array.isArray(data)) {
+    return {
+      ok: false,
+      reason: `the body is not a Xero collection envelope (${data === undefined ? 'no body' : Array.isArray(data) ? 'a bare array' : typeof data})`,
+    }
+  }
+  const rows = (data as Record<string, unknown>)[key]
+  if (!Array.isArray(rows)) {
+    const keys = Object.keys(data as Record<string, unknown>)
+    return { ok: false, reason: `no \`${key}\` array (top-level keys: ${keys.length ? keys.join(', ') : 'none'})` }
+  }
+  return { ok: true, rows: rows as T[] }
+}
+
 export async function pageAllComplete<T>(args: {
   read: Reader
   path: string
@@ -299,7 +339,17 @@ export async function pageAllComplete<T>(args: {
           `The read is incomplete, so no plan built from it can be trusted. Nothing was written.`,
       )
     }
-    const list = res.data?.[key] ?? []
+    // A 2xx is not by itself a read. The body has to be a collection envelope carrying `key` as an
+    // array before "the array is empty" is allowed to mean the collection is exhausted.
+    const parsed = parseCollectionPage<T>(res.data, key)
+    if (!parsed.ok) {
+      throw new ReadIncompleteError(
+        `ABORT: ${path} page ${page} answered HTTP ${res.status} but ${parsed.reason}. A response that cannot ` +
+          `be parsed says nothing about the collection — it is NOT an empty one. The read is incomplete, so no ` +
+          `plan built from it can be trusted. Nothing was written.`,
+      )
+    }
+    const list = parsed.rows
     if (list.length === 0) return out
 
     let fresh = 0
@@ -325,9 +375,62 @@ export async function pageAllComplete<T>(args: {
 }
 
 // ---------------------------------------------------------------------------
-// 4. MANIFEST — a reviewed, tenant-stamped id list
+// BLOCKERS — one grammar, shared by the audit that writes the manifest and the
+// writer that is authorised by it
 // ---------------------------------------------------------------------------
-export type ManifestEntry = { uuid: string; entity: string; status: string; contact: string; number: string }
+/**
+ * A "blocker" is anything Xero requires released before a document can be voided: an allocation,
+ * a payment, a refund. The manifest binds the blocker SET a human reviewed, so the audit and the
+ * writer have to name blockers the same way — two spellings of the same allocation would make
+ * every credit note look changed and reduce the check to noise, which is how a safety check gets
+ * switched off.
+ *
+ * An allocation is named by the INVOICE it links to, not by its own AllocationID: the id is absent
+ * from some collection responses, and a set of `allocation:?` entries collapses duplicates and
+ * silently agrees with itself. The invoice id is always present and is what actually identifies
+ * which link is being released.
+ */
+export type AllocationLike = { AllocationID?: string; Invoice?: { InvoiceID?: string } }
+export type PaymentLike = { PaymentID?: string }
+export type CreditNoteRefLike = { CreditNoteID?: string }
+
+export const allocationBlocker = (a: AllocationLike): string =>
+  `allocation:${a.Invoice?.InvoiceID ?? a.AllocationID ?? 'unidentified'}`
+
+/** Blockers on a CREDIT NOTE: its allocations to invoices, and any refund paid against it. */
+export function creditNoteBlockers(cn: { Allocations?: AllocationLike[]; Payments?: PaymentLike[] }): string[] {
+  return [
+    ...(cn.Allocations ?? []).map(allocationBlocker),
+    ...(cn.Payments ?? []).map((p) => `refund:${p.PaymentID ?? 'unidentified'}`),
+  ]
+}
+
+/** Blockers on an INVOICE: payments against it, and credit notes allocated to it. */
+export function invoiceBlockers(inv: { Payments?: PaymentLike[]; CreditNotes?: CreditNoteRefLike[] }): string[] {
+  return [
+    ...(inv.Payments ?? []).map((p) => `payment:${p.PaymentID ?? 'unidentified'}`),
+    ...(inv.CreditNotes ?? []).map((c) => `creditnote:${c.CreditNoteID ?? 'unidentified'}`),
+  ]
+}
+
+/** The manifest's on-disk form: sorted so the CSV is order-insensitive by construction. */
+export const formatBlockers = (blockers: string[]): string => [...blockers].sort().join(' ')
+export const parseBlockers = (field: string): string[] => field.split(/\s+/).filter(Boolean)
+
+// ---------------------------------------------------------------------------
+// 4. MANIFEST — a reviewed, tenant-stamped record of objects AND their state
+// ---------------------------------------------------------------------------
+export type ManifestEntry = {
+  uuid: string
+  entity: string
+  status: string
+  contact: string
+  number: string
+  /** The blocker set as reviewed, in the shared grammar above. */
+  blockers: string[]
+  /** Xero's raw UpdatedDateUTC as reviewed. Any movement at all is divergence. */
+  updatedDateUtc: string
+}
 export type WriteManifest = {
   tenantId: string
   entries: Map<string, ManifestEntry>
@@ -359,6 +462,14 @@ function splitCsvLine(line: string): string[] {
  * is just a list of uuids, and o3d-s36z (nothing records which organisation an id belongs to) is
  * precisely the defect that produced this incident: 553 ids that read as live-org objects and were
  * not. A manifest that cannot say which org it describes may not authorise a write.
+ *
+ * The STATE columns — status, contact, blockers, updatedDateUtc — are mandatory for the same
+ * reason and are just as load-bearing. A manifest of bare uuids authorises "you may act on these
+ * objects" forever; what a human actually signed off is "you may act on these objects AS THEY ARE
+ * NOW". A credit note reviewed as SUBMITTED (not posted, no GL effect, deletable) and since
+ * APPROVED by a person is a different object with the same uuid, and its removal is now a real
+ * ledger change. A manifest that cannot state what was reviewed cannot authorise the write, so an
+ * older CSV without these columns is refused rather than accepted at reduced strength.
  */
 export function parseWriteManifest(csvText: string): WriteManifest {
   const lines = csvText.trim().split(/\r?\n/).filter((l) => l.trim() !== '')
@@ -378,6 +489,25 @@ export function parseWriteManifest(csvText: string): WriteManifest {
   const iStatus = col('status')
   const iContact = col('contact')
   const iNumber = col('number')
+  const iBlockers = col('blockers')
+  const iUpdated = col('updatedDateUtc')
+  // The state columns are what turn a list of uuids into an authorisation. Missing columns are
+  // refused rather than defaulted: an empty string would compare equal to an object that genuinely
+  // has no blockers, and the check would pass by accident on exactly the manifests it cannot cover.
+  const missingState = [
+    iStatus < 0 ? 'status' : null,
+    iContact < 0 ? 'contact' : null,
+    iBlockers < 0 ? 'blockers' : null,
+    iUpdated < 0 ? 'updatedDateUtc' : null,
+  ].filter(Boolean)
+  if (missingState.length) {
+    throw new ManifestViolationError(
+      `ABORT: the manifest has no ${missingState.join(', ')} column(s), so it records WHICH objects were ` +
+        'reviewed but not WHAT STATE they were reviewed in. A uuid on its own authorises acting on an object ' +
+        'that a human has since approved, paid or re-contacted. Regenerate the manifest with ' +
+        'scripts/audit-xero-live-e2e-footprint.ts and review it again.',
+    )
+  }
 
   const entries = new Map<string, ManifestEntry>()
   const countsByEntity = new Map<string, number>()
@@ -394,9 +524,11 @@ export function parseWriteManifest(csvText: string): WriteManifest {
     entries.set(uuid, {
       uuid,
       entity,
-      status: iStatus >= 0 ? (f[iStatus] ?? '').trim() : '',
-      contact: iContact >= 0 ? (f[iContact] ?? '').trim() : '',
+      status: (f[iStatus] ?? '').trim(),
+      contact: (f[iContact] ?? '').trim(),
       number: iNumber >= 0 ? (f[iNumber] ?? '').trim() : '',
+      blockers: parseBlockers((f[iBlockers] ?? '').trim()),
+      updatedDateUtc: (f[iUpdated] ?? '').trim(),
     })
     countsByEntity.set(entity, (countsByEntity.get(entity) ?? 0) + 1)
   }
@@ -418,16 +550,40 @@ export function assertManifestTenant(manifest: WriteManifest, expectedTenantId: 
   }
 }
 
+/** An object as the live plan read it, in the same terms the manifest records. */
+export type PlannedObject = {
+  uuid: string
+  entity: string
+  /** Human-facing name for the error message — invoice number, contact name, item code. */
+  label: string
+  status: string
+  contactName?: string
+  blockers?: string[]
+  updatedDateUtc?: string
+}
+
 /**
- * Nothing gets mutated unless a human already looked at it.
+ * Nothing gets mutated unless a human already looked at it — AT THIS STATE.
  *
- * The asymmetry is deliberate and is the whole point:
- *   • a planned object that is NOT in the manifest is FATAL — it appeared after the review, so no
- *     one has agreed it is test residue;
- *   • a manifest id not present live is fine — it was already cleaned up, or never existed.
+ * Two separate refusals, and the second is the one that was missing:
+ *
+ *   • IDENTITY. A planned object that is NOT in the manifest is FATAL. It appeared after the
+ *     review, so nobody has agreed it is test residue. (A manifest id no longer present live is
+ *     fine — it was already cleaned up, or never existed. That asymmetry is deliberate.)
+ *
+ *   • STATE. A planned object whose status, contact, blocker set or UpdatedDateUTC differs from
+ *     the manifest is FATAL. Binding only the uuid authorises an object that has moved since a
+ *     human looked at it: a credit note reviewed as SUBMITTED and since APPROVED by a person, an
+ *     invoice re-contacted to a genuine customer, a document that has since been paid, or one that
+ *     picked up an allocation nobody in this run created. All of those keep their uuid, all of them
+ *     pass an id-only check, and all of them are irreversible when acted on. UpdatedDateUTC is
+ *     compared as the catch-all: it moves for changes none of the other columns can express.
+ *
+ * This runs against the PLAN — the complete read taken at the start of the apply — so it fires
+ * once, before the first mutation, rather than after part of the ledger has already been destroyed.
  */
-export function assertPlanWithinManifest(
-  plan: Array<{ uuid: string; entity: string; label: string }>,
+export function assertPlanAuthorizedByManifest(
+  plan: PlannedObject[],
   manifest: WriteManifest,
 ): { covered: number; missingFromLedger: string[] } {
   const unreviewed = plan.filter((p) => !manifest.entries.has(p.uuid))
@@ -441,6 +597,36 @@ export function assertPlanWithinManifest(
         `and pass the new manifest. Nothing was written.`,
     )
   }
+
+  const diverged: string[] = []
+  for (const p of plan) {
+    const reviewed = manifest.entries.get(p.uuid)!
+    const diffs: string[] = []
+    if (reviewed.entity !== p.entity) diffs.push(`entity ${reviewed.entity} -> ${p.entity}`)
+    if (reviewed.status !== p.status) diffs.push(`status ${reviewed.status || '(none)'} -> ${p.status || '(none)'}`)
+    if (reviewed.contact !== (p.contactName ?? '')) {
+      diffs.push(`contact ${JSON.stringify(reviewed.contact)} -> ${JSON.stringify(p.contactName ?? '')}`)
+    }
+    if (normaliseBlockers(reviewed.blockers) !== normaliseBlockers(p.blockers)) {
+      diffs.push(`blockers [${normaliseBlockers(reviewed.blockers)}] -> [${normaliseBlockers(p.blockers)}]`)
+    }
+    if (reviewed.updatedDateUtc !== (p.updatedDateUtc ?? '')) {
+      diffs.push(`updatedDateUTC ${reviewed.updatedDateUtc || '(none)'} -> ${p.updatedDateUtc || '(none)'}`)
+    }
+    if (diffs.length) diverged.push(`${p.entity} ${p.label} (${p.uuid}): ${diffs.join('; ')}`)
+  }
+  if (diverged.length) {
+    const shown = diverged.slice(0, 10)
+    throw new ManifestViolationError(
+      `ABORT: ${diverged.length} object(s) are in the manifest but are NO LONGER IN THE STATE THAT WAS REVIEWED:\n  ` +
+        shown.join('\n  ') +
+        (diverged.length > shown.length ? `\n  ... and ${diverged.length - shown.length} more` : '') +
+        `\nThe manifest authorises acting on these objects as they were when a human read the CSV, not on ` +
+        `whatever they have become since. Something — a person approving a document, a payment, a re-contact — ` +
+        `has changed them. Re-run the read-only footprint audit, review the new CSV, and pass that. Nothing was written.`,
+    )
+  }
+
   const planned = new Set(plan.map((p) => p.uuid))
   const missingFromLedger = [...manifest.entries.keys()].filter((id) => !planned.has(id))
   return { covered: plan.length, missingFromLedger }
@@ -463,20 +649,26 @@ export type RevalidationExpectation = {
   /**
    * Every status the object may legitimately be in when we reach it. It is a SET, not a single
    * value, because this script's own earlier steps move a document: releasing the allocations and
-   * payments off a PAID document leaves it AUTHORISED. Only transitions THIS RUN caused belong
-   * here — a SUBMITTED document that has become AUTHORISED was approved by a human, and that is
-   * exactly the divergence worth stopping for.
+   * payments off a PAID document leaves it AUTHORISED. Only transitions THIS RUN ACTUALLY CAUSED
+   * belong here — build it with `allowedStatusesAfterRun`, never with `statusesAfterReleasingBlockers`
+   * directly, or the set admits the same transition when somebody else caused it.
    */
   allowedStatuses: string[]
   contactName?: string
   blockers?: string[]
   /**
-   * 'exact'  — the blocker set must be unchanged (nothing has touched it yet).
-   * 'subset' — the live set may only be a subset of the plan's: an earlier step is allowed to have
-   *            released blockers, but a NEW one appearing means someone else is working on this
-   *            document and the run stops.
+   * 'exact'    — the blocker set must be unchanged (nothing has touched it yet).
+   * 'released' — the live set may differ from the plan's ONLY by blockers this run itself released,
+   *              listed in `releasedBlockers`. A blocker that appeared, or one that vanished
+   *              without this run deleting it, means someone else is working on the document.
    */
-  blockerPolicy?: 'exact' | 'subset'
+  blockerPolicy?: 'exact' | 'released'
+  /**
+   * The blockers THIS RUN deleted off this object, recorded at the moment the DELETE succeeded.
+   * Only meaningful under the 'released' policy. Anything not in here that has gone missing was
+   * removed by somebody else.
+   */
+  releasedBlockers?: string[]
   updatedDateUtc?: string
 }
 
@@ -487,6 +679,25 @@ function normaliseBlockers(b?: string[]): string {
 /** Releasing every blocker off a PAID document leaves it AUTHORISED; nothing else moves. */
 export function statusesAfterReleasingBlockers(plannedStatus: string): string[] {
   return plannedStatus === 'PAID' ? ['PAID', 'AUTHORISED'] : [plannedStatus]
+}
+
+/**
+ * The statuses a document may be in by the time this run reaches it — CONDITIONAL ON THIS RUN
+ * HAVING CAUSED THE MOVE.
+ *
+ * `statusesAfterReleasingBlockers` answers "what could this transition produce". That is a
+ * different question from "is this transition explained", and using the first as the answer to the
+ * second is how a permissive set gets written: PAID -> AUTHORISED is accepted whether step 1 of
+ * this run released the payment or a colleague did it by hand in the Xero UI two minutes ago,
+ * while the plan we are about to void was already stale. The run knows which of those happened —
+ * it recorded its own successful deletes — so the widened set is only offered when this run is the
+ * reason the document could have moved. Otherwise the planned status is the only acceptable one.
+ *
+ * `thisRunReleasedABlocker` must come from the run's own journal of SUCCEEDED deletes, not from
+ * intent: a delete that was attempted and failed explains nothing.
+ */
+export function allowedStatusesAfterRun(plannedStatus: string, thisRunReleasedABlocker: boolean): string[] {
+  return thisRunReleasedABlocker ? statusesAfterReleasingBlockers(plannedStatus) : [plannedStatus]
 }
 
 /**
@@ -519,9 +730,23 @@ export function assertUnchanged(expected: RevalidationExpectation, live: Revalid
       diffs.push(`blockers [${normaliseBlockers(expected.blockers)}] -> [${normaliseBlockers(live.blockers)}]`)
     }
   } else {
-    const allowed = new Set(expected.blockers ?? [])
-    const added = (live.blockers ?? []).filter((b) => !allowed.has(b))
+    const plannedSet = new Set(expected.blockers ?? [])
+    const liveSet = new Set(live.blockers ?? [])
+    const added = [...liveSet].filter((b) => !plannedSet.has(b))
     if (added.length) diffs.push(`new blocker(s) appeared since the plan: ${added.join(', ')}`)
+    // A blocker that has GONE is only acceptable if this run is the one that deleted it. The
+    // permissive version of this check ("the live set may be any subset of the plan's") accepts a
+    // colleague releasing a payment in the Xero UI as readily as it accepts step 1's own DELETE,
+    // and then the widened status set accepts the resulting PAID -> AUTHORISED too. Between them
+    // that is a document moving under the script and the script agreeing to void it anyway.
+    const released = new Set(expected.releasedBlockers ?? [])
+    const goneUnexplained = [...plannedSet].filter((b) => !liveSet.has(b) && !released.has(b))
+    if (goneUnexplained.length) {
+      diffs.push(
+        `blocker(s) released by something other than this run: ${goneUnexplained.join(', ')}` +
+          (released.size ? ` (this run released: ${[...released].sort().join(', ')})` : ' (this run released nothing here)'),
+      )
+    }
   }
   if (expected.updatedDateUtc && live.updatedDateUtc && live.updatedDateUtc !== expected.updatedDateUtc) {
     diffs.push(`updatedDateUTC ${expected.updatedDateUtc} -> ${live.updatedDateUtc}`)
@@ -543,19 +768,97 @@ export function assertStillFixtureContact(id: string, liveContactName?: string):
 }
 
 // ---------------------------------------------------------------------------
-// 7. OUTCOME
+// 7. OUTCOME — including the outcome of a run that threw part-way through
 // ---------------------------------------------------------------------------
 export type RunOutcome = { label: string; exitCode: number }
 
 /**
  * A run that failed anywhere does not get to print APPLIED and exit 0. Partial destruction reported
- * as success is the single worst shape this tooling can take.
+ * as success is the single worst shape this tooling can take — and so is partial destruction
+ * reported as nothing at all, which is what `aborted` exists for.
+ *
+ * `aborted` means the run threw: a safety guard refused, the ledger moved under it, the token
+ * expired. `writesMade` is how many irreversible writes had already succeeded when that happened.
+ * An abort after zero writes is a clean refusal; an abort after N writes is a PARTIAL APPLY, and
+ * the operator has to be told so in the same breath as the error — otherwise the last thing on
+ * screen is a stack-shaped message about one credit note and no indication that eighty invoices
+ * are already voided.
  */
-export function runOutcome(args: { apply: boolean; failed: number; incomplete?: boolean }): RunOutcome {
-  const { apply, failed, incomplete = false } = args
-  if (!apply) return { label: failed || incomplete ? 'DRY RUN — INCOMPLETE' : 'DRY RUN', exitCode: failed || incomplete ? 1 : 0 }
+export function runOutcome(args: {
+  apply: boolean
+  failed: number
+  incomplete?: boolean
+  aborted?: boolean
+  writesMade?: number
+}): RunOutcome {
+  const { apply, failed, incomplete = false, aborted = false, writesMade = 0 } = args
+  if (!apply) {
+    if (aborted) return { label: 'DRY RUN — ABORTED', exitCode: 1 }
+    return { label: failed || incomplete ? 'DRY RUN — INCOMPLETE' : 'DRY RUN', exitCode: failed || incomplete ? 1 : 0 }
+  }
+  if (aborted) {
+    return writesMade > 0
+      ? { label: `PARTIALLY APPLIED — ABORTED AFTER ${writesMade} IRREVERSIBLE WRITE(S)`, exitCode: 1 }
+      : { label: 'ABORTED — NOTHING WAS WRITTEN', exitCode: 1 }
+  }
   if (failed || incomplete) return { label: `PARTIALLY APPLIED — ${failed} FAILURE(S)`, exitCode: 1 }
   return { label: 'APPLIED', exitCode: 0 }
+}
+
+/**
+ * What this run has actually done to the live ledger, so far.
+ *
+ * It serves two of the safety checks at once, and they are the same fact seen from two sides:
+ *
+ *   • CAUSALITY. `recordRelease` is called only when a DELETE has SUCCEEDED, so `releasedFor` can
+ *     answer "did this run remove that blocker" — the difference between a document this run moved
+ *     and a document that moved for reasons nobody in this process knows about.
+ *   • REPORTABILITY. `writeCount` is the number of irreversible writes already made, which is what
+ *     turns a thrown exception from "the run failed" into "the run destroyed this much and then
+ *     failed".
+ *
+ * It is deliberately append-only and holds no opinions: the journal records what happened, the
+ * guards decide what it permits.
+ */
+export type MutationRecord = { kind: string; label: string }
+
+export class MutationJournal {
+  private readonly writes: MutationRecord[] = []
+  private readonly releases = new Map<string, Set<string>>()
+  private readonly failures: string[] = []
+
+  /** An irreversible write that SUCCEEDED. Never call this for an attempt. */
+  recordWrite(kind: string, label: string): void {
+    this.writes.push({ kind, label })
+  }
+
+  /**
+   * A blocker this run removed, keyed by the object it was removed FROM. A single allocation
+   * delete releases both sides, so it is recorded against both the credit note and the invoice.
+   */
+  recordRelease(subjectKey: string, blocker: string): void {
+    const set = this.releases.get(subjectKey) ?? new Set<string>()
+    set.add(blocker)
+    this.releases.set(subjectKey, set)
+  }
+
+  releasedFor(subjectKey: string): string[] {
+    return [...(this.releases.get(subjectKey) ?? [])]
+  }
+
+  /** Did THIS RUN release anything off this object? The gate for widening the allowed statuses. */
+  causedRelease(subjectKey: string): boolean {
+    return (this.releases.get(subjectKey)?.size ?? 0) > 0
+  }
+
+  recordFailure(message: string): void {
+    this.failures.push(message)
+  }
+
+  get writeCount(): number { return this.writes.length }
+  get writeRecords(): readonly MutationRecord[] { return this.writes }
+  get failureCount(): number { return this.failures.length }
+  get failureMessages(): readonly string[] { return this.failures }
 }
 
 // ---------------------------------------------------------------------------
@@ -616,8 +919,26 @@ export type RetirementAuthorization = {
   tenantId: string
   database: string
   ids: number
+  /** SHA-256 of the exact id set that was signed off. See `fingerprintIds`. */
+  idsSha256: string
   authorizedBy: string
   authorizedAt: string
+}
+
+/**
+ * The fingerprint of an id SET — order-insensitive, duplicate-insensitive, whitespace-insensitive,
+ * so it is a property of the set itself and not of how the CSV happened to be sorted the day it was
+ * read.
+ *
+ * A count is not a binding. `ids: 553` is satisfied by ANY 553 ids: a different export, a CSV
+ * regenerated after the underlying data moved, one id swapped for another, or the same file with
+ * a row edited. The authorization is supposed to say "I reviewed THESE rows and agreed to null
+ * THEM", and only a fingerprint of the actual ids says that. The count is kept as well, because it
+ * gives the operator a readable failure ("553 vs 554") before the opaque one.
+ */
+export function fingerprintIds(ids: Iterable<string>): string {
+  const unique = [...new Set([...ids].map((id) => id.trim()).filter((id) => id !== ''))].sort()
+  return createHash('sha256').update(unique.join('\n')).digest('hex')
 }
 
 export function parseRetirementAuthorization(text: string): RetirementAuthorization {
@@ -629,7 +950,7 @@ export function parseRetirementAuthorization(text: string): RetirementAuthorizat
     if (at < 0) continue
     fields.set(trimmed.slice(0, at).trim(), trimmed.slice(at + 1).trim())
   }
-  const required = ['token', 'tenantId', 'database', 'ids', 'authorizedBy', 'authorizedAt']
+  const required = ['token', 'tenantId', 'database', 'ids', 'idsSha256', 'authorizedBy', 'authorizedAt']
   const missing = required.filter((k) => !fields.get(k))
   if (missing.length) {
     throw new RetirementRefusedError(
@@ -640,11 +961,19 @@ export function parseRetirementAuthorization(text: string): RetirementAuthorizat
   if (!Number.isInteger(ids) || ids <= 0) {
     throw new RetirementRefusedError(`REFUSED: the authorization file's \`ids\` must be a positive integer.`)
   }
+  const idsSha256 = fields.get('idsSha256')!.toLowerCase()
+  if (!/^[0-9a-f]{64}$/.test(idsSha256)) {
+    throw new RetirementRefusedError(
+      `REFUSED: the authorization file's \`idsSha256\` must be a 64-character SHA-256 hex digest of the ` +
+        `reviewed id set. The dry run prints it.`,
+    )
+  }
   return {
     token: fields.get('token')!,
     tenantId: fields.get('tenantId')!,
     database: fields.get('database')!,
     ids,
+    idsSha256,
     authorizedBy: fields.get('authorizedBy')!,
     authorizedAt: fields.get('authorizedAt')!,
   }
@@ -661,8 +990,8 @@ export type RetirementGuardInput = {
   /** Every Xero token row in the database. */
   tenantRows: Array<{ tenantId: string; tenantName?: string | null }>
   expectedTenantId: string
-  /** How many ids the CSV actually resolved to. */
-  idCount: number
+  /** The ids the CSV actually resolved to — the set, not a count of it. */
+  ids: string[]
 }
 
 /**
@@ -679,8 +1008,9 @@ export type RetirementGuardInput = {
 export function assertRetirementAuthorized(input: RetirementGuardInput): void {
   const {
     overrideFlagPresent, authorization, currentDatabase, expectedDatabase,
-    tenantRows, expectedTenantId, idCount,
+    tenantRows, expectedTenantId, ids,
   } = input
+  const idCount = new Set(ids.map((id) => id.trim()).filter((id) => id !== '')).size
 
   if (!overrideFlagPresent || !authorization) {
     throw new RetirementRefusedError(
@@ -737,12 +1067,25 @@ export function assertRetirementAuthorized(input: RetirementGuardInput): void {
     )
   }
 
-  // The approval covered a specific id set of a specific size. A CSV that has since grown is not
-  // the set that was approved.
+  // The approval covered a SPECIFIC SET of ids. The count is checked first only because "553 vs
+  // 554" is a readable failure; it is not the binding, because any 553 ids satisfy it.
   if (authorization.ids !== idCount) {
     throw new RetirementRefusedError(
       `REFUSED: the authorization covers ${authorization.ids} id(s) but the CSV resolves to ${idCount}. ` +
         'Re-review and re-authorize.',
+    )
+  }
+
+  // The binding. Without it the authorization is a note saying "some ids were reviewed": point the
+  // script at a different CSV of the same size — a re-export after the data moved, one id swapped
+  // for another, a hand-edited row — and the same signed file authorises nulling back-references
+  // nobody ever looked at. The fingerprint is of the id SET, so re-ordering or re-exporting the
+  // same ids still matches, and anything else does not.
+  const fingerprint = fingerprintIds(ids)
+  if (authorization.idsSha256 !== fingerprint) {
+    throw new RetirementRefusedError(
+      `REFUSED: the authorization is signed for id set ${authorization.idsSha256}, but the CSV resolves to ` +
+        `${fingerprint}. Same count, different ids — this is not the set that was reviewed. Re-review and re-authorize.`,
     )
   }
 }

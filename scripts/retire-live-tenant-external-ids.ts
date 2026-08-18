@@ -69,10 +69,14 @@
  *   • Dry run is the ONLY mode available by default. --apply refuses outright.
  *   • Lifting the refusal requires ALL of, together:
  *       --i-have-read-o3d-t74p-and-authorize-demo-history-retirement
- *       --authorization <file> containing token/tenantId/database/ids/authorizedBy/authorizedAt
+ *       --authorization <file> containing
+ *         token/tenantId/database/ids/idsSha256/authorizedBy/authorizedAt
  *       `select current_database()` equal to the expected database EXACTLY (not a URL substring)
  *       EXACTLY ONE Xero token row, positively matching the authorised tenant
- *       an id count equal to the one the authorization was signed off for
+ *       an id count equal to the one the authorization was signed off for, AND a SHA-256 of the
+ *         id set itself equal to the signed `idsSha256` — the count alone is satisfied by any 553
+ *         ids, so it binds the approval to a number rather than to the rows that were reviewed.
+ *         The dry run prints the fingerprint to put in the file.
  *     The refusal and every one of those checks are pure functions in
  *     scripts/lib/xero-live-safety.ts, covered by tests/scripts/xero-live-safety.test.ts.
  *   • Writes happen in a single transaction, bounded by the explicit id list from the CSV.
@@ -87,6 +91,7 @@ import { existsSync, readFileSync } from 'node:fs'
 
 import {
   assertRetirementAuthorized,
+  fingerprintIds,
   parseRetirementAuthorization,
   RETIREMENT_OVERRIDE_FLAG,
   type RetirementAuthorization,
@@ -145,7 +150,7 @@ async function assertE2eDatabase(db: Client): Promise<string> {
  * The apply-path refusal. Read-only reporting never reaches this — it is called only when the
  * operator asked to WRITE, and its default answer is no.
  */
-async function assertAuthorizedToWrite(db: Client, idCount: number): Promise<void> {
+async function assertAuthorizedToWrite(db: Client, ids: string[]): Promise<void> {
   let authorization: RetirementAuthorization | null = null
   if (AUTHORIZATION_PATH) {
     if (!existsSync(AUTHORIZATION_PATH)) throw new Error(`REFUSED: no authorization file at ${AUTHORIZATION_PATH}`)
@@ -160,6 +165,9 @@ async function assertAuthorizedToWrite(db: Client, idCount: number): Promise<voi
     `select "tenantId", "tenantName" from accounting_tokens where connector = 'xero'`,
   )
 
+  // The id SET goes in, not a count of it. `ids: 553` is satisfied by any 553 ids — a re-export
+  // after the data moved, one id swapped for another — so a count binds the authorization to a
+  // number rather than to the rows a human actually reviewed.
   assertRetirementAuthorized({
     overrideFlagPresent: OVERRIDE_PRESENT,
     authorization,
@@ -167,12 +175,13 @@ async function assertAuthorizedToWrite(db: Client, idCount: number): Promise<voi
     expectedDatabase: E2E_DATABASE,
     tenantRows: tok.rows,
     expectedTenantId: DEMO_TENANT_ID,
-    idCount,
+    ids,
   })
 
   console.log(
     `\nAUTHORIZED: ${authorization!.authorizedBy} on ${authorization!.authorizedAt} — ` +
-      `database ${dbName.rows[0].current_database}, tenant ${tok.rows[0].tenantName ?? tok.rows[0].tenantId}, ${idCount} id(s).`,
+      `database ${dbName.rows[0].current_database}, tenant ${tok.rows[0].tenantName ?? tok.rows[0].tenantId}, ` +
+      `${ids.length} id(s), set ${fingerprintIds(ids)}.`,
   )
 }
 
@@ -225,10 +234,13 @@ async function main() {
       console.log(`\n=== DRY RUN — nothing written. ===`)
       console.log(`--apply is REFUSED: the premise for this operation was disproved (see the header).`)
       console.log(`Would clear ${syncLog.rows[0].in_scope} sync-log id(s) and ${backRefs.reduce((n, b) => n + b.inScope, 0)} back-reference(s).`)
+      // The fingerprint of the id set as read TODAY. It is what an authorization has to be signed
+      // for, so it is printed here, from the dry run the reviewer is actually looking at.
+      console.log(`\nid set fingerprint (idsSha256 for the authorization file): ${fingerprintIds(ids)}`)
       return
     }
 
-    await assertAuthorizedToWrite(db, ids.length)
+    await assertAuthorizedToWrite(db, ids)
 
     await db.query('begin')
     try {

@@ -35,8 +35,14 @@
  * Every helper there resolves auth through getAccessToken() -> db.accountingToken
  * (lib/connectors/xero/auth.ts:76). Using them would mean writing a LIVE-tenant token into an IMS
  * database, which is precisely the act that caused this incident. This script therefore carries its
- * own OAuth and its own fetch, and the fetch helper can only issue GET — there is no code path here
- * that can mutate the live ledger, whatever it is pointed at.
+ * own OAuth, and reads through the shared transport in scripts/lib/xero-live-safety.ts built with
+ * `apply: false` — which THROWS on any verb but GET. There is no code path here that can mutate the
+ * live ledger, whatever it is pointed at.
+ *
+ * It does NOT carry its own HTTP client any more. It used to, and so did the footprint audit, and
+ * all three copies had the same 429 handling; when that was fixed in the writer the two audits kept
+ * the broken version, where the retry refunded the call budget and recursed without a counter, so a
+ * permanently rate-limited endpoint retried for ever with nothing able to stop it. One client.
  *
  * It also asks Xero for READ-ONLY scopes. A token minted by this script is incapable of writing even
  * if some later edit tried to.
@@ -83,8 +89,10 @@ import { createDecipheriv, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 
 import {
+  createXeroTransport,
   isConclusive,
   pageAllComplete,
+  parseCollectionPage,
   resolveById,
   type Resolution,
 } from './lib/xero-live-safety'
@@ -93,7 +101,6 @@ import {
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections'
-const XERO_API_BASE = 'https://api.xero.com/api.xro/2.0'
 
 /**
  * READ-ONLY scopes, one per endpoint family this audit reads. Nothing here grants write access —
@@ -574,59 +581,38 @@ async function authorize(): Promise<StoredToken> {
 // ---------------------------------------------------------------------------
 // GET-only Xero client
 // ---------------------------------------------------------------------------
-let callCount = 0
-let lastCallAt = 0
+/**
+ * The If-Modified-Since header, for the one sweep that uses it. It is set immediately before that
+ * sweep and cleared after, so it cannot leak onto an unrelated read.
+ */
+let ifModifiedSinceHeader: string | null = null
+
+/**
+ * The ONLY way this script talks to Xero, and it is the SHARED transport built read-only
+ * (`apply: false`) — it throws on any verb other than GET without --apply, and this script never
+ * passes one. The audit cannot mutate the live ledger even by mistake.
+ *
+ * This replaces a hand-rolled client that was a copy of the writer's, carrying the writer's
+ * since-fixed 429 defect: the retry refunded the call budget (`callCount--`) and recursed with no
+ * retry counter, so an endpoint answering 429 indefinitely retried for ever and the call ceiling —
+ * the only thing that could have stopped it — could never be reached. Three copies of one client
+ * meant fixing it in one of them left the other two broken, which is exactly what happened.
+ */
 /** 60 calls/minute is the binding limit; pace at ~1.1s so a burst can never trip it. */
 const MIN_CALL_INTERVAL_MS = 1100
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
-/**
- * The ONLY way this script talks to Xero. There is deliberately no post/put/delete counterpart:
- * the audit cannot mutate the live ledger even by mistake.
- */
-async function xeroGet<T>(
-  token: StoredToken,
-  path: string,
-  opts?: { ifModifiedSince?: string },
-): Promise<{ ok: boolean; status: number; data?: T; error?: string }> {
-  if (callCount >= MAX_CALLS) throw new Error(`API call ceiling (${MAX_CALLS}) reached — aborting rather than spending more budget`)
+const transport = createXeroTransport({
+  apply: false,
+  maxCalls: MAX_CALLS,
+  minIntervalMs: MIN_CALL_INTERVAL_MS,
+  log: (m) => console.log(m),
+  headersFor: (): Record<string, string> =>
+    ifModifiedSinceHeader ? { 'If-Modified-Since': ifModifiedSinceHeader } : {},
+})
 
-  const wait = MIN_CALL_INTERVAL_MS - (Date.now() - lastCallAt)
-  if (wait > 0) await sleep(wait)
-
-  const headers: Record<string, string> = {
-    'Authorization': `Bearer ${token.accessToken}`,
-    'Xero-Tenant-Id': token.tenantId,
-    'Accept': 'application/json',
-  }
-  if (opts?.ifModifiedSince) headers['If-Modified-Since'] = opts.ifModifiedSince
-
-  callCount++
-  lastCallAt = Date.now()
-  const res = await fetch(`${XERO_API_BASE}/${path}`, { method: 'GET', headers })
-
-  if (res.status === 429) {
-    // Retry-After on the daily cap is measured in HOURS. Surface it rather than sleeping blind
-    // (o3d-98q: an unbudgeted sleep here is indistinguishable from a hung script).
-    const retryAfter = Number(res.headers.get('Retry-After') ?? '0')
-    if (retryAfter > 120) {
-      throw new Error(`Xero rate limit hit; Retry-After is ${retryAfter}s (${(retryAfter / 3600).toFixed(1)}h). Stopping after ${callCount} calls.`)
-    }
-    console.log(`  rate limited, sleeping ${retryAfter}s...`)
-    await sleep((retryAfter + 1) * 1000)
-    callCount--
-    return xeroGet<T>(token, path, opts)
-  }
-
-  const text = await res.text()
-  if (!res.ok) return { ok: false, status: res.status, error: text.slice(0, 300) }
-  try {
-    return { ok: true, status: res.status, data: JSON.parse(text) as T }
-  } catch {
-    return { ok: false, status: res.status, error: `Non-JSON response: ${text.slice(0, 200)}` }
-  }
-}
+const xeroGet = <T,>(token: StoredToken, path: string) => transport.request<T>(token, 'GET', path)
 
 function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = []
@@ -942,21 +928,32 @@ async function sweepJournals(
   const byId = new Map(rows.map((r) => [r.externalTransactionId, r]))
   const seen = new Map<string, XeroManualJournal>()
   const unknownInWindow: XeroManualJournal[] = []
-  const ifModifiedSince = new Date(CONTAMINATION_START).toUTCString()
   const seenPageIds = new Set<string>()
   let pagingComplete = false
 
+  // Scoped to this sweep only, and cleared in the `finally` below, so no other read can pick it up.
+  ifModifiedSinceHeader = new Date(CONTAMINATION_START).toUTCString()
+  try {
   for (let page = 1; page <= JOURNAL_PAGE_CEILING; page++) {
     const res = await xeroGet<{ ManualJournals?: XeroManualJournal[] }>(
       token,
       `ManualJournals?page=${page}`,
-      { ifModifiedSince },
     )
     if (!res.ok) {
       console.log(`  ! manual journal page ${page} failed (HTTP ${res.status}): ${res.error} — enumeration is INCOMPLETE`)
       break
     }
-    const batch = res.data?.ManualJournals ?? []
+    // A 2xx whose body we cannot read is NOT an empty page. `res.data?.ManualJournals ?? []`
+    // could not tell `{"ManualJournals":[]}` — the enumeration genuinely finishing — from an
+    // unparseable body, and the difference is published: the empty branch sets pagingComplete,
+    // which is this script's claim to have seen the whole collection. That claim is the entire
+    // reason the 251 journals were reported the way they were.
+    const parsed = parseCollectionPage<XeroManualJournal>(res.data, 'ManualJournals')
+    if (!parsed.ok) {
+      console.log(`  ! manual journal page ${page} answered HTTP ${res.status} but ${parsed.reason} — enumeration is INCOMPLETE`)
+      break
+    }
+    const batch = parsed.rows
     // Only an EMPTY page ends the walk. A short page does not: the page size is not a guarantee,
     // and treating "fewer than 100" as terminal is what dropped the older pages.
     if (!batch.length) { pagingComplete = true; break }
@@ -977,6 +974,11 @@ async function sweepJournals(
     if (page === JOURNAL_PAGE_CEILING) {
       console.log(`  ! manual journals hit the ${JOURNAL_PAGE_CEILING}-page ceiling — enumeration is INCOMPLETE`)
     }
+  }
+  } finally {
+    // The per-id confirmations below must NOT carry If-Modified-Since: a 304 on a per-id GET is
+    // not a 404, and this whole function exists because "not seen" was published as "absent".
+    ifModifiedSinceHeader = null
   }
 
   const findings: Finding[] = []
@@ -1191,7 +1193,7 @@ async function main() {
   }
 
   console.log(`\nWrote ${OUT_PATH}`)
-  console.log(`API calls used: ${callCount} (ceiling ${MAX_CALLS})`)
+  console.log(`API calls used: ${transport.callCount} (ceiling ${MAX_CALLS})`)
   console.log(`\nThe audit token is cached at ${TOKEN_FILE}. Delete it when the cleanup is done.`)
 
   // A reconciliation with an unresolved id is not a reconciliation. Say so, loudly, and exit

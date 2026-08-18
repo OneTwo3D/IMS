@@ -15,13 +15,27 @@
  *                        supplier and the previous prefix would have matched it.
  *   REVIEWED MANIFEST.   --apply requires --manifest: the tenant-stamped CSV that
  *                        audit-xero-live-e2e-footprint.ts writes, after a human has read it. An
- *                        object selected live but absent from the manifest is fatal.
+ *                        object selected live but absent from the manifest is fatal — and so is one
+ *                        whose STATE has moved since it was reviewed. The manifest records status,
+ *                        contact, blockers and UpdatedDateUTC, and the plan must match all of them.
+ *                        A uuid says which object a human approved; it cannot say what they
+ *                        approved doing to it, and a credit note reviewed as SUBMITTED (no GL
+ *                        effect, deletable) that a person has since APPROVED is a different
+ *                        proposition wearing the same id.
  *   RE-READ BEFORE EACH WRITE.  Every object is GET-ed again immediately before it is mutated and
  *                        must be identical to the plan — status, contact, blockers, UpdatedDateUTC.
  *                        The failure this closes is a document re-contacted to a GENUINE customer
  *                        between plan and write: still in a valid status, so Xero accepts the void.
  *                        That is a wrong write, not a rejected one.
- *   NO SUCCESSFUL PARTIAL.  Any failure exits non-zero and the banner says PARTIALLY APPLIED.
+ *   ONLY THIS RUN'S OWN CHANGES ARE FORGIVEN.  Step 1 legitimately moves a PAID document to
+ *                        AUTHORISED, so later steps have to tolerate that transition — but only on
+ *                        the documents where THIS RUN recorded the successful delete. The same
+ *                        transition caused by somebody else, in the Xero UI, while this run was
+ *                        part-way through, stops it. "It happened" is not "we did it".
+ *   NO SUCCESSFUL PARTIAL.  Any failure exits non-zero and the banner says PARTIALLY APPLIED —
+ *                        including when the run THROWS after writing. An abort that prints only an
+ *                        error message leaves the operator with no idea that eighty invoices are
+ *                        already irreversibly voided.
  *
  * WHAT "DELETE" CAN AND CANNOT MEAN HERE
  * --------------------------------------
@@ -61,22 +75,27 @@ import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 import { Client } from 'pg'
 
 import {
+  allocationBlocker,
+  allowedStatusesAfterRun,
   assertExpectedTenant,
   assertManifestTenant,
   assertNoNearMisses,
-  assertPlanWithinManifest,
+  assertPlanAuthorizedByManifest,
   assertStillFixtureContact,
   assertUnchanged,
   classifyContactName,
   classifyItemCode,
   createXeroTransport,
+  creditNoteBlockers,
+  invoiceBlockers,
   isFixtureContactName,
   isFixtureItemCode,
+  MutationJournal,
   pageAllComplete,
   parseWriteManifest,
   runOutcome,
   SafetyViolationError,
-  statusesAfterReleasingBlockers,
+  type PlannedObject,
   type TransportToken,
   type WriteManifest,
 } from './lib/xero-live-safety'
@@ -297,7 +316,8 @@ const transport = createXeroTransport({
 
 // ---------------------------------------------------------------------------
 type CreditNote = { CreditNoteID: string; CreditNoteNumber?: string; Status: string; Total?: number; UpdatedDateUTC?: string; Contact?: { Name?: string }; Allocations?: Array<{ AllocationID?: string; Amount: number; Invoice?: { InvoiceID: string } }>; Payments?: Array<{ PaymentID: string; Amount: number }> }
-type Invoice = { InvoiceID: string; InvoiceNumber?: string; Status: string; Total?: number; UpdatedDateUTC?: string; Contact?: { Name?: string }; Payments?: Array<{ PaymentID: string }>; CreditNotes?: Array<{ CreditNoteID: string }> }
+/** `Type` is ACCREC (sales invoice) or ACCPAY (bill). The manifest files them under those names. */
+type Invoice = { InvoiceID: string; Type?: string; InvoiceNumber?: string; Status: string; Total?: number; UpdatedDateUTC?: string; Contact?: { Name?: string }; Payments?: Array<{ PaymentID: string }>; CreditNotes?: Array<{ CreditNoteID: string }> }
 type Contact = { ContactID: string; Name: string; ContactStatus: string; UpdatedDateUTC?: string }
 type Item = { ItemID: string; Code: string; UpdatedDateUTC?: string }
 
@@ -305,6 +325,20 @@ const TERMINAL = new Set(['VOIDED', 'DELETED'])
 
 const stats = { allocationsDeleted: 0, refundsDeleted: 0, creditNotesVoided: 0, invoicesVoided: 0, contactsArchived: 0, itemsDeleted: 0, skipped: 0, failed: 0 }
 const failures: string[] = []
+
+/**
+ * What this run has actually done, so far. Two jobs, one fact:
+ *   • it is the record of which blockers THIS RUN released, so a later step can tell a status this
+ *     run caused from one that merely happened;
+ *   • it is the count of irreversible writes already made, so a run that throws can still report
+ *     how much of the ledger it had already destroyed.
+ * Only SUCCEEDED writes go in. An attempted delete that failed explains nothing.
+ */
+const journal = new MutationJournal()
+
+/** Journal keys. A single allocation delete releases both sides, so both are recorded. */
+const cnKey = (id: string) => `creditnote:${id}`
+const invKey = (id: string) => `invoice:${id}`
 
 function act(what: string): void {
   console.log(`${APPLY ? '  ' : '  [dry-run] '}${what}`)
@@ -322,14 +356,16 @@ function terminalStatusFor(status: string): 'VOIDED' | 'DELETED' {
   return status === 'DRAFT' || status === 'SUBMITTED' ? 'DELETED' : 'VOIDED'
 }
 
-const cnBlockers = (cn: CreditNote): string[] => [
-  ...(cn.Allocations ?? []).map((a) => `allocation:${a.AllocationID ?? '?'}`),
-  ...(cn.Payments ?? []).map((p) => `refund:${p.PaymentID}`),
-]
-const invBlockers = (inv: Invoice): string[] => [
-  ...(inv.Payments ?? []).map((p) => `payment:${p.PaymentID}`),
-  ...(inv.CreditNotes ?? []).map((c) => `creditnote:${c.CreditNoteID}`),
-]
+/**
+ * The SHARED blocker grammar (scripts/lib/xero-live-safety.ts), not a local one. The manifest
+ * records the blocker set a human reviewed and this script refuses any object whose set has moved,
+ * so the audit that writes the CSV and the writer that reads it have to name blockers identically.
+ * They previously did not — the audit wrote `allocated-to:<invoiceId>` where this file wrote
+ * `allocation:<AllocationID>` — and comparing those two would have reported every allocated credit
+ * note as changed, for a difference that is purely in vocabulary.
+ */
+const cnBlockers = creditNoteBlockers
+const invBlockers = invoiceBlockers
 
 // ---------------------------------------------------------------------------
 // Per-object re-read, immediately before the mutation
@@ -421,16 +457,33 @@ async function main() {
 
   console.log(`  exact fixture grammar selects ${invoices.length} invoices, ${creditNotes.length} credit notes, ${contacts.length} contacts, ${items.length} items`)
 
-  const plan = [
-    ...creditNotes.map((c) => ({ uuid: c.CreditNoteID, entity: 'creditnote', label: c.CreditNoteNumber ?? '' })),
-    ...invoices.map((i) => ({ uuid: i.InvoiceID, entity: 'invoice', label: i.InvoiceNumber ?? '' })),
-    ...contacts.map((c) => ({ uuid: c.ContactID, entity: 'contact', label: c.Name })),
-    ...items.map((i) => ({ uuid: i.ItemID, entity: 'item', label: i.Code })),
+  // The plan carries STATE, not just identity, because that is what the manifest authorises. Every
+  // field here has a counterpart column in the CSV a human read.
+  const plan: PlannedObject[] = [
+    ...creditNotes.map((c) => ({
+      uuid: c.CreditNoteID, entity: 'creditnote', label: c.CreditNoteNumber ?? '',
+      status: c.Status, contactName: c.Contact?.Name ?? '', blockers: cnBlockers(c), updatedDateUtc: c.UpdatedDateUTC ?? '',
+    })),
+    ...invoices.map((i) => ({
+      // The audit files ACCPAY under `bill`; the entity name is compared, so it has to agree.
+      uuid: i.InvoiceID, entity: i.Type === 'ACCPAY' ? 'bill' : 'invoice', label: i.InvoiceNumber ?? '',
+      status: i.Status, contactName: i.Contact?.Name ?? '', blockers: invBlockers(i), updatedDateUtc: i.UpdatedDateUTC ?? '',
+    })),
+    ...contacts.map((c) => ({
+      uuid: c.ContactID, entity: 'contact', label: c.Name,
+      status: c.ContactStatus, contactName: c.Name, blockers: [], updatedDateUtc: c.UpdatedDateUTC ?? '',
+    })),
+    ...items.map((i) => ({
+      uuid: i.ItemID, entity: 'item', label: i.Code,
+      status: '', contactName: '', blockers: [], updatedDateUtc: i.UpdatedDateUTC ?? '',
+    })),
   ]
 
   if (manifest) {
-    const { missingFromLedger } = assertPlanWithinManifest(plan, manifest)
-    console.log(`  manifest check: all ${plan.length} planned object(s) are reviewed; ${missingFromLedger.length} manifest id(s) are no longer in the org (already cleaned up).`)
+    // Identity AND state. An object that has moved since the review is refused here, BEFORE the
+    // first mutation, rather than discovered half-way through by the per-object re-read.
+    const { missingFromLedger } = assertPlanAuthorizedByManifest(plan, manifest)
+    console.log(`  manifest check: all ${plan.length} planned object(s) are reviewed AND still in the reviewed state; ${missingFromLedger.length} manifest id(s) are no longer in the org (already cleaned up).`)
   }
 
   // Persist the reviewed plan before the first write, so a run that dies part-way leaves behind
@@ -485,8 +538,18 @@ async function main() {
         act(`delete allocation ${alloc.AllocationID} (${alloc.Amount}) on ${live.CreditNoteNumber} -> invoice ${alloc.Invoice?.InvoiceID}`)
         if (!APPLY) { stats.allocationsDeleted++; continue }
         const res = await transport.request(token, 'DELETE', `CreditNotes/${live.CreditNoteID}/Allocations/${alloc.AllocationID}`)
-        if (res.ok) stats.allocationsDeleted++
-        else { stats.failed++; failures.push(`allocation ${alloc.AllocationID} on ${live.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
+        if (res.ok) {
+          stats.allocationsDeleted++
+          journal.recordWrite('allocation deleted', `${live.CreditNoteNumber} -> invoice ${alloc.Invoice?.InvoiceID ?? '?'}`)
+          // Recorded against BOTH sides: deleting the allocation releases the credit note and the
+          // invoice at once, and each of them may legitimately move PAID -> AUTHORISED as a result.
+          // This — a succeeded DELETE, in this process — is the ONLY thing that later licenses
+          // either document to have moved.
+          journal.recordRelease(cnKey(live.CreditNoteID), allocationBlocker(alloc))
+          if (alloc.Invoice?.InvoiceID) {
+            journal.recordRelease(invKey(alloc.Invoice.InvoiceID), `creditnote:${live.CreditNoteID}`)
+          }
+        } else { stats.failed++; failures.push(`allocation ${alloc.AllocationID} on ${live.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
       }
 
       // A refund paid out against the credit note blocks the void the same way an allocation does.
@@ -495,8 +558,11 @@ async function main() {
         act(`delete refund payment ${payment.PaymentID} (${payment.Amount}) on ${live.CreditNoteNumber}`)
         if (!APPLY) { stats.refundsDeleted++; continue }
         const res = await transport.request(token, 'POST', `Payments/${payment.PaymentID}`, { Status: 'DELETED' })
-        if (res.ok) stats.refundsDeleted++
-        else { stats.failed++; failures.push(`refund ${payment.PaymentID} on ${live.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
+        if (res.ok) {
+          stats.refundsDeleted++
+          journal.recordWrite('refund deleted', `${payment.PaymentID} on ${live.CreditNoteNumber}`)
+          journal.recordRelease(cnKey(live.CreditNoteID), `refund:${payment.PaymentID}`)
+        } else { stats.failed++; failures.push(`refund ${payment.PaymentID} on ${live.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
       }
     }
   }
@@ -511,15 +577,19 @@ async function main() {
         const fresh = await reread<CreditNote>(token, `CreditNotes/${planned.CreditNoteID}`, 'CreditNotes')
         assertStillFixtureContact(planned.CreditNoteID, fresh?.Contact?.Name)
         // Step 1 legitimately released this document's allocations and refunds, which also moves a
-        // PAID credit note to AUTHORISED. Those are the only changes allowed: a blocker that did
-        // not exist at plan time, or any other status, means someone else is working on it.
+        // PAID credit note to AUTHORISED — but ONLY on the documents where step 1's DELETE actually
+        // succeeded, and only for the blockers it actually removed. Both facts come from this run's
+        // own journal. A document that moved for any other reason, or lost a blocker this run did
+        // not delete, is a document somebody else is working on while we hold a write token.
+        const released = journal.releasedFor(cnKey(planned.CreditNoteID))
         assertUnchanged(
           {
             id: planned.CreditNoteID,
-            allowedStatuses: statusesAfterReleasingBlockers(planned.Status),
+            allowedStatuses: allowedStatusesAfterRun(planned.Status, journal.causedRelease(cnKey(planned.CreditNoteID))),
             contactName: planned.Contact?.Name,
             blockers: cnBlockers(planned),
-            blockerPolicy: 'subset',
+            blockerPolicy: 'released',
+            releasedBlockers: released,
           },
           fresh ? { id: fresh.CreditNoteID, status: fresh.Status, contactName: fresh.Contact?.Name, blockers: cnBlockers(fresh) } : null,
         )
@@ -529,8 +599,10 @@ async function main() {
       act(`${target === 'DELETED' ? 'delete' : 'void'} credit note ${current.CreditNoteNumber} (${current.Status}, ${current.Total})`)
       if (!APPLY) { stats.creditNotesVoided++; continue }
       const res = await transport.request(token, 'POST', `CreditNotes/${current.CreditNoteID}`, { Status: target })
-      if (res.ok) stats.creditNotesVoided++
-      else { stats.failed++; failures.push(`credit note ${current.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
+      if (res.ok) {
+        stats.creditNotesVoided++
+        journal.recordWrite(target === 'DELETED' ? 'credit note deleted' : 'credit note voided', current.CreditNoteNumber ?? current.CreditNoteID)
+      } else { stats.failed++; failures.push(`credit note ${current.CreditNoteNumber}: HTTP ${res.status} ${res.error}`) }
     }
   }
 
@@ -543,15 +615,20 @@ async function main() {
       if (APPLY) {
         const fresh = await reread<Invoice>(token, `Invoices/${planned.InvoiceID}`, 'Invoices')
         assertStillFixtureContact(planned.InvoiceID, fresh?.Contact?.Name)
-        // Steps 1-2 legitimately released this invoice's credit notes and payments, which also moves
-        // a PAID invoice to AUTHORISED. Nothing else may have changed.
+        // Step 1 legitimately released the credit notes allocated to this invoice, which also moves
+        // a PAID invoice to AUTHORISED — but only where this run's own DELETE succeeded. Note what
+        // is NOT forgiven: no step here deletes a PAYMENT against an invoice, so an invoice that
+        // has stopped being PAID without this run releasing a credit note was settled or unsettled
+        // by someone else, and voiding it on a stale plan is the wrong write.
+        const released = journal.releasedFor(invKey(planned.InvoiceID))
         assertUnchanged(
           {
             id: planned.InvoiceID,
-            allowedStatuses: statusesAfterReleasingBlockers(planned.Status),
+            allowedStatuses: allowedStatusesAfterRun(planned.Status, journal.causedRelease(invKey(planned.InvoiceID))),
             contactName: planned.Contact?.Name,
             blockers: invBlockers(planned),
-            blockerPolicy: 'subset',
+            blockerPolicy: 'released',
+            releasedBlockers: released,
           },
           fresh ? { id: fresh.InvoiceID, status: fresh.Status, contactName: fresh.Contact?.Name, blockers: invBlockers(fresh) } : null,
         )
@@ -561,8 +638,10 @@ async function main() {
       act(`${target === 'DELETED' ? 'delete' : 'void'} invoice ${current.InvoiceNumber} (${current.Status}, ${current.Total})`)
       if (!APPLY) { stats.invoicesVoided++; continue }
       const res = await transport.request(token, 'POST', `Invoices/${current.InvoiceID}`, { Status: target })
-      if (res.ok) stats.invoicesVoided++
-      else { stats.failed++; failures.push(`invoice ${current.InvoiceNumber}: HTTP ${res.status} ${res.error}`) }
+      if (res.ok) {
+        stats.invoicesVoided++
+        journal.recordWrite(target === 'DELETED' ? 'invoice deleted' : 'invoice voided', current.InvoiceNumber ?? current.InvoiceID)
+      } else { stats.failed++; failures.push(`invoice ${current.InvoiceNumber}: HTTP ${res.status} ${res.error}`) }
     }
   }
 
@@ -589,8 +668,10 @@ async function main() {
       act(`archive contact ${current.Name}`)
       if (!APPLY) { stats.contactsArchived++; continue }
       const res = await transport.request(token, 'POST', `Contacts/${current.ContactID}`, { ContactStatus: 'ARCHIVED' })
-      if (res.ok) stats.contactsArchived++
-      else { stats.failed++; failures.push(`contact ${current.Name}: HTTP ${res.status} ${res.error}`) }
+      if (res.ok) {
+        stats.contactsArchived++
+        journal.recordWrite('contact archived', current.Name)
+      } else { stats.failed++; failures.push(`contact ${current.Name}: HTTP ${res.status} ${res.error}`) }
     }
   }
 
@@ -610,8 +691,10 @@ async function main() {
       act(`delete item ${planned.Code}`)
       if (!APPLY) { stats.itemsDeleted++; continue }
       const res = await transport.request(token, 'DELETE', `Items/${planned.ItemID}`)
-      if (res.ok) stats.itemsDeleted++
-      else {
+      if (res.ok) {
+        stats.itemsDeleted++
+        journal.recordWrite('item deleted', planned.Code)
+      } else {
         // Expected for any item still referenced by a (now voided) document. It is still a failure
         // to complete the plan, so it counts and the run exits non-zero.
         stats.failed++
@@ -619,9 +702,33 @@ async function main() {
       }
     }
   }
+}
 
-  const outcome = runOutcome({ apply: APPLY, failed: stats.failed })
+/**
+ * The end-of-run banner. It is a separate function, and it is called from the abort path as well
+ * as the normal one, because those are the two ways this script stops and only one of them used
+ * to say anything about the ledger.
+ *
+ * A guard that fires half-way through step 3 is doing its job — but the process then threw, the
+ * `catch` printed one line about one credit note, and nothing on screen said that eighty invoices
+ * were already irreversibly voided. The reporting that exists precisely to say "destruction was
+ * partial" was bypassed by the exception. So: same summary, both paths, and when the run aborted
+ * after writing, the banner leads with PARTIALLY APPLIED and the count of irreversible writes.
+ */
+function report(aborted: boolean, error?: unknown): number {
+  const outcome = runOutcome({
+    apply: APPLY,
+    failed: stats.failed,
+    aborted,
+    writesMade: journal.writeCount,
+  })
   console.log(`\n=== ${outcome.label} ===`)
+  if (aborted) {
+    console.log(`  ABORTED: ${error instanceof Error ? error.message : String(error)}`)
+    console.log(journal.writeCount > 0
+      ? `  ${journal.writeCount} irreversible write(s) had ALREADY SUCCEEDED before the run stopped. They cannot be undone.`
+      : '  Nothing had been written when the run stopped.')
+  }
   console.log(`  allocations deleted: ${stats.allocationsDeleted}`)
   console.log(`  refund payments deleted: ${stats.refundsDeleted}`)
   console.log(`  credit notes voided: ${stats.creditNotesVoided}`)
@@ -635,15 +742,22 @@ async function main() {
     for (const f of failures.slice(0, 40)) console.log(`  - ${f}`)
     if (failures.length > 40) console.log(`  ... and ${failures.length - 40} more`)
   }
+  if (aborted && journal.writeCount > 0) {
+    console.log('\nirreversible writes already made:')
+    for (const w of journal.writeRecords.slice(0, 40)) console.log(`  - ${w.kind}: ${w.label}`)
+    if (journal.writeCount > 40) console.log(`  ... and ${journal.writeCount - 40} more`)
+  }
   console.log(`\nAPI calls used: ${transport.callCount}`)
-  if (!APPLY) console.log(`\nReview ${PLAN_OUT}, then re-run with --manifest <reviewed csv> --apply.`)
+  if (!APPLY && !aborted) console.log(`\nReview ${PLAN_OUT}, then re-run with --manifest <reviewed csv> --apply.`)
   if (outcome.exitCode !== 0) {
     console.error(`\nThe footprint was NOT fully removed. Re-run the read-only footprint audit before trying again.`)
-    process.exitCode = outcome.exitCode
   }
+  return outcome.exitCode
 }
 
-main().catch((e) => {
-  console.error(`\nFAILED: ${e instanceof Error ? e.message : String(e)}`)
-  process.exit(1)
-})
+main()
+  .then(() => { process.exitCode = report(false) })
+  .catch((e) => {
+    console.error(`\nFAILED: ${e instanceof Error ? e.message : String(e)}`)
+    process.exitCode = report(true, e)
+  })

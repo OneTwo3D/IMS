@@ -57,12 +57,14 @@ import {
   assertNoNearMisses,
   classifyContactName,
   classifyItemCode,
+  createXeroTransport,
+  creditNoteBlockers,
+  formatBlockers,
+  invoiceBlockers,
   isFixtureContactName,
   isFixtureItemCode,
   pageAllComplete,
 } from './lib/xero-live-safety'
-
-const XERO_API_BASE = 'https://api.xero.com/api.xro/2.0'
 
 function arg(name: string, fallback?: string): string | undefined {
   const i = process.argv.indexOf(`--${name}`)
@@ -88,44 +90,23 @@ const WINDOW_TO = '2026-07-27'
 
 type StoredToken = { accessToken: string; tenantId: string; tenantName: string }
 
-let callCount = 0
-let lastCallAt = 0
-const MIN_CALL_INTERVAL_MS = 1200
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+/**
+ * The shared transport, built read-only (`apply: false`), so this file cannot alter the live ledger
+ * — the transport THROWS on any verb other than GET without --apply, and this script never passes
+ * one. It replaces a hand-rolled client that was a copy of the writer's, including the writer's
+ * since-fixed 429 defect: the retry refunded the call budget (`callCount--`) and recursed with no
+ * retry counter, so an endpoint answering 429 indefinitely retried for ever and the call ceiling —
+ * the one thing that could have stopped it — could never be reached. There is now one client, so
+ * that defect cannot be fixed in one copy and left in another.
+ */
+const transport = createXeroTransport({
+  apply: false,
+  maxCalls: MAX_CALLS,
+  minIntervalMs: 1200,
+  log: (m) => console.log(m),
+})
 
-/** GET only. Deliberately no write counterpart — this file cannot alter the live ledger. */
-async function xeroGet<T>(token: StoredToken, path: string): Promise<{ ok: boolean; status: number; data?: T; error?: string }> {
-  if (callCount >= MAX_CALLS) throw new Error(`API call ceiling (${MAX_CALLS}) reached`)
-  const wait = MIN_CALL_INTERVAL_MS - (Date.now() - lastCallAt)
-  if (wait > 0) await sleep(wait)
-
-  callCount++
-  lastCallAt = Date.now()
-  const res = await fetch(`${XERO_API_BASE}/${path}`, {
-    method: 'GET',
-    headers: {
-      'Authorization': `Bearer ${token.accessToken}`,
-      'Xero-Tenant-Id': token.tenantId,
-      'Accept': 'application/json',
-    },
-  })
-
-  if (res.status === 429) {
-    const retryAfter = Number(res.headers.get('Retry-After') ?? '0')
-    if (retryAfter > 120) throw new Error(`Rate limited; Retry-After ${retryAfter}s. Stopped after ${callCount} calls.`)
-    await sleep((retryAfter + 1) * 1000)
-    callCount--
-    return xeroGet<T>(token, path)
-  }
-
-  const text = await res.text()
-  if (!res.ok) return { ok: false, status: res.status, error: text.slice(0, 300) }
-  try {
-    return { ok: true, status: res.status, data: JSON.parse(text) as T }
-  } catch {
-    return { ok: false, status: res.status, error: `Non-JSON: ${text.slice(0, 200)}` }
-  }
-}
+const xeroGet = <T,>(token: StoredToken, path: string) => transport.request<T>(token, 'GET', path)
 
 /**
  * Page to proven completeness, via the shared helper. Three endings, and only two are success: an
@@ -150,6 +131,13 @@ function xeroDate(value?: string): string {
   return m ? new Date(Number(m[1])).toISOString().slice(0, 10) : value
 }
 
+/**
+ * A manifest row. `tenantId`, `status`, `contact`, `blockers` and `updatedDateUtc` are not
+ * decoration — they are the STATE the reviewer signs off, and the writer refuses to act on any
+ * object that has moved away from them. A uuid alone says which object a human approved; it cannot
+ * say what they approved doing to it, so a credit note reviewed as SUBMITTED and since approved by
+ * a person would still be authorised by its uuid.
+ */
 type Row = {
   /** Which organisation this row describes. Mandatory: the manifest is worthless without it. */
   tenantId: string
@@ -157,7 +145,10 @@ type Row = {
   uuid: string
   number: string
   status: string
+  /** The document's own date (invoices/credit notes) or last-updated day. Informational. */
   date: string
+  /** Xero's RAW UpdatedDateUTC. Compared byte-for-byte by the writer, so it is not reformatted. */
+  updatedDateUtc: string
   total: string
   currency: string
   contact: string
@@ -167,7 +158,7 @@ type Row = {
 }
 
 function toCsv(rows: Row[]): string {
-  const cols: Array<keyof Row> = ['tenantId', 'cleanupStep', 'entity', 'uuid', 'number', 'status', 'date', 'total', 'currency', 'contact', 'blockers', 'note']
+  const cols: Array<keyof Row> = ['tenantId', 'cleanupStep', 'entity', 'uuid', 'number', 'status', 'date', 'updatedDateUtc', 'total', 'currency', 'contact', 'blockers', 'note']
   const esc = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v)
   return [cols.join(','), ...rows.map((r) => cols.map((c) => esc(String(r[c] ?? ''))).join(','))].join('\n')
 }
@@ -190,22 +181,24 @@ async function main() {
   const rows: Row[] = []
 
   console.log('\n--- invoices with an E2E contact ---')
-  type Inv = { InvoiceID: string; Type: string; InvoiceNumber?: string; Status: string; Date?: string; Total?: number; AmountPaid?: number; CurrencyCode?: string; Contact?: { Name?: string }; Payments?: Array<{ PaymentID: string }>; CreditNotes?: Array<{ CreditNoteID: string }> }
+  type Inv = { InvoiceID: string; Type: string; InvoiceNumber?: string; Status: string; Date?: string; UpdatedDateUTC?: string; Total?: number; AmountPaid?: number; CurrencyCode?: string; Contact?: { Name?: string }; Payments?: Array<{ PaymentID: string }>; CreditNotes?: Array<{ CreditNoteID: string }> }
   const allInvoices = await pageAll<Inv>(token, `Invoices?where=${contactWhere}`, 'Invoices', (i) => i.InvoiceID)
   assertNoNearMisses(allInvoices.map((i) => ({ label: i.InvoiceNumber ?? i.InvoiceID, value: i.Contact?.Name })), classifyContactName, 'invoice contacts')
   const invoices = allInvoices.filter((i) => isFixtureContactName(i.Contact?.Name))
   console.log(`  ${invoices.length} (of ${allInvoices.length} returned by the prefix filter)`)
   for (const i of invoices) {
-    const blockers = [
-      ...(i.Payments ?? []).map((p) => `payment:${p.PaymentID}`),
-      ...(i.CreditNotes ?? []).map((c) => `creditnote:${c.CreditNoteID}`),
-    ]
+    // The SHARED blocker grammar. The writer derives its blocker sets with the same function and
+    // refuses any object whose set has moved, so the two files have to name blockers identically —
+    // two spellings of the same allocation would make every document look changed and turn the
+    // check into noise, which is how a safety check ends up switched off.
+    const blockers = invoiceBlockers(i)
     rows.push({
       tenantId: token.tenantId,
       entity: i.Type === 'ACCPAY' ? 'bill' : 'invoice',
       uuid: i.InvoiceID, number: i.InvoiceNumber ?? '', status: i.Status,
-      date: xeroDate(i.Date), total: String(i.Total ?? ''), currency: i.CurrencyCode ?? '',
-      contact: i.Contact?.Name ?? '', blockers: blockers.join(' '),
+      date: xeroDate(i.Date), updatedDateUtc: i.UpdatedDateUTC ?? '',
+      total: String(i.Total ?? ''), currency: i.CurrencyCode ?? '',
+      contact: i.Contact?.Name ?? '', blockers: formatBlockers(blockers),
       // Anything holding an allocation or payment must be released before the void is accepted.
       cleanupStep: blockers.length ? '3-void-after-releasing-blockers' : '3-void',
       note: '',
@@ -213,19 +206,24 @@ async function main() {
   }
 
   console.log('--- credit notes with an E2E contact ---')
-  type CN = { CreditNoteID: string; Type: string; CreditNoteNumber?: string; Status: string; Date?: string; Total?: number; CurrencyCode?: string; Contact?: { Name?: string }; Allocations?: Array<{ Invoice?: { InvoiceID: string } }> }
+  // Payments on a credit note are REFUNDS, and a refund blocks the void exactly as an allocation
+  // does. The writer counts them as blockers, so the manifest has to record them too — otherwise
+  // every credit note carrying one reads as "changed since review" for a difference that is only
+  // in what the two scripts bothered to look at.
+  type CN = { CreditNoteID: string; Type: string; CreditNoteNumber?: string; Status: string; Date?: string; UpdatedDateUTC?: string; Total?: number; CurrencyCode?: string; Contact?: { Name?: string }; Allocations?: Array<{ AllocationID?: string; Invoice?: { InvoiceID: string } }>; Payments?: Array<{ PaymentID: string }> }
   const allCreditNotes = await pageAll<CN>(token, `CreditNotes?where=${contactWhere}`, 'CreditNotes', (c) => c.CreditNoteID)
   assertNoNearMisses(allCreditNotes.map((c) => ({ label: c.CreditNoteNumber ?? c.CreditNoteID, value: c.Contact?.Name })), classifyContactName, 'credit-note contacts')
   const creditNotes = allCreditNotes.filter((c) => isFixtureContactName(c.Contact?.Name))
   console.log(`  ${creditNotes.length} (of ${allCreditNotes.length} returned by the prefix filter)`)
   for (const c of creditNotes) {
-    const allocs = (c.Allocations ?? []).filter((a) => a.Invoice?.InvoiceID).map((a) => `allocated-to:${a.Invoice!.InvoiceID}`)
+    const blockers = creditNoteBlockers(c)
     rows.push({
       tenantId: token.tenantId,
       entity: 'creditnote', uuid: c.CreditNoteID, number: c.CreditNoteNumber ?? '', status: c.Status,
-      date: xeroDate(c.Date), total: String(c.Total ?? ''), currency: c.CurrencyCode ?? '',
-      contact: c.Contact?.Name ?? '', blockers: allocs.join(' '),
-      cleanupStep: allocs.length ? '2-remove-allocation-then-void' : '2-void',
+      date: xeroDate(c.Date), updatedDateUtc: c.UpdatedDateUTC ?? '',
+      total: String(c.Total ?? ''), currency: c.CurrencyCode ?? '',
+      contact: c.Contact?.Name ?? '', blockers: formatBlockers(blockers),
+      cleanupStep: blockers.length ? '2-remove-allocation-then-void' : '2-void',
       note: '',
     })
   }
@@ -240,7 +238,8 @@ async function main() {
     rows.push({
       tenantId: token.tenantId,
       entity: 'contact', uuid: c.ContactID, number: '', status: c.ContactStatus,
-      date: xeroDate(c.UpdatedDateUTC), total: '', currency: '', contact: c.Name,
+      date: xeroDate(c.UpdatedDateUTC), updatedDateUtc: c.UpdatedDateUTC ?? '',
+      total: '', currency: '', contact: c.Name,
       blockers: '', cleanupStep: '4-archive',
       note: 'a contact with transactions cannot be deleted, only archived',
     })
@@ -259,8 +258,12 @@ async function main() {
     rows.push({
       tenantId: token.tenantId,
       entity: 'item', uuid: i.ItemID, number: i.Code, status: '', date: xeroDate(i.UpdatedDateUTC),
-      total: '', currency: '', contact: i.Name ?? '', blockers: '', cleanupStep: '5-delete',
-      note: 'delete only after the documents referencing it are voided',
+      updatedDateUtc: i.UpdatedDateUTC ?? '',
+      // An item has no contact. The writer plans it with an empty contact too, so the manifest
+      // comparison is exact rather than "empty means unchecked" — the item's NAME is not a contact
+      // and must not be recorded in a column the writer treats as one.
+      total: '', currency: '', contact: '', blockers: '', cleanupStep: '5-delete',
+      note: `${i.Name ? `"${i.Name}" — ` : ''}delete only after the documents referencing it are voided`,
     })
   }
 
@@ -301,7 +304,7 @@ async function main() {
   console.log(`\nWrote ${OUT_PATH}`)
   console.log(`  Every row is stamped tenantId=${token.tenantId}. READ this file, then pass it to`)
   console.log(`  remove-xero-live-e2e-footprint.ts as --manifest to authorise the (irreversible) cleanup.`)
-  console.log(`API calls used: ${callCount}`)
+  console.log(`API calls used: ${transport.callCount}`)
 }
 
 main().catch((e) => {

@@ -6,31 +6,47 @@
  * token against a REAL ledger decides to void an invoice. Every assertion here corresponds to a way
  * that decision was previously reachable when it should not have been.
  *
- * The doubles are built to be able to represent the three things that actually go wrong:
+ * The doubles are built to be able to represent the things that actually go wrong:
  *   • a LEGITIMATE ledger record whose name satisfies the old prefix,
  *   • an object that CHANGES between the plan read and the write,
- *   • a page that FAILS part-way through planning.
- * A double that cannot express those cannot fail these tests for the right reason.
+ *   • a page that FAILS part-way through planning,
+ *   • an object A HUMAN APPROVED between the review and the apply — `FakeLedger` can be read
+ *     twice with a change in between, which is the entire gap the manifest is supposed to close,
+ *   • a 2xx page whose BODY IS MALFORMED, which must never read as an empty collection,
+ *   • an endpoint that is PERMANENTLY rate-limited,
+ *   • a run that WROTE and THEN THREW, via `MutationJournal`.
+ * A double that cannot express those cannot fail these tests for the right reason. The one that
+ * matters most is the first: a fake returning the same object on every read would satisfy an
+ * id-only manifest check and a state-bound one identically, and prove nothing about either.
  */
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { describe, test } from 'node:test'
 
 import {
+  allowedStatusesAfterRun,
   AmbiguousSelectionError,
   assertExpectedTenant,
   assertManifestTenant,
   assertNoNearMisses,
-  assertPlanWithinManifest,
+  assertPlanAuthorizedByManifest,
   assertRetirementAuthorized,
   assertStillFixtureContact,
   assertUnchanged,
   classifyContactName,
   classifyItemCode,
   createXeroTransport,
+  creditNoteBlockers,
+  fingerprintIds,
+  formatBlockers,
+  invoiceBlockers,
   isFixtureContactName,
   isFixtureItemCode,
   ManifestViolationError,
+  MutationJournal,
   pageAllComplete,
+  parseCollectionPage,
   parseRetirementAuthorization,
   parseWriteManifest,
   PlanDivergedError,
@@ -42,6 +58,7 @@ import {
   statusesAfterReleasingBlockers,
   TenantMismatchError,
   WriteWithoutApplyError,
+  type PlannedObject,
   type RetirementGuardInput,
   type XeroResult,
 } from '@/scripts/lib/xero-live-safety'
@@ -409,15 +426,16 @@ describe('re-validating an object immediately before mutating it', () => {
     )
   })
 
-  test('under the subset policy a blocker may disappear but never appear', () => {
+  test('under the released policy a blocker THIS RUN deleted may disappear, but never appear', () => {
     const expectation = {
       id: 'inv-1',
       allowedStatuses: ['AUTHORISED'],
       contactName: 'E2E E2E-FC-a1',
       blockers: ['payment:p1', 'creditnote:c1'],
-      blockerPolicy: 'subset' as const,
+      blockerPolicy: 'released' as const,
+      releasedBlockers: ['payment:p1', 'creditnote:c1'],
     }
-    // step 1/2 released them — fine.
+    // step 1 released them, and recorded that it did — fine.
     assert.doesNotThrow(() => assertUnchanged(expectation, { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [] }))
     // someone else attached a new payment — stop.
     assert.throws(
@@ -448,10 +466,16 @@ describe('re-validating an object immediately before mutating it', () => {
 // ===========================================================================
 describe('the reviewed write manifest', () => {
   const csv = [
-    'tenantId,cleanupStep,entity,uuid,number,status,contact',
-    'tenant-live,3-void,invoice,inv-1,INV-001,AUTHORISED,E2E E2E-FC-a1',
-    'tenant-live,4-archive,contact,con-1,,ACTIVE,E2E E2E-FC-a1',
+    'tenantId,cleanupStep,entity,uuid,number,status,updatedDateUtc,contact,blockers',
+    'tenant-live,3-void,invoice,inv-1,INV-001,AUTHORISED,/Date(1000)/,E2E E2E-FC-a1,',
+    'tenant-live,4-archive,contact,con-1,,ACTIVE,/Date(2000)/,E2E E2E-FC-a1,',
   ].join('\n')
+
+  /** The plan row for inv-1 exactly as the manifest records it. */
+  const invoiceAsReviewed = {
+    uuid: 'inv-1', entity: 'invoice', label: 'INV-001',
+    status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(1000)/',
+  }
 
   test('a well-formed manifest parses with its tenant stamp', () => {
     const m = parseWriteManifest(csv)
@@ -471,7 +495,7 @@ describe('the reviewed write manifest', () => {
 
   test('a manifest spanning two tenants is refused', () => {
     assert.throws(
-      () => parseWriteManifest(`${csv}\ntenant-demo,3-void,invoice,inv-2,INV-2,AUTHORISED,E2E E2E-FC-a2`),
+      () => parseWriteManifest(`${csv}\ntenant-demo,3-void,invoice,inv-2,INV-2,AUTHORISED,/Date(3000)/,E2E E2E-FC-a2,`),
       ManifestViolationError,
     )
   })
@@ -483,18 +507,18 @@ describe('the reviewed write manifest', () => {
 
   test('an object that appeared AFTER the review is fatal, not silently included', () => {
     const plan = [
-      { uuid: 'inv-1', entity: 'invoice', label: 'INV-001' },
-      { uuid: 'inv-99', entity: 'invoice', label: 'INV-099' },
+      invoiceAsReviewed,
+      { uuid: 'inv-99', entity: 'invoice', label: 'INV-099', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a9', blockers: [], updatedDateUtc: '/Date(9)/' },
     ]
     assert.throws(
-      () => assertPlanWithinManifest(plan, parseWriteManifest(csv)),
+      () => assertPlanAuthorizedByManifest(plan, parseWriteManifest(csv)),
       (e: Error) => e instanceof ManifestViolationError && /inv-99/.test(e.message),
     )
   })
 
   test('a manifest id that is no longer in the ledger is reported, not fatal', () => {
     // Already cleaned up, or never existed. The asymmetry is the point.
-    const res = assertPlanWithinManifest([{ uuid: 'inv-1', entity: 'invoice', label: 'INV-001' }], parseWriteManifest(csv))
+    const res = assertPlanAuthorizedByManifest([invoiceAsReviewed], parseWriteManifest(csv))
     assert.deepEqual(res.missingFromLedger, ['con-1'])
     assert.equal(res.covered, 1)
   })
@@ -502,11 +526,14 @@ describe('the reviewed write manifest', () => {
 
 // ===========================================================================
 describe('the retirement operation refuses to run', () => {
+  /** The exact id set that was reviewed and signed off. */
+  const REVIEWED_IDS = Array.from({ length: 553 }, (_, i) => `id-${i}`)
   const authorization = {
     token: RETIREMENT_AUTHORIZATION_TOKEN,
     tenantId: 'tenant-demo',
     database: 'onetwo3d_ims_e2e',
     ids: 553,
+    idsSha256: fingerprintIds(REVIEWED_IDS),
     authorizedBy: 'a.person',
     authorizedAt: '2026-08-18',
   }
@@ -517,7 +544,7 @@ describe('the retirement operation refuses to run', () => {
     expectedDatabase: 'onetwo3d_ims_e2e',
     tenantRows: [{ tenantId: 'tenant-demo', tenantName: 'Demo Company (UK)' }],
     expectedTenantId: 'tenant-demo',
-    idCount: 553,
+    ids: REVIEWED_IDS,
   }
 
   test('with no override at all it refuses — this is the default and it is not negotiable', () => {
@@ -591,7 +618,7 @@ describe('the retirement operation refuses to run', () => {
 
   test('an id set that has changed size since sign-off is refused', () => {
     assert.throws(
-      () => assertRetirementAuthorized({ ...base, idCount: 554 }),
+      () => assertRetirementAuthorized({ ...base, ids: [...REVIEWED_IDS, 'id-553'] }),
       (e: Error) => e instanceof RetirementRefusedError && /554/.test(e.message),
     )
   })
@@ -606,6 +633,7 @@ describe('the retirement operation refuses to run', () => {
       'tenantId: tenant-demo',
       'database: onetwo3d_ims_e2e',
       'ids: 553',
+      `idsSha256: ${fingerprintIds(REVIEWED_IDS)}`,
       'authorizedBy: a.person',
       'authorizedAt: 2026-08-18',
     ]
@@ -660,4 +688,518 @@ describe('absence classification', () => {
     assert.equal(resolveById(r(true, 200), true), 'PRESENT')
     assert.equal(resolveById(r(true, 200), false), 'UNKNOWN')
   })
+})
+
+// ===========================================================================
+// The four scenarios this round of review was about. Each needs a double that can actually
+// REPRESENT the failure — a fake that cannot express "a human approved this document at 09:14"
+// cannot fail a test for the right reason.
+// ===========================================================================
+
+/**
+ * A tiny ledger that can be READ TWICE and CHANGED IN BETWEEN.
+ *
+ * That is the whole point of it. The reviewed manifest is produced by one process and consumed by
+ * another, minutes or days later, and everything in finding 1 lives in the gap: the object that a
+ * person approved, paid, or re-contacted while nobody was looking. A double that returns the same
+ * object every time cannot express that gap, so it would pass an id-only check and a state-bound
+ * check identically and prove nothing about either.
+ */
+type LedgerObject = {
+  uuid: string
+  entity: string
+  label: string
+  status: string
+  contactName: string
+  blockers: string[]
+  updatedDateUtc: string
+}
+
+class FakeLedger {
+  private readonly objects = new Map<string, LedgerObject>()
+
+  add(o: LedgerObject): this {
+    this.objects.set(o.uuid, { ...o })
+    return this
+  }
+
+  /** A person acting in the Xero UI. Any real change bumps UpdatedDateUTC, as Xero's does. */
+  humanChanges(uuid: string, change: Partial<Omit<LedgerObject, 'uuid'>>): this {
+    const before = this.objects.get(uuid)
+    assert.ok(before, `the double cannot change ${uuid}: it is not in the ledger`)
+    const bumped = String(Number(/\/Date\((\d+)\)\//.exec(before.updatedDateUtc)?.[1] ?? 0) + 60_000)
+    this.objects.set(uuid, { ...before, ...change, updatedDateUtc: `/Date(${bumped})/` })
+    return this
+  }
+
+  /** What the read-only audit writes into the manifest CSV. */
+  toManifestCsv(tenantId: string): string {
+    const header = 'tenantId,cleanupStep,entity,uuid,number,status,updatedDateUtc,contact,blockers'
+    const rows = [...this.objects.values()].map((o) =>
+      [tenantId, 'x', o.entity, o.uuid, o.label, o.status, o.updatedDateUtc, o.contactName, formatBlockers(o.blockers)].join(','))
+    return [header, ...rows].join('\n')
+  }
+
+  /** What the writer's own planning read builds, from the ledger as it stands NOW. */
+  toPlan(): PlannedObject[] {
+    return [...this.objects.values()].map((o) => ({
+      uuid: o.uuid, entity: o.entity, label: o.label,
+      status: o.status, contactName: o.contactName, blockers: [...o.blockers], updatedDateUtc: o.updatedDateUtc,
+    }))
+  }
+}
+
+const TENANT = 'tenant-live'
+
+/** A SUBMITTED credit note: not posted to the GL, no VAT effect, hard-deletable. */
+const submittedCreditNote: LedgerObject = {
+  uuid: 'cn-1', entity: 'creditnote', label: 'CN-001',
+  status: 'SUBMITTED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(1000)/',
+}
+
+describe('the manifest authorises a STATE, not just a uuid', () => {
+  test('an object a HUMAN APPROVED between review and apply is refused, though its uuid is authorised', () => {
+    // The exact shape of finding 1. A reviewer read "SUBMITTED credit note, delete it" — a document
+    // that is not in the ledger, has no VAT effect and can be removed outright. Someone then
+    // approved it in Xero. Same uuid, same contact, same (empty) blockers: an id-only manifest
+    // check waves it straight through, and the writer voids a posted document nobody signed off.
+    const ledger = new FakeLedger().add(submittedCreditNote)
+    const manifest = parseWriteManifest(ledger.toManifestCsv(TENANT))
+
+    ledger.humanChanges('cn-1', { status: 'AUTHORISED' })
+
+    assert.throws(
+      () => assertPlanAuthorizedByManifest(ledger.toPlan(), manifest),
+      (e: Error) => e instanceof ManifestViolationError
+        && /NO LONGER IN THE STATE THAT WAS REVIEWED/.test(e.message)
+        && /status SUBMITTED -> AUTHORISED/.test(e.message)
+        && /cn-1/.test(e.message),
+    )
+  })
+
+  test('the same object, untouched, still passes — the check is not simply refusing everything', () => {
+    const ledger = new FakeLedger().add(submittedCreditNote)
+    const manifest = parseWriteManifest(ledger.toManifestCsv(TENANT))
+    const res = assertPlanAuthorizedByManifest(ledger.toPlan(), manifest)
+    assert.equal(res.covered, 1)
+    assert.deepEqual(res.missingFromLedger, [])
+  })
+
+  test('a document RE-CONTACTED to a genuine customer between review and apply is refused', () => {
+    const ledger = new FakeLedger().add({
+      uuid: 'inv-1', entity: 'invoice', label: 'INV-001',
+      status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(1000)/',
+    })
+    const manifest = parseWriteManifest(ledger.toManifestCsv(TENANT))
+    ledger.humanChanges('inv-1', { contactName: 'Acme Widgets Ltd' })
+    assert.throws(
+      () => assertPlanAuthorizedByManifest(ledger.toPlan(), manifest),
+      (e: Error) => e instanceof ManifestViolationError && /Acme Widgets Ltd/.test(e.message),
+    )
+  })
+
+  test('a document PAID since the review is refused — the blocker set is part of the authorisation', () => {
+    const ledger = new FakeLedger().add({
+      uuid: 'inv-2', entity: 'invoice', label: 'INV-002',
+      status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: '/Date(1000)/',
+    })
+    const manifest = parseWriteManifest(ledger.toManifestCsv(TENANT))
+    ledger.humanChanges('inv-2', { status: 'PAID', blockers: ['payment:p9'] })
+    assert.throws(
+      () => assertPlanAuthorizedByManifest(ledger.toPlan(), manifest),
+      (e: Error) => e instanceof ManifestViolationError && /payment:p9/.test(e.message),
+    )
+  })
+
+  test('a change none of the named columns can express is still caught, by UpdatedDateUTC', () => {
+    // The catch-all. Whatever moved — line items, dates, tax treatment — the object is not the one
+    // that was reviewed, and the manifest does not authorise acting on it.
+    const ledger = new FakeLedger().add(submittedCreditNote)
+    const manifest = parseWriteManifest(ledger.toManifestCsv(TENANT))
+    ledger.humanChanges('cn-1', {})
+    assert.throws(
+      () => assertPlanAuthorizedByManifest(ledger.toPlan(), manifest),
+      (e: Error) => e instanceof ManifestViolationError && /updatedDateUTC/.test(e.message),
+    )
+  })
+
+  test('a manifest without the state columns cannot authorise a write at all', () => {
+    // Refused, not accepted at reduced strength: an absent column defaulted to '' would compare
+    // equal to an object that genuinely has no blockers, and the check would pass by accident on
+    // exactly the manifests it cannot cover.
+    for (const dropped of ['status', 'contact', 'blockers', 'updatedDateUtc']) {
+      const header = 'tenantId,entity,uuid,status,contact,blockers,updatedDateUtc'
+        .split(',').filter((c) => c !== dropped).join(',')
+      const row = 'tenant-live,invoice,inv-1,AUTHORISED,E2E E2E-FC-a1,,/Date(1)/'
+        .split(',').filter((_, i) => 'tenantId,entity,uuid,status,contact,blockers,updatedDateUtc'.split(',')[i] !== dropped).join(',')
+      assert.throws(
+        () => parseWriteManifest(`${header}\n${row}`),
+        (e: Error) => e instanceof ManifestViolationError && new RegExp(dropped).test(e.message),
+        `dropping the ${dropped} column must be refused`,
+      )
+    }
+  })
+
+  test('the audit and the writer name blockers identically, or the state check is noise', () => {
+    // If the CSV said `allocated-to:inv-9` where the writer computes `allocation:inv-9`, every
+    // allocated credit note would read as "changed since review" and the check would be switched
+    // off by the first operator who met it.
+    const cn = { Allocations: [{ AllocationID: 'a1', Invoice: { InvoiceID: 'inv-9' } }], Payments: [{ PaymentID: 'p1' }] }
+    assert.deepEqual(creditNoteBlockers(cn), ['allocation:inv-9', 'refund:p1'])
+    assert.deepEqual(invoiceBlockers({ Payments: [{ PaymentID: 'p2' }], CreditNotes: [{ CreditNoteID: 'cn-9' }] }), ['payment:p2', 'creditnote:cn-9'])
+    // The manifest form is sorted, so a re-ordered response is not a divergence.
+    assert.equal(formatBlockers(['refund:p1', 'allocation:inv-9']), formatBlockers(['allocation:inv-9', 'refund:p1']))
+  })
+})
+
+// ===========================================================================
+describe('"this run caused it" is not the same as "it happened"', () => {
+  const paidInvoice = {
+    id: 'inv-1',
+    contactName: 'E2E E2E-FC-a1',
+    blockers: ['creditnote:cn-1'],
+  }
+
+  test('a PAID -> AUTHORISED move is accepted only when this run recorded the release that caused it', () => {
+    const journal = new MutationJournal()
+
+    // Nothing released yet: the widened set is not on offer, so the move is a divergence.
+    assert.deepEqual(allowedStatusesAfterRun('PAID', journal.causedRelease('invoice:inv-1')), ['PAID'])
+    assert.throws(
+      () => assertUnchanged(
+        {
+          ...paidInvoice,
+          allowedStatuses: allowedStatusesAfterRun('PAID', journal.causedRelease('invoice:inv-1')),
+          blockerPolicy: 'released',
+          releasedBlockers: journal.releasedFor('invoice:inv-1'),
+        },
+        { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [] },
+      ),
+      (e: Error) => e instanceof PlanDivergedError && /status AUTHORISED is not one of \[PAID\]/.test(e.message),
+    )
+
+    // This run deletes the allocation, and records that it succeeded. NOW the move is explained.
+    journal.recordRelease('invoice:inv-1', 'creditnote:cn-1')
+    assert.deepEqual(allowedStatusesAfterRun('PAID', journal.causedRelease('invoice:inv-1')), ['PAID', 'AUTHORISED'])
+    assert.doesNotThrow(() => assertUnchanged(
+      {
+        ...paidInvoice,
+        allowedStatuses: allowedStatusesAfterRun('PAID', journal.causedRelease('invoice:inv-1')),
+        blockerPolicy: 'released',
+        releasedBlockers: journal.releasedFor('invoice:inv-1'),
+      },
+      { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [] },
+    ))
+  })
+
+  test('a blocker released by SOMEONE ELSE is refused, even though the plan merely lost a blocker', () => {
+    // The permissive version of this check ("the live set may be any subset of the plan's") cannot
+    // tell our own DELETE from a colleague releasing a payment in the UI two minutes ago.
+    const journal = new MutationJournal()
+    journal.recordRelease('invoice:inv-1', 'creditnote:cn-1')
+    assert.throws(
+      () => assertUnchanged(
+        {
+          id: 'inv-1',
+          allowedStatuses: ['PAID', 'AUTHORISED'],
+          contactName: 'E2E E2E-FC-a1',
+          blockers: ['creditnote:cn-1', 'payment:p7'],
+          blockerPolicy: 'released',
+          releasedBlockers: journal.releasedFor('invoice:inv-1'),
+        },
+        { id: 'inv-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [] },
+      ),
+      (e: Error) => e instanceof PlanDivergedError
+        && /released by something other than this run: payment:p7/.test(e.message),
+    )
+  })
+
+  test('the journal records only SUCCEEDED writes, so a failed delete explains nothing', () => {
+    const journal = new MutationJournal()
+    // A delete was attempted against cn-2 and came back HTTP 400. Nothing is recorded, so the
+    // widened status set is not offered for it.
+    journal.recordFailure('allocation a2 on CN-002: HTTP 400')
+    assert.equal(journal.causedRelease('creditnote:cn-2'), false)
+    assert.deepEqual(allowedStatusesAfterRun('PAID', journal.causedRelease('creditnote:cn-2')), ['PAID'])
+    assert.equal(journal.writeCount, 0)
+    assert.equal(journal.failureCount, 1)
+  })
+
+  test('a release is recorded against BOTH sides, because one delete frees both', () => {
+    const journal = new MutationJournal()
+    journal.recordRelease('creditnote:cn-1', 'allocation:inv-1')
+    journal.recordRelease('invoice:inv-1', 'creditnote:cn-1')
+    assert.deepEqual(journal.releasedFor('creditnote:cn-1'), ['allocation:inv-1'])
+    assert.deepEqual(journal.releasedFor('invoice:inv-1'), ['creditnote:cn-1'])
+    assert.equal(journal.causedRelease('invoice:inv-2'), false)
+  })
+})
+
+// ===========================================================================
+describe('a malformed 2xx page is not an empty collection', () => {
+  const bodyServer = (body: unknown) => fakeFetch(() => response(200, body))
+
+  test('a 200 carrying a body that is not a collection envelope THROWS', async () => {
+    for (const body of ['[]', '"just a string"', '42']) {
+      const { impl } = fakeFetch(() => response(200, JSON.parse(body)))
+      await assert.rejects(
+        () => pageAllComplete({ read: reader(impl), path: 'Invoices', key: 'Invoices', idOf: (r: { id: string }) => r.id }),
+        ReadIncompleteError,
+        `a 200 whose body is ${body} must not read as an empty collection`,
+      )
+    }
+  })
+
+  test('a 200 with no `Invoices` key at all THROWS rather than ending the walk', async () => {
+    // A proxy's `{"message":"maintenance"}`, or our own misspelled collection key. Under
+    // `res.data?.[key] ?? []` both are indistinguishable from "the collection is exhausted", which
+    // is what stops the walk, truncates the manifest and leaves live objects behind.
+    const { impl } = bodyServer({ message: 'temporarily unavailable' })
+    await assert.rejects(
+      () => pageAllComplete({ read: reader(impl), path: 'Invoices', key: 'Invoices', idOf: (r: { id: string }) => r.id }),
+      (e: Error) => e instanceof ReadIncompleteError && /no `Invoices` array/.test(e.message) && /message/.test(e.message),
+    )
+  })
+
+  test('a 200 whose `Invoices` is not an array THROWS', async () => {
+    const { impl } = bodyServer({ Invoices: { InvoiceID: 'inv-1' } })
+    await assert.rejects(
+      () => pageAllComplete({ read: reader(impl), path: 'Invoices', key: 'Invoices', idOf: (r: { id: string }) => r.id }),
+      ReadIncompleteError,
+    )
+  })
+
+  test('a 200 with an EMPTY BODY THROWS — an empty body is not an empty collection', async () => {
+    const { impl } = fakeFetch(() => response(200, ''))
+    await assert.rejects(
+      () => pageAllComplete({ read: reader(impl), path: 'Invoices', key: 'Invoices', idOf: (r: { id: string }) => r.id }),
+      ReadIncompleteError,
+    )
+  })
+
+  test('a genuine empty collection — `{"Invoices":[]}` — still ends the walk cleanly', async () => {
+    // The check has to leave the ONE legitimate terminator intact, or paging never terminates.
+    const { impl } = bodyServer({ Invoices: [] })
+    assert.deepEqual(
+      await pageAllComplete({ read: reader(impl), path: 'Invoices', key: 'Invoices', idOf: (r: { id: string }) => r.id }),
+      [],
+    )
+  })
+
+  test('the shared page parser names the reason, so a caller that must not throw can still refuse', () => {
+    // The manual-journal sweep in audit-xero-live-contamination.ts cannot throw — its ids fall
+    // through to per-id confirmation — but it must not set `pagingComplete` on a body it could not
+    // read, because that flag is the script's claim to have enumerated the whole collection. It
+    // shares this parser rather than re-deriving "empty means exhausted" a second time.
+    assert.deepEqual(parseCollectionPage({ ManualJournals: [] }, 'ManualJournals'), { ok: true, rows: [] })
+    assert.deepEqual(parseCollectionPage({ ManualJournals: [{ id: 'mj-1' }] }, 'ManualJournals'), { ok: true, rows: [{ id: 'mj-1' }] })
+
+    for (const body of [undefined, null, 'text', 42, [], { other: [] }, { ManualJournals: 'nope' }]) {
+      const parsed = parseCollectionPage(body, 'ManualJournals')
+      assert.equal(parsed.ok, false, `${JSON.stringify(body) ?? 'undefined'} must not parse as a collection`)
+    }
+    const missing = parseCollectionPage({ message: 'maintenance' }, 'ManualJournals')
+    assert.equal(missing.ok, false)
+    assert.match(missing.ok === false ? missing.reason : '', /no `ManualJournals` array/)
+  })
+
+  test('the malformed page does not silently return the rows read before it', async () => {
+    // The dangerous variant: page 1 is fine, page 2 is garbage, and the walk returns page 1 as if
+    // it were the whole set. That partial accumulation is what the apply would then act on.
+    const { impl } = fakeFetch((url) => {
+      const page = Number(new URL(url, 'https://x/').searchParams.get('page') ?? '1')
+      return page === 1 ? response(200, { Invoices: [{ id: 'a' }] }) : response(200, { unexpected: true })
+    })
+    await assert.rejects(
+      () => pageAllComplete({ read: reader(impl), path: 'Invoices', key: 'Invoices', idOf: (r: { id: string }) => r.id }),
+      ReadIncompleteError,
+    )
+  })
+})
+
+// ===========================================================================
+describe('a permanently rate-limited endpoint cannot retry for ever', () => {
+  /** An endpoint that answers 429 to everything, always. */
+  const alwaysRateLimited = () => fakeFetch(() => response(429, 'rate limited', { 'Retry-After': '1' }))
+
+  test('the read-only reader gives up after the retry ceiling instead of looping', async () => {
+    // The defect was `callCount--` on every retry: the budget was refunded, so the call ceiling —
+    // the only thing that could ever stop the walk — was unreachable, and with no retry counter
+    // the recursion had no other end. Both audit scripts carried this after it was fixed in the
+    // writer; they now share this one client, so there is nowhere for it to survive.
+    const { impl, calls } = alwaysRateLimited()
+    const read = createXeroTransport({ fetchImpl: impl, minIntervalMs: 0, sleep: noSleep, maxRateLimitRetries: 3 }).reader(TOKEN)
+    await assert.rejects(() => read('Invoices'), /Rate limited 3 times in a row/)
+    // 1 original + 3 retries, and then it stops. Not 4,000; not for ever.
+    assert.equal(calls.length, 4)
+  })
+
+  test('paging over a permanently rate-limited endpoint terminates too', async () => {
+    const { impl, calls } = alwaysRateLimited()
+    const transport = createXeroTransport({ fetchImpl: impl, minIntervalMs: 0, sleep: noSleep, maxRateLimitRetries: 2, maxCalls: 50 })
+    await assert.rejects(
+      () => pageAllComplete({ read: transport.reader(TOKEN), path: 'Invoices', key: 'Invoices', idOf: (r: { id: string }) => r.id }),
+      /Rate limited 2 times in a row/,
+    )
+    assert.equal(calls.length, 3)
+  })
+
+  test('a Retry-After measured in hours is surfaced immediately, not slept on', async () => {
+    const { impl, calls } = fakeFetch(() => response(429, 'daily cap', { 'Retry-After': '7200' }))
+    const read = createXeroTransport({ fetchImpl: impl, minIntervalMs: 0, sleep: noSleep }).reader(TOKEN)
+    await assert.rejects(() => read('Invoices'), /Retry-After 7200s/)
+    assert.equal(calls.length, 1)
+  })
+})
+
+// ===========================================================================
+describe('a run that THROWS after writing reports how much it destroyed', () => {
+  test('an abort after successful writes is PARTIALLY APPLIED, not a bare error', () => {
+    // Finding 5. The guards are working — one of them stopped the run — but the process threw, and
+    // the reporting that exists precisely to say "destruction was partial" sat in the code path
+    // that never ran. The operator saw one line about one credit note and nothing about the
+    // eighty invoices already irreversibly voided.
+    const journal = new MutationJournal()
+    for (let i = 0; i < 80; i++) journal.recordWrite('invoice voided', `INV-${i}`)
+
+    const outcome = runOutcome({ apply: true, failed: 0, aborted: true, writesMade: journal.writeCount })
+    assert.equal(outcome.exitCode, 1)
+    assert.match(outcome.label, /^PARTIALLY APPLIED/)
+    assert.match(outcome.label, /80 IRREVERSIBLE WRITE\(S\)/)
+  })
+
+  test('an abort BEFORE any write says so, and does not cry partial', () => {
+    // Just as important in the other direction: a clean refusal must not read as damage.
+    const outcome = runOutcome({ apply: true, failed: 0, aborted: true, writesMade: 0 })
+    assert.deepEqual(outcome, { label: 'ABORTED — NOTHING WAS WRITTEN', exitCode: 1 })
+  })
+
+  test('a dry run that aborts exits non-zero and is never APPLIED', () => {
+    const outcome = runOutcome({ apply: false, failed: 0, aborted: true, writesMade: 0 })
+    assert.equal(outcome.exitCode, 1)
+    assert.match(outcome.label, /DRY RUN/)
+  })
+
+  test('the journal can list exactly what was destroyed before the throw', () => {
+    const journal = new MutationJournal()
+    journal.recordWrite('allocation deleted', 'CN-001 -> invoice inv-1')
+    journal.recordWrite('credit note voided', 'CN-001')
+    assert.equal(journal.writeCount, 2)
+    assert.deepEqual(journal.writeRecords.map((w) => w.kind), ['allocation deleted', 'credit note voided'])
+  })
+
+  test('a clean apply is still APPLIED — aborting is not the default verdict', () => {
+    assert.deepEqual(runOutcome({ apply: true, failed: 0, aborted: false, writesMade: 12 }), { label: 'APPLIED', exitCode: 0 })
+  })
+})
+
+// ===========================================================================
+describe('the retirement authorization is bound to the id SET, not to a count of it', () => {
+  const REVIEWED = ['id-a', 'id-b', 'id-c']
+  const base: RetirementGuardInput = {
+    overrideFlagPresent: true,
+    authorization: {
+      token: RETIREMENT_AUTHORIZATION_TOKEN,
+      tenantId: 'tenant-demo',
+      database: 'onetwo3d_ims_e2e',
+      ids: 3,
+      idsSha256: fingerprintIds(REVIEWED),
+      authorizedBy: 'a.person',
+      authorizedAt: '2026-08-18',
+    },
+    currentDatabase: 'onetwo3d_ims_e2e',
+    expectedDatabase: 'onetwo3d_ims_e2e',
+    tenantRows: [{ tenantId: 'tenant-demo', tenantName: 'Demo Company (UK)' }],
+    expectedTenantId: 'tenant-demo',
+    ids: REVIEWED,
+  }
+
+  test('a DIFFERENT id set of the SAME SIZE is refused', () => {
+    // Finding 4. `ids: 553` is satisfied by any 553 ids — a CSV re-exported after the data moved,
+    // one id swapped for another, a hand-edited row — so the signed file would authorise nulling
+    // back-references nobody ever reviewed.
+    assert.throws(
+      () => assertRetirementAuthorized({ ...base, ids: ['id-a', 'id-b', 'id-ZZZ'] }),
+      (e: Error) => e instanceof RetirementRefusedError && /Same count, different ids/.test(e.message),
+    )
+  })
+
+  test('the same set in a different order, or with duplicates, still matches', () => {
+    // The binding is to the SET. Re-exporting the same ids must not force a re-approval, or the
+    // override becomes something people work around rather than use.
+    assert.doesNotThrow(() => assertRetirementAuthorized({ ...base, ids: ['id-c', 'id-a', 'id-b'] }))
+    assert.doesNotThrow(() => assertRetirementAuthorized({ ...base, ids: ['id-c', 'id-a', 'id-b', 'id-a'] }))
+    assert.doesNotThrow(() => assertRetirementAuthorized({ ...base, ids: [' id-a ', 'id-b', 'id-c'] }))
+  })
+
+  test('an authorization with no fingerprint at all cannot be parsed, so it cannot authorise', () => {
+    const lines = [
+      `token: ${RETIREMENT_AUTHORIZATION_TOKEN}`,
+      'tenantId: tenant-demo',
+      'database: onetwo3d_ims_e2e',
+      'ids: 3',
+      'authorizedBy: a.person',
+      'authorizedAt: 2026-08-18',
+    ]
+    assert.throws(
+      () => parseRetirementAuthorization(lines.join('\n')),
+      (e: Error) => e instanceof RetirementRefusedError && /idsSha256/.test(e.message),
+    )
+  })
+
+  test('a fingerprint that is not a SHA-256 digest is refused rather than compared loosely', () => {
+    const withDigest = (v: string) => [
+      `token: ${RETIREMENT_AUTHORIZATION_TOKEN}`, 'tenantId: tenant-demo', 'database: onetwo3d_ims_e2e',
+      'ids: 3', `idsSha256: ${v}`, 'authorizedBy: a.person', 'authorizedAt: 2026-08-18',
+    ].join('\n')
+    assert.throws(() => parseRetirementAuthorization(withDigest('none')), RetirementRefusedError)
+    assert.throws(() => parseRetirementAuthorization(withDigest('deadbeef')), RetirementRefusedError)
+    assert.equal(parseRetirementAuthorization(withDigest(fingerprintIds(REVIEWED).toUpperCase())).idsSha256, fingerprintIds(REVIEWED))
+  })
+
+  test('the fingerprint is stable and id-sensitive', () => {
+    assert.equal(fingerprintIds(['b', 'a']), fingerprintIds(['a', 'b']))
+    assert.notEqual(fingerprintIds(['a', 'b']), fingerprintIds(['a', 'c']))
+    assert.notEqual(fingerprintIds(['a', 'b']), fingerprintIds(['a']))
+  })
+})
+
+// ===========================================================================
+/**
+ * The 429 defect was fixed in the writer and left in place in BOTH read-only audits, because each
+ * of them carried its own copy of the same client. That is not a bug that can be closed by fixing
+ * it a third time — it is closed by there being one client. This guard is what keeps it closed:
+ * it fails the moment an audit script grows a private Xero fetch loop again.
+ */
+describe('the audit scripts have no private Xero client to re-introduce the defect into', () => {
+  const AUDITS = [
+    'scripts/audit-xero-live-contamination.ts',
+    'scripts/audit-xero-live-e2e-footprint.ts',
+  ]
+
+  for (const relative of AUDITS) {
+    test(`${relative} talks to Xero through the shared bounded transport`, () => {
+      const source = readFileSync(join(process.cwd(), relative), 'utf8')
+      // Strip the block comments: the fix is described in prose in both files, and a guard that
+      // matches its own explanation is a guard that fails for the wrong reason.
+      const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+
+      assert.match(code, /createXeroTransport\(/, 'the shared transport is the only permitted client')
+      assert.doesNotMatch(
+        code,
+        /callCount--/,
+        'refunding the call budget on a 429 makes the ceiling unreachable, so a permanently rate-limited endpoint retries for ever',
+      )
+      assert.doesNotMatch(
+        code,
+        /status === 429/,
+        'a hand-rolled rate-limit retry is how the unbounded recursion came back; the shared transport bounds it',
+      )
+      assert.doesNotMatch(
+        code,
+        /api\.xro/,
+        'a private base URL means a private client; reads go through the shared transport',
+      )
+    })
+  }
 })
