@@ -2,12 +2,16 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { logActivity } from '@/lib/activity-log'
 import { requireAdmin } from '@/lib/auth/server'
 import { getSettingValue } from '@/lib/settings-store'
 import { getIntegrationPluginState, INTEGRATION_PLUGIN_SETTING_KEYS, type IntegrationPluginState } from '@/lib/integration-plugins'
 import { isBaseCurrencyLocked } from '@/lib/base-currency'
-import { syncCrontab } from '@/app/actions/cron'
+import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
+import { runPostCommit } from '@/lib/domain/post-commit'
+import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
+import { reconcileCrontab } from '@/lib/crontab-reconcile'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -167,7 +171,16 @@ export async function shouldShowOnboardingBanner(): Promise<boolean> {
 // Mutations
 // ---------------------------------------------------------------------------
 
-export async function setOnboardingStep(stepKey: string): Promise<void> {
+/**
+ * NOTE THE RETURN TYPE (o3d-osl8 round 10, finding 3, module axis).
+ *
+ * It used to be `Promise<void>`, and that was the same defect round 9 fixed in `setSetting`: the
+ * upsert commits, then `logActivity` and `revalidatePath` are awaited, and either of them rejecting
+ * REJECTED a call whose write is durable. The wizard awaits this inside a click handler with no
+ * catch, so the rejection surfaces as an unhandled error while the stored step has already moved.
+ * The structural rule missed it only because this MODULE was outside the inventory.
+ */
+export async function setOnboardingStep(stepKey: string): Promise<SettingSaveResult> {
   await requireAdmin()
   const nextStep = normalizeStoredStepKey(stepKey) ?? DEFAULT_ONBOARDING_STEP_KEY
   await db.setting.upsert({
@@ -175,16 +188,20 @@ export async function setOnboardingStep(stepKey: string): Promise<void> {
     create: { key: 'onboarding_current_step', value: nextStep },
     update: { value: nextStep },
   })
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: `Updated onboarding step to ${nextStep}`,
-  })
-  revalidatePath('/onboarding')
+  const postCommit = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: `Updated onboarding step to ${nextStep}`,
+    })
+    revalidatePath('/onboarding')
+  }, 'Failed to record the onboarding step change')
+  if (postCommit.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: postCommit.error }
+  return { status: 'saved' }
 }
 
-export async function completeOnboarding(): Promise<{ success: boolean; error?: string }> {
+export async function completeOnboarding(): Promise<{ success: boolean; error?: string; warning?: string }> {
   await requireAdmin()
   const state = await loadOnboardingFacts()
   if (!state.companyConfigured) {
@@ -194,41 +211,58 @@ export async function completeOnboarding(): Promise<{ success: boolean; error?: 
     return { success: false, error: 'Save and lock the base currency before finishing setup.' }
   }
 
-  await db.setting.upsert({
-    where: { key: 'onboarding_complete' },
-    create: { key: 'onboarding_complete', value: 'true' },
-    update: { value: 'true' },
+  // ONE TRANSACTION (o3d-osl8 round 11, finding 3). Two independent upserts could commit the first
+  // and fail the second, leaving `onboarding_complete = true` with `onboarding_dismissed` still
+  // true — a state the wizard reads as "finished AND dismissed" — while the action reported failure.
+  await db.$transaction(async (tx) => {
+    await tx.setting.upsert({
+      where: { key: 'onboarding_complete' },
+      create: { key: 'onboarding_complete', value: 'true' },
+      update: { value: 'true' },
+    })
+    await tx.setting.upsert({
+      where: { key: 'onboarding_dismissed' },
+      create: { key: 'onboarding_dismissed', value: 'false' },
+      update: { value: 'false' },
+    })
   })
-  await db.setting.upsert({
-    where: { key: 'onboarding_dismissed' },
-    create: { key: 'onboarding_dismissed', value: 'false' },
-    update: { value: 'false' },
-  })
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: 'Completed onboarding wizard',
-  })
-  revalidatePath('/dashboard')
-  revalidatePath('/onboarding')
+  // POST-COMMIT. Onboarding IS complete at this point; a rejection here left the operator looking
+  // at "Failed to complete onboarding" on a wizard that had already finished, with no way forward.
+  const postCommit = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: 'Completed onboarding wizard',
+    })
+    revalidatePath('/dashboard')
+    revalidatePath('/onboarding')
+  }, 'Failed to record the completed onboarding')
+  if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
   return { success: true }
 }
 
-export async function dismissOnboarding(): Promise<void> {
+export async function dismissOnboarding(): Promise<SettingSaveResult> {
   await requireAdmin()
   await db.setting.upsert({
     where: { key: 'onboarding_dismissed' },
     create: { key: 'onboarding_dismissed', value: 'true' },
     update: { value: 'true' },
   })
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: 'Dismissed onboarding banner',
-  })
-  revalidatePath('/dashboard')
+  // The banner's dismiss button awaits this inside a `startTransition` with no catch: a rejection
+  // after the commit threw out of the transition AND left the banner on screen, over a preference
+  // that is stored.
+  const postCommit = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: 'Dismissed onboarding banner',
+    })
+    revalidatePath('/dashboard')
+  }, 'Failed to record the onboarding dismissal')
+  if (postCommit.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: postCommit.error }
+  return { status: 'saved' }
 }
 
 type PluginStateInput = {
@@ -239,58 +273,95 @@ type PluginStateInput = {
   mintsoft: boolean
 }
 
-export async function saveOnboardingPluginState(state: PluginStateInput): Promise<{ success: boolean; error?: string }> {
+/**
+ * THREE outcomes, not two (o3d-osl8 round 7, finding 1). The union, the reasoning and the
+ * post-commit guard live in lib/domain/integrations/plugin-save-outcome.ts, next to the resolver
+ * that consumes them and shared with the Settings screen's writer (round 8, finding 2).
+ */
+export async function saveOnboardingPluginState(state: PluginStateInput): Promise<PluginSelectionSaveResult> {
   await requireAdmin()
 
+  // A cheap payload-only pre-check, so an obviously contradictory form never opens a transaction.
+  // It is NOT the guarantee — `resulting`, below, is (round 6, finding 1).
   if (state.woocommerce && state.shopify) {
-    return { success: false, error: 'Choose either WooCommerce or Shopify, not both.' }
+    return { status: 'refused', error: 'Choose either WooCommerce or Shopify, not both.' }
   }
   if (state.xero && state.quickbooks) {
-    return { success: false, error: 'Choose either Xero or QuickBooks, not both.' }
+    return { status: 'refused', error: 'Choose either Xero or QuickBooks, not both.' }
   }
 
-  await db.$transaction([
-    db.setting.upsert({
-      where: { key: 'plugin_woocommerce_enabled' },
-      create: { key: 'plugin_woocommerce_enabled', value: String(state.woocommerce) },
-      update: { value: String(state.woocommerce) },
-    }),
-    db.setting.upsert({
-      where: { key: 'plugin_shopify_enabled' },
-      create: { key: 'plugin_shopify_enabled', value: String(state.shopify) },
-      update: { value: String(state.shopify) },
-    }),
-    db.setting.upsert({
-      where: { key: 'plugin_xero_enabled' },
-      create: { key: 'plugin_xero_enabled', value: String(state.xero) },
-      update: { value: String(state.xero) },
-    }),
-    db.setting.upsert({
-      where: { key: 'plugin_quickbooks_enabled' },
-      create: { key: 'plugin_quickbooks_enabled', value: String(state.quickbooks) },
-      update: { value: String(state.quickbooks) },
-    }),
-    db.setting.upsert({
-      where: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft },
-      create: { key: INTEGRATION_PLUGIN_SETTING_KEYS.mintsoft, value: String(state.mintsoft) },
-      update: { value: String(state.mintsoft) },
-    }),
-  ])
+  // Lock, read, validate, write — in that order, inside one transaction (o3d-osl8 round 6,
+  // finding 1). This step writes every exclusivity-bearing key, so the RESULTING state is
+  // determined by the payload; the read still matters because the lock it comes with is what stops
+  // a concurrent PARTIAL write (saveIntegrationPluginState) from landing between this validation
+  // and this commit and leaving both accounting connectors enabled.
+  const outcome = await db.$transaction(async (tx): Promise<{ conflict: string } | { committed: IntegrationPluginState }> => {
+    const current = await lockIntegrationPluginSelection(tx)
+    const resulting = {
+      ...current,
+      woocommerce: state.woocommerce,
+      shopify: state.shopify,
+      xero: state.xero,
+      quickbooks: state.quickbooks,
+      mintsoft: state.mintsoft,
+    }
+    if (resulting.woocommerce && resulting.shopify) {
+      return { conflict: 'Choose either WooCommerce or Shopify, not both.' }
+    }
+    if (resulting.xero && resulting.quickbooks) {
+      return { conflict: 'Choose either Xero or QuickBooks, not both.' }
+    }
 
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-    description: 'Updated onboarding plugin selection',
-    metadata: state,
+    for (const [id, enabled] of [
+      ['woocommerce', state.woocommerce],
+      ['shopify', state.shopify],
+      ['xero', state.xero],
+      ['quickbooks', state.quickbooks],
+      ['mintsoft', state.mintsoft],
+    ] as const) {
+      const key = INTEGRATION_PLUGIN_SETTING_KEYS[id]
+      await tx.setting.upsert({
+        where: { key },
+        create: { key, value: String(enabled) },
+        update: { value: String(enabled) },
+      })
+    }
+    return { committed: resulting }
   })
+  if ('conflict' in outcome) return { status: 'refused', error: outcome.conflict }
 
-  const cronResult = await syncCrontab()
-  if (!cronResult.success) {
-    return { success: false, error: cronResult.error ?? 'Failed to apply scheduler changes' }
-  }
+  // EVERYTHING BELOW HAPPENS AFTER THE COMMIT, so none of it may reach the caller as a rejection
+  // (round 8, finding 1). Round 7 caught only the scheduler's RETURNED failure; a throw — from
+  // syncCrontab's own permission gate, from getCronSecret/getPublicAppUrl, from the activity-log
+  // write, from any of them — escaped the union and landed in the caller's "outcome unknown" path,
+  // over a selection that is unambiguously stored. The guard is shared with the Settings writer so
+  // the shape cannot drift back apart.
+  return completePluginSelectionSave({
+    committed: outcome.committed,
+    postCommit: async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'updated',
+        description: 'Updated onboarding plugin selection',
+        metadata: state,
+      })
 
-  revalidatePath('/onboarding')
-  revalidatePath('/dashboard')
-  return { success: true }
+      // UNCONDITIONAL, and before the scheduler result is inspected (round 7, finding 1). The
+      // selection is durable at this point; leaving the route cache holding the previous answer on
+      // the scheduler-failure path made the server itself agree with the rolled-back UI, which is
+      // how a stale connector survived a reload.
+      revalidatePath('/onboarding')
+      revalidatePath('/dashboard')
+
+      // The RECONCILIATION, not the gated `syncCrontab` server action (round 9, finding 4): that
+      // one re-runs a permission gate whose answer to an invalidated session is a thrown
+      // NEXT_REDIRECT, and a post-commit guard is exactly where such a throw must not be classified
+      // as an application failure. This action gated with requireAdmin before the transaction.
+      // reconcileCrontab logs its own crontab_sync ERROR; what the outcome adds is the committed
+      // selection, so the caller can keep showing what is actually stored instead of guessing from
+      // its own optimistic copy.
+      return reconcileCrontab()
+    },
+  })
 }

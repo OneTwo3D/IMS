@@ -267,6 +267,9 @@ This means an admin viewing the activity log can see who did what but not see se
 ## System Settings
 
 - **Plugins** — enable or disable shopping/accounting connector plugins. Disabled plugins are hidden from menus and shared UI.
+  - The pairs are **mutually exclusive**: Xero or QuickBooks, WooCommerce or Shopify — never both. Saving is refused with "Enable either Xero or QuickBooks, not both" rather than partially applied, and the refusal writes nothing at all, including the plugins in the same save that were individually fine.
+  - The rule is checked against the state the save is about to *land on*, not the state the page was loaded with. If a second administrator enables the other connector of a pair while your form is open, your save is refused rather than silently producing a both-enabled system. Reload to see the current selection before choosing again.
+  - Saves are applied as one all-or-nothing change and are serialised against anything that acts on which connector is active (notably cancelling stranded accounting sync rows), so no other part of the system can observe a half-switched selection.
 - **Scheduler** — configure the public app URL used for external callbacks and manage scheduled jobs
 - **Activity log retention** — set how many days to keep log entries, configurable per log level
 - **Data retention** — configure archival/deletion windows for operational records. Two kinds of

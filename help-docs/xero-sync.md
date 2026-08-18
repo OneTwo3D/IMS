@@ -809,13 +809,36 @@ The hash suffix is deterministic (computed from the entity IDs in the batch), so
 
 ## Sync Log
 
-The sync log at **Integrations → Xero** shows all queued transactions with their status:
+The sync log at **Integrations → Xero** shows queued transactions for the **currently active** accounting connector, with their status:
 
 - **Pending** — Queued, waiting for next cron run
 - **Synced** — Successfully pushed to Xero (shows Xero transaction ID)
 - **Failed** — Failed after 5 retries (shows error message)
 
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
+
+### Rows stranded on a connector you switched away from
+
+Because the sync log is scoped to the active connector, unresolved rows left behind on a connector that has since been turned off appear in **no** sync log. They are listed instead in the amber banner at the top of **Integrations**, which shows each row's connector, type, reference, status, age in days, and last error — plus the external transaction ID if the row already posted something before it stalled.
+
+These rows still block their sales order from being deleted. To clear one, either re-enable the connector it was queued for (Pending rows then resume on the next cron run), or look the document up in that accounting system using the reference and external ID shown. Pending and Processing rows queued for an inactive connector can also be bulk-cancelled from the same banner; cancelling discards the queued row and does not stop the document syncing to the active connector later.
+
+**If a cancel reports an error, read which kind it is.** There are two, and they mean different things:
+
+- A stated refusal — for example "The active accounting connector changed while this ran, so nothing was cancelled" — is a guarantee. Nothing was discarded, the reason is recorded in the activity log, and it is safe to reload and try again.
+- "The cancel request failed before it could report its outcome, so it is NOT known whether any rows were cancelled" means exactly that. The request may have been refused, or it may have completed and lost its reply on the way back. The banner reloads the stranded rows from the server when this happens: check that list, and the activity log, before pressing the button again — do not assume the attempt did nothing.
+
+Cancelling cannot be caught out by a connector switch happening at the same moment. The plugin selection is locked for the duration of the cancel, so a switch either lands entirely before it or entirely after it; if one somehow does land in between, the whole cancel is rolled back and reported rather than half-applied.
+
+**The list shows the oldest 50 rows only.** When there are more, it says so explicitly — "Showing the oldest 50 of 137 stranded row(s) — 87 more are not listed here." The hidden rows stay hidden until the listed ones are resolved: there is no per-row control here, and Failed rows in particular are not cleared by anything on this page, so a long-standing backlog at the front of the list will keep newer rows out of view. Resolve the oldest ones (re-enable their connector, or cancel the Pending/Processing ones) and the next set appears on reload. When the list is complete it says "Showing all N stranded row(s)" instead, so a count on this banner is never ambiguous about what it excludes.
+
+If the list itself cannot be loaded, the banner says so in red — "The list of stranded sync rows could not be loaded" — rather than showing nothing. An empty banner section always means there is nothing stranded; it never means the lookup failed.
+
+The banner does not depend on the rest of the page loading. If the integration settings and sync history below it cannot be read, they are replaced by a notice saying so and the banners above still render. This matters because the usual reason the stranded list fails — the database being unreachable — is the same reason those panels fail, and that is precisely when you need the banner. As with the banner, an unavailable panel says so: it is never rendered as "nothing is configured" or "nothing has synced".
+
+The list requires the **sync** permission (Admin and Manager). Roles without it do not see this section — the whole **Integrations** page requires it. Opening `/sync` directly (a bookmark, a pasted link) as a role without **sync** shows a short "You don't have access to Integrations" page naming the missing permission, with a link back to the dashboard: it is not an error, and signing in again or retrying will not change it. Nothing on the page is read for such a role, so no integration setting, log or stranded row is fetched at all.
+
+**Turning every integration off does not hide these rows.** Integrations normally redirects to the plugin settings when no connector is enabled, but if you hold **sync** and unresolved accounting rows exist, the page still opens and shows this banner — switching the last accounting connector off is precisely what strands every unresolved row, so that is the state where the list matters most.
 ## Xero Daily Batch Retry Semantics
 
 The daily batch intentionally processes A1 revenue deferral, A2 inventory allocation, and Group B shipment recognition in separate database transactions. A crash can therefore leave a partially advanced day, but each group is idempotent:

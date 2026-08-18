@@ -28,7 +28,18 @@ import {
 // Type re-export (allowed in 'use server' files)
 export type { XeroSettings } from '@/lib/connectors/xero/settings'
 
-async function requireAdmin() {
+/**
+ * `sync` is the entitlement for every guarded export in this file, and ADMIN and MANAGER both
+ * hold it.
+ *
+ * These helpers used to be named `requireAdmin`, which SHADOWED `requireAdmin` from
+ * @/lib/auth/server (that one is requireRole('ADMIN')). The name misled two separate review
+ * passes into reporting that MANAGER crashes on the Integrations page - the reader sees
+ * `requireAdmin()` and reasonably concludes ADMIN-only. They are renamed rather than merely
+ * commented, because a comment did not stop it happening the second time. The gate agreement
+ * across the whole page is asserted, not assumed, in tests/accounting/dashboard-read-gates.test.ts.
+ */
+async function requireSyncPermission() {
   return requirePermission('sync')
 }
 
@@ -67,7 +78,7 @@ async function buildXeroConnectionFingerprint(): Promise<string> {
 
 export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAdmin()
+    await requireSyncPermission()
     if (shouldFreshGateSecretWrite(data, 'xero_client_secret')) {
       await requireFreshAdmin()
     }
@@ -140,12 +151,12 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
 }
 
 export async function getXeroConnectionTestState(): Promise<IntegrationConnectionTestState> {
-  await requireAdmin()
+  await requireSyncPermission()
   return getIntegrationConnectionTestState('xero')
 }
 
 export async function testXeroConnection(): Promise<{ success: boolean; error?: string; message?: string }> {
-  await requireAdmin()
+  await requireSyncPermission()
 
   const fingerprint = await buildXeroConnectionFingerprint()
   const [imsBaseCurrency, orgRes] = await Promise.all([
@@ -321,7 +332,7 @@ export async function disconnectXero(): Promise<{ success: boolean; error?: stri
 // ---------------------------------------------------------------------------
 
 export async function syncAccountingAccounts(): Promise<{ synced: number; errors: string[] }> {
-  await requireAdmin()
+  await requireSyncPermission()
   const result = await syncChartOfAccounts()
 
   await logActivity({
@@ -417,7 +428,7 @@ export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
 
 export async function triggerXeroSync(): Promise<{ success: boolean; result?: unknown; error?: string }> {
   try {
-    await requireAdmin()
+    await requireSyncPermission()
 
     const enabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
     if (enabled?.value !== 'true') {
@@ -456,7 +467,7 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
 
 export async function retryFailedXeroSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
   try {
-    await requireAdmin()
+    await requireSyncPermission()
     const where = entryId
       ? { id: entryId, connector: 'xero', status: 'FAILED' as const }
       : { connector: 'xero', status: 'FAILED' as const }

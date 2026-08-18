@@ -6,6 +6,7 @@ import {
 } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { runMintsoftReturnsSync } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { runStockSyncForBinding } from '@/lib/connectors/mintsoft/sync/stock-sync'
+import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { serializeSettingValue } from '@/lib/settings-store'
 import { requireE2eAdminRoute } from '@/lib/testing/e2e-route-guard'
 
@@ -497,10 +498,18 @@ export async function POST(request: NextRequest) {
   }
 
   if (typeof body.pluginEnabled === 'boolean') {
-    await db.setting.upsert({
-      where: { key: PLUGIN_MINTSOFT_ENABLED_KEY },
-      create: { key: PLUGIN_MINTSOFT_ENABLED_KEY, value: String(body.pluginEnabled) },
-      update: { value: String(body.pluginEnabled) },
+    // Under the plugin-selection lock like every other plugin-key writer (o3d-osl8 round 6,
+    // finding 2). Mintsoft is not an accounting connector, so this particular flag cannot move the
+    // active accounting connector — it is routed through the same helper anyway because the
+    // exception is what future call sites copy, and because the row locks are what serialize it
+    // against a concurrent exclusivity check that reads all six keys.
+    await db.$transaction(async (tx) => {
+      await lockIntegrationPluginSelection(tx)
+      await tx.setting.upsert({
+        where: { key: PLUGIN_MINTSOFT_ENABLED_KEY },
+        create: { key: PLUGIN_MINTSOFT_ENABLED_KEY, value: String(body.pluginEnabled) },
+        update: { value: String(body.pluginEnabled) },
+      })
     })
   }
 

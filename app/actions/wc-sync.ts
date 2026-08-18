@@ -30,8 +30,9 @@ import {
   evaluateWooCommerceEnableConnectionGate,
 } from '@/lib/connectors/woocommerce/connection-test-gate'
 
-// All mutating exports in this file require the `sync` permission.
-async function requireAdmin() {
+// All mutating exports in this file require the `sync` permission. Renamed from `requireAdmin`,
+// which shadowed the ADMIN-only helper of that name in @/lib/auth/server.
+async function requireSyncPermission() {
   return requirePermission('sync')
 }
 
@@ -120,7 +121,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
 }
 
 export async function getWcSyncSettings(): Promise<WcSyncSettings> {
-  await requireAdmin()
+  await requireSyncPermission()
   const map = await getSettingValues(SYNC_SETTING_KEYS)
   const result = { ...SYNC_DEFAULTS }
   for (const k of Object.keys(result) as (keyof WcSyncSettings)[]) {
@@ -216,7 +217,7 @@ async function getCurrentWcConnectionFingerprint(): Promise<string> {
 }
 
 export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
-  await requireAdmin()
+  await requireSyncPermission()
   if (shouldFreshGateSecretWrite(data, 'wc_webhook_secret')) {
     // audit-ohou: return the structured fresh-auth failure so the client can
     // prompt step-up re-auth and retry, instead of throwing an opaque 500 that
@@ -551,7 +552,7 @@ export async function testWcCredentials(url: string, key: string, secret: string
 }
 
 export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean; envOverrides: Record<string, string>; connectionTest: IntegrationConnectionTestState }> {
-  await requireAdmin()
+  await requireSyncPermission()
   const [map, connectionTest] = await Promise.all([
     getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret']),
     getIntegrationConnectionTestState('woocommerce'),
@@ -585,7 +586,7 @@ export type TaxRateMappingRow = {
 }
 
 export async function getShoppingTaxRateMappings(): Promise<TaxRateMappingRow[]> {
-  await requireAdmin()
+  await requireSyncPermission()
   const rows = await db.shoppingTaxRateMapping.findMany({
     where: { connector: 'woocommerce' },
     include: { taxRate: { select: { name: true } } },
@@ -607,7 +608,7 @@ export async function updateShoppingTaxRateMapping(
   externalTaxRateId: string,
   taxRateId: string,
 ): Promise<{ success: boolean }> {
-  await requireAdmin()
+  await requireSyncPermission()
   await db.shoppingTaxRateMapping.update({
     where: {
       connector_externalTaxRateId: {
@@ -622,7 +623,7 @@ export async function updateShoppingTaxRateMapping(
 }
 
 export async function deleteShoppingTaxRateMapping(id: string): Promise<{ success: boolean }> {
-  await requireAdmin()
+  await requireSyncPermission()
   await db.shoppingTaxRateMapping.delete({ where: { id } })
   revalidatePath('/sync')
   return { success: true }
@@ -637,7 +638,7 @@ export async function importWcTaxRatesFromApi(): Promise<{
   error?: string
 }> {
   try {
-    await requireAdmin()
+    await requireSyncPermission()
     const { importWcTaxRates } = await import('@/lib/connectors/woocommerce/sync/taxes')
     const result = await importWcTaxRates()
 
@@ -674,7 +675,7 @@ export type StatusMappingRow = {
 }
 
 export async function getShoppingStatusMappings(): Promise<StatusMappingRow[]> {
-  await requireAdmin()
+  await requireSyncPermission()
   const rows = await db.shoppingStatusMapping.findMany({
     where: { connector: 'woocommerce' },
     orderBy: { externalStatus: 'asc' },
@@ -683,7 +684,7 @@ export async function getShoppingStatusMappings(): Promise<StatusMappingRow[]> {
 }
 
 export async function upsertShoppingStatusMapping(externalStatus: string, imsStatus: string): Promise<{ success: boolean }> {
-  await requireAdmin()
+  await requireSyncPermission()
   // o3d-gz6: never let a WooCommerce status map to SHIPPED. SHIPPED must reflect a REAL dispatch (a
   // shipment row), not a storefront status — importWcOrder writes this mapping straight into
   // SalesOrder.status, so a WC->SHIPPED mapping mints "false-SHIPPED" orders (SHIPPED with no shipment)
@@ -724,7 +725,7 @@ export type SyncLogRow = {
 }
 
 export async function getShoppingSyncLogs(limit = 50): Promise<SyncLogRow[]> {
-  await requireAdmin()
+  await requireSyncPermission()
   const rows = await db.shoppingSyncLog.findMany({
     where: { connector: 'woocommerce' },
     orderBy: { createdAt: 'desc' },
@@ -763,7 +764,7 @@ export async function createWcWebhooks(): Promise<{
   existing: number
   errors: string[]
 }> {
-  await requireAdmin()
+  await requireSyncPermission()
 
   const appUrl = await getPublicAppUrl()
   if (!appUrl) return { success: false, created: 0, existing: 0, errors: ['Public app URL is not configured'] }
@@ -833,7 +834,7 @@ export async function createWcWebhooks(): Promise<{
  * the UI will simply fall back to free-text entry or historical combos.
  */
 export async function getWcActivePaymentGateways(): Promise<Array<{ id: string; title: string }>> {
-  await requireAdmin()
+  await requireSyncPermission()
   try {
     const { wcFetch } = await import('@/lib/connectors/woocommerce/api')
     const { data, error } = await wcFetch('/payment_gateways')
@@ -856,13 +857,13 @@ export async function probeFxHelperPluginAction(): Promise<{
   httpStatus?: number
   message: string
 }> {
-  await requireAdmin()
+  await requireSyncPermission()
   const { probeFxHelperPlugin } = await import('@/lib/connectors/woocommerce/fx-rates')
   return probeFxHelperPlugin()
 }
 
 export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: number; supported: boolean; error?: string }> {
-  await requireAdmin()
+  await requireSyncPermission()
   try {
     const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
     const result = await pushCurrentFxRatesToWc()
@@ -897,7 +898,7 @@ export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: 
 }
 
 export async function triggerManualSync(type: 'orders' | 'products' | 'stock'): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  await requireAdmin()
+  await requireSyncPermission()
   try {
     if (type === 'orders') {
       const { syncNewWcOrders } = await import('@/lib/connectors/woocommerce/sync/order-import')

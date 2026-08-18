@@ -5,8 +5,9 @@ import { Check, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { setSetting } from '@/app/actions/settings'
-import { syncCrontab } from '@/app/actions/cron'
+import { savePublicAppUrl } from '@/app/actions/settings'
+import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
+import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outcome'
 
 type Props = {
   currentValue: string
@@ -19,37 +20,37 @@ export function PublicAppUrlSettings({ currentValue, source, suggestedValue }: P
   const [value, setValue] = useState(currentValue || suggestedValue || '')
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
+  /** Saved, but the scheduler is behind. Not an error — see handleSave. */
+  const [schedulerWarning, setSchedulerWarning] = useState('')
 
   function handleSave() {
     setSaved(false)
     setError('')
+    setSchedulerWarning('')
 
     startTransition(async () => {
       try {
-        const normalized = value.trim().replace(/\/+$/, '')
-        if (!normalized) {
-          setError('Enter the public base URL.')
+        // Immediate feedback only. The SAME function is the server action's gate, so a value that
+        // slips past here is still refused there rather than stored.
+        const normalized = normalizePublicAppUrl(value)
+        if (!normalized.ok) {
+          setError(normalized.error)
           return
         }
 
-        try {
-          const parsed = new URL(normalized)
-          if (!['http:', 'https:'].includes(parsed.protocol)) {
-            setError('URL must start with http:// or https://')
-            return
-          }
-        } catch {
-          setError('Enter a valid URL.')
+        // ONE round trip (o3d-osl8 round 9, finding 1). The write, the audit row, the cache
+        // revalidation and the crontab reconciliation are all inside the action, which classifies
+        // its own post-commit failures instead of rejecting. The screen renders the outcome; it
+        // does not reconstruct it. Reaching this catch now means the outcome is genuinely unknown.
+        const view = resolveSettingSaveView({
+          result: await savePublicAppUrl(normalized.url),
+          what: 'The Public App URL',
+        })
+        if (!view.committed) {
+          setError(view.error)
           return
         }
-
-        await setSetting('public_app_url', normalized)
-        const result = await syncCrontab()
-        if (!result.success) {
-          setError(result.error ?? 'Failed to apply scheduler changes')
-          return
-        }
-
+        setSchedulerWarning(view.warning)
         setSaved(true)
         setTimeout(() => setSaved(false), 2000)
       } catch (e) {
@@ -92,6 +93,9 @@ export function PublicAppUrlSettings({ currentValue, source, suggestedValue }: P
         )}
         {error && <span className="text-sm text-destructive">{error}</span>}
       </div>
+      {schedulerWarning && (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">{schedulerWarning}</p>
+      )}
     </div>
   )
 }

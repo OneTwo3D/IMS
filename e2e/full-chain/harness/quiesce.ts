@@ -57,6 +57,8 @@ import { hostname } from 'node:os'
 
 import { Client } from 'pg'
 import type { WcCreds } from './wc.ts'
+import { ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY } from '../../../lib/db/advisory-locks.ts'
+import { INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER } from '../../../lib/integration-plugin-keys.ts'
 
 const LOCK_KEY = 'e2e_quiesce_lock'
 
@@ -68,6 +70,67 @@ const STAGE_SETTINGS_TO_DISABLE = [
   'xero_daily_batch_enabled',
   'xero_payment_polling_enabled',
 ] as const
+
+/**
+ * Write settings on ANOTHER instance's database, under the same locks that instance's own code
+ * takes (o3d-osl8 round 6, finding 2).
+ *
+ * `plugin_xero_enabled` is in the list above, and this harness was the concrete counter-example to
+ * "the connector-selection advisory lock serializes every writer": it changes which accounting
+ * connector stage considers active, over a raw `pg` client, taking no lock at all. Stage's own
+ * `cancelOrphanedAccountingSyncRows` decides which sync rows to discard from exactly that value —
+ * so a run acquiring or releasing the quiesce lock while an operator clicked "cancel orphaned
+ * rows" on stage could have that cancel retire the queue of the connector this harness was in the
+ * middle of switching.
+ *
+ * The order matches lib/integration-plugin-selection-lock.ts exactly — advisory lock first, then
+ * the plugin rows `FOR UPDATE` in sorted key order — because taking them in the other order is the
+ * one way these can deadlock against the app.
+ *
+ * All of it in ONE transaction, so stage never observes a partially-disabled connector set either.
+ */
+async function writeSettingsUnderPluginSelectionLock(
+  client: Client,
+  writes: ReadonlyArray<{ key: string; value: string | null }>,
+  onWrite?: (key: string, value: string | null) => void,
+): Promise<void> {
+  const keys = [...INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER]
+  await client.query('begin')
+  try {
+    await client.query('select pg_advisory_xact_lock($1)', [ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY])
+    // Materialise before locking: `for update` locks only rows that exist, and on a fresh stage the
+    // plugin rows may not.
+    await client.query(
+      `insert into settings (key, value, "updatedAt")
+         select k, 'false', now() from unnest($1::text[]) as k
+       on conflict (key) do nothing`,
+      [keys],
+    )
+    await client.query(`select key from settings where key = any($1::text[]) order by key for update`, [keys])
+
+    for (const { key, value } of writes) {
+      if (value === null) {
+        await client.query(`delete from settings where key = $1`, [key])
+      } else {
+        await client.query(
+          `insert into settings (key, value, "updatedAt") values ($1, $2, now())
+             on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+          [key, value],
+        )
+      }
+    }
+    await client.query('commit')
+    // AFTER the commit, not per statement: a log line saying "restored to X" printed from inside a
+    // transaction that then rolls back is a false record of the one thing an operator reads to
+    // decide whether stage is armed.
+    for (const { key, value } of writes) onWrite?.(key, value)
+  } catch (error) {
+    // Best-effort: if the connection itself is gone the rollback fails too, and the original error
+    // is the one worth reporting.
+    await client.query('rollback').catch(() => {})
+    throw error
+  }
+}
 
 /**
  * Topics that must be registered on the store, pointing at this instance.
@@ -1015,13 +1078,10 @@ export async function acquire(runId: string): Promise<QuiesceHandle> {
     held = { token, raw: claimed.raw }
     startHeartbeat(token, claimed.lock)
 
-    for (const key of STAGE_SETTINGS_TO_DISABLE) {
-      await stage.query(
-        `insert into settings (key, value, "updatedAt") values ($1, 'false', now())
-           on conflict (key) do update set value = 'false', "updatedAt" = now()`,
-        [key],
-      )
-    }
+    await writeSettingsUnderPluginSelectionLock(
+      stage,
+      STAGE_SETTINGS_TO_DISABLE.map((key) => ({ key, value: 'false' })),
+    )
     console.log(`[quiesce] stage disabled: ${STAGE_SETTINGS_TO_DISABLE.join(', ')}`)
 
     // Stage's own webhooks live in WOOCOMMERCE, so disabling its settings does not stop Woo delivering
@@ -1129,19 +1189,20 @@ async function releaseInternal(
     }
   }
 
-  for (const [key, value] of Object.entries(lock.stageSettings)) {
-    if (value === null) {
-      await stage.query(`delete from settings where key = $1`, [key])
-      console.log(`[quiesce] stage ${key} restored to (absent)`)
-    } else {
-      await stage.query(
-        `insert into settings (key, value, "updatedAt") values ($1, $2, now())
-           on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
-        [key, value],
-      )
-      console.log(`[quiesce] stage ${key} restored to ${value}`)
-    }
-  }
+  // Under the SAME locks the disable took, and in one transaction: restoring stage puts
+  // plugin_xero_enabled back, which is a connector switch as far as stage's orphan-cancel sweep is
+  // concerned (o3d-osl8 round 6, finding 2).
+  //
+  // The session statement_timeout installed above applies to the lock wait too, deliberately: a
+  // stage transaction holding the selection lock is a sweep deciding what to discard, and it is
+  // measured in milliseconds. If we are still waiting after 20s something is wrong on stage, and
+  // failing the release loudly — leaving the lock row in place for the next run to recover — is the
+  // right outcome, not restoring underneath whatever is stuck.
+  await writeSettingsUnderPluginSelectionLock(
+    stage,
+    Object.entries(lock.stageSettings).map(([key, value]) => ({ key, value })),
+    (key, value) => console.log(`[quiesce] stage ${key} restored to ${value ?? '(absent)'}`),
+  )
 
   // Between the two databases, ask again. The stage writes above are the ones that matter most and are
   // now done; re-checking here keeps the window in which a lost fence goes unnoticed as short as the

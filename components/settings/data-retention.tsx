@@ -5,7 +5,7 @@ import { Loader2, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { setSetting } from '@/app/actions/settings'
+import { setSettings } from '@/app/actions/settings'
 
 type Props = {
   salesOrdersValue: string
@@ -47,9 +47,8 @@ export function DataRetentionSetting({
   function handleSave() {
     setSaved(false)
     startTransition(async () => {
-      await Promise.all(
-        FIELDS.map((f) => setSetting(f.key, values[f.stateKey]))
-      )
+      // ONE transaction (o3d-osl8 round 9, finding 1) — see setSettings.
+      await setSettings(Object.fromEntries(FIELDS.map((f) => [f.key, values[f.stateKey]])))
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
     })
