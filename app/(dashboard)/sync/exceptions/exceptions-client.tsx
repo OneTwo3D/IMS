@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { Fragment, useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { ArrowLeft, CheckCircle2, Inbox, Loader2, RotateCcw } from 'lucide-react'
@@ -47,6 +47,16 @@ export function ExceptionsClient({ data }: Props) {
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
+  // o3d-51du: a bulk quarantine is not a one-click action. The first click arms
+  // it and puts the affected orders under an explicit "these will be
+  // quarantined" heading; only the second one writes.
+  //
+  // Keyed by the ELIGIBLE-set digest, not the connector (o3d-0gzr r2).
+  // router.refresh() deliberately preserves useState, so a connector-keyed flag
+  // stayed armed across a refresh — and the confirm button then rendered,
+  // already armed, against whatever cohort came back. Keying it to the exact set
+  // means any change to that set disarms it by construction.
+  const [confirmingIsolate, setConfirmingIsolate] = useState<string | null>(null)
 
   async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
     const result = await run()
@@ -386,46 +396,111 @@ export function ExceptionsClient({ data }: Props) {
             </TableHeader>
             <TableBody>
               {data.unresolvedDrift.map((row) => (
-                <TableRow key={row.connector}>
-                  <TableCell className="text-xs font-medium">{row.connector}</TableCell>
-                  <TableCell className="text-xs">
-                    {row.linkCount}
-                    {row.touched > 0 ? <span className="text-muted-foreground"> of {row.touched} checked</span> : null}
-                  </TableCell>
-                  <TableCell className="text-xs text-muted-foreground">
-                    {row.firstSeenAt ? formatDateTime(row.firstSeenAt) : '—'}
-                  </TableCell>
-                  <TableCell className="text-xs">{row.consecutivePasses}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.reason ?? ''}>
-                    {row.reason ?? '—'}
-                  </TableCell>
-                  <TableCell className="text-right space-x-2">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(
-                        () => retryUnresolvedDriftCohort(row.connector, row.version),
-                        'Cleared — the next sweep will re-check these orders.',
+                <Fragment key={row.connector}>
+                  <TableRow>
+                    <TableCell className="text-xs font-medium">{row.connector}</TableCell>
+                    <TableCell className="text-xs">
+                      {row.linkCount}
+                      {row.touched > 0 ? <span className="text-muted-foreground"> of {row.touched} checked</span> : null}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {row.firstSeenAt ? formatDateTime(row.firstSeenAt) : '—'}
+                    </TableCell>
+                    <TableCell className="text-xs">{row.consecutivePasses}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.reason ?? ''}>
+                      {row.reason ?? '—'}
+                    </TableCell>
+                    <TableCell className="text-right space-x-2">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => runAction(
+                          () => retryUnresolvedDriftCohort(row.connector, row.version),
+                          'Cleared — the next sweep will re-check these orders.',
+                        )}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Retry
+                      </Button>
+                      {confirmingIsolate === row.eligibleVersion && row.eligibleCount > 0 ? (
+                        <>
+                          <Button
+                            type="button"
+                            variant="destructive"
+                            size="sm"
+                            disabled={isPending}
+                            onClick={() => {
+                              setConfirmingIsolate(null)
+                              runAction(
+                                () => isolateUnresolvedDriftCohort(row.connector, row.version, row.eligibleVersion),
+                                'Isolated — inbound sync resumes, and each order is now replayable above.',
+                              )
+                            }}
+                          >
+                            Confirm — isolate {row.eligibleCount}
+                          </Button>
+                          <Button type="button" variant="ghost" size="sm" disabled={isPending} onClick={() => setConfirmingIsolate(null)}>
+                            Cancel
+                          </Button>
+                        </>
+                      ) : (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={isPending}
+                          onClick={() => setConfirmingIsolate(row.eligibleVersion)}
+                          title={row.eligibleCount === 0 ? 'Nothing eligible to isolate' : undefined}
+                        >
+                          Isolate {row.eligibleCount}…
+                        </Button>
                       )}
-                    >
-                      <RotateCcw className="h-3 w-3 mr-1" />Retry
-                    </Button>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(
-                        () => isolateUnresolvedDriftCohort(row.connector, row.version),
-                        'Isolated — inbound sync resumes, and each order is now replayable above.',
-                      )}
-                    >
-                      Isolate {row.linkCount}
-                    </Button>
-                  </TableCell>
-                </TableRow>
+                    </TableCell>
+                  </TableRow>
+                  {/*
+                    o3d-51du: the orders Isolate would quarantine, on screen BEFORE
+                    the click. Binding the action to a digest of the cohort only
+                    guarantees the operator acts on the set the page showed them —
+                    which means nothing while the page shows a bare count.
+                  */}
+                  <TableRow className="hover:bg-transparent">
+                    <TableCell colSpan={6} className="pt-0 pb-3">
+                      <div className="rounded-md border border-dashed bg-muted/20 p-2">
+                        <p className="text-xs font-medium mb-1">
+                          {confirmingIsolate === row.eligibleVersion
+                            ? `These ${row.eligibleCount} order(s) will be quarantined:`
+                            : `Orders Isolate would quarantine (${row.eligibleCount} of ${row.linkCount} in the cohort still eligible):`}
+                        </p>
+                        {row.eligibleCount > 0 ? (
+                          <>
+                            <ul className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground max-h-48 overflow-y-auto">
+                              {row.orders.map((order) => (
+                                <li key={order.linkId} className="font-mono">
+                                  {order.orderNumber ?? '(no number)'}
+                                  {order.externalOrderNumber ? (
+                                    <span className="text-muted-foreground/70"> → {order.externalOrderNumber}</span>
+                                  ) : null}
+                                </li>
+                              ))}
+                            </ul>
+
+                            {row.eligibleCount > row.orders.length ? (
+                              <p className="text-xs text-amber-600 mt-1">
+                                Listing the first {row.orders.length} — Isolate quarantines all {row.eligibleCount}.
+                              </p>
+                            ) : null}
+                          </>
+                        ) : (
+                          <p className="text-xs text-muted-foreground">
+                            None of these orders is still eligible — they have resolved, shipped or been isolated
+                            already. Isolate would do nothing.
+                          </p>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                </Fragment>
               ))}
             </TableBody>
           </Table>

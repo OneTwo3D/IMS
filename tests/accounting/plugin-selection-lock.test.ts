@@ -713,9 +713,55 @@ const TAKES_THE_LOCK = /lockIntegrationPluginSelection|writeSettingsUnderPluginS
  * 5). Asserting "no offenders" over real files proves the scan found nothing; it does not prove the
  * scan can find anything. The fixture test below is what proves that.
  */
+/**
+ * A settings write counts only when the write ITSELF could be naming a plugin key.
+ *
+ * The whole-file conjunction this replaces asked two independent questions — does this file mention
+ * a plugin key anywhere, and does it write settings anywhere — and answered yes to a file that does
+ * both about DIFFERENT rows. app/actions/sync-exceptions.ts takes a `FOR UPDATE` READ on a plugin
+ * row (to stop a disable committing underneath it) and, elsewhere, deletes its own
+ * `wms_dispatch_unresolved_streak:<connector>` row. Neither writes a plugin selection, and
+ * `setting.delete` matches `setting.deleteMany` by substring, so the file read as an offender.
+ *
+ * A window rather than a parse: these writes are Prisma call expressions spanning a few lines, and
+ * the key is in the `where`/`create`/`update` clause right beside the call. WIPES_SETTINGS stays
+ * whole-file — an unconditional wipe writes every plugin key without naming one.
+ */
+const PLUGIN_KEY_WRITE_WINDOW = 12
+
+/**
+ * Identifiers bound to a plugin key, so a write that references the CONSTANT is still seen.
+ * app/api/e2e/mintsoft/route.ts declares `const PLUGIN_MINTSOFT_ENABLED_KEY = 'plugin_mintsoft_enabled'`
+ * at the top of the file and writes it ~500 lines later; matching only the literal loses it, and
+ * that indirection is precisely how a future writer would hide from this scan.
+ */
+function pluginKeyAliases(src: string): string[] {
+  const names: string[] = []
+  const decl = /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=]+)?=\s*([^\n]+)/g
+  let m: RegExpExecArray | null
+  while ((m = decl.exec(src)) !== null) {
+    if (NAMES_A_PLUGIN_KEY.test(m[2])) names.push(m[1])
+  }
+  return names
+}
+
+function writesAPluginKey(src: string): boolean {
+  if (WIPES_SETTINGS.test(src)) return true
+  const aliases = pluginKeyAliases(src)
+  const namesAKey = (chunk: string): boolean =>
+    NAMES_A_PLUGIN_KEY.test(chunk) || aliases.some((name) => new RegExp(`\\b${name}\\b`).test(chunk))
+  const lines = src.split('\n')
+  for (let i = 0; i < lines.length; i += 1) {
+    if (!WRITES_SETTINGS.test(lines[i])) continue
+    const from = Math.max(0, i - PLUGIN_KEY_WRITE_WINDOW)
+    const to = Math.min(lines.length, i + PLUGIN_KEY_WRITE_WINDOW + 1)
+    if (namesAKey(lines.slice(from, to).join('\n'))) return true
+  }
+  return false
+}
+
 export function isUnfencedPluginWriter(src: string): boolean {
-  const writesPluginKeys = (NAMES_A_PLUGIN_KEY.test(src) && WRITES_SETTINGS.test(src)) || WIPES_SETTINGS.test(src)
-  return writesPluginKeys && !TAKES_THE_LOCK.test(src)
+  return writesAPluginKey(src) && !TAKES_THE_LOCK.test(src)
 }
 
 test('every plugin-key writer in the repo goes through the selection lock', () => {
@@ -727,8 +773,7 @@ test('every plugin-key writer in the repo goes through the selection lock', () =
       const rel = relative(REPO, path)
       if (MECHANISM_FILES.has(rel)) continue
       const src = readFileSync(path, 'utf8')
-      const writesPluginKeys = (NAMES_A_PLUGIN_KEY.test(src) && WRITES_SETTINGS.test(src)) || WIPES_SETTINGS.test(src)
-      if (!writesPluginKeys) continue
+      if (!writesAPluginKey(src)) continue
       if (TAKES_THE_LOCK.test(src)) covered.push(rel)
       else offenders.push(rel)
     }
