@@ -56,9 +56,24 @@ type OrderRow = {
   unearnedRevenueAmount?: number | null
 }
 
+/** A mirrored AccountingEvent — what the o3d-y14 r5 ledger handoff replays the connector rule over. */
+type EventRow = {
+  sourceEntityType: string
+  sourceEntityId: string
+  type: string
+  status: string
+  currency: string
+  externalSystem: string | null
+  externalId: string | null
+  businessDate: string
+  createdAt: string
+  linesJson: unknown
+}
+
 type Store = {
   orders: OrderRow[]
   syncLogs: SyncLogRow[]
+  events?: EventRow[]
   activity: Array<{ action: string; entityId: string | null; metadata: Record<string, unknown> }>
 }
 
@@ -183,6 +198,40 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
         throw new Error('the backfill must never retire a queued job (o3d-5ct)')
       },
     },
+    // The mirrored-document read the o3d-y14 r5 ledger handoff makes. It honours its `where` for the
+    // same reason every other double here does: a double that ignored `status` could not tell a
+    // POSTED document from an unsettled invoice UPDATE, and those two produce OPPOSITE operator
+    // instructions ("nothing to do" versus "no remedy is prescribed").
+    accountingEvent: {
+      count: async ({
+        where,
+      }: {
+        where: { sourceEntityType: string; sourceEntityId: string; type: string; status: { notIn: string[] } }
+      }) => {
+        events.push(`event:count:${where.sourceEntityId}`)
+        return (store.events ?? []).filter(
+          (event) =>
+            event.sourceEntityType === where.sourceEntityType &&
+            event.sourceEntityId === where.sourceEntityId &&
+            event.type === where.type &&
+            !where.status.notIn.includes(event.status),
+        ).length
+      },
+      findMany: async ({
+        where,
+      }: {
+        where: { sourceEntityType: string; sourceEntityId: string; type: { in: string[] }; status: string }
+      }) => {
+        events.push(`event:findMany:${where.sourceEntityId}`)
+        return (store.events ?? []).filter(
+          (event) =>
+            event.sourceEntityType === where.sourceEntityType &&
+            event.sourceEntityId === where.sourceEntityId &&
+            where.type.in.includes(event.type) &&
+            event.status === where.status,
+        )
+      },
+    },
     activityLog: {
       create: async ({ data }: { data: { action: string; entityId: string | null; metadata: Record<string, unknown> } }) => {
         events.push('activityLog:create')
@@ -248,7 +297,7 @@ test('a reviewed order is corrected and STAMPED in the same write (o3d-5ct/o3d-9
 
   const result = await applyWcCouponCorrection(makeTx(store), entry)
 
-  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS, handoff: null })
   assert.equal(store.orders[0].discountAmount, 0, 'the duplicated part is cleared')
   assert.equal(
     store.orders[0].discountModel,
@@ -429,7 +478,7 @@ test('a TERMINAL job does not block, and another order\'s job is not confused fo
 
   const result = await applyWcCouponCorrection(makeTx(store), entry)
 
-  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS, handoff: null })
 })
 
 test('the queue is never written to, only counted (o3d-5ct)', async () => {
@@ -789,7 +838,7 @@ test('the residual actually written comes from the LIVE evidence, not the file',
     partial: true,
   })
 
-  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS, handoff: null })
   assert.equal(store.orders[0].discountAmount, 6)
 })
 
@@ -871,7 +920,7 @@ test('stamping records the model WITHOUT touching the amount (Codex r1 F3)', asy
 
   // `posted: null`, not an empty evidence set: stamping changes no amount, so it creates no ledger
   // inconsistency and must not add this order to the operator's manual-adjustment list.
-  assert.deepEqual(result, { outcome: 'CORRECTED', posted: null })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: null, handoff: null })
   assert.equal(store.orders[0].discountAmount, 6, 'the manually corrected amount SURVIVES')
   assert.equal(store.orders[0].discountModel, WC_COUPON_DISCOUNT_MODEL)
   assert.equal(store.activity[0].action, WC_COUPON_STAMP_ACTION, 'a distinct action: a human assertion, not a computation')

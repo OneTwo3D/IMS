@@ -31,18 +31,22 @@
  *   • `storedOrderDiscount` / `lineDiscountTotal` / `keptOrderLevel` — does the residual make sense
  *     for that order's coupons? `"partial": true` means a residual SURVIVES; those are unmodelled
  *     coupon shapes and are worth opening individually.
- *   • `accountingInvoiceId` — non-null means the ledger document ALREADY understates. Clearing the
- *     IMS field does not reach it; each needs a manual credit/adjustment in the accounting system.
+ *   • `accountingInvoiceId` — non-null means a ledger document exists for this order. It does NOT
+ *     by itself mean that document is wrong: the report classifies each one under "LEDGER HANDOFF"
+ *     below by replaying the connector's own posting rule over what was actually sent, and a Xero
+ *     invoice enqueued without a discount account code carries no order-level discount line at all
+ *     (o3d-y14 r5). Read the classification, not the column.
  *   • `postedInvoiceExternalIds` — SYNCED invoice jobs whose external id the order does NOT carry.
  *     A post can succeed and then fail to write its id back (o3d-9kek), so a non-empty list here
- *     with a null `accountingInvoiceId` is a REAL ledger document the column denies. Treat it
- *     exactly like `accountingInvoiceId`: it needs a manual credit/adjustment, and approving the
- *     entry is you saying you have seen it. Apply compares this list against live state and refuses
- *     if it has moved, so approving the row is what unsticks it — there is no separate repair to
- *     run first.
+ *     with a null `accountingInvoiceId` is a REAL ledger document the column denies. It is
+ *     classified exactly like `accountingInvoiceId`, and approving the entry is you saying you have
+ *     seen it. Apply compares this list against live state and refuses if it has moved, so approving
+ *     the row is what unsticks it — there is no separate repair to run first.
  *   • `revenueDeferredBatchRef` — non-null means a daily-batch Group A1 journal ALSO deferred this
- *     order's revenue using the same wrong discount, and stamped the result on the order. That is a
- *     SECOND document needing a manual adjustment, and the stamp stays stale after the correction.
+ *     order's revenue using the same wrong discount, and stamped the result on the order. That
+ *     journal is deliberately left alone: IMS recognises back out the SAME stamped
+ *     `unearnedRevenueAmount`, so the deferral/recognition pair still nets to zero and adjusting one
+ *     half of it by hand would strand the difference in unearned revenue forever.
  *   • Anything you are not sure about: DELETE the entry. Skipping is re-runnable; a wrong correction
  *     is not.
  *
@@ -61,10 +65,21 @@
  *
  * POSTING STATE IS NEVER READ FROM THE FILE. The allowlist decides WHICH ORDERS may be touched and
  * nothing else. What the accounting system holds is re-read at apply time under the correction's own
- * lock: a row whose posting state moved since the review is REFUSED, and the "needs a manual ledger
- * adjustment" list printed at the end is built from that live read. A file-derived list would report
- * an invoice posted between review and apply as unposted — telling the operator that nothing needs
- * fixing about the one order that most does.
+ * lock: a row whose posting state moved since the review is REFUSED, and the LEDGER HANDOFF printed
+ * at the end is built from that live read. A file-derived list would report an invoice posted between
+ * review and apply as unposted — telling the operator that nothing needs fixing about the one order
+ * that most does.
+ *
+ * THE LEDGER HANDOFF IS DERIVED PER DOCUMENT (o3d-y14 r5 finding 1). Earlier revisions printed one
+ * sentence for every order that had any accounting document — "still understates, needs a manual
+ * credit/adjustment" — and that sentence is wrong twice over. A Xero invoice enqueued without a
+ * discount ACCOUNT CODE never had the negative "Order discount" line appended, so it already charges
+ * the full goods less the per-line coupon and needs NOTHING done to it; and where a document DID
+ * carry the duplicate it charged too LITTLE, so its balance has to go UP and a credit note is the
+ * wrong instrument entirely. Both report and apply now replay each connector's posting rule over the
+ * payload that was actually mirrored — the same `readPostedInvoiceOrderDiscount` the chargeback path
+ * uses — and print the job that matches what the document carries, or refuse to prescribe one when
+ * the derivation cannot establish it.
  *
  * IT ONLY EVER TOUCHES SalesOrder.discountAmount + discountModel, and only on orders with a
  * WooCommerce link. It never touches the accounting queue: an order with unposted invoice work
@@ -96,13 +111,15 @@ import {
   sortedPostedInvoiceIds,
   stampWcCouponDiscountModel,
   sumLineDiscounts,
-  wcCouponCorrectionNeedsLedgerAdjustment,
   type WcCouponAllowlist,
   type WcCouponAllowlistEntry,
   type WcCouponBackfillDecision,
   type WcCouponBackfillRow,
-  type WcCouponPostedEvidence,
 } from '../lib/connectors/woocommerce/sync/coupon-discount-backfill'
+import {
+  buildWcCouponLedgerHandoff,
+  type WcCouponLedgerHandoff,
+} from '../lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
 import { liveDailyBatchDeferralWhere } from '../lib/domain/accounting/daily-batch-discount-fence'
 
 // .env MUST load before lib/db is imported: that module builds its pg Pool from
@@ -118,6 +135,20 @@ function flagValue(name: string): string | null {
 }
 
 const LOG = '[backfill-wc-coupon-order-discount]'
+
+/**
+ * Print ONE order's ledger handoff.
+ *
+ * The lines come from `coupon-discount-ledger-handoff.ts` verbatim: this script must not paraphrase
+ * a remedy, because the classification and the wording are the same decision (o3d-y14 r5 finding 1).
+ */
+function printHandoff(
+  order: { orderId: string; orderNumber: string },
+  handoff: { lines: string[] },
+): void {
+  console.log(`${LOG}   ${order.orderNumber || order.orderId}:`)
+  for (const line of handoff.lines) console.log(`${LOG}     ${line}`)
+}
 
 // ---------------------------------------------------------------------------
 // APPLY — consumes the reviewed allowlist and nothing else
@@ -172,14 +203,16 @@ async function apply(allowlistPath: string) {
   // holds now. An invoice queued after the review and posted before this run would be reported as
   // "not posted" from the file, and the operator would be told no manual ledger correction is
   // needed for the one order that most needs it (o3d-y14 r2).
-  const posted: Array<{ entry: WcCouponAllowlistEntry; evidence: WcCouponPostedEvidence }> = []
+  //
+  // And what it says about each of those documents is DERIVED from what that document carries
+  // (o3d-y14 r5 finding 1), so the two lists below are genuinely different jobs rather than one
+  // sentence printed twice.
+  const handoffs: Array<{ entry: WcCouponAllowlistEntry; handoff: WcCouponLedgerHandoff }> = []
   for (const entry of allowlist.clear) {
     const result = await db.$transaction((tx) => applyWcCouponCorrection(tx, entry))
     if (result.outcome === 'CORRECTED') {
       corrected += 1
-      if (wcCouponCorrectionNeedsLedgerAdjustment(result.posted)) {
-        posted.push({ entry, evidence: result.posted as WcCouponPostedEvidence })
-      }
+      if (result.handoff) handoffs.push({ entry, handoff: result.handoff })
     } else {
       declined.push(`clear ${entry.orderNumber || entry.orderId}: ${result.reason} — ${result.detail}`)
     }
@@ -190,24 +223,25 @@ async function apply(allowlistPath: string) {
     `${LOG} stamped ${stamped} order(s) as already-correct; corrected ${corrected} order(s). ` +
       'No queued or posted accounting payload was modified.',
   )
-  if (posted.length) {
+
+  const actionable = handoffs.filter(({ handoff }) => handoff.needsAccountingAction)
+  const settled = handoffs.filter(({ handoff }) => !handoff.needsAccountingAction)
+  if (actionable.length) {
+    console.log('')
     console.log(
-      `${LOG} ${posted.length} corrected order(s) ALREADY HAVE ACCOUNTING DOCUMENTS derived from the old ` +
-        'amount, read live at the moment of correction. Each still understates and needs a manual ' +
-        'credit/adjustment — clearing the IMS field does not reach a posted document:',
+      `${LOG} ${actionable.length} corrected order(s) NEED WORK IN THE ACCOUNTING SYSTEM. Each entry ` +
+        'names what its document actually carries — replayed from the connector rule that built it — ' +
+        'and the remedy that matches THAT case. Do not generalise one entry to another:',
     )
-    for (const { entry, evidence } of posted) {
-      const parts = [
-        evidence.accountingInvoiceId ? `invoice ${evidence.accountingInvoiceId}` : null,
-        evidence.postedInvoiceExternalIds.length
-          ? `posted-but-unlinked invoice(s) ${evidence.postedInvoiceExternalIds.join(', ')}`
-          : null,
-        evidence.revenueDeferredBatchRef
-          ? `revenue deferral ${evidence.revenueDeferredBatchRef} (unearned ${evidence.unearnedRevenueAmount})`
-          : null,
-      ].filter(Boolean)
-      console.log(`${LOG}   posted: ${entry.orderNumber || entry.orderId} -> ${parts.join('; ')}`)
-    }
+    for (const { entry, handoff } of actionable) printHandoff(entry, handoff)
+  }
+  if (settled.length) {
+    console.log('')
+    console.log(
+      `${LOG} ${settled.length} corrected order(s) have accounting documents that need NOTHING done ` +
+        'to them. They are listed so the list is complete, and so nobody "tidies them up" later:',
+    )
+    for (const { entry, handoff } of settled) printHandoff(entry, handoff)
   }
   if (declined.length) {
     console.log(
@@ -429,24 +463,38 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
   )
 
   if (postedCandidates.length) {
+    console.log('')
     console.log(
-      `${LOG} ${postedCandidates.length} of the candidates ALREADY HAVE ACCOUNTING DOCUMENTS derived from ` +
-        'the amount about to change. Each understates and needs a manual credit/adjustment — clearing the ' +
-        'IMS field does not reach a posted document. This is the state AT REPORT TIME; apply re-reads it ' +
-        'live and refuses any row whose posting state has moved since you reviewed it.',
+      `${LOG} ${postedCandidates.length} of the candidates ALREADY HAVE ACCOUNTING DOCUMENTS derived ` +
+        'from the amount about to change. What each of those documents actually CARRIES is derived ' +
+        "below by replaying the connector's own posting rule over the payload that was mirrored — a " +
+        'Xero invoice enqueued without a discount account code never had an "Order discount" line ' +
+        'appended and needs nothing done to it (o3d-y14 r5). This is the state AT REPORT TIME; apply ' +
+        're-reads it live, refuses any row whose posting state has moved since you reviewed it, and ' +
+        're-derives this same handoff from the state at the moment of correction.',
     )
-    for (const { row } of postedCandidates) {
-      const parts = [
-        row.accountingInvoiceId ? `invoice ${row.accountingInvoiceId}` : null,
-        // Listed SEPARATELY from the column, because "posted but the id was never written back"
-        // (o3d-9kek) is a different thing for the reviewer to check than a linked invoice — and it
-        // is the one apply used to refuse forever.
-        row.postedInvoiceExternalIds.length
-          ? `posted-but-unlinked invoice(s) ${row.postedInvoiceExternalIds.join(', ')}`
-          : null,
-        row.revenueDeferredBatchRef ? `revenue deferral batch ${row.revenueDeferredBatchRef}` : null,
-      ].filter(Boolean)
-      console.log(`${LOG}   posted: ${row.orderNumber || row.orderId} -> ${parts.join('; ')}`)
+    // ONE PAIR OF QUERIES PER POSTED CANDIDATE, and only for the posted ones. The candidate set is
+    // already capped at WC_COUPON_MAX_CANDIDATES and this defect affects tens of orders, so the
+    // bound is the operator list rather than the catalogue.
+    for (const { row, decision } of postedCandidates) {
+      const handoff = await buildWcCouponLedgerHandoff(db, {
+        orderId: row.orderId,
+        currency: row.currency,
+        keptOrderLevel: decision.keptOrderLevel,
+        evidence: {
+          accountingInvoiceId: row.accountingInvoiceId,
+          // Listed SEPARATELY from the column, because "posted but the id was never written back"
+          // (o3d-9kek) is a different thing for the reviewer to check than a linked invoice — and it
+          // is the one apply used to refuse forever.
+          postedInvoiceExternalIds: row.postedInvoiceExternalIds,
+          revenueDeferredBatchRef: row.revenueDeferredBatchRef,
+        },
+      })
+      console.log(
+        `${LOG}   ${row.orderNumber || row.orderId} — ` +
+          `${handoff.needsAccountingAction ? 'ACCOUNTING ACTION REQUIRED' : 'no accounting action'}:`,
+      )
+      for (const line of handoff.lines) console.log(`${LOG}     ${line}`)
     }
   }
 

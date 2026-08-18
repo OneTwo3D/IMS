@@ -142,6 +142,12 @@ export type PostedOrderDiscount =
       detail: string
       documentType: string
       externalId: string | null
+      /**
+       * Which connector's rule was replayed to reach `amount`. Carried because the remedy for a
+       * document that disagrees is performed in THAT system's UI, and the o3d-y14 operator handoff
+       * has to name steps that exist there rather than generic ones that exist nowhere.
+       */
+      externalSystem: string | null
     }
   /** A document exists and what it posted cannot be established. The caller must NOT guess. */
   | { source: 'UNRECOVERABLE'; detail: string }
@@ -245,6 +251,113 @@ export function readPostedDocumentDiscount(
 
 export type PostedOrderDiscountClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingSyncLog'>
 
+/** The client surface the mirrored-document read alone needs. */
+export type PostedInvoiceEventClient = Pick<Prisma.TransactionClient, 'accountingEvent'>
+
+/**
+ * What the POSTED sales-invoice document for this order carries, read from the mirrored events.
+ *
+ * Split out of `resolvePostedOrderDiscount` so the o3d-y14 backfill's operator handoff can ask the
+ * SAME question the chargeback path asks, with the same refusals, rather than a second
+ * near-identical derivation that could drift from it. The backfill asks it BEFORE any restatement
+ * record exists (in the dry run) and immediately AFTER writing one (at apply time), so it cannot go
+ * through the restatement gate that wraps this — but every rule below is common to both callers.
+ */
+export type PostedInvoiceOrderDiscount =
+  /** The document was found and its order-level discount replayed from the connector's rule. */
+  | {
+      ok: true
+      amount: number
+      detail: string
+      documentType: string
+      externalId: string | null
+      externalSystem: string | null
+    }
+  /** No POSTED mirrored sales-invoice event exists. NOT the same as "no document exists". */
+  | { ok: false; reason: 'NO_POSTED_EVENT' }
+  /** A document exists (or may) and what it carries cannot be established. Never guess past this. */
+  | { ok: false; reason: 'UNRECOVERABLE'; detail: string }
+
+export async function readPostedInvoiceOrderDiscount(
+  client: PostedInvoiceEventClient,
+  order: { id: string; currency: string },
+): Promise<PostedInvoiceOrderDiscount> {
+  // An invoice UPDATE that never settled. Under `@@unique([externalSystem, externalId])` this is
+  // exactly what a SUCCESSFUL update leaves behind (see the header), so it cannot be read as "the
+  // update never happened" and the original invoice's event cannot be trusted to describe the
+  // document as it now stands.
+  const unsettledUpdates = await client.accountingEvent.count({
+    where: {
+      sourceEntityType: 'SalesOrder',
+      sourceEntityId: order.id,
+      type: 'SALES_INVOICE_UPDATE',
+      status: { notIn: [...SETTLED_INVOICE_UPDATE_EVENT_STATUSES] },
+    },
+  })
+  if (unsettledUpdates > 0) {
+    return {
+      ok: false,
+      reason: 'UNRECOVERABLE',
+      detail:
+        `${unsettledUpdates} SALES_INVOICE_UPDATE event(s) for this order never reached POSTED — which ` +
+        'is the state an update that DID modify the ledger document is left in, because it cannot ' +
+        'record its own external id against the original invoice event',
+    }
+  }
+
+  const documents = (await client.accountingEvent.findMany({
+    where: {
+      sourceEntityType: 'SalesOrder',
+      sourceEntityId: order.id,
+      type: { in: [...POSTED_SALES_INVOICE_EVENT_TYPES] },
+      status: POSTED_ACCOUNTING_EVENT_STATUS,
+    },
+    // PRESENTATIONAL ONLY — the newest document names the refusal or the recovery in the operator's
+    // message. It decides no amount: every posted document must AGREE below, so no ordering
+    // guarantee is being relied on (and, per the header, none exists).
+    orderBy: [{ businessDate: 'desc' }, { createdAt: 'desc' }],
+    select: { type: true, status: true, currency: true, externalSystem: true, externalId: true, linesJson: true },
+  })) as MirroredDocument[]
+
+  if (documents.length === 0) return { ok: false, reason: 'NO_POSTED_EVENT' }
+
+  const amounts: number[] = []
+  for (const document of documents) {
+    const read = readPostedDocumentDiscount(document, order.currency)
+    if (!read.ok) {
+      return {
+        ok: false,
+        reason: 'UNRECOVERABLE',
+        detail: `a ${document.type} was posted for this order but ${read.detail}`,
+      }
+    }
+    amounts.push(read.amount)
+  }
+  const distinct = [...new Set(amounts)]
+  if (distinct.length > 1) {
+    return {
+      ok: false,
+      reason: 'UNRECOVERABLE',
+      detail:
+        `${documents.length} posted documents exist for this order and they carry different ` +
+        `order-level discounts (${distinct.join(', ')} ${order.currency}); nothing here says which ` +
+        'one a credit note now reverses',
+    }
+  }
+  const [newest] = documents
+  const amount = distinct[0]
+  return {
+    ok: true,
+    amount,
+    detail:
+      `the posted ${newest.type}${newest.externalId ? ` ${newest.externalId}` : ''} carries an ` +
+      `order-level discount of ${amount} ${order.currency}`,
+    documentType: newest.type,
+    externalId: newest.externalId,
+    externalSystem: newest.externalSystem,
+  }
+}
+
 /**
  * What order-level discount the ledger document for this order actually carries.
  *
@@ -283,74 +396,22 @@ export async function resolvePostedOrderDiscount(
     }
   }
 
-  // An invoice UPDATE that never settled. Under `@@unique([externalSystem, externalId])` this is
-  // exactly what a SUCCESSFUL update leaves behind (see the header), so it cannot be read as "the
-  // update never happened" and the original invoice's event cannot be trusted to describe the
-  // document as it now stands.
-  const unsettledUpdates = await client.accountingEvent.count({
-    where: {
-      sourceEntityType: 'SalesOrder',
-      sourceEntityId: order.id,
-      type: 'SALES_INVOICE_UPDATE',
-      status: { notIn: [...SETTLED_INVOICE_UPDATE_EVENT_STATUSES] },
-    },
-  })
-  if (unsettledUpdates > 0) {
-    return {
-      source: 'UNRECOVERABLE',
-      detail:
-        `${unsettledUpdates} SALES_INVOICE_UPDATE event(s) for this order never reached POSTED — which ` +
-        'is the state an update that DID modify the ledger document is left in, because it cannot ' +
-        'record its own external id against the original invoice event',
-    }
+  // THE SAME READ THE o3d-y14 OPERATOR HANDOFF USES (`readPostedInvoiceOrderDiscount`). One
+  // implementation, so "what the document carries" cannot mean two different things depending on
+  // which caller asks — the backfill tells an operator to alter a document on the strength of this
+  // answer, and a chargeback declines to auto-raise a credit note on the strength of the same one.
+  const document = await readPostedInvoiceOrderDiscount(client, order)
+  if (!document.ok && document.reason === 'UNRECOVERABLE') {
+    return { source: 'UNRECOVERABLE', detail: document.detail }
   }
-
-  const documents = (await client.accountingEvent.findMany({
-    where: {
-      sourceEntityType: 'SalesOrder',
-      sourceEntityId: order.id,
-      type: { in: [...POSTED_SALES_INVOICE_EVENT_TYPES] },
-      status: POSTED_ACCOUNTING_EVENT_STATUS,
-    },
-    // PRESENTATIONAL ONLY — the newest document names the refusal or the recovery in the operator's
-    // message. It decides no amount: every posted document must AGREE below, so no ordering
-    // guarantee is being relied on (and, per the header, none exists).
-    orderBy: [{ businessDate: 'desc' }, { createdAt: 'desc' }],
-    select: { type: true, status: true, currency: true, externalSystem: true, externalId: true, linesJson: true },
-  })) as MirroredDocument[]
-
-  if (documents.length > 0) {
-    const amounts: number[] = []
-    for (const document of documents) {
-      const read = readPostedDocumentDiscount(document, order.currency)
-      if (!read.ok) {
-        return {
-          source: 'UNRECOVERABLE',
-          detail: `a ${document.type} was posted for this order but ${read.detail}`,
-        }
-      }
-      amounts.push(read.amount)
-    }
-    const distinct = [...new Set(amounts)]
-    if (distinct.length > 1) {
-      return {
-        source: 'UNRECOVERABLE',
-        detail:
-          `${documents.length} posted documents exist for this order and they carry different ` +
-          `order-level discounts (${distinct.join(', ')} ${order.currency}); nothing here says which ` +
-          'one a credit note now reverses',
-      }
-    }
-    const [newest] = documents
-    const amount = distinct[0]
+  if (document.ok) {
     return {
       source: 'POSTED_DOCUMENT',
-      amount,
-      detail:
-        `the posted ${newest.type}${newest.externalId ? ` ${newest.externalId}` : ''} carries an ` +
-        `order-level discount of ${amount} ${order.currency}`,
-      documentType: newest.type,
-      externalId: newest.externalId,
+      amount: document.amount,
+      detail: document.detail,
+      documentType: document.documentType,
+      externalId: document.externalId,
+      externalSystem: document.externalSystem,
     }
   }
 

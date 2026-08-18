@@ -87,7 +87,10 @@
  *   of those columns, so it cannot make them stale — they were computed from the pre-correction
  *   amount and still faithfully record it. What it CAN do is leave them disagreeing with the
  *   corrected order, which is why `revenueDeferredBatchRef` and `unearnedRevenueAmount` are read
- *   live and reported as needing a manual adjustment, exactly like `accountingInvoiceId`.
+ *   live and reported. What is REPORTED about them is decided per document by
+ *   `coupon-discount-ledger-handoff.ts` and not asserted here: an invoice posted without a discount
+ *   account code never carried the duplicate at all and needs nothing done to it, and the deferral
+ *   journal must be left alone because IMS recognises back out exactly what it deferred (r5 F1).
  *
  *   `queueAccountingSyncTx` carries no discount fence. No order-scoped SALES_INVOICE reaches it
  *   today (its order-scoped callers are COGS_REVERSAL and INVOICE_PAYMENT), but its type union
@@ -102,6 +105,10 @@ import { liveDailyBatchDeferralWhere } from '@/lib/domain/accounting/daily-batch
 import { buildDiscountRestatement } from '@/lib/domain/accounting/discount-restatement'
 
 import { resolveWcOrderLevelDiscount } from './field-mapping'
+import {
+  buildWcCouponLedgerHandoff,
+  type WcCouponLedgerHandoff,
+} from './coupon-discount-ledger-handoff'
 
 /** ActivityLog action written for every corrected order — the audit trail, not the guard. */
 export const WC_COUPON_BACKFILL_ACTION = 'wc_coupon_order_discount_backfilled'
@@ -799,7 +806,16 @@ export type WcCouponPostedEvidence = {
 }
 
 export type WcCouponCorrectionResult =
-  | { outcome: 'CORRECTED'; posted: WcCouponPostedEvidence | null }
+  | {
+      outcome: 'CORRECTED'
+      posted: WcCouponPostedEvidence | null
+      /**
+       * WHAT THE OPERATOR MUST DO IN THE ACCOUNTING SYSTEM, derived per document rather than
+       * asserted (o3d-y14 r5 finding 1). NULL when nothing is in the ledger for this order and there
+       * is consequently no document to classify. See `coupon-discount-ledger-handoff.ts`.
+       */
+      handoff: WcCouponLedgerHandoff | null
+    }
   | {
       outcome: 'DECLINED'
       reason:
@@ -880,7 +896,13 @@ async function readLivePostedEvidence(
   }
 }
 
-/** Does this evidence describe a document a human now has to adjust by hand? */
+/**
+ * Does this evidence describe ANY accounting document derived from the pre-correction amount?
+ *
+ * It is the trigger for classifying the handoff, NOT the answer to "does a human have to do
+ * something" — that answer is `WcCouponLedgerHandoff.needsAccountingAction`, and for a Xero invoice
+ * posted without a discount account code it is NO (o3d-y14 r5 finding 1).
+ */
 export function wcCouponCorrectionNeedsLedgerAdjustment(posted: WcCouponPostedEvidence | null): boolean {
   if (!posted) return false
   return (
@@ -1119,6 +1141,24 @@ export async function applyWcCouponCorrection(
     }
   }
 
+  // THE HANDOFF IS DERIVED, NOT ASSERTED (o3d-y14 r5 finding 1).
+  //
+  // Read AFTER the update and inside the same transaction, so the restatement record it is written
+  // beside is already committed-to and the documents it names are the ones that existed at the
+  // moment this amount was rewritten. It replays each connector's own posting rule over the payload
+  // that was mirrored, through the SAME function the chargeback path uses, because "this invoice
+  // needs a manual adjustment" is false for every Xero invoice enqueued without a discount account
+  // code — that document never carried the duplicate, and telling an operator to credit it would
+  // put a wrong entry in the ledger.
+  const handoff = wcCouponCorrectionNeedsLedgerAdjustment(posted)
+    ? await buildWcCouponLedgerHandoff(tx, {
+        orderId: entry.orderId,
+        currency: entry.currency,
+        keptOrderLevel,
+        evidence: posted,
+      })
+    : null
+
   await tx.activityLog.create({
     data: {
       entityType: 'SYNC',
@@ -1131,9 +1171,11 @@ export async function applyWcCouponCorrection(
         `${keptOrderLevel} (${liveLines} already carried by the line items)` +
         // Written from the LIVE evidence, not from the reviewed file. This log is the durable record
         // of what still needs adjusting by hand, and a record of the state at REVIEW time would
-        // describe a moment that has already passed.
-        (wcCouponCorrectionNeedsLedgerAdjustment(posted)
-          ? ' — WARNING: already in the ledger as ' +
+        // describe a moment that has already passed. The classification travels with it: the
+        // ActivityLog is what anyone reads back months later, and "needs a manual credit" recorded
+        // against an invoice that was always correct is the r5 defect made permanent.
+        (handoff
+          ? ' — in the ledger as ' +
             [
               posted.accountingInvoiceId ? `invoice ${posted.accountingInvoiceId}` : null,
               posted.postedInvoiceExternalIds.length
@@ -1145,7 +1187,10 @@ export async function applyWcCouponCorrection(
             ]
               .filter(Boolean)
               .join(', ') +
-            '; those documents still understate and need a manual credit/adjustment.'
+            `. ${handoff.needsAccountingAction ? 'ACCOUNTING ACTION REQUIRED' : 'NO ACCOUNTING ACTION REQUIRED'} — ` +
+            // The HEADLINE only. The full remedy is `metadata.handoffLines`, so this column stays a
+            // sentence the activity feed can render while the durable record loses nothing.
+            (handoff.lines[0] ?? '')
           : ''),
       metadata: {
         connector: 'woocommerce',
@@ -1158,6 +1203,11 @@ export async function applyWcCouponCorrection(
         postedInvoiceExternalIds: posted.postedInvoiceExternalIds,
         revenueDeferredBatchRef: posted.revenueDeferredBatchRef,
         unearnedRevenueAmount: posted.unearnedRevenueAmount,
+        // The DERIVED classification, kept as a field so the handoff can be re-read from the log
+        // without re-parsing English.
+        ledgerCase: handoff ? handoff.invoice.case : null,
+        needsAccountingAction: handoff ? handoff.needsAccountingAction : false,
+        handoffLines: handoff ? handoff.lines : null,
         discountModel: WC_COUPON_DISCOUNT_MODEL,
         importedAt: entry.importedAt,
         nearCutoff: entry.nearCutoff,
@@ -1165,7 +1215,7 @@ export async function applyWcCouponCorrection(
     },
   })
 
-  return { outcome: 'CORRECTED', posted }
+  return { outcome: 'CORRECTED', posted, handoff }
 }
 
 /**
@@ -1278,6 +1328,6 @@ export async function stampWcCouponDiscountModel(
   // `posted: null` — deliberately, and not "no documents exist". Stamping changes NO amount, so
   // nothing in the ledger has been made inconsistent and there is no manual adjustment to report.
   // Reporting posted documents here would put orders on the operator's must-fix list that this run
-  // gave them no reason to fix.
-  return { outcome: 'CORRECTED', posted: null }
+  // gave them no reason to fix. `handoff: null` follows for the same reason.
+  return { outcome: 'CORRECTED', posted: null, handoff: null }
 }
