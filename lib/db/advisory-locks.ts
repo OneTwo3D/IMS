@@ -86,6 +86,29 @@ export const SWEEP_CURSOR_LOCK_KEY = 918_273_912
 export const COMPONENT_GRAPH_WRITE_LOCK_KEY = 918_274_101
 
 /**
+ * ACCOUNTING CONNECTOR SELECTION domain (o3d-osl8 round 5, finding 2).
+ *
+ * Serializes "which accounting connector is active" against every reader that
+ * DECIDES something from it and then writes. Today that is exactly two writers:
+ * the plugin-state save (saveIntegrationPluginState / saveOnboardingPluginState)
+ * and the orphan cancel (cancelOrphanedAccountingSyncRows).
+ *
+ * WHY IT IS NOT ENOUGH ON ITS OWN, and why the cancel also re-checks the
+ * selection inside its transaction: the lock only binds writers that take it. A
+ * settings write that reaches the plugin rows by some other path would not, and
+ * the failure mode there is not a slow query — it is a cancel that marks the
+ * NEWLY active connector's PENDING queue CANCELLED, which no later read can
+ * restore. Lock to serialize; re-read and abort to be safe if serialization
+ * fails.
+ *
+ * Deliberately its OWN domain rather than sharing ACCOUNTING_WRITE_LOCK_KEY: a
+ * connector switch has no overlap with refund posting or the daily batch, and
+ * folding it in would make an admin toggling a plugin wait behind (or block) an
+ * accounting batch for no correctness gain.
+ */
+export const ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY = 918_274_233
+
+/**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
  * declared here — the test fails on any module that writes its own key literal.
  */
@@ -95,6 +118,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   WC_SYNC_ADVISORY_LOCK_KEY,
   SWEEP_CURSOR_LOCK_KEY,
   COMPONENT_GRAPH_WRITE_LOCK_KEY,
+  ACCOUNTING_CONNECTOR_SELECTION_LOCK_KEY,
 } as const
 
 /**

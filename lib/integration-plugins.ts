@@ -1,18 +1,17 @@
 import { getSettingValues } from '@/lib/settings-store'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import {
+  INTEGRATION_PLUGIN_SETTING_KEYS as PLUGIN_SETTING_KEYS,
+  parseIntegrationPluginEnabled as parseEnabled,
+  type IntegrationPluginId,
+  type IntegrationPluginState,
+} from '@/lib/integration-plugin-keys'
 
-export type IntegrationPluginId = 'woocommerce' | 'shopify' | 'xero' | 'quickbooks' | 'mintsoft' | 'shiphero'
-
-const PLUGIN_SETTING_KEYS = {
-  woocommerce: 'plugin_woocommerce_enabled',
-  shopify: 'plugin_shopify_enabled',
-  xero: 'plugin_xero_enabled',
-  quickbooks: 'plugin_quickbooks_enabled',
-  mintsoft: 'plugin_mintsoft_enabled',
-  shiphero: 'plugin_shiphero_enabled',
-} as const
-
-export type IntegrationPluginState = Record<IntegrationPluginId, boolean>
+// The keys, the id union and the state shape now live in @/lib/integration-plugin-keys — a module
+// with no imports, so the full-chain quiesce harness can name the same keys without pulling Prisma
+// in (o3d-osl8 round 6, finding 2). Re-exported here because every existing call site imports them
+// from this module and one canonical name per concept is the point of the split.
+export type { IntegrationPluginId, IntegrationPluginState }
 
 const DEFAULT_PLUGIN_STATE: IntegrationPluginState = {
   woocommerce: false,
@@ -21,11 +20,6 @@ const DEFAULT_PLUGIN_STATE: IntegrationPluginState = {
   quickbooks: false,
   mintsoft: false,
   shiphero: false,
-}
-
-function parseEnabled(value: string | undefined): boolean {
-  if (value == null || value === '') return false
-  return value === 'true'
 }
 
 export async function getIntegrationPluginState(): Promise<IntegrationPluginState> {

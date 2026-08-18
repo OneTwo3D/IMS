@@ -439,7 +439,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
 export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary> {
   // Codex P1: failure rows carry order ids, connector errors and refund ids —
   // gate reads on the sync permission (READONLY/SUPPLIER must not see them).
-  // The /sync banner loader .catch()es, so the banner just hides for them.
+  //
+  // The /sync banner loader no longer swallows this into a hidden banner: /sync now requires
+  // `sync` at the page boundary, so a role without it never gets here, and a denial that DID
+  // reach the page is fatal there rather than being rendered as an unavailable panel.
   await requirePermission('sync')
   return loadExceptionCounts()
 }

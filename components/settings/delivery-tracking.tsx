@@ -6,7 +6,7 @@ import { Loader2, Plus, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { setSetting } from '@/app/actions/settings'
+import { setSettings } from '@/app/actions/settings'
 
 const DEFAULT_CARRIERS = [
   'Royal Mail',
@@ -70,10 +70,15 @@ export function DeliveryTrackingSettings({
       const resolvedSource = allowShoppingConnectorSource
         ? source
         : 'trackship'
-      await setSetting('delivery_tracking_enabled', enabled ? 'true' : 'false')
-      await setSetting('delivery_tracking_source', resolvedSource)
-      await setSetting('trackship_api_key', apiKey)
-      await setSetting('shipping_carriers', JSON.stringify(carriers))
+      // ONE transaction (o3d-osl8 round 9, finding 1). Sequential awaits were worse than the
+      // Promise.all sites: a rejection on the third left the first two stored and the connector
+      // half-configured, with the screen showing nothing at all.
+      await setSettings({
+        delivery_tracking_enabled: enabled ? 'true' : 'false',
+        delivery_tracking_source: resolvedSource,
+        trackship_api_key: apiKey,
+        shipping_carriers: JSON.stringify(carriers),
+      })
       router.refresh()
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)

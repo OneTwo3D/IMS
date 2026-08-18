@@ -45,8 +45,14 @@ test('the sweep cancels PENDING and leaves PROCESSING alone (o3d-sref)', async (
 
   // The updateMany that retires rows must scope to PENDING only. Asserted against the source
   // because the alternative — a full server-action harness with auth, settings and revalidatePath —
-  // would test the mocks rather than the predicate that matters.
-  const update = src.slice(src.indexOf('const result = await db.accountingSyncLog.updateMany('))
+  // would test the mocks rather than the predicate that matters. (Round 5 built that harness after
+  // all, for the concurrency fence: tests/accounting/orphan-cancel-fence.test.ts now asserts the
+  // same predicate on the arguments the action really passes. This stays because it is the cheaper
+  // guard and it reads the intent at the call site.)
+  //
+  // Anchored on the QUERY, not on the client it runs against: round 5 moved the update inside a
+  // fenced transaction, so it is `tx.accountingSyncLog.updateMany` now and could be renamed again.
+  const update = src.slice(src.indexOf('accountingSyncLog.updateMany('))
   const updateArgs = update.slice(0, update.indexOf('})'))
 
   assert.match(updateArgs, /status: 'PENDING' as const/, 'PENDING rows are still retired')
@@ -170,7 +176,14 @@ test('the survivor count re-derives its scope instead of reusing a pre-update sa
   const { join } = await import('node:path')
   const src = readFileSync(join(process.cwd(), 'app/actions/accounting-sync.ts'), 'utf8')
 
-  const countSection = src.slice(src.indexOf('const activeNow = await getActiveConnector()'))
+  // Anchored on the DECLARATION, not on the expression that initialises it. It used to be
+  // `const activeNow = await getActiveConnector()`; round 6 changed that to a locked read through
+  // the transaction, and `indexOf` then returned -1, making `slice(-1)` a one-character string that
+  // this test happened to notice only because BOTH assertions below failed. A source scan anchored
+  // on an implementation detail is one refactor away from asserting nothing at all.
+  const anchor = src.indexOf('const activeNow =')
+  assert.ok(anchor > 0, 'the re-read is still named activeNow — this scan has no other anchor')
+  const countSection = src.slice(anchor)
   const upToCount = countSection.slice(0, countSection.indexOf('})') + 2)
 
   assert.match(upToCount, /stillOrphaned/, 'the count uses a freshly derived orphan scope')

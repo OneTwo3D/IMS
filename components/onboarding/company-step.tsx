@@ -8,8 +8,9 @@ import { CountrySelect } from '@/components/ui/country-select'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { updateOrganisation, saveEmailSettings, sendTestEmailSettings, type EmailSettings, type OrganisationData } from '@/app/actions/company'
-import { setSetting } from '@/app/actions/settings'
-import { syncCrontab } from '@/app/actions/cron'
+import { savePublicAppUrl } from '@/app/actions/settings'
+import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
+import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outcome'
 import type { PublicAppUrlInfo } from '@/lib/public-app-url'
 
 export type CompanyStepHandle = {
@@ -84,6 +85,8 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
   const [emailTestResult, setEmailTestResult] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
   const [uploading, setUploading] = useState(false)
   const [error, setError] = useState('')
+  /** Saved, but the scheduler is behind. Not an error — see handleSave. */
+  const [schedulerWarning, setSchedulerWarning] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -154,23 +157,6 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
     setEmailSettings((prev) => ({ ...prev, [key]: value }))
   }
 
-  function normalizePublicAppUrl(value: string): string | null {
-    const normalized = value.trim().replace(/\/+$/, '')
-    if (!normalized) return null
-
-    try {
-      const parsed = new URL(normalized)
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        setError('Public App URL must start with http:// or https://')
-        return null
-      }
-      return normalized
-    } catch {
-      setError('Enter a valid Public App URL.')
-      return null
-    }
-  }
-
   async function handleLogoUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
@@ -220,9 +206,14 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
 
   const handleSave = useCallback(async function handleSave() {
     setError('')
+    setSchedulerWarning('')
     try {
+      // Client-side pre-check only, for immediate feedback: savePublicAppUrl re-runs the identical
+      // rule server-side and REFUSES rather than storing. One rule, one implementation
+      // (o3d-osl8 round 9, finding 1) — this step used to carry its own copy of it.
       const normalizedPublicAppUrl = publicAppUrl.trim() ? normalizePublicAppUrl(publicAppUrl) : null
-      if (publicAppUrl.trim() && !normalizedPublicAppUrl) {
+      if (normalizedPublicAppUrl && !normalizedPublicAppUrl.ok) {
+        setError(normalizedPublicAppUrl.error)
         return false
       }
 
@@ -238,13 +229,21 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
         return false
       }
 
-      if (normalizedPublicAppUrl) {
-        await setSetting('public_app_url', normalizedPublicAppUrl)
-        const cronResult = await syncCrontab()
-        if (!cronResult.success) {
-          setError(cronResult.error ?? 'Failed to apply Public App URL changes.')
+      if (normalizedPublicAppUrl && normalizedPublicAppUrl.ok) {
+        // ONE server action (o3d-osl8 round 9, finding 1). The write, the audit row, the cache
+        // revalidation and the crontab reconciliation all happen inside it, and it classifies its
+        // own post-commit failures rather than rejecting — so none of them can reach the catch
+        // below, where this step printed "Failed to save" AND refused to advance over data that was
+        // already in the database.
+        const view = resolveSettingSaveView({
+          result: await savePublicAppUrl(normalizedPublicAppUrl.url),
+          what: 'The Public App URL',
+        })
+        if (!view.committed) {
+          setError(view.error)
           return false
         }
+        setSchedulerWarning(view.warning)
       }
 
       router.refresh()
@@ -427,6 +426,9 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {schedulerWarning && (
+        <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">{schedulerWarning}</p>
+      )}
       <p className="text-xs text-muted-foreground">Your changes will be saved when you continue.</p>
     </div>
   )
