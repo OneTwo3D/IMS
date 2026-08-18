@@ -55,11 +55,59 @@
  *      has to know which it is looking at. Round 9 decided that from the LAST CHARACTER before the
  *      quote, so any identifier ending in `e` was read as an escape-string prefix — and
  *      `SELECT name'a\'; COMMIT; --' ;` was accepted, with the `COMMIT` swallowed as string
- *      content. That payload needs NO setting change: it works against a stock dump. A prefix is
- *      now recognised from the TOKEN before the quote (a standalone `E`, or `U` followed by `&`),
- *      never from a character that happens to end a longer word.
+ *      content. That payload needs NO setting change: it works against a stock dump. Round 10
+ *      recognised the prefix from the TOKEN before the quote instead — which was still wrong, and
+ *      wrong in the direction that accepts. See round 11 below.
  *
  * The scan is therefore mode-independent, and the residue below is stated in those terms.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ * ROUND 11 — WHY THE SAME BYPASS CAME BACK A THIRD TIME, AND THE RULE THAT ENDS IT
+ * ═══════════════════════════════════════════════════════════════════════════════════════════════
+ *
+ * Round 11 defeated the token-based prefix check with ONE SPACE:
+ *
+ *     CREATE DOMAIN e AS text;
+ *     SELECT e 'a\'; COMMIT; --' ;
+ *
+ * `prevToken` is `W:E` there, because whitespace and comments push no token — so the scanner read
+ * an escape-string, swallowed `COMMIT` as string content, and passed the file. PostgreSQL reads
+ * `e 'a\'` as a typed constant of type `e` over a PLAIN literal, ends that literal at the second
+ * quote, and executes the `COMMIT` at top level. Partial restore, again, by the third distinct
+ * route in three rounds.
+ *
+ * THE UNDERLYING MISREADING, stated once so it is not re-fixed a fourth time. Rounds 9 and 10 both
+ * asked "WHAT came before the quote?" — a character, then a token. Neither is the question.
+ * PostgreSQL's rule is not about what came before at all; it is about ADJACENCY: `scan.l` matches
+ * `xestart` as `[eE]{quote}` — ONE lexeme — so the prefix exists only when the `E` and the quote
+ * are touching, and flex's longest-match rule is what stops `name'…'` from ever matching it.
+ * A history of tokens has thrown position away, which is precisely the fact the rule turns on, so
+ * every answer computed from it can be defeated by moving something. That is why this class kept
+ * coming back: the model was missing the dimension the real rule lives in.
+ *
+ * SO POSITION IS NOW CARRIED. Every token records the absolute stream offset where it ENDED, and a
+ * prefix is recognised only when that offset is the quote's own offset. Whitespace, comments,
+ * newlines and chunk boundaries all move the offset and therefore all break the prefix, exactly as
+ * they do in PostgreSQL.
+ *
+ * AND THE RULE THAT MAKES THE DIRECTION SAFE, which is the part that generalises beyond `E`:
+ *
+ *     A LEXICAL DECISION THAT WIDENS WHAT THE SCANNER WILL SWALLOW MUST BE PROVEN EXACTLY.
+ *     ONE THAT ONLY NARROWS MAY BE APPROXIMATE, AND SHOULD BE DELIBERATELY LOOSE.
+ *
+ * Reading `E'…'` WIDENS: backslash escapes make the literal end later, so more bytes become string
+ * content and a `COMMIT` can hide in them. That decision is now exact (adjacency), and when it is
+ * not proven the scanner falls back to the PLAIN reading — which refuses `\'` as ambiguous, so the
+ * fallback is a refusal rather than a guess. Reading `U&'…'` only NARROWS: its outcome is an
+ * outright rejection, so its check is left LOOSE (token-based, whitespace-tolerant) on purpose —
+ * being over-eager there costs a false reject, which is the direction this file fails in.
+ *
+ * THE SECOND HALF OF THE SAME BUG: WHAT COUNTS AS ONE WORD. Adjacency is only as good as the token
+ * boundaries it is measured against. PostgreSQL's `ident_cont` is `[A-Za-z\200-\377_0-9\$]` — it
+ * includes every non-ASCII byte — and this scanner's did not. So `xée'a\'` split into `xé`, a
+ * standalone `e` and a quote, making the `e` adjacent and the payload live again through a
+ * different door. `isWordChar` now accepts every code unit ≥ 0x80, so this scanner's idea of one
+ * identifier is PostgreSQL's, and no accented character can manufacture a prefix.
  *
  * ═══ WHAT THIS CATCHES ═══
  *   • transaction control as a top-level statement, in any case and any whitespace/comment layout,
@@ -210,6 +258,16 @@ export function createRestoreSqlScanner() {
    */
   let prevToken = ''
   let prevToken2 = ''
+  /**
+   * The ABSOLUTE stream offset one past the end of `prevToken` (round 11).
+   *
+   * This is the dimension a token history throws away, and the one PostgreSQL's string-prefix rule
+   * actually turns on. Absolute rather than chunk-relative so a prefix split across a chunk
+   * boundary is measured the same way as one that is not.
+   */
+  let prevTokenEnd = -1
+  /** Absolute stream offset of the first character of `carry` — the base for every offset above. */
+  let streamPos = 0
   /** Buffer carried between chunks so a construct split across chunks still lexes. */
   let carry = ''
   /** True at the very start of a line (for metacommand and `\.` detection). */
@@ -219,13 +277,25 @@ export function createRestoreSqlScanner() {
     throw new RestoreSqlRejected(message, line)
   }
 
+  /**
+   * PostgreSQL's `ident_cont`, not a convenient subset of it (round 11).
+   *
+   * `scan.l` defines `ident_cont` as `[A-Za-z\200-\377_0-9\$]`, so EVERY non-ASCII byte continues
+   * an identifier. Leaving them out split `xée` into `xé` + `e`, which handed the adjacency test a
+   * standalone `E` that PostgreSQL never sees, and re-opened the escape-string bypass through a
+   * different door. Whether the file was decoded as UTF-8 (one char ≥ 0x80) or byte-wise (several,
+   * each ≥ 0x80) the answer is the same, which is why the test is on the code unit and not on a
+   * character class.
+   */
   function isWordChar(c: string): boolean {
-    return /[A-Za-z0-9_$]/.test(c)
+    return /[A-Za-z0-9_$]/.test(c) || c.charCodeAt(0) >= 0x80
   }
 
-  function pushToken(token: string) {
+  /** `endAbs` is the absolute offset one past this token's last character. */
+  function pushToken(token: string, endAbs: number) {
     prevToken2 = prevToken
     prevToken = token
+    prevTokenEnd = endAbs
   }
 
   function capture(text: string) {
@@ -331,6 +401,11 @@ export function createRestoreSqlScanner() {
   function push(chunk: string): void {
     const text = carry + chunk
     carry = ''
+    // Absolute offset of `text[0]`, so every position below can be expressed in stream coordinates
+    // that survive a chunk boundary. `hold` is the ONE way input is carried forward, so the two
+    // cannot drift apart.
+    const base = streamPos
+    const hold = (at: number) => { carry = text.slice(at); streamPos = base + at }
     let i = 0
     // A dollar-quote tag or a `\.` terminator can straddle a chunk boundary; hold back a small tail
     // and re-examine it with the next chunk rather than guessing.
@@ -356,7 +431,7 @@ export function createRestoreSqlScanner() {
           const lineText = (nl === -1 ? text.slice(i) : text.slice(i, nl))
           if (nl === -1) {
             // Incomplete line: carry it so `\.` split across chunks is still recognised.
-            carry = text.slice(i)
+            hold(i)
             return
           }
           if (lineText.trimEnd() === '\\.') {
@@ -384,14 +459,14 @@ export function createRestoreSqlScanner() {
             i += 2
             continue
           }
-          if (i === limit - 1 && (c === '*' || c === '/')) { carry = text.slice(i); return }
+          if (i === limit - 1 && (c === '*' || c === '/')) { hold(i); return }
           i += 1
           continue
         }
 
         case 'single': {
           if (c === '\\') {
-            if (i + 1 >= limit) { carry = text.slice(i); return }
+            if (i + 1 >= limit) { hold(i); return }
             if (state.escapes) {
               // An `E'…'` literal: backslash escapes are the standard reading, in every mode.
               capture(text.slice(i, i + 2))
@@ -421,7 +496,7 @@ export function createRestoreSqlScanner() {
             continue
           }
           if (c === "'") {
-            if (i + 1 >= limit) { carry = text.slice(i); return }
+            if (i + 1 >= limit) { hold(i); return }
             if (text[i + 1] === "'") {
               capture("'")
               i += 2
@@ -429,7 +504,7 @@ export function createRestoreSqlScanner() {
             }
             state = { kind: 'sql' }
             endCapture(statementLiterals)
-            pushToken("C:'")
+            pushToken("C:'", base + i + 1)
             i += 1
             continue
           }
@@ -440,11 +515,11 @@ export function createRestoreSqlScanner() {
 
         case 'double': {
           if (c === '"') {
-            if (i + 1 >= limit) { carry = text.slice(i); return }
+            if (i + 1 >= limit) { hold(i); return }
             if (text[i + 1] === '"') { capture('"'); i += 2; continue }
             state = { kind: 'sql' }
             endCapture(statementIdents)
-            pushToken('C:"')
+            pushToken('C:"', base + i + 1)
             i += 1
             continue
           }
@@ -456,10 +531,10 @@ export function createRestoreSqlScanner() {
         case 'dollar': {
           const close = state.tag
           if (c === '$') {
-            if (i + close.length > limit) { carry = text.slice(i); return }
+            if (i + close.length > limit) { hold(i); return }
             if (text.startsWith(close, i)) {
               state = { kind: 'sql' }
-              pushToken('C:$')
+              pushToken('C:$', base + i + close.length)
               i += close.length
               continue
             }
@@ -477,7 +552,7 @@ export function createRestoreSqlScanner() {
               reject('Restore file contains an unexpected backslash outside a string literal')
             }
             const nl = text.indexOf('\n', i)
-            if (nl === -1) { carry = text.slice(i); return }
+            if (nl === -1) { hold(i); return }
             const command = text.slice(i, nl)
             if (!ALLOWED_METACOMMAND.test(command)) {
               reject('Restore file contains an unsupported psql metacommand')
@@ -487,38 +562,48 @@ export function createRestoreSqlScanner() {
           }
 
           if (c === '-' && text[i + 1] === '-') { state = { kind: 'line-comment' }; i += 2; atLineStart = false; continue }
-          if (c === '-' && i === limit - 1) { carry = text.slice(i); return }
+          if (c === '-' && i === limit - 1) { hold(i); return }
           if (c === '/' && text[i + 1] === '*') { state = { kind: 'block-comment', depth: 1 }; i += 2; atLineStart = false; continue }
-          if (c === '/' && i === limit - 1) { carry = text.slice(i); return }
+          if (c === '/' && i === limit - 1) { hold(i); return }
 
           atLineStart = false
 
           if (c === ';') {
             finishStatement()
-            pushToken('C:;')
+            pushToken('C:;', base + i + 1)
             i += 1
             continue
           }
 
           if (c === "'") {
+            // Is the character before this quote the last character of the previous token, or is
+            // there whitespace, a comment or a newline in between? THAT is PostgreSQL's rule for a
+            // string prefix (`scan.l` matches `[eE]{quote}` as one lexeme), and it is the fact
+            // rounds 9 and 10 kept computing without — first from the previous character, then from
+            // the previous token, both of which are blind to a single space. See round 11 above.
+            const prefixTouchesQuote = prevTokenEnd === base + i
+
             // `U&'…'` chooses its own escape character (UESCAPE, default backslash), so the scanner
-            // cannot know what it is reading. Refused rather than guessed. Recognised from the two
-            // preceding TOKENS — a standalone `U` then `&` — so an identifier that merely ENDS in
-            // `u` is not mistaken for the prefix, and so a chunk boundary cannot hide it.
+            // cannot know what it is reading. Refused rather than guessed — and because the outcome
+            // is a REFUSAL, this check is deliberately left loose: adjacency is NOT required, so
+            // `u & 'x'` is refused too. Over-eagerness here costs a false reject, which is the
+            // direction this file is allowed to be wrong in.
             if (prevToken === 'C:&' && prevToken2 === 'W:U') {
               reject(
                 "Restore file contains a Unicode-escape string literal (U&'…'), whose escape "
                 + 'character is configurable; this file cannot be checked for transaction control',
               )
             }
-            // `E'…'` uses backslash escapes; a plain literal's backslashes are settled by the rule
-            // in the `single` case above. Round 10: this is the PREVIOUS TOKEN, not the previous
-            // character — `name'…'` and `date'…'` are typed literals, not escape-strings, and
-            // reading them as escape-strings swallowed a top-level COMMIT.
-            const escapes = prevToken === 'W:E'
+            // `E'…'` uses backslash escapes, so reading one WIDENS what the scanner swallows — a
+            // `COMMIT` can hide inside a literal that ends later than a plain one would. That makes
+            // it the decision that has to be exact: the previous token must be a standalone `E` AND
+            // must touch this quote. When it does not, the plain reading applies, and the plain
+            // reading REFUSES `\'` as ambiguous — so an unproven prefix ends in a refusal rather
+            // than in a guess.
+            const escapes = prevToken === 'W:E' && prefixTouchesQuote
             state = { kind: 'single', escapes }
             capturing = { value: '', truncated: false }
-            pushToken("C:'")
+            pushToken("C:'", base + i + 1)
             i += 1
             continue
           }
@@ -526,7 +611,7 @@ export function createRestoreSqlScanner() {
           if (c === '"') {
             state = { kind: 'double' }
             capturing = { value: '', truncated: false }
-            pushToken('C:"')
+            pushToken('C:"', base + i + 1)
             i += 1
             continue
           }
@@ -537,14 +622,14 @@ export function createRestoreSqlScanner() {
             const match = /^\$([A-Za-z_][A-Za-z0-9_]*)?\$/.exec(rest)
             if (match) {
               state = { kind: 'dollar', tag: match[0] }
+              pushToken('C:$', base + i + match[0].length)
               i += match[0].length
-              pushToken('C:$')
               continue
             }
             // Could be a tag straddling the chunk boundary — only if there is no newline after it,
             // since a dollar-quote tag cannot contain one.
-            if (!rest.includes('\n') && rest.length < 128) { carry = rest; return }
-            pushToken('C:$')
+            if (!rest.includes('\n') && rest.length < 128) { hold(i); return }
+            pushToken('C:$', base + i + 1)
             i += 1
             continue
           }
@@ -552,7 +637,7 @@ export function createRestoreSqlScanner() {
           if (isWordChar(c)) {
             let j = i
             while (j < limit && isWordChar(text[j])) j += 1
-            if (j === limit) { carry = text.slice(i); return }
+            if (j === limit) { hold(i); return }
             const word = text.slice(i, j)
             const upper = word.toUpperCase()
             if (atStatementStart) atStatementStart = false
@@ -563,17 +648,19 @@ export function createRestoreSqlScanner() {
             // the same desynchronisation by another route.
             if (statementWords[0] === 'COPY' && upper === 'STDIN' && previousWord === 'FROM') copyFromStdin = true
             previousWord = upper
-            pushToken(`W:${upper}`)
+            pushToken(`W:${upper}`, base + j)
             i = j
             continue
           }
 
-          pushToken(`C:${c}`)
+          pushToken(`C:${c}`, base + i + 1)
           i += 1
           continue
         }
       }
     }
+    // Everything in `text` was consumed and nothing was held back.
+    streamPos = base + limit
   }
 
   return {

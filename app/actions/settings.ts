@@ -14,6 +14,7 @@ import {
 import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
 import { runPostCommit } from '@/lib/domain/post-commit'
+import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
 import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
 import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
@@ -529,16 +530,23 @@ export async function autoLinkXeroTaxRates(): Promise<{
     let alreadyLinked = 0
     const unmatched: string[] = []
 
-    for (const ims of imsRates) {
-      if (ims.accountingTaxType) { alreadyLinked++; continue }
+    // ONE TRANSACTION FOR THE WHOLE LINK (o3d-osl8 round 11, finding 3). Row-at-a-time these each
+    // committed on their own, so a failure on mapping seventeen left sixteen mappings durable and
+    // the catch below reported `linked: 0` — a claim that nothing landed, over rows that had. The
+    // set is small (active tax rates) and the caller's recovery is to run the link again, so
+    // all-or-nothing is both cheap and the only outcome the return value can honestly describe.
+    const plan = imsRates.flatMap((ims) => {
+      if (ims.accountingTaxType) { alreadyLinked++; return [] }
       const match = xeroByName.get(ims.name.trim().toLowerCase())
-      if (!match) { unmatched.push(ims.name); continue }
-      await db.taxRate.update({
-        where: { id: ims.id },
-        data: { accountingTaxType: match.taxType },
-      })
-      linked++
-    }
+      if (!match) { unmatched.push(ims.name); return [] }
+      return [{ id: ims.id, taxType: match.taxType }]
+    })
+    await db.$transaction(async (tx) => {
+      for (const entry of plan) {
+        await tx.taxRate.update({ where: { id: entry.id }, data: { accountingTaxType: entry.taxType } })
+      }
+    })
+    linked = plan.length
 
     // POST-COMMIT. The mappings are already written, one row at a time — reporting `success: false`
     // here would claim NONE of them landed, and the screen's recovery is to run the link again.
@@ -593,16 +601,19 @@ export async function autoLinkQuickBooksTaxRates(): Promise<{
     let alreadyLinked = 0
     const unmatched: string[] = []
 
-    for (const ims of imsRates) {
-      if (ims.accountingTaxType) { alreadyLinked++; continue }
+    // ONE TRANSACTION, for the same reason as the Xero path above.
+    const plan = imsRates.flatMap((ims) => {
+      if (ims.accountingTaxType) { alreadyLinked++; return [] }
       const match = qboByName.get(ims.name.trim().toLowerCase())
-      if (!match) { unmatched.push(ims.name); continue }
-      await db.taxRate.update({
-        where: { id: ims.id },
-        data: { accountingTaxType: match.id },
-      })
-      linked++
-    }
+      if (!match) { unmatched.push(ims.name); return [] }
+      return [{ id: ims.id, taxType: match.id }]
+    })
+    await db.$transaction(async (tx) => {
+      for (const entry of plan) {
+        await tx.taxRate.update({ where: { id: entry.id }, data: { accountingTaxType: entry.taxType } })
+      }
+    })
+    linked = plan.length
 
     const postCommit = await runPostCommit(async () => {
       await logActivity({
@@ -1279,38 +1290,55 @@ export async function createWarehouse(
     return { success: false, error: 'Select a valid country.' }
   }
   try {
-    // Enforce unique code
+    /**
+     * ONE TRANSACTION, NOT THREE COMMITS (o3d-osl8 round 11, finding 3).
+     *
+     * This action used to clear the existing default flag, clear the existing default-return flag,
+     * and create the warehouse as three independent Prisma calls — three separate transactions.
+     * A failure on the third (a concurrent duplicate `code`, any constraint) returned
+     * `success: false` over two writes that were already durable, and left the tenant with NO
+     * default warehouse and no default return warehouse. Round 10's post-commit guard could not see
+     * that: it only starts after the final commit, so it changed WHERE the failure was reported
+     * without changing what had already been written.
+     *
+     * The pre-read below cannot decide uniqueness on its own — two concurrent creates both see
+     * "free" — so it exists for the MESSAGE, and the unique index on `code` is what enforces it.
+     * Losing that race now aborts the transaction, so the default flags roll back with it, and the
+     * catch turns the P2002 back into the same sentence the pre-read would have produced.
+     */
     const existing = await db.warehouse.findUnique({ where: { code: data.code } })
     if (existing) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
 
-    // If setting as default, unset others
-    if (data.isDefault) {
-      await db.warehouse.updateMany({ where: { isDefault: true }, data: { isDefault: false } })
-    }
-    if (data.defaultReturnWarehouse) {
-      await db.warehouse.updateMany({ where: { defaultReturnWarehouse: true }, data: { defaultReturnWarehouse: false } })
-    }
+    const item = await db.$transaction(async (tx) => {
+      // If setting as default, unset others
+      if (data.isDefault) {
+        await tx.warehouse.updateMany({ where: { isDefault: true }, data: { isDefault: false } })
+      }
+      if (data.defaultReturnWarehouse) {
+        await tx.warehouse.updateMany({ where: { defaultReturnWarehouse: true }, data: { defaultReturnWarehouse: false } })
+      }
 
-    const item = await db.warehouse.create({
-      data: {
-        code: data.code,
-        name: data.name,
-        type: data.type,
-        contactName: data.contactName || null,
-        email: data.email || null,
-        phone: data.phone || null,
-        addressLine1: data.addressLine1 || null,
-        addressLine2: data.addressLine2 || null,
-        city: data.city || null,
-        postcode: data.postcode || null,
-        country: normalizedCountry,
-        availableForSale: data.availableForSale,
-        syncToStore: data.syncToStore,
-        isDefault: data.isDefault,
-        defaultReturnWarehouse: data.defaultReturnWarehouse,
-        active: data.active,
-      },
-      select: warehouseFields,
+      return tx.warehouse.create({
+        data: {
+          code: data.code,
+          name: data.name,
+          type: data.type,
+          contactName: data.contactName || null,
+          email: data.email || null,
+          phone: data.phone || null,
+          addressLine1: data.addressLine1 || null,
+          addressLine2: data.addressLine2 || null,
+          city: data.city || null,
+          postcode: data.postcode || null,
+          country: normalizedCountry,
+          availableForSale: data.availableForSale,
+          syncToStore: data.syncToStore,
+          isDefault: data.isDefault,
+          defaultReturnWarehouse: data.defaultReturnWarehouse,
+          active: data.active,
+        },
+        select: warehouseFields,
+      })
     })
     const postCommit = await runPostCommit(async () => {
       await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created warehouse: ${data.code} — ${data.name}` })
@@ -1321,6 +1349,9 @@ export async function createWarehouse(
   } catch (e) {
     unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create warehouse: ${data.code}` })
+    // The unique index, not the pre-read, is what decides this under concurrency — and reporting it
+    // as a raw Prisma error would tell the operator nothing they can act on.
+    if (uniqueViolationTargetsField(e, 'code')) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
     return { success: false, error: String(e) }
   }
 }
@@ -1344,35 +1375,37 @@ export async function updateWarehouse(
     const dup = await db.warehouse.findUnique({ where: { code: data.code } })
     if (dup && dup.id !== id) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
 
-    // If setting as default, unset others
-    if (data.isDefault) {
-      await db.warehouse.updateMany({ where: { isDefault: true, id: { not: id } }, data: { isDefault: false } })
-    }
-    if (data.defaultReturnWarehouse) {
-      await db.warehouse.updateMany({ where: { defaultReturnWarehouse: true, id: { not: id } }, data: { defaultReturnWarehouse: false } })
-    }
+    const item = await db.$transaction(async (tx) => {
+      // If setting as default, unset others
+      if (data.isDefault) {
+        await tx.warehouse.updateMany({ where: { isDefault: true, id: { not: id } }, data: { isDefault: false } })
+      }
+      if (data.defaultReturnWarehouse) {
+        await tx.warehouse.updateMany({ where: { defaultReturnWarehouse: true, id: { not: id } }, data: { defaultReturnWarehouse: false } })
+      }
 
-    const item = await db.warehouse.update({
-      where: { id },
-      data: {
-        code: data.code,
-        name: data.name,
-        type: data.type,
-        contactName: data.contactName || null,
-        email: data.email || null,
-        phone: data.phone || null,
-        addressLine1: data.addressLine1 || null,
-        addressLine2: data.addressLine2 || null,
-        city: data.city || null,
-        postcode: data.postcode || null,
-        country: normalizedCountry,
-        availableForSale: data.availableForSale,
-        syncToStore: data.syncToStore,
-        isDefault: data.isDefault,
-        defaultReturnWarehouse: data.defaultReturnWarehouse,
-        active: data.active,
-      },
-      select: warehouseFields,
+      return tx.warehouse.update({
+        where: { id },
+        data: {
+          code: data.code,
+          name: data.name,
+          type: data.type,
+          contactName: data.contactName || null,
+          email: data.email || null,
+          phone: data.phone || null,
+          addressLine1: data.addressLine1 || null,
+          addressLine2: data.addressLine2 || null,
+          city: data.city || null,
+          postcode: data.postcode || null,
+          country: normalizedCountry,
+          availableForSale: data.availableForSale,
+          syncToStore: data.syncToStore,
+          isDefault: data.isDefault,
+          defaultReturnWarehouse: data.defaultReturnWarehouse,
+          active: data.active,
+        },
+        select: warehouseFields,
+      })
     })
     const postCommit = await runPostCommit(async () => {
       await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated warehouse: ${data.code} — ${data.name}` })
@@ -1383,6 +1416,7 @@ export async function updateWarehouse(
   } catch (e) {
     unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update warehouse: ${data.code}` })
+    if (uniqueViolationTargetsField(e, 'code')) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
     return { success: false, error: String(e) }
   }
 }

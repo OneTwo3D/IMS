@@ -61,6 +61,12 @@ const REPO = process.cwd()
 //   4. It says nothing about writers OUTSIDE these two modules. `lib/maintenance-mode.ts` and
 //      `lib/currencies/fx-refresh.ts` hold private `setSetting` helpers; they report to no screen,
 //      and they are not covered here.
+//   5. ROUND 11 adds a SECOND structural rule at the bottom of this file — at most one autonomous
+//      commit per writer — and it is lexical in the same ways and one more: it counts commits it
+//      can SEE in the function body, so a writer that commits through a HELPER it calls counts as
+//      zero, and two commits in mutually exclusive branches count as two. The first is a gap; the
+//      second is why there is a reasoned exception list rather than a bare pass. Neither is a
+//      semantic analysis, and neither should be described as one.
 // The list below is therefore a floor — "at least these" — never a ceiling.
 // ---------------------------------------------------------------------------
 
@@ -583,5 +589,188 @@ test('the reconciliation reachable from a post-commit step carries no permission
       `${relative(REPO, rel)} calls the ungated reconciliation, so it must gate first`,
     )
     assert.ok(!/\bsyncCrontab\(\)/.test(src), `${rel} must not call the gated action from a post-commit step`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-osl8 ROUND 11, FINDING 3 — THE GUARD MOVED THE PROBLEM, IT DID NOT FIX IT.
+//
+// Round 10 wrapped every post-commit tail in `runPostCommit`, so a failure AFTER the commit stopped
+// being reported as a failed save. Thirteen writers were pinned. But `createWarehouse` cleared the
+// existing default-warehouse flags with one `updateMany`, cleared the default-return flags with a
+// second, and only THEN created the warehouse — three autonomous Prisma calls, three separate
+// transactions. A failure on the third (a concurrent duplicate `code`, a constraint) returns
+// `success: false` over two writes that are already durable, and the tenant is left with no default
+// warehouse at all.
+//
+// So the round-10 rule was about the WRONG BOUNDARY. "Nothing after the commit may reject" only
+// means anything when there is ONE commit; a writer with three of them has two places where it can
+// both fail and have changed the database, and the post-commit guard never sees either. The rule
+// below is the missing half:
+//
+//   A COMMITTING SETTINGS WRITER PERFORMS AT MOST ONE AUTONOMOUS COMMIT.
+//
+// Everything it writes goes in a single `db.$transaction`, so "failed" and "changed nothing" are
+// the same statement. The exceptions are enumerated WITH REASONS below rather than left to whoever
+// reads the scan output, because an unexplained exception is how the previous three inventories
+// rotted.
+// ---------------------------------------------------------------------------
+
+/** `for`/`while` bodies and callback-taking iterators — a commit inside one is unbounded, not one. */
+function loopSpans(body: string): Array<[number, number]> {
+  const spans: Array<[number, number]> = []
+  const re = /\b(?:for|while)\s*\(|\.\s*(?:map|flatMap|forEach|reduce)\s*\(/g
+  let match: RegExpExecArray | null
+  while ((match = re.exec(body)) !== null) {
+    const openParen = match.index + match[0].length - 1
+    const [, parenEnd] = callSpan(body, openParen)
+    if (match[0].startsWith('.')) { spans.push([openParen, parenEnd]); continue }
+    // A `for (…)` head is not the loop; the block or single statement after it is.
+    let at = parenEnd + 1
+    while (at < body.length && /\s/.test(body[at])) at += 1
+    if (body[at] === '{') spans.push(callSpan(body, at))
+    else spans.push([at, body.indexOf('\n', at) === -1 ? body.length : body.indexOf('\n', at)])
+  }
+  return spans
+}
+
+/**
+ * How many INDEPENDENTLY COMMITTING units a writer performs.
+ *
+ * `Infinity` means "as many as the data has": a bare mutation inside a loop commits once per
+ * iteration, which is the shape `autoLinkXeroTaxRates` had — it mapped tax rates one row at a time
+ * and then reported `linked: 0` from its catch if any of them failed.
+ */
+function autonomousCommits(body: string): number {
+  const txSpans = spansOfPattern(body, /\b(?:db|prisma)\.\$transaction\(/)
+  const loops = loopSpans(body)
+  const inside = (at: number, spans: Array<[number, number]>) => spans.some(([s, e]) => at > s && at < e)
+
+  let units = 0
+  for (const [start] of txSpans) {
+    if (inside(start, loops)) return Number.POSITIVE_INFINITY
+    units += 1
+  }
+  for (const [start] of spansOfPattern(body, COMMIT_CALL_RE)) {
+    if (inside(start, txSpans)) continue
+    if (/\$transaction\($/.test(body.slice(0, start + 1))) continue
+    if (inside(start, loops)) return Number.POSITIVE_INFINITY
+    units += 1
+  }
+  return units
+}
+
+/**
+ * Writers that legitimately commit more than once. Each entry states WHY, because an exception
+ * without a reason is indistinguishable from a defect nobody got round to.
+ */
+const MULTI_COMMIT_EXCEPTIONS: Record<string, string> = {
+  'app/actions/settings.ts#deleteWarehouse':
+    'the two mutations are in mutually exclusive branches — a call deactivates OR deletes, never '
+    + 'both — so no single call can commit twice',
+  'app/actions/settings.ts#generateMissingXeroTaxRates':
+    'each iteration CREATES THE RATE IN XERO and then records the mapping locally. No database '
+    + 'transaction can span an external write, so all-or-nothing is not available; the action '
+    + 'instead reports per-rate `created`/`failed`, which is an honest description of a partial run '
+    + 'rather than a false claim of atomicity',
+}
+
+test('a committing settings writer performs at most ONE autonomous commit', () => {
+  // `createWarehouse` failed this with three: clear the default flags, clear the default-return
+  // flags, create the row. The first two were durable when the third threw, and the action returned
+  // `success: false`.
+  const offenders: string[] = []
+  for (const writer of committingWriters()) {
+    const key = `${writer.module}#${writer.name}`
+    const units = autonomousCommits(writer.body)
+    if (units <= 1) {
+      assert.ok(
+        MULTI_COMMIT_EXCEPTIONS[key] === undefined,
+        `${key} no longer needs its MULTI_COMMIT_EXCEPTIONS entry — remove it rather than leaving a `
+          + 'stale exemption behind',
+      )
+      continue
+    }
+    if (MULTI_COMMIT_EXCEPTIONS[key] !== undefined) continue
+    offenders.push(`${key} commits ${units === Number.POSITIVE_INFINITY ? 'once per iteration' : `${units} times`}`)
+  }
+  assert.deepEqual(
+    offenders,
+    [],
+    'each of these can fail with part of its work already durable, and then report failure. Put the '
+      + `whole write in one db.$transaction, or add a reasoned exception:\n${offenders.join('\n')}`,
+  )
+})
+
+test('...and the one-commit rule is not vacuous — it is fed the exact shapes that broke it', () => {
+  // ROUND 11, FINDING 3, verbatim: `createWarehouse` as it was.
+  const revertedCreateWarehouse = [
+    'export async function createWarehouse(input: WarehouseInput) {',
+    '  try {',
+    '    if (data.isDefault) {',
+    '      await db.warehouse.updateMany({ where: { isDefault: true }, data: { isDefault: false } })',
+    '    }',
+    '    if (data.defaultReturnWarehouse) {',
+    '      await db.warehouse.updateMany({ where: { defaultReturnWarehouse: true }, data: { defaultReturnWarehouse: false } })',
+    '    }',
+    '    const item = await db.warehouse.create({ data: {} })',
+    '    return { success: true, item }',
+    '  } catch (e) {',
+    '    return { success: false, error: String(e) }',
+    '  }',
+    '}',
+  ].join('\n')
+  assert.equal(autonomousCommits(revertedCreateWarehouse), 3, 'three independent commits, two of them durable when the third throws')
+
+  // ...and the row-at-a-time auto-link, whose catch reported `linked: 0` over rows it had written.
+  const revertedAutoLink = [
+    'export async function autoLinkXeroTaxRates() {',
+    '  for (const ims of imsRates) {',
+    '    await db.taxRate.update({ where: { id: ims.id }, data: { accountingTaxType: match.taxType } })',
+    '    linked++',
+    '  }',
+    '}',
+  ].join('\n')
+  assert.equal(autonomousCommits(revertedAutoLink), Number.POSITIVE_INFINITY, 'a commit per iteration is not one commit')
+
+  // ...and a `$transaction` inside a loop is no better than a bare mutation inside one.
+  const txInLoop = [
+    'export async function x() {',
+    '  for (const row of rows) {',
+    '    await db.$transaction(async (tx) => { await tx.setting.upsert({}) })',
+    '  }',
+    '}',
+  ].join('\n')
+  assert.equal(autonomousCommits(txInLoop), Number.POSITIVE_INFINITY)
+
+  // ...while the fixed shape — every mutation inside ONE transaction — counts as one.
+  const fixed = [
+    'export async function createWarehouse(input: WarehouseInput) {',
+    '  const item = await db.$transaction(async (tx) => {',
+    '    if (data.isDefault) await tx.warehouse.updateMany({ where: { isDefault: true }, data: { isDefault: false } })',
+    '    if (data.defaultReturnWarehouse) await tx.warehouse.updateMany({ where: {}, data: {} })',
+    '    return tx.warehouse.create({ data: {} })',
+    '  })',
+    '  return { success: true, item }',
+    '}',
+  ].join('\n')
+  assert.equal(autonomousCommits(fixed), 1, 'no false positive on the fix')
+
+  // ...and a writer with a single bare mutation is one commit, not zero.
+  assert.equal(
+    autonomousCommits('export async function d() { await db.setting.upsert({ where: {} }) }'),
+    1,
+  )
+})
+
+test('every multi-commit exception names a writer that still exists and still commits more than once', () => {
+  // An exemption for a writer that has been renamed or deleted is an exemption nobody is checking,
+  // and the next writer to take that name inherits it silently.
+  const byKey = new Map(committingWriters().map((w) => [`${w.module}#${w.name}`, w]))
+  for (const [key, reason] of Object.entries(MULTI_COMMIT_EXCEPTIONS)) {
+    const writer = byKey.get(key)
+    assert.ok(writer, `${key} is exempted but is not a committing writer any more`)
+    assert.ok(autonomousCommits(writer.body) > 1, `${key} is exempted but now commits once — drop the exception`)
+    assert.ok(reason.length > 40, `${key}'s exception must state a reason, not a label`)
   }
 })

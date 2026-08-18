@@ -356,3 +356,72 @@ test('a COPY wider than any fixed-size buffer still enters DATA mode', () => {
   // ...and the block still genuinely ends at `\.`
   assert.match(verdict(sql.replace('SELECT 1;', 'COMMIT;')), /transaction control/)
 })
+
+test('WHITESPACE, COMMENTS AND NEWLINES between E and the quote do not make an escape-string', () => {
+  // o3d-osl8 ROUND 11, FINDING 1 — the same bypass, back for the third time by a third route.
+  //
+  // Round 9 read the prefix from the previous CHARACTER (`name'…'` became an escape-string). Round
+  // 10 read it from the previous TOKEN and called the class closed by construction. One space
+  // defeats that: whitespace pushes no token, so `prevToken` is still `W:E`.
+  //
+  //     CREATE DOMAIN e AS text;
+  //     SELECT e 'a\'; COMMIT; --' ;
+  //
+  // PostgreSQL matches `xestart` as `[eE]{quote}` — ONE lexeme — so `e 'a\'` is a typed constant of
+  // type `e` over a PLAIN literal, that literal ends at the second quote, and the `COMMIT` executes
+  // at top level. The scanner read an escape-string and swallowed it. Prefix recognition is now
+  // ADJACENCY: the previous token must END where the quote BEGINS.
+  const payload = "SELECT e 'a\\'; COMMIT; --' ;\nSELECT 1;\n"
+  assert.notEqual(verdict(payload), 'accepted')
+  assert.notEqual(chunkedVerdict(payload), 'accepted')
+  assert.notEqual(verdict("CREATE DOMAIN e AS text;\nSELECT e 'a\\'; COMMIT; --' ;\n"), 'accepted')
+
+  // Every other way of putting distance between the two, since the rule is about position and not
+  // about the space character in particular.
+  assert.notEqual(verdict("SELECT e/*c*/'a\\'; COMMIT; --' ;\n"), 'accepted')
+  assert.notEqual(verdict("SELECT e -- c\n'a\\'; COMMIT; --' ;\n"), 'accepted')
+  assert.notEqual(verdict("SELECT e\n'a\\'; COMMIT; --' ;\n"), 'accepted')
+  assert.notEqual(verdict("SELECT e\t'a\\'; COMMIT; --' ;\n"), 'accepted')
+  assert.notEqual(verdict("SELECT E  'a\\'; COMMIT; --' ;\n"), 'accepted')
+
+  // ...and the same for the plain-literal case that has no prefix at all, so the refusal above is
+  // the PLAIN reading being applied rather than a new special case for `e`.
+  assert.notEqual(verdict("SELECT 'a\\'; COMMIT; --' ;\n"), 'accepted')
+
+  // A GENUINE escape-string is still one — the fix must not refuse what pg_dump legitimately emits.
+  assert.equal(verdict("SELECT E'it\\'s fine'; SELECT 2;"), 'accepted')
+  assert.equal(verdict("SELECT e'it\\'s fine'; SELECT 2;"), 'accepted')
+  assert.equal(chunkedVerdict("SELECT E'it\\'s fine'; SELECT 2;"), 'accepted')
+  // ...including one immediately after a closing quote, paren or dollar-quote, where adjacency
+  // holds against a non-word token.
+  assert.equal(verdict("SELECT ('x')::text, E'a\\'b'; SELECT 1;"), 'accepted')
+  assert.equal(verdict("SELECT $$body$$, E'a\\'b'; SELECT 1;"), 'accepted')
+})
+
+test('a non-ASCII identifier ending in `e` is ONE word, so it cannot manufacture a prefix', () => {
+  // ROUND 11, FINDING 1, second half. Adjacency is only as good as the token boundaries it is
+  // measured against. PostgreSQL's `ident_cont` includes every byte in \200-\377, and this
+  // scanner's word class did not — so `xée` split into `xé` and a standalone `e`, the `e` was
+  // adjacent to the quote, and the payload was live again by a different door.
+  assert.notEqual(verdict("SELECT xée'a\\'; COMMIT; --' ;\n"), 'accepted')
+  assert.notEqual(chunkedVerdict("SELECT xée'a\\'; COMMIT; --' ;\n"), 'accepted')
+  assert.notEqual(verdict("SELECT naïve'a\\'; COMMIT; --' ;\n"), 'accepted')
+  // ...and the same for the U& prefix, whose refusal must not be dodgeable the same way.
+  assert.notEqual(verdict("SELECT xé'\\0041'; COMMIT;\n"), 'accepted')
+
+  // A non-ASCII identifier in ordinary use is still ordinary SQL.
+  assert.equal(verdict('SELECT "café" FROM t; SELECT 1;'), 'accepted')
+  assert.equal(verdict("INSERT INTO t VALUES ('café'); SELECT 1;"), 'accepted')
+})
+
+test('the U& refusal is deliberately LOOSE, because its outcome is a refusal', () => {
+  // The asymmetry is the rule that generalises beyond `E`: a decision that WIDENS what the scanner
+  // swallows must be exact, and one that only NARROWS may be approximate. Reading `E'…'` widens —
+  // more bytes become string content — so it requires adjacency. Refusing `U&'…'` narrows, so it
+  // does not, and `u & 'x'` is refused too. That false reject is the direction this file fails in.
+  assert.match(verdict("SELECT U&'\\0041';"), /Unicode-escape/)
+  assert.match(verdict("SELECT u  &  'x'; SELECT 1;"), /Unicode-escape/)
+  assert.match(verdict("SELECT u\n&\n'x';"), /Unicode-escape/)
+  // ...but an identifier merely ENDING in `u` is still not the prefix.
+  assert.equal(verdict("SELECT menu & 'x'; SELECT 1;"), 'accepted')
+})

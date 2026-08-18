@@ -1482,7 +1482,8 @@ type RestoreRun = {
 }
 
 /**
- * A DATABASE BACKEND WITH A LIFETIME OF ITS OWN (o3d-osl8 round 10, finding 2).
+ * A DATABASE BACKEND WITH A LIFETIME AND AN IDENTITY OF ITS OWN
+ * (o3d-osl8 round 10 finding 2 → round 11 finding 2).
  *
  * The round-9 double answered `terminateRestoreBackends` with the number 1 — which is to say it
  * modelled termination as a value returned by a function call, and could therefore only ever
@@ -1491,22 +1492,52 @@ type RestoreRun = {
  * statement, and the catalogue keeps listing it. A double that cannot represent that gap cannot
  * observe the bug.
  *
- * This one is a state machine:
- *   • `signalsToExit` — how many signals before `pg_stat_activity` stops listing it. `Infinity` is a
- *     backend that outlives every signal, which is the case that must NOT release the lock.
+ * ROUND 11 found the round-10 state machine had the SAME shape of blind spot one field along. It
+ * modelled a backend's LIFETIME faithfully but gave it no IDENTITY: `application_name` was baked
+ * into the query text rather than being state the backend owns, so a backend that renames itself —
+ * which any `SET application_name` in the replayed dump does — was unrepresentable, and the test
+ * suite could not have failed on it. A double that cannot express the mutation cannot observe the
+ * bug that mutation causes.
+ *
+ * So this fake now models a row of `pg_stat_activity`:
+ *   • `pid` and `backendStart` — IMMUTABLE. No modelled operation changes them, because no SQL can.
+ *   • `name` — MUTABLE, via `renameBackend()`, exactly as a GUC is.
+ *   • `signalsToExit` — how many signals before it stops being listed. `Infinity` is a backend that
+ *     outlives every signal, which is the case that must NOT release the lock.
  *   • `refuseSignal` — `pg_terminate_backend` returns FALSE (no permission, wrong pid kind). The
  *     row still comes back, which is exactly how "1 backend terminated" used to be reported.
+ *   • `appearsAfterPolls` / `impostor` — a backend that is slow to connect, and a SECOND session
+ *     answering to the same name, which is the case identification must refuse rather than guess at.
  * It also records `end()`, so a session that was deliberately kept open is distinguishable from one
  * that was closed — the difference between the lock being held and the lock being gone.
+ *
+ * The two queries are answered by SHAPE, not by echoing whatever was asked: the identification
+ * query filters on the MUTABLE name, the confirmation query on the IMMUTABLE pair. Production code
+ * that confuses the two therefore gets a different answer here, which is the point.
  */
-type BackendModel = { signalsToExit: number; refuseSignal?: boolean }
+type BackendModel = {
+  signalsToExit: number
+  refuseSignal?: boolean
+  pid?: number
+  backendStart?: string
+  /** Polls of the identification query before this backend is listed at all. */
+  appearsAfterPolls?: number
+  /** A second, differently-identified session answering to the same application_name. */
+  impostor?: boolean
+}
 
-function fakeRestoreDatabase(events: string[], backend: BackendModel | null) {
+function fakeRestoreDatabase(events: string[], backend: BackendModel | null, applicationName: string) {
+  const pid = backend?.pid ?? 4242
+  const backendStart = backend?.backendStart ?? '2026-08-18 09:00:00.123456+00'
   let live: BackendModel | null = backend ? { ...backend } : null
+  let name = applicationName
+  let identifyPolls = 0
   const queries: Array<{ text: string; values?: unknown[] }> = []
   return {
     queries,
     get backendStillListed() { return live !== null },
+    /** What `SET application_name = '…'` in the replayed dump does. The pid does not move. */
+    renameBackend(to: string) { events.push(`backend-renamed(${to})`); name = to },
     client: {
       async connect() { events.push('lock-connect') },
       async query(text: string, values?: unknown[]) {
@@ -1516,6 +1547,14 @@ function fakeRestoreDatabase(events: string[], backend: BackendModel | null) {
         if (text.includes('pg_terminate_backend')) {
           events.push(`terminate-backends(${String(values?.[0])})`)
           if (live === null) return { rows: [] }
+          // A DATABASE, NOT A DESIGN. Both spellings of the WHERE clause are served faithfully —
+          // by the MUTABLE name, or by the IMMUTABLE pair — so the fake reports what PostgreSQL
+          // would report for whichever query production actually sends. A double that answered only
+          // the query the fix sends would pass its own tests by construction.
+          const matches = text.includes('application_name')
+            ? String(values?.[0]) === name
+            : Number(values?.[0]) === pid && String(values?.[1]) === backendStart
+          if (!matches) return { rows: [] }
           const terminated = live.refuseSignal !== true
           if (terminated) {
             live.signalsToExit -= 1
@@ -1523,7 +1562,17 @@ function fakeRestoreDatabase(events: string[], backend: BackendModel | null) {
           }
           // The rows are what the catalogue listed AT SIGNAL TIME — a backend that is still there
           // when it is signalled comes back in the result whether or not it then dies.
-          return { rows: [{ pid: 4242, terminated }] }
+          return { rows: [{ pid, terminated }] }
+        }
+        if (text.includes('backend_start') && text.includes('application_name')) {
+          identifyPolls += 1
+          if (live === null) return { rows: [] }
+          if (identifyPolls <= (live.appearsAfterPolls ?? 0)) return { rows: [] }
+          if (String(values?.[0]) !== name) return { rows: [] }
+          events.push(`backend-identified(${pid})`)
+          const rows: Array<Record<string, unknown>> = [{ pid, backend_start: backendStart }]
+          if (live.impostor) rows.push({ pid: pid + 1, backend_start: backendStart })
+          return { rows }
         }
         return { rows: [] }
       },
@@ -1550,6 +1599,13 @@ async function captureRestore(
     /** The server-side half. Defaults to one backend that goes away on its first signal. */
     backend?: BackendModel | null
     backendExitConfirmMs?: number
+    backendIdentifyMs?: number
+    /**
+     * What the dump does to `application_name` the moment it starts executing. This is the round-11
+     * payload: the rename happens AFTER identification and BEFORE the timeout, exactly as a
+     * `SET application_name` at the top of a replayed file would.
+     */
+    renameOnFirstWrite?: string
   } = {},
 ): Promise<RestoreRun> {
   const { runRestore, createRestoreSelectionLockHolder } = await import('../../app/api/backup/restore/route.ts')
@@ -1563,7 +1619,6 @@ async function captureRestore(
   let args: string[] = []
   let env: Record<string, string | undefined> = {}
   const stdin = new PassThrough()
-  stdin.on('data', (chunk: Buffer) => chunks.push(chunk.toString('utf8')))
 
   const child = new EventEmitter() as EventEmitter & {
     stdin: typeof stdin
@@ -1582,7 +1637,19 @@ async function captureRestore(
     })
   }
 
-  const database = fakeRestoreDatabase(events, options.backend === undefined ? { signalsToExit: 1 } : options.backend)
+  const database = fakeRestoreDatabase(
+    events,
+    options.backend === undefined ? { signalsToExit: 1 } : options.backend,
+    'ims_restore_test',
+  )
+  let renamed = false
+  stdin.on('data', (chunk: Buffer) => {
+    chunks.push(chunk.toString('utf8'))
+    if (options.renameOnFirstWrite !== undefined && !renamed) {
+      renamed = true
+      database.renameBackend(options.renameOnFirstWrite)
+    }
+  })
   let clock = 0
   const retainedReasons: string[] = []
   const holder = createRestoreSelectionLockHolder({
@@ -1590,6 +1657,7 @@ async function captureRestore(
     now: () => clock,
     delay: async (ms: number) => { clock += ms },
     backendExitConfirmMs: options.backendExitConfirmMs ?? 1_000,
+    backendIdentifyMs: options.backendIdentifyMs ?? 1_000,
     onLockRetained: (reason: string) => { events.push('lock-RETAINED'); retainedReasons.push(reason) },
   })
 
@@ -1635,8 +1703,20 @@ test('the selection lock is held, by a session of its own, for the WHOLE restore
 
   assert.deepEqual(
     events,
-    ['lock-connect', 'lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released', 'lock-session-ended'],
-    'acquired before psql is even spawned, released only after it has exited',
+    [
+      'lock-connect',
+      'lock-acquired',
+      'psql-spawned',
+      // ROUND 11, FINDING 2 — BEFORE `psql-stdin-first-byte`, and that ordering is the guarantee.
+      // `application_name` is only a trustworthy handle while the backend has not executed anything
+      // that could rename it, which is true exactly up to the first byte of the dump.
+      'backend-identified(4242)',
+      'psql-exited',
+      'lock-released',
+      'lock-session-ended',
+    ],
+    'acquired before psql is even spawned, identified before a byte is streamed, released only '
+      + 'after it has exited',
   )
   // THE ROUND-8 ASSERTION. The dump reaches psql UNCHANGED and nothing precedes it: the lock is not
   // in this stream, so no statement in this stream can end the transaction that holds it.
@@ -1683,7 +1763,8 @@ test('a dump that COMMITS mid-stream is REFUSED, before anything is spawned or l
           withSelectionLock: async (work) => {
             locked += 1
             return work({
-              terminateAndConfirmRestoreBackends: async () => ({ confirmed: true, found: 0, remaining: 0 }),
+              identifyRestoreBackend: async () => ({ status: 'identified' as const, identity: { pid: 1, backendStart: 'x' } }),
+              terminateAndConfirmRestoreBackend: async () => ({ confirmed: true, found: 0, remaining: 0 }),
               retainLock: () => { throw new Error('the lock must not be retained on this path') },
             })
           },
@@ -1845,11 +1926,14 @@ test('a psql that overruns its ceiling is killed AND its backend terminated befo
       'lock-connect',
       'lock-acquired',
       'psql-spawned',
+      'backend-identified(4242)',
       'psql-killed(SIGKILL)',
-      'terminate-backends(ims_restore_test)',
+      // ROUND 11: signalled BY PID, not by name — the argument is the immutable half of the
+      // identity captured above, and the fake serves this query from that pair alone.
+      'terminate-backends(4242)',
       // ROUND 10: the SECOND read is the confirmation. The first one only proves a signal was sent,
       // and the round-9 code released the lock on the strength of that alone.
-      'terminate-backends(ims_restore_test)',
+      'terminate-backends(4242)',
       'lock-released',
       'lock-session-ended',
     ],
@@ -1878,7 +1962,9 @@ test('a backend that OUTLIVES its signal keeps the lock held rather than releasi
   assert.equal(run.error?.name, 'RestoreBackendNotConfirmedError', 'the failure is TYPED — the caller has to treat it differently')
   assert.match(run.error?.message ?? '', /could NOT be confirmed gone/)
   assert.match(run.error?.message ?? '', /lock is being HELD/)
-  assert.match(run.error?.message ?? '', /Maintenance mode stays ON/)
+  // ROUND 11, FINDING 4 — the message must name the backend the operator has to look for, and must
+  // NOT claim the application is down. Both are asserted in the maintenance-mode test below.
+  assert.match(run.error?.message ?? '', /Backend pid 4242/)
 
   assert.equal(run.backendStillListed, true, 'the double models what the fix is about: the backend is still there')
   assert.ok(!run.events.includes('lock-released'), 'THE ASSERTION. The lock was never released.')
@@ -1968,8 +2054,12 @@ test('the timeout path waits for psql to actually exit before terminating and re
             events.push('lock-acquired')
             try {
               return await work({
-                terminateAndConfirmRestoreBackends: async (name: string) => {
-                  events.push(`terminate(${name})`)
+                identifyRestoreBackend: async () => {
+                  events.push('backend-identified')
+                  return { status: 'identified' as const, identity: { pid: 77, backendStart: '2026-08-18 09:00:00.1+00' } }
+                },
+                terminateAndConfirmRestoreBackend: async (identity) => {
+                  events.push(`terminate(pid ${identity.pid})`)
                   return { confirmed: true, found: 0, remaining: 0 }
                 },
                 retainLock: () => { throw new Error('the lock must not be retained on this path') },
@@ -1990,9 +2080,12 @@ test('the timeout path waits for psql to actually exit before terminating and re
   assert.deepEqual(events, [
     'lock-acquired',
     'psql-spawned',
+    // IDENTIFIED BEFORE ANYTHING IS STREAMED (round 11, finding 2) — that ordering is what makes
+    // `application_name` a trustworthy handle at this one moment and nowhere later.
+    'backend-identified',
     'psql-killed(SIGKILL)',
     'psql-close',
-    'terminate(ims_restore_wait)',
+    'terminate(pid 77)',
     'lock-released',
   ])
 })
@@ -2001,7 +2094,8 @@ test('a non-zero psql exit still reports its stderr, and still releases the lock
   const run = await captureRestore('SELECT 1;\n', { exitCode: 3 })
   assert.match(run.error?.message ?? '', /psql exited with code 3/)
   assert.deepEqual(run.events, [
-    'lock-connect', 'lock-acquired', 'psql-spawned', 'psql-exited', 'lock-released', 'lock-session-ended',
+    'lock-connect', 'lock-acquired', 'psql-spawned', 'backend-identified(4242)', 'psql-exited',
+    'lock-released', 'lock-session-ended',
   ])
 })
 
@@ -2025,7 +2119,8 @@ test('the restore still refuses psql metacommands before it locks anything', asy
           withSelectionLock: async (work) => {
             locked += 1
             return work({
-              terminateAndConfirmRestoreBackends: async () => ({ confirmed: true, found: 0, remaining: 0 }),
+              identifyRestoreBackend: async () => ({ status: 'identified' as const, identity: { pid: 1, backendStart: 'x' } }),
+              terminateAndConfirmRestoreBackend: async () => ({ confirmed: true, found: 0, remaining: 0 }),
               retainLock: () => { throw new Error('the lock must not be retained on this path') },
             })
           },
@@ -2039,4 +2134,226 @@ test('the restore still refuses psql metacommands before it locks anything', asy
   }
   assert.equal(spawned, 0, 'nothing was spawned')
   assert.equal(locked, 0, 'and nothing was locked')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-osl8 ROUND 11, FINDING 2 — THE CONFIRMATION CONFIRMED A NAME, NOT A PROCESS.
+//
+// Round 10 polled `pg_stat_activity WHERE application_name = $1`. `application_name` is a GUC, so
+// the thing being confirmed could change the answer about itself: one `SET application_name` in the
+// replayed dump — or a `SET` inside any function body it calls — and the poll returns zero rows, the
+// backend is reported GONE, the connector-selection lock is released and maintenance mode is
+// switched back off while the replay carries on writing.
+//
+// The tests below are written against a double that can express the rename (see `BackendModel`);
+// the round-10 double could not, which is why round 10's suite was green over this.
+// ---------------------------------------------------------------------------
+
+test('a restore that RENAMES ITSELF is still terminated by its immutable identity, and an unconfirmed one still holds the lock', async () => {
+  // THE PAYLOAD. The dump renames the backend the instant it starts executing — after the
+  // identification window, before the timeout — and then outlives every signal. Keyed on the name,
+  // the poll finds nothing and calls that "gone". Keyed on `(pid, backend_start)`, which no SQL can
+  // change, it finds the backend that is still there and refuses to release anything.
+  const run = await captureRestore('SELECT 1;\n', {
+    autoExit: false,
+    psqlTimeoutMs: 5,
+    killGraceMs: 1_000,
+    backend: { signalsToExit: Number.POSITIVE_INFINITY },
+    backendExitConfirmMs: 1_000,
+    renameOnFirstWrite: 'not_a_restore_at_all',
+  })
+
+  assert.ok(run.events.includes('backend-renamed(not_a_restore_at_all)'), 'the double actually renamed it')
+  assert.ok(
+    run.events.indexOf('backend-identified(4242)') < run.events.indexOf('backend-renamed(not_a_restore_at_all)'),
+    'and it renamed itself AFTER identification — which is the only order the dump can achieve',
+  )
+  assert.equal(run.error?.name, 'RestoreBackendNotConfirmedError', 'a renamed backend is not a gone backend')
+  assert.equal(run.backendStillListed, true)
+  assert.ok(!run.events.includes('lock-released'), 'THE ASSERTION: the lock was NOT released on a name that moved')
+  assert.ok(!run.events.includes('lock-session-ended'))
+  assert.equal(run.retainedReasons.length, 1)
+
+  // ...and the query that decided it names neither the application_name nor anything else the
+  // restore can set. This is the structural half: a future edit that reintroduces the name here
+  // fails without needing the timing above to line up.
+  const terminate = run.lockQueries.filter((q) => /pg_terminate_backend/.test(q.text))
+  assert.ok(terminate.length > 1, 'it polled')
+  for (const query of terminate) {
+    assert.ok(/WHERE pid = \$1 AND backend_start::text = \$2/.test(query.text), `matched on the immutable pair: ${query.text}`)
+    assert.ok(!/application_name/.test(query.text), 'and never on application_name, which the restore owns')
+    assert.equal(query.values?.[0], 4242)
+    assert.equal(query.values?.[1], '2026-08-18 09:00:00.123456+00')
+  }
+})
+
+test('a renamed backend that DOES exit still releases the lock normally', async () => {
+  // The other direction, so the fix cannot be "never confirm anything": identity-keyed confirmation
+  // has to reach the ordinary outcome too, or a renamed-but-dead backend would wedge the
+  // application forever.
+  const run = await captureRestore('SELECT 1;\n', {
+    autoExit: false,
+    psqlTimeoutMs: 5,
+    killGraceMs: 1_000,
+    backend: { signalsToExit: 2 },
+    backendExitConfirmMs: 1_000,
+    renameOnFirstWrite: 'renamed_mid_replay',
+  })
+
+  assert.match(run.error?.message ?? '', /Restore timed out \(terminated 1 database backend\)/)
+  assert.equal(run.backendStillListed, false)
+  assert.deepEqual(run.retainedReasons, [], 'confirmed gone, so the lock is released the ordinary way')
+  assert.ok(run.events.includes('lock-released'))
+  assert.ok(run.events.includes('lock-session-ended'))
+})
+
+test('a backend that never appears is refused BEFORE a single byte of the dump is streamed', async () => {
+  // If the backend cannot be identified there is nothing to terminate on a timeout, so running the
+  // restore anyway would be accepting the round-10 position by another route. Refusing here is free:
+  // nothing has been written, so this is an ordinary clean failure — the lock is released, and the
+  // caller's `finally` turns maintenance mode back off.
+  const run = await captureRestore('SELECT 1;\n', {
+    autoExit: false,
+    // Bounded so the harness's own psql-timeout timer cannot outlive the test; identification runs
+    // entirely on the injected clock and settles first.
+    psqlTimeoutMs: 50,
+    killGraceMs: 10,
+    backend: null,
+    backendIdentifyMs: 500,
+  })
+
+  assert.match(run.error?.message ?? '', /did not appear in pg_stat_activity/)
+  assert.match(run.error?.message ?? '', /Nothing was restored/)
+  assert.equal(run.written, '', 'THE ASSERTION: not one byte reached psql, so there is nothing to have half-applied')
+  assert.equal(run.error?.name, 'Error', 'and it is NOT the unconfirmed-backend error — no backend was ever running')
+  assert.ok(run.events.includes('lock-released'), 'so the lock is released normally')
+  assert.ok(run.events.includes('psql-killed(SIGKILL)'), 'and the client is killed rather than left holding stdin open')
+})
+
+test('two backends answering to the same name is refused rather than guessed at', async () => {
+  // Picking one would be a guess about which is writing, and the wrong guess terminates a bystander
+  // while the restore runs on. The name is per-run random precisely so this cannot happen; if it
+  // happens anyway, the assumption behind the whole identification step has failed.
+  const run = await captureRestore('SELECT 1;\n', {
+    autoExit: false,
+    psqlTimeoutMs: 50,
+    killGraceMs: 10,
+    backend: { signalsToExit: 1, impostor: true },
+    backendIdentifyMs: 500,
+  })
+
+  assert.match(run.error?.message ?? '', /2 database backends answer to this restore's application name/)
+  assert.equal(run.written, '', 'nothing streamed')
+  assert.ok(run.events.includes('lock-released'))
+})
+
+test('a psql that is slow to connect is waited for rather than refused', async () => {
+  // Identification is a poll for the same reason confirmation is: the connection is not
+  // instantaneous, and giving up on the first empty answer would refuse healthy restores.
+  const run = await captureRestore('SELECT 1;\n', {
+    backend: { signalsToExit: 1, appearsAfterPolls: 4 },
+    backendIdentifyMs: 5_000,
+  })
+
+  assert.equal(run.error, undefined, 'the restore ran')
+  assert.equal(run.written, 'SELECT 1;\n', 'and the dump was streamed once the backend was identified')
+  assert.ok(
+    run.lockQueries.filter((q) => /application_name/.test(q.text)).length >= 5,
+    'it polled rather than accepting the first empty answer',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-osl8 ROUND 11, FINDING 4 — MAINTENANCE MODE IS NOT A GLOBAL WRITE FENCE.
+//
+// Round 10 held the lock and left maintenance mode on, and described that as keeping the
+// application down. It does not: the flag is consulted by cron routes and the connector webhook
+// entry point, and by nothing else — every interactive server action writes straight through it.
+// A protection described but not provided is worse than a stated gap, because the next reader
+// trusts it, so the claim is now pinned against the repository rather than written in prose.
+// ---------------------------------------------------------------------------
+
+async function filesUnder(dir: string): Promise<string[]> {
+  const out: string[] = []
+  const walk = async (at: string) => {
+    for (const entry of await readdir(at, { withFileTypes: true })) {
+      if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue
+      const full = path.join(at, entry.name)
+      if (entry.isDirectory()) await walk(full)
+      else if (/\.tsx?$/.test(entry.name)) out.push(full)
+    }
+  }
+  await walk(dir)
+  return out
+}
+
+test('the reach of maintenance mode is what the restore path SAYS it is, measured over the repository', async () => {
+  const { MAINTENANCE_MODE_REACH } = await import('../../app/api/backup/restore/route.ts')
+  const repo = process.cwd()
+  const { readFile } = await import('node:fs/promises')
+
+  const consulting: string[] = []
+  for (const dir of ['app', 'lib', 'components']) {
+    for (const file of await filesUnder(path.join(repo, dir))) {
+      const rel = path.relative(repo, file)
+      if (rel === 'lib/maintenance-mode.ts') continue
+      const src = await readFile(file, 'utf8')
+      // CONSULTING it, not merely toggling it: the restore route enables and disables the flag but
+      // never gates on it, and counting that as a fence is exactly the mistake being corrected.
+      if (/getMaintenanceModeResponse\(|getMaintenanceModeState\(/.test(src)) consulting.push(rel)
+    }
+  }
+
+  const cron = consulting.filter((rel) => rel.startsWith('app/api/cron/'))
+  const other = consulting.filter((rel) => !rel.startsWith('app/api/cron/'))
+  assert.ok(cron.length > 0, 'cron routes do consult it')
+  assert.deepEqual(
+    other,
+    ['lib/connectors/woocommerce/webhooks.ts'],
+    'and outside cron, exactly ONE entry point does. If this list grows, MAINTENANCE_MODE_REACH and '
+      + 'the operator message in the restore route have to grow with it — that is the whole point of '
+      + 'pinning it here.',
+  )
+  assert.deepEqual([...MAINTENANCE_MODE_REACH.fenced], ['app/api/cron/*', 'lib/connectors/woocommerce/webhooks.ts'])
+
+  // THE HALF THAT WAS ASSUMED. Not one interactive server action gates on it, so an unconfirmed
+  // restore overlaps every dashboard write there is.
+  const actions = consulting.filter((rel) => rel.startsWith('app/actions/'))
+  assert.deepEqual(actions, [], 'no server action consults maintenance mode — so it fences none of them')
+  assert.equal(MAINTENANCE_MODE_REACH.hasOperatorControl, false)
+
+  // ...and there is no screen for the flag either, which is why the recovery in the message is a
+  // database operation and not "turn it off in Settings".
+  const uiReferences: string[] = []
+  for (const file of await filesUnder(path.join(repo, 'app'))) {
+    const rel = path.relative(repo, file)
+    if (!rel.startsWith('app/(dashboard)') && !rel.startsWith('app/settings')) continue
+    if (/system_maintenance_mode|MaintenanceMode/.test(await readFile(file, 'utf8'))) uiReferences.push(rel)
+  }
+  assert.deepEqual(uiReferences, [], 'no dashboard screen can clear it')
+})
+
+test('the unconfirmed-restore message describes only the protection that exists', async () => {
+  const run = await captureRestore('SELECT 1;\n', {
+    autoExit: false,
+    psqlTimeoutMs: 5,
+    killGraceMs: 1_000,
+    backend: { signalsToExit: Number.POSITIVE_INFINITY },
+    backendExitConfirmMs: 1_000,
+  })
+  const message = run.retainedReasons[0] ?? ''
+
+  // WHAT IS TRUE.
+  assert.match(message, /connector-selection lock is being HELD/)
+  assert.match(message, /Scheduled jobs and inbound webhooks are stopped by maintenance mode/)
+  assert.match(message, /INTERACTIVE WRITES FROM THE DASHBOARD ARE NOT STOPPED BY ANYTHING/)
+  assert.match(message, /Backend pid 4242, started 2026-08-18 09:00:00\.123456\+00/, 'the operator is told what to look for')
+
+  // WHAT ROUND 10 SAID AND MUST NOT SAY AGAIN. "Restart the application once the database is known
+  // to be quiet" is not merely vague — restarting DROPS the holder's session, which releases the
+  // advisory lock, so the instructed recovery destroyed the one real protection.
+  assert.doesNotMatch(message, /Maintenance mode stays ON\./, 'that clause implied the application was down')
+  assert.match(message, /Do NOT restart yet: restarting releases the held lock/)
+  assert.match(message, /clear maintenance mode/, 'and the flag it leaves behind has a named recovery')
+  assert.match(message, /system_maintenance_mode/)
 })

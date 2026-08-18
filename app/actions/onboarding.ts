@@ -211,15 +211,20 @@ export async function completeOnboarding(): Promise<{ success: boolean; error?: 
     return { success: false, error: 'Save and lock the base currency before finishing setup.' }
   }
 
-  await db.setting.upsert({
-    where: { key: 'onboarding_complete' },
-    create: { key: 'onboarding_complete', value: 'true' },
-    update: { value: 'true' },
-  })
-  await db.setting.upsert({
-    where: { key: 'onboarding_dismissed' },
-    create: { key: 'onboarding_dismissed', value: 'false' },
-    update: { value: 'false' },
+  // ONE TRANSACTION (o3d-osl8 round 11, finding 3). Two independent upserts could commit the first
+  // and fail the second, leaving `onboarding_complete = true` with `onboarding_dismissed` still
+  // true — a state the wizard reads as "finished AND dismissed" — while the action reported failure.
+  await db.$transaction(async (tx) => {
+    await tx.setting.upsert({
+      where: { key: 'onboarding_complete' },
+      create: { key: 'onboarding_complete', value: 'true' },
+      update: { value: 'true' },
+    })
+    await tx.setting.upsert({
+      where: { key: 'onboarding_dismissed' },
+      create: { key: 'onboarding_dismissed', value: 'false' },
+      update: { value: 'false' },
+    })
   })
   // POST-COMMIT. Onboarding IS complete at this point; a rejection here left the operator looking
   // at "Failed to complete onboarding" on a wizard that had already finished, with no way forward.
