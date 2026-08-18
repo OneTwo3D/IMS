@@ -276,3 +276,22 @@ test('sales.ts asks the ledger exactly when the decision needs it (o3d-0m56)', a
   assert.match(warn.slice(0, 900), /invoice_payment_not_registered/)
   assert.match(warn.slice(0, 900), /could pay the invoice twice/)
 })
+
+test('the BILL side is closed by a different mechanism, and it must stay closed (o3d-0m56)', async () => {
+  // Codex's finding 2 is about re-recording a receipt beside an unresolved attempt. The supplier
+  // side has the same shape and no equivalent guard — because markBillPaid is single-shot: it only
+  // writes paidAt while paidAt IS NULL, and the only thing that clears paidAt again is a payment
+  // poller finding the bill genuinely unpaid in the ledger. A committed-but-unacknowledged bill
+  // payment therefore leaves the ledger showing PAID, and the second attempt is refused before it
+  // reaches the queue.
+  //
+  // That argument depends entirely on the compare-and-set below, so it is pinned here rather than
+  // left as a comment: if the fence goes, BILL_PAYMENT needs the unresolved-attempt check too.
+  const source = await readFile(path.join(process.cwd(), 'app/actions/purchase-orders.ts'), 'utf8')
+  const at = source.indexOf('const paidUpdate = await db.purchaseInvoice.updateMany')
+  assert.notEqual(at, -1, 'markBillPaid must still write paidAt conditionally')
+  assert.match(source.slice(at, at + 200), /where: \{ id: invoiceId, paidAt: null \}/,
+    'a bill may only be marked paid while it is unpaid')
+  assert.match(source.slice(0, at), /if \(invoice\.paidAt\) return \{ success: false/,
+    'and the early refusal must stay too')
+})

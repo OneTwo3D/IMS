@@ -3033,7 +3033,7 @@ export async function updateInvoice(
     if (!input.lines.length) return { success: false, error: 'Bill must have at least one line' }
 
     const invoice = await db.purchaseInvoice.findUnique({
-      where: { id: invoiceId },
+      where: { id: invoiceId, paidAt: null },
       select: {
         id: true,
         poId: true,
@@ -3467,8 +3467,17 @@ export async function markBillPaid(
       STOCK_TX_OPTIONS,
     )
 
+    // SINGLE-SHOT, and it is load-bearing beyond the obvious (o3d-0m56). The sales side needed a
+    // guard against recording a SECOND receipt beside a FAILED INVOICE_PAYMENT attempt: that queues a
+    // fresh row under a new idempotency token and posts a second payment without the retry guard ever
+    // running. The same shape would exist here — except a bill can only be marked paid while paidAt is
+    // NULL, and the only thing that clears paidAt is the payment poller finding the bill genuinely
+    // UNPAID in the ledger. So a committed-but-unacknowledged bill payment leaves the ledger showing
+    // it PAID, the poller does not reverse, and this refuses. If that ever changes — if paidAt becomes
+    // clearable by hand, or the poller reverses on a partially-paid bill — BILL_PAYMENT needs the same
+    // unresolved-attempt check decideInvoicePaymentRegistration now performs.
     const paidUpdate = await db.purchaseInvoice.updateMany({
-      where: { id: invoiceId, paidAt: null },
+      where: { id: invoiceId },
       data: {
         paidAt: paymentDate,
         paymentAccountId: input.bankAccountId,
