@@ -1,6 +1,10 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import {
+  RESERVATION_RELEASING_SHIPMENT_STATUS,
+  UNCOMMITTED_SHIPMENT_STATUS,
+} from '@/lib/domain/inventory/reservation-residual'
 
 export type ReservationBreakdownSource =
   | 'sales_order'
@@ -55,6 +59,7 @@ type ActiveShipmentLineRow = {
   qty: DecimalInput
   shipment: {
     warehouseId: string
+    status: string
   }
 }
 
@@ -129,18 +134,33 @@ export async function loadReservationSourceRows(
   client: ReservationBreakdownClient = db as unknown as ReservationBreakdownClient,
   options: ReservationSourceLoadOptions = {},
 ): Promise<ReservationBreakdownRow[]> {
+  // o3d-4kfh: ZERO-DEMAND ORDERS ARE INCLUDED, not excluded.
+  //
+  // A CANCELLED or fully-refunded order has no outstanding demand, which is why this query used to
+  // drop it entirely. But demand is not the same thing as a reservation: a full refund on an order
+  // that already has a PICKING or PACKED shipment leaves the COMMITTED portion reserved on the
+  // stock level (allocation retains the committed set, and only dispatch decrements reservedQty).
+  // Excluding those rows reported a real, correctly-held reservation as an unattributed balance —
+  // the exact drift this breakdown exists to explain away. They are included below and credited
+  // for their still-committed portion ONLY; any stale outstanding remainder stays unattributed,
+  // because that part genuinely is a leak.
   const allocationWhere = {
     ...(options.productId ? { productId: options.productId } : {}),
     ...(options.warehouseId ? { warehouseId: options.warehouseId } : {}),
     qty: { gt: 0 },
-    order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
   }
+  // Every COMMITTED (non-PENDING) shipment line, tagged with its status so both readings come off
+  // ONE query: SHIPPED is what has already given reservation back (the residual), non-PENDING is
+  // what the warehouse is holding. A PICKING/PACKED shipment has not decremented reservedQty, so
+  // netting it out of the residual would understate every picked order's live reservation.
+  //
+  // Deliberately NOT filtered by order status: the zero-demand rows above need their committed
+  // lines too, and `lineId` is unique to one order, so no other order's shipment can be matched.
   const activeShipmentWhere = {
     ...(options.productId ? { productId: options.productId } : {}),
     shipment: {
-      status: { not: 'PENDING' },
+      status: { not: UNCOMMITTED_SHIPMENT_STATUS },
       ...(options.warehouseId ? { warehouseId: options.warehouseId } : {}),
-      order: { status: { not: 'CANCELLED' }, refundStatus: { not: 'FULL' } },
     },
   }
   const productionWhere = {
@@ -203,6 +223,7 @@ export async function loadReservationSourceRows(
         shipment: {
           select: {
             warehouseId: true,
+            status: true,
           },
         },
       },
@@ -232,7 +253,10 @@ export async function loadReservationSourceRows(
     }),
   ])
 
+  // Two sums per allocation row off the SAME set of lines: everything committed, and the DISPATCHED
+  // subset of it that has already given reservation back.
   const committedByAllocation = new Map<string, Decimal>()
+  const dispatchedByAllocation = new Map<string, Decimal>()
   for (const shipmentLine of activeShipmentLines) {
     if (options.productId && shipmentLine.productId !== options.productId) continue
     if (options.warehouseId && shipmentLine.shipment.warehouseId !== options.warehouseId) continue
@@ -241,35 +265,76 @@ export async function loadReservationSourceRows(
       shipmentLine.productId,
       shipmentLine.shipment.warehouseId,
     )
-    committedByAllocation.set(
-      key,
-      (committedByAllocation.get(key) ?? ZERO).add(toDecimal(shipmentLine.qty)),
-    )
+    const qty = toDecimal(shipmentLine.qty)
+    committedByAllocation.set(key, (committedByAllocation.get(key) ?? ZERO).add(qty))
+    if (shipmentLine.shipment.status === RESERVATION_RELEASING_SHIPMENT_STATUS) {
+      dispatchedByAllocation.set(key, (dispatchedByAllocation.get(key) ?? ZERO).add(qty))
+    }
   }
 
-  const rows: ReservationBreakdownRow[] = []
+  // o3d-4kfh r3: THE TOLERANCE IS APPLIED AT THE SAME AGGREGATION STAGE AS THE SQL FAST PATH.
+  //
+  // `invariants.ts` builds the identical census in SQL, and there the tolerance is a
+  // `HAVING SUM(...) > tolerance` — applied to the (product, warehouse) TOTAL of each UNION branch,
+  // after aggregation. This function used to drop each ROW whose credited residual was <= 0.0001
+  // BEFORE anything was summed, so two legitimate 0.0001 residuals contributed 0 here and 0.0002
+  // there. `knownReservedQty` then differed between the two implementations of the same check, and
+  // the SQL-shape assertion cannot see it because it compares query text, not results. Many
+  // fractional KIT rows in one scope amplify the gap without limit.
+  //
+  // Rows are therefore collected first and filtered per BRANCH-scoped (product, warehouse) group,
+  // where the branch is the UNION arm the SQL puts that row in — a scope dropped in one arm must
+  // not silently remove a sibling counted in another. Rows that are exactly zero are still dropped
+  // individually: they add nothing to either sum, so that costs no parity and keeps the breakdown
+  // free of empty lines.
+  type BranchedRow = { branch: string; productId: string; warehouseId: string; qty: Decimal; row: ReservationBreakdownRow }
+  const branched: BranchedRow[] = []
   for (const allocation of allocations) {
     if (options.productId && allocation.productId !== options.productId) continue
     if (options.warehouseId && allocation.warehouseId !== options.warehouseId) continue
-    if (allocation.order.status === 'CANCELLED' || allocation.order.refundStatus === 'FULL') continue
 
-    const committed = committedByAllocation.get(
-      allocationKey(allocation.lineId, allocation.productId, allocation.warehouseId),
-    ) ?? ZERO
-    const remaining = positiveOrZero(toDecimal(allocation.qty).sub(committed))
-    if (remaining.lte(RESERVATION_EPSILON)) continue
+    const key = allocationKey(allocation.lineId, allocation.productId, allocation.warehouseId)
+    const dispatched = dispatchedByAllocation.get(key) ?? ZERO
+    // The LIVE reservation this row holds: whole claim minus what dispatch already gave back.
+    const residual = positiveOrZero(toDecimal(allocation.qty).sub(dispatched))
+    const zeroDemand = allocation.order.status === 'CANCELLED' || allocation.order.refundStatus === 'FULL'
+
+    // o3d-4kfh: on a zero-demand order the row is credited ONLY for the part the warehouse is
+    // still committed to (picked/packed but not yet dispatched). Anything above that is stale
+    // outstanding quantity with no demand behind it — a genuine leak, correctly left to fall into
+    // the unattributed bucket rather than being explained away.
+    const committedResidual = positiveOrZero(
+      (committedByAllocation.get(key) ?? ZERO).sub(dispatched),
+    )
+    const remaining = zeroDemand ? Prisma.Decimal.min(residual, committedResidual) : residual
+    if (remaining.lte(ZERO)) continue
 
     const reference = allocation.order.orderNumber
       ?? allocation.order.externalOrderNumber
       ?? allocation.orderId
-    rows.push({
-      source: 'sales_order',
+    const detail = allocation.line.sku ?? allocation.line.description
+    branched.push({
+      // The two sales-order UNION arms in the SQL: one for orders with outstanding demand, one for
+      // the zero-demand orders it excludes.
+      branch: zeroDemand ? 'sales_zero_demand' : 'sales_active',
       productId: allocation.productId,
       warehouseId: allocation.warehouseId,
-      referenceId: allocation.orderId,
-      referenceLabel: sourceLabel('SO', reference, allocation.line.sku ?? allocation.line.description),
-      qty: decimalString(remaining),
-      expectedDate: isoDate(allocation.order.expectedDelivery),
+      qty: remaining,
+      row: {
+        source: 'sales_order',
+        productId: allocation.productId,
+        warehouseId: allocation.warehouseId,
+        referenceId: allocation.orderId,
+        referenceLabel: sourceLabel(
+          'SO',
+          reference,
+          zeroDemand
+            ? `${detail} (committed shipment on ${allocation.order.status === 'CANCELLED' ? 'cancelled' : 'fully refunded'} order)`
+            : detail,
+        ),
+        qty: decimalString(remaining),
+        expectedDate: isoDate(allocation.order.expectedDelivery),
+      },
     })
   }
 
@@ -279,31 +344,54 @@ export async function loadReservationSourceRows(
       for (const component of order.outputProduct.productComponents) {
         if (options.productId && component.componentId !== options.productId) continue
         const qty = toDecimal(order.qtyPlanned).mul(toDecimal(component.qty))
-        if (qty.lte(RESERVATION_EPSILON)) continue
-        rows.push({
-          source: 'production_order',
+        if (qty.lte(ZERO)) continue
+        branched.push({
+          branch: 'production_assembly',
           productId: component.componentId,
           warehouseId: order.warehouseId,
-          referenceId: order.id,
-          referenceLabel: sourceLabel('MO', order.reference, 'assembly component'),
-          qty: decimalString(qty),
-          expectedDate: isoDate(order.scheduledAt),
+          qty,
+          row: {
+            source: 'production_order',
+            productId: component.componentId,
+            warehouseId: order.warehouseId,
+            referenceId: order.id,
+            referenceLabel: sourceLabel('MO', order.reference, 'assembly component'),
+            qty: decimalString(qty),
+            expectedDate: isoDate(order.scheduledAt),
+          },
         })
       }
     } else if (!options.productId || order.outputProductId === options.productId) {
       const qty = toDecimal(order.qtyPlanned)
-      if (qty.lte(RESERVATION_EPSILON)) continue
-      rows.push({
-        source: 'production_order',
+      if (qty.lte(ZERO)) continue
+      branched.push({
+        branch: 'production_disassembly',
         productId: order.outputProductId,
         warehouseId: order.warehouseId,
-        referenceId: order.id,
-        referenceLabel: sourceLabel('MO', order.reference, 'disassembly input'),
-        qty: decimalString(qty),
-        expectedDate: isoDate(order.scheduledAt),
+        qty,
+        row: {
+          source: 'production_order',
+          productId: order.outputProductId,
+          warehouseId: order.warehouseId,
+          referenceId: order.id,
+          referenceLabel: sourceLabel('MO', order.reference, 'disassembly input'),
+          qty: decimalString(qty),
+          expectedDate: isoDate(order.scheduledAt),
+        },
       })
     }
   }
+
+  const branchTotals = new Map<string, Decimal>()
+  for (const entry of branched) {
+    const key = `${entry.branch}|${entry.productId}|${entry.warehouseId}`
+    branchTotals.set(key, (branchTotals.get(key) ?? ZERO).add(entry.qty))
+  }
+  const rows = branched
+    .filter((entry) => (
+      (branchTotals.get(`${entry.branch}|${entry.productId}|${entry.warehouseId}`) ?? ZERO).gt(RESERVATION_EPSILON)
+    ))
+    .map((entry) => entry.row)
 
   return rows.sort((a, b) => {
     const sourceOrder = a.source.localeCompare(b.source)

@@ -20,6 +20,14 @@ import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/acc
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
+import {
+  applyBackReference,
+  backReferenceHolder,
+  findExternalDocumentIdClaim,
+  followUpObligationClaim,
+  isExternalDocumentIdConflict,
+  releaseFollowUpObligation,
+} from '@/lib/domain/accounting/back-reference'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
@@ -339,6 +347,10 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // Claimed in the SYNCED transaction, exactly as Xero does (r10 finding 1). See the
+              // block above enqueueFollowUps at the end of this file for why the marker is set here
+              // even though the QuickBooks sweep is still unwired.
+              ...followUpObligationClaim(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -351,8 +363,12 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             externalId: entry.externalTransactionId,
           })
         })
-        await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+        await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
         await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+        // Only reached when the enqueue did NOT throw. This branch has no catch of its own — an
+        // exception propagates to the outer handler, which retries the row — so the obligation
+        // simply stays claimed, which is the correct state for work that has not run.
+        await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
         result.succeeded++
         continue
       }
@@ -378,6 +394,10 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
               syncedAt: new Date(),
               errorMessage: null,
               processingStartedAt: null,
+              // The external id and the record that follow-ups are owed become durable in ONE
+              // write (r10 finding 1) — the comment above is exactly why they have to: everything
+              // after this transaction can die without the row ever being re-posted.
+              ...followUpObligationClaim(),
             },
           })
           await updateMirroredEventForSyncLog(tx, {
@@ -395,13 +415,19 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // These are best-effort: if they fail, the external post is already
         // safely recorded and won't be replayed.
         try {
-          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
+          await updateBackReference(entry.id, entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
+          await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: QBO_CONNECTOR })
         } catch (followUpError) {
           // ERROR, not WARNING: the external post is committed and this entry is about to be
           // marked succeeded, so nothing will drive these follow-ups again. A payment or PDF
           // that never got enqueued is silently missing until someone notices, and at WARNING
           // nobody does (Codex review, r6).
+          //
+          // The obligation is deliberately NOT released here (r10 finding 1). This branch marks the
+          // entry succeeded regardless, so the row is about to look identical to one whose
+          // follow-ups ran — the marker is the only thing left that says otherwise, and it is what
+          // lets the QuickBooks sweep pick the work up once o3d-s36z unblocks it.
           await logActivity({
             entityType: 'SYSTEM',
             action: 'quickbooks_followup_error',
@@ -817,7 +843,85 @@ async function processEntry(
   }
 }
 
+/**
+ * QUARANTINE a posted document whose back-reference the unique index refused (o3d-9kek r7 finding 1).
+ *
+ * The remote document exists. The sync row already records that durably — status SYNCED,
+ * externalTransactionId set, and retention compacts it to a tombstone that KEEPS the external id
+ * rather than deleting it — so nothing is lost. What was missing is a route forward, because the
+ * message told the operator to "link it by hand" and the same index refuses a manual link for
+ * exactly the same reason. This writes the conflict onto the row, names the document that is
+ * blocking, and names the one command that resolves it.
+ *
+ * STATUS STAYS SYNCED. Moving it to FAILED would surface it in the failed-sync banner, which is
+ * tempting and is wrong: queueQuickBooksSync suppresses a duplicate enqueue by looking for a row in
+ * `PENDING | PROCESSING | SYNCED`, so a row moved out of SYNCED stops suppressing itself and the
+ * document posts to QuickBooks a second time. `SYNCED` with a non-null `errorMessage` is otherwise
+ * an unreachable state — the success path nulls it — so it is an unambiguous marker on its own.
+ */
+async function quarantineRefusedBackReference(params: {
+  syncLogId: string
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  externalId: string
+  error: unknown
+}): Promise<void> {
+  const holder = backReferenceHolder(params.type, params.referenceType)
+  let blockedBy: string | null = null
+  if (holder) {
+    try {
+      blockedBy = (await findExternalDocumentIdClaim(db, { holder, externalId: params.externalId }))?.id ?? null
+    } catch (lookupError) {
+      // Naming the blocker is an improvement to the message, not a precondition for recording the
+      // conflict. A failed lookup must not swallow the quarantine as well.
+      console.error('quickbooks: could not identify the holder of external id', params.externalId, lookupError)
+    }
+  }
+  const blockerText = blockedBy
+    ? `${holder?.model} ${blockedBy} currently holds it`
+    : 'the record holding it could not be identified'
+  const remedy = blockedBy
+    ? 'If that is a bill/invoice from a QuickBooks company this system is no longer connected to, its id is stale and can be '
+      + `released: run \`tsx scripts/release-accounting-external-id-claim.ts --sync-log ${params.syncLogId} `
+      + `--holder ${blockedBy} --apply\`, which clears the id from that record and writes it onto this one in a single step. `
+      + 'Do NOT release it if that record is a live, correctly linked document — check it first.'
+    : 'Find the record carrying that id and, once you have confirmed it is stale, release it with '
+      + `\`tsx scripts/release-accounting-external-id-claim.ts --sync-log ${params.syncLogId} --holder <id> --apply\`.`
+  const description = `QuickBooks ${params.type} for ${params.referenceType} ${params.referenceId} POSTED SUCCESSFULLY as `
+    + `external id ${params.externalId}, but that id could not be recorded locally: ${blockerText}. `
+    + 'The document exists in QuickBooks and this sync row is the only local record of it — it is NOT re-posted and NOT retried '
+    + '(QuickBooks has no back-reference repair sweep; blocked on realm isolation, o3d-s36z). '
+    + remedy
+
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'quickbooks_backreference_id_conflict',
+    tag: 'sync',
+    level: 'ERROR',
+    description,
+    metadata: {
+      syncLogId: params.syncLogId,
+      type: params.type,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      externalId: params.externalId,
+      blockedByModel: holder?.model ?? null,
+      blockedById: blockedBy,
+      error: String(params.error),
+    },
+  })
+  try {
+    // The DURABLE half. The activity log is the notification; this is the state, on the row that
+    // carries the external id, so the conflict survives a log that has been pruned or never read.
+    await db.accountingSyncLog.update({ where: { id: params.syncLogId }, data: { errorMessage: description } })
+  } catch (markError) {
+    console.error('quickbooks: could not record the back-reference conflict on the sync row', params.syncLogId, markError)
+  }
+}
+
 async function updateBackReference(
+  syncLogId: string,
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
@@ -827,42 +931,73 @@ async function updateBackReference(
   if (!externalId) return
 
   try {
-    if (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') {
-      await db.salesOrder.update({
-        where: { id: referenceId },
-        data: {
-          accountingInvoiceId: externalId,
-          invoiceNumber: invoiceNumber ?? undefined,
-          invoicedAt: new Date(),
-        },
+    // EVERY type goes through the shared writer, exactly as Xero's does (o3d-9kek). Hand-rolled
+    // per-type updates here were how the two connectors drifted: this function kept its own copy of
+    // the PurchaseOrder "newest unlinked bill" guess and its own bare `update` for the bill-keyed
+    // case, so the resolver's refusal to guess, the compare-and-swap and the unique-index handling
+    // all had to be reimplemented — or, in practice, were not. There is exactly one writer now.
+    const applied = await applyBackReference(db, { connector: QBO_CONNECTOR, type, referenceType, referenceId, externalId, invoiceNumber })
+    // o3d-9kek: a legacy PurchaseOrder-keyed row names the ORDER, not the bill. It used to write
+    // the external id onto "the newest bill with no id yet" — which stamps the wrong bill the
+    // moment a PO has two, and a wrong id is worse than a missing one because it looks correct
+    // (later payments and bill updates then post against the wrong QuickBooks document). The
+    // shared resolver decides from the whole population for that PO and refuses to guess.
+    if (applied.outcome === 'ambiguous') {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'quickbooks_backreference_ambiguous',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Did not write the QuickBooks back-reference for PO ${referenceId}: its bill cannot be identified `
+          + `(${applied.attribution.reason}). Link the bill manually — the external id is on the sync row. `
+          + 'NOTHING re-checks this automatically: QuickBooks has no back-reference repair sweep (it is blocked on realm '
+          + 'isolation, o3d-s36z), so resolving the ambiguity on its own will not link the bill.',
+        metadata: { referenceType, referenceId, externalId, reason: applied.attribution.reason },
       })
-    } else if (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') {
-      await db.salesOrderRefund.update({
-        where: { id: referenceId },
-        data: { accountingCreditNoteId: externalId },
-      })
-    } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseInvoice') {
-      await db.purchaseInvoice.update({
-        where: { id: referenceId },
-        data: { accountingInvoiceId: externalId },
-      })
-    } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseOrder') {
-      // Entries are queued with referenceType 'PurchaseOrder' — find the
-      // latest PurchaseInvoice for this PO and store the external bill ID.
-      const invoice = await db.purchaseInvoice.findFirst({
-        where: { poId: referenceId, accountingInvoiceId: null },
-        orderBy: { createdAt: 'desc' },
-        select: { id: true },
-      })
-      if (invoice) {
-        await db.purchaseInvoice.update({
-          where: { id: invoice.id },
-          data: { accountingInvoiceId: externalId },
-        })
-      }
     }
-  } catch {
-    // Non-critical — log entry already marked as SYNCED
+    // o3d-9kek finding 3: the resolved bill gained an external id between the resolve and
+    // the compare-and-swap, so nothing was written and nothing was overwritten. Not an
+    // error — the repair sweep re-resolves it from the state that actually won.
+    if (applied.outcome === 'contended') {
+      console.warn(`quickbooks: back-reference for PO ${referenceId} lost the race for bill ${applied.purchaseInvoiceId}; it must be linked by hand.`)
+    }
+  } catch (error) {
+    // AN EXTERNAL-ID CONFLICT IS NOT A FAILURE TO REPORT AND FORGET (o3d-9kek r7 finding 1). The
+    // document is already in the QuickBooks ledger; the index refused only the LOCAL record of it.
+    // It gets the quarantine treatment above — the conflict written onto the row, the blocking
+    // document named, and the one command that resolves it — because the generic warning below
+    // ends in "link it by hand", and for THIS failure that instruction cannot be carried out: the
+    // same index refuses a manual link too.
+    if (isExternalDocumentIdConflict(error)) {
+      await quarantineRefusedBackReference({ syncLogId, type, referenceType, referenceId, externalId, error })
+      return
+    }
+    // Pre-existing: QuickBooks swallows back-reference failures here (Xero does not — it
+    // propagates so the caller retries). Still not changed, because de-swallowing alters QBO's
+    // retry semantics for every type at once. What IS changed is the SILENCE: since o3d-9kek made
+    // the bill's external id unique, a real attribution conflict — two local bills pointing at one
+    // QuickBooks document — arrives here as an exception, and an invisible one is
+    // indistinguishable from success.
+    //
+    // THE WARNING MUST NOT PROMISE A RETRY (o3d-9kek r6). An earlier revision of this branch bound
+    // the connector-agnostic repair sweep to QuickBooks and this message said the sweep would retry
+    // it. That binding was removed — see the block at the end of this file: the sweep is scoped by
+    // connector alone, and a QuickBooks external id only means anything within one realm, so after a
+    // realm switch it could attribute a retired company's id to a live document. Nothing retries a
+    // failed QuickBooks back-reference now, and the operator is told exactly that instead of being
+    // told a sweep exists. Telling someone a retry will happen when nothing retries is worse than
+    // saying nothing; o3d-s36z is what would make the sweep safe to bind again.
+    console.error(`quickbooks: back-reference write failed for ${referenceType} ${referenceId}`, error)
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_backreference_failed',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Could not write the QuickBooks back-reference for ${referenceType} ${referenceId}: ${String(error)}. `
+        + 'The external id is on the sync row, but NOTHING retries this: QuickBooks has no back-reference repair sweep '
+        + '(blocked on realm isolation, o3d-s36z). Link the document to that external id by hand.',
+      metadata: { type, referenceType, referenceId, externalId },
+    })
   }
 }
 
@@ -999,3 +1134,48 @@ async function enqueueFollowUps(
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// THERE IS DELIBERATELY NO QuickBooks BINDING OF THE BACK-REFERENCE REPAIR SWEEP (o3d-9kek r6).
+//
+// One existed briefly on this branch and was REMOVED on purpose. Do not re-add it without first
+// closing o3d-s36z (connector-tenant / realm isolation) — that issue is this binding's precondition,
+// not a nice-to-have alongside it.
+//
+// WHY. repairAccountingBackReferences scopes its candidate query by `connector` and nothing else. A
+// QuickBooks external id is a small integer that is only meaningful inside ONE realm (company), and
+// disconnecting removes the expected-realm pin entirely — so after reconnecting to realm B, an
+// unresolved row that posted to realm A is still a candidate, and the sweep would write realm A's
+// integer onto a local document. The payment poller then reads that id as a realm-B document and can
+// mark or update the WRONG bill or order.
+//
+// The global unique index on purchase_invoices.accounting_invoice_id does NOT cover this: it only
+// stops a SECOND local row taking an id another row already holds. When no local row holds the
+// orphaned id — which is exactly the state a realm switch leaves behind — the write succeeds.
+//
+// So the choice was between a sweep that can attribute across realms and no sweep at all, and the
+// governing principle decides it: failing to repair is acceptable, repairing onto the wrong document
+// is not. QuickBooks is the secondary connector; Xero is the priority one and has no realm exposure
+// here (its poller builds its match set from Xero itself), so the Xero binding stays.
+//
+// The cost of the absence is real and is stated honestly rather than papered over: a QuickBooks
+// back-reference that fails to write is NOT retried by anything, and updateBackReference's warnings
+// above say so in as many words instead of promising a sweep. Whoever closes o3d-s36z should re-add
+// the binding here — the connector-agnostic sweep module needs no changes for it, only a trustworthy
+// realm boundary underneath.
+//
+// THE FOLLOW-UP OBLIGATION MARKER IS STILL CLAIMED HERE, AND THAT IS NOT A CONTRADICTION (r10
+// finding 1). Recording that work is owed and repairing it are two different acts, and only the
+// second one is what o3d-s36z gates. The marker writes nothing to any accounting document and
+// crosses no realm boundary — it is a timestamp on the sync row that already carries the external
+// id — so none of the reasoning above applies to it.
+//
+// Claiming it now was the choice over deferring it because the alternative is not "no marker", it
+// is "a window that stays silent". A QuickBooks row that dies between its SYNCED write and its
+// enqueue is indistinguishable afterwards from one that completed, and nothing can recover that
+// distinction later: it has to be recorded at the moment it is true or not at all. Adding it when
+// the sweep is wired would leave every row written before then permanently unrecoverable, for the
+// same reason there is no backfill for rows written before the column existed. Xero having the
+// marker and QuickBooks not having it would also be a difference nobody chose — the two connectors
+// drifted once already, on precisely this function's back-reference logic.
+// ---------------------------------------------------------------------------

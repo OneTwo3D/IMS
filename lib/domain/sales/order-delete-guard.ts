@@ -22,11 +22,13 @@ import { WMS_LOOKUP_CONFIRMED_ABSENT } from '@/lib/domain/wms/order-status-sweep
  *    remote call (the link was written only AFTER pushOrder returned), so the push sweep
  *    now claims the link under the order lock before calling the WMS.
  *
- * Daily batches (A1 revenue deferral / A2 inventory allocation) are keyed by
- * `referenceType='DailyBatch'` and a synthetic `<group>-<date>[-<8 hex digest>]`
+ * Daily batches (A1 revenue deferral / A2 inventory allocation / B shipment revenue+COGS)
+ * are keyed by `referenceType='DailyBatch'` and a synthetic `<group>-<date>[-<8 hex digest>]`
  * referenceId, NOT by order id, so they cannot be found by an order-id lookup. They are
- * detected here from the order's own stage stamps (revenueDeferredDate /
- * inventoryAllocatedDate) mapped to the batch reference the daily sync would have used.
+ * detected here from the batch reference the daily sync STAMPED on the row when it staged it
+ * (revenueDeferredBatchRef / inventoryAllocatedBatchRef / Shipment.shipmentJournalBatchRef),
+ * falling back for pre-o3d-0qoo rows to re-deriving that reference from the stage stamp
+ * beside it (revenueDeferredDate / inventoryAllocatedDate / shipmentJournalDate).
  *
  * NOTE: this module only REFUSES. It does not reverse anything. Reversal semantics for
  * an already-posted A2 (so an allocated order can be withdrawn from the ledger rather
@@ -80,24 +82,52 @@ export function dailyBatchDateKey(value: Date | string | null | undefined): stri
 }
 
 /**
- * Prisma `where` fragment matching a daily-batch referenceId for one stage date, in both
- * shapes that exist in the wild: the bare `<group>-<date>` QuickBooks writes and the
- * digest-suffixed `<group>-<date>-<8 hex>` Xero's buildDailyBatchReferenceId writes.
- * Returns null when the order was never staged into that batch.
+ * Prisma `where` fragment matching the daily-batch referenceId a row was staged into.
+ *
+ * o3d-0qoo — TWO sources, and the match is their UNION:
+ *
+ *  - `persistedReferenceId`: the exact referenceId the daily sync stamped on the row inside
+ *    the same transaction as the stage stamp. This is the reliable one, and the only one
+ *    that survives a run crossing UTC midnight: both daily-sync implementations capture the
+ *    batch date ONCE at run start and write the stage stamps with later new Date() calls, so
+ *    a batch keyed A2-2026-07-20-<digest> can leave a stamp of 2026-07-21T00:0x:xxZ behind.
+ *  - the derived shapes, in both forms that exist in the wild: the bare `<group>-<date>`
+ *    QuickBooks writes and the digest-suffixed `<group>-<date>-<8 hex>` Xero's
+ *    buildDailyBatchReferenceId writes. Pre-migration rows have no persisted ref, so this is
+ *    all they have.
+ *
+ * The union — rather than "persisted, else derived" — is deliberate. This guard's job is to
+ * REFUSE an irreversible delete, so it must never match a strictly smaller set than it did
+ * before the column existed; a persisted ref that somehow disagreed with a real log would
+ * otherwise open exactly the hole this closes. Over-matching costs a false blocker, which an
+ * operator can investigate. Under-matching costs a journal nothing can take back out.
+ *
+ * Returns null only when the row was never staged into that batch at all.
  */
 export function dailyBatchReferenceWhere(
   group: 'A1' | 'A2' | 'B',
   stagedAt: Date | string | null | undefined,
+  persistedReferenceId?: string | null,
 ): Prisma.AccountingSyncLogWhereInput | null {
+  const alternatives: Prisma.AccountingSyncLogWhereInput[] = []
+  if (persistedReferenceId) alternatives.push({ referenceId: persistedReferenceId })
   const key = dailyBatchDateKey(stagedAt)
-  if (!key) return null
-  const bare = `${group}-${key}`
-  return { OR: [{ referenceId: bare }, { referenceId: { startsWith: `${bare}-` } }] }
+  if (key) {
+    const bare = `${group}-${key}`
+    alternatives.push({ referenceId: bare }, { referenceId: { startsWith: `${bare}-` } })
+  }
+  if (alternatives.length === 0) return null
+  return { OR: alternatives }
 }
 
 export type SalesOrderDeleteStageStamps = {
   revenueDeferredDate: Date | null
   inventoryAllocatedDate: Date | null
+  // o3d-0qoo: the exact batch referenceIds, required rather than optional so that a caller
+  // that forgets to select them fails to compile instead of silently falling back to the
+  // derive-from-stamp path this issue exists to stop relying on.
+  revenueDeferredBatchRef: string | null
+  inventoryAllocatedBatchRef: string | null
 }
 
 /**
@@ -222,7 +252,12 @@ export async function findSalesOrderDeleteBlocker(
   }
 
   // 2. Accounting documents keyed by this order (or by one of its shipments).
-  const shipments = await tx.shipment.findMany({ where: { orderId }, select: { id: true } })
+  const shipments = await tx.shipment.findMany({
+    where: { orderId },
+    // shipmentJournalDate / shipmentJournalBatchRef are for the Group B check further down,
+    // read here so the guard makes one shipment query rather than two.
+    select: { id: true, shipmentJournalDate: true, shipmentJournalBatchRef: true },
+  })
   const shipmentIds = shipments.map((shipment) => shipment.id)
   const orderKeyed: Prisma.AccountingSyncLogWhereInput[] = [
     { referenceType: 'SalesOrder', referenceId: orderId },
@@ -305,16 +340,59 @@ export async function findSalesOrderDeleteBlocker(
     })
   }
 
-  // 3. Daily batches. These are DailyBatch-keyed, so they are unreachable by order id —
-  // derive the batch reference from the order's own stage stamps instead. A live batch
+  // 3. Daily batches. These are DailyBatch-keyed, so they are unreachable by order id — match
+  // them on the batch reference the daily sync stamped on the row when it staged it, or, for
+  // pre-o3d-0qoo rows that have none, on one re-derived from the stage stamp. A live batch
   // log means this order's value is inside a journal that is queued or already in the
   // ledger, and nothing here can take it back out.
-  const stagedBatches: Array<{ group: 'A1' | 'A2'; type: string; label: string; stagedAt: Date | null }> = [
-    { group: 'A1', type: 'DAILY_BATCH_REVENUE_DEFERRAL', label: 'A1 revenue deferral', stagedAt: stamps.revenueDeferredDate },
-    { group: 'A2', type: 'DAILY_BATCH_INVENTORY_ALLOC', label: 'A2 inventory allocation', stagedAt: stamps.inventoryAllocatedDate },
+  //
+  // Group B (shipment revenue recognition + COGS) is checked alongside A1/A2 because it is
+  // the same kind of claim: a DailyBatch-keyed journal that carries THIS order's value and
+  // cannot be un-posted from here. Its stage stamp lives on the shipments rather than the
+  // order, and its FK cascades, so deleting the order erases the only local record of what
+  // the journal was built from.
+  const stagedBatches: Array<{
+    group: 'A1' | 'A2' | 'B'
+    type: string
+    label: string
+    stagedAt: Date | null
+    persistedRef: string | null
+  }> = [
+    {
+      group: 'A1',
+      type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+      label: 'A1 revenue deferral',
+      stagedAt: stamps.revenueDeferredDate,
+      persistedRef: stamps.revenueDeferredBatchRef,
+    },
+    {
+      group: 'A2',
+      type: 'DAILY_BATCH_INVENTORY_ALLOC',
+      label: 'A2 inventory allocation',
+      stagedAt: stamps.inventoryAllocatedDate,
+      persistedRef: stamps.inventoryAllocatedBatchRef,
+    },
+    // One entry per journalled shipment: two shipments of the same order can be staged into
+    // two different Group B batches (they are staged as they ship), so a single stamp cannot
+    // stand for the order.
+    ...shipments
+      .filter((shipment) => shipment.shipmentJournalDate || shipment.shipmentJournalBatchRef)
+      .map((shipment) => ({
+        group: 'B' as const,
+        type: 'DAILY_BATCH_GROUP_B',
+        label: 'B shipment revenue/COGS',
+        stagedAt: shipment.shipmentJournalDate,
+        persistedRef: shipment.shipmentJournalBatchRef,
+      })),
   ]
+  // Several shipments of one order commonly land in the SAME Group B batch, and each would
+  // otherwise repeat an identical query and push an identical blocker.
+  const seenBatchKeys = new Set<string>()
   for (const batch of stagedBatches) {
-    const referenceWhere = dailyBatchReferenceWhere(batch.group, batch.stagedAt)
+    const batchKey = `${batch.group}|${batch.persistedRef ?? ''}|${dailyBatchDateKey(batch.stagedAt) ?? ''}`
+    if (seenBatchKeys.has(batchKey)) continue
+    seenBatchKeys.add(batchKey)
+    const referenceWhere = dailyBatchReferenceWhere(batch.group, batch.stagedAt, batch.persistedRef)
     if (!referenceWhere) continue
     const liveBatch = await tx.accountingSyncLog.findFirst({
       where: {
