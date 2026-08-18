@@ -3,13 +3,12 @@
  * (Named for the LIVE tenant it was built to target. That attribution turned out to be wrong —
  * see the warning immediately below. The filename is kept so the PR/issue history still resolves.)
  *
- * !!! READ THIS BEFORE RUNNING — THE ORIGINAL PREMISE WAS DISPROVED (2026-08-10) !!!
+ * !!! THIS OPERATION IS DISABLED. ITS PREMISE WAS DISPROVED (2026-08-10) !!!
  *
  * This script was written on the belief that the 553 ids in the CSV address objects in the LIVE
- * organisation. THEY DO NOT. The org-side audit (audit-xero-live-e2e-footprint.ts, run against
- * One Two Enterprises Ltd dd2af957-3438-4010-8e85-7841c33c8328) resolved every one of them: all
- * 553 return 404 and the overlap with the org's actual E2E footprint is 0 of 553. They are
- * DEMO-tenant ids, from the periods the instance was pointed at Demo Company (UK).
+ * organisation. THEY DO NOT. They are DEMO-tenant ids, from the periods the instance was pointed
+ * at Demo Company (UK). See "WHAT THE 404 EVIDENCE ACTUALLY SUPPORTS" below for exactly how far
+ * that is established and how far it is not.
  *
  * That inverts the argument for running this. The instance is connected to Demo RIGHT NOW, so
  * these ids are not stranded pointers to an unreachable org — they are plausibly CURRENT and
@@ -17,12 +16,34 @@
  * retiring dead ids; it would be deleting live back-references, after which the sweep re-creates
  * links and the pollers stop reconciling the documents they belong to.
  *
- * So this script is NOT the cleanup for o3d-t74p. The live-org cleanup is
- * remove-xero-live-e2e-footprint.ts, indexed from the ORG (contact/item prefixes), because the
- * sync log indexes the wrong tenant entirely. This file is kept for two reasons only: it is the
- * evidence trail for how the id set was scoped, and it remains the tool to use IF a future
- * decision is that e2e's Demo-tenant history should be dropped wholesale. Confirm which tenant
- * the ids belong to before passing --apply, because the CSV name says "live" and it is wrong.
+ * So --apply now REFUSES. A prominent warning in a header is not a control: the previous guard
+ * failed open in three ways at once (it positively permitted the connected Demo tenant, it
+ * permitted ZERO token rows, and its "e2e database" check was a substring match on DATABASE_URL
+ * that a username or query parameter can satisfy while connected elsewhere). The refusal can only
+ * be lifted by a deliberate, documented override — see SAFETY below — and every check in it is
+ * positive: it requires proof of the expected state, never the absence of a wrong one.
+ *
+ * WHAT THE 404 EVIDENCE ACTUALLY SUPPORTS
+ * ---------------------------------------
+ * The 2026-08-10 reconciliation (xero-live-reconciliation-20260810.csv) resolved all 553 ids
+ * against the live org and none of them came back PRESENT. But "not present" was reached by four
+ * different routes of very different strength, and only one of them is an HTTP 404:
+ *
+ *    14 payments      per-id GET Payments/{id} -> HTTP 404.        CONFIRMED ABSENT.
+ *   234 invoices      absent from a batched GET Invoices?IDs=.     Absent from a collection read,
+ *    54 credit notes  absent from a batched/per-id CreditNotes read.  not a per-id 404 — and a
+ *                                                                  FAILED batch produced the same
+ *                                                                  "NOT_FOUND" as a successful one.
+ *   251 journals      never fetched by id at all. The sweep paged  NOT ESTABLISHED. This only ever
+ *                     ManualJournals and stopped at the first      meant "not seen in the pages
+ *                     page shorter than 100.                       that were read".
+ *
+ * So "all 553 returned 404" is true of 14 ids. The INDEPENDENT cross-check is stronger and is what
+ * the Demo attribution actually rests on: audit-xero-live-e2e-footprint.ts indexes the org by the
+ * fixtures' own contact/item naming and finds 0 of 553 CSV ids among the 370 objects it holds —
+ * a different index reaching the same conclusion. That cross-check does NOT cover manual journals,
+ * which carry no contact and are not in the footprint at all. The journal bucket is UNKNOWN, not
+ * absent, and audit-xero-live-contamination.ts now reports it that way.
  *
  * o3d-s36z (nothing stamps a tenant onto these rows, so nothing can tell which org an id belongs
  * to) is the underlying defect and is UNCHANGED — this incident is precisely its consequence.
@@ -45,19 +66,31 @@
  * the only remaining link for the 106 sales-invoice rows whose local order no longer exists.
  *
  * SAFETY
- *   • Dry run by default; --apply is required to write, and writes in a single transaction.
- *   • Refuses to run against anything but the e2e database.
- *   • Refuses to run if this instance is currently connected to a non-Demo tenant — that would
- *     mean the incident is live again and clearing local ids is the wrong response.
- *   • Every statement is bounded by the explicit id list from the CSV. There is no unqualified
- *     UPDATE here, so a row outside that set cannot be touched.
+ *   • Dry run is the ONLY mode available by default. --apply refuses outright.
+ *   • Lifting the refusal requires ALL of, together:
+ *       --i-have-read-o3d-t74p-and-authorize-demo-history-retirement
+ *       --authorization <file> containing token/tenantId/database/ids/authorizedBy/authorizedAt
+ *       `select current_database()` equal to the expected database EXACTLY (not a URL substring)
+ *       EXACTLY ONE Xero token row, positively matching the authorised tenant
+ *       an id count equal to the one the authorization was signed off for
+ *     The refusal and every one of those checks are pure functions in
+ *     scripts/lib/xero-live-safety.ts, covered by tests/scripts/xero-live-safety.test.ts.
+ *   • Writes happen in a single transaction, bounded by the explicit id list from the CSV.
+ *     There is no unqualified UPDATE here, so a row outside that set cannot be touched.
  *
  * USAGE
  *   DATABASE_URL=postgresql://.../onetwo3d_ims_e2e node_modules/.bin/tsx \
- *     scripts/retire-live-tenant-external-ids.ts [--apply]
+ *     scripts/retire-live-tenant-external-ids.ts                       # dry run (the only mode)
  */
 import { Client } from 'pg'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
+
+import {
+  assertRetirementAuthorized,
+  parseRetirementAuthorization,
+  RETIREMENT_OVERRIDE_FLAG,
+  type RetirementAuthorization,
+} from './lib/xero-live-safety'
 
 const APPLY = process.argv.includes('--apply')
 
@@ -66,6 +99,8 @@ function arg(name: string, fallback?: string): string | undefined {
   return i >= 0 && process.argv[i + 1] ? process.argv[i + 1] : fallback
 }
 const CSV_PATH = arg('csv', '/root/xero-live-e2e-contamination-20260804.csv')!
+const OVERRIDE_PRESENT = process.argv.includes(RETIREMENT_OVERRIDE_FLAG)
+const AUTHORIZATION_PATH = arg('authorization')
 
 const E2E_DATABASE = 'onetwo3d_ims_e2e'
 const DEMO_TENANT_ID = '5c949ed5-9ac0-4f43-b716-b38ee59fe7cf'
@@ -91,22 +126,54 @@ function readContaminatedIds(path: string): string[] {
   return unique
 }
 
-async function guard(db: Client): Promise<void> {
-  const url = process.env.DATABASE_URL ?? ''
-  if (!url.includes(E2E_DATABASE)) {
-    throw new Error(`ABORT: DATABASE_URL does not point at ${E2E_DATABASE}. This script is for the e2e instance only.`)
+/**
+ * Even the read-only report is confined to the e2e database. Not because counting rows is
+ * dangerous, but because "would clear 553 ids" printed against production is a sentence nobody
+ * should ever read. This replaces the old `DATABASE_URL.includes(...)` substring check, which a
+ * username or query parameter could satisfy while connected elsewhere.
+ */
+async function assertE2eDatabase(db: Client): Promise<string> {
+  const res = await db.query<{ current_database: string }>('select current_database()')
+  const name = res.rows[0]?.current_database
+  if (name !== E2E_DATABASE) {
+    throw new Error(`ABORT: connected to database ${JSON.stringify(name ?? null)}, not ${E2E_DATABASE}. This script is for the e2e instance only.`)
+  }
+  return name
+}
+
+/**
+ * The apply-path refusal. Read-only reporting never reaches this — it is called only when the
+ * operator asked to WRITE, and its default answer is no.
+ */
+async function assertAuthorizedToWrite(db: Client, idCount: number): Promise<void> {
+  let authorization: RetirementAuthorization | null = null
+  if (AUTHORIZATION_PATH) {
+    if (!existsSync(AUTHORIZATION_PATH)) throw new Error(`REFUSED: no authorization file at ${AUTHORIZATION_PATH}`)
+    authorization = parseRetirementAuthorization(readFileSync(AUTHORIZATION_PATH, 'utf8'))
   }
 
+  // Ask the SERVER what database this is. DATABASE_URL is a request, not an identity: a username,
+  // a password or a query value containing "onetwo3d_ims_e2e" satisfies a substring check while the
+  // session is connected to something else entirely.
+  const dbName = await db.query<{ current_database: string }>('select current_database()')
   const tok = await db.query<{ tenantId: string; tenantName: string | null }>(
     `select "tenantId", "tenantName" from accounting_tokens where connector = 'xero'`,
   )
-  if (tok.rows.length && tok.rows[0].tenantId !== DEMO_TENANT_ID) {
-    throw new Error(
-      `ABORT: this instance is connected to "${tok.rows[0].tenantName ?? tok.rows[0].tenantId}", not the Demo org. ` +
-        `If that is a live organisation, the incident is ONGOING — disconnect it before clearing anything locally.`,
-    )
-  }
-  console.log(`Connected tenant: ${tok.rows[0]?.tenantName ?? '(none)'} — ok`)
+
+  assertRetirementAuthorized({
+    overrideFlagPresent: OVERRIDE_PRESENT,
+    authorization,
+    currentDatabase: dbName.rows[0]?.current_database ?? null,
+    expectedDatabase: E2E_DATABASE,
+    tenantRows: tok.rows,
+    expectedTenantId: DEMO_TENANT_ID,
+    idCount,
+  })
+
+  console.log(
+    `\nAUTHORIZED: ${authorization!.authorizedBy} on ${authorization!.authorizedAt} — ` +
+      `database ${dbName.rows[0].current_database}, tenant ${tok.rows[0].tenantName ?? tok.rows[0].tenantId}, ${idCount} id(s).`,
+  )
 }
 
 async function main() {
@@ -116,7 +183,9 @@ async function main() {
   const db = new Client({ connectionString: process.env.DATABASE_URL })
   await db.connect()
   try {
-    await guard(db)
+    // The report below is read-only, but it is still confined to the e2e database. The write path
+    // is gated separately and far more strictly, immediately before the first UPDATE.
+    console.log(`Connected database: ${await assertE2eDatabase(db)} — ok`)
 
     // Count exactly what is in scope, and — just as important — prove nothing outside the CSV is.
     const syncLog = await db.query<{ in_scope: string; total: string }>(
@@ -153,10 +222,13 @@ async function main() {
     }
 
     if (!APPLY) {
-      console.log(`\n=== DRY RUN — nothing written. Re-run with --apply to clear these. ===`)
+      console.log(`\n=== DRY RUN — nothing written. ===`)
+      console.log(`--apply is REFUSED: the premise for this operation was disproved (see the header).`)
       console.log(`Would clear ${syncLog.rows[0].in_scope} sync-log id(s) and ${backRefs.reduce((n, b) => n + b.inScope, 0)} back-reference(s).`)
       return
     }
+
+    await assertAuthorizedToWrite(db, ids.length)
 
     await db.query('begin')
     try {

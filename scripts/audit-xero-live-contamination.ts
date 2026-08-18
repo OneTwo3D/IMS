@@ -6,6 +6,30 @@
  * actually there now — so the cleanup worklist is built from Xero's answer rather than from a name
  * search in the UI. It writes NOTHING, anywhere.
  *
+ * ABSENCE IS A CLAIM, AND IT HAS TO BE EARNED
+ * -------------------------------------------
+ * Every id ends in one of four states, and they are not interchangeable:
+ *
+ *   PRESENT     Xero returned the object.
+ *   NOT_FOUND   a GET on the id ITSELF answered HTTP 404. The only proof of absence there is.
+ *   UNKNOWN     no read conclusively resolved it — a collection read did not mention it and no
+ *               per-id read confirmed that, or a 200 came back with no object in it.
+ *   ERROR       a read failed. Says nothing whatsoever about whether the object exists.
+ *
+ * The `evidence` column records which read produced the verdict. This matters because the first
+ * version of this script did not make the distinction, and the conclusion drawn from its output —
+ * "all 553 ids return 404 against the live org, so they are Demo ids" — was true of 14 of them.
+ * The other 539 were absent from a COLLECTION read, and 251 of those (the manual journals) were
+ * never fetched by id at all: they were labelled NOT_FOUND for not appearing in the pages the
+ * script happened to read before it stopped at the first page shorter than 100. A failed batch
+ * produced exactly the same NOT_FOUND as a successful one, so up to 40 false absences could be
+ * manufactured per failed request.
+ *
+ * Both are fixed here: collection reads are only used to find what IS present, everything else is
+ * settled by a per-id GET (bounded retry, --no-confirm-absence to skip at the cost of UNKNOWN
+ * verdicts), paging runs to an EMPTY page, and a run with ANY unresolved id prints INCONCLUSIVE
+ * and exits non-zero rather than publishing a reconciliation.
+ *
  * WHY IT DOES NOT IMPORT lib/connectors/xero/*
  * -------------------------------------------
  * Every helper there resolves auth through getAccessToken() -> db.accountingToken
@@ -19,9 +43,11 @@
  *
  * CALL BUDGET (Xero: 60/min, 5,000/day, per tenant per app)
  * --------------------------------------------------------
- * ~32 calls for the full sweep: invoices and credit notes are fetched in batched IDs= filters,
- * manual journals are paged with If-Modified-Since rather than fetched one by one. Only the
- * per-minute ceiling is reachable, so calls are paced and 429 Retry-After is honoured.
+ * Collection reads are cheap — invoices and credit notes in batched IDs= filters, manual journals
+ * paged with If-Modified-Since — but confirming an absence costs one GET per unresolved id, so a
+ * sweep where most ids are gone costs roughly one call per id. Budget for that: run --plan-only
+ * first, and note that Xero's daily cap is as low as 1,000/org/24h on some plans. Calls are paced
+ * and 429 Retry-After is honoured.
  *
  * USAGE
  *   # one-time: add the loopback redirect URI below to the Xero app in the developer portal
@@ -41,7 +67,10 @@
  *   --port <n>         loopback port for the OAuth callback (default 53100)
  *   --token-file <p>   where to cache the audit token (default /root/.xero-audit-token.json, 0600)
  *   --allow-demo       permit auditing Demo Company (UK); refused by default as a mistake-catcher
- *   --max-calls <n>    hard ceiling on API calls (default 500)
+ *   --max-calls <n>    hard ceiling on API calls (default 2000)
+ *   --no-confirm-absence   skip the per-id confirmation GETs. Cheaper, but then nothing can be
+ *                          reported as NOT_FOUND — those ids come back UNKNOWN and the run is
+ *                          INCONCLUSIVE by construction.
  *
  * The credentials come from the e2e database's own settings (xero_client_id / xero_client_secret,
  * decrypted with SETTINGS_ENCRYPTION_KEY) so no secret needs to be pasted on a command line;
@@ -52,6 +81,14 @@ import { createServer } from 'node:http'
 import { createInterface } from 'node:readline'
 import { createDecipheriv, randomBytes } from 'node:crypto'
 import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
+
+import {
+  isConclusive,
+  pageAllComplete,
+  resolveById,
+  type Resolution,
+} from './lib/xero-live-safety'
+
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
@@ -106,7 +143,15 @@ const CSV_PATH = arg('csv', '/root/xero-live-e2e-contamination-20260804.csv')!
 const OUT_PATH = arg('out', `./xero-live-reconciliation-${new Date().toISOString().slice(0, 10)}.csv`)!
 const CALLBACK_PORT = Number(arg('port', '53100'))
 const TOKEN_FILE = arg('token-file', '/root/.xero-audit-token.json')!
-const MAX_CALLS = Number(arg('max-calls', '500'))
+const MAX_CALLS = Number(arg('max-calls', '2000'))
+/**
+ * Confirm every id a collection read did not return with a GET on the id itself. ON by default:
+ * without it the audit cannot say NOT_FOUND about anything, only UNKNOWN. Turning it off is a
+ * budget decision, and it degrades the verdicts rather than changing them.
+ */
+const CONFIRM_ABSENCE = !process.argv.includes('--no-confirm-absence')
+/** Manual journals page until EMPTY; this is only the runaway stop, and hitting it is an error. */
+const JOURNAL_PAGE_CEILING = Number(arg('journal-page-ceiling', '50'))
 const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}/callback`
 
 // ---------------------------------------------------------------------------
@@ -643,7 +688,18 @@ type Finding = {
   entity: Entity
   syncType: string
   postedAt: string
+  /** PRESENT: the Xero status. Otherwise the Resolution — NOT_FOUND / UNKNOWN / ERROR. */
   actualStatus: string
+  /**
+   * How that verdict was reached, in its own column so a reader never has to infer it from prose.
+   *   per-id-404          a GET by id answered HTTP 404. The only proof of absence.
+   *   per-id-200          a GET by id returned the object.
+   *   collection-hit      the object came back in a batched/paged collection read.
+   *   collection-miss     a SUCCESSFUL collection read did not contain it, and no per-id read was
+   *                       done. Suggestive, not conclusive.
+   *   read-failed         a read errored. Says nothing at all about whether the object exists.
+   */
+  evidence: string
   xeroType: string
   number: string
   date: string
@@ -662,6 +718,57 @@ function xeroDate(value?: string): string {
   return new Date(Number(m[1])).toISOString().slice(0, 10)
 }
 
+function unresolvedFinding(id: string, row: ContaminationRow, entity: Entity, resolution: Resolution, evidence: string, note: string): Finding {
+  return {
+    uuid: id, entity, syncType: row.type, postedAt: row.createdAt,
+    actualStatus: resolution, evidence, xeroType: '', number: '', date: '', total: '', currency: '',
+    contact: '', blockers: '', note,
+  }
+}
+
+/**
+ * Confirm, by a GET on the id itself, whether an object that a collection read did not return
+ * actually exists.
+ *
+ * This is the whole of findings 5 and 6. A collection read that does not mention an id is not
+ * evidence that the id is gone: the batch may have failed, the filter may have been ignored, the
+ * paging may have stopped early. Only `GET <Endpoint>/{id}` -> 404 says the object is absent, and
+ * only that is allowed to print NOT_FOUND. Everything else is UNKNOWN, and an UNKNOWN anywhere
+ * makes the whole reconciliation inconclusive and the exit code non-zero.
+ */
+async function confirmAbsence<T>(
+  token: StoredToken,
+  endpoint: string,
+  key: string,
+  id: string,
+): Promise<{ resolution: Resolution; evidence: string; note: string; object?: T }> {
+  if (!CONFIRM_ABSENCE) {
+    return {
+      resolution: 'UNKNOWN',
+      evidence: 'collection-miss',
+      note: 'not returned by a collection read; per-id confirmation skipped (--no-confirm-absence)',
+    }
+  }
+  // A bounded retry, because a single transient 5xx must not decide the verdict either way.
+  let last: { ok: boolean; status: number; error?: string; data?: Record<string, T[]> } | null = null
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const res = await xeroGet<Record<string, T[]>>(token, `${endpoint}/${id}`)
+    last = res
+    if (res.ok || res.status === 404) break
+    if (attempt < 3) await sleep(1500 * attempt)
+  }
+  const object = last?.data?.[key]?.[0]
+  const resolution = resolveById(last!, !!object)
+  if (resolution === 'PRESENT') return { resolution, evidence: 'per-id-200', note: '', object }
+  if (resolution === 'NOT_FOUND') {
+    return { resolution, evidence: 'per-id-404', note: 'GET by id returned HTTP 404 — confirmed absent' }
+  }
+  if (last!.ok) {
+    return { resolution: 'UNKNOWN', evidence: 'per-id-200', note: 'HTTP 200 but no object in the response' }
+  }
+  return { resolution: 'ERROR', evidence: 'read-failed', note: `per-id read failed: HTTP ${last!.status}` }
+}
+
 async function sweepInvoices(token: StoredToken, rows: ContaminationRow[]): Promise<Finding[]> {
   const findings: Finding[] = []
   const byId = new Map(rows.map((r) => [r.externalTransactionId, r]))
@@ -670,7 +777,10 @@ async function sweepInvoices(token: StoredToken, rows: ContaminationRow[]): Prom
   for (const batch of chunk([...byId.keys()], 40)) {
     const res = await xeroGet<{ Invoices?: XeroInvoice[] }>(token, `Invoices?IDs=${batch.join(',')}`)
     if (!res.ok) {
-      console.log(`  ! invoice batch failed (HTTP ${res.status}): ${res.error}`)
+      // The batch is simply not evidence. Every id in it falls through to per-id confirmation
+      // below rather than being emitted as an absence — a transient 5xx used to manufacture up to
+      // 40 false "already gone" verdicts per request.
+      console.log(`  ! invoice batch failed (HTTP ${res.status}): ${res.error} — ${batch.length} id(s) fall back to per-id reads`)
       continue
     }
     for (const inv of res.data?.Invoices ?? []) {
@@ -680,37 +790,40 @@ async function sweepInvoices(token: StoredToken, rows: ContaminationRow[]): Prom
       const row = byId.get(inv.InvoiceID)
       if (!row) continue
       found.add(inv.InvoiceID)
-      // What must be undone BEFORE this invoice can be voided, in Xero's own terms.
-      const blockers: string[] = []
-      for (const p of inv.Payments ?? []) blockers.push(`payment:${p.PaymentID}`)
-      for (const c of inv.CreditNotes ?? []) blockers.push(`creditnote:${c.CreditNoteID}`)
-      findings.push({
-        uuid: inv.InvoiceID,
-        entity: 'invoice',
-        syncType: row.type,
-        postedAt: row.createdAt,
-        actualStatus: inv.Status,
-        xeroType: inv.Type,
-        number: inv.InvoiceNumber ?? '',
-        date: xeroDate(inv.Date),
-        total: String(inv.Total ?? ''),
-        currency: inv.CurrencyCode ?? '',
-        contact: inv.Contact?.Name ?? '',
-        blockers: blockers.join(' '),
-        note: '',
-      })
+      findings.push(invoiceFinding(inv, row, 'collection-hit'))
     }
   }
 
   for (const [id, row] of byId) {
     if (found.has(id)) continue
-    findings.push({
-      uuid: id, entity: 'invoice', syncType: row.type, postedAt: row.createdAt,
-      actualStatus: 'NOT_FOUND', xeroType: '', number: '', date: '', total: '', currency: '',
-      contact: '', blockers: '', note: 'not returned by Xero (never landed, or hard-deleted)',
-    })
+    const c = await confirmAbsence<XeroInvoice>(token, 'Invoices', 'Invoices', id)
+    if (c.object) findings.push(invoiceFinding(c.object, row, c.evidence))
+    else findings.push(unresolvedFinding(id, row, 'invoice', c.resolution, c.evidence, c.note))
   }
   return findings
+}
+
+function invoiceFinding(inv: XeroInvoice, row: ContaminationRow, evidence: string): Finding {
+  // What must be undone BEFORE this invoice can be voided, in Xero's own terms.
+  const blockers: string[] = []
+  for (const p of inv.Payments ?? []) blockers.push(`payment:${p.PaymentID}`)
+  for (const c of inv.CreditNotes ?? []) blockers.push(`creditnote:${c.CreditNoteID}`)
+  return {
+    uuid: inv.InvoiceID,
+    entity: 'invoice',
+    syncType: row.type,
+    postedAt: row.createdAt,
+    actualStatus: inv.Status,
+    evidence,
+    xeroType: inv.Type,
+    number: inv.InvoiceNumber ?? '',
+    date: xeroDate(inv.Date),
+    total: String(inv.Total ?? ''),
+    currency: inv.CurrencyCode ?? '',
+    contact: inv.Contact?.Name ?? '',
+    blockers: blockers.join(' '),
+    note: '',
+  }
 }
 
 async function sweepCreditNotes(token: StoredToken, rows: ContaminationRow[]): Promise<Finding[]> {
@@ -741,35 +854,25 @@ async function sweepCreditNotes(token: StoredToken, rows: ContaminationRow[]): P
       const row = byId.get(cn.CreditNoteID)
       if (!row) continue
       found.add(cn.CreditNoteID)
-      findings.push(creditNoteFinding(cn, row))
+      findings.push(creditNoteFinding(cn, row, 'collection-hit'))
     }
   }
 
   if (!batchWorks) {
     found.clear()
     findings.length = 0
-    for (const [id, row] of byId) {
-      const res = await xeroGet<{ CreditNotes?: XeroCreditNote[] }>(token, `CreditNotes/${id}`)
-      const cn = res.data?.CreditNotes?.[0]
-      if (res.ok && cn) {
-        found.add(id)
-        findings.push(creditNoteFinding(cn, row))
-      }
-    }
   }
 
   for (const [id, row] of byId) {
     if (found.has(id)) continue
-    findings.push({
-      uuid: id, entity: 'creditnote', syncType: row.type, postedAt: row.createdAt,
-      actualStatus: 'NOT_FOUND', xeroType: '', number: '', date: '', total: '', currency: '',
-      contact: '', blockers: '', note: 'not returned by Xero (never landed, or hard-deleted)',
-    })
+    const c = await confirmAbsence<XeroCreditNote>(token, 'CreditNotes', 'CreditNotes', id)
+    if (c.object) findings.push(creditNoteFinding(c.object, row, c.evidence))
+    else findings.push(unresolvedFinding(id, row, 'creditnote', c.resolution, c.evidence, c.note))
   }
   return findings
 }
 
-function creditNoteFinding(cn: XeroCreditNote, row: ContaminationRow): Finding {
+function creditNoteFinding(cn: XeroCreditNote, row: ContaminationRow, evidence: string): Finding {
   const blockers: string[] = []
   for (const a of cn.Allocations ?? []) {
     if (a.Invoice?.InvoiceID) blockers.push(`allocated-to:${a.Invoice.InvoiceID}`)
@@ -781,6 +884,7 @@ function creditNoteFinding(cn: XeroCreditNote, row: ContaminationRow): Finding {
     syncType: row.type,
     postedAt: row.createdAt,
     actualStatus: cn.Status,
+    evidence,
     xeroType: cn.Type,
     number: cn.CreditNoteNumber ?? '',
     date: xeroDate(cn.Date),
@@ -795,19 +899,19 @@ function creditNoteFinding(cn: XeroCreditNote, row: ContaminationRow): Finding {
 async function sweepPayments(token: StoredToken, rows: ContaminationRow[]): Promise<Finding[]> {
   const findings: Finding[] = []
   for (const row of rows) {
-    const res = await xeroGet<{ Payments?: XeroPayment[] }>(token, `Payments/${row.externalTransactionId}`)
-    const p = res.data?.Payments?.[0]
-    if (!res.ok || !p) {
-      findings.push({
-        uuid: row.externalTransactionId, entity: 'payment', syncType: row.type, postedAt: row.createdAt,
-        actualStatus: 'NOT_FOUND', xeroType: '', number: '', date: '', total: '', currency: '',
-        contact: '', blockers: '', note: res.ok ? 'no payment in response' : `HTTP ${res.status}`,
-      })
+    const id = row.externalTransactionId
+    const c = await confirmAbsence<XeroPayment>(token, 'Payments', 'Payments', id)
+    const p = c.object
+    if (!p) {
+      // A payment that errored is ERROR, not NOT_FOUND. The previous code collapsed every non-200
+      // into "gone" and stamped `HTTP ${status}` into a free-text note nobody aggregates.
+      findings.push(unresolvedFinding(id, row, 'payment', c.resolution, c.evidence, c.note))
       continue
     }
     findings.push({
       uuid: p.PaymentID, entity: 'payment', syncType: row.type, postedAt: row.createdAt,
-      actualStatus: p.Status, xeroType: p.PaymentType ?? '', number: p.Invoice?.InvoiceNumber ?? '',
+      actualStatus: p.Status, evidence: c.evidence, xeroType: p.PaymentType ?? '',
+      number: p.Invoice?.InvoiceNumber ?? '',
       date: xeroDate(p.Date), total: String(p.Amount ?? ''), currency: '',
       contact: p.Invoice?.Contact?.Name ?? '',
       blockers: p.Invoice?.InvoiceID ? `settles:${p.Invoice.InvoiceID}` : '',
@@ -818,81 +922,129 @@ async function sweepPayments(token: StoredToken, rows: ContaminationRow[]): Prom
 }
 
 /**
- * Journals are paged rather than fetched per id: 251 individual GETs would be most of a day's
- * budget, and paging also surfaces journals in the window that we have no local record of.
+ * Manual journals: paged for discovery, then CONFIRMED PER ID.
+ *
+ * The previous implementation paged `ManualJournals` with If-Modified-Since, stopped at the first
+ * page shorter than 100, and labelled every id it had not seen `NOT_FOUND`. Three things were
+ * wrong with that at once: a short non-empty page is not a terminal guarantee, a failed page ended
+ * the walk without a trace in the result, and "not seen in the pages I read" was published as
+ * absence. 251 of the 553 ids — 45% of the set — reached their verdict that way, and the claim
+ * that all 553 returned 404 was never true of any of them.
+ *
+ * So the paging is now only a cheap way to find the ones that ARE present (and to surface journals
+ * the org has that we have no record of). Anything the pages did not account for is settled by a
+ * GET on its own id, which is the only read that can return a 404.
  */
 async function sweepJournals(
   token: StoredToken,
   rows: ContaminationRow[],
-): Promise<{ findings: Finding[]; unknownInWindow: XeroManualJournal[] }> {
+): Promise<{ findings: Finding[]; unknownInWindow: XeroManualJournal[]; pagingComplete: boolean }> {
   const byId = new Map(rows.map((r) => [r.externalTransactionId, r]))
   const seen = new Map<string, XeroManualJournal>()
   const unknownInWindow: XeroManualJournal[] = []
   const ifModifiedSince = new Date(CONTAMINATION_START).toUTCString()
+  const seenPageIds = new Set<string>()
+  let pagingComplete = false
 
-  for (let page = 1; ; page++) {
+  for (let page = 1; page <= JOURNAL_PAGE_CEILING; page++) {
     const res = await xeroGet<{ ManualJournals?: XeroManualJournal[] }>(
       token,
       `ManualJournals?page=${page}`,
       { ifModifiedSince },
     )
     if (!res.ok) {
-      console.log(`  ! manual journal page ${page} failed (HTTP ${res.status}): ${res.error}`)
+      console.log(`  ! manual journal page ${page} failed (HTTP ${res.status}): ${res.error} — enumeration is INCOMPLETE`)
       break
     }
     const batch = res.data?.ManualJournals ?? []
-    if (!batch.length) break
+    // Only an EMPTY page ends the walk. A short page does not: the page size is not a guarantee,
+    // and treating "fewer than 100" as terminal is what dropped the older pages.
+    if (!batch.length) { pagingComplete = true; break }
+    let fresh = 0
     for (const mj of batch) {
+      if (seenPageIds.has(mj.ManualJournalID)) continue
+      seenPageIds.add(mj.ManualJournalID)
+      fresh++
       if (byId.has(mj.ManualJournalID)) seen.set(mj.ManualJournalID, mj)
       else unknownInWindow.push(mj)
     }
-    if (batch.length < 100) break
+    if (fresh === 0) {
+      // Xero ignored `page` and re-served the same collection: page 1 already was the whole set.
+      console.log(`  (ManualJournals: page ${page} repeated page ${page - 1} — \`page\` is being ignored; the first response was complete)`)
+      pagingComplete = true
+      break
+    }
+    if (page === JOURNAL_PAGE_CEILING) {
+      console.log(`  ! manual journals hit the ${JOURNAL_PAGE_CEILING}-page ceiling — enumeration is INCOMPLETE`)
+    }
   }
 
   const findings: Finding[] = []
   for (const [id, row] of byId) {
     const mj = seen.get(id)
-    findings.push({
-      uuid: id, entity: 'journal', syncType: row.type, postedAt: row.createdAt,
-      actualStatus: mj?.Status ?? 'NOT_FOUND',
-      xeroType: 'MANUAL_JOURNAL', number: '',
-      date: xeroDate(mj?.Date), total: '', currency: '',
-      contact: '', blockers: '',
-      note: mj ? (mj.Narration ?? '').slice(0, 80) : 'not seen in any page modified since 2026-07-15',
-    })
+    if (mj) {
+      findings.push({
+        uuid: id, entity: 'journal', syncType: row.type, postedAt: row.createdAt,
+        actualStatus: mj.Status, evidence: 'collection-hit',
+        xeroType: 'MANUAL_JOURNAL', number: '',
+        date: xeroDate(mj.Date), total: '', currency: '',
+        contact: '', blockers: '', note: (mj.Narration ?? '').slice(0, 80),
+      })
+      continue
+    }
+    const c = await confirmAbsence<XeroManualJournal>(token, 'ManualJournals', 'ManualJournals', id)
+    if (c.object) {
+      findings.push({
+        uuid: id, entity: 'journal', syncType: row.type, postedAt: row.createdAt,
+        actualStatus: c.object.Status, evidence: c.evidence,
+        xeroType: 'MANUAL_JOURNAL', number: '',
+        date: xeroDate(c.object.Date), total: '', currency: '',
+        contact: '', blockers: '', note: (c.object.Narration ?? '').slice(0, 80),
+      })
+      continue
+    }
+    findings.push(unresolvedFinding(id, row, 'journal', c.resolution, c.evidence, c.note))
   }
-  return { findings, unknownInWindow }
+  return { findings, unknownInWindow, pagingComplete }
+}
+
+/**
+ * Page to an EMPTY page and throw if the read cannot be proven complete. An under-reported contact
+ * or item list feeds the cleanup worklist, so a silent truncation here is a footprint left behind.
+ */
+async function pageComplete<T>(token: StoredToken, path: string, key: string, idOf: (row: T) => string): Promise<T[]> {
+  return pageAllComplete<T>({
+    read: <R,>(p: string) => xeroGet<R>(token, p),
+    path,
+    key,
+    idOf,
+    log: (m) => console.log(m),
+  })
 }
 
 async function sweepContacts(token: StoredToken): Promise<XeroContact[]> {
-  const out: XeroContact[] = []
   const where = encodeURIComponent(`Name.StartsWith("${E2E_PREFIX}")`)
-  for (let page = 1; ; page++) {
-    const res = await xeroGet<{ Contacts?: XeroContact[] }>(token, `Contacts?where=${where}&page=${page}`)
-    if (!res.ok) {
-      console.log(`  ! contact page ${page} failed (HTTP ${res.status}): ${res.error}`)
-      break
-    }
-    const batch = res.data?.Contacts ?? []
-    out.push(...batch)
-    if (batch.length < 100) break
-  }
-  return out
+  return pageComplete<XeroContact>(token, `Contacts?where=${where}`, 'Contacts', (c) => c.ContactID)
 }
 
+/**
+ * Items are PAGED, not read unpaged.
+ *
+ * An unpaged Xero GET over a collection that pages is silently truncated to the oldest 100, and
+ * "at most 100 items exist" is not something this audit gets to assume on the org's behalf —
+ * whatever this endpoint happened to do on one run. pageAllComplete proves completeness either
+ * way: it walks to an empty page, and recognises the case where Xero ignores `page` entirely and
+ * the first response was already the whole collection.
+ */
 async function sweepItems(token: StoredToken): Promise<XeroItem[]> {
-  const res = await xeroGet<{ Items?: XeroItem[] }>(token, 'Items')
-  if (!res.ok) {
-    console.log(`  ! items read failed (HTTP ${res.status}): ${res.error}`)
-    return []
-  }
-  return (res.data?.Items ?? []).filter((i) => (i.Code ?? '').startsWith(`${E2E_PREFIX}-`))
+  const all = await pageComplete<XeroItem>(token, 'Items', 'Items', (i) => i.ItemID)
+  return all.filter((i) => (i.Code ?? '').startsWith(`${E2E_PREFIX}-`))
 }
 
 // ---------------------------------------------------------------------------
 function toCsv(findings: Finding[]): string {
   const cols: Array<keyof Finding> = [
-    'uuid', 'entity', 'syncType', 'postedAt', 'actualStatus', 'xeroType',
+    'uuid', 'entity', 'syncType', 'postedAt', 'actualStatus', 'evidence', 'xeroType',
     'number', 'date', 'total', 'currency', 'contact', 'blockers', 'note',
   ]
   const esc = (v: string) => (/[",\n]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v)
@@ -926,6 +1078,8 @@ function reportPlan(grouped: Map<Entity, ContaminationRow[]>): void {
   console.log(`  GET Invoices?IDs=       x ${String(n('invoice')).padStart(4)} @40/batch ${String(invoiceCalls).padStart(3)} calls`)
   console.log(`  GET CreditNotes?IDs=    x ${String(n('creditnote')).padStart(4)} @40/batch ${String(creditNoteCalls).padStart(3)} calls`)
   console.log(`  GET ManualJournals?page x ${String(n('journal')).padStart(4)} @100/page ${String(journalCalls).padStart(3)} calls (min; more if the org has others in the window)`)
+  console.log(`  + one GET per id a collection read does not return, to turn "not seen" into a real 404`)
+  console.log(`    (worst case ${String(n('invoice') + n('creditnote') + n('journal')).padStart(4)} more calls; --no-confirm-absence skips them and downgrades those verdicts to UNKNOWN)`)
   console.log(`  GET Contacts (E2E*)                        ~2 calls`)
   console.log(`  GET Items                                   1 call`)
   const total = 1 + paymentCalls + invoiceCalls + creditNoteCalls + journalCalls + 3
@@ -989,7 +1143,7 @@ async function main() {
   console.log('--- credit notes ---')
   const creditNoteFindings = await sweepCreditNotes(token, grouped.get('creditnote') ?? [])
   console.log('--- manual journals ---')
-  const { findings: journalFindings, unknownInWindow } = await sweepJournals(token, grouped.get('journal') ?? [])
+  const { findings: journalFindings, unknownInWindow, pagingComplete } = await sweepJournals(token, grouped.get('journal') ?? [])
   console.log('--- E2E contacts ---')
   const contacts = await sweepContacts(token)
   console.log('--- E2E items ---')
@@ -1001,9 +1155,28 @@ async function main() {
   console.log(`\n=== RECONCILIATION (${findings.length} of ${rows.length} ids) ===`)
   for (const [key, count] of [...tally(findings)].sort()) console.log(`  ${String(count).padStart(4)}  ${key}`)
 
-  const live = findings.filter((f) => !['NOT_FOUND', 'VOIDED', 'DELETED'].includes(f.actualStatus))
-  console.log(`\nStill present and not voided: ${live.length}`)
-  console.log(`Already gone or voided:       ${findings.length - live.length}`)
+  // The three buckets that matter, and they are NOT "present" and "gone". An id that no read
+  // conclusively resolved belongs to neither, and lumping it in with "already gone" is how a
+  // transient 5xx becomes a reconciliation conclusion.
+  const unknown = findings.filter((f) => f.actualStatus === 'UNKNOWN')
+  const errored = findings.filter((f) => f.actualStatus === 'ERROR')
+  // Anything Xero returned carries a real status and is conclusive by construction; the two
+  // buckets above are exactly the ids `isConclusive` rejects.
+  const unresolvedIds = findings.filter((f) => ['NOT_FOUND', 'UNKNOWN', 'ERROR'].includes(f.actualStatus) && !isConclusive(f.actualStatus as Resolution))
+  const confirmedAbsent = findings.filter((f) => f.actualStatus === 'NOT_FOUND')
+  const live = findings.filter((f) => !['NOT_FOUND', 'UNKNOWN', 'ERROR', 'VOIDED', 'DELETED'].includes(f.actualStatus))
+  const voided = findings.filter((f) => ['VOIDED', 'DELETED'].includes(f.actualStatus))
+
+  console.log(`\nStill present and not voided:   ${live.length}`)
+  console.log(`Present but already voided:     ${voided.length}`)
+  console.log(`Confirmed absent (per-id 404):  ${confirmedAbsent.length}`)
+  console.log(`UNKNOWN (not conclusively resolved): ${unknown.length}`)
+  console.log(`ERROR (a read failed):          ${errored.length}`)
+
+  console.log('\n--- by evidence ---')
+  const byEvidence = new Map<string, number>()
+  for (const f of findings) byEvidence.set(f.evidence, (byEvidence.get(f.evidence) ?? 0) + 1)
+  for (const [k, v] of [...byEvidence].sort()) console.log(`  ${String(v).padStart(4)}  ${k}`)
 
   console.log(`\n=== NOT IN THE CSV ===`)
   console.log(`  E2E-named contacts:                 ${contacts.length} (${contacts.filter((c) => c.ContactStatus === 'ACTIVE').length} active)`)
@@ -1020,6 +1193,20 @@ async function main() {
   console.log(`\nWrote ${OUT_PATH}`)
   console.log(`API calls used: ${callCount} (ceiling ${MAX_CALLS})`)
   console.log(`\nThe audit token is cached at ${TOKEN_FILE}. Delete it when the cleanup is done.`)
+
+  // A reconciliation with an unresolved id is not a reconciliation. Say so, loudly, and exit
+  // non-zero so no caller and no reader can take the summary above as a settled answer.
+  const unresolved = unresolvedIds.length
+  if (unresolved !== unknown.length + errored.length) throw new Error('BUG: unresolved bucket disagrees with UNKNOWN+ERROR')
+  if (unresolved || !pagingComplete) {
+    console.error(
+      `\n=== INCONCLUSIVE ===\n` +
+        (unresolved ? `  ${unresolved} of ${findings.length} id(s) were not conclusively resolved.\n` : '') +
+        (!pagingComplete ? `  Manual-journal enumeration did not reach an empty page, so the page walk is incomplete.\n` : '') +
+        `  Do NOT quote "everything is gone" from this run. Re-run it${CONFIRM_ABSENCE ? '' : ' without --no-confirm-absence'}.`,
+    )
+    process.exitCode = 1
+  }
 }
 
 main().catch((e) => {
