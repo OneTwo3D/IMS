@@ -5,9 +5,15 @@
  * ----------------------------------------------------------
  * That script looks up the 553 externalTransactionIds recorded in the e2e database. Run against
  * the live org (One Two Enterprises Ltd, dd2af957-3438-4010-8e85-7841c33c8328) not one of them
- * came back present — while the same org demonstrably holds 150 E2E invoices dated inside the
+ * came back present — while the same org demonstrably held 150 E2E invoices dated inside the
  * incident window. The stored ids are NOT this organisation's objects; they belong to the Demo
  * tenant the instance spent most of that period pointed at.
+ *
+ * THE ORG HAS SINCE BEEN WRITTEN TO. A cleanup ran against it on 2026-08-10 between 08:01 and
+ * 08:43 (o3d-7thb), so every count in this header describes the org BEFORE that run, not now:
+ * those 150 invoices are VOIDED, 35 of 36 non-SUBMITTED credit notes are VOIDED, the 111 contacts
+ * are archived and the 217 items are deleted. 13 SUBMITTED and 1 AUTHORISED credit note remain
+ * (o3d-k8ic). Re-run this script before quoting any number from it.
  *
  * HOW STRONG IS "NOT ONE OF THEM CAME BACK"
  * -----------------------------------------
@@ -22,6 +28,11 @@
  * That cross-check does NOT cover manual journals — they carry no contact, so they are not in this
  * footprint at all. For the 251 journal ids the honest verdict is UNKNOWN unless the contamination
  * audit is re-run with its per-id confirmation enabled.
+ *
+ * CALL BUDGET. Xero's daily cap is as low as 1,000/org/rolling-24h on some plans. A full re-audit
+ * (this script, plus audit-xero-live-contamination.ts with per-id confirmation, plus a cleanup dry
+ * run) is on the order of a thousand calls between them. Sequence them across days rather than
+ * discovering the cap mid-run.
  *
  * So the sync log is the wrong index for "what is in the live org", and any cleanup driven from it
  * would have touched nothing while reporting success. The only reliable index is the ORGANISATION
