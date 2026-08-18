@@ -716,7 +716,7 @@ test('every read is made with the arguments it claims, and every result reaches 
     // Shaped: the page maps this to {id,name} for `taxRates` and passes it whole as `imsTaxRates`.
     taxRatesRaw: [{ id: 'tax-id', name: 'tax-name', sentinel: 'taxRatesRaw' }],
     accountingSettings: { sentinel: 'accountingSettings' },
-    accountingStatus: { connected: true, tenantName: 'tenant-sentinel' },
+    accountingStatus: { connected: true, tenantName: 'tenant-sentinel', hasStoredToken: true },
     accountingConnectionTest: { sentinel: 'accountingConnectionTest' },
     accountingAccounts: [{ sentinel: 'accountingAccounts' }],
     accountingLogs: [{ sentinel: 'accountingLogs' }],
@@ -800,8 +800,9 @@ test('every read is made with the arguments it claims, and every result reaches 
   const props = propsOf(tree, 'SyncDashboard')
   assert.ok(props)
   assert.deepEqual(Object.keys(props).sort(), [
-    'accountingAccounts', 'accountingBatchHistory', 'accountingBatchPreview', 'accountingConnected',
-    'accountingConnectionTest', 'accountingLogs', 'accountingReadiness', 'accountingSettings',
+    'accountingAccounts', 'accountingBatchHistory', 'accountingBatchPreview', 'accountingBlockedReason',
+    'accountingConnected', 'accountingConnectionTest', 'accountingHasStoredToken', 'accountingLogs',
+    'accountingReadiness', 'accountingSettings',
     'accountingTaxRates', 'accountingTenantName', 'currencies', 'imsTaxRates', 'paymentAccountMap',
     'paymentMethodCombos', 'pluginState', 'shopifyCredentials', 'shopifyLogs', 'shopifySettings',
     'shoppingCredentials', 'shoppingLogs', 'shoppingPaymentMethods', 'shoppingSettings',
@@ -822,6 +823,8 @@ test('every read is made with the arguments it claims, and every result reaches 
   assert.equal(props.accountingSettings, s.accountingSettings)
   assert.equal(props.accountingConnected, true)
   assert.equal(props.accountingTenantName, 'tenant-sentinel')
+  assert.equal(props.accountingHasStoredToken, true)
+  assert.equal(props.accountingBlockedReason, undefined, 'a healthy connection carries no refusal')
   assert.equal(props.accountingConnectionTest, s.accountingConnectionTest)
   assert.equal(props.accountingAccounts, s.accountingAccounts)
   assert.equal(props.accountingLogs, s.accountingLogs)
@@ -834,6 +837,26 @@ test('every read is made with the arguments it claims, and every result reaches 
   assert.equal(props.accountingBatchHistory, s.accountingBatchHistory)
   assert.equal(props.wmsData, s.wmsData)
   assert.equal(props.accountingTaxRates, s.accountingTaxRates)
+})
+
+test('an allow-list-blocked connection reaches the dashboard as a refusal, not as connected', async () => {
+  // o3d-9tbz. isConnected() used to answer `connected: true` for the presence of a token row alone, so
+  // /sync showed a green badge while every sync failed. The reason now travels to the screen the
+  // operator actually looks at, and the blocked instance makes no Xero call to render it.
+  state.plugins = { woocommerce: true, xero: true }
+  state.reads.getAccountingConnectionStatus = () => ({
+    connected: false,
+    tenantName: 'OneTwo3D Ltd',
+    hasStoredToken: true,
+    blockedReason: 'Xero sync is halted: the stored connection is to OneTwo3D Ltd [tenantId e7fb4378-live-org]…',
+  })
+
+  const { tree } = await renderSyncPage()
+  const props = propsOf(tree, 'SyncDashboard')
+  assert.equal(props?.accountingConnected, false)
+  assert.match(String(props?.accountingBlockedReason), /Xero sync is halted/)
+  assert.equal(props?.accountingHasStoredToken, true, 'so /sync keeps offering the Disconnect the refusal names')
+  assert.deepEqual(callArgs('fetchAccountingTaxRates'), [], 'a blocked connection makes no Xero round trip')
 })
 
 test('the accounting tax-rate round trip is skipped unless a connector is enabled AND connected', async () => {

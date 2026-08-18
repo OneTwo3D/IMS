@@ -131,6 +131,9 @@ beforeEach(() => {
   activity = []
   delete process.env.XERO_ALLOWED_TENANT_IDS
   delete process.env.XERO_ALLOWED_TENANT_NAMES
+  // XERO_TENANT_ID is READ as of o3d-9tbz. It has to be cleared here like the others, or a value left
+  // in the developer's own environment silently narrows the allow-list for every test in this file.
+  delete process.env.XERO_TENANT_ID
 })
 
 /** A fresh database: no token row, no pin. The exact state the e2e rig connected in. */
@@ -309,4 +312,176 @@ test('no block reason when the stored token is allowed, or when there is no toke
 
   freshDatabase()
   assert.equal(await getStoredTenantBlockReason(), null, 'a disconnected instance is not "blocked"')
+})
+
+
+// --- XERO_TENANT_ID, end to end ------------------------------------------------
+//
+// The documented control that nothing read. An operator who set it to their live org and connected an
+// e2e rig got precisely the incident it looks like it prevents. These run it through the real callback
+// and the real token path, because that is where the belief was false.
+
+test('XERO_TENANT_ID ALONE stops the incident at the callback: nothing stored, nothing read', async () => {
+  freshDatabase()
+  connectionsBody = [LIVE, DEMO]
+  process.env.XERO_TENANT_ID = DEMO.tenantId
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  // LIVE is connections[0] and there is no pin — the exact state of the e2e rig in o3d-t74p.
+  assert.equal(result.success, true)
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId, 'the org XERO_TENANT_ID names, not the first offered')
+  assert.equal(settings.xero_expected_tenant_id, DEMO.tenantId)
+})
+
+test('XERO_TENANT_ID ALONE refuses a consent that offers only the forbidden org', async () => {
+  freshDatabase()
+  connectionsBody = [LIVE]
+  process.env.XERO_TENANT_ID = DEMO.tenantId
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, false)
+  assert.equal(tokenRow, null, 'no token row was written')
+  assert.equal(organisationCalls, 0, 'not even a read against the live organisation')
+  assert.match(result.error ?? '', /OneTwo3D Ltd/)
+  assert.match(result.error ?? '', /replace the XERO_TENANT_ID line/, 'a remedy that does not create a conflict')
+})
+
+test('XERO_TENANT_ID ALONE halts a STORED token from a restored dump', async () => {
+  // The days-of-syncs half of the incident, and the only half a callback check cannot reach.
+  pinnedTo(LIVE)
+  process.env.XERO_TENANT_ID = DEMO.tenantId
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null, 'genuinely protected, not merely warned')
+  assert.equal(notifications.length, 1)
+  assert.match(notifications[0].message, /XERO_TENANT_ID/)
+})
+
+test('a blank XERO_TENANT_ID — as .env.example and install.sh ship it — changes nothing', async () => {
+  freshDatabase()
+  connectionsBody = [DEMO]
+  process.env.XERO_TENANT_ID = ''
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+  assert.equal(result.success, true, 'first-time setup on a stock .env is untouched')
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId)
+})
+
+
+// --- the two keys disagreeing, end to end ---------------------------------------
+
+test('a contradictory configuration refuses the callback even for a single-org consent', async () => {
+  freshDatabase()
+  connectionsBody = [DEMO]
+  process.env.XERO_TENANT_ID = DEMO.tenantId
+  process.env.XERO_ALLOWED_TENANT_IDS = LIVE.tenantId
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, false)
+  assert.equal(tokenRow, null)
+  assert.match(result.error ?? '', /contradict each other/)
+  assert.ok(
+    activity.some((entry) => entry.action === 'xero_connect_refused'),
+    'and the refusal is on the record, not just on the operator’s screen',
+  )
+})
+
+test('a contradictory configuration also halts an ALREADY-CONNECTED instance', async () => {
+  // Config drift on a running box: the contradiction arrives by .env edit, with no callback in sight.
+  pinnedTo(DEMO)
+  process.env.XERO_TENANT_ID = DEMO.tenantId
+  process.env.XERO_ALLOWED_TENANT_IDS = LIVE.tenantId
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null)
+  assert.match(notifications[0].message, /contradict each other/)
+  assert.match(notifications[0].message, /delete that line/)
+})
+
+test('the same organisation spelled in both keys is NOT a conflict', async () => {
+  // A migration off the deprecated name, done belt-and-braces, must not be an outage.
+  pinnedTo(DEMO)
+  process.env.XERO_TENANT_ID = DEMO.tenantId
+  process.env.XERO_ALLOWED_TENANT_IDS = DEMO.tenantId
+  const { getAccessToken } = await loadAuth()
+
+  const auth = await getAccessToken()
+  assert.equal(auth?.tenantId, DEMO.tenantId)
+  assert.equal(notifications.length, 0)
+})
+
+
+// --- isConnected: a blocked token is not a connection -----------------------------
+
+test('an allow-list-blocked token reports NOT connected, with the reason', async () => {
+  // It used to report a healthy green connection on /sync while every sync failed — the one screen an
+  // operator checks to find out whether Xero works told them it did.
+  pinnedTo(LIVE)
+  process.env.XERO_ALLOWED_TENANT_IDS = DEMO.tenantId
+  const { isConnected } = await loadAuth()
+
+  const status = await isConnected()
+  assert.equal(status.connected, false)
+  assert.match(status.blockedReason ?? '', /allow-list forbids/)
+  assert.match(status.blockedReason ?? '', /OneTwo3D Ltd/)
+})
+
+test('a blocked token still reports hasStoredToken, so Disconnect stays on screen', async () => {
+  // The refusal says "disconnect Xero on /sync". /sync only offers that button when something is
+  // stored, so dropping this flag would make the remedy name a control that is not there.
+  pinnedTo(LIVE)
+  process.env.XERO_ALLOWED_TENANT_IDS = DEMO.tenantId
+  const { isConnected } = await loadAuth()
+
+  const status = await isConnected()
+  assert.equal(status.hasStoredToken, true)
+  assert.match(status.blockedReason ?? '', /disconnect Xero on \/sync/i)
+})
+
+test('isConnected does NOT notify — it runs on every render of /sync', async () => {
+  // Minting an activity row and a notification per page view would bury the one that matters.
+  pinnedTo(LIVE)
+  process.env.XERO_ALLOWED_TENANT_IDS = DEMO.tenantId
+  const { isConnected } = await loadAuth()
+
+  await isConnected()
+  await isConnected()
+  assert.equal(notifications.length, 0)
+  assert.equal(activity.length, 0)
+})
+
+test('an allowed token reports connected, and a fresh database reports neither', async () => {
+  pinnedTo(DEMO)
+  process.env.XERO_ALLOWED_TENANT_IDS = DEMO.tenantId
+  const { isConnected } = await loadAuth()
+
+  const connectedStatus = await isConnected()
+  assert.equal(connectedStatus.connected, true)
+  assert.equal(connectedStatus.tenantName, 'Demo Company (UK)')
+  assert.equal(connectedStatus.blockedReason, undefined)
+
+  freshDatabase()
+  const freshStatus = await isConnected()
+  assert.equal(freshStatus.connected, false)
+  assert.equal(freshStatus.hasStoredToken, undefined, 'never connected is not the same as blocked')
+  assert.equal(freshStatus.blockedReason, undefined)
+})
+
+test('a contradictory configuration is reported by isConnected too, not just by the sync', async () => {
+  pinnedTo(DEMO)
+  process.env.XERO_TENANT_ID = DEMO.tenantId
+  process.env.XERO_ALLOWED_TENANT_IDS = LIVE.tenantId
+  const { isConnected } = await loadAuth()
+
+  const status = await isConnected()
+  assert.equal(status.connected, false)
+  assert.equal(status.hasStoredToken, true)
+  assert.match(status.blockedReason ?? '', /contradict each other/)
 })

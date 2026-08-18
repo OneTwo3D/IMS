@@ -557,10 +557,10 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
  * invoice. Checked: payment-poller.ts, payment-reconcile.ts and the sync-processor's update paths
  * all key on ids that came back from Xero within the current tenant.
  *
- * ONE RESIDUAL, tracked in o3d-gt8r rather than fixed here: selectTenantConnection falls back to
- * `connections[0]` when the pin is absent, so a post-disconnect reconnect can silently land on a
- * different organisation. Orphaning, not corruption — every stored id would simply resolve to
- * nothing in the new org — but it happens without asking.
+ * The residual this note used to describe — `connections[0]` when the pin is absent, so a
+ * post-disconnect reconnect could silently land on a different organisation — is GONE as of o3d-9tbz.
+ * Clearing the pin here now means the next consent must be unambiguous by itself: one organisation
+ * offered, or an allow-list that narrows it to one, or IMS refuses and asks.
  */
 export async function disconnect(): Promise<void> {
   await db.$transaction([
@@ -585,12 +585,45 @@ export async function disconnect(): Promise<void> {
 }
 
 /**
- * Check if Xero is connected (token exists).
+ * Is Xero connected — meaning USABLE, not merely "a token row exists" (o3d-9tbz).
+ *
+ * This used to answer `connected: true` for the presence of a row alone, so an instance whose stored
+ * tenant the allow-list forbids reported a healthy green connection on /sync while every single sync
+ * failed. That is the worst possible reading: the one screen an operator checks to find out whether
+ * Xero is working told them it was, and the real reason sat in a notification they had to go and find.
+ *
+ * A blocked connection is therefore NOT connected, and carries the reason with it.
+ *
+ * `hasStoredToken` is load-bearing and separate from `connected`: the refusal text tells the operator
+ * to "disconnect Xero on /sync", and /sync only offers a Disconnect button when there is something to
+ * disconnect. Collapsing the blocked state into a plain `connected: false` would hide that button and
+ * make the remedy unperformable — the operator would be told to press something that is not there.
+ *
+ * Deliberately uses the PURE allow-list check rather than `storedTenantAllowed`: this runs on every
+ * render of /sync, onboarding and settings, and a read that mints an activity row and a notification
+ * per page view would bury the one notification that matters.
  */
-export async function isConnected(): Promise<{ connected: boolean; tenantName?: string }> {
+export async function isConnected(): Promise<{
+  connected: boolean
+  tenantName?: string
+  blockedReason?: string
+  hasStoredToken?: boolean
+}> {
   const token = await readStoredToken()
   if (!token) return { connected: false }
-  return { connected: true, tenantName: token.tenantName ?? undefined }
+
+  const summary = { tenantId: token.tenantId, tenantName: token.tenantName }
+  const allowList = readXeroTenantAllowList()
+  if (!isXeroTenantAllowed(summary, allowList)) {
+    return {
+      connected: false,
+      hasStoredToken: true,
+      tenantName: token.tenantName ?? undefined,
+      blockedReason: storedTenantRefusalMessage(summary, allowList),
+    }
+  }
+
+  return { connected: true, tenantName: token.tenantName ?? undefined, hasStoredToken: true }
 }
 
 /**

@@ -78,6 +78,33 @@ Production may set it to the live organisation or leave it unset.
 Refusals are recorded in the **Activity log** (`xero_connect_refused`, `xero_stored_tenant_refused`), so
 a refusal that happened while nobody was watching the browser is still discoverable.
 
+#### If you already set `XERO_TENANT_ID`
+
+`XERO_TENANT_ID` is **deprecated**. It appeared in `.env.example`, in the installer and in the
+environment-variable reference for a long time, describing itself as the Xero organisation id and
+saying the app would fill it in after connecting — and no part of IMS ever read it. If you set it to
+your live organisation and assumed the tenant was pinned, it was not: you had no protection at all,
+which is worse than having no setting, because the name alone was enough to stop people looking harder.
+
+It is now read, as a single-organisation form of `XERO_ALLOWED_TENANT_IDS`, and enforced on exactly the
+same paths — the callback, the stored token, and over the database pin. **An instance whose only tenant
+setting is `XERO_TENANT_ID` is genuinely restricted to that organisation from this release on.** If
+that is not what you wanted, remove the line before upgrading.
+
+Rename it when convenient:
+
+```
+# before
+XERO_TENANT_ID=5c949ed5-…
+# after
+XERO_ALLOWED_TENANT_IDS=5c949ed5-…
+```
+
+Do not leave both in place with different values. Two tenant settings that disagree are refused
+outright — every Xero connection and every sync stops with a message naming both values — rather than
+IMS silently preferring one of two instructions you gave on purpose. Setting both to the *same* single
+organisation is fine, so you can migrate without a gap.
+
 **QuickBooks** does not have this control. It does not share the same defect — Intuit sends the company
 (`realmId`) in the callback itself, so there is no list to pick from and nothing is chosen silently —
 but it also has no environment allow-list, so a restored database with a QuickBooks token in it is not

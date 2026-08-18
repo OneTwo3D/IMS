@@ -59,6 +59,14 @@ export type AccountingConnectorSettingsMasked = AccountingConnectorSettings & { 
 export type AccountingConnectionStatus = {
   connected: boolean
   tenantName?: string
+  /**
+   * Why a stored connection is unusable, when it is (o3d-9tbz). Set together with `connected: false`
+   * and `hasStoredToken: true` — an allow-list-blocked token is NOT a connection, but it is also not
+   * the same thing as never having connected, and the operator has to be told which they are looking at.
+   */
+  blockedReason?: string
+  /** A token row exists, so /sync must keep offering Disconnect — the refusal text tells them to use it. */
+  hasStoredToken?: boolean
 }
 
 export type AccountingConnectorId = 'xero' | 'quickbooks'

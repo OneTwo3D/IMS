@@ -25,6 +25,15 @@
  *
  * Both refusals name every organisation they saw, with ids, and say what to do next: an operator who
  * cannot act on the message is no better off than one who was never told.
+ *
+ * THE PHANTOM CONTROL. `XERO_TENANT_ID` shipped in `.env.example`, `scripts/install.sh` and `CLAUDE.md`
+ * from long before any of this, and NOTHING ever read it. An operator who set it to their live org had
+ * every reason to believe the tenant was pinned and was in fact completely unprotected — strictly worse
+ * than no setting at all, because a control that does not exist still buys confidence. It is now wired
+ * up here as a deprecated single-tenant spelling of XERO_ALLOWED_TENANT_IDS and enforced on exactly the
+ * same paths, so an operator who has only ever set that one variable is genuinely protected today. Set
+ * alongside XERO_ALLOWED_TENANT_* it must agree exactly; any real disagreement refuses everything
+ * rather than silently preferring one of two deliberate instructions.
  */
 
 export type XeroConnectionSummary = {
@@ -33,7 +42,7 @@ export type XeroConnectionSummary = {
 }
 
 export type XeroTenantAllowList = {
-  /** Normalised (trimmed, lower-cased) tenant ids from XERO_ALLOWED_TENANT_IDS. */
+  /** Normalised (trimmed, lower-cased) tenant ids from XERO_ALLOWED_TENANT_IDS (or the legacy alias). */
   ids: string[]
   /** Normalised (trimmed, lower-cased, whitespace-collapsed) names from XERO_ALLOWED_TENANT_NAMES. */
   names: string[]
@@ -42,9 +51,29 @@ export type XeroTenantAllowList = {
   rawNames: string[]
   /** True when at least one id or name is configured. An empty/whitespace value is NOT configured. */
   configured: boolean
+  /**
+   * The DEPRECATED `XERO_TENANT_ID`, when set to a non-blank value — otherwise null (o3d-9tbz).
+   *
+   * It shipped in `.env.example`, `scripts/install.sh` and `CLAUDE.md` describing itself as the Xero
+   * tenant/organisation id, and NOTHING read it. An operator who set it to their live org believed they
+   * had pinned the tenant and was completely unprotected, which is worse than having no control at all
+   * because it manufactures confidence. It is now a single-tenant form of XERO_ALLOWED_TENANT_IDS and
+   * enforced identically, everywhere.
+   */
+  legacyTenantId: string | null
+  /**
+   * Non-null when the tenant configuration CONTRADICTS ITSELF, in which case NOTHING is allowed.
+   *
+   * Two settings that disagree about which ledger this instance may write to cannot be resolved by
+   * preferring one — either choice silently discards an instruction the operator gave deliberately, on
+   * a money path. So the disagreement is refused, loudly, naming both values and the one-line fix.
+   */
+  conflict: string | null
 }
 
 export type XeroTenantRefusalReason =
+  /** XERO_TENANT_ID and XERO_ALLOWED_TENANT_* disagree. Nothing is allowed until an operator resolves it. */
+  | 'config-conflict'
   /** Xero returned an empty connection list — which is also what a REVOKED authorisation returns (200, []). */
   | 'no-connections'
   /** An allow-list is configured and none of the offered organisations is on it. */
@@ -89,17 +118,48 @@ function normaliseName(value: string): string {
 export function readXeroTenantAllowList(env: Record<string, string | undefined> = process.env): XeroTenantAllowList {
   const rawIds = splitEnvList(env.XERO_ALLOWED_TENANT_IDS)
   const rawNames = splitEnvList(env.XERO_ALLOWED_TENANT_NAMES)
+  const legacyTenantId = (env.XERO_TENANT_ID ?? '').trim() || null
+  const modernConfigured = rawIds.length > 0 || rawNames.length > 0
+
+  // XERO_TENANT_ID is the deprecated spelling of a one-entry XERO_ALLOWED_TENANT_IDS. It is honoured
+  // ONLY when it is the sole tenant setting; where both are present they must agree exactly, and any
+  // other combination is a conflict rather than a union. A union would silently WIDEN what an operator
+  // who wrote `XERO_TENANT_ID=<one org>` believes they restricted this instance to — which is the exact
+  // class of silent widening this whole guard exists to stop.
+  let conflict: string | null = null
+  if (legacyTenantId && modernConfigured) {
+    const equivalent =
+      rawNames.length === 0 && rawIds.length === 1 && normaliseId(rawIds[0]) === normaliseId(legacyTenantId)
+    if (!equivalent) {
+      conflict =
+        `Refused: this server's Xero tenant settings contradict each other. XERO_TENANT_ID=${legacyTenantId} `
+        + `names one organisation, while ${describeModernAllowList(rawIds, rawNames)} names `
+        + 'a different set, and IMS will not pick a ledger by guessing which of the two you meant. No Xero '
+        + 'request was made and nothing was stored. XERO_TENANT_ID is DEPRECATED: delete that line from the '
+        + 'server .env, make sure XERO_ALLOWED_TENANT_IDS lists exactly the organisation(s) this instance '
+        + 'may use, and restart IMS.'
+    }
+  }
+
+  const effectiveRawIds = modernConfigured ? rawIds : (legacyTenantId ? [legacyTenantId] : [])
+
   return {
-    ids: rawIds.map(normaliseId),
+    ids: effectiveRawIds.map(normaliseId),
     names: rawNames.map(normaliseName),
-    rawIds,
+    rawIds: effectiveRawIds,
     rawNames,
-    configured: rawIds.length > 0 || rawNames.length > 0,
+    configured: effectiveRawIds.length > 0 || rawNames.length > 0,
+    legacyTenantId,
+    conflict,
   }
 }
 
-/** An unconfigured allow-list allows everything — it is opt-in, and production may legitimately not set it. */
+/**
+ * An unconfigured allow-list allows everything — it is opt-in, and production may legitimately not set it.
+ * A CONTRADICTORY one allows nothing: an instruction we cannot read unambiguously is not permission.
+ */
 export function isXeroTenantAllowed(connection: XeroConnectionSummary, allowList: XeroTenantAllowList): boolean {
+  if (allowList.conflict) return false
   if (!allowList.configured) return true
   if (allowList.ids.includes(normaliseId(connection.tenantId ?? ''))) return true
   const name = connection.tenantName == null ? '' : normaliseName(connection.tenantName)
@@ -116,11 +176,50 @@ export function describeXeroConnections(connections: XeroConnectionSummary[]): s
   return hidden > 0 ? `${described} (+${hidden} more)` : described
 }
 
-function describeAllowList(allowList: XeroTenantAllowList): string {
+/** Echoes the modern keys as configured, for the conflict message that has to quote both sides. */
+function describeModernAllowList(rawIds: string[], rawNames: string[]): string {
   const parts: string[] = []
-  if (allowList.rawIds.length) parts.push(`XERO_ALLOWED_TENANT_IDS=${allowList.rawIds.join(',')}`)
-  if (allowList.rawNames.length) parts.push(`XERO_ALLOWED_TENANT_NAMES=${allowList.rawNames.join(',')}`)
+  if (rawIds.length) parts.push(`XERO_ALLOWED_TENANT_IDS=${rawIds.join(',')}`)
+  if (rawNames.length) parts.push(`XERO_ALLOWED_TENANT_NAMES=${rawNames.join(',')}`)
   return parts.join(' and ')
+}
+
+/**
+ * Name the setting the operator has to EDIT, which is not always the one we read.
+ *
+ * An operator running on the deprecated `XERO_TENANT_ID` must be told to look for `XERO_TENANT_ID` in
+ * their .env — telling them to fix `XERO_ALLOWED_TENANT_IDS` sends them hunting for a line that is not
+ * there, which is a remedy they cannot perform.
+ */
+function describeAllowList(allowList: XeroTenantAllowList): string {
+  const usingLegacyOnly = allowList.legacyTenantId !== null && allowList.rawNames.length === 0
+    && allowList.rawIds.length === 1 && normaliseId(allowList.rawIds[0]) === normaliseId(allowList.legacyTenantId)
+  if (usingLegacyOnly) {
+    return `XERO_TENANT_ID=${allowList.legacyTenantId} (deprecated — rename it to XERO_ALLOWED_TENANT_IDS)`
+  }
+  return describeModernAllowList(allowList.rawIds, allowList.rawNames)
+}
+
+/** True when this instance is running purely off the deprecated XERO_TENANT_ID. */
+function usesLegacyKeyOnly(allowList: XeroTenantAllowList): boolean {
+  return allowList.legacyTenantId !== null && allowList.rawNames.length === 0 && allowList.rawIds.length === 1
+    && normaliseId(allowList.rawIds[0]) === normaliseId(allowList.legacyTenantId)
+}
+
+/**
+ * How to PERMIT an organisation, phrased for the key this operator actually has.
+ *
+ * An operator on the deprecated XERO_TENANT_ID who is told to "add its tenantId to
+ * XERO_ALLOWED_TENANT_IDS" and does exactly that ends up with both keys set and disagreeing — i.e. the
+ * conflict refusal. A remedy whose faithful execution produces a new refusal is not a remedy, so the
+ * legacy case is told to REPLACE the line rather than add one.
+ */
+function howToPermit(tenantId: string, allowList: XeroTenantAllowList): string {
+  if (usesLegacyKeyOnly(allowList)) {
+    return `replace the XERO_TENANT_ID line in the server .env with XERO_ALLOWED_TENANT_IDS=${tenantId} `
+      + '(XERO_TENANT_ID is deprecated and must not be left alongside it)'
+  }
+  return `set XERO_ALLOWED_TENANT_IDS=${tenantId} in the server .env`
 }
 
 /**
@@ -135,6 +234,12 @@ export function selectXeroTenant<T extends XeroConnectionSummary>(params: {
   allowList: XeroTenantAllowList
 }): XeroTenantChoice<T> {
   const { connections, expectedTenantId, allowList } = params
+
+  // Before the connection list, before the pin: a configuration we cannot read unambiguously is not a
+  // basis for choosing a ledger, whatever Xero offered.
+  if (allowList.conflict) {
+    return { ok: false, reason: 'config-conflict', error: allowList.conflict }
+  }
 
   if (connections.length === 0) {
     return {
@@ -159,8 +264,8 @@ export function selectXeroTenant<T extends XeroConnectionSummary>(params: {
         `Refused: none of the Xero organisations on this consent is on this server's allow-list. `
         + `Offered: ${describeXeroConnections(connections)}. Allowed: ${describeAllowList(allowList)}. `
         + 'Nothing was stored and no Xero data was read or written. Either reconnect choosing an allowed '
-        + `organisation, or — if this really is the organisation this instance should use — add its `
-        + 'tenantId above to XERO_ALLOWED_TENANT_IDS in the server .env, restart IMS, and connect again.',
+        + 'organisation, or — if one of the organisations above really is the one this instance should '
+        + `use — ${howToPermit('<its tenantId above>', allowList)}, restart IMS, and connect again.`,
     }
   }
 
@@ -176,8 +281,8 @@ export function selectXeroTenant<T extends XeroConnectionSummary>(params: {
         error:
           `Refused: this instance is pinned to Xero organisation ${describeXeroConnections([forbidden])}, `
           + `which this server's allow-list forbids. Allowed: ${describeAllowList(allowList)}. Nothing was `
-          + 'stored. Either correct the allow-list in the server .env and restart IMS, or disconnect Xero '
-          + 'on /sync (which clears the pin) and reconnect to an allowed organisation.',
+          + `stored. Either ${howToPermit(forbidden.tenantId, allowList)} and restart IMS, or disconnect `
+          + 'Xero on /sync (which clears the pin) and reconnect to an allowed organisation.',
       }
     }
 
@@ -213,10 +318,20 @@ export function selectXeroTenant<T extends XeroConnectionSummary>(params: {
  * ledger.
  */
 export function storedTenantRefusalMessage(stored: XeroConnectionSummary, allowList: XeroTenantAllowList): string {
+  // "add its tenantId to XERO_ALLOWED_TENANT_IDS" is the WRONG instruction when the block is caused by
+  // two settings disagreeing — following it would leave the contradiction in place and the sync still
+  // halted. Hand back the conflict's own remedy instead.
+  if (allowList.conflict) {
+    return (
+      `Xero sync is halted: the stored connection is to ${describeXeroConnections([stored])}, but this `
+      + `server's tenant settings contradict each other, so no organisation is permitted. `
+      + `${allowList.conflict}`
+    )
+  }
   return (
     `Xero sync is halted: the stored connection is to ${describeXeroConnections([stored])}, which this `
     + `server's allow-list forbids. Allowed: ${describeAllowList(allowList)}. No Xero request was made. `
-    + 'Either correct the allow-list in the server .env and restart IMS, or disconnect Xero on /sync and '
+    + `Either ${howToPermit(stored.tenantId, allowList)} and restart IMS, or disconnect Xero on /sync and `
     + 'reconnect to an allowed organisation. This usually means a database from another environment was '
     + 'restored here with its Xero token still in it.'
   )

@@ -52,6 +52,10 @@ export type AccountingConnectorClientProps = {
   settings: AccountingConnectorSettings & { secretMasked: boolean }
   connected: boolean
   tenantName?: string
+  /** Why a stored connection is refused, when it is — see isConnected() in lib/connectors/xero/auth.ts. */
+  blockedReason?: string
+  /** A token row exists even though `connected` is false: Disconnect must stay on screen (o3d-9tbz). */
+  hasStoredToken?: boolean
   connectionTest: IntegrationConnectionTestState
   accounts: AccountingAccount[]
   logs: AccountingSyncLogRow[]
@@ -110,7 +114,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: AccountingConnectorClientProps) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, blockedReason, hasStoredToken: initHasStoredToken, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: AccountingConnectorClientProps) {
   const router = useRouter()
   const formatDateTime = useFormatDateTime()
   const { promptReauth, stepUpDialog } = useStepUpReauth()
@@ -126,6 +130,10 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
   const [connected, setConnected] = useState(initConnected)
+  // Tracks whether a token ROW exists, which is not the same question as whether the connection is
+  // usable. A blocked connection is unusable but very much still stored, and the refusal tells the
+  // operator to disconnect it — so the button has to stay on screen (o3d-9tbz).
+  const [hasStoredToken, setHasStoredToken] = useState(initHasStoredToken ?? initConnected)
   const [tenantName, setTenantName] = useState(initTenant)
   const [clientId, setClientId] = useState(init.client_id ?? init.xero_client_id ?? init.quickbooks_client_id ?? '')
   const [clientSecret, setClientSecret] = useState(init.client_secret ?? init.xero_client_secret ?? init.quickbooks_client_secret ?? '')
@@ -176,6 +184,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     setSavingConnection(false)
     if (success) {
       setConnected(true)
+      setHasStoredToken(true)
       setTenantName(success)
       setConnectMsgTone('info')
       setConnectMsg(`Connected to ${success}`)
@@ -282,6 +291,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     setConnecting(false)
     if (result.success) {
       setConnected(false)
+      setHasStoredToken(false)
       setTenantName(undefined)
       setConnectMsg(`Disconnected from ${connectorLabel}.`)
       router.refresh()
@@ -461,6 +471,18 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             )}
           </div>
 
+          {blockedReason && hasStoredToken && (
+            // A stored token the allow-list forbids used to render as a green "connected" badge while
+            // every sync failed (o3d-9tbz). It is now reported as NOT connected, and the reason is put
+            // where the operator is already looking rather than only in a notification they have to
+            // go and find. Disconnect stays available below, because this text tells them to use it.
+            // Gated on hasStoredToken as well so that pressing Disconnect clears it immediately rather
+            // than leaving "sync is halted" on screen until the server round-trip lands.
+            <p className="text-xs text-destructive break-words whitespace-pre-line max-w-3xl" role="alert">
+              {blockedReason}
+            </p>
+          )}
+
           <div className="grid grid-cols-2 gap-4">
             <div className="space-y-1.5">
               <Label htmlFor="xero_client_id">Client ID</Label>
@@ -492,7 +514,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               {testingConnection ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
               Test Connection
             </Button>
-            {connected ? (
+            {hasStoredToken ? (
               <Button variant="outline" size="sm" onClick={handleDisconnect} disabled={connecting || savingConnection}>
                 {connecting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2Off className="h-3 w-3 mr-1" />}
                 Disconnect

@@ -667,8 +667,10 @@ WC_POLL_INTERVAL_MINUTES=5
 
 XERO_CLIENT_ID=${XERO_CLIENT_ID}
 XERO_CLIENT_SECRET=${XERO_CLIENT_SECRET}
-XERO_TENANT_ID=
 XERO_TOKEN_PATH=${DATA_DIR}/xero/token.json
+# XERO_TENANT_ID is DEPRECATED and no longer written by the installer (o3d-9tbz). It is
+# still read, as a single-organisation form of XERO_ALLOWED_TENANT_IDS, so that existing
+# installs that set it are protected — new installs should use the allow-list below.
 # Allow-list of Xero organisations this instance may use (o3d-9tbz). Comma-separated,
 # ids and names unioned, blank = unrestricted. Set it on every non-production install:
 # it is the only tenant control that survives a database reset.
