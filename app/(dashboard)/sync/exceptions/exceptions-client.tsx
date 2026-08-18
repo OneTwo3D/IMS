@@ -1109,6 +1109,13 @@ function RecordRefundManuallyDialog({
                       {target.kind === 'shipping'
                         ? <span className="font-medium">{target.description}</span>
                         : <>{target.sku ? `${target.sku} — ` : ''}{target.description}</>}
+                      {/* o3d-w00 (Codex r3 #1): a target whose posted VAT identity can't be established
+                          can't be allocated to — the credit note would come to a different figure than
+                          the refund it settles. Say so here, with the fix, rather than let the operator
+                          type an amount the server will refuse. */}
+                      {target.unrecordableReason ? (
+                        <span className="mt-1 block text-[11px] text-amber-700">{target.unrecordableReason}</span>
+                      ) : null}
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">
                       {target.taxRateName ?? 'none'} ({(Number(target.vatRate) * 100).toFixed(0)}%)
@@ -1119,6 +1126,7 @@ function RecordRefundManuallyDialog({
                         type="number"
                         min={0}
                         step="0.01"
+                        disabled={Boolean(target.unrecordableReason)}
                         value={amounts[targetKey(target)] ?? ''}
                         onChange={(event) => setAmounts((previous) => ({ ...previous, [targetKey(target)]: event.target.value }))}
                         className="h-7 text-sm text-right w-28 ml-auto font-mono"

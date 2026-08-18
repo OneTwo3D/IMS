@@ -18,6 +18,7 @@ import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
+import { findOverAllocatedRefundTarget, overAllocatedRefundTargetMessage } from '@/lib/domain/sales/refund-target-balances'
 import { scheduleRefundReservationReleaseOutbox, scheduleRefundUnmatchedWarningOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { calculateCoverageByLine, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
@@ -2832,6 +2833,15 @@ export async function createSalesOrderRefund(
     chargeback?: boolean
     /** Active accounting connector (scopes the prior-reversal guard); resolved by the caller. */
     activeAccountingConnector?: 'xero' | 'quickbooks'
+    /**
+     * o3d-w00 (Codex r3 #2): also cap each TARGET — every order line, and the shipping charge — at what
+     * it still has left to refund, under this transaction's order lock. The order-wide ceiling lets one
+     * line absorb money that came off another (right total, wrong account, wrong VAT), and a caller that
+     * checks the balances itself beforehand cannot serialise two concurrent recordings against the same
+     * order. Set by the hand-recording path, whose whole contract is that the operator attributed the
+     * money to specific parts of the order.
+     */
+    enforcePerTargetBalances?: boolean
   },
 ): Promise<CreateSalesOrderRefundResult> {
   // Keep discount lines (negative totalBase, qty 0) which the qty>0/totalBase>0 filter
@@ -2901,11 +2911,16 @@ export async function createSalesOrderRefund(
         // taxRateName -> the order-default tax type; per-line taxRate -> each line's own identity. Both
         // are needed to snapshot the SAME tax type the invoice resolved, at creation time (o3d-w00).
         taxRateName: true,
+        // o3d-w00 (Codex r3 #2): the per-target refundable balances are computed HERE, under the order
+        // lock, so shippingForeign and each line's net foreign total are part of the locked read.
+        shippingForeign: true,
         lines: {
           select: {
             id: true,
             productId: true,
+            description: true,
             qty: true,
+            totalForeign: true,
             taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
           },
         },
@@ -2933,13 +2948,39 @@ export async function createSalesOrderRefund(
     const reverseChargeSalesTaxType = input.accountingSettings?.reverseChargeSalesTaxType
 
     // Order tax uniformity, resolved from the LINES via the relation (active-independent, so a rate
-    // deactivated after the sale still counts) — o3d-w00 #5. The order is uniformly taxed when every line
-    // shares one non-null connector tax type and none is reverse-charged. Only then can a monetary-only
-    // (unlinked, un-attributable) SALE amount be posted under a single identity without mis-allocating.
-    const orderBaseTaxTypes = new Set(so.lines.map((line) => line.taxRate?.accountingTaxType ?? null))
-    const orderHasReverseCharge = so.lines.some((line) => line.taxRate?.reverseCharge)
-    const orderUniformlyTaxed = orderBaseTaxTypes.size === 1 && !orderBaseTaxTypes.has(null) && !orderHasReverseCharge
-    const orderSingleSafeTaxType = orderUniformlyTaxed ? ([...orderBaseTaxTypes][0] as string) : null
+    // deactivated after the sale still counts) — o3d-w00 #5. Only a uniformly taxed order can carry a
+    // monetary-only (unlinked, un-attributable) SALE amount under a single identity without
+    // mis-allocating it.
+    //
+    // Codex r3 #4: uniformity is a property of the EFFECTIVE, post-swap identity each line posts under,
+    // not of its raw accountingTaxType. Forcing it false whenever ANY line was reverse-charged made a
+    // FULLY reverse-charged order — every line carrying the one reverse-charge identity, zero seller VAT
+    // throughout — "not uniformly taxed", quarantining a refund that is trivially convertible (gross IS
+    // net) and telling the operator its VAT could not be determined when there was none to determine.
+    // Computing the swap first accepts that order and still refuses every genuine mixture: an RC line
+    // beside a VAT-bearing one resolves to two identities, as do two different VAT rates.
+    //
+    // The one case the swap cannot speak for is a reverse-charged line with NO reverse-charge sales tax
+    // code configured: resolveSalesLineTaxType then leaves it on its base code, which may be VAT-bearing,
+    // so an RC line and a standard-rated one would collapse to one "identity" and the monetary amount
+    // would post at a rate the customer was never charged. Keep refusing that (it is what happens today),
+    // and say which of the two reasons it was.
+    const reverseChargedLineCount = so.lines.filter((line) => line.taxRate?.reverseCharge).length
+    const orderHasReverseCharge = reverseChargedLineCount > 0
+    const reverseChargeSwapUnavailable = orderHasReverseCharge && !reverseChargeSalesTaxType
+    const orderEffectiveTaxTypes = new Set(so.lines.map((line) => resolveSalesLineTaxType({
+      baseTaxType: line.taxRate?.accountingTaxType ?? null,
+      reverseCharge: line.taxRate?.reverseCharge,
+      reverseChargeSalesTaxType,
+    }) ?? null))
+    const orderUniformlyTaxed = orderEffectiveTaxTypes.size === 1 &&
+      !orderEffectiveTaxTypes.has(null) &&
+      !reverseChargeSwapUnavailable
+    const orderSingleSafeTaxType = orderUniformlyTaxed ? ([...orderEffectiveTaxTypes][0] as string) : null
+    // A uniformly taxed all-reverse-charge order posts its unlinked sale line under the RC identity, so
+    // the snapshot must say so — `reverseCharge: false` would misdescribe the very line it created.
+    const orderUniformlyReverseCharged = orderUniformlyTaxed && reverseChargedLineCount === so.lines.length &&
+      orderHasReverseCharge
 
     const resolveRefundLineTaxIdentity = (
       lineId: string | null | undefined,
@@ -2963,7 +3004,7 @@ export async function createSalesOrderRefund(
       // lines keep the order-default treatment, consistent with how the invoice posts them (even on a
       // mixed-rate order the invoice posts shipping under the order default), so they are not gated.
       if (lineKind === 'sale') {
-        return { accountingTaxType: orderSingleSafeTaxType, reverseCharge: false }
+        return { accountingTaxType: orderSingleSafeTaxType, reverseCharge: orderUniformlyReverseCharged }
       }
       return { accountingTaxType: orderDefaultTaxType, reverseCharge: null }
     }
@@ -3145,10 +3186,17 @@ export async function createSalesOrderRefund(
       // refusal no longer applies — and stamps the external id so a redelivery dedups. For a refund an
       // operator is typing in by hand there is no park to resolve: they simply pick the lines in the
       // refund dialog instead of leaving the amount unattributed.
+      // Codex r3 #4: say WHICH of the two things went wrong. "Not uniformly taxed" on an order whose
+      // only problem is an unconfigured reverse-charge code sends the operator looking for a storefront
+      // tax breakdown that would not have helped — the fix is one setting.
+      const nonUniformCause = reverseChargeSwapUnavailable
+        ? 'the order carries reverse-charged lines but no reverse-charge sales tax code is configured ' +
+          '(Settings → Accounting), so IMS cannot tell which VAT identity those lines post under'
+        : 'the order is not uniformly taxed, so its VAT cannot be determined automatically'
       return {
         error:
-          'This refund is monetary-only (not itemised) but the order is not uniformly taxed, so its VAT ' +
-          'cannot be determined automatically and no credit note has been raised. ' +
+          `This refund is monetary-only (not itemised) but ${nonUniformCause} ` +
+          'and no credit note has been raised. ' +
           (input.externalRefundId != null
             ? `The money has ALREADY been returned in the storefront (refund ${input.externalRefundId}) — do NOT ` +
               'issue another storefront refund. ' + REFUND_PARK_MANUAL_RESOLUTION_HINT
@@ -3204,8 +3252,42 @@ export async function createSalesOrderRefund(
 
     const existingRefundLines = await tx.salesOrderRefundLine.findMany({
       where: { refund: { orderId: input.orderId } },
-      select: { productId: true, qty: true },
+      select: { productId: true, qty: true, salesOrderLineId: true, lineKind: true, totalForeign: true },
     })
+
+    // -----------------------------------------------------------------------
+    // o3d-w00 (Codex r3 #2): PER-TARGET refundable balances, enforced HERE.
+    //
+    // The ceiling above is order-wide, so it cannot stop one line absorbing money that came off another:
+    // the total reconciles while the credit posts to the wrong account under the wrong VAT identity. The
+    // hand-recording path (exception inbox) computes the same balances before it calls in, but that read
+    // happens outside this transaction — two concurrent recordings against one order each see the same
+    // £10 line as fully refundable, each allocate £10, and both then serialise successfully because the
+    // only locked check was the order total. Re-taking the decision inside the transaction that already
+    // holds the order row lock is what actually serialises them: the second reader blocks on the first
+    // and, under READ COMMITTED, sees the refund lines it committed.
+    //
+    // Opt-in (`enforcePerTargetBalances`) because it is the LINE-LINKED, operator-attributed path this
+    // invariant belongs to. Storefront-mapped refunds carry their own per-line reconciliation upstream
+    // and are not re-scoped here.
+    // -----------------------------------------------------------------------
+    if (input.enforcePerTargetBalances) {
+      const overAllocated = findOverAllocatedRefundTarget({
+        order: { shippingForeign: so.shippingForeign, lines: so.lines },
+        priorRefundLines: existingRefundLines,
+        allocations: refundLines.map((refundLine) => ({
+          lineId: refundLine.lineId ?? null,
+          lineKind: refundLine.lineKind ?? (refundLine.lineId ? 'sale' : null),
+          // The stored NET foreign amount — the same basis the order's line totals and any prior refund
+          // lines are held in. Derived from base only when the caller did not supply it.
+          netForeign: refundLine.totalForeign ?? Math.round(refundLine.totalBase * fxRate * 10000) / 10000,
+        })),
+      })
+      if (overAllocated) {
+        return { error: overAllocatedRefundTargetMessage(overAllocated) } as const
+      }
+    }
+
     const refundedQtyByProduct = new Map<string, number>()
     for (const refundLine of existingRefundLines) {
       if (!refundLine.productId) continue

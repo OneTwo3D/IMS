@@ -84,11 +84,21 @@ export type MonetaryRefundBasisOrder = {
   taxBase?: DecimalInput
   taxRatePercent?: DecimalInput
   shippingBase?: DecimalInput
+  /**
+   * Codex r3 #3: the order's own-currency VAT and shipping figures. The shipping leg's VAT is DERIVED
+   * (order tax − line tax), and that identity is exact only in the currency the order was taxed in — see
+   * the shipping check below. Optional so the base-currency fallback still works for an order shape that
+   * predates them, but the production caller supplies them.
+   */
+  taxForeign?: DecimalInput
+  shippingForeign?: DecimalInput
   lines?: readonly {
     // Codex r2 #1: the line's NET total, so its recorded VAT can be checked against its OWN net at the
     // order's rate. Without it a line's stored rate is an unverified claim.
     totalBase?: DecimalInput
     taxBase?: DecimalInput
+    /** The line's VAT in the ORDER's currency, as WooCommerce reported it (Codex r3 #3). */
+    taxForeign?: DecimalInput
     taxRate?: { rate?: DecimalInput; reverseCharge?: boolean | null } | null
   }[]
 }
@@ -103,6 +113,11 @@ const TAX_BASE_SCALE = 4
  * number, and not a percentage of the order — is what legitimate rounding actually looks like.
  */
 const MONEY_ROUNDING_HALF_UNIT = 0.005
+/**
+ * Half the last stored digit of a Decimal(18,4) base-currency figure: what ONE independent
+ * foreign→base conversion can be off by (order-import converts at `/fxRate` then rounds to 4dp).
+ */
+const BASE_CONVERSION_HALF_UNIT = 0.00005
 /** Two Decimal(18,4) conversions (totalBase and taxBase) sit underneath netOrderBase. */
 const BASE_CONVERSION_SLACK = 0.0002
 /**
@@ -269,17 +284,45 @@ export function resolveMonetaryRefundVatRate(order: MonetaryRefundBasisOrder): M
       ),
     }
   }
-  const lineTaxTotal = lines.reduce((sum, line) => sum.add(toDecimal(line.taxBase ?? 0)), toDecimal(0))
+  // ---------------------------------------------------------------------------------------------
   // Whatever VAT is not on a line is the shipping leg's: order tax = line tax + shipping tax, by
   // construction in order-import (computeWcOrderForeignTotals).
-  const shippingTax = taxBase.sub(lineTaxTotal)
-  const impliedShippingTax = shippingBase.mul(rate)
-  if (impliedShippingTax.sub(shippingTax).abs().gt(COMPONENT_ROUNDING_TOLERANCE)) {
+  //
+  // Codex r3 #3: that identity holds EXACTLY only in the order's OWN currency. order-import converts the
+  // AGGREGATE foreign tax once into SalesOrder.taxBase and each line's tax INDEPENDENTLY into
+  // SalesOrderLine.taxBase, both rounded to Decimal(18,4) — so `taxBase − Σ line.taxBase` carries one
+  // conversion residue per line PLUS one for the aggregate, and none of that is shipping VAT. On a
+  // 105-line EUR order at fx 1.6 the residue reaches 0.0053, past the single component's 0.0052, and a
+  // legitimate order with NO shipping at all was refused for "its shipping is not taxed at that rate" —
+  // where the "shipping tax" was pure FX rounding.
+  //
+  // So derive it where WooCommerce actually computed it: in the order currency, from the stored
+  // taxForeign figures, which sum exactly. Only genuine per-penny rounding of the shipping tax line
+  // remains, which is what MONEY_ROUNDING_HALF_UNIT measures. The base-currency derivation stays as a
+  // fallback for an order shape that carries no foreign figures, and there the residue is admitted
+  // EXPLICITLY — one half-unit per independently converted figure — instead of being charged against a
+  // single component's tolerance.
+  // ---------------------------------------------------------------------------------------------
+  const lineForeignTaxes = lines.map((line) => line.taxForeign)
+  const derivableInForeign = order.taxForeign != null &&
+    order.shippingForeign != null &&
+    lineForeignTaxes.every((taxForeign) => taxForeign != null)
+  const shippingTax = derivableInForeign
+    ? toDecimal(order.taxForeign).sub(lines.reduce((sum, line) => sum.add(toDecimal(line.taxForeign ?? 0)), toDecimal(0)))
+    : taxBase.sub(lines.reduce((sum, line) => sum.add(toDecimal(line.taxBase ?? 0)), toDecimal(0)))
+  const shippingNet = derivableInForeign ? toDecimal(order.shippingForeign) : shippingBase
+  const impliedShippingTax = shippingNet.mul(rate)
+  const shippingTolerance = derivableInForeign
+    ? toDecimal(COMPONENT_ROUNDING_TOLERANCE)
+    : toDecimal(MONEY_ROUNDING_HALF_UNIT)
+        // The aggregate taxBase, every line's taxBase, and shippingBase are each rounded independently.
+        .add(toDecimal(BASE_CONVERSION_HALF_UNIT).mul(lines.length + 2))
+  if (impliedShippingTax.sub(shippingTax).abs().gt(shippingTolerance)) {
     return {
       ok: false,
       error: undeterminableBasisMessage(
         `its shipping is not taxed at that rate (${shippingTax.toFixed(4)} of VAT on a shipping charge ` +
-        `of ${shippingBase.toFixed(4)}, where ${rate.toString()} implies ${impliedShippingTax.toFixed(4)})`,
+        `of ${shippingNet.toFixed(4)}, where ${rate.toString()} implies ${impliedShippingTax.toFixed(4)})`,
       ),
     }
   }
@@ -465,10 +508,17 @@ export async function syncWcRefund(
         // one for shipping) instead of to a percentage of its value, and let "zero-rated" be read off the
         // lines' own rates / reverse-charge flags instead of inferred from a small tax figure.
         shippingBase: true,
+        // o3d-w00 (Codex r3 #3): the ORDER-CURRENCY tax/shipping figures. The shipping leg's VAT is
+        // derived (order tax − line tax) and that identity is exact only before the per-figure
+        // foreign→base conversions; deriving it in base currency charged accumulated FX rounding to the
+        // shipping component's tolerance and refused legitimate multi-currency orders.
+        taxForeign: true,
+        shippingForeign: true,
         lines: {
           select: {
             id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true,
             taxBase: true,
+            taxForeign: true,
             taxRate: { select: { rate: true, reverseCharge: true } },
           },
         },

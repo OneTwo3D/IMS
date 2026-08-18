@@ -28,18 +28,37 @@ type ParkRow = { id: string; entityId: string | null; externalId: string | null;
  * A COHERENT non-uniformly-taxed order — the commonest quarantine cause. Goods £10 @ 20% + £20 @ 0% +
  * £5 shipping @ the order default 20%: net 35.00, VAT 3.00, gross 38.00. Gross per part: 12.00, 20.00
  * and 6.00. Every fixture below allocates against these, so the amounts add up to a real order.
+ *
+ * Codex r3 #1: each line also carries the ACCOUNTING TAX CODE its credit note will post under, because
+ * that — not `TaxRate.rate` — is what the conversion has to use. The two are separable in this fixture:
+ * clearing line-2's `accountingTaxType` makes it fall back to the order default (OUTPUT2, 20%) while its
+ * nominal rate stays 0%, which is exactly the divergence that let a park be "reconciled" to a figure the
+ * credit note would never come to. A fixture where the nominal rate and the posted identity can never
+ * differ would prove nothing about the conversion.
  */
 const ORDER = {
   id: 'so-1',
   currency: 'GBP',
   fxRateToBase: 1,
   taxRatePercent: 0.2,
+  taxRateName: 'UK Standard Rate' as string | null,
   shippingForeign: 5,
   lines: [
-    { id: 'line-1', productId: 'product-1', description: 'Widget @ 20%', totalForeign: 10, taxRate: { rate: 0.2, reverseCharge: false } },
-    { id: 'line-2', productId: 'product-2', description: 'Book @ 0%', totalForeign: 20, taxRate: { rate: 0, reverseCharge: false } },
+    { id: 'line-1', productId: 'product-1', description: 'Widget @ 20%', totalForeign: 10, taxRate: { rate: 0.2, reverseCharge: false, accountingTaxType: 'OUTPUT2' } },
+    { id: 'line-2', productId: 'product-2', description: 'Book @ 0%', totalForeign: 20, taxRate: { rate: 0, reverseCharge: false, accountingTaxType: 'ZERORATEDOUTPUT' as string | null } },
   ],
 }
+
+/**
+ * The tax rates IMS knows, which is how an accounting tax code is PRICED: the credit note posts a NET
+ * line under a code and the connector re-grosses it at that code's rate, so IMS can only convert the
+ * operator's gross when exactly one sales rate maps to the code.
+ */
+type TaxRateRow = { name: string; rate: number; accountingTaxType: string | null; active: boolean; usedFor: string }
+const TAX_RATES: TaxRateRow[] = [
+  { name: 'UK Standard Rate', rate: 0.2, accountingTaxType: 'OUTPUT2', active: true, usedFor: 'SALES' },
+  { name: 'UK Zero Rate', rate: 0, accountingTaxType: 'ZERORATEDOUTPUT', active: true, usedFor: 'SALES' },
+]
 /** The parked WooCommerce refund: one 20% widget (12.00 gross) plus the postage (6.00 gross). */
 const PARKED_GROSS = '18.00'
 
@@ -49,7 +68,9 @@ const state: {
   landedRefund: { orderId: string; creditNoteNumber: string | null } | null
   order: typeof ORDER | null
   priorRefundLines: Array<{ salesOrderLineId: string | null; lineKind: string | null; totalForeign: number }>
-  createRefundCalls: Array<{ orderId: string; lines: unknown[]; reason: string; returnWarehouseId: unknown; options: { externalRefundId?: number } }>
+  taxRates: TaxRateRow[]
+  reverseChargeSalesTaxType: string
+  createRefundCalls: Array<{ orderId: string; lines: unknown[]; reason: string; returnWarehouseId: unknown; options: { externalRefundId?: number; enforcePerTargetBalances?: boolean } }>
   createRefundResult: { success: boolean; error?: string }
   parkUpdates: Array<{ where: Record<string, unknown>; data: Record<string, unknown> }>
   activity: Array<Record<string, unknown>>
@@ -60,6 +81,8 @@ const state: {
   landedRefund: null,
   order: null,
   priorRefundLines: [],
+  taxRates: TAX_RATES,
+  reverseChargeSalesTaxType: '',
   createRefundCalls: [],
   createRefundResult: { success: true },
   parkUpdates: [],
@@ -113,7 +136,15 @@ mock.module('@/lib/db', {
         },
       },
       salesOrder: { async findUnique() { return state.order } },
+      // How an accounting tax code is priced (Codex r3 #1). Returned in full so a production query that
+      // forgot to filter deactivated / purchase-only rates would show up here rather than pass silently.
+      taxRate: { async findMany() { return state.taxRates } },
     },
+  },
+})
+mock.module('@/lib/accounting', {
+  namedExports: {
+    getAccountingSettings: async () => ({ reverseChargeSalesTaxType: state.reverseChargeSalesTaxType }),
   },
 })
 mock.module('@/lib/auth/server', {
@@ -185,14 +216,26 @@ test('the order fixture is a coherent order (o3d-w00)', () => {
   assert.equal(vat, 3, 'VAT 3.00 — 20% on the widget and on the postage, nothing on the book')
   // The parked refund is one 20% widget (12.00 gross) plus the postage (6.00 gross).
   assert.equal(Number(PARKED_GROSS), ORDER.lines[0].totalForeign * 1.2 + ORDER.shippingForeign * 1.2)
+  // Codex r3 #1: and the tax fixture is coherent too — every line's accounting tax code is priced at
+  // the rate that line was actually sold at, and the order default prices at taxRatePercent. Otherwise
+  // the "happy path" tests below would be passing over an order the conversion should have refused.
+  const rateForCode = (code: string | null) =>
+    TAX_RATES.filter((taxRate) => taxRate.accountingTaxType === code).map((taxRate) => taxRate.rate)
+  for (const orderLine of ORDER.lines) {
+    assert.deepEqual(rateForCode(orderLine.taxRate.accountingTaxType), [orderLine.taxRate.rate], orderLine.description)
+  }
+  const orderDefault = TAX_RATES.find((taxRate) => taxRate.name === ORDER.taxRateName && taxRate.active)
+  assert.equal(orderDefault?.rate, ORDER.taxRatePercent, 'the order default prices at the rate shipping was charged')
 })
 
 test.beforeEach(() => {
   state.park = { ...QUARANTINED_PARK }
   state.parkQueryStatus = null
   state.landedRefund = null
-  state.order = { ...ORDER }
+  state.order = { ...ORDER, lines: ORDER.lines.map((line) => ({ ...line, taxRate: { ...line.taxRate } })) }
   state.priorRefundLines = []
+  state.taxRates = TAX_RATES.map((taxRate) => ({ ...taxRate }))
+  state.reverseChargeSalesTaxType = ''
   state.createRefundCalls = []
   state.createRefundResult = { success: true }
   state.parkUpdates = []
@@ -413,6 +456,139 @@ test('a refund the ledger refuses leaves the park QUARANTINED and visible (o3d-w
   // Nothing was resolved: the operator fixes the split and tries again on the same row.
   assert.equal(state.parkUpdates.length, 0)
   assert.equal(state.park?.status, 'QUARANTINED')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-w00 (Codex r3 #1): the conversion must use the tax identity the credit note ACTUALLY posts
+// under, not the order line's nominal rate.
+//
+// `createSalesOrderRefund` snapshots each refund line's accountingTaxType and the credit-note payload
+// sends the NET line under that code with lineAmountsIncludeTax: false, so the connector re-grosses at
+// whatever that code is worth. Converting with `TaxRate.rate` instead let the park be resolved as
+// "reconciled to £X" while the credit note came to something else entirely — the precise failure the
+// reconciliation exists to prevent.
+// ---------------------------------------------------------------------------------------------
+
+test('a line whose tax rate has no accounting code is REFUSED, not converted at its nominal rate (o3d-w00 Codex r3 #1)', async () => {
+  // The Codex case. line-2 is nominally 0%, so the old conversion stored 20.00 gross as 20.00 "net".
+  // But with no accounting tax code of its own the credit note falls back to the ORDER-DEFAULT identity
+  // (OUTPUT2, 20%) — exactly as the invoice did — and posts 20.00 net as 24.00 gross against a 20.00
+  // storefront refund, with the park closed as reconciled. Refusing is the only honest answer, and the
+  // remedy is a mapping an admin can add.
+  state.park = { ...QUARANTINED_PARK, payload: { id: 7101, amount: '20.00' } }
+  state.order!.lines[1].taxRate.accountingTaxType = null
+
+  const result = await recordRefundParkManually('park-1', [line('line-2', 20)], 'the zero-rated book')
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /Book @ 0% was charged at 0%/)
+  // The refusal states the divergence in the only terms that matter: what the credit note would post at.
+  assert.match(result.error ?? '', /accounting tax code OUTPUT2, which is 20%/)
+  assert.match(result.error ?? '', /Settings → Tax Rates/)
+  assert.equal(state.createRefundCalls.length, 0, 'no credit note is raised on a rate that will not be used')
+  assert.equal(state.park?.status, 'QUARANTINED')
+
+  // And when the order default is missing too there is NO identity at all — a different refusal, not a
+  // silent zero rate.
+  state.order = { ...state.order!, taxRateName: null }
+  const noIdentity = await recordRefundParkManually('park-1', [line('line-2', 20)], 'the zero-rated book')
+  assert.equal(noIdentity.success, false)
+  assert.match(noIdentity.error ?? '', /has no accounting tax code/)
+  state.order = { ...state.order, taxRateName: ORDER.taxRateName }
+
+  // And with the mapping in place the SAME allocation goes through, storing the true net — so the
+  // refusal is about the missing identity, not about the line.
+  state.order!.lines[1].taxRate.accountingTaxType = 'ZERORATEDOUTPUT'
+  const mapped = await recordRefundParkManually('park-1', [line('line-2', 20)], 'the zero-rated book')
+  assert.equal(mapped.success, true)
+  const lines = state.createRefundCalls[0].lines as Array<{ totalBase: number }>
+  assert.equal(lines[0].totalBase, 20, 'zero-rated: gross IS net')
+})
+
+test('shipping is REFUSED when the order-default identity no longer resolves (o3d-w00 Codex r3 #1)', async () => {
+  // An unlinked shipping refund posts under the ACTIVE TaxRate named on the order. Deactivate it and
+  // there is no identity at all — the credit note would post the line under whatever the connector
+  // defaults to. The goods line, which carries its own code, is unaffected.
+  state.taxRates = state.taxRates.map((taxRate) =>
+    taxRate.name === 'UK Standard Rate' ? { ...taxRate, active: false } : taxRate)
+
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'x')
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /Shipping posts under the order's default VAT identity/)
+  assert.match(result.error ?? '', /deactivated/)
+  assert.equal(state.createRefundCalls.length, 0)
+
+  // Only the shipping leg was blocked: a goods-only allocation on the same order still records.
+  state.park = { ...QUARANTINED_PARK, payload: { id: 7101, amount: '12.00' } }
+  const goodsOnly = await recordRefundParkManually('park-1', [line('line-1', 12)], 'just the widget')
+  assert.equal(goodsOnly.success, true)
+})
+
+test('an accounting tax code IMS prices two ways is REFUSED rather than picked from (o3d-w00 Codex r3 #1)', async () => {
+  // A second sales rate mapped to OUTPUT2 at a different rate: IMS is being told the code is worth two
+  // things, so it cannot say what the credit note would be grossed up by.
+  state.taxRates = [...state.taxRates, { name: 'EU Standard Rate', rate: 0.19, accountingTaxType: 'OUTPUT2', active: true, usedFor: 'SALES' }]
+
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'x')
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /more than one rate/)
+  assert.match(result.error ?? '', /0\.19/)
+  assert.equal(state.createRefundCalls.length, 0)
+})
+
+test('a reverse-charged line is REFUSED until the reverse-charge code is configured (o3d-w00 Codex r3 #1)', async () => {
+  // Under reverse charge the seller charges no VAT, so gross IS net — but only because the credit note
+  // posts under the reverse-charge code. With that setting empty the swap does not happen and the line
+  // posts under its base code (OUTPUT2, 20%), which would restate VAT the customer never paid.
+  state.park = { ...QUARANTINED_PARK, payload: { id: 7101, amount: '10.00' } }
+  state.order!.lines[0].taxRate = { rate: 0.2, reverseCharge: true, accountingTaxType: 'OUTPUT2' }
+
+  const unconfigured = await recordRefundParkManually('park-1', [line('line-1', 10)], 'RC widget')
+  assert.equal(unconfigured.success, false)
+  assert.match(unconfigured.error ?? '', /reverse-charged/)
+  assert.match(unconfigured.error ?? '', /Settings → Accounting/)
+  assert.equal(state.createRefundCalls.length, 0)
+
+  // Configure it and the same allocation records, gross unchanged because there is no seller VAT.
+  state.reverseChargeSalesTaxType = 'REVERSECHARGE'
+  const configured = await recordRefundParkManually('park-1', [line('line-1', 10)], 'RC widget')
+  assert.equal(configured.success, true)
+  const lines = state.createRefundCalls[0].lines as Array<{ totalBase: number }>
+  assert.equal(lines[0].totalBase, 10, 'reverse charge: gross IS net')
+})
+
+test('the NET lines submitted re-gross to EXACTLY the storefront refund (o3d-w00 Codex r3 #1)', async () => {
+  // Codex's closing ask on this finding: the mocked createRefund only proves what was SUBMITTED, so
+  // assert the property that actually matters — that re-grossing those net lines at the rate each will
+  // post under lands back on the parked figure. The rate is derived here from the fixture's tax table
+  // and refund-service's documented fallback rule (line code, else the ACTIVE order-default code), NOT
+  // from the production resolver, so this is a cross-check rather than a restatement.
+  await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'reconciled by hand')
+
+  const orderDefaultCode = state.taxRates.find((taxRate) => taxRate.name === ORDER.taxRateName && taxRate.active)?.accountingTaxType ?? null
+  const postedRate = (lineId: string | null) => {
+    const orderLine = lineId ? ORDER.lines.find((candidate) => candidate.id === lineId) : null
+    const code = orderLine ? (orderLine.taxRate.accountingTaxType ?? orderDefaultCode) : orderDefaultCode
+    const rates = state.taxRates.filter((taxRate) => taxRate.accountingTaxType === code).map((taxRate) => taxRate.rate)
+    assert.equal(rates.length, 1, `exactly one rate prices ${code}`)
+    return rates[0]
+  }
+
+  const submitted = state.createRefundCalls[0].lines as Array<{ lineId: string | null; totalForeign: number }>
+  const creditNoteGross = submitted.reduce((sum, refundLine) => sum + refundLine.totalForeign * (1 + postedRate(refundLine.lineId)), 0)
+  assert.equal(creditNoteGross.toFixed(2), Number(PARKED_GROSS).toFixed(2), 'the credit note settles the refund exactly')
+})
+
+test('the per-target caps are re-taken inside the refund transaction (o3d-w00 Codex r3 #2)', async () => {
+  // The balances this action checks are read outside the refund transaction, so two concurrent
+  // recordings against one order would each see the same line as fully refundable. The authoritative
+  // cap has to be taken under the order lock, which is why the ledger call asks for it.
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'x')
+
+  assert.equal(result.success, true)
+  assert.equal(state.createRefundCalls[0].options.enforcePerTargetBalances, true)
 })
 
 let retry: ((id: string) => Promise<{ success: boolean; error?: string; synced?: boolean }>) | null = null

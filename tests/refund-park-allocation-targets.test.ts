@@ -23,10 +23,22 @@ const ORDER = {
   shippingForeign: 5,
   shippingService: 'Royal Mail',
   lines: [
-    { id: 'line-1', description: 'Widget', sku: 'WIDGET', totalForeign: 10, taxRate: { name: 'UK Standard Rate', rate: 0.2, reverseCharge: false } },
-    { id: 'line-2', description: 'Book', sku: 'BOOK', totalForeign: 20, taxRate: { name: 'UK Zero Rate', rate: 0, reverseCharge: false } },
+    { id: 'line-1', description: 'Widget', sku: 'WIDGET', totalForeign: 10, taxRate: { name: 'UK Standard Rate', rate: 0.2, reverseCharge: false, accountingTaxType: 'OUTPUT2' } },
+    { id: 'line-2', description: 'Book', sku: 'BOOK', totalForeign: 20, taxRate: { name: 'UK Zero Rate', rate: 0, reverseCharge: false, accountingTaxType: 'ZERORATEDOUTPUT' as string | null } },
   ],
 }
+
+/**
+ * Codex r3 #1: the rate a target is OFFERED at is the rate its credit note will post at, which comes
+ * from the accounting tax code the refund line will carry — so the tax rates IMS knows are part of the
+ * fixture. Without them every target would be unpriceable and the dialog would offer nothing.
+ */
+type TaxRateRow = { name: string; rate: number; accountingTaxType: string | null; active: boolean; usedFor: string }
+let TAX_RATES: TaxRateRow[] = []
+const DEFAULT_TAX_RATES: TaxRateRow[] = [
+  { name: 'UK Standard Rate', rate: 0.2, accountingTaxType: 'OUTPUT2', active: true, usedFor: 'SALES' },
+  { name: 'UK Zero Rate', rate: 0, accountingTaxType: 'ZERORATEDOUTPUT', active: true, usedFor: 'SALES' },
+]
 
 const PARK = {
   id: 'park-1',
@@ -72,10 +84,16 @@ mock.module('@/lib/db', {
             },
           }
         }
+        if (property === 'taxRate') {
+          return { ...emptyModel, async findMany() { return TAX_RATES } }
+        }
         return emptyModel
       },
     }),
   },
+})
+mock.module('@/lib/accounting', {
+  namedExports: { getAccountingSettings: async () => ({ reverseChargeSalesTaxType: '' }) },
 })
 mock.module('@/lib/auth/server', {
   namedExports: {
@@ -93,6 +111,11 @@ mock.module('@/lib/domain/integrations/outbox-admin', {
 })
 mock.module('@/lib/activity-log', { namedExports: { logActivity: async () => {} } })
 mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
+
+test.beforeEach(() => {
+  TAX_RATES = DEFAULT_TAX_RATES.map((taxRate) => ({ ...taxRate }))
+  ORDER.lines[1].taxRate.accountingTaxType = 'ZERORATEDOUTPUT'
+})
 
 test('the Record-manually dialog is offered SHIPPING as well as the order lines (o3d-w00 Codex r2 #3)', async () => {
   const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
@@ -133,4 +156,36 @@ test('each order line is offered at its OWN rate and its remaining balance (o3d-
       { lineId: 'line-2', vatRate: '0', remainingNetForeign: '20.00', remainingGrossForeign: '20.00' },
     ],
   )
+  assert.deepEqual(targets.map((target) => target.unrecordableReason), [null, null, null], 'every target is allocatable')
+})
+
+test('a target whose POSTED VAT identity cannot be established is offered as unrecordable (o3d-w00 Codex r3 #1)', async () => {
+  // The dialog's rate is the rate the CREDIT NOTE will post at, not the line's nominal one. Strip
+  // line-2's accounting tax code and it falls back to the order default (OUTPUT2, 20%) while still
+  // showing 0% on the invoice — so an operator entering £20 gross would settle a park with a £24 credit
+  // note. The row says so, with the fix, instead of quietly offering a rate that will not be used.
+  ORDER.lines[1].taxRate.accountingTaxType = null
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const data = await getExceptionInboxData()
+  const targets = data.refundSyncParks[0].allocationTargets
+
+  const book = targets.find((target) => target.lineId === 'line-2')
+  assert.match(book?.unrecordableReason ?? '', /Book was charged at 0%/)
+  assert.match(book?.unrecordableReason ?? '', /Settings → Tax Rates/)
+  // The other targets are untouched — one broken mapping does not close the whole dialog.
+  assert.equal(targets.find((target) => target.lineId === 'line-1')?.unrecordableReason, null)
+  assert.equal(targets.find((target) => target.kind === 'shipping')?.unrecordableReason, null)
+})
+
+test('shipping is unrecordable when the order-default rate is deactivated (o3d-w00 Codex r3 #1)', async () => {
+  // Shipping posts under the ACTIVE TaxRate named on the order; deactivate it and there is no identity
+  // to post under. The goods lines carry their own codes and stay allocatable.
+  TAX_RATES = TAX_RATES.map((taxRate) => taxRate.name === 'UK Standard Rate' ? { ...taxRate, active: false } : taxRate)
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const data = await getExceptionInboxData()
+  const targets = data.refundSyncParks[0].allocationTargets
+
+  const shipping = targets.find((target) => target.kind === 'shipping')
+  assert.match(shipping?.unrecordableReason ?? '', /order's default VAT identity/)
+  assert.equal(targets.find((target) => target.lineId === 'line-1')?.unrecordableReason, null, 'its own code still resolves')
 })

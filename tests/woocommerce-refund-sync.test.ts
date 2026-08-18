@@ -6,6 +6,7 @@ import { resolveMonetaryRefundVatRate, syncWcRefund, type WcRefundSyncDependenci
 import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
+import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 
 function makeRefund(overrides: Partial<WcRefund> = {}): WcRefund {
   return {
@@ -169,6 +170,10 @@ function makeDependencies(options: {
   const createRefundLines: Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }> = []
   let createRefundCalls = 0
   let nextLogId = 1
+  // o3d-w00 (Codex r3 #3): what the production query actually asks for. The foreign-currency shipping
+  // derivation is dead code unless those columns are selected, and no assertion on the returned double
+  // can tell the difference.
+  let orderSelect: Record<string, unknown> | null = null
   let orderDeleted = false // o3d-7yf finding 2: simulate the order being deleted before the park is written
 
   const shoppingSyncLogMock = {
@@ -246,7 +251,8 @@ function makeDependencies(options: {
         return cb(tx)
       },
       salesOrder: {
-        async findFirst() {
+        async findFirst(args: { select?: Record<string, unknown> }) {
+          orderSelect = args?.select ?? null
           return {
             id: 'so-1',
             externalOrderNumber: 'WC-1001',
@@ -293,6 +299,9 @@ function makeDependencies(options: {
     syncLogs,
     activityLogs,
     createRefundLines,
+    get orderSelect() {
+      return orderSelect
+    },
     get createRefundCalls() {
       return createRefundCalls
     },
@@ -874,6 +883,109 @@ test('a reverse-charged line NEXT TO a VAT-bearing one is refused, and says why 
   const basis = resolveMonetaryRefundVatRate(mixed)
   assert.equal(basis.ok, false)
   assert.match(basis.ok === false ? basis.error : '', /mixes reverse-charged supplies/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-w00 Codex r3 #3: the shipping leg's VAT is DERIVED (order tax − line tax), and that subtraction
+// is only exact in the currency the order was taxed in. order-import converts the AGGREGATE foreign tax
+// once into SalesOrder.taxBase and every line's tax INDEPENDENTLY into SalesOrderLine.taxBase, so the
+// base-currency difference carries one Decimal(18,4) residue per line plus one for the aggregate — none
+// of which is shipping VAT.
+// ---------------------------------------------------------------------------
+
+/**
+ * An imported multi-currency order, built the way order-import builds one: the foreign figures are what
+ * WooCommerce charged (exact 2dp), and every base figure is that foreign figure converted at /fx and
+ * rounded to Decimal(18,4) — the aggregate and each line SEPARATELY, which is where the residue is born.
+ * No shipping at all, so the derived "shipping tax" is PURE conversion residue.
+ */
+function makeConvertedOrder(input: { lineCount: number; lineNetForeign: string; lineTaxForeign: string; fxRateToBase: string; rate: number }) {
+  const toBase = (foreign: Decimal) => Number(roundQuantity(foreign.div(toDecimal(input.fxRateToBase)), 4).toFixed(4))
+  const lineNet = toDecimal(input.lineNetForeign)
+  const lineTax = toDecimal(input.lineTaxForeign)
+  const netForeign = lineNet.mul(input.lineCount)
+  const taxForeign = lineTax.mul(input.lineCount)
+  return {
+    totalBase: toBase(netForeign.add(taxForeign)),
+    taxBase: toBase(taxForeign),
+    taxRatePercent: input.rate,
+    shippingBase: 0,
+    taxForeign: Number(taxForeign.toFixed(4)),
+    shippingForeign: 0,
+    lines: Array.from({ length: input.lineCount }, () => ({
+      totalBase: toBase(lineNet),
+      taxBase: toBase(lineTax),
+      taxForeign: Number(lineTax.toFixed(4)),
+      taxRate: { rate: input.rate, reverseCharge: false },
+    })),
+  }
+}
+
+test('a multi-currency order with NO shipping is not refused for its FX conversion residue (o3d-w00 Codex r3 #3)', () => {
+  // 150 lines of 0.05 foreign net + 0.01 foreign VAT at 20%, converted at 1.6. Every line and the
+  // aggregate reconcile; the order charged no shipping at all. Derived in BASE currency the "shipping
+  // tax" comes to -0.0075 — past the single component's 0.0052 — and the refund was quarantined for
+  // "its shipping is not taxed at that rate" on an order with no shipping.
+  const order = makeConvertedOrder({ lineCount: 150, lineNetForeign: '0.05', lineTaxForeign: '0.01', fxRateToBase: '1.6', rate: 0.2 })
+
+  // The residue is real and large enough to have tripped the old check — otherwise this proves nothing.
+  const baseDerived = toDecimal(order.taxBase).sub(order.lines.reduce((sum, line) => sum.add(toDecimal(line.taxBase)), toDecimal(0)))
+  assert.equal(baseDerived.toFixed(4), '-0.0075')
+  assert.ok(baseDerived.abs().toNumber() > 0.0052, 'the base derivation exceeds one component of rounding')
+  // In the order's OWN currency the same subtraction is exact — that is why it is done there.
+  const foreignDerived = toDecimal(order.taxForeign).sub(order.lines.reduce((sum, line) => sum.add(toDecimal(line.taxForeign)), toDecimal(0)))
+  assert.equal(foreignDerived.toFixed(4), '0.0000')
+
+  assert.equal(resolveMonetaryRefundVatRate(order).ok, true, 'accepted: there is no shipping discrepancy, only FX rounding')
+})
+
+test('the base-currency fallback admits the conversion residue explicitly, not as slack (o3d-w00 Codex r3 #3)', () => {
+  // An order shape carrying no foreign figures still has to be judged. There the residue is admitted as
+  // what it is — one half-unit per independently converted figure — and REAL shipping VAT is still
+  // caught: on the same order, moving 0.05 of VAT off the lines is a discrepancy no rounding explains.
+  const order = makeConvertedOrder({ lineCount: 150, lineNetForeign: '0.05', lineTaxForeign: '0.01', fxRateToBase: '1.6', rate: 0.2 })
+  const withoutForeign = {
+    ...order,
+    taxForeign: undefined,
+    shippingForeign: undefined,
+    lines: order.lines.map((line) => ({ ...line, taxForeign: undefined })),
+  }
+  assert.equal(resolveMonetaryRefundVatRate(withoutForeign).ok, true, 'the residue alone is admitted')
+
+  const withRealShippingVat = {
+    ...withoutForeign,
+    taxBase: Number((withoutForeign.taxBase + 0.05).toFixed(4)),
+    totalBase: Number((withoutForeign.totalBase + 0.05).toFixed(4)),
+  }
+  const refused = resolveMonetaryRefundVatRate(withRealShippingVat)
+  assert.equal(refused.ok, false, 'VAT that no shipping charge explains is still refused')
+  assert.match(refused.ok === false ? refused.error : '', /shipping is not taxed at that rate/)
+})
+
+test('standard-rated shipping on zero-rated goods is STILL refused (o3d-w00 Codex r2 #1, guarded at r3 #3)', () => {
+  // The check the FX fix must not weaken: goods at 0% with the header at 20% because postage was
+  // standard-rated. Derived in the order's own currency the shipping VAT is real, not residue.
+  const zeroRatedGoodsStandardPostage = {
+    totalBase: 12.05, taxBase: 2, taxRatePercent: 0.2, shippingBase: 10,
+    taxForeign: 2, shippingForeign: 10,
+    lines: [{ totalBase: 0.05, taxBase: 0, taxForeign: 0, taxRate: { rate: 0, reverseCharge: false } }],
+  }
+  const basis = resolveMonetaryRefundVatRate(zeroRatedGoodsStandardPostage)
+  assert.equal(basis.ok, false)
+  // It fails on the per-line rate corroboration first — the goods were never taxed at the header rate.
+  assert.match(basis.ok === false ? basis.error : '', /is not the rate its goods were taxed at/)
+})
+
+test('the sync READS the order-currency tax figures the derivation needs (o3d-w00 Codex r3 #3)', async () => {
+  // Without these columns in the select the foreign derivation silently falls back to base currency, and
+  // no assertion on a hand-built order double would notice.
+  const state = makeDependencies({ alwaysMissExistingRefund: true })
+  await syncWcRefund(1001, makeRefund({ id: 7301, amount: '15.00', line_items: [], shipping_lines: [] }), state.dependencies)
+
+  const select = state.orderSelect as { taxForeign?: boolean; shippingForeign?: boolean; lines?: { select?: { taxForeign?: boolean } } }
+  assert.equal(select?.taxForeign, true, 'the order-currency VAT total')
+  assert.equal(select?.shippingForeign, true, 'the order-currency shipping charge')
+  assert.equal(select?.lines?.select?.taxForeign, true, "each line's order-currency VAT")
 })
 
 // ---------------------------------------------------------------------------

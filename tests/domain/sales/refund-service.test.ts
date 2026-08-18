@@ -28,6 +28,9 @@ type Order = {
   taxBase?: number
   taxRatePercent?: number
   taxRateName?: string | null
+  // o3d-w00 (Codex r3 #2): the shipping charge is a refund TARGET with its own remaining balance,
+  // enforced under the order lock, so the locked read of the order carries it.
+  shippingForeign?: number
   revenueDeferredDate: Date | null
   unearnedRevenueAmount: number | null
   inventoryAllocatedDate: Date | null
@@ -58,6 +61,8 @@ type SalesLine = {
   description: string
   qty: number
   totalBase: number
+  /** The line's NET total in the order's currency — what it has to refund against (Codex r3 #2). */
+  totalForeign?: number
   taxRate?: LineTaxRate | null
   /**
    * o3d-kouj: the line's PINNED fulfilment recipe. The refund's component factors — how many
@@ -391,7 +396,15 @@ function createClient(state: State): RefundServiceClient {
             ...order,
             lines: state.lines
               .filter((line) => line.orderId === order.id)
-              .map((line) => ({ id: line.id, productId: line.productId, qty: line.qty, taxRate: line.taxRate ?? null })),
+              .map((line) => ({
+                id: line.id,
+                productId: line.productId,
+                description: line.description,
+                qty: line.qty,
+                // Defaults to the base total, i.e. an fx-1 order — the fixtures that care set it.
+                totalForeign: line.totalForeign ?? line.totalBase,
+                taxRate: line.taxRate ?? null,
+              })),
             shipments: state.shipments
               .filter((row) => row.orderId === order.id && row.status === 'SHIPPED')
               .map((row) => ({ id: row.id })),
@@ -517,7 +530,15 @@ function createClient(state: State): RefundServiceClient {
           .map((refund) => refund.id)
         return state.refundLines
           .filter((line) => refundIds.includes(line.refundId))
-          .map((line) => ({ productId: line.productId, qty: line.qty }))
+          .map((line) => ({
+            productId: line.productId,
+            qty: line.qty,
+            // o3d-w00 (Codex r3 #2): the per-target balance read. Omitting these made the cap
+            // vacuous — every prior refund would look like it had credited nothing.
+            salesOrderLineId: line.salesOrderLineId ?? null,
+            lineKind: line.lineKind ?? null,
+            totalForeign: line.totalForeign,
+          }))
       },
       create: async ({ data }: { data: Omit<RefundLine, 'id'> }) => {
         const line = { id: `refund-line-${state.nextRefundLineId++}`, ...data }
@@ -825,6 +846,29 @@ test('a refund line SNAPSHOTS the resolved tax identity at creation (o3d-w00)', 
   assert.equal(state.refundLines[0].reverseCharge, false)
 })
 
+test('a line-linked refund with no tax code of its OWN snapshots the ORDER-DEFAULT identity (o3d-w00 Codex r3 #1)', async () => {
+  // This fallback is the contract the hand-recording conversion mirrors: a line whose TaxRate carries no
+  // accountingTaxType posts under the order default, so its credit is re-grossed at the DEFAULT's rate,
+  // not the line's nominal one. Pinned here because it is what makes converting at the nominal rate
+  // wrong — if this fallback ever changes, the exception-inbox conversion is wrong the same day.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 120, taxBase: 20, taxRatePercent: 0.2, taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+  })
+  state.lines[0].taxRate = { accountingTaxType: null, reverseCharge: false }
+  await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Return',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(
+    state.refundLines[0].accountingTaxType, 'OUTPUT2',
+    'an unmapped line posts under the ORDER DEFAULT — 20% here, whatever the line was sold at',
+  )
+})
+
 test('a monetary-only refund PERSISTS lineKind=sale so a retry does not re-post it as shipping (o3d-w00 #4)', async () => {
   // A WooCommerce monetary-only refund is a null-product 'sale' line with a POSITIVE total. The retry
   // loader used to re-infer the kind from productId/sign (null product + positive total => 'shipping'),
@@ -884,7 +928,11 @@ test('a monetary-only refund on a MIXED-rate order is REFUSED and quarantined (o
   assert.equal(state.refundLines.length, 0, 'nothing was created')
 })
 
-test('a monetary-only refund on a REVERSE-CHARGE order is REFUSED (o3d-w00 #2/#5)', async () => {
+test('a monetary-only refund on a reverse-charge order with NO reverse-charge code configured is REFUSED (o3d-w00 #2/#5, Codex r3 #4)', async () => {
+  // No reverseChargeSalesTaxType, so resolveSalesLineTaxType performs no swap and the line stays on its
+  // base code — indistinguishable from a non-reverse-charged line carrying the same code. IMS cannot say
+  // which identity the money would post under, so it fails closed. The refusal now SAYS that, instead of
+  // reporting a mixed-rate order the operator would go looking for a storefront breakdown of.
   const state = baseState()
   state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }
   const result = await createSalesOrderRefund(createClient(state), {
@@ -895,6 +943,157 @@ test('a monetary-only refund on a REVERSE-CHARGE order is REFUSED (o3d-w00 #2/#5
   })
   assert.equal(result.success, false)
   assert.equal(result.success === false && result.quarantine, true)
+  assert.match(result.success === false ? result.error : '', /no reverse-charge sales tax code is configured/)
+})
+
+test('a FULLY reverse-charged order IS uniformly taxed and its monetary refund posts under the RC identity (o3d-w00 Codex r3 #4)', async () => {
+  // Codex r3 #4: uniformity used to be forced false whenever ANY line was reverse-charged, so an order
+  // where EVERY line is reverse-charged — one effective identity, zero seller VAT throughout, gross
+  // trivially equal to net — was quarantined and the operator told its VAT could not be determined.
+  // There was nothing to determine. Uniformity is now read off the effective post-swap identities.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 100, taxBase: 0, taxRatePercent: 0, taxRateName: 'RC' }],
+    taxRates: [{ name: 'RC', accountingTaxType: 'ZERORATEDOUTPUT', active: true }],
+  })
+  state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }
+  state.lines.push({
+    id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 0,
+    // A DIFFERENT base code, so the acceptance can only come from the post-swap identity — if the test
+    // passed on the raw codes it would prove nothing about the swap.
+    taxRate: { accountingTaxType: 'ECOUTPUT', reverseCharge: true },
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 40, lineKind: 'sale' }],
+    reason: 'Monetary refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings: { ...accountingSettings, reverseChargeSalesTaxType: 'REVERSECHARGE' },
+  })
+
+  assert.equal(result.success, true, 'an all-reverse-charge order is uniformly taxed')
+  const line = state.refundLines.find((refundLine) => refundLine.description === 'Monetary refund')
+  assert.equal(line?.accountingTaxType, 'REVERSECHARGE', 'posted under the one reverse-charge identity')
+  assert.equal(line?.reverseCharge, true, 'and the snapshot says the line is reverse-charged')
+})
+
+test('a MIXTURE of reverse-charged and VAT-bearing lines is still REFUSED (o3d-w00 Codex r3 #4)', async () => {
+  // The relaxation must not reach a genuine mixture: two effective identities, and a monetary amount
+  // could belong to either.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], taxRateName: 'Standard' }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+  })
+  state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: true }
+  state.lines.push({
+    id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 0,
+    taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 40, lineKind: 'sale' }],
+    reason: 'Monetary refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings: { ...accountingSettings, reverseChargeSalesTaxType: 'REVERSECHARGE' },
+  })
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.quarantine, true)
+  assert.match(result.success === false ? result.error : '', /not uniformly taxed/)
+})
+
+test('one order line cannot absorb money that came off another, under the refund lock (o3d-w00 Codex r3 #2)', async () => {
+  // The order-wide ceiling is not enough: on a £200-net order with £100 already credited to line-1, a
+  // second £100 against line-1 still fits under the total — but line-1 has nothing left, so the credit
+  // would post to the wrong line's account under the wrong VAT identity. The cap is re-taken INSIDE the
+  // refund transaction (after lockSalesOrder), reading the refund lines committed by the earlier refund,
+  // which is what serialises two concurrent recordings against one order.
+  const makeState = () => {
+    const state = baseState({
+      orders: [{ ...baseState().orders[0], totalBase: 240, taxBase: 40, taxRatePercent: 0.2, taxRateName: 'Standard' }],
+      taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+      refunds: [{
+        id: 'refund-0', orderId: 'order-1', creditNoteNumber: 'CN-0', externalRefundId: null, reason: 'first',
+        totalForeign: 100, totalBase: 100, returnWarehouseId: null, totalsBasis: 'NET',
+      }],
+      refundLines: [{
+        id: 'refund-line-0', refundId: 'refund-0', salesOrderLineId: 'line-1', productId: null,
+        description: 'Widget refund', qty: 0, unitPriceForeign: 0, unitPriceBase: 0,
+        totalForeign: 100, totalBase: 100, lineKind: 'sale',
+      }],
+    })
+    state.lines[0] = {
+      id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1,
+      totalBase: 100, totalForeign: 100, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
+    }
+    state.lines.push({
+      id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Gadget', qty: 1,
+      totalBase: 100, totalForeign: 100, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
+    })
+    return state
+  }
+
+  const overLine1 = makeState()
+  const refused = await createSalesOrderRefund(createClient(overLine1), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: null, description: 'Widget refund', qty: 0, totalForeign: 100, totalBase: 100, lineKind: 'sale' }],
+    reason: 'second refund on the same line',
+    creditNotePrefix: 'CN-',
+    enforcePerTargetBalances: true,
+  })
+  assert.equal(refused.success, false)
+  assert.match(refused.success === false ? refused.error : '', /Widget/)
+  assert.match(refused.success === false ? refused.error : '', /more than it has left to refund/)
+  assert.match(refused.success === false ? refused.error : '', /after earlier refunds/)
+  assert.equal(overLine1.refunds.length, 1, 'no second credit note was created')
+
+  // The ORDER ceiling was never the thing stopping it: the same £100 against the untouched line-2 is
+  // accepted, so the refusal is per-target, not a total.
+  const onLine2 = makeState()
+  const allowed = await createSalesOrderRefund(createClient(onLine2), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-2', productId: null, description: 'Gadget refund', qty: 0, totalForeign: 100, totalBase: 100, lineKind: 'sale' }],
+    reason: 'the other line',
+    creditNotePrefix: 'CN-',
+    enforcePerTargetBalances: true,
+  })
+  assert.equal(allowed.success, true)
+})
+
+test('the shipping charge is a capped target too, and two rows for one target are summed (o3d-w00 Codex r3 #2)', async () => {
+  // Shipping has no order line, so it is keyed by lineKind. And the cap aggregates per target first:
+  // two rows of £3 against a £5 charge with £4 already credited must fail together even though each
+  // would pass alone.
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 126, taxBase: 21, taxRatePercent: 0.2, taxRateName: 'Standard', shippingForeign: 5 }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true }],
+    refunds: [{
+      id: 'refund-0', orderId: 'order-1', creditNoteNumber: 'CN-0', externalRefundId: null, reason: 'first',
+      totalForeign: 4, totalBase: 4, returnWarehouseId: null, totalsBasis: 'NET',
+    }],
+    refundLines: [{
+      id: 'refund-line-0', refundId: 'refund-0', salesOrderLineId: null, productId: null,
+      description: 'Shipping refund', qty: 0, unitPriceForeign: 0, unitPriceBase: 0,
+      totalForeign: 4, totalBase: 4, lineKind: 'shipping',
+    }],
+  })
+  state.lines[0] = {
+    id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1,
+    totalBase: 100, totalForeign: 100, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
+  }
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [
+      { lineId: null, productId: null, description: 'Shipping refund', qty: 0, totalForeign: 3, totalBase: 3, lineKind: 'shipping' },
+      { lineId: null, productId: null, description: 'Shipping refund', qty: 0, totalForeign: 3, totalBase: 3, lineKind: 'shipping' },
+    ],
+    reason: 'postage',
+    creditNotePrefix: 'CN-',
+    enforcePerTargetBalances: true,
+  })
+
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /shipping \(6\.00 net\) is more than it has left to refund \(1\.00 net, after earlier refunds\)/)
+  assert.equal(state.refunds.length, 1, 'no credit note was created')
 })
 
 test('a monetary-only refund on a UNIFORM order posts under the single safe identity, even if the default rate is deactivated (o3d-w00 #5)', async () => {

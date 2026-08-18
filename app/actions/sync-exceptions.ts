@@ -57,6 +57,15 @@ import {
 } from '@/lib/domain/sales/refund-park-recovery'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import {
+  buildTaxTypeRateIndex,
+  resolvePostedRefundTaxIdentity,
+  type TaxTypeRateIndex,
+} from '@/lib/domain/sales/refund-posted-tax-identity'
+import {
+  findOverAllocatedRefundTarget,
+  overAllocatedRefundTargetMessage,
+} from '@/lib/domain/sales/refund-target-balances'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { createPrismaDispatchDeps, reconcileOneOrder } from '@/lib/domain/wms/dispatch-sweep'
@@ -102,6 +111,44 @@ class DriftIsolationAborted extends Error {}
  * order's own stored rounding.
  */
 const REFUND_ALLOCATION_EPSILON = 0.005
+
+/**
+ * o3d-w00 (Codex r3 #1): everything needed to work out the rate a hand-recorded allocation will
+ * ACTUALLY be re-grossed at when its credit note posts — not the rate its order line nominally carries.
+ * Loaded once and shared by the dialog loader and the recording action, so the figure the operator is
+ * shown and the figure the conversion uses can never be two different numbers.
+ */
+type RefundPostingTaxContext = {
+  reverseChargeSalesTaxType: string
+  rateByTaxType: TaxTypeRateIndex
+  /**
+   * accountingTaxType of the ACTIVE TaxRate with this name — the order-default identity, resolved
+   * exactly as createSalesOrderRefund resolves it (`{ name, active: true }`, no usedFor filter).
+   */
+  activeTaxTypeByName: Map<string, string | null>
+}
+
+async function loadRefundPostingTaxContext(): Promise<RefundPostingTaxContext> {
+  const [taxRates, accountingSettings] = await Promise.all([
+    db.taxRate.findMany({ select: { name: true, rate: true, accountingTaxType: true, active: true, usedFor: true } }),
+    // A missing/unreadable settings row must not be read as "reverse charge is configured" — the empty
+    // string is what disables the swap, and resolvePostedRefundTaxIdentity refuses on that rather than
+    // guessing a rate.
+    import('@/lib/accounting').then((accounting) => accounting.getAccountingSettings()).catch(() => null),
+  ])
+  const activeTaxTypeByName = new Map<string, string | null>()
+  for (const taxRate of taxRates) {
+    if (!taxRate.active || activeTaxTypeByName.has(taxRate.name)) continue
+    activeTaxTypeByName.set(taxRate.name, taxRate.accountingTaxType ?? null)
+  }
+  return {
+    reverseChargeSalesTaxType: accountingSettings?.reverseChargeSalesTaxType ?? '',
+    // Only SALES-usable rates price a SALES tax code; an INPUT code sharing a string with an OUTPUT one
+    // would otherwise look like an ambiguous mapping.
+    rateByTaxType: buildTaxTypeRateIndex(taxRates.filter((taxRate) => taxRate.usedFor !== 'PURCHASE')),
+    activeTaxTypeByName,
+  }
+}
 
 export type WmsPushDeadLetterRow = {
   orderId: string
@@ -149,9 +196,15 @@ export type DeadReceiptEventRow = {
  * refund that included postage could not be described at all — the operator could only leave the park
  * open or push shipping money onto a goods line, which posts to the wrong account at the wrong VAT.
  *
- * `vatRate` is the rate this target will be RE-GROSSED at when the credit note posts (its own line's
- * rate, zero under reverse charge; the order default for shipping, which is what the invoice charged it
- * under), so the gross the operator types converts to net exactly.
+ * `vatRate` is the rate this target will be RE-GROSSED at when the credit note posts — resolved from the
+ * accounting tax IDENTITY the refund line will carry (o3d-w00 Codex r3 #1), not from the order line's
+ * nominal `TaxRate.rate`. The two diverge exactly where it costs money: a line whose TaxRate has no
+ * accounting tax code posts under the ORDER-DEFAULT identity, so a nominally 0% line on a 20% order
+ * posts at 20% and a "reconciled" £100 allocation would raise a £120 credit note.
+ *
+ * `unrecordableReason` is set when that identity cannot be established (or does not carry the rate the
+ * customer was charged). The target cannot be allocated to until it is fixed, and the reason names the
+ * fix — this is the same refusal the server action raises, surfaced before the operator types anything.
  */
 export type RefundParkAllocationTarget = {
   /** The order line, or null for the order's shipping charge. */
@@ -160,11 +213,13 @@ export type RefundParkAllocationTarget = {
   description: string
   sku: string | null
   taxRateName: string | null
-  /** A fraction, e.g. "0.2" for 20%. */
+  /** A fraction, e.g. "0.2" for 20%. The rate the credit note will post at. */
   vatRate: string
   /** Still refundable on this target, after any earlier refunds — net, and the gross that implies. */
   remainingNetForeign: string
   remainingGrossForeign: string
+  /** Why this target cannot be allocated to, or null when it can. */
+  unrecordableReason: string | null
 }
 
 export type RefundSyncParkRow = {
@@ -689,7 +744,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   // SHIPPING charge, each with the VAT rate its credit will be posted at and what is left to refund on
   // it. A refund attributed to the real parts of the order is exactly what both refusals (undeterminable
   // basis, non-uniform tax) are waiting for.
-  const [refundOrders, priorRefundLines] = await Promise.all([
+  const [refundOrders, priorRefundLines, postingTaxContext] = await Promise.all([
     refundOrderIds.length > 0
       ? db.salesOrder.findMany({
           where: { id: { in: refundOrderIds } },
@@ -707,7 +762,9 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
                 description: true,
                 sku: true,
                 totalForeign: true,
-                taxRate: { select: { name: true, rate: true, reverseCharge: true } },
+                // accountingTaxType (o3d-w00 Codex r3 #1): the identity the credit note posts under, and
+                // therefore the rate the operator's gross is really converted at.
+                taxRate: { select: { name: true, rate: true, reverseCharge: true, accountingTaxType: true } },
               },
             },
           },
@@ -721,6 +778,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
           select: { salesOrderLineId: true, lineKind: true, totalForeign: true, refund: { select: { orderId: true } } },
         })
       : Promise.resolve([]),
+    loadRefundPostingTaxContext(),
   ])
   const refundOrderById = new Map(refundOrders.map((order) => [order.id, order]))
   // o3d-54p: which WooCommerce order each parked order is linked to. Read for the whole page in one
@@ -750,16 +808,31 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   }
   const buildAllocationTargets = (order: typeof refundOrders[number] | undefined): RefundParkAllocationTarget[] => {
     if (!order) return []
+    // The order-default identity, resolved exactly as createSalesOrderRefund resolves it: the ACTIVE
+    // TaxRate named on the order. A deactivated/renamed default leaves shipping with no identity at all,
+    // which is a refusal, not a zero.
+    const orderDefaultTaxType = order.taxRateName
+      ? postingTaxContext.activeTaxTypeByName.get(order.taxRateName) ?? null
+      : null
     const targets: RefundParkAllocationTarget[] = order.lines.map((line) => {
-      // The rate the customer was actually charged on this line, which is also the rate its credit posts
-      // at: createSalesOrderRefund snapshots a LINE-LINKED refund line's identity from the line's own
-      // TaxRate. Reverse-charged lines carry no seller VAT, so their gross IS their net.
-      // (Residual, deliberately not second-guessed here: when a line's TaxRate has no accountingTaxType
-      // the credit note falls back to the ORDER-DEFAULT identity — exactly as the invoice did for that
-      // line — so the VAT it carries can differ from the rate used here. The NET recorded is still the
-      // true net of the money refunded, which is what IMS stores and what the refund ceiling and the
-      // FULL/PARTIAL classification compare against.)
-      const vatRate = line.taxRate?.reverseCharge ? toDecimal(0) : toDecimal(line.taxRate?.rate ?? 0)
+      // o3d-w00 (Codex r3 #1): the rate the credit note will RE-GROSS this line at, resolved from the
+      // accounting tax identity it will post under — NOT the line's nominal TaxRate.rate. Where the two
+      // disagree (an unmapped line rate falling back to the order default, an unconfigured reverse-charge
+      // swap) the target is refused rather than shown a rate that will not be used.
+      const identity = resolvePostedRefundTaxIdentity({
+        kind: 'sale',
+        lineTaxRate: line.taxRate,
+        orderDefaultTaxType,
+        orderDefaultRate: order.taxRatePercent,
+        reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
+        rateByTaxType: postingTaxContext.rateByTaxType,
+        label: line.description || `line ${line.id}`,
+      })
+      // Unresolvable: show what the customer was charged (so the row still reads truthfully) and say why
+      // it cannot be allocated to.
+      const vatRate = identity.ok
+        ? identity.vatRate
+        : (line.taxRate?.reverseCharge ? toDecimal(0) : toDecimal(line.taxRate?.rate ?? 0))
       const remainingNet = toDecimal(line.totalForeign).sub(priorRefundedByLineId.get(line.id) ?? toDecimal(0))
       return {
         lineId: line.id,
@@ -770,6 +843,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         vatRate: vatRate.toString(),
         remainingNetForeign: remainingNet.toFixed(2),
         remainingGrossForeign: remainingNet.mul(toDecimal(1).add(vatRate)).toFixed(2),
+        unrecordableReason: identity.ok ? null : identity.reason,
       }
     })
     const shippingForeign = toDecimal(order.shippingForeign)
@@ -777,7 +851,15 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       // An unlinked shipping refund line is posted under the ORDER-DEFAULT VAT identity (refund-service
       // resolveRefundLineTaxIdentity), the same identity the invoice charged shipping under — so that is
       // the rate the operator's gross must be converted at, whatever the goods lines carry.
-      const vatRate = toDecimal(order.taxRatePercent ?? 0)
+      const identity = resolvePostedRefundTaxIdentity({
+        kind: 'shipping',
+        orderDefaultTaxType,
+        orderDefaultRate: order.taxRatePercent,
+        reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
+        rateByTaxType: postingTaxContext.rateByTaxType,
+        label: 'Shipping',
+      })
+      const vatRate = identity.ok ? identity.vatRate : toDecimal(order.taxRatePercent ?? 0)
       const remainingNet = shippingForeign.sub(priorRefundedShippingByOrderId.get(order.id) ?? toDecimal(0))
       targets.push({
         lineId: null,
@@ -788,6 +870,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         vatRate: vatRate.toString(),
         remainingNetForeign: remainingNet.toFixed(2),
         remainingGrossForeign: remainingNet.mul(toDecimal(1).add(vatRate)).toFixed(2),
+        unrecordableReason: identity.ok ? null : identity.reason,
       })
     }
     return targets
@@ -1309,8 +1392,11 @@ export async function recordRefundParkManually(
         currency: true,
         fxRateToBase: true,
         // The order-default VAT identity: what the invoice charged shipping under, and what
-        // createSalesOrderRefund posts an unlinked shipping refund line under.
+        // createSalesOrderRefund posts an unlinked shipping refund line under. taxRateName is how that
+        // identity is RESOLVED (the ACTIVE TaxRate of that name); taxRatePercent is what it was CHARGED
+        // at, and the two must agree before a gross may be divided by either (o3d-w00 Codex r3 #1).
         taxRatePercent: true,
+        taxRateName: true,
         shippingForeign: true,
         lines: {
           select: {
@@ -1318,7 +1404,7 @@ export async function recordRefundParkManually(
             productId: true,
             description: true,
             totalForeign: true,
-            taxRate: { select: { rate: true, reverseCharge: true } },
+            taxRate: { select: { rate: true, reverseCharge: true, accountingTaxType: true } },
           },
         },
       },
@@ -1339,25 +1425,25 @@ export async function recordRefundParkManually(
     // What is still refundable, per target. createSalesOrderRefund caps the ORDER total; it does not stop
     // one line absorbing money that came off another, which would post the refund to the wrong account
     // and the wrong VAT even though the total reconciled.
-    const priorRefundLines = await db.salesOrderRefundLine.findMany({
-      where: { refund: { orderId: order.id } },
-      select: { salesOrderLineId: true, lineKind: true, totalForeign: true },
-    })
-    const priorByLineId = new Map<string, Decimal>()
-    let priorShipping = toDecimal(0)
-    for (const refundLine of priorRefundLines) {
-      if (refundLine.salesOrderLineId) {
-        priorByLineId.set(
-          refundLine.salesOrderLineId,
-          (priorByLineId.get(refundLine.salesOrderLineId) ?? toDecimal(0)).add(toDecimal(refundLine.totalForeign)),
-        )
-      } else if (refundLine.lineKind === 'shipping') {
-        priorShipping = priorShipping.add(toDecimal(refundLine.totalForeign))
-      }
-    }
+    //
+    // Codex r3 #2: this read is OUTSIDE the refund transaction, so it can only be a pre-flight — two
+    // concurrent recordings against one order would both pass it. The AUTHORITATIVE cap is re-taken
+    // inside createSalesOrderRefund under the order lock (enforcePerTargetBalances below), using this
+    // same helper. Keeping it here as well is what gives the operator the named-target refusal
+    // immediately, before anything is created.
+    const [priorRefundLines, postingTaxContext] = await Promise.all([
+      db.salesOrderRefundLine.findMany({
+        where: { refund: { orderId: order.id } },
+        select: { salesOrderLineId: true, lineKind: true, totalForeign: true },
+      }),
+      loadRefundPostingTaxContext(),
+    ])
 
     const fxRate = toDecimal(order.fxRateToBase).gt(0) ? toDecimal(order.fxRateToBase) : toDecimal(1)
-    const orderDefaultRate = toDecimal(order.taxRatePercent ?? 0)
+    // The order-default identity, resolved exactly as createSalesOrderRefund resolves it.
+    const orderDefaultTaxType = order.taxRateName
+      ? postingTaxContext.activeTaxTypeByName.get(order.taxRateName) ?? null
+      : null
     const refundLines: {
       lineId: string | null
       productId: string | null
@@ -1370,28 +1456,28 @@ export async function recordRefundParkManually(
     }[] = []
     for (const allocation of cleaned) {
       const gross = toDecimal(allocation.grossAmountForeign)
-      // The rate the refund line will be RE-GROSSED at when the credit note posts, so converting the
-      // operator's gross with it is exact: a linked sale line posts under its own line's identity (zero
-      // under reverse charge, where the seller charged no VAT), and an unlinked shipping line posts under
-      // the order default.
       const line = allocation.lineKind === 'sale' ? orderLineById.get(allocation.lineId!)! : null
-      const rate = line
-        ? (line.taxRate?.reverseCharge ? toDecimal(0) : toDecimal(line.taxRate?.rate ?? 0))
-        : orderDefaultRate
-      const net = roundQuantity(gross.div(toDecimal(1).add(rate)), 4)
-      const remaining = line
-        ? toDecimal(line.totalForeign).sub(priorByLineId.get(line.id) ?? toDecimal(0))
-        : orderShippingForeign.sub(priorShipping)
-      if (net.sub(remaining).gt(REFUND_ALLOCATION_EPSILON)) {
-        const label = line ? (line.description || `line ${line.id}`) : 'shipping'
-        return {
-          success: false,
-          error:
-            `The amount allocated to ${label} (${net.toFixed(2)} net) is more than it has left to refund ` +
-            `(${remaining.toFixed(2)} net${remaining.lt(toDecimal(line ? line.totalForeign : orderShippingForeign)) ? ', after earlier refunds' : ''}). ` +
-            'Split the refund across the parts it actually covered.',
-        }
+      // o3d-w00 (Codex r3 #1): the rate the credit note will RE-GROSS this line at is the rate of the
+      // accounting tax IDENTITY it posts under, resolved here the same way createSalesOrderRefund
+      // resolves it — NOT the line's nominal TaxRate.rate. Converting with the nominal rate let a park
+      // be "reconciled" to a figure the credit note would never come to: a 0%-nominal line with no
+      // accounting tax code falls back to a 20% order default, so £100 gross stored as £100 net posts a
+      // £120 credit note against a £100 storefront refund. Where the identity cannot be established, or
+      // does not carry the rate the customer was charged, the recording is REFUSED — with the fix named
+      // — rather than reconciled against a rate that will not be used.
+      const identity = resolvePostedRefundTaxIdentity({
+        kind: allocation.lineKind,
+        lineTaxRate: line?.taxRate ?? null,
+        orderDefaultTaxType,
+        orderDefaultRate: order.taxRatePercent,
+        reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
+        rateByTaxType: postingTaxContext.rateByTaxType,
+        label: line ? (line.description || `line ${line.id}`) : 'The shipping charge',
+      })
+      if (!identity.ok) {
+        return { success: false, error: identity.reason }
       }
+      const net = roundQuantity(gross.div(toDecimal(1).add(identity.vatRate)), 4)
       refundLines.push({
         lineId: line?.id ?? null,
         productId: line?.productId ?? null,
@@ -1404,6 +1490,20 @@ export async function recordRefundParkManually(
         lineKind: allocation.lineKind,
         grossForeign: roundQuantity(gross, 4).toNumber(),
       })
+    }
+
+    const overAllocated = findOverAllocatedRefundTarget({
+      order: { shippingForeign: order.shippingForeign, lines: order.lines },
+      priorRefundLines,
+      allocations: refundLines.map((refundLine) => ({
+        lineId: refundLine.lineId,
+        lineKind: refundLine.lineKind,
+        netForeign: refundLine.totalForeign,
+      })),
+      epsilon: REFUND_ALLOCATION_EPSILON,
+    })
+    if (overAllocated) {
+      return { success: false, error: overAllocatedRefundTargetMessage(overAllocated) }
     }
 
     // Codex r2 #2: the credit note must SETTLE the parked refund, not merely be smaller than the order.
@@ -1437,7 +1537,14 @@ export async function recordRefundParkManually(
       // No return warehouse: nothing physically came back, and a hand-recorded monetary refund must not
       // invent an inventory movement.
       undefined,
-      { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId },
+      {
+        internalBypassToken: INTERNAL_ACTION_BYPASS,
+        externalRefundId,
+        // Codex r3 #2: re-take the per-target caps under the refund transaction's order lock, so two
+        // concurrent recordings against this order cannot both pass their own pre-flight and jointly
+        // over-refund one line.
+        enforcePerTargetBalances: true,
+      },
     )
     if (!result.success) {
       // The park stays QUARANTINED and visible — the operator can fix the allocation and try again.

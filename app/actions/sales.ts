@@ -2088,7 +2088,17 @@ export async function createRefund(
   lines: RefundRequestLine[],
   reason: string,
   returnWarehouseId?: string,
-  options?: { internalBypassToken?: symbol; externalRefundId?: number; chargeback?: boolean },
+  options?: {
+    internalBypassToken?: symbol
+    externalRefundId?: number
+    chargeback?: boolean
+    /**
+     * o3d-w00 (Codex r3 #2): cap each order line / the shipping charge at its own remaining balance,
+     * inside the refund transaction's order lock. Internal-only, like the other provenance-bearing
+     * options: it is set by the exception inbox's hand-recording path.
+     */
+    enforcePerTargetBalances?: boolean
+  },
   // Two independent outcomes ride alongside `error`:
   //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
   //                OTHER reversal path (WC refund webhook vs payment-poller chargeback) had
@@ -2116,6 +2126,10 @@ export async function createRefund(
     if (!isInternal && (options?.chargeback || options?.externalRefundId != null)) {
       return { success: false, error: 'chargeback and externalRefundId may only be set by internal sync callers' }
     }
+    // o3d-w00 (Codex r3 #2): the per-target cap is a TIGHTENING, so a forged `true` cannot over-refund —
+    // but a forged `false` from a public caller could turn it off for the hand-recording path, so it is
+    // read only from an internal caller.
+    const enforcePerTargetBalances = isInternal && options?.enforcePerTargetBalances === true
 
     const { getNumberingFormats } = await import('./company')
     const [numbering, accountingSettings] = await Promise.all([
@@ -2137,6 +2151,7 @@ export async function createRefund(
       // COGS + restock suppressed). Used by the payment-poller on a payment reversal.
       chargeback: options?.chargeback,
       activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
+      enforcePerTargetBalances,
     })
     if (!refundResult.success) return refundResult
 
