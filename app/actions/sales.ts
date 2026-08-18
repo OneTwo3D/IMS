@@ -89,6 +89,7 @@ import {
   type CreatedRefundLine,
   type RefundAccountingSyncRequest,
   type RefundCreationConflict,
+  type RefundExpectedTaxIdentity,
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
 import {
@@ -2098,6 +2099,12 @@ export async function createRefund(
      * options: it is set by the exception inbox's hand-recording path.
      */
     enforcePerTargetBalances?: boolean
+    /**
+     * o3d-w00 (Codex r4 #2): the accounting tax identity each target was CONVERTED at, to be re-checked
+     * against the identity the credit note will actually post under, inside the refund transaction's
+     * order lock. Internal-only and a pure TIGHTENING — it can only refuse a refund, never widen one.
+     */
+    expectedTaxIdentities?: RefundExpectedTaxIdentity[]
   },
   // Two independent outcomes ride alongside `error`:
   //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
@@ -2152,6 +2159,10 @@ export async function createRefund(
       chargeback: options?.chargeback,
       activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
       enforcePerTargetBalances,
+      // o3d-w00 (Codex r4 #2): like enforcePerTargetBalances this is a tightening, but a forged EMPTY
+      // list from a public caller would switch the fence off for the hand-recording path, so it is read
+      // only from an internal caller.
+      expectedTaxIdentities: isInternal ? options?.expectedTaxIdentities : undefined,
     })
     if (!refundResult.success) return refundResult
 

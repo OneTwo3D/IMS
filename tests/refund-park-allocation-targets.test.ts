@@ -13,7 +13,14 @@ import test, { mock } from 'node:test'
  * after part of it has already been credited invites an allocation the action will refuse.
  */
 
-/** A COHERENT order: £10 @ 20% + £20 @ 0% goods + £5 shipping at the 20% order default = £38.00 gross. */
+/**
+ * A COHERENT order: £10 @ 20% + £20 @ 0% goods + £5 shipping at the 20% order default = £38.00 gross.
+ *
+ * Codex r4 #1: every line carries its OWN money — the net it was sold at and the VAT taken on it — so
+ * the rate it was CHARGED at is a fact the order records, not something read back out of a mutable tax
+ * table. `rate` stays on the taxRate object because the real row has one; the test below moves it away
+ * from the money to prove the loader does not read it.
+ */
 const ORDER = {
   id: 'so-1',
   orderNumber: 'SO-1001',
@@ -23,8 +30,8 @@ const ORDER = {
   shippingForeign: 5,
   shippingService: 'Royal Mail',
   lines: [
-    { id: 'line-1', description: 'Widget', sku: 'WIDGET', totalForeign: 10, taxRate: { name: 'UK Standard Rate', rate: 0.2, reverseCharge: false, accountingTaxType: 'OUTPUT2' } },
-    { id: 'line-2', description: 'Book', sku: 'BOOK', totalForeign: 20, taxRate: { name: 'UK Zero Rate', rate: 0, reverseCharge: false, accountingTaxType: 'ZERORATEDOUTPUT' as string | null } },
+    { id: 'line-1', description: 'Widget', sku: 'WIDGET', totalForeign: 10, taxForeign: 2, taxRate: { name: 'UK Standard Rate', rate: 0.2, reverseCharge: false, accountingTaxType: 'OUTPUT2' as string | null } },
+    { id: 'line-2', description: 'Book', sku: 'BOOK', totalForeign: 20, taxForeign: 0, taxRate: { name: 'UK Zero Rate', rate: 0, reverseCharge: false, accountingTaxType: 'ZERORATEDOUTPUT' as string | null } },
   ],
 }
 
@@ -114,7 +121,24 @@ mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
 
 test.beforeEach(() => {
   TAX_RATES = DEFAULT_TAX_RATES.map((taxRate) => ({ ...taxRate }))
+  ORDER.lines[0].taxRate.accountingTaxType = 'OUTPUT2'
+  ORDER.lines[0].taxRate.rate = 0.2
   ORDER.lines[1].taxRate.accountingTaxType = 'ZERORATEDOUTPUT'
+})
+
+test('the order fixture is a coherent order (o3d-w00)', () => {
+  // Its lines carry money, that money adds up to the order it claims to be, and the tax table prices
+  // each line's accounting code at the rate the line's OWN money says it was sold at. A fixture where
+  // charged and posted can never differ would say nothing about the check that separates them.
+  const linesNet = ORDER.lines.reduce((sum, line) => sum + line.totalForeign, 0)
+  const vat = ORDER.lines.reduce((sum, line) => sum + line.taxForeign, 0) + ORDER.shippingForeign * ORDER.taxRatePercent
+  assert.equal(linesNet + ORDER.shippingForeign + vat, 38, 'net 35.00 + VAT 3.00 = 38.00 gross')
+  for (const line of ORDER.lines) {
+    const chargedRate = line.taxForeign / line.totalForeign
+    const priced = DEFAULT_TAX_RATES.filter((taxRate) => taxRate.accountingTaxType === line.taxRate.accountingTaxType)
+    assert.deepEqual(priced.map((taxRate) => taxRate.rate), [chargedRate], line.description)
+    assert.equal(line.taxRate.rate, chargedRate, `${line.description}: the live row agrees with the sale, today`)
+  }
 })
 
 test('the Record-manually dialog is offered SHIPPING as well as the order lines (o3d-w00 Codex r2 #3)', async () => {
@@ -175,6 +199,30 @@ test('a target whose POSTED VAT identity cannot be established is offered as unr
   // The other targets are untouched — one broken mapping does not close the whole dialog.
   assert.equal(targets.find((target) => target.lineId === 'line-1')?.unrecordableReason, null)
   assert.equal(targets.find((target) => target.kind === 'shipping')?.unrecordableReason, null)
+})
+
+test('a target whose line was charged at a rate its code no longer carries is unrecordable (o3d-w00 Codex r4 #1)', async () => {
+  // An admin edits UK Standard Rate from 20% to 5%. The live row the widget points at moves with it;
+  // the widget's own money does not, because 2.00 of VAT on 10.00 of goods is what the customer paid.
+  // The dialog must not offer the widget at 5% (the operator would enter a gross that converts to a net
+  // whose credit note restates the VAT), and must not offer it at 20% either (that is not what the
+  // credit note will post at). It says so, with the fix.
+  TAX_RATES = TAX_RATES.map((taxRate) => taxRate.name === 'UK Standard Rate' ? { ...taxRate, rate: 0.05 } : taxRate)
+  ORDER.lines[0].taxRate.rate = 0.05
+  const { getExceptionInboxData } = await import('@/app/actions/sync-exceptions')
+  const data = await getExceptionInboxData()
+  const targets = data.refundSyncParks[0].allocationTargets
+
+  const widget = targets.find((target) => target.lineId === 'line-1')
+  assert.match(widget?.unrecordableReason ?? '', /Widget was charged at 20% but/)
+  assert.match(widget?.unrecordableReason ?? '', /OUTPUT2, which is 5%/)
+  // The rate SHOWN on a refused row is what the customer was charged, read off the line's own money —
+  // not the live rate, which is neither what was paid nor what would be posted.
+  assert.equal(widget?.vatRate, '0.2')
+  // Shipping goes the same way, from the order's own taxRatePercent.
+  assert.match(targets.find((target) => target.kind === 'shipping')?.unrecordableReason ?? '', /Shipping was charged at 20% but/)
+  // The zero-rated line is untouched: one edited rate does not close the whole dialog.
+  assert.equal(targets.find((target) => target.lineId === 'line-2')?.unrecordableReason, null)
 })
 
 test('shipping is unrecordable when the order-default rate is deactivated (o3d-w00 Codex r3 #1)', async () => {

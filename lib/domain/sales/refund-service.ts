@@ -19,6 +19,7 @@ import { refundDispositionForStatus } from '@/lib/domain/sales/refund-dispositio
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { findOverAllocatedRefundTarget, overAllocatedRefundTargetMessage } from '@/lib/domain/sales/refund-target-balances'
+import { RATE_EPSILON, buildTaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { scheduleRefundReservationReleaseOutbox, scheduleRefundUnmatchedWarningOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { calculateCoverageByLine, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
@@ -113,6 +114,20 @@ export type RefundRequestLine = {
   totalForeign?: number | null
   totalBase: number
   lineKind?: 'sale' | 'shipping' | 'discount'
+}
+
+/**
+ * o3d-w00 (Codex r4 #2): what a caller that CONVERTED a gross figure believes each target will post
+ * under. `vatRate` is the rate the gross was divided by, as a fraction string; the identity and its
+ * price are both re-checked under the order lock before anything is created.
+ */
+export type RefundExpectedTaxIdentity = {
+  /** The order line this covers, or null for the unlinked shipping target. */
+  lineId: string | null
+  lineKind: 'sale' | 'shipping'
+  accountingTaxType: string
+  reverseCharge: boolean
+  vatRate: string
 }
 
 export type ChargebackOrderLine = {
@@ -2842,6 +2857,21 @@ export async function createSalesOrderRefund(
      * money to specific parts of the order.
      */
     enforcePerTargetBalances?: boolean
+    /**
+     * o3d-w00 (Codex r4 #2): the accounting tax identity each target was CONVERTED at by the caller,
+     * re-checked here against the identity this transaction will actually post it under.
+     *
+     * The hand-recording path takes an operator's GROSS figure and divides it by the rate of the
+     * identity the refund line will carry, then submits the NET. That resolution and this one are two
+     * independent reads of the tax table and the accounting settings, so they can disagree — an admin
+     * remapping a tax rate's accounting code, editing its rate, renaming or deactivating the order's
+     * default rate, or setting/clearing the reverse-charge sales code in between is enough. The credit
+     * note would then post a net figure under an identity nobody divided by, and the total it settles
+     * would not be the total that was reconciled — the exact failure the reconciliation exists to
+     * prevent. Refusing the whole credit note is the only safe answer; the park stays open and the
+     * operator records it again against the configuration that now holds.
+     */
+    expectedTaxIdentities?: RefundExpectedTaxIdentity[]
   },
 ): Promise<CreateSalesOrderRefundResult> {
   // Keep discount lines (negative totalBase, qty 0) which the qty>0/totalBase>0 filter
@@ -3052,6 +3082,69 @@ export async function createSalesOrderRefund(
           createdRefundLines: existingExternalRefund.lines.map(reconstructReplayLine),
           creditNoteNumber: existingExternalRefund.creditNoteNumber ?? '',
           newStatus: so.refundStatus === 'FULL' ? 'REFUNDED' as const : 'PARTIALLY_REFUNDED' as const,
+        }
+      }
+    }
+
+    // -----------------------------------------------------------------------------------------------
+    // o3d-w00 (Codex r4 #2): FENCE the posting identity to the one the caller converted at.
+    //
+    // Everything above resolved the identity from THIS transaction's reads, under the order lock. The
+    // caller resolved it earlier, from its own reads, and divided the operator's gross by the rate it
+    // found. Nothing has been tying those two together: between them an admin can remap a tax rate's
+    // accounting code, edit that code's rate, rename or deactivate the order's default rate, or set /
+    // clear the reverse-charge sales code — and the credit note then posts a net figure under an
+    // identity nobody divided by. The total the operator reconciled and the total the credit note comes
+    // to are then different numbers, which is the one thing this whole path exists to make impossible.
+    //
+    // Both halves of the identity are checked: the CODE (and its reverse-charge flag), and the PRICE
+    // the code now carries — a rate edited in place leaves the code identical and would otherwise slip
+    // straight through. The price is read here, inside the transaction, with the same SALES-only scope
+    // the caller priced it with.
+    //
+    // Placed AFTER the external-refund replay short-circuit on purpose: the fence guards a NEW credit
+    // note. A redelivery of one that already exists replays the posting it was actually created with
+    // (from the persisted per-line snapshot), and must not be turned into an error by a tax
+    // configuration that has moved since.
+    // -----------------------------------------------------------------------------------------------
+    if (input.expectedTaxIdentities?.length) {
+      const salesTaxRates = await tx.taxRate.findMany({
+        where: { usedFor: { not: 'PURCHASE' } },
+        select: { accountingTaxType: true, rate: true },
+      })
+      const rateByTaxType = buildTaxTypeRateIndex(salesTaxRates)
+      const identityMoved = (target: string, was: string, now: string) => ({
+        error:
+          `The VAT identity of ${target} changed while this refund was being recorded — it was ${was} ` +
+          `when the amount was converted and is ${now} now, so the credit note would not come to the ` +
+          'figure that was reconciled. Nothing has been credited. Re-open the refund and record it ' +
+          'again against the tax settings that now apply.',
+      } as const)
+      for (const expected of input.expectedTaxIdentities) {
+        const target = expected.lineKind === 'shipping'
+          ? 'the shipping charge'
+          : `order line ${expected.lineId ?? '(unlinked)'}`
+        const resolved = resolveRefundLineTaxIdentity(expected.lineId, expected.lineKind)
+        if ((resolved.accountingTaxType ?? null) !== expected.accountingTaxType ||
+            Boolean(resolved.reverseCharge) !== expected.reverseCharge) {
+          return identityMoved(
+            target,
+            `${expected.accountingTaxType}${expected.reverseCharge ? ' (reverse-charged)' : ''}`,
+            `${resolved.accountingTaxType ?? 'unmapped'}${resolved.reverseCharge ? ' (reverse-charged)' : ''}`,
+          )
+        }
+        // Priced the same way the caller priced it: exactly one sales rate may map to the code, and it
+        // must still be the rate the gross was divided by.
+        const rates = rateByTaxType.get(expected.accountingTaxType)
+        const nowRate = rates && rates.size === 1 ? toDecimal([...rates][0]) : null
+        if (!nowRate || nowRate.sub(toDecimal(expected.vatRate)).abs().gt(RATE_EPSILON)) {
+          return identityMoved(
+            target,
+            `${expected.accountingTaxType} at ${toDecimal(expected.vatRate).mul(100).toString()}%`,
+            nowRate
+              ? `${expected.accountingTaxType} at ${nowRate.mul(100).toString()}%`
+              : `${expected.accountingTaxType}, which IMS can no longer price`,
+          )
         }
       }
     }

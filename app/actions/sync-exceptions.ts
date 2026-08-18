@@ -59,6 +59,8 @@ import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
   buildTaxTypeRateIndex,
+  chargedRateFromLineSnapshot,
+  resolveOrderUniformTaxIdentity,
   resolvePostedRefundTaxIdentity,
   type TaxTypeRateIndex,
 } from '@/lib/domain/sales/refund-posted-tax-identity'
@@ -761,10 +763,14 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
                 id: true,
                 description: true,
                 sku: true,
+                // The line's own money snapshot: the NET it was sold at and the VAT taken on it. Codex
+                // r4 #1 — this, not the live TaxRate.rate, is what the line was CHARGED at.
                 totalForeign: true,
+                taxForeign: true,
                 // accountingTaxType (o3d-w00 Codex r3 #1): the identity the credit note posts under, and
-                // therefore the rate the operator's gross is really converted at.
-                taxRate: { select: { name: true, rate: true, reverseCharge: true, accountingTaxType: true } },
+                // therefore the rate the operator's gross is really converted at. `rate` is deliberately
+                // NOT read — it is today's rate, not the one this order was billed under.
+                taxRate: { select: { name: true, reverseCharge: true, accountingTaxType: true } },
               },
             },
           },
@@ -814,6 +820,12 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     const orderDefaultTaxType = order.taxRateName
       ? postingTaxContext.activeTaxTypeByName.get(order.taxRateName) ?? null
       : null
+    // The identity an UNLINKED sale amount posts under — what refund-service falls back to for a line
+    // with no TaxRate row of its own (Codex r4 #2). Resolved from the whole order, once.
+    const orderUniform = resolveOrderUniformTaxIdentity({
+      lines: order.lines,
+      reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
+    })
     const targets: RefundParkAllocationTarget[] = order.lines.map((line) => {
       // o3d-w00 (Codex r3 #1): the rate the credit note will RE-GROSS this line at, resolved from the
       // accounting tax identity it will post under — NOT the line's nominal TaxRate.rate. Where the two
@@ -822,17 +834,19 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       const identity = resolvePostedRefundTaxIdentity({
         kind: 'sale',
         lineTaxRate: line.taxRate,
+        chargedLine: { netForeign: line.totalForeign, taxForeign: line.taxForeign },
         orderDefaultTaxType,
-        orderDefaultRate: order.taxRatePercent,
+        orderChargedRate: order.taxRatePercent,
+        orderUniform,
         reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
         rateByTaxType: postingTaxContext.rateByTaxType,
         label: line.description || `line ${line.id}`,
       })
-      // Unresolvable: show what the customer was charged (so the row still reads truthfully) and say why
-      // it cannot be allocated to.
+      // Unresolvable: show what the customer was charged — read off the line's OWN money (Codex r4 #1),
+      // so the row still reads truthfully — and say why it cannot be allocated to.
       const vatRate = identity.ok
         ? identity.vatRate
-        : (line.taxRate?.reverseCharge ? toDecimal(0) : toDecimal(line.taxRate?.rate ?? 0))
+        : (chargedRateFromLineSnapshot({ netForeign: line.totalForeign, taxForeign: line.taxForeign }) ?? toDecimal(0))
       const remainingNet = toDecimal(line.totalForeign).sub(priorRefundedByLineId.get(line.id) ?? toDecimal(0))
       return {
         lineId: line.id,
@@ -854,7 +868,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       const identity = resolvePostedRefundTaxIdentity({
         kind: 'shipping',
         orderDefaultTaxType,
-        orderDefaultRate: order.taxRatePercent,
+        orderChargedRate: order.taxRatePercent,
         reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
         rateByTaxType: postingTaxContext.rateByTaxType,
         label: 'Shipping',
@@ -1403,8 +1417,13 @@ export async function recordRefundParkManually(
             id: true,
             productId: true,
             description: true,
+            // The line's own money snapshot — what it was sold at and the VAT taken on it. Codex r4 #1:
+            // the CHARGED rate is read from these, never from the live TaxRate row, which an admin can
+            // edit at any time and which would then make the divergence check compare today's rate
+            // against today's rate.
             totalForeign: true,
-            taxRate: { select: { rate: true, reverseCharge: true, accountingTaxType: true } },
+            taxForeign: true,
+            taxRate: { select: { reverseCharge: true, accountingTaxType: true } },
           },
         },
       },
@@ -1444,6 +1463,13 @@ export async function recordRefundParkManually(
     const orderDefaultTaxType = order.taxRateName
       ? postingTaxContext.activeTaxTypeByName.get(order.taxRateName) ?? null
       : null
+    // The identity an UNLINKED sale amount posts under, resolved from the whole order exactly as
+    // createSalesOrderRefund resolves it (Codex r4 #2) — so a line with no TaxRate row of its own is
+    // priced here the same way it will be posted, rather than by a second, different rule.
+    const orderUniform = resolveOrderUniformTaxIdentity({
+      lines: order.lines,
+      reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
+    })
     const refundLines: {
       lineId: string | null
       productId: string | null
@@ -1453,6 +1479,20 @@ export async function recordRefundParkManually(
       totalBase: number
       lineKind: 'sale' | 'shipping'
       grossForeign: number
+    }[] = []
+    // Codex r4 #2: the identity every allocation was CONVERTED at, carried into the refund transaction
+    // so the posting can be fenced to it. Conversion happens here (it has to — the net lines are the
+    // input to the ledger call) and the posting identity is resolved again inside the transaction from
+    // its own locked read. Two independent reads can disagree — an admin remapping a tax rate, renaming
+    // or deactivating the order default, or setting/clearing the reverse-charge code in between — and
+    // the credit note would then post under an identity the gross was never divided by. That is exactly
+    // the disagreement the reconciliation exists to prevent, so the ledger refuses instead.
+    const expectedTaxIdentities: {
+      lineId: string | null
+      lineKind: 'sale' | 'shipping'
+      accountingTaxType: string
+      reverseCharge: boolean
+      vatRate: string
     }[] = []
     for (const allocation of cleaned) {
       const gross = toDecimal(allocation.grossAmountForeign)
@@ -1468,8 +1508,10 @@ export async function recordRefundParkManually(
       const identity = resolvePostedRefundTaxIdentity({
         kind: allocation.lineKind,
         lineTaxRate: line?.taxRate ?? null,
+        chargedLine: line ? { netForeign: line.totalForeign, taxForeign: line.taxForeign } : null,
         orderDefaultTaxType,
-        orderDefaultRate: order.taxRatePercent,
+        orderChargedRate: order.taxRatePercent,
+        orderUniform,
         reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
         rateByTaxType: postingTaxContext.rateByTaxType,
         label: line ? (line.description || `line ${line.id}`) : 'The shipping charge',
@@ -1477,6 +1519,15 @@ export async function recordRefundParkManually(
       if (!identity.ok) {
         return { success: false, error: identity.reason }
       }
+      expectedTaxIdentities.push({
+        lineId: line?.id ?? null,
+        lineKind: allocation.lineKind,
+        accountingTaxType: identity.accountingTaxType,
+        reverseCharge: identity.reverseCharge,
+        // The rate the gross was DIVIDED by. The fence re-prices the code under the order lock and
+        // compares against this, so a rate edited between the two reads is caught as well as a remap.
+        vatRate: identity.vatRate.toString(),
+      })
       const net = roundQuantity(gross.div(toDecimal(1).add(identity.vatRate)), 4)
       refundLines.push({
         lineId: line?.id ?? null,
@@ -1544,6 +1595,10 @@ export async function recordRefundParkManually(
         // concurrent recordings against this order cannot both pass their own pre-flight and jointly
         // over-refund one line.
         enforcePerTargetBalances: true,
+        // Codex r4 #2: and fence the POSTING identity to the one the gross was converted at. The
+        // ledger re-resolves and re-prices each target under the same lock and refuses the whole
+        // credit note if either has moved, so the two reads can never disagree in a committed refund.
+        expectedTaxIdentities,
       },
     )
     if (!result.success) {

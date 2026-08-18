@@ -197,7 +197,10 @@ type State = {
     payload: unknown
   }>
   settings: Record<string, string>
-  taxRates?: Array<{ name: string; accountingTaxType: string | null; active?: boolean }>
+  // `rate` and `usedFor` are how a tax code is PRICED (o3d-w00 Codex r4 #2). Optional only because the
+  // many fixtures that never fence an identity never read them — the double below REFUSES to answer a
+  // pricing query from a row that does not carry a rate, rather than silently pricing it at 0%.
+  taxRates?: Array<{ name: string; accountingTaxType: string | null; active?: boolean; rate?: number; usedFor?: string }>
   executeRawCalls: number
   nextRefundId: number
   nextRefundLineId: number
@@ -356,6 +359,18 @@ function createClient(state: State): RefundServiceClient {
           rate.name === where.name && (where.active ? rate.active !== false : true))
         return match ? { accountingTaxType: match.accountingTaxType } : null
       },
+      // o3d-w00 (Codex r4 #2): what each SALES tax code is worth, re-read under the order lock so the
+      // posting identity can be fenced to the one the caller converted at. A row with no `rate` is a
+      // fixture that has not said what it is worth, and answering 0% for it would let the fence "pass"
+      // on a number nobody chose — so it throws instead.
+      findMany: async ({ where }: { where?: { usedFor?: { not?: string } } }) => (state.taxRates ?? [])
+        .filter((taxRate) => where?.usedFor?.not == null || (taxRate.usedFor ?? 'BOTH') !== where.usedFor.not)
+        .map((taxRate) => {
+          if (taxRate.rate == null) {
+            throw new Error(`tax rate fixture ${taxRate.name} has no rate, so it cannot price ${taxRate.accountingTaxType}`)
+          }
+          return { accountingTaxType: taxRate.accountingTaxType, rate: taxRate.rate }
+        }),
     },
     setting: {
       findUnique: async ({ where }: { where: { key: string } }) => {
@@ -1094,6 +1109,169 @@ test('the shipping charge is a capped target too, and two rows for one target ar
   assert.equal(result.success, false)
   assert.match(result.success === false ? result.error : '', /shipping \(6\.00 net\) is more than it has left to refund \(1\.00 net, after earlier refunds\)/)
   assert.equal(state.refunds.length, 1, 'no credit note was created')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-w00 (Codex r4 #2): the identity the credit note posts under is FENCED to the identity the
+// caller converted the operator's gross at.
+//
+// The hand-recording path divides a GROSS figure by the rate of the identity it expects the refund
+// line to carry, and submits the NET. That resolution and this transaction's are two independent
+// reads of the tax table and the accounting settings, so an admin remapping a rate, editing a rate,
+// or changing the reverse-charge setting in between leaves a credit note posted under an identity
+// nobody divided by — a different total from the one that was reconciled.
+// ---------------------------------------------------------------------------------------------
+
+/** A coherent taxable order: one line of 100 net at 20% under OUTPUT2, plus 5 of postage. Gross 126. */
+function fencedOrderState() {
+  const state = baseState({
+    orders: [{ ...baseState().orders[0], totalBase: 126, taxBase: 21, taxRatePercent: 0.2, taxRateName: 'Standard', shippingForeign: 5 }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2, usedFor: 'SALES' }],
+  })
+  state.lines[0] = {
+    id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget', qty: 1,
+    totalBase: 100, totalForeign: 100, taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
+  }
+  return state
+}
+
+/** 60.00 gross of widget converted at 20% => 50.00 net, and 6.00 gross of postage => 5.00 net. */
+const FENCED_LINES = [
+  { lineId: 'line-1', productId: null, description: 'Widget refund', qty: 0, totalForeign: 50, totalBase: 50, lineKind: 'sale' as const },
+  { lineId: null, productId: null, description: 'Shipping refund', qty: 0, totalForeign: 5, totalBase: 5, lineKind: 'shipping' as const },
+]
+const FENCED_IDENTITIES = [
+  { lineId: 'line-1', lineKind: 'sale' as const, accountingTaxType: 'OUTPUT2', reverseCharge: false, vatRate: '0.2' },
+  { lineId: null, lineKind: 'shipping' as const, accountingTaxType: 'OUTPUT2', reverseCharge: false, vatRate: '0.2' },
+]
+
+test('a refund whose posting identity still matches what was converted is created (o3d-w00 Codex r4 #2)', async () => {
+  const state = fencedOrderState()
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: FENCED_LINES,
+    reason: 'hand-recorded',
+    creditNotePrefix: 'CN-',
+    enforcePerTargetBalances: true,
+    expectedTaxIdentities: FENCED_IDENTITIES,
+  })
+
+  assert.equal(result.success, true, 'the fence is not a blanket refusal')
+  assert.equal(state.refunds.length, 1)
+  assert.deepEqual(
+    state.refundLines.map((refundLine) => refundLine.accountingTaxType),
+    ['OUTPUT2', 'OUTPUT2'],
+    'and the lines really did post under the identity that was fenced',
+  )
+})
+
+test("a tax rate REMAPPED between the conversion and the posting refuses the credit note (o3d-w00 Codex r4 #2)", async () => {
+  // The operator's 60.00 gross was divided by 20% because the widget's rate mapped to OUTPUT2. An
+  // admin then moves that rate onto ZERORATEDOUTPUT. The credit note would post 50.00 net under a code
+  // the connector grosses at 0% — a 50.00 credit note settling a 60.00 storefront refund, with the
+  // park closed as reconciled.
+  const state = fencedOrderState()
+  state.lines[0].taxRate = { accountingTaxType: 'ZERORATEDOUTPUT', reverseCharge: false }
+  state.taxRates = [{ name: 'Zero', accountingTaxType: 'ZERORATEDOUTPUT', active: true, rate: 0, usedFor: 'SALES' }]
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: FENCED_LINES,
+    reason: 'hand-recorded',
+    creditNotePrefix: 'CN-',
+    enforcePerTargetBalances: true,
+    expectedTaxIdentities: FENCED_IDENTITIES,
+  })
+
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /VAT identity of order line line-1 changed/)
+  assert.match(result.success === false ? result.error : '', /was OUTPUT2 when the amount was converted/)
+  assert.match(result.success === false ? result.error : '', /Nothing has been credited/)
+  assert.equal(state.refunds.length, 0, 'no credit note, and the park stays open for a second attempt')
+})
+
+test('a tax rate RE-PRICED between the conversion and the posting refuses the credit note (o3d-w00 Codex r4 #2)', async () => {
+  // The subtler half: the CODE is untouched, so an identity-only comparison would pass — but OUTPUT2
+  // is now worth 5%, so the 50.00 net the operator's 60.00 gross was divided down to would re-gross to
+  // 52.50. Checking the code without its price would let this straight through.
+  const state = fencedOrderState()
+  state.taxRates = [{ name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.05, usedFor: 'SALES' }]
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: FENCED_LINES,
+    reason: 'hand-recorded',
+    creditNotePrefix: 'CN-',
+    enforcePerTargetBalances: true,
+    expectedTaxIdentities: FENCED_IDENTITIES,
+  })
+
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /was OUTPUT2 at 20% when the amount was converted and is OUTPUT2 at 5% now/)
+  assert.equal(state.refunds.length, 0)
+})
+
+test('an identity IMS can no longer price refuses the credit note (o3d-w00 Codex r4 #2)', async () => {
+  // The mapping is gone entirely, or has become ambiguous. Either way the transaction cannot confirm
+  // the rate the gross was divided by, and "cannot confirm" is not "unchanged".
+  const unmapped = fencedOrderState()
+  unmapped.taxRates = []
+  const gone = await createSalesOrderRefund(createClient(unmapped), {
+    orderId: 'order-1',
+    lines: FENCED_LINES,
+    reason: 'hand-recorded',
+    creditNotePrefix: 'CN-',
+    expectedTaxIdentities: FENCED_IDENTITIES,
+  })
+  // With no active rate of that name the order default no longer resolves either, so the identity
+  // itself has moved — which is the same refusal, reported at the first thing that changed.
+  assert.equal(gone.success, false)
+  assert.match(gone.success === false ? gone.error : '', /VAT identity of/)
+  assert.equal(unmapped.refunds.length, 0)
+
+  const ambiguous = fencedOrderState()
+  ambiguous.taxRates = [
+    { name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2, usedFor: 'SALES' },
+    { name: 'EU Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.19, usedFor: 'SALES' },
+  ]
+  const twoWays = await createSalesOrderRefund(createClient(ambiguous), {
+    orderId: 'order-1',
+    lines: FENCED_LINES,
+    reason: 'hand-recorded',
+    creditNotePrefix: 'CN-',
+    expectedTaxIdentities: FENCED_IDENTITIES,
+  })
+  assert.equal(twoWays.success, false)
+  assert.match(twoWays.success === false ? twoWays.error : '', /which IMS can no longer price/)
+  assert.equal(ambiguous.refunds.length, 0)
+})
+
+test('the reverse-charge setting changing between the two reads refuses the credit note (o3d-w00 Codex r4 #2)', async () => {
+  // The conversion treated the line as reverse-charged (gross IS net, 50.00 for 50.00) because the
+  // swap was configured. The setting is cleared before the posting, so the line would post under its
+  // VAT-bearing base code instead and the credit note would come to 60.00 against a 50.00 refund.
+  const state = fencedOrderState()
+  state.lines[0].taxRate = { accountingTaxType: 'OUTPUT2', reverseCharge: true }
+  state.taxRates = [
+    { name: 'Standard', accountingTaxType: 'OUTPUT2', active: true, rate: 0.2, usedFor: 'SALES' },
+    { name: 'EU Reverse Charge', accountingTaxType: 'REVERSECHARGE', active: true, rate: 0, usedFor: 'SALES' },
+  ]
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: null, description: 'Widget refund', qty: 0, totalForeign: 50, totalBase: 50, lineKind: 'sale' }],
+    reason: 'hand-recorded',
+    creditNotePrefix: 'CN-',
+    // No reverseChargeSalesTaxType in accountingSettings: the swap the caller relied on is gone.
+    accountingSettings: { ...accountingSettings, reverseChargeSalesTaxType: '' },
+    expectedTaxIdentities: [
+      { lineId: 'line-1', lineKind: 'sale', accountingTaxType: 'REVERSECHARGE', reverseCharge: true, vatRate: '0' },
+    ],
+  })
+
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /was REVERSECHARGE \(reverse-charged\) when the amount was converted and is OUTPUT2 \(reverse-charged\) now/)
+  assert.equal(state.refunds.length, 0)
 })
 
 test('a monetary-only refund on a UNIFORM order posts under the single safe identity, even if the default rate is deactivated (o3d-w00 #5)', async () => {
