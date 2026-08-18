@@ -102,7 +102,18 @@ const DEFAULT_ORDER_DOUBLE: OrderDouble = {
  *
  * At 20% a 0.0001 step in taxBase moves delta by 0.00012, which is what makes the tolerance edges below
  * land on exact decimal values rather than approximately.
+ *
+ * COHERENCE (Codex r2): the lines plus the shipping charge add up to the order's net total, and their
+ * VAT figures add up to the order's VAT — because that is the only shape order-import can produce
+ * (computeWcOrderForeignTotals sums the line tax and the shipping tax into taxBase) and because the
+ * guard now checks each component against its own net. The order's drift from "every component taxed at
+ * `rate`" is spread evenly across the components that were penny-rounded, which is where it comes from
+ * in a real order; the LAST line absorbs both division remainders so the sums are exact.
  */
+function round4(value: number): number {
+  return Number(value.toFixed(4))
+}
+
 function makeOrder(input: {
   grossTotal: number
   taxBase: number
@@ -110,26 +121,40 @@ function makeOrder(input: {
   lineCount?: number
   shippingBase?: number
   reverseCharge?: boolean
+  /** VAT recorded on the shipping leg. Defaults to the shipping charge at `rate`, drift included. */
+  shippingTaxBase?: number
+  /** Every line's OWN rate, when it differs from the order header's (a mixed-rate order). */
+  lineRate?: number
 }): OrderDouble {
   const lineCount = input.lineCount ?? 1
-  const netTotal = Number((input.grossTotal - input.taxBase).toFixed(4))
-  const netPerLine = Number((netTotal / lineCount).toFixed(4))
-  const taxPerLine = Number((input.taxBase / lineCount).toFixed(4))
+  const shippingBase = input.shippingBase ?? 0
+  const netTotal = round4(input.grossTotal - input.taxBase)
+  const linesNetTotal = round4(netTotal - shippingBase)
+  const components = lineCount + (shippingBase > 0 ? 1 : 0)
+  const driftPerComponent = (input.taxBase - netTotal * input.rate) / components
+  const shippingTaxBase = input.shippingTaxBase
+    ?? (shippingBase > 0 ? round4(shippingBase * input.rate + driftPerComponent) : 0)
+  const linesTaxTotal = round4(input.taxBase - shippingTaxBase)
+  const netPerLine = round4(linesNetTotal / lineCount)
+  const taxPerLine = round4(netPerLine * input.rate + driftPerComponent)
   return {
     totalBase: input.grossTotal,
     taxBase: input.taxBase,
     taxRatePercent: input.rate > 0 ? input.rate : null,
-    shippingBase: input.shippingBase ?? 0,
-    lines: Array.from({ length: lineCount }, (_unused, index) => ({
-      id: `line-${index + 1}`,
-      productId: `product-${index + 1}`,
-      externalLineItemId: 501 + index,
-      description: `Widget ${index + 1}`,
-      qty: 1,
-      totalBase: netPerLine,
-      taxBase: taxPerLine,
-      taxRate: { rate: input.rate, reverseCharge: input.reverseCharge ?? false },
-    })),
+    shippingBase,
+    lines: Array.from({ length: lineCount }, (_unused, index) => {
+      const isLast = index === lineCount - 1
+      return {
+        id: `line-${index + 1}`,
+        productId: `product-${index + 1}`,
+        externalLineItemId: 501 + index,
+        description: `Widget ${index + 1}`,
+        qty: 1,
+        totalBase: isLast ? round4(linesNetTotal - netPerLine * (lineCount - 1)) : netPerLine,
+        taxBase: isLast ? round4(linesTaxTotal - taxPerLine * (lineCount - 1)) : taxPerLine,
+        taxRate: { rate: input.lineRate ?? input.rate, reverseCharge: input.reverseCharge ?? false },
+      }
+    }),
   }
 }
 
@@ -439,15 +464,17 @@ test('a monetary-only refund whose gross->net basis CANNOT be determined is refu
   assert.equal(park?.data?.externalId, '7101')
 })
 
-test('a monetary-only refund is refused when the header tax rate does not reconcile with the order VAT (o3d-w00)', async () => {
-  // A rate that cannot reproduce the order's own tax (5% against 20 VAT on a 100 net order) is not the
-  // rate the credit note will re-gross at, so re-grossing the stored net would not return the amount the
-  // customer received. This check is also what independently catches a mis-scaled rate.
+test('a monetary-only refund is refused when the order total cannot be reproduced at its own tax rate (o3d-w00)', async () => {
+  // Everything the order SAYS agrees — one 20% line, a 20% header, no shipping — but the order total is
+  // £10 below its lines plus their VAT, i.e. money WooCommerce took off outside the lines and outside
+  // shipping (an unmodelled order-level coupon). Gross is then no longer net x 1.20, so dividing the
+  // refund by 1.20 would not return the net the customer was actually charged. This is the aggregate
+  // reconciliation doing the job the per-component checks cannot: they only see components.
   const state = makeDependencies({
     alwaysMissExistingRefund: true,
-    order: { ...makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 }), taxRatePercent: 0.05 },
+    order: { ...makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 }), totalBase: 110 },
   })
-  const refund = makeRefund({ id: 7102, amount: '120.00', line_items: [], shipping_lines: [] })
+  const refund = makeRefund({ id: 7102, amount: '110.00', line_items: [], shipping_lines: [] })
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
@@ -473,16 +500,23 @@ test('a monetary-only refund on a NON-taxable order still stores the gross amoun
 
 test('resolveMonetaryRefundVatRate reads taxRatePercent as a fraction and fails closed otherwise (o3d-w00)', async () => {
   // Unit-level pin on the basis resolver itself, so the units cannot regress behind the sync harness.
-  const taxed = resolveMonetaryRefundVatRate({ totalBase: 120, taxBase: 20, taxRatePercent: 0.2 })
+  const order = makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 })
+  const taxed = resolveMonetaryRefundVatRate(order)
   assert.equal(taxed.ok, true)
   assert.equal(taxed.ok === true && taxed.vatRate.toNumber(), 0.2, 'the fraction is used as-is')
 
   // The same order with the rate expressed as a percentage is NOT silently accepted.
-  assert.equal(resolveMonetaryRefundVatRate({ totalBase: 120, taxBase: 20, taxRatePercent: 20 }).ok, false)
-  assert.equal(resolveMonetaryRefundVatRate({ totalBase: 120, taxBase: 20, taxRatePercent: null }).ok, false)
-  assert.equal(resolveMonetaryRefundVatRate({ totalBase: 120, taxBase: 20, taxRatePercent: 0 }).ok, false)
+  assert.equal(resolveMonetaryRefundVatRate({ ...order, taxRatePercent: 20 }).ok, false)
+  assert.equal(resolveMonetaryRefundVatRate({ ...order, taxRatePercent: null }).ok, false)
+  assert.equal(resolveMonetaryRefundVatRate({ ...order, taxRatePercent: 0 }).ok, false)
 
-  const untaxed = resolveMonetaryRefundVatRate({ totalBase: 100, taxBase: 0, taxRatePercent: null })
+  // Codex r2 #1: a taxed order with no lines has nothing that SAYS what rate it was taxed at — "every
+  // line agrees" is vacuously true of no lines, and a vacuous truth must never establish a basis.
+  const noLines = resolveMonetaryRefundVatRate({ totalBase: 120, taxBase: 20, taxRatePercent: 0.2, shippingBase: 0, lines: [] })
+  assert.equal(noLines.ok, false)
+  assert.match(noLines.ok === false ? noLines.error : '', /no lines to establish which rate/)
+
+  const untaxed = resolveMonetaryRefundVatRate(makeOrder({ grossTotal: 100, taxBase: 0, rate: 0 }))
   assert.equal(untaxed.ok, true)
   assert.equal(untaxed.ok === true && untaxed.vatRate.toNumber(), 0)
 })
@@ -694,6 +728,155 @@ test('every basis the guard accepts survives BOTH downstream refund thresholds (
 })
 
 // ---------------------------------------------------------------------------
+// o3d-w00 Codex r2 #1: SHIPPING is a taxed component like any other, and it can carry ALL of an order's
+// VAT. `taxRatePercent` is the order DEFAULT — order-import picks the "standard"-named (or highest)
+// rate among the order's WooCommerce tax lines — so on zero-rated goods with standard-rated postage the
+// header reads 20% while every goods line is 0%. Numeric proximity alone could not tell that apart from
+// a genuinely 20% order, and the credit note posts the unlinked line at the GOODS identity, so the
+// difference walked straight out of the ledger.
+// ---------------------------------------------------------------------------
+
+/**
+ * Codex's order, coherent: £0.05 of zero-rated goods + a £10 shipping charge carrying £2.00 of VAT.
+ * Lines + shipping = £10.05 net, line VAT + shipping VAT = £2.00, gross £12.05 — exactly what
+ * order-import would store, header rate and all.
+ */
+function shippingOnlyTaxOrder(): OrderDouble {
+  return makeOrder({ grossTotal: 12.05, taxBase: 2, rate: 0.2, shippingBase: 10, shippingTaxBase: 2, lineRate: 0 })
+}
+
+test('VAT that sits on SHIPPING does not make the goods 20% — the basis is refused (o3d-w00 Codex r2 #1)', () => {
+  const order = shippingOnlyTaxOrder()
+  // The fixture is a real order, not a contrivance: its parts add up.
+  assert.equal(order.lines.reduce((sum, line) => sum + line.totalBase, 0) + order.shippingBase, order.totalBase - order.taxBase)
+  assert.equal(order.lines.reduce((sum, line) => sum + line.taxBase, 0), 0)
+
+  // It passes the AGGREGATE check — net 10.05 x 0.20 = 2.01 against 2.00 recorded is 0.01, inside the
+  // 0.0102 two-component tolerance — which is precisely why aggregate proximity may not decide this.
+  const netOrderBase = order.totalBase - order.taxBase
+  assert.ok(Math.abs(netOrderBase * 0.2 - order.taxBase) < 0.0102, 'the aggregate reconciliation alone would accept 20%')
+
+  const basis = resolveMonetaryRefundVatRate(order)
+  assert.equal(basis.ok, false, 'but the goods were zero-rated, so 20% is not the rate this refund converts at')
+  assert.match(basis.ok === false ? basis.error : '', /not the rate its goods were taxed at/)
+})
+
+test('a shipping-taxed order is QUARANTINED instead of being credited short (o3d-w00 Codex r2 #1)', async () => {
+  const order = shippingOnlyTaxOrder()
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order })
+  const refund = makeRefund({ id: 7301, amount: '12.05', line_items: [], shipping_lines: [] })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  assert.equal(state.createRefundCalls, 0, 'no credit note is raised on a rate the order did not charge')
+  const park = state.syncLogs.at(-1) as { data?: { status?: string; payload?: unknown } }
+  assert.equal(park?.data?.status, 'QUARANTINED')
+  assert.ok(park?.data?.payload, 'the payload is kept so the operator can reconcile against the gross')
+  // What the old guard did instead: 12.05 / 1.20 = 10.0417 stored as NET, then re-grossed at the goods
+  // lines' 0% identity — £10.04 of credit for a £12.05 refund, and it still classified FULL.
+  assert.equal(state.createRefundLines.length, 0)
+})
+
+test('goods taxed but the shipping leg untaxed is refused the same way (o3d-w00 Codex r2 #1)', () => {
+  // The mirror image: £100 of 20% goods + £10 of shipping that carried no VAT. An unattributed refund
+  // could be either, and converting shipping money at 20% over-credits it.
+  const order = makeOrder({ grossTotal: 130, taxBase: 20, rate: 0.2, shippingBase: 10, shippingTaxBase: 0 })
+  assert.equal(order.lines[0].totalBase, 100)
+  assert.equal(order.lines[0].taxBase, 20)
+
+  const basis = resolveMonetaryRefundVatRate(order)
+  assert.equal(basis.ok, false)
+  assert.match(basis.ok === false ? basis.error : '', /shipping is not taxed at that rate/)
+})
+
+test('one rate across goods AND shipping still converts — the guard bans mixing, not shipping (o3d-w00 Codex r2 #1)', async () => {
+  // £100 of 20% goods + £10 of 20% shipping = £132.00 gross. Every component agrees, so the basis is
+  // established and a full refund converts to the order's net total.
+  const order = makeOrder({ grossTotal: 132, taxBase: 22, rate: 0.2, shippingBase: 10 })
+  assert.equal(order.lines[0].taxBase, 20, 'the goods carry their own 20%')
+
+  const basis = resolveMonetaryRefundVatRate(order)
+  assert.equal(basis.ok, true)
+  assert.equal(basis.ok === true && basis.vatRate.toNumber(), 0.2)
+
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order })
+  await syncWcRefund(1001, makeRefund({ id: 7302, amount: '132.00', line_items: [], shipping_lines: [] }), state.dependencies)
+  assert.equal(state.createRefundLines[0]?.totalBase, 110, 'stored NET, and it is the whole net order total')
+  assert.equal(isFullRefundAmount(110, order.totalBase - order.taxBase), true)
+})
+
+test('a header rate that is not the goods rate is refused before any arithmetic (o3d-w00 Codex r2 #1)', () => {
+  // 5% recorded on an order whose lines are all 20%. Previously this only failed because the numbers
+  // happened not to reconcile; now the disagreement itself is the refusal, so it cannot be rescued by
+  // an order shape where the numbers coincidentally line up.
+  const basis = resolveMonetaryRefundVatRate({ ...makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2 }), taxRatePercent: 0.05 })
+  assert.equal(basis.ok, false)
+  assert.match(basis.ok === false ? basis.error : '', /not the rate its goods were taxed at/)
+})
+
+test('a line whose recorded VAT contradicts its own rate is not evidence of anything (o3d-w00 Codex r2 #1)', () => {
+  // The line SAYS 20% and the header agrees, but the line carries no VAT — so "20%" is a claim the
+  // order's own money does not support. Half a penny per component is rounding; this is not.
+  const order = makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2, lineCount: 2 })
+  const contradictory = {
+    ...order,
+    lines: [
+      { ...order.lines[0], taxBase: 0 },
+      { ...order.lines[1], taxBase: 20 },
+    ],
+  }
+  const basis = resolveMonetaryRefundVatRate(contradictory)
+  assert.equal(basis.ok, false)
+  assert.match(basis.ok === false ? basis.error : '', /which is not 0\.2 of it/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-w00 Codex r2 #4: reverse charge is a per-line fact, not an all-or-nothing order fact. The zero
+// test used to demand that EVERY line be reverse-charged before it would believe a 20% header charged
+// no VAT, so a partially reverse-charged order — RC line plus a genuinely zero-rated line, no VAT
+// anywhere — was measured against a rate it never charged and refused for "not reconciling".
+// ---------------------------------------------------------------------------
+
+test('a PARTIALLY reverse-charged order charged no VAT, so gross IS net (o3d-w00 Codex r2 #4)', () => {
+  // One £100 line reverse-charged at a 20% face rate, one £50 zero-rated line. Recorded VAT is zero
+  // everywhere and every line says WHY, so no conversion is owed.
+  const order = makeOrder({ grossTotal: 150, taxBase: 0, rate: 0.2, lineCount: 2 })
+  const partiallyReverseCharged: OrderDouble = {
+    ...order,
+    lines: [
+      { ...order.lines[0], totalBase: 100, taxBase: 0, taxRate: { rate: 0.2, reverseCharge: true } },
+      { ...order.lines[1], totalBase: 50, taxBase: 0, taxRate: { rate: 0, reverseCharge: false } },
+    ],
+  }
+  assert.equal(
+    partiallyReverseCharged.lines.reduce((sum, line) => sum + line.totalBase, 0),
+    partiallyReverseCharged.totalBase - partiallyReverseCharged.taxBase,
+    'the fixture is a coherent order',
+  )
+
+  const basis = resolveMonetaryRefundVatRate(partiallyReverseCharged)
+  assert.equal(basis.ok, true, 'nothing here is undeterminable — the order charged no VAT')
+  assert.equal(basis.ok === true && basis.vatRate.toNumber(), 0)
+})
+
+test('a reverse-charged line NEXT TO a VAT-bearing one is refused, and says why (o3d-w00 Codex r2 #4)', () => {
+  // The case the all-or-nothing test was reaching for: RC (no VAT charged) mixed with a line that DID
+  // charge VAT. One rate cannot convert an amount that could belong to either.
+  const order = makeOrder({ grossTotal: 220, taxBase: 20, rate: 0.2, lineCount: 2 })
+  const mixed: OrderDouble = {
+    ...order,
+    lines: [
+      { ...order.lines[0], totalBase: 100, taxBase: 0, taxRate: { rate: 0.2, reverseCharge: true } },
+      { ...order.lines[1], totalBase: 100, taxBase: 20, taxRate: { rate: 0.2, reverseCharge: false } },
+    ],
+  }
+  const basis = resolveMonetaryRefundVatRate(mixed)
+  assert.equal(basis.ok, false)
+  assert.match(basis.ok === false ? basis.error : '', /mixes reverse-charged supplies/)
+})
+
+// ---------------------------------------------------------------------------
 // o3d-w00 Codex r1 #3: the quarantine has to point at something an operator can actually do.
 // ---------------------------------------------------------------------------
 
@@ -711,7 +894,10 @@ test('an undeterminable-basis quarantine names the completion path that exists (
   // does not exist, which is the defect Codex reported.
   assert.match(message, /Sync → Exceptions/)
   assert.match(message, /Record manually/)
-  assert.match(message, /NET \(tax-exclusive\) amounts/)
+  // Codex r2 #2/#3: GROSS amounts that add up to the storefront refund, across the lines AND shipping.
+  // Saying NET here would be an instruction the dialog no longer accepts.
+  assert.match(message, /GROSS \(tax-inclusive\) amounts that add up to the refund/)
+  assert.match(message, /shipping charge/)
   // And it must say plainly that retrying is NOT the way out, because retry re-runs the same refusal.
   assert.match(message, /Retry cannot clear it/)
   // The gross figure the operator has to account for is in the message, and so is the warning that the
@@ -890,6 +1076,15 @@ test('a refused monetary-only refund is QUARANTINED and not re-attempted on the 
   }) as { data?: { externalId?: string } } | undefined
   assert.ok(parked, 'a QUARANTINED log was written')
   assert.equal(parked?.data?.externalId, String(makeRefund().id), 'keyed by the WC refund id')
+  // Codex r2 #2: the WooCommerce refund is KEPT on this park too, not just on the basis refusal. The
+  // Record-manually completion path reconciles the credit note it raises against this payload's gross
+  // amount, so a park without it advertises a remedy that cannot run — and this non-uniform-tax refusal
+  // is the commonest quarantine there is.
+  assert.ok(
+    (parked as { data?: { payload?: { amount?: string } } })?.data?.payload,
+    'the parked WooCommerce refund payload is retained for the manual completion path',
+  )
+  assert.equal((parked as { data?: { payload?: { amount?: string } } })?.data?.payload?.amount, '12.50')
 
   const callsAfterFirst = state.createRefundCalls
   // A duplicate delivery must be skipped by the parked-log dedup — no re-refusal loop.

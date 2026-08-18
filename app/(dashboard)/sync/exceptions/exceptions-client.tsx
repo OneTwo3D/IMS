@@ -38,6 +38,8 @@ import {
   retryRefundSyncPark,
   recoverRefundSyncPark,
   type ExceptionInboxData,
+  type RefundParkAllocationInput,
+  type RefundParkAllocationTarget,
   type RefundSyncParkRow,
 } from '@/app/actions/sync-exceptions'
 
@@ -1021,12 +1023,18 @@ function RecoverRefundParkPanel({
  *
  * The refund was refused because IMS could not work out how to record it — an undeterminable gross→net
  * basis, or an order that is not uniformly taxed. Retry re-runs that same decision, so it can never
- * clear. What IMS is missing is the one thing only a person knows: which order lines the refunded money
- * covered. Entering that here raises the credit note against those lines (each carrying its own VAT
- * rate) and resolves the row.
+ * clear. What IMS is missing is the one thing only a person knows: which parts of the order the refunded
+ * money covered. Entering that here raises the credit note against them (each carrying its own VAT
+ * identity) and resolves the row.
  *
- * Amounts are NET (tax-exclusive), matching how every refund line is stored; the gross figure from
- * WooCommerce is shown alongside so the operator can check their split against it.
+ * Amounts are GROSS (tax-inclusive) — Codex r2 #2. The credit note has to SETTLE the storefront refund,
+ * so the split must add up to the figure WooCommerce returned, and gross is the only figure the operator
+ * has: net entry would mean hand-dividing by each line's rate until the total happened to land. The
+ * server converts each amount at the rate that target will be re-grossed at, and refuses the recording
+ * if the total does not match the parked refund.
+ *
+ * Codex r2 #3: SHIPPING is one of the targets. Without it a refund that included postage could not be
+ * described here at all.
  */
 function RecordRefundManuallyDialog({
   row,
@@ -1036,12 +1044,16 @@ function RecordRefundManuallyDialog({
 }: {
   row: RefundSyncParkRow
   isPending: boolean
-  onSubmit: (allocations: { lineId: string; netAmountForeign: number }[], reason: string) => void
+  onSubmit: (allocations: RefundParkAllocationInput[], reason: string) => void
   onClose: () => void
 }) {
   const [reason, setReason] = useState('')
   const [amounts, setAmounts] = useState<Record<string, string>>({})
+  const targetKey = (target: RefundParkAllocationTarget) => target.lineId ?? 'shipping'
   const allocated = Object.values(amounts).reduce((sum, value) => sum + (Number(value) || 0), 0)
+  const parkedGross = row.refundGrossForeign == null ? null : Number(row.refundGrossForeign)
+  const reconciled = parkedGross != null && Number.isFinite(parkedGross) && Math.abs(allocated - parkedGross) <= 0.005
+  const outstanding = parkedGross == null ? 0 : parkedGross - allocated
 
   return (
     <Dialog open onOpenChange={() => { if (!isPending) onClose() }}>
@@ -1049,72 +1061,109 @@ function RecordRefundManuallyDialog({
         <DialogHeader>
           <DialogTitle>Record WooCommerce refund {row.externalRefundId} manually</DialogTitle>
         </DialogHeader>
-        <div className="space-y-4">
-          <p className="text-xs text-muted-foreground">
-            This refund could not be converted automatically, so no credit note exists — but the money has already
-            been returned to the customer in WooCommerce. Split it across the order lines it actually covered.
-            Enter <strong>NET (tax-exclusive)</strong> amounts; each line is re-grossed at its own VAT rate.
-            {row.refundGrossForeign
-              ? <> The customer received <strong>{row.refundGrossForeign} {row.currency ?? ''}</strong> gross.</>
-              : null}
-          </p>
-          <div className="space-y-1.5">
-            <Label htmlFor="record-refund-reason">Reason / reference *</Label>
-            <Input
-              id="record-refund-reason"
-              value={reason}
-              onChange={(event) => setReason(event.target.value)}
-              placeholder="e.g. WC refund 7101 — 2 units returned at 20%, shipping at 0%"
-              className="h-9 text-sm"
-            />
+        {parkedGross == null ? (
+          // The reconciliation has nothing to check against, so recording is closed — but not a dead
+          // end: Retry re-reads the refund from WooCommerce and re-parks it with the payload, and
+          // restores the quarantine if that fetch fails.
+          <div className="space-y-3">
+            <p className="text-sm">
+              This park does not carry the WooCommerce refund it came from, so an amount recorded here could not be
+              checked against the refund it settles.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              Use <strong>Retry</strong> on this row first — that re-reads the refund from WooCommerce and stores it —
+              then record it manually. Retry cannot double-credit: the refund is still quarantined, so nothing posts.
+            </p>
           </div>
-          <Table containerClassName="rounded-md border" className="min-w-[520px]">
-            <TableHeader className="bg-muted/40">
-              <TableRow>
-                <TableHead>Order line</TableHead>
-                <TableHead>VAT rate</TableHead>
-                <TableHead className="text-right">Line net</TableHead>
-                <TableHead className="text-right w-32">Refund net</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {row.orderLines.map((line) => (
-                <TableRow key={line.id}>
-                  <TableCell className="text-xs">{line.sku ? `${line.sku} — ` : ''}{line.description}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{line.taxRateName ?? 'none'}</TableCell>
-                  <TableCell className="text-right text-xs font-mono">{line.netTotalForeign}</TableCell>
-                  <TableCell>
-                    <Input
-                      type="number"
-                      min={0}
-                      step="0.01"
-                      value={amounts[line.id] ?? ''}
-                      onChange={(event) => setAmounts((previous) => ({ ...previous, [line.id]: event.target.value }))}
-                      className="h-7 text-sm text-right w-28 ml-auto font-mono"
-                    />
-                  </TableCell>
+        ) : (
+          <div className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              This refund could not be converted automatically, so no credit note exists — but the money has already
+              been returned to the customer in WooCommerce. Split it across the parts of the order it actually covered.
+              Enter <strong>GROSS (tax-inclusive)</strong> amounts; each is converted to net at the VAT rate its credit
+              will be posted at, and the split must add up to the refund exactly.
+            </p>
+            <div className="space-y-1.5">
+              <Label htmlFor="record-refund-reason">Reason / reference *</Label>
+              <Input
+                id="record-refund-reason"
+                value={reason}
+                onChange={(event) => setReason(event.target.value)}
+                placeholder="e.g. WC refund 7101 — 2 units returned at 20%, plus the postage"
+                className="h-9 text-sm"
+              />
+            </div>
+            <Table containerClassName="rounded-md border" className="min-w-[560px]">
+              <TableHeader className="bg-muted/40">
+                <TableRow>
+                  <TableHead>Order line</TableHead>
+                  <TableHead>VAT</TableHead>
+                  <TableHead className="text-right">Left to refund (gross)</TableHead>
+                  <TableHead className="text-right w-32">Refund gross</TableHead>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-          <div className="flex justify-end text-sm font-medium">
-            Allocated (net): <span className="ml-2 font-mono">{allocated.toFixed(2)}</span>
+              </TableHeader>
+              <TableBody>
+                {row.allocationTargets.map((target) => (
+                  <TableRow key={targetKey(target)}>
+                    <TableCell className="text-xs">
+                      {target.kind === 'shipping'
+                        ? <span className="font-medium">{target.description}</span>
+                        : <>{target.sku ? `${target.sku} — ` : ''}{target.description}</>}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {target.taxRateName ?? 'none'} ({(Number(target.vatRate) * 100).toFixed(0)}%)
+                    </TableCell>
+                    <TableCell className="text-right text-xs font-mono">{target.remainingGrossForeign}</TableCell>
+                    <TableCell>
+                      <Input
+                        type="number"
+                        min={0}
+                        step="0.01"
+                        value={amounts[targetKey(target)] ?? ''}
+                        onChange={(event) => setAmounts((previous) => ({ ...previous, [targetKey(target)]: event.target.value }))}
+                        className="h-7 text-sm text-right w-28 ml-auto font-mono"
+                      />
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+            <div className="flex justify-end text-sm">
+              <div className="space-y-0.5 text-right">
+                <div>
+                  WooCommerce refunded: <span className="ml-2 font-mono font-medium">{row.refundGrossForeign} {row.currency ?? ''}</span>
+                </div>
+                <div className={reconciled ? 'text-emerald-700' : 'text-amber-700'}>
+                  Allocated (gross): <span className="ml-2 font-mono font-medium">{allocated.toFixed(2)}</span>
+                  {reconciled ? ' — matches' : ` — ${outstanding > 0 ? `${outstanding.toFixed(2)} still to allocate` : `${Math.abs(outstanding).toFixed(2)} over`}`}
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
+        )}
         <DialogFooter>
-          <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-          <Button
-            type="button"
-            disabled={isPending || allocated <= 0 || !reason.trim()}
-            onClick={() => onSubmit(
-              row.orderLines
-                .map((line) => ({ lineId: line.id, netAmountForeign: Number(amounts[line.id]) || 0 }))
-                .filter((allocation) => allocation.netAmountForeign > 0),
-              reason,
-            )}
-          >
-            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Record refund
+          <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>
+            {parkedGross == null ? 'Close' : 'Cancel'}
           </Button>
+          {parkedGross == null ? null : (
+            <Button
+              type="button"
+              // The server re-checks all of this; disabling here just stops a submission that cannot succeed.
+              disabled={isPending || !reconciled || !reason.trim()}
+              onClick={() => onSubmit(
+                row.allocationTargets
+                  .map((target) => ({
+                    lineId: target.lineId,
+                    lineKind: target.kind,
+                    grossAmountForeign: Number(amounts[targetKey(target)]) || 0,
+                  }))
+                  .filter((allocation) => allocation.grossAmountForeign > 0),
+                reason,
+              )}
+            >
+              {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Record refund
+            </Button>
+          )}
         </DialogFooter>
       </DialogContent>
     </Dialog>

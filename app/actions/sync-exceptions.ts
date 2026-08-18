@@ -56,7 +56,7 @@ import {
   type WcOrderRefundEvidence,
 } from '@/lib/domain/sales/refund-park-recovery'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { createPrismaDispatchDeps, reconcileOneOrder } from '@/lib/domain/wms/dispatch-sweep'
@@ -93,6 +93,15 @@ const DRIFT_COHORT_PREVIEW_LIMIT = 200
  * `return`s.
  */
 class DriftIsolationAborted extends Error {}
+
+/**
+ * Half a currency minor unit. Used twice in the hand-recorded refund path (o3d-w00 Codex r2 #2): the
+ * allocation must add up to the parked WooCommerce refund, and no part of the order may be allocated
+ * more than it has left to refund. Both are penny comparisons on figures an operator typed at 2dp, so
+ * anything larger would be slack the invariant does not have, and anything smaller would trip on the
+ * order's own stored rounding.
+ */
+const REFUND_ALLOCATION_EPSILON = 0.005
 
 export type WmsPushDeadLetterRow = {
   orderId: string
@@ -134,6 +143,30 @@ export type DeadReceiptEventRow = {
   deadLetteredAt: string | null
 }
 
+/**
+ * Somewhere the refunded money can have come from, offered to the operator in the Record-manually
+ * dialog. o3d-w00 (Codex r2 #3): SHIPPING is one of them. The dialog used to list order lines only, so a
+ * refund that included postage could not be described at all — the operator could only leave the park
+ * open or push shipping money onto a goods line, which posts to the wrong account at the wrong VAT.
+ *
+ * `vatRate` is the rate this target will be RE-GROSSED at when the credit note posts (its own line's
+ * rate, zero under reverse charge; the order default for shipping, which is what the invoice charged it
+ * under), so the gross the operator types converts to net exactly.
+ */
+export type RefundParkAllocationTarget = {
+  /** The order line, or null for the order's shipping charge. */
+  lineId: string | null
+  kind: 'sale' | 'shipping'
+  description: string
+  sku: string | null
+  taxRateName: string | null
+  /** A fraction, e.g. "0.2" for 20%. */
+  vatRate: string
+  /** Still refundable on this target, after any earlier refunds — net, and the gross that implies. */
+  remainingNetForeign: string
+  remainingGrossForeign: string
+}
+
 export type RefundSyncParkRow = {
   id: string
   status: string
@@ -152,14 +185,16 @@ export type RefundSyncParkRow = {
   createdAt: string
   /**
    * o3d-w00 (Codex r1 #3): everything the Record-manually completion path needs, so a QUARANTINED park
-   * has a route to resolution instead of only a Retry that re-runs the decision that refused it. Null
-   * `refundGrossForeign` means the park predates the payload being kept (or is not a refusal park) —
-   * the operator then takes the amount from the storefront refund itself.
+   * has a route to resolution instead of only a Retry that re-runs the decision that refused it.
+   *
+   * Codex r2 #2: `refundGrossForeign` is the figure the allocation is RECONCILED to, not a hint. Null
+   * means the park predates the payload being retained, and then the path is closed — with a remedy that
+   * opens it: Retry re-reads the refund from WooCommerce and re-parks it with the payload.
    */
   manuallyRecordable: boolean
   currency: string | null
   refundGrossForeign: string | null
-  orderLines: { id: string; description: string; sku: string | null; netTotalForeign: string; taxRateName: string | null }[]
+  allocationTargets: RefundParkAllocationTarget[]
 }
 
 export type StuckDispatchRow = {
@@ -541,9 +576,11 @@ export async function getExceptionInboxSummary(): Promise<ExceptionInboxSummary>
 }
 
 /**
- * o3d-w00 (Codex r1 #3): the gross amount of the parked WooCommerce refund, read out of the stored
- * payload. Shown to the operator in the Record-manually dialog as the figure their NET allocation has to
- * add up to (once re-grossed). Returns null for a park with no payload rather than guessing a number.
+ * o3d-w00 (Codex r1 #3 / r2 #2): the gross amount of the parked WooCommerce refund, read out of the
+ * stored payload. This is the figure the hand-recorded allocation is RECONCILED to — the operator's
+ * amounts are gross and must add up to it — not merely a hint displayed alongside. Returns null for a
+ * park with no payload rather than guessing a number; the action then refuses and points at Retry,
+ * which re-reads the refund from WooCommerce and re-parks it with the payload.
  */
 function readParkedRefundGross(payload: unknown): string | null {
   if (payload == null || typeof payload !== 'object') return null
@@ -647,29 +684,44 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   ])
 
   const refundOrderIds = refundLogs.map((log) => log.entityId).filter((id): id is string => Boolean(id))
-  // o3d-w00 (Codex r1 #3): the QUARANTINED rows are the ones with no automatic route out, so they carry
-  // their order's LINES — the Record-manually dialog allocates the refunded amount across them, and a
-  // refund attributed to real lines is exactly what both refusals (undeterminable basis, non-uniform
-  // tax) are waiting for. Lines are net (tax-exclusive), matching what the dialog asks the operator for.
-  const refundOrders = refundOrderIds.length > 0
-    ? await db.salesOrder.findMany({
-        where: { id: { in: refundOrderIds } },
-        select: {
-          id: true,
-          orderNumber: true,
-          currency: true,
-          lines: {
-            select: {
-              id: true,
-              description: true,
-              sku: true,
-              totalForeign: true,
-              taxRate: { select: { name: true } },
+  // o3d-w00 (Codex r1 #3 / r2 #3): the QUARANTINED rows are the ones with no automatic route out, so they
+  // carry everything the Record-manually dialog needs to describe the refund — the order's LINES and its
+  // SHIPPING charge, each with the VAT rate its credit will be posted at and what is left to refund on
+  // it. A refund attributed to the real parts of the order is exactly what both refusals (undeterminable
+  // basis, non-uniform tax) are waiting for.
+  const [refundOrders, priorRefundLines] = await Promise.all([
+    refundOrderIds.length > 0
+      ? db.salesOrder.findMany({
+          where: { id: { in: refundOrderIds } },
+          select: {
+            id: true,
+            orderNumber: true,
+            currency: true,
+            taxRatePercent: true,
+            taxRateName: true,
+            shippingForeign: true,
+            shippingService: true,
+            lines: {
+              select: {
+                id: true,
+                description: true,
+                sku: true,
+                totalForeign: true,
+                taxRate: { select: { name: true, rate: true, reverseCharge: true } },
+              },
             },
           },
-        },
-      })
-    : []
+        })
+      : Promise.resolve([]),
+    // What each part of the order has ALREADY been credited, so the dialog offers what is left rather
+    // than the original amount — and the action refuses anything above it.
+    refundOrderIds.length > 0
+      ? db.salesOrderRefundLine.findMany({
+          where: { refund: { orderId: { in: refundOrderIds } } },
+          select: { salesOrderLineId: true, lineKind: true, totalForeign: true, refund: { select: { orderId: true } } },
+        })
+      : Promise.resolve([]),
+  ])
   const refundOrderById = new Map(refundOrders.map((order) => [order.id, order]))
   // o3d-54p: which WooCommerce order each parked order is linked to. Read for the whole page in one
   // query rather than per row.
@@ -680,6 +732,66 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       })
     : []
   const wcOrderIdByOrderId = new Map(refundOrderLinks.map((link) => [link.orderId, link.externalOrderId]))
+  const priorRefundedByLineId = new Map<string, Decimal>()
+  const priorRefundedShippingByOrderId = new Map<string, Decimal>()
+  for (const refundLine of priorRefundLines) {
+    if (refundLine.salesOrderLineId) {
+      priorRefundedByLineId.set(
+        refundLine.salesOrderLineId,
+        (priorRefundedByLineId.get(refundLine.salesOrderLineId) ?? toDecimal(0)).add(toDecimal(refundLine.totalForeign)),
+      )
+    } else if (refundLine.lineKind === 'shipping') {
+      const orderId = refundLine.refund.orderId
+      priorRefundedShippingByOrderId.set(
+        orderId,
+        (priorRefundedShippingByOrderId.get(orderId) ?? toDecimal(0)).add(toDecimal(refundLine.totalForeign)),
+      )
+    }
+  }
+  const buildAllocationTargets = (order: typeof refundOrders[number] | undefined): RefundParkAllocationTarget[] => {
+    if (!order) return []
+    const targets: RefundParkAllocationTarget[] = order.lines.map((line) => {
+      // The rate the customer was actually charged on this line, which is also the rate its credit posts
+      // at: createSalesOrderRefund snapshots a LINE-LINKED refund line's identity from the line's own
+      // TaxRate. Reverse-charged lines carry no seller VAT, so their gross IS their net.
+      // (Residual, deliberately not second-guessed here: when a line's TaxRate has no accountingTaxType
+      // the credit note falls back to the ORDER-DEFAULT identity — exactly as the invoice did for that
+      // line — so the VAT it carries can differ from the rate used here. The NET recorded is still the
+      // true net of the money refunded, which is what IMS stores and what the refund ceiling and the
+      // FULL/PARTIAL classification compare against.)
+      const vatRate = line.taxRate?.reverseCharge ? toDecimal(0) : toDecimal(line.taxRate?.rate ?? 0)
+      const remainingNet = toDecimal(line.totalForeign).sub(priorRefundedByLineId.get(line.id) ?? toDecimal(0))
+      return {
+        lineId: line.id,
+        kind: 'sale' as const,
+        description: line.description,
+        sku: line.sku,
+        taxRateName: line.taxRate?.name ?? null,
+        vatRate: vatRate.toString(),
+        remainingNetForeign: remainingNet.toFixed(2),
+        remainingGrossForeign: remainingNet.mul(toDecimal(1).add(vatRate)).toFixed(2),
+      }
+    })
+    const shippingForeign = toDecimal(order.shippingForeign)
+    if (shippingForeign.gt(0)) {
+      // An unlinked shipping refund line is posted under the ORDER-DEFAULT VAT identity (refund-service
+      // resolveRefundLineTaxIdentity), the same identity the invoice charged shipping under — so that is
+      // the rate the operator's gross must be converted at, whatever the goods lines carry.
+      const vatRate = toDecimal(order.taxRatePercent ?? 0)
+      const remainingNet = shippingForeign.sub(priorRefundedShippingByOrderId.get(order.id) ?? toDecimal(0))
+      targets.push({
+        lineId: null,
+        kind: 'shipping',
+        description: order.shippingService ? `Shipping — ${order.shippingService}` : 'Shipping',
+        sku: null,
+        taxRateName: order.taxRateName ?? null,
+        vatRate: vatRate.toString(),
+        remainingNetForeign: remainingNet.toFixed(2),
+        remainingGrossForeign: remainingNet.mul(toDecimal(1).add(vatRate)).toFixed(2),
+      })
+    }
+    return targets
+  }
 
   // The cohort's orders, for the operator to review before isolating (o3d-51du).
   // Read through the same eligibility predicate the isolate action writes
@@ -779,13 +891,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         manuallyRecordable: log.status === 'QUARANTINED' && Boolean(log.entityId) && Boolean(log.externalId),
         currency: order?.currency ?? null,
         refundGrossForeign: payloadAmount,
-        orderLines: (order?.lines ?? []).map((line) => ({
-          id: line.id,
-          description: line.description,
-          sku: line.sku,
-          netTotalForeign: String(line.totalForeign),
-          taxRateName: line.taxRate?.name ?? null,
-        })),
+        allocationTargets: buildAllocationTargets(order),
       }
     }),
     stuckDispatches,
@@ -1079,11 +1185,26 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
  * no way to say so.
  *
  * What makes this resolvable rather than merely dismissible: the operator supplies the ONE thing IMS
- * cannot derive — which order lines the refunded money covered, and how much (NET) of it each line took.
+ * cannot derive — which parts of the order the refunded money covered, and how much of it each took.
  * With that, the credit note is raised through the ordinary refund path, LINE-LINKED, so every refund
  * line carries its own line's VAT identity; the non-uniform-tax refusal does not apply to a line-linked
  * refund, and no header rate has to be guessed. The refund is stamped with the WooCommerce refund id, so
  * a later redelivery of the same refund dedups against it instead of raising a second credit note.
+ *
+ * Codex r2 #2 — the allocation is RECONCILED to the parked refund, not merely accepted. The action reads
+ * the WooCommerce refund off the park, and the operator's amounts are GROSS: they must add up to the
+ * gross the storefront returned, or the recording is refused. Anything else made this path a way to book
+ * a figure nobody checked — £1 entered against a £100 storefront refund cleared the exception forever
+ * and left the ledger £99 short, which is the same silent mis-crediting the automatic route was
+ * quarantined for. Gross is also the only figure an operator HAS: it is what the storefront shows, and
+ * asking for net would mean hand-dividing by each line's rate until the total happened to match.
+ *
+ * Codex r2 #3 — SHIPPING is an allocation target. The dialog used to offer order lines only, so a refund
+ * that included postage could not be expressed at all: the operator's choices were to leave the park open
+ * forever or to misattribute shipping money to a goods line (wrong account, wrong VAT). Shipping is
+ * emitted as an unlinked `lineKind: 'shipping'` refund line — the same shape a chargeback uses — and is
+ * grossed/posted under the ORDER-DEFAULT VAT identity, which is exactly what the invoice charged it under
+ * and what createSalesOrderRefund will post it under.
  *
  * Deliberately NOT a "dismiss" button. Marking the park resolved without a credit note would leave the
  * order's ledger short by the refunded amount, which is precisely the silent over-credit this epic exists
@@ -1093,9 +1214,17 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
  * MANAGER hold both, so an operator who can reach this screen can complete it. (FINANCE holds
  * `sales.refund` but not `sync`, so it never sees the inbox; that separation is intentional.)
  */
+export type RefundParkAllocationInput = {
+  /** The order line the money came off, or null together with `lineKind: 'shipping'`. */
+  lineId: string | null
+  lineKind: 'sale' | 'shipping'
+  /** GROSS (tax-inclusive) amount in the ORDER's currency — the figure the storefront refunded. */
+  grossAmountForeign: number
+}
+
 export async function recordRefundParkManually(
   parkId: string,
-  allocations: { lineId: string; netAmountForeign: number }[],
+  allocations: RefundParkAllocationInput[],
   reason: string,
 ): Promise<MutationResult> {
   try {
@@ -1106,17 +1235,32 @@ export async function recordRefundParkManually(
       return { success: false, error: 'A reason is required — it is the audit record for a hand-recorded refund.' }
     }
     const cleaned = allocations
-      .filter((allocation) => Number.isFinite(allocation.netAmountForeign) && allocation.netAmountForeign > 0)
-      .map((allocation) => ({ lineId: allocation.lineId, netAmountForeign: allocation.netAmountForeign }))
+      .filter((allocation) => Number.isFinite(allocation.grossAmountForeign) && allocation.grossAmountForeign > 0)
+      .map((allocation) => ({
+        lineId: allocation.lineKind === 'shipping' ? null : allocation.lineId,
+        lineKind: allocation.lineKind === 'shipping' ? ('shipping' as const) : ('sale' as const),
+        grossAmountForeign: allocation.grossAmountForeign,
+      }))
     if (cleaned.length === 0) {
-      return { success: false, error: 'Allocate the refunded amount across at least one order line (NET, tax-exclusive).' }
+      return { success: false, error: 'Allocate the refunded amount across at least one order line or the shipping charge (GROSS, tax-inclusive).' }
+    }
+    // Two rows for the same target would each pass their own balance check and together exceed it, and
+    // the audit record would no longer say where the money went.
+    const targetKeys = cleaned.map((allocation) => allocation.lineKind === 'shipping' ? 'shipping' : `line:${allocation.lineId}`)
+    if (new Set(targetKeys).size !== targetKeys.length) {
+      return { success: false, error: 'Each order line (and the shipping charge) may be allocated only once — combine the duplicates into a single amount.' }
+    }
+    if (cleaned.some((allocation) => allocation.lineKind === 'sale' && !allocation.lineId)) {
+      return { success: false, error: 'An order-line allocation must name the line it covers.' }
     }
 
     // Scoped to a QUARANTINED park: PENDING/FAILED rows are ordinary retryable failures whose remedy is
     // Retry, and hand-recording one would race the retry into a duplicate credit note.
     const park = await db.shoppingSyncLog.findFirst({
       where: { id: parkId, ...REFUND_PARK_WHERE, status: 'QUARANTINED' },
-      select: { id: true, entityId: true, externalId: true },
+      // The parked WooCommerce refund itself (Codex r2 #2): its gross `amount` is the figure the credit
+      // note has to come to. Without it there is nothing to reconcile against.
+      select: { id: true, entityId: true, externalId: true, payload: true },
     })
     if (!park?.entityId || !park.externalId) {
       return { success: false, error: 'This refund is no longer quarantined (already resolved, retried, or removed).' }
@@ -1124,6 +1268,23 @@ export async function recordRefundParkManually(
     const externalRefundId = Number(park.externalId)
     if (!Number.isSafeInteger(externalRefundId) || externalRefundId <= 0) {
       return { success: false, error: `The parked row has no usable WooCommerce refund id (${park.externalId}).` }
+    }
+    const parkedGrossText = readParkedRefundGross(park.payload)
+    if (parkedGrossText == null) {
+      // A park written before the payload was retained. Refusing is not a dead end: Retry re-fetches the
+      // refund from WooCommerce and re-parks it WITH the payload (and restores the quarantine if the
+      // fetch fails), after which this action can reconcile against it.
+      return {
+        success: false,
+        error:
+          'This park does not carry the WooCommerce refund it came from, so the amount recorded here ' +
+          'could not be checked against the refund it settles. Use Retry on this row first — that ' +
+          're-reads the refund from WooCommerce and stores it — then record it manually.',
+      }
+    }
+    const parkedGross = toDecimal(parkedGrossText).abs()
+    if (!parkedGross.isFinite() || parkedGross.lte(0)) {
+      return { success: false, error: `The parked WooCommerce refund has no usable amount (${parkedGrossText}).` }
     }
 
     // externalRefundId is GLOBALLY unique. If the refund has meanwhile landed — here or on another order
@@ -1145,42 +1306,133 @@ export async function recordRefundParkManually(
       where: { id: park.entityId },
       select: {
         id: true,
+        currency: true,
         fxRateToBase: true,
-        lines: { select: { id: true, productId: true, description: true } },
+        // The order-default VAT identity: what the invoice charged shipping under, and what
+        // createSalesOrderRefund posts an unlinked shipping refund line under.
+        taxRatePercent: true,
+        shippingForeign: true,
+        lines: {
+          select: {
+            id: true,
+            productId: true,
+            description: true,
+            totalForeign: true,
+            taxRate: { select: { rate: true, reverseCharge: true } },
+          },
+        },
       },
     })
     if (!order) {
       return { success: false, error: 'The order this refund belongs to no longer exists.' }
     }
     const orderLineById = new Map(order.lines.map((line) => [line.id, line]))
-    const unknown = cleaned.find((allocation) => !orderLineById.has(allocation.lineId))
+    const unknown = cleaned.find((allocation) => allocation.lineKind === 'sale' && !orderLineById.has(allocation.lineId!))
     if (unknown) {
       return { success: false, error: `Line ${unknown.lineId} is not on this order.` }
     }
+    const orderShippingForeign = toDecimal(order.shippingForeign)
+    if (cleaned.some((allocation) => allocation.lineKind === 'shipping') && orderShippingForeign.lte(0)) {
+      return { success: false, error: 'This order carries no shipping charge, so a shipping refund cannot be recorded against it.' }
+    }
+
+    // What is still refundable, per target. createSalesOrderRefund caps the ORDER total; it does not stop
+    // one line absorbing money that came off another, which would post the refund to the wrong account
+    // and the wrong VAT even though the total reconciled.
+    const priorRefundLines = await db.salesOrderRefundLine.findMany({
+      where: { refund: { orderId: order.id } },
+      select: { salesOrderLineId: true, lineKind: true, totalForeign: true },
+    })
+    const priorByLineId = new Map<string, Decimal>()
+    let priorShipping = toDecimal(0)
+    for (const refundLine of priorRefundLines) {
+      if (refundLine.salesOrderLineId) {
+        priorByLineId.set(
+          refundLine.salesOrderLineId,
+          (priorByLineId.get(refundLine.salesOrderLineId) ?? toDecimal(0)).add(toDecimal(refundLine.totalForeign)),
+        )
+      } else if (refundLine.lineKind === 'shipping') {
+        priorShipping = priorShipping.add(toDecimal(refundLine.totalForeign))
+      }
+    }
 
     const fxRate = toDecimal(order.fxRateToBase).gt(0) ? toDecimal(order.fxRateToBase) : toDecimal(1)
-    const refundLines = cleaned.map((allocation) => {
-      const line = orderLineById.get(allocation.lineId)!
-      const net = toDecimal(allocation.netAmountForeign)
-      return {
-        // The link is the whole point: a line-linked refund line carries its OWN line's VAT identity,
-        // which is what both quarantine refusals were missing.
-        lineId: line.id,
-        productId: line.productId,
-        description: line.description,
+    const orderDefaultRate = toDecimal(order.taxRatePercent ?? 0)
+    const refundLines: {
+      lineId: string | null
+      productId: string | null
+      description: string
+      qty: number
+      totalForeign: number
+      totalBase: number
+      lineKind: 'sale' | 'shipping'
+      grossForeign: number
+    }[] = []
+    for (const allocation of cleaned) {
+      const gross = toDecimal(allocation.grossAmountForeign)
+      // The rate the refund line will be RE-GROSSED at when the credit note posts, so converting the
+      // operator's gross with it is exact: a linked sale line posts under its own line's identity (zero
+      // under reverse charge, where the seller charged no VAT), and an unlinked shipping line posts under
+      // the order default.
+      const line = allocation.lineKind === 'sale' ? orderLineById.get(allocation.lineId!)! : null
+      const rate = line
+        ? (line.taxRate?.reverseCharge ? toDecimal(0) : toDecimal(line.taxRate?.rate ?? 0))
+        : orderDefaultRate
+      const net = roundQuantity(gross.div(toDecimal(1).add(rate)), 4)
+      const remaining = line
+        ? toDecimal(line.totalForeign).sub(priorByLineId.get(line.id) ?? toDecimal(0))
+        : orderShippingForeign.sub(priorShipping)
+      if (net.sub(remaining).gt(REFUND_ALLOCATION_EPSILON)) {
+        const label = line ? (line.description || `line ${line.id}`) : 'shipping'
+        return {
+          success: false,
+          error:
+            `The amount allocated to ${label} (${net.toFixed(2)} net) is more than it has left to refund ` +
+            `(${remaining.toFixed(2)} net${remaining.lt(toDecimal(line ? line.totalForeign : orderShippingForeign)) ? ', after earlier refunds' : ''}). ` +
+            'Split the refund across the parts it actually covered.',
+        }
+      }
+      refundLines.push({
+        lineId: line?.id ?? null,
+        productId: line?.productId ?? null,
+        description: line?.description ?? 'Shipping refund',
         // qty 0 — a monetary refund returns no goods. createSalesOrderRefund keeps amount-only lines
         // (its filter is qty > 0 OR totalBase > 0) and derives a 0 unit price for them.
         qty: 0,
-        totalForeign: roundQuantity(net, 4).toNumber(),
+        totalForeign: net.toNumber(),
         totalBase: roundQuantity(net.div(fxRate), 4).toNumber(),
-        lineKind: 'sale' as const,
+        lineKind: allocation.lineKind,
+        grossForeign: roundQuantity(gross, 4).toNumber(),
+      })
+    }
+
+    // Codex r2 #2: the credit note must SETTLE the parked refund, not merely be smaller than the order.
+    // Every allocation was converted at the rate its own posting will re-gross it by, so the sum of the
+    // grosses IS what the credit note will come to — and it has to be what WooCommerce returned.
+    const allocatedGross = cleaned.reduce((sum, allocation) => sum.add(toDecimal(allocation.grossAmountForeign)), toDecimal(0))
+    if (allocatedGross.sub(parkedGross).abs().gt(REFUND_ALLOCATION_EPSILON)) {
+      return {
+        success: false,
+        error:
+          `The allocation comes to ${allocatedGross.toFixed(2)} gross but WooCommerce refunded ` +
+          `${parkedGross.toFixed(2)}. Record the refund that was actually made: the amounts are GROSS ` +
+          '(tax-inclusive) and must add up to the storefront figure exactly.',
       }
-    })
+    }
 
     const { createRefund } = await import('@/app/actions/sales')
     const result = await createRefund(
       order.id,
-      refundLines,
+      // `grossForeign` is carried alongside for the audit record only — the ledger takes net.
+      refundLines.map((line) => ({
+        lineId: line.lineId,
+        productId: line.productId,
+        description: line.description,
+        qty: line.qty,
+        totalForeign: line.totalForeign,
+        totalBase: line.totalBase,
+        lineKind: line.lineKind,
+      })),
       reason.trim(),
       // No return warehouse: nothing physically came back, and a hand-recorded monetary refund must not
       // invent an inventory movement.
@@ -1208,13 +1460,22 @@ export async function recordRefundParkManually(
       level: 'WARNING',
       description:
         `WooCommerce refund ${park.externalId} could not be converted automatically and was recorded by hand ` +
-        `against ${refundLines.length} order line(s): ${reason.trim()}`,
-      // The evidence: exactly which lines the operator attributed the money to, and how much.
+        `against ${refundLines.length} part(s) of the order, reconciled to the ${parkedGross.toFixed(2)} ` +
+        `${order.currency ?? ''} the storefront refunded: ${reason.trim()}`.replace(/\s+/g, ' '),
+      // The evidence: exactly which parts of the order the operator attributed the money to, gross and
+      // net, and the storefront figure they were checked against.
       metadata: {
         shoppingSyncLogId: park.id,
         externalRefundId,
         userId: session.user.id,
-        allocations: refundLines.map((line) => ({ lineId: line.lineId, totalForeign: line.totalForeign, totalBase: line.totalBase })),
+        parkedGrossForeign: parkedGross.toFixed(2),
+        allocations: refundLines.map((line) => ({
+          lineId: line.lineId,
+          lineKind: line.lineKind,
+          grossForeign: line.grossForeign,
+          totalForeign: line.totalForeign,
+          totalBase: line.totalBase,
+        })),
       },
       resolveUser: false,
     })

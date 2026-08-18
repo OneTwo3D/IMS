@@ -85,6 +85,9 @@ export type MonetaryRefundBasisOrder = {
   taxRatePercent?: DecimalInput
   shippingBase?: DecimalInput
   lines?: readonly {
+    // Codex r2 #1: the line's NET total, so its recorded VAT can be checked against its OWN net at the
+    // order's rate. Without it a line's stored rate is an unverified claim.
+    totalBase?: DecimalInput
     taxBase?: DecimalInput
     taxRate?: { rate?: DecimalInput; reverseCharge?: boolean | null } | null
   }[]
@@ -102,6 +105,17 @@ const TAX_BASE_SCALE = 4
 const MONEY_ROUNDING_HALF_UNIT = 0.005
 /** Two Decimal(18,4) conversions (totalBase and taxBase) sit underneath netOrderBase. */
 const BASE_CONVERSION_SLACK = 0.0002
+/**
+ * What ONE component's VAT figure may legitimately be off by: its own half-penny of WooCommerce
+ * rounding plus the two Decimal(18,4) conversions underneath it. Used to check each line — and the
+ * shipping leg — against its own net at the order's rate (Codex r2 #1).
+ */
+const COMPONENT_ROUNDING_TOLERANCE = MONEY_ROUNDING_HALF_UNIT + BASE_CONVERSION_SLACK
+/**
+ * SalesOrder.taxRatePercent and TaxRate.rate are both Decimal(5,4), so two rates that differ by less
+ * than half of the last stored digit are the same rate.
+ */
+const RATE_EPSILON = 0.00005
 
 function minDecimal(first: Decimal, ...rest: Decimal[]): Decimal {
   return rest.reduce((smallest, value) => (value.lt(smallest) ? value : smallest), first)
@@ -123,27 +137,41 @@ export function resolveMonetaryRefundVatRate(order: MonetaryRefundBasisOrder): M
   const netOrderBase = toDecimal(order.totalBase).sub(taxBase)
   const rate = order.taxRatePercent == null ? null : toDecimal(order.taxRatePercent)
   const lines = order.lines ?? []
+  const shippingBase = toDecimal(order.shippingBase ?? 0)
 
   // ---------------------------------------------------------------------------------------------
   // Zero-rated. Codex r1 #1: this used to be `abs(taxBase) <= 0.02` — an absolute epsilon on a MONEY
   // value, which swallowed genuinely taxable orders whose VAT happens to be small (£0.10 net + £0.02
   // VAT was "zero-rated", so its £0.12 gross refund was stored gross under totalsBasis='NET' — the
   // very bug this function exists to stop). Zero-rating is a property of the RATE, not of the
-  // magnitude of the tax figure, so it is now read off signals that SAY so and must all agree:
+  // magnitude of the tax figure, so it is read off signals that SAY so and must all agree:
   //   - the order's recorded VAT is exactly zero at the scale it is stored at (not "small"), AND
-  //   - the order's rate says no tax — absent, zero, or every line reverse-charged (an explicit flag:
-  //     under RC the seller charges no VAT, so gross IS net regardless of the rate's face value), AND
-  //   - every order line agrees: no VAT recorded on it, and its own rate is zero or reverse-charged.
-  // Anything else — including one penny of real VAT — falls through to the rate check below, and is
-  // REFUSED if no rate reproduces it. Refusing is the fail-closed answer the whole fix is built on.
+  //   - every order line agrees: no VAT recorded on it, and its own rate is zero or reverse-charged
+  //     (an explicit flag: under RC the seller charges no VAT, so gross IS net regardless of the
+  //     rate's face value), AND
+  //   - there IS a line saying so, or the header rate itself says no tax. An order with no lines
+  //     satisfies "every line agrees" vacuously, and a vacuous truth must never establish a basis.
+  //
+  // Codex r2 #4: this used to ALSO require the header rate to say no tax *unless* EVERY line was
+  // reverse-charged, which falsely refused a partially reverse-charged order — one RC line at a 20%
+  // face rate plus one genuinely zero-rated line records zero VAT everywhere and every line explicitly
+  // says why, yet the all-or-nothing RC test rejected it and the order was then measured against a 20%
+  // header it never charged. Per-line evidence is the whole point; whether the OTHER lines happen to be
+  // RC or zero-rated does not change that this order charged no VAT, so gross IS net.
+  //
+  // Shipping needs no separate signal here: the order's VAT is the sum of the line VAT and the shipping
+  // VAT, so zero recorded order VAT with zero line VAT means the shipping leg carried none either.
+  //
+  // Anything else — including one penny of real VAT — falls through to the rate checks below, and is
+  // REFUSED if the order does not demonstrably carry that rate. Refusing is the fail-closed answer the
+  // whole fix is built on.
   // ---------------------------------------------------------------------------------------------
   const recordedTaxIsZero = roundQuantity(taxBase, TAX_BASE_SCALE).isZero()
-  const everyLineReverseCharged = lines.length > 0 && lines.every((line) => line.taxRate?.reverseCharge === true)
-  const rateSaysNoTax = rate == null || !rate.isFinite() || rate.lte(0) || everyLineReverseCharged
   const linesSayNoTax = lines.every((line) =>
     roundQuantity(toDecimal(line.taxBase ?? 0), TAX_BASE_SCALE).isZero() &&
     (toDecimal(line.taxRate?.rate ?? 0).lte(0) || line.taxRate?.reverseCharge === true))
-  if (recordedTaxIsZero && rateSaysNoTax && linesSayNoTax) {
+  const headerSaysNoTax = rate == null || !rate.isFinite() || rate.lte(0)
+  if (recordedTaxIsZero && linesSayNoTax && (headerSaysNoTax || lines.length > 0)) {
     return { ok: true, vatRate: toDecimal(0) }
   }
 
@@ -167,9 +195,100 @@ export function resolveMonetaryRefundVatRate(order: MonetaryRefundBasisOrder): M
   }
 
   // ---------------------------------------------------------------------------------------------
-  // The header rate must reproduce the order's OWN tax, otherwise it is not the rate this order was
-  // taxed at (a mixed-rate order, or a stale/mis-scaled snapshot) and re-grossing the stored net would
-  // not return the amount the customer actually received.
+  // Codex r2 #1: SHIPPING is a taxed component like any other, and on this order shape it is the one
+  // that can carry ALL of the VAT — so the rate may not be inferred from the line tax alone.
+  //
+  // `taxRatePercent` is the order's DEFAULT rate: order-import picks the "standard"-named (or highest)
+  // rate among the order's WooCommerce tax lines, which on a zero-rated-goods order with standard-rated
+  // postage is 20% even though every goods line is 0%. The aggregate reconciliation below cannot tell
+  // that apart from a genuinely 20% order: £0.05 of zero-rated goods + £10 shipping + £2 shipping VAT
+  // gives netOrderBase £10.05, implied VAT £2.01 against £2.00 recorded — a £0.01 gap that fits the
+  // two-component tolerance. The refund would then be divided by 1.20 while the credit note re-grosses
+  // the unlinked SALE line under the GOODS lines' identity (0%), so £12.05 returned to the customer
+  // books as ~£10.04 of credit. Money out, silently, on an order that "reconciled".
+  //
+  // So numeric proximity may no longer establish uniformity. The rate has to be corroborated by what
+  // the order SAYS it was taxed at, component by component:
+  //   1. every order line (WC fee lines are imported as order lines too) carries an EXPLICIT rate equal
+  //      to the header rate and is not reverse-charged. This is also the rate the credit note will
+  //      re-gross the unlinked line at, so the conversion and the posting agree by construction;
+  //   2. each line's own recorded VAT matches its own net at that rate — a line whose stored rate and
+  //      stored VAT disagree is not evidence of anything;
+  //   3. the VAT that is NOT on the lines belongs to the shipping leg, and it matches the shipping
+  //      charge at that same rate. Standard-rated shipping on zero-rated goods fails (1); zero-rated
+  //      shipping on standard-rated goods fails (3). Both are mixed orders, not rounding differences.
+  // ---------------------------------------------------------------------------------------------
+  if (lines.length === 0) {
+    return {
+      ok: false,
+      error: undeterminableBasisMessage(
+        'the order records VAT but has no lines to establish which rate it was actually taxed at',
+      ),
+    }
+  }
+  const reverseChargedLine = lines.some((line) => line.taxRate?.reverseCharge === true)
+  if (reverseChargedLine) {
+    return {
+      ok: false,
+      error: undeterminableBasisMessage(
+        'it mixes reverse-charged supplies (on which no VAT is charged) with VAT-bearing ones, so one ' +
+        'rate cannot convert an amount that is not attributed to either',
+      ),
+    }
+  }
+  const ratelessLine = lines.findIndex((line) => line.taxRate == null || line.taxRate.rate == null)
+  if (ratelessLine >= 0) {
+    return {
+      ok: false,
+      error: undeterminableBasisMessage(
+        `order line ${ratelessLine + 1} has no recorded VAT rate, so the order is not demonstrably ` +
+        'taxed at a single rate',
+      ),
+    }
+  }
+  const mismatchedRate = lines.findIndex((line) => toDecimal(line.taxRate?.rate ?? 0).sub(rate).abs().gt(RATE_EPSILON))
+  if (mismatchedRate >= 0) {
+    return {
+      ok: false,
+      error: undeterminableBasisMessage(
+        `its recorded tax rate (${rate.toString()}) is not the rate its goods were taxed at (order ` +
+        `line ${mismatchedRate + 1} is ${toDecimal(lines[mismatchedRate].taxRate?.rate ?? 0).toString()}) — ` +
+        'a monetary amount could belong to either, and the credit note would re-gross it at the line rate',
+      ),
+    }
+  }
+  const mismatchedLineTax = lines.findIndex((line) =>
+    toDecimal(line.totalBase ?? 0).mul(rate).sub(toDecimal(line.taxBase ?? 0)).abs().gt(COMPONENT_ROUNDING_TOLERANCE))
+  if (mismatchedLineTax >= 0) {
+    const line = lines[mismatchedLineTax]
+    return {
+      ok: false,
+      error: undeterminableBasisMessage(
+        `order line ${mismatchedLineTax + 1} records ${toDecimal(line.taxBase ?? 0).toFixed(4)} of VAT on a net ` +
+        `of ${toDecimal(line.totalBase ?? 0).toFixed(4)}, which is not ${rate.toString()} of it`,
+      ),
+    }
+  }
+  const lineTaxTotal = lines.reduce((sum, line) => sum.add(toDecimal(line.taxBase ?? 0)), toDecimal(0))
+  // Whatever VAT is not on a line is the shipping leg's: order tax = line tax + shipping tax, by
+  // construction in order-import (computeWcOrderForeignTotals).
+  const shippingTax = taxBase.sub(lineTaxTotal)
+  const impliedShippingTax = shippingBase.mul(rate)
+  if (impliedShippingTax.sub(shippingTax).abs().gt(COMPONENT_ROUNDING_TOLERANCE)) {
+    return {
+      ok: false,
+      error: undeterminableBasisMessage(
+        `its shipping is not taxed at that rate (${shippingTax.toFixed(4)} of VAT on a shipping charge ` +
+        `of ${shippingBase.toFixed(4)}, where ${rate.toString()} implies ${impliedShippingTax.toFixed(4)})`,
+      ),
+    }
+  }
+
+  // ---------------------------------------------------------------------------------------------
+  // The header rate must also reproduce the order's OWN total tax, otherwise re-grossing the stored net
+  // would not return the amount the customer actually received — this is the arithmetic the conversion
+  // itself rests on (gross = net x (1 + rate)), and it is what catches money in the order that is in
+  // neither the lines nor shipping (an order-level discount WooCommerce allocated outside them).
   //
   // Codex r1 #2: the tolerance used to be `0.02 + 0.2% of net`, which on a £10,000 net order accepted
   // ±£20.02 — wide enough to admit a header of 19.8% or 20.2% against £2,000 of recorded VAT, i.e. the
@@ -664,6 +783,11 @@ export async function syncWcRefund(
         externalId: String(wcRefund.id),
         status: quarantined ? 'QUARANTINED' : 'FAILED',
         errorMessage: result.error ?? 'refund sync failed',
+        // Codex r2 #2: keep the WooCommerce refund for EVERY park, not just the basis refusal. The
+        // Record-manually path reconciles the credit note it raises against the GROSS amount in this
+        // payload; a park without it has no figure to check against, so the completion path it advertises
+        // cannot run. This is the non-uniform-tax refusal — the commonest quarantine there is.
+        payload: wcRefund,
       })
       return { success: false, error: result.error }
     }
