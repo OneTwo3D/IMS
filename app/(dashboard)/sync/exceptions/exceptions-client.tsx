@@ -524,6 +524,48 @@ export function ExceptionsClient({ data }: Props) {
         </Card>
       ) : null}
 
+      {data.productStructureConflicts.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`WooCommerce products — structure conflicts (${data.summary.productStructureConflicts})`}
+            detail="The WooCommerce product sync refused to overwrite IMS-owned structure (bundle/BOM composition, a variable parent's children, a variant's parent), so the WooCommerce objects listed here exist nowhere in IMS — orders for those SKUs will import without a product or an allocation. Decide which side is right, then fix it in IMS or in WooCommerce; there is nothing to acknowledge, the next sync clears the row by itself. The product reconcile does not move past a conflicted product, so it retries automatically."
+            shown={data.productStructureConflicts.length}
+            total={data.summary.productStructureConflicts}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[860px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>IMS product</TableHead>
+                <TableHead>IMS type</TableHead>
+                <TableHead>WooCommerce id</TableHead>
+                <TableHead>Conflict</TableHead>
+                <TableHead>Found</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.productStructureConflicts.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell>
+                    {row.productId ? (
+                      <Link className="underline underline-offset-2" href={`/inventory/${row.productId}`}>
+                        {row.sku ?? row.productId}
+                      </Link>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">—</span>
+                    )}
+                    {row.productName ? <div className="text-xs text-muted-foreground">{row.productName}</div> : null}
+                  </TableCell>
+                  <TableCell className="text-xs">{row.productType ?? '—'}</TableCell>
+                  <TableCell className="text-xs font-mono">{row.externalProductId ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[420px]" title={row.detail ?? ''}>{row.detail ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.foundAt)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
       {isPending ? <p className="text-xs text-muted-foreground flex items-center gap-1"><Loader2 className="h-3 w-3 animate-spin" />Working…</p> : null}
     </div>
   )

@@ -104,6 +104,19 @@ export type StuckDispatchRow = {
   kind: 'dead-letter' | 'unresolved'
 }
 
+export type ProductStructureConflictRow = {
+  id: string
+  /** The IMS product the WooCommerce object was paired with. */
+  productId: string | null
+  sku: string | null
+  productName: string | null
+  productType: string | null
+  /** The WooCommerce product id. */
+  externalProductId: string | null
+  detail: string | null
+  foundAt: string
+}
+
 export type OrderReconcileDriftRow = {
   orderId: string
   orderNumber: string | null
@@ -142,6 +155,7 @@ export type ExceptionInboxSummary = {
   stuckDispatches: number
   pennyMismatches: number
   orderReconcileDrift: number
+  productStructureConflicts: number
   unresolvedDrift: number
   total: number
 }
@@ -155,6 +169,7 @@ export type ExceptionInboxData = {
   stuckDispatches: StuckDispatchRow[]
   pennyMismatches: PennyMismatchRow[]
   orderReconcileDrift: OrderReconcileDriftRow[]
+  productStructureConflicts: ProductStructureConflictRow[]
   unresolvedDrift: UnresolvedDriftRow[]
 }
 
@@ -261,6 +276,70 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
 }
 
 /**
+ * o3d-y89x / o3d-fjqk: a WooCommerce product and its IMS twin DISAGREE about the row's shape,
+ * so part of the payload could not be applied. One rule, both directions (o3d-y89x r3):
+ *
+ *   - WooCommerce says VARIABLE and the IMS row cannot be a parent (a KIT, a row that is
+ *     itself somebody's child, a live row the editor would refuse to transform): the
+ *     variations exist nowhere in IMS;
+ *   - WooCommerce says SIMPLE and the IMS row is a VARIABLE parent: its type and price go
+ *     unwritten and its IMS variants stay standing;
+ *   - or a single variation SKU resolves to an IMS row belonging to a different parent.
+ *
+ * The connector refuses to flatten the IMS side in every case, because the structure it would
+ * destroy is IMS-owned and WooCommerce never asked for it to go. An IMS KIT paired with a
+ * WooCommerce SIMPLE product is NOT here: both sides agree the row is not a parent, so nothing
+ * went unapplied and that ordinary bundle pairing stays silent.
+ *
+ * Written by the product sync itself, deduplicated to ONE open row per pairing, and DELETED
+ * by the next sync that completes cleanly — so this list is live rather than a log, and the
+ * rows need no acknowledge action: resolving the conflict is what removes them. The product
+ * reconcile cursor does not advance past a conflicted product, so the retry is automatic.
+ */
+const PRODUCT_STRUCTURE_CONFLICT_WHERE = {
+  connector: 'woocommerce',
+  direction: 'FROM_CONNECTOR' as const,
+  entityType: 'Product',
+  status: 'QUARANTINED' as const,
+}
+
+function countProductStructureConflicts(): Promise<number> {
+  return db.shoppingSyncLog.count({ where: PRODUCT_STRUCTURE_CONFLICT_WHERE })
+}
+
+async function loadProductStructureConflicts(): Promise<ProductStructureConflictRow[]> {
+  const rows = await db.shoppingSyncLog.findMany({
+    where: PRODUCT_STRUCTURE_CONFLICT_WHERE,
+    orderBy: { createdAt: 'desc' },
+    take: SECTION_LIMIT,
+    select: { id: true, entityId: true, externalId: true, errorMessage: true, createdAt: true },
+  })
+
+  const productIds = rows.map((row) => row.entityId).filter((id): id is string => Boolean(id))
+  const products = productIds.length > 0
+    ? await db.product.findMany({
+        where: { id: { in: productIds } },
+        select: { id: true, sku: true, name: true, type: true },
+      })
+    : []
+  const productById = new Map(products.map((product) => [product.id, product]))
+
+  return rows.map((row) => {
+    const product = row.entityId ? productById.get(row.entityId) : undefined
+    return {
+      id: row.id,
+      productId: row.entityId,
+      sku: product?.sku ?? null,
+      productName: product?.name ?? null,
+      productType: product?.type ?? null,
+      externalProductId: row.externalId,
+      detail: row.errorMessage,
+      foundAt: row.createdAt.toISOString(),
+    }
+  })
+}
+
+/**
  * q66in.4.4: drift findings are DURABLE wms_order_discrepancies rows — the
  * capped sweep upserts them and resolves a row only when that specific order
  * re-verifies clean, so a newer (necessarily partial) run never clears truth.
@@ -297,7 +376,7 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
 
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
 async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, driftIncidents] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
     db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
@@ -306,6 +385,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     db.wmsOrderPushLink.count({ where: { totalMismatchPence: { not: null } } }),
     countStuckDispatches(),
     countOrderReconcileDrift(),
+    countProductStructureConflicts(),
     // Only the ACTIVE connector: a disabled one's leftover incident is not
     // blocking anything, and showing it would invite an isolate on stale
     // evidence (o3d-bjc.12).
@@ -321,9 +401,10 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     stuckDispatches,
     pennyMismatches,
     orderReconcileDrift,
+    productStructureConflicts,
     unresolvedDrift: driftIncidents.length,
     total: wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks + stuckDispatches
-      + pennyMismatches + orderReconcileDrift + driftIncidents.length,
+      + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length,
   }
 }
 
@@ -339,7 +420,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   await requirePermission('sync')
 
   const counts = await loadExceptionCounts()
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, driftIncidents] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: 'DEAD_LETTER' },
       orderBy: { lastAttemptAt: 'desc' },
@@ -418,6 +499,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       },
     }),
     loadOrderReconcileDrift(),
+    loadProductStructureConflicts(),
     // Only the ACTIVE connector: a disabled one's leftover incident is not
     // blocking anything, and showing it would invite an isolate on stale
     // evidence (o3d-bjc.12).
@@ -493,6 +575,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       externalOrderNumber: link.externalOrderNumber,
     })),
     orderReconcileDrift,
+    productStructureConflicts,
     unresolvedDrift: driftIncidents.map((incident) => ({
       connector: incident.connector,
       version: incident.version,

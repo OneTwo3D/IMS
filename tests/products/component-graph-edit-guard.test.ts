@@ -566,13 +566,24 @@ test('o3d-4kfh: the CSV component pass is guarded, as a component-list mutation'
 // o3d-4kfh r6 (finding 1) — the bump has to be in the same transaction as the write, and after it.
 //
 // These are ORDERING assertions on the source, the same shape as the guard-placement tests above.
-// They prove the CAS is wired at all four mutation sites; the CAS's BEHAVIOUR is proved by the
+// They prove the CAS is wired at all six mutation sites; the CAS's BEHAVIOUR is proved by the
 // dispatch/commitment tests in tests/domain/sales/shipment-service.test.ts.
+//
+// THE TWO WOOCOMMERCE SITES ARE HERE BECAUSE THEY ARE CURRENTLY UNOBSERVABLE (o3d-y89x). #617's
+// allow-list means the connector can no longer make a type change that flips KIT-ness — every pair
+// it can still write is SIMPLE -> VARIABLE or SIMPLE -> VARIANT, and neither is a flip — so every
+// runtime test of that path correctly asserts that NOTHING bumps, and would keep passing if the two
+// calls were deleted as dead code. They must not be: the allow-list is one edit away from letting a
+// flip through again, and a graph write with no bump is exactly the silent corruption o3d-4kfh
+// closed. This test is the only thing standing between those calls and a plausible cleanup.
 // ---------------------------------------------------------------------------
 
-test('o3d-4kfh r6 (finding 1): all four graph-mutation sites bump the version after their write', async () => {
+const PRODUCT_SYNC = path.join(process.cwd(), 'lib/connectors/woocommerce/sync/product-sync.ts')
+
+test('o3d-4kfh r6 (finding 1): all six graph-mutation sites bump the version after their write', async () => {
   const productsSource = await readFile(PRODUCTS_ACTIONS, 'utf8')
   const importSource = await readFile(IMPORT_ACTIONS, 'utf8')
+  const productSyncSource = await readFile(PRODUCT_SYNC, 'utf8')
 
   const sites: Array<{ label: string; source: string; anchor: string; length: number; write: string }> = [
     {
@@ -602,6 +613,20 @@ test('o3d-4kfh r6 (finding 1): all four graph-mutation sites bump the version af
       anchor: 'await lockProductSkusForWrite(tx, [cr.sku])',
       length: 3200,
       write: 'tx.productComponent.deleteMany',
+    },
+    {
+      label: 'WooCommerce parent branch (KIT-ness)',
+      source: productSyncSource,
+      anchor: 'const writeParentRow = async (decision: ConnectorParentWriteDecision) => {',
+      length: 3600,
+      write: 'await updateProductGuardingOwnership(tx, existing, parentClaimants, updateData,',
+    },
+    {
+      label: 'WooCommerce applyVariations (KIT-ness)',
+      source: productSyncSource,
+      anchor: "const preserveType = isConnectorTypeWriteSuppressed(existing.type, 'VARIANT')",
+      length: 4400,
+      write: 'await updateProductGuardingOwnership(tx, existing, claimants, updateData,',
     },
   ]
 
