@@ -880,6 +880,17 @@ The sync log at **Integrations → Xero** shows queued transactions for the **cu
 
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
 
+### Payments IMS refuses to send
+
+Before every payment, bill payment and credit-note allocation — automatic or retried by hand — IMS reads the target document in the accounting system and refuses to post if it cannot positively establish that the settlement is not already there. These refusals are recorded as ordinary failures on the row, and all of them start "Not sent". They are not bugs to retry around; each one means a person has to look at the document.
+
+- **"already holds a settlement of £X dated …"** — the payment is in the ledger. Either IMS sent it and lost the reply, or it was entered by hand. Reconcile the row against the settlement it names rather than sending another.
+- **"could not establish what the accounting connector already holds"** — the read failed (the connector was down, or it returned something IMS cannot measure). Nothing was sent. The row retries on the next run and usually clears itself.
+- **"does not record the amount its attempt would send, and the accounting connector already holds N settlement(s)"** — the queued row is incomplete, so IMS cannot tell its payment apart from what is already on the document. It only appears when the document is not empty; a document with nothing on it still posts normally.
+- **"QuickBooks reports £X already applied … but only £Y of it is accounted for"** (QuickBooks only) — money has come off the bill or invoice by something IMS does not read: a vendor credit, a credit memo, a deposit, a journal entry, or a transaction IMS has never seen. IMS will not pay a document it cannot fully account for. Apply the remainder in QuickBooks, or resolve the row by hand.
+- **"another entry for this document is posting … right now"** — two queued rows target the same document. Nothing is wrong; the second one retries once the first is readable.
+- **"the money-post lock for this document was lost while IMS was posting"** — rare. The database connection holding this document's exclusive claim died mid-call, so another entry could in principle have posted at the same instant. Check the document for a duplicate settlement before retrying. When this happens the server log also carries a line beginning `[money-post] EXCLUSION LOST` naming the connector, document and entry.
+
 ### Rows stranded on a connector you switched away from
 
 Because the sync log is scoped to the active connector, unresolved rows left behind on a connector that has since been turned off appear in **no** sync log. They are listed instead in the amber banner at the top of **Integrations**, which shows each row's connector, type, reference, status, age in days, and last error — plus the external transaction ID if the row already posted something before it stalled.

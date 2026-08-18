@@ -187,24 +187,37 @@ const QBO_PAYMENT_LINK_TYPES: Record<'Bill' | 'Invoice', ReadonlySet<string>> = 
 }
 
 /**
- * Links that take money off the document by some means IMS does not post, and links that take no
- * money off it at all. Both are ignored; they are listed together because what matters here is
- * only "recognised", and split by comment so the coverage statement stays honest.
+ * RECOGNISED, AND NOT THEREFORE HARMLESS (Codex round 5, finding 3).
  *
- * OUT OF COVERAGE, DELIBERATELY: the settlements in the first group are not the shape any IMS
- * attempt creates, so none of them can BE the attempt this probe is asked about. They are not
- * treated as evidence for or against it. The residual is stated rather than closed: a human who
- * settles a bill with a vendor credit or a journal entry instead of a bill payment is invisible
- * to this probe, and the document's own balance check below is what notices that something has
- * happened that no link explains.
+ * These links take money off the document by a shape IMS neither posts nor reads. Round 4 lumped
+ * them in with the links that take NO money off it and ignored both, so a bill an operator had
+ * settled with a vendor credit or a journal entry came back from this probe as `records: []` —
+ * which the classifier reads as `clear` and the fence acts on. "Recognised" was doing the work of
+ * "accounted for", and they are not the same claim: an unrecognised type fails closed, while a
+ * recognised-but-uncovered one was reported as a positive clear. That is a lie about money.
+ *
+ * They are still not fetched — none of them can BE an IMS attempt, and reading five more entity
+ * shapes to measure them is a bigger change than this fence should carry. What they do instead is
+ * make the document's own arithmetic decide: see the settlement accounting at the end of
+ * `probeQuickBooksSettlement`. A linked vendor credit that has taken nothing off the balance
+ * changes no verdict; one that has taken money off leaves an amount no readable payment explains,
+ * and the probe then refuses instead of reporting a clear it cannot support.
  */
-const QBO_KNOWN_OTHER_LINK_TYPES: ReadonlySet<string> = new Set([
-  // Settle the document, by a shape IMS never posts.
+const QBO_UNCOVERED_SETTLEMENT_LINK_TYPES: ReadonlySet<string> = new Set([
   'CreditMemo', 'VendorCredit', 'Deposit', 'JournalEntry', 'Refund', 'RefundReceipt',
   'Check', 'Expense', 'Purchase', 'Transfer', 'CreditCardCredit', 'CreditCardPayment',
-  // The other document kind's payment link, seen on a document it does not settle.
+  // The other document kind's payment link. Treated as a settlement rather than as noise: it is
+  // payment-shaped money movement, and its appearing on a document this probe does not read it
+  // for means the reasoning about which endpoint holds the settlements is already off.
   'Payment', 'BillPayment', 'BillPaymentCheck', 'BillPaymentCreditCard',
-  // Carry no money off the document at all: what it was raised FROM, and what was billed ONTO it.
+])
+
+/**
+ * Links that carry no money off the document at all: what it was raised FROM, and what was billed
+ * ONTO it. These genuinely are noise, and ignoring them is what stops the probe refusing every
+ * bill that came from a purchase order.
+ */
+const QBO_NON_SETTLING_LINK_TYPES: ReadonlySet<string> = new Set([
   'Estimate', 'PurchaseOrder', 'SalesReceipt', 'TimeActivity', 'ReimburseCharge', 'Charge',
   'Invoice', 'Bill', 'InventoryQuantityAdjustment',
 ])
@@ -266,8 +279,15 @@ export async function probeQuickBooksSettlement(
 
   const links = body.LinkedTxn ?? []
   // Rule 3 first, so an unclassified link cannot be quietly outvoted by classified ones.
-  const unclassified = [...new Set(links.map((t) => str(t.TxnType)).filter(
-    (type) => type !== '' && !paymentLinkTypes.has(type) && !QBO_KNOWN_OTHER_LINK_TYPES.has(type),
+  //
+  // A link with NO READABLE TYPE counts as unclassified (Codex round 5, finding 4, escape one).
+  // Round 4 excluded `type !== ''` from this filter, so a link whose TxnType was absent, blank or
+  // not a string was matched by nothing: not a payment, so never read; not unclassified, so never
+  // refused. It is the same "a settlement the probe cannot account for, silently dropped" this
+  // rule exists to stop, wearing a missing field instead of a new name.
+  const unclassified = [...new Set(links.map((t) => str(t.TxnType) || '(untyped)').filter(
+    (type) => !paymentLinkTypes.has(type) && !QBO_UNCOVERED_SETTLEMENT_LINK_TYPES.has(type)
+      && !QBO_NON_SETTLING_LINK_TYPES.has(type),
   ))]
   if (unclassified.length > 0) {
     return {
@@ -277,10 +297,19 @@ export async function probeQuickBooksSettlement(
     }
   }
 
-  const settlementIds = links
-    .filter((t) => paymentLinkTypes.has(str(t.TxnType)))
-    .map((t) => str(t.TxnId))
-    .filter(Boolean)
+  const paymentLinks = links.filter((t) => paymentLinkTypes.has(str(t.TxnType)))
+  // A PAYMENT LINK WITH NO ID cannot be fetched, and dropping it is the second escape (Codex
+  // round 5, finding 4). `.filter(Boolean)` removed it silently, leaving a settlement this probe
+  // KNOWS exists out of the record list it then reports as complete — the same shape as the
+  // unreadable-settlement refusal below, and it must fail the same way.
+  if (paymentLinks.some((t) => str(t.TxnId) === '')) {
+    return {
+      ok: false,
+      reason: `QuickBooks linked a ${settlementKey} to this ${documentKey.toLowerCase()} with no id, `
+        + 'so IMS cannot read what it settled',
+    }
+  }
+  const settlementIds = paymentLinks.map((t) => str(t.TxnId))
 
   const records: LedgerSettlementRecord[] = []
   for (const id of settlementIds) {
@@ -302,24 +331,60 @@ export async function probeQuickBooksSettlement(
     })
   }
 
-  // THE SHAPE-INDEPENDENT BACKSTOP. Everything above depends on a list of type names being right,
-  // and the bug this replaces was a list of type names being wrong. `TotalAmt` and `Balance` are
-  // not names — they are the document's own account of how much of it has been settled, by any
-  // means whatsoever. When money has come off this document and NOTHING is linked to it, no list
-  // could have found what did that, so the probe must not report a picture it knows is short.
+  // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING. Everything above depends on a list of type names
+  // being right, and the bug this replaces was a list of type names being wrong. `TotalAmt` and
+  // `Balance` are not names — they are the document's own account of how much of it has been
+  // settled, by any means whatsoever. So the question asked here is arithmetic, not vocabulary:
+  // is every penny that has come off this document explained by a settlement this probe actually
+  // READ? Whatever is not is money moved by something the record list below does not contain, and
+  // a `clear` built from that list would be a claim the list cannot support.
   //
-  // Deliberately narrow: it fires only when there is no link at all to account for the movement.
-  // A credit memo, a vendor credit or a journal entry DOES appear as a link, is recognised above,
-  // and legitimately explains a reduced balance on a document IMS still has a payment to make
-  // against — refusing those would make every partially-credited document permanently unpayable
-  // through IMS, which is a self-inflicted outage rather than a safety property.
+  // Round 4 asked this only when NOTHING was linked, which is why finding 3 was possible: a
+  // vendor credit or a journal entry appears as a link, was "recognised", and so suppressed the
+  // only check that could have noticed it had taken money off the bill.
+  //
+  // WHAT THIS COSTS, STATED. A document part-settled by a shape IMS does not read — a vendor
+  // credit, a deposit, a manual journal — can no longer be posted to automatically; the row fails
+  // visibly and a human resolves it. That is a real cost and it is the right way round: the
+  // alternative is the fence being told the document is clear when an operator has already
+  // settled it. Restoring automatic coverage means READING those entities (each has its own line
+  // and link shape), which is a bigger change than this fence should carry — tracked separately.
   const total = num(body.TotalAmt)
   const balance = num(body.Balance)
-  if (total !== null && balance !== null && total - balance > QBO_AMOUNT_EPSILON && links.length === 0) {
+  const applied = total !== null && balance !== null ? total - balance : null
+  // Null the moment any read settlement's applied amount is unreadable: an unknown addend makes
+  // the whole sum unknown, and an unknown sum must not be allowed to "explain" anything.
+  const explained = records.reduce<number | null>(
+    (sum, record) => (sum === null || record.amount === null ? null : sum + record.amount),
+    0,
+  )
+  // `Payment` and the bill-payment spellings appear in BOTH tables — they are the covered shape on
+  // one document kind and an uncovered one on the other — so the payment table wins first, or a
+  // settlement this probe has just READ would be counted as one it cannot account for.
+  const uncovered = [...new Set(links.map((t) => str(t.TxnType)).filter(
+    (type) => !paymentLinkTypes.has(type) && QBO_UNCOVERED_SETTLEMENT_LINK_TYPES.has(type),
+  ))]
+  if (applied === null) {
+    // The document's own numbers are missing, so nothing can be reconciled against them. Only a
+    // problem when a settlement IMS cannot measure is linked — otherwise the read payments are
+    // the whole picture and the classifier judges them on their own terms.
+    if (uncovered.length > 0) {
+      return {
+        ok: false,
+        reason: `QuickBooks links ${uncovered.join(', ')} to this ${documentKey.toLowerCase()} and reports no `
+          + 'total or balance, so IMS cannot tell how much of it is already settled',
+      }
+    }
+  } else if (applied > QBO_AMOUNT_EPSILON && (explained === null || applied - explained > QBO_AMOUNT_EPSILON)) {
     return {
       ok: false,
-      reason: `QuickBooks reports ${(total - balance).toFixed(2)} already applied to this `
-        + `${documentKey.toLowerCase()} but links no transaction that accounts for it`,
+      reason: `QuickBooks reports ${applied.toFixed(2)} already applied to this ${documentKey.toLowerCase()} but `
+        + (explained === null
+          ? 'IMS could not measure what the payments it links applied to it'
+          : `only ${explained.toFixed(2)} of it is accounted for by payments IMS can read`)
+        + (uncovered.length > 0
+          ? ` (${uncovered.join(', ')} linked)`
+          : links.length === 0 ? ' and links no transaction that accounts for it' : ''),
     }
   }
   return { ok: true, records }
@@ -468,9 +533,10 @@ export async function authoriseMoneyPost(
   //           connector switch), or another worker claimed it a moment ago. All three mean the
   //           same thing here: IMS cannot say this row has never been sent, and unknown must
   //           never read as "first time".
+  const now = params.now ?? (() => new Date())
   const claimed = await params.db.accountingSyncLog.updateMany({
     where: { id: params.entryId, remoteAttemptedAt: null },
-    data: { remoteAttemptedAt: (params.now ?? (() => new Date()))() },
+    data: { remoteAttemptedAt: now() },
   })
   // This ROW may be new — but the DOCUMENT may not be (Codex round 3). A receipt recorded beside an
   // older failed attempt queues a brand-new row, and that row's first post would otherwise go out on
@@ -490,7 +556,7 @@ export async function authoriseMoneyPost(
     },
     select: { id: true, payload: true },
   })
-  const { classifyLedgerSettlement, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
+  const { classifyLedgerSettlement, describeAttempt, plannedAttemptDate, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   const { effectiveTokenFor, attemptCouldHaveReachedTheLedger, attemptCouldBeTheSameDocument } = await import('@/lib/domain/accounting/followup-retry-guard')
 
   // EVERY CONTENDER, EACH BY ITS OWN MARK — this row and every rival that could have settled the
@@ -540,17 +606,31 @@ export async function authoriseMoneyPost(
    * `_idempotencyKey` over from a row retention has since deleted posts under the SAME mark, and
    * that vanished predecessor leaves no sibling to be found.
    *
-   * The one place `unknown` does not refuse, stated plainly rather than left to be discovered:
-   * when the unknown is `attempt-undescribable` — our own payload does not pin an amount and a
-   * date. That is a fact about this row, not about the ledger; the processors default a missing
-   * date to the day they run, so such a row can never be described. Refusing on it would make
-   * every payment enqueued without a pinned date permanently unsendable while telling us nothing
-   * about whether the document is settled. Both LEDGER unknowns — the probe could not answer, or
-   * it returned a settlement it could not measure — still refuse.
+   * THE DATE IS PINNED HERE, NOT WAIVED (Codex round 5, finding 1). Round 4 let an `unknown` of
+   * cause `attempt-undescribable` proceed, on the reasoning that a row the processors will date
+   * "today at post time" can never be described, so refusing would strand it for ever. The
+   * reasoning was right that refusing for ever is wrong and wrong that proceeding is therefore
+   * right: it let a virgin undated row walk straight past a settlement the probe could SEE.
+   *
+   * What makes it describable is that this row has not been sent yet. `plannedAttemptDate` is
+   * the very value the processor is about to put in the ledger — the payload's date if it pins
+   * one, otherwise today, exactly as the branch below this fence computes it — so the attempt is
+   * compared on what it WILL create rather than treated as unknowable. (Sound only because this
+   * branch is unreachable for a row that has posted: a row that failed to claim the stamp is a
+   * contender unless `attemptCouldHaveReachedTheLedger` rejects its body, and that rejection is
+   * itself proof no call was ever made.)
+   *
+   * That leaves one genuinely undescribable shape — a payload with no readable AMOUNT, which
+   * both connectors reject before any HTTP call anyway. It may still not walk past a settlement
+   * the probe can see: an undescribable attempt proceeds only when the ledger positively holds
+   * NOTHING, which is the one state in which there is nothing to duplicate. Both LEDGER unknowns
+   * — the probe could not answer, or it returned a settlement it could not measure — refuse as
+   * before.
    */
   if (contenders.length === 0) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.entryId, payload: params.payload }))
-    const verdict = classifyLedgerSettlement(describeAttempt(params.payload, marker), probe)
+    const attempt = describeAttempt(params.payload, marker, { postingOn: plannedAttemptDate(params.payload, now()) })
+    const verdict = classifyLedgerSettlement(attempt, probe)
     if (verdict.outcome === 'present') {
       return {
         proceed: false,
@@ -559,11 +639,24 @@ export async function authoriseMoneyPost(
           + 'Sending this would pay it twice. Check the ledger and resolve this entry by hand.',
       }
     }
-    if (verdict.outcome === 'unknown' && verdict.cause !== 'attempt-undescribable') {
-      return {
-        proceed: false,
-        error: `Not sent: IMS could not establish what the accounting connector already holds against `
-          + `this document (${verdict.reason}). Posting on a reading that failed could pay it twice.`,
+    if (verdict.outcome === 'unknown') {
+      if (verdict.cause !== 'attempt-undescribable') {
+        return {
+          proceed: false,
+          error: `Not sent: IMS could not establish what the accounting connector already holds against `
+            + `this document (${verdict.reason}). Posting on a reading that failed could pay it twice.`,
+        }
+      }
+      // Undescribable AND the ledger is not empty: this row cannot say what it would create, so it
+      // cannot rule itself out against what is already there. Refuse on what is visible.
+      if (!probe.ok || probe.records.length > 0) {
+        return {
+          proceed: false,
+          error: 'Not sent: this entry does not record the amount its attempt would send, and the '
+            + `accounting connector already holds ${probe.ok ? probe.records.length : 'a'} settlement`
+            + `${probe.ok && probe.records.length === 1 ? '' : 's'} against this document. IMS cannot `
+            + 'tell them apart, so sending could pay it twice. Resolve this entry by hand.',
+        }
       }
     }
     return { proceed: true }
@@ -593,6 +686,27 @@ export async function authoriseMoneyPost(
 
 /** What a money branch returns to its processor. Structurally the two connectors' `EntryResult`. */
 export type MoneyPostOutcome = { success: boolean; externalId?: string; error?: string }
+
+/**
+ * A money POST made while its exclusion was gone. One line, one stable prefix, every field needed
+ * to find the document — this is the record that turns "we may have paid twice" from something
+ * discovered at reconciliation into something searchable from the minute it happened.
+ *
+ * Deliberately NOT a re-probe. Reading the ledger again here could not be conclusive: a rival
+ * post inside the same window may not be readable yet, and one that lands a second later would be
+ * missed anyway. An inconclusive check that reads like a verdict is worse than a plain alarm.
+ */
+function reportLostMoneyPostExclusion(
+  params: { connector: string; entryId: string; type: string; referenceType: string; referenceId: string },
+  outcome: 'committed' | 'failed' | 'threw',
+): void {
+  console.error(
+    `[money-post] EXCLUSION LOST during the post — the advisory lock's connection died while the call `
+    + `was in flight, so another entry may have posted to this document at the same time. `
+    + `connector=${params.connector} type=${params.type} scope=${params.referenceType}:${params.referenceId} `
+    + `entry=${params.entryId} outcome=${outcome}. Check the accounting connector for a duplicate settlement.`,
+  )
+}
 
 /**
  * o3d-0m56 round 4, Codex CRITICAL #2 — THE ONLY WAY A MONEY POST SHOULD BE SPELT.
@@ -639,7 +753,40 @@ export async function postMoneyUnderLedgerFence(
     // exclusion this verdict was taken under is already gone and another worker may be posting to
     // this document now. Throwing here is correct — the reading is void, not merely stale.
     held.assertHeld('posting money to the accounting connector')
-    return post()
+    let outcome: MoneyPostOutcome
+    try {
+      outcome = await post()
+    } catch (error) {
+      if (held.lost) reportLostMoneyPostExclusion(params, 'threw')
+      throw error
+    }
+    if (!held.lost) return outcome
+    // THE ASSERTION ABOVE CANNOT COVER THE CALL ITSELF (Codex round 5, finding 2). The connection
+    // can die after it and while the HTTP request is in flight, and no amount of re-checking makes
+    // a check-then-act atomic against a remote system. So the residual is not argued away, it is
+    // made DETECTABLE — asked once the call has returned, when the answer is finally knowable —
+    // and RECOVERABLE, which it already is by construction:
+    //
+    //   - the payment carries IMS's mark (Xero `Reference`, QuickBooks `PrivateNote`), so a later
+    //     probe finds it whoever posted it and whatever has since been done to its amount or date;
+    //   - `remoteAttemptedAt` was stamped before the call, so no later row treats this scope as
+    //     virgin, and every subsequent post re-probes under a FRESH lock — there is no path from
+    //     here to a second post on this reading;
+    //   - a successful outcome keeps its `externalId`, because that is the handle a reversal needs.
+    //     Discarding it to report a failure would hide a real payment and buy nothing.
+    //
+    // What is irreducible: if another worker took the freed lock and posted in the same window,
+    // the document really is paid twice. That is now announced at the moment it becomes possible,
+    // by the process that did it, naming the document — not discovered at reconciliation.
+    reportLostMoneyPostExclusion(params, outcome.success ? 'committed' : 'failed')
+    if (outcome.success) return outcome
+    return {
+      success: false,
+      error: 'Not sent safely: the money-post lock for this document was lost while IMS was posting to '
+        + 'the accounting connector, so another entry may have posted at the same time. '
+        + `The connector reported: ${outcome.error ?? 'no error'}. Check the ledger for a duplicate `
+        + 'before retrying.',
+    }
   })
   if (!outcome.locked) {
     return {

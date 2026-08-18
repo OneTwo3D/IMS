@@ -136,12 +136,54 @@ function attemptDate(payload: Record<string, unknown>): string | null {
   return null
 }
 
-export function describeAttempt(payload: unknown, marker?: string | null): AttemptDescription {
+/**
+ * The date an attempt that has NEVER BEEN SENT will carry when it is sent NOW.
+ *
+ * Mirrors both processors exactly — `(payload.paymentDate ?? payload.date)?.slice(0, 10) ||
+ * new Date()` — because the value this returns is a claim about what the imminent POST will put
+ * in the ledger, and a claim that does not match the post is worse than no claim.
+ *
+ * ONLY legitimate for an attempt that has not happened yet (Codex round 5, finding 1). For an
+ * attempt already made, the day it ran is unreconstructable and `attemptDate`'s null — which
+ * yields `attempt-undescribable` — is the honest answer; substituting today would invent a
+ * description of a payment that was actually dated last Tuesday, and then fail to find it.
+ */
+export function plannedAttemptDate(payload: unknown, now: Date): string | null {
+  const record = asRecord(payload)
+  const pinned = attemptDate(record)
+  if (pinned) return pinned
+  // A date field that is PRESENT but unreadable is not the same as no date field. The processors
+  // send whatever is there verbatim (`(payload.paymentDate as string)?.slice(0, 10) || today`), so
+  // `2026-08` posts as `2026-08` and a non-string throws before the call. Neither is today, so
+  // predicting today would describe an attempt that cannot exist — a description that can never
+  // match anything is a false clear with extra steps. Null keeps such a row undescribable, which
+  // the fence answers by refusing on whatever the ledger visibly holds.
+  return unreadableDateField(record) ? null : now.toISOString().slice(0, 10)
+}
+
+/** True when a date field is set to something `attemptDate` could not read. */
+function unreadableDateField(record: Record<string, unknown>): boolean {
+  return ['paymentDate', 'date'].some((field) => {
+    const value = record[field]
+    return value !== undefined && value !== null && value !== ''
+  })
+}
+
+export function describeAttempt(
+  payload: unknown,
+  marker?: string | null,
+  /**
+   * `postingOn` fills in the date ONLY when the payload pins none, and is only sound for an
+   * attempt about to be sent — see `plannedAttemptDate`. Callers judging a past attempt must
+   * omit it.
+   */
+  options?: { postingOn?: string | null },
+): AttemptDescription {
   const record = asRecord(payload)
   const amount = record.amount
   return {
     amount: typeof amount === 'number' && Number.isFinite(amount) ? amount : null,
-    date: attemptDate(record),
+    date: attemptDate(record) ?? options?.postingOn ?? null,
     marker: marker ?? null,
   }
 }

@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   classifyLedgerSettlement,
   describeAttempt,
+  plannedAttemptDate,
   settlementMarkerFor,
   type LedgerSettlementRecord,
 } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -88,6 +89,40 @@ test('the attempt is described from the payload the connector actually sends (o3
   assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '' }), { amount: 1, date: null, marker: null })
   assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '2026-08' }), { amount: 1, date: null, marker: null })
   assert.deepEqual(describeAttempt(null), { amount: null, date: null, marker: null })
+})
+
+// --- the date an UNSENT attempt will carry (Codex round 5, finding 1) ---
+
+test('the date an attempt has not yet sent is the date the processor will send (o3d-0m56 r5)', () => {
+  const now = new Date('2026-08-18T09:00:00Z')
+  // Both processors compute `(payload.paymentDate ?? payload.date)?.slice(0, 10) || today`, so a
+  // row that pins one keeps it and a row that pins none will carry today — which is a fact about
+  // the imminent POST, not a guess, and is what makes such a row describable at all.
+  assert.equal(plannedAttemptDate({ amount: 1, paymentDate: '2026-08-01T00:00:00Z' }, now), '2026-08-01')
+  assert.equal(plannedAttemptDate({ amount: 1, date: '2026-07-04' }, now), '2026-07-04')
+  assert.equal(plannedAttemptDate({ amount: 1 }, now), '2026-08-18')
+  assert.equal(plannedAttemptDate({ amount: 1, paymentDate: '' }, now), '2026-08-18')
+  assert.equal(plannedAttemptDate(null, now), '2026-08-18')
+  // A date field that is SET but unreadable is not "no date": the processors send it verbatim, so
+  // the post will carry something this module cannot predict. Predicting today anyway would
+  // describe an attempt that cannot exist, and a description that can never match is a false
+  // clear with extra steps.
+  assert.equal(plannedAttemptDate({ amount: 1, paymentDate: '2026-08' }, now), null)
+  assert.equal(plannedAttemptDate({ amount: 1, paymentDate: 20260818 }, now), null)
+})
+
+test('describeAttempt fills a missing date ONLY from postingOn (o3d-0m56 r5)', () => {
+  // The option exists so the caller has to say "this attempt has not happened yet". A pinned date
+  // is never overridden, because a past attempt's day is unreconstructable and substituting
+  // today's would go looking for a settlement that was never created.
+  assert.deepEqual(describeAttempt({ amount: 1 }, null, { postingOn: '2026-08-18' }),
+    { amount: 1, date: '2026-08-18', marker: null })
+  assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '2026-08-01' }, null, { postingOn: '2026-08-18' }),
+    { amount: 1, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt({ amount: 1 }, null, { postingOn: null }),
+    { amount: 1, date: null, marker: null })
+  assert.deepEqual(describeAttempt({ amount: 1 }), { amount: 1, date: null, marker: null },
+    'and a caller that does not opt in still gets the honest null')
 })
 
 // --- the durable mark (Codex round 3) ---

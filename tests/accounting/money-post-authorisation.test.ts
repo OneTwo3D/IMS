@@ -63,7 +63,7 @@ function lockDouble() {
   let lost = false
   const lock = async <T>(
     scope: { connector: string; type: string; referenceType: string; referenceId: string },
-    run: (held: { assertHeld: (context?: string) => void }) => Promise<T>,
+    run: (held: { assertHeld: (context?: string) => void; readonly lost: boolean }) => Promise<T>,
   ): Promise<{ locked: true; result: T } | { locked: false }> => {
     const key = [scope.connector, scope.type, scope.referenceType, scope.referenceId].join(' ')
     if (held.has(key)) {
@@ -77,6 +77,10 @@ function lockDouble() {
       return {
         locked: true,
         result: await run({
+          // `lost` is a GETTER, not a snapshot: the whole hazard is that the connection dies
+          // between the assertion and the post returning, so a double that captured the flag at
+          // entry could never express it.
+          get lost() { return lost },
           assertHeld: (context?: string) => {
             if (lost) throw new Error(`Advisory lock was lost before ${context}`)
           },
@@ -506,27 +510,101 @@ test('a settlement that is NOT this attempt still lets the first post through (o
   assert.deepEqual(await (await load())({ ...payment, entryId: 'log-1', db }), { proceed: true })
 })
 
-test('a first post is refused when the LEDGER cannot be read, and allowed when OUR ROW cannot be described (o3d-0m56 r4)', async () => {
-  // The one place `unknown` does not refuse, pinned so it cannot spread. A ledger that will not
-  // answer is a statement about the ledger — refuse. A payload with no date is a statement about
-  // this row: the processors default a missing date to the day they run, so such a row can NEVER
-  // be described, and refusing on it would make it permanently unsendable while telling us
-  // nothing about whether the document is settled.
+test('a first post is refused when the LEDGER cannot be read (o3d-0m56 r4)', async () => {
+  // A ledger that will not answer is a statement about the ledger, and the fence has no business
+  // paying money on a reading that failed.
   xeroCalls.length = 0
   xeroResponse = { Invoices: [] }
   const unreadable = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
   const refused = await (await load())({ ...payment, entryId: 'log-1', db: unreadable.db })
   assert.equal(refused.proceed, false, 'a first post on a reading that failed could pay it twice')
   assert.match(refused.proceed === false ? refused.error : '', /could not establish/)
+})
 
+/* ------------- round 5, CRITICAL 1: a virgin row with no pinned date is DESCRIBED ------------ */
+
+const POSTING_TODAY = () => new Date('2026-08-18T09:00:00Z')
+
+test('a virgin row with NO PINNED DATE is judged on the date it will post (o3d-0m56 r5, CRITICAL 1)', async () => {
+  // THE HOLE ROUND 4 LEFT. `attempt-undescribable` was allowed to proceed on the reasoning that a
+  // row the processors date "today at post time" can never be described — which let a virgin
+  // undated row walk straight past a settlement the probe could SEE. It is describable: the row
+  // has not been sent yet, so the date it WILL carry is exactly what the branch below the fence
+  // computes, `payload.paymentDate || today`.
   xeroCalls.length = 0
-  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Payments: [{ PaymentID: 'PAY-1', Date: '2026-08-01', Amount: 10 }] }] }
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: 'inv-1',
+      AmountPaid: 10,
+      // The human recorded it today, which is the day this row would post for.
+      Payments: [{ PaymentID: 'PAY-TODAY', Date: '2026-08-18', Amount: 10 }],
+    }],
+  }
   const undated = { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', amount: 10 }
-  const dateless = dbDouble([{ id: 'log-2', remoteAttemptedAt: null, payload: undated }])
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: undated }])
+
+  const verdict = await (await load())({ ...payment, entryId: 'log-1', payload: undated, db, now: POSTING_TODAY })
+
+  assert.deepEqual(xeroCalls, ['Invoices/inv-1'])
+  assert.equal(verdict.proceed, false, 'the settlement is the payment this row is about to make again')
+  assert.match(verdict.proceed === false ? verdict.error : '', /PAY-TODAY/)
+})
+
+test('a virgin undated row is NOT stranded by a settlement it would not create (o3d-0m56 r5)', async () => {
+  // The discriminating half: pinning the date must not become "any settlement refuses". A receipt
+  // for the same amount on a different day is a different payment, and instalments are ordinary.
+  xeroCalls.length = 0
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: 'inv-1',
+      AmountPaid: 10,
+      Payments: [{ PaymentID: 'PAY-JUNE', Date: '2026-06-01', Amount: 10 }],
+    }],
+  }
+  const undated = { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', amount: 10 }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: undated }])
   assert.deepEqual(
-    await (await load())({ ...payment, entryId: 'log-2', payload: undated, db: dateless.db }),
+    await (await load())({ ...payment, entryId: 'log-1', payload: undated, db, now: POSTING_TODAY }),
     { proceed: true },
-    'an undescribable FIRST attempt is not evidence of anything and must not be stranded',
+  )
+})
+
+test('a row that CANNOT be described may not walk past a visible settlement (o3d-0m56 r5, CRITICAL 1)', async () => {
+  // What is left once the date is pinned: a payload with no readable AMOUNT (or a date field set
+  // to something the processors would send verbatim and this module cannot predict). Such a row
+  // still cannot say what it would create — so it is not allowed to reason its way past what the
+  // ledger visibly holds. Refusing on the row's own indescribability is the point: the ledger is
+  // not being read as clear, it is being read as "something is there and IMS cannot tell".
+  for (const [label, undescribable] of [
+    ['no amount', { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', paymentDate: '2026-08-01' }],
+    ['a date it cannot predict', { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', amount: 99, paymentDate: '2026-08' }],
+  ] as const) {
+    xeroCalls.length = 0
+    xeroResponse = {
+      Invoices: [{
+        InvoiceID: 'inv-1',
+        AmountPaid: 10,
+        Payments: [{ PaymentID: 'PAY-HUMAN', Date: '2026-08-01', Amount: 10 }],
+      }],
+    }
+    const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: undescribable }])
+    const verdict = await (await load())({ ...payment, entryId: 'log-1', payload: undescribable, db, now: POSTING_TODAY })
+    assert.equal(verdict.proceed, false, `${label}: a visible settlement must stop it`)
+    assert.match(verdict.proceed === false ? verdict.error : '', /Resolve this entry by hand/, label)
+  }
+})
+
+test('an undescribable row still posts against a ledger that positively holds NOTHING (o3d-0m56 r5)', async () => {
+  // The other half, and the reason this is not simply "refuse". An empty ledger is the one state
+  // in which there is nothing to duplicate, so such a row is not permanently unsendable — which
+  // was the correct half of round 4's reasoning.
+  xeroCalls.length = 0
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  const noAmount = { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', paymentDate: '2026-08-01' }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: noAmount }])
+  assert.deepEqual(
+    await (await load())({ ...payment, entryId: 'log-1', payload: noAmount, db, now: POSTING_TODAY }),
+    { proceed: true },
   )
 })
 
@@ -696,6 +774,105 @@ test('a non-money post takes no lock and no reading (o3d-0m56 r4)', async () => 
   assert.deepEqual(acquisitions, [], 'ordinary queue traffic must not queue behind a payment')
   assert.deepEqual(xeroCalls, [])
   assert.deepEqual(writes, [])
+})
+
+/* ---------------- round 5, CRITICAL 2: the lock that dies DURING the call ---------------- */
+
+/** Capture what the fence announces, so "it is detectable" is asserted rather than asserted-about. */
+function captureErrors() {
+  const lines: string[] = []
+  const spy = mock.method(console, 'error', (...args: unknown[]) => { lines.push(args.map(String).join(' ')) })
+  return { lines, restore: () => spy.mock.restore() }
+}
+
+test('a lock lost DURING the post is detected afterwards and announced (o3d-0m56 r5, CRITICAL 2)', async () => {
+  // THE RESIDUAL `assertHeld` CANNOT COVER. It runs before the call; the pinned connection can die
+  // after it and while the HTTP request is in flight, and no re-check makes a check-then-act
+  // atomic against a remote system. So the exclusion is asked about again once the call has
+  // returned — the first moment the answer is knowable — and a post made without it is announced.
+  //
+  // The successful outcome is KEPT: the payment is real, and its externalId is the handle any
+  // reversal needs. Throwing it away would hide a real payment and prevent nothing.
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+  const { lock, loseIt } = lockDouble()
+  const { lines, restore } = captureErrors()
+  try {
+    const outcome = await (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => {
+      // The connection dies mid-flight: the assertion has already passed.
+      loseIt()
+      return { success: true, externalId: 'PAY-A' }
+    })
+    assert.deepEqual(outcome, { success: true, externalId: 'PAY-A' }, 'the payment is real; do not discard its id')
+    const announced = lines.filter((l) => l.includes('[money-post] EXCLUSION LOST'))
+    assert.equal(announced.length, 1, 'a post made without its exclusion must be announced, not inferred later')
+    assert.match(announced[0] ?? '', /entry=log-1/)
+    assert.match(announced[0] ?? '', /scope=SalesOrder:so-1/, 'and name the document, or it cannot be reconciled')
+    assert.match(announced[0] ?? '', /outcome=committed/)
+  } finally {
+    restore()
+  }
+})
+
+test('a FAILED post whose lock was lost is reported as unsafe, not as an ordinary failure (o3d-0m56 r5)', async () => {
+  // A failure and a lost exclusion together is the worst-read case: the call may still have
+  // committed. The row must not go back as a plain "Xero said no" that reads as "try again".
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+  const { lock, loseIt } = lockDouble()
+  const { lines, restore } = captureErrors()
+  try {
+    const outcome = await (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => {
+      loseIt()
+      return { success: false, error: 'HTTP 504' }
+    })
+    assert.equal(outcome.success, false)
+    assert.match(outcome.error ?? '', /lock for this document was lost/)
+    assert.match(outcome.error ?? '', /HTTP 504/, 'the connector\'s own words are kept, not replaced')
+    assert.match(outcome.error ?? '', /duplicate/)
+    assert.equal(lines.filter((l) => l.includes('[money-post] EXCLUSION LOST')).length, 1)
+  } finally {
+    restore()
+  }
+})
+
+test('a post that THREW with the lock lost still announces the exclusion (o3d-0m56 r5)', async () => {
+  // The throw path bypasses every return statement in the fence, which is exactly how a detection
+  // written only on the happy path goes missing.
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+  const { lock, loseIt, held } = lockDouble()
+  const { lines, restore } = captureErrors()
+  try {
+    await assert.rejects(
+      (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => {
+        loseIt()
+        throw new Error('socket hang up')
+      }),
+      /socket hang up/,
+    )
+    const announced = lines.filter((l) => l.includes('[money-post] EXCLUSION LOST'))
+    assert.equal(announced.length, 1)
+    assert.match(announced[0] ?? '', /outcome=threw/)
+    assert.equal(held.size, 0, 'and the lock is still released on the way out')
+  } finally {
+    restore()
+  }
+})
+
+test('a post whose lock SURVIVES announces nothing (o3d-0m56 r5)', async () => {
+  // The alarm has to be silent in the ordinary case or it is noise, and noise is not detection.
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', AmountPaid: 0, Payments: [] }] }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+  const { lock } = lockDouble()
+  const { lines, restore } = captureErrors()
+  try {
+    const outcome = await (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => ({ success: true, externalId: 'PAY-A' }))
+    assert.deepEqual(outcome, { success: true, externalId: 'PAY-A' })
+    assert.deepEqual(lines.filter((l) => l.includes('[money-post] EXCLUSION LOST')), [])
+  } finally {
+    restore()
+  }
 })
 
 test('a lock lost between the reading and the post stops the post (o3d-0m56 r4)', async () => {

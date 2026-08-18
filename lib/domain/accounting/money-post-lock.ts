@@ -45,8 +45,19 @@ import { ACCOUNTING_MONEY_POST_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 import { followUpScopeLockId, type FollowUpScope } from './followup-scope-lock'
 
-/** What `run` may ask the lock while it holds it. */
-export type HeldMoneyPostLock = { assertHeld: (context?: string) => void }
+/**
+ * What `run` may ask the lock while it holds it.
+ *
+ * `assertHeld` is a check-then-act, and no check-then-act can be made atomic against a remote
+ * call: the connection can die AFTER the assertion and DURING the POST (Codex round 5, finding
+ * 2). `lost` is the other half — read it once the call has returned to find out whether the
+ * exclusion survived the call, which is a question that can only be answered afterwards.
+ */
+export type HeldMoneyPostLock = {
+  assertHeld: (context?: string) => void
+  /** True once the pinned connection has failed — from that instant the lock is NOT held. */
+  readonly lost: boolean
+}
 
 export type MoneyPostLockOutcome<T> = { locked: true; result: T } | { locked: false }
 
