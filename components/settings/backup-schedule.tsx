@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import { setSetting } from '@/app/actions/settings'
+import { setSettings } from '@/app/actions/settings'
 
 type Props = {
   enabled: boolean
@@ -26,12 +26,13 @@ export function BackupScheduleSettings({ enabled, retentionDays, maxCount, autoU
   function handleSave() {
     setSaved(false)
     startTransition(async () => {
-      await Promise.all([
-        setSetting('backup_schedule_enabled', isEnabled ? 'true' : 'false'),
-        setSetting('backup_retention_days', days),
-        setSetting('backup_max_count', max),
-        setSetting('backup_auto_upload', upload),
-      ])
+      // ONE transaction (o3d-osl8 round 9, finding 1) — see setSettings.
+      await setSettings({
+        backup_schedule_enabled: isEnabled ? 'true' : 'false',
+        backup_retention_days: days,
+        backup_max_count: max,
+        backup_auto_upload: upload,
+      })
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
     })

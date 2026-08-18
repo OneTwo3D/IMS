@@ -1,10 +1,23 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { unstable_rethrow } from 'next/navigation'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import {
+  INTEGRATION_PLUGIN_SETTING_KEYS,
+  type IntegrationPluginId,
+  type IntegrationPluginState,
+} from '@/lib/integration-plugins'
+import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
+import { completePluginSelectionSave, type PluginSelectionSaveResult } from '@/lib/domain/integrations/plugin-save-outcome'
+import { runPostCommit } from '@/lib/domain/post-commit'
+import { uniqueViolationTargetsField } from '@/lib/db/prisma-unique-violation'
+import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outcome'
+import { reconcileCrontab } from '@/lib/crontab-reconcile'
+import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
@@ -57,6 +70,12 @@ export type ReasonFormState = {
   message?: string
   success?: boolean
   item?: AdjustmentReason
+  /**
+   * COMMITTED, but a step after the commit did not complete (o3d-osl8 round 10, finding 3). Additive
+   * so no screen has to change to stop reporting a stored value as unsaved; a screen with somewhere
+   * to put it can render it.
+   */
+  warning?: string
 }
 
 export type ReasonInput = {
@@ -80,10 +99,17 @@ export async function createAdjustmentReason(
       data: { name, accountCode: accountCode || null, sortOrder, active },
       select: { id: true, name: true, accountCode: true, sortOrder: true, active: true },
     })
-    await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created adjustment reason: ${name}` })
-    revalidatePath('/settings', 'layout')
+    // EVERYTHING BELOW IS POST-COMMIT (o3d-osl8 round 10, finding 3). The row is durable; the audit
+    // entry and the cache revalidation are not part of that write, and either of them throwing used
+    // to land in the catch below and report "Failed to create reason." over a reason that exists.
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created adjustment reason: ${name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the new adjustment reason')
+    if (postCommit.status === 'failed') return { success: true, item, warning: postCommit.error }
     return { success: true, item }
-  } catch {
+  } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create adjustment reason: ${name}` })
     return { message: 'Failed to create reason.' }
   }
@@ -105,23 +131,32 @@ export async function updateAdjustmentReason(
       data: { name, accountCode: accountCode || null, sortOrder, active },
       select: { id: true, name: true, accountCode: true, sortOrder: true, active: true },
     })
-    await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'updated', description: `Updated adjustment reason: ${name}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'updated', description: `Updated adjustment reason: ${name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the adjustment reason change')
+    if (postCommit.status === 'failed') return { success: true, item, warning: postCommit.error }
     return { success: true, item }
-  } catch {
+  } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update adjustment reason: ${name}` })
     return { message: 'Failed to update reason.' }
   }
 }
 
-export async function deleteAdjustmentReason(id: string): Promise<{ error?: string }> {
+export async function deleteAdjustmentReason(id: string): Promise<{ error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     await db.adjustmentReason.delete({ where: { id } })
-    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted adjustment reason' })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted adjustment reason' })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the adjustment reason deletion')
+    // The row is GONE. Reporting an error here would invite a retry of a delete that succeeded.
+    if (postCommit.status === 'failed') return { warning: postCommit.error }
     return {}
-  } catch {
+  } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete adjustment reason' })
     return { error: 'Failed to delete reason.' }
   }
@@ -237,7 +272,7 @@ export async function createTaxRate(input: {
   reverseCharge?: boolean
   reportingCategory?: string | null
   components?: TaxRateComponentInput[]
-}): Promise<{ success: boolean; error?: string }> {
+}): Promise<{ success: boolean; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     // o3d-r30: same write-time TaxType validation as updateTaxRate — createTaxRate is also a
@@ -286,22 +321,34 @@ export async function createTaxRate(input: {
         },
       },
     })
-    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
-    await maybeQueueTaxRateSync({
-      id: created.id,
-      name: created.name,
-      accountingTaxType: created.accountingTaxType,
-      components: created.components.map((component) => ({
-        name: component.name,
-        rate: Number(component.rate),
-        compoundOnPrevious: component.compoundOnPrevious,
-        accountingTaxType: component.accountingTaxType,
-        active: component.active,
-      })),
-    })
-    revalidatePath('/settings', 'layout')
+    // EVERYTHING BELOW IS POST-COMMIT (o3d-osl8 round 10, finding 3 — the SECOND site of this shape,
+    // and the one the round-9 structural test could not see, because it recognised a commit by two
+    // hand-listed call spellings and this one commits through a bare Prisma create).
+    // `maybeQueueTaxRateSync` reaches the accounting connector, so it is the most likely of the
+    // three to fail — and its failure used to report `success: false` over a rate that EXISTS,
+    // inviting the operator to create it a second time.
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
+      await maybeQueueTaxRateSync({
+        id: created.id,
+        name: created.name,
+        accountingTaxType: created.accountingTaxType,
+        components: created.components.map((component) => ({
+          name: component.name,
+          rate: Number(component.rate),
+          compoundOnPrevious: component.compoundOnPrevious,
+          accountingTaxType: component.accountingTaxType,
+          active: component.active,
+        })),
+      })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to complete follow-up work after the tax rate was created')
+    if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
     return { success: true }
   } catch (e) {
+    // FIRST: the guard above deliberately RETHROWS Next's control-flow exceptions, and this catch
+    // would otherwise swallow the redirect it took care to preserve.
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create tax rate: ${input.name}` })
     return { success: false, error: String(e) }
   }
@@ -319,7 +366,7 @@ export async function updateTaxRate(id: string, input: {
   reportingCategory?: string | null
   components?: TaxRateComponentInput[]
   active?: boolean
-}): Promise<{ success: boolean; error?: string }> {
+}): Promise<{ success: boolean; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     // o3d-r30: validate a mapped accounting TaxType against Xero's LIVE rate set before persisting. The
@@ -379,50 +426,69 @@ export async function updateTaxRate(id: string, input: {
       }
       return refreshMutableDocumentTaxSnapshotsForRate(tx, { oldRate, newRate: updated })
     })
-    await logActivity({
-      entityType: 'SETTING',
-      entityId: id,
-      tag: 'settings',
-      action: 'updated',
-      description: `Updated tax rate: ${input.name ?? id}`,
-      metadata: summary,
-    })
-    const refreshed = await db.taxRate.findUnique({
+
+    // EVERYTHING BELOW IS POST-COMMIT (o3d-osl8 round 9, finding 1 — found by the structural rule in
+    // tests/settings/post-commit-contract.test.ts, not by another hand sweep). The tax rate, its
+    // components and the document snapshot refresh are durable at this point. The activity row, the
+    // read-back, the accounting-sync enqueue and the cache revalidation are not part of that write,
+    // and any of them throwing used to land in the outer catch below and report `success: false` —
+    // over a rate that HAS been updated. The Xero mapper then shows a red error and invites a retry
+    // of a mapping that already landed.
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        entityId: id,
+        tag: 'settings',
+        action: 'updated',
+        description: `Updated tax rate: ${input.name ?? id}`,
+        metadata: summary,
+      })
+      const refreshed = await db.taxRate.findUnique({
       where: { id },
-      select: {
-        id: true,
-        name: true,
-        accountingTaxType: true,
-        components: {
-          select: {
-            name: true,
-            rate: true,
-            compoundOnPrevious: true,
-            accountingTaxType: true,
-            active: true,
+        select: {
+          id: true,
+          name: true,
+          accountingTaxType: true,
+          components: {
+            select: {
+              name: true,
+              rate: true,
+              compoundOnPrevious: true,
+              accountingTaxType: true,
+              active: true,
+            },
           },
         },
-      },
-    })
-    if (refreshed) {
-      await maybeQueueTaxRateSync({
-        id: refreshed.id,
-        name: refreshed.name,
-        accountingTaxType: refreshed.accountingTaxType,
-        components: refreshed.components.map((component) => ({
-          name: component.name,
-          rate: Number(component.rate),
-          compoundOnPrevious: component.compoundOnPrevious,
-          accountingTaxType: component.accountingTaxType,
-          active: component.active,
-        })),
       })
-    }
-    revalidatePath('/settings', 'layout')
-    revalidatePath('/sales')
-    revalidatePath('/purchase-orders')
+      if (refreshed) {
+        await maybeQueueTaxRateSync({
+          id: refreshed.id,
+          name: refreshed.name,
+          accountingTaxType: refreshed.accountingTaxType,
+          components: refreshed.components.map((component) => ({
+            name: component.name,
+            rate: Number(component.rate),
+            compoundOnPrevious: component.compoundOnPrevious,
+            accountingTaxType: component.accountingTaxType,
+            active: component.active,
+          })),
+        })
+      }
+      revalidatePath('/settings', 'layout')
+      revalidatePath('/sales')
+      revalidatePath('/purchase-orders')
+    }, 'Failed to complete follow-up work after the tax rate was updated')
+
+    // `success: true` because it IS. The warning is additive so no caller has to change to stop
+    // reporting a stored rate as unsaved; a caller that wants to surface it can.
+    if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
     return { success: true }
   } catch (e) {
+    // FIRST (o3d-osl8 round 9, finding 4). This catch now sits outside a guard that deliberately
+    // RETHROWS Next's control-flow exceptions, so without this line it would swallow the redirect
+    // the guard just took care to preserve — and report a committed update as a failed one on the
+    // way past. `unstable_rethrow` returns silently for ordinary errors.
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update tax rate: ${input.name ?? id}` })
     return { success: false, error: String(e) }
   }
@@ -441,6 +507,7 @@ export async function autoLinkXeroTaxRates(): Promise<{
   unmatched: string[]
   xeroRatesCount: number
   error?: string
+  warning?: string
 }> {
   await requirePermission('settings.company')
   try {
@@ -463,33 +530,46 @@ export async function autoLinkXeroTaxRates(): Promise<{
     let alreadyLinked = 0
     const unmatched: string[] = []
 
-    for (const ims of imsRates) {
-      if (ims.accountingTaxType) { alreadyLinked++; continue }
+    // ONE TRANSACTION FOR THE WHOLE LINK (o3d-osl8 round 11, finding 3). Row-at-a-time these each
+    // committed on their own, so a failure on mapping seventeen left sixteen mappings durable and
+    // the catch below reported `linked: 0` — a claim that nothing landed, over rows that had. The
+    // set is small (active tax rates) and the caller's recovery is to run the link again, so
+    // all-or-nothing is both cheap and the only outcome the return value can honestly describe.
+    const plan = imsRates.flatMap((ims) => {
+      if (ims.accountingTaxType) { alreadyLinked++; return [] }
       const match = xeroByName.get(ims.name.trim().toLowerCase())
-      if (!match) { unmatched.push(ims.name); continue }
-      await db.taxRate.update({
-        where: { id: ims.id },
-        data: { accountingTaxType: match.taxType },
-      })
-      linked++
-    }
-
-    await logActivity({
-      entityType: 'SETTING',
-      tag: 'settings',
-      action: 'xero_tax_rates_linked',
-      description: `Auto-linked ${linked} IMS tax rate(s) to Xero tax types (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
-      metadata: { linked, alreadyLinked, unmatched, xeroRatesCount: result.taxRates.length },
+      if (!match) { unmatched.push(ims.name); return [] }
+      return [{ id: ims.id, taxType: match.taxType }]
     })
-    revalidatePath('/settings/accounting')
+    await db.$transaction(async (tx) => {
+      for (const entry of plan) {
+        await tx.taxRate.update({ where: { id: entry.id }, data: { accountingTaxType: entry.taxType } })
+      }
+    })
+    linked = plan.length
+
+    // POST-COMMIT. The mappings are already written, one row at a time — reporting `success: false`
+    // here would claim NONE of them landed, and the screen's recovery is to run the link again.
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'xero_tax_rates_linked',
+        description: `Auto-linked ${linked} IMS tax rate(s) to Xero tax types (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
+        metadata: { linked, alreadyLinked, unmatched, xeroRatesCount: result.taxRates.length },
+      })
+      revalidatePath('/settings/accounting')
+    }, 'Failed to record the auto-link')
     return {
       success: true,
       linked,
       alreadyLinked,
       unmatched,
       xeroRatesCount: result.taxRates.length,
+      ...(postCommit.status === 'failed' ? { warning: postCommit.error } : {}),
     }
   } catch (e) {
+    unstable_rethrow(e)
     return { success: false, linked: 0, alreadyLinked: 0, unmatched: [], xeroRatesCount: 0, error: String(e) }
   }
 }
@@ -501,6 +581,7 @@ export async function autoLinkQuickBooksTaxRates(): Promise<{
   unmatched: string[]
   quickBooksRatesCount: number
   error?: string
+  warning?: string
 }> {
   await requirePermission('settings.company')
   try {
@@ -520,33 +601,40 @@ export async function autoLinkQuickBooksTaxRates(): Promise<{
     let alreadyLinked = 0
     const unmatched: string[] = []
 
-    for (const ims of imsRates) {
-      if (ims.accountingTaxType) { alreadyLinked++; continue }
+    // ONE TRANSACTION, for the same reason as the Xero path above.
+    const plan = imsRates.flatMap((ims) => {
+      if (ims.accountingTaxType) { alreadyLinked++; return [] }
       const match = qboByName.get(ims.name.trim().toLowerCase())
-      if (!match) { unmatched.push(ims.name); continue }
-      await db.taxRate.update({
-        where: { id: ims.id },
-        data: { accountingTaxType: match.id },
-      })
-      linked++
-    }
-
-    await logActivity({
-      entityType: 'SETTING',
-      tag: 'settings',
-      action: 'quickbooks_tax_rates_linked',
-      description: `Auto-linked ${linked} IMS tax rate(s) to QuickBooks tax codes (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
-      metadata: { linked, alreadyLinked, unmatched, quickBooksRatesCount: qboRates.length },
+      if (!match) { unmatched.push(ims.name); return [] }
+      return [{ id: ims.id, taxType: match.id }]
     })
-    revalidatePath('/settings/accounting')
+    await db.$transaction(async (tx) => {
+      for (const entry of plan) {
+        await tx.taxRate.update({ where: { id: entry.id }, data: { accountingTaxType: entry.taxType } })
+      }
+    })
+    linked = plan.length
+
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'quickbooks_tax_rates_linked',
+        description: `Auto-linked ${linked} IMS tax rate(s) to QuickBooks tax codes (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
+        metadata: { linked, alreadyLinked, unmatched, quickBooksRatesCount: qboRates.length },
+      })
+      revalidatePath('/settings/accounting')
+    }, 'Failed to record the auto-link')
     return {
       success: true,
       linked,
       alreadyLinked,
       unmatched,
       quickBooksRatesCount: qboRates.length,
+      ...(postCommit.status === 'failed' ? { warning: postCommit.error } : {}),
     }
   } catch (e) {
+    unstable_rethrow(e)
     return { success: false, linked: 0, alreadyLinked: 0, unmatched: [], quickBooksRatesCount: 0, error: String(e) }
   }
 }
@@ -683,16 +771,28 @@ export async function generateMissingXeroTaxRates(
       }
     }
 
-    await logActivity({
-      entityType: 'SETTING',
-      tag: 'settings',
-      action: 'xero_tax_rates_generated',
-      description: `Generated ${created} tax rate(s) in Xero and mapped them (${failed.length} failed)`,
-      metadata: { created, failed, requested: taxRateIds.length },
-    })
-    revalidatePath('/settings/accounting')
-    return { success: true, created, failed, externalRatesCount: result.taxRates.length, supported: true }
+    // POST-COMMIT, and the stakes are higher here than anywhere else in this file: the rates have
+    // been created IN XERO and mapped locally. `success: false` would say none of that happened.
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'xero_tax_rates_generated',
+        description: `Generated ${created} tax rate(s) in Xero and mapped them (${failed.length} failed)`,
+        metadata: { created, failed, requested: taxRateIds.length },
+      })
+      revalidatePath('/settings/accounting')
+    }, 'Failed to record the generated tax rates')
+    return {
+      success: true,
+      created,
+      failed,
+      externalRatesCount: result.taxRates.length,
+      supported: true,
+      ...(postCommit.status === 'failed' ? { warning: postCommit.error } : {}),
+    }
   } catch (e) {
+    unstable_rethrow(e)
     return { success: false, created: 0, failed: [], externalRatesCount: 0, supported: true, error: String(e) }
   }
 }
@@ -760,15 +860,239 @@ export async function getUsers(): Promise<UserOption[]> {
   return rows.map((u) => ({ id: u.id, name: u.name ?? u.email, email: u.email }))
 }
 
-export async function setSetting(key: string, value: string): Promise<void> {
+/**
+ * Write ONE generic setting. Sugar over `setSettings`, which is where the contract lives.
+ *
+ * NOTE THE RETURN TYPE. It used to be `Promise<void>`, and that was the defect: the action
+ * committed its upsert and then awaited `logActivity` and `revalidatePath`, so a failure in either
+ * REJECTED a call whose write was already durable. Every one of the fourteen screens behind this
+ * action has an outer `catch` that renders a rejection as a failed save. See `setSettings`.
+ */
+export async function setSetting(key: string, value: string): Promise<SettingSaveResult> {
+  return setSettings({ [key]: value })
+}
+
+/**
+ * WRITE A GROUP OF SETTINGS ATOMICALLY, AND NEVER REJECT AFTER THE COMMIT
+ * (o3d-osl8 round 9, finding 1).
+ *
+ * Two defects, both of them the same shape rounds 7 and 8 fixed at whichever sites were being
+ * looked at that round, surviving here because a per-screen sweep cannot be complete:
+ *
+ *   1. A COMMITTED WRITE REPORTED AS A FAILED SAVE. `setSetting` committed, then awaited
+ *      `logActivity` and `revalidatePath`. Either can reject — the activity-log write is a database
+ *      round-trip — and the rejection escaped as a rejected server action. The Public App URL panel
+ *      prints "Failed to save app URL", the Company onboarding step prints "Failed to save" AND
+ *      refuses to advance, the scheduled-jobs editor prints "An error occurred": three claims that
+ *      the value is not stored, over a value that is. The post-commit steps are now inside
+ *      `runPostCommit`, which classifies instead of rejecting (and rethrows Next's control-flow
+ *      throws first — round 9, finding 4).
+ *
+ *   2. AN ARBITRARY COMMITTED SUBSET. Seven screens saved several keys as `Promise.all(...)` of
+ *      independent `setSetting` calls. `Promise.all` rejects on the first failure while the others
+ *      keep running, so a failed save left some rows written and some not, with the screen showing
+ *      one red error and no way to tell which. All the keys of one save now go in ONE transaction.
+ *
+ * WHAT THIS CONTRACT COVERS AND WHAT IT CANNOT. It covers every post-commit step of THIS writer, for
+ * every caller, including callers that ignore the result — that is why the fix is here and not at
+ * the call sites. It does NOT cover:
+ *   • work a CALLER does after awaiting this action. A screen that commits here and then awaits
+ *     something else has its own post-commit tail, and it must classify it (the two that do —
+ *     `savePublicAppUrl` and `saveCronJobSettings` — are server actions for exactly that reason).
+ *   • other settings writers. `lib/maintenance-mode.ts` and `lib/currencies/fx-refresh.ts` have
+ *     private `setSetting` helpers of their own; they are not user-facing saves and report nothing
+ *     to a screen, but they are not covered by this and are listed here rather than left implied.
+ *   • the screens that DISCARD the returned `post-commit-failed`. Their save is honest — the value
+ *     is stored and they say so — but the missing audit row or stale cache is not surfaced. Only
+ *     the three screens that own a warning slot render it.
+ */
+export async function setSettings(values: Record<string, string>): Promise<SettingSaveResult> {
   await requirePermission('settings.company')
+
+  const entries = Object.entries(values)
+  if (entries.length === 0) return { status: 'saved' }
+
+  // o3d-osl8 round 5, finding 2. The integration plugin flags decide WHICH connector is active,
+  // and other writers make destructive decisions from that answer (cancelOrphanedAccountingSyncRows
+  // discards a non-active connector's queue). Changing them one generic key at a time is neither
+  // atomic — the plugins UI fired five of these in parallel, so "Xero off, QuickBooks on" passed
+  // through both-off and both-on states — nor serialized against those readers. Routed through
+  // saveIntegrationPluginState instead, which does both. Refused rather than silently allowed so
+  // the guarantee cannot be bypassed by a new call site. THROWN, not returned: this is a
+  // programming error at a call site, not an outcome an operator can act on, and it happens before
+  // the transaction so nothing is committed.
+  for (const [key] of entries) {
+    if ((Object.values(INTEGRATION_PLUGIN_SETTING_KEYS) as string[]).includes(key)) {
+      throw new Error(`Use saveIntegrationPluginState to change ${key} — it must be written atomically and under the connector-selection lock.`)
+    }
+  }
+
+  await db.$transaction(async (tx) => {
+    for (const [key, value] of entries) {
+      await tx.setting.upsert({
+        where: { key },
+        create: { key, value: serializeSettingValue(key, value) },
+        update: { value: serializeSettingValue(key, value) },
+      })
+    }
+  })
+
+  // EVERYTHING BELOW IS POST-COMMIT.
+  const outcome = await runPostCommit(async () => {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: `Updated setting${entries.length > 1 ? 's' : ''}: ${entries.map(([key]) => key).join(', ')}`,
+    })
+    revalidatePath('/settings', 'layout')
+  }, 'Failed to record the settings change')
+
+  if (outcome.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: outcome.error }
+  return { status: 'saved' }
+}
+
+/**
+ * SAVE THE PUBLIC APP URL AND RECONCILE THE CRONTAB, SERVER-SIDE (o3d-osl8 round 9, finding 1).
+ *
+ * Previously the Settings panel and the onboarding Company step each did this by hand: `setSetting`
+ * (which could reject after committing), then a second round-trip to `syncCrontab` (which re-runs a
+ * permission gate that answers by throwing `NEXT_REDIRECT`), then a client-side classification of
+ * the two. Three chances for the same defect, in two places, with the rule copied.
+ *
+ * One action: validate, commit, then run every post-commit step inside the guard. The screens only
+ * render the returned outcome.
+ */
+export async function savePublicAppUrl(value: string): Promise<SettingSaveResult> {
+  await requirePermission('settings.company')
+
+  // BEFORE the write, so a refusal genuinely means nothing was stored. The client validates with
+  // the same function for immediate feedback; this is the gate.
+  const normalized = normalizePublicAppUrl(value)
+  if (!normalized.ok) return { status: 'refused', error: normalized.error }
+
+  const key = 'public_app_url'
   await db.setting.upsert({
     where: { key },
-    create: { key, value: serializeSettingValue(key, value) },
-    update: { value: serializeSettingValue(key, value) },
+    create: { key, value: serializeSettingValue(key, normalized.url) },
+    update: { value: serializeSettingValue(key, normalized.url) },
   })
-  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated setting: ${key}` })
-  revalidatePath('/settings', 'layout')
+
+  const local = await runPostCommit(async () => {
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated setting: ${key}` })
+    revalidatePath('/settings', 'layout')
+  }, 'Failed to record the settings change')
+  if (local.status === 'failed') return { status: 'post-commit-failed', step: 'local', error: local.error }
+
+  // The crontab embeds the public app URL in every managed job line, so it is genuinely stale until
+  // this runs — and it is the step with a named operator recovery, which is why it reports
+  // separately from the local steps above.
+  const scheduler = await runPostCommit(reconcileCrontab, 'Failed to apply Public App URL changes.')
+  if (scheduler.status === 'failed') return { status: 'post-commit-failed', step: 'scheduler', error: scheduler.error }
+  return { status: 'saved' }
+}
+
+/** Not exported: nothing outside needs the name, and a 'use server' module's export surface is an RPC manifest. */
+type IntegrationPluginStateInput = Partial<Record<IntegrationPluginId, boolean>>
+
+/**
+ * Write the integration plugin flags ATOMICALLY and under the accounting connector-selection lock
+ * (o3d-osl8 round 5, finding 2).
+ *
+ * Both properties matter, for different readers:
+ *   • ATOMIC — the plugins settings page previously issued one setSetting per flag, in parallel.
+ *     A switch from Xero to QuickBooks therefore passed through observable both-off and both-on
+ *     states. getActiveConnector resolves xero-first and returns null when both are off, so a
+ *     reader landing in that window sees a DIFFERENT active connector than either the before or
+ *     the after — including "none", which is the state the orphan cancel treats as "specify a
+ *     connector" and the banner reports as "no accounting connector is enabled".
+ *   • LOCKED — cancelOrphanedAccountingSyncRows takes the same lock around its
+ *     read-decide-update, so a switch cannot land inside that window at all. Its generation check
+ *     is the backstop if a writer ever skips this path; this is what keeps the backstop from
+ *     firing during ordinary use.
+ *   • VALIDATED UNDER THE LOCK (round 6, finding 1) — the exclusivity rule is evaluated against
+ *     state read THROUGH the transaction, after the lock and the `FOR UPDATE` row locks. Reading
+ *     it beforehand made the check advisory only: two concurrent partial requests each saw both
+ *     connectors off, enabled one apiece, and committed a both-enabled state.
+ *
+ * Only the keys PRESENT in `state` are written, so a caller cannot silently disable a plugin it
+ * did not mean to mention.
+ *
+ * THE SAME THREE OUTCOMES AS THE WIZARD'S WRITER, from the same union and the same guard (round 8,
+ * finding 2). Round 7 split "refused" from "committed but the scheduler is behind" in
+ * saveOnboardingPluginState and cross-ported only the WARNING to this screen, leaving the
+ * classification itself duplicated in a component's try/catch — where a thrown `syncCrontab` was
+ * still rendered as a failed save over a committed write. The scheduler reconciliation moved in
+ * here for that reason: it is a post-commit step of this write, so it belongs inside the same
+ * post-commit guard rather than being a second server round-trip the caller has to classify.
+ */
+export async function saveIntegrationPluginState(
+  state: IntegrationPluginStateInput,
+): Promise<PluginSelectionSaveResult> {
+  await requirePermission('settings.company')
+
+  const entries = (Object.entries(state) as Array<[IntegrationPluginId, boolean | undefined]>)
+    .filter((entry): entry is [IntegrationPluginId, boolean] => typeof entry[1] === 'boolean')
+  if (entries.length === 0) return { status: 'saved' }
+
+  // READ, VALIDATE AND WRITE IN ONE LOCKED TRANSACTION (o3d-osl8 round 6, finding 1).
+  //
+  // The exclusivity rule is checked against the RESULTING state, not just the payload, so a
+  // PARTIAL write cannot turn both connectors on across two calls. That check is only worth
+  // anything if the state it reads cannot move before the write lands — and it could: this used to
+  // read through the pooled client BEFORE opening the locked transaction. Two concurrent partial
+  // requests then both observed both connectors disabled, one enabled Xero and the other
+  // QuickBooks, their writes serialized, and the result was BOTH ENABLED — an invalid state that
+  // no later validation ever revisits and that getActiveConnector silently resolves Xero-first, so
+  // nothing ever complains. WooCommerce/Shopify had the identical race.
+  //
+  // The read now goes through the transaction client, after the lock and under a `FOR UPDATE` row
+  // lock on the plugin rows (lockIntegrationPluginSelection), so the state validated IS the state
+  // written against — for writers that take the lock and for writers that do not.
+  const outcome = await db.$transaction(async (tx): Promise<{ conflict: string } | { committed: IntegrationPluginState }> => {
+    const resulting = { ...(await lockIntegrationPluginSelection(tx)) }
+    for (const [id, enabled] of entries) resulting[id] = enabled
+    if (resulting.xero && resulting.quickbooks) {
+      return { conflict: 'Enable either Xero or QuickBooks, not both — accounting dispatch is single-connector.' }
+    }
+    if (resulting.woocommerce && resulting.shopify) {
+      return { conflict: 'Enable either WooCommerce or Shopify, not both.' }
+    }
+
+    for (const [id, enabled] of entries) {
+      const key = INTEGRATION_PLUGIN_SETTING_KEYS[id]
+      await tx.setting.upsert({
+        where: { key },
+        create: { key, value: serializeSettingValue(key, String(enabled)) },
+        update: { value: serializeSettingValue(key, String(enabled)) },
+      })
+    }
+    return { committed: resulting }
+  })
+
+  // Returned rather than thrown: a refusal is an ordinary outcome the form displays, and throwing
+  // would reach the client as an opaque digest. The transaction has already committed nothing.
+  if ('conflict' in outcome) return { status: 'refused', error: outcome.conflict }
+
+  // Post-commit, so no failure below may be reported as a rejected save — returned or thrown.
+  return completePluginSelectionSave({
+    committed: outcome.committed,
+    postCommit: async () => {
+      await logActivity({
+        entityType: 'SETTING',
+        tag: 'settings',
+        action: 'updated',
+        description: `Updated integration plugins: ${entries.map(([id, enabled]) => `${id}=${enabled}`).join(', ')}`,
+        metadata: Object.fromEntries(entries),
+      })
+      revalidatePath('/settings', 'layout')
+      // The RECONCILIATION, not the gated server action (round 9, finding 4): `syncCrontab` re-runs
+      // `requirePermission`, which answers an invalidated or 2FA-unverified session by throwing
+      // NEXT_REDIRECT — and round 8's post-commit guard swallowed that into a scheduler warning
+      // instead of letting Next redirect. This caller has already run the identical gate above.
+      return reconcileCrontab()
+    },
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -806,7 +1130,7 @@ export async function createPurchaseUnit(input: {
   abbreviation: string
   conversionFactor: number
   stockUnitName: string
-}): Promise<{ success: boolean; error?: string }> {
+}): Promise<{ success: boolean; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     if (!input.name.trim()) return { success: false, error: 'Name is required' }
@@ -820,10 +1144,14 @@ export async function createPurchaseUnit(input: {
         stockUnitName: input.stockUnitName || 'pcs',
       },
     })
-    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created purchase unit: ${input.name}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created purchase unit: ${input.name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the new purchase unit')
+    if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
     return { success: true }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create purchase unit: ${input.name}` })
     return { success: false, error: String(e) }
   }
@@ -849,7 +1177,7 @@ export async function updatePurchaseUnit(id: string, input: {
   conversionFactor?: number
   stockUnitName?: string
   active?: boolean
-}): Promise<{ success: boolean; error?: string }> {
+}): Promise<{ success: boolean; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     await db.purchaseUnit.update({
@@ -862,10 +1190,14 @@ export async function updatePurchaseUnit(id: string, input: {
         ...(input.active !== undefined && { active: input.active }),
       },
     })
-    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated purchase unit: ${input.name ?? id}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated purchase unit: ${input.name ?? id}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the purchase unit change')
+    if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
     return { success: true }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update purchase unit: ${input.name ?? id}` })
     return { success: false, error: String(e) }
   }
@@ -946,7 +1278,7 @@ export type WarehouseInput = z.infer<typeof warehouseSchema>
 
 export async function createWarehouse(
   input: WarehouseInput
-): Promise<{ success: boolean; item?: WarehouseRow; error?: string }> {
+): Promise<{ success: boolean; item?: WarehouseRow; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   const parsed = warehouseSchema.safeParse(input)
   if (!parsed.success) {
@@ -958,44 +1290,68 @@ export async function createWarehouse(
     return { success: false, error: 'Select a valid country.' }
   }
   try {
-    // Enforce unique code
+    /**
+     * ONE TRANSACTION, NOT THREE COMMITS (o3d-osl8 round 11, finding 3).
+     *
+     * This action used to clear the existing default flag, clear the existing default-return flag,
+     * and create the warehouse as three independent Prisma calls — three separate transactions.
+     * A failure on the third (a concurrent duplicate `code`, any constraint) returned
+     * `success: false` over two writes that were already durable, and left the tenant with NO
+     * default warehouse and no default return warehouse. Round 10's post-commit guard could not see
+     * that: it only starts after the final commit, so it changed WHERE the failure was reported
+     * without changing what had already been written.
+     *
+     * The pre-read below cannot decide uniqueness on its own — two concurrent creates both see
+     * "free" — so it exists for the MESSAGE, and the unique index on `code` is what enforces it.
+     * Losing that race now aborts the transaction, so the default flags roll back with it, and the
+     * catch turns the P2002 back into the same sentence the pre-read would have produced.
+     */
     const existing = await db.warehouse.findUnique({ where: { code: data.code } })
     if (existing) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
 
-    // If setting as default, unset others
-    if (data.isDefault) {
-      await db.warehouse.updateMany({ where: { isDefault: true }, data: { isDefault: false } })
-    }
-    if (data.defaultReturnWarehouse) {
-      await db.warehouse.updateMany({ where: { defaultReturnWarehouse: true }, data: { defaultReturnWarehouse: false } })
-    }
+    const item = await db.$transaction(async (tx) => {
+      // If setting as default, unset others
+      if (data.isDefault) {
+        await tx.warehouse.updateMany({ where: { isDefault: true }, data: { isDefault: false } })
+      }
+      if (data.defaultReturnWarehouse) {
+        await tx.warehouse.updateMany({ where: { defaultReturnWarehouse: true }, data: { defaultReturnWarehouse: false } })
+      }
 
-    const item = await db.warehouse.create({
-      data: {
-        code: data.code,
-        name: data.name,
-        type: data.type,
-        contactName: data.contactName || null,
-        email: data.email || null,
-        phone: data.phone || null,
-        addressLine1: data.addressLine1 || null,
-        addressLine2: data.addressLine2 || null,
-        city: data.city || null,
-        postcode: data.postcode || null,
-        country: normalizedCountry,
-        availableForSale: data.availableForSale,
-        syncToStore: data.syncToStore,
-        isDefault: data.isDefault,
-        defaultReturnWarehouse: data.defaultReturnWarehouse,
-        active: data.active,
-      },
-      select: warehouseFields,
+      return tx.warehouse.create({
+        data: {
+          code: data.code,
+          name: data.name,
+          type: data.type,
+          contactName: data.contactName || null,
+          email: data.email || null,
+          phone: data.phone || null,
+          addressLine1: data.addressLine1 || null,
+          addressLine2: data.addressLine2 || null,
+          city: data.city || null,
+          postcode: data.postcode || null,
+          country: normalizedCountry,
+          availableForSale: data.availableForSale,
+          syncToStore: data.syncToStore,
+          isDefault: data.isDefault,
+          defaultReturnWarehouse: data.defaultReturnWarehouse,
+          active: data.active,
+        },
+        select: warehouseFields,
+      })
     })
-    await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created warehouse: ${data.code} — ${data.name}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created warehouse: ${data.code} — ${data.name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the new warehouse')
+    if (postCommit.status === 'failed') return { success: true, item, warning: postCommit.error }
     return { success: true, item }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create warehouse: ${data.code}` })
+    // The unique index, not the pre-read, is what decides this under concurrency — and reporting it
+    // as a raw Prisma error would tell the operator nothing they can act on.
+    if (uniqueViolationTargetsField(e, 'code')) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
     return { success: false, error: String(e) }
   }
 }
@@ -1003,7 +1359,7 @@ export async function createWarehouse(
 export async function updateWarehouse(
   id: string,
   input: WarehouseInput
-): Promise<{ success: boolean; item?: WarehouseRow; error?: string }> {
+): Promise<{ success: boolean; item?: WarehouseRow; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   const parsed = warehouseSchema.safeParse(input)
   if (!parsed.success) {
@@ -1019,48 +1375,55 @@ export async function updateWarehouse(
     const dup = await db.warehouse.findUnique({ where: { code: data.code } })
     if (dup && dup.id !== id) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
 
-    // If setting as default, unset others
-    if (data.isDefault) {
-      await db.warehouse.updateMany({ where: { isDefault: true, id: { not: id } }, data: { isDefault: false } })
-    }
-    if (data.defaultReturnWarehouse) {
-      await db.warehouse.updateMany({ where: { defaultReturnWarehouse: true, id: { not: id } }, data: { defaultReturnWarehouse: false } })
-    }
+    const item = await db.$transaction(async (tx) => {
+      // If setting as default, unset others
+      if (data.isDefault) {
+        await tx.warehouse.updateMany({ where: { isDefault: true, id: { not: id } }, data: { isDefault: false } })
+      }
+      if (data.defaultReturnWarehouse) {
+        await tx.warehouse.updateMany({ where: { defaultReturnWarehouse: true, id: { not: id } }, data: { defaultReturnWarehouse: false } })
+      }
 
-    const item = await db.warehouse.update({
-      where: { id },
-      data: {
-        code: data.code,
-        name: data.name,
-        type: data.type,
-        contactName: data.contactName || null,
-        email: data.email || null,
-        phone: data.phone || null,
-        addressLine1: data.addressLine1 || null,
-        addressLine2: data.addressLine2 || null,
-        city: data.city || null,
-        postcode: data.postcode || null,
-        country: normalizedCountry,
-        availableForSale: data.availableForSale,
-        syncToStore: data.syncToStore,
-        isDefault: data.isDefault,
-        defaultReturnWarehouse: data.defaultReturnWarehouse,
-        active: data.active,
-      },
-      select: warehouseFields,
+      return tx.warehouse.update({
+        where: { id },
+        data: {
+          code: data.code,
+          name: data.name,
+          type: data.type,
+          contactName: data.contactName || null,
+          email: data.email || null,
+          phone: data.phone || null,
+          addressLine1: data.addressLine1 || null,
+          addressLine2: data.addressLine2 || null,
+          city: data.city || null,
+          postcode: data.postcode || null,
+          country: normalizedCountry,
+          availableForSale: data.availableForSale,
+          syncToStore: data.syncToStore,
+          isDefault: data.isDefault,
+          defaultReturnWarehouse: data.defaultReturnWarehouse,
+          active: data.active,
+        },
+        select: warehouseFields,
+      })
     })
-    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated warehouse: ${data.code} — ${data.name}` })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated warehouse: ${data.code} — ${data.name}` })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the warehouse change')
+    if (postCommit.status === 'failed') return { success: true, item, warning: postCommit.error }
     return { success: true, item }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update warehouse: ${data.code}` })
+    if (uniqueViolationTargetsField(e, 'code')) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
     return { success: false, error: String(e) }
   }
 }
 
 export async function deleteWarehouse(
   id: string
-): Promise<{ success: boolean; deactivated?: boolean; error?: string }> {
+): Promise<{ success: boolean; deactivated?: boolean; error?: string; warning?: string }> {
   await requirePermission('settings.company')
   try {
     // Check for references that prevent hard delete
@@ -1077,16 +1440,27 @@ export async function deleteWarehouse(
     if (hasData) {
       // Deactivate instead of delete
       await db.warehouse.update({ where: { id }, data: { active: false } })
-      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: 'Deactivated warehouse (has associated data)' })
-      revalidatePath('/settings', 'layout')
+      // BOTH branches commit, so both have a post-commit tail. A rule that only looked after the
+      // LAST commit in a function would have seen the delete branch and missed this one.
+      const deactivatedPostCommit = await runPostCommit(async () => {
+        await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: 'Deactivated warehouse (has associated data)' })
+        revalidatePath('/settings', 'layout')
+      }, 'Failed to record the warehouse deactivation')
+      if (deactivatedPostCommit.status === 'failed') {
+        return { success: true, deactivated: true, warning: deactivatedPostCommit.error }
+      }
       return { success: true, deactivated: true }
     }
 
     await db.warehouse.delete({ where: { id } })
-    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted warehouse' })
-    revalidatePath('/settings', 'layout')
+    const postCommit = await runPostCommit(async () => {
+      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted warehouse' })
+      revalidatePath('/settings', 'layout')
+    }, 'Failed to record the warehouse deletion')
+    if (postCommit.status === 'failed') return { success: true, warning: postCommit.error }
     return { success: true }
   } catch (e) {
+    unstable_rethrow(e)
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete warehouse' })
     return { success: false, error: String(e) }
   }

@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { lockIntegrationPluginSelection } from '@/lib/integration-plugin-selection-lock'
 import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
 
@@ -163,7 +164,15 @@ async function clearFullScope() {
   await db.taxRate.deleteMany({})
   await db.adjustmentReason.deleteMany({})
   await db.documentTemplate.deleteMany({})
-  await db.setting.deleteMany({})
+  // Under the plugin-selection lock: this deletes the plugin_* rows too, which is a connector
+  // change (to "none") for anything reading them — the third of the three real bypasses the
+  // orphan-cancel sweep's row locks had to fence (o3d-osl8 round 6, finding 2). A concurrent
+  // cancel then either commits before this or waits for it, instead of deciding what to discard
+  // from a selection this is deleting underneath it.
+  await db.$transaction(async (tx) => {
+    await lockIntegrationPluginSelection(tx)
+    await tx.setting.deleteMany({})
+  })
   await db.warehouse.deleteMany({})
   await db.organisation.deleteMany({})
 }
