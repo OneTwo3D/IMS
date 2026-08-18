@@ -45,13 +45,12 @@
  *     (the VAT taken on it). Both are written once, in the order's currency, by createSalesOrder and by
  *     the WooCommerce importer — taxForeign on an imported order is WooCommerce's own `total_tax`, i.e.
  *     literally what the customer paid. The rate charged is taxForeign / totalForeign;
- *   - shipping: `SalesOrder.taxRatePercent`, an order column written alongside the money at creation /
- *     import. It is already a snapshot — it is not read back through the TaxRate table — so the
- *     historical/current distinction does not arise on that path.
+ *   - shipping: `SalesOrder.shippingForeign` (the NET shipping charge) and the VAT that is NOT on any
+ *     line — see the r5 note below.
  *
- * Where a sale line carries no such snapshot (no stored net, or a net of zero, or figures too small to
- * pin a rate down to better than a tenth of a percentage point), the answer is NOT to substitute the
- * live rate. It is to say so and refuse, naming what the operator can do instead.
+ * Where a part of the order carries no such snapshot (no stored net, or a net of zero, or figures too
+ * small to pin a rate down inside the gap between two real VAT rates), the answer is NOT to substitute
+ * the live rate. It is to say so and refuse, naming what the operator can do instead.
  *
  * Codex r4 #3: an UNMAPPED accounting tax code is not evidence of anything either. The r3 code returned
  * a 0% rate for a reverse-charge code that no IMS tax rate is mapped to, on the reasoning that reverse
@@ -59,6 +58,52 @@
  * the CODE, it knows nothing about the code's rate. Assuming zero converts the operator's gross as if no
  * VAT were charged. Every identity, reverse-charge included, is now priced from the tax table or
  * refused.
+ *
+ * ---------------------------------------------------------------------------------------------------
+ * Codex r5 #1: `SalesOrder.taxRatePercent` IS THE ORDER'S HEADER DEFAULT, NOT WHAT SHIPPING WAS CHARGED.
+ *
+ * r4 fixed the LINE path to read the charged rate off the line's own money and left shipping reading
+ * `taxRatePercent`, on the reasoning that it is an order column written alongside the money and so is
+ * already historical. It is historical — and it is still the wrong figure. It is the order's HEADER
+ * rate: what `createSalesOrder` charged shipping/fees/order-discount at, and what the WooCommerce
+ * importer resolved as the order's overall rate. On an order whose shipping was taxed differently from
+ * its goods — zero-rated delivery on standard-rated goods, or standard-rated delivery on zero-rated
+ * goods, the very shape the shipping work exists for — it is not shipping's rate, and comparing the
+ * posting rate against it either waves through a credit note that restates VAT shipping never bore, or
+ * refuses one that is perfectly correct.
+ *
+ * IMS STORES NO SHIPPING-VAT COLUMN. `SalesOrder` carries `shippingForeign` / `shippingBase` (the NET
+ * charge) and `taxForeign` / `taxBase` (the order's TOTAL VAT); `SalesOrderLine.taxForeign` carries each
+ * line's. Shipping's own VAT exists only as the difference, and only in the ORDER's currency, where the
+ * figures sum exactly:
+ *
+ *     shipping VAT = SalesOrder.taxForeign − Σ SalesOrderLine.taxForeign
+ *
+ * That identity is how both writers build the total. The WooCommerce importer sums the SAME stored line
+ * figures it writes and adds `shipping_lines[].total_tax` (computeWcOrderForeignTotals), so the residue
+ * is exactly WooCommerce's shipping tax with no accumulated rounding — fee lines are imported AS lines,
+ * so their VAT is inside the Σ. createSalesOrder does the same, with one exception: it also SUBTRACTS
+ * the VAT on an order-level discount. Where that discount exists the residue is `shipping VAT − discount
+ * VAT`, two figures IMS cannot separate, so the derivation refuses rather than reporting the mixture as
+ * shipping's rate. (Base currency is not usable at all: taxBase is one conversion of the aggregate and
+ * each line's taxBase is converted independently, so the residue there carries FX rounding that is not
+ * shipping VAT — the same trap Codex r3 #3 found in refund-sync.)
+ *
+ * Codex r5 #2: THE TOLERANCE BELONGS TO WHERE THE MONEY WAS ROUNDED, NOT TO WHERE IT IS STORED.
+ *
+ * A rate derived from two rounded figures inherits their rounding, and r4 sized that rounding to the
+ * `Decimal(18,4)` STORAGE scale — half a hundredth of a penny. Most of these figures were not rounded
+ * there. WooCommerce rounds every line's and every shipping line's tax to the currency's minor unit
+ * before IMS ever sees it, so a real £4.99 line at 20% arrives as £1.00 of VAT (not £0.998) and derives
+ * 20.04% — 4.0e-4 out, twenty times the storage bound, and refused as "not the rate it was charged at"
+ * when nothing whatever is wrong with it. Sizing the bound to the storage scale therefore refuses
+ * ordinary imported orders, which is a refusal with no remedy: there is nothing for the operator to fix.
+ *
+ * So each figure is given the rounding it can actually carry, read off the figure itself: one that
+ * carries sub-penny digits cannot have been rounded to the penny (0.0583 of VAT was computed at 4dp and
+ * is worth ±0.00005), and one that does not may have been (£1.00 of VAT is worth ±0.005). Never coarser
+ * than the penny — a 0-decimal currency (JPY) quantises coarser still and its lines get a bound that is
+ * too TIGHT, which refuses, never over-accepts.
  * ---------------------------------------------------------------------------------------------------
  *
  * Every refusal names a remedy an operator (or an admin) can carry out — mapping the tax rate to an
@@ -71,24 +116,55 @@ import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
- * TaxRate.rate and SalesOrder.taxRatePercent are both Decimal(5,4), so two rates that differ by less
- * than half of the last stored digit are the same rate. Exported because the posting side re-prices the
- * identity under the order lock and has to use the same notion of "the same rate" (Codex r4 #2).
+ * TaxRate.rate is Decimal(5,4), so two STORED rates that differ by less than half of the last stored
+ * digit are the same rate. Exported because the posting side re-prices the identity under the order
+ * lock and has to use the same notion of "the same rate" (Codex r4 #2). It is the floor for a DERIVED
+ * rate's tolerance too — no comparison of rates can be finer than the scale they are stored at.
  */
 export const RATE_EPSILON = 0.00005
 
-/** Half of the last digit of Decimal(18,4) — the storage precision of every stored money figure. */
-const MONEY_HALF_UNIT = 0.00005
+/** Decimal(18,4) — the storage scale of every money figure in this module. */
+const STORAGE_DECIMALS = 4
+/**
+ * The finest quantisation a SOURCE of these figures is assumed to use: the currency's minor unit, which
+ * is what WooCommerce rounds every line and shipping tax to before IMS stores it (Codex r5 #2).
+ */
+const SOURCE_DECIMALS = 2
 
 /**
- * A rate DERIVED from two independently rounded money figures carries their rounding, and on a small
- * line that uncertainty grows without bound (a 1p line pins its rate down to nothing at all). Past this
- * width the comparison could no longer tell 19% from 20%, which is precisely what it exists to do, so
- * the line is treated as carrying no usable snapshot rather than being waved through on a tolerance
- * wide enough to hide the defect. 0.1 of a percentage point is well inside the smallest gap between two
- * real VAT rates.
+ * Half of the last digit this figure can actually carry — its rounding exposure.
+ *
+ * Read off the figure itself rather than assumed, because the two sources quantise differently and the
+ * row does not say which wrote it. A figure with sub-penny digits (0.0583) was computed at the storage
+ * scale and is worth ±0.00005; one without (1.00, 0.6, 3) may have been rounded to the penny by
+ * WooCommerce and is worth ±0.005. Decimal drops trailing zeros — 0.6000 reads as 1 decimal place — so
+ * the count is clamped at both ends: never finer than the storage scale, never coarser than the penny.
  */
-const MAX_DERIVED_RATE_TOLERANCE = 0.001
+function moneyHalfUnit(amount: Decimal): Decimal {
+  const decimals = Math.min(Math.max(amount.decimalPlaces(), SOURCE_DECIMALS), STORAGE_DECIMALS)
+  return toDecimal(5).div(toDecimal(10).pow(decimals + 1))
+}
+
+/**
+ * The smallest gap between two DISTINCT rates a credit note could really be posted under: half a
+ * percentage point (5% against 5.5%, 9% against 9.5%, 13% against 13.5% are all live EU VAT rates).
+ */
+const MIN_DISTINCT_RATE_GAP = 0.005
+
+/**
+ * A rate DERIVED from two rounded money figures carries their rounding, and on a small amount that
+ * uncertainty grows without bound (a 1p line pins its rate down to nothing at all). It must stay under
+ * HALF of MIN_DISTINCT_RATE_GAP: a derived rate uncertain by more than half the gap can sit at the
+ * midpoint and agree with both rates, and the comparison could no longer do the one thing it exists for.
+ * 0.2 of a percentage point against a 0.25 limit, so the rejection is strict rather than marginal —
+ * past it the amount is treated as carrying no usable snapshot rather than waved through on a tolerance
+ * wide enough to hide the defect.
+ *
+ * Note what this bound is in MONEY: tolerance x net is (halfUnit of the VAT + rate x halfUnit of the
+ * net), i.e. at most about 0.006 whatever the amount. An accepted rate always reproduces the VAT the
+ * order records to within half a penny of it; the cap only ever makes that stricter.
+ */
+const MAX_DERIVED_RATE_TOLERANCE = MIN_DISTINCT_RATE_GAP * 0.4 // 0.002 — 0.2pp against a 0.25pp limit
 
 /**
  * The identity-bearing fields of the TaxRate row an order line points at. Deliberately does NOT carry
@@ -113,6 +189,30 @@ export type PostedRefundTaxRate = {
 export type ChargedLineSnapshot = {
   netForeign?: DecimalInput
   taxForeign?: DecimalInput
+}
+
+/**
+ * The order's own record of what SHIPPING was charged, in the order's currency (Codex r5 #1). IMS has
+ * no shipping-VAT column, so the VAT half is the money that is on the order but on none of its lines:
+ *
+ *     SalesOrder.taxForeign − Σ SalesOrderLine.taxForeign
+ *
+ * which is exactly how both writers built `taxForeign` in the first place. Every line of the order must
+ * be supplied — a partial read makes the residue larger than shipping's VAT, not smaller — and
+ * `orderDiscountAmount` must be supplied because createSalesOrder nets an order-level discount's VAT off
+ * the same total, which puts a second, inseparable figure into the residue.
+ *
+ * `undefined` anywhere means the caller did not read it, which is never the same as zero.
+ */
+export type ChargedShippingSnapshot = {
+  /** SalesOrder.shippingForeign — the NET shipping charge (both writers store it net of VAT). */
+  netForeign?: DecimalInput
+  /** SalesOrder.taxForeign — the order's TOTAL VAT, in its own currency. */
+  orderTaxForeign?: DecimalInput
+  /** SalesOrderLine.taxForeign for EVERY line on the order, including imported fee lines. */
+  lineTaxForeign?: readonly DecimalInput[]
+  /** SalesOrder.discountAmount — an order-level discount whose VAT is netted off orderTaxForeign. */
+  orderDiscountAmount?: DecimalInput
 }
 
 /**
@@ -178,34 +278,82 @@ type ChargedRate =
   | { ok: false; detail: string }
 
 /**
- * The rate a sale line was CHARGED at, from its own money snapshot. Never from the tax table.
+ * The rate an amount was CHARGED at, from the money the order recorded for it. Never from the tax table.
  *
- * The derived rate inherits the rounding of both stored figures: each is held to Decimal(18,4), so
- * `rate = tax / net` carries at most (halfUnit + rate x halfUnit) / net of error. That is the tolerance
- * the comparison is entitled to — no wider (which would hide a real rate difference) and no narrower
- * (which would refuse a legitimate small line for its own stored rounding).
+ * The derived rate inherits the rounding of BOTH figures, each sized to where it was actually rounded
+ * (Codex r5 #2): `rate = tax / net` carries at most (halfUnit(tax) + rate x halfUnit(net)) / net of
+ * error. That is the tolerance the comparison is entitled to — no wider (which would hide a real rate
+ * difference) and no narrower (which would refuse a legitimate amount for rounding it did not choose).
  */
-function chargedRateFromSnapshot(snapshot: ChargedLineSnapshot | null | undefined): ChargedRate {
-  if (snapshot?.netForeign == null || snapshot.taxForeign == null) {
-    return { ok: false, detail: 'IMS holds no record of the net it was sold at and the VAT taken on it' }
-  }
-  const net = toDecimal(snapshot.netForeign)
-  const tax = toDecimal(snapshot.taxForeign)
+function chargedRateFromMoney(net: Decimal, tax: Decimal, netNoun: string): ChargedRate {
   if (net.lte(0)) {
-    return { ok: false, detail: `it carries no net amount (${net.toFixed(4)}), so no rate can be read off it` }
+    return { ok: false, detail: `it carries no ${netNoun} (${net.toFixed(4)}), so no rate can be read off it` }
   }
   const rate = tax.div(net)
-  // (1 + rate) x halfUnit / net, evaluated with the derived rate itself — accurate enough for a bound.
-  const tolerance = toDecimal(MONEY_HALF_UNIT).mul(toDecimal(1).add(rate.abs())).div(net).toNumber()
+  // Evaluated with the derived rate itself rather than the true one — accurate enough for a bound.
+  const tolerance = moneyHalfUnit(tax).add(rate.abs().mul(moneyHalfUnit(net))).div(net).toNumber()
   if (tolerance > MAX_DERIVED_RATE_TOLERANCE) {
     return {
       ok: false,
       detail:
-        `its stored amounts (${tax.toFixed(4)} of VAT on a net of ${net.toFixed(4)}) are too small to fix ` +
-        'the rate it was charged at to better than a tenth of a percentage point',
+        `its stored amounts (${tax.toFixed(4)} of VAT on a ${netNoun} of ${net.toFixed(4)}) are too small ` +
+        'to fix the rate it was charged at to inside the gap between two real VAT rates',
     }
   }
   return { ok: true, rate, tolerance: Math.max(RATE_EPSILON, tolerance) }
+}
+
+/** The rate a sale LINE was charged at, from its own money snapshot. */
+function chargedRateFromSnapshot(snapshot: ChargedLineSnapshot | null | undefined): ChargedRate {
+  if (snapshot?.netForeign == null || snapshot.taxForeign == null) {
+    return { ok: false, detail: 'IMS holds no record of the net it was sold at and the VAT taken on it' }
+  }
+  return chargedRateFromMoney(toDecimal(snapshot.netForeign), toDecimal(snapshot.taxForeign), 'net amount')
+}
+
+/**
+ * The rate SHIPPING was charged at (Codex r5 #1) — from the order's own money, not from its header
+ * default rate. See ChargedShippingSnapshot for why the VAT half is a residue and what makes it unusable.
+ */
+function chargedShippingRateFromSnapshot(snapshot: ChargedShippingSnapshot | null | undefined): ChargedRate {
+  if (snapshot?.netForeign == null || snapshot.orderTaxForeign == null || snapshot.lineTaxForeign == null) {
+    return {
+      ok: false,
+      detail:
+        'IMS stores no VAT figure of its own for a shipping charge, and the order totals its VAT would ' +
+        'be derived from were not read',
+    }
+  }
+  if (snapshot.lineTaxForeign.some((lineTax) => lineTax == null)) {
+    return {
+      ok: false,
+      detail:
+        "not every order line's VAT was read, and shipping's VAT is what the order records over and " +
+        'above its lines',
+    }
+  }
+  const orderDiscount = toDecimal(snapshot.orderDiscountAmount ?? 0)
+  if (!orderDiscount.isZero()) {
+    return {
+      ok: false,
+      detail:
+        `this order carries an order-level discount (${orderDiscount.toFixed(4)}) whose VAT is netted off ` +
+        "the same total, so what the order records over and above its lines is shipping's VAT and the " +
+        "discount's together and neither can be read out of it",
+    }
+  }
+  const lineTax = snapshot.lineTaxForeign.reduce<Decimal>((sum, tax) => sum.add(toDecimal(tax)), toDecimal(0))
+  const orderTax = toDecimal(snapshot.orderTaxForeign)
+  const shippingTax = orderTax.sub(lineTax)
+  if (shippingTax.isNegative()) {
+    return {
+      ok: false,
+      detail:
+        `the order records less VAT (${orderTax.toFixed(4)}) than its own lines carry ` +
+        `(${lineTax.toFixed(4)}), so no shipping VAT can be read out of the difference`,
+    }
+  }
+  return chargedRateFromMoney(toDecimal(snapshot.netForeign), shippingTax, 'shipping charge')
 }
 
 /**
@@ -215,6 +363,16 @@ function chargedRateFromSnapshot(snapshot: ChargedLineSnapshot | null | undefine
  */
 export function chargedRateFromLineSnapshot(snapshot: ChargedLineSnapshot | null | undefined): Decimal | null {
   const charged = chargedRateFromSnapshot(snapshot)
+  return charged.ok ? charged.rate : null
+}
+
+/**
+ * The same, for a refused SHIPPING target: what the order says shipping was charged, never the order's
+ * header default rate — which is a different figure whenever shipping was taxed differently from the
+ * goods, and is exactly the substitution Codex r5 #1 found (o3d-w00). Null when it cannot be derived.
+ */
+export function chargedRateFromShippingSnapshot(snapshot: ChargedShippingSnapshot | null | undefined): Decimal | null {
+  const charged = chargedShippingRateFromSnapshot(snapshot)
   return charged.ok ? charged.rate : null
 }
 
@@ -233,10 +391,13 @@ export function resolvePostedRefundTaxIdentity(input: {
   /** accountingTaxType of the ACTIVE TaxRate named SalesOrder.taxRateName, or null. */
   orderDefaultTaxType: string | null
   /**
-   * SalesOrder.taxRatePercent — the ORDER's own snapshot of the rate it charged shipping at. An order
-   * column, not a read of the live TaxRate row, so it is already historical (Codex r4 #1).
+   * The order's money snapshot of its SHIPPING leg, for a `shipping` target. Ignored for `sale`.
+   *
+   * Codex r5 #1: deliberately NOT `SalesOrder.taxRatePercent`. That column is the order's HEADER
+   * default rate, which is only shipping's rate on an order taxed uniformly — and this type not being
+   * able to express it is how that substitution is kept from coming back.
    */
-  orderChargedRate?: DecimalInput
+  chargedShipping?: ChargedShippingSnapshot | null
   /** The order's single safe identity, for a sale line that has no TaxRate row of its own. */
   orderUniform?: { singleSafeTaxType: string | null; uniformlyReverseCharged: boolean }
   /** settings.reverseChargeSalesTaxType ('' disables the swap). */
@@ -287,20 +448,21 @@ export function resolvePostedRefundTaxIdentity(input: {
     }
   }
 
-  // What this part of the order was actually CHARGED — read from the ORDER, never from the tax table.
+  // What this part of the order was actually CHARGED — read from the ORDER's own money, never from the
+  // tax table and never from the order's header default rate (Codex r4 #1 / r5 #1).
   const charged: ChargedRate = isSale
     ? chargedRateFromSnapshot(input.chargedLine)
-    // SalesOrder.taxRatePercent is the order's own column; null means the order recorded no VAT rate,
-    // which is a fact about the order and not a missing reading.
-    : { ok: true, rate: toDecimal(input.orderChargedRate ?? 0), tolerance: RATE_EPSILON }
+    : chargedShippingRateFromSnapshot(input.chargedShipping)
   if (!charged.ok) {
     return {
       ok: false,
       reason:
         `${input.label} does not record what VAT was charged on it — ${charged.detail} — so IMS cannot ` +
         'check that its credit note would post at the rate the customer actually paid, and will not ' +
-        'guess from the current tax table. Allocate this refund to the parts of the order that carry ' +
-        'the money it came off, then record it.',
+        'guess from the current tax table or from the rate on the order header. ' +
+        (isSale
+          ? 'Allocate this refund to the parts of the order that carry the money it came off, then record it.'
+          : 'Allocate this refund to the order lines it came off instead, then record it.'),
     }
   }
 
@@ -346,9 +508,15 @@ export function resolvePostedRefundTaxIdentity(input: {
           ? ' — the line is reverse-charged but no reverse-charge sales tax code is configured, so the ' +
             'swap the invoice relies on does not happen. Set it in Settings → Accounting, then record ' +
             'this refund.'
-          : ' — so the credit note would restate VAT the customer was never charged. Map this line\'s ' +
-            'tax rate to an accounting tax code that matches the rate it was sold at (Settings → Tax ' +
-            'Rates), then record this refund.'),
+          : isSale
+            ? ' — so the credit note would restate VAT the customer was never charged. Map this line\'s ' +
+              'tax rate to an accounting tax code that matches the rate it was sold at (Settings → Tax ' +
+              'Rates), then record this refund.'
+            : ' — so the credit note would restate VAT the customer was never charged. Shipping posts ' +
+              'under the order\'s DEFAULT VAT identity, which is not the rate this order charged ' +
+              'shipping at: give that rate an accounting tax code carrying the rate shipping was ' +
+              'actually charged (Settings → Tax Rates), or allocate this refund to the order lines it ' +
+              'came off, then record it.'),
     }
   }
   return { ok: true, accountingTaxType, reverseCharge, vatRate: postedRate }

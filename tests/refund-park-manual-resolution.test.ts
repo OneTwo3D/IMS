@@ -40,13 +40,18 @@ const ORDER = {
   id: 'so-1',
   currency: 'GBP',
   fxRateToBase: 1,
-  taxRatePercent: 0.2,
   taxRateName: 'UK Standard Rate' as string | null,
   shippingForeign: 5,
   // Order-level money, so the fixture is a whole order rather than a bag of lines: net 30 of goods +
   // 5 of postage, 3 of VAT, 38 gross. Asserted below.
+  //
+  // Codex r5 #1: `taxForeign` is also what SHIPPING was charged, because IMS stores no shipping-VAT
+  // column — the postage's VAT is the 1.00 the order carries over and above its lines' 2.00. The
+  // order's HEADER rate (taxRatePercent) is deliberately absent from this fixture: production may not
+  // read it, and a fixture that still offered it could not show that it does not.
   subtotalForeign: 30,
   taxForeign: 3,
+  discountAmount: 0,
   totalForeign: 38,
   lines: [
     // Codex r4 #1: each line carries its OWN money — the net it was sold at and the VAT taken on it.
@@ -235,14 +240,18 @@ test('the order fixture is a coherent order (o3d-w00)', () => {
   // money at all, proves nothing about a path whose entire job is reconciling amounts.
   const linesNet = ORDER.lines.reduce((sum, orderLine) => sum + orderLine.totalForeign, 0)
   const linesVat = ORDER.lines.reduce((sum, orderLine) => sum + orderLine.taxForeign, 0)
-  const shippingVat = ORDER.shippingForeign * ORDER.taxRatePercent
+  // What the postage bore, read the way production reads it: the VAT the order records over and above
+  // its own lines (Codex r5 #1).
+  const shippingVat = ORDER.taxForeign - linesVat
+  const shippingRate = shippingVat / ORDER.shippingForeign
   assert.equal(linesNet, ORDER.subtotalForeign, 'the lines ARE the subtotal')
   assert.equal(linesVat + shippingVat, ORDER.taxForeign, 'VAT 3.00 — 2.00 on the widget, 1.00 on the postage')
+  assert.equal(shippingRate, 0.2, 'the postage was charged at 20%')
   assert.equal(linesNet + ORDER.shippingForeign + ORDER.taxForeign, ORDER.totalForeign, 'net + VAT = 38.00')
   // The parked refund is one 20% widget (12.00 gross) plus the postage (6.00 gross).
   assert.equal(
     Number(PARKED_GROSS),
-    ORDER.lines[0].totalForeign + ORDER.lines[0].taxForeign + ORDER.shippingForeign * (1 + ORDER.taxRatePercent),
+    ORDER.lines[0].totalForeign + ORDER.lines[0].taxForeign + ORDER.shippingForeign * (1 + shippingRate),
   )
   // Codex r3 #1 / r4 #1: the tax fixture is coherent too — every line's accounting tax code is priced
   // at the rate that line's OWN MONEY says it was sold at, and the order default prices at the rate the
@@ -258,7 +267,7 @@ test('the order fixture is a coherent order (o3d-w00)', () => {
     assert.equal(orderLine.taxRate.rate, chargedRate, `${orderLine.description}: live row matches the sale`)
   }
   const orderDefault = TAX_RATES.find((taxRate) => taxRate.name === ORDER.taxRateName && taxRate.active)
-  assert.equal(orderDefault?.rate, ORDER.taxRatePercent, 'the order default prices at the rate shipping was charged')
+  assert.equal(orderDefault?.rate, shippingRate, 'the order default prices at the rate shipping was charged')
 })
 
 test.beforeEach(() => {
@@ -536,6 +545,57 @@ test('a line whose tax rate has no accounting code is REFUSED, not converted at 
   assert.equal(mapped.success, true)
   const lines = state.createRefundCalls[0].lines as Array<{ totalBase: number }>
   assert.equal(lines[0].totalBase, 20, 'zero-rated: gross IS net')
+})
+
+test("shipping is converted at ITS OWN charged rate, not the order's header rate (o3d-w00 Codex r5 #1)", async () => {
+  // `SalesOrder.taxRatePercent` is the order's HEADER DEFAULT. It is what createSalesOrder charged
+  // shipping at and what the importer resolved for the order as a whole — and on an order whose
+  // delivery was taxed unlike its goods it is not the shipping leg's rate. r4 read it as one, so the
+  // check compared the posting rate against a figure shipping never bore.
+  //
+  // (1) ZERO-RATED DELIVERY on 20% goods: 10.00 @ 20% + 20.00 @ 0% + 5.00 of VAT-free postage — the
+  // order carries 2.00 of VAT, all of it the widget's, and comes to 37.00 gross. Shipping still posts
+  // under the ORDER-DEFAULT identity (OUTPUT2, 20%), so recording the 5.00 of postage would store 4.17
+  // net and credit 0.83 of VAT the customer was never charged, against a park that reconciled exactly.
+  state.order = { ...state.order!, taxForeign: 2, totalForeign: 37 }
+  state.park = { ...QUARANTINED_PARK, payload: { id: 7101, amount: '5.00' } }
+
+  const refused = await recordRefundParkManually('park-1', [shipping(5)], 'the postage only')
+
+  assert.equal(refused.success, false)
+  assert.match(refused.error ?? '', /The shipping charge was charged at 0% but/)
+  assert.match(refused.error ?? '', /accounting tax code OUTPUT2, which is 20%/)
+  // A refusal is only acceptable with a remedy, and both of shipping's are named.
+  assert.match(refused.error ?? '', /Settings → Tax Rates/)
+  assert.match(refused.error ?? '', /allocate this refund to the order lines it came off/)
+  assert.equal(state.createRefundCalls.length, 0, 'no credit note is raised on a rate shipping never bore')
+  assert.equal(state.park?.status, 'QUARANTINED')
+
+  // (2) The mirror image, which the header rate refused for nothing: STANDARD-RATED DELIVERY on
+  // zero-rated goods. 10.00 + 20.00 of VAT-free goods + 5.00 of postage carrying 1.00 of VAT — the
+  // order's whole 1.00 of VAT is the postage's, so shipping was charged 20%, which is exactly what its
+  // credit note posts at. 6.00 gross of postage converts to 5.00 net and records.
+  state.order = {
+    ...state.order,
+    taxForeign: 1,
+    totalForeign: 36,
+    lines: state.order.lines.map((orderLine) => ({
+      ...orderLine,
+      taxForeign: 0,
+      taxRate: { ...orderLine.taxRate, rate: 0, accountingTaxType: 'ZERORATEDOUTPUT' },
+    })),
+  }
+  state.park = { ...QUARANTINED_PARK, payload: { id: 7101, amount: '6.00' } }
+
+  const recorded = await recordRefundParkManually('park-1', [shipping(6)], 'the postage only')
+
+  assert.equal(recorded.success, true)
+  assert.deepEqual(
+    (state.createRefundCalls[0].lines as Array<{ lineKind?: string; totalBase: number }>)
+      .map((refundLine) => ({ lineKind: refundLine.lineKind, totalBase: refundLine.totalBase })),
+    [{ lineKind: 'shipping', totalBase: 5 }],
+    '6.00 gross of postage at the 20% it was really charged',
+  )
 })
 
 test('shipping is REFUSED when the order-default identity no longer resolves (o3d-w00 Codex r3 #1)', async () => {

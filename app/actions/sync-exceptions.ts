@@ -60,6 +60,7 @@ import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decima
 import {
   buildTaxTypeRateIndex,
   chargedRateFromLineSnapshot,
+  chargedRateFromShippingSnapshot,
   resolveOrderUniformTaxIdentity,
   resolvePostedRefundTaxIdentity,
   type TaxTypeRateIndex,
@@ -754,10 +755,16 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             id: true,
             orderNumber: true,
             currency: true,
-            taxRatePercent: true,
             taxRateName: true,
             shippingForeign: true,
             shippingService: true,
+            // o3d-w00 (Codex r5 #1): shipping's CHARGED rate is derived from the order's own money —
+            // the VAT it records over and above its lines, on the net shipping charge. taxRatePercent
+            // is deliberately NOT read: it is the order's header default, which is shipping's rate only
+            // on a uniformly taxed order. discountAmount is read because an order-level discount's VAT
+            // is netted off the same total and would otherwise be mistaken for shipping's.
+            taxForeign: true,
+            discountAmount: true,
             lines: {
               select: {
                 id: true,
@@ -826,6 +833,14 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       lines: order.lines,
       reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
     })
+    // What the ORDER says its shipping leg was charged (Codex r5 #1): the net shipping charge, and the
+    // VAT the order records over and above every one of its lines. IMS has no shipping-VAT column.
+    const chargedShipping = {
+      netForeign: order.shippingForeign,
+      orderTaxForeign: order.taxForeign,
+      lineTaxForeign: order.lines.map((line) => line.taxForeign),
+      orderDiscountAmount: order.discountAmount,
+    }
     const targets: RefundParkAllocationTarget[] = order.lines.map((line) => {
       // o3d-w00 (Codex r3 #1): the rate the credit note will RE-GROSS this line at, resolved from the
       // accounting tax identity it will post under — NOT the line's nominal TaxRate.rate. Where the two
@@ -836,7 +851,6 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         lineTaxRate: line.taxRate,
         chargedLine: { netForeign: line.totalForeign, taxForeign: line.taxForeign },
         orderDefaultTaxType,
-        orderChargedRate: order.taxRatePercent,
         orderUniform,
         reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
         rateByTaxType: postingTaxContext.rateByTaxType,
@@ -868,12 +882,16 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       const identity = resolvePostedRefundTaxIdentity({
         kind: 'shipping',
         orderDefaultTaxType,
-        orderChargedRate: order.taxRatePercent,
+        chargedShipping,
         reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
         rateByTaxType: postingTaxContext.rateByTaxType,
         label: 'Shipping',
       })
-      const vatRate = identity.ok ? identity.vatRate : toDecimal(order.taxRatePercent ?? 0)
+      // Unresolvable: show what the ORDER says shipping was charged (Codex r5 #1), not the order's
+      // header default rate — a different figure whenever shipping was taxed unlike the goods.
+      const vatRate = identity.ok
+        ? identity.vatRate
+        : (chargedRateFromShippingSnapshot(chargedShipping) ?? toDecimal(0))
       const remainingNet = shippingForeign.sub(priorRefundedShippingByOrderId.get(order.id) ?? toDecimal(0))
       targets.push({
         lineId: null,
@@ -1407,11 +1425,17 @@ export async function recordRefundParkManually(
         fxRateToBase: true,
         // The order-default VAT identity: what the invoice charged shipping under, and what
         // createSalesOrderRefund posts an unlinked shipping refund line under. taxRateName is how that
-        // identity is RESOLVED (the ACTIVE TaxRate of that name); taxRatePercent is what it was CHARGED
-        // at, and the two must agree before a gross may be divided by either (o3d-w00 Codex r3 #1).
-        taxRatePercent: true,
+        // identity is RESOLVED (the ACTIVE TaxRate of that name); what shipping was CHARGED is derived
+        // from the order's own money below, and the two must agree before a gross may be divided by
+        // either (o3d-w00 Codex r3 #1 / r5 #1). taxRatePercent is deliberately NOT read: it is the
+        // order's header default rate, not the shipping leg's.
         taxRateName: true,
         shippingForeign: true,
+        // Shipping's own VAT, which IMS stores in no column of its own: the VAT the order records over
+        // and above its lines. discountAmount is read because an order-level discount's VAT is netted
+        // off that same total and would otherwise be counted as shipping's.
+        taxForeign: true,
+        discountAmount: true,
         lines: {
           select: {
             id: true,
@@ -1470,6 +1494,14 @@ export async function recordRefundParkManually(
       lines: order.lines,
       reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
     })
+    // What the ORDER says its shipping leg was charged (Codex r5 #1) — its own money, not the header
+    // default rate, which is shipping's rate only on a uniformly taxed order.
+    const chargedShipping = {
+      netForeign: order.shippingForeign,
+      orderTaxForeign: order.taxForeign,
+      lineTaxForeign: order.lines.map((line) => line.taxForeign),
+      orderDiscountAmount: order.discountAmount,
+    }
     const refundLines: {
       lineId: string | null
       productId: string | null
@@ -1509,8 +1541,8 @@ export async function recordRefundParkManually(
         kind: allocation.lineKind,
         lineTaxRate: line?.taxRate ?? null,
         chargedLine: line ? { netForeign: line.totalForeign, taxForeign: line.taxForeign } : null,
+        chargedShipping,
         orderDefaultTaxType,
-        orderChargedRate: order.taxRatePercent,
         orderUniform,
         reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
         rateByTaxType: postingTaxContext.rateByTaxType,
