@@ -5,7 +5,7 @@ import { Loader2, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { setSetting } from '@/app/actions/settings'
+import { setSettings } from '@/app/actions/settings'
 
 type Props = {
   infoValue: string
@@ -23,11 +23,12 @@ export function ActivityLogRetentionSetting({ infoValue, warningValue, errorValu
   function handleSave() {
     setSaved(false)
     startTransition(async () => {
-      await Promise.all([
-        setSetting('activity_log_retention_info', info),
-        setSetting('activity_log_retention_warning', warning),
-        setSetting('activity_log_retention_error', error),
-      ])
+      // ONE transaction (o3d-osl8 round 9, finding 1) — see setSettings.
+      await setSettings({
+        activity_log_retention_info: info,
+        activity_log_retention_warning: warning,
+        activity_log_retention_error: error,
+      })
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
     })
