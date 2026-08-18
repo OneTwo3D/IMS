@@ -372,6 +372,14 @@ async function updateExistingWcOrderFromPayload(
  * path used to do exactly that (Codex review r4); marker recovery now belongs to
  * `sweepUnresolvedDirectCreateMarkers`, which waits out the import's grace window first.
  *
+ * IT ALSO CORRECTS A PREMATURE VERDICT. If this import was delayed past the marker sweep's grace
+ * window, the sweep may already have answered the coverage question — against an order that had
+ * not been allocated yet — and cleared the marker. Finding no marker is therefore not a reason to
+ * stop: `resolveDirectCreateMarker` re-asks the question with the allocation now in place and
+ * withdraws the record if it has been superseded. Both sides answer under this same row lock, so
+ * they cannot interleave, and this one runs strictly after the allocation, which makes it the
+ * later and better-informed of the two (Codex review r5).
+ *
  * It is also why the hot webhook path pays nothing: an import that wrote no marker never calls
  * this, and a redelivery never calls it at all — cheaper than the lock-free pre-check this
  * replaces, which still cost one indexed query on every import of every order.

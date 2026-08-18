@@ -29,6 +29,8 @@ const state = {
   allocatorRefuses: new Set<string>(),
   /** Ids whose status moved under the allocator's lock. */
   allocatorSkips: new Set<string>(),
+  /** activity_logs rows that already exist for an order, served to `findMany`. */
+  records: [] as Array<{ id: string; entityId: string; action: string; metadata: unknown }>,
 }
 
 mock.module('@/lib/activity-log', {
@@ -132,6 +134,7 @@ function reset() {
   state.allocatorThrows.clear()
   state.allocatorRefuses.clear()
   state.allocatorSkips.clear()
+  state.records.length = 0
 }
 
 test('only a CROSSING into fulfilment counts, not any PICKING/PACKING target (o3d-c9mi)', async () => {
@@ -479,20 +482,53 @@ function markerTx(
 ) {
   const deleted: string[] = []
   const selects: Array<Record<string, unknown>> = []
+  /** Every WHERE the code asked the sweep's selector with, so the ASK can be asserted. */
+  const selectorWheres: Array<Record<string, unknown>> = []
   const tx = {
     activityLog: {
       findFirst: async () => marker,
+      findMany: async ({ where }: { where: { entityId: string; action: string } }) =>
+        state.records.filter((row) => row.entityId === where.entityId && row.action === where.action),
       create: async ({ data }: { data: Row }) => { written.push(data); return data },
-      deleteMany: async ({ where }: { where: { id: string } }) => { deleted.push(where.id); return { count: 1 } },
+      deleteMany: async ({ where }: { where: { id: string | { in: string[] } } }) => {
+        const ids = typeof where.id === 'string' ? [where.id] : where.id.in
+        deleted.push(...ids)
+        return { count: ids.length }
+      },
     },
     salesOrder: {
       findUnique: async ({ select }: { select?: Record<string, unknown> }) => {
         selects.push(select ?? {})
         return state.orders.find((o) => o.id === orderId) ?? null
       },
+      // The sweep's OWN selector, evaluated clause by clause against the WHERE production
+      // actually passed — not a re-statement of what the sweep is believed to select. A clause
+      // this stub does not model throws rather than being silently ignored, so a widened
+      // selection cannot quietly start passing here.
+      findFirst: async ({ where }: { where: Record<string, unknown> }) => {
+        selectorWheres.push(where)
+        const order = state.orders.find((o) => o.id === where.id) as
+          | { id: string; status: string; _count: { shipments: number } }
+          | undefined
+        if (!order) return null
+        for (const [field, clause] of Object.entries(where)) {
+          if (field === 'id') continue
+          if (field === 'status') {
+            const allowed = (clause as { in?: string[] }).in
+            assert.ok(Array.isArray(allowed), 'the status clause must be an `in` list')
+            if (!allowed.includes(order.status)) return null
+          } else if (field === 'shipments') {
+            assert.deepEqual(clause, { none: {} }, 'the shipment-free clause must be asked for')
+            if (order._count.shipments > 0) return null
+          } else {
+            throw new Error(`markerTx does not model the sweep selection clause '${field}'`)
+          }
+        }
+        return { id: order.id }
+      },
     },
   } as never
-  return { tx, deleted, selects }
+  return { tx, deleted, selects, selectorWheres }
 }
 
 test('the marker carries the CREATION status, not the current one (o3d-z82a)', async () => {
@@ -516,10 +552,13 @@ test('the marker carries the CREATION status, not the current one (o3d-z82a)', a
   const { tx, deleted } = markerTx('o30', written, { id: 'm1', metadata: marker.metadata })
   const result = await resolveDirectCreateMarker({ tx, orderId: 'o30' })
 
-  assert.deepEqual(result, { recorded: true, resolved: true, verdict: 'uncovered' })
+  assert.deepEqual(result, { recorded: true, resolved: true, retracted: 0, verdict: 'uncovered' })
   assert.match(String(written[0]?.description), /was created directly at PICKING/)
   assert.deepEqual(written[0]?.metadata, {
     orderId: 'o30',
+    // The discriminator that makes this record retractable: only the direct-create path can
+    // produce a premature record, and only records it produced may ever be withdrawn.
+    source: 'direct-create',
     previousStatus: null,
     createdAtStatus: 'PICKING',
     currentStatus: 'PACKING',
@@ -559,7 +598,7 @@ test('no marker means already resolved, so this is safe to call repeatedly (o3d-
 
   assert.deepEqual(
     await resolveDirectCreateMarker({ tx, orderId: 'o31' }),
-    { recorded: false, resolved: false, verdict: 'no-marker' },
+    { recorded: false, resolved: false, retracted: 0, verdict: 'no-marker' },
   )
   assert.equal(written.length, 0)
   assert.equal(deleted.length, 0)
@@ -579,7 +618,7 @@ test('a marker resolved concurrently under the lock is a clean no-op, not a seco
 
   const result = await resolveDirectCreateMarker({ tx, orderId: 'o35' })
 
-  assert.deepEqual(result, { recorded: false, resolved: false, verdict: 'no-marker' })
+  assert.deepEqual(result, { recorded: false, resolved: false, retracted: 0, verdict: 'no-marker' })
   assert.equal(written.length, 0, 'the question was already answered; do not answer it twice')
   assert.equal(deleted.length, 0)
   assert.equal(selects.length, 0, 'and it must not even pay for the coverage read')
@@ -594,7 +633,7 @@ test('a covered order clears its marker without recording a shortfall (o3d-z82a)
 
   assert.deepEqual(
     await resolveDirectCreateMarker({ tx, orderId: 'o32' }),
-    { recorded: false, resolved: true, verdict: 'covered' },
+    { recorded: false, resolved: true, retracted: 0, verdict: 'covered' },
   )
   assert.equal(written.length, 0, 'a covered order is not a shortfall')
   assert.deepEqual(deleted, ['m1'], 'but its marker must still be cleared — coverage WAS verified')
@@ -614,7 +653,7 @@ test('a marker with no readable created status is still resolved, with the statu
 
   assert.deepEqual(
     await resolveDirectCreateMarker({ tx, orderId: 'o33' }),
-    { recorded: true, resolved: true, verdict: 'uncovered' },
+    { recorded: true, resolved: true, retracted: 0, verdict: 'uncovered' },
   )
   assert.match(String(written[0]?.description), /was created directly into fulfilment/)
   assert.equal((written[0]?.metadata as Row).createdAtStatus, null, 'reported as unknown, never guessed')
@@ -639,7 +678,7 @@ test('LEAVING PICKING is not the shortfall clearing — an order still short is 
 
     assert.deepEqual(
       await resolveDirectCreateMarker({ tx, orderId: 'o41' }),
-      { recorded: true, resolved: true, verdict: 'uncovered' },
+      { recorded: true, resolved: true, retracted: 0, verdict: 'uncovered' },
       `${status} — the demand is still uncovered and nothing will cover it`,
     )
     assert.equal((written[0]?.metadata as Row).currentStatus, status, 'the record says where it ended up')
@@ -647,27 +686,93 @@ test('LEAVING PICKING is not the shortfall clearing — an order still short is 
   }
 })
 
-test('the handed-back set is the sweep\'s OWN eligible set, and stays that way (o3d-z82a)', async () => {
-  // "Handed back" is only a resolution because a NAMED mechanism picks the order up. If the two
-  // lists drift, this silently becomes the thing it replaced: an order discharged into nothing,
-  // on the strength of a status. Pinned by text rather than by import, because pulling the sweep
-  // module in here would put @/lib/shopping on the WooCommerce importer's import graph.
+test('handed-back is ASKED of the sweep\'s selector, not matched against a status list (o3d-z82a)', async () => {
+  // THE ROUND-1 LESSON, one level down: a proxy for resolution is not resolution. The previous
+  // revision copied the sweep's STATUS list and pinned the copy with a parity test — but the
+  // sweep selects on status AND on the order having no shipments, and a status list cannot say
+  // that. An ALLOCATED order that has already shipped something matches the list perfectly and
+  // is excluded from the sweep permanently (reallocating it would decrement stock against
+  // committed ShipmentLines), so "handed back" would discharge the obligation to nobody.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o60', 1, 'ALLOCATED') // status says eligible; the shipment says never selected
+  state.short.add('o60')
+  const written: Row[] = []
+  const { tx, deleted, selectorWheres } = markerTx('o60', written)
+
+  const result = await resolveDirectCreateMarker({ tx, orderId: 'o60' })
+
+  assert.deepEqual(
+    result,
+    { recorded: true, resolved: true, retracted: 0, verdict: 'uncovered' },
+    'the sweep will never take this order, so the shortfall must be RECORDED',
+  )
+  assert.equal(written.length, 1, 'and the record is the whole point')
+  assert.deepEqual(deleted, ['m1'])
+
+  // The eligibility answer must come from asking, and the ask must carry the shipment clause —
+  // a query that only filtered on status would have answered "handed-back" here.
+  assert.equal(selectorWheres.length, 1, 'exactly one eligibility question')
+  assert.equal(selectorWheres[0].id, 'o60', 'asked about THIS order')
+  assert.deepEqual(selectorWheres[0].shipments, { none: {} }, 'with the sweep\'s shipment clause')
+})
+
+test('the same ALLOCATED order with no shipments IS handed back (o3d-z82a)', async () => {
+  // The other half of the pair: without the shipment, the identical order is genuinely inside
+  // the sweep's reach. Without this, the test above would also pass for code that simply never
+  // hands anything back.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o61', 0, 'ALLOCATED')
+  state.short.add('o61')
+  const written: Row[] = []
+  const { tx, deleted } = markerTx('o61', written)
+
+  assert.deepEqual(
+    await resolveDirectCreateMarker({ tx, orderId: 'o61' }),
+    { recorded: false, resolved: true, retracted: 0, verdict: 'handed-back' },
+  )
+  assert.equal(written.length, 0)
+  assert.deepEqual(deleted, ['m1'])
+})
+
+test('the sweep\'s selection lives in ONE place, and both sides use that object (o3d-z82a)', async () => {
+  // There is no copy left to keep in parity: the sweep's candidate page and the eligibility
+  // question are built from the same exported fragment, so a clause added to the sweep is a
+  // clause in the answer automatically. Asserted on the SOURCE because importing the sweep here
+  // would put @/lib/shopping — and through the connector registry, the WooCommerce importer —
+  // on the importer's own import graph.
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
   const read = async (file: string) => readFile(path.join(process.cwd(), file), 'utf8')
 
-  const statuses = (source: string, marker: string) => {
-    const at = source.indexOf(marker)
-    assert.notEqual(at, -1, `${marker} must exist`)
-    const body = source.slice(at, source.indexOf(']', at))
-    return (body.match(/'[A-Z_]+'/g) ?? []).map((quoted) => quoted.slice(1, -1)).sort()
-  }
+  const selection = await read('lib/fulfillment/reallocation-sweep-selection.ts')
+  const fragmentAt = selection.indexOf('export const REALLOCATION_SWEEP_SELECTION = {')
+  assert.notEqual(fragmentAt, -1, 'one fragment')
+  // Scoped to the DECLARATION, not the file: the comment above it names the shipment clause by
+  // hand, so a file-wide match would keep passing on prose after the clause itself was deleted.
+  const fragment = selection.slice(fragmentAt, selection.indexOf('} satisfies', fragmentAt))
+  assert.match(fragment, /status: \{ in: \[\.\.\.REALLOCATION_ELIGIBLE_STATUSES\] \}/)
+  assert.match(fragment, /shipments: \{ none: \{\} \}/, 'including the clause a status list cannot express')
+  assert.match(
+    selection,
+    /where: \{ id: orderId, \.\.\.REALLOCATION_SWEEP_SELECTION \}/,
+    'and the eligibility question is that fragment, asked of the database',
+  )
 
-  const mine = statuses(await read('lib/fulfillment/pre-fulfilment-reallocation.ts'), 'const AUTOMATICALLY_REVISITED_STATUSES = new Set([')
-  const theirs = statuses(await read('lib/fulfillment/reallocation-sweep.ts'), 'const REALLOCATION_ELIGIBLE_STATUSES = [')
+  const sweep = await read('lib/fulfillment/reallocation-sweep.ts')
+  assert.match(sweep, /\.\.\.REALLOCATION_SWEEP_SELECTION,/, 'the candidate page must spread it, not restate it')
+  assert.ok(
+    !/status: \{ in: \[\.\.\.REALLOCATION_ELIGIBLE_STATUSES\] \}/.test(sweep),
+    'and must not build its own copy of the predicate',
+  )
 
-  assert.deepEqual(mine, theirs, 'the handoff target must be exactly what the sweep selects')
-  assert.deepEqual(mine, ['ALLOCATED', 'PROCESSING'])
+  const helper = await read('lib/fulfillment/pre-fulfilment-reallocation.ts')
+  assert.match(helper, /await isSelectedByReallocationSweep\(tx, orderId\)/, 'the verdict asks the selector')
+  assert.ok(
+    !/AUTOMATICALLY_REVISITED_STATUSES/.test(helper),
+    'the status-list proxy must be gone, not merely unused',
+  )
 })
 
 test('a CANCELLED order has no demand to cover, so nothing is recorded (o3d-z82a)', async () => {
@@ -683,7 +788,7 @@ test('a CANCELLED order has no demand to cover, so nothing is recorded (o3d-z82a
 
   assert.deepEqual(
     await resolveDirectCreateMarker({ tx, orderId: 'o42' }),
-    { recorded: false, resolved: true, verdict: 'no-demand' },
+    { recorded: false, resolved: true, retracted: 0, verdict: 'no-demand' },
   )
   assert.equal(written.length, 0, 'no fabricated shortfall for an order that owes nothing')
   assert.deepEqual(deleted, ['m1'], 'but the marker must still be cleared, not left dangling')
@@ -704,7 +809,7 @@ test('an order back in the sweep\'s set is handed over, not recorded (o3d-z82a)'
 
     assert.deepEqual(
       await resolveDirectCreateMarker({ tx, orderId: 'o43' }),
-      { recorded: false, resolved: true, verdict: 'handed-back' },
+      { recorded: false, resolved: true, retracted: 0, verdict: 'handed-back' },
       `${status} is inside the sweep's reach`,
     )
     assert.equal(written.length, 0)
@@ -720,7 +825,7 @@ test('an order that no longer exists resolves its marker instead of stranding it
 
   assert.deepEqual(
     await resolveDirectCreateMarker({ tx, orderId: 'gone-o44' }),
-    { recorded: false, resolved: true, verdict: 'order-missing' },
+    { recorded: false, resolved: true, retracted: 0, verdict: 'order-missing' },
   )
   assert.equal(written.length, 0, 'nothing to describe')
   assert.deepEqual(deleted, ['m1'])
@@ -759,6 +864,146 @@ test('EVERY outcome clears the marker — that is what bounds the retention exem
   assert.deepEqual(deleted, ['m1'])
 })
 
+test('a record the sweep wrote while the import was still allocating is WITHDRAWN (o3d-z82a)', async () => {
+  // FINDING 2. The grace window gates who may DECIDE; it cannot decide what the answer is. An
+  // importer delayed past it still finishes allocating afterwards, so the sweep can commit
+  // "uncovered" for an order that is covered moments later — the fabricated record this feature
+  // exists to avoid. No timer closes that, because no timer distinguishes a slow importer from a
+  // dead one. What closes it: both sides decide under the SAME row lock (so they never
+  // interleave), and the importer's pass runs after its own allocation, so it is the later and
+  // better-informed decision — and it corrects the earlier one instead of stopping at "no marker".
+  const { resolveDirectCreateMarker, SHORTFALL_RETRACTED_ACTION } = await loadHelper()
+  reset()
+  seedOrder('o70', 0, 'PICKING') // NOT in state.short: the late allocation covered it
+  state.records.push({
+    id: 'r1',
+    entityId: 'o70',
+    action: 'fulfilment_entry_under_allocated',
+    metadata: { orderId: 'o70', source: 'direct-create', previousStatus: null },
+  })
+  const written: Row[] = []
+  const { tx, deleted } = markerTx('o70', written, null) // the sweep already cleared the marker
+
+  const result = await resolveDirectCreateMarker({ tx, orderId: 'o70' })
+
+  assert.deepEqual(result, { recorded: false, resolved: false, retracted: 1, verdict: 'no-marker' })
+  assert.deepEqual(deleted, ['r1'], 'the premature record must not survive as a standing warning')
+  assert.equal(written.length, 1, 'and the withdrawal is itself recorded')
+  assert.equal(written[0]?.action, SHORTFALL_RETRACTED_ACTION)
+  assert.equal(written[0]?.level, 'INFO', 'a correction, not a new alarm')
+  assert.equal((written[0]?.metadata as Row).verdict, 'covered', 'and it says what the truth turned out to be')
+})
+
+test('the record the writer produces is the record the withdrawal FINDS (o3d-z82a)', async () => {
+  // The round trip, so the discriminator cannot drift between the two halves. Both previous
+  // retraction tests hand-write the row they expect to find; if the writer stopped stamping it,
+  // or stamped something else, they would keep passing and nothing real would ever be withdrawn.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o73', 0, 'PICKING')
+  state.short.add('o73')
+  const written: Row[] = []
+  const first = await resolveDirectCreateMarker({ tx: markerTx('o73', written).tx, orderId: 'o73' })
+  assert.equal(first.recorded, true, 'the sweep records the shortfall it saw')
+
+  // The importer's allocation lands afterwards, and its pass finds no marker — only this record.
+  state.records.push({
+    id: 'real-1',
+    entityId: 'o73',
+    action: String(written[0]?.action),
+    metadata: written[0]?.metadata,
+  })
+  state.short.delete('o73')
+  const corrections: Row[] = []
+  const { tx, deleted } = markerTx('o73', corrections, null)
+
+  const second = await resolveDirectCreateMarker({ tx, orderId: 'o73' })
+
+  assert.equal(second.retracted, 1, 'the record actually written must be retractable')
+  assert.deepEqual(deleted, ['real-1'])
+})
+
+test('a shortfall that SURVIVES the late allocation stands untouched (o3d-z82a)', async () => {
+  // The correction must be a correction, not an eraser. An order still short after the importer's
+  // allocation is exactly the fact worth keeping — and it must not be re-recorded either, because
+  // the event it describes happened once.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o71', 0, 'PICKING')
+  state.short.add('o71')
+  state.records.push({
+    id: 'r1',
+    entityId: 'o71',
+    action: 'fulfilment_entry_under_allocated',
+    metadata: { orderId: 'o71', source: 'direct-create', previousStatus: null },
+  })
+  const written: Row[] = []
+  const { tx, deleted } = markerTx('o71', written, null)
+
+  assert.deepEqual(
+    await resolveDirectCreateMarker({ tx, orderId: 'o71' }),
+    { recorded: false, resolved: false, retracted: 0, verdict: 'no-marker' },
+  )
+  assert.deepEqual(deleted, [], 'a true record is never withdrawn')
+  assert.equal(written.length, 0, 'and never duplicated')
+})
+
+test('only the DIRECT-CREATE path\'s records may be withdrawn (o3d-z82a)', async () => {
+  // The transition path's record is atomic with the crossing it describes, so it can never be
+  // premature and nothing here may touch it. The discriminator is an explicit `source`, not the
+  // shape of some other writer's metadata.
+  const { resolveDirectCreateMarker } = await loadHelper()
+  reset()
+  seedOrder('o72', 0, 'PICKING') // covered — so a source-blind retraction WOULD delete it
+  state.records.push({
+    id: 'r9',
+    entityId: 'o72',
+    action: 'fulfilment_entry_under_allocated',
+    metadata: { orderId: 'o72', previousStatus: 'ALLOCATED', targetStatus: 'PICKING' },
+  })
+  const written: Row[] = []
+  const { tx, deleted, selects } = markerTx('o72', written, null)
+
+  assert.deepEqual(
+    await resolveDirectCreateMarker({ tx, orderId: 'o72' }),
+    { recorded: false, resolved: false, retracted: 0, verdict: 'no-marker' },
+  )
+  assert.deepEqual(deleted, [], 'the transition path\'s record is not this path\'s to withdraw')
+  assert.equal(written.length, 0)
+  assert.equal(selects.length, 0, 'and with nothing retractable there is no coverage read to pay for')
+})
+
+test('the marker sweep stops at its wall-clock budget, but never before one marker (o3d-z82a)', async () => {
+  // FINDING 4. 200 markers is a count of units, not a duration: each is a transaction that can
+  // block on a row lock for `maxWait` before doing anything, on a job that runs every 15 minutes.
+  // The deadline is checked AFTER the work, so a budget can throttle the page but can never stop
+  // it making progress — and markers are taken oldest-first, so nothing starves.
+  const { sweepUnresolvedDirectCreateMarkers } = await loadHelper()
+  reset()
+  for (const id of ['b1', 'b2', 'b3']) {
+    seedOrder(id, 0, 'PICKING')
+    agedMarkerOrderIds.push(id)
+    sweepTxByOrder.set(id, markerTx(id, []).tx)
+  }
+
+  const spent = await sweepUnresolvedDirectCreateMarkers({ budgetMs: 0, now: () => 0 })
+
+  assert.equal(spent.scanned, 1, 'exactly one marker — progress is guaranteed, the page is not')
+  assert.equal(spent.budgetExhausted, true)
+  assert.deepEqual(lockedOrders, ['b1'], 'and it is the oldest, so a tight budget cannot starve one')
+
+  // The same page with time to spare finishes it, so the bound is the CLOCK and not a hidden cap.
+  reset()
+  for (const id of ['b1', 'b2', 'b3']) {
+    seedOrder(id, 0, 'PICKING')
+    agedMarkerOrderIds.push(id)
+    sweepTxByOrder.set(id, markerTx(id, []).tx)
+  }
+  const whole = await sweepUnresolvedDirectCreateMarkers({ budgetMs: 60_000, now: () => 0 })
+  assert.equal(whole.scanned, 3)
+  assert.equal(whole.budgetExhausted, false)
+})
+
 test('the sweep only takes markers past the import\'s grace window, aged on the DB clock (o3d-z82a)', async () => {
   // The window is a SCHEDULING gate, not a verdict. Between the create transaction committing and
   // the importer's own autoAllocateOrder finishing, the order has no allocation rows at all — a
@@ -770,7 +1015,7 @@ test('the sweep only takes markers past the import\'s grace window, aged on the 
 
   const result = await sweepUnresolvedDirectCreateMarkers()
 
-  assert.deepEqual(result, { scanned: 0, recorded: 0, resolved: 0, errors: 0 })
+  assert.deepEqual(result, { scanned: 0, recorded: 0, resolved: 0, retracted: 0, errors: 0, budgetExhausted: false })
   assert.equal(rawQueries.length, 1, 'one indexed candidate query')
   const { sql, values } = rawQueries[0]
   assert.match(sql, /NOW\(\) - make_interval/, 'the cutoff must come from the database clock')
@@ -822,7 +1067,7 @@ test('the sweep resolves each aged marker under its own order lock (o3d-z82a)', 
 
   const result = await sweepUnresolvedDirectCreateMarkers()
 
-  assert.deepEqual(result, { scanned: 2, recorded: 1, resolved: 2, errors: 0 })
+  assert.deepEqual(result, { scanned: 2, recorded: 1, resolved: 2, retracted: 0, errors: 0, budgetExhausted: false })
   assert.deepEqual(lockedOrders, ['sw1', 'sw2'], 'each resolve holds that order\'s row lock')
   assert.equal(writtenA.length, 1)
   assert.equal(writtenB.length, 0)
@@ -842,22 +1087,57 @@ test('one unresolvable marker does not stop the rest of the page (o3d-z82a)', as
 
   const result = await sweepUnresolvedDirectCreateMarkers()
 
-  assert.deepEqual(result, { scanned: 2, recorded: 1, resolved: 1, errors: 1 })
+  assert.deepEqual(result, { scanned: 2, recorded: 1, resolved: 1, retracted: 0, errors: 1, budgetExhausted: false })
   assert.equal(written.length, 1, 'the order behind the failure is still resolved')
 })
 
-test('the marker sweep is wired into the reallocation-sweep cron (o3d-z82a)', async () => {
-  // It is the ONLY thing that clears a marker whose own import failed to resolve it, so an
-  // unwired sweep is the retention exemption growing without bound again.
+test('the marker sweep is wired into the cron, and survives the other pass failing (o3d-z82a)', async () => {
+  // FINDING 3. The marker sweep is the ONLY bound on the retention exemption, and it used to be
+  // sequenced behind a bare `await` on the allocation pass — so a throw there skipped it
+  // entirely, stopping the mechanism that drains markers exactly when the system is unhealthy and
+  // markers accumulate fastest. Each pass now fails into its own catch. The behavioural proof is
+  // in tests/cron/reallocation-sweep-independence.test.ts; this pins the shape it relies on.
   const { readFile } = await import('node:fs/promises')
   const path = await import('node:path')
   const source = await readFile(path.join(process.cwd(), 'app/api/cron/reallocation-sweep/route.ts'), 'utf8')
 
-  assert.match(source, /sweepUnresolvedDirectCreateMarkers/, 'the route must run the marker sweep')
   const allocAt = source.indexOf('await sweepUnallocatedProcessingOrders()')
-  const markerAt = source.indexOf('await sweepUnresolvedDirectCreateMarkers()')
-  assert.ok(allocAt !== -1 && markerAt !== -1 && allocAt < markerAt, 'after the allocation pass')
+  const markerAt = source.indexOf('await sweepUnresolvedDirectCreateMarkers(')
+  assert.ok(allocAt !== -1, 'the route must run the allocation pass')
+  assert.ok(markerAt !== -1, 'and the marker sweep')
+  assert.ok(allocAt < markerAt, 'in that order')
+  assert.match(
+    source.slice(allocAt, markerAt),
+    /\} catch \(error\) \{/,
+    'the allocation pass must fail into a catch, never past the marker sweep',
+  )
   assert.match(source, /directCreateMarkers/, 'and its counts must be reported')
+  assert.match(source, /failures/, 'without hiding that a pass failed')
+})
+
+test('the cron\'s wall time is bounded, not just its row counts (o3d-z82a)', async () => {
+  // FINDING 4, at the endpoint. The allocation pass cannot be interrupted safely — its cursor
+  // advances over the whole batch — so what it spends is taken OFF the marker sweep's budget
+  // rather than added to it. That is what bounds the ENDPOINT rather than each half of it.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'app/api/cron/reallocation-sweep/route.ts'), 'utf8')
+
+  assert.match(source, /const CRON_BUDGET_MS = /, 'the endpoint must name a wall-clock budget')
+  assert.match(
+    source,
+    /budgetMs: Math\.max\(0, CRON_BUDGET_MS - \(Date\.now\(\) - startedAt\)\)/,
+    'and hand the marker sweep only what is LEFT of it',
+  )
+
+  const helper = await readFile(path.join(process.cwd(), 'lib/fulfillment/pre-fulfilment-reallocation.ts'), 'utf8')
+  const at = helper.indexOf('for (const row of rows) {')
+  assert.notEqual(at, -1)
+  const loop = helper.slice(at, helper.indexOf('\n  return result', at))
+  const workAt = loop.indexOf('db.$transaction')
+  const checkAt = loop.indexOf('now() >= deadline')
+  assert.ok(workAt !== -1 && checkAt !== -1, 'the loop must do work and check the deadline')
+  assert.ok(workAt < checkAt, 'the deadline is checked AFTER the work, so a zero budget still progresses')
 })
 
 test('both entry points share one shortfall writer (o3d-z82a)', async () => {
@@ -872,8 +1152,23 @@ test('both entry points share one shortfall writer (o3d-z82a)', async () => {
   // logActivity, from o3d-c9mi's pre-lock attempt); that one is allowed to be lost, which is
   // precisely why the authoritative path exists. Conflating the two is what made a count-based
   // idempotency check wrong, and why provenance is now keyed on the marker instead.
-  const transactionalWrites = source.match(/await tx\.activityLog\.create\(/g) ?? []
-  assert.equal(transactionalWrites.length, 1, 'exactly ONE place may write the record through a transaction')
+  // The action string exists ONCE, as a constant, so the writer of these rows and the reader that
+  // withdraws them cannot drift apart on what to look for.
+  assert.equal(
+    (source.match(/'fulfilment_entry_under_allocated'/g) ?? []).length,
+    1,
+    'the shortfall action must be a single constant, never a repeated literal',
+  )
+  // Two transactional writers now: the shortfall record, and the withdrawal of a shortfall record
+  // a late allocation proved premature. Exactly ONE of them may write the shortfall action.
+  const transactionalWrites = source.split('await tx.activityLog.create(').slice(1)
+  assert.equal(transactionalWrites.length, 2, 'the shortfall record and its withdrawal, and nothing else')
+  const writesShortfall = transactionalWrites.filter((body) => body.slice(0, 400).includes('action: SHORTFALL_ACTION,'))
+  assert.equal(writesShortfall.length, 1, 'exactly ONE place may write the record through a transaction')
+  const writesRetraction = transactionalWrites.filter(
+    (body) => body.slice(0, 400).includes('action: SHORTFALL_RETRACTED_ACTION,'),
+  )
+  assert.equal(writesRetraction.length, 1, 'and exactly one may withdraw it')
   const bestEffort = source.indexOf('async function warnEnteringFulfilmentShort(')
   assert.notEqual(bestEffort, -1, 'the best-effort pre-lock warning must still exist')
   assert.match(source.slice(bestEffort, bestEffort + 500), /await logActivity\(/, 'and must remain the best-effort one')

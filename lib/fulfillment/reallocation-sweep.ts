@@ -6,6 +6,10 @@ import {
   selectOrdersNeedingAllocation,
   type CoverageOrder,
 } from '@/lib/fulfillment/order-allocation-coverage'
+import {
+  REALLOCATION_ELIGIBLE_STATUSES,
+  REALLOCATION_SWEEP_SELECTION,
+} from '@/lib/fulfillment/reallocation-sweep-selection'
 import type { SalesOrderStatus } from '@/app/generated/prisma/client'
 
 // Bound the work per tick. A durable keyset cursor (below) advances across ticks so EVERY eligible
@@ -30,22 +34,14 @@ const WATERMARK_SETTING_KEY = 'reallocation_sweep_watermark'
 const GENERATION_SETTING_KEY = 'reallocation_sweep_generation'
 
 /**
- * The statuses the sweep selects on, re-asserted under the order lock (o3d-6ab/o3d-lvcb).
+ * The sweep's selection, re-asserted under the order lock (o3d-6ab/o3d-lvcb).
  *
- * ONE constant drives the watermark query, the candidate page and requireStatusUnderLock, because
- * they must agree exactly: a wider guard would permit a write the selector never intended, and a
- * narrower one would skip every candidate.
- *
- * It must also match the replenishment allocator's BACKORDER_ELIGIBLE_STATUSES. That path selects
- * PROCESSING *and* ALLOCATED, and a skip there consumes a one-shot stock trigger. ON_HOLD ->
- * ALLOCATED is a legal transition (sales-order-state.ts), so a sweep that only scanned PROCESSING
- * would leave an order returned to ALLOCATED permanently outside its own backstop — the exact
- * stranding o3d-lvcb exists to prevent, one status along.
+ * ONE definition, in lib/fulfillment/reallocation-sweep-selection.ts, drives the watermark query,
+ * the candidate page, requireStatusUnderLock — and every OTHER module that needs to know whether
+ * this sweep would take a given order. It used to be a private constant here plus a copy
+ * elsewhere pinned by a parity test; a copy of the status half cannot express `shipments: none`,
+ * so an order that matched the list exactly could still never be selected (Codex review r5).
  */
-const REALLOCATION_ELIGIBLE_STATUSES = [
-  'PROCESSING',
-  'ALLOCATED',
-] as const satisfies readonly SalesOrderStatus[]
 
 // autoAllocateOrder reports these via { success:false, error } for orders that simply can't be covered
 // right now (a genuine backorder) or already have shipments — expected, not a failure to log.
@@ -203,7 +199,10 @@ async function defaultWriteState(
 
 async function defaultSnapshotWatermark(): Promise<string> {
   const row = await db.salesOrder.findFirst({
-    where: { status: { in: [...REALLOCATION_ELIGIBLE_STATUSES] } },
+    // The SAME fragment the candidate page uses. A watermark taken over a wider set would name an
+    // id the page can never reach, which is harmless; taking it over the same set keeps "the
+    // highest id this cycle covers" true by construction rather than by argument.
+    where: REALLOCATION_SWEEP_SELECTION,
     orderBy: { id: 'desc' },
     select: { id: true },
   })
@@ -220,8 +219,9 @@ async function defaultLoadCandidatesPage(
   // can tell a full page (remainder exists) from the final page (wrap) without a separate count.
   return db.salesOrder.findMany({
     where: {
-      status: { in: [...REALLOCATION_ELIGIBLE_STATUSES] },
-      shipments: { none: {} },
+      // Spread, never re-typed: this IS the sweep's eligibility, and isSelectedByReallocationSweep
+      // answers with the same object. The cursor/watermark below are the schedule, not eligibility.
+      ...REALLOCATION_SWEEP_SELECTION,
       ...(cursor ? { id: { gt: cursor, lte: watermark } } : { id: { lte: watermark } }),
     },
     select: {
