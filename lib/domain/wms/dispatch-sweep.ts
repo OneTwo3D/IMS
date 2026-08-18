@@ -92,6 +92,33 @@ export function formatCursorInTimeZone(instant: Date, timeZone?: string | null):
 export const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'] as const
 
 /**
+ * What makes a link a dispatch candidate — the ONE definition (o3d-0gzr).
+ *
+ * The operator-facing isolate path has to quarantine exactly the set the sweep
+ * would have, so it must ask the same question. It used to ask a hand-copied
+ * version of it: equal at the time, and free to drift apart afterwards, since
+ * nothing failed if one side gained a state the other did not. Both sides now
+ * call this, so a change to eligibility is a change to both by construction.
+ */
+export function dispatchCandidateWhere(connectorId: string) {
+  return {
+    connector: connectorId,
+    // MERGED links are repointed-to-survivor orders that still need despatch
+    // tracking; the push-sweep skips them (SYNCED-only) so they aren't re-pushed.
+    state: { in: ['SYNCED' as const, 'MERGED' as const] },
+    externalOrderNumber: { not: null },
+    // 6oyu.2: dead-lettered links stop re-erroring every sweep; an operator
+    // replays them from the exception inbox once the cause is fixed.
+    dispatchDeadLetteredAt: null,
+    // o3d-bjc.9: a QUARANTINED link is out of the sweep for the same reason a
+    // dead-lettered one is — its record cannot be read, so re-polling it every
+    // tick only pins the watermark. It comes back when an operator acts.
+    dispatchUnresolvedAt: null,
+    order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
+  }
+}
+
+/**
  * 6oyu.2: consecutive per-order reconcile failures before the link is
  * dead-lettered out of the sweep. Five failures ≈ five sweep cycles — enough
  * for transient WMS/API wobbles to clear, short enough that a genuinely stuck
@@ -1580,21 +1607,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
   return {
     async listCandidates(limit) {
       const rows = await db.wmsOrderPushLink.findMany({
-        where: {
-          connector: connectorId,
-          // MERGED links are repointed-to-survivor orders that still need despatch
-          // tracking; the push-sweep skips them (SYNCED-only) so they aren't re-pushed.
-          state: { in: ['SYNCED', 'MERGED'] },
-          externalOrderNumber: { not: null },
-          // 6oyu.2: dead-lettered links stop re-erroring every sweep; an operator
-          // replays them from the exception inbox once the cause is fixed.
-          dispatchDeadLetteredAt: null,
-          // o3d-bjc.9: a QUARANTINED link is out of the sweep for the same reason a
-          // dead-lettered one is — its record cannot be read, so re-polling it every
-          // tick only pins the watermark. It comes back when an operator acts.
-          dispatchUnresolvedAt: null,
-          order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
-        },
+        where: dispatchCandidateWhere(connectorId),
         select: { id: true, orderId: true, externalOrderNumber: true, externalOrderId: true },
         take: limit,
         orderBy: { pushedAt: 'asc' },

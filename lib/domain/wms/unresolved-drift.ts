@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 
 import { db } from '@/lib/db'
-import { POST_DISPATCH_STATUSES, type WmsUnresolvedDriftState } from '@/lib/domain/wms/dispatch-sweep'
+import { dispatchCandidateWhere, type WmsUnresolvedDriftState } from '@/lib/domain/wms/dispatch-sweep'
 
 /**
  * o3d-bjc.12: the operator's side of an indeterminate unresolved cohort.
@@ -64,11 +64,36 @@ export type UnresolvedDriftIncident = {
  * covers. The raw value is still compared inside the transaction, where the
  * lock makes it a genuine compare-and-set.
  */
-export function driftDecisionVersion(input: { connector: string; cohortKey: string | null; linkIds: string[] }): string {
+export function driftDecisionVersion(input: {
+  connector: string
+  cohortKey: string | null
+  linkIds: string[]
+  firstSeenAt: string | null
+}): string {
   const material = JSON.stringify({
     connector: input.connector,
     cohortKey: input.cohortKey ?? '',
     linkIds: [...input.linkIds].sort(),
+    // ABA (o3d-0gzr). Membership alone cannot tell "the cohort never changed"
+    // from "it changed away and back": A -> B -> A rehashes to A's version, so a
+    // page rendered against the FIRST occurrence could isolate the second one —
+    // a different incident, with its own start time and its own reason.
+    //
+    // firstSeenAt is the discriminator we already keep: the sweep preserves it
+    // while a cohort is stable and resets it whenever membership changes, which
+    // is exactly the "generation" this needs. Counter-only ticks leave it alone,
+    // so an open page still survives them, which was the point of hashing
+    // membership rather than the raw row.
+    //
+    // KNOWN RESIDUAL (o3d-0gzr r2): this holds only for membership changes that
+    // PERSIST. If the sweep fails to write the intermediate B, the store stays
+    // at A with A's original firstSeenAt, and A -> B -> A is invisible here. It
+    // is not the blast-radius guard it might look like — `eligibleCohortDigest`
+    // is, and that one is computed from the links actually about to be written.
+    // What survives this hole is narrower: an operator could authorise a set on
+    // the strength of a REASON belonging to the earlier occurrence. Closing it
+    // properly needs a generation counter the sweep bumps transactionally.
+    firstSeenAt: input.firstSeenAt ?? '',
   })
   return createHash('sha256').update(material).digest('hex').slice(0, 16)
 }
@@ -110,18 +135,60 @@ function parseState(raw: string | null | undefined): WmsUnresolvedDriftState | n
  */
 export const DRIFT_INCIDENT_MAX_AGE_MS = 60 * 60 * 1000
 
+/**
+ * How far ahead of us a confirmation may be stamped before we stop believing it.
+ *
+ * Generous on purpose (o3d-0gzr r3). This guard exists so a future stamp cannot
+ * read as maximally fresh and keep a dead incident actionable — but it is the
+ * SAME guard that, set tight, would suppress a live incident forever on a host
+ * running steadily fast, denying the only route out of a stuck watermark. A
+ * fail-closed rule that can permanently disable the recovery path trades one
+ * failure for a worse one. Five minutes absorbs any clock difference a working
+ * deployment produces, while a stamp that far ahead is a broken clock rather
+ * than evidence.
+ */
+export const DRIFT_INCIDENT_MAX_CLOCK_SKEW_MS = 5 * 60 * 1000
+
 export function toIncident(
   connector: string,
   state: WmsUnresolvedDriftState | null,
   raw?: string | null,
   now: Date = new Date(),
+  /**
+   * When the store row last changed (`Setting.updatedAt`).
+   *
+   * Preferred over the sweep's own `lastSeenAt` because it advances on every
+   * write, including one whose JSON happens to compare equal — so a stable
+   * cohort cannot expire while the sweep is still confirming it.
+   *
+   * NOT a database clock, despite the name (o3d-0gzr r3). Prisma's `@updatedAt`
+   * is ORM-level: the value is generated on the writing HOST, and the `now` we
+   * compare it against comes from whichever host serves this action. So this
+   * narrows the skew problem to sweep-host-vs-web-host rather than eliminating
+   * it. On this deployment those are the same process, which is why it is
+   * acceptable; the tolerance below is what keeps it from becoming a denial of
+   * the operator's only escape hatch if they ever diverge. Making it genuinely
+   * single-clock needs a database default or trigger on that column, and the
+   * comparison done in SQL.
+   */
+  confirmedAt?: Date | null,
 ): UnresolvedDriftIncident | null {
   if (!state) return null
   // Stale: the sweep has not re-confirmed this in an hour, so either it stopped
   // drifting (and the retraction did not persist) or it stopped running. Either
   // way it is not evidence any more.
-  const lastSeen = state.lastSeenAt ? Date.parse(state.lastSeenAt) : NaN
-  if (!Number.isFinite(lastSeen) || now.getTime() - lastSeen > DRIFT_INCIDENT_MAX_AGE_MS) return null
+  const lastSeen = confirmedAt ? confirmedAt.getTime() : (state.lastSeenAt ? Date.parse(state.lastSeenAt) : NaN)
+  if (!Number.isFinite(lastSeen)) return null
+  const age = now.getTime() - lastSeen
+  // A FUTURE confirmation is not a fresh one (o3d-0gzr). The sweep and whoever
+  // serves this action need not be the same host, and if the sweep's clock runs
+  // ahead the age goes negative — which the "> MAX_AGE" test reads as very
+  // recent, keeping a dead incident actionable for the skew PLUS the hour. An
+  // unreadable timestamp already fails closed; a future one has to as well, or
+  // the expiry is only enforced for clocks that happen to agree. Small
+  // allowance so ordinary NTP jitter does not retract a live offer; beyond it
+  // the timestamp is not evidence and the sweep's next pass will rewrite it.
+  if (age < -DRIFT_INCIDENT_MAX_CLOCK_SKEW_MS || age > DRIFT_INCIDENT_MAX_AGE_MS) return null
   const linkIds = state.linkIds ?? []
   // A live incident is one with a cohort. `consecutive` alone is not enough:
   // the sweep zeroes it the moment a pass reads record-local, and an offer to
@@ -136,7 +203,7 @@ export function toIncident(
     firstSeenAt: state.firstSeenAt ?? null,
     reason: state.reason ?? null,
     linkIds,
-    version: driftDecisionVersion({ connector, cohortKey: state.cohortKey, linkIds }),
+    version: driftDecisionVersion({ connector, cohortKey: state.cohortKey, linkIds, firstSeenAt: state.firstSeenAt ?? null }),
   }
 }
 
@@ -146,12 +213,15 @@ export async function loadUnresolvedDriftIncidents(
 ): Promise<UnresolvedDriftIncident[]> {
   if (connectors.length === 0) return []
   const keys = connectors.map(unresolvedDriftStateKey)
-  const rows = await db.setting.findMany({ where: { key: { in: keys } }, select: { key: true, value: true } })
-  const byKey = new Map(rows.map((row) => [row.key, row.value]))
+  const rows = await db.setting.findMany({
+    where: { key: { in: keys } },
+    select: { key: true, value: true, updatedAt: true },
+  })
+  const byKey = new Map(rows.map((row) => [row.key, row]))
   return connectors
     .map((connector) => {
-      const raw = byKey.get(unresolvedDriftStateKey(connector)) ?? null
-      return toIncident(connector, parseState(raw), raw, now)
+      const row = byKey.get(unresolvedDriftStateKey(connector)) ?? null
+      return toIncident(connector, parseState(row?.value), row?.value ?? null, now, row?.updatedAt ?? null)
     })
     .filter((incident): incident is UnresolvedDriftIncident => incident !== null)
 }
@@ -170,13 +240,8 @@ export function isolatableLinkWhere(incident: UnresolvedDriftIncident) {
   // no longer a dispatch candidate, and quarantining it would invent an
   // exception for an order nobody is waiting on.
   return {
+    ...dispatchCandidateWhere(incident.connector),
     id: { in: incident.linkIds },
-    connector: incident.connector,
-    state: { in: ['SYNCED' as const, 'MERGED' as const] },
-    externalOrderNumber: { not: null },
-    dispatchUnresolvedAt: null,
-    dispatchDeadLetteredAt: null,
-    order: { status: { notIn: [...POST_DISPATCH_STATUSES] } },
   }
 }
 
@@ -195,4 +260,22 @@ export async function readRawDriftState(connector: string): Promise<string | nul
     select: { value: true },
   })
   return row?.value ?? null
+}
+
+
+/**
+ * A digest of the links that would ACTUALLY be quarantined right now.
+ *
+ * `driftDecisionVersion` hashes the cohort the sweep STORED, which is not the
+ * same thing (o3d-0gzr r2). The store is a record of what an earlier pass could
+ * not read; eligibility is re-evaluated at write time, and an order can become
+ * eligible — or stop being — in between without the stored cohort changing at
+ * all. Binding a destructive action to the stored set therefore binds it to
+ * something adjacent to, but not identical with, what it does.
+ *
+ * This hashes the resolved set instead, so the page shows exactly what the
+ * write will take, and the write refuses if that set has moved since.
+ */
+export function eligibleCohortDigest(linkIds: readonly string[]): string {
+  return createHash('sha256').update(JSON.stringify([...linkIds].sort())).digest('hex').slice(0, 16)
 }
