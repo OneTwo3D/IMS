@@ -1,0 +1,29 @@
+-- o3d-y14 r4 finding 1: record that a row's order-level discount was RESTATED, and what the ledger
+-- held at that instant.
+--
+-- The o3d-y14 backfill rewrites sales_orders."discountAmount" on legacy WooCommerce orders whose
+-- invoices are already in Xero/QuickBooks. A chargeback raised afterwards must reverse what the
+-- INVOICE charged, not what the order now carries, so resolvePostedOrderDiscount has to tell a
+-- restated row from an untouched one — and, when it cannot recover the posted figure, to refuse
+-- rather than fall back to the column.
+--
+-- WHY THE EXISTING SIGNALS ARE NOT ENOUGH.
+--   discount_model says only that discountAmount is now residual-only. The FIXED importer stamps it
+--   on brand-new orders and the backfill's stamp-only pass stamps rows a reviewer declared already
+--   correct; neither of those was ever restated, and refusing their chargebacks would break the
+--   automatic payment-reversal credit note for ordinary orders.
+--
+--   The three ledger traces are all PRUNABLE or BEST-EFFORT: the mirrored accounting_events row is
+--   created on a best-effort basis (a mirror failure is logged and the enqueue still commits) and
+--   did not exist for older invoices at all; sales_orders.accounting_invoice_id is written after the
+--   post and that write can fail (o3d-9kek), leaving a real document and a NULL column; and
+--   purgeExpiredData DELETES the SYNCED accounting_sync_logs row past the retention horizon — which
+--   a payment dispute routinely outlives. Reading their absence as "no invoice ever posted" is
+--   exactly the guess this column removes.
+--
+-- Nullable JSONB with no default and no backfill: NULL is the honest state for every existing row
+-- and means "never restated". Adding a nullable column with no default is metadata-only on Postgres
+-- — no table rewrite, no lock beyond the catalogue update.
+--
+-- No index. It is read one order at a time, by primary key, on the chargeback path.
+ALTER TABLE "sales_orders" ADD COLUMN "discount_restatement" JSONB;

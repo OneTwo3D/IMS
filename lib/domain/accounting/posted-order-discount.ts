@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { readDiscountRestatement, restatementHadPostedInvoice } from './discount-restatement'
 
 /**
  * o3d-y14 r3 finding 1 — WHAT THE INVOICE POSTED, for a chargeback that must mirror it.
@@ -17,15 +18,25 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * producing a correct credit note for any of them. The problem is not that the two disagree; it is
  * that the chargeback reads the wrong one of them.
  *
+ * WHEN IT IS CONSULTED AT ALL (r4 finding 1). Only for orders carrying a `discountRestatement`
+ * marker, which `applyWcCouponCorrection` writes in the SAME `UPDATE` as the correction itself. A
+ * NULL marker proves the row was never restated, so its column IS what any document for it carried —
+ * which keeps every native, manual and pre-column order, every order the fixed importer wrote, and
+ * every row the backfill's stamp-only pass merely MARKED as already-correct, on exactly today's
+ * behaviour, without a single ledger query.
+ *
+ * The gate used to be `discountModel`, and that was wrong in both directions: the fixed importer
+ * stamps that column on brand-new orders it never restated (so ordinary orders were being made to
+ * depend on the mirror existing), while the marker below exists only where a figure was actually
+ * rewritten. See `lib/domain/accounting/discount-restatement.ts`.
+ *
  * WHERE THE POSTED FIGURE IS RECOVERED FROM, and why this source and not the obvious ones:
  *
- *   `AccountingEvent` — the internal mirror of the document that was actually sent. Every
- *   SALES_INVOICE / SALES_INVOICE_UPDATE enqueue mirrors its payload here through
- *   `mirrorAccountingSyncLogToEvent` (both connectors), and the processor flips it to POSTED on a
- *   successful post. Its `linesJson` is the document payload verbatim, so `discount.amount` is
- *   literally the number the negative "Order discount" line carried — in the order's currency and
- *   the order's tax-inclusive/exclusive convention, i.e. exactly the basis `SalesOrder.discountAmount`
- *   uses, so the caller's net/base conversion is unchanged by switching source.
+ *   `AccountingEvent` — the internal mirror of the document that was sent. Every SALES_INVOICE /
+ *   SALES_INVOICE_UPDATE enqueue mirrors its payload here through `mirrorAccountingSyncLogToEvent`
+ *   (both connectors), and the processor flips it to POSTED on a successful post. Nothing purges
+ *   these rows: `purgeExpiredData` does not touch `accounting_events` at all, which is what makes it
+ *   usable for a question asked months later.
  *
  *   NOT `AccountingSyncLog.payload`, though it holds the same payload: data retention DELETES
  *   resolved sync rows past the horizon and COMPACTS unresolved ones to an attribution-only
@@ -40,17 +51,57 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *   (subtotal + shipping − discount), not the discount, and it exists only for orders a daily batch
  *   has taken.
  *
- * WHEN IT IS CONSULTED AT ALL. Only for orders carrying a `discountModel` stamp. That stamp is
- * written in the SAME `UPDATE` as the backfill's correction, so `discountModel === null` proves the
- * backfill never restated this row and the live column IS what posted — which keeps every native
- * and pre-column order on exactly today's behaviour, and keeps the blast radius of this change to
- * the WooCommerce orders the backfill can have touched.
+ * WHAT `linesJson` ACTUALLY IS, and how the posted figure is derived from it (r4 finding 3).
  *
- * WHEN IT CANNOT BE RECOVERED. A stamped order that has a posted invoice but no readable mirrored
- * document leaves the question genuinely unanswerable, and a chargeback is a real credit note
- * against a real ledger. So it reports UNRECOVERABLE, and the caller refuses and surfaces — which is
- * what that path already does for the other cases where the remaining balance is ambiguous (prior
- * refunds, no discount account configured).
+ * The mirror records the payload IMS ENQUEUED, not a read-back of the document Xero or QuickBooks
+ * created. Treating `discount.amount` as "the figure the document carried" was therefore wrong: the
+ * Xero adapter appends its negative "Order discount" line only when a discount ACCOUNT CODE is
+ * present (`lib/connectors/xero/invoices.ts`), so an invoice enqueued with a discount but no
+ * configured account posted the FULL goods and no discount line at all — while the mirror recorded a
+ * positive discount. Auto-raising a credit note carrying that discount (against an invoice that
+ * never charged it) under-credits by the whole amount.
+ *
+ * The fix is NOT to start reading the document back. That would change what is recorded from now on
+ * and do nothing whatever for the invoices this exists for, which posted in the past and whose
+ * mirrored events already say what they say. What is recorded is the exact INPUT to a deterministic
+ * connector rule, and the discriminator that rule tests — the discount account code — is recorded
+ * with it. So the posted figure is derived by replaying that rule over the recorded request:
+ *
+ *   xero        the line is posted only when the payload carried a discount account code. Without
+ *               one the document's order-level discount is 0, and 0 is the ANSWER, not a fallback.
+ *   quickbooks  the DiscountLineDetail is pushed whenever the amount is positive — the account ref
+ *               is optional and merely left undefined — so the recorded amount IS the posted one,
+ *               rounded to 2dp exactly as that adapter rounds it.
+ *   anything else, including a mirrored event with no `externalSystem`: REFUSED. A rule that cannot
+ *               be replayed cannot be replayed optimistically.
+ *
+ * `connector-omission-rules.test.ts`-style source assertions in the test file pin both adapters, so
+ * a change to either condition fails here rather than silently rotting this derivation.
+ *
+ * WHAT THE CONSTRAINT ON `AccountingEvent` MAKES REPRESENTABLE (r4 finding 2).
+ *
+ * `@@unique([externalSystem, externalId])`. A Xero SALES_INVOICE_UPDATE modifies the existing
+ * invoice and returns the SAME InvoiceID, so when its mirrored event tries to go POSTED with that
+ * id it collides with the original invoice's event — a P2002 that is not caught, aborting the very
+ * transaction that marks the sync log SYNCED. An invoice update therefore CANNOT leave behind a
+ * second POSTED event carrying the newer figure; the earlier "the latest posted document wins"
+ * ordering described a row set the database cannot hold, and has been removed rather than left
+ * implying a guarantee it never provided.
+ *
+ * What the database CAN hold is read instead:
+ *
+ *   - an unresolved SALES_INVOICE_UPDATE event (anything but POSTED or VOID) is exactly the trace a
+ *     successfully-applied update leaves under that constraint, and is indistinguishable from one
+ *     that never reached the ledger. Either way the document may no longer carry what the original
+ *     invoice's event records, so this REFUSES;
+ *   - several POSTED events are possible only with distinct (or NULL) external ids, i.e. distinct
+ *     documents rather than revisions of one. They are all read: if they agree, that agreement is
+ *     the posted figure whichever of them the credit note reverses; if they disagree, no ordering
+ *     available here says which is current, so this REFUSES.
+ *
+ * WHEN IT CANNOT BE RECOVERED. Every branch that cannot establish the figure reports UNRECOVERABLE,
+ * and the caller refuses and surfaces — which is what that path already does for the other cases
+ * where the remaining balance is ambiguous (prior refunds, no discount account configured).
  *
  * WHAT THE CALLER DOES WITH A RECOVERED FIGURE THAT DISAGREES. It refuses too, and that is a
  * deliberate limit on this function rather than a failure of it. Recovering the posted figure is
@@ -67,6 +118,16 @@ export const POSTED_SALES_INVOICE_EVENT_TYPES = ['SALES_INVOICE', 'SALES_INVOICE
 
 /** The mirrored-event status that means the document reached the ledger. */
 export const POSTED_ACCOUNTING_EVENT_STATUS = 'POSTED'
+
+/**
+ * Mirrored-event statuses that settle a SALES_INVOICE_UPDATE.
+ *
+ * POSTED is read as a document below. VOID is written by `voidMirroredAccountingEventsForOrder` only
+ * for an order whose invoice work was retired unposted (a cancelled order), so it is a positive
+ * statement that this update never reached the ledger. Everything else — PENDING, FAILED, REVERSED —
+ * leaves open that the remote document was modified, and is refused.
+ */
+export const SETTLED_INVOICE_UPDATE_EVENT_STATUSES = ['POSTED', 'VOID'] as const
 
 export type PostedOrderDiscount =
   /**
@@ -89,6 +150,7 @@ type MirroredDocument = {
   type: string
   status: string
   currency: string
+  externalSystem: string | null
   externalId: string | null
   linesJson: unknown
 }
@@ -98,7 +160,43 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 /**
- * Pull the order-level discount out of ONE mirrored document payload.
+ * Replay ONE connector's order-level-discount rule over the enqueued payload it received.
+ *
+ * Returns the amount the DOCUMENT carries, which is not always the amount that was requested. See
+ * the module header; each branch names the adapter line it mirrors.
+ */
+function postedDiscountForConnector(
+  externalSystem: string | null,
+  requested: number,
+  accountCode: string | undefined,
+): { ok: true; amount: number } | { ok: false; detail: string } {
+  switch (externalSystem) {
+    case 'xero':
+      // lib/connectors/xero/invoices.ts: `if (data.discountAmount > 0 && data.discountAccountCode)`.
+      // No account code, no negative "Order discount" line — the invoice charged the full goods.
+      if (!accountCode) {
+        return { ok: true, amount: 0 }
+      }
+      // And when it is posted, it is posted verbatim as `UnitAmount: -data.discountAmount`.
+      return { ok: true, amount: requested }
+    case 'quickbooks':
+      // lib/connectors/quickbooks/invoices.ts: the DiscountLineDetail is pushed on `discountAmount >
+      // 0` alone — the account ref is resolved from the payload OR the connector setting and is
+      // simply left undefined when neither resolves — so the line always exists, rounded to 2dp.
+      return { ok: true, amount: Math.round(requested * 100) / 100 }
+    default:
+      return {
+        ok: false,
+        detail:
+          `the mirrored event names no connector whose posting rule can be replayed ` +
+          `(externalSystem ${JSON.stringify(externalSystem)}), so whether the document carried the ` +
+          `${requested} it requested is unknown`,
+      }
+  }
+}
+
+/**
+ * Pull the order-level discount THE DOCUMENT CARRIES out of ONE mirrored payload.
  *
  * Every branch that cannot answer says so rather than returning 0. A missing `discount` key means
  * "the document posted no discount leg", which is a real answer and genuinely 0; a payload this
@@ -106,7 +204,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * of either would omit a discount leg that exists, which is the very defect being fixed.
  */
 export function readPostedDocumentDiscount(
-  document: { currency: string; linesJson: unknown },
+  document: { currency: string; externalSystem: string | null; linesJson: unknown },
   expectedCurrency: string,
 ): { ok: true; amount: number } | { ok: false; detail: string } {
   const payload = document.linesJson
@@ -135,7 +233,14 @@ export function readPostedDocumentDiscount(
       detail: `the posted document's discount amount ${JSON.stringify(amount)} is not a usable number`,
     }
   }
-  return { ok: true, amount }
+  // Both adapters skip a non-positive adjustment, and `normalizeAdjustment` never records one, so
+  // there is no connector rule to replay: the document carried no order-level discount line.
+  if (amount === 0) return { ok: true, amount: 0 }
+
+  const accountCode = typeof payload.discount.accountCode === 'string' && payload.discount.accountCode.trim()
+    ? payload.discount.accountCode.trim()
+    : undefined
+  return postedDiscountForConnector(document.externalSystem, amount, accountCode)
 }
 
 export type PostedOrderDiscountClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingSyncLog'>
@@ -154,57 +259,105 @@ export async function resolvePostedOrderDiscount(
     currency: string
     /** `SalesOrder.discountAmount`, in the order's own currency and tax convention. */
     discountAmount: number
-    /** `SalesOrder.discountModel`. NULL proves the backfill never restated this row. */
-    discountModel: string | null
+    /** `SalesOrder.discountRestatement`. NULL proves the backfill never restated this row. */
+    discountRestatement: unknown
     accountingInvoiceId: string | null
   },
 ): Promise<PostedOrderDiscount> {
-  if (order.discountModel === null) {
+  const restatement = readDiscountRestatement(order.discountRestatement)
+  if (!restatement.present) {
     // Not "no discount model exists for WooCommerce orders" — the backfill's correction and its
-    // stamp are ONE update, so an unstamped row is one the backfill has never written.
+    // marker are ONE update, so an unmarked row is one the backfill has never restated.
     return {
       source: 'ORDER',
       amount: order.discountAmount,
-      detail: 'the order carries no discount-model stamp, so nothing has restated its order-level discount',
+      detail: 'this order carries no restatement record, so nothing has rewritten its order-level discount',
+    }
+  }
+  if (!restatement.ok) {
+    // Damaged marker. It is NOT read as "never restated": that is the one conclusion an unreadable
+    // record must not be able to produce.
+    return {
+      source: 'UNRECOVERABLE',
+      detail: `this order carries a discount-restatement record that cannot be read (${restatement.detail})`,
     }
   }
 
-  const document = (await client.accountingEvent.findFirst({
+  // An invoice UPDATE that never settled. Under `@@unique([externalSystem, externalId])` this is
+  // exactly what a SUCCESSFUL update leaves behind (see the header), so it cannot be read as "the
+  // update never happened" and the original invoice's event cannot be trusted to describe the
+  // document as it now stands.
+  const unsettledUpdates = await client.accountingEvent.count({
+    where: {
+      sourceEntityType: 'SalesOrder',
+      sourceEntityId: order.id,
+      type: 'SALES_INVOICE_UPDATE',
+      status: { notIn: [...SETTLED_INVOICE_UPDATE_EVENT_STATUSES] },
+    },
+  })
+  if (unsettledUpdates > 0) {
+    return {
+      source: 'UNRECOVERABLE',
+      detail:
+        `${unsettledUpdates} SALES_INVOICE_UPDATE event(s) for this order never reached POSTED — which ` +
+        'is the state an update that DID modify the ledger document is left in, because it cannot ' +
+        'record its own external id against the original invoice event',
+    }
+  }
+
+  const documents = (await client.accountingEvent.findMany({
     where: {
       sourceEntityType: 'SalesOrder',
       sourceEntityId: order.id,
       type: { in: [...POSTED_SALES_INVOICE_EVENT_TYPES] },
       status: POSTED_ACCOUNTING_EVENT_STATUS,
     },
-    // The LATEST posted document wins. A SALES_INVOICE_UPDATE posted after a correction carries the
-    // corrected figure and supersedes the original invoice, so the credit note must mirror it and
-    // not the document it replaced.
+    // PRESENTATIONAL ONLY — the newest document names the refusal or the recovery in the operator's
+    // message. It decides no amount: every posted document must AGREE below, so no ordering
+    // guarantee is being relied on (and, per the header, none exists).
     orderBy: [{ businessDate: 'desc' }, { createdAt: 'desc' }],
-    select: { type: true, status: true, currency: true, externalId: true, linesJson: true },
-  })) as MirroredDocument | null
+    select: { type: true, status: true, currency: true, externalSystem: true, externalId: true, linesJson: true },
+  })) as MirroredDocument[]
 
-  if (document) {
-    const read = readPostedDocumentDiscount(document, order.currency)
-    if (!read.ok) {
+  if (documents.length > 0) {
+    const amounts: number[] = []
+    for (const document of documents) {
+      const read = readPostedDocumentDiscount(document, order.currency)
+      if (!read.ok) {
+        return {
+          source: 'UNRECOVERABLE',
+          detail: `a ${document.type} was posted for this order but ${read.detail}`,
+        }
+      }
+      amounts.push(read.amount)
+    }
+    const distinct = [...new Set(amounts)]
+    if (distinct.length > 1) {
       return {
         source: 'UNRECOVERABLE',
-        detail: `a ${document.type} was posted for this order but ${read.detail}`,
+        detail:
+          `${documents.length} posted documents exist for this order and they carry different ` +
+          `order-level discounts (${distinct.join(', ')} ${order.currency}); nothing here says which ` +
+          'one a credit note now reverses',
       }
     }
+    const [newest] = documents
+    const amount = distinct[0]
     return {
       source: 'POSTED_DOCUMENT',
-      amount: read.amount,
+      amount,
       detail:
-        `the posted ${document.type}${document.externalId ? ` ${document.externalId}` : ''} carries an ` +
-        `order-level discount of ${read.amount} ${order.currency}`,
-      documentType: document.type,
-      externalId: document.externalId,
+        `the posted ${newest.type}${newest.externalId ? ` ${newest.externalId}` : ''} carries an ` +
+        `order-level discount of ${amount} ${order.currency}`,
+      documentType: newest.type,
+      externalId: newest.externalId,
     }
   }
 
-  // No mirrored document. Either nothing has posted — in which case the live column is both what a
-  // future invoice would carry and what there is nothing to contradict — or something posted before
-  // the mirror could record it, and then the figure is genuinely unrecoverable.
+  // No mirrored document — which is NOT evidence that no document exists. The mirror is best-effort
+  // (a mirroring failure is logged and the enqueue still commits), and invoices posted before
+  // mirroring existed never had one. So every other trace is checked, and where they are all silent
+  // the answer comes from the restatement record rather than from their silence.
   if (order.accountingInvoiceId) {
     return {
       source: 'UNRECOVERABLE',
@@ -232,10 +385,37 @@ export async function resolvePostedOrderDiscount(
     }
   }
 
+  // r4 finding 1. Everything above can be absent while a real invoice stands — the back-reference
+  // write can fail and retention DELETES the SYNCED sync log — so their silence decides nothing.
+  // The restatement record is the one statement about that moment that nothing prunes.
+  if (restatementHadPostedInvoice(restatement.value)) {
+    const evidence = [
+      restatement.value.ledger.accountingInvoiceId
+        ? `invoice ${restatement.value.ledger.accountingInvoiceId}`
+        : null,
+      restatement.value.ledger.postedInvoiceExternalIds.length
+        ? `unlinked invoice(s) ${restatement.value.ledger.postedInvoiceExternalIds.join(', ')}`
+        : null,
+    ]
+      .filter(Boolean)
+      .join(', ')
+    return {
+      source: 'UNRECOVERABLE',
+      detail:
+        `this order's order-level discount was restated on ${restatement.value.at} from ` +
+        `${restatement.value.from} to ${restatement.value.to} ${restatement.value.currency} while ` +
+        `${evidence} was already in the ledger, and no readable posted accounting event records what ` +
+        'that document charged',
+    }
+  }
+
   return {
     source: 'ORDER',
     amount: order.discountAmount,
-    detail: 'no sales invoice has posted for this order, so there is no earlier document to mirror',
+    detail:
+      `no sales invoice existed for this order when its order-level discount was restated on ` +
+      `${restatement.value.at}, and none has been recorded since — so no earlier document carries a ` +
+      'different figure',
   }
 }
 

@@ -47,6 +47,8 @@ type OrderRow = {
   id: string
   discountAmount: number
   discountModel: string | null
+  /** o3d-y14 r4 finding 1 — the durable "this row was restated" record. */
+  discountRestatement?: unknown
   lines: Array<{ discountAmount: number }>
   importedAt: string | null
   accountingInvoiceId?: string | null
@@ -96,7 +98,7 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
         data,
       }: {
         where: { id: string; discountAmount?: number; discountModel?: null }
-        data: { discountAmount?: number; discountModel: string }
+        data: { discountAmount?: number; discountModel: string; discountRestatement?: unknown }
       }) => {
         events.push(`updateMany:${where.id}`)
         // Modelled on Prisma: a predicate that is ABSENT does not constrain. If it did, dropping the
@@ -115,6 +117,9 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
           target.discountAmount = data.discountAmount
         }
         target.discountModel = data.discountModel
+        // Applied only when the write sets it, for the same reason as the amount above: a stamp that
+        // silently acquired a restatement record would be indistinguishable from a correction.
+        if ('discountRestatement' in data) target.discountRestatement = data.discountRestatement
         return { count: 1 }
       },
     },
@@ -252,6 +257,95 @@ test('a reviewed order is corrected and STAMPED in the same write (o3d-5ct/o3d-9
   )
   assert.equal(store.activity.length, 1)
   assert.equal(store.activity[0].entityId, 'order-1')
+})
+
+test('the correction writes the durable RESTATEMENT RECORD in that same write (o3d-y14 r4 F1)', async () => {
+  // The record a chargeback months later depends on. It has to be part of THIS update, because its
+  // absence is read as "this row was never restated" — a marker written in a later step would leave
+  // a window in which a restated row looks untouched, and the ActivityLog entry beside it is pruned
+  // at 30 days.
+  const { applyWcCouponCorrection } = await load()
+  const { readDiscountRestatement } = await import('@/lib/domain/accounting/discount-restatement')
+  reset()
+  const store = makeStore()
+
+  await applyWcCouponCorrection(makeTx(store), entry)
+
+  const read = readDiscountRestatement(store.orders[0].discountRestatement)
+  assert.equal(read.present, true)
+  assert.equal(read.present && read.ok, true)
+  if (!read.present || !read.ok) return
+  assert.equal(read.value.reason, 'o3d-y14-wc-coupon')
+  assert.equal(read.value.from, 10, 'what the column said, which is what any earlier invoice charged')
+  assert.equal(read.value.to, 0)
+  assert.equal(read.value.currency, 'GBP')
+  assert.deepEqual(read.value.ledger, {
+    accountingInvoiceId: null,
+    postedInvoiceExternalIds: [],
+    revenueDeferredBatchRef: null,
+  }, 'and it states positively that nothing was in the ledger when the amount was rewritten')
+})
+
+test('the restatement record carries the LIVE posting evidence, not the reviewed copy (o3d-y14 r4 F1)', async () => {
+  // Including the o3d-9kek shape — a posted invoice the order is not linked to. That id is the whole
+  // reason the record exists: retention DELETES the SYNCED sync log it came from, and the
+  // back-reference that would have named it never got written.
+  const { applyWcCouponCorrection } = await load()
+  const { readDiscountRestatement } = await import('@/lib/domain/accounting/discount-restatement')
+  reset()
+  const store = makeStore({
+    orders: [
+      {
+        id: 'order-1',
+        discountAmount: 10,
+        discountModel: null,
+        lines: [{ discountAmount: 10 }],
+        importedAt: IMPORTED_AT,
+        accountingInvoiceId: 'INV-778',
+      },
+    ],
+    syncLogs: [
+      {
+        id: 'job-1',
+        referenceType: 'SalesOrder',
+        referenceId: 'order-1',
+        type: 'SALES_INVOICE',
+        status: 'SYNCED',
+        externalTransactionId: 'INV-999',
+      },
+    ],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), {
+    ...entry,
+    accountingInvoiceId: 'INV-778',
+    postedInvoiceExternalIds: ['INV-999'],
+  })
+
+  assert.equal(result.outcome, 'CORRECTED')
+  const read = readDiscountRestatement(store.orders[0].discountRestatement)
+  assert.equal(read.present && read.ok, true)
+  if (!read.present || !read.ok) return
+  assert.deepEqual(read.value.ledger, {
+    accountingInvoiceId: 'INV-778',
+    postedInvoiceExternalIds: ['INV-999'],
+    revenueDeferredBatchRef: null,
+  })
+})
+
+test('a DECLINED correction writes no restatement record (o3d-y14 r4 F1)', async () => {
+  // Every refusal stays re-runnable, and a record left behind by a refusal would put an untouched
+  // order onto the chargeback path's refuse-or-recover branch for good.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({
+    syncLogs: [{ id: 'job-1', referenceType: 'SalesOrder', referenceId: 'order-1', type: 'SALES_INVOICE', status: 'PENDING' }],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), entry)
+
+  assert.equal(result.outcome, 'DECLINED')
+  assert.equal(store.orders[0].discountRestatement, undefined)
 })
 
 test('the order row lock is taken BEFORE anything is read or decided (o3d-5ct)', async () => {
@@ -782,6 +876,10 @@ test('stamping records the model WITHOUT touching the amount (Codex r1 F3)', asy
   assert.equal(store.orders[0].discountModel, WC_COUPON_DISCOUNT_MODEL)
   assert.equal(store.activity[0].action, WC_COUPON_STAMP_ACTION, 'a distinct action: a human assertion, not a computation')
   assert.equal(store.activity[0].metadata.amountChanged, false)
+  // o3d-y14 r4 finding 1: NO restatement record. This row's discount was never rewritten, so its
+  // column is still what any document for it charged — and a record here would make its chargeback
+  // depend on a mirrored accounting event existing, for no reason at all.
+  assert.equal(store.orders[0].discountRestatement, undefined)
 })
 
 test('a stamped row is thereafter refused by the CORRECTION path (Codex r1 F3)', async () => {

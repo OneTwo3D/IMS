@@ -74,7 +74,11 @@
  *      all, naming both figures in the manual-handling alert. Refusing rather than reversing the
  *      recovered figure is deliberate: the manual ledger adjustment this backfill reports happens
  *      in the accounting system, so IMS cannot tell whether the document still holds the figure it
- *      posted with.
+ *      posted with. That recovery is only REACHED for rows this script restated, and only decides
+ *      anything because `applyWcCouponCorrection` writes a durable `discountRestatement` record in
+ *      the same UPDATE as the amount: absence of a ledger trace is prunable and proves nothing,
+ *      whereas that record is the one statement about the moment of the rewrite that survives
+ *      (o3d-y14 r4 finding 1).
  *
  *   DERIVED readers — they consume `unearnedRevenueAmount` / `revenueRecognizedAmount` / a stored
  *   payload, all of which are RECORDS of a decision already taken. Group B recognition,
@@ -95,6 +99,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { liveDailyBatchDeferralWhere } from '@/lib/domain/accounting/daily-batch-discount-fence'
+import { buildDiscountRestatement } from '@/lib/domain/accounting/discount-restatement'
 
 import { resolveWcOrderLevelDiscount } from './field-mapping'
 
@@ -1072,9 +1077,39 @@ export async function applyWcCouponCorrection(
   // Compare-and-set as well as locked. The lock covers the enqueue paths; this covers anything that
   // reaches the row without taking it, and it stamps the model in the SAME write so a row can never
   // be corrected without also being marked.
+  // THE RESTATEMENT RECORD IS WRITTEN IN THIS SAME UPDATE (o3d-y14 r4 finding 1).
+  //
+  // It is the only durable statement that this row's order-level discount was REWRITTEN, and of what
+  // the ledger held when it was. `raiseChargebackForReversedOrder` needs both: a chargeback must
+  // reverse what the invoice charged, and for these rows the column deliberately no longer says it.
+  //
+  // Its ABSENCE has to keep meaning "never restated", which is why it is not a second statement made
+  // afterwards: the ActivityLog entry below is pruned at 30 days, and a marker written in a later
+  // step would leave a window in which a restated row looks untouched. One UPDATE, or neither.
+  //
+  // `discountModel: null` in the predicate already excludes an already-restated row (the two columns
+  // only ever move together, here), so no JSON predicate is needed to make this write-once.
+  const restatement = buildDiscountRestatement({
+    reason: 'o3d-y14-wc-coupon',
+    at: new Date(),
+    from: live,
+    to: keptOrderLevel,
+    currency: entry.currency,
+    ledger: {
+      // The evidence read LIVE under this lock, not the reviewed file's copy of it — the same
+      // reason the ActivityLog entry below is written from `posted`.
+      accountingInvoiceId: posted.accountingInvoiceId,
+      postedInvoiceExternalIds: sortedPostedInvoiceIds(posted.postedInvoiceExternalIds),
+      revenueDeferredBatchRef: posted.revenueDeferredBatchRef,
+    },
+  })
   const written = await tx.salesOrder.updateMany({
     where: { id: entry.orderId, discountAmount: entry.storedOrderDiscount, discountModel: null },
-    data: { discountAmount: keptOrderLevel, discountModel: WC_COUPON_DISCOUNT_MODEL },
+    data: {
+      discountAmount: keptOrderLevel,
+      discountModel: WC_COUPON_DISCOUNT_MODEL,
+      discountRestatement: restatement,
+    },
   })
   if (written.count !== 1) {
     return {
@@ -1202,6 +1237,10 @@ export async function stampWcCouponDiscountModel(
     }
   }
 
+  // NO `discountRestatement` HERE, deliberately (o3d-y14 r4 finding 1). That record means "this
+  // row's order-level discount was rewritten"; a stamp rewrites nothing. Writing one would put an
+  // untouched order onto the chargeback path's recover-the-posted-figure branch and make its credit
+  // note depend on a mirrored event existing — for a row whose column has always been correct.
   const written = await tx.salesOrder.updateMany({
     where: { id: entry.orderId, discountAmount: entry.storedOrderDiscount, discountModel: null },
     data: { discountModel: WC_COUPON_DISCOUNT_MODEL },

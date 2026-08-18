@@ -2423,9 +2423,9 @@ export async function raiseChargebackForReversedOrder(
       taxBase: true,
       discountAmount: true,
       // o3d-y14 r3 finding 1: the credit note mirrors WHAT THE INVOICE POSTED, so the discount
-      // resolution needs the order's currency, its restatement stamp and its invoice link.
+      // resolution needs the order's currency, its restatement record and its invoice link.
       currency: true,
-      discountModel: true,
+      discountRestatement: true,
       accountingInvoiceId: true,
       fxRateToBase: true,
       pricesIncludeVat: true,
@@ -2494,8 +2494,11 @@ export async function raiseChargebackForReversedOrder(
   // while the document this credit note reverses charged the old, larger figure — so building the
   // reversal from the live column omits the invoice's discount leg and over-reverses AR and revenue
   // by the cleared amount. That is the defect. `resolvePostedOrderDiscount` recovers what the
-  // document actually charged from the mirrored AccountingEvent (see that module for why the sync
-  // log, the ActivityLog marker and the batch stamp are all unusable here).
+  // document actually charged from the mirrored AccountingEvent — replaying the connector's own
+  // line-omission rule over the payload the mirror recorded, because the mirror records what IMS
+  // ENQUEUED and Xero omits the discount line when no discount account was configured (see that
+  // module for that derivation, and for why the sync log, the ActivityLog marker and the batch
+  // stamp are all unusable here).
   //
   // WHY A DISAGREEMENT IS A REFUSAL RATHER THAN "USE THE POSTED FIGURE". Because the backfill's own
   // output puts every one of these orders on an operator's must-fix list: the posted document
@@ -2514,7 +2517,7 @@ export async function raiseChargebackForReversedOrder(
     id: orderId,
     currency: order.currency,
     discountAmount: decimalToNumber(order.discountAmount),
-    discountModel: order.discountModel,
+    discountRestatement: order.discountRestatement,
     accountingInvoiceId: order.accountingInvoiceId,
   })
   const discountDecision = decideChargebackOrderDiscount({
