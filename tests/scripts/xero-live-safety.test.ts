@@ -20,7 +20,8 @@
  * id-only manifest check and a state-bound one identically, and prove nothing about either.
  */
 import assert from 'node:assert/strict'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
 
@@ -32,12 +33,14 @@ import {
   classifyWriteOutcome,
   assertManifestTenant,
   assertNoNearMisses,
+  assertNoUnresolvedWrites,
   assertPlanAuthorizedByManifest,
   assertRetirementAuthorized,
   assertStillFixtureContact,
   assertUnchanged,
   classifyContactName,
   classifyItemCode,
+  createWriteIntentLog,
   createXeroTransport,
   creditNoteBlockers,
   fingerprintIds,
@@ -47,24 +50,31 @@ import {
   isFixtureItemCode,
   ManifestViolationError,
   MutationJournal,
+  openWriteIntentLog,
   pageAllComplete,
   parseCollectionPage,
   parseRetirementAuthorization,
   parseWriteManifest,
   parseXeroTimestamp,
+  performWrite,
   PlanDivergedError,
   ReadIncompleteError,
   resolveById,
   RETIREMENT_AUTHORIZATION_TOKEN,
   RetirementRefusedError,
   runOutcome,
+  scanWriteIntentLog,
   settleWrite,
   statusesAfterReleasingBlockers,
   TenantMismatchError,
+  UnresolvedWriteError,
+  versionFromWriteResponse,
   WriteOutcomeUnknownError,
+  writeUnitsIndividually,
   WriteWithoutApplyError,
   type PlannedObject,
   type RetirementGuardInput,
+  type VersionExpectation,
   type XeroResult,
 } from '@/scripts/lib/xero-live-safety'
 
@@ -503,8 +513,9 @@ describe('re-validating an object immediately before mutating it', () => {
       blockers: ['payment:p1', 'creditnote:c1'],
       blockerPolicy: 'released' as const,
       releasedBlockers: ['payment:p1', 'creditnote:c1'],
-      // This run moved the document, so the version cannot be required to be byte-identical.
-      version: { policy: 'moved-by-this-run' as const, plannedUpdatedDateUtc: '/Date(1000)/', because: ['payment:p1'] },
+      // This run moved the document, so it is held to the version XERO REPORTED FOR OUR OWN WRITE
+      // rather than to the reviewed one. Still exact equality — just against a state we established.
+      version: { policy: 'matches-our-write' as const, updatedDateUtc: '/Date(1500)/', because: ['payment:p1'] },
     }
     // step 1 released them, and recorded that it did — fine.
     assert.doesNotThrow(() => assertUnchanged(expectation, {
@@ -600,26 +611,101 @@ describe('the catch-all version is enforced AT THE WRITE, not only at the manife
     )
   })
 
-  test('the exemption exists ONLY for objects this run itself moved, and it is narrow', () => {
-    const movedByUs = {
-      ...reviewed,
-      blockerPolicy: 'released' as const,
+  /**
+   * ROUND 4, FINDING 2. The exemption used to be `moved-by-this-run`: the version may move
+   * FORWARDS, because this run moved something. The point that closes it is not that the policy
+   * fails to DISTINGUISH our change from a third party's — it is that the policy AUTHORISES the
+   * third party's. "The version moved forward" and "we moved something" are two facts about one
+   * object; nothing joins them into "the movement is ours".
+   *
+   * So the version is bound to the change we actually made — the one Xero reported when it
+   * answered OUR write — and where Xero reports none, the exemption is withdrawn rather than
+   * narrowed.
+   */
+  describe('the version is bound to the change WE made, or no exemption is granted', () => {
+    /**
+     * A THIRD PARTY'S FORWARD CHANGE, on an object THIS RUN also moved. Everything else agrees with
+     * our own change: the blocker we released is gone, the status moved exactly as releasing it
+     * moves a document, the contact is untouched. Only the version says a second change happened.
+     */
+    const ourWriteLeftItAt = '/Date(1500)/'
+    const someoneElseMovedItTo = '/Date(1900)/'
+    const boundToOurWrite = {
+      id: 'cn-1',
+      allowedStatuses: ['PAID', 'AUTHORISED'],
+      contactName: 'E2E E2E-FC-a1',
       blockers: ['allocation:inv-9'],
+      blockerPolicy: 'released' as const,
       releasedBlockers: ['allocation:inv-9'],
-      version: { policy: 'moved-by-this-run' as const, plannedUpdatedDateUtc: '/Date(1000)/', because: ['allocation:inv-9'] },
+      version: { policy: 'matches-our-write' as const, updatedDateUtc: ourWriteLeftItAt, because: ['allocation:inv-9'] },
     }
-    // Forward: our own DELETE re-stamped it. Byte-equality is arithmetically impossible here.
-    assert.doesNotThrow(() => assertUnchanged(movedByUs, { ...changedOnlyInVersion, blockers: [] }))
-    // Backwards: whatever is being re-read, it is not the object that was planned.
-    assert.throws(
-      () => assertUnchanged(movedByUs, { ...changedOnlyInVersion, blockers: [], updatedDateUtc: '/Date(900)/' }),
-      (e: Error) => e instanceof PlanDivergedError && /BACKWARDS/.test(e.message),
-    )
-    // Unreadable: "I cannot compare these" is never allowed to resolve to "they are fine".
-    assert.throws(
-      () => assertUnchanged(movedByUs, { ...changedOnlyInVersion, blockers: [], updatedDateUtc: 'sometime last Tuesday' }),
-      (e: Error) => e instanceof PlanDivergedError && /not a timestamp this code can read/.test(e.message),
-    )
+    const afterOurWrite = {
+      id: 'cn-1', status: 'AUTHORISED', contactName: 'E2E E2E-FC-a1', blockers: [], updatedDateUtc: ourWriteLeftItAt,
+    }
+    const afterSomeoneElseAlsoWrote = { ...afterOurWrite, updatedDateUtc: someoneElseMovedItTo }
+
+    test('the object at the version OUR write left it at passes', () => {
+      assert.doesNotThrow(() => assertUnchanged(boundToOurWrite, afterOurWrite))
+    })
+
+    test('a THIRD PARTY forward change on an object this run also moved is REFUSED', () => {
+      // The double has to be defect-free in every other dimension, or it proves nothing about the
+      // version: under the OLD policy this exact object passed, because it moved forwards and we
+      // had moved something.
+      assert.deepEqual(
+        {
+          status: afterSomeoneElseAlsoWrote.status,
+          contact: afterSomeoneElseAlsoWrote.contactName,
+          blockers: afterSomeoneElseAlsoWrote.blockers,
+          direction: parseXeroTimestamp(someoneElseMovedItTo)! > parseXeroTimestamp(ourWriteLeftItAt)!,
+        },
+        { status: 'AUTHORISED', contact: 'E2E E2E-FC-a1', blockers: [], direction: true },
+        'the double must be a FORWARD move that every other column accepts, or the old policy would have caught it too',
+      )
+      assert.throws(
+        () => assertUnchanged(boundToOurWrite, afterSomeoneElseAlsoWrote),
+        (e: Error) => e instanceof PlanDivergedError && /moved AGAIN since. That second change is not ours/.test(e.message),
+      )
+    })
+
+    test('when Xero reported no version for our own write, the exemption is WITHDRAWN, not widened', () => {
+      // The branch that used to be `moved-by-this-run`. Xero answers an allocation DELETE about the
+      // allocation and a refund reversal about the payment, so for those writes there is no version
+      // of OURS to bind to — and a forward move is exactly what a third party's edit looks like.
+      const unestablished = {
+        ...boundToOurWrite,
+        version: { policy: 'unestablished' as const, plannedUpdatedDateUtc: '/Date(1000)/', because: ['allocation:inv-9'] },
+      }
+      for (const live of [afterOurWrite, afterSomeoneElseAlsoWrote, { ...afterOurWrite, updatedDateUtc: '/Date(1000)/' }]) {
+        assert.throws(
+          () => assertUnchanged(unestablished, live),
+          (e: Error) => e instanceof PlanDivergedError && /RE-RUN IS THE COST/.test(e.message),
+          `no version may satisfy an unestablished policy — ${live.updatedDateUtc} did`,
+        )
+      }
+    })
+
+    test('the refusal says plainly what it costs, so it is not mistaken for a bug', () => {
+      const unestablished = {
+        ...boundToOurWrite,
+        version: { policy: 'unestablished' as const, plannedUpdatedDateUtc: '/Date(1000)/', because: ['allocation:inv-9'] },
+      }
+      const message = (() => {
+        try { assertUnchanged(unestablished, afterOurWrite); return '' } catch (e) { return (e as Error).message }
+      })()
+      assert.match(message, /re-run the read-only footprint audit/)
+      assert.match(message, /is not evidence the movement is ours/)
+    })
+
+    test('an empty binding is not a binding — it is the unestablished case under a stronger name', () => {
+      assert.throws(
+        () => assertUnchanged(
+          { ...boundToOurWrite, version: { policy: 'matches-our-write', updatedDateUtc: '', because: [] } },
+          afterOurWrite,
+        ),
+        (e: Error) => e instanceof PlanDivergedError && /UNESTABLISHED version, not a satisfied one/.test(e.message),
+      )
+    })
   })
 
   test('the version cannot be dropped by omission — the compiler refuses it, and so does the guard', () => {
@@ -1044,15 +1130,18 @@ describe('"this run caused it" is not the same as "it happened"', () => {
     blockers: ['creditnote:cn-1'],
   }
   /**
-   * The version expectation the runner would build for this object, from the same journal fact
-   * that widens the status set. Nothing released off it => the catch-all is exact; this run
-   * released something => it may only have moved forwards. There is no third form in which the
-   * version simply is not checked.
+   * The version expectation the runner builds for this object — the same shape as `versionFor` in
+   * remove-xero-live-e2e-footprint.ts. This run has not written to it => the catch-all is the
+   * REVIEWED version; it has, and Xero said what its change produced => that version, exactly; it
+   * has, and Xero said nothing => refused. There is no form in which the version is not checked.
    */
-  const versionFor = (journal: MutationJournal, key: string) =>
-    journal.causedRelease(key)
-      ? { policy: 'moved-by-this-run' as const, plannedUpdatedDateUtc: '/Date(1000)/', because: journal.releasedFor(key) }
-      : { policy: 'unchanged' as const, updatedDateUtc: '/Date(1000)/' }
+  const versionFor = (journal: MutationJournal, key: string): VersionExpectation => {
+    if (!journal.wroteTo(key)) return { policy: 'unchanged', updatedDateUtc: '/Date(1000)/' }
+    const ours = journal.ownWriteVersion(key)
+    return ours == null
+      ? { policy: 'unestablished', plannedUpdatedDateUtc: '/Date(1000)/', because: journal.releasedFor(key) }
+      : { policy: 'matches-our-write', updatedDateUtc: ours, because: journal.releasedFor(key) }
+  }
 
   test('a PAID -> AUTHORISED move is accepted only when this run recorded the release that caused it', () => {
     const journal = new MutationJournal()
@@ -1073,8 +1162,11 @@ describe('"this run caused it" is not the same as "it happened"', () => {
       (e: Error) => e instanceof PlanDivergedError && /status AUTHORISED is not one of \[PAID\]/.test(e.message),
     )
 
-    // This run deletes the allocation, and records that it succeeded. NOW the move is explained.
+    // This run deletes the allocation, records that it succeeded, and records the version Xero
+    // reported for THIS INVOICE in the answer to that DELETE. NOW the move is explained — by our
+    // own change, named, and not merely by the fact that something changed.
     journal.recordRelease('invoice:inv-1', 'creditnote:cn-1')
+    journal.recordOwnWriteVersion('invoice:inv-1', '/Date(2000)/')
     assert.deepEqual(allowedStatusesAfterRun('PAID', journal.causedRelease('invoice:inv-1')), ['PAID', 'AUTHORISED'])
     assert.doesNotThrow(() => assertUnchanged(
       {
@@ -1093,6 +1185,8 @@ describe('"this run caused it" is not the same as "it happened"', () => {
     // tell our own DELETE from a colleague releasing a payment in the UI two minutes ago.
     const journal = new MutationJournal()
     journal.recordRelease('invoice:inv-1', 'creditnote:cn-1')
+    // The version side is satisfied on purpose, so the ONLY thing that can fail here is the blocker.
+    journal.recordOwnWriteVersion('invoice:inv-1', '/Date(2000)/')
     assert.throws(
       () => assertUnchanged(
         {
@@ -1574,12 +1668,20 @@ describe('the safety decisions have exactly one home each', () => {
     )
   })
 
-  test('every write in the remover is settled, and none is recorded as a success by hand', () => {
+  test('every write in the remover goes through performWrite, so none can skip the durable record', () => {
     const code = sourceOf('scripts/remove-xero-live-e2e-footprint.ts')
-    const writes = code.match(/transport\.request\(token, '(?:POST|PUT|PATCH|DELETE)'/g) ?? []
-    const settled = code.match(/settleWrite\(\{/g) ?? []
-    assert.ok(writes.length >= 5, `expected the five mutating steps, found ${writes.length}`)
-    assert.equal(settled.length, writes.length, 'a write that does not go through settleWrite has only two answers')
+    const performed = code.match(/performWrite\(\{/g) ?? []
+    assert.ok(performed.length >= 6, `expected one per mutating write, found ${performed.length}`)
+    assert.doesNotMatch(
+      code,
+      /transport\.request\(token, '(?:POST|PUT|PATCH|DELETE)'/,
+      'a write dispatched straight through the transport has no intent on disk before it leaves',
+    )
+    assert.doesNotMatch(
+      code,
+      /settleWrite\(\{/,
+      'settling by hand skips the write-intent log, which is the half that survives the process',
+    )
     assert.doesNotMatch(
       code,
       /journal\.recordWrite\(/,
@@ -1587,11 +1689,374 @@ describe('the safety decisions have exactly one home each', () => {
     )
   })
 
+  test('the withdrawn version exemption has no home left to come back to', () => {
+    // A grep-level guard because this policy has now been narrowed twice and re-flagged twice. It
+    // is not narrowed here, it is withdrawn, and the name is gone from the codebase.
+    for (const relative of ['scripts/remove-xero-live-e2e-footprint.ts', 'scripts/lib/xero-live-safety.ts']) {
+      assert.doesNotMatch(
+        sourceOf(relative),
+        /moved-by-this-run/,
+        `${relative} must not carry a version policy that accepts any forward movement`,
+      )
+    }
+  })
+
+  test('step 1 does not own its own write loop, so the per-write re-read cannot be hoisted out', () => {
+    const code = sourceOf('scripts/remove-xero-live-e2e-footprint.ts')
+    assert.match(code, /writeUnitsIndividually<Step1Unit, CreditNote>\(\{/)
+    assert.match(code, /revalidate: async \(\) => \(APPLY \? await revalidateCreditNote/)
+  })
+
   test('every re-read in the remover states a version policy', () => {
     const code = sourceOf('scripts/remove-xero-live-e2e-footprint.ts')
     const revalidations = code.match(/assertUnchanged\(/g) ?? []
-    const versions = code.match(/version: /g) ?? []
-    assert.ok(revalidations.length >= 5, `expected one per mutating step, found ${revalidations.length}`)
+    // Anchored to the start of a line so that prose in a banner string ("...the resulting
+    // version: 3") cannot pad the count and make the guard pass by accident.
+    const versions = code.match(/^\s*version: /gm) ?? []
+    assert.ok(revalidations.length >= 4, `expected one per mutating step, found ${revalidations.length}`)
     assert.equal(versions.length, revalidations.length, 'the catch-all is not optional at any call site')
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 4, FINDING 1. The re-read-before-mutation guarantee is per-OBJECT. Step 1 revalidated ONCE
+ * and then made SEVERAL irreversible writes against that one credit note — every allocation on it,
+ * plus any refund. So the check held for the first write and merely accompanied the rest, in the
+ * step that does the most damage.
+ *
+ * The other way to close this would be to make the batch atomic, so one re-read genuinely covers
+ * it. Xero does not offer that: each allocation is its own DELETE against its own URL, a refund
+ * reversal is a POST to a different endpoint, there is no transaction across them and no
+ * If-Match/version precondition on any of them. So the revalidation is repeated per write, and the
+ * loop that guarantees it lives here rather than in a `for` the next edit can hoist things out of.
+ */
+describe('a step that writes several times to one object revalidates before EACH write', () => {
+  type Alloc = { AllocationID: string; Amount: number }
+
+  /**
+   * A LEDGER, not a stub. It changes when something writes to it, and a re-read sees the change.
+   * A double that returns the same snapshot however often it is read cannot express a state change
+   * BETWEEN two writes of one step — which is the entire failure under test, so such a double
+   * would have passed against the defect exactly as it passes against the fix.
+   */
+  function ledger() {
+    return {
+      contactName: 'E2E E2E-FC-a1',
+      allocations: [{ AllocationID: 'al-1', Amount: 10 }, { AllocationID: 'al-2', Amount: 20 }] as Alloc[],
+    }
+  }
+
+  test('a third party changing the document BETWEEN write one and write two stops write two', async () => {
+    const live = ledger()
+    const planned: Alloc[] = live.allocations.map((a) => ({ ...a }))
+    const seenContacts: string[] = []
+    const written: string[] = []
+
+    await assert.rejects(
+      () => writeUnitsIndividually<Alloc, typeof live>({
+        units: planned,
+        revalidate: async () => {
+          seenContacts.push(live.contactName)
+          // Exactly what assertStillFixtureContact does in the runner.
+          if (!isFixtureContactName(live.contactName)) {
+            throw new PlanDivergedError(`ABORT: now contacted to ${live.contactName}`)
+          }
+          return live
+        },
+        confirmUnit: (unit, l) => {
+          assert.ok(l.allocations.some((a) => a.AllocationID === unit.AllocationID), 'unit must still be there')
+        },
+        write: async (unit) => {
+          written.push(unit.AllocationID)
+          live.allocations = live.allocations.filter((a) => a.AllocationID !== unit.AllocationID)
+          // Between OUR first write and OUR second, somebody re-contacts the credit note to a
+          // genuine customer. The document stays in a perfectly valid status; only a fresh read
+          // can see it, and under one-revalidation-per-object there is no fresh read left to take.
+          if (written.length === 1) live.contactName = 'Acme Trading Ltd'
+        },
+      }),
+      PlanDivergedError,
+    )
+
+    assert.deepEqual(written, ['al-1'], 'the second irreversible write must not go out')
+    assert.deepEqual(
+      seenContacts,
+      ['E2E E2E-FC-a1', 'Acme Trading Ltd'],
+      'the double must be re-read between the two writes AND must have changed, or it proves nothing',
+    )
+  })
+
+  test('the order is revalidate-then-write, per unit — never one read then a run of writes', async () => {
+    const order: string[] = []
+    await writeUnitsIndividually<string, null>({
+      units: ['a', 'b', 'c'],
+      revalidate: async () => { order.push('revalidate'); return null },
+      confirmUnit: () => { order.push('confirm') },
+      write: async (u) => { order.push(`write:${u}`) },
+    })
+    assert.deepEqual(order, [
+      'revalidate', 'confirm', 'write:a',
+      'revalidate', 'confirm', 'write:b',
+      'revalidate', 'confirm', 'write:c',
+    ])
+  })
+
+  test('with nothing changing, every unit is still written — the loop is not simply refusing', async () => {
+    // The other direction matters as much: a guard that stops everything is not a guard.
+    const live = ledger()
+    const written: string[] = []
+    await writeUnitsIndividually<Alloc, typeof live>({
+      units: live.allocations.map((a) => ({ ...a })),
+      revalidate: async () => live,
+      confirmUnit: () => {},
+      write: async (unit) => { written.push(unit.AllocationID) },
+    })
+    assert.deepEqual(written, ['al-1', 'al-2'])
+  })
+
+  test('a unit that has itself changed is refused BEFORE its write, not discovered after it', async () => {
+    // The document can be untouched while the individual allocation has been re-valued. That is
+    // still a different write from the one the manifest authorised.
+    const live = ledger()
+    live.allocations = [{ AllocationID: 'al-1', Amount: 10 }, { AllocationID: 'al-2', Amount: 999 }]
+    const written: string[] = []
+    await assert.rejects(
+      () => writeUnitsIndividually<Alloc, typeof live>({
+        units: [{ AllocationID: 'al-1', Amount: 10 }, { AllocationID: 'al-2', Amount: 20 }],
+        revalidate: async () => live,
+        confirmUnit: (unit, l) => {
+          const found = l.allocations.find((a) => a.AllocationID === unit.AllocationID)
+          if (!found || found.Amount !== unit.Amount) {
+            throw new PlanDivergedError(`ABORT: allocation ${unit.AllocationID} is not the one that was reviewed`)
+          }
+        },
+        write: async (unit) => { written.push(unit.AllocationID) },
+      }),
+      PlanDivergedError,
+    )
+    assert.deepEqual(written, ['al-1'])
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 4, FINDING 3. An unknown write was recorded IN MEMORY, after the response settled. But the
+ * event that produces an unknown outcome and the event that kills the process are the same class
+ * of thing, and when it is the second one the evidence dies with the recorder: no banner, no
+ * journal, and a next run that reads the object off Xero as though nobody had ever written to it.
+ *
+ * So the intent goes to disk, flushed, BEFORE the request is dispatched.
+ */
+describe('the evidence of a dispatched write outlives the process that dispatched it', () => {
+  const voidResponse = (id: string, version: string) => response(200, { Invoices: [{ InvoiceID: id, UpdatedDateUTC: version }] })
+
+  function inMemoryLog() {
+    const disk: string[] = []
+    return { disk, log: createWriteIntentLog({ tenantId: TENANT, append: (line) => disk.push(line) }) }
+  }
+
+  test('the intent is DURABLE BEFORE the request is dispatched, not after it settles', async () => {
+    const { disk, log } = inMemoryLog()
+    let diskAtDispatch = -1
+    const { impl } = fakeFetch(() => {
+      // Read from inside the request: this is the only moment at which "before" and "after" differ.
+      diskAtDispatch = disk.length
+      return voidResponse('inv-1', '/Date(2000)/')
+    })
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+
+    const { committed } = await performWrite({
+      transport, token: TOKEN, journal, writeLog: log,
+      method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+      kind: 'invoice voided', label: 'INV-0001',
+      subjects: [{ key: 'invoice:inv-1', collectionKey: 'Invoices', idField: 'InvoiceID', id: 'inv-1' }],
+    })
+
+    assert.equal(committed, true)
+    assert.equal(diskAtDispatch, 1, 'recording the intent AFTER the request is the defect; it must already be on disk')
+    assert.equal(disk.length, 2, 'and the outcome is appended after')
+    assert.match(disk[0], /"event":"intent"/)
+    assert.match(disk[1], /"event":"settled"/)
+    // The same response is what binds the later version check to OUR OWN write.
+    assert.equal(journal.ownWriteVersion('invoice:inv-1'), '/Date(2000)/')
+  })
+
+  test('a process KILLED between the request and the record leaves the evidence behind', () => {
+    const { disk, log } = inMemoryLog()
+    const xero = { voided: false }
+
+    // performWrite's sequence, stopped where a SIGKILL stops it. The intent is durable, the request
+    // has left, Xero has applied it — and then nothing runs. No settle, no journal, no banner.
+    log.intend({ kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
+    xero.voided = true
+    // <<< the process dies here; everything in memory goes with it >>>
+
+    assert.equal(xero.voided, true, 'the double must really apply the write, or this is a test about nothing')
+    const scan = scanWriteIntentLog(disk.join('\n'))
+    assert.equal(scan.unresolved.length, 1)
+    assert.equal(scan.unresolved[0].label, 'INV-0042')
+    assert.throws(
+      () => assertNoUnresolvedWrites({ path: './write-log.jsonl', text: disk.join('\n') }),
+      (e: Error) => e instanceof UnresolvedWriteError && /DISPATCHED and never accounted for/.test(e.message),
+    )
+  })
+
+  test('a write that SETTLED leaves nothing behind — the refusal is not simply always on', () => {
+    const { disk, log } = inMemoryLog()
+    const id = log.intend({ kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
+    log.settle(id, 'committed', 'Xero answered HTTP 200')
+    assert.deepEqual(scanWriteIntentLog(disk.join('\n')), { unresolved: [], unreadableLines: 0 })
+    assert.doesNotThrow(() => assertNoUnresolvedWrites({ path: './write-log.jsonl', text: disk.join('\n') }))
+  })
+
+  test('a write settled as UNKNOWN still stops the next run — settling it did not answer it', () => {
+    // The subtle version of the same hole: the outcome WAS recorded, and what it records is that
+    // nobody knows. If that run then died before printing its banner, the next one must not sail
+    // past a note saying the ledger may have changed.
+    const { disk, log } = inMemoryLog()
+    const id = log.intend({ kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
+    log.settle(id, 'unknown', 'the request left this process and no usable response came back')
+    assert.equal(scanWriteIntentLog(disk.join('\n')).unresolved.length, 1)
+    assert.throws(() => assertNoUnresolvedWrites({ path: './write-log.jsonl', text: disk.join('\n') }), UnresolvedWriteError)
+  })
+
+  test('an unknown outcome reaches the disk BEFORE the run aborts on it', async () => {
+    const { disk, log } = inMemoryLog()
+    const { impl } = fakeFetch(() => { throw new Error('socket hang up') })
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: log,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      WriteOutcomeUnknownError,
+    )
+    assert.equal(disk.length, 2, 'settleWrite throws; the record has to survive that throw')
+    assert.match(disk[1], /"state":"unknown"/)
+    assert.equal(journal.unknownCount, 1)
+    assert.equal(scanWriteIntentLog(disk.join('\n')).unresolved.length, 1)
+  })
+
+  test('a write the transport refused to dispatch at all is not reported as a maybe', async () => {
+    // The write gate fires before the network, so this one provably never left. Calling it unknown
+    // would send an operator hunting a ledger change that cannot exist.
+    const { disk, log } = inMemoryLog()
+    const { impl, calls } = fakeFetch(() => response(200, {}))
+    const transport = createXeroTransport({ apply: false, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: log,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      WriteWithoutApplyError,
+    )
+    assert.equal(calls.length, 0)
+    assert.equal(journal.unknownCount, 0)
+    assert.match(disk[1], /"state":"not-committed"/)
+    assert.deepEqual(scanWriteIntentLog(disk.join('\n')).unresolved, [])
+  })
+
+  test('a half-written final line is unreadable, not absent', () => {
+    // What a process dying mid-append actually leaves on disk.
+    const { disk, log } = inMemoryLog()
+    const id = log.intend({ kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
+    log.settle(id, 'committed', 'Xero answered HTTP 200')
+    const truncated = `${disk.join('\n')}\n{"event":"intent","id":"w2","kind":"invoice voi`
+    assert.equal(scanWriteIntentLog(truncated).unreadableLines, 1)
+    assert.throws(
+      () => assertNoUnresolvedWrites({ path: './write-log.jsonl', text: truncated }),
+      (e: Error) => e instanceof UnresolvedWriteError && /could not be read/.test(e.message),
+    )
+  })
+
+  test('the file-backed log appends real lines that the next run can read', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'xero-write-log-'))
+    const path = join(dir, 'write-log.jsonl')
+    const log = openWriteIntentLog({ path, tenantId: TENANT })
+    log.intend({ kind: 'item deleted', label: 'E2E-FC-A-SMOKE', method: 'DELETE', path: 'Items/item-1' })
+    log.close()
+    const scan = scanWriteIntentLog(readFileSync(path, 'utf8'))
+    assert.equal(scan.unresolved.length, 1)
+    assert.equal(scan.unresolved[0].tenantId, TENANT)
+    rmSync(dir, { recursive: true, force: true })
+  })
+})
+
+// ===========================================================================
+/**
+ * The other half of finding 2: what may be bound to. A version is only ours if it came back
+ * attached to the object we wrote, in the answer to that write.
+ */
+describe('the version bound to our own write is matched by collection AND id', () => {
+  test('the object we wrote reports its own new version', () => {
+    assert.equal(
+      versionFromWriteResponse({
+        data: { CreditNotes: [{ CreditNoteID: 'cn-1', UpdatedDateUTC: '/Date(2000)/' }] },
+        collectionKey: 'CreditNotes', idField: 'CreditNoteID', id: 'cn-1',
+      }),
+      '/Date(2000)/',
+    )
+  })
+
+  test('a DIFFERENT record in the response gives nothing — a payment is not the credit note', () => {
+    // `POST /Payments/{id}` answers with the PAYMENT. Its UpdatedDateUTC is real, recent, and
+    // belongs to something else; binding the credit note's next write to it would look strong and
+    // mean nothing.
+    assert.equal(
+      versionFromWriteResponse({
+        data: { Payments: [{ PaymentID: 'p-1', UpdatedDateUTC: '/Date(2000)/' }] },
+        collectionKey: 'CreditNotes', idField: 'CreditNoteID', id: 'cn-1',
+      }),
+      null,
+    )
+    assert.equal(
+      versionFromWriteResponse({
+        data: { CreditNotes: [{ CreditNoteID: 'cn-OTHER', UpdatedDateUTC: '/Date(2000)/' }] },
+        collectionKey: 'CreditNotes', idField: 'CreditNoteID', id: 'cn-1',
+      }),
+      null,
+    )
+  })
+
+  test('anything unreadable is null, which every caller treats as UNESTABLISHED', () => {
+    for (const data of [
+      undefined, null, 'text', 42, [],
+      { CreditNotes: 'nope' },
+      { CreditNotes: [] },
+      { CreditNotes: [{ CreditNoteID: 'cn-1' }] },
+      { CreditNotes: [{ CreditNoteID: 'cn-1', UpdatedDateUTC: '' }] },
+      { CreditNotes: [{ CreditNoteID: 'cn-1', UpdatedDateUTC: 12345 }] },
+    ]) {
+      assert.equal(
+        versionFromWriteResponse({ data, collectionKey: 'CreditNotes', idField: 'CreditNoteID', id: 'cn-1' }),
+        null,
+        `${JSON.stringify(data) ?? 'undefined'} must not establish a version`,
+      )
+    }
+  })
+
+  test('an unestablished write POISONS the object for the run — a later version cannot backfill it', () => {
+    // Order matters and the conservative direction is the only safe one: a version observed after
+    // the fact is a state, not a provenance, and this whole finding is about not confusing the two.
+    const journal = new MutationJournal()
+    assert.equal(journal.wroteTo('creditnote:cn-1'), false)
+    journal.recordOwnWriteVersion('creditnote:cn-1', null)
+    assert.equal(journal.wroteTo('creditnote:cn-1'), true)
+    assert.equal(journal.ownWriteVersion('creditnote:cn-1'), null)
+    journal.recordOwnWriteVersion('creditnote:cn-1', '/Date(9999)/')
+    assert.equal(journal.ownWriteVersion('creditnote:cn-1'), null)
+  })
+
+  test('a write this run never made leaves the object on the REVIEWED version', () => {
+    const journal = new MutationJournal()
+    journal.recordOwnWriteVersion('creditnote:cn-1', '/Date(2000)/')
+    assert.equal(journal.wroteTo('creditnote:cn-2'), false)
+    assert.equal(journal.ownWriteVersion('creditnote:cn-2'), undefined)
   })
 })

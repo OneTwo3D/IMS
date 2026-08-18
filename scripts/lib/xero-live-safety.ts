@@ -25,15 +25,24 @@
  *                     A walk that cannot ADVANCE has not FINISHED: a server that re-serves page 1
  *                     proves only that `page` is not working, and an unpaged Xero GET is silently
  *                     truncated to the oldest 100 rows.
- *   6. REVALIDATION   each object is re-read immediately before it is mutated and must be
- *                     byte-for-byte the object that was planned — INCLUDING UpdatedDateUTC, the
- *                     catch-all version, which is a REQUIRED field of the expectation precisely so
- *                     that no call site can drop it by omission.
+ *   6. REVALIDATION   each object is re-read immediately before EACH write to it — not once per
+ *                     object, because a step that writes several times to one object would then
+ *                     have checked only the first — and must be byte-for-byte the object that was
+ *                     planned, INCLUDING UpdatedDateUTC, the catch-all version, which is a REQUIRED
+ *                     field of the expectation precisely so that no call site can drop it by
+ *                     omission. Where this run has itself already written to the object, the write
+ *                     is held to the version XERO REPORTED FOR THAT WRITE; where Xero reported
+ *                     none, there is nothing attributable to this run and the write is REFUSED.
  *   7. OUTCOME        a run with any failure exits non-zero and does not report success; a run that
  *                     THREW after writing says how much it had already destroyed; and a write whose
  *                     outcome cannot be determined is reported as UNKNOWN, never as nothing.
+ *   8. DURABILITY     every write is recorded on disk, and flushed, BEFORE it is dispatched. An
+ *                     in-memory record of an unknown write dies with the process, and a killed
+ *                     process is the same class of event that produces one. An intent with no
+ *                     settlement stops the NEXT run rather than being lost.
  */
 import { createHash } from 'node:crypto'
+import { closeSync, fsyncSync, openSync, writeSync } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // Errors. All safety aborts share a base class so a caller can tell a refusal
@@ -57,6 +66,12 @@ export class AmbiguousSelectionError extends SafetyViolationError {}
 export class ManifestViolationError extends SafetyViolationError {}
 /** A live object no longer matches the plan that was reviewed. */
 export class PlanDivergedError extends SafetyViolationError {}
+/**
+ * The call budget ran out. It is its own class because it is one of only two failures that are
+ * known to happen BEFORE anything leaves this process — which is the only circumstance in which a
+ * write may be recorded as "not dispatched" rather than as an unknown outcome.
+ */
+export class CallCeilingError extends SafetyViolationError {}
 /**
  * A write left this process and its outcome could not be determined. It is a SafetyViolationError
  * because the run must stop: after this, nothing in the process knows what the ledger contains.
@@ -249,7 +264,7 @@ export function createXeroTransport(options: TransportOptions = {}): XeroTranspo
     if (method !== 'GET' && !apply) {
       throw new WriteWithoutApplyError(`BUG: attempted ${method} ${path} without --apply`)
     }
-    if (callCount >= maxCalls) throw new Error(`API call ceiling (${maxCalls}) reached`)
+    if (callCount >= maxCalls) throw new CallCeilingError(`API call ceiling (${maxCalls}) reached`)
 
     const wait = minIntervalMs - (now() - lastCallAt)
     if (wait > 0) await sleep(wait)
@@ -852,18 +867,33 @@ export type VersionExpectation =
    */
   | { policy: 'unchanged'; updatedDateUtc: string }
   /**
-   * THIS RUN wrote to the object — it released an allocation or a refund off it in an earlier
-   * step — so Xero has necessarily re-stamped it and byte-equality is impossible. Byte-equality
-   * cannot be demanded; silence must not be the alternative. Under this policy the version must
-   * still be READABLE and must not have gone BACKWARDS, and the exemption is only offered when the
-   * run's own journal of SUCCEEDED writes says this run is why the object could have moved.
+   * THIS RUN wrote to the object in an earlier step, so byte-equality with the REVIEWED version is
+   * arithmetically impossible — and Xero, answering that write, reported the version its own change
+   * produced. The object must be at THAT version. It is exact equality again, just against the
+   * state OUR write left behind instead of the state the human reviewed.
    *
-   * Be clear about what this does NOT prove: forward movement caused by somebody else, in a
-   * dimension no other column covers, is indistinguishable from our own. That residue is the
-   * reason the runner counts these objects and prints the count in the banner — a waived catch-all
-   * is a thing the operator should be told about, not a thing the code quietly decides.
+   * This is a binding, not an exemption. The version is the fingerprint of the change we made, so
+   * anything that has happened to the object since — including a forward change by somebody else,
+   * in a dimension no other column covers — fails it.
    */
-  | { policy: 'moved-by-this-run'; plannedUpdatedDateUtc: string; because: string[] }
+  | { policy: 'matches-our-write'; updatedDateUtc: string; because: string[] }
+  /**
+   * THIS RUN wrote to the object and Xero's response did NOT report the version its change
+   * produced, so there is no version to hold the next write to. This policy ALWAYS diverges.
+   *
+   * The policy this replaces said: the version may move FORWARDS, because this run moved
+   * something. That is not evidence the forward movement is ours — it authorises unrelated forward
+   * changes. "The version moved and we moved something" admits a third party's edit (a line
+   * changed, an account swapped, a tracking category attached, a due date altered) on the very
+   * document we are about to irreversibly void, because our own write supplies the alibi for
+   * someone else's. A narrowed residual is still an authorisation.
+   *
+   * Nothing can establish our own change here without writing to live, so the exemption is not
+   * granted blind: it is withdrawn. The run refuses and the operator re-runs the read-only audit,
+   * reviews the fresh CSV and applies the remaining steps from it. The writes already made stand.
+   * A RE-RUN IS THE COST, and it is the cheaper of the two mistakes available.
+   */
+  | { policy: 'unestablished'; plannedUpdatedDateUtc: string; because: string[] }
 
 /**
  * Xero returns timestamps in two shapes on the same API — `/Date(1613486114757+0000)/` on the
@@ -919,22 +949,34 @@ function versionDiffs(expected: VersionExpectation | undefined, liveVersion?: st
       ? []
       : [`updatedDateUTC ${expected.updatedDateUtc} -> ${liveVersion}`]
   }
-  const planned = parseXeroTimestamp(expected.plannedUpdatedDateUtc)
-  const live = parseXeroTimestamp(liveVersion)
-  if (planned === null || live === null) {
-    return [
-      `updatedDateUTC ${JSON.stringify(expected.plannedUpdatedDateUtc)} -> ${JSON.stringify(liveVersion)}: ` +
-      'one of these is not a timestamp this code can read, so it cannot be shown that the object only ' +
-      'moved forwards',
-    ]
+  if (expected.policy === 'matches-our-write') {
+    if (!expected.updatedDateUtc) {
+      // Belt and braces: an empty binding is not a binding. A caller that reaches here has failed
+      // to record what its own write produced, which is the 'unestablished' case wearing the
+      // stronger policy's name, and it is refused as such rather than passing on a blank compare.
+      return [
+        'this run wrote to the object but recorded no resulting version for it, so there is nothing ' +
+        'for the write to be held to. That is an UNESTABLISHED version, not a satisfied one',
+      ]
+    }
+    return expected.updatedDateUtc === liveVersion
+      ? []
+      : [
+        `updatedDateUTC ${expected.updatedDateUtc} -> ${liveVersion}: this run's own write left the object at ` +
+        `${expected.updatedDateUtc} (${expected.because.join(', ') || 'no released blocker recorded'}), and it has ` +
+        `moved AGAIN since. That second change is not ours`,
+      ]
   }
-  if (live < planned) {
-    return [
-      `updatedDateUTC went BACKWARDS, ${expected.plannedUpdatedDateUtc} -> ${liveVersion}. The object ` +
-      'being re-read is not the object that was planned',
-    ]
-  }
-  return []
+  // 'unestablished' — always a divergence. See the type above for why this is a refusal rather
+  // than a check: there is nothing here to compare that would mean anything.
+  return [
+    `this run wrote to the object (${expected.because.join(', ') || 'no released blocker recorded'}) and Xero's ` +
+    `response did not report the version its change produced. The reviewed version ` +
+    `${JSON.stringify(expected.plannedUpdatedDateUtc)} therefore no longer applies, and no other version is ` +
+    `attributable to us. "It moved forwards and we moved something" is not evidence the movement is ours, so no ` +
+    `exemption is granted: re-run the read-only footprint audit, review the fresh CSV, and apply the remaining ` +
+    `steps from it. The writes already made stand — a RE-RUN IS THE COST of this refusal`,
+  ]
 }
 
 /** Releasing every blocker off a PAID document leaves it AUTHORISED; nothing else moves. */
@@ -1114,6 +1156,11 @@ export class MutationJournal {
   private readonly writes: MutationRecord[] = []
   private readonly unknown: UnknownWriteRecord[] = []
   private readonly releases = new Map<string, Set<string>>()
+  /**
+   * Per object: the version Xero reported for it IN THE RESPONSE TO OUR OWN WRITE, or `null` when
+   * that response said nothing about it. Absent from the map means this run has not written to it.
+   */
+  private readonly ownVersions = new Map<string, string | null>()
   private readonly failures: string[] = []
 
   /** An irreversible write that SUCCEEDED. Never call this for an attempt. */
@@ -1153,6 +1200,29 @@ export class MutationJournal {
     return (this.releases.get(subjectKey)?.size ?? 0) > 0
   }
 
+  /**
+   * The version Xero reported for this object when it answered OUR OWN write — the only version
+   * this run is entitled to attribute to itself. Pass `null` when the response did not carry one.
+   *
+   * `null` is STICKY. Once a write to this object has come back without a version, nothing later
+   * in the run can say what state our writes left it in: a version observed afterwards is a state,
+   * not a provenance, and the whole defect being closed here is treating the two as the same.
+   */
+  recordOwnWriteVersion(subjectKey: string, version: string | null): void {
+    if (this.ownVersions.has(subjectKey) && this.ownVersions.get(subjectKey) === null) return
+    this.ownVersions.set(subjectKey, version)
+  }
+
+  /** Has THIS RUN written to this object at all? The gate for which version policy applies. */
+  wroteTo(subjectKey: string): boolean {
+    return this.ownVersions.has(subjectKey)
+  }
+
+  /** `undefined` — this run never wrote to it. `null` — it did, and the version is unestablished. */
+  ownWriteVersion(subjectKey: string): string | null | undefined {
+    return this.ownVersions.get(subjectKey)
+  }
+
   recordFailure(message: string): void {
     this.failures.push(message)
   }
@@ -1179,6 +1249,46 @@ export class MutationJournal {
  * it aborts — and because the abort carries `recordUnknown`, the banner says PARTIALLY APPLIED and
  * names the object instead of claiming nothing was written.
  */
+/**
+ * The version Xero reported FOR THIS OBJECT in the response to a write we just made.
+ *
+ * It is deliberately strict about identity. Xero answers a write with whatever object the endpoint
+ * is about, and that is not always the object whose version matters: `POST /Payments/{id}` answers
+ * with the PAYMENT while the document the refund was blocking is the credit note, and
+ * `DELETE /CreditNotes/{id}/Allocations/{id}` answers about the allocation. Accepting "some
+ * UpdatedDateUTC came back" would bind the next write to a version belonging to a different record
+ * — a binding that looks strong and means nothing — so the match is by collection AND by id.
+ *
+ * Anything it cannot match returns null, which every caller reads as UNESTABLISHED, never as fine.
+ */
+export function versionFromWriteResponse(args: {
+  data: unknown
+  collectionKey: string
+  idField: string
+  id: string
+}): string | null {
+  const { data, collectionKey, idField, id } = args
+  if (!data || typeof data !== 'object') return null
+  const rows = (data as Record<string, unknown>)[collectionKey]
+  if (!Array.isArray(rows)) return null
+  for (const row of rows) {
+    if (!row || typeof row !== 'object') continue
+    const record = row as Record<string, unknown>
+    if (record[idField] !== id) continue
+    const version = record.UpdatedDateUTC
+    return typeof version === 'string' && version.trim() !== '' ? version : null
+  }
+  return null
+}
+
+/** One reading of a write result's commit state, shared so nothing can classify it a second way. */
+export function commitOf(res: XeroResult<unknown>): WriteCommit {
+  return res.commit ?? {
+    state: 'unknown',
+    reason: 'the transport returned no commit classification for a write, so its outcome is not established',
+  }
+}
+
 export function settleWrite(args: {
   res: XeroResult<unknown>
   journal: MutationJournal
@@ -1186,10 +1296,7 @@ export function settleWrite(args: {
   label: string
 }): boolean {
   const { res, journal, kind, label } = args
-  const commit = res.commit ?? {
-    state: 'unknown' as const,
-    reason: 'the transport returned no commit classification for a write, so its outcome is not established',
-  }
+  const commit = commitOf(res)
   if (commit.state === 'unknown') {
     journal.recordUnknown(kind, label, commit.reason)
     throw new WriteOutcomeUnknownError(
@@ -1205,6 +1312,286 @@ export function settleWrite(args: {
     return true
   }
   return false
+}
+
+// ---------------------------------------------------------------------------
+// 8. THE WRITE-INTENT LOG — evidence of a write that OUTLIVES the process
+// ---------------------------------------------------------------------------
+/**
+ * `settleWrite` records an unknown outcome AFTER the response settles. That covers the write whose
+ * ANSWER was lost. It does not cover the process that never gets to see one.
+ *
+ * A killed process — OOM, SIGKILL, a dropped SSH session, the machine going away, the container
+ * being evicted — is the SAME class of event that produces an unknown outcome, and it is the one
+ * where the evidence dies with the recorder. The in-memory journal is garbage collected, the
+ * banner is never printed, `PLAN_OUT` still says what the run INTENDED, and the next run re-reads
+ * the object off Xero as though nobody had ever written to it. If the write landed, the next run
+ * plans from a state nobody confirmed — which is precisely the recovery the unknown-write banner
+ * exists to prevent.
+ *
+ * So the intent is written to disk and FLUSHED TO THE DEVICE BEFORE the request is dispatched, and
+ * the outcome is appended after it settles. An intent with no matching settlement is exactly the
+ * evidence that would otherwise have been lost, and the next run REFUSES TO START while one exists.
+ *
+ * The log is not date-stamped. It has to be found by the run that comes after the crash, and a
+ * file named after the day the dead run started is a file the next day's run walks straight past.
+ */
+export type WriteIntent = {
+  id: string
+  kind: string
+  label: string
+  method: HttpMethod
+  path: string
+  at: string
+  tenantId: string
+}
+
+export type WriteIntentLog = {
+  /** Durably record that a write is ABOUT to be dispatched. Returns the id used to settle it. */
+  intend(entry: { kind: string; label: string; method: HttpMethod; path: string }): string
+  /** Durably record what became of it. */
+  settle(id: string, state: WriteCommitState, reason: string): void
+  close(): void
+}
+
+/**
+ * A previous run left a write on disk that nobody can account for: an intent with no settlement
+ * (the process died), or one settled as UNKNOWN (the answer was lost and the banner may never have
+ * been read). Both mean the same thing about the ledger — it may have changed — so both stop the
+ * next run.
+ */
+export class UnresolvedWriteError extends SafetyViolationError {}
+
+/**
+ * For dry runs, which cannot dispatch a write at all, and for tests that are not about durability.
+ * It is a separate value rather than an `if (log)` at the call site: an optional log is a log a
+ * call site can forget, and the forgetting is invisible.
+ */
+export const NULL_WRITE_INTENT_LOG: WriteIntentLog = {
+  intend: () => 'not-logged',
+  settle: () => {},
+  close: () => {},
+}
+
+/**
+ * The log itself, over an injected `append` sink. The sink is injected so that the ORDERING
+ * contract — intent on disk before the request leaves, outcome after — is testable without a
+ * filesystem, and so that a test can make the flush itself fail.
+ */
+export function createWriteIntentLog(args: {
+  tenantId: string
+  /** MUST durably flush before returning. `openWriteIntentLog` is the fsync-ing implementation. */
+  append: (line: string) => void
+  now?: () => Date
+}): WriteIntentLog {
+  const { tenantId, append, now = () => new Date() } = args
+  let seq = 0
+  return {
+    intend(entry) {
+      const id = `w${++seq}`
+      const record: WriteIntent & { event: 'intent' } = {
+        event: 'intent', id, kind: entry.kind, label: entry.label,
+        method: entry.method, path: entry.path, at: now().toISOString(), tenantId,
+      }
+      append(JSON.stringify(record))
+      return id
+    },
+    settle(id, state, reason) {
+      append(JSON.stringify({ event: 'settled', id, state, reason, at: now().toISOString(), tenantId }))
+    },
+    close() {},
+  }
+}
+
+/**
+ * The on-disk sink. `writeSync` then `fsyncSync`: a buffered write that has not reached the device
+ * is not evidence of anything, and the events this log exists for — a kill, an OOM, a host going
+ * away — are exactly the ones that discard a buffer.
+ */
+export function openWriteIntentLog(args: { path: string; tenantId: string; now?: () => Date }): WriteIntentLog {
+  const fd = openSync(args.path, 'a')
+  const log = createWriteIntentLog({
+    tenantId: args.tenantId,
+    now: args.now,
+    append: (line) => {
+      writeSync(fd, `${line}\n`)
+      fsyncSync(fd)
+    },
+  })
+  return { ...log, close: () => closeSync(fd) }
+}
+
+export type WriteLogScan = { unresolved: WriteIntent[]; unreadableLines: number }
+
+/**
+ * What a previous run left behind, and could not account for.
+ *
+ * THREE things count, and they are all the same fact about the ledger — it may have changed and
+ * nothing knows how:
+ *   • an intent with no settlement at all — the process died between dispatching and recording;
+ *   • an intent settled as UNKNOWN — the answer was lost, and the banner that says so may never
+ *     have been printed, let alone read;
+ *   • a line that cannot be parsed — a half-written final record is exactly what a process dying
+ *     mid-append looks like, and "I could not read it" is not "there was nothing there".
+ */
+export function scanWriteIntentLog(text: string): WriteLogScan {
+  const open = new Map<string, WriteIntent>()
+  let unreadableLines = 0
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trim()
+    if (!trimmed) continue
+    let record: Record<string, unknown>
+    try {
+      const parsed: unknown = JSON.parse(trimmed)
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an object')
+      record = parsed as Record<string, unknown>
+    } catch {
+      unreadableLines++
+      continue
+    }
+    const id = typeof record.id === 'string' ? record.id : null
+    if (!id) { unreadableLines++; continue }
+    if (record.event === 'intent') {
+      open.set(id, {
+        id,
+        kind: String(record.kind ?? '(unnamed)'),
+        label: String(record.label ?? '(unlabelled)'),
+        method: (record.method ?? 'POST') as HttpMethod,
+        path: String(record.path ?? '(unknown path)'),
+        at: String(record.at ?? ''),
+        tenantId: String(record.tenantId ?? ''),
+      })
+    } else if (record.event === 'settled') {
+      // A settlement RESOLVES the intent only when it says what happened. 'unknown' is the answer
+      // that does not, so it stays on the pile: the run that recorded it may itself have died
+      // before printing the banner about it.
+      if (record.state !== 'unknown') open.delete(id)
+    } else {
+      unreadableLines++
+    }
+  }
+  return { unresolved: [...open.values()], unreadableLines }
+}
+
+/**
+ * The refusal. It runs before anything else, in BOTH modes: a dry run whose purpose is to build
+ * the plan for the next apply is planning from a ledger nobody has confirmed, which is the same
+ * mistake one step earlier.
+ */
+export function assertNoUnresolvedWrites(args: { path: string; text: string }): void {
+  const { unresolved, unreadableLines } = scanWriteIntentLog(args.text)
+  if (unresolved.length === 0 && unreadableLines === 0) return
+  const shown = unresolved.slice(0, 20).map((u) => `${u.kind}: ${u.label} — ${u.method} ${u.path} at ${u.at}`)
+  throw new UnresolvedWriteError(
+    `ABORT: ${args.path} records ${unresolved.length} write(s) that were DISPATCHED and never accounted for` +
+      (unreadableLines ? `, plus ${unreadableLines} line(s) that could not be read` : '') +
+      `. A previous run either stopped between sending a write and recording what became of it, or recorded ` +
+      `that it never learned the outcome, so the ledger may have changed in ways nothing in this process knows ` +
+      `about:\n  ` +
+      shown.join('\n  ') +
+      (unresolved.length > shown.length ? `\n  ... and ${unresolved.length - shown.length} more` : '') +
+      `\nResolve by READING: open each object in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts, and ` +
+      `establish what actually happened to it. Once every one is accounted for, move the log aside ` +
+      `(mv ${args.path} ${args.path}.resolved-<date>) and plan again from a FRESH manifest. Continuing on the old ` +
+      `plan would treat these objects as untouched.`,
+  )
+}
+
+/**
+ * A step that makes SEVERAL irreversible writes against ONE object, with the guarantee that every
+ * one of them is authorised by a revalidation of its own.
+ *
+ * The defect this closes: step 1 re-read the credit note once and then deleted every allocation and
+ * every refund on it. The re-read-before-mutation guarantee is per-OBJECT, so it held for the first
+ * DELETE and merely accompanied the rest — every write after the first acted on a state nobody had
+ * re-checked, in the step that does the most damage. A document re-contacted to a genuine customer,
+ * or re-allocated, between write one and write two was invisible.
+ *
+ * The other way to close it would be to make the batch atomic, so that a single revalidation
+ * genuinely covers all of it. That is not available: each allocation is its own DELETE against its
+ * own URL, a refund reversal is a POST to an entirely different endpoint, Xero has no batch verb
+ * spanning them, no transaction, and no If-Match/version precondition on any of them. There is
+ * nothing for one re-read to cover. So the revalidation is repeated, and this is the loop that
+ * makes repeating it structural rather than a thing each call site remembers.
+ *
+ * The order is fixed and is the whole point: revalidate, confirm the unit, write — per unit. A
+ * caller cannot hoist the revalidation out, because it does not own the loop.
+ */
+export async function writeUnitsIndividually<TUnit, TLive>(args: {
+  units: readonly TUnit[]
+  /** Re-read and revalidate the SUBJECT. Called once per unit, immediately before that unit's write. */
+  revalidate: () => Promise<TLive>
+  /**
+   * The subject is as planned; this confirms the UNIT is too — the allocation still points at the
+   * same invoice for the same amount, the refund is still the same refund. Throws to refuse.
+   */
+  confirmUnit: (unit: TUnit, live: TLive) => void
+  /** The irreversible write. Reached only after this unit's own revalidation and confirmation. */
+  write: (unit: TUnit, live: TLive) => Promise<void>
+}): Promise<void> {
+  for (const unit of args.units) {
+    const live = await args.revalidate()
+    args.confirmUnit(unit, live)
+    await args.write(unit, live)
+  }
+}
+
+/**
+ * THE ONLY WAY THIS TOOLING WRITES.
+ *
+ * It exists so that three things cannot come apart at a call site: the durable intent goes down
+ * BEFORE the request is dispatched, the outcome is settled on disk whatever happens, and the
+ * version Xero reports for the object it moved is captured from THAT response and no other. Each
+ * of those was a separate defect when the call sites did them by hand — or, in the case of the
+ * first, did not do them at all.
+ */
+export async function performWrite<T>(args: {
+  transport: XeroTransport
+  token: TransportToken
+  method: HttpMethod
+  path: string
+  body?: unknown
+  journal: MutationJournal
+  writeLog: WriteIntentLog
+  kind: string
+  label: string
+  /**
+   * The objects whose version THIS write moves, and where to find each one's new version in the
+   * response. Deleting one allocation moves BOTH the credit note and the invoice, so both are
+   * named: whatever the response does not report is recorded as unestablished, never assumed.
+   */
+  subjects?: Array<{ key: string; collectionKey: string; idField: string; id: string }>
+}): Promise<{ committed: boolean; res: XeroResult<T> }> {
+  const { transport, token, method, path, body, journal, writeLog, kind, label } = args
+  // BEFORE the request, not after. This is the whole point of the log.
+  const intentId = writeLog.intend({ kind, label, method, path })
+  let res: XeroResult<T>
+  try {
+    res = await transport.request<T>(token, method, path, body)
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    // A throw is not automatically "nothing was sent". Only the two checks that run BEFORE the
+    // network — the write gate and the call ceiling — can say that. Everything else is settled as
+    // unknown: over-reporting costs the operator one manual read, and under-reporting loses an
+    // irreversible write.
+    const neverDispatched = e instanceof WriteWithoutApplyError || e instanceof CallCeilingError
+    writeLog.settle(intentId, neverDispatched ? 'not-committed' : 'unknown', message)
+    if (!neverDispatched) journal.recordUnknown(kind, label, message)
+    throw e
+  }
+  const commit = commitOf(res)
+  // Settled on disk BEFORE settleWrite, because settleWrite throws on an unknown outcome and the
+  // record has to survive that throw as surely as it has to survive a kill.
+  writeLog.settle(intentId, commit.state, commit.reason)
+  if (commit.state === 'committed') {
+    for (const subject of args.subjects ?? []) {
+      journal.recordOwnWriteVersion(
+        subject.key,
+        versionFromWriteResponse({ data: res.data, collectionKey: subject.collectionKey, idField: subject.idField, id: subject.id }),
+      )
+    }
+  }
+  return { committed: settleWrite({ res, journal, kind, label }), res }
 }
 
 // ---------------------------------------------------------------------------
