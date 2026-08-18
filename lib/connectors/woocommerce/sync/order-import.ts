@@ -15,7 +15,7 @@ import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
+import { directCreateMarker, hasDirectCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import { addMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -376,6 +376,11 @@ async function updateExistingWcOrderFromPayload(
  */
 async function resolveDirectCreateShortfall(orderId: string): Promise<void> {
   try {
+    // Lock-free pre-check FIRST. Almost no order has a marker, and without this every import
+    // and every redelivery would open a transaction and take an exclusive row lock on the sales
+    // order just to find nothing to do. Re-read under the lock below, so this only ever skips
+    // work — see hasDirectCreateMarker for why losing a race here discharges nothing.
+    if (!(await hasDirectCreateMarker(db, orderId))) return
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
       await resolveDirectCreateMarker({ tx, orderId })
@@ -821,10 +826,15 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // either one).
     //
     // No allocation attempt here — the importer already made one. What was missing is the
-    // record. Written under the order lock and in one transaction so it carries the same
-    // guarantee as the transition-side record rather than being best-effort.
-    // Resolves the marker written with the order above. Non-fatal: if it never succeeds the
-    // marker remains as the durable signal.
+    // record. Resolves the marker written with the order above, under the order lock and in one
+    // transaction, so the record and the clearing of the marker can never disagree.
+    //
+    // The guarantee is deliberately WEAKER than the transition path's, and the difference is
+    // worth naming. There, the record is atomic with the crossing: if it cannot be written, the
+    // crossing does not happen. Here the order is already committed by the time this runs, so
+    // failing the import undoes nothing — this is non-fatal, and what carries the obligation
+    // forward is the MARKER, which was written atomically with the order and survives as a
+    // visible WARNING until some later attempt resolves it.
     await resolveDirectCreateShortfall(so.id)
 
     // Queue accounting sales invoice — only for PROCESSING orders and when

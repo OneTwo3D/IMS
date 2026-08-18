@@ -668,3 +668,57 @@ test('the retention exemption uses ALL, not ANY (o3d-z82a)', async () => {
   assert.match(statement, /action <> ALL\(\$\{RETAINED_ACTIONS\}::text\[\]\)/, 'must be <> ALL')
   assert.ok(!/<> ANY\(/.test(statement), '<> ANY is wrong as soon as there is a second entry')
 })
+
+test('the resolve is gated by a LOCK-FREE marker pre-check (o3d-z82a)', async () => {
+  // Almost no order has a marker: only a WooCommerce import mapped to PICKING/PACKING writes
+  // one, and the create path clears it moments later. Without this gate EVERY import and EVERY
+  // redelivery of every order ever imported opened an interactive transaction and took an
+  // exclusive `SELECT ... FOR UPDATE` on the sales order purely to discover there was nothing to
+  // do — on the hot webhook path, contending with allocation and dispatch for that row.
+  const { hasDirectCreateMarker } = await loadHelper()
+
+  const queries: Array<Record<string, unknown>> = []
+  const client = {
+    activityLog: {
+      findFirst: async ({ where, select }: { where: Record<string, unknown>; select: Record<string, unknown> }) => {
+        queries.push({ where, select })
+        return (where.entityId === 'has-one') ? { id: 'm1' } : null
+      },
+    },
+  } as never
+
+  assert.equal(await hasDirectCreateMarker(client, 'has-one'), true)
+  assert.equal(await hasDirectCreateMarker(client, 'has-none'), false)
+  // Indexed lookup only — it must not load the marker's metadata, and it must be scoped to the
+  // marker action or it would match any activity row the order has.
+  assert.deepEqual(queries[0]?.select, { id: true })
+  assert.deepEqual(queries[0]?.where, {
+    entityType: 'SALES_ORDER',
+    entityId: 'has-one',
+    action: 'fulfilment_entry_pending_verification',
+  })
+})
+
+test('the pre-check runs BEFORE the lock, and is never the decision (o3d-z82a)', async () => {
+  // Ordering is the whole point: a pre-check after the transaction opens saves nothing. And the
+  // marker is re-read INSIDE the lock, so racing its creation only defers a resolve — the create
+  // path resolves its own marker, and if that fails the marker survives for the next redelivery.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const source = await readFile(path.join(process.cwd(), 'lib/connectors/woocommerce/sync/order-import.ts'), 'utf8')
+
+  const at = source.indexOf('async function resolveDirectCreateShortfall(')
+  const helper = source.slice(at, at + 1200)
+  const checkAt = helper.indexOf('hasDirectCreateMarker(db, orderId)')
+  const txAt = helper.indexOf('db.$transaction')
+  assert.ok(checkAt !== -1, 'the lock-free pre-check must exist')
+  assert.ok(txAt !== -1 && checkAt < txAt, 'it must short-circuit BEFORE the transaction and the lock')
+
+  const guard = await readFile(path.join(process.cwd(), 'lib/fulfillment/pre-fulfilment-reallocation.ts'), 'utf8')
+  const resolveAt = guard.indexOf('export async function resolveDirectCreateMarker(')
+  assert.match(
+    guard.slice(resolveAt, resolveAt + 900),
+    /const marker = await tx\.activityLog\.findFirst\(/,
+    'the authoritative read must still happen under the caller\'s transaction',
+  )
+})

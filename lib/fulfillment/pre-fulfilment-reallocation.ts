@@ -262,12 +262,40 @@ export function directCreateMarker(orderId: string, createdStatus: string): Pris
 }
 
 /**
+ * Is there an outstanding marker for this order? A LOCK-FREE pre-check, so the common case never
+ * pays for the resolve.
+ *
+ * Almost no order has one: only a WooCommerce import mapped to PICKING/PACKING writes one, and
+ * the create path clears it moments later. Every other import, and every redelivery of every
+ * order ever imported, would otherwise open an interactive transaction and take an exclusive
+ * `SELECT ... FOR UPDATE` on the sales order purely to discover there is nothing to do — on the
+ * hot webhook path, contending with allocation and dispatch for that row.
+ *
+ * Racing the marker's creation costs nothing. A marker written after this read is resolved by
+ * the create path's own call; if that fails, the marker survives (that is its whole purpose) and
+ * the next redelivery picks it up. Missing it here defers the resolve, it never discharges it.
+ *
+ * Indexed by `@@index([entityType, entityId])` on activity_logs.
+ */
+export async function hasDirectCreateMarker(
+  client: Prisma.TransactionClient | typeof db,
+  orderId: string,
+): Promise<boolean> {
+  const marker = await client.activityLog.findFirst({
+    where: { entityType: 'SALES_ORDER', entityId: orderId, action: DIRECT_CREATE_PENDING_ACTION },
+    select: { id: true },
+  })
+  return marker !== null
+}
+
+/**
  * Resolve the marker: verify coverage under the order lock, record a shortfall if there is one,
  * and clear the marker either way.
  *
  * The marker — not the order's current status — is the provenance AND the idempotency key. No
  * marker means already resolved, so this is safe to call repeatedly; and the created status is
- * read back from the marker rather than inferred.
+ * read back from the marker rather than inferred. It is re-read HERE, under the caller's lock:
+ * `hasDirectCreateMarker` is an optimisation outside the lock and is never the decision.
  */
 export async function resolveDirectCreateMarker(params: {
   tx: Prisma.TransactionClient
