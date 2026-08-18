@@ -6,6 +6,7 @@ import {
 import {
   classifyLedgerSettlement,
   describeAttempt,
+  settlementMarkerFor,
   type LedgerSettlementProbe,
   type SettlementVerdict,
 } from './ledger-settlement-evidence'
@@ -230,6 +231,14 @@ function couldBeTheSameDocument(left: unknown, right: unknown): boolean {
 }
 
 /**
+ * Exported for the POST fence, which judges the same rival attempts this planner does and must
+ * not disagree with it about which of them could have settled the document being posted to.
+ */
+export function attemptCouldBeTheSameDocument(left: unknown, right: unknown): boolean {
+  return couldBeTheSameDocument(left, right)
+}
+
+/**
  * Decide whether one manual retry may proceed. Pure, so the rule is testable without a
  * database and cannot drift from the automatic path's definition of ambiguity.
  *
@@ -253,8 +262,10 @@ export function planManualRetry(params: {
 }): ManualRetryPlan {
   const { type, reference, target, siblings, ledger } = params
   const moneyMoving = isMoneyMovingSyncType(type)
+  // Each row is judged by ITS OWN mark: the token a row posted under is what it would have written
+  // into the ledger, so a rival attempt is recognised by its own reference, not by this one's.
   const verdictFor = (row: RetryCandidateRow): SettlementVerdict =>
-    classifyLedgerSettlement(describeAttempt(row.payload), ledger)
+    classifyLedgerSettlement(describeAttempt(row.payload, settlementMarkerFor(row.effectiveToken)), ledger)
 
   const contenders = siblings
     // A sibling missing a field its connector requires was rejected BEFORE any HTTP call, so it

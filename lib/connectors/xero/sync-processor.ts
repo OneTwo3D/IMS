@@ -26,6 +26,7 @@ import {
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { authoriseMoneyPost, ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
+import { settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
@@ -343,6 +344,7 @@ async function enqueueFollowUpSyncLog(
     type,
     payload: plan.payload,
     tokenDisposition: plan.action === 'reuse' ? plan.tokenDisposition : 'rotated',
+    syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
   })
   if (!evidence.clear) {
     await logActivity({
@@ -1412,7 +1414,7 @@ async function processEntry(
       // several more attempts. Everything that happens earlier (the retry guard, the revival
       // guard) is operator feedback; this is the reading the POST itself depends on.
       const authorised = await authoriseMoneyPost({
-        connector: XERO_CONNECTOR, entryId, type, payload, db,
+        connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
       })
       if (!authorised.proceed) return { success: false, error: authorised.error }
       try {
@@ -1421,6 +1423,10 @@ async function processEntry(
           Account: { AccountID: account.externalAccountId },
           Date: paymentDate,
           Amount: amount,
+          // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
+          // amount or date has since been corrected in Xero. Derived from the same token the
+          // Idempotency-Key is built from, so every attempt of this settlement carries one mark.
+          Reference: settlementMarkerFor(followUpIdempotencySource(entryId, payload)),
         }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'invoice-payment') })
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
@@ -1520,7 +1526,7 @@ async function processEntry(
       // several more attempts. Everything that happens earlier (the retry guard, the revival
       // guard) is operator feedback; this is the reading the POST itself depends on.
       const authorised = await authoriseMoneyPost({
-        connector: XERO_CONNECTOR, entryId, type, payload, db,
+        connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
       })
       if (!authorised.proceed) return { success: false, error: authorised.error }
       try {
@@ -1529,7 +1535,10 @@ async function processEntry(
           Account: { AccountID: account.externalAccountId },
           Date: paymentDate,
           Amount: amount,
-          Reference: (payload.reference as string | undefined) ?? undefined,
+          // The operator's reference is KEPT and the mark appended, never replaced: it is what they
+          // will look for on the bank reconciliation. See INVOICE_PAYMENT above for the mark.
+          Reference: [payload.reference as string | undefined, settlementMarkerFor(followUpIdempotencySource(entryId, payload))]
+            .filter(Boolean).join(' '),
         }, { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'bill-payment') })
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
@@ -1595,7 +1604,7 @@ async function processEntry(
       // several more attempts. Everything that happens earlier (the retry guard, the revival
       // guard) is operator feedback; this is the reading the POST itself depends on.
       const authorised = await authoriseMoneyPost({
-        connector: XERO_CONNECTOR, entryId, type, payload, db,
+        connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
       })
       if (!authorised.proceed) return { success: false, error: authorised.error }
       const result = await allocatePurchaseCreditNote(

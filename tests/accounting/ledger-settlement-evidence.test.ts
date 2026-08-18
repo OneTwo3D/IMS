@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   classifyLedgerSettlement,
   describeAttempt,
+  settlementMarkerFor,
   type LedgerSettlementRecord,
 } from '@/lib/domain/accounting/ledger-settlement-evidence'
 
@@ -15,7 +16,7 @@ import {
  * tests are written to pin the asymmetry, not merely the happy path.
  */
 
-const attempt = { amount: 10, date: '2026-08-01' }
+const attempt = { amount: 10, date: '2026-08-01', marker: null }
 const records = (...rows: LedgerSettlementRecord[]) => ({ ok: true as const, records: rows })
 
 test('an empty ledger clears the attempt (o3d-0m56)', () => {
@@ -58,7 +59,10 @@ test('an attempt IMS cannot describe is UNKNOWN (o3d-0m56)', () => {
   // The processors default a missing payment date to "today at post time", which cannot be
   // reconstructed afterwards — so a row that pins neither amount nor date can never be matched,
   // and must not be treated as absent from the ledger.
-  for (const partial of [{ amount: null, date: '2026-08-01' }, { amount: 10, date: null }]) {
+  for (const partial of [
+    { amount: null, date: '2026-08-01', marker: null },
+    { amount: 10, date: null, marker: null },
+  ]) {
     assert.equal(classifyLedgerSettlement(partial, records()).outcome, 'unknown', JSON.stringify(partial))
   }
 })
@@ -71,17 +75,69 @@ test('a ledger record IMS cannot measure is UNKNOWN (o3d-0m56)', () => {
 })
 
 test('the attempt is described from the payload the connector actually sends (o3d-0m56)', () => {
-  assert.deepEqual(describeAttempt({ amount: 12.5, paymentDate: '2026-08-01' }), { amount: 12.5, date: '2026-08-01' })
+  assert.deepEqual(describeAttempt({ amount: 12.5, paymentDate: '2026-08-01' }), { amount: 12.5, date: '2026-08-01', marker: null })
   // Allocations carry `date`, payments carry `paymentDate`; both are sliced to 10 characters
   // exactly as the processors slice them.
-  assert.deepEqual(describeAttempt({ amount: 1, date: '2026-08-01T09:30:00Z' }), { amount: 1, date: '2026-08-01' })
+  assert.deepEqual(describeAttempt({ amount: 1, date: '2026-08-01T09:30:00Z' }), { amount: 1, date: '2026-08-01', marker: null })
   // A zero amount is a real request — the connectors reject an amount only when it is null.
-  assert.deepEqual(describeAttempt({ amount: 0, paymentDate: '2026-08-01' }), { amount: 0, date: '2026-08-01' })
-  assert.deepEqual(describeAttempt({ paymentDate: '2026-08-01' }), { amount: null, date: '2026-08-01' })
-  assert.deepEqual(describeAttempt({ amount: 1 }), { amount: 1, date: null })
+  assert.deepEqual(describeAttempt({ amount: 0, paymentDate: '2026-08-01' }), { amount: 0, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt({ paymentDate: '2026-08-01' }), { amount: null, date: '2026-08-01', marker: null })
+  assert.deepEqual(describeAttempt({ amount: 1 }), { amount: 1, date: null, marker: null })
   // A blank or truncated date is not a date. Slicing it anyway would produce a value that can
   // never match a real settlement, which reads as "clear" for the wrong reason.
-  assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '' }), { amount: 1, date: null })
-  assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '2026-08' }), { amount: 1, date: null })
-  assert.deepEqual(describeAttempt(null), { amount: null, date: null })
+  assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '' }), { amount: 1, date: null, marker: null })
+  assert.deepEqual(describeAttempt({ amount: 1, paymentDate: '2026-08' }), { amount: 1, date: null, marker: null })
+  assert.deepEqual(describeAttempt(null), { amount: null, date: null, marker: null })
+})
+
+// --- the durable mark (Codex round 3) ---
+
+test("a settlement carrying this attempt's own mark IS this attempt (o3d-0m56)", () => {
+  // Amount and date are both editable in both ledgers. Correct a committed payment's date in Xero
+  // and it stops matching the attempt that created it while still paying the invoice — so a retry
+  // would add a second one. The mark does not move.
+  const marker = settlementMarkerFor('followup:xero:INVOICE_PAYMENT:SalesOrder:so-1:inv-9')
+  const marked = { amount: 10, date: '2026-08-01', marker }
+
+  const edited = classifyLedgerSettlement(marked, {
+    ok: true,
+    records: [{ amount: 999, date: '2020-01-01', id: 'PAY-1', reference: `Deposit ${marker}` }],
+  })
+  assert.equal(edited.outcome, 'present', 'neither field matches, and it is still the same payment')
+  assert.match(edited.outcome === 'present' ? edited.detail : '', new RegExp(marker))
+})
+
+test('another entry\'s mark is not this attempt (o3d-0m56)', () => {
+  const mine = settlementMarkerFor('token-a')
+  const theirs = settlementMarkerFor('token-b')
+  assert.notEqual(mine, theirs)
+  assert.deepEqual(
+    classifyLedgerSettlement({ amount: 10, date: '2026-08-01', marker: mine }, {
+      ok: true,
+      records: [{ amount: 4, date: '2026-07-01', reference: theirs }],
+    }),
+    { outcome: 'clear' },
+    'a payment IMS made for something else must not strand this one',
+  )
+})
+
+test('the mark is stable, short, and derived from the token (o3d-0m56)', () => {
+  // It shares a user-visible reference field, so it has to stay short — and it has to be identical
+  // for every attempt of the same settlement, which is what makes a retry able to find it.
+  const marker = settlementMarkerFor('invoice-payment:payment:p1')
+  assert.equal(marker, settlementMarkerFor('invoice-payment:payment:p1'))
+  assert.match(marker, /^IMS-[0-9a-f]{12}$/)
+})
+
+test('an unmarked settlement still matches on amount and date (o3d-0m56)', () => {
+  // Everything posted before IMS started marking its work — and Xero credit-note allocations,
+  // which have no reference field at all — can only be recognised this way.
+  const marker = settlementMarkerFor('token-a')
+  assert.equal(
+    classifyLedgerSettlement({ amount: 10, date: '2026-08-01', marker }, {
+      ok: true,
+      records: [{ amount: 10, date: '2026-08-01', reference: null }],
+    }).outcome,
+    'present',
+  )
 })

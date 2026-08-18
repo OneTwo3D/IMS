@@ -65,7 +65,8 @@ import {
   unresolvedInvoicePaymentAttempts,
 } from '@/lib/domain/accounting/invoice-payment-registration'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
-import { attemptCouldHaveReachedTheLedger } from '@/lib/domain/accounting/followup-retry-guard'
+import { attemptCouldHaveReachedTheLedger, effectiveTokenFor } from '@/lib/domain/accounting/followup-retry-guard'
+import { settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
 import {
   aggregatePaymentSyncRows,
@@ -698,6 +699,8 @@ export async function getSalesOrders(
  */
 type InvoicePaymentSyncRow = PaymentSyncRow & {
   paymentId: string | null
+  /** The mark this attempt would have written into the ledger (o3d-0m56). */
+  settlementMarker: string | null
   /** The date that attempt sent, so a settlement in the ledger can be matched to it (o3d-0m56). */
   paymentDate: string | null
   /** False when the stored body was too incomplete for the connector to have made the call. */
@@ -716,7 +719,7 @@ async function loadInvoicePaymentSyncRows(
   if (!connector) return []
   const rows = await client.accountingSyncLog.findMany({
     where: { connector, type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: orderId },
-    select: { status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true },
+    select: { id: true, status: true, externalTransactionId: true, errorMessage: true, retryCount: true, payload: true },
     orderBy: { createdAt: 'desc' },
   })
   return rows.map((r) => {
@@ -736,6 +739,12 @@ async function loadInvoicePaymentSyncRows(
       // Judged by the SAME rule the retry guard uses, so the two paths cannot disagree about
       // which failed attempts could have reached the ledger.
       couldHaveReachedLedger: attemptCouldHaveReachedTheLedger('INVOICE_PAYMENT', r.payload),
+      // The mark this attempt would have written into the ledger, derived exactly as its connector
+      // derives the token it posted under (o3d-0m56). Matching it identifies the attempt even if
+      // its amount or date has since been corrected there.
+      settlementMarker: connector === 'xero' || connector === 'quickbooks'
+        ? settlementMarkerFor(effectiveTokenFor(connector, { id: r.id, payload: r.payload }))
+        : null,
       paymentId: payloadPaymentId(r.payload),
     }
   })

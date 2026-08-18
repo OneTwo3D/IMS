@@ -470,6 +470,25 @@ Recording a **second receipt** against an order with an unresolved failed attemp
 same grounds, with a warning on the order: the receipt stays recorded in IMS, and nothing is sent
 to Xero until the earlier attempt is resolved.
 
+### Closing a Payment That Is Already in the Ledger
+
+Those refusals leave one state with no way out on its own: a payment that **did** reach Xero but
+whose response was lost. It can never be retried (the ledger holds it), it will never post, and it
+goes on blocking the next receipt for that order as an unresolved attempt.
+
+Failed **payment** rows on the Sync Dashboard therefore carry an extra action — *Already paid in the
+accounting system? Check and close this entry*. It is not a "mark as done": IMS re-reads the
+document in Xero and closes the row **only if it can see the matching settlement itself**. Three
+outcomes:
+
+| What the ledger says | What happens |
+| --- | --- |
+| It holds the payment | The row is closed as synced, and the remote payment's id is recorded against it, so the row afterwards says *which* payment settled it |
+| It does **not** hold the payment | Refused — closing it would leave the invoice unpaid in Xero with nothing in IMS still asking anyone to look at it. Retry the row instead, or record the payment in Xero by hand first |
+| It could not be read | Refused. Try again when the connector responds |
+
+Only a `FAILED` payment row can be closed this way, and every use is written to the activity log.
+
 ### Tax Rate Sync (Multi-Component Profiles)
 
 When an IMS VAT rate has one or more active components (e.g. Canada `GST 5% + PST 7%`), saving the

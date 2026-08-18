@@ -58,6 +58,12 @@ export type ExistingInvoicePaymentSync = {
   /** The local Payment row it was queued for; null on rows queued before that was recorded. */
   paymentId?: string | null
   /**
+   * The mark this attempt would have written into the ledger, derived from its own idempotency
+   * token (o3d-0m56 round 3). Null when the caller cannot derive one — the amount-and-date match
+   * is then the only evidence available, and it is weaker.
+   */
+  settlementMarker?: string | null
+  /**
    * False when the stored body was missing a field the connector requires, which PROVES the attempt
    * was rejected before any HTTP call. Undefined means unknown, which reads as "it could have".
    */
@@ -212,7 +218,7 @@ export function invoicePaymentRowSetBlocker(input: {
     }
     for (const attempt of unresolved) {
       const verdict = classifyLedgerSettlement(
-        { amount: attempt.amount ?? null, date: attempt.paymentDate ?? null },
+        { amount: attempt.amount ?? null, date: attempt.paymentDate ?? null, marker: attempt.settlementMarker ?? null },
         { ok: true, records: input.ledgerSettlements },
       )
       if (verdict.outcome === 'clear') continue

@@ -27,6 +27,25 @@
  * after the fact). `unknown` is never treated as `clear`.
  */
 
+import { createHash } from 'node:crypto'
+
+/**
+ * The mark IMS writes into the settlement it creates, so it can recognise its own work later.
+ *
+ * WHY AMOUNT AND DATE ARE NOT ENOUGH (Codex round 3). Both are editable in both ledgers. Correct a
+ * committed payment's date in Xero and it stops matching the attempt that created it, while still
+ * paying the invoice — so a retry would add a second one. A mark derived from the attempt's own
+ * idempotency token is not editable by accident: it is written once, in the payment's reference
+ * field, and a matching mark is proof of authorship in a way that a number and a day never are.
+ *
+ * Short by design — it shares a user-visible reference field with whatever the operator typed.
+ * Twelve hex characters of a SHA-256 is 48 bits, which is not a collision anyone will meet across
+ * one organisation's payments, and the token it is built from is already scoped to one document.
+ */
+export function settlementMarkerFor(effectiveToken: string): string {
+  return `IMS-${createHash('sha256').update(effectiveToken).digest('hex').slice(0, 12)}`
+}
+
 /** One settlement already recorded against the target document, as the ledger reports it. */
 export type LedgerSettlementRecord = {
   /** In the document's currency, as posted. Null when the ledger did not report one. */
@@ -35,6 +54,11 @@ export type LedgerSettlementRecord = {
   date: string | null
   /** The remote id, carried only so a refusal can name it. */
   id?: string | null
+  /**
+   * The reference/note field IMS writes its mark into (Xero `Payment.Reference`, QuickBooks
+   * `PrivateNote`). Null when the ledger does not expose one for this kind of settlement.
+   */
+  reference?: string | null
 }
 
 export type LedgerSettlementProbe =
@@ -46,13 +70,22 @@ export type AttemptDescription = {
   amount: number | null
   /** `YYYY-MM-DD` as the processor would have sent it, or null when the row does not pin one. */
   date: string | null
+  /**
+   * The mark this attempt would have written, or null when the caller cannot derive one. Matching
+   * it is DEFINITIVE — it survives an edit to the amount or the date, which the pair below does not.
+   */
+  marker: string | null
 }
 
 export type SettlementVerdict =
   /** Positively established: the ledger holds no settlement matching this attempt. */
   | { outcome: 'clear' }
-  /** Positively established: it does. Re-posting would very likely duplicate it. */
-  | { outcome: 'present'; detail: string }
+  /**
+   * Positively established: it does. Re-posting would very likely duplicate it — and `matchedId`
+   * is what an operator's reconciliation writes back, so the row records WHICH settlement it was
+   * rather than merely that one existed.
+   */
+  | { outcome: 'present'; detail: string; matchedId: string | null }
   /** Not established either way. Treated exactly as `present` by every caller. */
   | { outcome: 'unknown'; reason: string }
 
@@ -81,12 +114,13 @@ function attemptDate(payload: Record<string, unknown>): string | null {
   return null
 }
 
-export function describeAttempt(payload: unknown): AttemptDescription {
+export function describeAttempt(payload: unknown, marker?: string | null): AttemptDescription {
   const record = asRecord(payload)
   const amount = record.amount
   return {
     amount: typeof amount === 'number' && Number.isFinite(amount) ? amount : null,
     date: attemptDate(record),
+    marker: marker ?? null,
   }
 }
 
@@ -108,6 +142,23 @@ export function classifyLedgerSettlement(
       reason: `the accounting connector could not be asked what it already holds (${probe.reason})`,
     }
   }
+  // THE MARK FIRST, and on its own terms. A settlement carrying this attempt's mark IS this
+  // attempt, whatever has since been done to its amount or its date — which is exactly the case
+  // the pair below cannot see. Checked across every record before anything else is judged.
+  if (attempt.marker) {
+    for (const record of probe.records) {
+      if (typeof record.reference === 'string' && record.reference.includes(attempt.marker)) {
+        return {
+          outcome: 'present',
+          matchedId: record.id ?? null,
+          detail: `${record.amount === null ? 'a payment' : money(record.amount)}`
+            + `${record.date ? ` dated ${record.date}` : ''} carrying this entry's own reference `
+            + `${attempt.marker}${record.id ? ` (${record.id})` : ''}`,
+        }
+      }
+    }
+  }
+
   if (attempt.amount === null || attempt.date === null) {
     return {
       outcome: 'unknown',
@@ -127,6 +178,7 @@ export function classifyLedgerSettlement(
     if (Math.abs(record.amount - attempt.amount) <= AMOUNT_EPSILON && record.date === attempt.date) {
       return {
         outcome: 'present',
+        matchedId: record.id ?? null,
         detail: `${money(record.amount)} dated ${record.date}`
           + (record.id ? ` (${record.id})` : ''),
       }

@@ -38,7 +38,7 @@ test('xero reads payments from the SINGLE-invoice endpoint (o3d-0m56)', async ()
       Invoices: [{
         InvoiceID: 'inv-1',
         Payments: [
-          { PaymentID: 'PAY-1', Date: '/Date(1785542400000+0000)/', Amount: 10 },
+          { PaymentID: 'PAY-1', Date: '/Date(1785542400000+0000)/', Amount: 10, Reference: 'IMS-abc123abc123' },
           { PaymentID: 'PAY-2', Date: '2026-07-01T00:00:00', Amount: 25 },
         ],
       }],
@@ -51,8 +51,8 @@ test('xero reads payments from the SINGLE-invoice endpoint (o3d-0m56)', async ()
   assert.deepEqual(probe, {
     ok: true,
     records: [
-      { amount: 10, date: '2026-08-01', id: 'PAY-1' },
-      { amount: 25, date: '2026-07-01', id: 'PAY-2' },
+      { amount: 10, date: '2026-08-01', id: 'PAY-1', reference: 'IMS-abc123abc123' },
+      { amount: 25, date: '2026-07-01', id: 'PAY-2', reference: null },
     ],
   })
 })
@@ -92,7 +92,7 @@ test('xero: a credit-note allocation is read from the credit note, filtered to T
   )
 
   assert.deepEqual(calls, [{ path: 'CreditNotes/cn-1' }])
-  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01' }] },
+  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', reference: null }] },
     'the same credit note legitimately offsets other bills; only this one is evidence')
 })
 
@@ -130,6 +130,7 @@ test('quickbooks follows the invoice\'s linked payments and measures the APPLIED
       Payment: {
         TxnDate: '2026-08-01',
         TotalAmt: 500,
+        PrivateNote: 'IMS-deadbeef0000',
         Line: [
           { Amount: 10, LinkedTxn: [{ TxnId: 'inv-1', TxnType: 'Invoice' }] },
           { Amount: 490, LinkedTxn: [{ TxnId: 'inv-OTHER', TxnType: 'Invoice' }] },
@@ -141,7 +142,8 @@ test('quickbooks follows the invoice\'s linked payments and measures the APPLIED
   const probe = await probeQuickBooksSettlement({ type: 'INVOICE_PAYMENT', payload: { accountingInvoiceId: 'inv-1' } }, get)
 
   assert.deepEqual(calls, [{ path: 'invoice/inv-1' }, { path: 'payment/55' }], 'the Estimate link is not a settlement')
-  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '55' }] })
+  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '55', reference: 'IMS-deadbeef0000' }] },
+    'and PrivateNote is carried through as the mark')
 })
 
 test('quickbooks: a linked settlement it cannot read fails the whole probe (o3d-0m56)', async () => {
@@ -164,7 +166,7 @@ test('quickbooks: a bill payment reads bill → billpayment (o3d-0m56)', async (
   })
   const probe = await probeQuickBooksSettlement({ type: 'BILL_PAYMENT', payload: { accountingInvoiceId: 'bill-1' } }, get)
   assert.deepEqual(calls, [{ path: 'bill/bill-1' }, { path: 'billpayment/77' }])
-  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '77' }] })
+  assert.deepEqual(probe, { ok: true, records: [{ amount: 10, date: '2026-08-01', id: '77', reference: null }] })
 })
 
 test('a row with no document id, and a type QuickBooks cannot answer, both fail closed (o3d-0m56)', async () => {

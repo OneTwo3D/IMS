@@ -19,6 +19,7 @@ import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import { authoriseMoneyPost, ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
+import { settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
@@ -223,6 +224,7 @@ async function enqueueFollowUpSyncLog(
     type,
     payload: plan.payload,
     tokenDisposition: plan.action === 'reuse' ? plan.tokenDisposition : 'rotated',
+    syncLogId: plan.action === 'reuse' ? plan.syncLogId : undefined,
   })
   if (!evidence.clear) {
     await logActivity({
@@ -719,7 +721,7 @@ async function processEntry(
       // several more attempts. Everything that happens earlier (the retry guard, the revival
       // guard) is operator feedback; this is the reading the POST itself depends on.
       const authorised = await authoriseMoneyPost({
-        connector: QBO_CONNECTOR, entryId, type, payload, db,
+        connector: QBO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
       })
       if (!authorised.proceed) return { success: false, error: authorised.error }
       try {
@@ -730,6 +732,10 @@ async function processEntry(
         const paymentRes = await qboPostIdempotent<{ Payment: { Id: string } }>('payment', {
           CustomerRef: { value: customerRefId },
           TotalAmt: amount,
+          // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
+          // amount or date has since been corrected. PrivateNote is not customer-visible, and it
+          // is derived from the same source the Request-Id is built from.
+          PrivateNote: settlementMarkerFor(getIdempotencySource(entryId, type, referenceId, payload)),
           TxnDate: paymentDate,
           DepositToAccountRef: accountRef,
           Line: [{
@@ -777,7 +783,7 @@ async function processEntry(
       // several more attempts. Everything that happens earlier (the retry guard, the revival
       // guard) is operator feedback; this is the reading the POST itself depends on.
       const authorised = await authoriseMoneyPost({
-        connector: QBO_CONNECTOR, entryId, type, payload, db,
+        connector: QBO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
       })
       if (!authorised.proceed) return { success: false, error: authorised.error }
       try {
@@ -786,6 +792,8 @@ async function processEntry(
         const paymentRes = await qboPostIdempotent<{ BillPayment: { Id: string } }>('billpayment', {
           VendorRef: { value: vendorRefId },
           TotalAmt: amount,
+          // See INVOICE_PAYMENT above — the same mark, from the same source as the Request-Id.
+          PrivateNote: settlementMarkerFor(getIdempotencySource(entryId, type, referenceId, payload)),
           TxnDate: paymentDate,
           PayType: 'Check',
           CheckPayment: { BankAccountRef: accountRef },

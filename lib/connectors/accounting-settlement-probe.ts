@@ -12,6 +12,7 @@
  * kind of document"; the comparison itself is pure and lives in the domain module.
  */
 
+import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
 
 export type SettlementProbeTarget = {
@@ -55,7 +56,10 @@ export function normaliseXeroSettlementDate(value: unknown): string | null {
 
 /** The document a settlement probe reads, per money-moving type. */
 type XeroPaymentsResponse = {
-  Invoices?: Array<{ InvoiceID?: string; Payments?: Array<{ PaymentID?: string; Date?: string; Amount?: number }> }>
+  Invoices?: Array<{
+    InvoiceID?: string
+    Payments?: Array<{ PaymentID?: string; Date?: string; Amount?: number; Reference?: string }>
+  }>
 }
 type XeroCreditNoteResponse = {
   CreditNotes?: Array<{
@@ -87,7 +91,10 @@ export async function probeXeroSettlement(
     // Only allocations against THIS bill: the same credit note legitimately offsets others.
     const records: LedgerSettlementRecord[] = (note.Allocations ?? [])
       .filter((a) => str(a.Invoice?.InvoiceID).toLowerCase() === invoiceId.toLowerCase())
-      .map((a) => ({ amount: num(a.Amount), date: normaliseXeroSettlementDate(a.Date) }))
+      // No reference field exists on a Xero credit-note allocation, so this type has no mark to
+      // match and falls back to amount and date alone. Stated rather than left to be inferred from
+      // a missing property.
+      .map((a) => ({ amount: num(a.Amount), date: normaliseXeroSettlementDate(a.Date), reference: null }))
     return { ok: true, records }
   }
 
@@ -103,6 +110,9 @@ export async function probeXeroSettlement(
     amount: num(p.Amount),
     date: normaliseXeroSettlementDate(p.Date),
     id: str(p.PaymentID) || null,
+    // Where IMS writes its own mark; matching it identifies the attempt whatever has since been
+    // done to the amount or the date.
+    reference: str(p.Reference) || null,
   }))
   return { ok: true, records }
 }
@@ -166,7 +176,7 @@ export async function probeQuickBooksSettlement(
 
   const records: LedgerSettlementRecord[] = []
   for (const id of settlementIds) {
-    const res = await qboGet<Record<string, { TxnDate?: string; Line?: QboPaymentLine[] } | undefined>>(
+    const res = await qboGet<Record<string, { TxnDate?: string; PrivateNote?: string; Line?: QboPaymentLine[] } | undefined>>(
       `${settlementPath}/${encodeURIComponent(id)}`,
     )
     // A settlement we know EXISTS but cannot read is the most dangerous shape of all: dropping it
@@ -179,6 +189,8 @@ export async function probeQuickBooksSettlement(
       amount: qboAmountAppliedTo(settlement.Line, documentId, linkedType),
       date: date.length >= 10 ? date.slice(0, 10) : null,
       id,
+      // PrivateNote is where IMS writes its mark on this connector.
+      reference: str(settlement.PrivateNote) || null,
     })
   }
   return { ok: true, records }
@@ -233,13 +245,16 @@ export async function ledgerClearsFollowUpRevival(params: {
   type: string
   payload: unknown
   tokenDisposition: 'pinned' | 'rotated'
+  /** The row being revived, so its own mark can be looked for. */
+  syncLogId?: string
 }): Promise<{ clear: true } | { clear: false; reason: string }> {
-  const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
+  const { isMoneyMovingSyncType, effectiveTokenFor } = await import('@/lib/domain/accounting/followup-retry-guard')
   if (params.tokenDisposition !== 'pinned' || !isMoneyMovingSyncType(params.type)) return { clear: true }
 
-  const { classifyLedgerSettlement, describeAttempt } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
+  const { classifyLedgerSettlement, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
-  const verdict = classifyLedgerSettlement(describeAttempt(params.payload), probe)
+  const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.syncLogId ?? '', payload: params.payload }))
+  const verdict = classifyLedgerSettlement(describeAttempt(params.payload, marker), probe)
   if (verdict.outcome === 'clear') return { clear: true }
   return {
     clear: false,
@@ -264,7 +279,13 @@ export async function ledgerClearsFollowUpRevival(params: {
  * Both close the same way: the reading that permits a POST is taken in the same code path as the
  * POST, immediately before it. `remoteAttemptedAt` is what makes that possible — it is set once,
  * before the first call, and survives every retryCount reset, so a row can always answer "have I
- * been sent before?". A first attempt is free; every repeat pays for a GET.
+ * been sent before?". A first attempt against a document nothing else has been sent to is free;
+ * everything else pays for a GET.
+ *
+ * "Everything else" is wider than this row's own history, and that is round 3: the fence judges
+ * this attempt AND every rival attempt in the same scope, each against its own mark. A rival's
+ * committed payment carries the rival's mark, so it is invisible to this row's — and invisible to
+ * the amount-and-date fallback as soon as the two receipts differ.
  *
  * Returns the refusal as an ERROR rather than a silent skip: the caller reports it exactly like a
  * remote rejection, so the row retries a bounded number of times and then ends FAILED — visible,
@@ -274,11 +295,24 @@ export async function authoriseMoneyPost(params: {
   connector: 'xero' | 'quickbooks'
   entryId: string
   type: string
+  referenceType: string
+  referenceId: string
   payload: unknown
   /** Injected so the guard is testable without a database. */
   db: {
     accountingSyncLog: {
       updateMany: (args: { where: { id: string; remoteAttemptedAt: null }; data: { remoteAttemptedAt: Date } }) => Promise<{ count: number }>
+      findMany: (args: {
+        where: {
+          connector: string
+          type: AccountingSyncType
+          referenceType: string
+          referenceId: string
+          remoteAttemptedAt: { not: null }
+          id: { not: string }
+        }
+        select: { id: true; payload: true }
+      }) => Promise<Array<{ id: string; payload: unknown }>>
     }
   }
   now?: () => Date
@@ -301,19 +335,85 @@ export async function authoriseMoneyPost(params: {
     where: { id: params.entryId, remoteAttemptedAt: null },
     data: { remoteAttemptedAt: (params.now ?? (() => new Date()))() },
   })
-  if (claimed.count > 0) return { proceed: true }
+  // This ROW may be new — but the DOCUMENT may not be (Codex round 3). A receipt recorded beside an
+  // older failed attempt queues a brand-new row, and that row's first post would otherwise go out on
+  // the strength of a reading taken before it was even created. So: every OTHER row in this scope
+  // that has ever been sent, whatever became of it.
+  //
+  // Fetched even when this row is a repeat, because a rival attempt is a hazard to it too, and it
+  // is one indexed read on a path that is about to make a network call anyway.
+  const attemptedSiblings = await params.db.accountingSyncLog.findMany({
+    where: {
+      connector: params.connector,
+      type: params.type as AccountingSyncType,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      remoteAttemptedAt: { not: null },
+      id: { not: params.entryId },
+    },
+    select: { id: true, payload: true },
+  })
+  // A first attempt from a row whose document nothing has ever been sent to cannot duplicate
+  // anything. That is the only free pass, and it is the common case.
+  if (claimed.count > 0 && attemptedSiblings.length === 0) return { proceed: true }
 
-  const { classifyLedgerSettlement, describeAttempt } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
+  const { classifyLedgerSettlement, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
+  const { effectiveTokenFor, attemptCouldHaveReachedTheLedger, attemptCouldBeTheSameDocument } = await import('@/lib/domain/accounting/followup-retry-guard')
+
+  // EVERY CONTENDER, EACH BY ITS OWN MARK — this row and every rival that could have settled the
+  // same document (Codex round 3 follow-up). Judging only this row's own attempt was the hole the
+  // mark was invented to close, reopened one level down: the sibling that made this post suspicious
+  // in the first place was never asked about. Its payment carries ITS token's mark, not this one's,
+  // so a settlement it committed is invisible to this row's marker — and invisible to the amount-
+  // and-date fallback too the moment the second receipt is entered for a different day or amount,
+  // which is exactly what an operator re-recording a lost payment does.
+  //
+  // This row is a contender only when it did NOT claim the stamp. Winning the claim is proof that
+  // no remote call has ever left this row, so its own attempt cannot be in the ledger; judging it
+  // anyway would refuse a fresh receipt whenever some unrelated payment happened to share its
+  // amount and date, and leave the row pointing at a settlement that was never its own.
+  const contenders: Array<{ id: string; payload: unknown; own: boolean }> = [
+    ...(claimed.count > 0 ? [] : [{ id: params.entryId, payload: params.payload, own: true }]),
+    ...attemptedSiblings.map((row) => ({ id: row.id, payload: row.payload, own: false })),
+  ]
+    // Filtered the same two ways `planManualRetry` filters its contenders, so the POST fence and
+    // the retry planner cannot disagree about who the rivals are.
+    //
+    // A body missing a field its connector requires was rejected before any HTTP call, so it
+    // provably committed nothing. Without this, one malformed row makes a valid payment unsendable
+    // for ever — and a malformed body of our own would be refused for want of evidence about a
+    // call that was never made, which is the exemption `planManualRetry` already gives its target.
+    .filter((row) => attemptCouldHaveReachedTheLedger(params.type, row.payload))
+    // An attempt against a different document cannot have settled this one, and is not covered by
+    // the probe below either — so judging this post against it would be comparing an attempt with
+    // a ledger reading that says nothing about it.
+    .filter((row) => attemptCouldBeTheSameDocument(row.payload, params.payload))
+
+  // Nothing that could have settled this document has ever been sent, or been sendable at all, so
+  // there is nothing for a ledger read to rule out. Skipped rather than taken and ignored: it is a
+  // network call on the money path, and it must not be spent to reach a foregone conclusion.
+  if (contenders.length === 0) return { proceed: true }
+
   const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
-  const verdict = classifyLedgerSettlement(describeAttempt(params.payload), probe)
-  if (verdict.outcome === 'clear') return { proceed: true }
-  return {
-    proceed: false,
-    error: verdict.outcome === 'present'
-      ? `Not sent: the accounting connector already holds a settlement of ${verdict.detail} against this `
-        + 'document, matching an earlier attempt from this entry. Sending it again would pay it twice. '
-        + 'Check the ledger and resolve this entry by hand.'
-      : `Not sent: this entry has been attempted before and IMS could not establish whether that attempt `
-        + `reached the ledger (${verdict.reason}). Re-posting could pay the document twice.`,
+
+  for (const contender of contenders) {
+    const marker = settlementMarkerFor(effectiveTokenFor(params.connector, contender))
+    const verdict = classifyLedgerSettlement(describeAttempt(contender.payload, marker), probe)
+    if (verdict.outcome === 'clear') continue
+    if (verdict.outcome === 'present') {
+      return {
+        proceed: false,
+        error: `Not sent: the accounting connector already holds a settlement of ${verdict.detail} against `
+          + `this document, matching ${contender.own ? 'an earlier attempt from this entry' : `another entry for it (${contender.id})`}. `
+          + 'Sending it again would pay it twice. Check the ledger and resolve this entry by hand.',
+      }
+    }
+    return {
+      proceed: false,
+      error: `Not sent: ${contender.own ? 'this entry has been attempted before' : `another entry for this document has been attempted (${contender.id})`} `
+        + `and IMS could not establish whether that attempt reached the ledger (${verdict.reason}). `
+        + 'Re-posting could pay the document twice.',
+    }
   }
+  return { proceed: true }
 }

@@ -139,6 +139,24 @@ test('attempts against a DIFFERENT document do not trigger a refusal (o3d-0m56)'
     { id: 'log-old', effectiveToken: 'log-old', payload: postable('inv-old') },
   ]
   assert.deepEqual(plan({ ...scopeArgs, target: rows[0]!, siblings: rows }), { action: 'allow' })
+
+  // ...and specifically when that other attempt is UNRESOLVABLE. Two clear attempts are allowed
+  // by the rest of rule 1 whatever the anchor filter does, so a sibling nobody can rule out is
+  // what actually distinguishes the filter from its absence: `inv-old` records no date, so its
+  // own verdict can never be `clear`, and counting it as a contender would refuse `inv-new` for
+  // ever on evidence about a document it has nothing to do with. The ledger reading here is the
+  // one taken for inv-new, which is exactly why it says nothing about inv-old.
+  const unresolvableRival = [
+    rows[0]!,
+    // Complete enough to have posted (the connector requires id, bank account and amount) but
+    // pinning no date, so `classifyLedgerSettlement` can only ever answer `unknown` about it.
+    { id: 'log-old', effectiveToken: 'log-old', payload: { accountingInvoiceId: 'inv-old', bankAccountId: 'bank-1', amount: 10 } },
+  ]
+  assert.deepEqual(
+    plan({ ...scopeArgs, target: unresolvableRival[0]!, siblings: unresolvableRival }),
+    { action: 'allow' },
+    'an attempt on another document cannot make this one unresolvable',
+  )
 })
 
 test('an anchorless money row is UNPOSTABLE, so it neither counts nor strands (o3d-0m56)', () => {
@@ -244,6 +262,17 @@ for (const action of ACTIONS) {
     const siblingAt = body.indexOf('siblingRows')
     const planAt = body.indexOf('planManualRetry')
     assert.ok(siblingAt < planAt, 'siblings must be loaded before the guard runs')
+
+    // ...and loaded BY SCOPE. Position alone does not say that: a query keyed on the selected
+    // candidates' own ids sits in exactly the same place and answers "no siblings" every time,
+    // which is the failure this test is named for. So the query itself is pinned — the document
+    // is what it selects on, and the chosen rows are what it must NOT select on.
+    const queryAt = body.indexOf('const siblingRows = await tx.accountingSyncLog.findMany({')
+    assert.notEqual(queryAt, -1, 'the siblings must come from a query, not from the candidate list')
+    const query = body.slice(queryAt, body.indexOf('select:', queryAt))
+    assert.match(query, /referenceType: scope\.referenceType,\s*\n\s*referenceId: scope\.referenceId,/,
+      'the snapshot must be keyed on the DOCUMENT')
+    assert.ok(!/\bid:/.test(query), 'and never narrowed to the rows the operator happened to select')
   })
 }
 

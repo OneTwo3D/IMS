@@ -15,6 +15,7 @@ import {
   connectAccountingConnector,
   disconnectAccountingConnector,
   fetchAccountingTaxRates,
+  reconcileSettledAccountingSyncRow,
   retryFailedAccountingSync,
   saveAccountingConnectionSettings,
   saveAccountingSettings,
@@ -110,6 +111,13 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
+/**
+ * The types the reconcile action accepts (o3d-0m56). Kept in step with isMoneyMovingSyncType by a
+ * test — a type shown here that the server refuses would be a button that only ever errors, and a
+ * type missing here would hide the only exit a wedged payment row has.
+ */
+const MONEY_SYNC_TYPES = new Set(['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'])
+
 export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: AccountingConnectorClientProps) {
   const router = useRouter()
   const formatDateTime = useFormatDateTime()
@@ -152,6 +160,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [logPage, setLogPage] = useState(0)
   const [retryingId, setRetryingId] = useState<string | null>(null)
   const [retryingAll, setRetryingAll] = useState(false)
+  const [reconcilingId, setReconcilingId] = useState<string | null>(null)
   const [retryMsg, setRetryMsg] = useState<string | null>(null)
   const searchParams = useSearchParams()
   const connectorId: AccountingConnectorId = searchParams.get('connector') === 'quickbooks' ? 'quickbooks' : 'xero'
@@ -377,6 +386,29 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       }
       router.refresh()
     })
+  }
+
+  /**
+   * o3d-0m56. The refusals this issue adds are correct and, on their own, produce a state with no
+   * exit: a payment that reached the ledger but whose response was lost can never be retried, never
+   * posts, and goes on blocking the next receipt for that order. This closes it — but only when the
+   * server can see the settlement in the ledger, so it can never be used to wave through a payment
+   * that is not actually there.
+   */
+  async function handleReconcile(entryId: string) {
+    setRetryMsg(null)
+    setReconcilingId(entryId)
+    const result = await reconcileSettledAccountingSyncRow(entryId)
+    setReconcilingId(null)
+    if (result.success) {
+      setRetryMsg(
+        `Closed: the accounting system already holds that payment`
+        + `${result.externalTransactionId ? ` (${result.externalTransactionId})` : ''}. Nothing was posted.`,
+      )
+      router.refresh()
+    } else {
+      setRetryMsg(result.error ?? 'Could not reconcile that entry.')
+    }
   }
 
   async function handleRetryOne(entryId: string) {
@@ -1014,16 +1046,39 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                           </TableCell>
                           <TableCell>
                             {log.status === 'FAILED' && (
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-7 w-7 p-0"
-                                title="Retry this entry"
-                                onClick={() => handleRetryOne(log.id)}
-                                disabled={retryingId === log.id}
-                              >
-                                {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
-                              </Button>
+                              <div className="flex items-center gap-1">
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 w-7 p-0"
+                                  title="Retry this entry"
+                                  onClick={() => handleRetryOne(log.id)}
+                                  disabled={retryingId === log.id || reconcilingId === log.id}
+                                >
+                                  {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+                                </Button>
+                                {/*
+                                  o3d-0m56: the way out of a payment that reached the ledger but lost
+                                  its response. Retrying it is refused for ever (the ledger holds it),
+                                  and until it is resolved it blocks the next receipt for that order.
+                                  Only shown for the payment types, because it only means anything
+                                  there — and it refuses unless IMS can SEE the settlement itself.
+                                */}
+                                {MONEY_SYNC_TYPES.has(log.type) && (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    className="h-7 w-7 p-0"
+                                    title="Already paid in the accounting system? Check and close this entry"
+                                    onClick={() => handleReconcile(log.id)}
+                                    disabled={retryingId === log.id || reconcilingId === log.id}
+                                  >
+                                    {reconcilingId === log.id
+                                      ? <Loader2 className="h-3 w-3 animate-spin" />
+                                      : <CheckCircle2 className="h-3 w-3" />}
+                                  </Button>
+                                )}
+                              </div>
                             )}
                           </TableCell>
                         </TableRow>
