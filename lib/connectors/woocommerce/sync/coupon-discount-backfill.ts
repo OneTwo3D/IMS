@@ -107,7 +107,9 @@ import { buildDiscountRestatement } from '@/lib/domain/accounting/discount-resta
 import { resolveWcOrderLevelDiscount } from './field-mapping'
 import {
   buildWcCouponLedgerHandoff,
+  isWcCouponOrderRefunded,
   type WcCouponLedgerHandoff,
+  type WcCouponRefundEvidence,
 } from './coupon-discount-ledger-handoff'
 
 /** ActivityLog action written for every corrected order — the audit trail, not the guard. */
@@ -164,6 +166,60 @@ export const POSTED_SALES_INVOICE_STATUSES = ['SYNCED'] as const
  */
 export function sortedPostedInvoiceIds(ids: readonly (string | null | undefined)[]): string[] {
   return [...new Set(ids.filter((id): id is string => !!id))].sort()
+}
+
+/**
+ * CREDIT NOTES that reached the ledger, and the refund rows behind them (o3d-y14 r6 finding 1).
+ *
+ * The same two-source read the invoice side does, for the same o3d-9kek reason: a credit note can
+ * post and fail to write its id onto the refund, so `accountingCreditNoteId` alone under-reports.
+ * SYNCED is the terminal status that means the document reached the accounting system.
+ */
+export const CREDIT_NOTE_SYNC_TYPES = ['CREDIT_NOTE'] as const
+
+/**
+ * The canonical form of a refund position, used on BOTH sides of the review→apply comparison.
+ *
+ * Same reason as `sortedPostedInvoiceIds`: two sets read at different times by different queries,
+ * and an unsorted comparison would refuse a row for a row-order difference that no re-run can fix.
+ */
+export function sortedWcCouponRefundEvidence(refunds: WcCouponRefundEvidence): WcCouponRefundEvidence {
+  return {
+    disposition: refunds.disposition,
+    refundIds: sortedPostedInvoiceIds(refunds.refundIds),
+    postedCreditNoteExternalIds: sortedPostedInvoiceIds(refunds.postedCreditNoteExternalIds),
+  }
+}
+
+/** Is this the SAME refund position the reviewer saw? Compared field by field, in canonical form. */
+export function sameWcCouponRefundEvidence(left: WcCouponRefundEvidence, right: WcCouponRefundEvidence): boolean {
+  const a = sortedWcCouponRefundEvidence(left)
+  const b = sortedWcCouponRefundEvidence(right)
+  return (
+    a.disposition === b.disposition &&
+    a.refundIds.join('|') === b.refundIds.join('|') &&
+    a.postedCreditNoteExternalIds.join('|') === b.postedCreditNoteExternalIds.join('|')
+  )
+}
+
+/** Render a refund position for an operator message. */
+export function describeWcCouponRefundEvidence(refunds: WcCouponRefundEvidence): string {
+  const canonical = sortedWcCouponRefundEvidence(refunds)
+  return (
+    `refundStatus=${canonical.disposition}, refund(s) [${canonical.refundIds.join(', ')}], ` +
+    `credit note(s) [${canonical.postedCreditNoteExternalIds.join(', ')}]`
+  )
+}
+
+/** `SalesOrder.refundStatus` as this backfill reads it. Anything unknown is treated as a refund. */
+export function normalizeWcCouponRefundDisposition(value: unknown): WcCouponRefundEvidence['disposition'] {
+  if (value === 'FULL') return 'FULL'
+  if (value === 'PARTIAL') return 'PARTIAL'
+  if (value === 'NONE' || value === null || value === undefined) return 'NONE'
+  // A disposition this build does not know about is NOT read as "no refund": that is the one
+  // conclusion an unrecognised value must not be able to produce, because it is the conclusion that
+  // lets a remedy be prescribed against a refunded customer.
+  return 'PARTIAL'
 }
 
 function money(value: DecimalInput): number {
@@ -490,6 +546,15 @@ export type WcCouponBackfillRow = {
    * means a worker can still post a GL journal built from the pre-correction amount.
    */
   liveBatchDeferralJobs: number
+  /**
+   * WHAT HAS ALREADY BEEN CREDITED BACK (o3d-y14 r6 finding 1).
+   *
+   * It changes no decision about the AMOUNT — the duplicated coupon is duplicated whether or not the
+   * order was refunded, and clearing it is right either way — but it decides what the operator may
+   * be told to do about the documents, so it is on the row the reviewer sees and in the entry apply
+   * re-verifies.
+   */
+  refunds: WcCouponRefundEvidence
 }
 
 export type WcCouponBackfillDecision =
@@ -627,6 +692,17 @@ export type WcCouponAllowlistEntry = {
    * corrected, and apply refuses if it has moved since the review (o3d-y14 r2).
    */
   revenueDeferredBatchRef: string | null
+  /**
+   * WHAT WAS ALREADY CREDITED BACK when the reviewer looked (o3d-y14 r6 finding 1).
+   *
+   * Carried for the same reason `postedInvoiceExternalIds` is, and settling the same kind of
+   * question: a refund that appears between the proposal and the run changes what the operator may
+   * be told to do about this order's documents — from "raise a further invoice for the difference"
+   * to "prescribe nothing, this customer has been refunded". The reviewer signed off on the first
+   * of those; apply compares the refund position they saw against the live one and refuses if it
+   * moved.
+   */
+  refunds: WcCouponRefundEvidence
   /** The cutoff CHOICE, not a comfortable margin, is what classified this row. Review each one. */
   nearCutoff: boolean
 }
@@ -649,8 +725,14 @@ export type WcCouponAllowlist = {
    * would assert on the reviewer's behalf that they saw no unlinked posted invoice — about the one
    * row where that is most likely to be false. So a v1 file is REFUSED with a version message and
    * the operator re-runs the report, which is a dry run and costs nothing.
+   *
+   * BUMPED TO 3 by o3d-y14 r6 finding 1, on exactly that argument: entries now carry the REFUND
+   * position, and a version-2 file has none. Defaulting it to "not refunded" would assert on the
+   * reviewer's behalf that no credit note stands against the order — and that is the assertion that
+   * lets a remedy re-bill a customer who has already been refunded, so it is the one default this
+   * file must never take. A v2 file is refused and the report re-run.
    */
-  version: 2
+  version: 3
   /** When the dry run produced the proposal. */
   generatedAt: string
   /** The cutoff the proposal was generated under, carried for the audit trail. */
@@ -684,7 +766,23 @@ function isEntry(value: unknown): value is WcCouponAllowlistEntry {
     // Same argument, and the same failure it would hide: an absent list would read as "the reviewer
     // saw no posted-but-unlinked invoice" (o3d-y14 r3 finding 2).
     Array.isArray(entry.postedInvoiceExternalIds) &&
-    entry.postedInvoiceExternalIds.every((id) => typeof id === 'string')
+    entry.postedInvoiceExternalIds.every((id) => typeof id === 'string') &&
+    // r6 finding 1. Same argument once more, and the most expensive omission of the three: an
+    // absent refund position would read as "the reviewer saw an order nobody had been refunded on",
+    // and that is what turns an invoice discrepancy into an instruction to bill the customer again.
+    isRefundEvidence(entry.refunds)
+  )
+}
+
+function isRefundEvidence(value: unknown): value is WcCouponRefundEvidence {
+  if (!value || typeof value !== 'object') return false
+  const refunds = value as Record<string, unknown>
+  return (
+    (refunds.disposition === 'NONE' || refunds.disposition === 'PARTIAL' || refunds.disposition === 'FULL') &&
+    Array.isArray(refunds.refundIds) &&
+    refunds.refundIds.every((id) => typeof id === 'string') &&
+    Array.isArray(refunds.postedCreditNoteExternalIds) &&
+    refunds.postedCreditNoteExternalIds.every((id) => typeof id === 'string')
   )
 }
 
@@ -697,15 +795,16 @@ export function parseWcCouponAllowlist(value: unknown): WcCouponAllowlistParse {
     return { ok: false, reason: 'MALFORMED', detail: 'the allowlist is not a JSON object' }
   }
   const raw = value as Record<string, unknown>
-  if (raw.version !== 2) {
+  if (raw.version !== 3) {
     return {
       ok: false,
       reason: 'UNSUPPORTED_VERSION',
       detail:
-        `version ${JSON.stringify(raw.version)} was not written by this build (expected 2). ` +
-        'Re-run the dry run to regenerate the proposal — a version-1 file predates the ' +
-        'posted-but-unlinked invoice evidence apply now compares against live state, so its ' +
-        'review cannot describe what apply must check (o3d-y14 r3).',
+        `version ${JSON.stringify(raw.version)} was not written by this build (expected 3). ` +
+        'Re-run the dry run to regenerate the proposal — a version-2 file predates the REFUND ' +
+        'evidence apply now compares against live state (o3d-y14 r6), and a version-1 file predates ' +
+        'the posted-but-unlinked invoice evidence as well (o3d-y14 r3). Neither review can describe ' +
+        'what apply must check.',
     }
   }
   const clear = raw.clear
@@ -741,7 +840,7 @@ export function parseWcCouponAllowlist(value: unknown): WcCouponAllowlistParse {
   return {
     ok: true,
     allowlist: {
-      version: 2,
+      version: 3,
       generatedAt: typeof raw.generatedAt === 'string' ? raw.generatedAt : '',
       cutoff: typeof raw.cutoff === 'string' ? raw.cutoff : '',
       reviewed: true,
@@ -773,6 +872,7 @@ export function buildWcCouponAllowlistEntry(
     accountingInvoiceId: row.accountingInvoiceId,
     postedInvoiceExternalIds: sortedPostedInvoiceIds(row.postedInvoiceExternalIds),
     revenueDeferredBatchRef: row.revenueDeferredBatchRef,
+    refunds: sortedWcCouponRefundEvidence(row.refunds),
     nearCutoff: isNearWcCouponCutoff(row.importedAt, cutoff),
   }
 }
@@ -803,6 +903,12 @@ export type WcCouponPostedEvidence = {
   revenueDeferredBatchRef: string | null
   /** What that batch stamped. Not recomputed by this backfill, so it stays stale until adjusted. */
   unearnedRevenueAmount: number | null
+  /**
+   * What has already been credited back against this order (o3d-y14 r6 finding 1). Read under the
+   * SAME lock as everything else here, because the handoff derived from it decides whether an
+   * operator is told to bill this customer again.
+   */
+  refunds: WcCouponRefundEvidence
 }
 
 export type WcCouponCorrectionResult =
@@ -847,6 +953,12 @@ async function readLockedEvidence(tx: Prisma.TransactionClient, orderId: string)
       accountingInvoiceId: true,
       revenueDeferredBatchRef: true,
       unearnedRevenueAmount: true,
+      // r6 finding 1. Both signals, because a SalesOrderRefund row can exist while the order's
+      // summary column still reads NONE — the workflow writes the status, the row's existence does
+      // not — and either one means a remedy derived from the invoice alone may re-bill a refunded
+      // customer.
+      refundStatus: true,
+      refunds: { select: { id: true, accountingCreditNoteId: true } },
       lines: { select: { discountAmount: true } },
       shoppingLinks: {
         where: { connector: 'woocommerce' },
@@ -871,6 +983,10 @@ async function readLivePostedEvidence(
     accountingInvoiceId: string | null
     revenueDeferredBatchRef: string | null
     unearnedRevenueAmount: unknown
+    // REQUIRED, not optional. An optional refund read is one a caller can omit by accident, and the
+    // omission would read as "this order was never refunded" — the assertion r6 finding 1 is about.
+    refundStatus: unknown
+    refunds: Array<{ id: string; accountingCreditNoteId: string | null }>
   },
 ): Promise<WcCouponPostedEvidence> {
   const syncedInvoices = await tx.accountingSyncLog.findMany({
@@ -893,6 +1009,50 @@ async function readLivePostedEvidence(
       order.unearnedRevenueAmount === null || order.unearnedRevenueAmount === undefined
         ? null
         : money(order.unearnedRevenueAmount as DecimalInput),
+    refunds: await readLiveRefundEvidence(tx, order),
+  }
+}
+
+/**
+ * The refund position for one order, read under the same lock (o3d-y14 r6 finding 1).
+ *
+ * `order` is the row already read under that lock, so the disposition and the refund rows are the
+ * same read the correction decides on. Only the CREDIT-NOTE ids cost an extra query, and only when
+ * refunds exist at all — an unrefunded order (which is nearly all of them) issues none.
+ */
+async function readLiveRefundEvidence(
+  tx: Prisma.TransactionClient,
+  order: {
+    refundStatus: unknown
+    refunds: Array<{ id: string; accountingCreditNoteId: string | null }>
+  },
+): Promise<WcCouponRefundEvidence> {
+  const rows = order.refunds
+  const refundIds = [...new Set(rows.map((refund) => refund.id))].sort()
+  const disposition = normalizeWcCouponRefundDisposition(order.refundStatus)
+  if (refundIds.length === 0) {
+    return { disposition, refundIds, postedCreditNoteExternalIds: [] }
+  }
+  // BOTH sources, exactly as the invoice side reads both: the back-reference column can be NULL on
+  // a credit note that really did post (o3d-9kek), and a SYNCED row with an external id is that
+  // document however the column reads.
+  const syncedCreditNotes = await tx.accountingSyncLog.findMany({
+    where: {
+      referenceType: 'SalesOrderRefund',
+      referenceId: { in: refundIds },
+      type: { in: [...CREDIT_NOTE_SYNC_TYPES] },
+      status: { in: [...POSTED_SALES_INVOICE_STATUSES] },
+      externalTransactionId: { not: null },
+    },
+    select: { externalTransactionId: true },
+  })
+  return {
+    disposition,
+    refundIds,
+    postedCreditNoteExternalIds: sortedPostedInvoiceIds([
+      ...rows.map((refund) => refund.accountingCreditNoteId),
+      ...syncedCreditNotes.map((row) => row.externalTransactionId),
+    ]),
   }
 }
 
@@ -908,7 +1068,12 @@ export function wcCouponCorrectionNeedsLedgerAdjustment(posted: WcCouponPostedEv
   return (
     !!posted.accountingInvoiceId ||
     posted.postedInvoiceExternalIds.length > 0 ||
-    !!posted.revenueDeferredBatchRef
+    !!posted.revenueDeferredBatchRef ||
+    // r6 finding 1. A CREDIT NOTE is a document derived from the pre-correction amount too, and an
+    // order can carry one with no invoice evidence at all (the invoice's back-reference never
+    // written, its sync row pruned). Without this the refunded order the handoff exists to protect
+    // would be corrected with nothing said about the ledger at all.
+    isWcCouponOrderRefunded(posted.refunds)
   )
 }
 
@@ -1096,6 +1261,32 @@ export async function applyWcCouponCorrection(
     }
   }
 
+  // THE REFUND POSITION IS COMPARED THE SAME WAY (o3d-y14 r6 finding 1).
+  //
+  // A refund raised between the proposal and this run does not change whether the amount is wrong —
+  // it changes what may be DONE about the documents derived from it. The reviewer approved a row
+  // whose invoice discrepancy the operator would be told to invoice for; on the refunded version of
+  // that same row the honest instruction is that no remedy may be prescribed at all. Those are
+  // different decisions, so the reviewer has to make the second one. Refusing is fully recoverable:
+  // the next report re-proposes the row WITH the refund evidence attached.
+  //
+  // AND THE COMPARISON IS DECISIVE, not a sample, for the same reason the invoice one is: refund
+  // creation takes `lockSalesOrder` on this very row before it writes anything
+  // (`lib/domain/sales/refund-service.ts`), so a refund either commits BEFORE us — and we see it and
+  // refuse — or AFTER us, against an order whose handoff already records the position it was derived
+  // from.
+  if (!sameWcCouponRefundEvidence(posted.refunds, entry.refunds)) {
+    return {
+      outcome: 'DECLINED',
+      reason: 'POSTING_CHANGED',
+      detail:
+        `the refund position for this order is now ${describeWcCouponRefundEvidence(posted.refunds)}, ` +
+        `not the ${describeWcCouponRefundEvidence(entry.refunds)} this row was reviewed with — a ` +
+        'credit note against this order decides whether any invoice remedy may be prescribed at all ' +
+        '(o3d-y14 r6). Re-run the report to review it again.',
+    }
+  }
+
   // Compare-and-set as well as locked. The lock covers the enqueue paths; this covers anything that
   // reaches the row without taking it, and it stamps the model in the SAME write so a row can never
   // be corrected without also being marked.
@@ -1184,6 +1375,11 @@ export async function applyWcCouponCorrection(
               posted.revenueDeferredBatchRef
                 ? `revenue deferral ${posted.revenueDeferredBatchRef} of ${posted.unearnedRevenueAmount}`
                 : null,
+              // r6 finding 1: a credit note is a ledger document derived from the same amount, and
+              // on this order it is the one that decides no remedy may be named.
+              posted.refunds.postedCreditNoteExternalIds.length
+                ? `credit note(s) ${posted.refunds.postedCreditNoteExternalIds.join(', ')}`
+                : null,
             ]
               .filter(Boolean)
               .join(', ') +
@@ -1206,6 +1402,13 @@ export async function applyWcCouponCorrection(
         // The DERIVED classification, kept as a field so the handoff can be re-read from the log
         // without re-parsing English.
         ledgerCase: handoff ? handoff.invoice.case : null,
+        // r6 finding 1. WHY a row with a real invoice discrepancy carries no remedy is not
+        // recoverable from `ledgerCase` alone — the case is the same either way — so the refund
+        // position that suppressed it is recorded beside it.
+        refundDisposition: posted.refunds.disposition,
+        refundIds: posted.refunds.refundIds,
+        postedCreditNoteExternalIds: posted.refunds.postedCreditNoteExternalIds,
+        refunded: handoff ? handoff.refunded : isWcCouponOrderRefunded(posted.refunds),
         needsAccountingAction: handoff ? handoff.needsAccountingAction : false,
         handoffLines: handoff ? handoff.lines : null,
         discountModel: WC_COUPON_DISCOUNT_MODEL,

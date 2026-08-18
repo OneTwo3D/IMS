@@ -54,6 +54,9 @@ type OrderRow = {
   accountingInvoiceId?: string | null
   revenueDeferredBatchRef?: string | null
   unearnedRevenueAmount?: number | null
+  /** o3d-y14 r6 finding 1 — the two refund signals read under the same lock. */
+  refundStatus?: 'NONE' | 'PARTIAL' | 'FULL'
+  refunds?: Array<{ id: string; accountingCreditNoteId: string | null }>
 }
 
 /** A mirrored AccountingEvent — what the o3d-y14 r5 ledger handoff replays the connector rule over. */
@@ -98,6 +101,8 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
               accountingInvoiceId: found.accountingInvoiceId ?? null,
               revenueDeferredBatchRef: found.revenueDeferredBatchRef ?? null,
               unearnedRevenueAmount: found.unearnedRevenueAmount ?? null,
+              refundStatus: found.refundStatus ?? 'NONE',
+              refunds: (found.refunds ?? []).map((refund) => ({ ...refund })),
               lines: found.lines.map((line) => ({ ...line })),
               shoppingLinks: found.importedAt ? [{ createdAt: new Date(found.importedAt) }] : [],
             }
@@ -165,23 +170,29 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
       },
       // The POSTED-invoice evidence read (o3d-y14 r2 finding 2). Filters on status AND on
       // `externalTransactionId: { not: null }`, because a SYNCED row with no id is not a document.
+      //
+      // BOTH `referenceId` shapes, like `count` above: the invoice read keys on a bare id, the
+      // CREDIT-NOTE read (o3d-y14 r6 finding 1) on `{ in: [refundIds] }`. A double that understood
+      // only the first would return [] for every credit-note query and could not tell an order with
+      // a posted credit note from one without — which is the distinction that suppresses a remedy.
       findMany: async ({
         where,
       }: {
         where: {
           referenceType: string
-          referenceId: string
+          referenceId: string | { in: string[] }
           type: { in: string[] }
           status: { in: string[] }
           externalTransactionId: { not: null }
         }
       }) => {
-        events.push(`findMany:${where.referenceId}`)
+        const refs = typeof where.referenceId === 'string' ? [where.referenceId] : where.referenceId.in
+        events.push(`findMany:${where.referenceType}:${refs.join('|')}`)
         return store.syncLogs
           .filter(
             (log) =>
               log.referenceType === where.referenceType &&
-              log.referenceId === where.referenceId &&
+              refs.includes(log.referenceId) &&
               where.type.in.includes(log.type) &&
               where.status.in.includes(log.status) &&
               (!('externalTransactionId' in where) || !!log.externalTransactionId),
@@ -274,6 +285,9 @@ const entry = {
   accountingInvoiceId: null,
   postedInvoiceExternalIds: [] as string[],
   revenueDeferredBatchRef: null,
+  // o3d-y14 r6 finding 1. The reviewed refund position; apply refuses the row if the live one has
+  // moved, so a fixture that omitted it would not describe an entry apply can accept.
+  refunds: { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[] },
   nearCutoff: false,
 }
 
@@ -283,6 +297,7 @@ const NO_LEDGER_DOCUMENTS = {
   postedInvoiceExternalIds: [],
   revenueDeferredBatchRef: null,
   unearnedRevenueAmount: null,
+  refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
 }
 
 function reset() {
@@ -412,7 +427,7 @@ test('the order row lock is taken BEFORE anything is read or decided (o3d-5ct)',
       'count:order-1',
       // No `count:` for the batch: this order carries no revenueDeferredBatchRef, so there is no
       // batch to look for. The posted-evidence read still happens, under the same lock.
-      'findMany:order-1',
+      'findMany:SalesOrder:order-1',
       'updateMany:order-1',
       'activityLog:create',
     ],
@@ -587,6 +602,7 @@ test('a POSTED batch journal does not block — it is reported instead (o3d-y14 
       postedInvoiceExternalIds: [],
       revenueDeferredBatchRef: BATCH_REF,
       unearnedRevenueAmount: 90,
+      refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
     },
     'the posted deferral is REPORTED as needing a manual adjustment, not silently ignored',
   )
@@ -741,6 +757,7 @@ test('the reported posting state is the LIVE read, not the reviewed file (o3d-y1
     postedInvoiceExternalIds: ['INV-1', 'INV-1-REV2'],
     revenueDeferredBatchRef: BATCH_REF,
     unearnedRevenueAmount: 42.5,
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
   })
   assert.deepEqual(
     store.activity[0].metadata.postedInvoiceExternalIds,
@@ -1073,6 +1090,90 @@ const UNLINKED_SYNCED_INVOICE = {
   externalTransactionId: 'INV-999',
 }
 
+// ---------------------------------------------------------------------------
+// o3d-y14 r6 finding 1 — the REFUND position is read live, from both sources
+// ---------------------------------------------------------------------------
+
+/** A credit note that POSTED and never wrote its id onto the refund — o3d-9kek on the refund side. */
+const UNLINKED_SYNCED_CREDIT_NOTE = {
+  id: 'job-cn-1',
+  referenceType: 'SalesOrderRefund',
+  referenceId: 'refund-1',
+  type: 'CREDIT_NOTE',
+  status: 'SYNCED',
+  externalTransactionId: 'CN-501',
+}
+
+test('a posted credit note the refund row denies is still read (o3d-y14 r6 F1)', async () => {
+  // `accountingCreditNoteId` is NULL and the credit note is in the ledger anyway. Reading only the
+  // column would report this order as carrying no credit note — and an order carrying no credit
+  // note gets a remedy prescribed for it.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({ syncLogs: [UNLINKED_SYNCED_CREDIT_NOTE] })
+  store.orders[0].refundStatus = 'FULL'
+  store.orders[0].refunds = [{ id: 'refund-1', accountingCreditNoteId: null }]
+
+  const result = await applyWcCouponCorrection(makeTx(store), {
+    ...entry,
+    refunds: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'] },
+  })
+
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.deepEqual(result.outcome === 'CORRECTED' ? result.posted?.refunds : null, {
+    disposition: 'FULL',
+    refundIds: ['refund-1'],
+    postedCreditNoteExternalIds: ['CN-501'],
+  })
+  assert.equal(store.activity[0].metadata.refunded, true)
+  assert.match(
+    (store.activity[0].metadata.handoffLines as string[]).join('\n'),
+    /NO REMEDY IS PRESCRIBED/,
+    'and a refunded order gets no prescribed remedy, whatever its invoice says',
+  )
+})
+
+test('a credit note with NO invoice evidence still produces a handoff (o3d-y14 r6 F1)', async () => {
+  // The trigger for classifying the ledger at all used to be invoice-or-deferral only. An order can
+  // carry a posted CREDIT NOTE and no invoice evidence whatever — the back-reference never written,
+  // the sync row pruned — and the refunded order this refusal exists for would then be corrected
+  // with nothing said about the ledger at all.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore({ syncLogs: [UNLINKED_SYNCED_CREDIT_NOTE] })
+  store.orders[0].accountingInvoiceId = null
+  store.orders[0].refundStatus = 'FULL'
+  store.orders[0].refunds = [{ id: 'refund-1', accountingCreditNoteId: null }]
+
+  const result = await applyWcCouponCorrection(makeTx(store), {
+    ...entry,
+    refunds: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'] },
+  })
+
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.notEqual(result.outcome === 'CORRECTED' ? result.handoff : null, null, 'the ledger IS classified')
+  assert.equal(result.outcome === 'CORRECTED' && result.handoff?.invoice.case, 'NO_INVOICE_IN_LEDGER')
+  assert.equal(result.outcome === 'CORRECTED' && result.handoff?.needsAccountingAction, true)
+  assert.equal(store.activity[0].metadata.posted, true)
+  assert.match((store.activity[0].metadata.handoffLines as string[]).join('\n'), /CN-501/)
+})
+
+test('an order with NO refunds never queries for a credit note (o3d-y14 r6 F1)', async () => {
+  // The cost of the new read is bounded by the refunded orders, not by the run: nearly every
+  // candidate is unrefunded, and for those this issues no statement at all.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const store = makeStore()
+
+  await applyWcCouponCorrection(makeTx(store), entry)
+
+  assert.deepEqual(
+    events.filter((event) => event.startsWith('findMany:')),
+    ['findMany:SalesOrder:order-1'],
+    'the invoice read, and nothing keyed on SalesOrderRefund',
+  )
+})
+
 test('an unlinked posted invoice the reviewer SAW is applied, not refused forever (o3d-y14 r3 F2)', async () => {
   // The recovery path, end to end: the first run refused because the report had not shown the
   // document; the re-run reports it, the reviewer approves the row WITH it, and this is that apply.
@@ -1092,6 +1193,7 @@ test('an unlinked posted invoice the reviewer SAW is applied, not refused foreve
     postedInvoiceExternalIds: ['INV-999'],
     revenueDeferredBatchRef: null,
     unearnedRevenueAmount: null,
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
   })
   assert.equal(
     store.activity[0].metadata.posted,

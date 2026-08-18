@@ -118,6 +118,9 @@ function makeTx(hooks: { onCount?: () => Promise<void> | void } = {}) {
           accountingInvoiceId: null,
           revenueDeferredBatchRef: null,
           unearnedRevenueAmount: null,
+          // o3d-y14 r6 finding 1 — the refund position the correction reads under the same lock.
+          refundStatus: 'NONE',
+          ...(select?.refunds ? { refunds: [] } : {}),
           ...(select?.lines ? { lines: found.lines.map((line) => ({ ...line })) } : {}),
           ...(select?.shoppingLinks ? { shoppingLinks: [{ createdAt: new Date('2026-05-01T00:00:00.000Z') }] } : {}),
         }
@@ -226,6 +229,9 @@ const ENTRY = {
   accountingInvoiceId: null,
   revenueDeferredBatchRef: null,
   postedInvoiceExternalIds: [] as string[],
+  // o3d-y14 r6 finding 1: the refund position the reviewer saw, which apply compares against live
+  // state before it will prescribe anything about this order's documents.
+  refunds: { disposition: 'NONE' as const, refundIds: [] as string[], postedCreditNoteExternalIds: [] as string[] },
   nearCutoff: false,
 }
 

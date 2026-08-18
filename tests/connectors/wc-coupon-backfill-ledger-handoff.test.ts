@@ -20,6 +20,19 @@ import test, { mock } from 'node:test'
  * AND THE DIRECTION IS ASSERTED, not just the amount. An invoice that discounted MORE than the
  * corrected order charged the customer too LITTLE: its balance has to go UP, and a credit note moves
  * it DOWN. The old sentence named the wrong instrument even in the case it was written for.
+ *
+ * o3d-y14 r6 finding 1 — AND NONE OF IT MAY BE PRESCRIBED ON A REFUNDED ORDER.
+ *
+ * Every case above judges the order by its INVOICE. On an order with credit notes against it that
+ * is half a position: a fully refunded order's invoice and credit note can already net to nothing,
+ * because the credit note that reversed the invoice was computed from the same pre-correction
+ * figure. Telling the operator to raise a further invoice for the difference there RE-BILLS A
+ * CUSTOMER WHO HAS BEEN REFUNDED, and telling them to credit it refunds the same money twice.
+ *
+ * THE FIXTURES HERE SEPARATE REFUNDED FROM UNREFUNDED on one field at a time — `refundStatus`
+ * alone, a `SalesOrderRefund` row alone, a posted credit note alone — and each pair is asserted to
+ * render DIFFERENT text with `notDeepEqual`. A fixture set where the two rendered the same handoff
+ * would prove nothing at all, which is the same trap the r5 pair above was written to avoid.
  */
 
 const events: string[] = []
@@ -137,11 +150,26 @@ function invoiceWithNoDiscountAccount(over: Partial<EventRow> = {}): EventRow {
 
 type LedgerEvidence = import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff').WcCouponLedgerEvidence
 
+type RefundEvidence = import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff').WcCouponRefundEvidence
+
+const NO_REFUNDS: RefundEvidence = { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] }
+
+/** A full refund with its credit note in the ledger: the position the r6 finding is about. */
+const FULLY_REFUNDED: RefundEvidence = {
+  disposition: 'FULL',
+  refundIds: ['refund-1'],
+  postedCreditNoteExternalIds: ['CN-501'],
+}
+
 const LINKED_INVOICE: LedgerEvidence = {
   accountingInvoiceId: 'INV-778',
   postedInvoiceExternalIds: [],
   revenueDeferredBatchRef: null,
+  refunds: NO_REFUNDS,
 }
+
+/** The SAME order, the SAME invoice, refunded. Only the refund evidence differs. */
+const LINKED_INVOICE_REFUNDED: LedgerEvidence = { ...LINKED_INVOICE, refunds: FULLY_REFUNDED }
 
 async function handoffFor(rows: EventRow[], keptOrderLevel: number, evidence: LedgerEvidence = LINKED_INVOICE) {
   const { buildWcCouponLedgerHandoff } = await import(
@@ -286,6 +314,7 @@ test('a posted-but-UNLINKED invoice with no mirrored event is UNVERIFIED too (o3
     accountingInvoiceId: null,
     postedInvoiceExternalIds: ['INV-999'],
     revenueDeferredBatchRef: null,
+    refunds: NO_REFUNDS,
   })
 
   assert.equal(handoff.invoice.case, 'DOCUMENT_UNVERIFIED')
@@ -310,6 +339,172 @@ test('two posted documents that disagree prescribe no remedy either', async () =
 })
 
 // ---------------------------------------------------------------------------
+// o3d-y14 r6 finding 1 — a refunded order is judged on its NET position
+// ---------------------------------------------------------------------------
+
+test('a FULLY REFUNDED order is NEVER told to raise a further invoice (o3d-y14 r6 F1)', async () => {
+  // THE FINDING. The invoice discounted 10 more than the corrected order retains, so the unrefunded
+  // handoff says "raise a further invoice for 10 GBP". This customer has already been refunded in
+  // full — and the credit note that reversed this invoice was computed from the same pre-correction
+  // figure, so the two errors cancel and the net owed is nothing. Billing them again is real money
+  // moving in the wrong direction.
+  const handoff = await handoffFor([postedInvoice()], 0, LINKED_INVOICE_REFUNDED)
+
+  assert.equal(handoff.refunded, true)
+  assert.equal(handoff.invoice.case, 'DOCUMENT_DISCOUNTS_MORE', 'the invoice FINDING is still reported')
+  const text = handoff.lines.join('\n')
+  assert.match(text, /charged 10 GBP TOO LITTLE/, 'the operator still gets the figure')
+  assert.match(text, /NO REMEDY IS PRESCRIBED/)
+  assert.match(text, /RECREATES A RECEIVABLE against a customer\s+who has already been refunded/)
+  assert.doesNotMatch(text, /Otherwise raise a further invoice to the same contact/)
+  assert.doesNotMatch(text, /re-approve/, 'nor the edit-it-up alternative, which moves the balance the same way')
+  assert.match(text, /FULLY REFUNDED/)
+  assert.match(text, /CN-501/, 'and the credit note it must be netted against is named')
+})
+
+test('the refunded and unrefunded handoffs for the SAME invoice differ (o3d-y14 r6 F1)', async () => {
+  // The property the whole finding turns on, asserted the way the r5 pair is: one field apart, and
+  // if the two rendered the same paragraph every other assertion here would pass on a coincidence.
+  const unrefunded = await handoffFor([postedInvoice()], 0, LINKED_INVOICE)
+  const refunded = await handoffFor([postedInvoice()], 0, LINKED_INVOICE_REFUNDED)
+
+  assert.notDeepEqual(unrefunded.lines, refunded.lines)
+  assert.equal(unrefunded.invoice.case, refunded.invoice.case, 'the invoice-side FACT is unchanged')
+  assert.match(unrefunded.lines.join('\n'), /raise a further invoice to the same contact for 10 GBP/)
+  assert.doesNotMatch(refunded.lines.join('\n'), /raise a further invoice to the same contact for 10 GBP/)
+})
+
+test('a PARTIAL refund suppresses the remedy too — the apportionment is not derivable (o3d-y14 r6 F1)', async () => {
+  // A partial refund is MORE ambiguous, not less: how much of the order-level discount the credit
+  // note reversed depends on what it credited, and nothing IMS recorded says.
+  const handoff = await handoffFor([postedInvoice()], 0, {
+    ...LINKED_INVOICE,
+    refunds: { disposition: 'PARTIAL', refundIds: ['refund-9'], postedCreditNoteExternalIds: [] },
+  })
+
+  assert.equal(handoff.refunded, true)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /PARTLY REFUNDED/)
+  assert.match(text, /NO REMEDY IS PRESCRIBED/)
+  assert.doesNotMatch(text, /Otherwise raise a further invoice/)
+})
+
+test('a refund row alone is enough, even with refundStatus NONE (o3d-y14 r6 F1)', async () => {
+  // The status is written by the refund workflow; the row's existence does not write it. Reading
+  // only the column would let a real credit note through as "not refunded".
+  const handoff = await handoffFor([postedInvoice()], 0, {
+    ...LINKED_INVOICE,
+    refunds: { disposition: 'NONE', refundIds: ['refund-2'], postedCreditNoteExternalIds: [] },
+  })
+
+  assert.equal(handoff.refunded, true)
+  assert.match(handoff.lines.join('\n'), /NO REMEDY IS PRESCRIBED/)
+})
+
+test('a posted credit note alone is enough, with no refund row and no status (o3d-y14 r6 F1)', async () => {
+  // The o3d-9kek shape on the refund side: the document is in the ledger and IMS's own rows are
+  // silent about it.
+  const handoff = await handoffFor([postedInvoice()], 0, {
+    ...LINKED_INVOICE,
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: ['CN-777'] },
+  })
+
+  assert.equal(handoff.refunded, true)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /NO REMEDY IS PRESCRIBED/)
+  assert.match(text, /CN-777/)
+})
+
+test('a refunded order whose invoice discounts LESS is NOT told to credit it (o3d-y14 r6 F1)', async () => {
+  // The other direction, and the other real-money error: crediting an invoice that has already been
+  // credited away refunds the same money twice, and Xero will happily allocate it.
+  const handoff = await handoffFor([invoiceWithNoDiscountAccount()], 4, LINKED_INVOICE_REFUNDED)
+
+  assert.equal(handoff.invoice.case, 'DOCUMENT_DISCOUNTS_LESS')
+  const text = handoff.lines.join('\n')
+  assert.match(text, /charged 4 GBP TOO MUCH/)
+  assert.match(text, /NO REMEDY IS PRESCRIBED/)
+  assert.match(text, /refunds the same money a second time/)
+  assert.doesNotMatch(text, /Add Credit Note/, 'the pre-filled credit note is NOT offered')
+  assert.doesNotMatch(text, /Raise a credit note for 4 GBP\./)
+})
+
+test('DOCUMENT_AGREES on a refunded order stops claiming the ledger is already right (o3d-y14 r6 F1)', async () => {
+  // The invoice IS right — and the old text went on to say the ledger was, which is a claim about
+  // credit notes nobody has read. It still prescribes nothing against the invoice, which is the part
+  // that was true.
+  const refunded = await handoffFor([invoiceWithNoDiscountAccount()], 0, LINKED_INVOICE_REFUNDED)
+  const unrefunded = await handoffFor([invoiceWithNoDiscountAccount()], 0, LINKED_INVOICE)
+
+  assert.equal(refunded.invoice.case, 'DOCUMENT_AGREES')
+  assert.notDeepEqual(refunded.lines, unrefunded.lines)
+  const text = refunded.lines.join('\n')
+  assert.match(text, /NOTHING IS OWED ON THE INVOICE/)
+  assert.match(text, /Do NOT raise a credit note or an adjustment/)
+  assert.doesNotMatch(text, /the ledger is already right/, 'that claim is not available on a refunded order')
+  assert.equal(refunded.needsAccountingAction, true, 'the credit-note side still has to be read')
+  assert.equal(unrefunded.needsAccountingAction, false)
+})
+
+test('UNVERIFIED on a refunded order drops the read-it-off-the-document ladder (o3d-y14 r6 F1)', async () => {
+  // Every branch of that ladder ends in an instrument ("raise a further invoice for it", "credit the
+  // difference"), so printing it on a refunded order prescribes exactly what this refuses.
+  const rows = [postedInvoice(), postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null })]
+  const refunded = await handoffFor(rows, 4, LINKED_INVOICE_REFUNDED)
+  const unrefunded = await handoffFor(rows, 4, LINKED_INVOICE)
+
+  assert.equal(refunded.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.notDeepEqual(refunded.lines, unrefunded.lines)
+  assert.match(unrefunded.lines.join('\n'), /credit the difference/)
+  assert.doesNotMatch(refunded.lines.join('\n'), /credit the difference/)
+  assert.doesNotMatch(refunded.lines.join('\n'), /raise a further invoice for the difference/)
+  assert.match(refunded.lines.join('\n'), /TWO unknowns here, not one/)
+})
+
+test('NO_INVOICE_IN_LEDGER with a credit note is reported, but still prescribes nothing (o3d-y14 r6 F1)', async () => {
+  const handoff = await handoffFor([], 0, {
+    accountingInvoiceId: null,
+    postedInvoiceExternalIds: [],
+    revenueDeferredBatchRef: null,
+    refunds: { disposition: 'FULL', refundIds: ['refund-3'], postedCreditNoteExternalIds: ['CN-900'] },
+  })
+
+  assert.equal(handoff.invoice.case, 'NO_INVOICE_IN_LEDGER')
+  assert.equal(handoff.needsAccountingAction, true, 'a credit note IS a ledger document derived from the old amount')
+  const text = handoff.lines.join('\n')
+  assert.match(text, /nothing to do on the invoice side/)
+  assert.match(text, /CN-900/)
+  assert.doesNotMatch(text, /raise a further invoice/)
+})
+
+test('a refunded order with NOTHING in the ledger is not put on the must-fix list (o3d-y14 r6 F1)', async () => {
+  // The one refunded shape that stays non-actionable. Inventing work here — "there is nothing to
+  // look at, go look at it" — is the r5 defect in a new place.
+  const handoff = await handoffFor([], 0, {
+    accountingInvoiceId: null,
+    postedInvoiceExternalIds: [],
+    revenueDeferredBatchRef: null,
+    refunds: { disposition: 'FULL', refundIds: ['refund-4'], postedCreditNoteExternalIds: [] },
+  })
+
+  assert.equal(handoff.invoice.case, 'NO_INVOICE_IN_LEDGER')
+  assert.equal(handoff.needsAccountingAction, false)
+})
+
+test('no refund evidence leaves every r5 remedy exactly as it was (o3d-y14 r6 F1)', async () => {
+  // The regression guard for rounds 1-5: the refusal must be reachable ONLY through refund
+  // evidence, or this round has quietly removed the remedies the last one derived.
+  const more = await handoffFor([postedInvoice()], 0)
+  const less = await handoffFor([invoiceWithNoDiscountAccount()], 4)
+
+  assert.equal(more.refunded, false)
+  assert.equal(less.refunded, false)
+  assert.match(more.lines.join('\n'), /Otherwise raise a further invoice to the same contact for 10 GBP/)
+  assert.match(less.lines.join('\n'), /Raise a credit note for 4 GBP/)
+  assert.doesNotMatch(more.lines.join('\n'), /NO REMEDY IS PRESCRIBED/)
+})
+
+// ---------------------------------------------------------------------------
 // The revenue-deferral journal — a different document with an EMPTY remedy
 // ---------------------------------------------------------------------------
 
@@ -322,6 +517,7 @@ test('the Group A1 deferral journal is reported and explicitly NOT to be adjuste
     postedInvoiceExternalIds: [],
     revenueDeferredBatchRef: 'A1-2026-07-01-abcd1234',
     unearnedRevenueAmount: 90,
+    refunds: NO_REFUNDS,
   })
 
   assert.equal(handoff.invoice.case, 'NO_INVOICE_IN_LEDGER')
@@ -339,6 +535,7 @@ test('an order with BOTH an understating invoice and a deferral gets both paragr
     postedInvoiceExternalIds: [],
     revenueDeferredBatchRef: 'A1-2026-07-01-abcd1234',
     unearnedRevenueAmount: 90,
+    refunds: NO_REFUNDS,
   })
 
   assert.equal(handoff.invoice.case, 'DOCUMENT_DISCOUNTS_MORE')
@@ -360,6 +557,9 @@ type OrderRow = {
   lines: Array<{ discountAmount: number }>
   importedAt: string | null
   accountingInvoiceId?: string | null
+  /** o3d-y14 r6: the two refund signals the correction reads under its own lock. */
+  refundStatus?: 'NONE' | 'PARTIAL' | 'FULL'
+  refunds?: Array<{ id: string; accountingCreditNoteId: string | null }>
 }
 
 const IMPORTED_AT = '2026-05-01T00:00:00.000Z'
@@ -378,6 +578,7 @@ const ENTRY = {
   accountingInvoiceId: 'INV-778' as string | null,
   postedInvoiceExternalIds: [] as string[],
   revenueDeferredBatchRef: null as string | null,
+  refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] } as RefundEvidence,
   nearCutoff: false,
 }
 
@@ -397,6 +598,8 @@ function makeTx(store: { orders: OrderRow[]; eventRows: EventRow[]; activity: Ar
               accountingInvoiceId: found.accountingInvoiceId ?? null,
               revenueDeferredBatchRef: null,
               unearnedRevenueAmount: null,
+              refundStatus: found.refundStatus ?? 'NONE',
+              refunds: found.refunds ?? [],
               lines: found.lines.map((line) => ({ ...line })),
               shoppingLinks: found.importedAt ? [{ createdAt: new Date(found.importedAt) }] : [],
             }
@@ -436,7 +639,7 @@ function makeTx(store: { orders: OrderRow[]; eventRows: EventRow[]; activity: Ar
   } as never
 }
 
-function correctionStore(eventRows: EventRow[]) {
+function correctionStore(eventRows: EventRow[], order: Partial<OrderRow> = {}) {
   return {
     orders: [
       {
@@ -446,6 +649,7 @@ function correctionStore(eventRows: EventRow[]) {
         lines: [{ discountAmount: 10 }],
         importedAt: IMPORTED_AT,
         accountingInvoiceId: 'INV-778',
+        ...order,
       } as OrderRow,
     ],
     eventRows,
@@ -475,6 +679,58 @@ test('the correction records NO ACCOUNTING ACTION for an invoice that never carr
     /NO ACCOUNTING ACTION for this order/,
     'the durable record keeps the whole instruction, not just the headline',
   )
+})
+
+test('the durable record of a REFUNDED order carries the refusal, not a remedy (o3d-y14 r6 F1)', async () => {
+  // The ActivityLog entry is what anyone reads back months later, and it is also where an operator
+  // working the list gets their instruction. "Raise a further invoice for 10 GBP" written against a
+  // fully refunded order is the r6 defect made permanent.
+  const { applyWcCouponCorrection } = await import(
+    '@/lib/connectors/woocommerce/sync/coupon-discount-backfill'
+  )
+  const store = correctionStore([postedInvoice()], {
+    refundStatus: 'FULL',
+    refunds: [{ id: 'refund-1', accountingCreditNoteId: 'CN-501' }],
+  })
+
+  const result = await applyWcCouponCorrection(
+    makeTx(store),
+    { ...ENTRY, refunds: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'] } },
+  )
+
+  assert.equal(result.outcome, 'CORRECTED', 'the AMOUNT is still corrected — the coupon is duplicated either way')
+  assert.equal(result.outcome === 'CORRECTED' && result.handoff?.refunded, true)
+  assert.equal(store.activity[0].metadata.refundDisposition, 'FULL')
+  assert.deepEqual(store.activity[0].metadata.postedCreditNoteExternalIds, ['CN-501'])
+  assert.equal(store.activity[0].metadata.refunded, true)
+  const lines = (store.activity[0].metadata.handoffLines as string[]).join('\n')
+  assert.match(lines, /NO REMEDY IS PRESCRIBED/)
+  assert.doesNotMatch(lines, /Otherwise raise a further invoice to the same contact/)
+  assert.match(store.activity[0].description, /credit note\(s\) CN-501/)
+})
+
+test('a refund that appeared since the review is REFUSED, not silently re-classified (o3d-y14 r6 F1)', async () => {
+  // The reviewer approved a row whose operator instruction was "raise a further invoice"; on the
+  // refunded version of that row the honest instruction is that no remedy may be prescribed at all.
+  // Those are different decisions, so the reviewer makes the second one — and nothing is written.
+  const { applyWcCouponCorrection } = await import(
+    '@/lib/connectors/woocommerce/sync/coupon-discount-backfill'
+  )
+  const store = correctionStore([postedInvoice()], {
+    refundStatus: 'FULL',
+    refunds: [{ id: 'refund-1', accountingCreditNoteId: 'CN-501' }],
+  })
+
+  const result = await applyWcCouponCorrection(makeTx(store), ENTRY)
+
+  assert.equal(result.outcome, 'DECLINED')
+  assert.equal(result.outcome === 'DECLINED' && result.reason, 'POSTING_CHANGED')
+  assert.match(
+    result.outcome === 'DECLINED' ? result.detail : '',
+    /refund position for this order is now refundStatus=FULL/,
+  )
+  assert.equal(store.orders[0].discountAmount, 10, 'and nothing was written')
+  assert.equal(store.activity.length, 0)
 })
 
 test('and it records ACCOUNTING ACTION REQUIRED for one that did (o3d-y14 r5 F1)', async () => {

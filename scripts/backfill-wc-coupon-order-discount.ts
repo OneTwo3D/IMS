@@ -47,6 +47,15 @@
  *     journal is deliberately left alone: IMS recognises back out the SAME stamped
  *     `unearnedRevenueAmount`, so the deferral/recognition pair still nets to zero and adjusting one
  *     half of it by hand would strand the difference in unearned revenue forever.
+ *   • `refunds` — the refund position (o3d-y14 r6). `disposition` other than NONE, any `refundIds`,
+ *     or any `postedCreditNoteExternalIds` means value has already been credited back on this order,
+ *     and the LEDGER HANDOFF for it prescribes NO remedy at all: an invoice discrepancy on a
+ *     refunded order may already have been credited away with the invoice, so "raise a further
+ *     invoice for the difference" would re-bill a customer who has been refunded, and "raise a
+ *     credit note" would refund the same money twice. Those entries are still correctable — the
+ *     duplicated coupon is duplicated either way — but the accounting follow-up is a manual netting
+ *     job, not a step this report can write for you. Apply compares this position against live state
+ *     and refuses if it has moved.
  *   • Anything you are not sure about: DELETE the entry. Skipping is re-runnable; a wrong correction
  *     is not.
  *
@@ -97,6 +106,7 @@ import {
   WC_COUPON_BACKFILL_ACTION,
   WC_COUPON_MAX_CANDIDATES,
   WC_COUPON_SCAN_PAGE_SIZE,
+  CREDIT_NOTE_SYNC_TYPES,
   LIVE_SALES_INVOICE_STATUSES,
   POSTED_SALES_INVOICE_STATUSES,
   SALES_INVOICE_SYNC_TYPES,
@@ -106,9 +116,11 @@ import {
   collectWcCouponCandidates,
   decideWcCouponBackfill,
   isNearWcCouponCutoff,
+  normalizeWcCouponRefundDisposition,
   parseWcCouponAllowlist,
   parseWcCouponCutoff,
   sortedPostedInvoiceIds,
+  sortedWcCouponRefundEvidence,
   stampWcCouponDiscountModel,
   sumLineDiscounts,
   type WcCouponAllowlist,
@@ -118,6 +130,7 @@ import {
 } from '../lib/connectors/woocommerce/sync/coupon-discount-backfill'
 import {
   buildWcCouponLedgerHandoff,
+  isWcCouponOrderRefunded,
   type WcCouponLedgerHandoff,
 } from '../lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
 import { liveDailyBatchDeferralWhere } from '../lib/domain/accounting/daily-batch-discount-fence'
@@ -294,6 +307,9 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
         discountModel: true,
         accountingInvoiceId: true,
         revenueDeferredBatchRef: true,
+        // o3d-y14 r6 finding 1: whether this order has been credited against decides whether the
+        // handoff below may prescribe an invoice remedy for it at all.
+        refundStatus: true,
         lines: { select: { discountAmount: true } },
         shoppingLinks: {
           where: { connector: 'woocommerce' },
@@ -380,6 +396,48 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
     }
   }
 
+  // REFUNDS AND THEIR CREDIT NOTES (o3d-y14 r6 finding 1). Read in the REPORT for exactly the
+  // reason the posted-but-unlinked invoices are: apply refuses a row whose refund position has moved
+  // since the review, so a position the report cannot show is one the reviewer can never approve.
+  // Both sources again — the back-reference column AND the SYNCED credit-note rows — because a
+  // credit note can post and fail to write its id back (o3d-9kek) just as an invoice can.
+  const refundRows = new Map<string, Array<{ id: string; accountingCreditNoteId: string | null }>>()
+  for (const batch of chunkWcCouponIds(orderIds)) {
+    const rows = await db.salesOrderRefund.findMany({
+      where: { orderId: { in: batch } },
+      select: { id: true, orderId: true, accountingCreditNoteId: true },
+    })
+    for (const row of rows) {
+      refundRows.set(row.orderId, [
+        ...(refundRows.get(row.orderId) ?? []),
+        { id: row.id, accountingCreditNoteId: row.accountingCreditNoteId },
+      ])
+    }
+  }
+  const refundIdToOrderId = new Map<string, string>()
+  for (const [orderId, rows] of refundRows) for (const row of rows) refundIdToOrderId.set(row.id, orderId)
+  const syncedCreditNoteIds = new Map<string, string[]>()
+  for (const batch of chunkWcCouponIds([...refundIdToOrderId.keys()])) {
+    const rows = await db.accountingSyncLog.findMany({
+      where: {
+        referenceType: 'SalesOrderRefund',
+        referenceId: { in: batch },
+        type: { in: [...CREDIT_NOTE_SYNC_TYPES] },
+        status: { in: [...POSTED_SALES_INVOICE_STATUSES] },
+        externalTransactionId: { not: null },
+      },
+      select: { referenceId: true, externalTransactionId: true },
+    })
+    for (const row of rows) {
+      const orderId = refundIdToOrderId.get(row.referenceId)
+      if (!orderId || !row.externalTransactionId) continue
+      syncedCreditNoteIds.set(orderId, [
+        ...(syncedCreditNoteIds.get(orderId) ?? []),
+        row.externalTransactionId,
+      ])
+    }
+  }
+
   // The daily-batch producer (o3d-y14 r2 finding 1). Its rows are keyed on the BATCH, not on the
   // order, so they are looked up by the batch reference each order carries — an order-scoped query
   // of any shape would find none of them.
@@ -413,6 +471,14 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
       liveBatchDeferralJobs: order.revenueDeferredBatchRef
         ? (liveBatchCounts.get(order.revenueDeferredBatchRef) ?? 0)
         : 0,
+      refunds: sortedWcCouponRefundEvidence({
+        disposition: normalizeWcCouponRefundDisposition(order.refundStatus),
+        refundIds: (refundRows.get(order.id) ?? []).map((refund) => refund.id),
+        postedCreditNoteExternalIds: [
+          ...(refundRows.get(order.id) ?? []).map((refund) => refund.accountingCreditNoteId),
+          ...(syncedCreditNoteIds.get(order.id) ?? []),
+        ].filter((id): id is string => !!id),
+      }),
     }
     rows.push({ row, decision: decideWcCouponBackfill(row, { importedBefore }) })
   }
@@ -452,7 +518,11 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
     (entry) =>
       entry.row.accountingInvoiceId ||
       entry.row.postedInvoiceExternalIds.length > 0 ||
-      entry.row.revenueDeferredBatchRef,
+      entry.row.revenueDeferredBatchRef ||
+      // o3d-y14 r6 finding 1: a credit note is a document derived from the same amount, and an
+      // order can carry one with no invoice evidence at all. It is the same set apply classifies
+      // (`wcCouponCorrectionNeedsLedgerAdjustment`), so the reviewer sees what apply will act on.
+      isWcCouponOrderRefunded(entry.row.refunds),
   )
   const nearCutoff = corrections.filter((entry) => isNearWcCouponCutoff(entry.row.importedAt, importedBefore))
   console.log('')
@@ -469,7 +539,10 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
         'from the amount about to change. What each of those documents actually CARRIES is derived ' +
         "below by replaying the connector's own posting rule over the payload that was mirrored — a " +
         'Xero invoice enqueued without a discount account code never had an "Order discount" line ' +
-        'appended and needs nothing done to it (o3d-y14 r5). This is the state AT REPORT TIME; apply ' +
+        'appended and needs nothing done to it (o3d-y14 r5). An order that has been REFUNDED is ' +
+        'judged on its net position instead and gets NO prescribed remedy, because a credit note ' +
+        'may already have reversed the discrepancy along with the invoice (o3d-y14 r6). This is the ' +
+        'state AT REPORT TIME; apply ' +
         're-reads it live, refuses any row whose posting state has moved since you reviewed it, and ' +
         're-derives this same handoff from the state at the moment of correction.',
     )
@@ -488,6 +561,10 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
           // is the one apply used to refuse forever.
           postedInvoiceExternalIds: row.postedInvoiceExternalIds,
           revenueDeferredBatchRef: row.revenueDeferredBatchRef,
+          // o3d-y14 r6 finding 1. Passed, never defaulted: the handoff prescribes a DIFFERENT job
+          // for a refunded order, and an omitted refund position here would print the unrefunded
+          // remedy — the instruction that bills an already-refunded customer a second time.
+          refunds: row.refunds,
         },
       })
       console.log(
@@ -542,7 +619,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
     const header =
       'salesOrderId,orderNumber,externalOrderNumber,currency,storedOrderDiscount,lineDiscountTotal,' +
       'importedAt,nearCutoff,discountModel,accountingInvoiceId,postedInvoiceExternalIds,liveInvoiceJobs,revenueDeferredBatchRef,' +
-      'liveBatchDeferralJobs,action,reason,keptOrderLevel,clearedBy,detail'
+      'liveBatchDeferralJobs,refundStatus,refundIds,postedCreditNoteExternalIds,action,reason,keptOrderLevel,clearedBy,detail'
     const body = rows.map(({ row, decision }) =>
       [
         row.orderId,
@@ -561,6 +638,11 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
         row.liveInvoiceJobs,
         row.revenueDeferredBatchRef ?? '',
         row.liveBatchDeferralJobs,
+        row.refunds.disposition,
+        // Space-separated inside ONE field, for the same reason the invoice ids are: the separator
+        // must not be the CSV separator.
+        row.refunds.refundIds.join(' '),
+        row.refunds.postedCreditNoteExternalIds.join(' '),
         decision.action,
         decision.action === 'CORRECT' ? (decision.partial ? 'PARTIAL' : 'FULL') : decision.reason,
         decision.action === 'CORRECT' ? decision.keptOrderLevel : '',
@@ -574,7 +656,7 @@ async function report(importedBefore: Date | null, csvPath: string | null, allow
 
   if (allowlistOut) {
     const proposal: WcCouponAllowlist = {
-      version: 2,
+      version: 3,
       generatedAt: new Date().toISOString(),
       cutoff: importedBefore ? importedBefore.toISOString() : '',
       // UNSIGNED. Apply refuses this file until a human sets these three.

@@ -140,6 +140,7 @@ test('the proposal entry carries the near-cutoff flag and the evidence it was de
     liveInvoiceJobs: 0,
     revenueDeferredBatchRef: 'A1-2026-07-01-aaaabbbb',
     liveBatchDeferralJobs: 0,
+    refunds: { disposition: 'FULL', refundIds: ['refund-2', 'refund-1'], postedCreditNoteExternalIds: ['CN-7'] },
   }
   const decision = decideWcCouponBackfill(row, { importedBefore: CUTOFF })
   assert.equal(decision.action, 'CORRECT')
@@ -158,6 +159,12 @@ test('the proposal entry carries the near-cutoff flag and the evidence it was de
     'A1-2026-07-01-aaaabbbb',
     'and the SECOND accounting artefact derived from the same amount — the daily revenue deferral ' +
       '— which apply also compares against live state (o3d-y14 r2)',
+  )
+  assert.deepEqual(
+    entry.refunds,
+    { disposition: 'FULL', refundIds: ['refund-1', 'refund-2'], postedCreditNoteExternalIds: ['CN-7'] },
+    'and the REFUND position, canonicalised — it decides whether the handoff may prescribe any ' +
+      'remedy at all, and apply refuses the row if it has moved since (o3d-y14 r6 F1)',
   )
 })
 
@@ -180,6 +187,7 @@ function entry(over: Partial<WcCouponAllowlistEntry> = {}): WcCouponAllowlistEnt
     accountingInvoiceId: null,
     postedInvoiceExternalIds: [],
     revenueDeferredBatchRef: null,
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
     nearCutoff: false,
     ...over,
   }
@@ -187,7 +195,7 @@ function entry(over: Partial<WcCouponAllowlistEntry> = {}): WcCouponAllowlistEnt
 
 function file(over: Record<string, unknown> = {}) {
   return {
-    version: 2,
+    version: 3,
     generatedAt: '2026-08-16T09:00:00.000Z',
     cutoff: CUTOFF.toISOString(),
     reviewed: true,
@@ -308,9 +316,15 @@ test('the report PAGES its scan and CHUNKS every id lookup (o3d-y14 r2 F3)', asy
   assert.doesNotMatch(src, /\{ in: orderIds \}/, 'no statement takes the whole candidate id list')
   assert.equal(
     src.split('for (const batch of chunkWcCouponIds(').length - 1,
-    4,
-    'all four id-keyed lookups — the backfill marker, the invoice count, the POSTED-invoice external ' +
-      'ids (o3d-y14 r3 F2) and the batch count — are chunked',
+    6,
+    'all six id-keyed lookups — the backfill marker, the invoice count, the POSTED-invoice external ' +
+      'ids (o3d-y14 r3 F2), the batch count, and the REFUND rows and their SYNCED credit notes ' +
+      '(o3d-y14 r6 F1) — are chunked',
+  )
+  assert.doesNotMatch(
+    src,
+    /\{ in: \[\.\.\.refundIdToOrderId\.keys\(\)\] \}/,
+    'and the refund-id lookup is not a whole-set IN list either',
   )
 })
 
@@ -423,14 +437,14 @@ test('the scan page is smaller than the refusal ceiling (o3d-y14 r2 F3)', () => 
 })
 
 test('a file from another build version is refused', () => {
-  const parsed = parseWcCouponAllowlist(file({ version: 3 }))
+  const parsed = parseWcCouponAllowlist(file({ version: 4 }))
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'UNSUPPORTED_VERSION')
 })
 
 test('a file with no lists at all is refused rather than treated as empty', () => {
-  const parsed = parseWcCouponAllowlist({ version: 2, reviewed: true, reviewedBy: 'Jan' })
+  const parsed = parseWcCouponAllowlist({ version: 3, reviewed: true, reviewedBy: 'Jan' })
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
@@ -506,6 +520,34 @@ test('the report READS the posted-but-unlinked invoice evidence apply compares a
   )
 })
 
+test('the REPORT reads the refund position and hands it to the classifier (o3d-y14 r6 F1)', async () => {
+  // The report is a script against a live database, so what it PASSES to the handoff can only be
+  // asserted at the source. It matters as much as apply does: the handoff prescribes a different job
+  // for a refunded order, and a report that omitted the refund position would print the unrefunded
+  // remedy — "raise a further invoice" — beside an order whose customer has already been refunded.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
+
+  assert.match(src, /refundStatus: true/, 'the candidate scan reads the order\'s refund disposition')
+  assert.match(src, /db\.salesOrderRefund\.findMany/, 'and the refund rows behind it')
+  assert.match(
+    src,
+    /referenceType: 'SalesOrderRefund'/,
+    'and the SYNCED credit notes for those refunds — the id a refund row can deny (o3d-9kek)',
+  )
+  assert.match(
+    src,
+    /refunds: row\.refunds,/,
+    'and the position reaches the ledger handoff, which prescribes nothing when it is non-empty',
+  )
+  assert.match(
+    src,
+    /isWcCouponOrderRefunded\(entry\.row\.refunds\)/,
+    'and a refunded order is IN the classified set even with no invoice evidence at all',
+  )
+})
+
 test('the entry carries the posted-but-unlinked ids the reviewer was shown (o3d-y14 r3 F2)', () => {
   const row: WcCouponBackfillRow = {
     orderId: 'order-1',
@@ -524,6 +566,7 @@ test('the entry carries the posted-but-unlinked ids the reviewer was shown (o3d-
     liveInvoiceJobs: 0,
     revenueDeferredBatchRef: null,
     liveBatchDeferralJobs: 0,
+    refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [] },
   }
   const decision = decideWcCouponBackfill(row, { importedBefore: CUTOFF })
   assert.equal(decision.action, 'CORRECT')
@@ -542,6 +585,37 @@ test('an allowlist entry without the posted-invoice evidence is MALFORMED, never
 
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
+})
+
+test('an allowlist entry without the REFUND evidence is MALFORMED, never defaulted (o3d-y14 r6 F1)', () => {
+  // The most expensive of the three defaults: an absent refund position would read as "the reviewer
+  // saw an order nobody had been refunded on", which is the assertion that lets the handoff tell an
+  // operator to bill an already-refunded customer again.
+  const { refunds: _dropped, ...withoutRefunds } = entry()
+  const parsed = parseWcCouponAllowlist(file({ clear: [withoutRefunds] }))
+
+  assert.equal(parsed.ok, false)
+  assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
+})
+
+test('an entry whose refund disposition is not one this build knows is MALFORMED (o3d-y14 r6 F1)', () => {
+  const parsed = parseWcCouponAllowlist(
+    file({ clear: [entry({ refunds: { disposition: 'PARTIALLY', refundIds: [], postedCreditNoteExternalIds: [] } } as never)] }),
+  )
+
+  assert.equal(parsed.ok, false)
+  assert.equal(!parsed.ok && parsed.reason, 'MALFORMED')
+})
+
+test('a version-2 file is refused — it predates the refund evidence (o3d-y14 r6 F1)', () => {
+  // Same upgrade path as v1, for the same reason: a v2 entry carries no refund position, and
+  // reading its absence as "not refunded" is exactly the finding.
+  const parsed = parseWcCouponAllowlist(file({ version: 2 }))
+
+  assert.equal(parsed.ok, false)
+  assert.equal(!parsed.ok && parsed.reason, 'UNSUPPORTED_VERSION')
+  assert.match(!parsed.ok ? parsed.detail : '', /REFUND evidence/)
+  assert.match(!parsed.ok ? parsed.detail : '', /Re-run the dry run/)
 })
 
 test('a version-1 file is refused with an instruction to re-run the report (o3d-y14 r3 F2)', () => {
