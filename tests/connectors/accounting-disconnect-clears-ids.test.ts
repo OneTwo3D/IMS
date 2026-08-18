@@ -42,6 +42,10 @@ mock.module('@/lib/db', {
       customer: recorder('customer'),
       supplier: recorder('supplier'),
       product: recorder('product'),
+      // Present so a disconnect that DID clear bill links would be recorded rather than crashing —
+      // the assertion below has to be able to fail (o3d-9kek r3 finding 1).
+      purchaseInvoice: recorder('purchaseInvoice'),
+      salesOrder: recorder('salesOrder'),
     },
   },
 })
@@ -78,3 +82,28 @@ test('disconnecting QuickBooks clears contact AND item ids', async () => {
   assert.deepEqual(models, ['customer', 'product', 'supplier'])
   assert.deepEqual(cleared.find((c) => c.model === 'product')?.data, { accountingItemId: null, accountingItemProvenance: null })
 })
+
+// ---------------------------------------------------------------------------
+// o3d-9kek r3 finding 1 — the other half of the same rule. Cached LOOKUP ids are a performance
+// cache with an authoritative source, so disconnect clears them. DOCUMENT ids are not: a bill's
+// accounting_invoice_id is the only local record of which ledger document it became, and every
+// later correction and payment posts against it. Clearing them on disconnect would destroy
+// financial evidence to work around a namespace problem.
+//
+// Keeping them is only safe because they are namespaced: each id is stored with the
+// "<connector>:<tenantId>" that issued it, uniqueness is enforced over the pair, and a reconnect
+// to a different company sees the old ids as a foreign namespace — inert, not conflicting.
+// ---------------------------------------------------------------------------
+
+for (const [name, disconnectFn] of [['Xero', disconnectXero], ['QuickBooks', disconnectQbo]] as const) {
+  test(`[o3d-9kek r3 f1] disconnecting ${name} KEEPS document external ids`, async () => {
+    cleared.length = 0
+    await disconnectFn()
+
+    const models = cleared.map((c) => c.model)
+    assert.equal(models.includes('purchaseInvoice'), false, 'a bill\'s external id is financial evidence, not a cache')
+    assert.equal(models.includes('salesOrder'), false)
+    // ...and the caches still go, so this is a deliberate distinction rather than an omission.
+    assert.deepEqual(models.sort(), ['customer', 'product', 'supplier'])
+  })
+}

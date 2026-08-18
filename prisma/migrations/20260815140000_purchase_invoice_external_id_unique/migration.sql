@@ -1,0 +1,56 @@
+-- o3d-9kek: make "one external bill ↔ one local bill" a DATABASE invariant.
+--
+-- The back-reference write for a legacy PurchaseOrder-keyed sync row has to DEDUCE which bill
+-- the external id belongs to. Every safeguard so far was a protocol: check that no bill of this
+-- PO already carries the id, then compare-and-swap the id onto the bill that is still unlinked.
+-- Neither half closes the hole, because they are separate statements and the guard was scoped to
+-- one PO:
+--
+--   * the authoritative bill-keyed writer can link a SIBLING bill with the candidate id between
+--     the guard and the swap. The swap's predicate only asks whether ITS bill is still unlinked,
+--     so it matches, and the id lands on two bills;
+--   * an id already held by a bill of a DIFFERENT PurchaseOrder was never looked at at all.
+--
+-- Duplicating an external id is the worst outcome in this area, worse than never repairing:
+-- PURCHASE_INVOICE_UPDATE posts to /Invoices/{accountingInvoiceId}, so from then on every
+-- correction to one bill silently rewrites the other's document in the accounting ledger, and
+-- both sides report success (see the o3d-9oq note in app/actions/purchase-orders.ts).
+--
+-- A unique index makes that impossible by construction rather than by protocol: no interleaving
+-- of sweeps, connectors and manual edits can produce it, and no future writer can forget it. The
+-- application still refuses to guess — the constraint is the backstop that makes the refusal
+-- unconditional, and a P2002 from it is CLASSIFIED (the id is already attributed, so the write is
+-- abandoned and reported) rather than allowed to overwrite.
+--
+-- Postgres does not treat NULLs as equal, so this is precisely a partial unique index over the
+-- bills that HAVE an external id: any number of bills may be unlinked.
+--
+-- GLOBAL, ON THE VALUE ALONE — AND THAT IS A DELIBERATE TRADE. The known objection: an external id
+-- is tenant-owned, and QuickBooks realm ids are integers that repeat across companies. Disconnect
+-- keeps historical bill ids (they are financial evidence: the only local record of which ledger
+-- document a bill became) while clearing the realm pin, so after a reconnect to a DIFFERENT company
+-- a new bill can post successfully to the ledger and then fail this constraint because a retired
+-- realm's bill already holds that integer.
+--
+-- That is a BLOCKED WRITE WITH A LOUD ERROR, not silent corruption, and it is the correct trade.
+-- The alternative — pairing the id with the connection that issued it and making the PAIR unique —
+-- was implemented and reverted, because it PERMITS the collision: both bills then exist, and the
+-- roughly 190 call sites that read a naked accounting_invoice_id cannot tell them apart. Worse,
+-- sales_orders, sales_order_refunds and supplier_credit_notes have no provenance column to consult
+-- even in principle, so no reader-side rule can be written for them at all. Failing to repair is
+-- acceptable; repairing (or paying, or updating) the wrong bill is not.
+--
+-- The application's error for this constraint says so in the operator's terms — that the id is
+-- already held locally and that a connector reconnect to a different company is the likeliest cause
+-- (see applyBackReference in lib/domain/accounting/back-reference.ts). o3d-gt8r carries the
+-- connector-tenant isolation work that would have to land before namespacing this is safe.
+--
+-- No backfill. IMS is not in productive use, and a duplicate present at migration time is exactly
+-- the corruption described above — this statement will fail loudly, which is the correct outcome:
+-- the duplicates must be resolved by a human against the ledger (which of the two documents is
+-- real cannot be inferred from IMS data alone). To find them before migrating:
+--   SELECT accounting_invoice_id, count(*), array_agg(id)
+--     FROM purchase_invoices WHERE accounting_invoice_id IS NOT NULL
+--    GROUP BY 1 HAVING count(*) > 1;
+CREATE UNIQUE INDEX "purchase_invoices_accounting_invoice_id_key"
+  ON "purchase_invoices"("accounting_invoice_id");
