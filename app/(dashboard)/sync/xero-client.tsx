@@ -403,8 +403,10 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       // as a clean success, and the refused rows silently stayed FAILED.
       setRetryMsg(
         result.refused
-          ? `Reset ${result.reset} failed entry/entries. ${result.refused} were NOT reset because `
-            + 'retrying them could post a second payment — check the ledger before acting.'
+          ? `Reset ${result.reset} failed entry/entries. ${result.refused} were NOT reset — each has `
+            + 'a recorded reason in the sync warnings. Either retrying them could post a second '
+            + 'payment (check the ledger before acting), or another entry for the same document is '
+            + 'already queued and they can be retried after it finishes.'
           : `Reset ${result.reset} failed entry/entries for retry.`,
       )
       router.refresh()

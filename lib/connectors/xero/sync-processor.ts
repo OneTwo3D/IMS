@@ -25,6 +25,8 @@ import {
   type BackReferenceRepairResult,
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -330,8 +332,37 @@ async function enqueueFollowUpSyncLog(
     })
     return
   }
+
+  // o3d-0m56: the AUTOMATIC path carries the identical hazard the manual retry does. Reviving a
+  // money row under a PINNED token only protects while Xero still remembers that token — minutes —
+  // and this runs whenever the connector next sweeps, long after. So the ledger has to say the
+  // attempt is not already in it. Refusing here leaves the row FAILED and visible, which is the
+  // same end state as before this check existed; posting twice is not.
+  const evidence = await ledgerClearsFollowUpRevival({
+    connector: XERO_CONNECTOR,
+    type,
+    payload: plan.payload,
+    tokenDisposition: plan.action === 'reuse' ? plan.tokenDisposition : 'rotated',
+  })
+  if (!evidence.clear) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: `
+        + `${evidence.reason}. Re-posting it could duplicate a payment; check the ledger and resolve `
+        + 'the row by hand.',
+      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+    })
+    return
+  }
+
   try {
     const outcome = await db.$transaction(async (tx) => {
+      // Serializes this insert/revival against the manual retry's read-then-reset for the same
+      // document (o3d-0m56). Money-moving types only; everything else pays nothing.
+      await lockFollowUpScope(tx, { connector: XERO_CONNECTOR, type, referenceType, referenceId })
       if (plan.action === 'reuse') {
         // Fenced on status: if another run revived the same row first — or retention
         // deleted it between the read and here (o3d-nepa) — this updates nothing rather

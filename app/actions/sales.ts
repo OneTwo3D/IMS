@@ -59,7 +59,12 @@ import {
   expectedSalesOrderLineTaxForeign,
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
-import { decideInvoicePaymentRegistration } from '@/lib/domain/accounting/invoice-payment-registration'
+import {
+  decideInvoicePaymentRegistration,
+  unresolvedInvoicePaymentAttempts,
+} from '@/lib/domain/accounting/invoice-payment-registration'
+import { attemptCouldHaveReachedTheLedger } from '@/lib/domain/accounting/followup-retry-guard'
+import { probeLedgerSettlement } from '@/lib/connectors/accounting-settlement-probe'
 import {
   aggregatePaymentSyncRows,
   effectivePaymentSyncRows,
@@ -689,7 +694,13 @@ export async function getSalesOrders(
  * longer in use describe a ledger nobody is reconciling against, and judging today's settlement by them
  * would report a discrepancy against a system that has been switched off.
  */
-type InvoicePaymentSyncRow = PaymentSyncRow & { paymentId: string | null }
+type InvoicePaymentSyncRow = PaymentSyncRow & {
+  paymentId: string | null
+  /** The date that attempt sent, so a settlement in the ledger can be matched to it (o3d-0m56). */
+  paymentDate: string | null
+  /** False when the stored body was too incomplete for the connector to have made the call. */
+  couldHaveReachedLedger: boolean
+}
 
 async function loadInvoicePaymentSyncRows(orderId: string, connector: string | null): Promise<InvoicePaymentSyncRow[]> {
   if (!connector) return []
@@ -707,6 +718,14 @@ async function loadInvoicePaymentSyncRows(orderId: string, connector: string | n
       retryCount: r.retryCount,
       // The amount actually SENT, so a part payment is not mistaken for full settlement.
       amount: typeof payload.amount === 'number' ? payload.amount : null,
+      // ...and the date it sent, because amount alone cannot tell one receipt from another
+      // (o3d-0m56). Both together are what identifies this attempt's payment in the ledger.
+      paymentDate: typeof payload.paymentDate === 'string' && payload.paymentDate.length >= 10
+        ? payload.paymentDate.slice(0, 10)
+        : null,
+      // Judged by the SAME rule the retry guard uses, so the two paths cannot disagree about
+      // which failed attempts could have reached the ledger.
+      couldHaveReachedLedger: attemptCouldHaveReachedTheLedger('INVOICE_PAYMENT', r.payload),
       paymentId: payloadPaymentId(r.payload),
     }
   })
@@ -3085,6 +3104,31 @@ async function registerInvoicePaymentWithLedger(params: {
     ])
     if (!so) return
 
+    const existing = paymentSyncEnabled && so.accountingInvoiceId
+      ? await loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null)
+      : []
+
+    // o3d-0m56: a FAILED or CANCELLED attempt does NOT prove the ledger is clear — the call may have
+    // committed before its response was lost. Recording another receipt beside one queues a fresh row
+    // under a NEW token, which posts a second payment without ever touching the retry guard. So when
+    // there is such an attempt, ask the ledger what it holds; the decision refuses unless the answer
+    // positively rules that attempt out.
+    //
+    // Conditional on purpose: this is a network read, and the ordinary receipt has no history to check.
+    const probeConnector = connector?.id === 'xero' || connector?.id === 'quickbooks' ? connector.id : null
+    const ledgerSettlements = so.accountingInvoiceId
+      && probeConnector
+      && unresolvedInvoicePaymentAttempts(existing, params.paymentId).length > 0
+      ? await (async () => {
+        const probe = await probeLedgerSettlement(probeConnector, {
+          type: 'INVOICE_PAYMENT',
+          payload: { accountingInvoiceId: so.accountingInvoiceId },
+        })
+        // A probe that could not answer stays null, which the decision reads as "refuse".
+        return probe.ok ? probe.records : null
+      })()
+      : null
+
     const decision = decideInvoicePaymentRegistration({
       syncEnabled: paymentSyncEnabled,
       accountingInvoiceId: so.accountingInvoiceId,
@@ -3095,9 +3139,8 @@ async function registerInvoicePaymentWithLedger(params: {
       bankAccountId: paymentSyncEnabled && so.accountingInvoiceId
         ? lookupPaymentAccount(await getPaymentAccountMap(), params.method ?? '', params.currency)
         : null,
-      existing: paymentSyncEnabled && so.accountingInvoiceId
-        ? await loadInvoicePaymentSyncRows(params.orderId, connector?.id ?? null)
-        : [],
+      existing,
+      ledgerSettlements,
       ledgerTotal: ledgerSalesInvoiceTotalForeign({
         totalForeign: Number(so.totalForeign),
         taxForeign: Number(so.taxForeign),
@@ -3150,6 +3193,21 @@ async function registerInvoicePaymentWithLedger(params: {
             {
               amount: params.amount, currency: params.currency, refusal: decision.refusal,
               alreadyRegistered: decision.alreadyRegistered, ledgerTotal: decision.ledgerTotal,
+            })
+          return
+        // o3d-0m56. The receipt stays recorded and visibly unsettled; what must not happen is a
+        // second payment landing in the ledger beside one that may already be there.
+        case 'UNRESOLVED_PAYMENT_ATTEMPT':
+          await warn('invoice_payment_not_registered',
+            `Recorded ${amount} against ${params.orderReference}, but an earlier attempt to register a ` +
+            `payment for this order failed or was cancelled without IMS being able to confirm what ` +
+            `reached the accounting connector` +
+            (decision.detail ? ` (${decision.detail})` : '') +
+            `. Sending this one could pay the invoice twice, so it was not sent. Check the invoice in ` +
+            `the ledger, then ${tail.charAt(0).toLowerCase()}${tail.slice(1)}`,
+            {
+              amount: params.amount, currency: params.currency, refusal: decision.refusal,
+              detail: decision.detail, ledgerTotal: decision.ledgerTotal,
             })
           return
         case 'WOULD_OVERPAY':

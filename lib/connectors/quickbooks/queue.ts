@@ -9,6 +9,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getQuickBooksSettings, type QuickBooksSettings } from './settings'
 import { lockOrderForAccountingEnqueue } from '@/lib/domain/accounting/enqueue-order-guard'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 
 /** Map sync type enum → setting key for per-type enable/disable */
 const SYNC_TYPE_SETTING: Record<string, keyof QuickBooksSettings> = {
@@ -72,6 +73,15 @@ export async function queueQuickBooksSync(params: {
       // order is gone — and the worker then posts a real document for an order that no longer
       // exists. AccountingSyncLog has no FK to SalesOrder, so nothing else objects.
       const lockedOrderId = await lockOrderForAccountingEnqueue(tx, {
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+      })
+      // o3d-0m56: and the accounting scope lock, so this enqueue cannot land between the manual
+      // retry's sibling snapshot and its reset. Taken AFTER the order lock, the same order every
+      // other enqueue writer takes them in, so the pair cannot deadlock.
+      await lockFollowUpScope(tx, {
+        connector: 'quickbooks',
+        type: params.type,
         referenceType: params.referenceType,
         referenceId: params.referenceId,
       })

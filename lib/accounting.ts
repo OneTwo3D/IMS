@@ -6,6 +6,7 @@ import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 
 export type AccountingSettings = {
   syncEnabled: boolean
@@ -301,6 +302,17 @@ export async function queueAccountingSyncTx(
     _postingMode: context.postingMode,
     ...(params.idempotencyKey ? { _idempotencyKey: params.idempotencyKey } : {}),
   }
+
+  // o3d-0m56: serialize this enqueue against the manual retry's read-then-reset for the same
+  // document. Without it, a receipt registered here can appear (and fail) between the retry's
+  // sibling snapshot and its reset, so the retry revives a row beside a SECOND token it never saw.
+  // Money-moving types only — ordinary queue traffic takes no lock.
+  await lockFollowUpScope(tx, {
+    connector: context.connector,
+    type: params.type,
+    referenceType: params.referenceType,
+    referenceId: params.referenceId,
+  })
 
   if (params.idempotencyKey) {
     const existing = await tx.accountingSyncLog.findFirst({

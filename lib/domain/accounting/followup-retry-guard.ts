@@ -3,9 +3,10 @@ import {
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
 } from './followup-idempotency'
+import type { SettlementVerdict } from './ledger-settlement-evidence'
 
 /**
- * o3d-0m56 — the manual retry must refuse what the automatic enqueue refuses.
+ * o3d-0m56 — an operator action that looks safe must not be able to post a payment twice.
  *
  * o3d-h2wx routed every AUTOMATIC follow-up enqueue through `planFollowUpEnqueue`, which
  * refuses when several FAILED rows for one reference each posted under a DIFFERENT idempotency
@@ -16,43 +17,41 @@ import {
  * PENDING. The "Retry All Failed" variant is worse: it drops the id filter entirely, so it
  * re-queues every ambiguous scope at once, each row under its own distinct token.
  *
- * WHAT IS ALREADY SAFE, and must keep working:
+ * THREE THINGS ARE CHECKED, and a money-moving retry must pass all of them.
  *
- *   - a single FAILED row in its scope. The retry preserves the row id and payload, so it posts
- *     under the SAME token the failed attempt used — the one token that, if it committed, the
- *     remote can still recognise as a repeat.
- *   - several FAILED rows that SHARE one token — the ordinary QuickBooks shape, where repeated
- *     receipts all carry `invoice-payment:payment:<paymentId>`. Whichever committed, committed
- *     under that token. Refusing these on row count alone is the mistake o3d-h2wx already
- *     corrected once in the automatic path.
- *   - anything that is not money-moving. A duplicate PDF or email is not a financial error.
+ *  1. UNAMBIGUOUS HISTORY. More than one distinct token among the rows that could have posted
+ *     this document means any one of them may be the one that committed, and no single token can
+ *     be re-sent safely. Same-token rows are NOT ambiguous — whichever committed, committed under
+ *     that token — and refusing them on row count alone is the mistake o3d-h2wx already corrected
+ *     once in the automatic path.
  *
- * So the refusal is narrow by construction: money-moving, same target document, more than one
- * distinct token.
+ *  2. ONE LIVE ROW PER DOCUMENT. A sibling that is PENDING, PROCESSING or SYNCED is either in
+ *     flight or already in the ledger. Reviving beside it is a second live attempt at the same
+ *     settlement — and for the types covered by `accounting_sync_logs_followup_live_unique` the
+ *     database rejects the write outright, which used to abort the whole bulk update and reset
+ *     NOTHING, including the unrelated scopes in the same click (Codex review).
  *
- * WHAT THIS DOES NOT CLOSE, stated plainly because the same-token cases above are ALLOWED and it
- * would be easy to read that as proof they are safe. Re-posting under the original token is only
- * protective while the remote still remembers it. QuickBooks replays by `requestid`; XERO
- * retains an Idempotency-Key for a short documented window (minutes), and a manual retry is by
- * nature minutes to days after the failure. So a lone FAILED Xero payment whose call COMMITTED
- * but whose response was lost — which FAILED never rules out (o3d-ju8t) — can still be
- * double-posted by an operator retrying it, and this guard allows that because there is nothing
- * ambiguous about it.
+ *  3. POSITIVE SETTLEMENT EVIDENCE. This is the one that used to be missing, and the reasoning
+ *     that let it be missing was wrong. Re-posting under the original token protects nothing
+ *     unless the remote still REMEMBERS that token: Xero retains an Idempotency-Key for minutes,
+ *     and a manual retry is minutes to days later. So a lone FAILED Xero payment whose call
+ *     COMMITTED but whose response was lost — which FAILED never rules out (o3d-ju8t) — was
+ *     re-posted, and nothing refused it because nothing was ambiguous. It is not enough for a
+ *     retry to be unambiguous; it must be shown not to have already happened. The caller reads
+ *     the target document from the ledger and passes the verdict here; anything short of a
+ *     positive `clear` refuses. See ledger-settlement-evidence.ts.
  *
- * That hazard is IDENTICAL in the automatic enqueue path, which pins the same token for the same
- * reason; it is not introduced or widened here, and closing it needs positive evidence of what
- * reached the ledger (a settlement probe), not a broader refusal — refusing every money-moving
- * retry would leave no manual route at all. Tracked as o3d-wc1d; do not "fix" it by tightening
- * this predicate.
+ * Rule 3 applies to the AUTOMATIC path too, where the identical hazard lives: both connectors'
+ * `enqueueFollowUpSyncLog` revives a money-moving FAILED row under a pinned token, and now takes
+ * the same evidence before it does.
  *
- * NOR IS THE RETRY THE ONLY WAY BACK TO THE LEDGER. `decideInvoicePaymentRegistration` filters
- * FAILED and CANCELLED rows out of the "already registered" set on the opposite reading — that
- * they hold nothing — so re-recording a receipt beside a FAILED attempt queues a fresh row under
- * a NEW token and reaches the same double payment without touching this guard at all (o3d-crdo).
- * Guarding the retry alone does not make the system safe; it makes this route safe.
- *
- * Ambiguity means more than one distinct token among rows that could have posted -- and no
- * status is safe to drop from that set. See the note above the contender filter.
+ * WHAT THIS STILL COSTS, stated because it is real. A part-payment history, and a payment
+ * reversed in the ledger then legitimately re-posted, can both be refused — the first by a
+ * settled sibling's token, the second by a settlement record that matches the amount and date of
+ * the very payment being replaced. There is no per-row settlement action yet, so "resolve these
+ * rows manually" means editing the ledger and leaving the row. That is the stranding direction:
+ * an operator can act on a refusal they can read, and cannot act on a duplicate payment nobody
+ * told them about.
  */
 
 export type RetryCandidateRow = {
@@ -61,36 +60,29 @@ export type RetryCandidateRow = {
   effectiveToken: string
   payload: unknown
   /**
-   * Sync status. Carried for the refusal message and for future settlement work; it does NOT
-   * exclude a row from the token set -- see the note above on why no status is safe to drop.
+   * Sync status. It does NOT exclude a row from the token set (see the note above the contender
+   * filter); it is what identifies a LIVE sibling for rule 2, and it names the state in refusals.
    */
   status?: string | null
 }
 
 /**
- * EVERY status in the scope counts. Two attempts I made to narrow this were both wrong, in the
- * dangerous direction, and the reasoning is worth keeping because it is not obvious.
+ * EVERY status in the scope counts toward ambiguity. Two attempts I made to narrow this were both
+ * wrong, in the dangerous direction, and the reasoning is worth keeping because it is not obvious.
  *
  * I excluded SYNCED on the grounds that its outcome is known, and that retrying a FAILED row
  * re-posts under ITS OWN token which the remote would deduplicate. THE SECOND HALF IS FALSE FOR
  * XERO: Xero retains an Idempotency-Key only for a short, documented window (minutes), after
  * which the same key is processed as a brand-new request. A MANUAL retry is by nature minutes
  * to days after the failure, so it is essentially never inside that window. QuickBooks does
- * replay by `requestid`, so the same-token case is protected there -- but the guard cannot be
- * correct on one connector only, and the cross-token case (A never landed, replacement B is
+ * replay by `requestid`, so the same-token case is better protected there -- but the guard cannot
+ * be correct on one connector only, and the cross-token case (A never landed, replacement B is
  * SYNCED, retrying A posts a second payment beside B) is unprotected on BOTH.
  *
  * I also excluded CANCELLED as "proven never attempted". It is not: a row whose remote call
  * COMMITTED but whose response was lost is returned to PENDING for retry, and deleting the
  * local receipt then cancels that row. A cancelled sibling can therefore represent money that
  * is already in the ledger.
- *
- * THE COST, stated because it is real and permanent today: a part-payment history, and a
- * payment reversed in the ledger then legitimately re-posted, are both refused -- the settled
- * sibling's token blocks its own replacement. There is currently NO per-row settlement action
- * for a FAILED row, so "resolve these rows manually" means editing the ledger and leaving the
- * row, not clearing it. Tracked as a follow-up; it is the right fix for the stranding, and it
- * is a better fix than making this guard guess.
  */
 export type ManualRetryPlan =
   | { action: 'allow' }
@@ -113,6 +105,44 @@ const MONEY_MOVING_SYNC_TYPES = new Set([
 
 export function isMoneyMovingSyncType(type: string): boolean {
   return MONEY_MOVING_SYNC_TYPES.has(type)
+}
+
+/**
+ * The types `accounting_sync_logs_followup_live_unique` covers: a PARTIAL UNIQUE index on
+ * (connector, type, referenceType, referenceId) restricted to PENDING/PROCESSING/SYNCED rows.
+ *
+ * Mirrored here because the retry decides what to revive, and a decision that ignores the index
+ * does not fail safely — it fails with a constraint error that rolls back the whole statement.
+ * Kept in step with the migration by a test that reads the SQL.
+ */
+const LIVE_UNIQUE_FOLLOW_UP_TYPES = new Set([
+  'INVOICE_PAYMENT',
+  'BILL_ATTACHMENT',
+  'INVOICE_PDF',
+  'INVOICE_EMAIL',
+  'WC_INVOICE_NOTE',
+  'PURCHASE_CREDIT_NOTE_ALLOCATION',
+])
+
+export function isLiveUniqueFollowUpType(type: string): boolean {
+  return LIVE_UNIQUE_FOLLOW_UP_TYPES.has(type)
+}
+
+/**
+ * Types where at most ONE row per scope may be live at a time — either because the database says
+ * so, or because two live money rows for one document are two payments.
+ *
+ * BILL_PAYMENT is in the second group only: the index does not cover it, so nothing would stop
+ * "Retry All" reviving two failed bill payments for one bill and posting both.
+ */
+export function revivesAtMostOnePerScope(type: string): boolean {
+  return isMoneyMovingSyncType(type) || isLiveUniqueFollowUpType(type)
+}
+
+const LIVE_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED'])
+
+function isLiveStatus(status: string | null | undefined): boolean {
+  return typeof status === 'string' && LIVE_STATUSES.has(status)
 }
 
 /**
@@ -158,6 +188,11 @@ function couldHaveReachedTheLedger(type: string, payload: unknown): boolean {
   })
 }
 
+/** Exported for the registration guard, which must judge an unresolved attempt the same way. */
+export function attemptCouldHaveReachedTheLedger(type: string, payload: unknown): boolean {
+  return couldHaveReachedTheLedger(type, payload)
+}
+
 const ANCHOR_FIELDS = ['accountingInvoiceId', 'creditNoteId'] as const
 
 function asPayload(value: unknown): FollowUpPayload | null {
@@ -193,16 +228,19 @@ function couldBeTheSameDocument(left: unknown, right: unknown): boolean {
  * Decide whether one manual retry may proceed. Pure, so the rule is testable without a
  * database and cannot drift from the automatic path's definition of ambiguity.
  *
- * `siblings` is every FAILED row in the target's scope, INCLUDING the target itself.
+ * `siblings` is every row in the target's scope AT ANY STATUS, including the target itself.
+ * `settlement` is what the connector's ledger says about the target's own attempt; it is
+ * required rather than optional so a caller cannot reach "allow" by forgetting to ask.
  */
 export function planManualRetry(params: {
   type: string
   reference: string
   target: RetryCandidateRow
   siblings: RetryCandidateRow[]
+  settlement: SettlementVerdict
 }): ManualRetryPlan {
-  const { type, reference, target, siblings } = params
-  if (!isMoneyMovingSyncType(type)) return { action: 'allow' }
+  const { type, reference, target, siblings, settlement } = params
+  const moneyMoving = isMoneyMovingSyncType(type)
 
   const contenders = siblings
     // A sibling missing a field its connector requires was rejected BEFORE any HTTP call, so it
@@ -212,16 +250,96 @@ export function planManualRetry(params: {
     .filter((row) => couldHaveReachedTheLedger(type, row.payload))
     .filter((row) => couldBeTheSameDocument(row.payload, target.payload))
   const tokens = new Set(contenders.map((row) => row.effectiveToken))
-  if (tokens.size <= 1) return { action: 'allow' }
 
-  return {
-    action: 'refuse',
-    tokenCount: tokens.size,
-    reason: `${tokens.size} attempts for ${reference} were made under different idempotency `
-      + 'keys. Any one of them may have reached the ledger, and a manual retry is too late for '
-      + 'the remote to deduplicate it, so retrying could post a second payment. Check the '
-      + 'ledger for an existing payment against this document before acting.',
+  if (moneyMoving && tokens.size > 1) {
+    return {
+      action: 'refuse',
+      tokenCount: tokens.size,
+      reason: `${tokens.size} attempts for ${reference} were made under different idempotency `
+        + 'keys. Any one of them may have reached the ledger, and a manual retry is too late for '
+        + 'the remote to deduplicate it, so retrying could post a second payment. Check the '
+        + 'ledger for an existing payment against this document before acting.',
+    }
   }
+
+  // Rule 2. A live sibling is an attempt in flight or already posted. For an index-covered type
+  // ANY live sibling in the scope blocks the write; for BILL_PAYMENT, which the index does not
+  // cover, the money argument is what blocks it, so only a sibling that could be the same
+  // document counts.
+  if (revivesAtMostOnePerScope(type)) {
+    const live = siblings.filter((row) =>
+      row.id !== target.id
+      && isLiveStatus(row.status)
+      && (isLiveUniqueFollowUpType(type) || couldBeTheSameDocument(row.payload, target.payload)))
+    if (live.length > 0) {
+      return {
+        action: 'refuse',
+        tokenCount: new Set(live.map((row) => row.effectiveToken)).size,
+        reason: `Another entry for ${reference} is already queued or has posted (${live
+          .map((row) => `${row.id} ${row.status}`).join(', ')}). Only one live entry per document `
+          + 'is allowed, so this row was left failed. Let the live one finish, then retry this if '
+          + 'it is still needed.',
+      }
+    }
+  }
+
+  if (!moneyMoving) return { action: 'allow' }
+
+  // Rule 3. Unambiguous is not the same as safe: the remote's deduplication window has closed by
+  // the time anyone clicks retry, so the ledger itself has to say this attempt is not in it.
+  if (settlement.outcome === 'present') {
+    return {
+      action: 'refuse',
+      tokenCount: tokens.size,
+      reason: `The accounting connector already holds a settlement of ${settlement.detail} against `
+        + `the document for ${reference}, which matches what this attempt sent. It may have `
+        + 'committed before its response was lost, so retrying could post a second payment. Check '
+        + 'the ledger and resolve this row by hand.',
+    }
+  }
+  if (settlement.outcome === 'unknown') {
+    return {
+      action: 'refuse',
+      tokenCount: tokens.size,
+      reason: `IMS could not establish whether the attempt for ${reference} already reached the `
+        + `ledger (${settlement.reason}). A manual retry is too late for the remote to deduplicate `
+        + 'it, so retrying could post a second payment. Check the ledger for an existing payment '
+        + 'against this document before acting.',
+    }
+  }
+
+  return { action: 'allow' }
+}
+
+/**
+ * Split one scope's ALLOWED candidates into the row to revive and the rows that must wait.
+ *
+ * "Retry All" put every allowed id into a single `updateMany`. Two FAILED INVOICE_PAYMENT rows
+ * sharing a token are both allowed — correctly, they are not ambiguous — but reviving both makes
+ * two live rows in one scope: PostgreSQL rejects the statement on the partial unique index, and
+ * because the statement is atomic NOTHING in that bulk retry is reset, including unrelated safe
+ * scopes (Codex review). For BILL_PAYMENT, which the index does not cover, the same input simply
+ * posts two supplier payments.
+ *
+ * `allowed` must arrive OLDEST FIRST. The oldest postable row is chosen for the same reason
+ * `planFollowUpEnqueue` pins the oldest postable body: under a shared token the remote returns
+ * the request that reached it first, so any other body would record a settlement the ledger never
+ * made. A row too incomplete to post is never the canonical one — it would strand the scope
+ * behind a request that can only fail.
+ */
+export function selectRevivableCandidates<T extends { id: string; payload: unknown }>(
+  type: string,
+  allowed: T[],
+): { revive: T[]; deferred: T[] } {
+  if (!revivesAtMostOnePerScope(type) || allowed.length <= 1) return { revive: allowed, deferred: [] }
+  const canonical = allowed.find((row) => couldHaveReachedTheLedger(type, row.payload)) ?? allowed[0]!
+  return { revive: [canonical], deferred: allowed.filter((row) => row.id !== canonical.id) }
+}
+
+/** The message a deferred row gets, so an operator is never left with a silent no-op. */
+export function deferredRevivalReason(reference: string, kept: string): string {
+  return `Only one entry for ${reference} can be queued at a time, so ${kept} was re-queued and the `
+    + 'others were left failed. Retry them once it has finished if they are still needed.'
 }
 
 /**

@@ -426,6 +426,43 @@ Operators correct the underlying issue (in IMS or in the accounting system) and 
 sync from the Sync Dashboard. Once the row transitions out of `FAILED`, the alert disappears
 automatically.
 
+### When a Retry Is Refused
+
+A retry of a **payment** — a customer receipt, a supplier payment, or a credit-note allocation — is
+not the same kind of action as a retry of a PDF or an email. `FAILED` does **not** mean the ledger
+never saw it: a call that Xero committed and then failed to acknowledge lands here too. Re-sending
+it would settle the invoice twice, and only a human can reverse that in Xero.
+
+So before re-queueing a money row IMS **reads the target document in the accounting system** and
+looks for the settlement that attempt would have created — the same amount, on the same date. Four
+things can happen, and the last three leave the row `FAILED` with a message saying which:
+
+| Outcome | What IMS does |
+| --- | --- |
+| The ledger holds no such settlement | The row is re-queued normally |
+| The ledger already holds it | Refused. The payment is very likely already there — check the invoice in Xero, and if the row is genuinely owed, register it by hand |
+| The ledger could not be asked (connector down, document not found) | Refused. An unanswered question about money that may already be posted is not permission to send it again. Retry once the connector responds |
+| Several earlier attempts were sent under different idempotency keys | Refused. Any one of them may be the one that committed, and no single key can be re-sent safely. Reconcile the document in Xero |
+
+Two more refusals are about ordering rather than evidence:
+
+- **Another entry for this document is already queued or has posted.** Only one live entry per
+  document is allowed. Wait for it to finish, then retry this one if it is still needed.
+- **Only one entry can be queued at a time**, so a "Retry All" over several failed rows for the
+  *same* document re-queues the oldest usable one and leaves the rest failed. Retry them afterwards
+  if they are still needed — they are not lost, and nothing about them is wrong.
+
+Every refusal is written to the activity log as a warning naming the rows involved, and the count
+appears beside the retry result as *refused*. **A refusal is not a failure of the retry** — it is
+IMS declining to move money twice on your behalf.
+
+The same check now runs on the automatic path: when the connector re-queues a failed payment by
+itself, it reads the ledger first and leaves the row alone if the payment is already there.
+
+Recording a **second receipt** against an order with an unresolved failed attempt is refused on the
+same grounds, with a warning on the order: the receipt stays recorded in IMS, and nothing is sent
+to Xero until the earlier attempt is resolved.
+
 ### Tax Rate Sync (Multi-Component Profiles)
 
 When an IMS VAT rate has one or more active components (e.g. Canada `GST 5% + PST 7%`), saving the

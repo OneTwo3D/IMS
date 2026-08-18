@@ -170,9 +170,25 @@ export const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
 export const BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE = 411_220_868
 
 
+/**
+ * Per-(connector, type, reference) serialization of money-moving accounting rows (o3d-0m56).
+ *
+ * Taken by every writer that can create or revive a money-moving AccountingSyncLog row — the two
+ * connector queues, the shared in-transaction queue, both processors' follow-up enqueue, and the
+ * manual retry action. Without it the retry's read-then-reset is not atomic against an enqueue
+ * for the same document, and the two can post under different tokens (see followup-scope-lock.ts
+ * for the full argument, including why row locks cannot substitute).
+ *
+ * Deliberately NOT shared with ACCOUNTING_WRITE_LOCK_KEY: that one is global and held for whole
+ * batch runs, and folding a per-document lock into it would serialize every payment enqueue in
+ * the system behind the daily batch.
+ */
+export const ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE = 411_220_869
+
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
   BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
+  ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE,
 } as const

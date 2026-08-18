@@ -18,6 +18,8 @@ import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} fro
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { ledgerClearsFollowUpRevival } from '@/lib/connectors/accounting-settlement-probe'
+import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import { isUniqueConstraintViolation } from '@/lib/db/prisma-unique-violation'
 import {
@@ -210,20 +212,52 @@ async function enqueueFollowUpSyncLog(
     })
     return
   }
+
+  // o3d-0m56: the AUTOMATIC path carries the identical hazard the manual retry does. Reviving a
+  // money row under a PINNED token assumes the remote still recognises that token; Intuit's
+  // `requestid` replay is better behaved than Xero's, but this guard exists because a lost
+  // response is indistinguishable from a failed call, and "their retention is probably long
+  // enough" is not evidence. So the ledger has to say the attempt is not already in it.
+  const evidence = await ledgerClearsFollowUpRevival({
+    connector: QBO_CONNECTOR,
+    type,
+    payload: plan.payload,
+    tokenDisposition: plan.action === 'reuse' ? plan.tokenDisposition : 'rotated',
+  })
+  if (!evidence.clear) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue QuickBooks ${type} for ${referenceType} ${referenceId}: `
+        + `${evidence.reason}. Re-posting it could duplicate a payment; check the ledger and resolve `
+        + 'the row by hand.',
+      metadata: { type, referenceType, referenceId, failedRowIds: failedRows.map((row) => row.id) },
+    })
+    return
+  }
+
   try {
     if (plan.action === 'reuse') {
       // Fenced on status: if another run revived the same row first — or retention deleted
       // it between the read and here (o3d-nepa) — this updates nothing rather than
       // resetting a claim it does not own.
-      const revived = await db.accountingSyncLog.updateMany({
-        where: { id: plan.syncLogId, status: 'FAILED' },
-        data: {
-          status: 'PENDING',
-          payload: plan.payload as never,
-          retryCount: 0,
-          errorMessage: null,
-          processingStartedAt: null,
-        },
+      //
+      // In a transaction ONLY to hold the scope lock across it, which serializes this revival
+      // against the manual retry's read-then-reset for the same document (o3d-0m56).
+      const revived = await db.$transaction(async (tx) => {
+        await lockFollowUpScope(tx, { connector: QBO_CONNECTOR, type, referenceType, referenceId })
+        return tx.accountingSyncLog.updateMany({
+          where: { id: plan.syncLogId, status: 'FAILED' },
+          data: {
+            status: 'PENDING',
+            payload: plan.payload as never,
+            retryCount: 0,
+            errorMessage: null,
+            processingStartedAt: null,
+          },
+        })
       })
       if (revived.count === 0) {
         await resolveLostFollowUpRevival({
@@ -244,15 +278,18 @@ async function enqueueFollowUpSyncLog(
       await logFollowUpRevival(QBO_CONNECTOR, type, referenceType, referenceId, plan)
       return
     }
-    await db.accountingSyncLog.create({
-      data: {
-        connector: QBO_CONNECTOR,
-        type,
-        status: 'PENDING',
-        referenceType,
-        referenceId,
-        payload: plan.payload as never,
-      },
+    await db.$transaction(async (tx) => {
+      await lockFollowUpScope(tx, { connector: QBO_CONNECTOR, type, referenceType, referenceId })
+      await tx.accountingSyncLog.create({
+        data: {
+          connector: QBO_CONNECTOR,
+          type,
+          status: 'PENDING',
+          referenceType,
+          referenceId,
+          payload: plan.payload as never,
+        },
+      })
     })
   } catch (error) {
     // A concurrent run took the live slot and the partial unique index

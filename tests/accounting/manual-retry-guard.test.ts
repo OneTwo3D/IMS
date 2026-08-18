@@ -3,7 +3,26 @@ import { readFile } from 'node:fs/promises'
 import path from 'node:path'
 import test from 'node:test'
 
-import { effectiveTokenFor, planManualRetry } from '@/lib/domain/accounting/followup-retry-guard'
+import {
+  deferredRevivalReason,
+  effectiveTokenFor,
+  isLiveUniqueFollowUpType,
+  planManualRetry,
+  revivesAtMostOnePerScope,
+  selectRevivableCandidates,
+} from '@/lib/domain/accounting/followup-retry-guard'
+import type { SettlementVerdict } from '@/lib/domain/accounting/ledger-settlement-evidence'
+
+/**
+ * Most of this file is about the token/ambiguity rules, which are independent of the ledger, so
+ * they run against a ledger that has been ASKED and answered "not here". `settlement` is a
+ * required argument of the real planner precisely so no caller can reach `allow` by omission;
+ * the tests that matter for it pass their own verdict explicitly.
+ */
+const CLEAR: SettlementVerdict = { outcome: 'clear' }
+const plan = (
+  args: Omit<Parameters<typeof planManualRetry>[0], 'settlement'> & { settlement?: SettlementVerdict },
+) => planManualRetry({ settlement: CLEAR, ...args })
 
 /**
  * o3d-0m56: the manual retry must refuse what the automatic enqueue refuses.
@@ -27,7 +46,7 @@ test('a single failed row retries freely — its token is preserved (o3d-0m56)',
   // The row id and payload survive the retry, so the token is bit-identical to the one the
   // failed attempt used and the remote deduplicates.
   const row = { id: 'log-1', effectiveToken: 'log-1', payload: { accountingInvoiceId: 'inv-9' } }
-  assert.deepEqual(planManualRetry({ ...scopeArgs, target: row, siblings: [row] }), { action: 'allow' })
+  assert.deepEqual(plan({ ...scopeArgs, target: row, siblings: [row] }), { action: 'allow' })
 })
 
 test('rows SHARING one token retry freely (o3d-0m56)', () => {
@@ -39,7 +58,7 @@ test('rows SHARING one token retry freely (o3d-0m56)', () => {
     { id: 'log-1', effectiveToken: shared, payload: { accountingInvoiceId: 'inv-9' } },
     { id: 'log-2', effectiveToken: shared, payload: { accountingInvoiceId: 'inv-9' } },
   ]
-  assert.deepEqual(planManualRetry({ ...scopeArgs, target: rows[0]!, siblings: rows }), { action: 'allow' })
+  assert.deepEqual(plan({ ...scopeArgs, target: rows[0]!, siblings: rows }), { action: 'allow' })
 })
 
 test('DISTINCT tokens for the same document refuse (o3d-0m56)', () => {
@@ -49,11 +68,11 @@ test('DISTINCT tokens for the same document refuse (o3d-0m56)', () => {
     { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9') },
     { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9') },
   ]
-  const plan = planManualRetry({ ...scopeArgs, target: rows[0]!, siblings: rows })
-  assert.equal(plan.action, 'refuse')
-  assert.equal(plan.action === 'refuse' ? plan.tokenCount : 0, 2)
-  assert.match(plan.action === 'refuse' ? plan.reason : '', /could post a second payment/)
-  assert.match(plan.action === 'refuse' ? plan.reason : '', /SalesOrder so-1/, 'the refusal must name the reference')
+  const verdict = plan({ ...scopeArgs, target: rows[0]!, siblings: rows })
+  assert.equal(verdict.action, 'refuse')
+  assert.equal(verdict.action === 'refuse' ? verdict.tokenCount : 0, 2)
+  assert.match(verdict.action === 'refuse' ? verdict.reason : '', /could post a second payment/)
+  assert.match(verdict.action === 'refuse' ? verdict.reason : '', /SalesOrder so-1/, 'the refusal must name the reference')
 })
 
 test('attempts against a DIFFERENT document do not trigger a refusal (o3d-0m56)', () => {
@@ -63,7 +82,7 @@ test('attempts against a DIFFERENT document do not trigger a refusal (o3d-0m56)'
     { id: 'log-new', effectiveToken: 'log-new', payload: postable('inv-new') },
     { id: 'log-old', effectiveToken: 'log-old', payload: postable('inv-old') },
   ]
-  assert.deepEqual(planManualRetry({ ...scopeArgs, target: rows[0]!, siblings: rows }), { action: 'allow' })
+  assert.deepEqual(plan({ ...scopeArgs, target: rows[0]!, siblings: rows }), { action: 'allow' })
 })
 
 test('an anchorless money row is UNPOSTABLE, so it neither counts nor strands (o3d-0m56)', () => {
@@ -75,7 +94,7 @@ test('an anchorless money row is UNPOSTABLE, so it neither counts nor strands (o
     { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9') },
     { id: 'log-b', effectiveToken: 'log-b', payload: { amount: 10 } },
   ]
-  assert.deepEqual(planManualRetry({ ...scopeArgs, target: rows[0]!, siblings: rows }), { action: 'allow' })
+  assert.deepEqual(plan({ ...scopeArgs, target: rows[0]!, siblings: rows }), { action: 'allow' })
 
   // The conservative anchor rule still governs rows that ARE postable: a complete sibling whose
   // anchors cannot be read is treated as possibly-this-one. (Reachable for types with no
@@ -85,7 +104,7 @@ test('an anchorless money row is UNPOSTABLE, so it neither counts nor strands (o
     { id: 'log-b', effectiveToken: 'log-b', payload: {} },
   ]
   assert.equal(
-    planManualRetry({ type: 'INVOICE_PDF', reference: 'SalesOrder so-1', target: notes[0]!, siblings: notes }).action,
+    plan({ type: 'INVOICE_PDF', reference: 'SalesOrder so-1', target: notes[0]!, siblings: notes }).action,
     'allow',
     'and a non-money type never refuses regardless',
   )
@@ -99,7 +118,7 @@ test('non-money-moving types never refuse (o3d-0m56)', () => {
   ]
   for (const type of ['INVOICE_PDF', 'INVOICE_EMAIL', 'WC_INVOICE_NOTE', 'BILL_ATTACHMENT']) {
     assert.deepEqual(
-      planManualRetry({ type, reference: 'SalesOrder so-1', target: rows[0]!, siblings: rows }),
+      plan({ type, reference: 'SalesOrder so-1', target: rows[0]!, siblings: rows }),
       { action: 'allow' },
       `${type} must never be refused`,
     )
@@ -187,7 +206,7 @@ test('the token derivation mirrors each processor EXACTLY, empty string included
     { id: 'log-2', effectiveToken: effectiveTokenFor('quickbooks', { id: 'log-2', payload: { _idempotencyKey: '' } }), payload: postable('inv-9') },
   ]
   assert.deepEqual(
-    planManualRetry({ type: 'INVOICE_PAYMENT', reference: 'SalesOrder so-1', target: rows[0]!, siblings: rows }),
+    plan({ type: 'INVOICE_PAYMENT', reference: 'SalesOrder so-1', target: rows[0]!, siblings: rows }),
     { action: 'allow' },
   )
 
@@ -234,7 +253,7 @@ test('BILL_PAYMENT is money-moving too (o3d-0m56)', async () => {
     { id: 'log-b', effectiveToken: 'log-b', payload: body },
   ]
   assert.equal(
-    planManualRetry({ type: 'BILL_PAYMENT', reference: 'PurchaseInvoice pi-1', target: rows[0]!, siblings: rows }).action,
+    plan({ type: 'BILL_PAYMENT', reference: 'PurchaseInvoice pi-1', target: rows[0]!, siblings: rows }).action,
     'refuse',
     'two bill payments under distinct tokens must refuse, exactly as invoice payments do',
   )
@@ -252,7 +271,7 @@ test('a sibling that provably never posted cannot strand a valid payment (o3d-0m
     { id: 'log-broken', effectiveToken: 'log-broken', payload: { accountingInvoiceId: 'inv-9', amount: 10 } },
   ]
   assert.deepEqual(
-    planManualRetry({ ...scopeArgs, target: rows[0]!, siblings: rows }),
+    plan({ ...scopeArgs, target: rows[0]!, siblings: rows }),
     { action: 'allow' },
     'a structurally unpostable sibling must not make the valid row un-retryable',
   )
@@ -263,7 +282,7 @@ test('a sibling that provably never posted cannot strand a valid payment (o3d-0m
     { id: 'log-good', effectiveToken: 'log-good', payload: good },
     { id: 'log-zero', effectiveToken: 'log-zero', payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 0 } },
   ]
-  assert.equal(planManualRetry({ ...scopeArgs, target: zero[0]!, siblings: zero }).action, 'refuse')
+  assert.equal(plan({ ...scopeArgs, target: zero[0]!, siblings: zero }).action, 'refuse')
 })
 
 for (const action of ACTIONS) {
@@ -273,13 +292,13 @@ for (const action of ACTIONS) {
     // ambiguous rows targeting the old one either let the pair through or refused the safe row
     // along with them, depending which came first.
     const source = await readFile(path.join(process.cwd(), action.file), 'utf8')
-    const at = source.indexOf('const refusedIds')
+    const at = source.indexOf('const allowed: typeof scopeCandidates')
     const body = source.slice(at, source.indexOf('const allowedIds', at))
 
-    assert.match(body, /for \(const candidate of candidates\)/, 'the plan must be per candidate')
-    assert.match(body, /refusedIds\.add\(candidate\.id\)/, 'only the judged candidate may be refused')
+    assert.match(body, /for \(const candidate of scopeCandidates\)/, 'the plan must be per candidate')
+    assert.match(body, /refused\.push\(\{ id: candidate\.id/, 'only the judged candidate may be refused')
     assert.ok(
-      !/for \(const row of rows\) refusedIds\.add/.test(body),
+      !/for \(const row of siblings\) refused\.push/.test(body),
       'refusing every sibling makes a safe row un-retryable because of its neighbours',
     )
     assert.match(body, /target: \{\s*id: candidate\.id/, 'the candidate must be the plan target, not an arbitrary sibling')
@@ -295,8 +314,8 @@ for (const action of ACTIONS) {
     //   - a SYNCED sibling under a different token is the strongest evidence available -- that
     //     token demonstrably reached the ledger.
     const source = await readFile(path.join(process.cwd(), action.file), 'utf8')
-    const at = source.indexOf('const siblingRows = await db.accountingSyncLog.findMany')
-    assert.notEqual(at, -1, 'the sibling snapshot must still exist')
+    const at = source.indexOf('const siblingRows = await tx.accountingSyncLog.findMany')
+    assert.notEqual(at, -1, 'the sibling snapshot must still exist, and must read inside the transaction')
     const query = source.slice(at, source.indexOf('})', source.indexOf('select:', at)))
 
     assert.ok(
@@ -306,30 +325,46 @@ for (const action of ACTIONS) {
     assert.match(query, /connector: '(xero|quickbooks)'/, 'it must still be scoped to the connector')
 
     // The reset itself must stay narrow: only FAILED rows may be re-queued.
-    const update = source.slice(source.indexOf('await db.accountingSyncLog.updateMany'))
+    const update = source.slice(source.indexOf('await tx.accountingSyncLog.updateMany'))
     assert.match(update.slice(0, 400), /status: 'FAILED'/, 'the UPDATE must still only touch FAILED rows')
   })
 
-  test(`${action.name}: the scope filter is deduplicated (o3d-0m56)`, async () => {
-    // "Retry All" over hundreds of rows in a handful of scopes built one OR arm per candidate.
+  test(`${action.name}: the scope is deduplicated and locked before it is read (o3d-0m56)`, async () => {
+    // "Retry All" over hundreds of rows in a handful of scopes must plan each SCOPE once, not
+    // each candidate — and must hold that scope's lock across the read, the plan and the reset,
+    // or an enqueue landing in between is invisible to the verdict it invalidates.
     const source = await readFile(path.join(process.cwd(), action.file), 'utf8')
-    const at = source.indexOf('const siblingRows = await db.accountingSyncLog.findMany')
-    const query = source.slice(at, at + 700)
-    assert.match(query, /OR: \[\.\.\.scopes\.values\(\)\]\.map/, 'the OR must be built from deduplicated scopes')
-    assert.ok(!/OR: candidates\.map/.test(query), 'not one arm per candidate')
+    assert.match(source, /const scopes = new Map<string, \(typeof candidates\)\[number\]>\(\)/,
+      'scopes must be deduplicated')
+    const at = source.indexOf('for (const [key, scope] of [...scopes.entries()]')
+    assert.notEqual(at, -1, 'the work must be driven per scope')
+    const body = source.slice(at, source.indexOf('const siblingRows', at))
+    assert.match(body, /db\.\$transaction/, 'each scope is one transaction')
+    assert.match(body, /await lockFollowUpScope\(tx, \{ connector: '(xero|quickbooks)', \.\.\.scope \}\)/,
+      'and the lock is taken first, inside it')
+    // The probe is I/O and must NOT be inside that transaction: one unreachable remote would
+    // otherwise hold an accounting lock for its whole timeout. Asserted on the LOOP BODY, not on
+    // first-occurrence order — a probe added inside the transaction leaves the earlier call in
+    // place and would slip past a position check.
+    assert.ok(
+      source.indexOf('probeLedgerSettlement') < at,
+      'the ledger read must happen before any scope transaction is opened',
+    )
+    const loopBody = source.slice(at, source.indexOf('for (const [, entry] of refusedByScope)', at))
+    assert.ok(!/probeLedgerSettlement/.test(loopBody), 'and must not be repeated inside the locked scope')
   })
 
   test(`${action.name}: refusals are logged once per scope, not once per row (o3d-0m56)`, async () => {
     // One sequential activityLog.create per refused candidate produced N near-duplicate
     // warnings before any allowed row was reset.
     const source = await readFile(path.join(process.cwd(), action.file), 'utf8')
-    const at = source.indexOf('const refusedIds')
-    const body = source.slice(at, source.indexOf('const allowedIds', at))
-    assert.match(body, /for \(const \[key, entry\] of refusedByScope\)/, 'the log must be emitted per scope')
-    const loopAt = body.indexOf('for (const candidate of candidates)')
-    const logAt = body.indexOf('await logActivity')
-    assert.ok(loopAt !== -1 && logAt !== -1 && logAt > body.indexOf('for (const [key, entry]'),
-      'no logActivity inside the per-candidate loop')
+    assert.match(source, /for \(const \[, entry\] of refusedByScope\) \{\n\s*await logActivity\(/,
+      'the log must be emitted per scope, from the collected map')
+    const planAt = source.indexOf('for (const candidate of scopeCandidates)')
+    const scopeLogAt = source.indexOf('for (const [, entry] of refusedByScope)')
+    const perCandidateBody = source.slice(planAt, source.indexOf('const { revive, deferred }', planAt))
+    assert.ok(!/await logActivity/.test(perCandidateBody), 'no logActivity inside the per-candidate loop')
+    assert.ok(scopeLogAt > planAt, 'the warnings are written after the planning, not during it')
   })
 
   test(`${action.name}: the surfaced reason does not depend on candidate order (o3d-0m56)`, async () => {
@@ -356,7 +391,10 @@ test('a partial refusal is not reported as plain success (o3d-0m56)', async () =
   for (const file of ['app/(dashboard)/sync/xero-client.tsx', 'app/(dashboard)/sync/failed-sync-banner.tsx']) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     assert.match(source, /result\.refused|res\.refused/, `${file} must render the refused count`)
-    assert.match(source, /could post a second payment/, `${file} must say WHY they were not re-queued`)
+    assert.match(source, /could post a /, `${file} must say WHY they were not re-queued`)
+    // ...and must not claim that is the ONLY reason: a row can also be left failed because another
+    // entry for the same document is already queued, which is not a money warning at all.
+    assert.match(source, /already queued/, `${file} must not present a deferral as a money hazard`)
   }
 })
 
@@ -377,7 +415,7 @@ test('a SETTLED sibling still counts, because settled does not mean unposted (o3
     const settled = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status }
     const target = { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' }
     assert.equal(
-      planManualRetry({ ...scopeArgs, target, siblings: [settled, target] }).action,
+      plan({ ...scopeArgs, target, siblings: [settled, target] }).action,
       'refuse',
       `a ${status} sibling under a different token may be money already posted`,
     )
@@ -391,22 +429,22 @@ test('the refusal says the remote will NOT save us (o3d-0m56)', () => {
     { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'SYNCED' },
     { id: 'log-b', effectiveToken: 'log-b', payload: postable('inv-9'), status: 'FAILED' },
   ]
-  const plan = planManualRetry({ ...scopeArgs, target: rows[1]!, siblings: rows })
-  assert.ok(plan.action === 'refuse')
-  assert.match(plan.reason, /too late for the remote to deduplicate/)
-  assert.match(plan.reason, /Check the ledger/)
+  const verdict = plan({ ...scopeArgs, target: rows[1]!, siblings: rows })
+  assert.ok(verdict.action === 'refuse')
+  assert.match(verdict.reason, /too late for the remote to deduplicate/)
+  assert.match(verdict.reason, /Check the ledger/)
 })
 
 test('a single row in its scope is still allowed (o3d-0m56)', () => {
   // The narrowness that matters most: one row, one token, nothing to be ambiguous with.
   const only = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'FAILED' }
-  assert.deepEqual(planManualRetry({ ...scopeArgs, target: only, siblings: [only] }), { action: 'allow' })
+  assert.deepEqual(plan({ ...scopeArgs, target: only, siblings: [only] }), { action: 'allow' })
 
   // And rows SHARING a token stay allowed however many there are.
   const shared = ['a', 'b', 'c'].map((id) => ({
     id: `log-${id}`, effectiveToken: 'shared-token', payload: postable('inv-9'), status: 'FAILED',
   }))
-  assert.deepEqual(planManualRetry({ ...scopeArgs, target: shared[0]!, siblings: shared }), { action: 'allow' })
+  assert.deepEqual(plan({ ...scopeArgs, target: shared[0]!, siblings: shared }), { action: 'allow' })
 })
 
 for (const action of ACTIONS) {
@@ -429,3 +467,135 @@ for (const action of ACTIONS) {
     assert.match(source, /payload: true, status: true/, 'and be selected in the first place')
   })
 }
+
+// --- Rule 3: positive settlement evidence (Codex finding 1) ---
+
+test('a LONE money row is refused unless the ledger says the attempt is not there (o3d-0m56)', () => {
+  // The hole this closes, and the false reasoning that left it open: "a single row is safe
+  // because it re-posts under its own token, which the remote deduplicates". Xero remembers an
+  // Idempotency-Key for MINUTES; a manual retry is minutes to days later. So an unambiguous row
+  // whose call committed before its response was lost was re-posted, and nothing refused it
+  // because nothing was ambiguous.
+  const only = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'FAILED' }
+  const args = { ...scopeArgs, target: only, siblings: [only] }
+
+  assert.deepEqual(plan({ ...args, settlement: { outcome: 'clear' } }), { action: 'allow' },
+    'a ledger that has been asked and answered "not here" is what makes a retry safe')
+
+  const present = plan({ ...args, settlement: { outcome: 'present', detail: '10.00 dated 2026-08-01 (PAY-1)' } })
+  assert.equal(present.action, 'refuse')
+  assert.match(present.action === 'refuse' ? present.reason : '', /already holds a settlement of 10\.00 dated 2026-08-01/)
+  assert.match(present.action === 'refuse' ? present.reason : '', /could post a second payment/)
+
+  const unknown = plan({ ...args, settlement: { outcome: 'unknown', reason: 'HTTP 503' } })
+  assert.equal(unknown.action, 'refuse', 'unknown is not clear — fail closed')
+  assert.match(unknown.action === 'refuse' ? unknown.reason : '', /could not establish/)
+  assert.match(unknown.action === 'refuse' ? unknown.reason : '', /HTTP 503/, 'and say why')
+})
+
+test('the settlement verdict does not touch NON-money types (o3d-0m56)', () => {
+  // The cost has to stay proportionate: a PDF or an email is not worth an API call, and a
+  // connector outage must not stop an operator re-sending one.
+  const only = { id: 'log-a', effectiveToken: 'log-a', payload: postable('inv-9'), status: 'FAILED' }
+  for (const type of ['INVOICE_PDF', 'INVOICE_EMAIL', 'WC_INVOICE_NOTE', 'BILL_ATTACHMENT']) {
+    assert.deepEqual(
+      plan({
+        type, reference: 'SalesOrder so-1', target: only, siblings: [only],
+        settlement: { outcome: 'unknown', reason: 'never asked' },
+      }),
+      { action: 'allow' },
+      `${type} must not be refused for want of ledger evidence`,
+    )
+  }
+})
+
+// --- Rule 2 and the one-per-scope revival (Codex findings 3 and 4) ---
+
+test('a LIVE sibling blocks the revival, whatever the token says (o3d-0m56)', () => {
+  // Two live rows in one scope is two attempts at one settlement — and for the index-covered
+  // types PostgreSQL rejects the second outright, which used to abort the whole bulk update.
+  const shared = 'invoice-payment:payment:p1'
+  const target = { id: 'log-b', effectiveToken: shared, payload: postable('inv-9'), status: 'FAILED' }
+  for (const status of ['PENDING', 'PROCESSING', 'SYNCED']) {
+    const live = { id: 'log-a', effectiveToken: shared, payload: postable('inv-9'), status }
+    const verdict = plan({ ...scopeArgs, target, siblings: [live, target] })
+    assert.equal(verdict.action, 'refuse', `a ${status} sibling owns the live slot`)
+    assert.match(verdict.action === 'refuse' ? verdict.reason : '', /already queued or has posted/)
+    assert.match(verdict.action === 'refuse' ? verdict.reason : '', new RegExp(`log-a ${status}`))
+  }
+  // A CANCELLED or FAILED sibling under the same token does NOT hold the slot — the index
+  // ignores those statuses, and refusing on them would strand every ordinary repeated receipt.
+  for (const status of ['FAILED', 'CANCELLED']) {
+    const spent = { id: 'log-a', effectiveToken: shared, payload: postable('inv-9'), status }
+    assert.deepEqual(plan({ ...scopeArgs, target, siblings: [spent, target] }), { action: 'allow' },
+      `a ${status} sibling must not block the retry`)
+  }
+})
+
+test('BILL_PAYMENT is fenced by the MONEY argument, not the index (o3d-0m56)', () => {
+  // accounting_sync_logs_followup_live_unique does not cover BILL_PAYMENT, so nothing in the
+  // database stops two live rows for one bill. Two live rows is two supplier payments.
+  assert.equal(isLiveUniqueFollowUpType('BILL_PAYMENT'), false, 'the index really does not cover it')
+  assert.equal(revivesAtMostOnePerScope('BILL_PAYMENT'), true, 'and the guard must cover it anyway')
+
+  const shared = 'bill-payment:1'
+  const bill = (accountingInvoiceId: string) => ({ accountingInvoiceId, bankAccountId: 'bank-1', amount: 10 })
+  const target = { id: 'log-b', effectiveToken: shared, payload: bill('bill-1'), status: 'FAILED' }
+  const live = { id: 'log-a', effectiveToken: shared, payload: bill('bill-1'), status: 'PENDING' }
+  assert.equal(
+    plan({ type: 'BILL_PAYMENT', reference: 'PurchaseInvoice pi-1', target, siblings: [live, target] }).action,
+    'refuse',
+  )
+  // ...but a live row for a DIFFERENT bill is not evidence about this one, and refusing it would
+  // strand a legitimate payment. Only the index-covered types refuse on scope alone.
+  const other = { id: 'log-c', effectiveToken: shared, payload: bill('bill-2'), status: 'PENDING' }
+  assert.deepEqual(
+    plan({ type: 'BILL_PAYMENT', reference: 'PurchaseInvoice pi-1', target, siblings: [other, target] }),
+    { action: 'allow' },
+  )
+})
+
+test('at most ONE row per scope is revived, and it is the oldest POSTABLE one (o3d-0m56)', () => {
+  // "Retry All" put every allowed id into one updateMany. Two same-token FAILED payments are
+  // both allowed — they are not ambiguous — and reviving both violates the live-row index, which
+  // rolls back the entire statement and leaves unrelated safe scopes unreset too.
+  const rows = [
+    // Oldest first, as the action loads them. The first is missing bankAccountId, so its request
+    // can only ever fail: pinning the scope behind it would strand the payment.
+    { id: 'log-old', payload: { accountingInvoiceId: 'inv-9', amount: 10 } },
+    { id: 'log-mid', payload: postable('inv-9') },
+    { id: 'log-new', payload: postable('inv-9') },
+  ]
+  const chosen = selectRevivableCandidates('INVOICE_PAYMENT', rows)
+  assert.deepEqual(chosen.revive.map((r) => r.id), ['log-mid'])
+  assert.deepEqual(chosen.deferred.map((r) => r.id), ['log-old', 'log-new'])
+
+  // An index-covered NON-money type is bound by the same rule, for the database's reason.
+  assert.deepEqual(selectRevivableCandidates('INVOICE_PDF', rows).revive.map((r) => r.id), ['log-old'])
+
+  // A type outside both sets revives every allowed row, exactly as before.
+  assert.deepEqual(selectRevivableCandidates('SALES_INVOICE', rows).revive.map((r) => r.id),
+    ['log-old', 'log-mid', 'log-new'])
+  assert.deepEqual(selectRevivableCandidates('SALES_INVOICE', rows).deferred, [])
+
+  assert.match(deferredRevivalReason('SalesOrder so-1', 'log-mid'), /Only one entry for SalesOrder so-1/)
+})
+
+test('the guard\'s live-unique type set matches the migration (o3d-0m56)', async () => {
+  // The guard decides what may be revived from a copy of the index's WHERE clause. A migration
+  // that adds a type without updating the copy reintroduces the bulk-rollback bug silently.
+  const sql = await readFile(
+    path.join(process.cwd(), 'prisma/migrations/20260615000000_followup_unique_index_add_credit_note_allocation/migration.sql'),
+    'utf8',
+  )
+  const create = sql.slice(sql.lastIndexOf('CREATE UNIQUE INDEX "accounting_sync_logs_followup_live_unique"'))
+  const types = [...create.matchAll(/'([A-Z_]+)'/g)].map((m) => m[1]!)
+    .filter((t) => !['PENDING', 'PROCESSING', 'SYNCED'].includes(t))
+  assert.ok(types.length >= 6, 'the index must still list its types')
+  for (const type of types) {
+    assert.equal(isLiveUniqueFollowUpType(type), true, `${type} is in the index and must be in the guard`)
+  }
+  for (const type of ['SALES_INVOICE', 'COGS_JOURNAL', 'BILL_PAYMENT']) {
+    assert.equal(isLiveUniqueFollowUpType(type), false, `${type} is NOT in the index`)
+  }
+})
