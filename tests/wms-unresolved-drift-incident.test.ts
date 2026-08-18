@@ -181,24 +181,27 @@ test('[o3d-0gzr] isolate eligibility IS the sweep predicate, not a copy of it', 
   assert.deepEqual(isolate.id, { in: incident.linkIds })
 })
 
-test('[o3d-0gzr r2] freshness comes from the DATABASE clock when we have it', async () => {
+test('[o3d-0gzr r2] freshness prefers the store row stamp over the sweep stamp', async () => {
   const { DRIFT_INCIDENT_MAX_AGE_MS } = await import('../lib/domain/wms/unresolved-drift.ts')
-  // The sweep's own lastSeenAt is written by whichever host ran the sweep.
-  // Judging by it made a fast host produce future stamps; failing those closed
-  // then turned persistent skew into permanent suppression of the escape hatch.
-  // The Setting row's updatedAt is one clock for everyone, so prefer it.
+  // Prefer Setting.updatedAt over the sweep's own lastSeenAt: it advances on
+  // every write, including one whose JSON compares equal, so a stable cohort
+  // cannot expire while the sweep is still confirming it.
+  //
+  // NOT because it is a database clock — it is not. Prisma's @updatedAt is
+  // ORM-level, generated on the writing host, which is why the production
+  // comment names that residual instead of claiming a single clock.
   const skewedIntoTheFuture = { ...LIVE, lastSeenAt: new Date(NOW.getTime() + 45 * 60_000).toISOString() }
   const confirmedRecently = new Date(NOW.getTime() - 60_000)
   assert.ok(
     toIncident('mintsoft', skewedIntoTheFuture, undefined, NOW, confirmedRecently),
-    'a skewed sweep stamp must not suppress an incident the database says is fresh',
+    'a skewed sweep stamp must not suppress an incident the store row says is fresh',
   )
   // ...and the database clock is what expires it, too.
   const confirmedLongAgo = new Date(NOW.getTime() - DRIFT_INCIDENT_MAX_AGE_MS - 1000)
   assert.equal(
     toIncident('mintsoft', { ...LIVE, lastSeenAt: NOW.toISOString() }, undefined, NOW, confirmedLongAgo),
     null,
-    'a recent sweep stamp must not resurrect a row the database says is stale',
+    'a recent sweep stamp must not resurrect a row the store says is stale',
   )
 })
 
