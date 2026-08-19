@@ -11,6 +11,9 @@ import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 // its where clause — the double below returns a canned count and cannot observe a fence at all.
 const CLAIMED_AT = new Date('2026-03-01T09:00:00.000Z')
 
+// o3d-e2mz: the same where also carries the claimed attemptRevision, so a failure
+// from one attempt can never reopen a row an operator settled while it was in flight.
+//
 // audit-om4e: the inline MAIN-sync failure retry updates must advance retryCount
 // optimistically (where: { id, retryCount }) like markSyncLogForFollowUpRetry, so
 // two workers on the same row can't double-write the failure transition / mirrored
@@ -63,15 +66,19 @@ function makeTx(stub: { updateCount: number; current?: { retryCount: number; sta
   return { tx: tx as never, calls }
 }
 
-const entry = { id: 'log-1', retryCount: 2, type: 'SALES_INVOICE' as const, referenceType: 'SalesOrder', referenceId: 'so-1' }
+const attempt = { id: 'log-1', attemptRevision: 4 }
+const entry = { retryCount: 2, type: 'SALES_INVOICE' as const, referenceType: 'SalesOrder', referenceId: 'so-1' }
 
 test('optimistic update keys on the observed retryCount; non-terminal stays PENDING', async () => {
   const { tx, calls } = makeTx({ updateCount: 1 })
-  const result = await applyMainSyncFailureRetry(tx, entry, 'boom', {}, claimHeldFrom(CLAIMED_AT))
+  const result = await applyMainSyncFailureRetry(tx, attempt, entry, 'boom', {}, claimHeldFrom(CLAIMED_AT))
+  // BOTH fences on one where (o3d-550x + o3d-e2mz): the held claim proves this worker still owns
+  // the row, the attempt revision proves the failure belongs to the attempt it claimed.
   assert.deepEqual(calls.updateMany[0].where, {
     id: 'log-1',
     status: 'PROCESSING',
     processingStartedAt: CLAIMED_AT,
+    attemptRevision: 4,
     retryCount: 2,
   })
   assert.equal(calls.updateMany[0].data.retryCount, 3)
@@ -82,26 +89,26 @@ test('optimistic update keys on the observed retryCount; non-terminal stays PEND
 
 test('reaching MAX_RETRIES marks FAILED (and writes the mirror on the winning path)', async () => {
   const { tx } = makeTx({ updateCount: 1 })
-  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 4 }, 'boom', {}, claimHeldFrom(CLAIMED_AT))
+  const result = await applyMainSyncFailureRetry(tx, attempt, { ...entry, retryCount: 4 }, 'boom', {}, claimHeldFrom(CLAIMED_AT))
   assert.equal(result.finalFailure, true)
 })
 
 test('lost race (count 0) reports the PERSISTED terminal state, not the stale view', async () => {
   const { tx, calls } = makeTx({ updateCount: 0, current: { retryCount: 5, status: 'FAILED' } })
-  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 1 }, 'boom', {}, claimHeldFrom(CLAIMED_AT))
+  const result = await applyMainSyncFailureRetry(tx, attempt, { ...entry, retryCount: 1 }, 'boom', {}, claimHeldFrom(CLAIMED_AT))
   assert.equal(calls.findUnique, 1)
   assert.equal(result.finalFailure, true)
 })
 
 test('lost race where the winner left the row retryable reports finalFailure=false', async () => {
   const { tx } = makeTx({ updateCount: 0, current: { retryCount: 2, status: 'PENDING' } })
-  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 1 }, 'boom', {}, claimHeldFrom(CLAIMED_AT))
+  const result = await applyMainSyncFailureRetry(tx, attempt, { ...entry, retryCount: 1 }, 'boom', {}, claimHeldFrom(CLAIMED_AT))
   assert.equal(result.finalFailure, false)
 })
 
 test('lost race with a vanished row falls back to the computed view', async () => {
   const { tx } = makeTx({ updateCount: 0, current: null })
-  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 4 }, 'boom', {}, claimHeldFrom(CLAIMED_AT))
+  const result = await applyMainSyncFailureRetry(tx, attempt, { ...entry, retryCount: 4 }, 'boom', {}, claimHeldFrom(CLAIMED_AT))
   assert.equal(result.finalFailure, true) // 4 → 5 == MAX
 })
 
@@ -110,10 +117,14 @@ test('o3d-a3wx r6: the write is keyed on the CLAIM INSTANT, not merely on the ro
   // status-only fence would still let the displaced owner through. Only the worker that stamped this
   // exact timestamp owns the row.
   const { tx, calls } = makeTx({ updateCount: 0, current: { retryCount: 2, status: 'PROCESSING' } })
-  const result = await applyMainSyncFailureRetry(tx, entry, 'boom', {}, claimHeldFrom(CLAIMED_AT))
+  const result = await applyMainSyncFailureRetry(tx, attempt, entry, 'boom', {}, claimHeldFrom(CLAIMED_AT))
 
   assert.equal(calls.updateMany[0].where.processingStartedAt, CLAIMED_AT)
   assert.equal(calls.updateMany[0].where.status, 'PROCESSING')
+  // o3d-e2mz: and the revision beside it. The two answer different questions — "do I still own
+  // this row" and "is this still the attempt I claimed" — and neither implies the other, since
+  // two claims inside one millisecond share a `processingStartedAt`.
+  assert.equal(calls.updateMany[0].where.attemptRevision, 4)
   // Displaced: nothing was written, and the row is reported as it actually stands — still claimed and
   // still retryable — so the caller retries the outbox job instead of marking it permanently failed.
   assert.equal(calls.findUnique, 1)

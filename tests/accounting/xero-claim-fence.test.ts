@@ -40,6 +40,13 @@ type Row = {
   id: string
   status: string
   processingStartedAt: Date | null
+  /**
+   * o3d-e2mz: the per-attempt identity the processor now stamps on every claim. Carried by this
+   * double because `applyMainSyncFailureRetry` fences on it as well as on the claim instant — a
+   * double without it answers `undefined` to `attemptRevision: 0` and refuses EVERY write, which
+   * would make the o3d-550x tests below pass for entirely the wrong reason.
+   */
+  attemptRevision: number
   retryCount: number
   externalTransactionId: string | null
   syncedAt: Date | null
@@ -68,6 +75,7 @@ function makeRowStore(
   const state: Row | null = row === null ? null : {
     status: 'PROCESSING',
     processingStartedAt: null,
+    attemptRevision: 0,
     retryCount: 0,
     externalTransactionId: null,
     syncedAt: null,
@@ -150,6 +158,7 @@ function makeRowStore(
 const T_DISPLACED_CLAIM = new Date('2026-03-01T09:00:00.000Z')
 const T_REPLACEMENT_CLAIM = new Date('2026-03-01T09:20:00.000Z')
 
+const ATTEMPT = { id: 'log-1', attemptRevision: 0 }
 const ENTRY = {
   id: 'log-1',
   retryCount: 2,
@@ -302,7 +311,7 @@ test('o3d-550x: a displaced owner cannot release the replacement\'s claim', asyn
     retryCount: 2,
   })
 
-  await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, claimHeldFrom(T_DISPLACED_CLAIM))
+  await applyMainSyncFailureRetry(tx, ATTEMPT, ENTRY, 'connection reset', {}, claimHeldFrom(T_DISPLACED_CLAIM))
 
   assert.equal(state!.status, 'PROCESSING', 'the replacement still holds the row')
   assert.equal(state!.processingStartedAt?.valueOf(), T_REPLACEMENT_CLAIM.valueOf())
@@ -320,7 +329,7 @@ test('o3d-550x: the worker that DOES hold the claim still records its failure', 
     retryCount: 2,
   })
 
-  const result = await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, claimHeldFrom(T_REPLACEMENT_CLAIM))
+  const result = await applyMainSyncFailureRetry(tx, ATTEMPT, ENTRY, 'connection reset', {}, claimHeldFrom(T_REPLACEMENT_CLAIM))
 
   assert.equal(state!.status, 'PENDING')
   assert.equal(state!.retryCount, 3)

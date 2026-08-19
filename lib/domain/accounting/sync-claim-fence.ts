@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import type { AttemptRef } from '@/lib/domain/accounting/sync-log-attempt'
 
 /**
  * A CLAIM THIS WORKER IS HOLDING RIGHT NOW — the thing every fence below is built from (o3d-550x).
@@ -111,11 +112,27 @@ export async function releaseClaimForRetry(
   entryId: string,
   claim: HeldClaim,
   release: { errorMessage: string; nextAttemptAt: Date },
+  /**
+   * o3d-e2mz: the ATTEMPT this release belongs to, where the caller minted one.
+   *
+   * The two fences answer different questions and neither implies the other. The held claim asks
+   * "do I still own this row?" and stops a DISPLACED owner writing over its replacement. The attempt
+   * revision asks "is this still the attempt I claimed?" and stops the release landing on a row an
+   * OPERATOR has decided about — `applyFencedAttemptDecision` bumps the revision, and a decision that
+   * leaves the row PROCESSING at the same claim instant is invisible to `heldClaimWhere` alone.
+   *
+   * Optional because not every caller of this release mints an attempt: the cancelled-order
+   * retirement path fences on the claim only. Omitting it releases exactly as before.
+   */
+  attempt?: AttemptRef,
 ): Promise<boolean> {
   const released = await client.accountingSyncLog.updateMany({
     // The instant is read HERE, as the statement is built — so a claim that has been renewed since
     // the entry was picked up releases the row it actually holds (Codex r2, medium 2).
-    where: heldClaimWhere(entryId, claim),
+    where: {
+      ...heldClaimWhere(entryId, claim),
+      ...(attempt ? { attemptRevision: attempt.attemptRevision } : {}),
+    },
     data: {
       status: 'PENDING',
       errorMessage: release.errorMessage,

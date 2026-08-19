@@ -73,6 +73,12 @@ import {
   retireOverSettlingInvoicePayment,
 } from '@/lib/domain/accounting/invoice-payment-capacity'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
+import {
+  claimAttemptWhere,
+  nextAttemptRevision,
+  updateAtAttemptRevision,
+  type AttemptRef,
+} from '@/lib/domain/accounting/sync-log-attempt'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
@@ -778,8 +784,8 @@ export async function buryOutboxJobForUnwrittenPostedEvidence(
  * SYNCED row is what the post-time capacity guard counts, so the slot it frees is not a silent one.
  */
 export async function markSyncLogForFollowUpRetry(
-
-  entry: { id: string; retryCount: number },
+  attempt: AttemptRef,
+  entry: { retryCount: number },
   error: unknown,
   client?: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
 ): Promise<{ errorMessage: string; finalFailure: boolean }> {
@@ -792,8 +798,12 @@ export async function markSyncLogForFollowUpRetry(
   // at one AccountingSyncLog) must not both increment from a stale value and
   // double-write the failure transition. The compound where makes the update a
   // no-op for the loser of the race.
+  //
+  // o3d-e2mz: fenced on the claimed attempt too. retryCount alone cannot identify
+  // an attempt — retryFailedXeroSync resets it to 0 — so without the revision this
+  // write could land on a LATER attempt, or revive a row an operator has settled.
   const updated = await conn.accountingSyncLog.updateMany({
-    where: { id: entry.id, retryCount: entry.retryCount },
+    where: { id: attempt.id, attemptRevision: attempt.attemptRevision, retryCount: entry.retryCount },
     data: {
       status: finalFailure ? 'FAILED' : 'PENDING',
       retryCount,
@@ -809,7 +819,7 @@ export async function markSyncLogForFollowUpRetry(
   // reality, not our stale view — otherwise we could mark the outbox job for
   // retry while the row is already terminally FAILED (or vice-versa).
   const current = await conn.accountingSyncLog.findUnique({
-    where: { id: entry.id },
+    where: { id: attempt.id },
     select: { retryCount: true, status: true },
   })
   return {
@@ -840,7 +850,8 @@ export async function markSyncLogForFollowUpRetry(
  */
 export async function applyMainSyncFailureRetry(
   tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog'>,
-  entry: { id: string; retryCount: number; type: AccountingSyncType; referenceType: string; referenceId: string },
+  attempt: AttemptRef,
+  entry: { retryCount: number; type: AccountingSyncType; referenceType: string; referenceId: string },
   errorMessage: string,
   payload: SyncPayload,
   /** The claim THIS worker holds. Required: an unfenced release is the o3d-550x defect. */
@@ -848,8 +859,20 @@ export async function applyMainSyncFailureRetry(
 ): Promise<{ finalFailure: boolean }> {
   const retryCount = entry.retryCount + 1
   const computedFinal = retryCount >= MAX_RETRIES
+  // o3d-e2mz: fenced on the claimed attempt as well as the observed retryCount. A
+  // failure belongs to ONE attempt; without the revision this write reopens a row an
+  // operator settled while this attempt was in flight, sending it round again as
+  // PENDING/FAILED with no trace that a decision was discarded.
   const updated = await tx.accountingSyncLog.updateMany({
-    where: { ...heldClaimWhere(entry.id, held), retryCount: entry.retryCount },
+    // BOTH fences, and they answer different questions (o3d-550x + o3d-e2mz). The held claim says
+    // "I still own this row" — it stops a DISPLACED owner writing over its replacement. The attempt
+    // revision says "this failure belongs to the attempt I claimed" — it stops the write landing on
+    // a row an OPERATOR has decided about, which moves the revision without touching the claim.
+    where: {
+      ...heldClaimWhere(attempt.id, held),
+      attemptRevision: attempt.attemptRevision,
+      retryCount: entry.retryCount,
+    },
     data: {
       status: computedFinal ? 'FAILED' : 'PENDING',
       retryCount,
@@ -860,7 +883,7 @@ export async function applyMainSyncFailureRetry(
   if (updated.count > 0) {
     if (computedFinal) {
       await updateMirroredEventForSyncLog(tx, {
-        syncLogId: entry.id,
+        syncLogId: attempt.id,
         type: entry.type,
         referenceType: entry.referenceType,
         referenceId: entry.referenceId,
@@ -874,7 +897,7 @@ export async function applyMainSyncFailureRetry(
   // Lost the race: another worker already advanced this row (and wrote the
   // mirrored event if it became terminal). Report the persisted state.
   const current = await tx.accountingSyncLog.findUnique({
-    where: { id: entry.id },
+    where: { id: attempt.id },
     select: { retryCount: true, status: true },
   })
   return {
@@ -1344,15 +1367,28 @@ export type SyncLogClaimResult =
  * unnecessary order lock in front of every journal and invoice push.
  */
 async function claimAccountingSyncLog(
-  entry: { id: string; type: string; referenceType: string; referenceId: string },
+  entry: { id: string; type: string; referenceType: string; referenceId: string; attemptRevision: number },
   claimedAt: Date,
   staleClaimCutoff: Date,
+  /**
+   * o3d-e2mz: the attempt this claim MINTS, taken from the revision the caller read.
+   *
+   * It is stamped by the claim statement itself and the claim swaps on the observed revision, so the
+   * claim is the compare-and-swap that creates the identity: two workers reading the same row can
+   * never both believe they hold it, and the winner holds a value nothing else can name. Passed in
+   * rather than derived here so the caller and every write below fence on ONE object.
+   */
+  attempt: AttemptRef,
 ): Promise<SyncLogClaimResult> {
-  const claimData = { status: 'PROCESSING' as const, processingStartedAt: claimedAt }
+  const claimData = {
+    status: 'PROCESSING' as const,
+    attemptRevision: attempt.attemptRevision,
+    processingStartedAt: claimedAt,
+  }
 
   if (entry.type !== 'INVOICE_PAYMENT' || entry.referenceType !== 'SalesOrder') {
     const claim = await db.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
+      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
       data: claimData,
     })
     return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
@@ -1375,7 +1411,7 @@ async function claimAccountingSyncLog(
       return { outcome: 'deferred', reason: decision.reason, blockedBy: decision.blockedBy }
     }
     const claim = await tx.accountingSyncLog.updateMany({
-      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
+      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff, entry.attemptRevision),
       data: claimData,
     })
     return claim.count === 0 ? { outcome: 'not-claimable' } : { outcome: 'claimed' }
@@ -1418,17 +1454,22 @@ export function invoicePaymentDeferralMessage(detail?: InvoicePaymentDeferralDet
   return PAYMENT_ORDERING_DEFERRAL_MESSAGE
 }
 
-/** o3d-550x: the caller holds the claim, so this gives it back through the one fenced release. */
+/**
+ * o3d-550x: the caller holds the claim, so this gives it back through the one fenced release.
+ * o3d-e2mz: and through the attempt it claimed — a deferral is still a write ABOUT one attempt, and
+ * unfenced on the revision it can hand back a row an operator has decided about.
+ */
 export async function deferPaymentUntilEarlierLogsPost(
   client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
   entry: { id: string },
   held: HeldClaim,
   detail?: InvoicePaymentDeferralDetail,
+  attempt?: AttemptRef,
 ): Promise<boolean> {
   return releaseClaimForRetry(client, entry.id, held, {
     errorMessage: invoicePaymentDeferralMessage(detail),
     nextAttemptAt: new Date(Date.now() + ORDERING_DEFERRAL_MS),
-  })
+  }, attempt)
 }
 
 /**
@@ -1527,16 +1568,20 @@ export async function findInvoiceUpdatesBlockedByPendingCreate(
   return blocked
 }
 
-/** o3d-550x: fenced on the claim this worker holds, through the one release, like every other. */
+/**
+ * o3d-550x: fenced on the claim this worker holds, through the one release, like every other.
+ * o3d-e2mz: and on the attempt that claim minted, for the reason on the payment deferral above.
+ */
 export async function deferUpdateUntilCreatePosts(
   client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
   entry: { id: string },
   held: HeldClaim,
+  attempt?: AttemptRef,
 ): Promise<boolean> {
   return releaseClaimForRetry(client, entry.id, held, {
     errorMessage: UPDATE_ORDERING_DEFERRAL_MESSAGE,
     nextAttemptAt: new Date(Date.now() + ORDERING_DEFERRAL_MS),
-  })
+  }, attempt)
 }
 
 async function ensureXeroOutboxForPendingSyncLogs(limit: number, staleClaimCutoff: Date): Promise<void> {
@@ -1573,8 +1618,15 @@ async function ensureXeroOutboxForPendingSyncLogs(limit: number, staleClaimCutof
   }
 }
 
-function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
-  return {
+/**
+ * o3d-e2mz: the claim is itself a compare-and-swap on `attemptRevision`. Reading a row and then
+ * claiming it on status alone lets two workers that read the same row both believe they hold it —
+ * and lets a claim land on a row an operator has decided about since the read. Pairing this where
+ * with `attemptRevision: nextAttemptRevision(observed)` in the data makes exactly one of them win
+ * and gives the winner a value nothing else can hold.
+ */
+function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date, observedAttemptRevision: number) {
+  return claimAttemptWhere({
     id,
     connector: XERO_CONNECTOR,
     retryCount: { lt: MAX_RETRIES },
@@ -1591,7 +1643,7 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
         processingStartedAt: { lt: staleClaimCutoff },
       },
     ],
-  }
+  }, observedAttemptRevision)
 }
 
 
@@ -2131,6 +2183,58 @@ async function markXeroOutboxSuccess(job: IntegrationOutboxRow): Promise<void> {
   }
 }
 
+/**
+ * o3d-e2mz: DID AN OPERATOR DECIDE ABOUT THIS ATTEMPT WHILE IT WAS POSTING?
+ *
+ * ESCALATION ONLY. It writes NOTHING to the sync row, and that is the whole of this branch's rebase
+ * onto o3d-550x. An earlier round fenced the SYNCED write itself on the attempt revision and then
+ * recovered from losing that fence by writing the external id anyway — which is a SECOND
+ * implementation of the posted-document record. There is exactly one: `recordPostedSyncResult`,
+ * reached here through `recordPostedDocumentDurably` / `persistPostedXeroDocument`. It records the
+ * post unconditionally, its only precondition being that the row does not already name a DIFFERENT
+ * document, precisely because evidence of a post must never be conditional on winning a race — which
+ * is the same end state the earlier round's recovery path arrived at by a longer route.
+ *
+ * WHAT THE REVISION STILL BUYS, AND NOTHING ELSE DOES: an operator who settled attempt N as "did not
+ * post" has to be TOLD that attempt N posted. `heldClaimWhere` cannot see that — `applyFencedAttemptDecision`
+ * moves the revision, and a decision can leave the claim instant untouched — so this asks the row.
+ *
+ * One indexed read per posted document, on the post path only. A row that is GONE escalates too:
+ * retention deleted the only record of an attempt whose document is in the ledger.
+ */
+async function reportPostOnMovedAttempt(
+  attempt: AttemptRef,
+  entry: { type: AccountingSyncType; referenceType: string; referenceId: string },
+  externalId: string | null,
+): Promise<void> {
+  const current = await db.accountingSyncLog.findUnique({
+    where: { id: attempt.id },
+    select: { status: true, attemptRevision: true },
+  })
+  if (current && current.attemptRevision === attempt.attemptRevision) return
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'xero_sync_post_fenced_out',
+    tag: 'sync',
+    level: 'ERROR',
+    description: `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as `
+      + `${externalId ?? 'a document whose id Xero did not return'} on attempt ${attempt.attemptRevision}, but sync `
+      + `row ${attempt.id} had already moved to attempt ${current?.attemptRevision ?? 'a deleted row'} `
+      + `(${current?.status ?? 'gone'}). Anything decided about attempt ${attempt.attemptRevision} was decided `
+      + 'without this outcome. The document is in the ledger: reverse or credit-note it there if it should not exist.',
+    metadata: {
+      syncLogId: attempt.id,
+      claimedAttemptRevision: attempt.attemptRevision,
+      currentAttemptRevision: current?.attemptRevision ?? null,
+      currentStatus: current?.status ?? null,
+      externalId,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+    },
+  })
+}
+
 export async function processPendingXeroSync(): Promise<ProcessResult> {
   if (!isXeroAccountingOutboxEnabled()) {
     return processPendingXeroSyncDirect()
@@ -2173,13 +2277,23 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     // closing over a Date, which is what a renewing lease needs and what a merge would otherwise have
     // to find by hand at six call sites.
     const held = claimHeldFrom(claimedAt)
+    // o3d-e2mz: the claim is ALSO the compare-and-swap that mints this attempt's identity. `attempt`
+    // fences every write below on the revision, so nothing this worker does can land on a different
+    // attempt — including one an operator has decided about while this claim was held.
+    const attempt: AttemptRef = { id: entry.id, attemptRevision: nextAttemptRevision(entry.attemptRevision) }
     // The claim itself is the exclusion for INVOICE_PAYMENT: taken under the order row lock together
     // with the "is anything else for this order already posting?" test, so two runners working from
-    // different snapshots cannot both elect themselves (round 4 #3).
-    const claim = await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)
+    // different snapshots cannot both elect themselves (o3d-a3wx round 4 #3). The attempt is minted
+    // INSIDE that one statement rather than beside it — see claimAccountingSyncLog.
+    const claim = await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff, attempt)
     if (claim.outcome === 'deferred') {
       // NOT `deferPaymentUntilEarlierLogsPost`: the locked claim declined, so `held` was never
       // granted and there is nothing to release. See deferUnclaimedPaymentUntilEarlierLogsPost.
+      //
+      // And no attempt fence either, for the same reason and it is the same fact: `attempt` was
+      // MINTED here but never written, so the row is still at the revision we read. Fencing this
+      // write on a value nothing ever stamped would match nothing, and because these fences fail
+      // closed the symptom would be a deferral that silently never landed.
       await deferUnclaimedPaymentUntilEarlierLogsPost(db, entry, claim)
       result.skipped++
       continue
@@ -2194,12 +2308,15 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       // safe — the locked claim above is — but it still spares a lock round-trip in the ordinary case
       // and its verdict, when it fires, is the same one.
       if (blockedPaymentEntryIds.has(entry.id)) {
-        await deferPaymentUntilEarlierLogsPost(db, entry, held)
+        // No `detail`: this is the snapshot PRE-FILTER, which knows only that something earlier was
+        // live when the run began — the two conditions a detail names are the ones only the locked
+        // claim can tell apart. `undefined` is what makes this read exactly as it always did.
+        await deferPaymentUntilEarlierLogsPost(db, entry, held, undefined, attempt)
         result.skipped++
         continue
       }
       if (blockedUpdateEntryIds.has(entry.id)) {
-        await deferUpdateUntilCreatePosts(db, entry, held)
+        await deferUpdateUntilCreatePosts(db, entry, held, attempt)
         result.skipped++
         continue
       }
@@ -2215,6 +2332,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           result.failed++
           continue
         }
+        // o3d-e2mz: the record above is deliberately unfenced, so it lands even when the attempt has
+        // moved. Whether it moved is still news for whoever moved it — see reportPostOnMovedAttempt.
+        await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId)
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
@@ -2239,7 +2359,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           // NOT released: the follow-ups did not run. The row goes back to PENDING (or FAILED at
           // MAX_RETRIES) still carrying the obligation, so whichever gets there first — this
           // processor's own retry or the repair sweep — knows the work is outstanding.
-          await markSyncLogForFollowUpRetry(entry, followUpError)
+          await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
           result.failed++
           continue
@@ -2324,13 +2444,15 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           result.failed++
           continue
         }
+        // o3d-e2mz: see reportPostOnMovedAttempt — the persist is unfenced by design, the news is not.
+        await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null)
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
-          await markSyncLogForFollowUpRetry(entry, followUpError)
+          await markSyncLogForFollowUpRetry(attempt, entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
           result.failed++
           continue
@@ -2341,14 +2463,15 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         const errorMessage = syncResult.error ?? 'Unknown error'
         if (isRateLimitError(errorMessage)) {
           // o3d-550x: the one fenced release — a displaced owner backing off here would hand the
-          // row back to PENDING mid-post.
+          // row back to PENDING mid-post. o3d-e2mz: and fenced on the attempt, so a backoff cannot
+          // reopen a row an operator has decided about.
           await releaseClaimForRetry(db, entry.id, held, {
             errorMessage,
             nextAttemptAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
-          })
+          }, attempt)
         } else {
           await db.$transaction(async (tx) => {
-            await applyMainSyncFailureRetry(tx, entry, errorMessage, payload, held)
+            await applyMainSyncFailureRetry(tx, attempt, entry, errorMessage, payload, held)
           })
         }
         result.failed++
@@ -2367,14 +2490,14 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       }
       const errorMessage = String(e)
       if (isRateLimitError(errorMessage)) {
-        // o3d-550x: the one fenced release.
+        // o3d-550x: the one fenced release. o3d-e2mz: on the attempt as well as the claim.
         await releaseClaimForRetry(db, entry.id, held, {
           errorMessage,
           nextAttemptAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
-        })
+        }, attempt)
       } else {
         await db.$transaction(async (tx) => {
-          await applyMainSyncFailureRetry(tx, entry, errorMessage, payload, held)
+          await applyMainSyncFailureRetry(tx, attempt, entry, errorMessage, payload, held)
         })
       }
       result.failed++
@@ -2603,11 +2726,15 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     // closing over a Date, which is what a renewing lease needs and what a merge would otherwise have
     // to find by hand at six call sites.
     const held = claimHeldFrom(claimedAt)
-    const claim = await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)
+    // o3d-e2mz: same claim-as-CAS as the direct path — `attempt` fences every write below to the
+    // attempt this worker actually holds.
+    const attempt: AttemptRef = { id: entry.id, attemptRevision: nextAttemptRevision(entry.attemptRevision) }
+    const claim = await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff, attempt)
     if (claim.outcome === 'deferred') {
       // Same shape as the blocked-payment branch below: the sync row's next attempt moves out and the
       // outbox job is retried, in ONE transaction so the queue and the row cannot disagree about
-      // whether this entry is waiting. Unclaimed, so `held` is not used — the claim was declined.
+      // whether this entry is waiting. Unclaimed, so `held` is not used and no attempt fence applies
+      // — the claim was declined, so nothing stamped the revision this worker minted.
       await db.$transaction(async (tx) => {
         await deferUnclaimedPaymentUntilEarlierLogsPost(tx, entry, claim)
         await markXeroOutboxRetry(job, invoicePaymentDeferralMessage(claim), tx)
@@ -2655,8 +2782,10 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       // safe. The claim IS held here, so the deferral gives it back under its own fence.
       if (blockedPaymentEntryIds.has(entry.id)) {
         await db.$transaction(async (tx) => {
-          // o3d-550x: THE SAME release as the direct runner, not a copy of it.
-          await deferPaymentUntilEarlierLogsPost(tx, entry, held)
+          // o3d-550x: THE SAME release as the direct runner, not a copy of it. o3d-e2mz: fenced on
+          // the claimed attempt too; the outbox job is released either way, since this worker holds
+          // that job regardless of what happened to the sync row.
+          await deferPaymentUntilEarlierLogsPost(tx, entry, held, undefined, attempt)
           await markXeroOutboxRetry(job, PAYMENT_ORDERING_DEFERRAL_MESSAGE, tx)
         })
         result.skipped++
@@ -2665,8 +2794,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
 
       if (blockedUpdateEntryIds.has(entry.id)) {
         await db.$transaction(async (tx) => {
-          // o3d-550x: THE SAME release as the direct runner, not a copy of it.
-          await deferUpdateUntilCreatePosts(tx, entry, held)
+          // o3d-550x: THE SAME release as the direct runner, not a copy of it. o3d-e2mz: attempt-fenced.
+          await deferUpdateUntilCreatePosts(tx, entry, held, attempt)
           await markXeroOutboxRetry(job, UPDATE_ORDERING_DEFERRAL_MESSAGE, tx)
         })
         result.skipped++
@@ -2691,6 +2820,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           result.failed++
           continue
         }
+        // o3d-e2mz: see reportPostOnMovedAttempt — the record above is unfenced by design, the news
+        // that an operator's decision about this attempt is now known to be wrong is not.
+        await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId)
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
@@ -2713,7 +2845,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
-            const nextRetry = await markSyncLogForFollowUpRetry(entry, followUpError, tx)
+            const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
             if (nextRetry.finalFailure) {
               await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
             } else {
@@ -2824,6 +2956,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           result.failed++
           continue
         }
+        // o3d-e2mz: see reportPostOnMovedAttempt.
+        await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null)
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
@@ -2831,7 +2965,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {
-            const nextRetry = await markSyncLogForFollowUpRetry(entry, followUpError, tx)
+            const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
             if (nextRetry.finalFailure) {
               await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
             } else {
@@ -2852,16 +2986,16 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         if (isRateLimitError(errorMessage)) {
           const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
           await db.$transaction(async (tx) => {
-            // o3d-550x: the one fenced release.
+            // o3d-550x: the one fenced release. o3d-e2mz: on the attempt as well as the claim.
             await releaseClaimForRetry(tx, entry.id, held, {
               errorMessage,
               nextAttemptAt: new Date(Date.now() + retryDelayMs),
-            })
+            }, attempt)
             await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
           })
         } else {
           await db.$transaction(async (tx) => {
-            const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload, held)
+            const { finalFailure } = await applyMainSyncFailureRetry(tx, attempt, entry, errorMessage, payload, held)
             if (finalFailure) {
               await markXeroOutboxPermanent(job, errorMessage, tx)
             } else {
@@ -2891,16 +3025,16 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       if (isRateLimitError(errorMessage)) {
         const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
         await db.$transaction(async (tx) => {
-          // o3d-550x: the one fenced release.
+          // o3d-550x: the one fenced release. o3d-e2mz: on the attempt as well as the claim.
           await releaseClaimForRetry(tx, entry.id, held, {
             errorMessage,
             nextAttemptAt: new Date(Date.now() + retryDelayMs),
-          })
+          }, attempt)
           await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
         })
       } else {
         await db.$transaction(async (tx) => {
-          const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload, held)
+          const { finalFailure } = await applyMainSyncFailureRetry(tx, attempt, entry, errorMessage, payload, held)
           if (finalFailure) {
             await markXeroOutboxPermanent(job, errorMessage, tx)
           } else {
