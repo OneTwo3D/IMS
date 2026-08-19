@@ -193,11 +193,19 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
         // (paidAt: not null) and the recognised revenue would never be reversed.
         const invoiceVoided = order.accountingInvoiceId != null && reversedIds.voided.has(order.accountingInvoiceId)
         let chargebackFailed = false
+        // o3d-w00 (Codex r8 #3): the refusal the posted-VAT fence raises stands until an admin changes
+        // the tax configuration, so holding paidAt AND the poll watermark for it would freeze the whole
+        // QuickBooks cursor indefinitely — every later payment and reversal behind it, not just this
+        // order. Payment truth is reconciled and the order flagged instead.
+        let chargebackManualReason: string | undefined
         if (order.revenueDeferredDate && !invoiceVoided) {
           try {
             const { raiseChargebackForReversedOrder } = await import('@/app/actions/sales')
             const chargeback = await raiseChargebackForReversedOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
-            if (chargeback.error) {
+            if (chargeback.error && chargeback.manualResolutionRequired) {
+              chargebackManualReason = chargeback.error
+              errors.push(`Chargeback for order ${order.orderNumber ?? order.id} needs manual handling: ${chargeback.error}`)
+            } else if (chargeback.error) {
               chargebackFailed = true
               errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${chargeback.error}`)
             }
@@ -224,7 +232,9 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
           action: 'payment_reversal_detected',
           tag: 'sync',
           level: 'WARNING',
-          description: `Payment no longer present in QuickBooks for order ${order.orderNumber ?? order.externalOrderNumber} (status: ${order.status}) — cleared paidAt. Review whether the order status should revert.`,
+          description: chargebackManualReason
+            ? `Payment no longer present in QuickBooks for order ${order.orderNumber ?? order.externalOrderNumber} (status: ${order.status}) — cleared paidAt, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
+            : `Payment no longer present in QuickBooks for order ${order.orderNumber ?? order.externalOrderNumber} (status: ${order.status}) — cleared paidAt. Review whether the order status should revert.`,
           resolveUser: false,
         })
       }

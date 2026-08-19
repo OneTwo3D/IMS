@@ -32,22 +32,22 @@ type Recorder = {
     recentWc: string[]
     chargeback: string[]
     clearPaidAt: string[]
-    notify: { id: string; wcHandled: boolean }[]
-    logReversal: { id: string; wcHandled: boolean }[]
+    notify: { id: string; wcHandled: boolean; chargebackManualReason?: string }[]
+    logReversal: { id: string; wcHandled: boolean; chargebackManualReason?: string }[]
   }
 }
 
 function makeEffects(opts: {
   recentWcRefund?: boolean
-  chargebackResult?: { raised?: boolean; error?: string }
+  chargebackResult?: { raised?: boolean; error?: string; manualResolutionRequired?: boolean }
   chargebackThrows?: unknown
 } = {}): Recorder {
   const calls = {
     recentWc: [] as string[],
     chargeback: [] as string[],
     clearPaidAt: [] as string[],
-    notify: [] as { id: string; wcHandled: boolean }[],
-    logReversal: [] as { id: string; wcHandled: boolean }[],
+    notify: [] as { id: string; wcHandled: boolean; chargebackManualReason?: string }[],
+    logReversal: [] as { id: string; wcHandled: boolean; chargebackManualReason?: string }[],
   }
   const effects: ReversalEffects = {
     wasHandledByRecentWcRefund: async (orderId) => {
@@ -63,10 +63,18 @@ function makeEffects(opts: {
       calls.clearPaidAt.push(orderId)
     },
     notifyNeedsAttention: async (order, ctx) => {
-      calls.notify.push({ id: order.id, wcHandled: ctx.wcHandled })
+      calls.notify.push({
+        id: order.id,
+        wcHandled: ctx.wcHandled,
+        ...(ctx.chargebackManualReason ? { chargebackManualReason: ctx.chargebackManualReason } : {}),
+      })
     },
     logReversalDetected: async (order, ctx) => {
-      calls.logReversal.push({ id: order.id, wcHandled: ctx.wcHandled })
+      calls.logReversal.push({
+        id: order.id,
+        wcHandled: ctx.wcHandled,
+        ...(ctx.chargebackManualReason ? { chargebackManualReason: ctx.chargebackManualReason } : {}),
+      })
     },
   }
   return { effects, calls }
@@ -186,4 +194,58 @@ test('idempotency: an already-existing chargeback (no error) still clears paidAt
 
   assert.equal(result.outcome, 'reversed')
   assert.deepEqual(calls.clearPaidAt, ['so_1'])
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-w00 (Codex r8 #3): a chargeback refusal POLLING CANNOT CLEAR is not a retry cursor.
+//
+// Holding paidAt is the right answer to a transient failure — the next poll re-attempts and completes
+// it. It is the wrong answer to the posted-VAT fence refusing to unwind an invoice at a rate the order
+// never charged: that stands until an admin changes the tax configuration, and every poll re-fails, so
+// IMS goes on presenting and processing the order as PAID after Xero has proved the payment is gone —
+// with no alert and no audit entry, both of which sat after the early return.
+// ---------------------------------------------------------------------------------------------
+
+test('a NON-TRANSIENT chargeback refusal reconciles paidAt and alerts on the first failure (o3d-w00 Codex r8 #3)', async () => {
+  const reason = 'No credit note has been raised: The refunded shipping returned 12.00 of the customer\'s money'
+  const { effects, calls } = makeEffects({
+    chargebackResult: { raised: false, error: reason, manualResolutionRequired: true },
+  })
+  const result = await handleDetectedReversal(makeOrder(), { invoiceVoided: false }, effects)
+
+  assert.equal(result.outcome, 'chargeback-manual')
+  assert.equal(result.error, reason)
+  assert.deepEqual(calls.chargeback, ['so_1'])
+  // The payment IS gone in Xero. Showing the order paid until a human edits the tax table is the one
+  // outcome that must not be available.
+  assert.deepEqual(calls.clearPaidAt, ['so_1'], 'payment truth is reconciled immediately')
+  // And the alert carries WHY, because nothing else will ever say it: no later poll can raise this
+  // credit note, so a silent hold would be the only record that revenue is still recognised.
+  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false, chargebackManualReason: reason }])
+  assert.deepEqual(calls.logReversal, [{ id: 'so_1', wcHandled: false, chargebackManualReason: reason }])
+})
+
+test('a TRANSIENT chargeback failure still holds paidAt for the next poll (o3d-w00 Codex r8 #3)', async () => {
+  // The distinction is the whole point: an unjournaled shipment or a Xero outage IS cleared by
+  // re-attempting, and clearing paidAt for it would drop the order out of the next poll's window and
+  // leave the recognised revenue unreversed forever.
+  const { effects, calls } = makeEffects({
+    chargebackResult: { raised: false, error: 'shipped quantity not yet journaled by the daily batch' },
+  })
+  const result = await handleDetectedReversal(makeOrder(), { invoiceVoided: false }, effects)
+
+  assert.equal(result.outcome, 'chargeback-failed')
+  assert.deepEqual(calls.clearPaidAt, [], 'paidAt is HELD so the reversal is re-attempted')
+  assert.deepEqual(calls.notify, [])
+  assert.deepEqual(calls.logReversal, [])
+})
+
+test('a chargeback that THROWS is transient, not manual (o3d-w00 Codex r8 #3)', async () => {
+  // An exception says nothing about whether the condition is permanent, so it keeps the conservative
+  // hold-and-retry treatment rather than being promoted to "a human must fix this".
+  const { effects, calls } = makeEffects({ chargebackThrows: new Error('ECONNRESET') })
+  const result = await handleDetectedReversal(makeOrder(), { invoiceVoided: false }, effects)
+
+  assert.equal(result.outcome, 'chargeback-failed')
+  assert.deepEqual(calls.clearPaidAt, [])
 })

@@ -588,11 +588,24 @@ export function postedCreditNoteTotalCheck(input: {
   kind: 'sale' | 'shipping'
   /** For the refusal message: what this target is called on screen. */
   label: string
+  /**
+   * o3d-w00 (Codex r8 #5): check a leg whose NET is zero or NEGATIVE as well.
+   *
+   * A single refund line's net is never negative, and one of zero credits nothing, so the default is to
+   * pass both unchecked. A chargeback's shipping and order-discount legs COMBINED are a different
+   * figure: the discount leg is negative by construction (it mirrors the invoice's negative discount
+   * line) and IMS records only their combined VAT, so the pair has to be checked as one amount whose
+   * sign is whichever of the two legs is larger. The arithmetic is sign-agnostic — net x (1 + rate)
+   * against net + tax — so only this guard has to be lifted.
+   */
+  allowNonPositiveNet?: boolean
 }): { ok: true } | { ok: false; reason: string } {
   if (input.netForeign == null || input.taxForeign == null) return { ok: true }
   const net = toDecimal(input.netForeign)
   const tax = toDecimal(input.taxForeign)
-  if (!net.isFinite() || !tax.isFinite() || net.lte(0)) return { ok: true }
+  if (!net.isFinite() || !tax.isFinite()) return { ok: true }
+  if (net.lte(0) && !input.allowNonPositiveNet) return { ok: true }
+  if (net.isZero() && tax.isZero()) return { ok: true }
   const chargedGross = net.add(tax)
   const postedGross = net.mul(toDecimal(1).add(input.postedRate))
   const tolerance = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(input.currency)))
@@ -612,6 +625,97 @@ export function postedCreditNoteTotalCheck(input: {
           'charged shipping at: give that rate an accounting tax code carrying the rate shipping was ' +
           'actually charged (Settings → Tax Rates), or allocate this refund to the order lines it came ' +
           'off, then record it.'),
+  }
+}
+
+/**
+ * o3d-w00 (Codex r8 #1): one leg of a refund, as the AGGREGATE check sees it.
+ *
+ * `postedNetForeign` is what this refund actually posts; `chargedNetForeign`/`chargedTaxForeign` are
+ * the money the rate is READ OFF, which is not the same basis — a refund of one unit of a two-unit
+ * line is priced against the whole line's snapshot, because that is the only record of what the unit
+ * was charged at. The two are related by the ratio between them, which is why both are carried.
+ */
+export type PostedCreditNoteLeg = {
+  label: string
+  postedNetForeign: DecimalInput
+  chargedNetForeign: DecimalInput
+  chargedTaxForeign: DecimalInput
+  /** What the accounting tax code this leg posts under is worth, from `priceRefundTaxIdentity`. */
+  postedRate: Decimal
+}
+
+/**
+ * o3d-w00 (Codex r8 #1): does the WHOLE credit note come to what the WHOLE refund settles?
+ *
+ * `postedCreditNoteTotalCheck` is applied to one leg at a time with a tolerance of one minor unit,
+ * which is the right bound for one leg and the wrong bound for a refund made of many. A GBP 1.00 line
+ * charged at 19% but posting under a 20% code is out by exactly GBP 0.01 — inside the per-leg
+ * tolerance, every time — so a hundred such lines pass one by one while the credit note they add up to
+ * exceeds the storefront refund by a pound. The per-leg check cannot see that; nothing did.
+ *
+ * WHAT IS MEASURED. Not the credit note's arithmetic total (the ledger quantises its own computed VAT
+ * per line, and that residue is neither a rate disagreement nor anything an operator could fix by
+ * remapping a tax code). What is measured is the RATE divergence, expressed in money on each leg's own
+ * basis and summed:
+ *
+ *     drift = SUM over legs of  postedNet x (postedRate - chargedRate)
+ *
+ * WHAT IS ALLOWED. Each charged pair reached IMS quantised — by WooCommerce to the currency's minor
+ * unit, by createSalesOrder to whatever its inputs carried — so the rate read off it is uncertain by
+ * (halfUnit(tax) + rate x halfUnit(net)) / net, exactly the bound `chargedRateFromMoney` derives. In
+ * money on the posted net that is `postedNet / chargedNet` times (halfUnit(tax) + rate x halfUnit(net)),
+ * and it is allowed once per leg — the honest sum of the same rounding the per-leg check allows, rather
+ * than a flat minor unit per leg that a wrong rate can hide inside indefinitely. One further minor unit
+ * of slack covers the credit note's own total.
+ *
+ * The result: a leg whose figures merely round awkwardly contributes at most its own rounding and never
+ * accumulates past the slack, while a systematic rate error contributes a fixed fraction of every leg
+ * and crosses the bound by the third one.
+ */
+export function postedCreditNoteAggregateCheck(input: {
+  /** The currency every figure is in, which fixes the minor unit the slack is measured in. */
+  currency: string
+  legs: readonly PostedCreditNoteLeg[]
+}): { ok: true } | { ok: false; reason: string } {
+  const sourceDecimals = sourceDecimalsFor(input.currency)
+  const minorUnit = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(input.currency)))
+  let drift = toDecimal(0)
+  let allowance = minorUnit
+  let chargedGross = toDecimal(0)
+  let postedGross = toDecimal(0)
+  let checked = 0
+  for (const leg of input.legs) {
+    const postedNet = toDecimal(leg.postedNetForeign)
+    const chargedNet = toDecimal(leg.chargedNetForeign)
+    const chargedTax = toDecimal(leg.chargedTaxForeign)
+    if (!postedNet.isFinite() || !chargedNet.isFinite() || !chargedTax.isFinite()) continue
+    // A leg with no net on either side prices nothing and is left to the per-leg check, which passes
+    // it for the same reason: nothing is credited, so no credit-note total can be wrong about it.
+    if (postedNet.lte(0) || chargedNet.lte(0)) continue
+    checked += 1
+    const chargedRate = chargedTax.div(chargedNet)
+    const scale = postedNet.div(chargedNet)
+    drift = drift.add(postedNet.mul(leg.postedRate.sub(chargedRate)))
+    allowance = allowance.add(scale.mul(
+      moneyHalfUnit(chargedTax, sourceDecimals).add(chargedRate.abs().mul(moneyHalfUnit(chargedNet, sourceDecimals))),
+    ))
+    chargedGross = chargedGross.add(postedNet.mul(toDecimal(1).add(chargedRate)))
+    postedGross = postedGross.add(postedNet.mul(toDecimal(1).add(leg.postedRate)))
+  }
+  // One leg cannot drift past the per-leg check without failing it first, so the aggregate never
+  // refuses alone there; it exists for the many-leg case the per-leg tolerance is blind to.
+  if (checked < 2 || drift.abs().lte(allowance)) return { ok: true }
+  return {
+    ok: false,
+    reason:
+      `This refund returned ${chargedGross.toDecimalPlaces(2).toFixed(2)} of the customer's money across ` +
+      `${checked} parts of the order, but the credit note raised for it would come to ` +
+      `${postedGross.toDecimalPlaces(2).toFixed(2)} — ${drift.abs().toDecimalPlaces(2).toFixed(2)} ` +
+      `${drift.isNegative() ? 'under' : 'over'}. No single part is out by enough to be refused on its ` +
+      'own, but the accounting tax codes these parts post under are not worth the VAT they bore, and ' +
+      'the difference adds up. Map each line\'s tax rate to an accounting tax code carrying the rate it ' +
+      'was sold at (Settings → Tax Rates), then record this refund.',
   }
 }
 
@@ -701,6 +805,31 @@ function priceIdentityCode(
     }
   }
   return { ok: true, rate: toDecimal([...knownRates][0]) }
+}
+
+/**
+ * o3d-w00 (Codex r8 #4): what an ALREADY-SNAPSHOTTED accounting tax code is worth, today.
+ *
+ * `priceRefundTaxIdentity` resolves the code from the order and then prices it. A refund that already
+ * exists has its code stored on every line (`SalesOrderRefundLine.accountingTaxType`), so an accounting
+ * RETRY has nothing to resolve — but it still has everything to re-price, because the tax table is
+ * mutable and the credit note has not been posted yet. Same refusals: an unmapped code is not a 0% one,
+ * and a code IMS maps two ways is not one IMS may pick from.
+ */
+export function priceSnapshottedTaxIdentity(input: {
+  accountingTaxType: string
+  rateByTaxType: TaxTypeRateIndex
+  label: string
+}): { ok: true; rate: Decimal } | { ok: false; reason: string } {
+  return priceIdentityCode(
+    { ok: true, accountingTaxType: input.accountingTaxType, reverseCharge: false, unlinkedSale: false },
+    {
+      kind: 'sale',
+      orderDefaultTaxType: null,
+      rateByTaxType: input.rateByTaxType,
+      label: input.label,
+    },
+  )
 }
 
 /**

@@ -20,7 +20,11 @@
 //
 // paidAt reconciliation is UNCONDITIONAL on a genuine Xero regression: the payment
 // is gone in Xero regardless of channel, and the WC refund path does not clear
-// paidAt itself. Only a FAILED chargeback holds paidAt (so it is re-attempted).
+// paidAt itself. Only a TRANSIENTLY failed chargeback holds paidAt (so it is
+// re-attempted); a refusal polling cannot clear — the posted-VAT fence declining to
+// unwind an invoice at a rate the order never charged — reconciles paidAt and alerts
+// on the first failure instead, since re-attempting it forever would show the order
+// paid after Xero proved otherwise (o3d-w00 / Codex r8 #3).
 //
 // This module is the pure, dependency-injected decision+execution unit so the
 // policy is unit-testable without a database or Xero. The poller supplies
@@ -49,18 +53,27 @@ export type ReversalEffects = {
    * refuses orders with any prior refund: a benign re-run returns { raised: false }
    * with no error; a still-pending/failed reversal returns an `error` so paidAt is
    * held and the reversal is re-attempted on the next poll.
+   *
+   * o3d-w00 (Codex r8 #3): `manualResolutionRequired` marks an error that POLLING CANNOT CLEAR — the
+   * posted-VAT fence refusing to unwind the invoice at a rate the order never charged, which stands
+   * until an admin changes the tax configuration. Holding paidAt for that is not a retry cursor, it is
+   * IMS showing an order paid after Xero has proved the payment is gone, indefinitely and silently.
    */
-  raiseChargeback: (orderId: string) => Promise<{ raised?: boolean; error?: string }>
+  raiseChargeback: (orderId: string) => Promise<{ raised?: boolean; error?: string; manualResolutionRequired?: boolean }>
   clearPaidAt: (orderId: string) => Promise<void>
   // Alert + audit ALWAYS fire on a completed reversal (status is never auto-reverted).
   // `wcHandled` carries whether a recent WC refund may already cover the revenue side,
   // so the message can add context — but the alert is never suppressed, since a WC
   // refund can only PARTIALLY explain a full payment removal and that still needs review.
-  notifyNeedsAttention: (order: DetectedReversalOrder, ctx: { wcHandled: boolean }) => Promise<void>
-  logReversalDetected: (order: DetectedReversalOrder, ctx: { wcHandled: boolean }) => Promise<void>
+  // `chargebackManualReason` carries the non-transient refusal, so the alert and the audit entry say
+  // that the revenue unwind is OUTSTANDING and why, rather than reading as a clean reversal.
+  notifyNeedsAttention: (order: DetectedReversalOrder, ctx: ReversalContext) => Promise<void>
+  logReversalDetected: (order: DetectedReversalOrder, ctx: ReversalContext) => Promise<void>
 }
 
-export type ReversalOutcome = 'reversed' | 'chargeback-failed'
+export type ReversalContext = { wcHandled: boolean; chargebackManualReason?: string }
+
+export type ReversalOutcome = 'reversed' | 'chargeback-failed' | 'chargeback-manual'
 
 /**
  * Handle a single detected payment reversal for a paid sales order.
@@ -69,9 +82,10 @@ export type ReversalOutcome = 'reversed' | 'chargeback-failed'
  *  2. Raise the chargeback credit note only when revenue was recognised, the
  *     invoice is still live (a VOIDED invoice already had AR/revenue reversed by
  *     Xero), no recent WC refund covers it, and the ledger is not still holding a
- *     payment against the invoice. A failed chargeback HOLDS paidAt.
+ *     payment against the invoice. A TRANSIENTLY failed chargeback HOLDS paidAt;
+ *     one refused for a reason polling cannot clear does not.
  *  3. Clear paidAt unconditionally (payment is gone in Xero) once no chargeback is
- *     owed or the chargeback succeeded.
+ *     owed, the chargeback succeeded, or it was refused non-transiently.
  *  4. Alert + audit ALWAYS fire (status is never auto-reverted). A WC-handled
  *     reversal is alerted too — the refund may only partially cover a full payment
  *     removal — with WC context so finance can distinguish it.
@@ -97,19 +111,38 @@ export async function handleDetectedReversal(
 ): Promise<{ outcome: ReversalOutcome; wcHandled: boolean; error?: string }> {
   const wcHandled = await effects.wasHandledByRecentWcRefund(order.id)
 
+  let chargebackManualReason: string | undefined
   // Revenue unwind — skipped when a recent WC refund already reversed revenue (no
   // double credit note), the invoice is VOIDED, or no revenue was recognised.
   if (order.revenueDeferredDate && !opts.invoiceVoided && !wcHandled && !opts.ledgerStillHoldsPayment) {
     let error: string | undefined
+    let manualResolutionRequired = false
     try {
       const chargeback = await effects.raiseChargeback(order.id)
-      if (chargeback.error) error = chargeback.error
+      if (chargeback.error) {
+        error = chargeback.error
+        manualResolutionRequired = chargeback.manualResolutionRequired === true
+      }
     } catch (chargebackError) {
       error = String(chargebackError)
     }
-    // Hold paidAt on a failed chargeback so the reversal is re-attempted and the
-    // order is not silently shown unpaid-and-unreversed.
-    if (error) return { outcome: 'chargeback-failed', wcHandled, error }
+    // o3d-w00 (Codex r8 #3): a refusal the next poll CANNOT clear is not a retry cursor.
+    //
+    // Holding paidAt is the right answer to a TRANSIENT failure — a Xero outage, a shipment the daily
+    // batch has not journaled yet — because the next poll re-attempts and completes it. It is the wrong
+    // answer to a refusal that stands until a human changes the tax configuration: the payment IS gone
+    // in Xero, and every poll would re-fail, leaving IMS presenting and processing the order as PAID
+    // indefinitely, with no alert and no audit entry (both of which sit after this return). So payment
+    // truth is reconciled immediately and finance is told on the FIRST failure, carrying the reason —
+    // the revenue unwind is then outstanding and visible, rather than invisible and unpaid-and-paid at
+    // the same time.
+    if (error && manualResolutionRequired) {
+      chargebackManualReason = error
+    } else if (error) {
+      // Hold paidAt on a failed chargeback so the reversal is re-attempted and the
+      // order is not silently shown unpaid-and-unreversed.
+      return { outcome: 'chargeback-failed', wcHandled, error }
+    }
   }
 
   // Payment is genuinely gone in Xero → reconcile paidAt regardless of channel.
@@ -117,7 +150,9 @@ export async function handleDetectedReversal(
 
   // Always surface for manual review — a WC-handled reversal is flagged too (it may
   // only partially explain the removal), just with WC context.
-  await effects.notifyNeedsAttention(order, { wcHandled })
-  await effects.logReversalDetected(order, { wcHandled })
-  return { outcome: 'reversed', wcHandled }
+  await effects.notifyNeedsAttention(order, { wcHandled, chargebackManualReason })
+  await effects.logReversalDetected(order, { wcHandled, chargebackManualReason })
+  return chargebackManualReason
+    ? { outcome: 'chargeback-manual', wcHandled, error: chargebackManualReason }
+    : { outcome: 'reversed', wcHandled }
 }

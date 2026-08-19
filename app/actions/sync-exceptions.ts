@@ -1555,12 +1555,29 @@ export async function recordRefundParkManually(
       const qty = line.externalLineItemId == null ? 0 : refundedQtyByExternalLineId.get(line.externalLineItemId) ?? 0
       if (qty > 0) refundedQtyByLineId.set(line.id, qty)
     }
-    // Only the units on lines the operator is actually attributing money to: an allocation is what says
-    // this part of the order is being refunded, and a line nobody credits must not have stock returned
-    // against it either.
-    const restockedLineIds = cleaned
-      .filter((allocation) => allocation.lineKind === 'sale' && refundedQtyByLineId.has(allocation.lineId!))
-      .map((allocation) => allocation.lineId!)
+    // o3d-w00 (Codex r8 #2): EVERY matched quantity, not only the ones the operator put money against.
+    //
+    // r7 restocked only lines that also received a positive monetary allocation, on the reasoning that
+    // an allocation is what says this part of the order is being refunded. It is not: the PAYLOAD says
+    // what came back. WooCommerce reports a returned quantity on lines that carry no refundable money
+    // at all — a fully discounted item, a free gift, a line whose value was credited on a different
+    // refund — and the automatic route restocks those units regardless, because a returned unit is a
+    // physical fact and its value is a separate question. Filtering by allocation therefore reproduced
+    // the exact defect this block was added to end, on a narrower set of lines: the units are recorded
+    // nowhere, and the park closes.
+    //
+    // Quantities that match NO IMS line are carried in the audit record rather than refused: the
+    // automatic route cannot restock them either (there is no product to move), so refusing here would
+    // be a dead end for a case that has no remedy, not a safeguard.
+    const restockedLineIds = [...refundedQtyByLineId.keys()]
+    const matchedExternalLineIds = new Set(
+      order.lines
+        .filter((line) => line.externalLineItemId != null && refundedQtyByExternalLineId.has(line.externalLineItemId))
+        .map((line) => line.externalLineItemId!),
+    )
+    const unmatchedRefundedQty = [...refundedQtyByExternalLineId.entries()]
+      .filter(([externalLineItemId]) => !matchedExternalLineIds.has(externalLineItemId))
+      .map(([externalLineItemId, qty]) => ({ externalLineItemId, qty }))
     let returnWarehouseId: string | undefined
     if (restockedLineIds.length > 0) {
       const returnWarehouse = await db.warehouse.findFirst({
@@ -1697,6 +1714,28 @@ export async function recordRefundParkManually(
       })
     }
 
+    // o3d-w00 (Codex r8 #2): the returned units on lines the operator credited NOTHING against. They
+    // are carried as their own zero-value refund lines — createSalesOrderRefund keeps a line on qty > 0
+    // OR totalBase > 0, and its posted-VAT fence skips a line that credits nothing, so the units come
+    // back into stock and appear on the refund without inventing money or a tax identity for them.
+    const allocatedLineIds = new Set(
+      refundLines.filter((refundLine) => refundLine.lineKind === 'sale' && refundLine.lineId).map((refundLine) => refundLine.lineId!),
+    )
+    for (const [lineId, qty] of refundedQtyByLineId) {
+      if (allocatedLineIds.has(lineId)) continue
+      const line = orderLineById.get(lineId)!
+      refundLines.push({
+        lineId,
+        productId: line.productId,
+        description: line.description,
+        qty,
+        totalForeign: 0,
+        totalBase: 0,
+        lineKind: 'sale',
+        grossForeign: 0,
+      })
+    }
+
     const overAllocated = findOverAllocatedRefundTarget({
       order: { shippingForeign: order.shippingForeign, lines: order.lines },
       priorRefundLines,
@@ -1780,7 +1819,7 @@ export async function recordRefundParkManually(
       level: 'WARNING',
       description:
         `WooCommerce refund ${park.externalId} could not be converted automatically and was recorded by hand ` +
-        `against ${refundLines.length} part(s) of the order, reconciled to the ${parkedGross.toFixed(2)} ` +
+        `against ${cleaned.length} part(s) of the order, reconciled to the ${parkedGross.toFixed(2)} ` +
         `${order.currency ?? ''} the storefront refunded: ${reason.trim()}` +
         // o3d-w00 (Codex r7 #3): say what happened to the GOODS as well as the money. A hand-recorded
         // itemised refund now brings its units back; the reader has to be able to tell that from a
@@ -1798,6 +1837,10 @@ export async function recordRefundParkManually(
         parkedGrossForeign: parkedGross.toFixed(2),
         returnWarehouseId: returnWarehouseId ?? null,
         restockedUnits,
+        // o3d-w00 (Codex r8 #2): units WooCommerce says came back on a line IMS cannot identify. Nobody
+        // can restock these — the automatic route cannot either — so they are recorded here rather than
+        // silently dropped or used to refuse a refund that has no other problem.
+        unmatchedRefundedQty,
         allocations: refundLines.map((line) => ({
           lineId: line.lineId,
           lineKind: line.lineKind,

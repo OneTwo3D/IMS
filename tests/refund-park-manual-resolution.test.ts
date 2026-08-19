@@ -400,22 +400,79 @@ test('recording an ITEMISED park brings its units back into stock (o3d-w00 Codex
   assert.match(String(logged?.description), /2 unit\(s\) were returned to stock/)
 })
 
-test('units on a line nobody credited are not returned (o3d-w00 Codex r7 #3)', async () => {
-  // The allocation is what says which part of the order is being refunded. Restocking a line the
-  // operator attributed no money to would put stock back against a credit that was never raised.
+test('units on a line nobody credited ARE returned (o3d-w00 Codex r8 #2)', async () => {
+  // r7 restocked only lines the operator also put money against, on the reasoning that an allocation is
+  // what says which part of the order is being refunded. It is not: the PAYLOAD says what physically
+  // came back. WooCommerce reports a returned quantity on lines carrying no refundable money — a fully
+  // discounted item, a free gift, a line credited on an earlier refund — and the automatic route
+  // restocks those units regardless. Filtering by allocation therefore reproduced, on a narrower set of
+  // lines, exactly the silent write-off this block was added to end: the units recorded nowhere, and
+  // the park closed behind them.
+  //
+  // Here the storefront returned 2 widgets (credited) AND 1 book (credited nothing — its whole value
+  // was discounted away). Both come back.
   state.park = {
     ...ITEMISED_PARK,
     payload: {
       ...(ITEMISED_PARK.payload as Record<string, unknown>),
-      line_items: [{ id: 9002, quantity: -1, total: '-20.00', total_tax: '0.00', meta_data: [{ id: 1, key: '_refunded_item_id', value: '502' }] }],
+      line_items: [
+        { id: 9001, quantity: -2, total: '-10.00', total_tax: '-2.00', meta_data: [{ id: 1, key: '_refunded_item_id', value: '501' }] },
+        { id: 9002, quantity: -1, total: '0.00', total_tax: '0.00', meta_data: [{ id: 2, key: '_refunded_item_id', value: '502' }] },
+      ],
     },
   }
-  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'only the widget and the postage')
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'the widget, the postage, and a returned book')
+
+  assert.equal(result.success, true)
+  const call = state.createRefundCalls[0]
+  const lines = call.lines as Array<{ lineId?: string | null; qty: number; totalForeign: number; totalBase: number; lineKind?: string }>
+  assert.equal(lines.find((refundLine) => refundLine.lineId === 'line-1')?.qty, 2)
+  const uncredited = lines.find((refundLine) => refundLine.lineId === 'line-2')
+  assert.equal(uncredited?.qty, 1, 'the returned book is on the refund even though it was credited nothing')
+  // And it credits nothing: the operator attributed no money to it, and the units are not an excuse to
+  // invent some. createSalesOrderRefund keeps a line on qty > 0 OR totalBase > 0.
+  assert.equal(uncredited?.totalForeign, 0)
+  assert.equal(uncredited?.totalBase, 0)
+  // Shipping returns no goods however the money was allocated.
+  assert.equal(lines.find((refundLine) => refundLine.lineKind === 'shipping')?.qty, 0)
+  assert.equal(call.returnWarehouseId, 'return-wh')
+  const logged = state.activity[0] as { description?: string; metadata?: { restockedUnits?: number } }
+  assert.equal(logged?.metadata?.restockedUnits, 3)
+})
+
+test('a monetary-only park still invents no inventory movement (o3d-w00 Codex r8 #2)', async () => {
+  // The other half of the same rule: a park whose payload states no quantities returns no units, so a
+  // hand-recorded MONETARY refund neither restocks nor demands a return warehouse. Carrying quantities
+  // through independently of the money must not turn every monetary recording into a stock movement.
+  state.park = { ...QUARANTINED_PARK }
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'monetary goodwill refund')
 
   assert.equal(result.success, true)
   const call = state.createRefundCalls[0]
   assert.deepEqual((call.lines as Array<{ qty: number }>).map((refundLine) => refundLine.qty), [0, 0])
-  assert.equal(call.returnWarehouseId, undefined, 'nothing to return, so no inventory movement is invented')
+  assert.equal(call.returnWarehouseId, undefined, 'nothing came back, so no inventory movement is invented')
+})
+
+test('units WooCommerce reports on a line IMS cannot identify are recorded, not refused (o3d-w00 Codex r8 #2)', async () => {
+  // Nobody can restock a line that matches no IMS product — the automatic route cannot either — so
+  // refusing here would be a dead end for a case with no remedy rather than a safeguard. The units are
+  // carried in the audit record instead, which is the only place anyone could go looking for them.
+  state.park = {
+    ...ITEMISED_PARK,
+    payload: {
+      ...(ITEMISED_PARK.payload as Record<string, unknown>),
+      line_items: [
+        { id: 9001, quantity: -2, total: '-10.00', total_tax: '-2.00', meta_data: [{ id: 1, key: '_refunded_item_id', value: '501' }] },
+        { id: 9003, quantity: -4, total: '0.00', total_tax: '0.00', meta_data: [{ id: 3, key: '_refunded_item_id', value: '999' }] },
+      ],
+    },
+  }
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'WC refund 7101')
+
+  assert.equal(result.success, true)
+  const logged = state.activity[0] as { metadata?: { restockedUnits?: number; unmatchedRefundedQty?: Array<{ externalLineItemId: number; qty: number }> } }
+  assert.equal(logged?.metadata?.restockedUnits, 2, 'only the units that matched an IMS line were restocked')
+  assert.deepEqual(logged?.metadata?.unmatchedRefundedQty, [{ externalLineItemId: 999, qty: 4 }])
 })
 
 test('an itemised park with no default return warehouse is REFUSED, not silently written off (o3d-w00 Codex r7 #3)', async () => {

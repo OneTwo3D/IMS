@@ -34,12 +34,20 @@ parts of the order the money came off and how much of each, in **GROSS (tax-incl
   WooCommerce and re-parks it with the payload.
 - The credit note is raised **line-linked**, stamped with the WooCommerce refund id (so a redelivery
   dedups), and the park is resolved.
-- **Returned units come back with the money.** A quarantine stops the automatic restock, so if the
-  parked refund states refunded quantities, recording it by hand returns those units to the default
-  return warehouse and records them on the refund (the park's message names them too). If no active
-  default return warehouse is configured, the recording is **refused** rather than crediting the money
-  and dropping the units — set one in Settings → Warehouses and record the row again. A monetary-only
-  park states no quantities and still records as money alone.
+- **Returned units come back with the money — and independently of it.** A quarantine stops the
+  automatic restock, so if the parked refund states refunded quantities, recording it by hand returns
+  those units to the default return warehouse and records them on the refund (the park's message names
+  them too). Every quantity the payload states on a line IMS can identify is carried, **whether or not
+  the operator allocated money to that line**: WooCommerce reports returned quantities on lines that
+  carry no refundable value (a fully discounted item, a free gift, a line credited on an earlier
+  refund), the automatic route restocks those units regardless, and a returned unit is a physical fact
+  rather than an opinion about value. Such a line is added to the refund at **zero value**, so nothing
+  is credited for it. If no active default return warehouse is configured, the recording is **refused**
+  rather than crediting the money and dropping the units — set one in Settings → Warehouses and record
+  the row again. A monetary-only park states no quantities and still records as money alone. Quantities
+  on lines IMS cannot match to a product are recorded in the activity-log metadata
+  (`unmatchedRefundedQty`) rather than refused — nobody, including the automatic route, can restock
+  those.
 
 ### Why a target can be refused, and what fixes it
 
@@ -87,23 +95,49 @@ credit note would come to what the refund actually settles:
   currency's minor unit — not as rates. A £2.00 line bearing £0.40 is an ordinary 20% line whose
   *derived rate* is too uncertain to pin down, and refusing it would name no remedy anyone could carry
   out; in money it is 2.40 against 2.40. The same line zero-rated against a 20% code is 2.00 against
-  2.40 and is still caught, at any size.
+  2.40 and is still caught, at any size;
+- and then the refund is checked **as a whole**. A one-minor-unit tolerance is the right bound for one
+  leg and the wrong bound for a refund made of many: £1.00 charged at 19% posting under a 20% code is
+  out by exactly a penny every time, so a hundred such lines pass one by one while the credit note they
+  add up to is £1.00 over the storefront refund. The aggregate check sums each leg's rate divergence in
+  money and allows each leg only the rounding its own figures can actually carry — so legs that merely
+  round awkwardly never accumulate past the slack, while a systematic rate error crosses the bound by
+  the third leg;
+- a **chargeback's** shipping and order-discount legs are checked as **one figure**. Neither can be
+  checked alone on an order whose totals `createSalesOrder` wrote (the residue is `shipping VAT −
+  discount VAT`), but the automatic chargeback emits both legs, both under the order default, so their
+  combined net is exactly the amount that residue is the VAT of.
 
 A refusal creates nothing. A WooCommerce refund is parked `QUARANTINED` (with the payload, so it can be
-recorded by hand); a chargeback returns an error, so the payment poller holds `paidAt` and re-attempts
-once the tax configuration is fixed; the refund dialog shows the message.
+recorded by hand); the refund dialog shows the message. A **chargeback** refused this way is not a
+retry cursor: the payment really is gone in the ledger and the refusal stands until an admin changes
+the tax configuration, so the payment poller clears `paidAt`, alerts administrators and writes the
+audit entry on the **first** failure, carrying the reason — rather than holding `paidAt` and showing
+the order paid indefinitely. (A *transient* chargeback failure — an unjournaled shipment, a connector
+outage — still holds `paidAt` and is re-attempted.) The revenue unwind is then outstanding and visible;
+raise the credit note by hand, or restore the mapping and re-run the poller.
+
+The **accounting retry** (`retryRefundAccounting`, and the sweep behind it) is a route into a credit
+note in its own right — it re-queues or re-stages one for a refund that already exists — so it re-runs
+the same fence against the tax table as it stands at retry time. The identity snapshotted on each
+refund line fixes *which* code posts and nothing about what that code is *worth*; a rate edited,
+remapped or unmapped between the failure and the retry is caught there. A refusal leaves
+`accountingRetryRequired` set and records the reason on the refund, so the row stays visible until the
+mapping is restored.
 
 Two deliberate limits, so they are not mistaken for oversights:
 
-- the check runs only when an **accounting connector is active**. With no ledger, nothing re-grosses
-  the stored net lines, so there is no credit-note total to be wrong about — and refusing would strand
-  refunds on stores that map no accounting tax codes at all.
+- the check runs only when a **credit note will actually be posted** — the connector is active, its
+  sync is enabled, and its `CREDIT_NOTE` type is not `off` (`isAccountingSyncTypeEnabled`). With no
+  ledger entry going to be written, nothing re-grosses the stored net lines, so there is no
+  credit-note total to be wrong about — and refusing would strand refunds on stores that map no
+  accounting tax codes at all. Gating on plugin *activation* alone would quarantine refunds on a store
+  that has deliberately switched credit-note posting off;
 - a **shipping** leg whose VAT is inseparable (an order-level discount whose VAT `createSalesOrder`
-  netted off the same total, on a non-WooCommerce order) is left unchecked rather than refused: IMS
-  holds no record of what shipping bore there, so there is nothing to check against and no remedy to
-  name. An order-level **discount** refund line is out of the fence for the same reason.
-- `retryRefundAccounting` re-posts from the identity **snapshotted at creation** and is not re-fenced;
-  a tax edit between creation and a later retry is not caught there.
+  netted off the same total, on a non-WooCommerce order) is left unchecked rather than refused **on a
+  non-chargeback refund**: IMS holds no record of what shipping bore there, so there is nothing to
+  check against and no remedy to name. An order-level **discount** refund line is out of the per-leg
+  fence for the same reason — on a chargeback the two are checked together, as above.
 
 ## Relationship to other surfaces
 

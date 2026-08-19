@@ -6,6 +6,7 @@ import {
   chargedRateFromLineSnapshot,
   chargedRateFromShippingSnapshot,
   chargedShippingMoney,
+  postedCreditNoteAggregateCheck,
   postedCreditNoteTotalCheck,
   priceRefundTaxIdentity,
   resolveOrderUniformTaxIdentity,
@@ -645,6 +646,22 @@ test('the credit-note total check compares money, not rates (o3d-w00 Codex r7 #5
   // No snapshot means there is NOTHING to check the posting against — never that it agrees.
   assert.equal(postedCreditNoteTotalCheck({ currency: 'GBP', netForeign: 10, postedRate: toDecimal(0.2), kind: 'sale', label: 'x' }).ok, true)
   assert.equal(postedCreditNoteTotalCheck({ currency: 'GBP', netForeign: 0, taxForeign: 0, postedRate: toDecimal(0.2), kind: 'sale', label: 'x' }).ok, true)
+
+  // o3d-w00 (Codex r8 #5): a chargeback's shipping and order-discount legs are checked as ONE amount,
+  // and the discount leg is negative by construction, so the pair's net can be either sign. One refund
+  // LINE is never negative and one of zero credits nothing, so both stay unchecked by default.
+  const combined = (netForeign: number, taxForeign: number, postedRate: number) => postedCreditNoteTotalCheck({
+    currency: 'GBP', netForeign, taxForeign, postedRate: toDecimal(postedRate),
+    kind: 'shipping', label: 'The pair', allowNonPositiveNet: true,
+  })
+  // £4.00 of postage less a £10.00 discount is −£6.00 net bearing −£1.20 of VAT: −7.20 either way.
+  assert.equal(combined(-6, -1.2, 0.2).ok, true)
+  assert.equal(combined(-6, -1.2, 0.05).ok, false, 'and a moved rate is caught on a negative pair too')
+  // Without the flag the same figures are waved through, which is why the two chargeback legs cannot
+  // simply be handed to the per-line check.
+  assert.equal(postedCreditNoteTotalCheck({
+    currency: 'GBP', netForeign: -6, taxForeign: -1.2, postedRate: toDecimal(0.05), kind: 'shipping', label: 'The pair',
+  }).ok, true)
 })
 
 test('the shipping residue and its refusals are shared with the money check (o3d-w00 Codex r7 #5)', () => {
@@ -661,4 +678,73 @@ test('the shipping residue and its refusals are shared with the money check (o3d
   const stated = chargedShippingMoney({ currency: 'GBP', netForeign: 10, shippingTaxForeign: 0, orderDiscountAmount: 5 })
   assert.equal(stated.ok, true, 'a STATED figure is not a residue, so no residue refusal applies to it')
   assert.equal(stated.ok && stated.taxForeign.toString(), '0')
+})
+
+test('the aggregate check catches a drift every leg hides inside its own tolerance (o3d-w00 Codex r8 #1)', () => {
+  const leg = (postedNet: number, chargedTax: number, postedRate: number, label = 'line') => ({
+    label,
+    postedNetForeign: postedNet,
+    chargedNetForeign: postedNet,
+    chargedTaxForeign: chargedTax,
+    postedRate: toDecimal(postedRate),
+  })
+  const check = (legs: ReturnType<typeof leg>[], currency = 'GBP') =>
+    postedCreditNoteAggregateCheck({ currency, legs })
+
+  // £1.00 charged at 19% posting under a 20% code is out by exactly £0.01 — one minor unit, so the
+  // per-leg check passes it every time, at any number of repetitions. Each of these legs passes on its
+  // own; a hundred of them add up to a credit note £1.00 over the refund it settles.
+  const perLeg = postedCreditNoteTotalCheck({
+    currency: 'GBP', netForeign: 1, taxForeign: 0.19, postedRate: toDecimal(0.2), kind: 'sale', label: 'line',
+  })
+  assert.equal(perLeg.ok, true, 'the premise: no single leg is refusable')
+
+  const hundred = check(Array.from({ length: 100 }, () => leg(1, 0.19, 0.2)))
+  assert.equal(hundred.ok, false)
+  assert.match(hundred.ok ? '' : hundred.reason, /returned 119\.00 of the customer's money across 100 parts/)
+  assert.match(hundred.ok ? '' : hundred.reason, /credit note.*would come to 120\.00/)
+  assert.match(hundred.ok ? '' : hundred.reason, /1\.00 over/)
+
+  // One leg can never be refused here — it is the per-leg check's business, and refusing it twice with
+  // two different tolerances would only make the narrower one the real rule.
+  assert.equal(check([leg(1, 0.19, 0.2)]).ok, true)
+  // Two is still inside the slack; by three the systematic part has outgrown the rounding it hides in.
+  assert.equal(check([leg(1, 0.19, 0.2), leg(1, 0.19, 0.2)]).ok, true)
+  assert.equal(check(Array.from({ length: 3 }, () => leg(1, 0.19, 0.2))).ok, false)
+
+  // And the legs that merely ROUND awkwardly are not refused, however many there are. £4.99 at 20% is
+  // £0.998 of VAT, which WooCommerce stores as £1.00 — a real 20% line whose derived rate is 20.04%.
+  assert.equal(check(Array.from({ length: 100 }, () => leg(4.99, 1, 0.2))).ok, true)
+  // The same, priced INCLUSIVE of tax: £9.99 gross at 20% splits as 8.33 + 1.66, deriving 19.928%.
+  assert.equal(check(Array.from({ length: 100 }, () => leg(8.33, 1.66, 0.2))).ok, true)
+  // Mixed rounding in both directions cancels rather than accumulating.
+  assert.equal(check([...Array.from({ length: 50 }, () => leg(4.99, 1, 0.2)), ...Array.from({ length: 50 }, () => leg(8.33, 1.66, 0.2))]).ok, true)
+
+  // A leg refunded in PART is priced against the whole line's snapshot but posts only its own net, so
+  // both its drift and its rounding allowance scale with what is actually credited.
+  assert.equal(
+    postedCreditNoteAggregateCheck({
+      currency: 'GBP',
+      legs: Array.from({ length: 20 }, () => ({
+        label: 'half a line',
+        postedNetForeign: 0.5,
+        chargedNetForeign: 1,
+        chargedTaxForeign: 0.19,
+        postedRate: toDecimal(0.2),
+      })),
+    }).ok,
+    false,
+  )
+
+  // The rounding allowed is the CURRENCY's, not the penny's. ¥499 at 20% is ¥99.8 of VAT, quantised to
+  // ¥100 — ordinary yen rounding, and 100 such legs are not a divergence...
+  assert.equal(check(Array.from({ length: 100 }, () => leg(499, 100, 0.2)), 'JPY').ok, true)
+  // ...while the identical figures in a currency quantised to the penny are, because in GBP nothing
+  // rounded them: 499.00 bearing 100.00 was charged at 20.04%, and 100 legs of it is £20.00 of drift.
+  assert.equal(check(Array.from({ length: 100 }, () => leg(499, 100, 0.2))).ok, false)
+  // A rate difference big enough to outrun even yen rounding is still caught.
+  assert.equal(check(Array.from({ length: 100 }, () => leg(100, 19, 0.2)), 'JPY').ok, false)
+
+  // Legs with nothing on one side of the comparison price nothing and are skipped, not treated as zero.
+  assert.equal(check([leg(0, 0, 0.2), leg(0, 0, 0.2)]).ok, true)
 })

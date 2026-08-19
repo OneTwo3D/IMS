@@ -108,11 +108,17 @@ async function notifyReversalAdmins(
   // The reversal was proved by the payment's IDENTITY while the invoice still carries a payment, so
   // no chargeback was raised — the alert must say that, or finance reads "reversed" as "unwound".
   registeredPaymentGone = false,
+  // o3d-w00 (Codex r8 #3): set when the revenue unwind was REFUSED for a reason polling cannot clear.
+  // The alert has to say so on the FIRST failure — this is the only thing that will tell anyone the
+  // credit note is outstanding, since no further poll can raise it.
+  chargebackManualReason?: string,
 ): Promise<void> {
   const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
-  const message = (wcHandled
-    ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). A WooCommerce refund in this window already reversed revenue (no duplicate credit note raised) and paidAt was cleared — verify the refund fully covers the reversal and whether the order status should revert.`
-    : `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). paidAt was cleared and revenue unwound where applicable — review whether the order status should revert.`)
+  const message = (chargebackManualReason
+    ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). paidAt was cleared, but the revenue unwind was REFUSED and NO credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the payment poller.`
+    : wcHandled
+      ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). A WooCommerce refund in this window already reversed revenue (no duplicate credit note raised) and paidAt was cleared — verify the refund fully covers the reversal and whether the order status should revert.`
+      : `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). paidAt was cleared and revenue unwound where applicable — review whether the order status should revert.`)
     + (registeredPaymentGone
       ? ` The payment IMS registered is gone from the invoice but ANOTHER payment (or an amount Xero did not state) remains, so revenue was NOT unwound automatically — decide the credit note by hand.`
       : '')
@@ -853,16 +859,22 @@ async function processDeltaChunk(
           clearPaidAt: async (orderId) => {
             await db.salesOrder.update({ where: { id: orderId }, data: { paidAt: null } })
           },
-          notifyNeedsAttention: (o, { wcHandled }) => notifyReversalAdmins(o, wcHandled, registeredPaymentGone),
-          logReversalDetected: (o, { wcHandled }) => logActivity({
+          notifyNeedsAttention: (o, { wcHandled, chargebackManualReason }) =>
+            notifyReversalAdmins(o, wcHandled, registeredPaymentGone, chargebackManualReason),
+          logReversalDetected: (o, { wcHandled, chargebackManualReason }) => logActivity({
             entityType: 'SALES_ORDER',
             entityId: o.id,
             action: 'payment_reversal_detected',
             tag: 'sync',
             level: 'WARNING',
-            description: (wcHandled
-              ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); cleared paidAt. Verify the WC refund fully covers the reversal and whether the order status should revert.`
-              : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — cleared paidAt. Review whether the order status should revert.`)
+            // o3d-w00 (Codex r8 #3): a reversal whose revenue unwind was REFUSED is not a clean one, and
+            // the audit entry is the durable record that it is outstanding — paidAt has been cleared
+            // (the payment really is gone) but no credit note exists, and no poll will make one.
+            description: (chargebackManualReason
+              ? `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — cleared paidAt, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
+              : wcHandled
+                ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); cleared paidAt. Verify the WC refund fully covers the reversal and whether the order status should revert.`
+                : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — cleared paidAt. Review whether the order status should revert.`)
               + (registeredPaymentGone
                 ? ` The payment IMS registered (${salesResidual.provenGone.get(o.accountingInvoiceId ?? '')?.paymentIds.join(', ')}) is no longer among the payments Xero lists on this invoice, but the invoice still carries another payment or an amount Xero did not state — so NO chargeback credit note was raised automatically. Unwind revenue by hand if that is what the removal means.`
                 : ''),
@@ -871,6 +883,12 @@ async function processDeltaChunk(
         })
         if (outcome === 'reversed') {
           result.salesReversed++
+        } else if (outcome === 'chargeback-manual') {
+          // Payment truth is already reconciled and finance already alerted; surfacing it as a run
+          // error as well keeps the cursor gate (errors.length === 0) from advancing past an order
+          // whose revenue is still recognised.
+          result.salesReversed++
+          result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} needs manual handling: ${error}`)
         } else if (outcome === 'chargeback-failed') {
           result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${error}`)
         }

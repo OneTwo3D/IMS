@@ -2167,6 +2167,12 @@ export async function createRefund(
       // COGS + restock suppressed). Used by the payment-poller on a payment reversal.
       chargeback: options?.chargeback,
       activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
+      // o3d-w00 (Codex r8 #6): the posted-VAT fence is gated on a credit note ACTUALLY being posted,
+      // which is not the same as an accounting plugin being enabled — both connector queues no-op when
+      // the connector's sync is off or its CREDIT_NOTE type is set to `off`. Gating on plugin
+      // activation refused (and quarantined) refunds on stores that had deliberately turned
+      // credit-note posting off, over a ledger entry nobody was going to write.
+      creditNotePostingEnabled: await isAccountingSyncTypeEnabled('CREDIT_NOTE'),
       enforcePerTargetBalances,
       // o3d-w00 (Codex r4 #2): like enforcePerTargetBalances this is a tightening, but a forged EMPTY
       // list from a public caller would switch the fence off for the hand-recording path, so it is read
@@ -2448,7 +2454,11 @@ export async function createRefund(
 export async function raiseChargebackForReversedOrder(
   orderId: string,
   options?: { internalBypassToken?: symbol },
-): Promise<{ raised: boolean; reason?: string; error?: string }> {
+  // o3d-w00 (Codex r8 #3): `manualResolutionRequired` distinguishes an error the next poll can clear
+  // (a Xero outage, an unjournaled shipment) from one it cannot — the posted-VAT fence refusing to
+  // unwind the invoice at a rate the order never charged, which stands until an admin fixes the tax
+  // configuration. The poller must not hold paidAt on the second kind.
+): Promise<{ raised: boolean; reason?: string; error?: string; manualResolutionRequired?: boolean }> {
   // SECURITY: this is a privileged path — it calls createRefund with
   // INTERNAL_ACTION_BYPASS, skipping the sales.refund permission. As an export of a
   // 'use server' module it is reachable as a Server Function via direct POST, so it
@@ -2636,6 +2646,25 @@ export async function raiseChargebackForReversedOrder(
   // accountingRetryRequired flag still drives the refund-accounting retry sweep that
   // re-queues the failed credit note.
   if (result.warning) return { raised: false, error: result.warning }
+  // o3d-w00 (Codex r8 #3): the posted-VAT fence refused the reversal — deliberate, non-transient, and
+  // already recorded on the order by the activity log below. Say so, so the poller reconciles payment
+  // truth and alerts finance on the first failure instead of holding paidAt against a poll that can
+  // never succeed on its own.
+  if (result.quarantine) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'chargeback_requires_manual_handling',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `Payment reversed on order ${order.orderNumber ?? order.externalOrderNumber ?? orderId} but the ` +
+        `revenue unwind was refused: ${result.error ?? ''} Raise the credit note manually, or restore the ` +
+        'tax mapping and re-run the payment poller.',
+      resolveUser: false,
+    })
+    return { raised: false, error: result.error, manualResolutionRequired: true }
+  }
   return { raised: result.success, error: result.error }
 }
 
@@ -2650,6 +2679,10 @@ export async function retryRefundAccounting(
       refundId,
       accountingSettings,
       activeAccountingConnector: (await getActiveAccountingConnectorInfo())?.id,
+      // o3d-w00 (Codex r8 #4): the retry is a route into a credit note in its own right, so it re-asks
+      // both questions — will one post at all, and is the identity each line snapshotted still worth
+      // the VAT the money bore — against the tax table as it stands now.
+      creditNotePostingEnabled: await isAccountingSyncTypeEnabled('CREDIT_NOTE'),
     })
     if (!result.success) {
       const auditContext = await loadRefundAuditContext(refundId)
