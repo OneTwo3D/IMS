@@ -16,19 +16,20 @@
 #   bash scripts/deploy.sh --skip-migrate # build + restart (no migrate)
 #   bash scripts/deploy.sh --restart-only # just restart the running process
 #
-# DEPLOY ORDER IS LOAD-BEARING. This script migrates, then builds, then STOPS the old
-# server and only then starts the new one — and it refuses to continue until the port is
-# free. That stop-before-start is not only about EADDRINUSE: accounting money posts stamp
-# `accounting_sync_logs.remoteAttemptedAt` before the remote call, and an unstamped row is
-# treated as proof that no call was ever made from it. The migration backfills the rows
-# that exist when it runs; the build takes minutes with the old binary still serving. The
-# first money operation after the swap records `accounting.money-attempt-stamping-since` in
-# `settings` and re-stamps everything older, which is only sound if no non-stamping process
-# is still running. So: never run two versions against one database at once (no rolling or
-# blue/green overlap). If that ever happens, run
-#   DELETE FROM settings WHERE key = 'accounting.money-attempt-stamping-since';
-# and the next money operation re-establishes it. See
-# lib/domain/accounting/money-attempt-provenance.ts.
+# DEPLOY ORDER: STOP THE OLD SERVER BEFORE STARTING THE NEW ONE. This script migrates, then
+# builds, then STOPS the old server and only then starts the new one — and it refuses to
+# continue until the port is free. Never run two versions against one database at once (no
+# rolling or blue/green overlap).
+#
+# ACCOUNTING MONEY POSTS NO LONGER DEPEND ON THAT ORDER, and it is worth knowing why, because
+# they used to. Money posts stamp `accounting_sync_logs.remoteAttemptedAt` before the remote
+# call, and an unstamped row is treated as proof that no call was ever made from it. Whether
+# that proof holds is now recorded ON THE ROW, in `attemptStampingCustodyAt`: a version that
+# does not write the column leaves it NULL when it creates a row, and the database's trigger
+# nulls it when such a version claims one. Rows outside custody are never recycled, and the
+# next sync run stamps them. So an overlap — or a ROLLBACK, which no deploy order can prevent
+# — is discovered from the rows themselves and healed automatically, with no operator step and
+# no setting to clear. See lib/domain/accounting/money-attempt-provenance.ts.
 # =============================================================================
 
 set -euo pipefail

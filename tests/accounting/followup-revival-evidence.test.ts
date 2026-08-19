@@ -121,40 +121,38 @@ for (const connector of ['xero', 'quickbooks']) {
 }
 
 for (const connector of ['xero', 'quickbooks']) {
-  test(`${connector}: the revival knows WHEN unstamped started meaning something (o3d-0m56 r9)`, async () => {
-    // A NULL `remoteAttemptedAt` is only proof for a row a STAMPING binary created. The migration
-    // backfilled the rows that existed when it ran; the old binary went on creating unstamped
-    // money rows for the minutes `scripts/deploy.sh` spends building and swapping. So the row's
-    // age and the epoch have to reach the planner as well, or it is back to trusting a NULL that
-    // nothing was ever going to write.
+  test(`${connector}: the revival reads the CUSTODY the row carries, not a global epoch (o3d-0m56 r10)`, async () => {
+    // A NULL `remoteAttemptedAt` is only proof for a row nothing but a stamping binary has handled.
+    // Round 9 answered that with an epoch resolved per enqueue; round 10 reads it off the row, so
+    // the column has to be selected AND passed — and the epoch lookup has to be GONE, or the same
+    // clock-skew, cache and rollback failures come back with it.
     const source = await readFile(path.join(process.cwd(), `lib/connectors/${connector}/sync-processor.ts`), 'utf8')
     const at = source.indexOf("status: 'FAILED' },\n    orderBy: { createdAt: 'desc' },")
     assert.notEqual(at, -1, 'the enqueue must read the scope\'s FAILED rows')
 
     const window = source.slice(at, source.indexOf('const plan = planFollowUpEnqueue({', at))
-    assert.match(window, /select: \{[^}]*createdAt: true[^}]*\}/, 'the FAILED-row read must select createdAt')
-    assert.match(window, /createdAt: row\.createdAt/, 'and pass it through to the planner')
-    assert.match(window, /const stampsAttemptsSince = liveRowExists \? null : await moneyAttemptStampingSinceOrNull\(\)/,
-      'the epoch must be resolved, and resolved without throwing — this enqueue runs after its invoice has posted')
-
-    const planCall = source.slice(source.indexOf('const plan = planFollowUpEnqueue({', at))
-    assert.match(planCall.slice(0, 400), /stampsAttemptsSince,/,
-      'and handed to the planner; without it the planner refuses to recycle anything at all')
+    assert.match(window, /select: \{[^}]*attemptStampingCustodyAt: true[^}]*\}/,
+      'the FAILED-row read must select attemptStampingCustodyAt')
+    assert.match(window, /attemptStampingCustodyAt: row\.attemptStampingCustodyAt/,
+      'and pass it through to the planner, not drop it in the map')
+    assert.ok(!source.includes('moneyAttemptStampingSince'),
+      'no epoch may be resolved here: the fact is on the row, and a second source for it is a second answer')
   })
 
-  test(`${connector}: the money-post fence's rival query gets its premise before any entry posts (o3d-0m56 r9)`, async () => {
+  test(`${connector}: the money-post fence's rival query gets its premise before any entry is claimed (o3d-0m56 r10)`, async () => {
     // `authoriseMoneyPost` looks for rivals with `remoteAttemptedAt: { not: null }`, so it is blind
-    // to the same deploy-window rows. Establishing the epoch at the top of the run re-stamps them
-    // once per database, which is what makes that query complete again. It must come BEFORE the
-    // pending entries are read, or the first run after a deploy posts against a blind fence.
+    // to a money row a binary outside stamping custody posted from. The repair stamps those rows,
+    // and it must come BEFORE the pending entries are read and claimed — both because the first run
+    // after a deploy or a rollback would otherwise post against a blind fence, and because this
+    // binary's own claim RESTORES custody, so the forfeit has to be made permanent first.
     const source = await readFile(path.join(process.cwd(), `lib/connectors/${connector}/sync-processor.ts`), 'utf8')
     const entry = source.indexOf(connector === 'xero'
       ? 'export async function processPendingXeroSync('
       : 'export async function processPendingQuickBooksSync(')
     assert.notEqual(entry, -1)
 
-    const ensure = source.indexOf('await moneyAttemptStampingSince()', entry)
-    assert.notEqual(ensure, -1, 'the run must establish the epoch')
+    const ensure = source.indexOf('await repairMoneyAttemptsOutsideStampingCustody()', entry)
+    assert.notEqual(ensure, -1, 'the run must repair rows outside custody')
     const firstRead = source.indexOf('db.accountingSyncLog.findMany', entry)
     assert.ok(firstRead === -1 || ensure < firstRead, 'and do it before it reads anything to post')
   })

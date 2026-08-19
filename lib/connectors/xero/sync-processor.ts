@@ -25,7 +25,7 @@ import {
   type BackReferenceRepairResult,
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
-import { moneyAttemptStampingSince, moneyAttemptStampingSinceOrNull } from '@/lib/domain/accounting/money-attempt-provenance'
+import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
@@ -307,15 +307,12 @@ async function enqueueFollowUpSyncLog(
     // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
     // that reached Xero. A revival OVERWRITES the payload it recycles, so recycling an attempted
     // row rotates that attempt's token and discards its anchors, amount and date — see the recycle
-    // note in followup-idempotency.ts. createdAt comes with it because an unstamped row only
-    // proves anything when a STAMPING binary created it (round 9).
-    select: { id: true, payload: true, remoteAttemptedAt: true, createdAt: true },
+    // note in followup-idempotency.ts. attemptStampingCustodyAt comes with it because an unstamped
+    // row only proves anything when nothing but a STAMPING binary has handled it (round 10): it is
+    // read off the row rather than resolved from a global epoch, so this path needs no extra query
+    // and cannot be given a stale answer.
+    select: { id: true, payload: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true },
   })
-  // Resolved before the plan, never defaulted: null means "unknown", and the planner then recycles
-  // nothing rather than trusting a NULL stamp the old binary may have left behind. Swallowed
-  // rather than thrown because this enqueue runs AFTER its invoice has already posted — failing it
-  // would re-drive that post, which is a worse failure than one extra sync row.
-  const stampsAttemptsSince = liveRowExists ? null : await moneyAttemptStampingSinceOrNull()
   const failedRows = failedLogs.map((row) => ({
     id: row.id,
     payload: row.payload,
@@ -323,7 +320,7 @@ async function enqueueFollowUpSyncLog(
     // reproduces a byte-identical Idempotency-Key even after the row itself is gone.
     effectiveToken: followUpIdempotencySource(row.id, (row.payload ?? {}) as SyncPayload),
     remoteAttemptedAt: row.remoteAttemptedAt,
-    createdAt: row.createdAt,
+    attemptStampingCustodyAt: row.attemptStampingCustodyAt,
   }))
   const plan = planFollowUpEnqueue({
     connector: XERO_CONNECTOR,
@@ -333,7 +330,6 @@ async function enqueueFollowUpSyncLog(
     payload,
     liveRowExists,
     failedRows,
-    stampsAttemptsSince,
   })
   if (plan.action === 'skip') return
   if (plan.action === 'refuse') {
@@ -411,6 +407,10 @@ async function enqueueFollowUpSyncLog(
           referenceType,
           referenceId,
           payload: plan.payload as never,
+          // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+          // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+          // money-attempt-provenance.ts. A row created without it is never recycled again.
+          ...stampingCustodyOnCreate(),
         },
       })
       await scheduleXeroAccountingOutbox(tx, {
@@ -519,7 +519,7 @@ async function deferPaymentUntilEarlierLogsPost(entry: { id: string }): Promise<
       status: 'PENDING',
       // Future processingStartedAt is the existing retry gate for PENDING sync
       // rows. Treat future values on PENDING rows as "earliest next claim time".
-      processingStartedAt: new Date(Date.now() + 60_000),
+      ...stampingCustodyOnClaim(new Date(Date.now() + 60_000)),
       errorMessage: 'Deferred until older invoice payment sync logs post',
     },
   })
@@ -595,7 +595,7 @@ async function deferUpdateUntilCreatePosts(entry: { id: string }): Promise<void>
     where: { id: entry.id },
     data: {
       status: 'PENDING',
-      processingStartedAt: new Date(Date.now() + 60_000),
+      ...stampingCustodyOnClaim(new Date(Date.now() + 60_000)),
       errorMessage: 'Deferred until the invoice CREATE for this document posts',
     },
   })
@@ -725,19 +725,48 @@ async function markXeroOutboxSuccess(job: IntegrationOutboxRow): Promise<void> {
   }
 }
 
+/**
+ * o3d-0m56 round 10: make a custody forfeit VISIBLE.
+ *
+ * `repairMoneyAttemptsOutsideStampingCustody` stamps money rows that a binary outside stamping
+ * custody may have posted from — rows created during a deploy window, by an overlapping second
+ * instance, or by a version this one was rolled back to. Zero on every ordinary run: a non-zero
+ * count is the only signal that any of those happened, and it is worth an operator seeing, because
+ * each stamped row is a row whose next post now pays for a ledger read.
+ *
+ * The repair itself is what makes the fence correct; this only reports it.
+ */
+async function reportMoneyAttemptCustodyRepair(repaired: number, connector: string): Promise<void> {
+  if (repaired === 0) return
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: `${connector}_money_attempt_custody_repaired`,
+    tag: 'sync',
+    level: 'WARNING',
+    description: `Stamped ${repaired} accounting money row${repaired === 1 ? '' : 's'} that a version of IMS `
+      + 'outside attempt-stamping custody may have posted from (a deploy window, an overlapping instance, '
+      + 'or a rollback). They are now treated as attempted, so each will be checked against the ledger '
+      + 'before it is posted again.',
+    metadata: { repaired, connector },
+  })
+}
+
 export async function processPendingXeroSync(): Promise<ProcessResult> {
-  // BEFORE ANY ENTRY IS POSTED (round 9). Every money post in this run goes through
-  // `authoriseMoneyPost`, whose rival-attempt query is `remoteAttemptedAt: { not: null }` — so it
-  // is blind to a row the OLD binary created and posted from during the deploy window, exactly as
-  // the revival planner was. Establishing the epoch here re-stamps those rows once per database,
-  // which is what makes that query's premise true again; the enqueue path needs the same call for
-  // the VALUE, and it is cached, so this costs one `findUnique` per process.
+  // BEFORE ANY ENTRY IS CLAIMED OR POSTED (round 10). Every money post in this run goes through
+  // `authoriseMoneyPost`, whose rival-attempt query is `remoteAttemptedAt: { not: null }` — kept
+  // deliberately narrow, and the partial index depends on it — so it is blind to a money row a
+  // binary outside stamping custody posted from. This makes those rows visible by stamping them,
+  // conservatively, and it is also what makes a forfeited custody PERMANENT before this run's
+  // claims can restore it.
   //
-  // THROWS rather than continuing on an unresolvable epoch. This is not the follow-up enqueue's
-  // situation: nothing has posted yet, so failing the run costs a five-minute delay, whereas
-  // posting into a fence that cannot see its rivals costs a duplicate payment. The cron treats a
-  // throw here as it treats any other sync failure.
-  await moneyAttemptStampingSince()
+  // EVERY RUN, not once per database. Round 9 established its epoch once, which is precisely how a
+  // ROLLBACK got underneath it; a repair that re-runs cannot be got underneath, and in steady state
+  // it matches nothing through a partial index that is empty.
+  //
+  // THROWS rather than continuing if the repair fails. Nothing has posted yet, so failing the run
+  // costs a five-minute delay, whereas posting into a fence that cannot see its rivals costs a
+  // duplicate payment. The cron treats a throw here as it treats any other sync failure.
+  await reportMoneyAttemptCustodyRepair(await repairMoneyAttemptsOutsideStampingCustody(), XERO_CONNECTOR)
   if (!isXeroAccountingOutboxEnabled()) {
     return processPendingXeroSyncDirect()
   }
@@ -778,7 +807,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
       data: {
         status: 'PROCESSING',
-        processingStartedAt: claimedAt,
+        // The claim and attempt-stamping CUSTODY move together, always (o3d-0m56 r10). A claim is
+        // what precedes a post, so the database reads a claim that does not re-assert custody as
+        // one made by a binary that does not stamp, and forfeits it — see
+        // money-attempt-provenance.ts.
+        ...stampingCustodyOnClaim(claimedAt),
       },
     })
     if (claim.count === 0) continue
@@ -893,7 +926,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             data: {
               status: 'PENDING',
               errorMessage,
-              processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+              ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
             },
           })
         } else {
@@ -911,7 +944,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           data: {
             status: 'PENDING',
             errorMessage,
-            processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+            ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
           },
         })
       } else {
@@ -1000,7 +1033,11 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
       data: {
         status: 'PROCESSING',
-        processingStartedAt: claimedAt,
+        // The claim and attempt-stamping CUSTODY move together, always (o3d-0m56 r10). A claim is
+        // what precedes a post, so the database reads a claim that does not re-assert custody as
+        // one made by a binary that does not stamp, and forfeits it — see
+        // money-attempt-provenance.ts.
+        ...stampingCustodyOnClaim(claimedAt),
       },
     })
     if (claim.count === 0) {
@@ -1036,7 +1073,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               status: 'PENDING',
               // Future processingStartedAt is the existing retry gate for
               // PENDING sync rows; here it means "earliest next claim time".
-              processingStartedAt: new Date(Date.now() + 60_000),
+              ...stampingCustodyOnClaim(new Date(Date.now() + 60_000)),
               errorMessage: 'Deferred until older invoice payment sync logs post',
             },
           })
@@ -1052,7 +1089,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             where: { id: entry.id },
             data: {
               status: 'PENDING',
-              processingStartedAt: new Date(Date.now() + 60_000),
+              ...stampingCustodyOnClaim(new Date(Date.now() + 60_000)),
               errorMessage: 'Deferred until the invoice CREATE for this document posts',
             },
           })
@@ -1176,7 +1213,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
               data: {
                 status: 'PENDING',
                 errorMessage,
-                processingStartedAt: new Date(Date.now() + retryDelayMs),
+                ...stampingCustodyOnClaim(new Date(Date.now() + retryDelayMs)),
               },
             })
             await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
@@ -1204,7 +1241,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             data: {
               status: 'PENDING',
               errorMessage,
-              processingStartedAt: new Date(Date.now() + retryDelayMs),
+              ...stampingCustodyOnClaim(new Date(Date.now() + retryDelayMs)),
             },
           })
           await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)

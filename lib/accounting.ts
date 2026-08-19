@@ -7,6 +7,7 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
 import { hasLockedSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 
 export type AccountingSettings = {
   syncEnabled: boolean
@@ -343,6 +344,10 @@ export async function queueAccountingSyncTx(
         referenceType: params.referenceType,
         referenceId: params.referenceId,
         payload: payload as never,
+        // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+        // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+        // money-attempt-provenance.ts. A row created without it is never recycled again.
+        ...stampingCustodyOnCreate(),
       },
     })
     if (context.connector === 'xero') {

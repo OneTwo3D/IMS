@@ -18,7 +18,7 @@ import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} fro
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
-import { moneyAttemptStampingSince, moneyAttemptStampingSinceOrNull } from '@/lib/domain/accounting/money-attempt-provenance'
+import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
@@ -185,15 +185,12 @@ async function enqueueFollowUpSyncLog(
     // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
     // that reached QuickBooks. A revival OVERWRITES the payload it recycles, so recycling an
     // attempted row rotates that attempt's token and discards its anchors, amount and date — see
-    // the recycle note in followup-idempotency.ts. createdAt comes with it because an unstamped
-    // row only proves anything when a STAMPING binary created it (round 9).
-    select: { id: true, payload: true, remoteAttemptedAt: true, createdAt: true },
+    // the recycle note in followup-idempotency.ts. attemptStampingCustodyAt comes with it because
+    // an unstamped row only proves anything when nothing but a STAMPING binary has handled it
+    // (round 10): it is read off the row rather than resolved from a global epoch, so this path
+    // needs no extra query and cannot be given a stale answer.
+    select: { id: true, payload: true, remoteAttemptedAt: true, attemptStampingCustodyAt: true },
   })
-  // Resolved before the plan, never defaulted: null means "unknown", and the planner then recycles
-  // nothing rather than trusting a NULL stamp the old binary may have left behind. Swallowed
-  // rather than thrown because this enqueue runs AFTER its invoice has already posted — failing it
-  // would re-drive that post, which is a worse failure than one extra sync row.
-  const stampsAttemptsSince = liveRowExists ? null : await moneyAttemptStampingSinceOrNull()
   const failedRows = failedLogs.map((row) => ({
     id: row.id,
     payload: row.payload,
@@ -203,7 +200,7 @@ async function enqueueFollowUpSyncLog(
     // Xero, whose payment branches never did.
     effectiveToken: getIdempotencySource(row.id, type, referenceId, (row.payload ?? {}) as SyncPayload),
     remoteAttemptedAt: row.remoteAttemptedAt,
-    createdAt: row.createdAt,
+    attemptStampingCustodyAt: row.attemptStampingCustodyAt,
   }))
   const plan = planFollowUpEnqueue({
     connector: QBO_CONNECTOR,
@@ -213,7 +210,6 @@ async function enqueueFollowUpSyncLog(
     payload,
     liveRowExists,
     failedRows,
-    stampsAttemptsSince,
   })
   if (plan.action === 'skip') return
   if (plan.action === 'refuse') {
@@ -304,6 +300,10 @@ async function enqueueFollowUpSyncLog(
           referenceType,
           referenceId,
           payload: plan.payload as never,
+          // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+          // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+          // money-attempt-provenance.ts. A row created without it is never recycled again.
+          ...stampingCustodyOnCreate(),
         },
       })
     })
@@ -331,10 +331,37 @@ async function enqueueFollowUpSyncLog(
   }
 }
 
+/**
+ * o3d-0m56 round 10: make a custody forfeit VISIBLE.
+ *
+ * `repairMoneyAttemptsOutsideStampingCustody` stamps money rows that a binary outside stamping
+ * custody may have posted from — rows created during a deploy window, by an overlapping second
+ * instance, or by a version this one was rolled back to. Zero on every ordinary run: a non-zero
+ * count is the only signal that any of those happened, and it is worth an operator seeing, because
+ * each stamped row is a row whose next post now pays for a ledger read.
+ *
+ * The repair itself is what makes the fence correct; this only reports it.
+ */
+async function reportMoneyAttemptCustodyRepair(repaired: number, connector: string): Promise<void> {
+  if (repaired === 0) return
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: `${connector}_money_attempt_custody_repaired`,
+    tag: 'sync',
+    level: 'WARNING',
+    description: `Stamped ${repaired} accounting money row${repaired === 1 ? '' : 's'} that a version of IMS `
+      + 'outside attempt-stamping custody may have posted from (a deploy window, an overlapping instance, '
+      + 'or a rollback). They are now treated as attempted, so each will be checked against the ledger '
+      + 'before it is posted again.',
+    metadata: { repaired, connector },
+  })
+}
+
 export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
-  // Before any entry is posted — see the note on processPendingXeroSync. The epoch is per
-  // DATABASE, not per connector, so whichever processor runs first establishes it for both.
-  await moneyAttemptStampingSince()
+  // Before any entry is CLAIMED or posted — see the note on processPendingXeroSync. The repair is
+  // per DATABASE, not per connector: it stamps every money row outside stamping custody whichever
+  // connector wrote it, so whichever processor runs first repairs for both.
+  await reportMoneyAttemptCustodyRepair(await repairMoneyAttemptsOutsideStampingCustody(), QBO_CONNECTOR)
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
   const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
 
@@ -383,7 +410,11 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       },
       data: {
         status: 'PROCESSING',
-        processingStartedAt: claimedAt,
+        // The claim and attempt-stamping CUSTODY move together, always (o3d-0m56 r10). A claim is
+        // what precedes a post, so the database reads a claim that does not re-assert custody as
+        // one made by a binary that does not stamp, and forfeits it — see
+        // money-attempt-provenance.ts.
+        ...stampingCustodyOnClaim(claimedAt),
       },
     })
     if (claim.count === 0) continue
@@ -505,7 +536,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             data: {
               status: 'PENDING',
               errorMessage,
-              processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+              ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
             },
           })
         } else {
@@ -544,7 +575,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           data: {
             status: 'PENDING',
             errorMessage,
-            processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+            ...stampingCustodyOnClaim(new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage))),
           },
         })
       } else {

@@ -1,207 +1,163 @@
 import { db } from '@/lib/db'
 
 /**
- * o3d-0m56 round 9 (Codex HIGH) — WHAT `remoteAttemptedAt IS NULL` PROVES, AND SINCE WHEN.
+ * o3d-0m56 round 10 (Codex HIGH x3) — WHAT `remoteAttemptedAt IS NULL` PROVES, AND HOW THE ROW
+ * ITSELF SAYS SO.
  *
  * Round 8 made a money row's payload evidence: `planFollowUpEnqueue` will not recycle a FAILED
  * row that ever made a remote call, because overwriting it rotates that attempt's token and
- * discards the anchors, amount and date the ledger's mark has to be matched against. The test
- * for "ever made a remote call" is the `remoteAttemptedAt` stamp, claimed by `authoriseMoneyPost`
+ * discards the anchors, amount and date the ledger's mark has to be matched against. The test for
+ * "ever made a remote call" is the `remoteAttemptedAt` stamp, claimed by `authoriseMoneyPost`
  * immediately before the call. So the rule rests on one premise:
  *
  *   AN UNSTAMPED MONEY ROW IS PROOF THAT NO CALL EVER LEFT IT.
  *
- * THE PREMISE HAS A DEPLOYMENT-SHAPED HOLE. The migration `20260818090000` backfills every
- * pre-existing money row, on the reasoning that a row this code has never seen may already have
- * reached the ledger. That is sound for the rows that existed WHEN IT RAN. It says nothing about
- * the rows created AFTER it and BEFORE the stamping binary is live — and there is a window, it is
- * minutes long, and `scripts/deploy.sh` opens it by design:
+ * That premise is only true of a row every binary that ever handled it stamps. Round 9 tried to
+ * establish it with a single global instant — an epoch written once to `settings`, with a backfill
+ * under it — and Codex round 10 took that apart three ways, all of them the same shape: the thing
+ * that made the premise true lived OUTSIDE the row.
  *
- *   1. the migration step             <- the backfill commits here
- *   2. `npm run build`               <- minutes; THE OLD BINARY IS STILL SERVING
- *   3. stop the old server
- *   4. start the new one             <- stamping begins here
+ *   1. THE BOUNDARY CROSSED CLOCKS. It compared a row's `createdAt` (PostgreSQL's clock, via
+ *      `@default(now())`) with an epoch built from `new Date()` in the app process. Two clocks a
+ *      few seconds apart put a row on the wrong side of the boundary, and the wrong side here is
+ *      an attempted row read as never-attempted.
+ *   2. THE DOCUMENTED RECOVERY DID NOT RECOVER. `DELETE FROM settings WHERE key = …` was
+ *      advertised as safe at any time, but the epoch was cached for the life of the process: a
+ *      running server never saw the delete, so an operator following the runbook believed they had
+ *      reset something they had not.
+ *   3. A ROLLBACK DEFEATED IT. The epoch is established once, so rolling the binary BACK posts
+ *      unstamped rows AFTER it, which the rule reads as never-attempted. The no-overlap deploy
+ *      order round 9 leaned on does not help: a rollback is a sequential deploy, so the order is
+ *      satisfied and the property still breaks.
  *
- * Everything the old binary posts in steps 1–3 lands unstamped, after the backfill has already
- * been and gone. The new binary then reads those rows as "never attempted", recycles their
- * payloads, and destroys exactly the evidence round 8 exists to keep — a lost-response payment
- * against invoice A, recycled into a request for invoice B, and the next enqueue for A finds no
- * attempt, rotates a token and pays it twice. `authoriseMoneyPost`'s rival-attempt query has the
- * same premise (`remoteAttemptedAt: { not: null }`) and goes blind to the same rows.
+ * THE ANSWER IS TO MAKE THE PREMISE SELF-EVIDENCING — CARRIED BY THE ROW, NOT BY AN INSTANT.
  *
- * THE FIX: A BACKFILL THAT RUNS AFTER THE OLD BINARY IS GONE — AUTOMATICALLY, AND ONCE PER
- * DATABASE. The migration cannot do it, because a migration by definition runs before the binary
- * it ships with. The running binary can: the first time a stamping process needs the premise, it
- * stamps every money row that already exists and records the instant it did so. From then on
- * "unstamped" means "created after that instant", i.e. created by a binary that stamps.
+ * `accounting_sync_logs.attemptStampingCustodyAt` is that carrier. It is written by binaries that
+ * stamp `remoteAttemptedAt` before every money call, and only by them:
  *
- * WHY NOT AN OPERATOR STEP. "Run this SQL after the deploy" is a fix that is applied by
- * remembering. Forgetting it is silent, and what it costs is a duplicate payment weeks later.
- * This runs itself, is idempotent, and is one `findUnique` per process after the first time.
+ *   - at CREATE, by every `accountingSyncLog.create` in this codebase (`stampingCustodyOnCreate`);
+ *   - at CLAIM and at every other write that moves `processingStartedAt` forward
+ *     (`stampingCustodyOnClaim`), because a claim is what precedes a post.
  *
- * WHY THE EPOCH IS PERSISTED AND NOT THE PROCESS START TIME. Process start would also be a sound
- * cutoff, but it MOVES: after every restart, every money row created before it stops being
- * recyclable, so the rows the rule is meant to tidy up accumulate for ever and the fence acquires
- * a growing set of rows it cannot classify. A value written once and never rewritten makes the
- * untrusted set exactly what it should be — the rows that existed before stamping began — and
- * that set never grows.
+ * and it is TAKEN AWAY, by the database itself, from any row a binary that does not know about it
+ * claims. The trigger `accounting_sync_logs_forfeit_stamping_custody` (migration 20260819090000)
+ * nulls the column on any UPDATE that starts a claim without re-asserting custody in the same
+ * statement — where re-asserting means writing custody EQUAL TO THE CLAIM INSTANT, which is the
+ * pair `stampingCustodyOnClaim` returns. A binary that has never heard of the column cannot write
+ * it at all, so:
  *
- * WHAT THE OPERATOR MUST DO. Nothing, for a normal deploy — but the DEPLOY ORDER is now
- * load-bearing and is documented as such in `docs/installation.md`, `CLAUDE.md` and the header of
- * `scripts/deploy.sh`:
+ *   attemptStampingCustodyAt IS NOT NULL  ->  every binary that has created or claimed this row
+ *                                             stamps before it posts, so a NULL stamp is proof.
+ *   attemptStampingCustodyAt IS NULL      ->  something else had it. The NULL stamp proves nothing.
  *
- *   THE OLD PROCESS MUST BE FULLY STOPPED BEFORE THE NEW ONE IS STARTED. Never run two binaries
- *   against one database at once (no rolling or blue/green overlap).
+ * WHAT THIS BUYS, FINDING BY FINDING.
  *
- * `scripts/deploy.sh` already does this — it kills the old server and refuses to continue until
- * the port is free — but that check was there for EADDRINUSE, and it is now the thing that makes
- * the epoch true. If an overlap ever happens (or an operator is unsure), the recovery is one
- * statement, and it is safe to run at any time:
+ *   1. NO CLOCK IS CONSULTED. The test is a NULL check on one column. Two clocks disagreeing can
+ *      no longer move a row across a boundary, because there is no boundary. The column's VALUE is
+ *      never compared with anything — only its presence is read (it is a timestamp rather than a
+ *      boolean solely so the trigger's "did this statement re-assert custody?" test has something
+ *      that changes on every write, and so an operator can see WHEN custody was taken).
+ *   2. NOTHING IS CACHED, SO THERE IS NOTHING TO INVALIDATE. There is no settings key, no
+ *      process-lifetime memo and no runbook step whose effect a running process could miss. The
+ *      repair below re-runs at the top of every sync run.
+ *   3. A ROLLBACK IS SELF-DECLARING. The rolled-back binary creates rows without the column (the
+ *      default is NULL) and claims existing ones through the trigger (which nulls it). Both
+ *      populations are then exactly the untrusted set, discovered from the rows themselves — no
+ *      deploy order, no operator action, and no need to know a rollback happened at all.
  *
- *   DELETE FROM settings WHERE key = 'accounting.money-attempt-stamping-since';
+ * AND THE SAME FACT REPAIRS THE FENCE. `authoriseMoneyPost`'s rival-attempt query is
+ * `remoteAttemptedAt: { not: null }` — deliberately narrow, and the partial index
+ * `accounting_sync_logs_money_attempted_idx` depends on it staying that way — so a money row a
+ * non-stamping binary posted from is invisible to it, whatever the recycle rule believes.
+ * `repairMoneyAttemptsOutsideStampingCustody` closes that by stamping every money row that is
+ * OUTSIDE custody and still unstamped, conservatively, with the best lower bound the row itself
+ * carries. Both processors run it before they claim anything, so:
  *
- * The next money operation re-establishes the epoch and re-stamps everything created before that
- * moment. Being wrong in that direction costs one extra ledger GET per row, which is the same
- * trade the original backfill made.
+ *   - a deploy window, an accidental overlap or a rollback is healed at the next sync run;
+ *   - being wrong costs one extra ledger GET for that row, the same trade the migration's original
+ *     backfill made;
+ *   - in steady state the statement matches nothing and is served by a partial index of its own.
+ *
+ * IT IS NOT MEMOISED, AND THAT IS THE POINT. Round 9 ran its backfill once per database, which is
+ * why a rollback could get underneath it. A repair that runs every sync run cannot: whatever the
+ * rolled-back binary left behind is stamped the first time the new binary sweeps, before it claims
+ * a single row.
+ *
+ * WHY THE ROW-LEVEL FACT ALSO NEEDS THAT REPAIR TO BE STICKY. Custody is re-asserted by our own
+ * claim, so a row the old binary claimed (custody NULL) would look trustworthy again the moment
+ * this binary re-claimed it. It never does: the repair converts "outside custody" into a permanent
+ * `remoteAttemptedAt`, and it runs BEFORE the claim, in the same function. That ordering is a
+ * property of this code — `processPendingXeroSync` and `processPendingQuickBooksSync` call it on
+ * their first line — not of how anything is deployed, and it is pinned by a test.
  */
-
-/** The `settings` key holding the instant from which an unstamped money row proves anything. */
-export const MONEY_ATTEMPT_STAMPING_SINCE_KEY = 'accounting.money-attempt-stamping-since'
 
 /**
  * The types `authoriseMoneyPost` stamps — `MONEY_MOVING_SYNC_TYPES` in followup-retry-guard.ts,
  * repeated rather than imported because that module imports this one's sibling and a cycle here
  * would be resolved at runtime inside a money path. Pinned to the fence's own set by a test: a
- * money type missing from here is a type whose deploy-window rows are never repaired.
+ * money type missing from here is a type whose out-of-custody rows are never repaired.
  */
 export const STAMPED_MONEY_TYPES = ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'] as const
 
 /**
- * The two database operations the epoch needs, named rather than passed as a Prisma client so the
- * decision logic can be tested without one. The concrete implementation is `prismaEpochStore`.
+ * Custody for a row this binary is CREATING.
+ *
+ * Every `accountingSyncLog.create` in this codebase spreads this. A row created without it is a
+ * row whose NULL `remoteAttemptedAt` can never be trusted again — safe, but it permanently gives
+ * up the revival bookkeeping for that scope, so the omission is pinned by a source-scanning test
+ * rather than left to reviewers.
+ *
+ * The value is only ever read as present/absent. It is `new Date()` rather than anything derived
+ * from the row so that no caller has to have a timestamp to hand.
  */
-export type StampingEpochStore = {
-  /** The recorded epoch, or null when stamping has never been established on this database. */
-  read: () => Promise<Date | null>
-  /**
-   * ATOMICALLY: record `epoch`, then stamp every money row created before it that is still
-   * unstamped. Records first, so a lost race rolls the whole thing back before it writes.
-   *
-   * Returns the epoch that is now recorded — which is the WINNER's when this call lost a race,
-   * not `epoch`. Reporting our own would let a caller trust rows the winner's backfill has
-   * already judged untrustworthy.
-   */
-  establish: (epoch: Date) => Promise<Date>
-}
-
-function isUniqueViolation(error: unknown): boolean {
-  return typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'P2002'
-}
-
-export const prismaEpochStore: StampingEpochStore = {
-  read: async () => {
-    const row = await db.setting.findUnique({ where: { key: MONEY_ATTEMPT_STAMPING_SINCE_KEY }, select: { value: true } })
-    if (!row) return null
-    const parsed = new Date(row.value)
-    // A key someone has hand-edited into nonsense must not read as "the epoch is 1970", which
-    // would trust every row on the database. Unparseable is unknown, and unknown fails closed.
-    return Number.isNaN(parsed.getTime()) ? null : parsed
-  },
-  establish: async (epoch) => {
-    try {
-      return await db.$transaction(async (tx) => {
-        await tx.setting.create({
-          data: { key: MONEY_ATTEMPT_STAMPING_SINCE_KEY, value: epoch.toISOString() },
-        })
-        // The same conservative value the migration's backfill used: the best lower bound the row
-        // itself carries, never `now()`, which would claim an attempt happened at deploy time.
-        // `updateMany` cannot express a per-row COALESCE, hence raw SQL; the only interpolation is
-        // the epoch, as a bound parameter.
-        //
-        // The type list is the CONSTANT, not a second copy of it written out in SQL: a literal
-        // list here could silently fall out of step with the set the fence actually stamps, and
-        // a money type missing from it would be a type this whole mechanism skips. `::text` casts
-        // the enum so it can be compared with a bound text array.
-        await tx.$executeRaw`
-          UPDATE "accounting_sync_logs"
-             SET "remoteAttemptedAt" = COALESCE("syncedAt", "processingStartedAt", "createdAt")
-           WHERE "type"::text = ANY(${[...STAMPED_MONEY_TYPES]}::text[])
-             AND "remoteAttemptedAt" IS NULL
-             AND "createdAt" < ${epoch}
-        `
-        return epoch
-      })
-    } catch (error) {
-      if (!isUniqueViolation(error)) throw error
-      // The key exists, so someone recorded an epoch between our read and our write — normally the
-      // other process in a start-up race, whose backfill is the one that actually ran.
-      const winner = await prismaEpochStore.read()
-      if (winner) return winner
-      // The key exists but does not parse. Refusing is the only safe answer: an unreadable epoch
-      // cannot say which rows are trustworthy, and inventing one would trust rows the deploy window
-      // may have left unstamped. The recovery is to DELETE the key and let it re-establish.
-      throw new Error(
-        `The setting "${MONEY_ATTEMPT_STAMPING_SINCE_KEY}" holds a value that is not a timestamp, so IMS `
-        + 'cannot tell which accounting money rows predate attempt stamping. Delete the row and the next '
-        + 'money operation will re-establish it (see docs/installation.md, "Deploy order").',
-      )
-    }
-  },
+export function stampingCustodyOnCreate(now: Date = new Date()): { attemptStampingCustodyAt: Date } {
+  return { attemptStampingCustodyAt: now }
 }
 
 /**
- * Resolve the epoch, establishing it if this database has never had one. Exported uncached so the
- * decision can be tested against a fake store; production goes through
- * `moneyAttemptStampingSince`.
+ * Custody for a row this binary is CLAIMING — or re-gating, which is the same write with a future
+ * timestamp (the retry backoff parks a row by moving `processingStartedAt` ahead).
+ *
+ * Returns BOTH fields so the pairing cannot be half-applied: the database's trigger reads a claim
+ * whose custody does not EQUAL its own claim instant as one made by a binary that does not stamp,
+ * and forfeits custody. That failure is deliberately the safe direction — a missed pairing
+ * costs one ledger GET and one un-recycled row, never a lost attempt — but it is still a defect,
+ * so the two values are produced together, from the same instant, by this function.
  */
-export async function resolveMoneyAttemptStampingSince(
-  store: StampingEpochStore,
-  now: () => Date = () => new Date(),
-): Promise<Date> {
-  return (await store.read()) ?? store.establish(now())
+export function stampingCustodyOnClaim(
+  processingStartedAt: Date,
+): { processingStartedAt: Date; attemptStampingCustodyAt: Date } {
+  return { processingStartedAt, attemptStampingCustodyAt: processingStartedAt }
 }
 
 /**
- * Cached for the life of the process — the epoch is written once per DATABASE and never rewritten,
- * so re-reading it on every follow-up enqueue would be a query that can only ever return the same
- * answer.
+ * Stamp every money row that is outside stamping custody and has no attempt recorded, so
+ * `authoriseMoneyPost`'s rival query can see it. Returns how many rows that was — zero on every
+ * run that follows an ordinary deploy.
  *
- * A FAILURE IS NOT CACHED. A transient error must not pin "unknown" for the life of the process:
- * unknown fails closed, and a fence that has failed closed for ever is a fence nobody can deploy
- * past.
+ * Called at the top of both sync processors, BEFORE anything is claimed. A non-zero count means a
+ * binary that does not stamp has handled money rows on this database (a deploy window, an overlap,
+ * or a rollback), which is worth an operator's attention, so the callers log it.
  */
-let inFlight: Promise<Date> | null = null
-
-export async function moneyAttemptStampingSince(store: StampingEpochStore = prismaEpochStore): Promise<Date> {
-  // The cache belongs to the REAL store. A caller that supplies its own is answered without it, so
-  // an injected store can never be handed production's cached value — nor leave its own behind for
-  // production to read.
-  if (store !== prismaEpochStore) return resolveMoneyAttemptStampingSince(store)
-  if (!inFlight) {
-    inFlight = resolveMoneyAttemptStampingSince(store).catch((error) => {
-      inFlight = null
-      throw error
-    })
-  }
-  return inFlight
-}
-
-/**
- * The epoch, or null when it could not be established.
- *
- * For callers that must not FAIL because of it. `planFollowUpEnqueue` treats null as "nothing is
- * proof", which costs an extra row and never a duplicate payment — whereas throwing out of a
- * follow-up enqueue would fail the parent entry that has already posted its invoice.
- *
- * Not a silent-only path: the same resolution is made at the top of every sync run, where it is NOT
- * swallowed, so a database that cannot answer surfaces there rather than degrading unnoticed here.
- */
-export async function moneyAttemptStampingSinceOrNull(
-  store: StampingEpochStore = prismaEpochStore,
-): Promise<Date | null> {
-  try {
-    return await moneyAttemptStampingSince(store)
-  } catch {
-    return null
-  }
+export async function repairMoneyAttemptsOutsideStampingCustody(): Promise<number> {
+  // The conservative value the migration's backfill used: the best lower bound the row itself
+  // carries, never `now()`, which would claim an attempt happened at repair time. `updateMany`
+  // cannot express a per-row COALESCE, hence raw SQL; the only interpolation is the type list, as
+  // a bound parameter.
+  //
+  // The type list is the CONSTANT, not a second copy of it written out in SQL: a literal list here
+  // could silently fall out of step with the set the fence actually stamps, and a money type
+  // missing from it would be a type this whole mechanism skips. `::text` casts the enum so it can
+  // be compared with a bound text array.
+  //
+  // `attemptStampingCustodyAt IS NULL` is the whole test, and it is the same predicate as the
+  // partial index `accounting_sync_logs_money_attempt_uncustodied_idx`, so this statement is served
+  // by an index that is empty in steady state rather than by a scan of every sync row ever written.
+  return db.$executeRaw`
+    UPDATE "accounting_sync_logs"
+       SET "remoteAttemptedAt" = COALESCE("syncedAt", "processingStartedAt", "createdAt")
+     WHERE "remoteAttemptedAt" IS NULL
+       AND "attemptStampingCustodyAt" IS NULL
+       AND "type"::text = ANY(${[...STAMPED_MONEY_TYPES]}::text[])
+  `
 }

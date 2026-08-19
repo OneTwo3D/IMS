@@ -1,28 +1,3 @@
-### Deploy order: the old process must be stopped before the new one starts
-
-**This is a correctness requirement, not just a convenience.** Never run two versions of IMS
-against the same database at once — no rolling restart, no blue/green overlap, no second
-instance left running on another port. Stop the old process, then start the new one.
-
-Why: accounting money posts (customer receipts, supplier payments, credit-note allocations)
-record `accounting_sync_logs.remoteAttemptedAt` immediately **before** the remote call, and the
-retry and revival logic treats an unstamped row as proof that no call was ever made from it.
-`prisma migrate deploy` backfills the rows that exist when it runs, and the build and restart
-that follow it take minutes — so any version that does **not** write that stamp will leave rows
-looking like they were never sent when they may already be in the ledger. The first money
-operation after the swap records the instant stamping began, in the setting
-`accounting.money-attempt-stamping-since`, and re-stamps everything older; that instant is only
-meaningful if no non-stamping process is still running when it is recorded.
-
-**If an overlap did happen** (or you are not sure), clear the marker and let the next money
-operation re-establish it. This is safe to run at any time; the cost of running it needlessly is
-one extra ledger read per affected row.
-
-```sql
-DELETE FROM settings WHERE key = 'accounting.money-attempt-stamping-since';
-```
-
-
 # Installation & Deployment
 
 ## Prerequisites
@@ -390,6 +365,28 @@ npm run build
 # Restart
 systemctl restart one-two-inventory.service
 ```
+
+### Deploy order, and what happens on a rollback
+
+Stop the old process, then start the new one. Never run two versions of IMS against the same
+database at once — no rolling restart, no blue/green overlap, no second instance left running on
+another port. `scripts/update.sh` and `scripts/deploy.sh` already do this.
+
+**You do not have to get this right for accounting money posts to stay safe**, and it is worth
+knowing why, because a rollback is a deploy nobody plans. Money posts (customer receipts, supplier
+payments, credit-note allocations) record `accounting_sync_logs.remoteAttemptedAt` immediately
+**before** the remote call, and the retry and revival logic treats an unstamped row as proof that no
+call was ever made from it. A version that does not write that stamp would break the proof — so
+whether the proof holds is recorded on each row, in `attemptStampingCustodyAt`:
+
+- a version that does not know the column leaves it NULL when it **creates** a row;
+- a database trigger nulls it when such a version **claims** one;
+- rows outside custody are never recycled, and the next sync run marks them as attempted, so the
+  ledger is read before anything is posted for them again.
+
+The cost of that repair is one extra ledger read per affected row. There is nothing to run and no
+setting to clear — an overlap, a deploy window or a rollback is discovered from the rows themselves.
+See `lib/domain/accounting/money-attempt-provenance.ts`.
 
 ## Environment Variables Reference
 

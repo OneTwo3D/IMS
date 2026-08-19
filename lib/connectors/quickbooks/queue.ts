@@ -10,6 +10,7 @@ import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounti
 import { getQuickBooksSettings, type QuickBooksSettings } from './settings'
 import { lockOrderForAccountingEnqueue } from '@/lib/domain/accounting/enqueue-order-guard'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
+import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 
 /** Map sync type enum → setting key for per-type enable/disable */
 const SYNC_TYPE_SETTING: Record<string, keyof QuickBooksSettings> = {
@@ -100,6 +101,10 @@ export async function queueQuickBooksSync(params: {
           referenceType: params.referenceType,
           referenceId: params.referenceId,
           payload: payload as never,
+          // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+          // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+          // money-attempt-provenance.ts. A row created without it is never recycled again.
+          ...stampingCustodyOnCreate(),
         },
       })
       try {

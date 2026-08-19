@@ -37,6 +37,14 @@ type SyncRow = {
   createdAt: Date
   /** Written by the quarantine path (r7 finding 1) — the durable half of the conflict record. */
   errorMessage?: string | null
+  syncedAt?: Date | null
+  /**
+   * o3d-0m56 r10: the two columns the money-attempt repair reads. `attemptStampingCustodyAt` is
+   * written by every production create path, so a row this codebase made carries it and the repair
+   * passes it over; a row left without it is one a binary outside stamping custody wrote.
+   */
+  remoteAttemptedAt?: Date | null
+  attemptStampingCustodyAt?: Date | null
 }
 
 type BillRow = { id: string; poId: string; accountingInvoiceId: string | null; createdAt: number }
@@ -108,16 +116,19 @@ const billClient = {
   },
 }
 
+const MONEY_TYPES = new Set(['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'])
+
 const db = {
-  // o3d-0m56 r9: a sync run establishes the money-attempt stamping epoch before it posts anything.
-  // Recorded as already set — this file is about back-reference writing, not the epoch.
-  setting: {
-    async findUnique(args: { where: { key: string } }) {
-      return args.where.key === 'accounting.money-attempt-stamping-since'
-        ? { value: new Date('2026-01-01T00:00:00Z').toISOString() }
-        : null
-    },
-    async create() { throw new Error('fake db: the epoch is already recorded') },
+  // o3d-0m56 r10: a sync run REPAIRS money rows outside attempt-stamping custody before it claims
+  // anything, and the repair is raw SQL. The double applies the rule to its own rows rather than
+  // returning 0 — the rows here are BILL rows written by this binary, so they are in custody and
+  // the repair correctly stamps none of them, which is a fact worth being able to observe.
+  async $executeRaw() {
+    const matched = state.syncRows.filter((row) => row.remoteAttemptedAt == null
+      && row.attemptStampingCustodyAt == null
+      && MONEY_TYPES.has(String(row.type)))
+    for (const row of matched) row.remoteAttemptedAt = row.syncedAt ?? row.processingStartedAt ?? row.createdAt
+    return matched.length
   },
   accountingSyncLog: {
     async findMany() { return state.syncRows.map((row) => ({ ...row })) },

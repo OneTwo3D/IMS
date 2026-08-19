@@ -32,6 +32,7 @@ import {
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { GL_BASE_PRECISION, roundToGlPrecisionNumber } from '@/lib/domain/math/precision-policy'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
@@ -218,6 +219,10 @@ async function createPendingSyncLog(
       referenceType: 'DailyBatch',
       referenceId: params.referenceId,
       payload: params.payload as never,
+      // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
+      // read this row's unset `remoteAttemptedAt` as proof no remote call ever left it — see
+      // money-attempt-provenance.ts. A row created without it is never recycled again.
+      ...stampingCustodyOnCreate(),
     },
   })
   // Mirror failure must not abort the whole daily batch: the sync log is already

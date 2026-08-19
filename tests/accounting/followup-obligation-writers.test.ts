@@ -43,6 +43,13 @@ type SyncRow = {
   createdAt: Date
   backReferenceCheckedAt: Date | null
   backReferenceFollowUpsPendingAt: Date | null
+  /**
+   * o3d-0m56 r10: the two columns the money-attempt repair reads. `attemptStampingCustodyAt` is
+   * written by every production create path, so a row this codebase made carries it and the repair
+   * passes it over; a row left without it is one a binary outside stamping custody wrote.
+   */
+  remoteAttemptedAt?: Date | null
+  attemptStampingCustodyAt?: Date | null
 }
 
 type BillRow = { id: string; accountingInvoiceId: string | null }
@@ -205,24 +212,30 @@ const outboxClient = {
   },
 }
 
+const MONEY_TYPES = new Set(['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'])
+
 /**
- * o3d-0m56 r9: a sync run establishes the money-attempt stamping epoch before it posts anything,
- * so the double has to be able to answer for it. Recorded as ALREADY SET — this file is about the
- * obligation marker, not the epoch, and a store that had to establish one would also have to model
- * the backfill.
+ * o3d-0m56 r10: a sync run REPAIRS money rows outside attempt-stamping custody before it claims
+ * anything, and that repair is raw SQL.
+ *
+ * The double applies the rule rather than returning a convenient 0. Returning 0 would be a double
+ * that cannot tell the difference between "no row needed repairing" and "the repair no longer
+ * matches anything", and the rows in this file are created through the production enqueue path, so
+ * they carry custody and the repair correctly leaves them alone.
  */
-const settingClient = {
-  async findUnique(args: { where: { key: string } }) {
-    return args.where.key === 'accounting.money-attempt-stamping-since'
-      ? { value: new Date('2026-01-01T00:00:00Z').toISOString() }
-      : null
-  },
-  async create() { throw new Error('fake db: the epoch is already recorded') },
+function repairOutsideCustody(): number {
+  const matched = state.syncRows.filter((row) => row.remoteAttemptedAt == null
+    && row.attemptStampingCustodyAt == null
+    && MONEY_TYPES.has(String(row.type)))
+  for (const row of matched) {
+    row.remoteAttemptedAt = row.syncedAt ?? row.processingStartedAt ?? row.createdAt
+  }
+  return matched.length
 }
 
 const db = {
   accountingSyncLog: syncLogClient,
-  setting: settingClient,
+  async $executeRaw() { return repairOutsideCustody() },
   purchaseInvoice: billClient,
   salesOrder: { async findUnique() { return null }, async update() { return {} } },
   salesOrderRefund: { async findUnique() { return null }, async update() { return {} } },
