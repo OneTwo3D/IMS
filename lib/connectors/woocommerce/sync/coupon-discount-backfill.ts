@@ -109,6 +109,7 @@ import {
   buildWcCouponLedgerHandoff,
   isWcCouponOrderRefunded,
   wcCouponRemedySteps,
+  wcCouponNetClaimSteps,
   type WcCouponLedgerHandoff,
   type WcCouponRefundEvidence,
 } from './coupon-discount-ledger-handoff'
@@ -1645,6 +1646,19 @@ export async function applyWcCouponCorrection(
         // the credit notes were derived to have reversed, or why that could not be established.
         remedyKind: handoff?.remedy ? handoff.remedy.kind : null,
         remedyAmount: handoff?.remedy ? handoff.remedy.amount : null,
+        // r10 finding 1. WAS THE POSITION ACTUALLY NETTED? NULL is the durable statement that the
+        // two sides were never compared — which `creditNoteReversal.ok` does NOT answer, because a
+        // perfectly derivable credit-note side can still have its subtraction withdrawn (a
+        // tax-inclusive invoice, several posted documents, two ledgers). Without this the log cannot
+        // distinguish "the errors cancelled" from "nobody could tell".
+        netPosition: handoff?.netPosition
+          ? {
+              postedDiscount: handoff.netPosition.postedDiscount,
+              reversedAmount: handoff.netPosition.reversedAmount,
+              net: handoff.netPosition.net,
+              nettedAgainst: handoff.netPosition.nettedAgainst,
+            }
+          : null,
         creditNoteReversal: handoff
           ? {
               ok: handoff.reversal.ok,
@@ -1798,29 +1812,45 @@ export async function revalidateWcCouponHandoff(
 }
 
 /**
- * Strip the remedy and say why, keeping every FACT the handoff established.
+ * Strip the remedy AND the netting conclusion, say why, and keep every FACT the handoff established.
  *
  * The facts are still true — what the invoice carries is a property of the invoice — and the
  * operator needs them to read the documents at all. Only the instruction is withdrawn, and
  * `needsAccountingAction` is forced TRUE because a position nobody can currently vouch for is
  * exactly a position a human has to look at.
+ *
+ * THE NETTING CONCLUSION GOES WITH IT (o3d-y14 r10 finding 1). A net is
+ * `invoice - credit notes` against the refund position it was derived from; a refund arriving after
+ * the correction committed is precisely a change to the credit-note side of that subtraction. The
+ * conclusion is therefore no longer a netting that ran against the CURRENT position, and the zero
+ * case is the dangerous one — "THE TWO ERRORS CANCEL … there is NO ACCOUNTING ACTION" is the line
+ * that takes the order off the operator's list, and it survived every earlier withdrawal because
+ * the block that stripped lines only ever stripped a remedy's. `wcCouponNetClaimSteps` is the sole
+ * producer of those sentences, so removing its output removes all of them.
  */
 function withdrawRemedy(handoff: WcCouponLedgerHandoff, detail: string): WcCouponLedgerHandoff {
-  if (!handoff.remedy) {
+  const withdrawn = new Set([
+    ...(handoff.remedy ? wcCouponRemedySteps(handoff.remedy) : []),
+    ...(handoff.netPosition ? wcCouponNetClaimSteps(handoff.netPosition) : []),
+  ])
+  if (withdrawn.size === 0) {
     return handoff.needsAccountingAction
       ? handoff
       : { ...handoff, needsAccountingAction: true, lines: [...handoff.lines, `SUPERSEDED: ${detail}.`] }
   }
-  const remedyLines = new Set(wcCouponRemedySteps(handoff.remedy))
+  const what = handoff.remedy
+    ? 'THE REMEDY PRINTED FOR THIS ORDER IS WITHDRAWN'
+    : 'THE NETTED CONCLUSION PRINTED FOR THIS ORDER IS WITHDRAWN'
   return {
     ...handoff,
     remedy: null,
+    netPosition: null,
     needsAccountingAction: true,
     lines: [
-      ...handoff.lines.filter((line) => !remedyLines.has(line)),
-      `THE REMEDY PRINTED FOR THIS ORDER IS WITHDRAWN: ${detail}. Post NOTHING on the strength of it. ` +
-        'Re-derive the position with `--reprint <allowlist>` — the correction has already committed, ' +
-        'so a plain report will skip this order and print nothing for it.',
+      ...handoff.lines.filter((line) => !withdrawn.has(line)),
+      `${what}: ${detail}. Post NOTHING on the strength of it, and do not file this order as ` +
+        'settled. Re-derive the position with `--reprint <allowlist>` — the correction has already ' +
+        'committed, so a plain report will skip this order and print nothing for it.',
     ],
   }
 }

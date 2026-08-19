@@ -847,6 +847,34 @@ test('the recovered figure reports HOW MANY documents agreed on it (o3d-y14 r8 F
   assert.equal(read.ok && read.documentCount, 2, 'and it no longer implies there is only one of them')
 })
 
+test('the recovered figure names EVERY posted document, not the newest (o3d-y14 r10 F2)', async () => {
+  // `externalId` is the NEWEST document's, and naming it is right for a REFUSAL, which prescribes
+  // nothing. It is not right for anything an operator is told to go and do: with two agreeing
+  // documents the duplicate is held twice, and an instruction naming one leaves the other standing.
+  const { client } = makeClient({
+    events: [postedInvoice(), postedInvoice({ externalId: 'INV-779', createdAt: '2026-05-03T09:00:00.000Z' })],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.deepEqual(read.ok && read.externalIds, ['INV-779', 'INV-778'], 'newest first, and BOTH of them')
+  assert.equal(read.ok && read.externalId, 'INV-779', 'the presentational newest is unchanged')
+})
+
+test('a posted document with NO external id is counted but not named (o3d-y14 r10 F2)', async () => {
+  // The id write-back can fail after the post succeeds (o3d-9kek). `documentCount` minus the ids is
+  // the number of documents that exist and cannot be named — a fact the caller has to state rather
+  // than round away.
+  const { client } = makeClient({
+    events: [postedInvoice(), postedInvoice({ externalId: null, createdAt: '2026-05-01T09:00:00.000Z' })],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(read.ok && read.documentCount, 2)
+  assert.deepEqual(read.ok && read.externalIds, ['INV-778'])
+})
+
 test('one posted document reports a count of one — the pair differs on the count alone', async () => {
   const { client } = makeClient({ events: [postedInvoice()] })
 
@@ -854,6 +882,7 @@ test('one posted document reports a count of one — the pair differs on the cou
 
   assert.equal(read.ok, true)
   assert.equal(read.ok && read.documentCount, 1)
+  assert.deepEqual(read.ok && read.externalIds, ['INV-778'])
 })
 
 test('the recovered figure reports the TAX BASIS it is denominated in (o3d-y14 r8 F1)', async () => {

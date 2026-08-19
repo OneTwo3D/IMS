@@ -329,6 +329,21 @@ export type PostedInvoiceOrderDiscount =
        */
       documentCount: number
       /**
+       * THE EXTERNAL ID OF EVERY POSTED DOCUMENT, newest first (o3d-y14 r10 finding 2).
+       *
+       * `externalId` above is the NEWEST document's, and naming it is right for a refusal ("the
+       * posted SALES_INVOICE INV-778 carries…") because a refusal prescribes nothing. It is NOT
+       * right for anything an operator is told to go and DO: with two agreeing documents the
+       * duplicate is held twice, and an instruction naming one of them leaves the other standing.
+       * So every id the ledger holds travels with the figure, and the caller names all of them.
+       *
+       * SHORTER THAN `documentCount` when a posted event carries no external id at all (the id
+       * write-back can fail after the post succeeds — o3d-9kek). The difference is the number of
+       * documents that exist and cannot be named, which is a fact the caller has to state rather
+       * than round away.
+       */
+      externalIds: string[]
+      /**
        * The tax convention those documents' order-discount lines are denominated in (r8 finding 1).
        * MIXED only where several documents disagree about it.
        */
@@ -337,7 +352,20 @@ export type PostedInvoiceOrderDiscount =
   /** No POSTED mirrored sales-invoice event exists. NOT the same as "no document exists". */
   | { ok: false; reason: 'NO_POSTED_EVENT' }
   /** A document exists (or may) and what it carries cannot be established. Never guess past this. */
-  | { ok: false; reason: 'UNRECOVERABLE'; detail: string }
+  | {
+      ok: false
+      reason: 'UNRECOVERABLE'
+      detail: string
+      /**
+       * HOW MANY POSTED DOCUMENTS THE REFUSAL IS ABOUT, where that is known (o3d-y14 r10 finding 2).
+       *
+       * Set only by the branch that read several documents and found them in DISAGREEMENT — the one
+       * refusal where the count is established. A caller that goes on to tell an operator to read
+       * the figure off "the document" needs it: with two documents disagreeing there is no "the
+       * document", and every branch of a read-it-then-choose ladder ends in an instrument.
+       */
+      documentCount?: number
+    }
 
 export async function readPostedInvoiceOrderDiscount(
   client: PostedInvoiceEventClient,
@@ -405,6 +433,7 @@ export async function readPostedInvoiceOrderDiscount(
         `${documents.length} posted documents exist for this order and they carry different ` +
         `order-level discounts (${distinct.join(', ')} ${order.currency}); nothing here says which ` +
         'one a credit note now reverses',
+      documentCount: documents.length,
     }
   }
   const [newest] = documents
@@ -420,6 +449,8 @@ export async function readPostedInvoiceOrderDiscount(
     externalId: newest.externalId,
     externalSystem: newest.externalSystem,
     documentCount: documents.length,
+    // Newest first, in the same order the documents were read. r10 finding 2.
+    externalIds: documents.map((document) => document.externalId).filter((id): id is string => id !== null),
     taxBasis: distinctBases.length === 1 ? distinctBases[0] : 'MIXED',
   }
 }

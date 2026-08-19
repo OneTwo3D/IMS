@@ -1462,7 +1462,7 @@ function instrumentIsForbidden(line: string): boolean {
 }
 
 /** Every shape the handoff can take, as (name, builder) — enumerated so none can be forgotten. */
-const MATRIX: Array<[string, () => Promise<{ lines: string[]; remedy: unknown }>]> = [
+const MATRIX: Array<[string, () => Promise<{ lines: string[]; remedy: unknown; netPosition: unknown }>]> = [
   ['unrefunded / no invoice', () => handoffFor([], 0, { ...LINKED_INVOICE, accountingInvoiceId: null })],
   ['unrefunded / agrees', () => handoffFor([invoiceWithNoDiscountAccount()], 0)],
   ['unrefunded / discounts more', () => handoffFor([postedInvoice()], 0)],
@@ -1507,6 +1507,30 @@ const MATRIX: Array<[string, () => Promise<{ lines: string[]; remedy: unknown }>
     () =>
       handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_QUICKBOOKS),
   ],
+  // r10 finding 1. THE OTHER THREE WAYS THE NETTING IS SUPPRESSED. Each renders the refusal prose
+  // that used to assert the netting's own conclusion, and each is reached with a perfectly
+  // derivable credit-note side — which is what made the assertion look safe.
+  [
+    'netting withdrawn / tax-inclusive',
+    () => handoffFor([inclusiveInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)]),
+  ],
+  [
+    'netting withdrawn / two posted documents',
+    () => handoffFor(twoAgreeingInvoices(), 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)]),
+  ],
+  [
+    'netting withdrawn / credit note not standing',
+    () =>
+      handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], [
+        { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501', externalSystem: 'xero' },
+      ]),
+  ],
+  // r10 finding 2. The suppressed netting's counterpart on an UNREFUNDED order, where the remedy
+  // used to be prescribed against one of two documents.
+  ['unrefunded / two posted documents, discounts more', () => handoffFor(twoAgreeingInvoices(), 0)],
+  ['unrefunded / two posted documents, discounts less', () => handoffFor(twoAgreeingInvoices(), 14)],
+  // r10 finding 2. A second document that reached the ledger and never recorded its external id.
+  ['unrefunded / a posted document that cannot be named', () => handoffFor(twoInvoicesOneUnnamed(), 0)],
 ]
 
 test('NO instrument reaches an operator except through a WcCouponRemedy (o3d-y14 r7 F3)', async () => {
@@ -1589,4 +1613,326 @@ test('every remedy carries the refund position it depends on, and says to re-che
     assert.match(first, /VALID ONLY WHILE this order's refund position is/, name)
     assert.match(first, /RE-CHECK THAT IMMEDIATELY BEFORE POSTING/, name)
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r10 finding 1 — NO NETTING CLAIM REACHES AN OPERATOR EXCEPT FROM A
+// NETTING THAT RAN
+// ---------------------------------------------------------------------------
+
+/**
+ * TWO AGREEING posted invoices: the ledger holds that discount TWICE (r8 finding 2, r10 finding 2).
+ *
+ * The pair fixture for both r10 findings. It differs from the single-invoice one on the NUMBER of
+ * posted documents alone — same amount, same account code, same ledger — so every assertion below
+ * is about the count and not about some other field that came along with it.
+ */
+function twoAgreeingInvoices(): EventRow[] {
+  return [
+    postedInvoice(),
+    postedInvoice({ externalId: 'INV-779', businessDate: '2026-05-01', createdAt: '2026-05-01T09:00:00.000Z' }),
+  ]
+}
+
+/** Two posted documents, one of which never recorded its external id (o3d-9kek). */
+function twoInvoicesOneUnnamed(): EventRow[] {
+  return [
+    postedInvoice(),
+    postedInvoice({ externalId: null, businessDate: '2026-05-01', createdAt: '2026-05-01T09:00:00.000Z' }),
+  ]
+}
+
+test('a netting SUPPRESSED by tax basis no longer says the two errors cancel (o3d-y14 r10 F1)', async () => {
+  // THE DEFECT. `wcCouponNettingBasis` withdraws the subtraction on a tax-INCLUSIVE invoice because
+  // a GROSS figure and a NET one are not one quantity. The refusal it falls through to then told the
+  // operator "so on a full refund the two errors cancel and the net owed is nothing" — the
+  // conclusion the netting would have reached, asserted in the one case where it could not be
+  // computed. An operator reading it files the order as square, which is the outcome the
+  // suppression exists to prevent.
+  const suppressed = await handoffFor([inclusiveInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])
+  const computed = await NETTED_TO_ZERO()
+
+  assert.equal(suppressed.netPosition, null, 'no netting ran')
+  assert.equal(computed.netPosition?.net, 0, 'and on the pair fixture one did')
+  const text = suppressed.lines.join('\n')
+  assert.doesNotMatch(text, /the two errors cancel and the net owed is nothing/)
+  // What it says instead: the same reasoning, as the CONDITIONAL it is, naming the refusal.
+  assert.match(text, /IF the credit note that reversed this invoice was computed from the same/)
+  assert.match(text, /IMS DID NOT NET THEM FOR THIS ORDER/)
+  assert.match(text, /whether they cancel is UNESTABLISHED/)
+  // And the pair still renders opposite answers, so the fixtures separate the two states.
+  assert.notDeepEqual(suppressed.lines, computed.lines)
+  assert.equal(suppressed.needsAccountingAction, true)
+  assert.equal(computed.needsAccountingAction, false)
+})
+
+test('a netting SUPPRESSED cross-ledger no longer says the invoice was already credited away (r10 F1)', async () => {
+  // The same defect in the other direction, on the other side of the classification: the
+  // DOCUMENT_DISCOUNTS_LESS refusal stated "an invoice that has already been credited away" as a
+  // fact — which is precisely the half of the position the withdrawn subtraction could not read.
+  // Here the credit note is in QuickBooks and the invoice in Xero, so nothing IMS holds says the
+  // invoice was credited at all.
+  const suppressed = await handoffFor(
+    [invoiceWithNoDiscountAccount()],
+    4,
+    FULLY_REVERSED_INVOICE,
+    [chargebackReversing(10)],
+    CREDIT_NOTE_IN_QUICKBOOKS,
+  )
+
+  assert.equal(suppressed.invoice.case, 'DOCUMENT_DISCOUNTS_LESS')
+  assert.equal(suppressed.netPosition, null)
+  const text = suppressed.lines.join('\n')
+  assert.doesNotMatch(text, /Crediting an invoice that has already been credited away refunds/)
+  assert.match(text, /IF this invoice has already been credited away/)
+  assert.match(text, /IMS DID NOT ESTABLISH for this order/)
+  assert.match(text, /TWO SEPARATE LEDGERS/, 'and the reason the subtraction was withdrawn is named')
+})
+
+test('a suppressed netting does not assert what the credit notes were RAISED FROM either (r10 F1)', async () => {
+  // DOCUMENT_AGREES's refusal said the credit note(s) "were raised from the PRE-CORRECTION figure".
+  // That is a claim about how the two documents relate, and it is not true of every credit note here
+  // — a WooCommerce-mirrored refund reverses what WooCommerce refunded, not what the invoice
+  // charged. On a suppressed netting nothing has compared them.
+  // Suppressed CROSS-LEDGER, so the AGREES refusal is what renders: with everything else equal the
+  // subtraction would have run and this branch would never be reached.
+  const handoff = await handoffFor(
+    [invoiceWithNoDiscountAccount()],
+    0,
+    FULLY_REVERSED_INVOICE,
+    [chargebackReversing(10)],
+    CREDIT_NOTE_IN_QUICKBOOKS,
+  )
+
+  assert.equal(handoff.invoice.case, 'DOCUMENT_AGREES')
+  assert.equal(handoff.netPosition, null)
+  const text = handoff.lines.join('\n')
+  assert.doesNotMatch(text, /the credit note\(s\) were raised from the PRE-CORRECTION figure/)
+  assert.match(text, /the credit note\(s\) MAY have been raised from the PRE-CORRECTION figure/)
+})
+
+/**
+ * Phrases that state how the INVOICE AND THE CREDIT NOTES RELATE — the conclusion of a subtraction.
+ *
+ * Anything here, in a line that is not part of a rendered `WcCouponNetPosition` and is not governed
+ * by a hedge, is a netting claim that escaped the netting — which is r10 finding 1, and which two
+ * separate refusal branches shipped.
+ */
+const NET_CLAIM =
+  /errors cancel|THE POSITION NETS|net owed is nothing|customer still owes|customer is owed|customer is square|net to nothing|credited away|credited back/i
+
+/**
+ * A clause that makes the claim CONDITIONAL rather than asserted, and — as with the r7 finding 3
+ * prohibition — it must come FIRST. "The two errors cancel, and IMS could not check" leaves the
+ * conclusion standing in the reader's head; "IF … then the two errors cancel" does not.
+ */
+const HEDGE = /\bif\b|\bunless\b|\bmay\b|\bwhether\b|\bwould\b|PROVIDED|CANNOT|could not|DID NOT|NOT ESTABLISH/i
+
+function netClaimIsHedged(line: string): boolean {
+  const claim = line.search(NET_CLAIM)
+  const hedge = line.search(HEDGE)
+  return hedge >= 0 && hedge < claim
+}
+
+test('NO netting claim reaches an operator except from a netting that RAN (o3d-y14 r10 F1)', async () => {
+  // THE PROPERTY, asserted over the whole matrix — every case x refund shape x suppression reason —
+  // rather than case by case. Both r10 finding 1 defects were in refusal paragraphs that a
+  // case-by-case reading had gone past for four rounds, which is exactly what happened to the
+  // instrument property in r7, and this is the same guarantee one layer up.
+  const { wcCouponNetClaimSteps } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+
+  for (const [name, build] of MATRIX) {
+    const handoff = await build()
+    const claimLines = new Set(
+      handoff.netPosition ? wcCouponNetClaimSteps(handoff.netPosition as never) : [],
+    )
+    // Every claim the netting produced is actually IN the output — otherwise "the claim is a value"
+    // would be true and irrelevant.
+    for (const step of claimLines) {
+      assert.ok(handoff.lines.includes(step), `${name}: a netting claim was built and never printed`)
+    }
+    for (const line of handoff.lines) {
+      if (claimLines.has(line)) continue
+      if (!NET_CLAIM.test(line)) continue
+      assert.ok(
+        netClaimIsHedged(line),
+        `${name}: a netting conclusion reached the operator outside a netting that ran, and nothing ` +
+          `before it makes it conditional:\n  ${line}`,
+      )
+    }
+  }
+})
+
+test('"netted to nothing" is only ever true of an order that was NETTED (o3d-y14 r10 F1)', async () => {
+  // The r8 finding 1 reconstruction, closed by construction: `needsAccountingAction === false` on a
+  // refunded order is reachable only from a netting that ran to zero, never from "no remedy and a
+  // readable credit-note side".
+  for (const [name, build] of MATRIX) {
+    const handoff = (await build()) as { netPosition: { net: number } | null; needsAccountingAction?: boolean }
+    if (handoff.netPosition === null) continue
+    assert.equal(typeof handoff.netPosition.net, 'number', `${name}: a net position with no net`)
+  }
+
+  const settled = await NETTED_TO_ZERO()
+  assert.equal(settled.needsAccountingAction, false)
+  assert.equal(settled.netPosition?.net, 0)
+
+  // Every suppression reason, each with a perfectly derivable credit-note side — the shape that
+  // would otherwise read as "settled, nothing to do".
+  const suppressions: Array<[string, () => Promise<{ netPosition: unknown; needsAccountingAction: boolean; reversal: { ok: boolean } }>]> = [
+    ['tax-inclusive', () => handoffFor([inclusiveInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])],
+    ['two documents', () => handoffFor(twoAgreeingInvoices(), 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])],
+    [
+      'cross-ledger',
+      () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_QUICKBOOKS),
+    ],
+  ]
+  for (const [name, build] of suppressions) {
+    const handoff = await build()
+    assert.equal(handoff.netPosition, null, `${name}: a suppressed netting produced a net position`)
+    assert.equal(handoff.reversal.ok, true, `${name}: the credit-note side is derivable — that is the trap`)
+    assert.equal(handoff.needsAccountingAction, true, `${name}: a suppressed order was filed as settled`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r10 finding 2 — a remedy may not name one of several documents
+// ---------------------------------------------------------------------------
+
+test('TWO agreeing invoices name BOTH documents and prescribe NOTHING (o3d-y14 r10 F2)', async () => {
+  // THE DEFECT. r8 refused the NETTING when the ledger holds several posted documents, on the
+  // ground that two agreeing invoices hold the discount twice. The non-netted remedy went on
+  // prescribing from one difference against the NEWEST document, so an operator told to correct
+  // "invoice INV-778" corrected one of two documents that each carry the duplicate.
+  const two = await handoffFor(twoAgreeingInvoices(), 0)
+  const one = await handoffFor([postedInvoice()], 0)
+
+  // The pair differs on the number of posted documents ALONE, and the answers are opposite.
+  assert.equal(one.invoice.case, 'DOCUMENT_DISCOUNTS_MORE')
+  assert.equal(two.invoice.case, 'DOCUMENT_DISCOUNTS_MORE')
+  assert.equal(one.remedy?.kind, 'INCREASE_RECEIVABLE')
+  assert.match(one.lines.join('\n'), /raise a further invoice to the same contact for 10 GBP/i)
+
+  assert.equal(two.remedy, null, 'no remedy computed from ONE difference may be prescribed')
+  assert.equal(two.needsAccountingAction, true, 'and it is emphatically not settled')
+  const text = two.lines.join('\n')
+  assert.match(text, /INV-778/)
+  assert.match(text, /INV-779/, 'the document the old remedy left standing')
+  assert.match(text, /EACH of the 2 posted sales-invoice documents/)
+  assert.match(text, /per document, not the ledger's total/)
+  assert.doesNotMatch(text, /Raise a further invoice/i)
+  assert.doesNotMatch(text, /set its "Order discount" line to/)
+  assert.notDeepEqual(one.lines, two.lines)
+})
+
+test('the same holds in the other direction — two documents, discounting too much (r10 F2)', async () => {
+  // DOCUMENT_DISCOUNTS_LESS prescribed a credit note for the difference against the newest document.
+  // Crediting one of two documents that each discount too much settles half of it.
+  const two = await handoffFor(twoAgreeingInvoices(), 14)
+  const one = await handoffFor([postedInvoice()], 14)
+
+  assert.equal(one.remedy?.kind, 'DECREASE_RECEIVABLE')
+  assert.equal(two.remedy, null)
+  const text = two.lines.join('\n')
+  assert.match(text, /EACH of those documents charged 4 GBP TOO MUCH/)
+  assert.doesNotMatch(text, /Raise a credit note for 4 GBP/)
+  assert.match(text, /no single correction settles it/)
+})
+
+test('a posted document that recorded NO external id is COUNTED, not dropped (o3d-y14 r10 F2)', async () => {
+  // The id write-back can fail after the post succeeds (o3d-9kek). "2 documents, one of which
+  // cannot be named" is the fact; naming the one that can and going quiet about the other is the
+  // same defect in a shape that looks tidier.
+  const handoff = await handoffFor(twoInvoicesOneUnnamed(), 0)
+
+  assert.equal(handoff.remedy, null)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /EACH of the 2 posted sales-invoice documents/)
+  assert.match(text, /invoice\(s\) INV-778/)
+  assert.match(text, /1 further posted document\(s\) that record NO external id and cannot be named/)
+})
+
+test('a REFUNDED order with two documents names both of them too (o3d-y14 r10 F2)', async () => {
+  // The refunded path renders its own prose, and it named `documentRef` in every sentence — so
+  // fixing only the remedy would have left the facts naming one of two. The reference itself is
+  // plural, which is why one change covers both paths.
+  const handoff = await handoffFor(twoAgreeingInvoices(), 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])
+
+  assert.equal(handoff.netPosition, null, 'and the netting is still withdrawn, per r8 F2')
+  const text = handoff.lines.join('\n')
+  assert.match(text, /INV-779/)
+  assert.match(text, /EACH of those documents charged 10 GBP TOO LITTLE/)
+  assert.match(text, /per document, not the ledger's total/)
+})
+
+test('ONE posted document still reads in the singular (o3d-y14 r10 F2)', async () => {
+  // The plural reference must not leak into the overwhelmingly common case: 70 defective doubles,
+  // nearly all of them with one invoice, and "EACH of the 1 posted documents" would teach an
+  // operator to skim the line that matters.
+  const handoff = await handoffFor([postedInvoice()], 0)
+
+  const text = handoff.lines.join('\n')
+  assert.match(text, /^invoice INV-778 carries an order-level discount of 10 GBP/m)
+  assert.match(text, /that document charged 10 GBP TOO LITTLE\./)
+  assert.doesNotMatch(text, /EACH of/)
+  assert.doesNotMatch(text, /per document/)
+})
+
+test('an order whose several documents AGREE with the correction prescribes nothing, and says why', async () => {
+  // r10 finding 2's quiet case. Each document already carries what the corrected order retains, so
+  // THIS run asks for nothing — but "the ledger is already right" is a claim about a ledger holding
+  // several sales invoices for one order, which this backfill establishes nothing about.
+  const handoff = await handoffFor(
+    [invoiceWithNoDiscountAccount(), invoiceWithNoDiscountAccount({ externalId: 'INV-779', businessDate: '2026-05-01' })],
+    0,
+  )
+
+  assert.equal(handoff.invoice.case, 'DOCUMENT_AGREES')
+  assert.equal(handoff.remedy, null)
+  const text = handoff.lines.join('\n')
+  assert.doesNotMatch(text, /the ledger is already right/)
+  assert.match(text, /NO ACCOUNTING ACTION FOLLOWS FROM THIS CORRECTION/)
+  assert.match(text, /the ledger holds 2 posted sales-invoice documents for this ONE order/)
+  assert.match(text, /establishes nothing about whether it should, and prescribes nothing about it/)
+})
+
+test('DISAGREEING posted documents get no read-it-off-the-document ladder either (o3d-y14 r10 F2)', async () => {
+  // The last place a remedy was written against ONE document. READ_THEN_CHOOSE is a remedy — every
+  // branch of it ends in an instrument — and it opens "Open the document and read its order-level
+  // discount line". Where the derivation refused BECAUSE two posted documents disagree, there is no
+  // "the document": reading one of them and raising a further invoice for its difference settles a
+  // figure the ledger does not hold.
+  const disagreeing = await handoffFor(
+    [
+      postedInvoice({ externalId: 'INV-A' }),
+      postedInvoice({
+        externalId: 'INV-B',
+        businessDate: '2026-05-03',
+        linesJson: documentPayload({ discount: { amount: 3, accountCode: '260' } }),
+      }),
+    ],
+    0,
+  )
+  // The pair: an UNVERIFIED refusal whose count is NOT established still gets the ladder, because
+  // one document is what it is about.
+  const single = await handoffFor(
+    [postedInvoice(), postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null })],
+    0,
+  )
+
+  assert.equal(disagreeing.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.equal(disagreeing.invoice.case === 'DOCUMENT_UNVERIFIED' && disagreeing.invoice.documentCount, 2)
+  assert.equal(disagreeing.remedy, null)
+  assert.equal(disagreeing.needsAccountingAction, true)
+  const text = disagreeing.lines.join('\n')
+  assert.match(text, /carry different\s+order-level discounts/)
+  assert.match(text, /2 posted sales-invoice documents disagree/)
+  assert.doesNotMatch(text, /Open the document and read its order-level discount line/)
+  assert.doesNotMatch(text, /raise a further invoice for it/)
+
+  assert.equal(single.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.equal(single.invoice.case === 'DOCUMENT_UNVERIFIED' && single.invoice.documentCount, null)
+  assert.equal(single.remedy?.kind, 'READ_THEN_CHOOSE')
+  assert.match(single.lines.join('\n'), /Open the document and read its order-level discount line/)
+  assert.notDeepEqual(disagreeing.lines, single.lines)
 })

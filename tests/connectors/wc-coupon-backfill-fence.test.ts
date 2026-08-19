@@ -103,7 +103,14 @@ type Store = {
    * still STANDS as its persisted lines describe. Undefined means "the mirror says nothing", which
    * is itself a refusal, so a store that forgets them cannot accidentally net.
    */
-  creditNoteEvents?: Array<{ sourceEntityId: string; type: string; status: string; externalId: string | null }>
+  creditNoteEvents?: Array<{
+    sourceEntityId: string
+    type: string
+    status: string
+    externalId: string | null
+    /** o3d-y14 r9 finding 1 — WHICH LEDGER it stands in. A netting needs both sides in one. */
+    externalSystem?: string | null
+  }>
   activity: Array<{ action: string; entityId: string | null; description?: string; metadata: Record<string, unknown> }>
 }
 
@@ -1845,4 +1852,102 @@ test('every "re-derive this" sentence an operator reads names --reprint, not the
 
   assert.match(steps, /--reprint <allowlist>/)
   assert.doesNotMatch(steps, /re-running the report reproduces/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r10 finding 1 — a superseded netting takes its CONCLUSION with it
+// ---------------------------------------------------------------------------
+
+/** A fully-refunded order whose credit note reversed exactly what the invoice discounted. */
+function nettedToZeroStore(): Store {
+  const store = invoicedStore()
+  store.orders[0].refundStatus = 'FULL'
+  store.orders[0].refunds = [{ id: 'refund-1', accountingCreditNoteId: 'CN-501' }]
+  store.refundRows = [
+    {
+      id: 'refund-1',
+      chargeback: true,
+      totalsBasis: 'NET',
+      accountingCreditNoteId: 'CN-501',
+      lines: [
+        { salesOrderLineId: 'line-1', totalBase: 100, totalForeign: 100, lineKind: 'sale' },
+        { salesOrderLineId: null, totalBase: -10, totalForeign: -10, lineKind: 'discount' },
+      ],
+    },
+  ]
+  store.creditNoteEvents = [
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'xero' },
+  ]
+  return store
+}
+
+const NETTED_ZERO_REFUNDS = {
+  disposition: 'FULL' as const,
+  refundIds: ['refund-1'],
+  postedCreditNoteExternalIds: ['CN-501'],
+  unresolvedRefundParkExternalIds: [] as string[],
+}
+
+test('a refund landing after the correction WITHDRAWS the netted "nothing to do" too (o3d-y14 r10 F1)', async () => {
+  // THE GAP. `withdrawRemedy` stripped the lines a `WcCouponRemedy` had rendered, and a netted-to-
+  // ZERO order carries no remedy at all — so "THE TWO ERRORS CANCEL … there is NO ACCOUNTING ACTION"
+  // survived every withdrawal, on the one outcome that takes an order off the operator's list. The
+  // netting is a subtraction against the credit-note side, and a refund arriving afterwards is
+  // exactly a change to that side.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = nettedToZeroStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, refunds: NETTED_ZERO_REFUNDS })
+  assert.equal(result.outcome, 'CORRECTED')
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  assert.equal(handoff?.netPosition?.net, 0, 'the netting ran and came to zero')
+  assert.equal(handoff?.needsAccountingAction, false)
+  assert.match(handoff?.lines.join('\n') ?? '', /THE TWO ERRORS CANCEL/)
+
+  // ... and now an unrecordable WooCommerce refund lands, after the commit.
+  store.parks = [park()]
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(revalidated.handoff.netPosition, null, 'the netting no longer stands')
+  assert.equal(revalidated.handoff.needsAccountingAction, true)
+  const text = revalidated.handoff.lines.join('\n')
+  assert.doesNotMatch(text, /THE TWO ERRORS CANCEL/)
+  assert.doesNotMatch(text, /THE POSITION NETS/)
+  assert.match(text, /THE NETTED CONCLUSION PRINTED FOR THIS ORDER IS WITHDRAWN/)
+  assert.match(text, /do not file this order as settled/)
+  // The FACTS survive, exactly as they do when a remedy is withdrawn.
+  assert.match(text, /invoice INV-778 carries an order-level discount of 10 GBP/)
+})
+
+test('the netted position is recorded on the ActivityLog, so "nobody could tell" is not "square" (r10 F1)', async () => {
+  // `creditNoteReversal.ok` does NOT answer whether the two sides were compared — a perfectly
+  // derivable credit-note side can still have its subtraction withdrawn — so the log records the
+  // netting itself, and NULL is the durable statement that it never ran.
+  const { applyWcCouponCorrection } = await load()
+  reset()
+  const netted = nettedToZeroStore()
+  await applyWcCouponCorrection(makeTx(netted), { ...invoicedEntry, refunds: NETTED_ZERO_REFUNDS })
+
+  assert.deepEqual(netted.activity[0].metadata.netPosition, {
+    postedDiscount: 10,
+    reversedAmount: 10,
+    net: 0,
+    nettedAgainst: ['CN-501'],
+  })
+
+  // The SAME order with its credit note in another ledger: the subtraction is withdrawn, and the
+  // log says so rather than recording a net nobody computed.
+  reset()
+  const crossLedger = nettedToZeroStore()
+  crossLedger.creditNoteEvents = [
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'quickbooks' },
+  ]
+  await applyWcCouponCorrection(makeTx(crossLedger), { ...invoicedEntry, refunds: NETTED_ZERO_REFUNDS })
+
+  assert.equal(crossLedger.activity[0].metadata.netPosition, null)
+  assert.equal(crossLedger.activity[0].metadata.creditNoteReversal !== null, true, 'the credit-note side derived')
+  assert.equal(crossLedger.activity[0].metadata.needsAccountingAction, true)
 })

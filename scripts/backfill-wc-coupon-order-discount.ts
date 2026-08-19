@@ -89,6 +89,22 @@
  *     invoice standing at full value that the credit memo reduces by nothing. Each names the
  *     condition that failed and prescribes nothing.
  *
+ *     AND A SUPPRESSED NETTING STATES NO NETTING CONCLUSION EITHER (o3d-y14 r10 finding 1). Two of
+ *     those refusal paragraphs used to end with the netting's own answer — "so on a full refund the
+ *     two errors cancel and the net owed is nothing", "crediting an invoice that has already been
+ *     credited away refunds the same money a second time" — asserted in exactly the cases where no
+ *     subtraction could be performed. An operator reading "the two errors cancel" files the order as
+ *     square, which is what the suppression exists to prevent. The conclusion is now a value the
+ *     netting branch alone constructs, with one renderer; a suppressed path carries none, states
+ *     both sides' facts, and gives the same reasoning as the conditional it is.
+ *
+ *   • SEVERAL POSTED SALES-INVOICE DOCUMENTS PRESCRIBE NOTHING (o3d-y14 r10 finding 2). The
+ *     document reference names EVERY posted document rather than the newest, and where there is
+ *     more than one the remedy is withdrawn: the reported difference is per document, not what the
+ *     ledger is out by, and multiplying it is equally unfounded because nothing IMS records says
+ *     whether those documents each bill the whole order or divide it. Correcting the one document
+ *     the report happened to name left the other carrying the duplicate.
+ *
  *   • A REMEDY CAN BE WITHDRAWN AFTER THE FACT (o3d-y14 r7 finding 2, r8 finding 4). Every remedy
  *     printed at the end of an apply run is re-validated against the live refund position TWICE:
  *     once for the whole batch, which decides which of the two lists each order goes on, and again
