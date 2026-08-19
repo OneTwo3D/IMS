@@ -181,7 +181,11 @@ async function enqueueFollowUpSyncLog(
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: QBO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true },
+    // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
+    // that reached QuickBooks. A revival OVERWRITES the payload it recycles, so recycling an
+    // attempted row rotates that attempt's token and discards its anchors, amount and date — see
+    // the recycle note in followup-idempotency.ts.
+    select: { id: true, payload: true, remoteAttemptedAt: true },
   })
   const failedRows = failedLogs.map((row) => ({
     id: row.id,
@@ -191,6 +195,7 @@ async function enqueueFollowUpSyncLog(
     // consults the generic `_idempotencyKey`, which QuickBooks has always honoured — unlike
     // Xero, whose payment branches never did.
     effectiveToken: getIdempotencySource(row.id, type, referenceId, (row.payload ?? {}) as SyncPayload),
+    remoteAttemptedAt: row.remoteAttemptedAt,
   }))
   const plan = planFollowUpEnqueue({
     connector: QBO_CONNECTOR,

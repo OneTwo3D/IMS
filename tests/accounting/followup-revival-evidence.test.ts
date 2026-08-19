@@ -100,3 +100,22 @@ for (const connector of ['xero', 'quickbooks']) {
       'and it must pass the plan\'s own disposition, not a constant')
   })
 }
+
+for (const connector of ['xero', 'quickbooks']) {
+  test(`${connector}: the revival's candidate rows carry remoteAttemptedAt (o3d-0m56 r8)`, async () => {
+    // The revival WRITES OVER the payload of the row it recycles, and that payload is where an
+    // earlier attempt is recorded: its anchors, its amount and date, and the token whose mark the
+    // ledger carries. `planFollowUpEnqueue` can only refuse to recycle an attempted row if the
+    // connector tells it which rows were attempted — so the column has to be selected AND passed.
+    // The enqueue helper is module-private, which is why this is asserted on the source.
+    const source = await readFile(path.join(process.cwd(), `lib/connectors/${connector}/sync-processor.ts`), 'utf8')
+    const at = source.indexOf("status: 'FAILED' },\n    orderBy: { createdAt: 'desc' },")
+    assert.notEqual(at, -1, 'the enqueue must read the scope\'s FAILED rows')
+
+    const window = source.slice(at, source.indexOf('const plan = planFollowUpEnqueue({', at))
+    assert.match(window, /select: \{[^}]*remoteAttemptedAt: true[^}]*\}/,
+      'the FAILED-row read must select remoteAttemptedAt')
+    assert.match(window, /remoteAttemptedAt: row\.remoteAttemptedAt/,
+      'and pass it through to the planner, not drop it in the map')
+  })
+}

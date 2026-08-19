@@ -303,7 +303,11 @@ async function enqueueFollowUpSyncLog(
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true },
+    // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
+    // that reached Xero. A revival OVERWRITES the payload it recycles, so recycling an attempted
+    // row rotates that attempt's token and discards its anchors, amount and date — see the recycle
+    // note in followup-idempotency.ts.
+    select: { id: true, payload: true, remoteAttemptedAt: true },
   })
   const failedRows = failedLogs.map((row) => ({
     id: row.id,
@@ -311,6 +315,7 @@ async function enqueueFollowUpSyncLog(
     // Exactly what followUpIdempotencySource would have produced for this row, so pinning it
     // reproduces a byte-identical Idempotency-Key even after the row itself is gone.
     effectiveToken: followUpIdempotencySource(row.id, (row.payload ?? {}) as SyncPayload),
+    remoteAttemptedAt: row.remoteAttemptedAt,
   }))
   const plan = planFollowUpEnqueue({
     connector: XERO_CONNECTOR,
