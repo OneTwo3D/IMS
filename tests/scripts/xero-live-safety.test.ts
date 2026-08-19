@@ -14,18 +14,24 @@
  *     twice with a change in between, which is the entire gap the manifest is supposed to close,
  *   • a 2xx page whose BODY IS MALFORMED, which must never read as an empty collection,
  *   • an endpoint that is PERMANENTLY rate-limited,
+ *   • a 429 on a WRITE, followed by a CHANGE to the document, followed by the retry — the whole
+ *     sequence, because a double that cannot move the ledger during the delay cannot tell a
+ *     re-dispatch from a refusal,
+ *   • TWO RUNS INTERLEAVING on one write log, which is what two processes with the same file open
+ *     actually produce,
  *   • a run that WROTE and THEN THREW, via `MutationJournal`.
  * A double that cannot express those cannot fail these tests for the right reason. The one that
  * matters most is the first: a fake returning the same object on every read would satisfy an
  * id-only manifest check and a state-bound one identically, and prove nothing about either.
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
 
 import {
+  acquireWriteLogLock,
   allowedStatusesAfterRun,
   AmbiguousSelectionError,
   assertExpectedTenant,
@@ -50,6 +56,7 @@ import {
   isFixtureItemCode,
   ManifestViolationError,
   MutationJournal,
+  NULL_WRITE_INTENT_LOG,
   openWriteIntentLog,
   pageAllComplete,
   parseCollectionPage,
@@ -69,7 +76,9 @@ import {
   TenantMismatchError,
   UnresolvedWriteError,
   versionFromWriteResponse,
+  WriteLogLockedError,
   WriteOutcomeUnknownError,
+  WriteRateLimitedError,
   writeUnitsIndividually,
   WriteWithoutApplyError,
   type PlannedObject,
@@ -2058,5 +2067,279 @@ describe('the version bound to our own write is matched by collection AND id', (
     journal.recordOwnWriteVersion('creditnote:cn-1', '/Date(2000)/')
     assert.equal(journal.wroteTo('creditnote:cn-2'), false)
     assert.equal(journal.ownWriteVersion('creditnote:cn-2'), undefined)
+  })
+})
+
+// ===========================================================================
+/**
+ * Round 5, finding 1. Every write is individually authorised — revalidate, confirm the unit,
+ * write — and the transport used to close a 429 by SLEEPING and RE-DISPATCHING the same request.
+ * The retried write carries an authorisation minted before the sleep, so it lands on state nobody
+ * re-checked. The first attempt is safe because Xero's limiter refuses before applying; that says
+ * nothing about the second.
+ *
+ * The double has to be able to express the whole sequence — a 429, THEN a change to the document,
+ * THEN the retry — or it cannot fail for the right reason. `rateLimitedThenEdited` is a miniature
+ * ledger that mutates while the retry would be sleeping: the credit note is re-contacted to a
+ * genuine customer, exactly the change the per-write re-read exists to catch. A second dispatch
+ * really does void it, and the test below proves the double does that rather than assuming it.
+ */
+describe('a rate-limited WRITE is refused, because its authorisation is behind the delay', () => {
+  function rateLimitedThenEdited() {
+    const ledger = {
+      cn1: { Status: 'SUBMITTED', ContactName: 'E2E E2E-FC-mrmdzz', version: '/Date(1000)/', voided: false },
+    }
+    const dispatched: string[] = []
+    const { impl, calls } = fakeFetch((url, init) => {
+      const method = String(init.method ?? 'GET')
+      if (method === 'GET') {
+        return response(200, { CreditNotes: [{ CreditNoteID: 'cn-1', Status: ledger.cn1.Status, Contact: { Name: ledger.cn1.ContactName }, UpdatedDateUTC: ledger.cn1.version }] })
+      }
+      dispatched.push(`${method} ${url}`)
+      if (dispatched.length === 1) {
+        // Xero's limiter refuses this one before applying it — the ledger is untouched by the
+        // request itself. And then, in the seconds a retry would have spent asleep, a person in
+        // Xero re-contacts the document to a genuine customer.
+        ledger.cn1.ContactName = 'Acme Trading Ltd'
+        ledger.cn1.version = '/Date(2000)/'
+        return response(429, 'rate limit exceeded', { 'Retry-After': '2' })
+      }
+      // Any SECOND dispatch lands here — on the document as it is NOW, which nothing re-read.
+      ledger.cn1.voided = true
+      ledger.cn1.Status = 'VOIDED'
+      return response(200, { CreditNotes: [{ CreditNoteID: 'cn-1', UpdatedDateUTC: '/Date(3000)/' }] })
+    })
+    return { ledger, dispatched, impl, calls }
+  }
+
+  test('the double really does void a re-contacted document on the second dispatch', async () => {
+    // Proves the scenario is reachable at all. If the second attempt were inert, every assertion
+    // below would pass against a transport that retried freely.
+    const { ledger, impl } = rateLimitedThenEdited()
+    const raw = impl as unknown as (u: string, i: RequestInit) => Promise<Response>
+    await raw('https://x/CreditNotes/cn-1', { method: 'POST' })
+    assert.equal(ledger.cn1.ContactName, 'Acme Trading Ltd', 'the document moved while a retry would have been sleeping')
+    assert.equal(ledger.cn1.voided, false, 'the 429 itself applied nothing')
+    await raw('https://x/CreditNotes/cn-1', { method: 'POST' })
+    assert.equal(ledger.cn1.voided, true, 'a retry voids a document contacted to a genuine customer')
+  })
+
+  test('the transport refuses the rate-limited write instead of sleeping and re-sending it', async () => {
+    const { ledger, dispatched, impl } = rateLimitedThenEdited()
+    const slept: number[] = []
+    const transport = createXeroTransport({
+      apply: true, fetchImpl: impl, minIntervalMs: 0,
+      sleep: async (ms) => { slept.push(ms) },
+    })
+    await assert.rejects(
+      () => transport.request(TOKEN, 'POST', 'CreditNotes/cn-1', { Status: 'VOIDED' }),
+      (e: Error) => e instanceof WriteRateLimitedError && /never left this process|NOT retried|refused/i.test(e.message),
+    )
+    assert.equal(dispatched.length, 1, 'the write must be dispatched ONCE; a second dispatch is the defect')
+    assert.deepEqual(slept, [], 'a rate-limited write does not even wait — there is nothing to wait for')
+    assert.equal(ledger.cn1.voided, false, 'the re-contacted document was never voided')
+  })
+
+  for (const method of ['POST', 'PUT', 'DELETE'] as const) {
+    test(`${method} is refused too — the rule is about writes, not about one verb`, async () => {
+      const { impl, calls } = fakeFetch(() => response(429, 'rate limit exceeded', { 'Retry-After': '1' }))
+      const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+      await assert.rejects(() => transport.request(TOKEN, method, 'Items/item-1'), WriteRateLimitedError)
+      assert.equal(calls.length, 1)
+    })
+  }
+
+  test('a GET is still retried — a read authorises nothing, and its own result is what gets checked', async () => {
+    let n = 0
+    const { impl, calls } = fakeFetch(() => (++n === 1
+      ? response(429, 'rate limit exceeded', { 'Retry-After': '1' })
+      : response(200, { Invoices: [{ InvoiceID: 'inv-1' }] })))
+    const slept: number[] = []
+    const transport = createXeroTransport({
+      apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: async (ms) => { slept.push(ms) },
+    })
+    const res = await transport.request<{ Invoices: unknown[] }>(TOKEN, 'GET', 'Invoices')
+    assert.equal(res.ok, true)
+    assert.equal(calls.length, 2, 'reads still retry; refusing them would turn a rate limit into a failed audit')
+    assert.deepEqual(slept, [2000])
+  })
+
+  test('a rate-limited write is settled on disk as NOT-COMMITTED, so it strands nothing', async () => {
+    // 429 is Xero's own application layer declining before it applies anything — the same class of
+    // evidence as a 400 or a 404. Recording it as UNKNOWN would leave the next run refusing to
+    // start over a write that provably never touched the ledger.
+    const disk: string[] = []
+    const log = createWriteIntentLog({ tenantId: TENANT, append: (line) => disk.push(line) })
+    const { impl } = fakeFetch(() => response(429, 'rate limit exceeded', { 'Retry-After': '1' }))
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: log,
+        method: 'POST', path: 'CreditNotes/cn-1', body: { Status: 'VOIDED' },
+        kind: 'credit note voided', label: 'CN-0001',
+      }),
+      WriteRateLimitedError,
+    )
+    assert.equal(disk.length, 2)
+    assert.match(disk[1], /"state":"not-committed"/)
+    assert.equal(journal.unknownCount, 0, 'Xero answered; nothing about this outcome is unknown')
+    assert.equal(journal.writeCount, 0)
+    assert.deepEqual(scanWriteIntentLog(disk.join('\n')).unresolved, [], 'the next run has nothing to account for')
+  })
+
+  test('the refusal stops the step; the units after it are not written on the same stale check', async () => {
+    const { impl } = fakeFetch((_url, init) => (String(init.method ?? 'GET') === 'GET'
+      ? response(200, { CreditNotes: [{ CreditNoteID: 'cn-1' }] })
+      : response(429, 'rate limit exceeded', { 'Retry-After': '1' })))
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+    const written: string[] = []
+
+    await assert.rejects(
+      () => writeUnitsIndividually<string, null>({
+        units: ['alloc-1', 'alloc-2', 'alloc-3'],
+        revalidate: async () => null,
+        confirmUnit: () => {},
+        write: async (unit) => {
+          written.push(unit)
+          await performWrite({
+            transport, token: TOKEN, journal, writeLog: NULL_WRITE_INTENT_LOG,
+            method: 'DELETE', path: `CreditNotes/cn-1/Allocations/${unit}`,
+            kind: 'allocation deleted', label: unit,
+          })
+        },
+      }),
+      WriteRateLimitedError,
+    )
+    assert.deepEqual(written, ['alloc-1'], 'the run stops; it does not carry on hammering a limiter that is refusing')
+  })
+})
+
+// ===========================================================================
+/**
+ * Round 5, finding 2. The write log is the record that survives process death, and it only answers
+ * "did a dispatched write go unaccounted for?" if it describes ONE run at a time. Two runs sharing
+ * it settle over each other's records, and the landed write nobody can account for ends up in a
+ * file the next run reads as clean — the guarantee inverted by the thing meant to provide it.
+ *
+ * The double is two logs appending into ONE array, in interleaved order: that is what two processes
+ * with the same file open actually produce. The fix has two halves and they are tested separately —
+ * the lock, which makes the collision impossible and fails closed when the lock itself cannot be
+ * taken, and the run-scoped ids, which stop a collision that happens anyway from HIDING anything.
+ */
+describe('two runs cannot share the write log, and cannot erase each other in it', () => {
+  function sharedFile() {
+    const disk: string[] = []
+    const openRun = (runId?: string) =>
+      createWriteIntentLog({ tenantId: TENANT, append: (line) => disk.push(line), runId })
+    return { disk, openRun }
+  }
+
+  test('run B settling its own write does not erase run A\'s dispatched-and-unaccounted-for one', () => {
+    const { disk, openRun } = sharedFile()
+    const runA = openRun()
+    const runB = openRun()
+
+    // Interleaved exactly as two live processes interleave. A dispatches, and dies before it can
+    // settle; B is on its first write of its own and finishes it cleanly.
+    runA.intend({ kind: 'invoice voided', label: 'INV-A-0042', method: 'POST', path: 'Invoices/inv-42' })
+    const b1 = runB.intend({ kind: 'invoice voided', label: 'INV-B-0007', method: 'POST', path: 'Invoices/inv-7' })
+    runB.settle(b1, 'committed', 'Xero answered HTTP 200')
+    // <<< run A was killed here; its write may be in the ledger and only this file can say so >>>
+
+    const scan = scanWriteIntentLog(disk.join('\n'))
+    assert.equal(scan.unresolved.length, 1, "run B's settlement must not resolve run A's intent")
+    assert.equal(scan.unresolved[0].label, 'INV-A-0042')
+    assert.throws(
+      () => assertNoUnresolvedWrites({ path: './write-log.jsonl', text: disk.join('\n') }),
+      (e: Error) => e instanceof UnresolvedWriteError && /INV-A-0042/.test(e.message),
+    )
+  })
+
+  test('a settlement from another run cannot resolve an intent even when the ids collide', () => {
+    // A log written by the version that minted bare `w1` counters, plus one line from a colliding
+    // run. Same id, different run: it resolves nothing.
+    const text = [
+      JSON.stringify({ event: 'intent', id: 'w1', runId: 'run-a', kind: 'invoice voided', label: 'INV-A-0042', method: 'POST', path: 'Invoices/inv-42', at: '2026-08-19T10:00:00.000Z', tenantId: TENANT }),
+      JSON.stringify({ event: 'settled', id: 'w1', runId: 'run-b', state: 'committed', reason: 'Xero answered HTTP 200', at: '2026-08-19T10:00:01.000Z', tenantId: TENANT }),
+    ].join('\n')
+    const scan = scanWriteIntentLog(text)
+    assert.equal(scan.unresolved.length, 1)
+    assert.equal(scan.unresolved[0].label, 'INV-A-0042')
+  })
+
+  test('a log from a single pre-run-id writer still resolves normally', () => {
+    // The cross-check must not turn every historical log into a permanent refusal.
+    const text = [
+      JSON.stringify({ event: 'intent', id: 'w1', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42', at: '2026-08-10T10:00:00.000Z', tenantId: TENANT }),
+      JSON.stringify({ event: 'settled', id: 'w1', state: 'committed', reason: 'Xero answered HTTP 200', at: '2026-08-10T10:00:01.000Z', tenantId: TENANT }),
+    ].join('\n')
+    assert.deepEqual(scanWriteIntentLog(text), { unresolved: [], unreadableLines: 0 })
+  })
+
+  test('the ids two runs mint are not the same ids', () => {
+    const { openRun } = sharedFile()
+    const a = openRun().intend({ kind: 'k', label: 'l', method: 'POST', path: 'p' })
+    const b = openRun().intend({ kind: 'k', label: 'l', method: 'POST', path: 'p' })
+    assert.notEqual(a, b, 'a per-process counter gives both runs `w1`, which is how one erases the other')
+  })
+
+  test('a second run cannot take the lock a first run holds, and gets it once that run releases', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'xero-write-lock-'))
+    const path = join(dir, 'write-log.jsonl')
+    const first = acquireWriteLogLock({ path })
+    assert.equal(existsSync(first.path), true)
+    assert.throws(
+      () => acquireWriteLogLock({ path }),
+      (e: Error) => e instanceof WriteLogLockedError && /another run/i.test(e.message),
+    )
+    // It names itself, so the operator deciding whether to clear it has something to decide on.
+    assert.match(readFileSync(first.path, 'utf8'), new RegExp(`"pid":${process.pid}`))
+    first.release()
+    first.release() // idempotent: the log's close() and the caller's finally both call it
+    assert.equal(existsSync(first.path), false)
+    const second = acquireWriteLogLock({ path })
+    second.release()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('a lock that cannot be taken AT ALL is a refusal, not a warning', () => {
+    // The mechanism itself failing must fail closed: a lock this process could not establish is,
+    // as far as its own knowledge goes, indistinguishable from one somebody else is holding.
+    assert.throws(
+      () => acquireWriteLogLock({
+        path: './write-log.jsonl',
+        openLock: () => { throw Object.assign(new Error("EACCES: permission denied, open './write-log.jsonl.lock'"), { code: 'EACCES' }) },
+      }),
+      (e: Error) => e instanceof WriteLogLockedError && /EACCES/.test(e.message),
+    )
+  })
+
+  test('opening the file-backed log is itself exclusive, and closing it hands the lock back', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'xero-write-log-excl-'))
+    const path = join(dir, 'write-log.jsonl')
+    const log = openWriteIntentLog({ path, tenantId: TENANT })
+    assert.throws(() => openWriteIntentLog({ path, tenantId: TENANT }), WriteLogLockedError)
+    log.close()
+    const again = openWriteIntentLog({ path, tenantId: TENANT })
+    again.close()
+    assert.equal(existsSync(`${path}.lock`), false)
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('the remover locks BEFORE it reads the log, and gives the lock back on every exit path', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    const lockAt = code.indexOf('writeLogLock = acquireWriteLogLock(')
+    const scanAt = code.indexOf('assertNoUnresolvedWrites({ path: WRITE_LOG_PATH')
+    assert.ok(lockAt > 0 && scanAt > 0)
+    assert.ok(
+      lockAt < scanAt,
+      'reading the log and then acting on what it said is only sound if nothing can append in between',
+    )
+    // closeWriteLog runs from report(), which runs on the normal path AND the abort path.
+    assert.match(code, /writeLogLock\?\.release\(\)/)
+    assert.match(code, /openWriteIntentLog\(\{ path: WRITE_LOG_PATH, tenantId: token\.tenantId, lock: writeLogLock! \}\)/)
   })
 })

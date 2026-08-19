@@ -10,7 +10,10 @@
  *
  * The contract, in the order it is enforced:
  *
- *   1. TRANSPORT      no method other than GET can leave the process unless --apply was passed.
+ *   1. TRANSPORT      no method other than GET can leave the process unless --apply was passed, and
+ *                     a rate-limited WRITE is refused rather than re-dispatched: the retry would
+ *                     land an authorisation minted before the sleep. A GET still retries — a read
+ *                     authorises nothing, and its own result is what gets checked.
  *   2. TENANT         the organisation Xero reports must be the expected one, by id AND by name.
  *   3. SELECTION      only the exact full-chain fixture naming grammar selects an object, and
  *                     anything that merely looks E2E-ish aborts the run instead of being included
@@ -33,6 +36,9 @@
  *                     omission. Where this run has itself already written to the object, the write
  *                     is held to the version XERO REPORTED FOR THAT WRITE; where Xero reported
  *                     none, there is nothing attributable to this run and the write is REFUSED.
+ *                     An authorisation does not outlive its window either: nothing may re-dispatch
+ *                     a write after a delay, because the check that authorised it is behind that
+ *                     delay. A rate-limited write is refused and the operator re-runs.
  *   7. OUTCOME        a run with any failure exits non-zero and does not report success; a run that
  *                     THREW after writing says how much it had already destroyed; and a write whose
  *                     outcome cannot be determined is reported as UNKNOWN, never as nothing.
@@ -41,8 +47,8 @@
  *                     process is the same class of event that produces one. An intent with no
  *                     settlement stops the NEXT run rather than being lost.
  */
-import { createHash } from 'node:crypto'
-import { closeSync, fsyncSync, openSync, writeSync } from 'node:fs'
+import { createHash, randomBytes } from 'node:crypto'
+import { closeSync, fsyncSync, openSync, unlinkSync, writeSync } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // Errors. All safety aborts share a base class so a caller can tell a refusal
@@ -77,6 +83,33 @@ export class CallCeilingError extends SafetyViolationError {}
  * because the run must stop: after this, nothing in the process knows what the ledger contains.
  */
 export class WriteOutcomeUnknownError extends SafetyViolationError {}
+/**
+ * Xero rate-limited a WRITE, and the write is therefore refused rather than retried.
+ *
+ * An authorisation must not outlive its window. Every write in this tooling is authorised
+ * individually — re-read the object, confirm the unit, write — and that whole guarantee is about
+ * the gap between the check and the write being as small as the process can make it. The transport
+ * used to close a 429 by sleeping (up to 121s, up to `maxRateLimitRetries` times) and then
+ * RE-DISPATCHING the same request. The retried write carries an authorisation minted before the
+ * sleep: nothing re-read the object, nothing re-confirmed the unit, and the document may have been
+ * re-contacted, re-allocated or edited by a person in Xero in the meantime. The first attempt was
+ * safe — Xero's limiter refuses before applying — and that says nothing about the second.
+ *
+ * So a rate-limited write is REFUSED, not retried, and this is the refusal. It is safe to treat as
+ * a clean stop: 429 is an answer from Xero's own application layer declining the request, so it is
+ * `not-committed` by the same rule as a 400 or a 404 — the ledger is unchanged and the write log
+ * records it as such, leaving nothing for the next run to account for.
+ *
+ * The cost is a re-run, and it was always a re-run: the retry was bounded, so an endpoint that
+ * stays limited ended in a throw anyway. Refusing at the FIRST 429 buys the same outcome without
+ * ever dispatching a write on a stale check. Re-running re-reads everything, which is exactly the
+ * re-authorisation a retry cannot do — the transport is below the manifest, the journal and the
+ * unit, and has nothing to re-authorise against.
+ */
+export class WriteRateLimitedError extends SafetyViolationError {
+  /** Xero refused it. Carried so `performWrite` settles the log from the same classifier. */
+  readonly commit: WriteCommit = classifyWriteOutcome({ status: 429 })
+}
 
 // ---------------------------------------------------------------------------
 // 3. SELECTION — the exact fixture naming grammar
@@ -230,7 +263,11 @@ export type TransportOptions = {
   sleep?: (ms: number) => Promise<void>
   now?: () => number
   log?: (message: string) => void
-  /** Consecutive 429s tolerated on one call before giving up. */
+  /**
+   * Consecutive 429s tolerated on one GET before giving up. It does not apply to writes: a
+   * rate-limited write is refused outright, because a retry would carry an authorisation minted
+   * before the sleep. See `WriteRateLimitedError`.
+   */
   maxRateLimitRetries?: number
   /** Extra headers per request, e.g. If-Modified-Since. */
   headersFor?: (path: string) => Record<string, string>
@@ -297,6 +334,19 @@ export function createXeroTransport(options: TransportOptions = {}): XeroTranspo
 
     if (res.status === 429) {
       const retryAfter = Number(res.headers.get('Retry-After') ?? '0')
+      // A WRITE IS NEVER RE-DISPATCHED. See `WriteRateLimitedError`: the authorisation for this
+      // write was granted before the sleep, and a retry would spend it on state nobody re-checked.
+      // This is checked FIRST, so a rate-limited write never sleeps at all.
+      if (method !== 'GET') {
+        throw new WriteRateLimitedError(
+          `ABORT: Xero rate-limited ${method} ${path} (HTTP 429, Retry-After ${retryAfter || 'unset'}s) after ${callCount} calls.\n` +
+            `THE WRITE WAS REFUSED AND THE LEDGER IS UNCHANGED — 429 is Xero's own application layer declining ` +
+            `the request before applying it.\n` +
+            `It is NOT retried: this write was authorised by a re-read taken immediately before it, and that ` +
+            `authorisation does not survive the wait. Re-run once the limit has cleared, from a FRESH manifest, ` +
+            `so the write is authorised by a read taken next to it.`,
+        )
+      }
       // The daily cap's Retry-After is measured in HOURS. Sleeping on it is indistinguishable from
       // a hung script, so surface it instead.
       if (retryAfter > 120) throw new Error(`Rate limited; Retry-After ${retryAfter}s after ${callCount} calls`)
@@ -1338,6 +1388,14 @@ export function settleWrite(args: {
  */
 export type WriteIntent = {
   id: string
+  /**
+   * Which RUN wrote this line. Ids used to be `w1`, `w2`, ... from a per-process counter, so two
+   * runs sharing the log produced the same ids and a settlement from one resolved an intent from
+   * the other — the landed unknown write disappearing behind a colliding run's success. The id is
+   * now scoped to the run that minted it, and a settlement only resolves an intent from its OWN
+   * run. See `acquireWriteLogLock` for the half that stops the collision happening at all.
+   */
+  runId: string
   kind: string
   label: string
   method: HttpMethod
@@ -1383,23 +1441,119 @@ export function createWriteIntentLog(args: {
   /** MUST durably flush before returning. `openWriteIntentLog` is the fsync-ing implementation. */
   append: (line: string) => void
   now?: () => Date
+  /**
+   * Identifies THIS RUN in the log. Defaults to fresh randomness, and must never be derived from
+   * anything two runs could agree on — a pid, a date, a hostname — because the whole job of this
+   * value is to make a colliding run's ids provably not ours.
+   */
+  runId?: string
 }): WriteIntentLog {
-  const { tenantId, append, now = () => new Date() } = args
+  const { tenantId, append, now = () => new Date(), runId = randomBytes(8).toString('hex') } = args
   let seq = 0
   return {
     intend(entry) {
-      const id = `w${++seq}`
+      // Scoped to the run. `w1` from a bare counter is the same string in every process that ever
+      // opens this file, which is exactly how one run's settlement erased another run's evidence.
+      const id = `${runId}-w${++seq}`
       const record: WriteIntent & { event: 'intent' } = {
-        event: 'intent', id, kind: entry.kind, label: entry.label,
+        event: 'intent', id, runId, kind: entry.kind, label: entry.label,
         method: entry.method, path: entry.path, at: now().toISOString(), tenantId,
       }
       append(JSON.stringify(record))
       return id
     },
     settle(id, state, reason) {
-      append(JSON.stringify({ event: 'settled', id, state, reason, at: now().toISOString(), tenantId }))
+      append(JSON.stringify({ event: 'settled', id, runId, state, reason, at: now().toISOString(), tenantId }))
     },
     close() {},
+  }
+}
+
+/**
+ * Two runs must not share this log, and the reason is the guarantee the log exists to give.
+ *
+ * The refusal in `assertNoUnresolvedWrites` reads the whole file and asks "is there a write nobody
+ * accounted for?". That question has an answer only if the file describes ONE run's writes at a
+ * time. With two runs appending, run A can dispatch a write, die before settling it, and run B —
+ * which read the file before A's intent reached it, or which is simply further along — appends its
+ * own settlements over the top. The landed write that nobody can account for is then sitting in a
+ * file that the next run reads as clean. That is not a smaller version of the guarantee; it is the
+ * absence of it, in exactly the crash the log was built for.
+ *
+ * Both halves of the fix are here, and they answer different failures:
+ *
+ *   • THIS LOCK makes the collision impossible. `openSync(..., 'wx')` is O_CREAT|O_EXCL, one
+ *     atomic syscall: the second run does not get the file, and does not start. It FAILS CLOSED on
+ *     every path — if the lock is already held it refuses, and if the lock CANNOT BE TAKEN for any
+ *     other reason (no permission, no directory, a read-only filesystem) it refuses then too,
+ *     because a lock that could not be established is indistinguishable from one held by someone
+ *     else as far as this process's knowledge goes. Nothing here treats "the mechanism broke" as
+ *     "carry on".
+ *   • THE RUN-SCOPED IDS in `createWriteIntentLog` mean that a collision which happens ANYWAY —
+ *     a lock cleared by hand, two runs pointed at the same log through different paths, a
+ *     filesystem where O_EXCL is not honoured — still cannot HIDE anything: a settlement resolves
+ *     only an intent from its own run, so the dead run's intent stays on the pile.
+ *
+ * A stale lock after a crash is deliberate, and is the same policy as an unresolved intent: the
+ * operator looks, establishes what happened, and clears it. A lock that auto-expired would hand
+ * the next run exactly the state this file refuses to let it plan from.
+ */
+export class WriteLogLockedError extends SafetyViolationError {}
+
+export type WriteLogLock = {
+  /** The lock file, so the message that tells an operator to remove it can name it. */
+  path: string
+  /** Idempotent: the log's `close()` and a caller's `finally` may both call it. */
+  release(): void
+}
+
+export function acquireWriteLogLock(args: {
+  /** The LOG path. The lock is `<path>.lock`, so it travels with the log a run is told to use. */
+  path: string
+  /** Injected for tests, and so a caller can make the mechanism itself fail. */
+  openLock?: (lockPath: string) => number
+  removeLock?: (lockPath: string) => void
+  now?: () => Date
+}): WriteLogLock {
+  const lockPath = `${args.path}.lock`
+  const openLock = args.openLock ?? ((p: string) => openSync(p, 'wx'))
+  const removeLock = args.removeLock ?? ((p: string) => unlinkSync(p))
+  const now = args.now ?? (() => new Date())
+
+  let fd: number
+  try {
+    fd = openLock(lockPath)
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    throw new WriteLogLockedError(
+      `ABORT: could not take the exclusive lock on the write-intent log (${lockPath}): ${message}\n` +
+        `Either another run of this script is writing to ${args.path} right now, or one died holding the lock.\n` +
+        `TWO RUNS MUST NOT SHARE THIS LOG: the log is what proves no dispatched write went unaccounted for, and ` +
+        `one run's records appended over another's destroy that proof.\n` +
+        `If no other run is live: read ${lockPath} to see which run left it, account for every write in ` +
+        `${args.path} (open each object in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts), and only ` +
+        `then remove the lock file.`,
+    )
+  }
+  try {
+    // Best effort identity for the human who has to decide whether this lock is live. It is not
+    // part of the exclusion — O_EXCL already did that — but a lock nobody can attribute is a lock
+    // nobody dares clear.
+    writeSync(fd, `${JSON.stringify({ pid: process.pid, at: now().toISOString(), log: args.path })}\n`)
+    fsyncSync(fd)
+  } catch {
+    /* the exclusion is the file's existence, not its contents */
+  }
+
+  let released = false
+  return {
+    path: lockPath,
+    release() {
+      if (released) return
+      released = true
+      try { closeSync(fd) } catch { /* releasing the lock must not mask the run's own error */ }
+      try { removeLock(lockPath) } catch { /* a lock left behind fails CLOSED; that is the safe way to fail */ }
+    },
   }
 }
 
@@ -1407,18 +1561,45 @@ export function createWriteIntentLog(args: {
  * The on-disk sink. `writeSync` then `fsyncSync`: a buffered write that has not reached the device
  * is not evidence of anything, and the events this log exists for — a kill, an OOM, a host going
  * away — are exactly the ones that discard a buffer.
+ *
+ * It is EXCLUSIVE. The lock is taken here rather than left to the call site, for the same reason
+ * the null log is a value rather than an `if (log)`: a lock a caller has to remember is a lock a
+ * caller can forget, and the forgetting is invisible until two runs have already interleaved. A
+ * caller that must lock EARLIER — before it reads the log to check for unresolved writes, which is
+ * the window a second run could append into — takes the lock itself with `acquireWriteLogLock` and
+ * hands it in.
  */
-export function openWriteIntentLog(args: { path: string; tenantId: string; now?: () => Date }): WriteIntentLog {
-  const fd = openSync(args.path, 'a')
+export function openWriteIntentLog(args: {
+  path: string
+  tenantId: string
+  now?: () => Date
+  /** An already-held lock, for a caller that locked before scanning. Released by `close()`. */
+  lock?: WriteLogLock
+  runId?: string
+}): WriteIntentLog {
+  const lock = args.lock ?? acquireWriteLogLock({ path: args.path, now: args.now })
+  let fd: number
+  try {
+    fd = openSync(args.path, 'a')
+  } catch (e) {
+    lock.release()
+    throw e
+  }
   const log = createWriteIntentLog({
     tenantId: args.tenantId,
     now: args.now,
+    runId: args.runId,
     append: (line) => {
       writeSync(fd, `${line}\n`)
       fsyncSync(fd)
     },
   })
-  return { ...log, close: () => closeSync(fd) }
+  return {
+    ...log,
+    close: () => {
+      try { closeSync(fd) } finally { lock.release() }
+    },
+  }
 }
 
 export type WriteLogScan = { unresolved: WriteIntent[]; unreadableLines: number }
@@ -1454,6 +1635,7 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
     if (record.event === 'intent') {
       open.set(id, {
         id,
+        runId: String(record.runId ?? ''),
         kind: String(record.kind ?? '(unnamed)'),
         label: String(record.label ?? '(unlabelled)'),
         method: (record.method ?? 'POST') as HttpMethod,
@@ -1465,7 +1647,14 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
       // A settlement RESOLVES the intent only when it says what happened. 'unknown' is the answer
       // that does not, so it stays on the pile: the run that recorded it may itself have died
       // before printing the banner about it.
-      if (record.state !== 'unknown') open.delete(id)
+      if (record.state === 'unknown') continue
+      // And only its OWN run's intent. Ids are run-scoped now, so this can only fire on a log
+      // written by a version that minted bare `w1`, `w2` counters — the exact shape in which one
+      // run's settlement erased another's dispatched-but-unaccounted-for write. Where neither line
+      // carries a run, they are from the same (pre-run-id) writer and still match.
+      const intent = open.get(id)
+      if (intent && intent.runId !== String(record.runId ?? '')) continue
+      open.delete(id)
     } else {
       unreadableLines++
     }
@@ -1570,13 +1759,20 @@ export async function performWrite<T>(args: {
     res = await transport.request<T>(token, method, path, body)
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
-    // A throw is not automatically "nothing was sent". Only the two checks that run BEFORE the
-    // network — the write gate and the call ceiling — can say that. Everything else is settled as
+    // A throw is not automatically "nothing was sent". Only three things can say the ledger is
+    // unchanged: the write gate and the call ceiling, which run BEFORE the network, and a 429,
+    // which is XERO ITSELF refusing the request — the same evidence as a 400 or a 404, just
+    // delivered as a refusal to retry rather than as a result. Everything else is settled as
     // unknown: over-reporting costs the operator one manual read, and under-reporting loses an
     // irreversible write.
-    const neverDispatched = e instanceof WriteWithoutApplyError || e instanceof CallCeilingError
-    writeLog.settle(intentId, neverDispatched ? 'not-committed' : 'unknown', message)
-    if (!neverDispatched) journal.recordUnknown(kind, label, message)
+    const commit: WriteCommit =
+      e instanceof WriteWithoutApplyError || e instanceof CallCeilingError
+        ? { state: 'not-committed', reason: `the request never left this process: ${message}` }
+        : e instanceof WriteRateLimitedError
+          ? e.commit
+          : { state: 'unknown', reason: message }
+    writeLog.settle(intentId, commit.state, commit.reason)
+    if (commit.state === 'unknown') journal.recordUnknown(kind, label, message)
     throw e
   }
   const commit = commitOf(res)

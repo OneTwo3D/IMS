@@ -57,7 +57,18 @@
  *                        same class of event that produces one. An intent with no settlement is
  *                        what that kill looks like from outside, and the NEXT RUN REFUSES TO START
  *                        while one exists; otherwise it reads the object as untouched and plans
- *                        from a state nobody confirmed.
+ *                        from a state nobody confirmed. That log is held under an EXCLUSIVE LOCK
+ *                        for the whole apply run, taken before the log is even read: two runs
+ *                        appending to it can settle over each other's records, and a dispatched
+ *                        write nobody accounted for then sits in a file the next run reads as
+ *                        clean — the guarantee inverted by the very thing meant to provide it.
+ *   AN AUTHORISATION DOES NOT SURVIVE A WAIT.  A write is authorised by a re-read taken next to
+ *                        it, so nothing may re-dispatch that write after a delay. Xero
+ *                        rate-limiting a write (HTTP 429) is therefore a REFUSAL, not a retry:
+ *                        429 is Xero's own layer declining before it applies anything, so the
+ *                        ledger is unchanged and the cost is a re-run — which re-reads everything,
+ *                        which is the re-authorisation a retry cannot do. Reads still retry; a
+ *                        read authorises nothing.
  *   ONLY THIS RUN'S OWN CHANGES ARE FORGIVEN.  Step 1 legitimately moves a PAID document to
  *                        AUTHORISED, so later steps have to tolerate that transition — but only on
  *                        the documents where THIS RUN recorded the successful delete. The same
@@ -116,6 +127,7 @@ import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 import { Client } from 'pg'
 
 import {
+  acquireWriteLogLock,
   allocationBlocker,
   allowedStatusesAfterRun,
   assertExpectedTenant,
@@ -146,6 +158,7 @@ import {
   type TransportToken,
   type VersionExpectation,
   type WriteIntentLog,
+  type WriteLogLock,
   type WriteManifest,
 } from './lib/xero-live-safety'
 
@@ -417,11 +430,20 @@ const journal = new MutationJournal()
  * null log until --apply opens a real one, because a dry run cannot dispatch a write at all.
  */
 let writeLog: WriteIntentLog = NULL_WRITE_INTENT_LOG
+/**
+ * The exclusive lock on that log, held for the WHOLE apply run — taken before the log is even read
+ * for unresolved writes, because the gap between reading it and opening it is a gap another run
+ * can append into. `openWriteIntentLog` is handed this lock rather than taking its own.
+ */
+let writeLogLock: WriteLogLock | null = null
 let writeLogClosed = false
 function closeWriteLog(): void {
   if (writeLogClosed) return
   writeLogClosed = true
   try { writeLog.close() } catch { /* closing the evidence file must not mask the run's own error */ }
+  // Also on the path where the lock was taken but the log was never opened — an abort in planning
+  // still has to give the lock back, or the next run refuses for no reason.
+  try { writeLogLock?.release() } catch { /* releasing the lock must not mask the run's own error */ }
 }
 
 /** Journal keys. A single allocation delete releases both sides, so both are recorded. */
@@ -578,6 +600,13 @@ async function main() {
   // dispatching a write and recording what became of it? That evidence is on disk precisely
   // because it could not survive in memory, and a run that plans over the top of it plans from a
   // ledger state nobody has confirmed.
+  // The lock comes FIRST in an apply run, before the log is even read. Reading it and then acting
+  // on what it said is only sound if nothing else can write it in between: two runs sharing this
+  // file can settle over each other's records, and a dispatched write nobody accounted for then
+  // sits in a log the next run reads as clean. A dry run takes no lock — it cannot dispatch a
+  // write, so it has nothing to record and nothing to hide — but it still reads the log, and an
+  // apply run in flight will show up as an unresolved intent and stop it.
+  if (APPLY) writeLogLock = acquireWriteLogLock({ path: WRITE_LOG_PATH })
   if (existsSync(WRITE_LOG_PATH)) {
     assertNoUnresolvedWrites({ path: WRITE_LOG_PATH, text: readFileSync(WRITE_LOG_PATH, 'utf8') })
   }
@@ -625,8 +654,9 @@ async function main() {
   if (APPLY) {
     // Opened before the first write and flushed on every record. A dry run keeps the null log,
     // because the transport refuses to dispatch a non-GET without --apply at all.
-    writeLog = openWriteIntentLog({ path: WRITE_LOG_PATH, tenantId: token.tenantId })
+    writeLog = openWriteIntentLog({ path: WRITE_LOG_PATH, tenantId: token.tenantId, lock: writeLogLock! })
     console.log(`  write-intent log: ${WRITE_LOG_PATH} — every write is recorded here, and flushed, BEFORE it is dispatched`)
+    console.log(`  held exclusively via ${writeLogLock!.path} for the duration of this run`)
   }
 
   // =========================================================================
