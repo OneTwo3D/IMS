@@ -669,6 +669,27 @@ export type PostedCreditNoteLeg = {
  * than a flat minor unit per leg that a wrong rate can hide inside indefinitely. One further minor unit
  * of slack covers the credit note's own total.
  *
+ * WHICH RATE PRICES THE NET SIDE (o3d-w00, Codex r9 #1). `rate x halfUnit(net)` is the NET side of that
+ * rounding: it is how much of the drift a half-unit of movement in the charged net accounts for. r8
+ * priced it with the DERIVED rate — and the derived rate is the very quantity the rounding is being
+ * bounded for, so on every leg where the pair rounded DOWN (chargedRate below the rate the money was
+ * really charged at) the allowance shrinks by exactly as much as the drift grows. The net side's
+ * rounding is then partly dropped, and the shortfall, (postedRate - chargedRate) x halfUnit(net) per
+ * leg, is one-signed: it accumulates leg after leg until an ordinary refund of ordinary lines is
+ * refused with nothing for an operator to change.
+ *
+ *     GBP, 20% goods sold tax-inclusive at 0.15 => net 0.125, VAT 0.025, stored 0.13 + 0.02.
+ *     drift/leg = 0.13 x (0.20 - 0.153846...) x ... = 0.13 x 0.20 - 0.02 = 0.006 — the largest a
+ *     penny-quantised pair CAN be out by (halfUnit(tax) + rate x halfUnit(net) = 0.005 + 0.001).
+ *     r8 allowed 0.005 + 0.153846 x 0.005 = 0.005769, i.e. LESS than that leg's own rounding, so 44
+ *     such lines exhausted the slack and the refund was refused. Pricing the net side at the rate the
+ *     credit note posts under allows 0.005 + 0.20 x 0.005 = 0.006 and it passes at any count.
+ *
+ * So the net side is priced at the LARGER of the two rates. When the posting is right, the posted rate
+ * IS the rate the money bore and the bound is exact; when the posting is wrong, the extra it concedes
+ * is half a minor unit of net times the rate GAP, which is bounded by the gap itself and cannot hide a
+ * systematic error — a leg out by a whole minor unit still contributes ~0.004 of unexplained drift.
+ *
  * The result: a leg whose figures merely round awkwardly contributes at most its own rounding and never
  * accumulates past the slack, while a systematic rate error contributes a fixed fraction of every leg
  * and crosses the bound by the third one.
@@ -697,8 +718,12 @@ export function postedCreditNoteAggregateCheck(input: {
     const chargedRate = chargedTax.div(chargedNet)
     const scale = postedNet.div(chargedNet)
     drift = drift.add(postedNet.mul(leg.postedRate.sub(chargedRate)))
+    // Codex r9 #1: the NET side of the rounding is priced at the larger of the derived and the posted
+    // rate. Pricing it at the derived rate alone under-allows every leg whose pair rounded down, by
+    // exactly the amount that made it round down — see the worked case above.
+    const netSideRate = chargedRate.abs().gte(leg.postedRate.abs()) ? chargedRate.abs() : leg.postedRate.abs()
     allowance = allowance.add(scale.mul(
-      moneyHalfUnit(chargedTax, sourceDecimals).add(chargedRate.abs().mul(moneyHalfUnit(chargedNet, sourceDecimals))),
+      moneyHalfUnit(chargedTax, sourceDecimals).add(netSideRate.mul(moneyHalfUnit(chargedNet, sourceDecimals))),
     ))
     chargedGross = chargedGross.add(postedNet.mul(toDecimal(1).add(chargedRate)))
     postedGross = postedGross.add(postedNet.mul(toDecimal(1).add(leg.postedRate)))

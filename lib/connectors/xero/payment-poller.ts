@@ -112,13 +112,19 @@ async function notifyReversalAdmins(
   // The alert has to say so on the FIRST failure — this is the only thing that will tell anyone the
   // credit note is outstanding, since no further poll can raise it.
   chargebackManualReason?: string,
+  // o3d-w00 (Codex r9 #4): the alert now fires even when clearing paidAt FAILED, so it must say which
+  // of the two happened. `false` means IMS still shows the order paid; the next poll re-detects it.
+  paidAtCleared: boolean = true,
 ): Promise<void> {
   const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
+  const paidAtClause = paidAtCleared
+    ? 'paidAt was cleared'
+    : 'paidAt could NOT be cleared and the order still shows as paid in IMS'
   const message = (chargebackManualReason
-    ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). paidAt was cleared, but the revenue unwind was REFUSED and NO credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the payment poller.`
+    ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). ${paidAtClause}, but the revenue unwind was REFUSED and NO credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the payment poller.`
     : wcHandled
-      ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). A WooCommerce refund in this window already reversed revenue (no duplicate credit note raised) and paidAt was cleared — verify the refund fully covers the reversal and whether the order status should revert.`
-      : `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). paidAt was cleared and revenue unwound where applicable — review whether the order status should revert.`)
+      ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). A WooCommerce refund in this window already reversed revenue (no duplicate credit note raised) and ${paidAtClause} — verify the refund fully covers the reversal and whether the order status should revert.`
+      : `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). ${paidAtClause} and revenue unwound where applicable — review whether the order status should revert.`)
     + (registeredPaymentGone
       ? ` The payment IMS registered is gone from the invoice but ANOTHER payment (or an amount Xero did not state) remains, so revenue was NOT unwound automatically — decide the credit note by hand.`
       : '')
@@ -859,9 +865,9 @@ async function processDeltaChunk(
           clearPaidAt: async (orderId) => {
             await db.salesOrder.update({ where: { id: orderId }, data: { paidAt: null } })
           },
-          notifyNeedsAttention: (o, { wcHandled, chargebackManualReason }) =>
-            notifyReversalAdmins(o, wcHandled, registeredPaymentGone, chargebackManualReason),
-          logReversalDetected: (o, { wcHandled, chargebackManualReason }) => logActivity({
+          notifyNeedsAttention: (o, { wcHandled, chargebackManualReason, paidAtCleared }) =>
+            notifyReversalAdmins(o, wcHandled, registeredPaymentGone, chargebackManualReason, paidAtCleared),
+          logReversalDetected: (o, { wcHandled, chargebackManualReason, paidAtCleared }) => logActivity({
             entityType: 'SALES_ORDER',
             entityId: o.id,
             action: 'payment_reversal_detected',
@@ -871,10 +877,10 @@ async function processDeltaChunk(
             // the audit entry is the durable record that it is outstanding — paidAt has been cleared
             // (the payment really is gone) but no credit note exists, and no poll will make one.
             description: (chargebackManualReason
-              ? `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — cleared paidAt, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
+              ? `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — ${paidAtCleared ? 'cleared paidAt' : 'FAILED to clear paidAt'}, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
               : wcHandled
-                ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); cleared paidAt. Verify the WC refund fully covers the reversal and whether the order status should revert.`
-                : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — cleared paidAt. Review whether the order status should revert.`)
+                ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); ${paidAtCleared ? 'cleared paidAt' : 'FAILED to clear paidAt'}. Verify the WC refund fully covers the reversal and whether the order status should revert.`
+                : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — ${paidAtCleared ? 'cleared paidAt' : 'FAILED to clear paidAt'}. Review whether the order status should revert.`)
               + (registeredPaymentGone
                 ? ` The payment IMS registered (${salesResidual.provenGone.get(o.accountingInvoiceId ?? '')?.paymentIds.join(', ')}) is no longer among the payments Xero lists on this invoice, but the invoice still carries another payment or an amount Xero did not state — so NO chargeback credit note was raised automatically. Unwind revenue by hand if that is what the removal means.`
                 : ''),
@@ -891,6 +897,12 @@ async function processDeltaChunk(
           result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} needs manual handling: ${error}`)
         } else if (outcome === 'chargeback-failed') {
           result.errors.push(`Chargeback for order ${order.orderNumber ?? order.id} failed: ${error}`)
+        } else if (outcome === 'reversal-incomplete') {
+          // o3d-w00 (Codex r9 #4): the decision was made and every effect attempted, but at least one
+          // (paidAt, alert, audit) did not land. NOT counted as reversed, and reported so the cursor
+          // gate holds — a failed paidAt clear leaves the order in the next poll's window, and a lost
+          // alert is the one thing nobody would otherwise find out about.
+          result.errors.push(`Payment reversal for order ${order.orderNumber ?? order.id} was not completed: ${error}`)
         }
       }
     }

@@ -748,3 +748,55 @@ test('the aggregate check catches a drift every leg hides inside its own toleran
   // Legs with nothing on one side of the comparison price nothing and are skipped, not treated as zero.
   assert.equal(check([leg(0, 0, 0.2), leg(0, 0, 0.2)]).ok, true)
 })
+
+test("the aggregate prices the net side's rounding at the rate the credit note posts under (o3d-w00 Codex r9 #1)", () => {
+  const leg = (postedNet: number, chargedTax: number, postedRate: number, label = 'line') => ({
+    label,
+    postedNetForeign: postedNet,
+    chargedNetForeign: postedNet,
+    chargedTaxForeign: chargedTax,
+    postedRate: toDecimal(postedRate),
+  })
+  const check = (legs: ReturnType<typeof leg>[], currency = 'GBP') =>
+    postedCreditNoteAggregateCheck({ currency, legs })
+
+  // ---------------------------------------------------------------------------------------------
+  // TOO TIGHT — the direction r8 introduced. The rounding a leg is allowed is
+  // halfUnit(tax) + rate x halfUnit(net); r8 evaluated `rate` there as the rate DERIVED from the very
+  // pair whose rounding it is bounding, so every leg that rounded DOWN was allowed less than it could
+  // legitimately be out by, by exactly the amount that made it round down. One-signed, so it
+  // accumulated.
+  //
+  // A perfectly ordinary 20% item sold tax-inclusive at £0.15: net 0.125 and VAT 0.025, which the
+  // storefront stores as 0.13 + 0.02. Its drift is 0.13 x 0.20 − 0.02 = £0.006 — the very largest a
+  // penny-quantised pair CAN be out by (0.005 of tax rounding plus 0.20 x 0.005 of net rounding).
+  // r8 allowed 0.005 + 0.153846 x 0.005 = £0.005769 for it, LESS than its own rounding, so the
+  // shortfall of £0.000231 a leg exhausted the £0.01 of slack at the 44th line and refused a refund
+  // whose tax codes are all correctly mapped and which no operator could do anything about.
+  const roundedDown = leg(0.13, 0.02, 0.2)
+  assert.equal(
+    postedCreditNoteTotalCheck({
+      currency: 'GBP', netForeign: 0.13, taxForeign: 0.02, postedRate: toDecimal(0.2), kind: 'sale', label: 'line',
+    }).ok,
+    true,
+    'the premise: each leg passes on its own — this is ordinary penny rounding, not a rate difference',
+  )
+  assert.equal(check(Array.from({ length: 44 }, () => roundedDown)).ok, true, 'r8 refused this one')
+  assert.equal(check(Array.from({ length: 200 }, () => roundedDown)).ok, true, 'and it never accumulates')
+  // The same worst-case rounding at a different rate: £0.13 at 5% is £0.0065 of VAT, stored as £0.01.
+  assert.equal(check(Array.from({ length: 500 }, () => leg(0.13, 0.01, 0.05))).ok, true)
+
+  // ---------------------------------------------------------------------------------------------
+  // TOO LOOSE — the direction r8 was itself fixing, which the correction must not reopen. What the
+  // net side is now allowed is at most rate x half a minor unit of net, so a leg out by a WHOLE minor
+  // unit still carries ~£0.004 of drift nothing explains, and three of them still cross the bound.
+  assert.equal(check([leg(1, 0.19, 0.2), leg(1, 0.19, 0.2)]).ok, true, 'two is still inside the slack')
+  assert.equal(check(Array.from({ length: 3 }, () => leg(1, 0.19, 0.2))).ok, false)
+  assert.equal(check(Array.from({ length: 100 }, () => leg(1, 0.19, 0.2))).ok, false)
+  // Half a percentage point — the smallest gap between two REAL VAT rates — is still caught, and the
+  // wider allowance buys the wrong rate no more than one extra leg.
+  assert.equal(check(Array.from({ length: 4 }, () => leg(1, 0.195, 0.2))).ok, false)
+  // A rate error on the CHARGED side is symmetrical: the larger of the two rates prices the net side,
+  // so a leg charged ABOVE what it posts under is allowed no more than r8 allowed it.
+  assert.equal(check(Array.from({ length: 3 }, () => leg(1, 0.21, 0.2))).ok, false)
+})

@@ -71,9 +71,27 @@ export type ReversalEffects = {
   logReversalDetected: (order: DetectedReversalOrder, ctx: ReversalContext) => Promise<void>
 }
 
-export type ReversalContext = { wcHandled: boolean; chargebackManualReason?: string }
+export type ReversalContext = {
+  wcHandled: boolean
+  chargebackManualReason?: string
+  /**
+   * o3d-w00 (Codex r9 #4): whether paidAt was ACTUALLY cleared before this alert/audit entry was
+   * written. The notification fires even when the clear failed — it is the only thing that makes a
+   * permanent refusal visible — so the message must not claim a reconciliation that did not happen.
+   */
+  paidAtCleared: boolean
+}
 
-export type ReversalOutcome = 'reversed' | 'chargeback-failed' | 'chargeback-manual'
+export type ReversalOutcome =
+  | 'reversed'
+  | 'chargeback-failed'
+  | 'chargeback-manual'
+  /**
+   * The reversal DECISION was made and everything that could be attempted was, but at least one of
+   * the three closing effects (clear paidAt, alert, audit) failed. Never counted as reversed, always
+   * reported, so the poll's cursor gate does not advance over it.
+   */
+  | 'reversal-incomplete'
 
 /**
  * Handle a single detected payment reversal for a paid sales order.
@@ -88,7 +106,9 @@ export type ReversalOutcome = 'reversed' | 'chargeback-failed' | 'chargeback-man
  *     owed, the chargeback succeeded, or it was refused non-transiently.
  *  4. Alert + audit ALWAYS fire (status is never auto-reverted). A WC-handled
  *     reversal is alerted too — the refund may only partially cover a full payment
- *     removal — with WC context so finance can distinguish it.
+ *     removal — with WC context so finance can distinguish it. Steps 3 and 4 are
+ *     attempted INDEPENDENTLY (Codex r9 #4): one failing never suppresses the others,
+ *     and any failure returns `reversal-incomplete` rather than a clean outcome.
  */
 export async function handleDetectedReversal(
   order: DetectedReversalOrder,
@@ -145,13 +165,56 @@ export async function handleDetectedReversal(
     }
   }
 
-  // Payment is genuinely gone in Xero → reconcile paidAt regardless of channel.
-  await effects.clearPaidAt(order.id)
+  // -----------------------------------------------------------------------------------------------
+  // o3d-w00 (Codex r9 #4): THE THREE CLOSING EFFECTS ARE INDEPENDENT, AND ONE FAILING MUST NOT TAKE
+  // THE OTHERS WITH IT.
+  //
+  // r8 #3 made a PERMANENT chargeback refusal reconcile paidAt, alert and audit on the first failure,
+  // precisely because holding paidAt forever would leave the outstanding revenue unwind invisible.
+  // But the three ran as one unbroken await chain: a failure in the first — a lost connection on the
+  // paidAt update, an alert that cannot be delivered — threw straight out of this function, past the
+  // notification and the audit entry. The part that goes missing is then the alert that was the whole
+  // point of the branch, and the poller's surrounding catch abandons every remaining order in the
+  // pass as well.
+  //
+  // So each effect is attempted on its own and its failure recorded rather than thrown. paidAt is
+  // still cleared FIRST (the message says what happened, in the order it happened), but whether it
+  // succeeded is carried into the context so the alert and the audit entry cannot claim a
+  // reconciliation that did not occur. Any failure makes the outcome `reversal-incomplete`: not
+  // counted as reversed, always reported. A failed paidAt clear is self-healing — the order still has
+  // paidAt set, so the next poll re-detects it and re-runs the whole decision.
+  // -----------------------------------------------------------------------------------------------
+  const failures: string[] = []
+  let paidAtCleared = true
+  try {
+    // Payment is genuinely gone in Xero → reconcile paidAt regardless of channel.
+    await effects.clearPaidAt(order.id)
+  } catch (clearError) {
+    paidAtCleared = false
+    failures.push(`clearing paidAt failed: ${String(clearError)}`)
+  }
 
+  const ctx: ReversalContext = { wcHandled, chargebackManualReason, paidAtCleared }
   // Always surface for manual review — a WC-handled reversal is flagged too (it may
   // only partially explain the removal), just with WC context.
-  await effects.notifyNeedsAttention(order, { wcHandled, chargebackManualReason })
-  await effects.logReversalDetected(order, { wcHandled, chargebackManualReason })
+  try {
+    await effects.notifyNeedsAttention(order, ctx)
+  } catch (notifyError) {
+    failures.push(`notifying admins failed: ${String(notifyError)}`)
+  }
+  try {
+    await effects.logReversalDetected(order, ctx)
+  } catch (logError) {
+    failures.push(`recording the audit entry failed: ${String(logError)}`)
+  }
+
+  if (failures.length > 0) {
+    return {
+      outcome: 'reversal-incomplete',
+      wcHandled,
+      error: [chargebackManualReason, ...failures].filter(Boolean).join(' '),
+    }
+  }
   return chargebackManualReason
     ? { outcome: 'chargeback-manual', wcHandled, error: chargebackManualReason }
     : { outcome: 'reversed', wcHandled }

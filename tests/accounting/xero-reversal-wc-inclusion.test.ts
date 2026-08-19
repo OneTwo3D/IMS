@@ -32,22 +32,33 @@ type Recorder = {
     recentWc: string[]
     chargeback: string[]
     clearPaidAt: string[]
-    notify: { id: string; wcHandled: boolean; chargebackManualReason?: string }[]
-    logReversal: { id: string; wcHandled: boolean; chargebackManualReason?: string }[]
+    notify: RecordedCall[]
+    logReversal: RecordedCall[]
   }
 }
+
+// o3d-w00 (Codex r9 #4): the alert and the audit entry now carry whether paidAt was ACTUALLY cleared,
+// because they fire even when clearing it failed and must not claim a reconciliation that did not
+// happen. Recorded so the tests can assert on it.
+type RecordedCall = { id: string; wcHandled: boolean; chargebackManualReason?: string; paidAtCleared: boolean }
 
 function makeEffects(opts: {
   recentWcRefund?: boolean
   chargebackResult?: { raised?: boolean; error?: string; manualResolutionRequired?: boolean }
   chargebackThrows?: unknown
+  // o3d-w00 (Codex r9 #4): each closing effect can fail on its own, and one failing must not take the
+  // others with it — least of all the notification, which is the only thing that makes a permanent
+  // refusal visible.
+  clearPaidAtThrows?: unknown
+  notifyThrows?: unknown
+  logReversalThrows?: unknown
 } = {}): Recorder {
   const calls = {
     recentWc: [] as string[],
     chargeback: [] as string[],
     clearPaidAt: [] as string[],
-    notify: [] as { id: string; wcHandled: boolean; chargebackManualReason?: string }[],
-    logReversal: [] as { id: string; wcHandled: boolean; chargebackManualReason?: string }[],
+    notify: [] as RecordedCall[],
+    logReversal: [] as RecordedCall[],
   }
   const effects: ReversalEffects = {
     wasHandledByRecentWcRefund: async (orderId) => {
@@ -61,20 +72,25 @@ function makeEffects(opts: {
     },
     clearPaidAt: async (orderId) => {
       calls.clearPaidAt.push(orderId)
+      if (opts.clearPaidAtThrows !== undefined) throw opts.clearPaidAtThrows
     },
     notifyNeedsAttention: async (order, ctx) => {
       calls.notify.push({
         id: order.id,
         wcHandled: ctx.wcHandled,
         ...(ctx.chargebackManualReason ? { chargebackManualReason: ctx.chargebackManualReason } : {}),
+        paidAtCleared: ctx.paidAtCleared,
       })
+      if (opts.notifyThrows !== undefined) throw opts.notifyThrows
     },
     logReversalDetected: async (order, ctx) => {
       calls.logReversal.push({
         id: order.id,
         wcHandled: ctx.wcHandled,
         ...(ctx.chargebackManualReason ? { chargebackManualReason: ctx.chargebackManualReason } : {}),
+        paidAtCleared: ctx.paidAtCleared,
       })
+      if (opts.logReversalThrows !== undefined) throw opts.logReversalThrows
     },
   }
   return { effects, calls }
@@ -88,8 +104,8 @@ test('WC order with a Xero reversal and NO recent WC refund → reversed once + 
   assert.equal(result.wcHandled, false)
   assert.deepEqual(calls.chargeback, ['so_1'], 'chargeback raised exactly once')
   assert.deepEqual(calls.clearPaidAt, ['so_1'], 'paidAt cleared exactly once')
-  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false }], 'needs-attention notification fired once')
-  assert.deepEqual(calls.logReversal, [{ id: 'so_1', wcHandled: false }])
+  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false, paidAtCleared: true }], 'needs-attention notification fired once')
+  assert.deepEqual(calls.logReversal, [{ id: 'so_1', wcHandled: false, paidAtCleared: true }])
 })
 
 test('WC order already refunded via WC webhook (recent) → NO second credit note (dedup), paidAt reconciled, still alerted with WC context', async () => {
@@ -100,8 +116,8 @@ test('WC order already refunded via WC webhook (recent) → NO second credit not
   assert.equal(result.wcHandled, true)
   assert.deepEqual(calls.chargeback, [], 'no chargeback — WC refund path owns the revenue reversal (no double credit note)')
   assert.deepEqual(calls.clearPaidAt, ['so_1'], 'paidAt STILL cleared — payment is genuinely gone in Xero and the WC path does not clear it')
-  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: true }], 'still alerted (refund may only partially cover the removal) — with WC context')
-  assert.deepEqual(calls.logReversal, [{ id: 'so_1', wcHandled: true }])
+  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: true, paidAtCleared: true }], 'still alerted (refund may only partially cover the removal) — with WC context')
+  assert.deepEqual(calls.logReversal, [{ id: 'so_1', wcHandled: true, paidAtCleared: true }])
 })
 
 test('manual order path unchanged: no WC refund exists → still reverses + charges back', async () => {
@@ -112,7 +128,7 @@ test('manual order path unchanged: no WC refund exists → still reverses + char
   assert.equal(result.outcome, 'reversed')
   assert.deepEqual(calls.chargeback, ['so_manual'])
   assert.deepEqual(calls.clearPaidAt, ['so_manual'])
-  assert.deepEqual(calls.notify, [{ id: 'so_manual', wcHandled: false }])
+  assert.deepEqual(calls.notify, [{ id: 'so_manual', wcHandled: false, paidAtCleared: true }])
 })
 
 test('historic-only WC refund (not recent) does NOT suppress a genuine reversal — chargeback self-dedups, paidAt cleared, alerted', async () => {
@@ -129,7 +145,7 @@ test('historic-only WC refund (not recent) does NOT suppress a genuine reversal 
   assert.equal(result.outcome, 'reversed')
   assert.deepEqual(calls.chargeback, ['so_1'], 'chargeback attempted; it self-dedups internally')
   assert.deepEqual(calls.clearPaidAt, ['so_1'], 'paidAt reconciled')
-  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false }], 'genuine reversal is alerted for manual review')
+  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false, paidAtCleared: true }], 'genuine reversal is alerted for manual review')
 })
 
 test('VOIDED invoice: skip chargeback (Xero already reversed AR/revenue) but still clear paidAt + notify', async () => {
@@ -139,7 +155,7 @@ test('VOIDED invoice: skip chargeback (Xero already reversed AR/revenue) but sti
   assert.equal(result.outcome, 'reversed')
   assert.deepEqual(calls.chargeback, [], 'no separate credit note — would double-reverse a voided invoice')
   assert.deepEqual(calls.clearPaidAt, ['so_1'])
-  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false }])
+  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false, paidAtCleared: true }])
 })
 
 test('revenue not posted (no revenueDeferredDate): no chargeback, but clear paidAt + notify', async () => {
@@ -153,7 +169,7 @@ test('revenue not posted (no revenueDeferredDate): no chargeback, but clear paid
   assert.equal(result.outcome, 'reversed')
   assert.deepEqual(calls.chargeback, [], 'no recognised revenue to unwind')
   assert.deepEqual(calls.clearPaidAt, ['so_1'])
-  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false }])
+  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false, paidAtCleared: true }])
 })
 
 test('failed chargeback holds paidAt (retried next poll) — no clear, no notify', async () => {
@@ -221,8 +237,8 @@ test('a NON-TRANSIENT chargeback refusal reconciles paidAt and alerts on the fir
   assert.deepEqual(calls.clearPaidAt, ['so_1'], 'payment truth is reconciled immediately')
   // And the alert carries WHY, because nothing else will ever say it: no later poll can raise this
   // credit note, so a silent hold would be the only record that revenue is still recognised.
-  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false, chargebackManualReason: reason }])
-  assert.deepEqual(calls.logReversal, [{ id: 'so_1', wcHandled: false, chargebackManualReason: reason }])
+  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false, paidAtCleared: true, chargebackManualReason: reason }])
+  assert.deepEqual(calls.logReversal, [{ id: 'so_1', wcHandled: false, paidAtCleared: true, chargebackManualReason: reason }])
 })
 
 test('a TRANSIENT chargeback failure still holds paidAt for the next poll (o3d-w00 Codex r8 #3)', async () => {
@@ -248,4 +264,81 @@ test('a chargeback that THROWS is transient, not manual (o3d-w00 Codex r8 #3)', 
 
   assert.equal(result.outcome, 'chargeback-failed')
   assert.deepEqual(calls.clearPaidAt, [])
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-w00 (Codex r9 #4): A PARTIAL FAILURE MUST NOT SWALLOW THE ALERT.
+//
+// r8 #3 made a PERMANENT chargeback refusal reconcile paidAt, notify and audit on the FIRST failure,
+// because the alternative — holding paidAt and re-failing forever — leaves an outstanding revenue
+// unwind invisible. All three then ran as one unbroken await chain, so a failure in the first threw
+// out of the handler past the other two: the part that goes missing is the alert the branch exists to
+// send, and the poller's surrounding catch abandons every remaining order in the pass with it.
+// ---------------------------------------------------------------------------------------------
+
+test('a permanent refusal still ALERTS when clearing paidAt fails (o3d-w00 Codex r9 #4)', async () => {
+  const { effects, calls } = makeEffects({
+    chargebackResult: {
+      raised: false,
+      error: 'the credit note would come to 10.50 against the 12.00 the invoice charged',
+      manualResolutionRequired: true,
+    },
+    clearPaidAtThrows: new Error('deadlock detected'),
+  })
+  const result = await handleDetectedReversal(makeOrder(), { invoiceVoided: false }, effects)
+
+  assert.deepEqual(calls.clearPaidAt, ['so_1'], 'it was attempted')
+  assert.equal(calls.notify.length, 1, 'and the alert fired anyway — this is the only thing that surfaces the refusal')
+  assert.equal(calls.logReversal.length, 1, 'as did the audit entry')
+  // ...and neither of them claims a reconciliation that did not happen.
+  assert.equal(calls.notify[0].paidAtCleared, false)
+  assert.equal(calls.logReversal[0].paidAtCleared, false)
+  assert.equal(
+    calls.notify[0].chargebackManualReason,
+    'the credit note would come to 10.50 against the 12.00 the invoice charged',
+    'carrying the refusal, so the alert says WHY no credit note exists',
+  )
+  // Not a clean reversal: reported, not counted, and the order still has paidAt set, so the next poll
+  // re-detects it and re-runs the whole decision.
+  assert.equal(result.outcome, 'reversal-incomplete')
+  assert.match(result.error ?? '', /the credit note would come to 10\.50/)
+  assert.match(result.error ?? '', /clearing paidAt failed/)
+})
+
+test('a failed alert does not take the audit entry with it (o3d-w00 Codex r9 #4)', async () => {
+  // The three effects are independent, in both directions: an undeliverable notification must still
+  // leave the durable record behind, and must still be reported rather than swallowed.
+  const { effects, calls } = makeEffects({ notifyThrows: new Error('notification store unavailable') })
+  const result = await handleDetectedReversal(makeOrder(), { invoiceVoided: false }, effects)
+
+  assert.deepEqual(calls.clearPaidAt, ['so_1'])
+  assert.equal(calls.notify.length, 1)
+  assert.equal(calls.logReversal.length, 1, 'the audit entry is written even though the alert failed')
+  assert.equal(calls.logReversal[0].paidAtCleared, true, 'and paidAt really was cleared, so it says so')
+  assert.equal(result.outcome, 'reversal-incomplete')
+  assert.match(result.error ?? '', /notifying admins failed/)
+})
+
+test('a failed audit entry is reported, not swallowed (o3d-w00 Codex r9 #4)', async () => {
+  const { effects, calls } = makeEffects({ logReversalThrows: new Error('activity log write failed') })
+  const result = await handleDetectedReversal(makeOrder(), { invoiceVoided: false }, effects)
+
+  assert.equal(calls.notify.length, 1, 'the alert landed')
+  assert.equal(result.outcome, 'reversal-incomplete')
+  assert.match(result.error ?? '', /recording the audit entry failed/)
+})
+
+test('a clean reversal is still a clean reversal (o3d-w00 Codex r9 #4)', async () => {
+  // The guards must not turn every success into an "incomplete": with nothing failing, the outcomes
+  // r8 established are unchanged.
+  const clean = makeEffects()
+  assert.equal((await handleDetectedReversal(makeOrder(), { invoiceVoided: false }, clean.effects)).outcome, 'reversed')
+
+  const manual = makeEffects({
+    chargebackResult: { raised: false, error: 'tax mapping missing', manualResolutionRequired: true },
+  })
+  const manualResult = await handleDetectedReversal(makeOrder(), { invoiceVoided: false }, manual.effects)
+  assert.equal(manualResult.outcome, 'chargeback-manual')
+  assert.equal(manualResult.error, 'tax mapping missing')
+  assert.equal(manual.calls.notify[0].paidAtCleared, true)
 })

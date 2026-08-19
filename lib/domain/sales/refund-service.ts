@@ -3566,6 +3566,16 @@ export async function createSalesOrderRefund(
       const netForeignOf = (refundLine: RefundRequestLine) => (refundLine.totalForeign != null
         ? Math.round(refundLine.totalForeign * 10000) / 10000
         : Math.round(refundLine.totalBase * fxRate * 10000) / 10000)
+      // o3d-w00 (Codex r9 #3): "credits nothing" is a fact about the LINE, not about one currency's
+      // column on it. A refund line carries BOTH a foreign and a base amount and they are written
+      // independently: totalForeign is `Decimal @default(0)` and legacy rows (and any caller that
+      // states only base money) carry a real totalBase against a zero totalForeign, while the
+      // hand-recording path can state a foreign figure on a line whose base amount is zero. Testing
+      // one column skips a line that is crediting real money in the other — the credit note is raised
+      // for it, and its tax code was never priced.
+      const creditsNothing = (refundLine: RefundRequestLine) =>
+        !(Math.abs(netForeignOf(refundLine)) > 0) &&
+        !(Math.abs(Math.round(refundLine.totalBase * 10000) / 10000) > 0)
       // o3d-w00 (Codex r8 #1): every leg the fence priced, kept so the refund can be checked AS A WHOLE
       // once each part has been checked on its own — see postedCreditNoteAggregateCheck.
       const legs: PostedCreditNoteLeg[] = []
@@ -3586,7 +3596,11 @@ export async function createSalesOrderRefund(
         // fully-discounted line, which the hand-recording path now carries through so the stock comes
         // back — posts a zero-value credit-note line. Zero cannot be re-grossed into a wrong total, and
         // pricing its identity would refuse a refund over a tax code nobody is posting money under.
-        if (!(refundNetForeign > 0)) continue
+        //
+        // Codex r9 #3: BOTH columns have to be nothing. A line with a zero base amount and a foreign
+        // one (or the reverse) is credited, so its identity is priced like any other; only the
+        // aggregate leg below is skipped, because a zero posted net contributes no drift to weigh.
+        if (creditsNothing(refundLine)) continue
         // What the SOURCE says this money bore, when it says anything (Codex r7 #1). A WooCommerce
         // refund states it per refunded line; restating it needs no tax-code mapping at all, and it is
         // the only record of what an itemised line that matched no IMS order line was charged.
@@ -4081,6 +4095,12 @@ async function fenceRetryPostedTax(
     lines: readonly { id: string; totalForeign: DecimalInput; taxForeign: DecimalInput }[]
   },
   refundLines: readonly CreatedRefundLine[],
+  /**
+   * o3d-w00 (Codex r9 #2): whether this refund is the CHARGEBACK reversal, which is what makes the
+   * shipping and order-discount legs one checkable figure — see the combined check below and the
+   * creation fence's own.
+   */
+  chargeback: boolean,
 ): Promise<string | null> {
   const rateByTaxType = buildTaxTypeRateIndex(
     await tx.taxRate.findMany({
@@ -4088,13 +4108,14 @@ async function fenceRetryPostedTax(
       select: { accountingTaxType: true, rate: true },
     }),
   )
+  const orderTaxIsSumOfComponents = order.shoppingLinks.some((link) => link.connector === 'woocommerce')
   const chargedShipping = {
     currency: order.currency,
     netForeign: order.shippingForeign,
     orderTaxForeign: order.taxForeign,
     lineTaxForeign: order.lines.map((salesLine) => salesLine.taxForeign),
     orderDiscountAmount: order.discountAmount,
-    orderTaxIsSumOfComponents: order.shoppingLinks.some((link) => link.connector === 'woocommerce'),
+    orderTaxIsSumOfComponents,
   }
   const salesLineMoneyById = new Map(order.lines.map((salesLine) => [salesLine.id, salesLine]))
   const orderGoodsAggregate = {
@@ -4109,7 +4130,11 @@ async function fenceRetryPostedTax(
     // line rather than posting it, so there is nothing here to be wrong about.
     if (!refundLine.accountingTaxType) continue
     const net = Math.round(refundLine.totalForeign * 10000) / 10000
-    if (!(net > 0)) continue
+    // Codex r9 #3: a line credits nothing only when BOTH its columns are nothing. SalesOrderRefundLine
+    // .totalForeign is `Decimal @default(0)`, so a legacy row — or one written by a caller that stated
+    // only base money — reaches this retry with a real totalBase and a zero foreign figure. Testing the
+    // foreign column alone left every such line unpriced while the retry re-staged its credit note.
+    if (!(Math.abs(net) > 0) && !(Math.abs(Math.round(refundLine.totalBase * 10000) / 10000) > 0)) continue
     const label = refundLine.lineKind === 'shipping'
       ? 'The refunded shipping'
       : (refundLine.description || 'The refunded line')
@@ -4150,6 +4175,63 @@ async function fenceRetryPostedTax(
       })
     }
   }
+  // -------------------------------------------------------------------------------------------
+  // o3d-w00 (Codex r9 #2): THE COMBINED SHIPPING-AND-DISCOUNT LEG, ON THIS ROUTE TOO.
+  //
+  // r8 #5 added this check at the WRITER and r8 #4 fenced the retry — separately, and the retry never
+  // got the combined leg. That left the posting route that raises a credit note WITHOUT creating a
+  // refund missing a check the creating route has, on the one figure neither leg can be checked
+  // against alone: a chargeback's shipping and mirrored order-discount legs share a single recorded
+  // VAT (the order total's residue over its lines) whenever the writer netted the discount's VAT off
+  // that total. The credit note is per-refund and attached to POSTING, not to creation, so both
+  // posting routes have to ask it.
+  //
+  // Same scoping as the writer's, for the same reasons: only a chargeback (raiseChargebackForReversedOrder
+  // refuses any order with a prior refund, so these legs are the WHOLE of both and the residue is the
+  // WHOLE of their VAT), and only where the order total is NOT the plain sum of its components.
+  // -------------------------------------------------------------------------------------------
+  const combinedLegs = refundLines.filter(
+    (refundLine) => refundLine.lineKind === 'discount' || refundLine.lineKind === 'shipping',
+  )
+  const hasDiscountLeg = combinedLegs.some((refundLine) => refundLine.lineKind === 'discount')
+  if (chargeback && hasDiscountLeg && !orderTaxIsSumOfComponents) {
+    // Both legs post under the ORDER's default identity, which is what each carries as its snapshot.
+    // No snapshot at all means no identity was established and the poster refuses the line anyway;
+    // two DIFFERENT snapshots mean the pair does not post as one identity, and IMS holds no separate
+    // VAT for either half — so there is nothing a refusal could name a remedy for.
+    const combinedTaxTypes = new Set(
+      combinedLegs.map((refundLine) => refundLine.accountingTaxType).filter((taxType): taxType is string => !!taxType),
+    )
+    if (combinedTaxTypes.size === 1) {
+      const label = 'The reversed shipping and order discount together'
+      const pricedDefault = priceSnapshottedTaxIdentity({
+        accountingTaxType: [...combinedTaxTypes][0],
+        rateByTaxType,
+        label,
+      })
+      if (!pricedDefault.ok) return refusalPrefixForRetry(pricedDefault.reason)
+      const combinedNet = combinedLegs.reduce(
+        (sum, refundLine) => sum.add(toDecimal(Math.round(refundLine.totalForeign * 10000) / 10000)),
+        toDecimal(0),
+      )
+      const lineTaxTotal = order.lines.reduce((sum, salesLine) => sum.add(toDecimal(salesLine.taxForeign)), toDecimal(0))
+      // The money the order records over and above its lines — here, shipping's VAT less the order
+      // discount's, which is precisely the VAT of the combined net above.
+      const combinedTax = toDecimal(order.taxForeign).sub(lineTaxTotal)
+      const combined = postedCreditNoteTotalCheck({
+        currency: order.currency,
+        netForeign: combinedNet,
+        taxForeign: combinedTax,
+        postedRate: pricedDefault.rate,
+        kind: 'shipping',
+        label,
+        // The discount leg is negative by construction, so the pair's net can be either sign.
+        allowNonPositiveNet: true,
+      })
+      if (!combined.ok) return refusalPrefixForRetry(combined.reason)
+    }
+  }
+
   const aggregate = postedCreditNoteAggregateCheck({ currency: order.currency, legs })
   if (!aggregate.ok) return refusalPrefixForRetry(aggregate.reason)
   return null
@@ -4264,7 +4346,7 @@ export async function retrySalesOrderRefundAccounting(
       // -------------------------------------------------------------------------------------------
       const replayLines = refund.lines.map(reconstructReplayLine)
       const postedTaxRefusal = input.creditNotePostingEnabled
-        ? await fenceRetryPostedTax(tx, refund.order, replayLines)
+        ? await fenceRetryPostedTax(tx, refund.order, replayLines, refund.chargeback)
         : null
 
       const persistedSyncs = parseRefundAccountingRetrySyncs(refund.accountingRetrySyncs)
