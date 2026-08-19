@@ -18,6 +18,7 @@ import { qboPost, qboUploadAttachment, resolveAccountRef, qboPostIdempotent} fro
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { moneyAttemptStampingSince, moneyAttemptStampingSinceOrNull } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
@@ -184,9 +185,15 @@ async function enqueueFollowUpSyncLog(
     // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
     // that reached QuickBooks. A revival OVERWRITES the payload it recycles, so recycling an
     // attempted row rotates that attempt's token and discards its anchors, amount and date — see
-    // the recycle note in followup-idempotency.ts.
-    select: { id: true, payload: true, remoteAttemptedAt: true },
+    // the recycle note in followup-idempotency.ts. createdAt comes with it because an unstamped
+    // row only proves anything when a STAMPING binary created it (round 9).
+    select: { id: true, payload: true, remoteAttemptedAt: true, createdAt: true },
   })
+  // Resolved before the plan, never defaulted: null means "unknown", and the planner then recycles
+  // nothing rather than trusting a NULL stamp the old binary may have left behind. Swallowed
+  // rather than thrown because this enqueue runs AFTER its invoice has already posted — failing it
+  // would re-drive that post, which is a worse failure than one extra sync row.
+  const stampsAttemptsSince = liveRowExists ? null : await moneyAttemptStampingSinceOrNull()
   const failedRows = failedLogs.map((row) => ({
     id: row.id,
     payload: row.payload,
@@ -196,6 +203,7 @@ async function enqueueFollowUpSyncLog(
     // Xero, whose payment branches never did.
     effectiveToken: getIdempotencySource(row.id, type, referenceId, (row.payload ?? {}) as SyncPayload),
     remoteAttemptedAt: row.remoteAttemptedAt,
+    createdAt: row.createdAt,
   }))
   const plan = planFollowUpEnqueue({
     connector: QBO_CONNECTOR,
@@ -205,6 +213,7 @@ async function enqueueFollowUpSyncLog(
     payload,
     liveRowExists,
     failedRows,
+    stampsAttemptsSince,
   })
   if (plan.action === 'skip') return
   if (plan.action === 'refuse') {
@@ -323,6 +332,9 @@ async function enqueueFollowUpSyncLog(
 }
 
 export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
+  // Before any entry is posted — see the note on processPendingXeroSync. The epoch is per
+  // DATABASE, not per connector, so whichever processor runs first establishes it for both.
+  await moneyAttemptStampingSince()
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
   const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
 

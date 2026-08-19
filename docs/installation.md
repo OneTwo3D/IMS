@@ -1,3 +1,28 @@
+### Deploy order: the old process must be stopped before the new one starts
+
+**This is a correctness requirement, not just a convenience.** Never run two versions of IMS
+against the same database at once — no rolling restart, no blue/green overlap, no second
+instance left running on another port. Stop the old process, then start the new one.
+
+Why: accounting money posts (customer receipts, supplier payments, credit-note allocations)
+record `accounting_sync_logs.remoteAttemptedAt` immediately **before** the remote call, and the
+retry and revival logic treats an unstamped row as proof that no call was ever made from it.
+`prisma migrate deploy` backfills the rows that exist when it runs, and the build and restart
+that follow it take minutes — so any version that does **not** write that stamp will leave rows
+looking like they were never sent when they may already be in the ledger. The first money
+operation after the swap records the instant stamping began, in the setting
+`accounting.money-attempt-stamping-since`, and re-stamps everything older; that instant is only
+meaningful if no non-stamping process is still running when it is recorded.
+
+**If an overlap did happen** (or you are not sure), clear the marker and let the next money
+operation re-establish it. This is safe to run at any time; the cost of running it needlessly is
+one extra ledger read per affected row.
+
+```sql
+DELETE FROM settings WHERE key = 'accounting.money-attempt-stamping-since';
+```
+
+
 # Installation & Deployment
 
 ## Prerequisites
@@ -365,7 +390,6 @@ npm run build
 # Restart
 systemctl restart one-two-inventory.service
 ```
-
 
 ## Environment Variables Reference
 

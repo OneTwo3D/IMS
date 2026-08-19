@@ -44,6 +44,12 @@
  * a row that HAD posted therefore rotated a real attempt's token and threw away the only local
  * record that it happened — see the note above the recycle below.
  *
+ * AND "UNSTAMPED" ONLY MEANS THAT FOR A ROW A STAMPING BINARY CREATED (Codex round 9, HIGH). The
+ * migration's backfill covered the rows that existed when it ran, and a deploy keeps the OLD binary
+ * serving for minutes afterwards — so rows land unstamped on the far side of the backfill, and were
+ * being read as "never attempted". `stampsAttemptsSince` is the cutoff that fixes it; see
+ * money-attempt-provenance.ts for where the value comes from and what a deployer must do.
+ *
  * WHY NOT REUSE THE EXISTING `_idempotencyKey` FIELD. It is already populated on rows this
  * module does not own: `addPayment` queues an INVOICE_PAYMENT through the generic
  * `queueAccountingSyncTx` with `invoice-payment:payment:<paymentId>`. Xero's payment
@@ -190,8 +196,25 @@ export type FailedFollowUpRow = {
    * backfill in 20260818090000 covered the pre-existing money rows). A PDF or e-mail follow-up
    * therefore reads null forever — correctly, because a duplicate of one is not a settlement and
    * its payload is not evidence of money.
+   *
+   * NULL ONLY PROVES ANYTHING FOR A ROW A STAMPING BINARY CREATED — see `createdAt` below.
    */
   remoteAttemptedAt: Date | null
+  /**
+   * When this row was created, which is what says whether its NULL stamp is evidence of anything
+   * (Codex round 9, HIGH).
+   *
+   * The backfill in 20260818090000 stamped the money rows that existed when it RAN. It could not
+   * stamp the ones the OLD binary went on to create while the new one was still being built and
+   * started — `scripts/deploy.sh` migrates, then builds, then swaps, so that window is minutes
+   * long and the old binary is serving throughout it. Those rows are unstamped because nothing
+   * stamped them, not because nothing was sent from them, and recycling one destroys the evidence
+   * of a payment that may be sitting in the ledger.
+   *
+   * Compared against `stampsAttemptsSince` below. Not to be confused with ordering: `failedRows`
+   * is ordered newest-first by the caller and that is unchanged.
+   */
+  createdAt: Date
 }
 
 export type FollowUpEnqueueInput = FollowUpIdentity & {
@@ -199,6 +222,19 @@ export type FollowUpEnqueueInput = FollowUpIdentity & {
   liveRowExists: boolean
   /** Every surviving FAILED row for this scope, newest first. */
   failedRows: FailedFollowUpRow[]
+  /**
+   * The instant from which an unstamped row proves no remote call was made — i.e. when a binary
+   * that stamps `remoteAttemptedAt` before every money call took over this database. Resolved by
+   * `moneyAttemptStampingSince` (money-attempt-provenance.ts), which records it once and re-runs
+   * the migration's backfill over everything older, so that after it the two populations are
+   * exactly: stamped, or created by a stamping binary.
+   *
+   * NULL = UNKNOWN, AND UNKNOWN IS NOT PROOF. Nothing is then recycled and a new row is created
+   * beside the old one instead. Deliberately not defaulted to the epoch, to `new Date(0)`, or to
+   * anything else a caller might get for free: this value is the whole basis on which a row's
+   * payload is judged disposable, and a default would be a way of forgetting to establish it.
+   */
+  stampsAttemptsSince: Date | null
 }
 
 /**
@@ -423,7 +459,32 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // A row that never made a remote call records nothing that happened, so recycling it destroys
   // nothing and the bookkeeping is kept for exactly those. Anything else is left FAILED and a new
   // row is created beside it; the cost is one extra row per distinct document in a scope.
-  const rowToReuse = input.failedRows.find((row) => row.remoteAttemptedAt === null)
+  //
+  // AND ONLY A ROW WHOSE UNSTAMPED-NESS IS ITSELF EVIDENCE (Codex round 9, HIGH). `remoteAttemptedAt
+  // === null` alone is not that. The stamp is written by `authoriseMoneyPost`, so a NULL means one
+  // of two very different things:
+  //
+  //   - this binary created the row and never posted from it  -> nothing happened, recycle freely;
+  //   - something that does not stamp created the row         -> the NULL says nothing at all.
+  //
+  // The second is not hypothetical and it is not history. `scripts/deploy.sh` runs the migration
+  // (which backfills every money row that exists at that moment), then BUILDS, then stops the old
+  // server and starts the new one. For the minutes in between, the OLD binary is still serving —
+  // still posting payments, still not stamping — and every row it creates lands unstamped on the
+  // far side of the backfill. Recycling one of those is precisely the evidence destruction this
+  // branch was written to stop, reintroduced at every rollout: the recycled row's anchors, amount,
+  // date and `_followUpIdempotencyKey` are overwritten with another document's, and the payment it
+  // may have committed becomes invisible to all three readers listed above.
+  //
+  // `stampsAttemptsSince` separates them. It is the instant a stamping binary took over, recorded
+  // once per database, with everything older re-stamped at the same moment — so a row created at or
+  // after it was created by a binary that stamps, and its NULL is proof. Older, or unknown, is not.
+  const stampsAttemptsSince = input.stampsAttemptsSince
+  const provablyNeverAttempted = (row: FailedFollowUpRow): boolean =>
+    row.remoteAttemptedAt === null
+    && stampsAttemptsSince !== null
+    && row.createdAt.getTime() >= stampsAttemptsSince.getTime()
+  const rowToReuse = input.failedRows.find(provablyNeverAttempted)
   const freshPayload = withFollowUpIdempotencyKey(input)
   if (rowToReuse) {
     const stored = asPayload(rowToReuse.payload)

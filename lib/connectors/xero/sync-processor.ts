@@ -25,6 +25,7 @@ import {
   type BackReferenceRepairResult,
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import { moneyAttemptStampingSince, moneyAttemptStampingSinceOrNull } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
 import { lockFollowUpScope } from '@/lib/domain/accounting/followup-scope-lock'
@@ -306,9 +307,15 @@ async function enqueueFollowUpSyncLog(
     // remoteAttemptedAt is what tells the planner whether a row's payload is the record of a call
     // that reached Xero. A revival OVERWRITES the payload it recycles, so recycling an attempted
     // row rotates that attempt's token and discards its anchors, amount and date — see the recycle
-    // note in followup-idempotency.ts.
-    select: { id: true, payload: true, remoteAttemptedAt: true },
+    // note in followup-idempotency.ts. createdAt comes with it because an unstamped row only
+    // proves anything when a STAMPING binary created it (round 9).
+    select: { id: true, payload: true, remoteAttemptedAt: true, createdAt: true },
   })
+  // Resolved before the plan, never defaulted: null means "unknown", and the planner then recycles
+  // nothing rather than trusting a NULL stamp the old binary may have left behind. Swallowed
+  // rather than thrown because this enqueue runs AFTER its invoice has already posted — failing it
+  // would re-drive that post, which is a worse failure than one extra sync row.
+  const stampsAttemptsSince = liveRowExists ? null : await moneyAttemptStampingSinceOrNull()
   const failedRows = failedLogs.map((row) => ({
     id: row.id,
     payload: row.payload,
@@ -316,6 +323,7 @@ async function enqueueFollowUpSyncLog(
     // reproduces a byte-identical Idempotency-Key even after the row itself is gone.
     effectiveToken: followUpIdempotencySource(row.id, (row.payload ?? {}) as SyncPayload),
     remoteAttemptedAt: row.remoteAttemptedAt,
+    createdAt: row.createdAt,
   }))
   const plan = planFollowUpEnqueue({
     connector: XERO_CONNECTOR,
@@ -325,6 +333,7 @@ async function enqueueFollowUpSyncLog(
     payload,
     liveRowExists,
     failedRows,
+    stampsAttemptsSince,
   })
   if (plan.action === 'skip') return
   if (plan.action === 'refuse') {
@@ -717,6 +726,18 @@ async function markXeroOutboxSuccess(job: IntegrationOutboxRow): Promise<void> {
 }
 
 export async function processPendingXeroSync(): Promise<ProcessResult> {
+  // BEFORE ANY ENTRY IS POSTED (round 9). Every money post in this run goes through
+  // `authoriseMoneyPost`, whose rival-attempt query is `remoteAttemptedAt: { not: null }` — so it
+  // is blind to a row the OLD binary created and posted from during the deploy window, exactly as
+  // the revival planner was. Establishing the epoch here re-stamps those rows once per database,
+  // which is what makes that query's premise true again; the enqueue path needs the same call for
+  // the VALUE, and it is cached, so this costs one `findUnique` per process.
+  //
+  // THROWS rather than continuing on an unresolvable epoch. This is not the follow-up enqueue's
+  // situation: nothing has posted yet, so failing the run costs a five-minute delay, whereas
+  // posting into a fence that cannot see its rivals costs a duplicate payment. The cron treats a
+  // throw here as it treats any other sync failure.
+  await moneyAttemptStampingSince()
   if (!isXeroAccountingOutboxEnabled()) {
     return processPendingXeroSyncDirect()
   }

@@ -205,8 +205,24 @@ const outboxClient = {
   },
 }
 
+/**
+ * o3d-0m56 r9: a sync run establishes the money-attempt stamping epoch before it posts anything,
+ * so the double has to be able to answer for it. Recorded as ALREADY SET — this file is about the
+ * obligation marker, not the epoch, and a store that had to establish one would also have to model
+ * the backfill.
+ */
+const settingClient = {
+  async findUnique(args: { where: { key: string } }) {
+    return args.where.key === 'accounting.money-attempt-stamping-since'
+      ? { value: new Date('2026-01-01T00:00:00Z').toISOString() }
+      : null
+  },
+  async create() { throw new Error('fake db: the epoch is already recorded') },
+}
+
 const db = {
   accountingSyncLog: syncLogClient,
+  setting: settingClient,
   purchaseInvoice: billClient,
   salesOrder: { async findUnique() { return null }, async update() { return {} } },
   salesOrderRefund: { async findUnique() { return null }, async update() { return {} } },

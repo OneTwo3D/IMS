@@ -15,6 +15,20 @@
 #   bash scripts/deploy.sh --skip-build   # migrate + restart (no build)
 #   bash scripts/deploy.sh --skip-migrate # build + restart (no migrate)
 #   bash scripts/deploy.sh --restart-only # just restart the running process
+#
+# DEPLOY ORDER IS LOAD-BEARING. This script migrates, then builds, then STOPS the old
+# server and only then starts the new one — and it refuses to continue until the port is
+# free. That stop-before-start is not only about EADDRINUSE: accounting money posts stamp
+# `accounting_sync_logs.remoteAttemptedAt` before the remote call, and an unstamped row is
+# treated as proof that no call was ever made from it. The migration backfills the rows
+# that exist when it runs; the build takes minutes with the old binary still serving. The
+# first money operation after the swap records `accounting.money-attempt-stamping-since` in
+# `settings` and re-stamps everything older, which is only sound if no non-stamping process
+# is still running. So: never run two versions against one database at once (no rolling or
+# blue/green overlap). If that ever happens, run
+#   DELETE FROM settings WHERE key = 'accounting.money-attempt-stamping-since';
+# and the next money operation re-establishes it. See
+# lib/domain/accounting/money-attempt-provenance.ts.
 # =============================================================================
 
 set -euo pipefail
@@ -40,7 +54,7 @@ for arg in "$@"; do
     --skip-migrate) SKIP_MIGRATE=true ;;
     --restart-only) RESTART_ONLY=true; SKIP_BUILD=true; SKIP_MIGRATE=true ;;
     --help|-h)
-      sed -n '3,17p' "$0"; exit 0 ;;
+      sed -n '3,31p' "$0"; exit 0 ;;
     *) die "Unknown option: $arg (try --help)" ;;
   esac
 done

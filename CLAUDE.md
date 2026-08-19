@@ -580,6 +580,17 @@ migration. Xero tokens live encrypted in Postgres, not a token file (see the env
    `systemctl restart ims-stage-dev.service` (or `ims-stage.service` once migrated).
 5. Verify locally on `http://127.0.0.1:3000` (behind nginx at the stage hostname).
 
+**Deploy order (correctness requirement, not just convenience):** the old process must be fully
+stopped before the new one is started — never run two versions against the same database at once
+(no rolling restart, no blue/green overlap). Money posts stamp
+`accounting_sync_logs.remoteAttemptedAt` before the remote call, and an unstamped row is treated as
+proof that nothing was ever sent from it; a version that does not write that stamp running
+alongside one that does breaks that proof. The first money operation after the swap records
+`accounting.money-attempt-stamping-since` in `settings` and re-stamps everything older. If an
+overlap ever happens, `DELETE FROM settings WHERE key = 'accounting.money-attempt-stamping-since';`
+and the next money operation re-establishes it. See
+`lib/domain/accounting/money-attempt-provenance.ts`.
+
 **Database migrations:**
 - Migrations are applied during `npm run build` via `prisma migrate deploy` in postinstall hook
 - Always review schema.prisma changes before deployment

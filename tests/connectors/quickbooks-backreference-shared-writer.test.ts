@@ -109,6 +109,16 @@ const billClient = {
 }
 
 const db = {
+  // o3d-0m56 r9: a sync run establishes the money-attempt stamping epoch before it posts anything.
+  // Recorded as already set — this file is about back-reference writing, not the epoch.
+  setting: {
+    async findUnique(args: { where: { key: string } }) {
+      return args.where.key === 'accounting.money-attempt-stamping-since'
+        ? { value: new Date('2026-01-01T00:00:00Z').toISOString() }
+        : null
+    },
+    async create() { throw new Error('fake db: the epoch is already recorded') },
+  },
   accountingSyncLog: {
     async findMany() { return state.syncRows.map((row) => ({ ...row })) },
     async updateMany() { return { count: 1 } },
