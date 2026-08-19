@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 import { toJsonInputValue } from '@/lib/db/json-input'
 // decimal-boundary-ok: report-only (accounting reconciliation finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
-import { isMirrorableAccountingSyncType } from './accounting-event-mirror'
+import { isDocumentRevisionAccountingSyncType, isMirrorableAccountingSyncType } from './accounting-event-mirror'
 
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
 export type AccountingReconciliationRunStatus = 'COMPLETED' | 'FAILED' | 'PARTIAL'
@@ -640,11 +640,20 @@ export function evaluateAccountingReconciliationRows(
     const key = `${event.externalSystem}|${event.externalId}`
     eventReferences.set(key, [...(eventReferences.get(key) ?? []), event.id])
   }
-  const syncLogReferences = new Map<string, string[]>()
+  // o3d-cvj9: a *_INVOICE_UPDATE sync log posts a REVISION of a document that already exists, and
+  // the connector returns the same external id it returned for the create — so a create plus its
+  // revisions legitimately share one external reference. Grouping the documents each reference is
+  // claimed by, and counting the CREATE rows separately, keeps both real duplicates reportable:
+  // one reference spanning two source documents, or one document posted by two create rows.
+  const syncLogReferences = new Map<string, { logIds: string[]; documents: Set<string>; creates: number }>()
   for (const log of rows.syncLogs) {
     if (!log.connector.trim() || !log.externalTransactionId?.trim()) continue
     const key = `${log.connector}|${log.externalTransactionId}`
-    syncLogReferences.set(key, [...(syncLogReferences.get(key) ?? []), log.id])
+    const entry = syncLogReferences.get(key) ?? { logIds: [], documents: new Set<string>(), creates: 0 }
+    entry.logIds.push(log.id)
+    entry.documents.add(`${log.referenceType}\x00${log.referenceId}`)
+    if (!isDocumentRevisionAccountingSyncType(log.type)) entry.creates += 1
+    syncLogReferences.set(key, entry)
   }
 
   for (const [reference, eventIds] of eventReferences) {
@@ -661,16 +670,17 @@ export function evaluateAccountingReconciliationRows(
     })
   }
 
-  for (const [reference, syncLogIds] of syncLogReferences) {
-    if (syncLogIds.length <= 1) continue
+  for (const [reference, entry] of syncLogReferences) {
+    if (entry.logIds.length <= 1) continue
+    if (entry.documents.size <= 1 && entry.creates <= 1) continue
     findings.push({
       severity: 'critical',
       code: 'duplicate_external_reference',
-      message: `External accounting reference ${reference} appears on ${syncLogIds.length} sync logs`,
+      message: `External accounting reference ${reference} appears on ${entry.logIds.length} sync logs`,
       details: {
         externalReference: reference,
         accountingEventIds: [],
-        syncLogIds,
+        syncLogIds: entry.logIds,
       },
     })
   }

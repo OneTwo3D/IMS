@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
+
 import {
   buildMirroredAccountingEventDraft,
   isMirrorableAccountingSyncType,
@@ -456,4 +458,289 @@ test('failed daily batch mirror reset moves matching events back to pending', as
       },
     }],
   }])
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9: a document REVISION posts against the external document that already exists, so its
+// mirrored event and the event it revises compete for the one `(externalSystem, externalId)` row
+// the unique index allows.
+//
+// The double below is a table that ENFORCES both unique indexes on `accounting_events` and raises
+// the P2002 from the statement that would violate one, with the meta shape `@prisma/adapter-pg`
+// actually produces (captured from a rolled-back probe against onetwo3d_ims_dev: `meta.target` is
+// undefined and the column list arrives quoted under
+// `meta.driverAdapterError.cause.constraint.fields`). What it CANNOT express is Postgres aborting
+// the transaction on 23505 — a double keeps answering queries after a throw. That half is covered
+// against a real database in tests/concurrency/mirrored-document-revision.concurrent.test.ts.
+// ---------------------------------------------------------------------------------------------
+
+type FakeAccountingEventRow = {
+  id: string
+  type: string
+  sourceEntityType: string
+  sourceEntityId: string
+  idempotencyKey: string
+  status: string
+  externalSystem: string | null
+  externalId: string | null
+}
+
+function uniqueViolation(fields: string[]): Error {
+  return new Prisma.PrismaClientKnownRequestError(
+    `Unique constraint failed on the fields: (${fields.map((field) => `\`"${field}"\``).join(', ')})`,
+    {
+      code: 'P2002',
+      clientVersion: 'test',
+      meta: {
+        modelName: 'AccountingEvent',
+        driverAdapterError: {
+          name: 'DriverAdapterError',
+          cause: {
+            originalCode: '23505',
+            originalMessage: `duplicate key value violates unique constraint "accounting_events_${fields.join('_')}_key"`,
+            kind: 'UniqueConstraintViolation',
+            constraint: { fields: fields.map((field) => `"${field}"`) },
+          },
+        },
+      },
+    },
+  )
+}
+
+function createAccountingEventStore(seed: FakeAccountingEventRow[]) {
+  const table = seed.map((row) => ({ ...row }))
+  const logs: Array<Record<string, unknown>> = []
+  const statements: string[] = []
+
+  function claimIsFree(row: FakeAccountingEventRow, externalSystem: string | null, externalId: string | null): boolean {
+    if (externalId === null) return true
+    return !table.some((other) => other.id !== row.id
+      && other.externalSystem === externalSystem
+      && other.externalId === externalId)
+  }
+
+  const client = {
+    accountingEvent: {
+      update: async (args: {
+        where: { idempotencyKey?: string; id?: string }
+        data: Record<string, unknown>
+      }) => {
+        statements.push('update')
+        const row = table.find((candidate) => (args.where.idempotencyKey !== undefined
+          ? candidate.idempotencyKey === args.where.idempotencyKey
+          : candidate.id === args.where.id))
+        if (!row) {
+          throw new Prisma.PrismaClientKnownRequestError('An operation failed because it depends on one or more records that were required but not found.', {
+            code: 'P2025',
+            clientVersion: 'test',
+          })
+        }
+        const next = { ...row, ...args.data } as FakeAccountingEventRow
+        if (!claimIsFree(row, next.externalSystem, next.externalId)) throw uniqueViolation(['externalSystem', 'externalId'])
+        Object.assign(row, args.data)
+        return { id: row.id }
+      },
+      updateMany: async (args: {
+        where: { id?: string; externalSystem?: string; externalId?: string }
+        data: Record<string, unknown>
+      }) => {
+        statements.push('updateMany')
+        const matched = table.filter((row) => (args.where.id === undefined || row.id === args.where.id)
+          && (args.where.externalSystem === undefined || row.externalSystem === args.where.externalSystem)
+          && (args.where.externalId === undefined || row.externalId === args.where.externalId))
+        for (const row of matched) Object.assign(row, args.data)
+        return { count: matched.length }
+      },
+      findUnique: async (args: {
+        where: { externalSystem_externalId?: { externalSystem: string; externalId: string } }
+      }) => {
+        statements.push('findUnique')
+        const key = args.where.externalSystem_externalId
+        if (!key) return null
+        return table.find((row) => row.externalSystem === key.externalSystem && row.externalId === key.externalId) ?? null
+      },
+    },
+    accountingEventLog: {
+      create: async (args: { data: Record<string, unknown> }) => {
+        statements.push('log')
+        logs.push(args.data)
+        return { id: `log-${logs.length}` }
+      },
+    },
+  }
+
+  return { table, logs, statements, client }
+}
+
+const REVISION_PAYLOAD = {
+  _idempotencyKey: 'sales-invoice-update:so-1:INV-9',
+  invoiceNumber: 'INV-1001',
+  contactName: 'Customer One',
+  date: '2026-08-19',
+  currency: 'GBP',
+  lines: [{ description: 'Widget', quantity: 1, unitAmount: 120, accountCode: '200' }],
+}
+
+const REVISION_EVENT_KEY = 'accounting-sync:xero:sales_invoice_update:sales-invoice-update:so-1:inv-9'
+
+function invoiceCreateRow(overrides: Partial<FakeAccountingEventRow> = {}): FakeAccountingEventRow {
+  return {
+    id: 'event-create',
+    type: 'SALES_INVOICE',
+    sourceEntityType: 'SalesOrder',
+    sourceEntityId: 'so-1',
+    idempotencyKey: 'accounting-sync:xero:sales_invoice:sales-invoice:so-1',
+    status: 'POSTED',
+    externalSystem: 'xero',
+    externalId: 'INV-9',
+    ...overrides,
+  }
+}
+
+function revisionRow(overrides: Partial<FakeAccountingEventRow> = {}): FakeAccountingEventRow {
+  return {
+    id: 'event-revision',
+    type: 'SALES_INVOICE_UPDATE',
+    sourceEntityType: 'SalesOrder',
+    sourceEntityId: 'so-1',
+    idempotencyKey: REVISION_EVENT_KEY,
+    status: 'PENDING',
+    externalSystem: 'xero',
+    externalId: null,
+    ...overrides,
+  }
+}
+
+function postRevision(store: ReturnType<typeof createAccountingEventStore>, overrides: {
+  status?: 'POSTED' | 'FAILED'
+  type?: string
+} = {}) {
+  return updateMirroredAccountingEventStatus(store.client as never, {
+    connector: 'xero',
+    syncLogId: 'log-update',
+    type: overrides.type ?? 'SALES_INVOICE_UPDATE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    payload: REVISION_PAYLOAD,
+    status: overrides.status ?? 'POSTED',
+    externalId: 'INV-9',
+  })
+}
+
+test('a posted sales invoice revision takes the external id from the invoice event it revises', async () => {
+  const store = createAccountingEventStore([invoiceCreateRow(), revisionRow()])
+
+  await postRevision(store)
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
+  ])
+  // The rejected write, the release of the claim, then the write that now succeeds — the P2002 is
+  // handled where it was raised, not by rewriting the transition into something that cannot fail.
+  assert.deepEqual(store.statements, ['update', 'findUnique', 'updateMany', 'update', 'log', 'log'])
+  assert.deepEqual(store.logs, [
+    {
+      accountingEventId: 'event-create',
+      action: 'superseded_by_revision',
+      metadata: {
+        connector: 'xero',
+        syncLogId: 'log-update',
+        syncType: 'SALES_INVOICE_UPDATE',
+        referenceType: 'SalesOrder',
+        referenceId: 'so-1',
+        externalId: 'INV-9',
+        supersededByEventId: 'event-revision',
+      },
+    },
+    {
+      accountingEventId: 'event-revision',
+      action: 'posted_from_sync_log',
+      metadata: {
+        connector: 'xero',
+        syncLogId: 'log-update',
+        syncType: 'SALES_INVOICE_UPDATE',
+        referenceType: 'SalesOrder',
+        referenceId: 'so-1',
+        externalId: 'INV-9',
+      },
+    },
+  ])
+})
+
+test('a revision does not take an external id that belongs to a different source document', async () => {
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ id: 'event-other-order', sourceEntityId: 'so-2' }),
+    revisionRow(),
+  ])
+
+  await assert.rejects(
+    () => postRevision(store),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, 'P2002')
+      assert.deepEqual(
+        (error as { meta?: { driverAdapterError?: { cause?: { constraint?: unknown } } } }).meta?.driverAdapterError?.cause?.constraint,
+        { fields: ['"externalSystem"', '"externalId"'] },
+      )
+      return true
+    },
+  )
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-other-order', status: 'POSTED', externalId: 'INV-9' },
+    { id: 'event-revision', status: 'PENDING', externalId: null },
+  ])
+  assert.deepEqual(store.logs, [], 'a rejected takeover must not be audited as one')
+})
+
+test('a revision does not take an external id held by an unrelated event type on the same order', async () => {
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ id: 'event-credit-note', type: 'CREDIT_NOTE' }),
+    revisionRow(),
+  ])
+
+  await assert.rejects(() => postRevision(store), (error: unknown) => (error as { code?: string }).code === 'P2002')
+  assert.equal(store.table[0].status, 'POSTED')
+  assert.equal(store.table[0].externalId, 'INV-9')
+  assert.deepEqual(store.logs, [])
+})
+
+test('a FAILED transition never takes over an external id', async () => {
+  const store = createAccountingEventStore([invoiceCreateRow(), revisionRow()])
+
+  await assert.rejects(
+    () => postRevision(store, { status: 'FAILED' }),
+    (error: unknown) => (error as { code?: string }).code === 'P2002',
+  )
+  assert.equal(store.table[0].status, 'POSTED', 'only a successful post owns a document id')
+  assert.equal(store.table[0].externalId, 'INV-9')
+})
+
+test('a create-type event never takes over an external id another event holds', async () => {
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ id: 'event-first-create' }),
+    revisionRow({ id: 'event-second-create', type: 'SALES_INVOICE', idempotencyKey: 'accounting-sync:xero:sales_invoice:sales-invoice-update:so-1:inv-9' }),
+  ])
+
+  await assert.rejects(
+    () => postRevision(store, { type: 'SALES_INVOICE' }),
+    (error: unknown) => (error as { code?: string }).code === 'P2002',
+    'two documents claiming one external id is the double post the unique index exists to catch',
+  )
+  assert.equal(store.table[0].status, 'POSTED')
+  assert.equal(store.table[0].externalId, 'INV-9')
+})
+
+test('re-posting a revision that already holds the external id is a no-op, not a takeover', async () => {
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    revisionRow({ status: 'POSTED', externalId: 'INV-9' }),
+  ])
+
+  await postRevision(store)
+
+  assert.deepEqual(store.statements, ['update', 'log'], 'the retry path must not run when nothing conflicts')
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
+  ])
 })

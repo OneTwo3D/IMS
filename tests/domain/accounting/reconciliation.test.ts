@@ -939,3 +939,69 @@ test('o3d-0qoo: a persisted batch ref with no mirrored event still reports the m
   // Reported against the reference the batch actually wrote, not a derived guess.
   assert.equal((finding!.details as { sourceEntityId: string }).sourceEntityId, A1_REF)
 })
+
+// o3d-cvj9: a *_INVOICE_UPDATE posts a REVISION of a document that already exists and the
+// connector hands back the id it gave the create, so a create plus its revisions legitimately
+// share one external reference. Before the mirrored revision could reach POSTED at all, the
+// update sync log never got an externalTransactionId, so this was never observable; it is now.
+function invoiceSyncLog(id: string, type: string, referenceId: string, externalTransactionId: string) {
+  return {
+    id,
+    connector: 'xero',
+    type,
+    status: 'SYNCED',
+    referenceType: 'SalesOrder',
+    referenceId,
+    externalTransactionId,
+    payload: { date: '2026-04-25' },
+  }
+}
+
+function duplicateReferenceFindings(rows: AccountingReconciliationRows, reference: string) {
+  return evaluateAccountingReconciliationRows(rows).filter((finding) => (
+    finding.code === 'duplicate_external_reference' &&
+    (finding.details as { externalReference?: string }).externalReference === reference
+  ))
+}
+
+test('a sales invoice and its update sharing one external id are not a duplicate reference', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    invoiceSyncLog('sync-invoice', 'SALES_INVOICE', 'order-1', 'INV-9'),
+    invoiceSyncLog('sync-invoice-update', 'SALES_INVOICE_UPDATE', 'order-1', 'INV-9'),
+  )
+
+  assert.deepEqual(duplicateReferenceFindings(rows, 'xero|INV-9'), [])
+})
+
+test('one external id claimed by two sales orders is still a duplicate reference', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    invoiceSyncLog('sync-invoice-update-1', 'SALES_INVOICE_UPDATE', 'order-1', 'INV-9'),
+    invoiceSyncLog('sync-invoice-update-2', 'SALES_INVOICE_UPDATE', 'order-2', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1, 'a reference spanning two source documents must stay critical')
+  assert.equal(findings[0].severity, 'critical')
+  assert.deepEqual(
+    (findings[0].details as { syncLogIds: string[] }).syncLogIds,
+    ['sync-invoice-update-1', 'sync-invoice-update-2'],
+  )
+})
+
+test('one document posted by two create sync logs is still a duplicate reference', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    invoiceSyncLog('sync-invoice-1', 'SALES_INVOICE', 'order-1', 'INV-9'),
+    invoiceSyncLog('sync-invoice-2', 'SALES_INVOICE', 'order-1', 'INV-9'),
+    invoiceSyncLog('sync-invoice-update', 'SALES_INVOICE_UPDATE', 'order-1', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1, 'two creates for one document is the double post the check exists for')
+  assert.deepEqual(
+    (findings[0].details as { syncLogIds: string[] }).syncLogIds,
+    ['sync-invoice-1', 'sync-invoice-2', 'sync-invoice-update'],
+  )
+})
