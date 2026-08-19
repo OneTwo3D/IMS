@@ -65,9 +65,31 @@ So:
   > choose the organisation this instance is meant to use.
 
   If you are auditing what such an instance posted, look in the **token's** organisation: that is where
-  everything went. A token with **no pin beside it** is not this state and is not refused — that is the
-  ordinary state after `provision-xero-demo.ts --clear-tenant-pin`, and for any connection made before
-  the pin existed.
+  everything went.
+- **Deleting the pin is not a way out of that refusal.** A token with **no pin beside it** used to be
+  exempt, which made the refusal above one `DELETE FROM settings` away from being switched off — and a
+  `settings` table restored from a different backup than `accounting_tokens` arrives in the same state
+  without anybody deleting anything. IMS now asks what the *token row* says about its own history:
+
+  | State of the token row | Meaning | Result |
+  | --- | --- | --- |
+  | No token row at all | A first connection | Connects normally |
+  | No connection marker | Connected before this shipped | Keeps working, as before |
+  | Released by `--clear-tenant-pin` | Deliberately unpinned, awaiting a re-consent | Keeps working |
+  | Carries a connection marker, pin gone | The pin was deleted or lost | **Sync halted** |
+
+  The marker is minted by the connect that wrote the pin, in the same transaction, and **Disconnect**
+  removes the token and the pin together — so a token that has outlived its pin can only mean the pin
+  went away on its own. The halt says so and tells you to press **Disconnect** on `/sync` and connect
+  again; nothing in the `.env` needs editing, and writing the setting back by hand is deliberately *not*
+  offered as a remedy (a pin typed in beside a token that came from somewhere else only makes the two
+  agree, which is not the same as the binding being right).
+
+  To be unpinned **on purpose** — the ~28-day Demo reset — use
+  `provision-xero-demo.ts --clear-tenant-pin`, which deletes the pin and records the release on the
+  token row in one transaction, or simply press **Disconnect**. A release ends by itself at the next
+  connect, and while it is outstanding the consent is free to land on the rebuilt organisation's new
+  tenantId — but it still will not guess between two organisations.
 - **A token refresh belongs to one connection, not just one organisation.** Each binding stamps the
   token row with a connection generation, and a refresh only writes back if that generation is still
   there. So a refresh that was in flight while somebody disconnected and reconnected — even to the

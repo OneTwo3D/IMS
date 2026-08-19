@@ -100,6 +100,25 @@
  * a restored database. `xeroBindingMismatchRefusal` is the read-time half: a pin and a token that name
  * different organisations mean the binding is UNKNOWN — not that one of them is right — so the sync
  * stops, both organisations are named, and the remedy is the one action that clears both halves at once.
+ *
+ * AND DELETING THE PIN IS NOT A WAY OUT OF THAT REFUSAL (the r6 finding). Round 5 exempted an ABSENT
+ * pin, deliberately, because that is what every pre-pin connection looks like and what the documented
+ * `--clear-tenant-pin` recovery produces. But an exemption reachable by DELETING something is a switch:
+ * one `DELETE FROM settings` turns a halted instance into an unconstrained one, and restoring `settings`
+ * and `accounting_tokens` from different backups arrives at the same place — which is the very scenario
+ * the refusal was written for, so the refusal was one restore away from being absent exactly when it
+ * mattered. `xeroMissingPinRefusal` closes it by asking what the TOKEN ROW says about its own history:
+ *
+ *   connectionGeneration PRESENT — the row was written by `bindXeroTenant`, which writes the pin in the
+ *                                  same transaction, and `disconnect()` deletes both together. So a pin
+ *                                  that is gone while this marker is here went away on its own: REFUSE.
+ *   pinReleasedAt PRESENT        — the documented recovery cleared the pin and stamped the token row in
+ *                                  one transaction. A deliberate, recorded release: ALLOW.
+ *   neither                      — a row written before any of this existed. It is evidence of nothing,
+ *                                  and every pre-pin installation is in it: ALLOW, exactly as in r5.
+ *
+ * The asymmetry is the point. Both legitimate states are things IMS's own code WROTE onto the token row;
+ * the bypass is a DELETION from a different table, and a deletion cannot forge a value it never touches.
  */
 
 export type XeroConnectionSummary = {
@@ -554,20 +573,26 @@ export function storedXeroConnectionRefusal(
   stored: XeroConnectionSummary,
   allowList: XeroTenantAllowList,
   pinnedTenantId: string | null | undefined,
+  binding: XeroStoredBinding,
 ): string | null {
   // A configuration that contradicts itself permits NOTHING, so it is answered before every other
   // refusal: no remedy below can be carried out while it stands, and offering one would send the
   // operator to do work that cannot take effect.
   if (allowList.conflict) return storedTenantRefusalMessage(stored, allowList)
 
-  // Then the binding itself, BEFORE the allow-list, because a split binding invalidates the allow-list's
-  // own remedy. `storedTenantRefusalMessage` offers "permit the stored organisation in the .env"; an
-  // operator who does exactly that on a mismatched instance permits an organisation their pin denies and
-  // lands straight in this refusal instead. A remedy whose faithful execution produces a new refusal is
-  // not a remedy, so the ambiguity is reported first and the allow-list question waits until there is a
-  // single organisation to ask it about.
-  const mismatch = xeroBindingMismatchRefusal(stored, pinnedTenantId)
-  if (mismatch !== null) return mismatch
+  // Then the binding itself, BEFORE the allow-list, because a broken binding invalidates the
+  // allow-list's own remedy. `storedTenantRefusalMessage` offers "permit the stored organisation in the
+  // .env"; an operator who does exactly that on a mismatched instance permits an organisation their pin
+  // denies and lands straight in this refusal instead. A remedy whose faithful execution produces a new
+  // refusal is not a remedy, so the ambiguity is reported first and the allow-list question waits until
+  // there is a single organisation to ask it about.
+  //
+  // `binding` is a REQUIRED argument rather than an optional one with a permissive default, for the
+  // reason this round exists: the r5 hole was an absent value read as permission. A call site that
+  // forgets it does not compile, which is the only version of this check that cannot be switched off by
+  // omission.
+  const broken = xeroBindingRefusal(stored, pinnedTenantId, binding)
+  if (broken !== null) return broken
 
   if (!isXeroTenantAllowed(stored, allowList)) return storedTenantRefusalMessage(stored, allowList)
   const demoVerdict = xeroDemoOrgVerdict(allowList, stored.isDemoCompany)
@@ -575,6 +600,127 @@ export function storedXeroConnectionRefusal(
     return demoOrgStoredRefusal(stored, demoVerdict)
   }
   return null
+}
+
+/**
+ * What the TOKEN ROW itself says about the binding it belongs to (o3d-9tbz r6).
+ *
+ * Both fields are written by IMS onto `accounting_tokens`, and neither is derived from anything an
+ * operator, a backup or a Xero response supplies. That is what makes them usable as evidence about a
+ * row in a DIFFERENT table having gone missing.
+ */
+export type XeroStoredBinding = {
+  /**
+   * The generation minted by the binding transaction — the one that also writes the pin.
+   *
+   * Non-null is therefore proof that a pin was written beside this token row, by this code, and that
+   * `disconnect()` (which deletes the two together) has not run since. Null means the row predates the
+   * marker, which is evidence of nothing at all.
+   */
+  connectionGeneration: string | null
+  /**
+   * When the pin was DELIBERATELY released by the documented Demo-reset recovery — or null.
+   *
+   * Stamped by `provision-xero-demo.ts --clear-tenant-pin` in the same transaction that deletes the pin,
+   * and cleared by the next binding, which writes a pin again. It is the release's receipt: it says the
+   * pin's absence was intended, and when — which is the one thing a missing settings row cannot say
+   * about itself.
+   */
+  pinReleasedAt: Date | null
+}
+
+/** Why this instance has no pin — which decides whether that is a supported state or a halt. */
+export type XeroPinAbsenceVerdict =
+  /** Deliberately released by the documented recovery. Supported: a re-consent is expected next. */
+  | 'released'
+  /** A token row that predates the binding marker. No evidence a pin was ever written. Supported. */
+  | 'never-established'
+  /** A binding wrote a pin beside this token, and the pin is gone. The binding is unverifiable. */
+  | 'lost'
+
+export function xeroPinAbsenceVerdict(binding: XeroStoredBinding): XeroPinAbsenceVerdict {
+  // The release is checked FIRST and beats the generation, because a released connection has both: it
+  // was bound (so it has a generation) and then deliberately unpinned (so it has a receipt). Reading
+  // them the other way round would halt the recovery this branch is required to keep working.
+  if (binding.pinReleasedAt != null) return 'released'
+  if ((binding.connectionGeneration ?? '').trim().length > 0) return 'lost'
+  return 'never-established'
+}
+
+/**
+ * A token that has outlived its pin, or null when the pin's absence is accounted for (o3d-9tbz r6).
+ *
+ * WHY AN ABSENT PIN CANNOT SIMPLY BE EXEMPT. Round 5 refuses a pin and a token that name different
+ * organisations. Every refusal has to survive the question "what does someone who wants it gone do?",
+ * and the answer here was one statement: delete the pin. Worse, nobody has to want it gone — restoring
+ * `settings` and `accounting_tokens` from different backups is the scenario the refusal exists for, and
+ * a `settings` dump from before the pin was written restores no pin at all. The guard was therefore
+ * absent in precisely the case it was written for.
+ *
+ * WHAT IT IS KEYED ON, and why that is not forgeable. `connectionGeneration` is minted by
+ * `bindXeroTenant` with `crypto.randomUUID()` INSIDE the transaction that writes the pin, and
+ * `disconnect()` deletes the token row and the pin row together. Those are the only two writers, so in
+ * every state IMS can produce, a token row carrying a generation has a pin beside it. If the generation
+ * is here and the pin is not, something outside IMS removed the pin. Nothing an operator can type, and
+ * nothing a restore of the SETTINGS table can do, puts a generation on a token row — a deletion cannot
+ * forge a value in a table it does not touch. To make a pin-deleted instance look never-bound you have
+ * to write to `accounting_tokens` itself, at which point you could equally have written a token and a
+ * pin of your own choosing: it is not an escalation, it is the same authority the binding already has.
+ *
+ * AND WHY IT IS NOT ACCIDENTALLY TRIPPED. The two legitimate states are exempt by their own evidence
+ * rather than by luck. A genuine FIRST connection has no token row at all, so this is never asked. A
+ * connection made before the generation column existed carries null and stays exempt exactly as it was
+ * in r5 — this deploy takes no working installation offline. And the documented recovery is exempt
+ * because it now leaves a receipt: `--clear-tenant-pin` deletes the pin and stamps `pinReleasedAt` in
+ * one transaction. Every other route to an absent pin is the one being refused.
+ */
+export function xeroMissingPinRefusal(
+  stored: XeroConnectionSummary,
+  binding: XeroStoredBinding,
+): string | null {
+  if (xeroPinAbsenceVerdict(binding) !== 'lost') return null
+  const who = describeXeroConnections([stored])
+  return (
+    `Xero sync is halted: this instance's Xero binding has lost its pin. The stored token belongs to `
+    + `${who}, and it was written by a consent that pinned this instance to that organisation in the `
+    + `same database transaction — the token row still carries that consent's connection marker — but `
+    + `the xero_expected_tenant_id setting is no longer there. IMS never removes one without the other: `
+    + `Disconnect deletes the token and the pin together. So the pin was removed separately, and with it `
+    + `went the only record of which organisation this instance was bound to; what is left is a token `
+    + `that nothing checks, and an unverifiable binding is not permission to post into a ledger. `
+    + `No Xero request was made. `
+    + `To fix it: on /sync press Disconnect — that clears the token and the pin together, leaving neither `
+    + `half to contradict the next one — then connect again and choose the organisation this instance is `
+    + `meant to use. That is the whole remedy: nothing in the server .env needs editing. Writing the `
+    + `setting back by hand is NOT one — a pin typed in beside a token that came from somewhere else `
+    + `only makes the two agree, which is not the same as the binding being right. `
+    + `If you cleared the pin deliberately in order to re-consent after a Xero Demo reset, clear it with `
+    + `scripts/provision-xero-demo.ts --clear-tenant-pin, which deletes the pin and records the release `
+    + `on the token row in one transaction; a connection released that way is not halted, and the `
+    + `release ends by itself at the next connect. A pin removed any other way cannot be told apart from `
+    + `one that was lost. `
+    + `If you are auditing what this instance has already posted, look in ${who}: everything it wrote `
+    + `went to the token's organisation. The usual causes are a settings table and an accounting_tokens `
+    + `table restored from different backups, a database copied here from another environment, or a `
+    + `hand-run delete of the xero_expected_tenant_id row.`
+  )
+}
+
+/**
+ * The one question the sync path asks about the binding: is it whole?
+ *
+ * Two refusals, one per state of the pin, and they cannot both apply — a pin either exists and is
+ * compared, or does not and is accounted for. They are asked together so no caller can add the second
+ * check to one call site and forget the other two, which is what `storedXeroConnectionRefusal` already
+ * exists to prevent for the allow-list and the demo requirement.
+ */
+export function xeroBindingRefusal(
+  stored: XeroConnectionSummary,
+  pinnedTenantId: string | null | undefined,
+  binding: XeroStoredBinding,
+): string | null {
+  if ((pinnedTenantId ?? '').trim().length > 0) return xeroBindingMismatchRefusal(stored, pinnedTenantId)
+  return xeroMissingPinRefusal(stored, binding)
 }
 
 /**
@@ -598,11 +744,11 @@ export function storedXeroConnectionRefusal(
  * posting with them anyway — the token, not the pin, is what every Xero call presents. Choosing the
  * token would silently ratify whatever arrived in the database. So neither is trusted: the sync stops.
  *
- * AN ABSENT PIN IS NOT A MISMATCH. A token with no pin beside it is an ordinary, supported state — every
- * connection made before the pin was written is in it, and `provision-xero-demo.ts --clear-tenant-pin`
- * deliberately produces it so a human can re-consent after a ~28-day Demo reset. Refusing it would take
- * a documented recovery procedure and an unknown number of working installations offline, which is a far
- * larger outage than the one being prevented. Only a pin that EXISTS and DISAGREES is refused.
+ * AN ABSENT PIN IS NOT A MISMATCH — there is nothing to compare, and this function says so by returning
+ * null. It is NOT thereby permitted: an absent pin is its own question, with its own evidence and its
+ * own refusal, and it is asked by `xeroMissingPinRefusal` immediately below. Splitting the two keeps
+ * each message about the state it describes; collapsing them would put "bound to two organisations at
+ * once" on the screen of an instance that is bound to one and has lost the record of it.
  */
 export function xeroBindingMismatchRefusal(
   stored: XeroConnectionSummary,

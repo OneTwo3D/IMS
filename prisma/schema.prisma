@@ -2316,6 +2316,13 @@ model AccountingToken {
   // it. NULL = a row written before this column existed (its generation is "the one with
   // no generation", which the same predicate matches until something rebinds).
   connectionGeneration String?
+  // o3d-9tbz r6: set ONLY by the documented Demo-reset recovery
+  // (scripts/provision-xero-demo.ts --clear-tenant-pin), which deletes the pin and stamps this
+  // column in ONE transaction. It is what separates a pin that was deliberately released from a
+  // pin that was DELETED or lost: with `connectionGeneration` present the token row proves a
+  // binding once wrote a pin beside it, so an absent pin means the pin went away on its own and
+  // the sync halts. NULL = never released. Cleared by the next binding, which writes a pin again.
+  pinReleasedAt DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

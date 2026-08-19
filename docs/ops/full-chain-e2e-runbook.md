@@ -215,6 +215,12 @@ it will **not** restore stage on the new owner's behalf.
      include`. Disconnecting clears the pin; neither `XERO_REQUIRE_DEMO_ORG` nor
      `XERO_BLOCKED_TENANT_IDS` needs an edit. Re-consent from **one** tab: two callbacks in flight at
      once bind one organisation and the other is refused, telling you to disconnect and retry.
+
+     If you clear the pin from the database instead, use
+     `provision-xero-demo.ts --clear-tenant-pin` — it deletes the pin **and** records the release on
+     the token row in one transaction. Deleting the `xero_expected_tenant_id` row by hand does not,
+     and IMS halts the sync on a token that has outlived its pin (o3d-9tbz r6): an absent pin used to
+     be an exemption from the split-binding refusal, i.e. a way to switch it off.
   2. Re-consent the connection (Settings → Accounting → Xero → Connect).
   3. Re-run the **Demo provisioner** so the accounts/currencies/bank accounts/VAT rates the specs
      expect exist again (o3d-lgo.9).

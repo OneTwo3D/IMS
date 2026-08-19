@@ -83,8 +83,11 @@ export async function preflight(): Promise<PreflightReport> {
   await db.connect()
   try {
     // --- Xero connection + tenant identity
-    const tok = await db.query<{ tenantName: string; tenantId: string }>(
-      `select "tenantName", "tenantId" from accounting_tokens where connector = 'xero'`,
+    const tok = await db.query<{
+      tenantName: string; tenantId: string; connectionGeneration: string | null; pinReleasedAt: Date | null
+    }>(
+      `select "tenantName", "tenantId", "connectionGeneration", "pinReleasedAt"
+         from accounting_tokens where connector = 'xero'`,
     )
     if (!tok.rows.length) {
       problems.push('No Xero connection on this instance. A human must consent at /sync?connector=xero.')
@@ -125,6 +128,20 @@ export async function preflight(): Promise<PreflightReport> {
         problems.push(
           `xero_expected_tenant_id (${pin.rows[0].value}) does not match the connected tenant (${tenantId}). ` +
             `The Demo probably reset — run: provision-xero-demo.ts --clear-tenant-pin, reconnect, then re-provision.`,
+        )
+      }
+      // A pin that has GONE MISSING halts every Xero sync as of o3d-9tbz r6, and it halts it silently
+      // as far as a spec is concerned: the failures land later, on whatever posts first. Diagnosed here
+      // instead, because the state is one hand-run DELETE (or one settings-only restore) away and the
+      // rig is exactly where somebody does that.
+      const { connectionGeneration, pinReleasedAt } = tok.rows[0]
+      if (!pin.rows.length && connectionGeneration !== null && pinReleasedAt === null) {
+        problems.push(
+          `The Xero tenant pin (xero_expected_tenant_id) is missing, but the token row still carries the ` +
+            `connection marker its binding minted — so the pin was deleted rather than released, and IMS ` +
+            `halts every Xero sync until it is resolved. Fix it by disconnecting on /sync and connecting ` +
+            `again, or — to be unpinned on purpose — run provision-xero-demo.ts --clear-tenant-pin, which ` +
+            `records the release on the token row in the same transaction.`,
         )
       }
     }

@@ -4,9 +4,26 @@ import test from 'node:test'
 import {
   demoOrgConnectRefusal, demoOrgStoredRefusal, describeXeroConnections, isXeroTenantAllowed,
   nameOnlyGuardWarning, readXeroTenantAllowList, selectXeroTenant, storedTenantRefusalMessage,
-  storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroTenantBindingRaceMessage, xeroTenantVerdict,
-  type XeroConnectionSummary,
+  storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroMissingPinRefusal, xeroPinAbsenceVerdict,
+  xeroTenantBindingRaceMessage, xeroTenantVerdict,
+  type XeroConnectionSummary, type XeroStoredBinding,
 } from '@/lib/connectors/xero/tenant-guard'
+
+/**
+ * What the TOKEN ROW says about its own binding (o3d-9tbz r6) — the three states an absent pin can be in.
+ *
+ * These are not decoration. `storedXeroConnectionRefusal` now takes them as a required argument, because
+ * the hole this round closes was an absent value being read as permission: BOUND with no pin beside it
+ * is the bypass, and the other two are the states that must keep working.
+ */
+/** Written by a binding: the transaction that minted this marker wrote the pin in the same breath. */
+const BOUND: XeroStoredBinding = { connectionGeneration: 'gen-a1b2', pinReleasedAt: null }
+/** A row from before the marker existed. Evidence of nothing — every pre-pin installation is here. */
+const PRE_MARKER: XeroStoredBinding = { connectionGeneration: null, pinReleasedAt: null }
+/** The documented recovery's receipt: --clear-tenant-pin deleted the pin and stamped this together. */
+const RELEASED: XeroStoredBinding = {
+  connectionGeneration: 'gen-a1b2', pinReleasedAt: new Date('2026-08-19T09:00:00.000Z'),
+}
 
 /**
  * o3d-9tbz. `selectTenantConnection` used to return `connections[0]` whenever no tenant was pinned, and
@@ -753,15 +770,15 @@ test('the stored check applies the allow-list FIRST, so the message names the bi
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
     XERO_REQUIRE_DEMO_ORG: 'true',
   })
-  const refusal = storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: false }, allowList, LIVE.tenantId)
+  const refusal = storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: false }, allowList, LIVE.tenantId, BOUND)
   assert.match(refusal ?? '', /allow-list forbids/)
 
   assert.equal(
-    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: true }, allowList, DEMO.tenantId), null,
+    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: true }, allowList, DEMO.tenantId, BOUND), null,
     'an allowed demo organisation passes both',
   )
   assert.match(
-    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: null }, allowList, DEMO.tenantId) ?? '',
+    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: null }, allowList, DEMO.tenantId, BOUND) ?? '',
     /XERO_REQUIRE_DEMO_ORG/,
     'and an allow-listed organisation with no proof is still refused',
   )
@@ -770,7 +787,9 @@ test('the stored check applies the allow-list FIRST, so the message names the bi
 test('with the requirement off, an unverified stored token is untouched', () => {
   // Every installation that predates the column is in this state. It must not become an outage. Those
   // installations predate the PIN too, so the honest value for it here is "there is not one".
-  assert.equal(storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: null }, NO_ALLOW_LIST, null), null)
+  assert.equal(
+    storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: null }, NO_ALLOW_LIST, null, PRE_MARKER), null,
+  )
 })
 
 
@@ -779,7 +798,7 @@ test('with the requirement off, an unverified stored token is untouched', () => 
 test('a pin and a token naming different organisations halt the sync, naming both', () => {
   // The state rounds 3 and 4 stopped being CREATED, on an instance that already has one. Nothing runs
   // on deploy, so unless the read path asks, such an instance syncs into the token's ledger forever.
-  const message = storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, DEMO.tenantId)
+  const message = storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, DEMO.tenantId, BOUND)
 
   assert.match(message ?? '', /bound to two different Xero organisations at once/)
   assert.match(message ?? '', new RegExp(DEMO.tenantId), 'the pin is named')
@@ -792,7 +811,7 @@ test('the split-binding refusal trusts NEITHER side, and says which one did the 
   // Preferring the pin would leave the token in place and go on posting with it; preferring the token
   // would ratify whatever arrived in the database. The operator needs to know that the damage, if any,
   // is in the TOKEN'S organisation — that is where an audit has to look.
-  const message = storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, DEMO.tenantId) ?? ''
+  const message = storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, DEMO.tenantId, BOUND) ?? ''
 
   assert.match(message, /will not guess which of the two/)
   assert.match(message, /the binding is simply unknown/)
@@ -806,7 +825,7 @@ test('the split binding is reported BEFORE the allow-list, whose remedy it would
   // storedTenantRefusalMessage offers "permit the stored organisation in the .env". An operator who does
   // exactly that on a mismatched instance permits an organisation their own pin denies and lands in the
   // mismatch refusal instead — a remedy whose faithful execution produces a new refusal.
-  const message = storedXeroConnectionRefusal(LIVE, DEMO_BY_ID, DEMO.tenantId) ?? ''
+  const message = storedXeroConnectionRefusal(LIVE, DEMO_BY_ID, DEMO.tenantId, BOUND) ?? ''
 
   assert.match(message, /bound to two different Xero organisations at once/)
   assert.doesNotMatch(message, /allow-list forbids/)
@@ -819,24 +838,98 @@ test('a self-contradictory .env is still reported first — no other remedy can 
   })
   assert.notEqual(conflicted.conflict, null)
 
-  const message = storedXeroConnectionRefusal(LIVE, conflicted, DEMO.tenantId) ?? ''
+  const message = storedXeroConnectionRefusal(LIVE, conflicted, DEMO.tenantId, BOUND) ?? ''
   assert.match(message, /contradict each other/)
 })
 
-test('NO pin beside a token is not a mismatch — it is the documented Demo-reset state', () => {
-  // provision-xero-demo.ts --clear-tenant-pin deliberately produces exactly this so a human can
-  // re-consent after a ~28-day reset, and every connection made before the pin existed is in it too.
-  // Refusing it would take a documented recovery procedure offline.
-  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, null), null)
-  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, undefined), null)
-  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, '   '), null, 'nor a blank one')
+test('NO pin beside a token is not a MISMATCH — there is nothing to compare', () => {
+  // Whether it is permitted is a different question, asked below. What must not happen is the
+  // two-organisations message being shown to an instance that names one organisation and has mislaid
+  // the record of it.
+  const absent = storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, null, PRE_MARKER)
+  assert.equal(absent, null)
+  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, undefined, PRE_MARKER), null)
+  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, '   ', PRE_MARKER), null, 'nor a blank one')
+})
+
+
+// --- an absent pin is not a licence (r6) --------------------------------------
+//
+// r5 exempted an absent pin outright, so the refusal above was one `DELETE FROM settings` away from
+// being switched off — and a settings table restored from a different backup than accounting_tokens
+// arrives there without anybody deleting anything, which is the very scenario r5 was written for.
+
+test('a pin that was DELETED is refused: the token row still carries its binding marker', () => {
+  const message = xeroMissingPinRefusal(LIVE, BOUND) ?? ''
+
+  assert.equal(xeroPinAbsenceVerdict(BOUND), 'lost')
+  assert.match(message, /has lost its pin/)
+  assert.match(message, /OneTwo3D Ltd/, 'the organisation the token belongs to, by name')
+  assert.match(message, new RegExp(LIVE.tenantId), 'and by id')
+  assert.match(message, /never removes one without the other/, 'why an absent pin is evidence at all')
+  assert.match(message, /No Xero request was made/)
+})
+
+test('the deleted-pin refusal is performable, and does not send the operator round a loop', () => {
+  const message = xeroMissingPinRefusal(LIVE, BOUND) ?? ''
+
+  assert.match(message, /press Disconnect/, 'the one action that clears both halves')
+  assert.match(message, /nothing in the server .env needs editing/)
+  assert.match(message, /Writing the setting back by hand is NOT one/,
+    'the obvious repair is the one that ratifies a token from somewhere else')
+  assert.match(message, /--clear-tenant-pin/, 'and the supported way to be unpinned on purpose')
+  assert.match(message, /everything it wrote went to the token's organisation/, 'where an audit looks')
+  assert.doesNotMatch(message, /XERO_ALLOWED_TENANT_IDS/, 'an env edit cannot repair a lost pin')
+})
+
+test('a RELEASED connection is not refused — the documented recovery must still work', () => {
+  // scripts/provision-xero-demo.ts --clear-tenant-pin deletes the pin and stamps the token row in one
+  // transaction. That receipt is the whole difference between a deliberate release and a deletion.
+  assert.equal(xeroPinAbsenceVerdict(RELEASED), 'released')
+  assert.equal(xeroMissingPinRefusal(LIVE, RELEASED), null)
+  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, null, RELEASED), null)
+})
+
+test('a token row from before the marker existed is exempt, exactly as it was in r5', () => {
+  // Every installation connected before this column shipped is in this state, and none of them may go
+  // offline on the deploy that adds it. The row is evidence of nothing, so it is not read as evidence.
+  assert.equal(xeroPinAbsenceVerdict(PRE_MARKER), 'never-established')
+  assert.equal(xeroMissingPinRefusal(LIVE, PRE_MARKER), null)
+})
+
+test('a blank generation is not a marker — an empty string proves nothing', () => {
+  assert.equal(xeroPinAbsenceVerdict({ connectionGeneration: '  ', pinReleasedAt: null }), 'never-established')
+})
+
+test('a release outranks the generation, or the recovery would halt the instance it recovers', () => {
+  // A released connection has BOTH markers: it was bound (generation) and then deliberately unpinned
+  // (receipt). Reading them the other way round refuses every rig that follows the runbook.
+  assert.equal(xeroPinAbsenceVerdict({ ...BOUND, pinReleasedAt: new Date() }), 'released')
+})
+
+test('the lost pin is refused BEFORE the allow-list, whose remedy would not repair it', () => {
+  // "Permit the stored organisation in the .env" is the wrong instruction for an instance whose binding
+  // record is missing: performing it faithfully leaves the sync halted for a different reason.
+  const message = storedXeroConnectionRefusal(LIVE, DEMO_BY_ID, null, BOUND) ?? ''
+
+  assert.match(message, /has lost its pin/)
+  assert.doesNotMatch(message, /allow-list forbids/)
+})
+
+test('a pin that is PRESENT is compared, never treated as an absence', () => {
+  // The two refusals are mutually exclusive by construction, and a mismatched instance must get the
+  // message about its mismatch — the one that names both organisations.
+  assert.match(
+    storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, DEMO.tenantId, BOUND) ?? '',
+    /bound to two different Xero organisations at once/,
+  )
 })
 
 test('a pin that agrees with the token changes nothing', () => {
   // The overwhelmingly common state, and the one this must not touch.
-  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, LIVE.tenantId), null)
+  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, LIVE.tenantId, BOUND), null)
   assert.equal(
-    storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, ` ${LIVE.tenantId.toUpperCase()} `), null,
+    storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, ` ${LIVE.tenantId.toUpperCase()} `, BOUND), null,
     'compared the way every other id here is compared — case and whitespace are not a disagreement',
   )
 })

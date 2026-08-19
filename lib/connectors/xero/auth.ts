@@ -19,7 +19,7 @@ import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from '
 import {
   demoOrgConnectRefusal, nameOnlyGuardWarning, readXeroTenantAllowList, selectXeroTenant,
   storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroTenantBindingRaceMessage,
-  type XeroConnectionSummary, type XeroTenantAllowList,
+  type XeroConnectionSummary, type XeroStoredBinding, type XeroTenantAllowList,
 } from './tenant-guard'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
@@ -80,6 +80,15 @@ type StoredAccountingToken = {
    * and the predicate matches null to null so those instances keep refreshing without a reconnect.
    */
   connectionGeneration: string | null
+  /**
+   * When the pin was deliberately released by the documented Demo-reset recovery — or null (r6).
+   *
+   * Read here for the same reason the generation is: it is compared AT THE WRITE. A refresh that began
+   * before a release must not carry a stale "not released" back over a row that has since been
+   * released, because that would silently re-arm the missing-pin halt about half an hour after an
+   * operator performed a documented recovery correctly.
+   */
+  pinReleasedAt: Date | null
 }
 
 type OAuthStatePayload = {
@@ -132,6 +141,7 @@ async function readStoredToken(): Promise<StoredAccountingToken | null> {
     grantedScopes: row.grantedScopes,
     tenantIsDemo: row.tenantIsDemo ?? null,
     connectionGeneration: row.connectionGeneration ?? null,
+    pinReleasedAt: row.pinReleasedAt ?? null,
   }
 }
 
@@ -146,15 +156,16 @@ type StoredTokenWrite = {
 }
 
 /**
- * The row to write, for the ONE generation named.
+ * The row to write, for the ONE binding state named.
  *
- * The generation is a separate argument rather than a field of `StoredTokenWrite` on purpose: the two
- * writers answer it differently and neither answer is a default. A binding MINTS one, because a consent
- * is a new connection; a refresh CARRIES THE READ ONE FORWARD, because a refresh is the same connection
- * continuing. Folding it into the payload would let a future writer inherit whichever answer happened to
- * be lying around, and the whole value of the marker is that it means exactly one thing.
+ * The markers are a separate argument rather than fields of `StoredTokenWrite` on purpose: the two
+ * writers answer them differently and neither answer is a default. A binding MINTS a generation and
+ * ENDS any release, because a consent is a new connection and it writes a pin. A refresh CARRIES BOTH
+ * FORWARD unchanged, because a refresh is the same connection continuing and learns nothing about its
+ * pin. Folding them into the payload would let a future writer inherit whichever answer happened to be
+ * lying around, and the whole value of these markers is that each means exactly one thing.
  */
-function storedTokenRow(params: StoredTokenWrite, connectionGeneration: string | null) {
+function storedTokenRow(params: StoredTokenWrite, markers: XeroStoredBinding) {
   return {
     connector: XERO_CONNECTOR,
     accessToken: encryptSecret(params.accessToken),
@@ -164,7 +175,8 @@ function storedTokenRow(params: StoredTokenWrite, connectionGeneration: string |
     tenantName: params.tenantName,
     grantedScopes: params.grantedScopes,
     tenantIsDemo: params.tenantIsDemo,
-    connectionGeneration,
+    connectionGeneration: markers.connectionGeneration,
+    pinReleasedAt: markers.pinReleasedAt,
   }
 }
 
@@ -232,11 +244,22 @@ async function storeRefreshedToken(previous: StoredAccountingToken, params: Stor
       tenantId: params.tenantId,
       id: previous.id,
       connectionGeneration: previous.connectionGeneration,
+      // The release is in the predicate for the same reason the generation is, and it catches something
+      // the generation cannot: a release does NOT rebind, so it leaves the id, the tenant and the
+      // generation exactly as this refresh read them (r6). A refresh that began before
+      // `--clear-tenant-pin` would otherwise write its own "not released" back over the row and re-arm
+      // the missing-pin halt roughly half an hour after an operator performed the documented recovery
+      // correctly — a refusal manufactured by the fix, aimed at somebody who did the right thing.
+      pinReleasedAt: previous.pinReleasedAt,
     },
-    // A refresh is the same connection continuing, so it carries the generation it read rather than
-    // minting one. Writing a new value here would make every refresh look like a rebinding to the next
-    // refresh in flight, and re-open this hole from the other side.
-    data: storedTokenRow(params, previous.connectionGeneration),
+    // A refresh is the same connection continuing, so it carries the markers it read rather than minting
+    // or clearing them. Writing a new generation here would make every refresh look like a rebinding to
+    // the next refresh in flight and re-open that hole from the other side; clearing the release would
+    // undo a recovery a refresh knows nothing about.
+    data: storedTokenRow(params, {
+      connectionGeneration: previous.connectionGeneration,
+      pinReleasedAt: previous.pinReleasedAt,
+    }),
   })
   return count > 0
 }
@@ -254,13 +277,28 @@ async function readPinnedTenantId(): Promise<string | null> {
   return await getSettingValue(XERO_EXPECTED_TENANT_KEY)
 }
 
+/**
+ * What the next consent must match: the pin, or the organisation an unpinned token already belongs to.
+ *
+ * THE TOKEN FALLBACK IS RIGHT, EXCEPT AFTER A RELEASE (o3d-9tbz r6). Falling back to the stored token's
+ * own organisation is what keeps an unpinned instance re-consenting to itself. But the ~28-day Demo
+ * reset re-creates the organisation with a NEW tenantId, so on the one path that exists to prepare for
+ * that — `--clear-tenant-pin` — the fallback answered with the RETIRED tenantId and the reconnect was
+ * refused as `pinned-not-offered`: a documented recovery that could not be completed, and the pin was
+ * not even the thing refusing it. A release says, in the database and on purpose, that this instance is
+ * waiting to be told which organisation it belongs to; the fallback is the one thing that must not
+ * answer that question for it. Everything else still applies to the consent — the allow-list, the demo
+ * requirement, and the refusal to guess between two organisations.
+ */
 async function getExpectedTenantId(): Promise<string | null> {
   const token = await db.accountingToken.findUnique({
     where: { connector: XERO_CONNECTOR },
-    select: { tenantId: true },
+    select: { tenantId: true, pinReleasedAt: true },
   })
   const stored = await getSettingValue(XERO_EXPECTED_TENANT_KEY)
-  return stored ?? token?.tenantId ?? null
+  if (stored) return stored
+  if (token?.pinReleasedAt != null) return null
+  return token?.tenantId ?? null
 }
 
 /**
@@ -322,7 +360,10 @@ async function bindXeroTenant(params: {
       // makes "the connection a refresh belongs to" a thing the database can compare, rather than
       // something only the tenant id stands in for — and it changes on the update path as well as the
       // insert path, because a re-consent to the same organisation is a new connection too (r5).
-      const data = storedTokenRow(token, newConnectionGeneration())
+      // ...and no release: a binding writes a pin, so whatever release was outstanding is over. It is
+      // cleared HERE, in the transaction that writes the pin, rather than by the recovery script, so the
+      // exemption lasts exactly as long as the state it describes (r6).
+      const data = storedTokenRow(token, { connectionGeneration: newConnectionGeneration(), pinReleasedAt: null })
       await tx.accountingToken.upsert({ where: { connector: XERO_CONNECTOR }, create: data, update: data })
     })
     return { ok: true }
@@ -450,7 +491,9 @@ async function storedTenantAllowed(token: StoredAccountingToken): Promise<boolea
   // The pin is read HERE, on the path that decides whether a sync happens, because that is the only
   // place a split binding can be acted on. Nothing runs on deploy, and an instance that already has one
   // would otherwise go on syncing off the token forever (r5 finding 1).
-  const message = storedXeroConnectionRefusal(summary, allowList, await readPinnedTenantId())
+  const message = storedXeroConnectionRefusal(
+    summary, allowList, await readPinnedTenantId(), storedBinding(token),
+  )
   if (message === null) {
     allowListWarnedTenantId = null
     await warnNameOnlyGuard(allowList, token.tenantId)
@@ -488,7 +531,10 @@ export async function getStoredTenantBlockReason(): Promise<string | null> {
   const [row, pinnedTenantId] = await Promise.all([
     db.accountingToken.findUnique({
       where: { connector: XERO_CONNECTOR },
-      select: { tenantId: true, tenantName: true, tenantIsDemo: true },
+      select: {
+        tenantId: true, tenantName: true, tenantIsDemo: true,
+        connectionGeneration: true, pinReleasedAt: true,
+      },
     }),
     readPinnedTenantId(),
   ])
@@ -497,12 +543,24 @@ export async function getStoredTenantBlockReason(): Promise<string | null> {
     { tenantId: row.tenantId, tenantName: row.tenantName, isDemoCompany: row.tenantIsDemo ?? null },
     readXeroTenantAllowList(),
     pinnedTenantId,
+    { connectionGeneration: row.connectionGeneration ?? null, pinReleasedAt: row.pinReleasedAt ?? null },
   )
 }
 
 /** The stored connection as the guard sees it — including what it knows about the organisation. */
 function storedSummary(token: StoredAccountingToken): XeroConnectionSummary {
   return { tenantId: token.tenantId, tenantName: token.tenantName, isDemoCompany: token.tenantIsDemo }
+}
+
+/**
+ * What the token row itself proves about its own binding (o3d-9tbz r6).
+ *
+ * Both markers are read from the row that was already fetched, so asking the question costs no extra
+ * query on the sync path — which matters, because the question is asked on every single use of the
+ * token.
+ */
+function storedBinding(token: StoredAccountingToken): XeroStoredBinding {
+  return { connectionGeneration: token.connectionGeneration, pinReleasedAt: token.pinReleasedAt }
 }
 
 /**
@@ -926,6 +984,12 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
  * post-disconnect reconnect could silently land on a different organisation — is GONE as of o3d-9tbz.
  * Clearing the pin here now means the next consent must be unambiguous by itself: one organisation
  * offered, or an allow-list that narrows it to one, or IMS refuses and asks.
+ *
+ * ONE TRANSACTION, and that is load-bearing beyond atomicity (o3d-9tbz r6): because the token row and
+ * the pin go together, a token row that still carries its binding marker while the pin is gone proves
+ * the pin was removed by something that is not this function — which is exactly what
+ * `xeroMissingPinRefusal` reads it as. Splitting these two statements would make a deleted pin
+ * indistinguishable from an interrupted disconnect and re-open the hole from inside IMS.
  */
 export async function disconnect(): Promise<void> {
   await db.$transaction([
@@ -978,7 +1042,7 @@ export async function isConnected(): Promise<{
   if (!token) return { connected: false }
 
   const blockedReason = storedXeroConnectionRefusal(
-    storedSummary(token), readXeroTenantAllowList(), await readPinnedTenantId(),
+    storedSummary(token), readXeroTenantAllowList(), await readPinnedTenantId(), storedBinding(token),
   )
   if (blockedReason !== null) {
     return {

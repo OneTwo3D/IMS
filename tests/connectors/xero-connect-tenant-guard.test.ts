@@ -60,6 +60,14 @@ import test, { beforeEach, mock } from 'node:test'
  *     organisations without any callback ever having run — the deployed state rounds 3 and 4 do nothing
  *     about, and the one a restored dump arrives in.
  *
+ * THE TWO TABLES MOVE INDEPENDENTLY (o3d-9tbz r6), which is what an absent pin is about. `settings` and
+ * the token row are separate state here and can be manipulated separately, so the double can express
+ * the three states an absent pin comes in and which r5 could not tell apart: `pinDeleted()` (the
+ * bypass — a bound row whose settings entry was removed), `releasedPin()` (the documented recovery,
+ * which stamps the token row in the same breath), and `unpinnedLegacyRow()` (a connection older than
+ * any of it). A double that only ever deleted the pin would pass against the bug, because under r5 all
+ * three are the same state.
+ *
  * `fetchedUrls` records every call that reached Xero, so "no Xero request was made" can be asserted
  * rather than assumed — the refusal claims it, and an expired token makes the claim load-bearing.
  */
@@ -75,6 +83,7 @@ type TokenRow = {
   grantedScopes: string | null
   tenantIsDemo: boolean | null
   connectionGeneration: string | null
+  pinReleasedAt: Date | null
 }
 
 const LIVE = { id: 'c-live', tenantId: 'e7fb4378-live-org', tenantName: 'OneTwo3D Ltd', tenantType: 'ORGANISATION' }
@@ -222,11 +231,24 @@ async function awaitTokenRowLock(): Promise<void> {
   if (held) await held
 }
 
-/** Every field in the `where` compared against the row AS IT IS NOW — the write-time predicate. */
+/**
+ * Every field in the `where` compared against the row AS IT IS NOW — the write-time predicate.
+ *
+ * Timestamps are compared BY VALUE, as Postgres compares them, not by object identity. `pinReleasedAt`
+ * is in the predicate as of r6, and a double that compared Dates with === would pass a refresh that a
+ * real database rejects (and, worse, fail one it accepts) purely on which Date instance was handed
+ * around.
+ */
 function tokenRowMatches(where: Record<string, unknown>): boolean {
   if (!tokenRow) return false
   const row = tokenRow as unknown as Record<string, unknown>
-  return Object.entries(where).every(([field, value]) => row[field] === value)
+  return Object.entries(where).every(([field, value]) => {
+    const actual = row[field]
+    if (actual instanceof Date || value instanceof Date) {
+      return actual instanceof Date && value instanceof Date && actual.getTime() === value.getTime()
+    }
+    return actual === value
+  })
 }
 
 /** One interactive transaction: staged writes, committed together, discarded on throw. */
@@ -479,7 +501,44 @@ function pinnedTo(conn: typeof DEMO) {
     grantedScopes: 'accounting.transactions',
     tenantIsDemo: null,
     connectionGeneration: 'generation-before',
+    pinReleasedAt: null,
   }
+}
+
+/**
+ * THE BYPASS (o3d-9tbz r6): a bound instance whose PIN HAS BEEN DELETED, token row untouched.
+ *
+ * One `DELETE FROM settings WHERE key = 'xero_expected_tenant_id'` reaches this state from an ordinary
+ * connected instance, and so does restoring `settings` and `accounting_tokens` from different backups —
+ * which is the scenario the split-binding refusal was written for, so under r5 the refusal was absent
+ * exactly when it mattered. The token row is left carrying the generation its binding minted, which is
+ * the whole evidence: that transaction wrote the pin too, and only `disconnect()` removes both.
+ */
+function pinDeleted(conn: typeof DEMO) {
+  pinnedTo(conn)
+  delete settings.xero_expected_tenant_id
+}
+
+/**
+ * THE DOCUMENTED RECOVERY: `provision-xero-demo.ts --clear-tenant-pin`.
+ *
+ * It deletes the pin and stamps the token row in ONE transaction, so the release leaves a receipt that
+ * a deletion cannot. Written here as the script writes it, because the point under test is that the two
+ * states are distinguishable — not that some flag can be set.
+ */
+function releasedPin(conn: typeof DEMO) {
+  pinDeleted(conn)
+  tokenRow!.pinReleasedAt = new Date('2026-08-19T09:00:00.000Z')
+}
+
+/**
+ * A CONNECTION FROM BEFORE ANY OF THIS: no pin, and a token row with no generation to prove there ever
+ * was one. Every installation connected before r5 shipped is in this state, and none of them may go
+ * offline on the deploy that starts reading the marker.
+ */
+function unpinnedLegacyRow(conn: typeof DEMO) {
+  pinDeleted(conn)
+  tokenRow!.connectionGeneration = null
 }
 
 /**
@@ -1571,19 +1630,198 @@ test('the remedy WORKS: disconnect clears both halves and the reconnect binds on
   assert.equal((await getAccessToken())?.tenantId, pin.tenantId, 'and the sync runs again')
 })
 
-test('a token with NO pin beside it keeps working — the Demo-reset runbook depends on it', async () => {
-  // provision-xero-demo.ts --clear-tenant-pin deletes the pin and leaves the token, deliberately, so a
-  // human can re-consent after a ~28-day reset. Every connection made before the pin existed is in the
-  // same state. Treating "no pin" as a mismatch would take a documented recovery procedure and an
-  // unknown number of working installations offline.
-  const demo = { ...DEMO, tenantId: '5c949ed5-demo-no-pin' }
-  pinnedTo(demo)
-  delete settings.xero_expected_tenant_id
+/**
+ * AN ABSENT PIN IS NOT A LICENCE (o3d-9tbz r6).
+ *
+ * r5 exempted a token with no pin beside it, deliberately: that is what every pre-pin connection looks
+ * like and what `--clear-tenant-pin` produces. But the exemption was reachable by DELETING something.
+ * `DELETE FROM settings WHERE key = 'xero_expected_tenant_id'` switched the split-binding refusal off,
+ * and restoring `settings` and `accounting_tokens` from different backups arrives in the same state
+ * without anybody deleting anything — which is the scenario the refusal exists for, so it was absent
+ * precisely when it was needed.
+ *
+ * The token row can tell the two apart, because IMS wrote both halves of it: a `connectionGeneration`
+ * was minted by the binding transaction that also wrote the pin, and `disconnect()` deletes the token
+ * and the pin together. A deletion in `settings` cannot forge a value in `accounting_tokens`.
+ */
+
+test('a token whose PIN WAS DELETED stops syncing — an absent pin is not a licence', async () => {
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-pin-deleted' }
+  pinDeleted(demo)
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null, 'no token is handed out')
+  assert.deepEqual(fetchedUrls, [], 'and nothing was asked of Xero')
+
+  const refusal = activity.find((e) => e.action === 'xero_stored_tenant_refused')
+  assert.ok(refusal, 'the refusal is on the record, not only on somebody\'s screen')
+  assert.match(refusal.description, /has lost its pin/)
+  assert.match(refusal.description, new RegExp(demo.tenantId), 'the organisation the token belongs to')
+  assert.match(refusal.description, /press Disconnect/)
+  assert.match(refusal.description, /--clear-tenant-pin/, 'and the supported way to be unpinned')
+  assert.equal(notifications.length, 1, 'the operator is told once, not once per sync tick')
+})
+
+test('a deleted pin on an EXPIRED token is refused before the refresh, not after it', async () => {
+  // The claim "No Xero request was made" earns its keep here: the refresh path would otherwise present
+  // an unverifiable connection's credentials to Xero and store what came back.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-pin-deleted-expired' }
+  pinDeleted(demo)
+  tokenRow!.expiresAt = new Date(Date.now() - 1000)
+  const before = { ...tokenRow! }
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null)
+  assert.deepEqual(fetchedUrls, [], 'the identity endpoint was never called')
+  assert.deepEqual({ ...tokenRow! }, before, 'and the row was not touched')
+})
+
+test('a deleted pin reports NOT connected, with a Disconnect button to press', async () => {
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-pin-deleted-status' }
+  pinDeleted(demo)
+  const { isConnected, getStoredTenantBlockReason } = await loadAuth()
+
+  const status = await isConnected()
+
+  assert.equal(status.connected, false)
+  assert.equal(status.hasStoredToken, true, 'or the remedy would be a button that is not drawn')
+  assert.match(status.blockedReason ?? '', /has lost its pin/)
+  assert.equal(notifications.length, 0, 'isConnected runs on every render and must not notify')
+  assert.match(await getStoredTenantBlockReason() ?? '', /has lost its pin/)
+})
+
+test('the deleted-pin remedy WORKS: disconnect, then connect, and the sync runs again', async () => {
+  // A refusal is only as good as the instruction attached to it. This runs the instruction.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-pin-deleted-remedy' }
+  pinDeleted(demo)
+  const { getAccessToken, disconnect, exchangeCodeForTokens } = await loadAuth()
+  assert.equal(await getAccessToken(), null, 'halted to begin with')
+
+  await disconnect()
+  reconsentTo(demo, 'c2')
+  assert.equal((await exchangeCodeForTokens('c2', 'https://ims.example/cb')).success, true)
+
+  assert.equal(settings.xero_expected_tenant_id, demo.tenantId, 'the pin is back')
+  assert.equal((await getAccessToken())?.tenantId, demo.tenantId, 'and the halt lifts')
+})
+
+test('a genuine FIRST connection is untouched — there is no token row to have lost a pin', async () => {
+  // The state that must never be refused: nothing stored at all. This is also the o3d-t74p rig's state.
+  freshDatabase()
+  const { isConnected, getStoredTenantBlockReason, exchangeCodeForTokens } = await loadAuth()
+
+  assert.equal((await isConnected()).connected, false)
+  assert.equal((await isConnected()).blockedReason, undefined, 'not connected is not "blocked"')
+  assert.equal(await getStoredTenantBlockReason(), null)
+
+  connectionsBody = [DEMO]
+  assert.equal((await exchangeCodeForTokens('code-1', 'https://ims.example/cb')).success, true)
+  assert.equal(settings.xero_expected_tenant_id, DEMO.tenantId, 'and it pins itself on the way in')
+  assert.equal(tokenRow?.pinReleasedAt, null, 'with no release outstanding')
+})
+
+test('a connection RELEASED by the documented recovery keeps syncing', async () => {
+  // --clear-tenant-pin deletes the pin and stamps the token row in ONE transaction. That receipt is the
+  // difference between a deliberate release and a deletion, and it is what keeps the runbook working.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-released' }
+  releasedPin(demo)
+  const { getAccessToken, isConnected } = await loadAuth()
+
+  assert.equal((await getAccessToken())?.tenantId, demo.tenantId)
+  assert.equal((await isConnected()).connected, true)
+  assert.equal(activity.length, 0, 'and it is not an event worth recording')
+})
+
+test('a connection from before the binding marker keeps working with no pin', async () => {
+  // Every installation connected before that column shipped is in this state. A deploy that halted them
+  // all would be a far larger outage than the one being prevented, and it would be caused by the fix.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-legacy-unpinned' }
+  unpinnedLegacyRow(demo)
   const { getAccessToken, isConnected } = await loadAuth()
 
   assert.equal((await getAccessToken())?.tenantId, demo.tenantId)
   assert.equal((await isConnected()).connected, true)
   assert.equal(activity.length, 0)
+})
+
+test('THE DEMO-RESET RECOVERY, end to end: release, re-consent to the NEW tenantId, sync', async () => {
+  // Xero re-creates the Demo company with a NEW tenantId every ~28 days, which is why --clear-tenant-pin
+  // exists at all. The consent must therefore be free to land on an organisation the stored token has
+  // never seen — so the release has to silence the "fall back to the token's own tenantId" rule as well
+  // as the pin itself, or the reconnect is refused as pinned-not-offered and the runbook cannot be
+  // completed by anybody following it exactly.
+  const retired = { ...DEMO, tenantId: '5c949ed5-demo-retired-cycle' }
+  const rebuilt = { ...DEMO, tenantId: '5c949ed5-demo-rebuilt-cycle' }
+  releasedPin(retired)
+  const { getAccessToken, exchangeCodeForTokens, isConnected } = await loadAuth()
+  assert.equal((await isConnected()).connected, true, 'released, not halted, while it waits')
+
+  reconsentTo(rebuilt, 'c2')
+  const result = await exchangeCodeForTokens('c2', 'https://ims.example/cb')
+
+  assert.equal(result.success, true, 'the re-consent is accepted')
+  assert.equal(tokenRow?.tenantId, rebuilt.tenantId, 'the token now belongs to the rebuilt organisation')
+  assert.equal(settings.xero_expected_tenant_id, rebuilt.tenantId, 'and the pin is re-established')
+  assert.equal(tokenRow?.pinReleasedAt, null, 'the release ends at the connect that answers it')
+  assert.equal((await getAccessToken())?.tenantId, rebuilt.tenantId)
+})
+
+test('a released connection still refuses to guess between two organisations', async () => {
+  // A release says "I am waiting to be told which organisation I belong to". It does not say "take the
+  // first one offered" — that line is what put 150 invoices in the live ledger.
+  releasedPin({ ...DEMO, tenantId: '5c949ed5-demo-released-ambiguous' })
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  connectionsByCode = { c2: [LIVE, DEMO] }
+  accessTokenByCode = { c2: 'access-c2' }
+  const result = await exchangeCodeForTokens('c2', 'https://ims.example/cb')
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /will not guess which ledger to invoice into/)
+})
+
+test('an ordinary REFRESH on a released connection carries the release forward', async () => {
+  // Otherwise the halt re-arms itself about half an hour after an operator performed the documented
+  // recovery correctly — an outage manufactured by the guard, aimed at somebody who did the right thing.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-released-refresh' }
+  releasedPin(demo)
+  const released = tokenRow!.pinReleasedAt
+  tokenRow!.expiresAt = new Date(Date.now() - 1000)
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal((await getAccessToken())?.accessToken, 'access-1', 'the refresh lands')
+  assert.deepEqual(tokenRow?.pinReleasedAt, released, 'and the row is still released')
+
+  tokenRow!.expiresAt = new Date(Date.now() - 1000)
+  assert.equal((await getAccessToken())?.accessToken, 'access-1', 'and again at the next expiry')
+  assert.equal(activity.length, 0, 'no halt, no discarded refresh, nothing to explain')
+})
+
+test('a refresh in flight across a RELEASE cannot un-release the connection', async () => {
+  // The refresh read the row before --clear-tenant-pin ran and would write its own "not released" back
+  // over it — re-arming the halt from behind the operator. The release is in the write-time predicate
+  // for that reason, so the stale write matches nothing.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-release-race' }
+  dueForRefresh(demo)
+  const { getAccessToken, isConnected } = await loadAuth()
+
+  const refreshHeld = latch()
+  refreshGrantGate = refreshHeld.wait
+  const refreshing = getAccessToken()
+  await refreshHeld.reached
+
+  // --clear-tenant-pin, mid-flight: one transaction, both halves.
+  delete settings.xero_expected_tenant_id
+  tokenRow!.pinReleasedAt = new Date('2026-08-19T10:00:00.000Z')
+
+  refreshHeld.release()
+
+  assert.equal(await refreshing, null, 'the stale write is discarded')
+  assert.notEqual(tokenRow?.pinReleasedAt, null, 'the release survives it')
+  assert.equal(tokenRow?.accessToken, 'stored-access', 'and the row was not written at all')
+  assert.equal((await isConnected()).connected, true, 'so the recovery is not halted by its own refresh')
+  assert.ok(activity.some((e) => e.action === 'xero_refresh_discarded'), 'the blip is explainable')
+  assert.equal(notifications.length, 0, 'and it is not an incident to alarm anybody with')
 })
 
 test('an ordinary pinned instance is unaffected — pin and token name one organisation', async () => {

@@ -28,9 +28,14 @@
  *
  *   1. NODE_OPTIONS='--import tsx' node --env-file=.env \
  *        scripts/provision-xero-demo.ts --clear-tenant-pin
- *      The pin is ENFORCED on connect (selectTenantConnection() matches on
- *      tenantId), so a pin left over from the previous Demo makes the reconnect
- *      find no tenant. Clearing it first is not optional.
+ *      The pin is ENFORCED on connect (selectXeroTenant() matches on tenantId),
+ *      so a pin left over from the previous Demo makes the reconnect find no
+ *      tenant. Clearing it first is not optional. This RELEASES the connection:
+ *      it deletes the pin and stamps accounting_tokens.pinReleasedAt in one
+ *      transaction, which is what tells IMS the pin's absence was deliberate.
+ *      Deleting the settings row by hand does NOT do that and halts the sync
+ *      (o3d-9tbz r6) — use this flag, or press Disconnect on /sync, which
+ *      clears both halves and needs no script at all.
  *   2. A human re-consents at <public_app_url>/sync?connector=xero and picks
  *      "Demo Company (UK)". OAuth is interactive; it cannot be scripted.
  *   3. Re-run this script normally. It rebuilds the org and RE-PINS the new
@@ -226,20 +231,56 @@ async function remapOnly(db: Client) {
 }
 
 /**
- * Clear the tenant pin so a human can re-consent after a Demo reset.
+ * RELEASE the tenant pin so a human can re-consent after a Demo reset.
+ *
  * Needed because the pin is enforced on connect against a tenantId that no longer
- * exists; without clearing it the reconnect silently finds no tenant.
+ * exists; without clearing it the reconnect finds no tenant and is refused.
+ *
+ * TWO STATEMENTS, ONE TRANSACTION (o3d-9tbz r6). Deleting the pin on its own is
+ * indistinguishable from the pin having been LOST — a settings table restored from a
+ * different backup than accounting_tokens, or a hand-run delete — and IMS now halts
+ * the sync in that state rather than treating an absent pin as permission. What makes
+ * this release legitimate is the receipt it leaves on the token row: `pinReleasedAt`
+ * is stamped in the same transaction that removes the pin, so the two either both
+ * happen or neither does, and a crash between them cannot leave the rig halted with
+ * nothing to explain it. The receipt is cleared by the next connect, which writes a
+ * pin again — the exemption lasts exactly as long as the state it describes.
+ *
+ * `pinReleasedAt is null` in the UPDATE keeps a re-run idempotent: it does not move a
+ * release that is already outstanding.
  */
 async function clearTenantPin(db: Client) {
-  const before = await db.query<{ value: string }>(
-    `select value from settings where key = 'xero_expected_tenant_id'`,
-  )
-  if (!before.rows.length) {
-    console.log('tenant pin already absent — nothing to clear.')
-  } else {
-    await db.query(`delete from settings where key = 'xero_expected_tenant_id'`)
-    console.log(`cleared stale tenant pin (was ${before.rows[0].value}).`)
+  await db.query('begin')
+  let cleared: string | null = null
+  let released = 0
+  try {
+    const before = await db.query<{ value: string }>(
+      `delete from settings where key = 'xero_expected_tenant_id' returning value`,
+    )
+    cleared = before.rows.length ? before.rows[0].value : null
+    const stamped = await db.query(
+      `update accounting_tokens set "pinReleasedAt" = now(), "updatedAt" = now()
+         where connector = 'xero' and "pinReleasedAt" is null`,
+    )
+    released = stamped.rowCount ?? 0
+    await db.query('commit')
+  } catch (e) {
+    await db.query('rollback')
+    throw e
   }
+
+  console.log(
+    cleared === null
+      ? 'tenant pin already absent — nothing to clear.'
+      : `cleared stale tenant pin (was ${cleared}).`,
+  )
+  console.log(
+    released > 0
+      ? 'recorded the release on the Xero token row (accounting_tokens.pinReleasedAt), so IMS treats\n' +
+        'the missing pin as deliberate instead of halting the sync.'
+      : 'no Xero token row needed a release marker (either there is no connection, or it was already\n' +
+        'released).',
+  )
   console.log(
     '\nNext: reconnect at <public_app_url>/sync?connector=xero, choose "Demo Company (UK)",\n' +
       'then re-run this script WITHOUT --clear-tenant-pin to rebuild the org and re-pin.',
