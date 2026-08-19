@@ -25,7 +25,7 @@
  * id-only manifest check and a state-bound one identically, and prove nothing about either.
  */
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
@@ -86,7 +86,19 @@ import {
   SharedRunInProgressError,
   SharedUnresolvedWriteError,
   assertCoordinatorOwnsLedger,
+  assertCoordinatorAttested,
+  assertSessionContinuity,
+  CoordinatorNotAttestedError,
   LedgerCoordinatorMismatchError,
+  persistUnderFence,
+  readHeldAnswer,
+  SESSION_CONTINUITY_PROBES,
+  SESSION_MARK_SETTING,
+  SESSION_MARK_TABLE,
+  SessionDiscontinuityError,
+  STAGED_ARTEFACT_SUFFIX,
+  StagedArtefactStrandedError,
+  xeroCoordinatorFingerprint,
   readSettlementState,
   RESOLVED_SETTLEMENT_STATES,
   SETTLEMENT_STATES,
@@ -175,7 +187,10 @@ function fence(behaviour: {
     mode: 'exclusive',
     intents,
     settlements,
-    coordinator: { database: 'ims_test', connectionId: 'conn-test', tenantName: 'Test Org' },
+    coordinator: {
+      database: 'ims_test', databaseOid: '1', clusterId: 'cluster-test',
+      connectionId: 'conn-test', tenantName: 'Test Org', fingerprint: 'coord-test',
+    },
     assertStillHeld: async () => {},
     scanUnresolved: async () => [],
     async intend(entry) {
@@ -194,6 +209,22 @@ function fence(behaviour: {
 const LEDGER_UUID = '11111111-2222-4333-8444-555555555555'
 
 /**
+ * What the DEFAULT `FakeCoordinationDatabase` identity fingerprints to for `LEDGER_UUID` — i.e.
+ * what an operator would have attested for it. Computed rather than hard-coded, so a change to the
+ * fingerprint's inputs is a change in one place and not a hunt through 22 literals.
+ *
+ * Every --apply fence in this file carries it, because --apply now REFUSES without one (r9 finding
+ * 2). The tests that give it a wrong value, or none, are the ones that check the gate itself.
+ */
+const ATTESTED = xeroCoordinatorFingerprint({
+  tenantId: LEDGER_UUID,
+  clusterId: 'cluster-ims',
+  database: 'ims',
+  databaseOid: '16385',
+  connectionId: 'conn-ims',
+})
+
+/**
  * ONE PostgreSQL, reached by any number of SESSIONS — which is the whole point of the double.
  *
  * The defect under test is that a lock FILE and a log FILE describe one machine, so two runs on two
@@ -209,8 +240,16 @@ const LEDGER_UUID = '11111111-2222-4333-8444-555555555555'
 class FakeCoordinationDatabase {
   /** The `xero_live_write_intents` table. */
   readonly rows = new Map<string, Record<string, unknown>>()
-  /** key -> the sessions holding it, and how. */
+  /** key -> the BACKENDS holding it, and how. A lock belongs to a backend, never to a client. */
   private readonly locks = new Map<number, { exclusive: symbol | null; shared: Set<symbol> }>()
+  /**
+   * PER-BACKEND session state, which is what makes this double able to express r9 finding 1. A
+   * session GUC and a temp relation live on ONE backend; another backend of the same cluster has
+   * neither, however healthy the socket in front of them looks.
+   */
+  private readonly settings = new Map<symbol, string>()
+  private readonly temps = new Map<symbol, string>()
+  private nextPid = 4000
   /** Statements this database should refuse, by substring, for as long as it is set. */
   refuse: { match: string; message: string } | null = null
   /**
@@ -220,9 +259,22 @@ class FakeCoordinationDatabase {
    */
   connections: Array<{ connectionId: string; tenantId: string; tenantName: string }>
   readonly name: string
+  /** `pg_database.oid`, and the cluster's `system_identifier`. Both feed the coordinator fingerprint. */
+  readonly oid: string
+  /** `null` models a role without EXECUTE on pg_control_system(): the statement RAISES. */
+  readonly clusterId: string | null
 
-  constructor(options: { name?: string; tenantId?: string; connectionId?: string; connections?: Array<{ connectionId: string; tenantId: string; tenantName: string }> } = {}) {
+  constructor(options: {
+    name?: string
+    tenantId?: string
+    connectionId?: string
+    oid?: string
+    clusterId?: string | null
+    connections?: Array<{ connectionId: string; tenantId: string; tenantName: string }>
+  } = {}) {
     this.name = options.name ?? 'ims'
+    this.oid = options.oid ?? '16385'
+    this.clusterId = options.clusterId === undefined ? 'cluster-ims' : options.clusterId
     this.connections = options.connections ?? [{
       connectionId: options.connectionId ?? `conn-${this.name}`,
       tenantId: options.tenantId ?? LEDGER_UUID,
@@ -230,16 +282,41 @@ class FakeCoordinationDatabase {
     }]
   }
 
+  /** What this store would compute about itself, so a test can attest it without hard-coding a hash. */
+  fingerprint = (tenantId: string = LEDGER_UUID): string =>
+    xeroCoordinatorFingerprint({
+      tenantId,
+      clusterId: this.clusterId,
+      database: this.name,
+      databaseOid: this.oid,
+      connectionId: this.connections[0]?.connectionId ?? '(none)',
+    })
+
   /**
    * Free every lock a session holds WITHOUT ending the session — a reaped backend whose client
    * socket is still usable, an unlock issued out of band, a pooler that handed the next statement
    * to a different backend. It is the sharp version of the case under test: the connection answers
    * perfectly well, and the exclusion is gone.
    */
-  dropLocksOf = (session: { id: symbol }): void => {
+  dropLocksOf = (session: { ids: readonly symbol[] }): void => {
     for (const entry of this.locks.values()) {
-      if (entry.exclusive === session.id) entry.exclusive = null
-      entry.shared.delete(session.id)
+      for (const id of session.ids) {
+        if (entry.exclusive === id) entry.exclusive = null
+        entry.shared.delete(id)
+      }
+    }
+  }
+
+  /**
+   * Wipe one backend's SESSION state — the GUC and the temp relation — while leaving its locks and
+   * its socket alone. This is what a pooler's `DISCARD ALL` does between clients, and what a
+   * backend recycled from somebody else looks like: the lock question still answers yes, and the
+   * connection is no longer the session that took it.
+   */
+  discardSessionStateOf = (session: { ids: readonly symbol[] }): void => {
+    for (const id of session.ids) {
+      this.settings.delete(id)
+      this.temps.delete(id)
     }
   }
 
@@ -249,19 +326,68 @@ class FakeCoordinationDatabase {
     return entry
   }
 
-  /** One connection. `end()` — or `kill()` — frees everything it holds, as a real session does. */
-  session = (host: string): CoordinationClient & { kill: () => void; alive: boolean; id: symbol } => {
-    const id = Symbol(host)
+  /**
+   * ONE CLIENT, ONE BACKEND, for the life of the connection — a direct PostgreSQL session, which is
+   * what this tooling requires. `end()` — or `kill()` — frees everything it holds, as a real
+   * session does.
+   */
+  session = (host: string) => this.client(host, 1)
+
+  /**
+   * ONE CLIENT, SEVERAL BACKENDS, and each statement lands on whichever one comes next: a
+   * transaction-pooling proxy (r9 finding 1). Nothing about the client handle betrays it — connect
+   * succeeds, every statement succeeds, the socket never drops. What differs is that the backend
+   * that answers statement N+1 is not the one that answered statement N, so a lock taken on one is
+   * checked on another, and the session marks planted on one are invisible from the rest.
+   *
+   * Two backends is the smallest arrangement that expresses it; more only makes it easier to catch.
+   */
+  pooledSession = (host: string, backends = 2) => this.client(host, Math.max(2, backends))
+
+  private client = (host: string, backendCount: number): CoordinationClient & {
+    kill: () => void
+    alive: boolean
+    id: symbol
+    ids: symbol[]
+    pids: number[]
+    divert: () => void
+  } => {
+    const pool = Array.from({ length: backendCount }, (_, i) => ({
+      id: Symbol(`${host}#backend${i}`),
+      pid: ++this.nextPid,
+    }))
+    const ids = pool.map((b) => b.id)
     let alive = false
+    let next = 0
     const free = () => {
       for (const entry of this.locks.values()) {
-        if (entry.exclusive === id) entry.exclusive = null
-        entry.shared.delete(id)
+        for (const b of pool) {
+          if (entry.exclusive === b.id) entry.exclusive = null
+          entry.shared.delete(b.id)
+        }
+      }
+      for (const b of pool) {
+        this.settings.delete(b.id)
+        this.temps.delete(b.id)
       }
       alive = false
     }
     return {
-      id,
+      id: pool[0].id,
+      ids,
+      pids: pool.map((b) => b.pid),
+      /**
+       * START ROTATING NOW. A connection that was a session when the lock was taken and becomes a
+       * pooled one afterwards — a proxy reconfigured, a failover, a backend recycled underneath a
+       * long-lived handle. The acquisition-time probe cannot see this; the held check must.
+       */
+      divert: () => {
+        pool.push({ id: Symbol(`${host}#diverted`), pid: ++this.nextPid })
+        // The NEXT statement lands on the new backend, deterministically. Leaving it to the
+        // rotation counter would make the test pass or fail on how many statements happened to
+        // have been issued before it, which is a coin toss dressed as a test.
+        next = pool.length - 1
+      },
       get alive() { return alive },
       kill: free,
       connect: async () => { alive = true },
@@ -269,19 +395,54 @@ class FakeCoordinationDatabase {
       query: async (sql: string, params: unknown[] = []) => {
         if (!alive) throw new Error('Connection terminated unexpectedly')
         if (this.refuse && sql.includes(this.refuse.match)) throw new Error(this.refuse.message)
+        // WHICH BACKEND ANSWERS THIS STATEMENT. For a direct session it is always the same one; for
+        // a pooled one it rotates, and that single line is the entire defect being modelled.
+        const backend = pool[next++ % pool.length]
+        const id = backend.id
+
+        if (sql === SHARED_FENCE_SQL.session.mark) {
+          this.settings.set(id, String(params[0]))
+          return { rows: [{ pid: backend.pid, nonce: String(params[0]) }] }
+        }
+        if (sql === SHARED_FENCE_SQL.session.plant) {
+          // Not IF NOT EXISTS, exactly as production is not: a backend that already carries one was
+          // somebody else's session a moment ago.
+          if (this.temps.has(id)) throw new Error(`relation "${SESSION_MARK_TABLE}" already exists`)
+          this.temps.set(id, String(params[0]))
+          return { rows: [] }
+        }
+        if (sql === SHARED_FENCE_SQL.session.recall) {
+          return { rows: [{ pid: backend.pid, nonce: this.settings.get(id) ?? null, tempPresent: this.temps.has(id) }] }
+        }
+        if (sql === SHARED_FENCE_SQL.cluster) {
+          // A role without EXECUTE on pg_control_system() gets an error, not a null.
+          if (this.clusterId === null) throw new Error('permission denied for function pg_control_system')
+          return { rows: [{ clusterId: this.clusterId }] }
+        }
         if (sql === SHARED_FENCE_SQL.identify) {
           // A database with no Xero connection still answers — with one row whose columns are null,
           // exactly as the LEFT JOIN does. "No rows" would let the production code read absence as
           // an empty list rather than as an answer, which is the shape this file refuses everywhere.
           if (this.connections.length === 0) {
-            return { rows: [{ database: this.name, connectionId: null, tenantId: null, tenantName: null }] }
+            return { rows: [{ database: this.name, databaseOid: this.oid, connectionId: null, tenantId: null, tenantName: null }] }
           }
-          return { rows: this.connections.map((c) => ({ database: this.name, ...c })) }
+          return { rows: this.connections.map((c) => ({ database: this.name, databaseOid: this.oid, ...c })) }
         }
         if (sql === SHARED_FENCE_SQL.held) {
           const entry = this.held(Number(params[1]))
           const mine = params[2] === 'ExclusiveLock' ? entry.exclusive === id : entry.shared.has(id)
-          return { rows: [{ held: mine ? 1 : 0 }] }
+          // ALL FOUR ANSWERS COME FROM THE BACKEND THAT RAN THIS STATEMENT, because that is what
+          // one SQL statement means. A double that answered the lock question from the backend that
+          // took it and the session question from the one that ran the statement would be modelling
+          // a database that does not exist, and would hide the defect.
+          return {
+            rows: [{
+              held: mine ? 1 : 0,
+              pid: backend.pid,
+              nonce: this.settings.get(id) ?? null,
+              tempPresent: this.temps.has(id),
+            }],
+          }
         }
         const key = Number(params[1])
         if (sql === SHARED_FENCE_SQL.lock.exclusive) {
@@ -2750,7 +2911,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
 
     const lockA = acquireWriteLogLock({ tenantId: LEDGER, stateDir: dirA })
     const fenceA = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
     })
 
     // THE FINDING, demonstrated first: host B's FILE lock is free. Everything round 6 built is
@@ -2761,7 +2922,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     // And what stops it now.
     await assert.rejects(
       () => acquireSharedWriteFence({
-        tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-b'), setKeepalive: noKeepalive,
+        tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-b'), setKeepalive: noKeepalive,
       }),
       (e: Error) => e instanceof SharedRunInProgressError && /another run holds this LEDGER/i.test(e.message),
     )
@@ -2780,7 +2941,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     // Host A: intent recorded, request dispatched, and then the machine goes away.
     const sessionA = db.session('host-a')
     const fenceA = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => sessionA, setKeepalive: noKeepalive, hostId: 'host-a',
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => sessionA, setKeepalive: noKeepalive, hostId: 'host-a',
     })
     await fenceA.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
     sessionA.kill() // <<< the host dies: its session ends, so its advisory lock is freed too >>>
@@ -2791,7 +2952,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     assert.notEqual(dirA, dirB)
 
     const fenceB = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-b'), setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-b'), setKeepalive: noKeepalive,
     })
     const unresolved = await fenceB.scanUnresolved()
     assert.equal(unresolved.length, 1)
@@ -2812,7 +2973,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     const db = new FakeCoordinationDatabase()
     const session = db.session('host-a')
     const f = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => session, setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => session, setKeepalive: noKeepalive,
     })
     await f.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
     await f.settle({ id: 'runA-w1', runId: 'runA', state: 'committed', reason: 'Xero answered HTTP 200' })
@@ -2824,7 +2985,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
   test('a write settled as UNKNOWN still stops the next run, on any host', async () => {
     const db = new FakeCoordinationDatabase()
     const f = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
     })
     await f.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
     await f.settle({ id: 'runA-w1', runId: 'runA', state: 'unknown', reason: 'no usable response came back' })
@@ -2840,7 +3001,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     // as well as the id, so a colliding id cannot make somebody else's evidence disappear.
     const db = new FakeCoordinationDatabase()
     const f = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
     })
     await f.intend({ id: 'shared-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
     await assert.rejects(
@@ -2856,7 +3017,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     // so building it while an apply mutates the ledger underneath is planning from a moving state.
     const db = new FakeCoordinationDatabase()
     const applyRun = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
     })
     await assert.rejects(
       () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'shared', createClient: () => db.session('host-b'), setKeepalive: noKeepalive }),
@@ -2868,7 +3029,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
       tenantId: LEDGER, mode: 'shared', createClient: () => db.session('host-b'), setKeepalive: noKeepalive,
     })
     await assert.rejects(
-      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-c'), setKeepalive: noKeepalive }),
+      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-c'), setKeepalive: noKeepalive }),
       SharedRunInProgressError,
     )
     // Two dry runs may coexist: neither can change anything the other reads.
@@ -2885,8 +3046,8 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     // connection — which is also why a coordinator can be identified BY the ledger at all.
     const dbA = new FakeCoordinationDatabase({ name: 'ims-a', tenantId: LEDGER })
     const dbB = new FakeCoordinationDatabase({ name: 'ims-b', tenantId: other })
-    const a = await acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => dbA.session('h1'), setKeepalive: noKeepalive })
-    const b = await acquireSharedWriteFence({ tenantId: other, mode: 'exclusive', createClient: () => dbB.session('h2'), setKeepalive: noKeepalive })
+    const a = await acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: dbA.fingerprint(LEDGER), createClient: () => dbA.session('h1'), setKeepalive: noKeepalive })
+    const b = await acquireSharedWriteFence({ tenantId: other, mode: 'exclusive', attestedCoordinator: dbB.fingerprint(other), createClient: () => dbB.session('h2'), setKeepalive: noKeepalive })
     assert.notEqual(a.lockId, b.lockId)
     await a.release()
     await b.release()
@@ -2923,7 +3084,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     const db = new FakeCoordinationDatabase()
     db.refuse = { match: 'pg_try_advisory_lock', message: 'terminating connection due to administrator command' }
     await assert.rejects(
-      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive }),
+      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-a'), setKeepalive: noKeepalive }),
       (e: Error) => e instanceof SharedCoordinatorUnavailableError
         && /treated exactly like one another run is holding/.test(e.message),
     )
@@ -2988,7 +3149,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     const db = new FakeCoordinationDatabase()
     const dir = host()
     const sharedFence = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
     })
     const log = openWriteIntentLog({ tenantId: LEDGER, stateDir: dir })
     const { impl } = fakeFetch(() => response(200, { Invoices: [{ InvoiceID: 'inv-1', UpdatedDateUTC: '/Date(2000)/' }] }))
@@ -3041,7 +3202,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
   test('the intent reaches the shared store BEFORE the request is dispatched', async () => {
     const db = new FakeCoordinationDatabase()
     const sharedFence = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
     })
     let rowsAtDispatch = -1
     const { impl } = fakeFetch(() => {
@@ -3078,10 +3239,16 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
 
   test('every performWrite in the remover is handed the shared fence', () => {
     const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
-    const performed = code.match(/performWrite\(\{/g) ?? []
-    const fenced = code.match(/fence: sharedFence,/g) ?? []
+    // Each call is inspected on its own rather than by counting `fence: sharedFence` across the
+    // file. Counting was a coincidence that held only while performWrite was the sole consumer of
+    // the fence: `persistUnderFence` takes one too (r9 finding 3), and the totals stopped matching
+    // for a reason that has nothing to do with an unfenced write.
+    const performed = [...code.matchAll(/performWrite\(\{/g)]
     assert.ok(performed.length > 0)
-    assert.equal(fenced.length, performed.length, 'a write that skips the fence is a write another host cannot see')
+    for (const m of performed) {
+      const call = code.slice(m.index ?? 0, (m.index ?? 0) + 600)
+      assert.match(call, /fence: sharedFence,/, 'a write that skips the fence is a write another host cannot see')
+    }
     assert.equal(code.includes('NULL_SHARED_WRITE_FENCE'), true, 'and the pre-acquire placeholder is the null fence')
   })
 })
@@ -3494,7 +3661,7 @@ describe('a dry run that loses the ledger lock does not go on to produce a plan'
     const db = new FakeCoordinationDatabase()
     const session = db.session('apply-host')
     const fence = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => session, setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => session, setKeepalive: noKeepalive,
     })
     db.dropLocksOf(session)
     await assert.rejects(
@@ -3523,21 +3690,24 @@ describe('a dry run that loses the ledger lock does not go on to produce a plan'
     await fence.release()
   })
 
-  test('the remover asserts the fence is still held before the plan becomes a file, and before it reports success', () => {
+  test('the remover writes the plan THROUGH the fence, and asserts again before it reports success', () => {
     const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
     const acquireAt = code.indexOf('sharedFence = await acquireSharedWriteFence(')
-    const stillHeldAt = code.indexOf("await sharedFence.assertStillHeld('about to persist the reviewed plan')")
-    const persistAt = code.indexOf('writeFileSync(PLAN_OUT')
+    const persistAt = code.indexOf('await persistUnderFence({')
     const finalAt = code.indexOf("await sharedFence.assertStillHeld('about to report the run as complete')")
-    assert.ok(acquireAt > 0 && stillHeldAt > acquireAt, 'the check must come after the fence is taken')
-    assert.ok(
-      stillHeldAt < persistAt,
-      'the plan is the artefact the next --apply is authorised by, so the lock is re-established BEFORE it is written',
+    assert.ok(acquireAt > 0 && persistAt > acquireAt, 'the plan is written after the fence is taken')
+    assert.ok(finalAt > persistAt, 'and the fence is re-established again before the run is allowed to end cleanly')
+    // THE PLAN MAY NOT BE WRITTEN BY HAND (r9 finding 3). An `assertStillHeld` followed by a
+    // `writeFileSync` is the shape that leaves the artefact behind when the lock goes between the
+    // two, and it is the shape this file had. The plan goes through persistUnderFence or not at all.
+    assert.match(code.slice(persistAt, persistAt + 600), /path: PLAN_OUT,/)
+    assert.equal(
+      /writeFileSync\(\s*PLAN_OUT/.test(code), false,
+      'a direct write to PLAN_OUT is a plan that outlives a lock lost while it was landing',
     )
-    assert.ok(finalAt > persistAt, 'and again before the run is allowed to end cleanly')
     // Both live in main(), so the abort path reports them as an aborted run rather than a clean one.
     const mainAt = code.indexOf('async function main()')
-    assert.ok(mainAt > 0 && stillHeldAt > mainAt && finalAt > mainAt)
+    assert.ok(mainAt > 0 && persistAt > mainAt && finalAt > mainAt)
   })
 })
 
@@ -3564,14 +3734,14 @@ describe('the coordinator is identified by the LEDGER, not by whichever database
     const elsewhere = new FakeCoordinationDatabase({ name: 'ims_staging', tenantId: OTHER_LEDGER, connectionId: 'conn-stage' })
 
     const held = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => real.session('host-a'), setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: real.fingerprint(LEDGER), createClient: () => real.session('host-a'), setKeepalive: noKeepalive,
     })
     assert.equal(held.coordinator.database, 'ims_production')
     assert.equal(held.coordinator.connectionId, 'conn-real')
 
     await assert.rejects(
       () => acquireSharedWriteFence({
-        tenantId: LEDGER, mode: 'exclusive', createClient: () => elsewhere.session('host-b'), setKeepalive: noKeepalive,
+        tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: elsewhere.fingerprint(LEDGER), createClient: () => elsewhere.session('host-b'), setKeepalive: noKeepalive,
       }),
       (e: Error) => e instanceof LedgerCoordinatorMismatchError
         && /ims_staging/.test(e.message)
@@ -3610,7 +3780,7 @@ describe('the coordinator is identified by the LEDGER, not by whichever database
     })
     await assert.rejects(
       () => acquireSharedWriteFence({
-        tenantId: LEDGER, mode: 'exclusive', createClient: () => ambiguous.session('host'), setKeepalive: noKeepalive,
+        tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => ambiguous.session('host'), setKeepalive: noKeepalive,
       }),
       (e: Error) => e instanceof LedgerCoordinatorMismatchError && /holds 2 Xero connections/.test(e.message),
     )
@@ -3621,7 +3791,7 @@ describe('the coordinator is identified by the LEDGER, not by whichever database
     // Cased differently on the two sides, because a uuid is a uuid; a case-sensitive comparison here
     // would refuse the one database that IS the coordinator.
     const fence = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host'), setKeepalive: noKeepalive,
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: db.fingerprint(LEDGER), createClient: () => db.session('host'), setKeepalive: noKeepalive,
     })
     assert.equal(fence.coordinator.connectionId, 'conn-1')
     assert.equal(fence.coordinator.tenantName, 'The Ledger')
@@ -3638,10 +3808,23 @@ describe('the coordinator is identified by the LEDGER, not by whichever database
       end: () => inner.end(),
     }
     await assert.rejects(
-      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => spy, setKeepalive: noKeepalive }),
+      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => spy, setKeepalive: noKeepalive }),
       LedgerCoordinatorMismatchError,
     )
-    assert.deepEqual(seen, [SHARED_FENCE_SQL.identify], 'a lock in a store that is not the coordinator is not a lock')
+    // The session-continuity probe comes first — it establishes that these statements are even
+    // about one backend, without which none of the rest means anything (r9 finding 1) — and the
+    // identification is the next thing asked. What must NOT appear is any lock statement.
+    assert.deepEqual(
+      seen,
+      [
+        SHARED_FENCE_SQL.session.mark,
+        SHARED_FENCE_SQL.session.plant,
+        ...Array.from({ length: SESSION_CONTINUITY_PROBES }, () => SHARED_FENCE_SQL.session.recall),
+        SHARED_FENCE_SQL.identify,
+        SHARED_FENCE_SQL.cluster,
+      ],
+      'a lock in a store that is not the coordinator is not a lock',
+    )
   })
 
   test('a store that cannot be ASKED which ledger it holds is refused as an unreachable coordinator', async () => {
@@ -3695,7 +3878,7 @@ describe('a settlement nobody can interpret is not a settlement', () => {
     const db = new FakeCoordinationDatabase()
     const session = db.session('host-a')
     const fence = await acquireSharedWriteFence({
-      tenantId: LEDGER, mode: 'exclusive', createClient: () => session, setKeepalive: noKeepalive, hostId: 'host-a',
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => session, setKeepalive: noKeepalive, hostId: 'host-a',
     })
     await fence.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
     // Set by hand, exactly as an operator settling a row by hand would: this is the route the
@@ -3897,6 +4080,611 @@ describe('the printed recovery is executable only when somebody established the 
       (e: Error) => /NOBODY ESTABLISHED WHAT BECAME OF THIS WRITE/.test(e.message)
         && /SET "state" = '<committed\|not-committed>'/.test(e.message)
         && !/SET "state" = 'unknown'/.test(e.message),
+    )
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 9, FINDING 1. Round 8 replaced the keepalive with a real `pg_locks` check keyed on
+ * `pg_backend_pid()`, and left the thing that makes it meaningless as an operational note: "confirm
+ * DATABASE_URL is not a pgbouncer endpoint". Under transaction pooling BOTH the acquisition and the
+ * check are about whichever backend happened to answer that statement — the lock is taken on one
+ * backend and the check passes on another, or on nothing at all — and the run believes it holds an
+ * exclusion it does not.
+ *
+ * A precondition nobody can verify from inside is not a guarantee, so it is measured. The double
+ * below is the whole point: `pooledSession` is one client handle over several BACKENDS, and every
+ * statement lands on the next one. Nothing about it looks broken — connect succeeds, every
+ * statement succeeds, the socket never drops.
+ */
+describe('a connection that is not one session cannot hold a session lock', () => {
+  const LEDGER = LEDGER_UUID
+
+  test('the double really does route successive statements to different backends', async () => {
+    // Guarding the guard. A `pooledSession` that quietly behaved like a session would make every
+    // test below pass while proving nothing at all.
+    const db = new FakeCoordinationDatabase()
+    const pooled = db.pooledSession('proxy', 3)
+    await pooled.connect()
+    const pids = new Set<number>()
+    for (let i = 0; i < 3; i++) {
+      const res = await pooled.query(SHARED_FENCE_SQL.session.recall)
+      pids.add(Number(res.rows[0]?.pid))
+    }
+    assert.equal(pids.size, 3, 'the pooled double must answer from three different backends')
+    const direct = db.session('host')
+    await direct.connect()
+    const directPids = new Set<number>()
+    for (let i = 0; i < 3; i++) {
+      const res = await direct.query(SHARED_FENCE_SQL.session.recall)
+      directPids.add(Number(res.rows[0]?.pid))
+    }
+    assert.equal(directPids.size, 1, 'and the direct double must answer from exactly one')
+    await pooled.end()
+    await direct.end()
+  })
+
+  test('a connection whose statements land on different backends is refused BEFORE any lock', async () => {
+    const db = new FakeCoordinationDatabase()
+    // Three backends, so the marking statement and the first recall are answered by different ones.
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED,
+        createClient: () => db.pooledSession('pgbouncer', 3), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof SessionDiscontinuityError
+        && /not a single PostgreSQL session/.test(e.message)
+        && /was answered by backend/.test(e.message)
+        && /pgbouncer in transaction or statement mode/.test(e.message),
+    )
+    // AND IT TOOK NOTHING. A refusal that had already locked a key on one of those backends would
+    // leave a lock nobody can release and no session that can be shown to hold it.
+    const witness = db.session('direct')
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED,
+      createClient: () => witness, setKeepalive: noKeepalive,
+    })
+    assert.equal(fence.mode, 'exclusive', 'the ledger key was free, so the refused run locked nothing')
+    await fence.release()
+  })
+
+  test('two backends is enough: the temp relation does not follow the statement', async () => {
+    // The mark lands on backend 0 and the temp relation on backend 1, so the recall on backend 0
+    // carries the setting and not the relation. Requiring BOTH marks is what catches this shape;
+    // a GUC alone would have said yes.
+    const db = new FakeCoordinationDatabase()
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'shared', createClient: () => db.pooledSession('proxy', 2),
+        setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof SessionDiscontinuityError
+        && new RegExp(`cannot see the temp relation ${SESSION_MARK_TABLE}`).test(e.message),
+    )
+  })
+
+  test('a DRY RUN is refused too — the plan is built on the same exclusion', async () => {
+    const db = new FakeCoordinationDatabase()
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'shared', createClient: () => db.pooledSession('proxy', 3),
+        setKeepalive: noKeepalive,
+      }),
+      SessionDiscontinuityError,
+    )
+  })
+
+  test('a backend that already carries the marker is refused as the recycled session it is', async () => {
+    // A pooler handing back a backend that was this tool's session a moment ago: the temp relation
+    // is still there, so CREATE fails. Reported as what it is rather than as "the coordinator is
+    // unreachable", because the operator's next move is completely different.
+    const db = new FakeCoordinationDatabase()
+    const client = db.session('recycled')
+    await client.connect()
+    await client.query(SHARED_FENCE_SQL.session.plant, ['somebody-elses-nonce'])
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'shared', createClient: () => client, setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof SessionDiscontinuityError
+        && /would not carry a session marker/.test(e.message)
+        && /already exists/.test(e.message)
+        && /another client's session moments ago/.test(e.message),
+    )
+  })
+
+  test('a DIRECT session is accepted — the probe is not simply always on', async () => {
+    const db = new FakeCoordinationDatabase()
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED,
+      createClient: () => db.session('host'), setKeepalive: noKeepalive,
+    })
+    await fence.assertStillHeld('immediately after acquisition')
+    await fence.release()
+  })
+
+  test('the session is probed BEFORE the store is asked anything else', async () => {
+    const db = new FakeCoordinationDatabase()
+    const inner = db.session('host')
+    const seen: string[] = []
+    const spy: CoordinationClient = {
+      connect: () => inner.connect(),
+      query: async (sql: string, params?: unknown[]) => { seen.push(sql); return inner.query(sql, params) },
+      end: () => inner.end(),
+    }
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => spy,
+      setKeepalive: noKeepalive,
+    })
+    assert.equal(seen[0], SHARED_FENCE_SQL.session.mark)
+    assert.equal(seen[1], SHARED_FENCE_SQL.session.plant)
+    assert.equal(
+      seen.filter((q) => q === SHARED_FENCE_SQL.session.recall).length, SESSION_CONTINUITY_PROBES,
+      'each probe is a SEPARATE statement, which is the only way a rotation can show itself',
+    )
+    const firstLockAt = seen.findIndex((q) => q === SHARED_FENCE_SQL.lock.exclusive)
+    const lastProbeAt = seen.lastIndexOf(SHARED_FENCE_SQL.session.recall)
+    assert.ok(lastProbeAt >= 0 && firstLockAt > lastProbeAt,
+      'a lock taken before the connection is known to be a session is a lock nobody can be shown to hold')
+    await fence.release()
+  })
+
+  test('a connection that STARTS pooling after the lock is taken loses the fence at the next check', async () => {
+    // The acquisition-time probe cannot see this, and that is exactly why the marks are carried in
+    // the held statement as well: a proxy reconfigured mid-run, a failover, a recycled backend.
+    const db = new FakeCoordinationDatabase()
+    const client = db.session('host')
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => client,
+      setKeepalive: noKeepalive,
+    })
+    await fence.assertStillHeld('before the proxy is reconfigured')
+    client.divert()
+    await assert.rejects(
+      () => fence.assertStillHeld('about to persist the reviewed plan'),
+      (e: Error) => e instanceof SharedFenceLostError
+        && /landing on different backends/.test(e.message)
+        && /about to persist the reviewed plan/.test(e.message),
+    )
+    await fence.release()
+  })
+
+  test('an --apply cannot dispatch once its statements start landing elsewhere', async () => {
+    const db = new FakeCoordinationDatabase()
+    const client = db.session('apply-host')
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => client,
+      setKeepalive: noKeepalive,
+    })
+    client.divert()
+    await assert.rejects(
+      () => fence.intend({ id: 'w1', runId: 'r1', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1' }),
+      // `landing on`, not merely `different backends`: the standing advice paragraph in every
+      // SharedFenceLostError already contains the phrase "successive statements to different
+      // backends", so the looser regex passed on boilerplate and measured nothing.
+      (e: Error) => e instanceof SharedFenceLostError && /landing on different backends/.test(e.message),
+    )
+    assert.equal(db.rows.size, 0, 'and nothing was recorded, because nothing may be dispatched')
+    await fence.release()
+  })
+
+  test('a backend that HOLDS the lock but is no longer our session is still a loss', async () => {
+    // The sharpest case, and the one a lock-only check cannot see: `DISCARD ALL` between clients, a
+    // backend handed back to us with our lock still on it and our session state gone. `held` would
+    // answer 1. It is not our session, so it is not our exclusion.
+    const db = new FakeCoordinationDatabase()
+    const client = db.session('host')
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => client,
+      setKeepalive: noKeepalive,
+    })
+    db.discardSessionStateOf(client)
+    await assert.rejects(
+      () => fence.assertStillHeld('after the pooler reset the session'),
+      (e: Error) => e instanceof SharedFenceLostError
+        && new RegExp(`no longer carries this run's session marker`).test(e.message),
+    )
+    await fence.release()
+  })
+
+  test('the lock question and the session questions are ONE statement', () => {
+    // Two statements would leave the gap open from the other side: either could land on the marked
+    // backend by chance while the other did not. The tuple has to be about one backend.
+    const held = SHARED_FENCE_SQL.held
+    assert.equal(held.split(';').length, 1, 'one statement, so one backend answers all of it')
+    assert.match(held, /pg_locks/)
+    assert.match(held, /pid = pg_backend_pid\(\)/)
+    assert.match(held, /pg_backend_pid\(\)::int AS pid/)
+    assert.ok(held.includes(`current_setting('${SESSION_MARK_SETTING}', true)`))
+    assert.ok(held.includes(`to_regclass('pg_temp.${SESSION_MARK_TABLE}')`))
+  })
+
+  test('assertSessionContinuity names each way a connection fails to be one', () => {
+    const ok = { pid: 42, nonce: 'n', tempPresent: true }
+    // The happy path first, so none of the refusals below are refusals of everything.
+    assert.equal(assertSessionContinuity({ nonce: 'n', mark: { pid: 42, applied: 'n' }, observations: [ok, ok] }), 42)
+
+    assert.throws(
+      () => assertSessionContinuity({ nonce: 'n', mark: { pid: 0, applied: 'n' }, observations: [ok] }),
+      (e: Error) => e instanceof SessionDiscontinuityError && /did not report a backend pid/.test(e.message),
+    )
+    assert.throws(
+      () => assertSessionContinuity({ nonce: 'n', mark: { pid: 42, applied: null }, observations: [ok] }),
+      (e: Error) => e instanceof SessionDiscontinuityError && /marker did not take/.test(e.message),
+    )
+    // No probes is not a pass. "Nothing was measured" and "it is fine" are different states.
+    assert.throws(
+      () => assertSessionContinuity({ nonce: 'n', mark: { pid: 42, applied: 'n' }, observations: [] }),
+      (e: Error) => e instanceof SessionDiscontinuityError && /not probed at all/.test(e.message),
+    )
+    assert.throws(
+      () => assertSessionContinuity({ nonce: 'n', mark: { pid: 42, applied: 'n' }, observations: [ok, { ...ok, pid: 43 }] }),
+      (e: Error) => e instanceof SessionDiscontinuityError && /statement 2 was answered by backend 43/.test(e.message),
+    )
+    assert.throws(
+      () => assertSessionContinuity({ nonce: 'n', mark: { pid: 42, applied: 'n' }, observations: [{ ...ok, nonce: null }] }),
+      (e: Error) => e instanceof SessionDiscontinuityError && /does not carry this run's session marker/.test(e.message),
+    )
+    assert.throws(
+      () => assertSessionContinuity({ nonce: 'n', mark: { pid: 42, applied: 'n' }, observations: [{ ...ok, tempPresent: false }] }),
+      (e: Error) => e instanceof SessionDiscontinuityError && /cannot see the temp relation/.test(e.message),
+    )
+  })
+
+  test('readHeldAnswer reports a routed statement as routing, not as a lost lock', () => {
+    const expect = { pid: 7, nonce: 'n', mode: 'ExclusiveLock', lockId: 99 }
+    const good = { held: 1, pid: 7, nonce: 'n', tempPresent: true }
+    assert.equal(readHeldAnswer({ row: good, expect }), null)
+    assert.match(String(readHeldAnswer({ row: undefined, expect })), /no row at all/)
+    // ORDER: a statement answered by another backend says so, rather than reporting "the lock is
+    // gone" and sending the operator to look for a reaper that does not exist. Note this row claims
+    // held = 0 as well, so only the ordering decides which message comes out.
+    assert.match(
+      String(readHeldAnswer({ row: { ...good, pid: 8, held: 0 }, expect })),
+      /landing on different backends/,
+    )
+    assert.match(String(readHeldAnswer({ row: { ...good, nonce: null }, expect })), /session marker/)
+    assert.match(String(readHeldAnswer({ row: { ...good, tempPresent: false }, expect })), /temp relation/)
+    assert.match(String(readHeldAnswer({ row: { ...good, held: 0 }, expect })), /holds 0 ExclusiveLock\(s\)/)
+    // A silent answer is not a yes.
+    assert.match(String(readHeldAnswer({ row: { pid: 7, nonce: 'n', tempPresent: true }, expect })), /holds 0 /)
+  })
+
+  test('the remover says DATABASE_URL must be a session, not a pool', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    assert.match(code, /DATABASE_URL MUST BE A SESSION, NOT A POOL/)
+    assert.match(code, /pooler in SESSION mode/)
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 9, FINDING 2. Round 8 bound the coordination to the `accounting_tokens` row for the
+ * organisation, which closed every case where the store is UNRELATED to the ledger — and described
+ * the residual, two stores that BOTH legitimately claim it, as unclosable from inside a database
+ * and therefore made visible rather than blocked.
+ *
+ * "Made visible" is not a control. It fires after both runs have written to a ledger whose writes
+ * cannot be undone, and it needs a second human who happens to be reading the other run's terminal.
+ * So --apply refuses until somebody names the store it may run in. The attestation is not a proof
+ * of uniqueness — nothing inside a database can produce one — but the same attestation cannot
+ * authorise a run in the other store, so the split fails at the second run instead of afterwards.
+ */
+describe('two stores can both claim the ledger, so a human names the one that may be used', () => {
+  const LEDGER = LEDGER_UUID
+  /** The IMS database. */
+  const original = () => new FakeCoordinationDatabase({ name: 'ims_prod', oid: '16400', clusterId: 'cluster-prod', connectionId: 'conn-1' })
+  /**
+   * A RESTORED SNAPSHOT of it, in another cluster. Same organisation, same connection row id, same
+   * database name — everything round 8 checked, it answers identically. This is the case.
+   */
+  const restored = () => new FakeCoordinationDatabase({ name: 'ims_prod', oid: '16400', clusterId: 'cluster-dr', connectionId: 'conn-1' })
+
+  test('--apply refuses when nobody has said which store it may coordinate in', async () => {
+    const db = original()
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host'), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof CoordinatorNotAttestedError
+        && /--apply must name the coordinator/.test(e.message)
+        && e.message.includes(db.fingerprint(LEDGER))
+        && /no second IMS installation authorised against/.test(e.message),
+    )
+    // And it locked nothing on the way out, so the refusal costs the next run nothing.
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: db.fingerprint(LEDGER),
+      createClient: () => db.session('host'), setKeepalive: noKeepalive,
+    })
+    await fence.release()
+  })
+
+  test('an attestation for the ORIGINAL does not authorise a run in the restored copy', async () => {
+    const prod = original()
+    const copy = restored()
+    // Both are legitimate: each holds the accounting connection for this ledger, so round 8's check
+    // says yes to both. Demonstrated first, because it is the defect.
+    assert.equal(
+      assertCoordinatorOwnsLedger({
+        tenantId: LEDGER, database: 'ims_prod', databaseOid: '16400', clusterId: 'cluster-dr',
+        connections: copy.connections,
+      }).connectionId,
+      'conn-1',
+    )
+    const attested = prod.fingerprint(LEDGER)
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: attested,
+      createClient: () => prod.session('host-a'), setKeepalive: noKeepalive,
+    })
+    // The second host, pointed at the restore, carrying the attestation the first one was given.
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: attested,
+        createClient: () => copy.session('host-b'), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof CoordinatorNotAttestedError
+        && /a DIFFERENT one/.test(e.message)
+        && /Do not attest both/.test(e.message),
+    )
+    await fence.release()
+  })
+
+  test('a DRY RUN is not gated, and is told the fingerprint --apply will want', async () => {
+    const db = original()
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'shared', createClient: () => db.session('host'), setKeepalive: noKeepalive,
+    })
+    assert.equal(fence.coordinator.fingerprint, db.fingerprint(LEDGER))
+    assert.equal(fence.coordinator.clusterId, 'cluster-prod')
+    assert.equal(fence.coordinator.databaseOid, '16400')
+    await fence.release()
+  })
+
+  test('a dry run that names the WRONG store is still refused', async () => {
+    const copy = restored()
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'shared', attestedCoordinator: original().fingerprint(LEDGER),
+        createClient: () => copy.session('host'), setKeepalive: noKeepalive,
+      }),
+      CoordinatorNotAttestedError,
+    )
+  })
+
+  test('a bare --coordinator with no value is not an attestation', () => {
+    const coordinator = {
+      database: 'ims', databaseOid: '1', clusterId: 'c', connectionId: 'conn', tenantName: 'X',
+      fingerprint: 'coord-abc',
+    }
+    // The empty string is what `--coordinator` with nothing after it produces. It must not read as
+    // "something was supplied", and it must not read as a matching value either.
+    for (const attested of ['', '   ', null, undefined]) {
+      assert.throws(
+        () => assertCoordinatorAttested({ tenantId: LEDGER, mode: 'exclusive', coordinator, attested }),
+        CoordinatorNotAttestedError,
+      )
+      // A dry run, by contrast, treats all four as "not supplied" and carries on.
+      assertCoordinatorAttested({ tenantId: LEDGER, mode: 'shared', coordinator, attested })
+    }
+    // And the right value, with the whitespace an operator's copy-paste brings.
+    assertCoordinatorAttested({ tenantId: LEDGER, mode: 'exclusive', coordinator, attested: ' coord-abc ' })
+  })
+
+  test('the fingerprint moves with every field that could tell two stores apart', () => {
+    const base = { tenantId: LEDGER, clusterId: 'c1', database: 'ims', databaseOid: '1', connectionId: 'conn-1' }
+    const seen = new Set([
+      xeroCoordinatorFingerprint(base),
+      xeroCoordinatorFingerprint({ ...base, clusterId: 'c2' }),
+      xeroCoordinatorFingerprint({ ...base, clusterId: null }),
+      xeroCoordinatorFingerprint({ ...base, database: 'ims_dr' }),
+      xeroCoordinatorFingerprint({ ...base, databaseOid: '2' }),
+      xeroCoordinatorFingerprint({ ...base, connectionId: 'conn-2' }),
+      xeroCoordinatorFingerprint({ ...base, tenantId: '99999999-8888-4777-a666-555555555555' }),
+    ])
+    assert.equal(seen.size, 7, 'two stores that differ anywhere must not fingerprint alike')
+    // Stable across runs, and case-insensitive on the tenant for the same reason the coordinator
+    // check is: a uuid is a uuid.
+    assert.equal(xeroCoordinatorFingerprint(base), xeroCoordinatorFingerprint(base))
+    assert.equal(xeroCoordinatorFingerprint({ ...base, tenantId: LEDGER.toUpperCase() }), xeroCoordinatorFingerprint(base))
+  })
+
+  test('a role that may not read pg_control_system still coordinates, and is told the gap', async () => {
+    // Refusing here would trade a real capability for a missing GRANT. The absence travels on the
+    // coordinator instead, and the attestation prompt says which of the two fingerprints it means.
+    const db = new FakeCoordinationDatabase({ name: 'ims_prod', clusterId: null })
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'shared', createClient: () => db.session('host'), setKeepalive: noKeepalive,
+    })
+    assert.equal(fence.coordinator.clusterId, null)
+    assert.equal(fence.coordinator.fingerprint, db.fingerprint(LEDGER))
+    await fence.release()
+
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host'), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof CoordinatorNotAttestedError
+        && /NOT IDENTIFIABLE/.test(e.message)
+        && /would fingerprint alike/.test(e.message),
+    )
+  })
+
+  test('the attestation is asked BEFORE the lock, and only of an identified store', async () => {
+    const db = original()
+    const seen: string[] = []
+    const inner = db.session('host')
+    const spy: CoordinationClient = {
+      connect: () => inner.connect(),
+      query: async (sql: string, params?: unknown[]) => { seen.push(sql); return inner.query(sql, params) },
+      end: () => inner.end(),
+    }
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', createClient: () => spy, setKeepalive: noKeepalive,
+      }),
+      CoordinatorNotAttestedError,
+    )
+    assert.ok(seen.includes(SHARED_FENCE_SQL.identify), 'the fingerprint is computed from what the store said')
+    assert.equal(
+      seen.some((q) => q === SHARED_FENCE_SQL.lock.exclusive || q === SHARED_FENCE_SQL.lock.shared), false,
+      'a lock taken in a store nobody vouched for IS the split happening',
+    )
+  })
+
+  test('the remover requires --coordinator for --apply and reads it by presence', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    assert.match(code, /const COORDINATOR_ATTESTED = process\.argv\.includes\('--coordinator'\)/)
+    assert.match(code, /attestedCoordinator: COORDINATOR_ATTESTED,/)
+    // Printed in both modes, because a dry run is where the operator learns the value.
+    assert.match(code, /coordinator fingerprint: \$\{sharedFence\.coordinator\.fingerprint\}/)
+  })
+
+  test('assertCoordinatorAttested is the one home for the rule, and says what would close it', async () => {
+    const source = readFileSync('scripts/lib/xero-live-safety.ts', 'utf8')
+    const doc = source.slice(0, source.indexOf('export function assertCoordinatorAttested'))
+    assert.match(doc, /WHAT WOULD ACTUALLY CLOSE IT/)
+    assert.match(doc, /REFUSE, RATHER THAN PROCEED AND PRINT/)
+    // And the reason a dry run is NOT gated is written down, so it reads as a decision rather than
+    // as the gate having been forgotten in one mode.
+    assert.match(doc, /A DRY RUN IS NOT GATED, and that is a decision rather than an omission/)
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 9, FINDING 3. The dry run asserted the fence before it wrote the plan and again at the end
+ * of the run — which leaves the write itself outside the fence. A loss in between aborts the run
+ * loudly and leaves the plan on disk, indistinguishable from one assembled under an unbroken fence,
+ * ready for the next `--apply --manifest` to be pointed at.
+ *
+ * The artefact is now STAGED under a name nothing reads, the fence is re-established, and only then
+ * does it take the name it is consumed under.
+ */
+describe('a plan exists only if the fence held across the whole of writing it', () => {
+  const dirs: string[] = []
+  const dir = () => { const d = mkdtempSync(join(tmpdir(), 'xero-plan-')); dirs.push(d); return d }
+  const cleanup = () => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }) }
+
+  /** A fence that holds for `holdsFor` assertions and then reports the loss the ledger lock reports. */
+  const failingFence = (holdsFor: number) => {
+    const contexts: string[] = []
+    return {
+      contexts,
+      fence: {
+        assertStillHeld: async (context: string) => {
+          contexts.push(context)
+          if (contexts.length > holdsFor) throw new SharedFenceLostError(`ABORT: lost at "${context}"`)
+        },
+      },
+    }
+  }
+
+  test('a loss BETWEEN the assert and the write leaves no plan and no staged file', async () => {
+    const d = dir()
+    const path = join(d, 'plan.json')
+    const { fence, contexts } = failingFence(1)
+    await assert.rejects(
+      () => persistUnderFence({ fence, path, body: '{"plan":[]}', what: 'the reviewed plan' }),
+      (e: Error) => e instanceof SharedFenceLostError,
+    )
+    assert.equal(contexts.length, 2, 'the fence is asked on BOTH sides of the write, or the window is still open')
+    assert.equal(existsSync(path), false, 'a plan assembled while the lock was going away must not exist')
+    assert.equal(existsSync(`${path}${STAGED_ARTEFACT_SUFFIX}`), false, 'and neither must the staged copy')
+    cleanup()
+  })
+
+  test('a loss BEFORE the write never writes anything at all', async () => {
+    const d = dir()
+    const path = join(d, 'plan.json')
+    const { fence } = failingFence(0)
+    // Measured on the io, not only on the filesystem: a first assert that had been dropped would
+    // still leave no file (the second one removes the staged copy), so "no file afterwards" cannot
+    // tell the two apart. Whether a byte was written at all can.
+    const touched: string[] = []
+    await assert.rejects(
+      () => persistUnderFence({
+        fence, path, body: '{}', what: 'the reviewed plan',
+        io: {
+          write: (p) => { touched.push(`write ${p}`) },
+          publish: () => { touched.push('publish') },
+          discard: (p) => { touched.push(`discard ${p}`) },
+        },
+      }),
+      SharedFenceLostError,
+    )
+    assert.deepEqual(touched, [], 'the fence is established before a byte is written, not after')
+    assert.equal(existsSync(path), false)
+    assert.equal(existsSync(`${path}${STAGED_ARTEFACT_SUFFIX}`), false)
+    cleanup()
+  })
+
+  test('a fence that holds throughout DOES publish the plan — the refusal is not always on', async () => {
+    const d = dir()
+    const path = join(d, 'plan.json')
+    const { fence, contexts } = failingFence(99)
+    await persistUnderFence({ fence, path, body: '{"plan":["one"]}', what: 'the reviewed plan' })
+    assert.equal(readFileSync(path, 'utf8'), '{"plan":["one"]}')
+    assert.equal(existsSync(`${path}${STAGED_ARTEFACT_SUFFIX}`), false, 'and the staging name is not left behind')
+    assert.deepEqual(contexts, [
+      'about to persist the reviewed plan',
+      `about to publish the reviewed plan to ${path}`,
+    ])
+    cleanup()
+  })
+
+  test('a run that loses the fence does not destroy the plan a previous run left', async () => {
+    // The direct write truncated the file before it knew whether it was allowed to; a failed run
+    // could therefore take a good artefact with it.
+    const d = dir()
+    const path = join(d, 'plan.json')
+    writeFileSync(path, '{"generatedAt":"yesterday"}')
+    const { fence } = failingFence(1)
+    await assert.rejects(() => persistUnderFence({ fence, path, body: '{"new":true}', what: 'the reviewed plan' }), SharedFenceLostError)
+    assert.equal(readFileSync(path, 'utf8'), '{"generatedAt":"yesterday"}', 'the earlier plan is untouched')
+    cleanup()
+  })
+
+  test('the bytes land under the staging name, and are renamed only after the second assert', async () => {
+    const order: string[] = []
+    const { fence } = failingFence(99)
+    await persistUnderFence({
+      fence,
+      path: '/nowhere/plan.json',
+      body: 'x',
+      what: 'the reviewed plan',
+      io: {
+        write: (p) => { order.push(`write ${p}`) },
+        publish: (from, to) => { order.push(`publish ${from} -> ${to}`) },
+        discard: (p) => { order.push(`discard ${p}`) },
+      },
+    })
+    assert.deepEqual(order, [
+      `write /nowhere/plan.json${STAGED_ARTEFACT_SUFFIX}`,
+      `publish /nowhere/plan.json${STAGED_ARTEFACT_SUFFIX} -> /nowhere/plan.json`,
+    ], 'nothing may be written under the consumed name before the fence has been re-established')
+  })
+
+  test('a staged file that cannot be removed is named, not swallowed', async () => {
+    const { fence } = failingFence(1)
+    await assert.rejects(
+      () => persistUnderFence({
+        fence,
+        path: '/nowhere/plan.json',
+        body: 'x',
+        what: 'the reviewed plan',
+        io: {
+          write: () => {},
+          publish: () => { throw new Error('must not publish') },
+          discard: () => { throw new Error('EACCES: permission denied, unlink') },
+        },
+      }),
+      (e: Error) => e instanceof StagedArtefactStrandedError
+        && /COULD NOT BE REMOVED/.test(e.message)
+        && /EACCES/.test(e.message)
+        && /DELETE IT BY HAND/.test(e.message)
+        // The reason the fence went is still in the message: the operator needs both facts.
+        && /lost at/.test(e.message),
     )
   })
 })

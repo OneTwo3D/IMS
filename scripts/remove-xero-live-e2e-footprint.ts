@@ -121,9 +121,12 @@
  * USAGE
  *   node_modules/.bin/tsx scripts/remove-xero-live-e2e-footprint.ts                    # dry run
  *   node_modules/.bin/tsx scripts/remove-xero-live-e2e-footprint.ts \
- *     --manifest ./xero-live-e2e-footprint-<date>.csv --apply                          # writes
+ *     --manifest ./xero-live-e2e-footprint-<date>.csv \
+ *     --coordinator coord-<fingerprint> --apply                                        # writes
  *   ... --steps 1,2,3        run only some phases (default: all)
  *   ... --plan-out <path>    where to persist the reviewed plan (default ./xero-live-cleanup-plan-<date>.json)
+ *   ... --coordinator <fp>   which IMS database this run may coordinate in. REQUIRED by --apply;
+ *                            a dry run prints the value and does not require it.
  *
  * THE WRITE-INTENT LOG has no flag. It is /var/lib/o3d/xero-cleanup/write-log-<tenantId>.jsonl,
  * with <tenantId>.jsonl.lock beside it, and every run against this ledger uses that pair whatever
@@ -140,22 +143,45 @@
  * next --apply is authorised by, so it takes the lock in SHARE mode and is refused while an apply
  * is in flight anywhere. Two dry runs may run together; an apply excludes everything.
  *
+ * AND DATABASE_URL MUST BE A SESSION, NOT A POOL. The exclusion is a PostgreSQL SESSION advisory
+ * lock: it belongs to the backend that took it, and the check that re-establishes it asks
+ * pg_backend_pid(), which answers about the backend that ran THAT statement. Through a
+ * transaction-pooling proxy the two can be different backends, so the lock is taken in one place
+ * and confirmed in another — a run that believes it holds an exclusion it does not. This is
+ * MEASURED, not assumed: on connect the script plants a session-scoped setting and a temp relation
+ * and reads both back several times, and refuses unless the same backend answers every time. The
+ * same two marks are then carried in every held check, in the same statement as the lock question,
+ * so a connection that starts pooling later is caught before the next dispatch. Point DATABASE_URL
+ * at PostgreSQL directly, or at a pooler in SESSION mode.
+ *
  * AND IT MUST BE **THIS LEDGER'S** DATABASE, not merely a reachable one. Which store DATABASE_URL
  * names is per-host configuration, so two hosts given two URLs would each find the ledger's key
  * free in their own store and exclude nobody — the same defect as two runs given two log paths, one
  * layer out. The coordinator is therefore identified BY THE LEDGER: the store must hold the IMS
  * accounting connection for this Xero organisation (accounting_tokens is unique on connector, so an
  * IMS database is the installation for exactly one org). A scratch database, an empty one, or
- * another tenant's IMS is refused before any lock is taken, and the run prints which store it
- * coordinated through. What that cannot see, and nothing inside a database can: two stores that BOTH
- * legitimately claim the ledger — a restored snapshot, or a second IMS installation authorised
- * against the same organisation. Comparing the printed coordinator across runs is what catches that.
+ * another tenant's IMS is refused before any lock is taken.
+ *
+ * AND SOMEBODY MUST SAY IT IS THE ONLY ONE. Two stores can BOTH legitimately claim this ledger — a
+ * restored snapshot of the IMS database, or a second IMS installation authorised against the same
+ * organisation — and neither can see the other, so both take a free lock and exclude nobody. No
+ * check inside a database can close that; the only thing that can is a coordination authority
+ * outside all of them, which this repo does not have. So --apply REFUSES until a human names the
+ * store it may run in, with --coordinator <fingerprint>, where the fingerprint is what that store
+ * computes about itself (cluster system identifier, database name and oid, accounting connection
+ * row, tenant). It is not a proof of uniqueness — nothing here can make one — but the same
+ * attestation cannot authorise a run in the other store, so the split fails at the second run
+ * rather than being noticed afterwards by nobody. A dry run prints the fingerprint and is not
+ * gated: it dispatches nothing, and an attestation people paste without reading is worth nothing.
  *
  * A LOCK LOST MID-RUN IS A REFUSAL. The lock is a SESSION advisory lock, so a reaped session or a
  * coordinator restart frees it silently. Every --apply dispatch re-establishes it before the request
- * leaves; a DRY RUN, which dispatches nothing, re-establishes it before it persists the plan and
- * again before it reports success, because the plan is the artefact the next --apply is authorised
- * by. A loss is latched permanently: a lock that came back is not the lock that was held.
+ * leaves; a DRY RUN, which dispatches nothing, re-establishes it before it stages the plan, again
+ * before that staged file is given the name --apply is pointed at, and again before it reports
+ * success, because the plan is the artefact the next --apply is authorised by. The plan is written
+ * to <plan-out>.partial first for exactly that reason: a lock lost while the bytes are landing must
+ * leave NO plan behind, not a plan that looks like every other one. A loss is latched permanently:
+ * a lock that came back is not the lock that was held.
  *
  * Unresolved rows in that table are cleared the same way the log is: by READING Xero, then
  * settling each row by hand. Nothing expires them, because only Xero can say what became of a
@@ -202,6 +228,7 @@ import {
   pageAllComplete,
   parseWriteManifest,
   performWrite,
+  persistUnderFence,
   PlanDivergedError,
   runOutcome,
   SafetyViolationError,
@@ -254,6 +281,16 @@ const APPLY = process.argv.includes('--apply')
 const READ_TOKEN_FILE = arg('read-token', '/root/.xero-audit-token.json')!
 const WRITE_TOKEN_FILE = arg('write-token', '/root/.xero-cleanup-token.json')!
 const MANIFEST_PATH = arg('manifest')
+/**
+ * WHICH IMS DATABASE THIS RUN IS AUTHORISED TO COORDINATE IN (r9 finding 2), as the fingerprint
+ * that store computes about itself. Required by --apply; printed by a dry run, which is where the
+ * operator gets the value. See `assertCoordinatorAttested`.
+ *
+ * Read by PRESENCE as well as value, like --write-log, so that `--coordinator` with nothing after
+ * it is distinguishable from the flag being absent. Both refuse an --apply — an empty attestation
+ * attests nothing — but the distinction is what lets the refusal be about the right thing.
+ */
+const COORDINATOR_ATTESTED = process.argv.includes('--coordinator') ? (arg('coordinator') ?? '') : undefined
 const PLAN_OUT = arg('plan-out', `./xero-live-cleanup-plan-${new Date().toISOString().slice(0, 10)}.json`)!
 /**
  * The write-intent log and its lock. Both are derived from EXPECTED_TENANT_ID — the ledger this
@@ -711,6 +748,11 @@ async function main() {
   sharedFence = await acquireSharedWriteFence({
     tenantId: EXPECTED_TENANT_ID,
     mode: APPLY ? 'exclusive' : 'shared',
+    // Two stores can BOTH legitimately claim this ledger, and no store can see the other. --apply
+    // therefore refuses until a human names the one it may run in; a dry run prints it. A bare
+    // --coordinator arrives here as '' and is read as NOTHING SUPPLIED, so it refuses an --apply
+    // rather than authorising one — which is the only safe reading of a flag with no value.
+    attestedCoordinator: COORDINATOR_ATTESTED,
   })
   // Which store this run is coordinating through, and what makes it this ledger's rather than
   // whichever one DATABASE_URL happened to name. Printed rather than merely checked: the one case
@@ -722,6 +764,11 @@ async function main() {
       `${sharedFence.coordinator.tenantName} (${EXPECTED_TENANT_ID}), connection ` +
       `${sharedFence.coordinator.connectionId}. Ledger lock ${sharedFence.lockId}, held ` +
       `${sharedFence.mode === 'exclusive' ? 'EXCLUSIVELY' : 'in SHARE mode'} by ${sharedFence.hostId}.`,
+  )
+  console.log(
+    `  coordinator fingerprint: ${sharedFence.coordinator.fingerprint}` +
+      `${sharedFence.coordinator.clusterId ? ` (cluster ${sharedFence.coordinator.clusterId})` : ' (cluster NOT identifiable by this role)'}` +
+      `${APPLY ? '' : ` — --apply will require --coordinator ${sharedFence.coordinator.fingerprint}`}`,
   )
   if (APPLY) writeLogLock = acquireWriteLogLock({ tenantId: EXPECTED_TENANT_ID })
   // And the cross-host half of the recovery refusal, asked BEFORE the local one: a write dispatched
@@ -857,25 +904,33 @@ async function main() {
     console.log(`  manifest check: all ${plan.length} planned object(s) are reviewed AND still in the reviewed state; ${missingFromLedger.length} manifest id(s) are no longer in the org (already cleaned up).`)
   }
 
-  // STILL HOLDING THE LEDGER? Asked here, immediately before the plan becomes a file, because this
-  // is the moment the plan stops being this process's opinion and becomes the artefact the next
-  // --apply is authorised by. Everything above was read under the fence; if the fence went at any
-  // point during those reads — a reaped session, a coordinator restart — then some of it was read
-  // while another run could have been mutating the ledger, and none of it may be written down as a
-  // plan. In an --apply run the per-dispatch intent INSERT asks the same question again before
-  // every single write; a dry run dispatches nothing, so without this it asked nobody (r8 finding 1).
-  await sharedFence.assertStillHeld('about to persist the reviewed plan')
-
-  // Persist the reviewed plan before the first write, so a run that dies part-way leaves behind
-  // exactly what it intended to do.
-  writeFileSync(PLAN_OUT, JSON.stringify({
-    generatedAt: new Date().toISOString(),
-    tenantId: token.tenantId,
-    tenantName: orgName,
-    apply: APPLY,
-    manifest: MANIFEST_PATH ?? null,
-    plan,
-  }, null, 2))
+  // STILL HOLDING THE LEDGER? Asked immediately before the plan becomes a file, because this is the
+  // moment the plan stops being this process's opinion and becomes the artefact the next --apply is
+  // authorised by. Everything above was read under the fence; if the fence went at any point during
+  // those reads — a reaped session, a coordinator restart — then some of it was read while another
+  // run could have been mutating the ledger, and none of it may be written down as a plan. In an
+  // --apply run the per-dispatch intent INSERT asks the same question again before every single
+  // write; a dry run dispatches nothing, so without this it asked nobody (r8 finding 1).
+  //
+  // AND AGAIN ON THE FAR SIDE OF THE WRITE (r9 finding 3). One assertion in front of the write
+  // leaves the write itself outside the fence: the lock goes while the bytes are landing, the run
+  // aborts loudly — and the plan is on disk afterwards, indistinguishable from one assembled under
+  // an unbroken fence. `persistUnderFence` stages it under a name nothing reads, re-establishes the
+  // lock, and only then gives it the name --apply is pointed at; a loss in between removes the
+  // staged file and leaves no plan at all, which is the only artefact this run is entitled to.
+  await persistUnderFence({
+    fence: sharedFence,
+    path: PLAN_OUT,
+    what: 'the reviewed plan',
+    body: JSON.stringify({
+      generatedAt: new Date().toISOString(),
+      tenantId: token.tenantId,
+      tenantName: orgName,
+      apply: APPLY,
+      manifest: MANIFEST_PATH ?? null,
+      plan,
+    }, null, 2),
+  })
   console.log(`  plan persisted to ${PLAN_OUT}`)
 
   // =========================================================================

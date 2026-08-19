@@ -77,7 +77,7 @@
  *                     ledger.
  */
 import { createHash, randomBytes } from 'node:crypto'
-import { closeSync, fsyncSync, mkdirSync, openSync, unlinkSync, writeSync } from 'node:fs'
+import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { hostname } from 'node:os'
 import pg from 'pg'
 import { XERO_LIVE_CLEANUP_LOCK_NAMESPACE } from '../../lib/db/advisory-locks.ts'
@@ -2091,6 +2091,26 @@ export class LedgerCoordinatorMismatchError extends SafetyViolationError {}
  * of a ledger that was, from that moment, unexcluded.
  */
 export class SharedFenceLostError extends SafetyViolationError {}
+/**
+ * THIS CONNECTION IS NOT A SESSION (r9 finding 1).
+ *
+ * Successive statements were shown to land somewhere other than the backend that answered the one
+ * before — a transaction-pooling proxy in front of `DATABASE_URL`, in practice. Everything the
+ * fence is built on is session-scoped: `pg_try_advisory_lock` lives on the backend that took it,
+ * and `pg_backend_pid()` in the held check answers about whichever backend that statement landed
+ * on. Under a pooler the lock can be taken on one backend and the check satisfied on another, or
+ * on nothing at all, and the run believes it holds an exclusion it does not.
+ *
+ * Round 8 wrote this down as an operational precondition ("confirm DATABASE_URL is not a pgbouncer
+ * endpoint"). A precondition nobody can verify from inside is not a guarantee, so it is measured
+ * instead — see `proveSessionContinuity`.
+ */
+export class SessionDiscontinuityError extends SafetyViolationError {}
+/**
+ * The coordinator this run reached is a legitimate claimant of the ledger, and nobody has said it
+ * is the ONLY one (r9 finding 2). See `assertCoordinatorAttested`.
+ */
+export class CoordinatorNotAttestedError extends SafetyViolationError {}
 
 /**
  * THE SETTLEMENT VOCABULARY, and it is closed.
@@ -2233,10 +2253,20 @@ export type SharedUnresolvedWrite = {
 export type LedgerCoordinator = {
   /** `current_database()` of the session holding the lock. For the operator, not for the binding. */
   database: string
+  /** That database's oid. Part of the fingerprint; `null` where the store would not say. */
+  databaseOid: string | null
+  /**
+   * The PostgreSQL cluster's `system_identifier`, or `null` where `pg_control_system()` is not
+   * readable by this role. It is the field that separates a restored snapshot from the original, so
+   * its absence weakens the fingerprint and is reported rather than hidden.
+   */
+  clusterId: string | null
   /** The `accounting_tokens` row that makes this database this ledger's IMS installation. */
   connectionId: string
   /** What that row calls the organisation. Printed so a mismatch reads as English. */
   tenantName: string
+  /** All of the above as one comparable token. See `xeroCoordinatorFingerprint`. */
+  fingerprint: string
 }
 
 export type SharedWriteFence = {
@@ -2272,7 +2302,10 @@ export const NULL_SHARED_WRITE_FENCE: SharedWriteFence = {
   hostId: '(none)',
   lockId: 0,
   mode: 'shared',
-  coordinator: { database: '(none)', connectionId: '(none)', tenantName: '(none)' },
+  coordinator: {
+    database: '(none)', databaseOid: null, clusterId: null,
+    connectionId: '(none)', tenantName: '(none)', fingerprint: '(none)',
+  },
   // It holds nothing, so it cannot have lost anything. The remover never reaches its own
   // still-held check through this value: by then the real fence has replaced it, and the tests
   // assert that ordering.
@@ -2305,6 +2338,30 @@ export function xeroLedgerLockId(tenantId: string): number {
 }
 
 /**
+ * WHERE THE SESSION MARKS LIVE (r9 finding 1).
+ *
+ * Two of them, and they fail in different ways on purpose. A custom GUC set with `is_local = false`
+ * survives the implicit transaction but is a plain setting, and a pooler that runs `DISCARD ALL`
+ * or `RESET ALL` between clients clears it. A temp relation is bound to the backend's own temp
+ * schema and cannot be forged by another backend at all, but is heavier and leaves a relation
+ * behind for the life of the session. Requiring BOTH means neither failure mode alone is enough
+ * for a routed-away statement to pass as ours.
+ *
+ * The names are prefixed and boring on purpose: they appear in `pg_temp` and in `pg_settings` on a
+ * real IMS database, and an operator who finds one should be able to tell what put it there.
+ */
+export const SESSION_MARK_SETTING = 'o3d.xero_fence_session'
+export const SESSION_MARK_TABLE = 'o3d_xero_fence_session'
+
+/**
+ * How many times `recall` is asked, as separate statements, before the connection is accepted as a
+ * session. One would be the coin-flip a pooler with a warm backend passes; each extra one is
+ * another independent chance to be routed away, and they cost a round trip each on a connection
+ * that is about to be used for irreversible work.
+ */
+export const SESSION_CONTINUITY_PROBES = 3
+
+/**
  * The exact SQL the fence issues. Exported so the test double is measured against the statements
  * that actually run rather than against a paraphrase of them, and so that a change to one without
  * the other fails a test instead of a production run.
@@ -2324,11 +2381,24 @@ export const SHARED_FENCE_SQL = {
    * down. `objsubid = 2` is the two-int form, `mode` distinguishes the exclusive lock an --apply
    * takes from the share lock a dry run takes, and `pid = pg_backend_pid()` is what makes it a
    * question about OURSELVES rather than about whoever else may be holding it.
+   *
+   * ROUND 9 FOLDED THE SESSION PROOF INTO THE SAME STATEMENT, and the "same statement" is the whole
+   * point. `pg_backend_pid()` answers about whichever backend THIS statement landed on, so under a
+   * transaction pooler the lock can be held on backend A while the check runs — and passes, or
+   * fails — on backend B. Asking the two questions in two statements would leave exactly that gap
+   * open, because either one could land on the marked backend by chance while the other did not.
+   * Asked together, the answer is a single tuple about a single backend: it holds the lock in this
+   * mode, AND it is the backend that carries the marks this run planted at acquisition. A backend
+   * that is not ours has neither the session GUC nor the temp object, so a routed-away statement
+   * cannot answer yes. See `proveSessionContinuity` and `assertSessionStillOurs`.
    */
   held:
-    'SELECT count(*)::int AS held FROM pg_locks ' +
+    'SELECT (SELECT count(*)::int FROM pg_locks ' +
     "WHERE locktype = 'advisory' AND classid = $1::oid AND objid = $2::oid AND objsubid = 2 " +
-    'AND pid = pg_backend_pid() AND granted AND mode = $3',
+    'AND pid = pg_backend_pid() AND granted AND mode = $3) AS held, ' +
+    'pg_backend_pid()::int AS pid, ' +
+    `current_setting('${SESSION_MARK_SETTING}', true) AS nonce, ` +
+    `(to_regclass('pg_temp.${SESSION_MARK_TABLE}') IS NOT NULL) AS "tempPresent"`,
   /**
    * Does this database hold the IMS connection to the ledger we are about to lock? The LEFT JOIN
    * against a one-row source is so that a database with NO Xero connection still answers — with a
@@ -2336,9 +2406,41 @@ export const SHARED_FENCE_SQL = {
    * read as "fine".
    */
   identify:
-    'SELECT current_database() AS "database", t."id" AS "connectionId", t."tenantId" AS "tenantId", ' +
+    'SELECT current_database() AS "database", ' +
+    '(SELECT oid::text FROM pg_database WHERE datname = current_database()) AS "databaseOid", ' +
+    't."id" AS "connectionId", t."tenantId" AS "tenantId", ' +
     't."tenantName" AS "tenantName" ' +
     'FROM (SELECT 1) AS present LEFT JOIN "accounting_tokens" t ON t."connector" = \'xero\'',
+  /**
+   * WHICH POSTGRESQL CLUSTER this is, for the coordinator fingerprint (r9 finding 2). Its own
+   * statement, and its failure is tolerated: `pg_control_system()` is REVOKEd from PUBLIC on some
+   * installations, and a fingerprint that names one field less is still worth having — it just
+   * distinguishes fewer of the two-legitimate-claimants cases, and the refusal says so out loud
+   * rather than pretending otherwise.
+   */
+  cluster: 'SELECT system_identifier::text AS "clusterId" FROM pg_control_system()',
+  /**
+   * THE SESSION MARKS (r9 finding 1). Three statements, because one statement can prove nothing
+   * about continuity: what is being established is that a LATER statement lands on the SAME backend
+   * as an earlier one.
+   *
+   * `mark` plants a session-scoped GUC (`is_local = false`, so it outlives the implicit
+   * transaction) and reports the backend that took it. `plant` creates a temp object, which only
+   * the backend that created it can see. `recall` asks a backend to produce all three — its pid,
+   * the GUC and the temp object — and is run repeatedly, as separate statements, because a pooler
+   * that rotates backends must be given more than one chance to route us away.
+   *
+   * `plant` is deliberately NOT `IF NOT EXISTS`: a temp table that is already there means this
+   * backend was somebody else's session a moment ago, which is the condition being detected.
+   */
+  session: {
+    mark: `SELECT pg_backend_pid()::int AS pid, set_config('${SESSION_MARK_SETTING}', $1, false) AS nonce`,
+    plant: `CREATE TEMP TABLE ${SESSION_MARK_TABLE} AS SELECT $1::text AS nonce`,
+    recall:
+      'SELECT pg_backend_pid()::int AS pid, ' +
+      `current_setting('${SESSION_MARK_SETTING}', true) AS nonce, ` +
+      `(to_regclass('pg_temp.${SESSION_MARK_TABLE}') IS NOT NULL) AS "tempPresent"`,
+  },
   /**
    * Everything for this ledger that is not accounted for, stated as the COMPLEMENT of the resolved
    * vocabulary rather than as a list of the unresolved ones (r8 finding 3). `state IS NULL` is
@@ -2382,6 +2484,30 @@ export const SHARED_FENCE_SQL = {
  *     a recognised one. Again inside a transaction that was ROLLED BACK; the table does not exist
  *     in that database afterwards and no advisory lock was left behind.
  *
+ * ROUND 9 ADDED THE SESSION-CONTINUITY STATEMENTS, measured the same way against the same database:
+ *   • `session.mark` sets the GUC and reports the backend pid in one statement; `session.plant`
+ *     creates the temp relation; `session.recall` answers pid + GUC + `tempPresent = true` on the
+ *     same connection, repeatedly;
+ *   • the extended `held` statement answers `held = 1` with the pid, the nonce and `tempPresent`
+ *     together while the session holds the lock — and, with the marks removed to imitate a routed
+ *     statement, answers `held = 1` with a NULL nonce and `tempPresent = false`, which is the exact
+ *     tuple `readHeldAnswer` refuses;
+ *   • asked from a SECOND session (which is what a transaction pooler hands you), the same
+ *     statement answers a different pid, a NULL nonce, `tempPresent = false` and `held = 0` — all
+ *     four signals fire together, so no one of them carries the check alone;
+ *   • `identify` still runs with the added `databaseOid`, and `cluster` answers this cluster's
+ *     `system_identifier` for the IMS role — so the fingerprint names the cluster here, though the
+ *     code does not require that anywhere it may not.
+ * Measured twice over. First by hand at a SQL prompt, with the marks planted inside a transaction
+ * that was ROLLED BACK and confirmed gone afterwards (`current_setting` NULL, `to_regclass`
+ * NULL, no row in pg_class). Then over the WIRE through node-postgres, in autocommit, issuing these exact strings
+ * as parameterised queries — which also settles that a parameterised `CREATE TEMP TABLE ... AS
+ * SELECT $1::text` is accepted through the extended query protocol, not only as literal SQL — and
+ * running `acquireSharedWriteFence` itself against the dev database, where the session probe passed
+ * and the run was then refused by the coordinator check, as it must be. Afterwards: no advisory
+ * lock and no `o3d_xero_fence_session` relation anywhere in the cluster. Nothing was left behind
+ * by either pass, and no row in that database was written.
+ *
  * The Xero side of this file has no equivalent check available: the stored audit token expired
  * 2026-08-18T14:49Z and refreshing it rotates the refresh token out of band.
  */
@@ -2400,6 +2526,276 @@ export const SHARED_FENCE_HELD_CHECK_MS = 30_000
 export const SHARED_FENCE_LOCK_MODE: Record<SharedFenceMode, string> = {
   exclusive: 'ExclusiveLock',
   shared: 'ShareLock',
+}
+
+/** One backend's answer about itself. */
+export type SessionObservation = {
+  /** `pg_backend_pid()` — WHICH backend answered this particular statement. */
+  pid: number
+  /** The session GUC, or `null` where this backend has never had it set. */
+  nonce: string | null
+  /** Whether this backend can see the temp relation the marking statement created. */
+  tempPresent: boolean
+}
+
+/**
+ * IS THIS CONNECTION A SESSION? (r9 finding 1.)
+ *
+ * Everything the fence guarantees is session-scoped. `pg_try_advisory_lock` is held by the BACKEND
+ * that executed it and is released the moment that backend's session ends; the held check asks
+ * `pg_backend_pid()`, which answers about the backend that ran THAT statement. Both are correct
+ * against a real connection and both are meaningless through a transaction-pooling proxy, where a
+ * connection is a queue onto a rotating set of backends: the lock is taken on one, the check passes
+ * on another that never held it, or on one that holds nothing at all.
+ *
+ * Round 8 recorded this as something for an operator to confirm out of band. It is not confirmable
+ * out of band by the thing that depends on it, so it is asked of the connection instead — and the
+ * connection can answer, because "did a later statement land on the backend an earlier one did" is
+ * a question PostgreSQL will settle. The marks are planted, then read back several times, and
+ * anything other than the same backend producing all of them every time is a refusal.
+ *
+ * WHAT THIS CATCHES: pgbouncer/pgcat/odyssey in transaction or statement mode, RDS Proxy with
+ * pinning off, any middlebox that multiplexes statements across backends, and a backend recycled
+ * from another client mid-run (the temp relation or the GUC is somebody else's, or absent).
+ *
+ * WHAT IT DOES NOT: a pooler with exactly one server connection and one client, which cannot route
+ * us anywhere else and where session continuity therefore genuinely holds for the run's duration —
+ * that is a pass because it is true, not because the check missed it. And a pooler that begins
+ * rotating only later is caught not here but by the held check, which carries the same marks and
+ * runs before the plan is written and before every dispatch.
+ */
+export function assertSessionContinuity(args: {
+  nonce: string
+  /** What the marking statement answered: the backend that took the mark, and the value it applied. */
+  mark: { pid: number; applied: string | null }
+  /** What each later, SEPARATE statement answered. */
+  observations: readonly SessionObservation[]
+}): number {
+  const remedy =
+    `\nA transaction-pooling proxy in front of DATABASE_URL is what this looks like — pgbouncer in ` +
+    `transaction or statement mode, pgcat, odyssey, RDS Proxy without pinning. Point DATABASE_URL at ` +
+    `PostgreSQL DIRECTLY for this script, or at a pooler in SESSION mode. Do not re-run until it passes: ` +
+    `a run that passes by luck holds the ledger on one backend and asks another whether it does.`
+  const preface =
+    `The live-Xero cleanup excludes every other run through a PostgreSQL SESSION advisory lock, and ` +
+    `re-establishes it before the plan is written and before every single dispatch. A session advisory ` +
+    `lock belongs to the backend that took it, and pg_backend_pid() answers about the backend that ran ` +
+    `the asking statement — so if successive statements can land on different backends, the lock is taken ` +
+    `in one place and checked in another, and this run would believe it holds an exclusion it does not.`
+
+  if (!Number.isInteger(args.mark.pid) || args.mark.pid <= 0) {
+    throw new SessionDiscontinuityError(
+      `ABORT: the coordinator did not report a backend pid for this connection (got ` +
+        `${JSON.stringify(args.mark.pid)}), so nothing here can be shown to be one session.\n${preface}${remedy}`,
+    )
+  }
+  if (args.mark.applied !== args.nonce) {
+    throw new SessionDiscontinuityError(
+      `ABORT: the session marker did not take on this connection (asked for ${JSON.stringify(args.nonce)}, ` +
+        `the coordinator applied ${JSON.stringify(args.mark.applied)}).\n${preface}${remedy}`,
+    )
+  }
+  if (args.observations.length === 0) {
+    // A caller that asks for no probes has established nothing, and "established nothing" is refused
+    // here for the same reason silence is refused everywhere else in this file.
+    throw new SessionDiscontinuityError(
+      `ABORT: session continuity was not probed at all, so it is not established.\n${preface}${remedy}`,
+    )
+  }
+  args.observations.forEach((o, i) => {
+    const fault =
+      o.pid !== args.mark.pid
+        ? `statement ${i + 1} was answered by backend ${o.pid}, not by backend ${args.mark.pid}, which took the mark`
+        : o.nonce !== args.nonce
+          ? `backend ${o.pid} does not carry this run's session marker (${SESSION_MARK_SETTING} is ` +
+            `${o.nonce == null ? 'unset' : JSON.stringify(o.nonce)}, not ${JSON.stringify(args.nonce)})`
+          : !o.tempPresent
+            ? `backend ${o.pid} cannot see the temp relation ${SESSION_MARK_TABLE} this connection created`
+            : null
+    if (fault) {
+      throw new SessionDiscontinuityError(
+        `ABORT: this connection is not a single PostgreSQL session — ${fault}.\n${preface}${remedy}`,
+      )
+    }
+  })
+  return args.mark.pid
+}
+
+/**
+ * Read one `held` answer as either "still ours" or a reason it is not.
+ *
+ * Split out from the fence so the four ways the answer can be wrong are testable individually, and
+ * so that adding a fifth is a change to one function. `null` means the backend that answered holds
+ * the lock in the right mode AND is the backend this run marked; anything else is a loss, and
+ * losses in this file are latched.
+ *
+ * ORDER MATTERS. The session questions are asked BEFORE the lock count, so that a statement which
+ * landed on another backend is reported as what it is — a connection that is not a session — rather
+ * than as "the lock is gone", which sends the operator looking for a reaper that does not exist.
+ */
+export function readHeldAnswer(args: {
+  row: Record<string, unknown> | undefined
+  expect: { pid: number; nonce: string; mode: string; lockId: number }
+}): string | null {
+  const row = args.row
+  if (!row) return 'the coordinator answered the held check with no row at all'
+  const pid = Number(row.pid ?? 0)
+  if (pid !== args.expect.pid) {
+    return (
+      `the held check was answered by backend ${pid || '(none reported)'}, not by backend ${args.expect.pid}, ` +
+      `which took the lock — successive statements on this connection are landing on different backends`
+    )
+  }
+  const nonce = row.nonce == null ? null : String(row.nonce)
+  if (nonce !== args.expect.nonce) {
+    return (
+      `backend ${pid} no longer carries this run's session marker (${SESSION_MARK_SETTING} is ` +
+      `${nonce == null ? 'unset' : JSON.stringify(nonce)}), so it is not the session that took the lock`
+    )
+  }
+  if (row.tempPresent !== true) {
+    return `backend ${pid} can no longer see the temp relation ${SESSION_MARK_TABLE} this session created`
+  }
+  const held = Number(row.held ?? 0)
+  if (held !== 1) {
+    return (
+      `PostgreSQL reports this session holds ${held} ${args.expect.mode}(s) on advisory key ` +
+      `(${XERO_LIVE_CLEANUP_LOCK_NAMESPACE}, ${args.expect.lockId}), not 1`
+    )
+  }
+  return null
+}
+
+/**
+ * WHICH COORDINATOR THIS IS, as one short string a human can carry between runs (r9 finding 2).
+ *
+ * Hashed rather than printed field by field so that "the operator attested THIS store" is a single
+ * comparison that cannot be half-satisfied, and short enough to be typed on a command line. Every
+ * field that could differ between two stores which both legitimately claim the ledger is in it: the
+ * PostgreSQL cluster's system identifier, the database name and its oid, and the id of the
+ * accounting connection row. The tenant is in it too, so a fingerprint cannot be carried from a run
+ * against one organisation to a run against another.
+ *
+ * The cluster identifier is the field that does the work, and it is the one that may be missing:
+ * `pg_control_system()` is REVOKEd from PUBLIC on some installations. `null` is folded in as a
+ * named absence rather than skipped, so a fingerprint taken with it and one taken without it can
+ * never collide, and the attestation prompt says which of the two it is offering.
+ */
+export function xeroCoordinatorFingerprint(args: {
+  tenantId: string
+  clusterId: string | null
+  database: string
+  databaseOid: string | null
+  connectionId: string
+}): string {
+  const digest = createHash('sha256')
+    .update(
+      [
+        'o3d-xero-cleanup-coordinator/1',
+        args.tenantId.toLowerCase(),
+        args.clusterId ?? '(cluster unidentified)',
+        args.database,
+        args.databaseOid ?? '(database oid unavailable)',
+        args.connectionId,
+      ].join(' '),
+    )
+    .digest('hex')
+  return `coord-${digest.slice(0, 24)}`
+}
+
+/**
+ * IS THIS THE ONLY STORE THAT CLAIMS THE LEDGER? (r9 finding 2.)
+ *
+ * `assertCoordinatorOwnsLedger` closes every case where the store is UNRELATED to the ledger. What
+ * it cannot close — and round 8 said so, then carried on — is two stores that BOTH legitimately
+ * claim it: a snapshot of the IMS database restored elsewhere, or a second IMS installation
+ * authorised against the same Xero organisation. Both hold a matching accounting_tokens row, both
+ * answer this ledger's name, and neither can see the other. Two runs then take two different locks
+ * and exclude nobody.
+ *
+ * WHAT WOULD ACTUALLY CLOSE IT, stated because "unclosable" is not an answer on its own. Exactly
+ * one thing: a mutual-exclusion authority OUTSIDE all of the candidate stores, whose address every
+ * run derives from the LEDGER rather than from host configuration. Two shapes exist and neither is
+ * available here —
+ *   (a) a marker in the ledger itself. Ruled out for the three reasons under "WHY NOT A MARKER IN
+ *       THE LEDGER ITSELF", any one of them fatal: it writes to the ledger in order to protect the
+ *       ledger, a dry run would have to write, and Xero has no conditional create to arbitrate the
+ *       race between two hosts planting one.
+ *   (b) one designated coordination service — a single registry database, or a lock service —
+ *       reached at an address derived from the tenant id. That IS the fix, it is a piece of shared
+ *       infrastructure this repo does not have, and inventing a second candidate store to solve
+ *       "there may be two candidate stores" is not a thing to do inside an incident script.
+ *
+ * SO: REFUSE, RATHER THAN PROCEED AND PRINT. Round 8 carried the coordinator's identity on the
+ * fence and printed it, on the theory that two operators comparing two runs' output would notice a
+ * split. That is not a control. It fires after both runs have already written to the ledger, it
+ * needs a second human who is looking at the other run's terminal, and this tooling's writes are
+ * irreversible — a voided credit note cannot be un-voided. A check whose whole effect happens after
+ * the damage is a report, and this is the class of defect that has to fail closed.
+ *
+ * What a refusal can reach that a database cannot is the one thing a human has and no store here
+ * does: sight of both installations. So `--apply` requires the operator to name the coordinator it
+ * is allowed to run in, as the fingerprint that store computes about itself. The attestation is not
+ * a proof of uniqueness — nothing here can produce one — it is a recorded human statement, made
+ * against a specific cluster, database and connection row, that they have checked. Its mechanical
+ * value is real and narrow: the same attestation cannot authorise a run in the OTHER store, because
+ * the other store computes a different fingerprint. The split fails at the second run instead of
+ * being noticed afterwards by nobody.
+ *
+ * A DRY RUN IS NOT GATED, and that is a decision rather than an omission. A dry run dispatches
+ * nothing, and the plan it leaves is re-authorised object by object against a live re-read at apply
+ * time, under this gate. Putting a human attestation in front of a read-only run teaches the
+ * operator to paste the value without reading the question, which is how attestations stop being
+ * worth anything. It prints the fingerprint instead, which is where the operator gets the value
+ * they will later have to attest. A dry run that IS given a fingerprint is still checked against
+ * it: an operator who says which store they mean is entitled to be told they are somewhere else.
+ */
+export function assertCoordinatorAttested(args: {
+  tenantId: string
+  mode: SharedFenceMode
+  coordinator: LedgerCoordinator
+  /** What the operator named, if anything. */
+  attested: string | null | undefined
+}): void {
+  const c = args.coordinator
+  const identity =
+    `  fingerprint : ${c.fingerprint}\n` +
+    `  cluster     : ${c.clusterId ?? 'NOT IDENTIFIABLE — pg_control_system() is not readable by this role'}\n` +
+    `  database    : ${c.database}${c.databaseOid ? ` (oid ${c.databaseOid})` : ''}\n` +
+    `  connection  : ${c.connectionId} — ${c.tenantName}\n`
+  const attested = args.attested == null || args.attested.trim() === '' ? null : args.attested.trim()
+
+  if (attested !== null && attested !== c.fingerprint) {
+    throw new CoordinatorNotAttestedError(
+      `ABORT: this run was authorised for coordinator ${attested}, and the store it reached is a DIFFERENT ` +
+        `one:\n${identity}` +
+        `Both stores can hold a valid accounting connection for ${args.tenantId} — a restored snapshot of the ` +
+        `IMS database, or a second IMS installation authorised against the same Xero organisation — and two ` +
+        `runs in two of them take two different locks and exclude each other from nothing. That is precisely ` +
+        `what the attestation exists to stop, and it has just stopped it.\n` +
+        `Either point DATABASE_URL at the store you attested, or establish which store is the one every run ` +
+        `must coordinate through and attest THAT one. Do not attest both.`,
+    )
+  }
+  if (attested === null && args.mode === 'exclusive') {
+    throw new CoordinatorNotAttestedError(
+      `ABORT: --apply must name the coordinator it is allowed to run in. This store says it is:\n${identity}` +
+        `Re-run with --coordinator ${c.fingerprint} once you have established, OUTSIDE any database, that it ` +
+        `is the ONLY store that claims this ledger — no restored snapshot of the IMS database reachable by ` +
+        `anyone who could run this script, and no second IMS installation authorised against ` +
+        `${c.tenantName} (${args.tenantId}).\n` +
+        `WHY YOU ARE BEING ASKED. The exclusion is a lock in this database. A second store holding a valid ` +
+        `connection row for the same organisation answers every check in this script identically, takes its ` +
+        `own free lock, and excludes nobody — and nothing inside either database can see the other. A human ` +
+        `can. This is that check, and there is no version of it that runs unattended.\n` +
+        (c.clusterId === null
+          ? `NOTE: pg_control_system() is not readable by this role, so the fingerprint does not name the ` +
+            `PostgreSQL cluster — it separates stores only by database name, oid and connection row. Two ` +
+            `clusters holding same-named restores of the same database would fingerprint alike. Grant the ` +
+            `role EXECUTE on pg_control_system() to close that, or be correspondingly more careful here.\n`
+          : ''),
+    )
+  }
 }
 
 /**
@@ -2443,6 +2839,10 @@ export function assertCoordinatorOwnsLedger(args: {
   tenantId: string
   /** `current_database()`, for the message. It is not part of the decision. */
   database: string
+  /** The database oid, for the fingerprint. Not part of the decision either. */
+  databaseOid?: string | null
+  /** The cluster's system identifier, where the role may read it. Not part of the decision. */
+  clusterId?: string | null
   /** Every `accounting_tokens` row with `connector = 'xero'`, as the store answered. */
   connections: ReadonlyArray<{ connectionId?: string | null; tenantId?: string | null; tenantName?: string | null }>
 }): LedgerCoordinator {
@@ -2484,10 +2884,18 @@ export function assertCoordinatorOwnsLedger(args: {
         `${args.tenantId}.`,
     )
   }
+  const connectionId = String(only.connectionId)
+  const databaseOid = args.databaseOid == null ? null : String(args.databaseOid)
+  const clusterId = args.clusterId == null ? null : String(args.clusterId)
   return {
     database: args.database,
-    connectionId: String(only.connectionId),
+    databaseOid,
+    clusterId,
+    connectionId,
     tenantName: only.tenantName ? String(only.tenantName) : '(unnamed organisation)',
+    fingerprint: xeroCoordinatorFingerprint({
+      tenantId: args.tenantId, clusterId, database: args.database, databaseOid, connectionId,
+    }),
   }
 }
 
@@ -2502,10 +2910,17 @@ export async function acquireSharedWriteFence(args: {
   tenantId: string
   /** `--apply` takes the ledger exclusively; a dry run shares it with other dry runs. */
   mode: SharedFenceMode
+  /**
+   * The coordinator the operator has authorised this run to use, as its own fingerprint. Required
+   * for `exclusive`; checked whenever it is supplied. See `assertCoordinatorAttested`.
+   */
+  attestedCoordinator?: string | null
   /** Injected for tests, and so a caller can make the coordinator itself fail. */
   createClient?: () => CoordinationClient
   hostId?: string
   now?: () => Date
+  /** Injected so a test can hand the probe a fixed value instead of a random one. */
+  sessionNonce?: string
   /** Injected so tests leave no timers behind. */
   setKeepalive?: (fn: () => void, ms: number) => { clear: () => void }
 }): Promise<SharedWriteFence> {
@@ -2513,6 +2928,7 @@ export async function acquireSharedWriteFence(args: {
   const hostId = args.hostId ?? `${hostname()}#${process.pid}`
   const now = args.now ?? (() => new Date())
   const createClient = args.createClient ?? defaultCoordinationClient
+  const sessionNonce = args.sessionNonce ?? randomBytes(16).toString('hex')
   const setKeepalive =
     args.setKeepalive ??
     ((fn: () => void, ms: number) => {
@@ -2540,6 +2956,27 @@ export async function acquireSharedWriteFence(args: {
 
   const end = async () => { try { await client.end() } catch { /* the session is going away regardless */ } }
 
+  // BEFORE EVERYTHING ELSE, because everything else is session-scoped and would be meaningless
+  // otherwise: is this connection ONE PostgreSQL session, or a queue onto a rotating set of
+  // backends? (r9 finding 1.) A failure here is not "the coordinator is busy" and not "somebody
+  // else holds the ledger" — it is that no statement this fence issues can be relied on to be about
+  // the same backend as the one before it, so it keeps its own class.
+  let sessionPid: number
+  try {
+    sessionPid = await proveSessionContinuity(client, sessionNonce)
+  } catch (e) {
+    await end()
+    if (e instanceof SessionDiscontinuityError) throw e
+    throw new SharedCoordinatorUnavailableError(
+      `ABORT: the store this run reached could not be shown to be a single PostgreSQL session ` +
+        `(${args.tenantId}): ${errText(e)}\n` +
+        `The ledger lock, and every re-establishment of it, is scoped to ONE backend. A connection that ` +
+        `cannot answer which backend it is — or that will not let this run plant a session-scoped marker on ` +
+        `it — cannot be shown to hold anything, so it is refused on the same terms as an unreachable ` +
+        `coordinator.`,
+    )
+  }
+
   // BEFORE THE LOCK, because a lock taken in a store that has nothing to do with this ledger is not
   // a lock at all — it is a free key in somebody's scratch database while the run that matters
   // takes the free key in another one. See `assertCoordinatorOwnsLedger`.
@@ -2549,6 +2986,11 @@ export async function acquireSharedWriteFence(args: {
     coordinator = assertCoordinatorOwnsLedger({
       tenantId: args.tenantId,
       database: String(identity.rows[0]?.database ?? '(unnamed database)'),
+      databaseOid: identity.rows[0]?.databaseOid == null ? null : String(identity.rows[0].databaseOid),
+      // Its own statement, and its failure is not the run's failure: a role without EXECUTE on
+      // pg_control_system() still gets a fingerprint, one field weaker, and is told so at the point
+      // it matters rather than here.
+      clusterId: await readClusterId(client),
       connections: identity.rows.map((r) => ({
         connectionId: r.connectionId == null ? null : String(r.connectionId),
         tenantId: r.tenantId == null ? null : String(r.tenantId),
@@ -2568,6 +3010,19 @@ export async function acquireSharedWriteFence(args: {
         `by DATABASE_URL — so a store that cannot answer that question cannot be shown to be the one every ` +
         `other run coordinates through, and taking its lock would exclude nobody.`,
     )
+  }
+
+  // AND IS THIS STORE THE ONE A HUMAN AUTHORISED? (r9 finding 2.) Before the lock, because a lock
+  // taken in a store nobody vouched for is the two-legitimate-claimants split happening — and after
+  // the identification, because the fingerprint the operator is asked for is computed from what the
+  // store just said about itself.
+  try {
+    assertCoordinatorAttested({
+      tenantId: args.tenantId, mode: args.mode, coordinator, attested: args.attestedCoordinator,
+    })
+  } catch (e) {
+    await end()
+    throw e
   }
 
   let locked: boolean
@@ -2615,12 +3070,12 @@ export async function acquireSharedWriteFence(args: {
       const res = await client.query(SHARED_FENCE_SQL.held, [
         XERO_LIVE_CLEANUP_LOCK_NAMESPACE, lockId, SHARED_FENCE_LOCK_MODE[args.mode],
       ])
-      const held = Number(res.rows[0]?.held ?? 0)
-      if (held !== 1) {
-        lost =
-          `PostgreSQL reports this session holds ${held} ${SHARED_FENCE_LOCK_MODE[args.mode]}(s) on ` +
-          `advisory key (${XERO_LIVE_CLEANUP_LOCK_NAMESPACE}, ${lockId}), not 1`
-      }
+      // One tuple, four questions, one backend. See `readHeldAnswer` and the note on
+      // SHARED_FENCE_SQL.held for why they may not be asked separately.
+      lost = readHeldAnswer({
+        row: res.rows[0],
+        expect: { pid: sessionPid, nonce: sessionNonce, mode: SHARED_FENCE_LOCK_MODE[args.mode], lockId },
+      })
     } catch (e) {
       // Unanswerable is treated as lost, for the reason every other refusal in this file gives: from
       // inside this process "I could not ask" and "somebody else has it" are the same state.
@@ -2762,10 +3217,95 @@ export async function acquireSharedWriteFence(args: {
 const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e))
 
 /**
+ * Plant this run's session marks and establish, against PostgreSQL, that later statements land on
+ * the backend that took them (r9 finding 1). Returns that backend's pid, which every subsequent
+ * held check is measured against.
+ *
+ * Three kinds of statement, in this order and not another:
+ *   1. `mark` — set a session-scoped GUC and report the backend that took it. `is_local = false`
+ *      so it outlives the implicit transaction the statement runs in.
+ *   2. `plant` — create a temp relation. Only the backend that created it can see it, and no other
+ *      backend can produce one that looks the same by accident. Deliberately not IF NOT EXISTS: a
+ *      relation that is already there means this backend was somebody else's session moments ago,
+ *      which is the condition being detected, and an error is the correct answer to it.
+ *   3. `recall`, `SESSION_CONTINUITY_PROBES` times as SEPARATE statements — each one another
+ *      independent opportunity for a pooler to route us somewhere else.
+ *
+ * The temp relation is not dropped afterwards. It is the marker the held check keeps asking for,
+ * and it goes away with the session, which is the only lifetime that would be correct for it.
+ */
+async function proveSessionContinuity(client: CoordinationClient, nonce: string): Promise<number> {
+  const marked = await client.query(SHARED_FENCE_SQL.session.mark, [nonce])
+  try {
+    await client.query(SHARED_FENCE_SQL.session.plant, [nonce])
+  } catch (e) {
+    // Named rather than folded into "the coordinator is unreachable", because the most likely cause
+    // is the thing being detected: the relation ALREADY EXISTS, which means this backend was
+    // somebody else's session a moment ago. The other cause — a role without TEMPORARY on the
+    // database — lands in the same place for the same reason: continuity cannot be shown, so the
+    // run does not start.
+    throw new SessionDiscontinuityError(
+      `ABORT: this connection would not carry a session marker for this run: ${errText(e)}\n` +
+        `The ledger lock is a SESSION advisory lock, and the only way to establish that later statements ` +
+        `reach the backend that took it is to plant something on that backend and read it back. ` +
+        `${SESSION_MARK_TABLE} could not be created.\n` +
+        `If the error says the relation already exists, this backend was another client's session moments ` +
+        `ago — a transaction-pooling proxy in front of DATABASE_URL. Point DATABASE_URL at PostgreSQL ` +
+        `directly, or at a pooler in SESSION mode. If it says permission denied, grant this role TEMPORARY ` +
+        `on the database; without it nothing here can prove it is holding anything.`,
+    )
+  }
+  const observations: SessionObservation[] = []
+  for (let i = 0; i < SESSION_CONTINUITY_PROBES; i++) {
+    const res = await client.query(SHARED_FENCE_SQL.session.recall)
+    const row = res.rows[0]
+    observations.push({
+      pid: Number(row?.pid ?? 0),
+      nonce: row?.nonce == null ? null : String(row.nonce),
+      tempPresent: row?.tempPresent === true,
+    })
+  }
+  return assertSessionContinuity({
+    nonce,
+    mark: {
+      pid: Number(marked.rows[0]?.pid ?? 0),
+      applied: marked.rows[0]?.nonce == null ? null : String(marked.rows[0].nonce),
+    },
+    observations,
+  })
+}
+
+/**
+ * The cluster's system identifier, or `null` if this role may not read it.
+ *
+ * Tolerated rather than fatal, and it is the only question in this file that is. It contributes to
+ * the coordinator FINGERPRINT — how well two stores can be told apart — and not to any decision
+ * about whether this store may be used at all. Refusing the run because a GRANT is missing would
+ * trade a real capability for a weaker one; instead the absence travels on the coordinator and the
+ * attestation prompt says out loud which of the two fingerprints it is offering.
+ */
+async function readClusterId(client: CoordinationClient): Promise<string | null> {
+  try {
+    const res = await client.query(SHARED_FENCE_SQL.cluster)
+    const value = res.rows[0]?.clusterId
+    return value == null || String(value) === '' ? null : String(value)
+  } catch {
+    return null
+  }
+}
+
+
+/**
  * The real client. A dedicated session, never a pooled one: `pg_try_advisory_lock` lives on the
  * connection that took it, and a pool would hand the unlock — or the next intent INSERT — to a
  * different socket that never held the lock. Injectable, so every test in this file runs against a
  * double that models one database shared by two hosts instead of against a socket.
+ *
+ * `pg.Client` is a single connection rather than a `pg.Pool`, which settles this end of it — but it
+ * settles only THIS end. What DATABASE_URL points AT can be a pooling proxy, and from here that is
+ * indistinguishable from PostgreSQL. That is why the fence does not rely on this constructor: it
+ * establishes session continuity against whatever answers, on the wire. See
+ * `proveSessionContinuity`.
  */
 function defaultCoordinationClient(): CoordinationClient {
   const connectionString = process.env.DATABASE_URL
@@ -2777,6 +3317,86 @@ function defaultCoordinationClient(): CoordinationClient {
     )
   }
   return new pg.Client({ connectionString, application_name: 'o3d_xero_live_cleanup_fence' }) as unknown as CoordinationClient
+}
+
+/**
+ * The staged artefact could not be removed after the fence went. Its own class because the operator
+ * has something to do about it, and it is not the same something as "the lock was lost".
+ */
+export class StagedArtefactStrandedError extends SafetyViolationError {}
+
+/** What `persistUnderFence` appends to make the staging name. Exported so the tests name one thing. */
+export const STAGED_ARTEFACT_SUFFIX = '.partial'
+
+/**
+ * WRITE AN ARTEFACT ONLY IF THE FENCE HELD ACROSS THE WHOLE WRITE (r9 finding 3).
+ *
+ * The plan is not a report of what happened; it is the thing the next `--apply` is authorised by.
+ * So it may exist only if the ledger was held CONTINUOUSLY from the reads it was assembled out of
+ * to the moment it lands on disk. Round 8 asserted before it and again at the end of the run, which
+ * leaves the window in between: the fence goes, the file is already written, the run aborts loudly
+ * — and the plan is sitting there afterwards, indistinguishable from one produced under an
+ * unbroken fence, ready for somebody to point `--apply --manifest` at.
+ *
+ * Closing it needs the check to be on the PUBLISHING step rather than around it, which is what
+ * staging buys: the bytes go to a name nothing consumes, the fence is re-established, and only then
+ * does the artefact take the name it is read under. A loss anywhere in the window is now a run that
+ * leaves no plan at all — which is the honest outcome, because there is no plan it is entitled to
+ * leave.
+ *
+ * Two more things fall out of staging, and both were live defects of the direct write:
+ *   • the previous run's plan is no longer truncated by a write that then aborts, so a failed run
+ *     cannot destroy a good artefact;
+ *   • a crash during the write itself cannot leave half a JSON document under the real name.
+ *
+ * If the staged file cannot be removed the run does NOT quietly swallow it: a `.partial` nobody
+ * mentioned is a plan waiting to be renamed by a tired operator.
+ */
+export async function persistUnderFence(args: {
+  /** The live fence. Both assertions are made against it; nothing here can substitute for one. */
+  fence: Pick<SharedWriteFence, 'assertStillHeld'>
+  /** The name the artefact is read under. */
+  path: string
+  body: string
+  /** What it is, in words, for the two assertion contexts and the refusal. */
+  what: string
+  /** Injected so a test can measure the ORDER of write/assert/publish rather than a paraphrase. */
+  io?: {
+    write: (path: string, body: string) => void
+    publish: (from: string, to: string) => void
+    discard: (path: string) => void
+  }
+}): Promise<void> {
+  const io = args.io ?? {
+    write: (path: string, body: string) => { writeFileSync(path, body) },
+    publish: (from: string, to: string) => { renameSync(from, to) },
+    discard: (path: string) => { unlinkSync(path) },
+  }
+  const staged = `${args.path}${STAGED_ARTEFACT_SUFFIX}`
+
+  // Before a byte is written. Everything the artefact is made of was read under the fence, and if
+  // the fence went during those reads none of it may be written down at all.
+  await args.fence.assertStillHeld(`about to persist ${args.what}`)
+  io.write(staged, args.body)
+  try {
+    // And again, on the far side of the write. THIS is the assertion round 8 did not have: a loss
+    // between the first one and the file landing is a loss that leaves the artefact behind.
+    await args.fence.assertStillHeld(`about to publish ${args.what} to ${args.path}`)
+  } catch (e) {
+    try {
+      io.discard(staged)
+    } catch (removeError) {
+      throw new StagedArtefactStrandedError(
+        `ABORT: ${errText(e)}\n` +
+          `AND THE STAGED ARTEFACT COULD NOT BE REMOVED: ${staged} (${errText(removeError)}).\n` +
+          `DELETE IT BY HAND. It holds ${args.what} assembled while the ledger lock was going away, which is ` +
+          `exactly what must never be renamed to ${args.path} and fed to --apply. Nothing was published under ` +
+          `that name by this run.`,
+      )
+    }
+    throw e
+  }
+  io.publish(staged, args.path)
 }
 
 /**
