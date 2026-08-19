@@ -27,6 +27,7 @@ import {
   type AccountingSyncLogRow,
   type AccountingSyncReadiness,
 } from '@/app/actions/accounting-sync'
+import { accountingRetryDuplicateCaution } from '@/lib/domain/accounting/idempotency-retention'
 import {
   refreshAccountingBatchPreview,
   type AccountingBatchPreview,
@@ -1012,6 +1013,10 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               </div>
             </div>
             {syncMsg && <p className="text-xs text-muted-foreground">{syncMsg}</p>}
+            {/* o3d-wahn: what "Retry All Failed" actually costs if the first attempt landed. */}
+            {hasFailedEntries && (
+              <p className="text-xs text-muted-foreground">{accountingRetryDuplicateCaution('xero')}</p>
+            )}
             {retryMsg && <p className="text-xs text-muted-foreground">{retryMsg}</p>}
             {logs.length === 0 ? (
               <p className="text-sm text-muted-foreground">No sync entries yet.</p>
@@ -1531,6 +1536,10 @@ function HistoryEntryRow({
         <div className="text-[11px] text-destructive">
           Error (attempt {entry.retryCount}): {entry.errorMessage}
         </div>
+      )}
+      {canRetry && (
+        // o3d-wahn: the per-row half of the same caution — Xero's key is six minutes old at most.
+        <div className="text-[11px] text-muted-foreground">{accountingRetryDuplicateCaution('xero')}</div>
       )}
       {retryMsg && (
         <div className={`text-[11px] ${retryMsg.startsWith('Error') ? 'text-destructive' : 'text-green-600 dark:text-green-400'}`}>

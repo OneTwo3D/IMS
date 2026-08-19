@@ -1059,6 +1059,29 @@ Operators correct the underlying issue (in IMS or in the accounting system) and 
 sync from the Sync Dashboard. Once the row transitions out of `FAILED`, the alert disappears
 automatically.
 
+#### Retrying is not protected by idempotency — check Xero first
+
+IMS derives every `Idempotency-Key` deterministically from the sync entry id, so a re-post sends the
+same key it sent the first time. That only prevents a duplicate while **Xero still remembers the
+key**, and Xero keeps one for **6 minutes** from the first call
+([Xero: Idempotent requests](https://developer.xero.com/documentation/guides/idempotent-requests/idempotency/)):
+
+> Idempotency keys are intended to help resolve transient issues only and so keys are stored for 6
+> minutes from the time of the first call, after which they expire.
+
+A row only becomes `FAILED` after its automatic retries are exhausted, so by the time the manual
+Retry control appears the key has already expired. **A manual retry is therefore a new request to
+Xero.** If the original attempt actually reached Xero — a timeout or a dropped response looks
+identical to a rejection from here — re-queueing creates a SECOND invoice, bill or payment.
+
+The retry controls (the failed-sync banner, "Retry All Failed", and the per-row retry in the sync
+log) all state this. Before re-queueing an aged row, search Xero for the document. IMS deliberately
+does not block the retry: it is the only remedy for a row whose cause has since been fixed, and
+refusing everything older than six minutes would refuse every retry there is.
+
+QuickBooks' `RequestId` dedupe window has not been established, so no equivalent claim is made for
+that connector and no caution is shown at its retry controls.
+
 ### Tax Rate Sync (Multi-Component Profiles)
 
 When an IMS VAT rate has one or more active components (e.g. Canada `GST 5% + PST 7%`), saving the

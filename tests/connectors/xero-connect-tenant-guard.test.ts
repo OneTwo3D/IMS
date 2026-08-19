@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test, { beforeEach, mock } from 'node:test'
 
 /**
@@ -2649,4 +2650,97 @@ test('o3d-iaqy: PRODUCTION with nothing configured is completely unaffected', as
   const auth = await getAccessToken()
   assert.equal(auth?.tenantId, LIVE.tenantId)
   assert.equal(notifications.length, 0)
+})
+
+/**
+ * THE ACQUISITION ORDER IS READ OUT OF THE SOURCE (o3d-2w2j).
+ *
+ * A lock-ordering inversion is not a behaviour. It is which row each writer touches FIRST, and the
+ * deadlock it causes only happens when two of them interleave on a real Postgres — so there is nothing
+ * for the doubles above to observe. Worse, they would happily model either order: the database double
+ * applies an array transaction statement by statement and never blocks, so `disconnect()` passed
+ * identically before and after the fix. A test that asserted behaviour here would be a test that cannot
+ * fail, which is the exact defect class this branch spent its time on.
+ *
+ * So this reads the order out of `auth.ts` and compares the two writers of both halves of a binding
+ * against each other. COMMENTS ARE STRIPPED FIRST, deliberately: the file is dense with prose that names
+ * these rows in every order there is ("the pin is therefore INSERTed first", "token row and the pin go
+ * together"), and a guard that matched documentation instead of code has produced false positives here
+ * twice already. Only real `tx.`/`db.` write calls are counted, and only the classified ones — an
+ * unrecognised settings write fails the test by name rather than being silently skipped, because a
+ * fourth row joining the transaction is precisely the change this should be re-read for.
+ */
+function xeroAuthSource(): string {
+  const raw = readFileSync(new URL('../../lib/connectors/xero/auth.ts', import.meta.url), 'utf8')
+  return raw.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+}
+
+/** The body of a named function, brace-matched out of already-comment-stripped code. */
+function functionBody(code: string, signature: string): string {
+  const start = code.indexOf(signature)
+  assert.notEqual(start, -1, `${signature} is no longer in lib/connectors/xero/auth.ts`)
+  // The body brace, not the first one after the signature: these return types carry braces of their own
+  // (`Promise<{ ok: true } | { ok: false }>`), and only the body's opens a line.
+  const afterParams = code.indexOf(')', start)
+  const open = afterParams + code.slice(afterParams).search(/\{[ \t]*\r?\n/)
+  let depth = 0
+  for (let i = open; i < code.length; i++) {
+    if (code[i] === '{') depth++
+    else if (code[i] === '}' && --depth === 0) return code.slice(open, i + 1)
+  }
+  throw new Error(`unbalanced braces after ${signature}`)
+}
+
+/**
+ * The binding rows this function locks, in the order it locks them.
+ *
+ * Reads only, and `findUnique` in particular, are NOT counted: they take no row lock, so they cannot
+ * take part in an inversion. Consecutive touches of the same row collapse — the two pin branches of
+ * `bindXeroTenant` (update on the re-consent path, create on the fresh one) are one acquisition, and
+ * only one of them ever runs.
+ */
+function bindingRowAcquisitions(body: string): string[] {
+  const call = /\b(?:tx|db)\.(setting|accountingToken)\.(?:create|createMany|update|updateMany|upsert|delete|deleteMany)\(/g
+  const order: string[] = []
+  for (let m = call.exec(body); m; m = call.exec(body)) {
+    const statement = body.slice(m.index, body.indexOf('\n', m.index) === -1 ? undefined : body.indexOf('\n', m.index))
+    let row: string
+    if (m[1] === 'accountingToken') row = 'token'
+    else if (statement.includes('XERO_EXPECTED_TENANT_KEY')) row = 'pin'
+    else if (statement.includes('XERO_PIN_RELEASE_WITNESS_KEY')) row = 'witness'
+    else row = `UNCLASSIFIED settings write: ${statement.trim()}`
+    if (order[order.length - 1] !== row) order.push(row)
+  }
+  return order
+}
+
+test('disconnect acquires the binding rows in the PIN WRITERS order, not the reverse', () => {
+  const code = xeroAuthSource()
+  const bind = bindingRowAcquisitions(functionBody(code, 'async function bindXeroTenant'))
+  const disconnect = bindingRowAcquisitions(functionBody(code, 'export async function disconnect'))
+
+  // Stated rather than derived from `bind`, so that reversing BOTH writers together still fails.
+  assert.deepEqual(bind, ['pin', 'token', 'witness'],
+    'the binding transaction takes the pin first — that is what makes the P2002 the arbiter')
+  assert.deepEqual(disconnect, ['pin', 'token', 'witness'],
+    'and disconnect must take them the same way round; token-then-pin is the inversion o3d-2w2j filed')
+  assert.deepEqual(disconnect, bind, 'ONE canonical order, so no two writers can hold what the other needs next')
+})
+
+test('the OTHER writers of both halves take the pin first too', async () => {
+  // The rule is only worth anything if it holds everywhere, and these two are the writers that can be
+  // in flight against a consent: the full reset, and the raw-SQL pin establishment the provisioner and
+  // the recovery script share. Comments stripped here for the same reason as above — reset.ts argues
+  // about this ordering at length in prose.
+  const reset = readFileSync(new URL('../../app/actions/reset.ts', import.meta.url), 'utf8')
+    .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '')
+  const wipe = reset.slice(reset.indexOf('lockIntegrationPluginSelection(tx)'))
+  assert.ok(wipe.indexOf('tx.setting.deleteMany') < wipe.indexOf('tx.accountingToken.deleteMany'),
+    'resetDatabase deletes the settings (the pin among them) before the token row')
+
+  const { xeroPinEstablishmentStatements } = await import('@/lib/connectors/xero/tenant-guard')
+  const statements = xeroPinEstablishmentStatements('5c949ed5-demo-order')
+  assert.match(statements[0].text, /insert into settings/, 'pin first')
+  assert.match(statements[1].text, /update accounting_tokens/, 'then the token row')
+  assert.match(statements[2].text, /delete from settings/, 'then the witness')
 })

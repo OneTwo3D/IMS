@@ -222,6 +222,23 @@ const REFUND_REVERSAL_TYPES = new Set([
   'UNEARNED_REV_REVERSAL',
 ])
 
+// The three SOURCE_TRACKED types whose sourceEntityId is a daily-batch reference, i.e. the only ones
+// a digest can ever be on. COGS_REVERSAL / UNEARNED_REV_REVERSAL are keyed on a refund or shipment id
+// and must never be bridged.
+const DAILY_BATCH_EVENT_TYPES = new Set([
+  'DAILY_BATCH_REVENUE_DEFERRAL',
+  'DAILY_BATCH_INVENTORY_ALLOC',
+  'DAILY_BATCH_GROUP_B',
+])
+
+// Live Xero daily-batch logs carry a digest-suffixed referenceId
+// (buildDailyBatchReferenceId -> `<group>-<date>-<8 hex>`), and accounting-event-mirror copies that
+// string verbatim into AccountingEvent.sourceEntityId. QuickBooks writes the bare `<group>-<date>`.
+// Same rule, same regex, same reason as invariants.ts stripDailyBatchDigest (scjz.37).
+function stripDailyBatchDigest(sourceEntityId: string): string {
+  return sourceEntityId.replace(/-[0-9a-f]{8}$/, '')
+}
+
 function dateKey(value: Date | string | null | undefined): string | null {
   if (!value) return null
   const date = typeof value === 'string' ? new Date(value) : value
@@ -246,17 +263,26 @@ function dateKey(value: Date | string | null | undefined): string | null {
  *    daily batch double-reported (both directions) even without a midnight crossing.
  *
  * The derive-from-stamp fallback stays for pre-migration rows, which carry no ref and
- * never will; on Xero those keep double-reporting exactly as they did before.
+ * never will.
+ *
+ * o3d-ecow: and THOSE rows are why the answer says which path produced it. A derived key is bare, the
+ * Xero event it should match is digest-suffixed, and nothing here stripped a digest — so on Xero every
+ * legacy daily batch reported TWICE, a `source_*_without_event` going forward and an
+ * `event_without_source` coming back, with no midnight crossing needed. `digestBridged` marks the keys
+ * that may be matched against a digest-stripped event id, and it is true ONLY on the derived path: a
+ * persisted ref is the literal referenceId the batch wrote, so bridging it would widen the match past
+ * the single journal it names. Exactly the split invariants.ts draws between its `exact` and
+ * `digestBridged` indexes, from the same premise.
  */
 function dailyBatchSourceEntityId(
   group: 'A1' | 'A2' | 'B',
   persistedReferenceId: string | null | undefined,
   stagedAt: Date | string | null,
-): string | null {
+): { sourceEntityId: string; digestBridged: boolean } | null {
   const persisted = persistedReferenceId?.trim()
-  if (persisted) return persisted
+  if (persisted) return { sourceEntityId: persisted, digestBridged: false }
   const key = dateKey(stagedAt)
-  return key ? `${group}-${key}` : null
+  return key ? { sourceEntityId: `${group}-${key}`, digestBridged: true } : null
 }
 
 function eventKey(input: {
@@ -310,14 +336,25 @@ function orderLabel(order: SourceOrderRow): string {
 
 function hasAccountingEvent(
   accountingEvents: AccountingEventRow[],
-  params: { type: string; sourceEntityType: string; sourceEntityId: string; externalSystem?: string | null },
+  params: {
+    type: string
+    sourceEntityType: string
+    sourceEntityId: string
+    externalSystem?: string | null
+    /** o3d-ecow: match a digest-suffixed event id against this bare key. Legacy derived keys only. */
+    digestBridged?: boolean
+  },
 ): boolean {
+  const bridge = Boolean(params.digestBridged) && DAILY_BATCH_EVENT_TYPES.has(params.type)
+  const idOf = (event: AccountingEventRow): string => (
+    bridge ? stripDailyBatchDigest(event.sourceEntityId) : event.sourceEntityId
+  )
   const exactKey = eventKey(params)
   if (params.externalSystem) {
-    return accountingEvents.some((event) => eventKey(event) === exactKey)
+    return accountingEvents.some((event) => eventKey({ ...event, sourceEntityId: idOf(event) }) === exactKey)
   }
   const anyConnectorKey = sourceKey(params.type, params.sourceEntityType, params.sourceEntityId)
-  return accountingEvents.some((event) => sourceKey(event.type, event.sourceEntityType, event.sourceEntityId) === anyConnectorKey)
+  return accountingEvents.some((event) => sourceKey(event.type, event.sourceEntityType, idOf(event)) === anyConnectorKey)
 }
 
 function hasRefundCreditNoteEvidence(rows: AccountingReconciliationRows, refund: SourceRefundRow): boolean {
@@ -397,6 +434,7 @@ function addExpectedSourceEventFinding(
     type: string
     sourceEntityType: string
     sourceEntityId: string
+    digestBridged?: boolean
     message: string
     orderId?: string
     shipmentId?: string
@@ -456,6 +494,11 @@ export function evaluateAccountingReconciliationRows(
   const findings: AccountingReconciliationFinding[] = []
   addRowCapFindings(findings, rows)
   const sourceKeys = new Set<string>()
+  // o3d-ecow, the REVERSE direction. A legacy row can only offer the bare `<group>-<date>` it derives
+  // from its stage stamp, so the digest has to come off the EVENT to meet it. Kept apart from
+  // `sourceKeys` because only the derived keys may be matched that loosely — a persisted ref is
+  // exact, and stripping a digest off an event to satisfy one would vouch for a different journal.
+  const digestBridgedSourceKeys = new Set<string>()
   const refundIds = new Set(rows.refunds.map((refund) => refund.id))
   const refundsByOrderId = new Map<string, SourceRefundRow[]>()
   for (const refund of rows.refunds) {
@@ -473,13 +516,16 @@ export function evaluateAccountingReconciliationRows(
     const label = orderLabel(order)
     const a1SourceEntityId = dailyBatchSourceEntityId('A1', order.revenueDeferredBatchRef, order.revenueDeferredDate)
     if (a1SourceEntityId) {
-      const sourceEntityId = a1SourceEntityId
-      sourceKeys.add(sourceKey('DAILY_BATCH_REVENUE_DEFERRAL', 'DailyBatch', sourceEntityId))
+      const { sourceEntityId, digestBridged } = a1SourceEntityId
+      const key = sourceKey('DAILY_BATCH_REVENUE_DEFERRAL', 'DailyBatch', sourceEntityId)
+      sourceKeys.add(key)
+      if (digestBridged) digestBridgedSourceKeys.add(key)
       addExpectedSourceEventFinding(findings, rows, {
         code: 'source_order_revenue_deferral_without_event',
         type: 'DAILY_BATCH_REVENUE_DEFERRAL',
         sourceEntityType: 'DailyBatch',
         sourceEntityId,
+        digestBridged,
         orderId: order.id,
         message: `Sales order ${label} has A1 revenue deferral but no mirrored accounting event`,
         details: { status: order.status, revenueDeferredDate: order.revenueDeferredDate },
@@ -488,13 +534,16 @@ export function evaluateAccountingReconciliationRows(
 
     const a2SourceEntityId = dailyBatchSourceEntityId('A2', order.inventoryAllocatedBatchRef, order.inventoryAllocatedDate)
     if (a2SourceEntityId) {
-      const sourceEntityId = a2SourceEntityId
-      sourceKeys.add(sourceKey('DAILY_BATCH_INVENTORY_ALLOC', 'DailyBatch', sourceEntityId))
+      const { sourceEntityId, digestBridged } = a2SourceEntityId
+      const key = sourceKey('DAILY_BATCH_INVENTORY_ALLOC', 'DailyBatch', sourceEntityId)
+      sourceKeys.add(key)
+      if (digestBridged) digestBridgedSourceKeys.add(key)
       addExpectedSourceEventFinding(findings, rows, {
         code: 'source_order_inventory_allocation_without_event',
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
         sourceEntityType: 'DailyBatch',
         sourceEntityId,
+        digestBridged,
         orderId: order.id,
         message: `Sales order ${label} has A2 inventory allocation but no mirrored accounting event`,
         details: { status: order.status, inventoryAllocatedDate: order.inventoryAllocatedDate },
@@ -569,14 +618,18 @@ export function evaluateAccountingReconciliationRows(
   }
 
   for (const shipment of rows.shipments) {
-    const sourceEntityId = dailyBatchSourceEntityId('B', shipment.shipmentJournalBatchRef, shipment.shipmentJournalDate)
-    if (!sourceEntityId) continue
-    sourceKeys.add(sourceKey('DAILY_BATCH_GROUP_B', 'DailyBatch', sourceEntityId))
+    const groupB = dailyBatchSourceEntityId('B', shipment.shipmentJournalBatchRef, shipment.shipmentJournalDate)
+    if (!groupB) continue
+    const { sourceEntityId, digestBridged } = groupB
+    const key = sourceKey('DAILY_BATCH_GROUP_B', 'DailyBatch', sourceEntityId)
+    sourceKeys.add(key)
+    if (digestBridged) digestBridgedSourceKeys.add(key)
     addExpectedSourceEventFinding(findings, rows, {
       code: 'source_shipment_without_event',
       type: 'DAILY_BATCH_GROUP_B',
       sourceEntityType: 'DailyBatch',
       sourceEntityId,
+      digestBridged,
       orderId: shipment.orderId,
       shipmentId: shipment.id,
       message: `Shipment ${shipment.id} has Group B posting state but no mirrored accounting event`,
@@ -652,8 +705,12 @@ export function evaluateAccountingReconciliationRows(
 
     if (!SOURCE_TRACKED_EVENT_TYPES.has(event.type)) continue
     const key = sourceKey(event.type, event.sourceEntityType, event.sourceEntityId)
+    // o3d-ecow: ...or a legacy bare key that this digest-suffixed id is the Xero spelling of.
+    const bridgedKey = DAILY_BATCH_EVENT_TYPES.has(event.type) && event.sourceEntityType === 'DailyBatch'
+      ? sourceKey(event.type, event.sourceEntityType, stripDailyBatchDigest(event.sourceEntityId))
+      : null
     const isKnownRefund = event.sourceEntityType === 'SalesOrderRefund' && refundIds.has(event.sourceEntityId)
-    if (!sourceKeys.has(key) && !isKnownRefund) {
+    if (!sourceKeys.has(key) && !(bridgedKey !== null && digestBridgedSourceKeys.has(bridgedKey)) && !isKnownRefund) {
       findings.push({
         severity: 'warning',
         code: 'event_without_source',

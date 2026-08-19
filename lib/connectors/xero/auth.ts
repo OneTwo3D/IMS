@@ -1085,13 +1085,23 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
  * the pin was removed by something that is not this function — which is exactly what
  * `xeroMissingPinRefusal` reads it as. Splitting these two statements would make a deleted pin
  * indistinguishable from an interrupted disconnect and re-open the hole from inside IMS.
+ *
+ * AND THE ORDER INSIDE IT IS THE PIN WRITERS' ORDER (o3d-2w2j): pin, then token row, then witness. Every
+ * other writer of both halves of a binding already acquires them that way — `bindXeroTenant` above,
+ * `xeroPinEstablishmentStatements`, the provisioner's `clearTenantPin`, and `resetDatabase`, which
+ * documents its own pin-before-token ordering under o3d-9tbz r7. This function used to take the token
+ * row FIRST, which is a lock-ordering inversion: a disconnect and a concurrent consent each held the row
+ * the other needed next, and Postgres resolves that by killing one of them as a deadlock. Nothing about
+ * the pin/receipt/witness logic depended on the old order — atomicity is what this transaction is for —
+ * but the auth path is what an operator reaches for when they are already mid-incident, so it is the
+ * last place to leave a liveness hazard. ONE canonical order everywhere; this was the only exception.
  */
 export async function disconnect(): Promise<void> {
   await db.$transaction([
-    db.accountingToken.deleteMany({ where: { connector: XERO_CONNECTOR } }),
     db.setting.deleteMany({ where: { key: XERO_EXPECTED_TENANT_KEY } }),
+    db.accountingToken.deleteMany({ where: { connector: XERO_CONNECTOR } }),
     // The release witness goes with them (r8): a disconnect ends the binding, and a witness left behind
-    // would be a half-receipt waiting for a token row to corroborate.
+    // would be a half-receipt waiting for a token row to corroborate. Last, as in every other writer.
     db.setting.deleteMany({ where: { key: XERO_PIN_RELEASE_WITNESS_KEY } }),
     db.customer.updateMany({
       where: { accountingContactId: { not: null } },

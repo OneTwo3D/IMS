@@ -37,10 +37,18 @@ const state = {
   // `where.productId` would make every "blocked" test and every "not blocked" test pass for
   // the same reason.
   stockLevels: [] as Array<{ productId: string; quantity: number; reservedQty: number }>,
-  /** Open sales-order lines. The double is handed rows already restricted to open orders. */
-  salesOrderLines: [] as Array<{ productId: string }>,
-  purchaseOrderLines: [] as Array<{ productId: string }>,
-  productionOrders: [] as Array<{ outputProductId: string }>,
+  /**
+   * Document rows WITH the status their parent document is in (o3d-mzme).
+   *
+   * They used to be bare product ids, on the reasoning that "the double is handed rows already
+   * restricted to open orders" — which is exactly the defect: production restricts them with a
+   * `status: { in: [...] }` predicate, and a double that models the restriction as already having
+   * happened cannot tell a query that still carries the predicate from one that has lost it. The
+   * transfer arm was given statuses in o3d-y89x r6; these four are the same fix, one round later.
+   */
+  salesOrderLines: [] as Array<{ productId: string; status: string }>,
+  purchaseOrderLines: [] as Array<{ productId: string; status: string }>,
+  productionOrders: [] as Array<{ outputProductId: string; status: string }>,
   /**
    * Transfer lines WITH their transfer's status (o3d-y89x r6, Codex finding 2).
    *
@@ -216,16 +224,41 @@ function transformBlockerWhereRejects(where: Row, productId: string): boolean {
 
   if (relationKeys.includes('stockLevels')
     && state.stockLevels.some((r) => r.productId === productId && (r.quantity > 0 || r.reservedQty > 0))) return true
+  // Each arm is evaluated against the STATUS SET THE FRAGMENT NAMES (o3d-mzme), not against every
+  // row of the relation. The rows carry their document's status now, so a fragment that has lost
+  // its status filter and one that still carries it give different answers here — which is the
+  // whole reason the state and the doubles share it.
   if (relationKeys.includes('salesOrderLines')
-    && state.salesOrderLines.some((r) => r.productId === productId)) return true
+    && state.salesOrderLines.some((r) => r.productId === productId
+      && matchesFragmentStatus(where.salesOrderLines, ['none', 'order'], r.status))) return true
   if (relationKeys.includes('poLines')
-    && state.purchaseOrderLines.some((r) => r.productId === productId)) return true
+    && state.purchaseOrderLines.some((r) => r.productId === productId
+      && matchesFragmentStatus(where.poLines, ['none', 'po'], r.status))) return true
   if (relationKeys.includes('productionOrdersAsOutput')
-    && state.productionOrders.some((r) => r.outputProductId === productId)) return true
+    && state.productionOrders.some((r) => r.outputProductId === productId
+      && matchesFragmentStatus(where.productionOrdersAsOutput, ['none'], r.status))) return true
   if (relationKeys.includes('usedAsComponentIn')
     && state.components.some((c) => c.componentId === productId
-      && state.productionOrders.some((r) => r.outputProductId === c.productId))) return true
+      && state.productionOrders.some((r) => r.outputProductId === c.productId
+        && matchesFragmentStatus(where.usedAsComponentIn, ['none', 'product', 'productionOrdersAsOutput', 'some'], r.status)))) return true
   return false
+}
+
+/**
+ * Read `status: { in: [...] }` out of a relation-filter arm at the given path and answer whether
+ * this row's status is in it. An arm with NO status filter matches every row — which is faithful
+ * to what Prisma would do, and is exactly the state the per-row doubles refuse, so a lost
+ * predicate shows up as the two sides DISAGREEING rather than as both quietly agreeing.
+ */
+function matchesFragmentStatus(arm: unknown, path: readonly string[], status: string): boolean {
+  let node: unknown = arm
+  for (const key of path) {
+    if (typeof node !== 'object' || node === null) return true
+    node = (node as Record<string, unknown>)[key]
+  }
+  const statuses = (node as { status?: { in?: unknown[] } } | undefined)?.status?.in
+  if (!Array.isArray(statuses)) return true
+  return statuses.map(String).includes(status)
 }
 
 /**
@@ -410,11 +443,12 @@ const productDelegate = {
  * if the editor's query ever changes shape, the connector must fail loudly here rather than
  * quietly start answering "clean" for every product.
  */
-function requireProductId(where: Row | undefined, delegate: string): string {
+function requireProductId(where: Row | undefined, delegate: string, otherKeys: readonly string[] = []): string {
   const productId = where?.productId
   if (typeof productId !== 'string') {
     throw new Error(`${delegate} double got an unmodelled where: ${JSON.stringify(where)}`)
   }
+  requireExactWhereKeys(where, ['productId', ...otherKeys], delegate)
   state.blockerQueries.push(productId)
   recordCommitPhaseStatement([productId])
   beforeBlockerQuery?.(productId)
@@ -422,32 +456,85 @@ function requireProductId(where: Row | undefined, delegate: string): string {
 }
 
 /**
- * The statuses `lib/products/type-transforms.ts` calls OPEN. Duplicated here on purpose: the
- * doubles below demand this EXACT set, so if production ever widens or narrows it the doubles
- * fail loudly instead of silently agreeing with whatever production now asks (o3d-y89x r6,
- * Codex finding 2).
+ * The `where` names EXACTLY these keys — no more, no fewer (o3d-mzme).
+ *
+ * A missing key is a lost predicate and a surplus key is one this double does not evaluate; both
+ * mean the double is answering a different question from the one production asked, and both used
+ * to pass silently. Every arm below states its own key set, so a widened filter fails here rather
+ * than being quietly ignored while the test still reads "blocked" or "clean".
  */
-const OPEN_TRANSFER_STATUSES = ['DRAFT', 'IN_TRANSIT'] as const
-
-function requireOpenTransferFilter(where: Row | undefined, delegate: string): void {
-  const statuses = (where?.transfer as { status?: { in?: unknown[] } } | undefined)?.status?.in
-  const asked = Array.isArray(statuses) ? [...statuses].map(String).sort().join(',') : null
-  if (asked !== [...OPEN_TRANSFER_STATUSES].sort().join(',')) {
+function requireExactWhereKeys(where: Row | undefined, expected: readonly string[], delegate: string): void {
+  const actual = Object.keys(where ?? {}).sort().join(',')
+  if (actual !== [...expected].sort().join(',')) {
     throw new Error(
-      `${delegate} double got an unmodelled transfer filter — it models `
-      + `transfer.status.in = [${OPEN_TRANSFER_STATUSES.join(', ')}] and got: ${JSON.stringify(where)}`,
+      `${delegate} double got an unmodelled where — it models exactly `
+      + `[${[...expected].sort().join(', ')}] and got [${actual}]: ${JSON.stringify(where)}`,
     )
   }
 }
 
+/**
+ * The status set production asks for, compared EXACTLY.
+ *
+ * Not "contains PROCESSING" and not "is non-empty": a set that has been widened by one status is
+ * a different question, and the whole point of duplicating these lists in the test file is that
+ * the doubles demand the set production is supposed to send rather than agreeing with whatever it
+ * now sends (o3d-y89x r6, generalised to the other four arms by o3d-mzme).
+ */
+function requireExactStatusIn(
+  actual: unknown,
+  expected: readonly string[],
+  delegate: string,
+  describe: string,
+  path: string,
+  where: Row | undefined,
+): void {
+  const asked = Array.isArray(actual) ? [...actual].map(String).sort().join(',') : null
+  if (asked !== [...expected].sort().join(',')) {
+    throw new Error(
+      `${delegate} double got an unmodelled ${describe} filter — it models `
+      + `${path}.in = [${expected.join(', ')}] and got: ${JSON.stringify(where)}`,
+    )
+  }
+}
+
+/**
+ * The statuses `lib/products/type-transforms.ts` calls OPEN, for all five arms. Duplicated here on
+ * purpose: the doubles below demand these EXACT sets, so if production ever widens or narrows one
+ * the doubles fail loudly instead of silently agreeing with whatever production now asks (o3d-y89x
+ * r6, Codex finding 2 — extended from the transfer arm to the other four by o3d-mzme).
+ */
+const OPEN_TRANSFER_STATUSES = ['DRAFT', 'IN_TRANSIT'] as const
+const OPEN_SALES_ORDER_STATUSES = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] as const
+const OPEN_PURCHASE_ORDER_STATUSES = ['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'] as const
+const OPEN_PRODUCTION_ORDER_STATUSES = ['DRAFT', 'IN_PROGRESS'] as const
+
+function requireOpenTransferFilter(where: Row | undefined, delegate: string): void {
+  const statuses = (where?.transfer as { status?: { in?: unknown[] } } | undefined)?.status?.in
+  requireExactStatusIn(statuses, OPEN_TRANSFER_STATUSES, delegate, 'transfer', 'transfer.status', where)
+}
+
+function isOpen(status: string, open: readonly string[]): boolean {
+  return open.includes(status)
+}
+
 function isOpenTransferLine(row: { status: string }): boolean {
-  return (OPEN_TRANSFER_STATUSES as readonly string[]).includes(row.status)
+  return isOpen(row.status, OPEN_TRANSFER_STATUSES)
 }
 
 const blockerDelegates = {
   stockLevel: {
-    aggregate: async ({ where }: { where?: Row } = {}) => {
+    // The one arm with no status predicate — stock on hand is stock on hand. What it DOES carry is
+    // a `_sum` selection naming both columns, and the answer is read as two separate blockers
+    // (`stockQty` and `reservedQty`), so the double demands both are asked for: production that
+    // stopped summing `reservedQty` would otherwise get an undefined it reads as zero, and every
+    // "reserved stock blocks the transform" test would keep passing (o3d-mzme).
+    aggregate: async ({ where, _sum }: { where?: Row; _sum?: Row } = {}) => {
       const productId = requireProductId(where, 'stockLevel.aggregate')
+      const summed = Object.keys(_sum ?? {}).filter((key) => (_sum as Row)[key] === true).sort().join(',')
+      if (summed !== 'quantity,reservedQty') {
+        throw new Error(`stockLevel.aggregate double models _sum {quantity, reservedQty} and got: ${JSON.stringify(_sum)}`)
+      }
       const rows = state.stockLevels.filter((row) => row.productId === productId)
       return {
         _sum: {
@@ -458,31 +545,65 @@ const blockerDelegates = {
     },
   },
   salesOrderLine: {
+    // Honours the ORDER's status as well as the product (o3d-mzme). A line on a SHIPPED or
+    // CANCELLED order is not a blocker, and a double that counted it would agree with a production
+    // query that had lost its `order.status` filter — leaving every shipped order in history as a
+    // permanent blocker, with this suite still green.
     count: async ({ where }: { where?: Row } = {}) => {
-      const productId = requireProductId(where, 'salesOrderLine.count')
-      return state.salesOrderLines.filter((row) => row.productId === productId).length
+      const productId = requireProductId(where, 'salesOrderLine.count', ['order'])
+      requireExactStatusIn(
+        (where?.order as { status?: { in?: unknown[] } } | undefined)?.status?.in,
+        OPEN_SALES_ORDER_STATUSES, 'salesOrderLine.count', 'order status', 'order.status', where,
+      )
+      return state.salesOrderLines
+        .filter((row) => row.productId === productId && isOpen(row.status, OPEN_SALES_ORDER_STATUSES)).length
     },
   },
   purchaseOrderLine: {
+    // Same treatment, on `po.status`.
     count: async ({ where }: { where?: Row } = {}) => {
-      const productId = requireProductId(where, 'purchaseOrderLine.count')
-      return state.purchaseOrderLines.filter((row) => row.productId === productId).length
+      const productId = requireProductId(where, 'purchaseOrderLine.count', ['po'])
+      requireExactStatusIn(
+        (where?.po as { status?: { in?: unknown[] } } | undefined)?.status?.in,
+        OPEN_PURCHASE_ORDER_STATUSES, 'purchaseOrderLine.count', 'po status', 'po.status', where,
+      )
+      return state.purchaseOrderLines
+        .filter((row) => row.productId === productId && isOpen(row.status, OPEN_PURCHASE_ORDER_STATUSES)).length
     },
   },
   productionOrder: {
-    // The only one whose `where` names the product inside an OR (output product, or a product
-    // consumed as a component of the output). The double answers the first arm, which is the
-    // one every test here exercises, and refuses the shape it cannot answer.
+    // The only one whose `where` names the product inside an OR: the order's OUTPUT is this
+    // product, or its output CONSUMES this product as a component. Both arms are answered now
+    // (o3d-mzme) — the double used to read `OR[0]` and drop the component arm on the floor, so a
+    // production query that lost that arm was indistinguishable from one that kept it, and the
+    // set-wise write predicate (`usedAsComponentIn`, evaluated in `transformBlockerWhereRejects`)
+    // disagreed with the SELECT about the same state.
     count: async ({ where }: { where?: Row } = {}) => {
+      requireExactWhereKeys(where, ['status', 'OR'], 'productionOrder.count')
+      requireExactStatusIn(
+        (where?.status as { in?: unknown[] } | undefined)?.in,
+        OPEN_PRODUCTION_ORDER_STATUSES, 'productionOrder.count', 'production status', 'status', where,
+      )
       const or = where?.OR as Array<Row> | undefined
       const outputProductId = or?.[0]?.outputProductId
-      if (typeof outputProductId !== 'string') {
+      const componentId = (or?.[1]?.outputProduct as
+        { productComponents?: { some?: { componentId?: unknown } } } | undefined)?.productComponents?.some?.componentId
+      if (or?.length !== 2 || typeof outputProductId !== 'string' || componentId !== outputProductId) {
         throw new Error(`productionOrder.count double got an unmodelled where: ${JSON.stringify(where)}`)
       }
-      state.blockerQueries.push(outputProductId)
-      recordCommitPhaseStatement([outputProductId])
-      beforeBlockerQuery?.(outputProductId)
-      return state.productionOrders.filter((row) => row.outputProductId === outputProductId).length
+      const productId = outputProductId
+      state.blockerQueries.push(productId)
+      recordCommitPhaseStatement([productId])
+      beforeBlockerQuery?.(productId)
+      return state.productionOrders.filter((row) => (
+        isOpen(row.status, OPEN_PRODUCTION_ORDER_STATUSES)
+        && (
+          row.outputProductId === productId
+          || state.components.some((component) => (
+            component.componentId === productId && component.productId === row.outputProductId
+          ))
+        )
+      )).length
     },
   },
   stockTransferLine: {
@@ -490,8 +611,10 @@ const blockerDelegates = {
     // line on a RECEIVED or CANCELLED transfer is not a blocker, and a double that returned it
     // would agree with a production query that had lost its filter.
     count: async ({ where }: { where?: Row } = {}) => {
-      const productId = requireProductId(where, 'stockTransferLine.count')
+      // Status filter checked FIRST, so a query that dropped it is reported as the lost predicate
+      // it is rather than as a surplus/missing key.
       requireOpenTransferFilter(where, 'stockTransferLine.count')
+      const productId = requireProductId(where, 'stockTransferLine.count', ['transfer'])
       return state.stockTransferLines
         .filter((row) => row.productId === productId && isOpenTransferLine(row)).length
     },
@@ -832,7 +955,7 @@ test('DOUBLE AUDIT: the set-wise blocker query filters by BOTH the id list and t
   state.products.push(imsRow({ id: 'p-1', sku: 'P1', type: 'SIMPLE' }))
   state.products.push(imsRow({ id: 'p-2', sku: 'P2', type: 'SIMPLE' }))
   state.products.push(imsRow({ id: 'p-3', sku: 'P3', type: 'SIMPLE' }))
-  state.salesOrderLines.push({ productId: 'p-2' })
+  state.salesOrderLines.push({ productId: 'p-2', status: 'PROCESSING' })
 
   const blockerWhere = { salesOrderLines: { none: { order: { status: { in: ['PROCESSING'] } } } } }
   assert.deepEqual(
@@ -930,21 +1053,25 @@ test('DOUBLE AUDIT: the blocker doubles answer per product, not with a constant'
   // clean" would both pass without production ever having asked about the right row.
   resetState()
   state.stockLevels.push({ productId: 'live', quantity: 5, reservedQty: 2 })
-  state.salesOrderLines.push({ productId: 'live' })
-  state.purchaseOrderLines.push({ productId: 'live' })
-  state.productionOrders.push({ outputProductId: 'live' })
+  state.salesOrderLines.push({ productId: 'live', status: 'PROCESSING' })
+  state.purchaseOrderLines.push({ productId: 'live', status: 'PO_SENT' })
+  state.productionOrders.push({ outputProductId: 'live', status: 'IN_PROGRESS' })
   state.stockTransferLines.push({ productId: 'live', status: 'IN_TRANSIT' })
 
-  const live = await blockerDelegates.stockLevel.aggregate({ where: { productId: 'live' } })
+  const live = await blockerDelegates.stockLevel.aggregate({
+    where: { productId: 'live' }, _sum: { quantity: true, reservedQty: true },
+  })
   assert.equal(live._sum.quantity, 5)
   assert.equal(live._sum.reservedQty, 2)
-  const clean = await blockerDelegates.stockLevel.aggregate({ where: { productId: 'clean' } })
+  const clean = await blockerDelegates.stockLevel.aggregate({
+    where: { productId: 'clean' }, _sum: { quantity: true, reservedQty: true },
+  })
   assert.equal(clean._sum.quantity, 0, 'a different product is not blocked by this one')
 
-  assert.equal(await blockerDelegates.salesOrderLine.count({ where: { productId: 'live' } }), 1)
-  assert.equal(await blockerDelegates.salesOrderLine.count({ where: { productId: 'clean' } }), 0)
-  assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: { productId: 'live' } }), 1)
-  assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: { productId: 'clean' } }), 0)
+  assert.equal(await blockerDelegates.salesOrderLine.count({ where: openSalesLineWhere('live') }), 1)
+  assert.equal(await blockerDelegates.salesOrderLine.count({ where: openSalesLineWhere('clean') }), 0)
+  assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: openPoLineWhere('live') }), 1)
+  assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: openPoLineWhere('clean') }), 0)
   const openTransfers = { transfer: { status: { in: ['DRAFT', 'IN_TRANSIT'] } } }
   assert.equal(await blockerDelegates.stockTransferLine.count({ where: { productId: 'live', ...openTransfers } }), 1)
   assert.equal(await blockerDelegates.stockTransferLine.count({ where: { productId: 'clean', ...openTransfers } }), 0)
@@ -955,14 +1082,8 @@ test('DOUBLE AUDIT: the blocker doubles answer per product, not with a constant'
     0,
     'a RECEIVED transfer line is not an open one',
   )
-  assert.equal(
-    await blockerDelegates.productionOrder.count({ where: { OR: [{ outputProductId: 'live' }, {}] } }),
-    1,
-  )
-  assert.equal(
-    await blockerDelegates.productionOrder.count({ where: { OR: [{ outputProductId: 'clean' }, {}] } }),
-    0,
-  )
+  assert.equal(await blockerDelegates.productionOrder.count({ where: openProductionWhere('live') }), 1)
+  assert.equal(await blockerDelegates.productionOrder.count({ where: openProductionWhere('clean') }), 0)
 
   // And an unrecognised `where` is a loud failure, not a silent "clean".
   await assert.rejects(() => blockerDelegates.salesOrderLine.count({ where: {} }), /unmodelled where/)
@@ -972,6 +1093,126 @@ test('DOUBLE AUDIT: the blocker doubles answer per product, not with a constant'
     /unmodelled transfer filter/,
     'a transfer query that lost its status predicate is refused, not answered',
   )
+})
+
+/**
+ * The production-shaped `where` for each arm, spelled exactly as `getProductTransformBlockers`
+ * spells it, so the paired controls below are asking the doubles the question production asks.
+ */
+function openSalesLineWhere(productId: string): Row {
+  return { productId, order: { status: { in: [...OPEN_SALES_ORDER_STATUSES] } } }
+}
+function openPoLineWhere(productId: string): Row {
+  return { productId, po: { status: { in: [...OPEN_PURCHASE_ORDER_STATUSES] } } }
+}
+function openProductionWhere(productId: string): Row {
+  return {
+    status: { in: [...OPEN_PRODUCTION_ORDER_STATUSES] },
+    OR: [
+      { outputProductId: productId },
+      { outputProduct: { productComponents: { some: { componentId: productId } } } },
+    ],
+  }
+}
+
+test('DOUBLE AUDIT: the OTHER four blocker doubles honour their status predicates too (o3d-mzme)', async () => {
+  // o3d-y89x r6 hardened the transfer arm and left these four modelling their rows as "already
+  // restricted to open orders". That is the vacuous shape: a double that counts every row answers
+  // a production query that has LOST its status filter exactly as it answers one that kept it, so
+  // dropping the filter — which would make every shipped order in history a permanent blocker —
+  // left the suite green. Each arm is now asked about a CLOSED document and must answer zero.
+  resetState()
+  state.salesOrderLines.push({ productId: 'shipped-only', status: 'SHIPPED' })
+  state.purchaseOrderLines.push({ productId: 'received-only', status: 'RECEIVED' })
+  state.productionOrders.push({ outputProductId: 'completed-only', status: 'COMPLETED' })
+
+  assert.equal(await blockerDelegates.salesOrderLine.count({ where: openSalesLineWhere('shipped-only') }), 0,
+    'a line on a SHIPPED order is not an open one')
+  assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: openPoLineWhere('received-only') }), 0,
+    'nor a line on a fully RECEIVED purchase order')
+  assert.equal(await blockerDelegates.productionOrder.count({ where: openProductionWhere('completed-only') }), 0,
+    'nor a COMPLETED manufacturing order')
+
+  // ...and the same rows under an OPEN status DO block, so the zeros above are the predicate
+  // doing work rather than the double failing to find anything.
+  state.salesOrderLines.push({ productId: 'shipped-only', status: 'PROCESSING' })
+  state.purchaseOrderLines.push({ productId: 'received-only', status: 'PO_SENT' })
+  state.productionOrders.push({ outputProductId: 'completed-only', status: 'IN_PROGRESS' })
+  assert.equal(await blockerDelegates.salesOrderLine.count({ where: openSalesLineWhere('shipped-only') }), 1)
+  assert.equal(await blockerDelegates.purchaseOrderLine.count({ where: openPoLineWhere('received-only') }), 1)
+  assert.equal(await blockerDelegates.productionOrder.count({ where: openProductionWhere('completed-only') }), 1)
+})
+
+test('DOUBLE AUDIT: a blocker query that LOST or WIDENED a predicate is refused, not answered (o3d-mzme)', async () => {
+  // The other half of the same fix. Modelling the statuses is worth nothing if the double will
+  // still answer a query that does not send them — it would just answer "clean" and the deleted
+  // filter would never be noticed.
+  resetState()
+
+  await assert.rejects(
+    () => blockerDelegates.salesOrderLine.count({ where: { productId: 'p' } }),
+    /unmodelled where/, 'a sales-order query with no order.status filter at all')
+  await assert.rejects(
+    () => blockerDelegates.salesOrderLine.count({ where: { productId: 'p', order: { status: { in: ['PROCESSING'] } } } }),
+    /unmodelled order status filter/, 'or a NARROWED set — the set is the predicate, not a hint')
+  await assert.rejects(
+    () => blockerDelegates.salesOrderLine.count({
+      where: { productId: 'p', order: { status: { in: [...OPEN_SALES_ORDER_STATUSES, 'SHIPPED'] } } },
+    }),
+    /unmodelled order status filter/, 'and a WIDENED one')
+
+  await assert.rejects(
+    () => blockerDelegates.purchaseOrderLine.count({ where: { productId: 'p' } }),
+    /unmodelled where/)
+  await assert.rejects(
+    () => blockerDelegates.purchaseOrderLine.count({
+      where: { productId: 'p', po: { status: { in: [...OPEN_PURCHASE_ORDER_STATUSES, 'RECEIVED'] } } },
+    }),
+    /unmodelled po status filter/)
+
+  await assert.rejects(
+    () => blockerDelegates.productionOrder.count({ where: { OR: openProductionWhere('p').OR as Row[] } }),
+    /unmodelled where/, 'a production query with no status filter')
+  await assert.rejects(
+    () => blockerDelegates.productionOrder.count({
+      where: { ...openProductionWhere('p'), status: { in: [...OPEN_PRODUCTION_ORDER_STATUSES, 'COMPLETED'] } },
+    }),
+    /unmodelled production status filter/)
+  await assert.rejects(
+    () => blockerDelegates.productionOrder.count({
+      where: { status: { in: [...OPEN_PRODUCTION_ORDER_STATUSES] }, OR: [{ outputProductId: 'p' }] },
+    }),
+    /unmodelled where/, 'or that has dropped the "consumed as a component" arm')
+
+  // A WIDENED where is refused as well as a narrowed one: an extra key is a predicate this double
+  // does not evaluate, so answering it would be answering a different question.
+  await assert.rejects(
+    () => blockerDelegates.salesOrderLine.count({ where: { ...openSalesLineWhere('p'), warehouseId: 'w1' } }),
+    /unmodelled where/)
+  await assert.rejects(
+    () => blockerDelegates.stockLevel.aggregate({ where: { productId: 'p' }, _sum: { quantity: true } }),
+    /_sum \{quantity, reservedQty\}/, 'and an aggregate that stopped summing reservedQty')
+})
+
+test('DOUBLE AUDIT: the production-order double answers BOTH arms of its OR (o3d-mzme)', async () => {
+  // It used to read `OR[0]` and ignore the rest, so a product blocked only because it is CONSUMED
+  // by an open order read as clean — while the set-wise write predicate (`usedAsComponentIn`)
+  // said blocked about the same state. The two sides now agree.
+  resetState()
+  state.components.push({ id: 'pc-a', productId: 'ims-kit', componentId: 'ims-part', quantity: 2 })
+  state.productionOrders.push({ outputProductId: 'ims-kit', status: 'IN_PROGRESS' })
+
+  assert.equal(await blockerDelegates.productionOrder.count({ where: openProductionWhere('ims-kit') }), 1,
+    'the output product is blocked')
+  assert.equal(await blockerDelegates.productionOrder.count({ where: openProductionWhere('ims-part') }), 1,
+    'and so is the component the open order consumes')
+  assert.equal(await blockerDelegates.productionOrder.count({ where: openProductionWhere('ims-other') }), 0,
+    'a product neither built nor consumed is not')
+
+  // ...and the component arm honours the status too, rather than blocking on any historical order.
+  state.productionOrders.length = 0
+  state.productionOrders.push({ outputProductId: 'ims-kit', status: 'COMPLETED' })
+  assert.equal(await blockerDelegates.productionOrder.count({ where: openProductionWhere('ims-part') }), 0)
 })
 
 test('DOUBLE AUDIT: the blocker doubles give DIFFERENT answers to two reads across a change', async () => {
@@ -1739,9 +1980,9 @@ test("each of the editor's five blockers refuses the transform, in the editor's 
   const cases: Array<[string, () => void, RegExp]> = [
     ['stock on hand', () => state.stockLevels.push({ productId: 'ims-live', quantity: 3, reservedQty: 0 }), /stock on hand \(3\.00\)/],
     ['reserved stock', () => state.stockLevels.push({ productId: 'ims-live', quantity: 0, reservedQty: 2 }), /reserved stock \(2\.00\)/],
-    ['open sales order line', () => state.salesOrderLines.push({ productId: 'ims-live' }), /1 open sales order line/],
-    ['open purchase order line', () => state.purchaseOrderLines.push({ productId: 'ims-live' }), /1 open purchase order line/],
-    ['open manufacturing order', () => state.productionOrders.push({ outputProductId: 'ims-live' }), /1 open manufacturing order/],
+    ['open sales order line', () => state.salesOrderLines.push({ productId: 'ims-live', status: 'PROCESSING' }), /1 open sales order line/],
+    ['open purchase order line', () => state.purchaseOrderLines.push({ productId: 'ims-live', status: 'PO_SENT' }), /1 open purchase order line/],
+    ['open manufacturing order', () => state.productionOrders.push({ outputProductId: 'ims-live', status: 'IN_PROGRESS' }), /1 open manufacturing order/],
     ['open stock transfer line', () => state.stockTransferLines.push({ productId: 'ims-live', status: 'IN_TRANSIT' }), /1 open stock transfer line/],
   ]
 
@@ -1810,7 +2051,7 @@ test('a live SIMPLE row is not adopted as a WooCommerce variation either (o3d-y8
   // under a WooCommerce parent, which the editor blocks outright.
   state.products.push(imsRow({ id: 'ims-parent', sku: 'PARENT-SKU', name: 'Parent', type: 'VARIABLE' }))
   state.products.push(imsRow({ id: 'ims-native', sku: 'VAR-1', name: 'IMS-native product', type: 'SIMPLE' }))
-  state.salesOrderLines.push({ productId: 'ims-native' })
+  state.salesOrderLines.push({ productId: 'ims-native', status: 'PROCESSING' })
 
   const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
 
@@ -2180,7 +2421,7 @@ test('o3d-y89x r3: a blocker created BETWEEN the check and the write refuses the
   beforeProductWrite = (productId) => {
     if (productId !== 'ims-simple') return
     // An order is placed against the product between the check and the write.
-    state.salesOrderLines.push({ productId: 'ims-simple' })
+    state.salesOrderLines.push({ productId: 'ims-simple', status: 'PROCESSING' })
   }
 
   const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
@@ -2243,7 +2484,7 @@ test('o3d-y89x r3: a NON-transforming write is not made conditional — a live r
   resetState()
   state.products.push(imsRow({ id: 'ims-simple', sku: 'KIT-SKU', name: 'Old name', type: 'SIMPLE' }))
   state.stockLevels.push({ productId: 'ims-simple', quantity: 12, reservedQty: 3 })
-  state.salesOrderLines.push({ productId: 'ims-simple' })
+  state.salesOrderLines.push({ productId: 'ims-simple', status: 'PROCESSING' })
 
   const result = await capturingWarnings(() => syncWcProductToIms(simpleProduct()))
 
@@ -2283,7 +2524,7 @@ test('o3d-y89x r4: a blocker arriving AFTER the transform, before the commit, ro
   // committed to the transaction. Only then does the order arrive.
   state.products.push(imsRow({ id: 'ims-simple', sku: 'PARENT-SKU', name: 'Was simple', type: 'SIMPLE' }))
   beforeConflictsRecorded = () => {
-    state.salesOrderLines.push({ productId: 'ims-simple' })
+    state.salesOrderLines.push({ productId: 'ims-simple', status: 'PROCESSING' })
   }
 
   const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
@@ -2321,7 +2562,7 @@ test('o3d-y89x r4: the pre-commit re-assertion costs nothing when nothing was tr
   // Live rows, every arm of the blocker question answered "blocked" — and irrelevant, because
   // nothing here is being restructured.
   state.stockLevels.push({ productId: 'ims-parent', quantity: 9, reservedQty: 1 })
-  state.salesOrderLines.push({ productId: 'ims-v1' })
+  state.salesOrderLines.push({ productId: 'ims-v1', status: 'PROCESSING' })
 
   const result = await capturingWarnings(() => syncWcProductToIms(variableProduct()))
 
@@ -2498,7 +2739,7 @@ test('o3d-y89x r5: a blocker on the FIRST-transformed row is still caught after 
   state.products.push(imsRow({ id: 'ims-simple', sku: 'PARENT-SKU', name: 'Was simple', type: 'SIMPLE' }))
   const variations = seedAdoptableVariations(20)
   beforeConflictsRecorded = () => {
-    state.salesOrderLines.push({ productId: 'ims-simple' })
+    state.salesOrderLines.push({ productId: 'ims-simple', status: 'PROCESSING' })
   }
 
   const result = await capturingWarnings(() => syncWcProductToIms(variableProduct({ variations })))
@@ -2666,7 +2907,7 @@ test('o3d-y89x r5: a blocker the DECISION saw and the itemisation missed still r
   state.products.push(imsRow({ id: 'ims-simple', sku: 'PARENT-SKU', name: 'Was simple', type: 'SIMPLE' }))
   variationPages = { '1': [] }
   beforeConflictsRecorded = () => {
-    state.salesOrderLines.push({ productId: 'ims-simple' })
+    state.salesOrderLines.push({ productId: 'ims-simple', status: 'PROCESSING' })
   }
   // Statements 1 and 2 are the decision; anything past them is the itemisation.
   beforeBlockerQuery = () => {

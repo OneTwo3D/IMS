@@ -1201,3 +1201,79 @@ test('o3d-cvj9 r7: fixtures that never read the dataset report neither a finding
     [],
   )
 })
+
+// --- o3d-ecow: the legacy rows o3d-0qoo deliberately left alone ---
+
+/**
+ * The pre-migration Xero shape: the batch ref column is empty (those rows carry no persisted ref and
+ * never will), so the source key can only be DERIVED from the stage stamp and comes out bare — while
+ * the sync log and the mirrored event both carry the live `-<8 hex>` digest, because
+ * accounting-event-mirror copies the referenceId verbatim. Nothing else is wrong with these rows: the
+ * stamps agree with the batch date, and no midnight is crossed.
+ */
+function legacyDigestRows(): AccountingReconciliationRows {
+  const rows = persistedRefRows()
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    revenueDeferredBatchRef: null,
+    inventoryAllocatedBatchRef: null,
+  }
+  rows.shipments[0] = { ...rows.shipments[0], shipmentJournalBatchRef: null }
+  return rows
+}
+
+test('o3d-ecow: a LEGACY Xero row and the event it mirrored are one journal, not two findings', () => {
+  // Every healthy legacy Xero daily batch was reported TWICE: `source_*_without_event` going forward,
+  // because the derived `A1-<date>` never equalled the mirrored `A1-<date>-<digest>`, and
+  // `event_without_source` coming back, for the same reason from the other side. o3d-0qoo fixed the
+  // rows staged after its migration and said in as many words that it was leaving these alone.
+  const findings = evaluateAccountingReconciliationRows(legacyDigestRows())
+  const codes = findings.map((finding) => finding.code)
+
+  for (const code of DAILY_BATCH_SOURCE_CODES) {
+    assert.ok(!codes.includes(code), `${code} must not fire for a legacy row whose event carries a digest`)
+  }
+  assert.ok(!codes.includes('event_without_source'),
+    'and the same journal must not come back as an orphan event in the reverse direction')
+  assert.deepEqual(findings, [])
+})
+
+test('o3d-ecow: the bridge matches the batch the row NAMES, not any batch with a digest on it', () => {
+  // The bridge strips a digest; it must not strip the date with it. A legacy row stamped on the 24th
+  // whose only mirrored event belongs to the 23rd is a real gap, and both directions must still say so
+  // — otherwise the fix has replaced double-reporting with under-reporting, which is worse.
+  const rows = legacyDigestRows()
+  const wrongDay = 'A1-2026-04-23-abcd1234'
+  rows.accountingEvents = rows.accountingEvents.map((event) => (
+    event.type === 'DAILY_BATCH_REVENUE_DEFERRAL' ? { ...event, sourceEntityId: wrongDay } : event
+  ))
+  rows.syncLogs = rows.syncLogs.map((log) => (
+    log.type === 'DAILY_BATCH_REVENUE_DEFERRAL' ? { ...log, referenceId: wrongDay } : log
+  ))
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+  const codes = findings.map((finding) => finding.code)
+
+  assert.ok(codes.includes('source_order_revenue_deferral_without_event'),
+    'the row stamped on the 24th still has no mirrored event')
+  const orphan = findings.find((finding) => finding.code === 'event_without_source')
+  assert.ok(orphan, 'and the event on the 23rd still has no source')
+  assert.equal((orphan!.details as { sourceEntityId: string }).sourceEntityId, wrongDay)
+  assert.equal(codes.filter((code) => DAILY_BATCH_SOURCE_CODES.includes(code)).length, 1,
+    'A2 and Group B are untouched and stay clean')
+})
+
+test('o3d-ecow: a PERSISTED ref is matched exactly — the digest is not stripped to meet it', () => {
+  // The split o3d-0qoo drew, and the reason the bridge is carried per key rather than switched on for
+  // the whole module. A persisted ref IS the referenceId the batch wrote; a digest-suffixed event
+  // beside a bare persisted ref is a different journal, and bridging it would vouch for the wrong one.
+  const rows = persistedRefRows()
+  rows.salesOrders[0] = { ...rows.salesOrders[0], revenueDeferredBatchRef: 'A1-2026-04-24' }
+
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+  assert.ok(codes.includes('source_order_revenue_deferral_without_event'),
+    'the persisted ref names a journal that was never mirrored')
+  assert.ok(codes.includes('event_without_source'),
+    'and the digest-suffixed event it sits beside is not that journal')
+})

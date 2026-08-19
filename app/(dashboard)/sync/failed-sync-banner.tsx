@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 import { AlertTriangle, Loader2, RotateCcw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { retryFailedAccountingSync } from '@/app/actions/accounting-sync'
+import { accountingRetryDuplicateCaution } from '@/lib/domain/accounting/idempotency-retention'
 import type { FailedAccountingSyncSummary } from '@/app/actions/accounting-sync'
 
 const CONNECTOR_LABELS: Record<string, string> = { xero: 'Xero', quickbooks: 'QuickBooks' }
@@ -25,6 +26,11 @@ export function FailedSyncBanner({ summary }: { summary: FailedAccountingSyncSum
   // after a retry, so the banner hides (or shows the remainder) on its own.
   if (summary.failedCount === 0) return null
   const connectorLabel = summary.connector ? (CONNECTOR_LABELS[summary.connector] ?? summary.connector) : 'the accounting connector'
+  // o3d-wahn: the connector's idempotency key does NOT protect this button. Xero keeps one for six
+  // minutes and a row is only FAILED after its automatic retries are exhausted, so by the time this
+  // control exists the key has expired and a re-post is a new request. Stated here rather than
+  // enforced, because refusing every aged row would remove the only remedy the operator has.
+  const duplicateCaution = accountingRetryDuplicateCaution(summary.connector)
 
   function retryAll() {
     setMessage(null)
@@ -49,6 +55,7 @@ export function FailedSyncBanner({ summary }: { summary: FailedAccountingSyncSum
             They will not post to the ledger until re-queued. Review the errors in the sync log below, then
             re-queue them once the cause is resolved.
           </p>
+          {duplicateCaution && <p className="text-xs">{duplicateCaution}</p>}
           {message && <p className="text-xs" role="alert">{message}</p>}
           <Button variant="outline" size="sm" onClick={retryAll} disabled={pending}>
             {pending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RotateCcw className="h-3 w-3 mr-1" />}
