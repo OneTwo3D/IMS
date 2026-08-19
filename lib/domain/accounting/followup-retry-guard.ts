@@ -207,11 +207,19 @@ function asPayload(value: unknown): FollowUpPayload | null {
     : null
 }
 
+/**
+ * CASE-FOLDED (Codex round 7, HIGH #2). Two rows naming one Xero GUID in different case are the
+ * same document — `4d8a…` and `4D8A…` address one invoice — so a byte-exact compare declared them
+ * DIFFERENT documents and dropped the rival from the contender list, which is the same double-post
+ * this filter exists to prevent, wearing a different spelling. Folding is injective over the ids
+ * either connector issues (hex GUIDs, decimal strings), so it cannot merge two real documents;
+ * see money-post-document.ts.
+ */
 function anchorsOf(payload: unknown): string[] {
   const record = asPayload(payload)
   return ANCHOR_FIELDS.map((field) => {
     const value = record?.[field]
-    return typeof value === 'string' ? value.trim() : ''
+    return typeof value === 'string' ? value.trim().toLowerCase() : ''
   })
 }
 

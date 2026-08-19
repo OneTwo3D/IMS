@@ -5,14 +5,27 @@ import test from 'node:test'
 
 import {
   classifyLedgerSettlement,
+  comparableAttemptDate,
   describeAttempt,
   moneyPostDateFieldFor,
   moneyPostDateToSend,
   pinnedAttemptDate,
-  plannedAttemptDate,
   settlementMarkerFor,
   type LedgerSettlementRecord,
 } from '@/lib/domain/accounting/ledger-settlement-evidence'
+
+/**
+ * What the module used to export as `plannedAttemptDate`, spelt out here instead (round 7, Codex
+ * HIGH #1). The production path no longer has a function that resolves a wall-clock posting date
+ * on demand: the processor resolves it ONCE with `moneyPostDateToSend` and hands the value to the
+ * fence, so an on-demand resolver could only be a second resolution site to drift from. The rule
+ * it expressed is still worth asserting, so the composition lives in the test, where nothing pays
+ * anybody.
+ */
+const plannedAttemptDate = (type: string, payload: unknown, now: Date): string | null => {
+  const sending = moneyPostDateToSend(type, payload, now)
+  return sending.ok ? comparableAttemptDate(sending.date) : null
+}
 
 /**
  * o3d-0m56 — the rule that decides whether money may move a second time.

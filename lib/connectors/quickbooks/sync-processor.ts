@@ -730,6 +730,10 @@ async function processEntry(
       // exactly that reason.
       return postMoneyUnderLedgerFence({
         connector: QBO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: paymentDate,
       }, async () => {
         try {
           // o3d-b3gw: idempotent, like every other document this connector posts. Without a
@@ -800,6 +804,10 @@ async function processEntry(
       // exactly that reason.
       return postMoneyUnderLedgerFence({
         connector: QBO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: paymentDate,
       }, async () => {
         try {
           // o3d-b3gw: same reasoning as the customer payment above — a lost response must not

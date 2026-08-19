@@ -1423,6 +1423,10 @@ async function processEntry(
       // exactly that reason.
       return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: paymentDate,
       }, async () => {
         try {
           const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
@@ -1543,6 +1547,10 @@ async function processEntry(
       // exactly that reason.
       return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: paymentDate,
       }, async () => {
         try {
           const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
@@ -1629,6 +1637,10 @@ async function processEntry(
       // exactly that reason.
       return postMoneyUnderLedgerFence({
         connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+        // The date this post is SENDING, carried rather than re-resolved (round 7, Codex HIGH #1):
+        // the fence must authorise against the very day the call below creates, and a second
+        // wall-clock read here is a second day whenever the two straddle a UTC midnight.
+        postingDate: allocationDate,
       }, async () => {
         const result = await allocatePurchaseCreditNote(
           { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },

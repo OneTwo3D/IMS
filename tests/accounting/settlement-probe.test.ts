@@ -400,6 +400,17 @@ test('the probe key separates documents (o3d-0m56)', () => {
     key('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'a', creditNoteId: 'c2' }),
   )
   assert.equal(key('INVOICE_PAYMENT', { accountingInvoiceId: 'a' }), key('INVOICE_PAYMENT', { accountingInvoiceId: ' a ' }))
+  // ...and one document written in two cases is ONE cached reading (round 7, HIGH 2). A Xero id is
+  // a GUID: keeping case here would have made the actions probe the same invoice twice and — worse
+  // — take two different money-post locks on it, since both come from this key.
+  const GUID = '4d8a1f2e-0000-4c11-9a3b-7e5d2c9b1a44'
+  assert.equal(key('BILL_PAYMENT', { accountingInvoiceId: GUID }), key('BILL_PAYMENT', { accountingInvoiceId: GUID.toUpperCase() }))
+  // But the parts still cannot run together: as one space-delimited string these were equal, and a
+  // cache key that collapses two documents hands one of them the other's ledger reading.
+  assert.notEqual(
+    key('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'a b', creditNoteId: 'c' }),
+    key('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'a', creditNoteId: 'b c' }),
+  )
 })
 
 /* ------------------------------------------------------------------------------------------- *

@@ -37,9 +37,44 @@ function str(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
+/**
+ * CASE IS NOT PART OF A DOCUMENT'S IDENTITY (Codex round 7, HIGH #2).
+ *
+ * Both connectors' document ids are case-INSENSITIVE by construction: Xero's are GUIDs (hex and
+ * hyphens — `4d8a…` and `4D8A…` address the same invoice, which is why the credit-note allocation
+ * probe has always compared them with `toLowerCase`), and QuickBooks' are decimal strings, on
+ * which case is not expressible at all. A key that keeps case therefore lets ONE document take
+ * TWO locks, and the whole point of the document key was that it cannot.
+ *
+ * CAN THIS COLLIDE TWO GENUINELY DIFFERENT DOCUMENTS? No. Over the alphabet either connector
+ * issues — [0-9a-f-] and [0-9] — lower-casing is injective, so two ids that differ only in case
+ * are the same id and two ids that differ otherwise still differ afterwards. The claim is about
+ * those two alphabets specifically: a connector that ever issued case-significant opaque ids
+ * (base64, say) would need its own rule, and there is no such connector on this path.
+ */
+function documentIdentity(value: unknown): string {
+  return str(value).toLowerCase()
+}
+
 /** The invoice/bill a post settles, or '' when the row records none (which no post survives). */
 export function settlementDocumentId(payload: unknown): string {
   return str(asRecord(payload).accountingInvoiceId)
+}
+
+/**
+ * Every spelling of this row's document id that a STORED payload could literally hold.
+ *
+ * The sibling query matches JSON with `equals`, which is byte-exact in PostgreSQL and cannot be
+ * told to fold case — so the folding has to happen on the query side, by asking for the spellings
+ * a connector actually issues. `settlementDocumentId` is kept as the first entry because the
+ * common case is an exact match on the value this row itself carries.
+ *
+ * The result is a SUPERSET pre-filter, never the decision: every row it returns is still put
+ * through `attemptCouldBeTheSameDocument`, which compares the same way this module does.
+ */
+export function settlementDocumentIdMatches(payload: unknown): string[] {
+  const id = settlementDocumentId(payload)
+  return id === '' ? [] : [...new Set([id, id.toLowerCase(), id.toUpperCase()])]
 }
 
 /**
@@ -47,10 +82,20 @@ export function settlementDocumentId(payload: unknown): string {
  *
  * Deliberately the SAME value the settlement probe caches on, so the thing the lock excludes and
  * the thing the probe reads can never be two different documents.
+ *
+ * JSON-encoded rather than space-joined so the parts cannot run together: as one delimited string,
+ * `{invoice: 'a b'}` and `{invoice: 'a', creditNote: 'b'}` produced the SAME key, and this value is
+ * a CACHE key for the probe as well as a lock key — two different documents sharing it would hand
+ * one of them the other's ledger reading, which is a false clear rather than merely extra
+ * serialization.
  */
 export function settlementDocumentKey(type: string, payload: unknown): string {
   const record = asRecord(payload)
-  return [type, str(record.accountingInvoiceId), str(record.creditNoteId)].join(' ')
+  return JSON.stringify([
+    str(type).toLowerCase(),
+    documentIdentity(record.accountingInvoiceId),
+    documentIdentity(record.creditNoteId),
+  ])
 }
 
 export type MoneyPostDocument = {

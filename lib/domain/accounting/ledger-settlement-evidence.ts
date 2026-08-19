@@ -218,8 +218,12 @@ export function moneyPostDateToSend(
  * against the date it reports is a match that can never happen — a false CLEAR with extra steps.
  * Null instead, which reads as `attempt-undescribable`, and the fence answers that by refusing on
  * whatever the ledger visibly holds.
+ *
+ * EXPORTED so the POST fence can ask it about the date its CALLER already resolved (Codex round 7,
+ * HIGH #1). It takes the sent string and nothing else — there is no clock in it — which is what
+ * makes it impossible for the fence to arrive at a different day from the post it is authorising.
  */
-function comparableSettlementDate(sent: string): string | null {
+export function comparableAttemptDate(sent: string): string | null {
   return /^\d{4}-\d{2}-\d{2}$/.test(sent) ? sent : null
 }
 
@@ -231,21 +235,24 @@ function comparableSettlementDate(sent: string): string | null {
  */
 export function pinnedAttemptDate(type: string, payload: unknown): string | null {
   const posted = moneyPostDate(type, payload)
-  return posted.kind === 'pinned' ? comparableSettlementDate(posted.date) : null
+  return posted.kind === 'pinned' ? comparableAttemptDate(posted.date) : null
 }
 
 /**
- * The date an attempt that has NEVER BEEN SENT will carry when it is sent NOW.
+ * THE DATE AN UNSENT ATTEMPT WILL CARRY IS NOT RESOLVED TWICE (Codex round 7, HIGH #1).
  *
- * ONLY legitimate for an attempt that has not happened yet (Codex round 5, finding 1). For an
- * attempt already made, the day it ran is unreconstructable and `pinnedAttemptDate`'s null — which
- * yields `attempt-undescribable` — is the honest answer; substituting today would invent a
- * description of a payment that was actually dated last Tuesday, and then fail to find it.
+ * There used to be a `plannedAttemptDate(type, payload, now)` here, and the POST fence called it
+ * with a clock of its own while the processor called `moneyPostDateToSend` with another. One
+ * shared function was not enough: its wall-clock arm reads whatever `Date` it is handed, so the
+ * two calls straddling a UTC midnight authorised against 2026-08-19 and posted 2026-08-18. A
+ * settlement a human made on the 18th was then searched for on the 19th, not found, and a second
+ * payment authorised — the weakened match IS the double post, not a harmless imprecision.
+ *
+ * So the resolver is deliberately absent, and `moneyPostDateToSend` is called ONCE per post, by
+ * the processor branch that puts the value on the wire; the fence receives that value as
+ * `postingDate` and compares it through `comparableAttemptDate`. There is no second caller to
+ * drift from because there is no second call.
  */
-export function plannedAttemptDate(type: string, payload: unknown, now: Date): string | null {
-  const sending = moneyPostDateToSend(type, payload, now)
-  return sending.ok ? comparableSettlementDate(sending.date) : null
-}
 
 export function describeAttempt(
   /** Which money-moving type this row is: the date convention is per type, never per payload. */
@@ -254,8 +261,9 @@ export function describeAttempt(
   marker?: string | null,
   /**
    * `postingOn` fills in the date ONLY when the payload pins none, and is only sound for an
-   * attempt about to be sent — see `plannedAttemptDate`. Callers judging a past attempt must
-   * omit it.
+   * attempt about to be sent — it must be the date that post is ACTUALLY sending, resolved once
+   * by the caller (see the note where `plannedAttemptDate` used to be). Callers judging a past
+   * attempt must omit it.
    */
   options?: { postingOn?: string | null },
 ): AttemptDescription {

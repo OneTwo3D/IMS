@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
+import { settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
+
 /**
  * o3d-0m56 round 4, Codex CRITICAL #2 — the lock the money post is actually made under.
  *
@@ -42,7 +44,10 @@ const DOCUMENT = {
   type: 'INVOICE_PAYMENT',
   referenceType: 'SalesOrder',
   referenceId: 'so-1',
-  documentKey: 'INVOICE_PAYMENT inv-1 ',
+  // Built by the production key function rather than written out. A hand-written key is a double
+  // with a false premise: it can stay valid while the real key changes shape underneath it, and
+  // then every lock-identity assertion below is about a string nothing produces.
+  documentKey: settlementDocumentKey('INVOICE_PAYMENT', PAYLOAD),
 }
 
 function reset() {
@@ -134,5 +139,41 @@ test('the SAME document in two different SCOPES is one lock (o3d-0m56 r6, CRITIC
   assert.equal(
     moneyPostDocumentLockId({ connector: 'xero', type: 'BILL_PAYMENT', referenceType: 'PurchaseOrder', referenceId: 'po-1', documentKey }),
     moneyPostDocumentLockId({ connector: 'xero', type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: 'pi-9', documentKey }),
+  )
+})
+
+test('one document id in TWO CASES is ONE lock (o3d-0m56 r7, HIGH 2)', async () => {
+  // A Xero document id is a GUID, and `4D8A…` addresses the invoice `4d8a…` addresses — the
+  // allocation probe has always compared them with `toLowerCase`. A case-SENSITIVE key therefore
+  // handed one document two locks, which is the cross-scope double post the document key was
+  // written to close, reopened one spelling later.
+  const { moneyPostDocumentLockId } = await import('@/lib/domain/accounting/money-post-document')
+  const lower = settlementDocumentKey('BILL_PAYMENT', { accountingInvoiceId: '4d8a1f2e-0000-4c11-9a3b-7e5d2c9b1a44' })
+  const upper = settlementDocumentKey('BILL_PAYMENT', { accountingInvoiceId: '4D8A1F2E-0000-4C11-9A3B-7E5D2C9B1A44' })
+  assert.equal(lower, upper, 'case is not part of a document\'s identity')
+  assert.equal(
+    moneyPostDocumentLockId({ connector: 'xero', type: 'BILL_PAYMENT', referenceType: 'PurchaseOrder', referenceId: 'po-1', documentKey: lower }),
+    moneyPostDocumentLockId({ connector: 'xero', type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: 'pi-9', documentKey: upper }),
+  )
+  // ...and the credit note half of the key folds too, or an allocation gets the same second lock.
+  assert.equal(
+    settlementDocumentKey('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'bill-1', creditNoteId: 'CN-1' }),
+    settlementDocumentKey('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'BILL-1', creditNoteId: 'cn-1' }),
+  )
+})
+
+test('the key cannot run two DIFFERENT documents together (o3d-0m56 r7, HIGH 2)', async () => {
+  // The other direction, because folding case is only safe if it stays injective. It is, over the
+  // alphabets either connector issues — and the parts are delimited, so an id that contains the
+  // separator cannot borrow the next field's value. Delimited as one space, these two were the
+  // SAME key, and this value caches the probe as well as keying the lock: a collision hands one
+  // document the other's ledger reading, which is a false clear.
+  assert.notEqual(
+    settlementDocumentKey('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'a b', creditNoteId: 'c' }),
+    settlementDocumentKey('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'a', creditNoteId: 'b c' }),
+  )
+  assert.notEqual(
+    settlementDocumentKey('BILL_PAYMENT', { accountingInvoiceId: '4d8a1f2e-0000-4c11-9a3b-7e5d2c9b1a44' }),
+    settlementDocumentKey('BILL_PAYMENT', { accountingInvoiceId: '4d8a1f2e-0000-4c11-9a3b-7e5d2c9b1a45' }),
   )
 })

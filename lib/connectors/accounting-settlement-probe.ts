@@ -14,7 +14,7 @@
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
-import { settlementDocumentId, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
+import { settlementDocumentIdMatches, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
 import type { MoneyPostLock } from '@/lib/domain/accounting/money-post-lock'
 
 export type SettlementProbeTarget = {
@@ -622,6 +622,24 @@ export type MoneyPostFenceParams = {
   referenceType: string
   referenceId: string
   payload: unknown
+  /**
+   * THE DATE THIS POST IS SENDING — resolved ONCE, by the caller, and carried (Codex round 7,
+   * HIGH #1).
+   *
+   * Round 6 gave the processor and the fence one shared function and called the mirror gone. It
+   * was not: `moneyPostDateToSend`'s wall-clock arm answers about the `Date` it is handed, and the
+   * two sides handed it two different instants. Astride a UTC midnight those are different days,
+   * so the probe went looking for a settlement dated the 19th while the post created one dated the
+   * 18th — and a human's payment on the 18th was therefore not matched. A weakened match is not a
+   * conservative failure here; it is precisely how a real settlement goes unseen and a second
+   * payment is authorised.
+   *
+   * REQUIRED, not defaulted: a fence that could fall back to a clock of its own is a fence that
+   * still has a second resolution site in it. The value is the exact string the branch puts on the
+   * wire, so the date this authorisation was taken against and the date the ledger will hold are
+   * the same value by construction, not by agreement.
+   */
+  postingDate: string
   /** Injected so the guard is testable without a database. */
   db: {
     accountingSyncLog: {
@@ -634,7 +652,9 @@ export type MoneyPostFenceParams = {
           id: { not: string }
           /**
            * BOTH KEYS, IN A DEFINED ORDER (round 6, Codex CRITICAL #2): the local scope this row
-           * sits in, then the external document it names. See the query below.
+           * sits in, then the external document it names — the latter once per spelling the id can
+           * be stored in, because `equals` on a JSON path is byte-exact (round 7, HIGH #2). See the
+           * query below.
            */
           OR: Array<
             | { referenceType: string; referenceId: string }
@@ -645,6 +665,13 @@ export type MoneyPostFenceParams = {
       }) => Promise<Array<{ id: string; payload: unknown }>>
     }
   }
+  /**
+   * The clock for the ATTEMPT STAMP only, injected so the write is testable.
+   *
+   * Deliberately NOT the source of the posting date any more (round 7, Codex HIGH #1) — that
+   * arrives as `postingDate`, already resolved. Two clocks on one path is exactly how the fence
+   * ended up authorising a different day from the one it was authorising for.
+   */
   now?: () => Date
 }
 
@@ -689,7 +716,15 @@ export async function authoriseMoneyPost(
   // `attemptCouldBeTheSameDocument` has always treated as "possibly this document". The document
   // arm is added only when this row names one — with no id there is nothing to match, and the
   // probe below refuses such a post outright anyway.
-  const documentId = settlementDocumentId(params.payload)
+  //
+  // AND CASE-FOLDED (round 7, Codex HIGH #2). `equals` on a JSON path is byte-exact in PostgreSQL,
+  // so a rival row holding the SAME Xero GUID in another case was matched by neither arm — the
+  // scope arm because it sits elsewhere, the document arm because `4D8A…` is not `4d8a…`. It is
+  // the same cross-scope double post, one spelling later. The arms ask for every spelling either
+  // connector issues; the returned rows are still put through `attemptCouldBeTheSameDocument`
+  // below, which folds case the same way, so a superset here can only add contenders and never
+  // decide anything on its own.
+  const documentIds = settlementDocumentIdMatches(params.payload)
   const attemptedSiblings = await params.db.accountingSyncLog.findMany({
     where: {
       connector: params.connector,
@@ -698,12 +733,12 @@ export async function authoriseMoneyPost(
       id: { not: params.entryId },
       OR: [
         { referenceType: params.referenceType, referenceId: params.referenceId },
-        ...(documentId ? [{ payload: { path: ['accountingInvoiceId'], equals: documentId } }] : []),
+        ...documentIds.map((id) => ({ payload: { path: ['accountingInvoiceId'], equals: id } })),
       ],
     },
     select: { id: true, payload: true },
   })
-  const { classifyLedgerSettlement, describeAttempt, plannedAttemptDate, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
+  const { classifyLedgerSettlement, comparableAttemptDate, describeAttempt, settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
   const { effectiveTokenFor, attemptCouldHaveReachedTheLedger, attemptCouldBeTheSameDocument } = await import('@/lib/domain/accounting/followup-retry-guard')
 
   // EVERY CONTENDER, EACH BY ITS OWN MARK — this row and every rival that could have settled the
@@ -759,13 +794,16 @@ export async function authoriseMoneyPost(
    * reasoning was right that refusing for ever is wrong and wrong that proceeding is therefore
    * right: it let a virgin undated row walk straight past a settlement the probe could SEE.
    *
-   * What makes it describable is that this row has not been sent yet. `plannedAttemptDate` is
-   * the very value the processor is about to put in the ledger — the payload's date if it pins
-   * one, otherwise today, exactly as the branch below this fence computes it — so the attempt is
-   * compared on what it WILL create rather than treated as unknowable. (Sound only because this
-   * branch is unreachable for a row that has posted: a row that failed to claim the stamp is a
-   * contender unless `attemptCouldHaveReachedTheLedger` rejects its body, and that rejection is
-   * itself proof no call was ever made.)
+   * What makes it describable is that this row has not been sent yet. `params.postingDate` is
+   * the very value the processor is about to put in the ledger — not a prediction of it. Round 6
+   * predicted it by calling the processors' own date function a second time here, which is a
+   * prediction whenever that function reads a clock: astride a UTC midnight the two calls answer
+   * different days, and the probe then hunts a settlement the post will never create (round 7,
+   * Codex HIGH #1). The caller resolves it once and hands it over, so the attempt is compared on
+   * what it WILL create by construction. (Sound only because this branch is unreachable for a row
+   * that has posted: a row that failed to claim the stamp is a contender unless
+   * `attemptCouldHaveReachedTheLedger` rejects its body, and that rejection is itself proof no
+   * call was ever made.)
    *
    * That leaves one genuinely undescribable shape — a payload with no readable AMOUNT, which
    * both connectors reject before any HTTP call anyway. It may still not walk past a settlement
@@ -776,7 +814,7 @@ export async function authoriseMoneyPost(
    */
   if (contenders.length === 0) {
     const marker = settlementMarkerFor(effectiveTokenFor(params.connector, { id: params.entryId, payload: params.payload }))
-    const attempt = describeAttempt(params.type, params.payload, marker, { postingOn: plannedAttemptDate(params.type, params.payload, now()) })
+    const attempt = describeAttempt(params.type, params.payload, marker, { postingOn: comparableAttemptDate(params.postingDate) })
     const verdict = classifyLedgerSettlement(attempt, probe)
     if (verdict.outcome === 'present') {
       return {
@@ -849,9 +887,26 @@ export type MoneyPostOutcome = { success: boolean; externalId?: string; error?: 
  * So it is also written to the ACTIVITY LOG, at ERROR, against the sync row. Not to the sync row
  * itself: a successful post is immediately followed by `status: SYNCED, errorMessage: null` in
  * both processors, so anything this wrote there would be erased by the write that reports the
- * success. `logActivity` never throws and swallows its own failures, which is what makes it safe
- * to call on the way out of a post that has already moved money — the incident must not turn a
- * committed payment into an exception.
+ * success.
+ *
+ * AND THE WRITE IS CHECKED (round 7, Codex MEDIUM #3). It used to call `logActivity`, which never
+ * throws AND swallows its own failures — so the `catch` around it could not fire, and a write that
+ * failed was indistinguishable here from one that succeeded. The durable record could therefore
+ * vanish silently at exactly the moment it mattered, leaving the code believing it had made the
+ * incident findable. `logActivityPersisted` is the same call that REPORTS, and its answer is used:
+ *
+ *  1. one retry, because the common failure is a transient blip on a connection pool that has just
+ *     been hammered by an HTTP round trip, and a second attempt costs nothing on the happy path
+ *     (it is not reached at all unless the first fails);
+ *  2. failing that, a distinct stderr line that says the durable record was NOT written and
+ *     carries the whole incident as JSON, so it is reconstructable from the log stream rather than
+ *     merely alluded to;
+ *  3. the outcome is RETURNED, so the caller can put the incident somewhere that does survive when
+ *     it has such a place — a failed post's `errorMessage` is written to the sync row and not
+ *     overwritten, so that branch says so in the operator-facing text.
+ *
+ * It still never throws. The incident must not turn a committed payment into an exception, which
+ * is the one thing worse than an unrecorded incident.
  *
  * Deliberately NOT a re-probe. Reading the ledger again here could not be conclusive: a rival
  * post inside the same window may not be readable yet, and one that lands a second later would be
@@ -861,45 +916,62 @@ async function reportLostMoneyPostExclusion(
   params: { connector: string; entryId: string; type: string; referenceType: string; referenceId: string; payload?: unknown },
   outcome: 'committed' | 'failed' | 'threw',
   externalId?: string,
-): Promise<void> {
+): Promise<{ persisted: boolean }> {
   const description = `Money post made without its exclusion: the advisory lock's connection died `
     + `while the ${params.type} call to ${params.connector} was in flight, so another entry may have `
     + `posted to this document at the same time (outcome=${outcome}). Check the accounting connector `
     + `for a duplicate settlement.`
+  const metadata = {
+    connector: params.connector,
+    type: params.type,
+    referenceType: params.referenceType,
+    referenceId: params.referenceId,
+    documentKey: settlementDocumentKey(params.type, params.payload),
+    entryId: params.entryId,
+    outcome,
+    externalId: externalId ?? null,
+  }
   console.error(
     `[money-post] EXCLUSION LOST during the post — the advisory lock's connection died while the call `
     + `was in flight, so another entry may have posted to this document at the same time. `
     + `connector=${params.connector} type=${params.type} scope=${params.referenceType}:${params.referenceId} `
     + `entry=${params.entryId} outcome=${outcome}. Check the accounting connector for a duplicate settlement.`,
   )
+  let persisted = false
   try {
-    const { logActivity } = await import('@/lib/activity-log')
-    await logActivity({
-      entityType: 'SYNC',
+    const { logActivityPersisted } = await import('@/lib/activity-log')
+    const entry = {
+      entityType: 'SYNC' as const,
       entityId: params.entryId,
       action: 'money_post_exclusion_lost',
       tag: 'accounting',
-      level: 'ERROR',
+      level: 'ERROR' as const,
       description,
       // No session to resolve on a connector worker, and resolving one would be the only part of
       // this call that can be slow on a path that has just moved money.
       resolveUser: false,
-      metadata: {
-        connector: params.connector,
-        type: params.type,
-        referenceType: params.referenceType,
-        referenceId: params.referenceId,
-        documentKey: settlementDocumentKey(params.type, params.payload),
-        entryId: params.entryId,
-        outcome,
-        externalId: externalId ?? null,
-      },
-    })
+      metadata,
+    }
+    persisted = await logActivityPersisted(entry)
+    if (!persisted) persisted = await logActivityPersisted(entry)
   } catch (error) {
-    // The console line above is still out. An activity-log failure must not be the thing that
-    // turns a committed payment into an exception.
+    // `logActivityPersisted` does not throw, so this is the module failing to import at all. The
+    // console line above is still out; an activity-log failure must not be the thing that turns a
+    // committed payment into an exception.
     console.error('[money-post] could not record the lost-exclusion incident:', error)
   }
+  if (!persisted) {
+    // NOT the same line as the one above, and not a duplicate of it: that one says a payment went
+    // out unprotected, this one says the only durable record of it does not exist. An operator
+    // reading IMS's own history will find nothing about this payment, so the log stream is now the
+    // sole copy and it has to carry the whole incident rather than a pointer to it.
+    console.error(
+      '[money-post] INCIDENT NOT PERSISTED — the lost-exclusion record could not be written to the '
+      + 'activity log, so IMS holds no durable trace of this unprotected money post. Incident: '
+      + JSON.stringify(metadata),
+    )
+  }
+  return { persisted }
 }
 
 /**
@@ -976,14 +1048,22 @@ export async function postMoneyUnderLedgerFence(
     // What is irreducible: if another worker took the freed lock and posted in the same window,
     // the document really is paid twice. That is now announced at the moment it becomes possible,
     // by the process that did it, naming the document — not discovered at reconciliation.
-    await reportLostMoneyPostExclusion(params, outcome.success ? 'committed' : 'failed', outcome.externalId)
+    const incident = await reportLostMoneyPostExclusion(params, outcome.success ? 'committed' : 'failed', outcome.externalId)
     if (outcome.success) return outcome
     return {
       success: false,
       error: 'Not sent safely: the money-post lock for this document was lost while IMS was posting to '
         + 'the accounting connector, so another entry may have posted at the same time. '
         + `The connector reported: ${outcome.error ?? 'no error'}. Check the ledger for a duplicate `
-        + 'before retrying.',
+        + 'before retrying.'
+        // The DURABLE fallback for this branch (round 7, Codex MEDIUM #3). A failed post's error
+        // message IS written to the sync row and survives, so when the activity-log record could
+        // not be written the incident still reaches an operator through the row itself — which is
+        // the only place left once the activity log is unavailable.
+        + (incident.persisted
+          ? ''
+          : ' IMS could also not record this incident in the activity log, so this message is the '
+            + 'only durable record of it.'),
     }
   })
   if (!outcome.locked) {

@@ -737,3 +737,47 @@ test('the guard\'s live-unique type set matches the migration (o3d-0m56)', async
     assert.equal(isLiveUniqueFollowUpType(type), false, `${type} is NOT in the index`)
   }
 })
+
+test('a sibling naming the target document in ANOTHER CASE is still a contender (o3d-0m56 r7, HIGH 2)', () => {
+  // The planner and the POST fence must not disagree about who the rivals are — they share
+  // `couldBeTheSameDocument` for exactly that reason. It compared anchors byte-exactly, so a
+  // sibling recording the same Xero GUID in upper case was declared a DIFFERENT document and
+  // dropped: the retry was then planned as though nothing else had ever targeted the invoice, and
+  // the sibling's committed payment — carrying ITS token's mark, not the target's — was invisible.
+  const LOWER = '4d8a1f2e-0000-4c11-9a3b-7e5d2c9b1a44'
+  // The target's OWN numbers match nothing in the ledger, so only the rival can produce a refusal
+  // — without that the target would match the record itself and the test would pass for a reason
+  // that has nothing to do with case.
+  const target = {
+    id: 'log-new', effectiveToken: 'log-new',
+    payload: { accountingInvoiceId: LOWER, bankAccountId: 'bank-1', amount: 25, paymentDate: '2026-09-20' },
+  }
+  const rival = {
+    id: 'log-old', effectiveToken: 'log-old',
+    payload: { accountingInvoiceId: LOWER.toUpperCase(), bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' },
+  }
+  const plan1 = plan({
+    ...scopeArgs,
+    target,
+    siblings: [target, rival],
+    ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-OLD', reference: null }] },
+  })
+  assert.notEqual(plan1.action, 'allow', 'one GUID in two cases is one invoice, and it is already paid')
+
+  // The discriminating half: a genuinely different id is still a different document, so folding
+  // case has not turned the filter into "everything matches".
+  const elsewhere = {
+    id: 'log-else', effectiveToken: 'log-else',
+    payload: { accountingInvoiceId: '4d8a1f2e-0000-4c11-9a3b-7e5d2c9b1a45', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' },
+  }
+  assert.deepEqual(
+    plan({
+      ...scopeArgs,
+      target,
+      siblings: [target, elsewhere],
+      ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-OLD', reference: null }] },
+    }),
+    { action: 'allow' },
+    'a genuinely different id is still a different document — folding case has not made everything match',
+  )
+})
