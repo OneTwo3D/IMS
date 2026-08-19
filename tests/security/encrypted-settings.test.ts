@@ -204,7 +204,12 @@ test('settings-store env fallbacks take precedence and expose active overrides',
     process.env.WC_WEBHOOK_SECRET = 'env-secret'
 
     assert.equal(getEnvFallback('wc_webhook_secret'), 'env-secret')
-    assert.deepEqual(getActiveSettingEnvOverrides(['wc_webhook_secret', 'wc_url']), {
+    // wc_sync_order_statuses is the negative case on purpose: o3d-tj6v decided
+    // NOT to give it an env fallback, because install.sh wrote
+    // WC_SYNC_STATUSES=processing into every .env and an override would pin
+    // every install to it and make the Settings checkboxes inert.
+    assert.equal(getSettingEnvFallbackKey('wc_sync_order_statuses'), null)
+    assert.deepEqual(getActiveSettingEnvOverrides(['wc_webhook_secret', 'wc_url', 'wc_sync_order_statuses']), {
       wc_webhook_secret: 'WC_WEBHOOK_SECRET',
     })
   } finally {
@@ -244,5 +249,29 @@ test('the WooCommerce API credentials have no environment override, so both sync
     else process.env.WC_CONSUMER_KEY = previousKey
     if (previousSecret == null) delete process.env.WC_CONSUMER_SECRET
     else process.env.WC_CONSUMER_SECRET = previousSecret
+  }
+})
+
+// o3d-esha item 3: WC_CONSUMER_KEY / WC_CONSUMER_SECRET / WC_WEBHOOK_SECRET /
+// WC_INVOICE_PDF_SECRET were env-backed but wc_url was not, so a WooCommerce
+// configured entirely by environment landed its credentials with no store to
+// point them at and reported itself unconfigured.
+test('settings-store backs the WooCommerce store URL with WC_STORE_URL', () => {
+  const previousUrl = process.env.WC_STORE_URL
+  const previousKey = process.env.WC_CONSUMER_KEY
+  try {
+    process.env.WC_STORE_URL = 'https://env-store.example'
+    delete process.env.WC_CONSUMER_KEY
+
+    assert.equal(getSettingEnvFallbackKey('wc_url'), 'WC_STORE_URL')
+    assert.equal(getEnvFallback('wc_url'), 'https://env-store.example')
+    assert.deepEqual(getActiveSettingEnvOverrides(['wc_url', 'wc_consumer_key']), {
+      wc_url: 'WC_STORE_URL',
+    })
+  } finally {
+    if (previousUrl == null) delete process.env.WC_STORE_URL
+    else process.env.WC_STORE_URL = previousUrl
+    if (previousKey == null) delete process.env.WC_CONSUMER_KEY
+    else process.env.WC_CONSUMER_KEY = previousKey
   }
 })

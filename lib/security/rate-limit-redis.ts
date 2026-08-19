@@ -73,7 +73,23 @@ function parseRedisValue(buffer: Buffer, offset = 0): ParsedRedisValue | null {
   throw new Error(`Unsupported Redis response type "${type}"`)
 }
 
-function redisConnectionOptions(redisUrl: string) {
+export type RedisRateLimitOptions = {
+  /**
+   * o3d-esha: scripts/install.sh:445 writes `requirepass` into redis.conf but
+   * builds REDIS_URL with no credentials, so the only password an operator can
+   * supply through the installer never reached AUTH. Used when the URL itself
+   * carries no password; an inline URL password still wins.
+   */
+  password?: string
+  /**
+   * o3d-esha: keys were hardcoded to `rate-limit:`, so two tenants sharing one
+   * Redis shared rate-limit buckets while provision-ims-tenant.sh reported a
+   * per-tenant namespace that did not exist.
+   */
+  keyPrefix?: string
+}
+
+export function redisConnectionOptions(redisUrl: string, fallbackPassword = '') {
   const url = new URL(redisUrl)
   if (url.protocol !== 'redis:' && url.protocol !== 'rediss:') {
     throw new Error('REDIS_URL must use redis:// or rediss://')
@@ -85,9 +101,14 @@ function redisConnectionOptions(redisUrl: string) {
     host: url.hostname,
     port: url.port ? Number(url.port) : (url.protocol === 'rediss:' ? 6380 : 6379),
     username: decodeURIComponent(url.username),
-    password: decodeURIComponent(url.password),
+    password: decodeURIComponent(url.password) || fallbackPassword,
     db: url.pathname.length > 1 ? url.pathname.slice(1) : '',
   }
+}
+
+export function redisRateLimitKey(key: string, keyPrefix = ''): string {
+  const prefix = keyPrefix.trim()
+  return prefix ? `${prefix}:rate-limit:${key}` : `rate-limit:${key}`
 }
 
 type PendingRedisBatch = {
@@ -110,6 +131,7 @@ class RedisCommandClient {
   constructor(
     private readonly redisUrl: string,
     private readonly idleTimeoutMs = 30_000,
+    private readonly password = '',
   ) {}
 
   run(commands: string[][]): Promise<RedisValue[]> {
@@ -129,7 +151,7 @@ class RedisCommandClient {
   }
 
   private setupCommands(): string[][] {
-    const options = redisConnectionOptions(this.redisUrl)
+    const options = redisConnectionOptions(this.redisUrl, this.password)
     const commands: string[][] = []
     if (options.password) {
       commands.push(options.username
@@ -262,31 +284,29 @@ class RedisCommandClient {
   }
 }
 
-function redisKey(key: string): string {
-  return `rate-limit:${key}`
-}
-
 function numberValue(value: RedisValue): number {
   return typeof value === 'number' ? value : Number(value ?? 0)
 }
 
 export class RedisRateLimitBackend implements RateLimitBackend {
   private readonly runCommands: RedisCommandRunner
+  private readonly keyPrefix: string
 
-  constructor(redisUrl: string, runner?: RedisCommandRunner) {
+  constructor(redisUrl: string, runner?: RedisCommandRunner, options: RedisRateLimitOptions = {}) {
+    this.keyPrefix = options.keyPrefix ?? ''
     if (runner) {
       this.runCommands = runner
       return
     }
 
-    const client = new RedisCommandClient(redisUrl)
+    const client = new RedisCommandClient(redisUrl, 30_000, options.password ?? '')
     this.runCommands = (commands) => client.run(commands)
   }
 
   async check(key: string, max = 5, windowMs = 5 * 60_000): Promise<RateLimitResult> {
     const now = Date.now()
     const cutoff = now - windowMs
-    const bucketKey = redisKey(key)
+    const bucketKey = redisRateLimitKey(key, this.keyPrefix)
     const member = `${now}:${randomUUID()}`
 
     const [resultRaw] = await this.runCommands([
@@ -305,6 +325,6 @@ export class RedisRateLimitBackend implements RateLimitBackend {
   }
 
   async clear(key: string): Promise<void> {
-    await this.runCommands([['DEL', redisKey(key)]])
+    await this.runCommands([['DEL', redisRateLimitKey(key, this.keyPrefix)]])
   }
 }

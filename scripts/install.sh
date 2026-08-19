@@ -704,10 +704,10 @@ prompt WC_CONSUMER_KEY    "WooCommerce consumer key"   ""
 prompt WC_CONSUMER_SECRET "WooCommerce consumer secret" "" "secret"
 prompt WC_WEBHOOK_SECRET  "WooCommerce webhook secret"  "$(openssl rand -hex 16)" "secret"
 
-echo ""
-info "--- Xero (optional — can be configured later in Settings) ---"
-prompt XERO_CLIENT_ID     "Xero client ID"     ""
-prompt XERO_CLIENT_SECRET "Xero client secret" "" "secret"
+# Xero is configured entirely in the app: the client id/secret are stored in the
+# settings table and connecting requires the interactive OAuth consent round
+# trip regardless. Prompting here wrote two secrets into .env that nothing read
+# (o3d-esha).
 
 echo ""
 info "--- Outbound email (optional, required for automatic credential email) ---"
@@ -1102,13 +1102,12 @@ WC_STORE_URL=${WC_STORE_URL}
 WC_CONSUMER_KEY=${WC_CONSUMER_KEY}
 WC_CONSUMER_SECRET=${WC_CONSUMER_SECRET}
 WC_WEBHOOK_SECRET=${WC_WEBHOOK_SECRET}
-WC_SYNC_STATUSES=processing
-WC_USE_WEBHOOKS=true
-WC_POLL_INTERVAL_MINUTES=5
+# Order status filter, webhook-vs-polling and the poll interval are application
+# settings (Settings -> Sync -> WooCommerce), not env vars. Writing them here
+# produced lines nothing read (o3d-tj6v).
 
-XERO_CLIENT_ID=${XERO_CLIENT_ID}
-XERO_CLIENT_SECRET=${XERO_CLIENT_SECRET}
-XERO_TOKEN_PATH=${DATA_DIR}/xero/token.json
+# Xero client id/secret live in the settings table (Settings -> Integrations ->
+# Xero). Tokens are encrypted in Postgres, so there is no XERO_TOKEN_PATH.
 # XERO_TENANT_ID is DEPRECATED and no longer written by the installer (o3d-9tbz). It is
 # still read, as a single-organisation form of XERO_ALLOWED_TENANT_IDS, so that existing
 # installs that set it are protected — new installs should use the allow-list below.
@@ -1130,23 +1129,15 @@ CRON_SECRET=${CRON_SECRET}
 NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}
 TURNSTILE_SECRET_KEY=${TURNSTILE_SECRET_KEY}
 
-FX_BASE_CURRENCY=GBP
-
-PDF_TEMP_DIR=/tmp/${APP_NAME}/pdf
 BACKUP_DIR=${BACKUP_DIR}
-UPLOAD_MAX_SIZE_MB=10
 UPLOAD_STORAGE_DIR=${UPLOAD_STORAGE_DIR}
 PUBLIC_UPLOAD_STORAGE_DIR=${PUBLIC_UPLOAD_STORAGE_DIR}
-UPLOAD_TEMP_DIR=/tmp/${APP_NAME}/uploads
 FILE_SCAN_MODE=disabled
 FILE_SCAN_COMMAND_ARGV=
 FILE_SCAN_COMMAND=
 FILE_SCAN_NAME=
 FILE_SCAN_ENV_ALLOWLIST=PATH,HOME,TMPDIR,TEMP,TMP,LANG,LC_ALL
 FILE_SCAN_TIMEOUT_MS=30000
-
-LOG_LEVEL=info
-LOG_FORMAT=json
 EOF
 
 chown "${APP_USER}:${APP_USER}" "${APP_DIR}/.env"

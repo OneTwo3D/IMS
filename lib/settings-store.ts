@@ -20,6 +20,11 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
   shopify_invoice_pdf_secret: 'SHOPIFY_INVOICE_PDF_SECRET',
   shopify_webhook_secret: 'SHOPIFY_WEBHOOK_SECRET',
   wc_invoice_pdf_secret: 'WC_INVOICE_PDF_SECRET',
+  // o3d-esha: scripts/install.sh prompts for WC_STORE_URL alongside the three
+  // secrets below, but wc_url had no entry here, so an env-configured
+  // WooCommerce landed its credentials with no store to point them at and
+  // reported itself unconfigured. The env path is only complete with all four.
+  wc_url: 'WC_STORE_URL',
   wc_webhook_secret: 'WC_WEBHOOK_SECRET',
 }
 

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { RedisRateLimitBackend } from '@/lib/security/rate-limit-redis'
+import { RedisRateLimitBackend, redisConnectionOptions, redisRateLimitKey } from '@/lib/security/rate-limit-redis'
 import { MemoryRateLimitBackend } from '@/lib/security/rate-limit-memory'
 import {
   checkRateLimit,
@@ -101,11 +101,14 @@ test('checkRateLimit fails open by default but denies when failClosed is set', a
 function makeFakeAtomicRedisRunner() {
   const buckets = new Map<string, Array<{ score: number; member: string }>>()
   const evalCommands: string[][] = []
+  const allCommands: string[][] = []
 
   return {
     evalCommands,
+    allCommands,
     async runner(commands: string[][]) {
       return commands.map((command) => {
+        allCommands.push(command)
         if (command[0] === 'DEL') {
           buckets.delete(command[1] ?? '')
           return 1
@@ -171,4 +174,55 @@ test('redis rate limiter preserves atomic limit under concurrent calls and suppo
 
   await backend.clear('totp:redis')
   assert.equal((await backend.check('totp:redis', 3, 10_000)).allowed, true)
+})
+
+// o3d-esha item 5: REDIS_KEY_PREFIX was prompted for by install.sh, defaulted to
+// the tenant slug by provision-ims-tenant.sh and printed in its summary, while
+// every Redis key was hardcoded to `rate-limit:`. Two tenants on one Redis
+// therefore shared rate-limit buckets under a namespace that did not exist.
+test('redis rate limiter namespaces keys with the configured key prefix', async () => {
+  const { runner, evalCommands, allCommands } = makeFakeAtomicRedisRunner()
+  const backend = new RedisRateLimitBackend('redis://example.test:6379/0', runner, {
+    keyPrefix: 'tenant-acme',
+  })
+
+  await backend.check('login:redis', 2, 10_000)
+  await backend.clear('login:redis')
+
+  assert.equal(evalCommands[0]?.[3], 'tenant-acme:rate-limit:login:redis')
+  // clear() must namespace too, or a reset wipes another tenant's bucket.
+  assert.deepEqual(allCommands.at(-1), ['DEL', 'tenant-acme:rate-limit:login:redis'])
+  assert.equal(redisRateLimitKey('login:redis', 'tenant-acme'), 'tenant-acme:rate-limit:login:redis')
+  // Unprefixed installs must keep the existing keyspace, or an upgrade silently
+  // resets every in-flight lockout.
+  assert.equal(redisRateLimitKey('login:redis'), 'rate-limit:login:redis')
+  assert.equal(redisRateLimitKey('login:redis', '   '), 'rate-limit:login:redis')
+})
+
+test('two key prefixes produce disjoint buckets for the same logical key', async () => {
+  const { runner, evalCommands } = makeFakeAtomicRedisRunner()
+  const acme = new RedisRateLimitBackend('redis://example.test:6379/0', runner, { keyPrefix: 'acme' })
+  const beta = new RedisRateLimitBackend('redis://example.test:6379/0', runner, { keyPrefix: 'beta' })
+
+  // max 1: without namespacing the second tenant's first attempt would be
+  // rejected by the first tenant's bucket.
+  assert.equal((await acme.check('login:shared', 1, 10_000)).allowed, true)
+  assert.equal((await beta.check('login:shared', 1, 10_000)).allowed, true)
+  assert.equal(evalCommands[0]?.[3], 'acme:rate-limit:login:shared')
+  assert.equal(evalCommands[1]?.[3], 'beta:rate-limit:login:shared')
+})
+
+// o3d-esha item 6: install.sh:445 writes `requirepass` into redis.conf but
+// install.sh:277 builds REDIS_URL with no credentials, so the prompted password
+// never reached AUTH and a redis-backed install would fail NOAUTH.
+test('redis connection falls back to the standalone password, and an inline URL password still wins', () => {
+  assert.equal(
+    redisConnectionOptions('redis://example.test:6379/0', 'from-redis-password').password,
+    'from-redis-password',
+  )
+  assert.equal(
+    redisConnectionOptions('redis://:from-url@example.test:6379/0', 'from-redis-password').password,
+    'from-url',
+  )
+  assert.equal(redisConnectionOptions('redis://example.test:6379/0').password, '')
 })

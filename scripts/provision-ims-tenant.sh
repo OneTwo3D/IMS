@@ -443,8 +443,8 @@ append_env_line "${INSTALL_ENV_FILE}" WC_STORE_URL "${WC_STORE_URL:-}"
 append_env_line "${INSTALL_ENV_FILE}" WC_CONSUMER_KEY "${WC_CONSUMER_KEY:-}"
 append_env_line "${INSTALL_ENV_FILE}" WC_CONSUMER_SECRET "${WC_CONSUMER_SECRET:-}"
 append_env_line "${INSTALL_ENV_FILE}" WC_WEBHOOK_SECRET "${WC_WEBHOOK_SECRET:-$(random_secret)}"
-append_env_line "${INSTALL_ENV_FILE}" XERO_CLIENT_ID "${XERO_CLIENT_ID:-}"
-append_env_line "${INSTALL_ENV_FILE}" XERO_CLIENT_SECRET "${XERO_CLIENT_SECRET:-}"
+# Xero client id/secret are settings-table values entered in the app, not env
+# vars; writing them here produced lines nothing read (o3d-esha).
 
 if [[ "${POSTGRES_MODE}" == "external" ]]; then
   info "Provisioning database ${DB_NAME} on external PostgreSQL server ${DB_HOST}:${DB_PORT}."

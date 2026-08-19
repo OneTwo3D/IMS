@@ -11,6 +11,7 @@ import {
   undeclaredInstanceNotice,
 } from '@/lib/ops/instance-identity'
 import { checkFileScanHealth, type FileScanResult } from '@/lib/security/file-scan'
+import { RETIRED_ENV_VARS } from '@/lib/ops/retired-env-vars'
 
 export type PreflightStatus = 'pass' | 'fail' | 'warn'
 
@@ -388,12 +389,21 @@ function checkInstanceRole(checks: PreflightCheck[], env: Env): void {
   add(checks, 'pass', 'instance-role', INSTANCE_ROLE_ENV_VAR, 'Instance is declared as production.')
 }
 
-function checkLogLevel(checks: PreflightCheck[], env: Env): void {
-  if (envValue(env, 'LOG_LEVEL').toLowerCase() === 'debug') {
-    add(checks, 'warn', 'log-level', 'LOG_LEVEL', 'LOG_LEVEL is debug in production; revert after incident triage to avoid excessive sensitive metadata in logs.')
+function checkRetiredEnvVars(checks: PreflightCheck[], env: Env): void {
+  const present = Object.keys(RETIRED_ENV_VARS).filter((name) => envValue(env, name) !== '')
+  if (present.length === 0) {
+    add(checks, 'pass', 'retired-env-vars', 'Retired environment variables', 'No retired environment variables are set.')
     return
   }
-  add(checks, 'pass', 'log-level', 'LOG_LEVEL', 'LOG_LEVEL is not debug.')
+  for (const name of present) {
+    add(
+      checks,
+      'warn',
+      `retired-env-var:${name}`,
+      name,
+      `${name} is set but nothing reads it, so it is not in force. ${RETIRED_ENV_VARS[name]} Remove the line from .env to avoid implying a control that does not exist.`,
+    )
+  }
 }
 
 export async function runProductionPreflight(options: PreflightOptions = {}): Promise<PreflightResult> {
@@ -444,7 +454,7 @@ export async function runProductionPreflight(options: PreflightOptions = {}): Pr
   checkTrustedProxyConfig(checks, env)
   await checkFileScanner(checks, env, options.scanHealth ?? ((scanEnv) => checkFileScanHealth({ env: scanEnv })))
   checkRestoreFlags(checks, env)
-  checkLogLevel(checks, env)
+  checkRetiredEnvVars(checks, env)
 
   return {
     ok: !checks.some((check) => check.status === 'fail'),

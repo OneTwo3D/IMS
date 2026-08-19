@@ -1,0 +1,13 @@
+{
+  "_comment": "o3d-o8cp. Suppressions for scripts/check-documented-env-vars.mjs. Every entry needs a reason of at least 24 characters, so that suppressing an entry is a decision someone wrote down rather than a silent exception. A stale entry (no longer documented, or now genuinely read) fails the check rather than lingering.",
+  "documentedButUnread": {
+    "APP_PORT": "Consumed by shell, not by application code: scripts/update.sh reads it back out of .env for its health probe, and scripts/install.sh uses it to build the nginx upstream and the cron base URL. The Node process gets its port from PORT in the systemd unit.",
+    "BD_GIT_HOOK": "Consumed by the beads (bd) git hook, which is developer tooling outside this application's process.",
+    "BEADS_HOOK_TIMEOUT": "Consumed by the beads (bd) git hook, which is developer tooling outside this application's process.",
+    "QUICKBOOKS_CLIENT_ID": "A real instance of the o3d-esha defect, deliberately left open: QuickBooks is deprioritised (connector priority 2026-08) and the real control is the quickbooks_client_id setting written by the OAuth flow. Wire it up or delete the documentation when QuickBooks work resumes.",
+    "QUICKBOOKS_CLIENT_SECRET": "A real instance of the o3d-esha defect, deliberately left open: QuickBooks is deprioritised (connector priority 2026-08) and the real control is the quickbooks_client_secret setting. Wire it up or delete the documentation when QuickBooks work resumes.",
+    "QUICKBOOKS_COMPANY_ID": "A real instance of the o3d-esha defect, deliberately left open: QuickBooks is deprioritised (connector priority 2026-08) and the realm id is written to the quickbooks_company_id setting by the OAuth callback. Wire it up or delete the documentation when QuickBooks work resumes.",
+    "SHOPIFY_STORE_DOMAIN": "A real instance of the o3d-esha defect, deliberately left open: Shopify is deprioritised (connector priority 2026-08). Exactly the WC_STORE_URL shape - the three Shopify secrets have SETTING_ENV_FALLBACKS entries and the store domain does not, so an env-only Shopify config can never become configured."
+  },
+  "undocumentedReads": {}
+}
