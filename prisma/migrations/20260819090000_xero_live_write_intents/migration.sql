@@ -38,6 +38,25 @@
 -- was lost. Both are unresolved as far as the next run is concerned; only `committed` and
 -- `not-committed` account for a row.
 --
+-- AND ONLY THOSE FOUR VALUES EXIST (r8 finding 3). The fence used to hold a row when its state was
+-- NULL or `unknown` and let go of it otherwise, so ANY value outside the vocabulary — an operator's
+-- `commited`, a `COMMITTED`, a `resolved` copied out of another tool, a partial UPDATE — dropped
+-- the row off the fence silently. That is the read-side defect this file already fixed in the other
+-- direction (an unreadable line is not "nothing there") re-appearing on the write side: a
+-- settlement nobody can INTERPRET must not read as a settlement.
+--
+-- It is closed twice over, because the two halves fail in different directions:
+--
+--   • THE CHECK CONSTRAINT below refuses the value at the point it is typed. An operator settling a
+--     row by hand gets an error naming the vocabulary instead of a silent success that quietly
+--     unblocks the next apply against a ledger nobody read.
+--   • THE FENCE'S QUERY (scripts/lib/xero-live-safety.ts, SHARED_FENCE_SQL.scan) is stated as the
+--     COMPLEMENT of the resolved set — `state IS NULL OR state NOT IN ('committed','not-committed')`
+--     — so anything that reaches the column by a route this constraint does not govern (a restored
+--     dump written by an older schema, a COPY, the constraint dropped) still HOLDS the fence rather
+--     than vanishing from it. The constraint decides what may be written; the query decides what is
+--     believed, and it believes only what it recognises.
+--
 -- NOTHING DELETES THESE ROWS. Resolution is a human reading the ledger and settling the row, exactly
 -- as the file-based fence requires, because the only thing that can say what happened to a
 -- dispatched write is Xero. A sweep that expired them would hand the next run the empty fence this
@@ -66,7 +85,15 @@ CREATE TABLE "xero_live_write_intents" (
     "reason" TEXT,
     "settledAt" TIMESTAMP(3),
 
-    CONSTRAINT "xero_live_write_intents_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "xero_live_write_intents_pkey" PRIMARY KEY ("id"),
+    -- The whole vocabulary. NULL (dispatched, never accounted for) and 'unknown' (settled, and the
+    -- answer was lost) HOLD the fence; 'committed' and 'not-committed' resolve a row. Nothing else
+    -- is a settlement, and a value nobody can interpret is refused here rather than being believed
+    -- somewhere downstream. It is enforced for every row from the first one: the table is created
+    -- empty in this same transaction, so there is no pre-existing row to be lenient about and no
+    -- reason to defer validation.
+    CONSTRAINT "xero_live_write_intents_state_vocabulary"
+        CHECK ("state" IS NULL OR "state" IN ('committed', 'not-committed', 'unknown'))
 );
 
 -- The fence's only query: every write against this ledger that nobody has accounted for.

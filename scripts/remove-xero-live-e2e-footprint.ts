@@ -140,6 +140,23 @@
  * next --apply is authorised by, so it takes the lock in SHARE mode and is refused while an apply
  * is in flight anywhere. Two dry runs may run together; an apply excludes everything.
  *
+ * AND IT MUST BE **THIS LEDGER'S** DATABASE, not merely a reachable one. Which store DATABASE_URL
+ * names is per-host configuration, so two hosts given two URLs would each find the ledger's key
+ * free in their own store and exclude nobody — the same defect as two runs given two log paths, one
+ * layer out. The coordinator is therefore identified BY THE LEDGER: the store must hold the IMS
+ * accounting connection for this Xero organisation (accounting_tokens is unique on connector, so an
+ * IMS database is the installation for exactly one org). A scratch database, an empty one, or
+ * another tenant's IMS is refused before any lock is taken, and the run prints which store it
+ * coordinated through. What that cannot see, and nothing inside a database can: two stores that BOTH
+ * legitimately claim the ledger — a restored snapshot, or a second IMS installation authorised
+ * against the same organisation. Comparing the printed coordinator across runs is what catches that.
+ *
+ * A LOCK LOST MID-RUN IS A REFUSAL. The lock is a SESSION advisory lock, so a reaped session or a
+ * coordinator restart frees it silently. Every --apply dispatch re-establishes it before the request
+ * leaves; a DRY RUN, which dispatches nothing, re-establishes it before it persists the plan and
+ * again before it reports success, because the plan is the artefact the next --apply is authorised
+ * by. A loss is latched permanently: a lock that came back is not the lock that was held.
+ *
  * Unresolved rows in that table are cleared the same way the log is: by READING Xero, then
  * settling each row by hand. Nothing expires them, because only Xero can say what became of a
  * dispatched write.
@@ -188,6 +205,7 @@ import {
   PlanDivergedError,
   runOutcome,
   SafetyViolationError,
+  settlementRecoveryInstruction,
   writeLogTargetForTenant,
   writeUnitsIndividually,
   type PlannedObject,
@@ -694,6 +712,17 @@ async function main() {
     tenantId: EXPECTED_TENANT_ID,
     mode: APPLY ? 'exclusive' : 'shared',
   })
+  // Which store this run is coordinating through, and what makes it this ledger's rather than
+  // whichever one DATABASE_URL happened to name. Printed rather than merely checked: the one case
+  // the check cannot close is two databases that BOTH legitimately claim the ledger (a restored
+  // snapshot, a second IMS installation), and the only thing that catches that is two humans
+  // comparing two runs' output.
+  console.log(
+    `Coordinating through ${sharedFence.coordinator.database} — the IMS installation connected to ` +
+      `${sharedFence.coordinator.tenantName} (${EXPECTED_TENANT_ID}), connection ` +
+      `${sharedFence.coordinator.connectionId}. Ledger lock ${sharedFence.lockId}, held ` +
+      `${sharedFence.mode === 'exclusive' ? 'EXCLUSIVELY' : 'in SHARE mode'} by ${sharedFence.hostId}.`,
+  )
   if (APPLY) writeLogLock = acquireWriteLogLock({ tenantId: EXPECTED_TENANT_ID })
   // And the cross-host half of the recovery refusal, asked BEFORE the local one: a write dispatched
   // from another machine that nobody accounted for is invisible to every file on this one.
@@ -827,6 +856,15 @@ async function main() {
     const { missingFromLedger } = assertPlanAuthorizedByManifest(plan, manifest)
     console.log(`  manifest check: all ${plan.length} planned object(s) are reviewed AND still in the reviewed state; ${missingFromLedger.length} manifest id(s) are no longer in the org (already cleaned up).`)
   }
+
+  // STILL HOLDING THE LEDGER? Asked here, immediately before the plan becomes a file, because this
+  // is the moment the plan stops being this process's opinion and becomes the artefact the next
+  // --apply is authorised by. Everything above was read under the fence; if the fence went at any
+  // point during those reads — a reaped session, a coordinator restart — then some of it was read
+  // while another run could have been mutating the ledger, and none of it may be written down as a
+  // plan. In an --apply run the per-dispatch intent INSERT asks the same question again before
+  // every single write; a dry run dispatches nothing, so without this it asked nobody (r8 finding 1).
+  await sharedFence.assertStillHeld('about to persist the reviewed plan')
 
   // Persist the reviewed plan before the first write, so a run that dies part-way leaves behind
   // exactly what it intended to do.
@@ -1136,6 +1174,13 @@ async function main() {
       }
     }
   }
+
+  // LAST, before this run is allowed to end cleanly. A dry run's exit code and its "review the plan,
+  // then re-run with --apply" line are a statement that the plan on disk is fit to authorise
+  // irreversible writes, and that statement is only true if the ledger was held still for the whole
+  // of the reading that produced it. A loss latched at any point since acquisition surfaces here
+  // and turns the run into DRY RUN — ABORTED, which is what it was.
+  await sharedFence.assertStillHeld('about to report the run as complete')
 }
 
 /**
@@ -1216,10 +1261,17 @@ async function report(aborted: boolean, error?: unknown): Promise<number> {
       console.log(`      intent ${u.intentId}: ${u.state.toUpperCase()} (${u.reason})`)
       for (const f of u.failures) console.log(`      NOT RECORDED — ${f}`)
       console.log(
-        `      settle it once you have confirmed the object in Xero:\n` +
-        `        UPDATE "xero_live_write_intents" SET "state" = '${u.state}', "reason" = '<who checked, and how>', ` +
-        `"settledAt" = now() WHERE "id" = '${u.intentId}';\n` +
-        `      and account for the same intent in ${WRITE_LOG.logPath}.`,
+        // For a KNOWN outcome this prints an UPDATE, because this run established the answer and the
+        // operator is transcribing it back after confirming the object. For an UNKNOWN one it prints
+        // no UPDATE at all: nobody established anything, so there is nothing to settle it as, and
+        // the statement this used to print would have written 'unknown' over 'unknown' — a command
+        // that runs cleanly, changes nothing, and leaves the fence refusing (r8 finding 4).
+        settlementRecoveryInstruction({
+          intentId: u.intentId,
+          state: u.state,
+          subject: `${u.kind} ${u.label}`,
+          indent: '      ',
+        }) + `\n      Account for the same intent in ${WRITE_LOG.logPath}.`,
       )
     }
   }

@@ -30,6 +30,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
 
+import { XERO_LIVE_CLEANUP_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+
 import {
   acquireSharedWriteFence,
   acquireWriteLogLock,
@@ -77,10 +79,19 @@ import {
   runOutcome,
   scanWriteIntentLog,
   settleWrite,
+  SHARED_FENCE_HELD_CHECK_MS,
   SHARED_FENCE_SQL,
   SharedCoordinatorUnavailableError,
+  SharedFenceLostError,
   SharedRunInProgressError,
   SharedUnresolvedWriteError,
+  assertCoordinatorOwnsLedger,
+  LedgerCoordinatorMismatchError,
+  readSettlementState,
+  RESOLVED_SETTLEMENT_STATES,
+  SETTLEMENT_STATES,
+  settlementRecoveryInstruction,
+  settlementResolvesIntent,
   statusesAfterReleasingBlockers,
   TenantMismatchError,
   UnresolvedWriteError,
@@ -164,6 +175,8 @@ function fence(behaviour: {
     mode: 'exclusive',
     intents,
     settlements,
+    coordinator: { database: 'ims_test', connectionId: 'conn-test', tenantName: 'Test Org' },
+    assertStillHeld: async () => {},
     scanUnresolved: async () => [],
     async intend(entry) {
       behaviour.intend?.(entry.id)
@@ -200,6 +213,35 @@ class FakeCoordinationDatabase {
   private readonly locks = new Map<number, { exclusive: symbol | null; shared: Set<symbol> }>()
   /** Statements this database should refuse, by substring, for as long as it is set. */
   refuse: { match: string; message: string } | null = null
+  /**
+   * The `accounting_tokens` row that makes this database an IMS installation, and says WHICH Xero
+   * organisation it is the installation for. Settable, because "two hosts coordinating through two
+   * databases" is modelled as two of these objects whose connections disagree.
+   */
+  connections: Array<{ connectionId: string; tenantId: string; tenantName: string }>
+  readonly name: string
+
+  constructor(options: { name?: string; tenantId?: string; connectionId?: string; connections?: Array<{ connectionId: string; tenantId: string; tenantName: string }> } = {}) {
+    this.name = options.name ?? 'ims'
+    this.connections = options.connections ?? [{
+      connectionId: options.connectionId ?? `conn-${this.name}`,
+      tenantId: options.tenantId ?? LEDGER_UUID,
+      tenantName: 'The Ledger',
+    }]
+  }
+
+  /**
+   * Free every lock a session holds WITHOUT ending the session — a reaped backend whose client
+   * socket is still usable, an unlock issued out of band, a pooler that handed the next statement
+   * to a different backend. It is the sharp version of the case under test: the connection answers
+   * perfectly well, and the exclusion is gone.
+   */
+  dropLocksOf = (session: { id: symbol }): void => {
+    for (const entry of this.locks.values()) {
+      if (entry.exclusive === session.id) entry.exclusive = null
+      entry.shared.delete(session.id)
+    }
+  }
 
   private held(key: number) {
     const entry = this.locks.get(key) ?? { exclusive: null, shared: new Set<symbol>() }
@@ -208,7 +250,7 @@ class FakeCoordinationDatabase {
   }
 
   /** One connection. `end()` — or `kill()` — frees everything it holds, as a real session does. */
-  session = (host: string): CoordinationClient & { kill: () => void; alive: boolean } => {
+  session = (host: string): CoordinationClient & { kill: () => void; alive: boolean; id: symbol } => {
     const id = Symbol(host)
     let alive = false
     const free = () => {
@@ -219,6 +261,7 @@ class FakeCoordinationDatabase {
       alive = false
     }
     return {
+      id,
       get alive() { return alive },
       kill: free,
       connect: async () => { alive = true },
@@ -226,7 +269,20 @@ class FakeCoordinationDatabase {
       query: async (sql: string, params: unknown[] = []) => {
         if (!alive) throw new Error('Connection terminated unexpectedly')
         if (this.refuse && sql.includes(this.refuse.match)) throw new Error(this.refuse.message)
-        if (sql === SHARED_FENCE_SQL.keepalive) return { rows: [{ ok: 1 }] }
+        if (sql === SHARED_FENCE_SQL.identify) {
+          // A database with no Xero connection still answers — with one row whose columns are null,
+          // exactly as the LEFT JOIN does. "No rows" would let the production code read absence as
+          // an empty list rather than as an answer, which is the shape this file refuses everywhere.
+          if (this.connections.length === 0) {
+            return { rows: [{ database: this.name, connectionId: null, tenantId: null, tenantName: null }] }
+          }
+          return { rows: this.connections.map((c) => ({ database: this.name, ...c })) }
+        }
+        if (sql === SHARED_FENCE_SQL.held) {
+          const entry = this.held(Number(params[1]))
+          const mine = params[2] === 'ExclusiveLock' ? entry.exclusive === id : entry.shared.has(id)
+          return { rows: [{ held: mine ? 1 : 0 }] }
+        }
         const key = Number(params[1])
         if (sql === SHARED_FENCE_SQL.lock.exclusive) {
           const entry = this.held(key)
@@ -249,7 +305,10 @@ class FakeCoordinationDatabase {
         if (sql === SHARED_FENCE_SQL.scan) {
           return {
             rows: [...this.rows.values()]
-              .filter((r) => r.tenantId === params[0] && (r.state == null || r.state === 'unknown'))
+              // The production predicate, verbatim: the COMPLEMENT of the resolved vocabulary.
+              // Modelling it as `state == null || state === 'unknown'` is what let a state outside
+              // the vocabulary disappear, so the double must not paraphrase it either.
+              .filter((r) => r.tenantId === params[0] && (r.state == null || (r.state !== 'committed' && r.state !== 'not-committed')))
               .sort((a, b) => String(a.intendedAt).localeCompare(String(b.intendedAt))),
           }
         }
@@ -2741,7 +2800,8 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     assert.throws(
       () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved }),
       (e: Error) => e instanceof SharedUnresolvedWriteError
-        && /DISPATCHED and never accounted for/.test(e.message)
+        && /DISPATCHED and are not accounted for/.test(e.message)
+        && /never settled — the run died between dispatching it and recording the answer/.test(e.message)
         && /host-a/.test(e.message),
     )
     await fenceB.release()
@@ -2820,10 +2880,13 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
   })
 
   test('two DIFFERENT ledgers do not exclude each other', async () => {
-    const db = new FakeCoordinationDatabase()
     const other = '99999999-8888-4777-a666-555555555555'
-    const a = await acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('h1'), setKeepalive: noKeepalive })
-    const b = await acquireSharedWriteFence({ tenantId: other, mode: 'exclusive', createClient: () => db.session('h2'), setKeepalive: noKeepalive })
+    // Two ledgers means two IMS installations, because an IMS database holds exactly one Xero
+    // connection — which is also why a coordinator can be identified BY the ledger at all.
+    const dbA = new FakeCoordinationDatabase({ name: 'ims-a', tenantId: LEDGER })
+    const dbB = new FakeCoordinationDatabase({ name: 'ims-b', tenantId: other })
+    const a = await acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => dbA.session('h1'), setKeepalive: noKeepalive })
+    const b = await acquireSharedWriteFence({ tenantId: other, mode: 'exclusive', createClient: () => dbB.session('h2'), setKeepalive: noKeepalive })
     assert.notEqual(a.lockId, b.lockId)
     await a.release()
     await b.release()
@@ -2902,14 +2965,20 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
   test('the SQL the fence issues is the SQL the double is measured against', () => {
     // The double models statements by exact text. If the two drift, this fails rather than a
     // production run — and the statements themselves are the contract worth pinning: the settle is
-    // predicated on the RUN, and the scan treats NULL and 'unknown' alike.
+    // predicated on the RUN, the scan is the COMPLEMENT of the resolved vocabulary, and the
+    // held-check asks pg_locks about THIS backend rather than saying SELECT 1.
     assert.match(SHARED_FENCE_SQL.lock.exclusive, /^SELECT pg_try_advisory_lock\(\$1, \$2\)/)
     assert.match(SHARED_FENCE_SQL.lock.shared, /^SELECT pg_try_advisory_lock_shared\(\$1, \$2\)/)
     assert.match(SHARED_FENCE_SQL.unlock.exclusive, /^SELECT pg_advisory_unlock\(\$1, \$2\)/)
     assert.match(SHARED_FENCE_SQL.unlock.shared, /^SELECT pg_advisory_unlock_shared\(\$1, \$2\)/)
-    assert.match(SHARED_FENCE_SQL.scan, /"state" IS NULL OR "state" = 'unknown'/)
+    assert.match(SHARED_FENCE_SQL.scan, /"state" IS NULL OR "state" NOT IN \('committed', 'not-committed'\)/)
     assert.match(SHARED_FENCE_SQL.settle, /WHERE "id" = \$1 AND "runId" = \$2 RETURNING "id"/)
     assert.match(SHARED_FENCE_SQL.intend, /RETURNING "id"/)
+    assert.match(SHARED_FENCE_SQL.held, /FROM pg_locks/)
+    assert.match(SHARED_FENCE_SQL.held, /pid = pg_backend_pid\(\) AND granted AND mode = \$3/)
+    assert.match(SHARED_FENCE_SQL.identify, /FROM \(SELECT 1\) AS present LEFT JOIN "accounting_tokens"/)
+    // Nothing in this fence may settle for "the socket is open" as evidence that the lock is held.
+    assert.ok(!Object.values(SHARED_FENCE_SQL).some((v) => v === 'SELECT 1'))
   })
 
   test('the shared store and the on-disk log record the SAME run and the SAME intent', async () => {
@@ -3298,11 +3367,536 @@ describe('a settlement that cannot be recorded must not suppress the mutation', 
     assert.match(code, /unrecordedSettlements: journal\.unrecordedSettlementCount/)
     assert.match(code, /THIS OUTPUT IS THE ONLY COPY/)
     assert.match(code, /for \(const u of journal\.unrecordedSettlements\)/)
-    // Naming the intent id is the point: it is what the next run refuses over.
-    assert.match(code, /WHERE "id" = '\$\{u\.intentId\}'/)
+    // Naming the intent id is the point: it is what the next run refuses over. It now reaches the
+    // banner through the one function that decides whether an executable settlement even exists.
+    assert.match(code, /settlementRecoveryInstruction\(\{\s*\n\s*intentId: u\.intentId,/)
     // And the block is reachable from the abort path, which is how this run always ends.
     const reportAt = code.indexOf('async function report(')
     const blockAt = code.indexOf('if (journal.unrecordedSettlementCount > 0) {')
     assert.ok(reportAt > 0 && blockAt > reportAt)
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 8, FINDING 1. Round 7 gave a dry run a SHARE-mode lock on the ledger, so an `--apply`
+ * excludes it: the plan a dry run produces is what the next apply is authorised by, and it must not
+ * be assembled over a ledger somebody is mutating.
+ *
+ * A dry run that LOST that lock carried on. In an `--apply` the loss is caught by construction —
+ * every dispatch is preceded by an intent INSERT on the very session that holds the lock, so a dead
+ * session throws before the request leaves — but a dry run dispatches nothing, so nothing ever
+ * asked. It read on, finished, wrote the plan and exited 0, and the plan is precisely the artefact
+ * the lock existed to protect.
+ *
+ * The double models the sharp version: `dropLocksOf` frees a session's locks WITHOUT killing the
+ * session, so the connection still answers every statement perfectly. A test that only killed the
+ * session would pass against a fence whose "liveness check" was `SELECT 1`, which is the fence that
+ * had the bug.
+ */
+describe('a dry run that loses the ledger lock does not go on to produce a plan', () => {
+  const LEDGER = LEDGER_UUID
+
+  const dryFence = async (db: FakeCoordinationDatabase, session: ReturnType<FakeCoordinationDatabase['session']>) =>
+    acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'shared', createClient: () => session, setKeepalive: noKeepalive, hostId: 'dry-host',
+    })
+
+  test('the lock going away MID-RUN, on a session that still answers, is a refusal', async () => {
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('dry-host')
+    const fence = await dryFence(db, session)
+
+    // It was held a moment ago, and the plan-building reads happened under it.
+    await fence.assertStillHeld('half way through reading the ledger')
+
+    db.dropLocksOf(session)
+    assert.equal(session.alive, true, 'the point of the case: the connection is fine, the EXCLUSION is gone')
+
+    await assert.rejects(
+      () => fence.assertStillHeld('about to persist the reviewed plan'),
+      (e: Error) => e instanceof SharedFenceLostError
+        && /no longer holds the lock/.test(e.message)
+        && /about to persist the reviewed plan/.test(e.message)
+        && /THIS IS A DRY RUN, AND THAT IS NOT A REASON TO CARRY ON/.test(e.message)
+        && /not written and not offered/.test(e.message),
+    )
+    await fence.release()
+  })
+
+  test('a fence that still holds its lock does NOT refuse — the check is not simply always on', async () => {
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('dry-host')
+    const fence = await dryFence(db, session)
+    // Twice, because a check that latched on its own first call would pass the test above and be
+    // useless here.
+    await fence.assertStillHeld('first')
+    await fence.assertStillHeld('second')
+    assert.deepEqual(await fence.scanUnresolved(), [])
+    await fence.release()
+  })
+
+  test('the loss is LATCHED: a lock that came back is not the lock that was held', async () => {
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('dry-host')
+    const fence = await dryFence(db, session)
+
+    db.dropLocksOf(session)
+    await assert.rejects(() => fence.assertStillHeld('noticed'), SharedFenceLostError)
+
+    // Now the same session takes the same lock again — which a real one could do the instant the
+    // other holder let go. It changes nothing: continuity is the property, and the window in
+    // between is a window in which another run could have taken the ledger and changed it.
+    await session.query(SHARED_FENCE_SQL.lock.shared, [XERO_LIVE_CLEANUP_LOCK_NAMESPACE, xeroLedgerLockId(LEDGER)])
+    await assert.rejects(
+      () => fence.assertStillHeld('after it came back'),
+      (e: Error) => e instanceof SharedFenceLostError,
+    )
+    // And it stays refused for everything else the fence can do, not just for the check.
+    await assert.rejects(() => fence.scanUnresolved(), SharedFenceLostError)
+    await fence.release()
+  })
+
+  test('a coordinator that cannot ANSWER whether the lock is held is treated as lost', async () => {
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('dry-host')
+    const fence = await dryFence(db, session)
+    db.refuse = { match: 'FROM pg_locks', message: 'terminating connection due to administrator command' }
+    await assert.rejects(
+      () => fence.assertStillHeld('about to persist the reviewed plan'),
+      (e: Error) => e instanceof SharedFenceLostError && /could not be asked whether this session still holds/.test(e.message),
+    )
+    db.refuse = null
+    await fence.release()
+  })
+
+  test('the scheduled check latches a loss even when the run asks nothing', async () => {
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('dry-host')
+    const scheduled: Array<{ fn: () => void; ms: number }> = []
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'shared', createClient: () => session,
+      setKeepalive: (fn, ms) => { scheduled.push({ fn, ms }); return { clear: () => { scheduled.length = 0 } } },
+    })
+    assert.equal(scheduled.length, 1, 'the fence must schedule a check of its own; a fence only checked on demand is not checked')
+    assert.equal(scheduled[0].ms, SHARED_FENCE_HELD_CHECK_MS)
+
+    db.dropLocksOf(session)
+    scheduled[0].fn()
+    await new Promise((r) => setImmediate(r))
+
+    // Nothing asked the coordinator anything in between. The next thing the run does refuses.
+    await assert.rejects(() => fence.scanUnresolved(), SharedFenceLostError)
+    await fence.release()
+  })
+
+  test('an --apply cannot dispatch a write once the lock is gone', async () => {
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('apply-host')
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => session, setKeepalive: noKeepalive,
+    })
+    db.dropLocksOf(session)
+    await assert.rejects(
+      () => fence.intend({ id: 'run1-w1', runId: 'run1', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1' }),
+      (e: Error) => e instanceof SharedFenceLostError && /recording the intent to POST Invoices\/inv-1/.test(e.message),
+    )
+    assert.equal(db.rows.size, 0, 'and nothing was recorded, because nothing may be dispatched')
+    await fence.release()
+  })
+
+  test('the held-check asks about THIS session and THIS mode, not merely whether the socket is open', async () => {
+    const db = new FakeCoordinationDatabase()
+    const a = db.session('a')
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'shared', createClient: () => a, setKeepalive: noKeepalive,
+    })
+    // A DIFFERENT session takes a share lock on the same key. The key is now held — but not by us,
+    // and a check that asked "is anyone holding it" would be satisfied by this and say nothing.
+    const b = db.session('b')
+    await b.connect()
+    await b.query(SHARED_FENCE_SQL.lock.shared, [XERO_LIVE_CLEANUP_LOCK_NAMESPACE, xeroLedgerLockId(LEDGER)])
+    db.dropLocksOf(a)
+
+    await assert.rejects(() => fence.assertStillHeld('somebody else holds it now'), SharedFenceLostError)
+    await b.end()
+    await fence.release()
+  })
+
+  test('the remover asserts the fence is still held before the plan becomes a file, and before it reports success', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    const acquireAt = code.indexOf('sharedFence = await acquireSharedWriteFence(')
+    const stillHeldAt = code.indexOf("await sharedFence.assertStillHeld('about to persist the reviewed plan')")
+    const persistAt = code.indexOf('writeFileSync(PLAN_OUT')
+    const finalAt = code.indexOf("await sharedFence.assertStillHeld('about to report the run as complete')")
+    assert.ok(acquireAt > 0 && stillHeldAt > acquireAt, 'the check must come after the fence is taken')
+    assert.ok(
+      stillHeldAt < persistAt,
+      'the plan is the artefact the next --apply is authorised by, so the lock is re-established BEFORE it is written',
+    )
+    assert.ok(finalAt > persistAt, 'and again before the run is allowed to end cleanly')
+    // Both live in main(), so the abort path reports them as an aborted run rather than a clean one.
+    const mainAt = code.indexOf('async function main()')
+    assert.ok(mainAt > 0 && stillHeldAt > mainAt && finalAt > mainAt)
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 8, FINDING 2. Round 6 took the coordination off "the operator's path choice"; round 7 moved
+ * it into the IMS database — and WHICH database is `DATABASE_URL`, which is per-host configuration.
+ * So the same defect survived one layer out: two hosts pointed at two different databases each find
+ * the ledger's key FREE, each take it, and each read an empty recovery fence.
+ *
+ * The fix is that the coordinator is identified BY THE LEDGER: an IMS database holds exactly one
+ * Xero connection, and that row names the organisation it is the installation for. A store that
+ * names a different organisation — or none — is not this ledger's coordinator, and locking a key in
+ * it excludes nobody.
+ */
+describe('the coordinator is identified by the LEDGER, not by whichever database the host names', () => {
+  const LEDGER = LEDGER_UUID
+  const OTHER_LEDGER = '99999999-8888-4777-a666-555555555555'
+
+  test('two hosts pointed at DIFFERENT databases cannot both take the ledger', async () => {
+    // The real database: the IMS installation connected to the ledger this tooling acts on.
+    const real = new FakeCoordinationDatabase({ name: 'ims_production', tenantId: LEDGER, connectionId: 'conn-real' })
+    // The second host's DATABASE_URL: a perfectly healthy IMS database — for a different org.
+    const elsewhere = new FakeCoordinationDatabase({ name: 'ims_staging', tenantId: OTHER_LEDGER, connectionId: 'conn-stage' })
+
+    const held = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => real.session('host-a'), setKeepalive: noKeepalive,
+    })
+    assert.equal(held.coordinator.database, 'ims_production')
+    assert.equal(held.coordinator.connectionId, 'conn-real')
+
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', createClient: () => elsewhere.session('host-b'), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof LedgerCoordinatorMismatchError
+        && /ims_staging/.test(e.message)
+        && /a DIFFERENT Xero organisation/.test(e.message)
+        && /Taking the ledger's lock here would exclude nothing/.test(e.message),
+    )
+    // And host B took nothing in its own store on the way out, so a later run there is not blocked
+    // by a lock nobody is holding.
+    const check = elsewhere.session('probe')
+    await check.connect()
+    const { rows } = await check.query(SHARED_FENCE_SQL.lock.exclusive, [XERO_LIVE_CLEANUP_LOCK_NAMESPACE, xeroLedgerLockId(LEDGER)])
+    assert.equal(rows[0].locked, true, 'the refused run must not leave a lock behind in the store it refused')
+    await check.end()
+    await held.release()
+  })
+
+  test('a store with NO Xero connection cannot coordinate for a ledger', async () => {
+    const empty = new FakeCoordinationDatabase({ name: 'scratch', connections: [] })
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'shared', createClient: () => empty.session('host'), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof LedgerCoordinatorMismatchError
+        && /holds no Xero connection at all/.test(e.message)
+        && /Do NOT hand-write a connection row to get past this check/.test(e.message),
+    )
+  })
+
+  test('a store that claims TWO Xero connections is ambiguous, and ambiguous is refused', async () => {
+    const ambiguous = new FakeCoordinationDatabase({
+      name: 'merged',
+      connections: [
+        { connectionId: 'c1', tenantId: LEDGER, tenantName: 'The Ledger' },
+        { connectionId: 'c2', tenantId: OTHER_LEDGER, tenantName: 'Another Org' },
+      ],
+    })
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', createClient: () => ambiguous.session('host'), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof LedgerCoordinatorMismatchError && /holds 2 Xero connections/.test(e.message),
+    )
+  })
+
+  test('the RIGHT database still coordinates — the check is not simply always on', async () => {
+    const db = new FakeCoordinationDatabase({ name: 'ims', tenantId: LEDGER.toUpperCase(), connectionId: 'conn-1' })
+    // Cased differently on the two sides, because a uuid is a uuid; a case-sensitive comparison here
+    // would refuse the one database that IS the coordinator.
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host'), setKeepalive: noKeepalive,
+    })
+    assert.equal(fence.coordinator.connectionId, 'conn-1')
+    assert.equal(fence.coordinator.tenantName, 'The Ledger')
+    await fence.release()
+  })
+
+  test('the store is asked WHICH LEDGER it belongs to BEFORE any lock is taken', async () => {
+    const seen: string[] = []
+    const elsewhere = new FakeCoordinationDatabase({ name: 'ims_staging', tenantId: OTHER_LEDGER })
+    const inner = elsewhere.session('host')
+    const spy: CoordinationClient = {
+      connect: () => inner.connect(),
+      query: async (sql: string, params?: unknown[]) => { seen.push(sql); return inner.query(sql, params) },
+      end: () => inner.end(),
+    }
+    await assert.rejects(
+      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => spy, setKeepalive: noKeepalive }),
+      LedgerCoordinatorMismatchError,
+    )
+    assert.deepEqual(seen, [SHARED_FENCE_SQL.identify], 'a lock in a store that is not the coordinator is not a lock')
+  })
+
+  test('a store that cannot be ASKED which ledger it holds is refused as an unreachable coordinator', async () => {
+    const db = new FakeCoordinationDatabase()
+    db.refuse = { match: 'accounting_tokens', message: 'relation "accounting_tokens" does not exist' }
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'shared', createClient: () => db.session('host'), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof SharedCoordinatorUnavailableError
+        && /could not be asked which Xero organisation it belongs to/.test(e.message),
+    )
+    db.refuse = null
+  })
+
+  test('assertCoordinatorOwnsLedger is the one home for the rule, and it names what it cannot close', async () => {
+    // A row whose columns came back NULL — the LEFT JOIN's answer for "no connection" — is an
+    // ANSWER, not an empty list, and it must not read as a match.
+    assert.throws(
+      () => assertCoordinatorOwnsLedger({
+        tenantId: LEDGER, database: 'x', connections: [{ connectionId: null, tenantId: null, tenantName: null }],
+      }),
+      LedgerCoordinatorMismatchError,
+    )
+    const source = readFileSync('scripts/lib/xero-live-safety.ts', 'utf8')
+    // The residual is stated in the file rather than left for the next reviewer to rediscover: two
+    // stores that BOTH legitimately claim the ledger cannot be told apart from inside either one.
+    assert.match(source, /OPEN, AND UNCLOSEABLE FROM HERE/)
+    assert.match(source, /restored snapshot of the IMS database, or a second IMS installation/)
+  })
+
+  test('the remover prints which store it coordinated through, so a split can be seen by comparing runs', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    assert.match(code, /Coordinating through \$\{sharedFence\.coordinator\.database\}/)
+    assert.match(code, /sharedFence\.coordinator\.connectionId/)
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 8, FINDING 3. The shared fence held a row when its settlement state was NULL or `unknown`
+ * and let go of it otherwise — so ANY value outside the vocabulary (`commited`, `COMMITTED`,
+ * `resolved` pasted from another tool, a half-applied UPDATE) removed the intent from the fence
+ * silently. Same class as the read-side defect this file fixed earlier: an answer nobody can read
+ * must not read as "nothing there".
+ */
+describe('a settlement nobody can interpret is not a settlement', () => {
+  const LEDGER = LEDGER_UUID
+
+  const withIntent = async (state: string | null) => {
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('host-a')
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => session, setKeepalive: noKeepalive, hostId: 'host-a',
+    })
+    await fence.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
+    // Set by hand, exactly as an operator settling a row by hand would: this is the route the
+    // vocabulary check exists for, and the one no application code guards.
+    if (state !== null) db.rows.get('runA-w1')!.state = state
+    return { db, fence }
+  }
+
+  for (const bogus of ['commited', 'COMMITTED', 'resolved', 'not committed', '']) {
+    test(`an intent settled as ${JSON.stringify(bogus)} still HOLDS the fence`, async () => {
+      const { fence } = await withIntent(bogus)
+      const unresolved = await fence.scanUnresolved()
+      assert.equal(unresolved.length, 1, 'a state outside the vocabulary must not remove the row from the fence')
+      assert.equal(unresolved[0].state, bogus)
+      assert.throws(
+        () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved }),
+        (e: Error) => e instanceof SharedUnresolvedWriteError
+          && /nobody can say what it claims, so it claims nothing/.test(e.message)
+          && new RegExp(`settled as ${JSON.stringify(bogus).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`).test(e.message),
+      )
+      await fence.release()
+    })
+  }
+
+  test('a RECOGNISED settlement still resolves the row — the fence is not simply always on', async () => {
+    for (const good of ['committed', 'not-committed']) {
+      const { fence } = await withIntent(good)
+      assert.deepEqual(await fence.scanUnresolved(), [], `${good} accounts for the write`)
+      await fence.release()
+    }
+  })
+
+  test("'unknown' and a never-settled row hold the fence, and say so in their own words", async () => {
+    const unknown = await withIntent('unknown')
+    const never = await withIntent(null)
+    assert.equal((await unknown.fence.scanUnresolved()).length, 1)
+    assert.equal((await never.fence.scanUnresolved()).length, 1)
+    assert.throws(
+      () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved: [{
+        id: 'i', runId: 'r', host: 'h', kind: 'k', label: 'l', method: 'POST', path: 'p', intendedAt: 't', state: 'unknown',
+      }] }),
+      /settled as UNKNOWN — the answer was lost/,
+    )
+    assert.throws(
+      () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved: [{
+        id: 'i', runId: 'r', host: 'h', kind: 'k', label: 'l', method: 'POST', path: 'p', intendedAt: 't', state: null,
+      }] }),
+      /never settled — the run died between dispatching it and recording the answer/,
+    )
+    await unknown.fence.release()
+    await never.fence.release()
+  })
+
+  test('the rule is one predicate, stated as the complement of the resolved vocabulary', () => {
+    assert.deepEqual([...RESOLVED_SETTLEMENT_STATES], ['committed', 'not-committed'])
+    assert.deepEqual([...SETTLEMENT_STATES], ['committed', 'not-committed', 'unknown'])
+    assert.equal(readSettlementState('committed'), 'resolved')
+    assert.equal(readSettlementState('not-committed'), 'resolved')
+    assert.equal(readSettlementState('unknown'), 'unknown-outcome')
+    assert.equal(readSettlementState(null), 'never-settled')
+    assert.equal(readSettlementState(undefined), 'never-settled')
+    assert.equal(readSettlementState('commited'), 'uninterpretable')
+    assert.equal(settlementResolvesIntent('commited'), false)
+    assert.equal(settlementResolvesIntent('committed'), true)
+  })
+
+  test('the ON-DISK log applies the same rule, so the two fences cannot disagree', () => {
+    const intent = JSON.stringify({ event: 'intent', id: 'w1', runId: 'r1', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1', at: 't', tenantId: LEDGER })
+    const settledAs = (state: unknown) => JSON.stringify({ event: 'settled', id: 'w1', runId: 'r1', state })
+    // The defect, on disk: anything that was not the literal string 'unknown' resolved the intent.
+    for (const bogus of ['commited', 'COMMITTED', 'resolved', 42, null]) {
+      const scan = scanWriteIntentLog(`${intent}\n${settledAs(bogus)}\n`)
+      assert.equal(scan.unresolved.length, 1, `a settlement of ${JSON.stringify(bogus)} must not resolve the intent`)
+    }
+    // And the recognised ones still do.
+    for (const good of ['committed', 'not-committed']) {
+      assert.equal(scanWriteIntentLog(`${intent}\n${settledAs(good)}\n`).unresolved.length, 0)
+    }
+    assert.equal(scanWriteIntentLog(`${intent}\n${settledAs('unknown')}\n`).unresolved.length, 1)
+  })
+
+  test('the database refuses the value at the point it is typed, as well', () => {
+    // Belt and braces on purpose, and they fail in different directions: the constraint stops the
+    // operator's typo becoming a row, the query stops any row that got there another way (a restored
+    // dump, a COPY, the constraint dropped) from being believed.
+    const sql = readFileSync('prisma/migrations/20260819090000_xero_live_write_intents/migration.sql', 'utf8')
+    assert.match(sql, /CONSTRAINT "xero_live_write_intents_state_vocabulary"/)
+    assert.match(sql, /CHECK \("state" IS NULL OR "state" IN \('committed', 'not-committed', 'unknown'\)\)/)
+    // Not NOT VALID: the table is created empty in the same transaction, so there is nothing to be
+    // lenient about — and a constraint that is not enforced for existing rows is not this guarantee.
+    assert.equal(/NOT VALID/.test(sql), false)
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 8, FINDING 4. The banner printed `UPDATE ... SET "state" = '<the state>'` for every
+ * unrecorded settlement — `'unknown'` included. For a KNOWN outcome that is real recovery. For an
+ * unknown one it is not: nobody established anything, so there is nothing to transcribe, and the
+ * statement it printed wrote 'unknown' over 'unknown' — a command that runs cleanly, changes
+ * nothing, and leaves the fence still refusing.
+ */
+describe('the printed recovery is executable only when somebody established the outcome', () => {
+  test('an UNKNOWN outcome gets no UPDATE to copy, and says why', () => {
+    const text = settlementRecoveryInstruction({ intentId: 'run1-w3', state: 'unknown', subject: 'invoice INV-1' })
+    assert.match(text, /NOBODY ESTABLISHED WHAT BECAME OF THIS WRITE/)
+    assert.match(text, /THERE IS NOTHING TO SETTLE IT AS YET/)
+    assert.match(text, /Settling it as 'unknown' is not recovery/)
+    // The only UPDATE in it carries a placeholder, not a value that could be pasted as-is.
+    assert.equal(/SET "state" = 'unknown'/.test(text), false, "it must never print an UPDATE that settles 'unknown' as 'unknown'")
+    assert.match(text, /SET "state" = '<committed\|not-committed>'/)
+    // The three answers, including the one that is not a settlement at all.
+    assert.match(text, /the outcome is 'committed'/)
+    assert.match(text, /the outcome is 'not-committed'/)
+    assert.match(text, /you cannot tell from the ledger\s+-> STOP, and leave the row exactly as it is/)
+    assert.match(text, /run1-w3/)
+    assert.match(text, /invoice INV-1/)
+  })
+
+  test('a never-settled row is the same case: nobody knows, so there is nothing to write down', () => {
+    for (const state of [null, undefined]) {
+      const text = settlementRecoveryInstruction({ intentId: 'i', state })
+      assert.match(text, /NOBODY ESTABLISHED WHAT BECAME OF THIS WRITE/)
+      assert.equal(/SET "state" = 'null'/.test(text), false)
+    }
+  })
+
+  test('a KNOWN outcome DOES get an executable settlement — the refusal to print one is not always on', () => {
+    for (const state of ['committed', 'not-committed'] as const) {
+      const text = settlementRecoveryInstruction({ intentId: 'run1-w4', state })
+      assert.match(text, new RegExp(`THIS RUN ESTABLISHED THE OUTCOME: ${state.toUpperCase()}`))
+      assert.match(text, new RegExp(`SET "state" = '${state}'`))
+      assert.equal(/<committed\|not-committed>/.test(text), false, 'a known answer is transcribed, not looked up')
+      assert.match(text, /Confirm it against the ledger/)
+    }
+  })
+
+  test('a write whose outcome is UNKNOWN and whose settlement is lost carries the same statement out of performWrite', async () => {
+    const journal = new MutationJournal()
+    const sharedFence = fence({ settle: () => { throw new Error('the coordinator session is gone') } })
+    const { impl } = fakeFetch(() => { throw new TypeError('fetch failed') })
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    // The intent reaches the disk; it is the SETTLEMENT the disk will not take, which is the shape
+    // that produces an unrecorded settlement rather than a refusal to dispatch.
+    const log = createWriteIntentLog({
+      tenantId: TENANT_UUID,
+      append: (line) => { if (line.includes('"settled"')) throw new Error('disk full') },
+    })
+
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: log, fence: sharedFence,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      (e: Error) => e instanceof WriteSettlementNotRecordedError
+        && /its outcome is UNKNOWN/.test(e.message)
+        // THE ASSERTION THIS TEST EXISTS FOR: the abort message about a write nobody can account
+        // for must not hand the operator a statement that settles 'unknown' as 'unknown'.
+        && !/SET "state" = 'unknown'/.test(e.message)
+        && /THERE IS NOTHING TO SETTLE IT AS YET/.test(e.message)
+        && /SET "state" = '<committed\|not-committed>'/.test(e.message),
+    )
+    assert.equal(journal.unknownCount, 1, 'the outcome is unknown')
+    assert.equal(journal.unrecordedSettlementCount, 1, 'and neither store would keep that fact')
+    const [entry] = journal.unrecordedSettlements
+    assert.equal(entry.state, 'unknown')
+    const printed = settlementRecoveryInstruction({ intentId: entry.intentId, state: entry.state, subject: `${entry.kind} ${entry.label}` })
+    assert.equal(/SET "state" = 'unknown'/.test(printed), false)
+    assert.match(printed, /NOBODY ESTABLISHED WHAT BECAME OF THIS WRITE/)
+  })
+
+  test('performWrite refuses to print an unknown-settling UPDATE in its own abort message either', async () => {
+    const journal = new MutationJournal()
+    const sharedFence = fence({ settle: () => { throw new Error('the coordinator session is gone') } })
+    // Xero answers 400 — a KNOWN not-committed — so this is the case that SHOULD print an UPDATE,
+    // which is what makes the previous assertions about the unknown case mean something.
+    const { impl } = fakeFetch(() => response(400, { Message: 'no' }))
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const log = createWriteIntentLog({ tenantId: TENANT_UUID, append: () => {} })
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: log, fence: sharedFence,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      (e: Error) => e instanceof WriteSettlementNotRecordedError
+        && /THIS RUN ESTABLISHED THE OUTCOME: NOT-COMMITTED/.test(e.message)
+        && /SET "state" = 'not-committed'/.test(e.message),
+    )
+  })
+
+  test('the cross-host refusal points at a read, never at an UPDATE nobody can fill in', () => {
+    assert.throws(
+      () => assertNoUnresolvedSharedWrites({ tenantId: TENANT_UUID, unresolved: [{
+        id: 'runA-w1', runId: 'runA', host: 'host-a', kind: 'invoice voided', label: 'INV-1',
+        method: 'POST', path: 'Invoices/inv-1', intendedAt: 't', state: 'unknown',
+      }] }),
+      (e: Error) => /NOBODY ESTABLISHED WHAT BECAME OF THIS WRITE/.test(e.message)
+        && /SET "state" = '<committed\|not-committed>'/.test(e.message)
+        && !/SET "state" = 'unknown'/.test(e.message),
+    )
   })
 })

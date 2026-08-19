@@ -3497,6 +3497,14 @@ model XeroLiveWriteIntent {
   /// NULL means DISPATCHED AND NEVER ACCOUNTED FOR — the run died between sending the
   /// request and recording what became of it. `unknown` means the answer was lost. Both
   /// stop the next run, anywhere; only `committed` and `not-committed` resolve a row.
+  ///
+  /// The vocabulary is CLOSED and enforced by a CHECK constraint Prisma cannot express
+  /// (`xero_live_write_intents_state_vocabulary`, in the migration): NULL, 'committed',
+  /// 'not-committed', 'unknown' and nothing else. An operator's `commited` is refused
+  /// where it is typed rather than silently dropping the row off the recovery fence — and
+  /// the fence's own query is stated as the COMPLEMENT of the resolved pair, so a value
+  /// that reaches the column by any route the constraint does not govern still HOLDS the
+  /// fence instead of vanishing from it.
   state      String?
   reason     String?
   settledAt  DateTime?

@@ -61,6 +61,20 @@
  *                     `xero_live_write_intents` table in the IMS database, both keyed on the same
  *                     tenant. Otherwise a second host, a container or a restored VM takes a free
  *                     lock and reads an empty fence. Unreachable is REFUSED, in both modes.
+ *  11. AND THE COORDINATOR IS THE LEDGER'S, not whichever store DATABASE_URL names — otherwise
+ *                     "the operator's path choice" has merely become "the operator's DATABASE_URL"
+ *                     and two hosts on two databases each take a free lock. The store must hold
+ *                     the IMS accounting connection for this Xero organisation, or it is refused
+ *                     before any lock is taken. A LOST lock is refused too, in both modes: an
+ *                     --apply notices at its next dispatch, a dry run at the two points where its
+ *                     plan becomes an artefact, and the loss is latched permanently.
+ *  12. AND A SETTLEMENT NOBODY CAN INTERPRET IS NOT A SETTLEMENT. The vocabulary is closed —
+ *                     NULL, 'unknown', 'committed', 'not-committed' — and every question about it
+ *                     is asked as the COMPLEMENT of the resolved pair, so a value outside the
+ *                     vocabulary HOLDS the recovery fence rather than silently clearing it. Where
+ *                     nobody established an outcome, the tooling prints an investigation, not an
+ *                     UPDATE: there is nothing to settle a write as until somebody has read the
+ *                     ledger.
  */
 import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, fsyncSync, mkdirSync, openSync, unlinkSync, writeSync } from 'node:fs'
@@ -1927,10 +1941,15 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
         tenantId: String(record.tenantId ?? ''),
       })
     } else if (record.event === 'settled') {
-      // A settlement RESOLVES the intent only when it says what happened. 'unknown' is the answer
-      // that does not, so it stays on the pile: the run that recorded it may itself have died
-      // before printing the banner about it.
-      if (record.state === 'unknown') continue
+      // A settlement RESOLVES the intent only when it says what happened, IN WORDS THIS TOOL
+      // RECOGNISES. 'unknown' is the answer that does not, so it stays on the pile: the run that
+      // recorded it may itself have died before printing the banner about it. So does anything
+      // outside the vocabulary — a truncated value, a hand-edited line, a state written by some
+      // future version of this file — for the same reason the shared fence stops believing it
+      // (r8 finding 3): a settlement nobody can interpret is not a settlement, and this scan's own
+      // rule about unreadable LINES ("I could not read it" is not "there was nothing there") has to
+      // hold for unreadable FIELDS as well.
+      if (typeof record.state !== 'string' || !settlementResolvesIntent(record.state)) continue
       // And only its OWN run's intent. Ids are run-scoped now, so this can only fire on a log
       // written by a version that minted bare `w1`, `w2` counters — the exact shape in which one
       // run's settlement erased another's dispatched-but-unaccounted-for write. Where neither line
@@ -2011,11 +2030,22 @@ export function assertNoUnresolvedWrites(args: { path: string; text: string }): 
  * coordinator is down" is indistinguishable, from inside this process, from "another host is
  * writing to the ledger right now", and there is only one safe reading of that.
  *
- * A LOST LOCK CANNOT GO UNNOTICED FOR MORE THAN ONE WRITE, which is the property that makes a
- * session lock adequate here. PostgreSQL frees a session advisory lock the instant its connection
- * dies. Every dispatch in this tooling is preceded by an INSERT of its intent on that same
- * session, so a dead session throws before the request leaves rather than after: the liveness
- * check is not a heartbeat that might be stale, it is the write the run cannot skip.
+ * A LOST LOCK IS A REFUSAL, IN BOTH MODES, and this is where round 7 was still wrong.
+ *
+ * PostgreSQL frees a session advisory lock the instant its connection dies, so a reaped session or
+ * a coordinator restart un-excludes this run silently. In an --apply that is caught by construction:
+ * every dispatch is preceded by an INSERT of its intent on the very session that holds the lock, so
+ * a dead session throws before the request leaves. The liveness check is the write the run cannot
+ * skip.
+ *
+ * A DRY RUN MAKES NO WRITES, so it had no such check and simply carried on — and what it carries on
+ * to produce is the PLAN, which is the artefact the whole share-mode lock was introduced to protect.
+ * A dry run that loses its lock and finishes hands the next `--apply` a plan assembled over a ledger
+ * that was, from some unknown point onwards, being mutated by somebody else. So the fence now asks
+ * pg_locks directly — `SHARED_FENCE_SQL.held`, keyed on this backend's pid and the mode it took —
+ * on a timer AND on demand, LATCHES any loss permanently, and the remover asserts it is still held
+ * before it persists the plan and again before it reports success. A lock that came back is not the
+ * lock that was held; continuity is the property, so the latch is never cleared.
  *
  * WHY NOT A MARKER IN THE LEDGER ITSELF, which is the other thing both runs can see. It was
  * considered and is UNAVAILABLE, for three independent reasons, any one of which is fatal:
@@ -2045,6 +2075,129 @@ export class SharedCoordinatorUnavailableError extends SafetyViolationError {}
 export class SharedRunInProgressError extends SafetyViolationError {}
 /** A previous run, on this host or any other, dispatched a write nobody has accounted for. */
 export class SharedUnresolvedWriteError extends SafetyViolationError {}
+/**
+ * The database this run was told to coordinate through is not the one that holds this LEDGER.
+ *
+ * Separate from "unavailable" on purpose: an unreachable coordinator is a fact about the network,
+ * this is a fact about WHICH LEDGER the store in front of us belongs to, and the operator's next
+ * move is completely different. See `assertCoordinatorOwnsLedger`.
+ */
+export class LedgerCoordinatorMismatchError extends SafetyViolationError {}
+/**
+ * The ledger lock this run WAS holding is not held any more.
+ *
+ * It is not "could not take"; it is "took it, and it is gone" — a reaper closed the session, the
+ * coordinator restarted, the connection dropped. Everything this run has read since is a reading
+ * of a ledger that was, from that moment, unexcluded.
+ */
+export class SharedFenceLostError extends SafetyViolationError {}
+
+/**
+ * THE SETTLEMENT VOCABULARY, and it is closed.
+ *
+ * Only these two values ACCOUNT for a dispatched write. `null` (dispatched, and the run died before
+ * recording anything) and `'unknown'` (settled, and the answer was lost) are the two ways a write
+ * stays on the fence — and so is ANY OTHER VALUE, which is the point.
+ *
+ * The defect (r8 finding 3): the fence held a row when the state was NULL or `'unknown'` and let go
+ * of it otherwise, so a state nobody can interpret — an operator's `commited`, a `COMMITTED`, a
+ * `resolved` pasted from another tool, a half-applied UPDATE — silently REMOVED the row from the
+ * shared recovery fence. That is the same class as the read-side defect fixed earlier in this file:
+ * an unreadable answer must not read as "nothing there". So the rule is stated as the COMPLEMENT of
+ * this list everywhere it is asked, in SQL and in TypeScript: recognised-and-resolved is the only
+ * thing that resolves; everything else holds.
+ */
+export const RESOLVED_SETTLEMENT_STATES = ['committed', 'not-committed'] as const
+/** Every value the column may legally hold. Mirrors the CHECK constraint in the migration. */
+export const SETTLEMENT_STATES = ['committed', 'not-committed', 'unknown'] as const
+
+/** Why a row is still on the fence — or that it is not. */
+export type SettlementReading =
+  /** A recognised terminal answer. The only reading that lets a row go. */
+  | 'resolved'
+  /** Dispatched, and nothing ever came back to record. */
+  | 'never-settled'
+  /** Settled, and the answer was lost. Somebody knows nothing; that is not nothing. */
+  | 'unknown-outcome'
+  /** A value outside the vocabulary. Nobody can say what it claims, so it claims nothing. */
+  | 'uninterpretable'
+
+export function readSettlementState(state: string | null | undefined): SettlementReading {
+  if (state === null || state === undefined) return 'never-settled'
+  if ((RESOLVED_SETTLEMENT_STATES as readonly string[]).includes(state)) return 'resolved'
+  if (state === 'unknown') return 'unknown-outcome'
+  return 'uninterpretable'
+}
+
+/** Does this settlement value account for the write? Anything unrecognised: no. */
+export const settlementResolvesIntent = (state: string | null | undefined): boolean =>
+  readSettlementState(state) === 'resolved'
+
+/**
+ * How an operator actually recovers ONE unaccounted-for intent — and, for the outcomes nobody
+ * established, the statement that there is nothing to run yet.
+ *
+ * The defect this closes (r8 finding 4): the banner printed
+ * `UPDATE ... SET "state" = '<the state>' ...` for every unrecorded settlement, `'unknown'`
+ * included. For a KNOWN outcome that is genuine recovery — this process established the answer, the
+ * stores refused to keep it, and the operator is transcribing it back after confirming the object.
+ * For an UNKNOWN one it is not recovery at all: nobody established anything, so there is nothing to
+ * transcribe, and the statement it printed would have written back the exact value the row already
+ * holds — a command that runs cleanly, changes nothing, and leaves the fence refusing. An operator
+ * following it would reasonably conclude the fence was broken.
+ *
+ * So an unknown outcome gets INVESTIGATION first and a settlement second, with the vocabulary
+ * spelled out and the third answer — "I cannot tell" — given an explicit, non-settling home.
+ */
+export function settlementRecoveryInstruction(args: {
+  intentId: string
+  /**
+   * What this process established. `'unknown'` — the answer was lost — and `null`/`undefined` — the
+   * row was never settled at all — mean the same thing to an operator: nobody knows, so there is
+   * nothing to write down. They take the same branch, and that mapping is decided HERE rather than
+   * at each call site, because a call site that forgets it prints an executable-looking lie.
+   */
+  state: WriteCommitState | string | null | undefined
+  /** What to go and look at, e.g. `item E2E-FC-A-1`. The audit script is always named as well. */
+  subject?: string
+  indent?: string
+}): string {
+  const pad = args.indent ?? ''
+  const where = args.subject ? `${args.subject} ` : ''
+  const settle = (value: string) =>
+    `${pad}  UPDATE "xero_live_write_intents" SET "state" = '${value}', "reason" = '<who checked, and how>', ` +
+    `"settledAt" = now() WHERE "id" = '${args.intentId}';`
+  const join = (...parts: string[]) => parts.join('\n')
+
+  if (settlementResolvesIntent(args.state)) {
+    // This run KNOWS. The operator is transcribing a known answer back after confirming the object,
+    // so the statement is executable exactly as printed and the confirmation is what makes running
+    // it honest.
+    const established = String(args.state)
+    return join(
+      `${pad}THIS RUN ESTABLISHED THE OUTCOME: ${established.toUpperCase()}. Confirm it against the ledger —`,
+      `${pad}open ${where}in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts — and then record it:`,
+      settle(established),
+    )
+  }
+  // Nobody established anything, so there is nothing to transcribe and no statement to print.
+  return join(
+    `${pad}NOBODY ESTABLISHED WHAT BECAME OF THIS WRITE, so THERE IS NOTHING TO SETTLE IT AS YET and`,
+    `${pad}no UPDATE here to copy. Settling it as 'unknown' is not recovery: that is the value the row`,
+    `${pad}already holds, it resolves nothing, and the fence would go on refusing — correctly.`,
+    `${pad}RECOVERY IS A READ, and it has to come first. Open ${where}in Xero, or re-run`,
+    `${pad}scripts/audit-xero-live-e2e-footprint.ts, and establish which of three things is true:`,
+    `${pad}  * the ledger shows the change this write intended   -> the outcome is 'committed'`,
+    `${pad}  * the object is untouched, with no trace of it      -> the outcome is 'not-committed'`,
+    `${pad}  * you cannot tell from the ledger                   -> STOP, and leave the row exactly as it is.`,
+    `${pad}    An unresolved row is then the correct description of the world, and no further --apply may`,
+    `${pad}    run against this ledger until a human can say which of the first two it was. Xero's audit`,
+    `${pad}    history for the object, and the output of the run that dispatched it, are what is left to read.`,
+    `${pad}ONLY THEN, with the outcome you established substituted in — never the placeholder, and never`,
+    `${pad}'unknown':`,
+    settle('<committed|not-committed>'),
+  )
+}
 
 /**
  * The slice of a PostgreSQL client this file needs. Deliberately tiny, and deliberately NOT
@@ -2073,11 +2226,32 @@ export type SharedUnresolvedWrite = {
   state: string | null
 }
 
+/**
+ * WHICH STORE THIS IS, established by asking it about the LEDGER rather than by trusting the name
+ * it was reached under. See `assertCoordinatorOwnsLedger`.
+ */
+export type LedgerCoordinator = {
+  /** `current_database()` of the session holding the lock. For the operator, not for the binding. */
+  database: string
+  /** The `accounting_tokens` row that makes this database this ledger's IMS installation. */
+  connectionId: string
+  /** What that row calls the organisation. Printed so a mismatch reads as English. */
+  tenantName: string
+}
+
 export type SharedWriteFence = {
   readonly tenantId: string
   readonly hostId: string
   readonly lockId: number
   readonly mode: SharedFenceMode
+  /** Which store took the lock, and what makes it this ledger's. */
+  readonly coordinator: LedgerCoordinator
+  /**
+   * Re-establish, against PostgreSQL, that THIS SESSION still holds the ledger lock in the mode it
+   * took. Throws `SharedFenceLostError` otherwise. Call it before anything is derived from what was
+   * read under the lock — a plan, above all.
+   */
+  assertStillHeld(context: string): Promise<void>
   /** Every write against this LEDGER that no run, on any host, has accounted for. */
   scanUnresolved(): Promise<SharedUnresolvedWrite[]>
   /** Durably record — COMMITTED — that a write is about to be dispatched. Throws to refuse it. */
@@ -2098,6 +2272,11 @@ export const NULL_SHARED_WRITE_FENCE: SharedWriteFence = {
   hostId: '(none)',
   lockId: 0,
   mode: 'shared',
+  coordinator: { database: '(none)', connectionId: '(none)', tenantName: '(none)' },
+  // It holds nothing, so it cannot have lost anything. The remover never reaches its own
+  // still-held check through this value: by then the real fence has replaced it, and the tests
+  // assert that ordering.
+  assertStillHeld: async () => {},
   scanUnresolved: async () => [],
   intend: async () => {},
   settle: async () => {},
@@ -2139,11 +2318,37 @@ export const SHARED_FENCE_SQL = {
     exclusive: 'SELECT pg_advisory_unlock($1, $2) AS unlocked',
     shared: 'SELECT pg_advisory_unlock_shared($1, $2) AS unlocked',
   },
-  keepalive: 'SELECT 1',
+  /**
+   * Not `SELECT 1`. A heartbeat that only proves the socket is open proves the wrong thing: the
+   * guarantee is "this session still HOLDS the ledger lock", and pg_locks is where that is written
+   * down. `objsubid = 2` is the two-int form, `mode` distinguishes the exclusive lock an --apply
+   * takes from the share lock a dry run takes, and `pid = pg_backend_pid()` is what makes it a
+   * question about OURSELVES rather than about whoever else may be holding it.
+   */
+  held:
+    'SELECT count(*)::int AS held FROM pg_locks ' +
+    "WHERE locktype = 'advisory' AND classid = $1::oid AND objid = $2::oid AND objsubid = 2 " +
+    'AND pid = pg_backend_pid() AND granted AND mode = $3',
+  /**
+   * Does this database hold the IMS connection to the ledger we are about to lock? The LEFT JOIN
+   * against a one-row source is so that a database with NO Xero connection still answers — with a
+   * row saying so — instead of answering nothing, which is the shape this whole file refuses to
+   * read as "fine".
+   */
+  identify:
+    'SELECT current_database() AS "database", t."id" AS "connectionId", t."tenantId" AS "tenantId", ' +
+    't."tenantName" AS "tenantName" ' +
+    'FROM (SELECT 1) AS present LEFT JOIN "accounting_tokens" t ON t."connector" = \'xero\'',
+  /**
+   * Everything for this ledger that is not accounted for, stated as the COMPLEMENT of the resolved
+   * vocabulary rather than as a list of the unresolved ones (r8 finding 3). `state IS NULL` is
+   * spelled separately because `NULL NOT IN (...)` is NULL, not true, and a three-valued predicate
+   * that quietly answers "unknown" for the most dangerous row is exactly the bug.
+   */
   scan:
     'SELECT "id", "runId", "host", "kind", "label", "method", "path", "intendedAt", "state" ' +
     'FROM "xero_live_write_intents" ' +
-    'WHERE "tenantId" = $1 AND ("state" IS NULL OR "state" = \'unknown\') ' +
+    'WHERE "tenantId" = $1 AND ("state" IS NULL OR "state" NOT IN (\'committed\', \'not-committed\')) ' +
     'ORDER BY "intendedAt"',
   intend:
     'INSERT INTO "xero_live_write_intents" ' +
@@ -2163,12 +2368,128 @@ export const SHARED_FENCE_SQL = {
  * rows; and `unknown` puts a settled row back on the fence. The table was created and the rows
  * written inside a transaction that was ROLLED BACK, so nothing was left behind.
  *
+ * ROUND 8 ADDED FOUR MORE, measured the same way against the same database:
+ *   • `held` reports 0 before the lock, 1 while this session holds it, 0 when asked about the OTHER
+ *     mode, and 0 after the unlock — and 0 for a lock a DIFFERENT session holds, which is what
+ *     makes it a question about ourselves rather than about the key;
+ *   • the two-int advisory lock really does appear in pg_locks with `objsubid = 2` and
+ *     mode `ShareLock` / `ExclusiveLock`, which is what the predicate keys on;
+ *   • `identify` runs as written, and the dev database correctly answered that it is the IMS
+ *     installation for a DIFFERENT organisation — so `acquireSharedWriteFence`, called with the
+ *     live tenant and the real `pg` client, refused it with LedgerCoordinatorMismatchError;
+ *   • the migration's CHECK constraint rejects `commited` and accepts `committed`, and with the
+ *     constraint dropped the scan predicate still HOLDS the uninterpretable row and still releases
+ *     a recognised one. Again inside a transaction that was ROLLED BACK; the table does not exist
+ *     in that database afterwards and no advisory lock was left behind.
+ *
  * The Xero side of this file has no equivalent check available: the stored audit token expired
  * 2026-08-18T14:49Z and refreshing it rotates the refresh token out of band.
  */
 
-/** How often the fence's session says hello, so an idle-session reaper cannot quietly free the lock. */
-export const SHARED_FENCE_KEEPALIVE_MS = 30_000
+/**
+ * How often the fence RE-ESTABLISHES that it still holds the lock.
+ *
+ * It is not a keepalive any more, and the rename is the point (r8 finding 1). `SELECT 1` proved the
+ * socket was open, which is not the guarantee: the guarantee is that this session still holds the
+ * ledger lock in the mode it took, and only pg_locks can say that. A tick that fails LATCHES the
+ * loss, so it is discovered by the next thing the run does rather than by nothing at all.
+ */
+export const SHARED_FENCE_HELD_CHECK_MS = 30_000
+
+/** What pg_locks calls the two lock modes this fence takes. */
+export const SHARED_FENCE_LOCK_MODE: Record<SharedFenceMode, string> = {
+  exclusive: 'ExclusiveLock',
+  shared: 'ShareLock',
+}
+
+/**
+ * IS THE STORE IN FRONT OF US THIS LEDGER'S COORDINATOR? (r8 finding 2.)
+ *
+ * Round 6 keyed the coordination on the tenant instead of on a path anybody typed, and round 7
+ * moved it off the filesystem into the IMS database — but WHICH database is `DATABASE_URL`, which
+ * is per-host configuration. So the defect survived one layer out, in exactly the shape round 6
+ * closed: two hosts pointed at two different databases each find the ledger's key FREE, each take
+ * it, and each read an empty fence. "The operator's path choice" had become "the operator's
+ * DATABASE_URL".
+ *
+ * A lock is only exclusion if every run that can reach the protected thing takes THE SAME ONE. So
+ * the coordinator may not be whatever store the host names — it has to be identified by the LEDGER.
+ * That is what this asks, and it is a question only the store can answer about itself: an IMS
+ * database holds exactly one Xero connection (`accounting_tokens` is unique on `connector`), and
+ * that row names the organisation the installation is connected to. A database whose row names a
+ * DIFFERENT organisation, or that has no Xero connection at all, is not this ledger's coordinator,
+ * and locking a key in it excludes nobody. It is refused rather than used.
+ *
+ * WHAT THIS DOES AND DOES NOT BUY, stated plainly because the residue matters:
+ *
+ *   • CLOSED: an empty database, a scratch database, a per-developer database, another tenant's IMS
+ *     installation, and a host re-pointed at any of them. None of these can be made to hold the
+ *     ledger's lock any more. That is the whole of the "operator's DATABASE_URL" class except one.
+ *   • OPEN, AND UNCLOSEABLE FROM HERE: two databases that BOTH legitimately claim this ledger — a
+ *     restored snapshot of the IMS database, or a second IMS installation authorised against the
+ *     same Xero organisation. Both hold a matching row, both answer yes, and nothing inside either
+ *     one can see the other.
+ *
+ * SO WHAT COULD SELF-IDENTIFY AGAINST THE TENANT, since the database provably cannot on its own?
+ * Only the ledger, and it is the one place this tooling may not put a marker — for the three
+ * reasons under "WHY NOT A MARKER IN THE LEDGER ITSELF" above, any one of them fatal. What is left
+ * is to make the split VISIBLE rather than silent: the coordinator's identity is carried on the
+ * fence, printed by the remover at start-up and named in every refusal, so two operators comparing
+ * two runs' output can see they coordinated in two places. A guarantee it is not, and it is not
+ * described as one. The check that IS a guarantee — that a run cannot coordinate through a store
+ * unrelated to the ledger — is the one above.
+ */
+export function assertCoordinatorOwnsLedger(args: {
+  tenantId: string
+  /** `current_database()`, for the message. It is not part of the decision. */
+  database: string
+  /** Every `accounting_tokens` row with `connector = 'xero'`, as the store answered. */
+  connections: ReadonlyArray<{ connectionId?: string | null; tenantId?: string | null; tenantName?: string | null }>
+}): LedgerCoordinator {
+  const preface =
+    `The live-Xero cleanup coordinates through the IMS database that OWNS this ledger — that is what makes ` +
+    `the single-apply lock and the crash-recovery fence true across hosts. Which database that is cannot be ` +
+    `taken from DATABASE_URL, because two hosts given two URLs would each take a free lock in their own ` +
+    `store and exclude nobody; it is established by asking the store which Xero organisation it is connected ` +
+    `to.`
+  const real = args.connections.filter((c) => c.connectionId != null && c.tenantId != null)
+  if (real.length === 0) {
+    throw new LedgerCoordinatorMismatchError(
+      `ABORT: the database this run reached (${args.database}) holds no Xero connection at all, so it is not ` +
+        `the coordinator for ledger ${args.tenantId} — or for any ledger.\n${preface}\n` +
+        `Point DATABASE_URL at the IMS database whose accounting connection is ${args.tenantId} and run it ` +
+        `again. If that database IS the one already named and its connection has been removed, re-authorise ` +
+        `IMS against the organisation through the normal settings flow — that restores the row as evidence of ` +
+        `something real. Do NOT hand-write a connection row to get past this check: the row is what makes one ` +
+        `store the coordinator, and forging it makes an unrelated database claim a ledger it has nothing to do ` +
+        `with, which is the whole defect this check exists to close.`,
+    )
+  }
+  if (real.length > 1) {
+    throw new LedgerCoordinatorMismatchError(
+      `ABORT: the database this run reached (${args.database}) holds ${real.length} Xero connections ` +
+        `(${real.map((c) => `${c.tenantName ?? '(unnamed)'} ${c.tenantId}`).join(', ')}), so which ledger it ` +
+        `coordinates is ambiguous. accounting_tokens is unique on connector, so this schema is not the one ` +
+        `this tooling was written against.\n${preface}`,
+    )
+  }
+  const [only] = real
+  if (String(only.tenantId).toLowerCase() !== args.tenantId.toLowerCase()) {
+    throw new LedgerCoordinatorMismatchError(
+      `ABORT: the database this run reached (${args.database}) is the IMS installation for ` +
+        `${only.tenantName ?? '(unnamed organisation)'} (${only.tenantId}) — a DIFFERENT Xero organisation ` +
+        `from the one this script acts on (${args.tenantId}).\n${preface}\n` +
+        `Taking the ledger's lock here would exclude nothing: the run that matters coordinates in the other ` +
+        `database, finds the key free, and both proceed. Point DATABASE_URL at the IMS database for ` +
+        `${args.tenantId}.`,
+    )
+  }
+  return {
+    database: args.database,
+    connectionId: String(only.connectionId),
+    tenantName: only.tenantName ? String(only.tenantName) : '(unnamed organisation)',
+  }
+}
 
 /**
  * Take the ledger's cross-host fence, or refuse.
@@ -2219,6 +2540,36 @@ export async function acquireSharedWriteFence(args: {
 
   const end = async () => { try { await client.end() } catch { /* the session is going away regardless */ } }
 
+  // BEFORE THE LOCK, because a lock taken in a store that has nothing to do with this ledger is not
+  // a lock at all — it is a free key in somebody's scratch database while the run that matters
+  // takes the free key in another one. See `assertCoordinatorOwnsLedger`.
+  let coordinator: LedgerCoordinator
+  try {
+    const identity = await client.query(SHARED_FENCE_SQL.identify)
+    coordinator = assertCoordinatorOwnsLedger({
+      tenantId: args.tenantId,
+      database: String(identity.rows[0]?.database ?? '(unnamed database)'),
+      connections: identity.rows.map((r) => ({
+        connectionId: r.connectionId == null ? null : String(r.connectionId),
+        tenantId: r.tenantId == null ? null : String(r.tenantId),
+        tenantName: r.tenantName == null ? null : String(r.tenantName),
+      })),
+    })
+  } catch (e) {
+    await end()
+    // A mismatch is a finding about the world and keeps its own class; anything else means the
+    // question could not be ASKED, which is indistinguishable from "this is not an IMS database"
+    // and is refused on the same terms as an unreachable coordinator.
+    if (e instanceof LedgerCoordinatorMismatchError) throw e
+    throw new SharedCoordinatorUnavailableError(
+      `ABORT: the store this run reached could not be asked which Xero organisation it belongs to ` +
+        `(${args.tenantId}): ${errText(e)}\n` +
+        `The coordinator for this ledger is identified by the accounting_tokens row that names the ledger, not ` +
+        `by DATABASE_URL — so a store that cannot answer that question cannot be shown to be the one every ` +
+        `other run coordinates through, and taking its lock would exclude nobody.`,
+    )
+  }
+
   let locked: boolean
   try {
     const res = await client.query(SHARED_FENCE_SQL.lock[args.mode], [XERO_LIVE_CLEANUP_LOCK_NAMESPACE, lockId])
@@ -2234,6 +2585,8 @@ export async function acquireSharedWriteFence(args: {
     await end()
     throw new SharedRunInProgressError(
       `ABORT: another run holds this LEDGER (${args.tenantId}).\n` +
+        `Coordinated through ${coordinator.database}, the IMS installation connected to ` +
+        `${coordinator.tenantName} (connection ${coordinator.connectionId}).\n` +
         `The lock is a PostgreSQL advisory lock in the IMS database — namespace ` +
         `${XERO_LIVE_CLEANUP_LOCK_NAMESPACE}, key ${lockId} — so it is held across HOSTS, not just across ` +
         `processes on this one. ${args.mode === 'exclusive'
@@ -2246,7 +2599,69 @@ export async function acquireSharedWriteFence(args: {
     )
   }
 
-  const keepalive = setKeepalive(() => { void client.query(SHARED_FENCE_SQL.keepalive).catch(() => {}) }, SHARED_FENCE_KEEPALIVE_MS)
+  /**
+   * THE LOSS LATCH (r8 finding 1).
+   *
+   * Once this is set the fence is finished: every method refuses, and it is never cleared. A lock
+   * that came back is not the lock that was held — the window in between is a window in which
+   * another run could take the ledger, do anything to it, and give it back — so "it is held again"
+   * is not the question. The question is whether it has been held CONTINUOUSLY since the reads this
+   * run's conclusions rest on, and once the answer is no, nothing later can make it yes.
+   */
+  let lost: string | null = null
+  const checkHeld = async (): Promise<void> => {
+    if (lost) return
+    try {
+      const res = await client.query(SHARED_FENCE_SQL.held, [
+        XERO_LIVE_CLEANUP_LOCK_NAMESPACE, lockId, SHARED_FENCE_LOCK_MODE[args.mode],
+      ])
+      const held = Number(res.rows[0]?.held ?? 0)
+      if (held !== 1) {
+        lost =
+          `PostgreSQL reports this session holds ${held} ${SHARED_FENCE_LOCK_MODE[args.mode]}(s) on ` +
+          `advisory key (${XERO_LIVE_CLEANUP_LOCK_NAMESPACE}, ${lockId}), not 1`
+      }
+    } catch (e) {
+      // Unanswerable is treated as lost, for the reason every other refusal in this file gives: from
+      // inside this process "I could not ask" and "somebody else has it" are the same state.
+      lost = `the coordinator could not be asked whether this session still holds the ledger: ${errText(e)}`
+    }
+  }
+  const lostError = (context: string): SharedFenceLostError =>
+    new SharedFenceLostError(
+      `ABORT: this run no longer holds the lock on ledger ${args.tenantId} — ${lost}.\n` +
+        `Where it was noticed: ${context}.\n` +
+        `A PostgreSQL session advisory lock lives and dies with its connection, so a reaped session, a ` +
+        `coordinator restart or a dropped connection frees it silently and instantly. From the moment it went, ` +
+        `nothing excluded another run — an --apply on any host could have taken this ledger and changed it — so ` +
+        `everything read since is a reading of a ledger nobody was holding still.\n` +
+        (args.mode === 'shared'
+          ? `THIS IS A DRY RUN, AND THAT IS NOT A REASON TO CARRY ON. A dry run writes nothing, but the PLAN it ` +
+            `produces is the artefact the next --apply is authorised by, and a plan assembled over an unexcluded ` +
+            `ledger authorises writes against states nobody confirmed. That plan is exactly what this lock ` +
+            `existed to protect, so it is not written and not offered.\n`
+          : `NOTHING FURTHER IS DISPATCHED. Writes already made stand and are listed below; they cannot be undone.\n`) +
+        `Re-run from the start. There is nothing to clear by hand — an advisory lock nobody holds leaves ` +
+        `nothing behind — but if this keeps happening, find out WHY the session stopped holding it: an idle ` +
+        `reaper, a coordinator restart, or a connection pooler in front of DATABASE_URL. A pooler that hands ` +
+        `successive statements to different backends makes a SESSION lock meaningless, and this refusal is what ` +
+        `that configuration looks like. Point DATABASE_URL at PostgreSQL directly.`,
+    )
+  const ensureHeld = (context: string): void => { if (lost) throw lostError(context) }
+  /**
+   * Ask PostgreSQL NOW, rather than trusting the last tick. The extra round trip is bought on every
+   * dispatch on purpose: the intent INSERT proves the SESSION is alive, and that is not the same
+   * question as whether the session still HOLDS the ledger — a lock released out of band, or a
+   * pooler that moved the statement to another backend, leaves an INSERT that succeeds beautifully
+   * on a run that is excluding nobody.
+   */
+  const assertHeldNow = async (context: string): Promise<void> => {
+    ensureHeld(context)
+    await checkHeld()
+    ensureHeld(context)
+  }
+
+  const keepalive = setKeepalive(() => { void checkHeld() }, SHARED_FENCE_HELD_CHECK_MS)
 
   const fail = (what: string, e: unknown): never => {
     throw new SharedCoordinatorUnavailableError(
@@ -2262,7 +2677,19 @@ export async function acquireSharedWriteFence(args: {
     hostId,
     lockId,
     mode: args.mode,
+    coordinator,
+    /**
+     * Ask PostgreSQL, NOW, whether this session still holds the ledger — do not settle for the last
+     * tick's answer. Called before anything derived from what was read under the lock becomes an
+     * artefact, and in an --apply run the intent INSERT plays the same role for every dispatch.
+     */
+    async assertStillHeld(context: string) {
+      await assertHeldNow(context)
+    },
     async scanUnresolved() {
+      // Latch-only: this runs immediately after acquisition, and the SELECT below is on the same
+      // session anyway. `assertStillHeld` is what a caller uses when the answer has to be fresh.
+      ensureHeld('reading the unaccounted-for writes')
       let rows: Array<Record<string, unknown>>
       try {
         rows = (await client.query(SHARED_FENCE_SQL.scan, [args.tenantId])).rows
@@ -2282,6 +2709,10 @@ export async function acquireSharedWriteFence(args: {
       }))
     },
     async intend(entry) {
+      // BEFORE the intent, and therefore before the dispatch. The INSERT below runs on the session
+      // that holds the lock, so it catches a DEAD session — but not a lock that went while the
+      // session lived, which is the same hole the dry run had. Asked out loud, every time.
+      await assertHeldNow(`recording the intent to ${entry.method} ${entry.path}`)
       let rows: Array<Record<string, unknown>>
       try {
         rows = (await client.query(SHARED_FENCE_SQL.intend, [
@@ -2297,6 +2728,11 @@ export async function acquireSharedWriteFence(args: {
       }
     },
     async settle(entry) {
+      // DELIBERATELY NOT gated on the loss latch, unlike `intend`. This is recording what became of
+      // a write that has ALREADY been dispatched, and the answer is the scarcest thing in the run:
+      // refusing to try because the lock is gone would throw away the only account of it while the
+      // store may well still be writable. If the session really is dead the UPDATE fails on its own
+      // and `recordSettlement` reports it as an unrecorded settlement, which is the honest outcome.
       let rows: Array<Record<string, unknown>>
       try {
         rows = (await client.query(SHARED_FENCE_SQL.settle, [entry.id, entry.runId, entry.state, entry.reason, now()])).rows
@@ -2336,7 +2772,8 @@ function defaultCoordinationClient(): CoordinationClient {
   if (!connectionString) {
     throw new Error(
       'DATABASE_URL is not set. The live-Xero cleanup coordinates through the IMS database because a lock ' +
-        'file only coordinates one host.',
+        'file only coordinates one host — and specifically through the IMS installation whose accounting ' +
+        'connection IS this ledger, which is checked once the connection is open.',
     )
   }
   return new pg.Client({ connectionString, application_name: 'o3d_xero_live_cleanup_fence' }) as unknown as CoordinationClient
@@ -2352,21 +2789,32 @@ export function assertNoUnresolvedSharedWrites(args: {
   unresolved: readonly SharedUnresolvedWrite[]
 }): void {
   if (args.unresolved.length === 0) return
+  // Why each row is still here. `uninterpretable` is the case r8 finding 3 was about: a state
+  // outside the vocabulary used to make the row VANISH from this list, so the run it should have
+  // stopped started instead. It now holds the fence like any other unaccounted-for write, and it
+  // says so in its own words rather than being reported as one of the other two.
+  const describe = (u: SharedUnresolvedWrite): string => {
+    switch (readSettlementState(u.state)) {
+      case 'never-settled': return 'never settled — the run died between dispatching it and recording the answer'
+      case 'unknown-outcome': return 'settled as UNKNOWN — the answer was lost'
+      case 'uninterpretable':
+        return `settled as ${JSON.stringify(u.state)}, which is not one of ` +
+          `${SETTLEMENT_STATES.map((v) => `'${v}'` ).join(', ')} — nobody can say what it claims, so it claims nothing`
+      case 'resolved': return 'accounted for (this row should not be on the fence; report it)'
+    }
+  }
   const shown = args.unresolved
     .slice(0, 20)
-    .map((u) => `${u.kind}: ${u.label} — ${u.method} ${u.path} at ${u.intendedAt}, dispatched from ${u.host} by run ${u.runId}` +
-      (u.state === 'unknown' ? ' (settled as UNKNOWN — the answer was lost)' : ' (never settled — the run died)'))
+    .map((u) => `${u.kind}: ${u.label} — ${u.method} ${u.path} at ${u.intendedAt}, dispatched from ${u.host} by run ` +
+      `${u.runId}\n      intent ${u.id}: ${describe(u)}\n` +
+      settlementRecoveryInstruction({ intentId: u.id, state: null, subject: `${u.kind} ${u.label}`, indent: '      ' }))
   throw new SharedUnresolvedWriteError(
     `ABORT: the shared write fence records ${args.unresolved.length} write(s) against ledger ${args.tenantId} that ` +
-      `were DISPATCHED and never accounted for. These come from the IMS database, not from this machine's disk, ` +
+      `were DISPATCHED and are not accounted for. These come from the IMS database, not from this machine's disk, ` +
       `so they include runs on OTHER HOSTS — which is the case a lock file and a log file could not see at all:\n  ` +
       shown.join('\n  ') +
       (args.unresolved.length > shown.length ? `\n  ... and ${args.unresolved.length - shown.length} more` : '') +
-      `\nResolve by READING: open each object in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts, and ` +
-      `establish what actually happened to it. Then settle each row by hand —\n` +
-      `  UPDATE "xero_live_write_intents" SET "state" = '<committed|not-committed>', "reason" = '<who checked, and how>', ` +
-      `"settledAt" = now() WHERE "id" = '<id>';\n` +
-      `— and plan again from a FRESH manifest. Nothing expires these rows on a timer: the only thing that can say ` +
+      `\nThen plan again from a FRESH manifest. Nothing expires these rows on a timer: the only thing that can say ` +
       `what became of a dispatched write is Xero, and a fence that cleared itself would hand the next run exactly ` +
       `the empty state it exists to refuse.`,
   )
@@ -2528,11 +2976,11 @@ export async function performWrite<T>(args: {
         `${commit.state.toUpperCase()} (${commit.reason}), but that outcome could not be recorded — ${failures.join('; ')}.\n` +
         `The intent for it is durable; the ANSWER is not. So the next run, on this host or any other, will refuse ` +
         `to start over intent ${intentId} — and the only place the answer now exists is this run's output.\n` +
-        `WRITE THIS DOWN, then reconcile it: confirm the object in Xero (or re-run ` +
-        `scripts/audit-xero-live-e2e-footprint.ts), settle the row by hand —\n` +
-        `  UPDATE "xero_live_write_intents" SET "state" = '${commit.state}', "reason" = '<who checked, and how>', ` +
-        `"settledAt" = now() WHERE "id" = '${intentId}';\n` +
-        `— and account for the same intent in the on-disk log before the next run.`,
+        `WRITE THIS DOWN.\n` +
+        // An UNKNOWN outcome gets investigation, not an UPDATE: there is nothing to transcribe,
+        // because nobody established anything. That decision lives in one place, below.
+        settlementRecoveryInstruction({ intentId, state: commit.state, subject: `${kind} ${label}` }) +
+        `\nAccount for the same intent in the on-disk log before the next run.`,
     )
   }
   return { committed: settleWrite({ res, journal, kind, label }), res }
