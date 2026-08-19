@@ -14,7 +14,7 @@
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
-import { settlementDocumentIdMatches, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
+import { settlementDocumentIdFilter, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
 import type { MoneyPostLock } from '@/lib/domain/accounting/money-post-lock'
 
 export type SettlementProbeTarget = {
@@ -652,13 +652,13 @@ export type MoneyPostFenceParams = {
           id: { not: string }
           /**
            * BOTH KEYS, IN A DEFINED ORDER (round 6, Codex CRITICAL #2): the local scope this row
-           * sits in, then the external document it names — the latter once per spelling the id can
-           * be stored in, because `equals` on a JSON path is byte-exact (round 7, HIGH #2). See the
-           * query below.
+           * sits in, then the external document it names — the latter as a CASE-INSENSITIVE match,
+           * because `equals` on a JSON path is byte-exact and an enumeration of spellings cannot
+           * cover mixed case (round 8, HIGH #1). See the query below.
            */
           OR: Array<
             | { referenceType: string; referenceId: string }
-            | { payload: { path: string[]; equals: string } }
+            | { payload: { path: string[]; string_contains: string; mode: 'insensitive' } }
           >
         }
         select: { id: true; payload: true }
@@ -717,14 +717,26 @@ export async function authoriseMoneyPost(
   // arm is added only when this row names one — with no id there is nothing to match, and the
   // probe below refuses such a post outright anyway.
   //
-  // AND CASE-FOLDED (round 7, Codex HIGH #2). `equals` on a JSON path is byte-exact in PostgreSQL,
-  // so a rival row holding the SAME Xero GUID in another case was matched by neither arm — the
-  // scope arm because it sits elsewhere, the document arm because `4D8A…` is not `4d8a…`. It is
-  // the same cross-scope double post, one spelling later. The arms ask for every spelling either
-  // connector issues; the returned rows are still put through `attemptCouldBeTheSameDocument`
-  // below, which folds case the same way, so a superset here can only add contenders and never
-  // decide anything on its own.
-  const documentIds = settlementDocumentIdMatches(params.payload)
+  // AND CASE-FOLDED — FOR EVERY CASING, NOT THREE OF THEM (round 8, Codex HIGH #1). `equals` on a
+  // JSON path is byte-exact in PostgreSQL, so a rival row holding the SAME Xero GUID in another
+  // case was matched by neither arm: the scope arm because it sits elsewhere, the document arm
+  // because `4D8A…` is not `4d8a…`. Round 7 answered that with three spellings — as-stored, lower,
+  // upper — which a MIXED-case id is outside all of, leaving the identical cross-scope double post
+  // one spelling further along. Enumerating spellings can never be complete; the fold has to be in
+  // the predicate, so the arm is a case-insensitive match the database performs
+  // (`LOWER(payload#>>…) LIKE LOWER(…)`, verified against the dev database — see
+  // settlementDocumentIdFilter). The returned rows are still put through
+  // `attemptCouldBeTheSameDocument` below, which folds case the same way, so this pre-filter can
+  // only add contenders and never decides anything on its own.
+  //
+  // NOTHING IN THE TYPES CHECKS THIS ARM, and it was worth finding out: `db` is a structural shape
+  // so the call sites never compare it with the real client, and Prisma's own `payload` filter type
+  // admits any JSON object, so a misspelt filter key type-checks either way (both tried; `tsc
+  // --noEmit` stayed silent across the repo for `string_contains_bogus`). A wrong key here would
+  // therefore fail at runtime, inside the money-post lock. What pins it instead is the pair of
+  // checks that can: this exact filter was run against the dev database, and the tests assert the
+  // arm's shape literally.
+  const documentFilter = settlementDocumentIdFilter(params.payload)
   const attemptedSiblings = await params.db.accountingSyncLog.findMany({
     where: {
       connector: params.connector,
@@ -733,7 +745,7 @@ export async function authoriseMoneyPost(
       id: { not: params.entryId },
       OR: [
         { referenceType: params.referenceType, referenceId: params.referenceId },
-        ...documentIds.map((id) => ({ payload: { path: ['accountingInvoiceId'], equals: id } })),
+        ...(documentFilter === null ? [] : [{ payload: documentFilter }]),
       ],
     },
     select: { id: true, payload: true },
@@ -1027,8 +1039,31 @@ export async function postMoneyUnderLedgerFence(
     try {
       outcome = await post()
     } catch (error) {
-      if (held.lost) await reportLostMoneyPostExclusion(params, 'threw')
-      throw error
+      if (!held.lost) throw error
+      const incident = await reportLostMoneyPostExclusion(params, 'threw')
+      // THE THROWN PATH HAS THE SAME DURABLE FALLBACK AS THE FAILED ONE (round 8, Codex MEDIUM #2).
+      // A throw here is a post of UNKNOWN outcome made without its exclusion, and both processors
+      // record `String(e)` as the row's `errorMessage` — so the thrown text is written to the sync
+      // row exactly as a failed post's error text is, and is the same last-resort place to put the
+      // incident when the activity log could not take it. Round 7 added that fallback to the failed
+      // branch and left this one rethrowing the bare error, which discards it: the activity write
+      // had already failed, the stderr line is a stream, and the row then said only "socket hang
+      // up" about a call that may have moved money unprotected.
+      //
+      // The connector's own words come FIRST and unaltered, and the original is kept as `cause`:
+      // the retry classification both processors run (`isRateLimitError`) reads this text, and it
+      // must still recognise a 429 that happened to lose the lock.
+      throw new Error(
+        `${error instanceof Error ? error.message : String(error)} — Not sent safely: the money-post `
+        + 'lock for this document was lost while IMS was posting to the accounting connector, so '
+        + 'another entry may have posted at the same time and this call\'s outcome is unknown. Check '
+        + 'the ledger for a duplicate before retrying.'
+        + (incident.persisted
+          ? ''
+          : ' IMS could also not record this incident in the activity log, so this message is the '
+            + 'only durable record of it.'),
+        { cause: error },
+      )
     }
     if (!held.lost) return outcome
     // THE ASSERTION ABOVE CANNOT COVER THE CALL ITSELF (Codex round 5, finding 2). The connection

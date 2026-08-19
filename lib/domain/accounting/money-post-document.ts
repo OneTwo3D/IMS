@@ -62,19 +62,44 @@ export function settlementDocumentId(payload: unknown): string {
 }
 
 /**
- * Every spelling of this row's document id that a STORED payload could literally hold.
+ * The document arm of the sibling query: how a rival row holding THIS document's id is fetched
+ * whatever case it is stored in — or `null` when this row names no document, in which case there
+ * is nothing to match and the arm is left off entirely (an empty needle would match every row).
  *
- * The sibling query matches JSON with `equals`, which is byte-exact in PostgreSQL and cannot be
- * told to fold case — so the folding has to happen on the query side, by asking for the spellings
- * a connector actually issues. `settlementDocumentId` is kept as the first entry because the
- * common case is an exact match on the value this row itself carries.
+ * WHY NOT `equals`, AND WHY NOT A LIST OF SPELLINGS (Codex round 8, HIGH #1). Round 7 emitted
+ * three spellings — as-stored, lower, upper — and a MIXED-case id is in none of them, so a rival
+ * holding `4D8a…` was never fetched and never judged. The argument that no connector issues one
+ * is an assumption about a payload IMS does not control, made on the path that exists precisely
+ * to catch what the scope key cannot see.
  *
- * The result is a SUPERSET pre-filter, never the decision: every row it returns is still put
- * through `attemptCouldBeTheSameDocument`, which compares the same way this module does.
+ * VERIFIED AGAINST `onetwo3d_ims_dev` (Prisma 7.7.0, PostgreSQL), one mixed-case row per probe in
+ * a rolled-back transaction:
+ *
+ *   - the three-spelling `equals` superset, asked in lower case, matched 0 rows — the hole, live;
+ *   - `equals` + `mode: 'insensitive'` does not merely fail to fold case, it PANICS the query
+ *     compiler (`PrismaClientRustPanicError: LIKE filter value should be String or Placeholder`,
+ *     `sql-query-builder/src/filter/visitor.rs`), and a Rust panic is non-recoverable — inside the
+ *     money-post lock that is worse than the bug;
+ *   - `string_contains` + `mode: 'insensitive'` matched the mixed-case row, compiling to
+ *     `LOWER(payload#>>ARRAY['accountingInvoiceId']) LIKE LOWER('%' || $1 || '%')
+ *      AND JSONB_TYPEOF(payload#>ARRAY['accountingInvoiceId']) = 'string'`.
+ *
+ * `LOWER(...) LIKE LOWER(...)` covers EVERY casing rather than an enumerated few, which is what
+ * the finding asked for: there is no spelling of the same id that escapes it.
+ *
+ * IT IS A SUPERSET, AND ONLY A SUPERSET. `string_contains` also matches rows whose id merely
+ * CONTAINS this one, and Prisma does not escape LIKE metacharacters, so an id carrying `%` or `_`
+ * would match more rows still. That can only ADD contenders: every row whose id is case-equal to
+ * ours contains it, so none is ever dropped. What decides is `attemptCouldBeTheSameDocument`,
+ * which folds case exactly as `documentIdentity` does here and rejects the extras. The row set it
+ * runs over is already narrow — one connector, one type, `remoteAttemptedAt` set, which the
+ * partial index covers.
  */
-export function settlementDocumentIdMatches(payload: unknown): string[] {
+export function settlementDocumentIdFilter(
+  payload: unknown,
+): { path: string[]; string_contains: string; mode: 'insensitive' } | null {
   const id = settlementDocumentId(payload)
-  return id === '' ? [] : [...new Set([id, id.toLowerCase(), id.toUpperCase()])]
+  return id === '' ? null : { path: ['accountingInvoiceId'], string_contains: id, mode: 'insensitive' }
 }
 
 /**

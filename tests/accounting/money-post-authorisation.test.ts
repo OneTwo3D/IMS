@@ -157,9 +157,24 @@ function dbDouble(rows: Row[]) {
               if ('referenceType' in arm) {
                 return (r.scope ?? SCOPE) === `${where.type} ${arm.referenceType} ${arm.referenceId}`
               }
-              const json = arm.payload as { path: string[]; equals: string }
+              // BOTH JSON PREDICATE SHAPES, EACH AS POSTGRES REALLY EVALUATES IT — verified against
+              // `onetwo3d_ims_dev` (Prisma 7.7.0) with a mixed-case row in a rolled-back
+              // transaction:
+              //   `equals`                         → `payload#>path = $1`, byte-exact: matched 0
+              //   `string_contains` + insensitive  → `LOWER(payload#>>path) LIKE LOWER('%'||$1||'%')
+              //                                      AND JSONB_TYPEOF(payload#>path) = 'string'`
+              // Modelling `equals` too is deliberate: it is what the query said before round 8, so
+              // reverting the production change makes the rival genuinely unfetchable here rather
+              // than crashing the double, and the test fails for the reason the bug fails.
+              const json = arm.payload as { path: string[]; equals?: string; string_contains?: string; mode?: string }
               const payload = (r.payload ?? DEFAULT_PAYLOAD) as Record<string, unknown>
-              return payload[json.path[0]!] === json.equals
+              const value = payload[json.path[0]!]
+              if (typeof json.equals === 'string') return value === json.equals
+              if (typeof json.string_contains !== 'string') return false
+              if (typeof value !== 'string') return false
+              return json.mode === 'insensitive'
+                ? value.toLowerCase().includes(json.string_contains.toLowerCase())
+                : value.includes(json.string_contains)
             })
           }).map((r) => ({ id: r.id, payload: r.payload ?? DEFAULT_PAYLOAD }))
         },
@@ -1086,13 +1101,12 @@ test('a rival in ANOTHER SCOPE naming the same document is a contender (o3d-0m56
   assert.match(verdict.proceed === false ? verdict.error : '', /log-old/)
   const where = counts[0] as { OR: Array<Record<string, unknown>> }
   assert.deepEqual(where.OR[0], { referenceType: 'PurchaseInvoice', referenceId: 'pi-1' }, 'scope arm first')
-  // The document arm asks for every spelling the id can be STORED in (round 7, HIGH 2): `equals`
-  // on a JSON path is byte-exact, so one spelling misses a rival that recorded the same GUID in
-  // another case.
+  // The document arm matches the id in ANY case (round 8, HIGH 1): `equals` on a JSON path is
+  // byte-exact, and the three spellings round 7 enumerated still missed a mixed-case rival, so the
+  // fold is done by the database inside the predicate instead.
   assert.deepEqual(where.OR.slice(1), [
-    { payload: { path: ['accountingInvoiceId'], equals: 'bill-1' } },
-    { payload: { path: ['accountingInvoiceId'], equals: 'BILL-1' } },
-  ], 'document arms second, case-folded')
+    { payload: { path: ['accountingInvoiceId'], string_contains: 'bill-1', mode: 'insensitive' } },
+  ], 'document arm second, case-folded by the predicate')
 })
 
 test('two rows in DIFFERENT scopes naming one document take the SAME lock (o3d-0m56 r6, CRITICAL 2)', async () => {
@@ -1410,9 +1424,8 @@ test('a rival in another SCOPE and another CASE is still found by the query (o3d
   assert.match(verdict.proceed === false ? verdict.error : '', /log-old/)
   const where = counts[0] as { OR: Array<Record<string, unknown>> }
   assert.deepEqual(where.OR.slice(1), [
-    { payload: { path: ['accountingInvoiceId'], equals: LOWER } },
-    { payload: { path: ['accountingInvoiceId'], equals: UPPER } },
-  ], 'the query asks for every spelling the id can be stored in')
+    { payload: { path: ['accountingInvoiceId'], string_contains: LOWER, mode: 'insensitive' } },
+  ], 'the fold is IN the predicate, so no set of spellings has to be enumerated')
 })
 
 test('two rows naming one document in two CASES take the same lock (o3d-0m56 r7, HIGH 2)', async () => {
@@ -1549,4 +1562,156 @@ test('a persisted incident does not claim the row is its only record (o3d-0m56 r
     restore()
   }
   assert.equal(activityEntries.length, 1, 'and a write that succeeded is not retried')
+})
+
+/* ---- round 8, HIGH 1: a spelling nobody enumerated is still the same document ---- */
+
+test('a rival holding this document in MIXED case, in another scope, is still fetched (o3d-0m56 r8, HIGH 1)', async () => {
+  // The hole three spellings left. Round 7 asked for the id as stored, lower-cased and upper-cased;
+  // `4D8a…` is none of those, so the rival was never fetched and nothing downstream could judge it
+  // — the same cross-scope double post, one spelling further along. Whether either connector can
+  // produce such an id is not the point: this arm exists to catch what the scope key cannot see,
+  // and it must not depend on an assumption about a payload IMS does not control.
+  const { settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
+  const LOWER = '4d8a1f2e-0000-4c11-9a3b-7e5d2c9b1a44'
+  const MIXED = '4D8a1F2e-0000-4c11-9A3b-7e5D2c9b1A44'
+  assert.notEqual(MIXED, LOWER.toUpperCase(), 'the whole point is a spelling the old list did not hold')
+  assert.notEqual(MIXED, LOWER)
+  xeroCalls.length = 0
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: LOWER,
+      Total: 25,
+      AmountDue: 13.5,
+      AmountPaid: 11.5,
+      // The rival's payment, since corrected in Xero — only its own mark still names it, so the
+      // amount-and-date fallback cannot find it either.
+      Payments: [{ PaymentID: 'PAY-OLD', Date: '2026-08-04', Amount: 11.5, Reference: settlementMarkerFor('log-old') }],
+    }],
+  }
+  const ours = { accountingInvoiceId: LOWER, bankAccountId: 'bank-1', amount: 25, paymentDate: '2026-09-20' }
+  const { db, counts } = dbDouble([
+    { id: 'log-new', remoteAttemptedAt: null, payload: ours, scope: 'BILL_PAYMENT PurchaseInvoice pi-1' },
+    {
+      id: 'log-old',
+      remoteAttemptedAt: new Date('2026-08-01T00:00:00Z'),
+      // ANOTHER scope, so the scope arm cannot reach it: only the document arm can, and only if the
+      // database itself folds the case.
+      scope: 'BILL_PAYMENT PurchaseOrder po-1',
+      payload: { accountingInvoiceId: MIXED, bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' },
+    },
+  ])
+
+  const verdict = await (await load())({
+    connector: 'xero',
+    type: 'BILL_PAYMENT',
+    referenceType: 'PurchaseInvoice',
+    referenceId: 'pi-1',
+    entryId: 'log-new',
+    payload: ours,
+    postingDate: '2026-09-20',
+    db,
+  })
+
+  assert.equal(verdict.proceed, false, 'one bill in two spellings is one bill, and it is already paid')
+  assert.match(verdict.proceed === false ? verdict.error : '', /log-old/)
+  const where = counts[0] as { OR: Array<Record<string, unknown>> }
+  assert.deepEqual(where.OR.slice(1), [
+    { payload: { path: ['accountingInvoiceId'], string_contains: LOWER, mode: 'insensitive' } },
+  ], 'one predicate that folds case, not a list of spellings that cannot be complete')
+})
+
+test('a row naming NO document still asks only its own scope (o3d-0m56 r8, HIGH 1)', async () => {
+  // The guard the insensitive match makes load-bearing: an empty needle inside a LIKE '%…%' matches
+  // EVERY row, so a payload with no `accountingInvoiceId` would drag in every attempted money row
+  // for this connector and type. The arm is left off entirely instead.
+  xeroResponse = { Invoices: [] }
+  const anchorless = { bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' }
+  const { db, counts } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null, payload: anchorless }])
+
+  await (await load())({ ...payment, entryId: 'log-1', payload: anchorless, db })
+
+  const where = counts[0] as { OR: Array<Record<string, unknown>> }
+  assert.equal(where.OR.length, 1, 'no document named, no document arm')
+  assert.deepEqual(where.OR[0], { referenceType: 'SalesOrder', referenceId: 'so-1' })
+})
+
+/* ---- round 8, MEDIUM 2: a thrown post keeps the unpersisted-incident fallback ---- */
+
+test('a THROWN post whose incident could not be persisted says so in the error the row keeps (o3d-0m56 r8, MEDIUM 2)', async () => {
+  // A throw here is a post of UNKNOWN outcome made without its exclusion. Both processors record
+  // `String(e)` as the row's errorMessage, so the thrown text is written to the sync row exactly as
+  // a failed post's error text is — and when the activity log has refused the incident, that row is
+  // the only place left to put it. Rethrowing the bare error discarded it.
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+  const { lock, loseIt, held } = lockDouble()
+  const { lines, restore } = captureErrors()
+  activityEntries.length = 0
+  activityWriteFailures = 2
+  let thrown: unknown
+  try {
+    await (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => {
+      loseIt()
+      throw new Error('socket hang up')
+    }).catch((error: unknown) => { thrown = error })
+  } finally {
+    restore()
+    activityWriteFailures = 0
+  }
+
+  assert.ok(thrown instanceof Error, 'it still THROWS — the caller must not read this as a failure it can retry quietly')
+  const message = (thrown as Error).message
+  assert.match(message, /socket hang up/, "the connector's own words are kept")
+  assert.match(message, /^socket hang up/, 'and kept first, so the retry classification still reads them')
+  assert.match(message, /lock for this document was lost/)
+  assert.match(message, /only durable record/, 'the row is the last place left to say the incident exists nowhere else')
+  assert.equal((thrown as Error).cause instanceof Error, true, 'and the original error survives as the cause')
+  assert.equal(activityEntries.length, 2, 'after both write attempts failed')
+  assert.equal(lines.filter((l) => l.includes('INCIDENT NOT PERSISTED')).length, 1)
+  assert.equal(held.size, 0, 'and the lock is still released on the way out')
+})
+
+test('a THROWN post whose incident WAS persisted does not claim the error is its only record (o3d-0m56 r8, MEDIUM 2)', async () => {
+  // The over-correction. The activity log holds it, so the thrown text must not tell an operator
+  // this message is all there is — and a rate-limit throw must still read as one to the processors'
+  // `isRateLimitError`, which matches on this same text.
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+  const { lock, loseIt } = lockDouble()
+  const { restore } = captureErrors()
+  activityEntries.length = 0
+  let thrown: unknown
+  try {
+    await (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => {
+      loseIt()
+      throw new Error('HTTP 429 rate limited, retry after 2000ms')
+    }).catch((error: unknown) => { thrown = error })
+  } finally {
+    restore()
+  }
+
+  const message = thrown instanceof Error ? thrown.message : String(thrown)
+  assert.match(message, /lock for this document was lost/, 'the unsafe post is still announced in the row')
+  assert.equal(/only durable record/.test(message), false, 'the activity log has it; saying otherwise is noise')
+  assert.match(message, /rate limit|http 429/i, 'and the processors can still classify it as a rate limit')
+  assert.match(message, /retry after 2000ms/, 'including the backoff hint they parse out of it')
+  assert.equal(activityEntries.length, 1, 'a write that succeeded is not retried')
+})
+
+test('a throw with the lock INTACT is rethrown exactly as it came (o3d-0m56 r8, MEDIUM 2)', async () => {
+  // The other over-correction. Nothing was posted unprotected, so there is no incident to attach:
+  // an ordinary connector exception must reach the processor unaltered, as the same object.
+  xeroResponse = { Invoices: [{ InvoiceID: 'inv-1', Total: 10, AmountDue: 10, AmountPaid: 0, Payments: [] }] }
+  const { db } = dbDouble([{ id: 'log-1', remoteAttemptedAt: null }])
+  const { lock } = lockDouble()
+  activityEntries.length = 0
+  const original = new Error('socket hang up')
+  let thrown: unknown
+  await (await loadFence())({ ...payment, entryId: 'log-1', db, lock }, async () => { throw original })
+    .catch((error: unknown) => { thrown = error })
+
+  assert.equal(thrown, original, 'the very same error, not a wrapper')
+  assert.equal(thrown === original ? original.message : '', 'socket hang up')
+  assert.deepEqual(activityEntries, [], 'and no incident, because the exclusion held')
 })
