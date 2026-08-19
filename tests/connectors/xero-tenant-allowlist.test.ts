@@ -747,28 +747,98 @@ test('the stored refusal names the reconnect, because only a consent can re-read
 
 test('the stored check applies the allow-list FIRST, so the message names the binding reason', () => {
   // Both would refuse this token. The allow-list is the more specific instruction and its remedy is the
-  // one that works, so it must not be shadowed by the demo requirement.
+  // one that works, so it must not be shadowed by the demo requirement. The pin AGREES with the token
+  // throughout, which is the ordinary connected state and the one these verdicts are about.
   const allowList = readXeroTenantAllowList({
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
     XERO_REQUIRE_DEMO_ORG: 'true',
   })
-  const refusal = storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: false }, allowList)
+  const refusal = storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: false }, allowList, LIVE.tenantId)
   assert.match(refusal ?? '', /allow-list forbids/)
 
   assert.equal(
-    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: true }, allowList), null,
+    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: true }, allowList, DEMO.tenantId), null,
     'an allowed demo organisation passes both',
   )
   assert.match(
-    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: null }, allowList) ?? '',
+    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: null }, allowList, DEMO.tenantId) ?? '',
     /XERO_REQUIRE_DEMO_ORG/,
     'and an allow-listed organisation with no proof is still refused',
   )
 })
 
 test('with the requirement off, an unverified stored token is untouched', () => {
-  // Every installation that predates the column is in this state. It must not become an outage.
-  assert.equal(storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: null }, NO_ALLOW_LIST), null)
+  // Every installation that predates the column is in this state. It must not become an outage. Those
+  // installations predate the PIN too, so the honest value for it here is "there is not one".
+  assert.equal(storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: null }, NO_ALLOW_LIST, null), null)
+})
+
+
+// --- a binding that is already split (r5 finding 1) ---------------------------
+
+test('a pin and a token naming different organisations halt the sync, naming both', () => {
+  // The state rounds 3 and 4 stopped being CREATED, on an instance that already has one. Nothing runs
+  // on deploy, so unless the read path asks, such an instance syncs into the token's ledger forever.
+  const message = storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, DEMO.tenantId)
+
+  assert.match(message ?? '', /bound to two different Xero organisations at once/)
+  assert.match(message ?? '', new RegExp(DEMO.tenantId), 'the pin is named')
+  assert.match(message ?? '', /OneTwo3D Ltd/, 'and the token\'s organisation by name')
+  assert.match(message ?? '', new RegExp(LIVE.tenantId), 'and by id, which is what configures anything')
+  assert.match(message ?? '', /No Xero request was made/)
+})
+
+test('the split-binding refusal trusts NEITHER side, and says which one did the posting', () => {
+  // Preferring the pin would leave the token in place and go on posting with it; preferring the token
+  // would ratify whatever arrived in the database. The operator needs to know that the damage, if any,
+  // is in the TOKEN'S organisation — that is where an audit has to look.
+  const message = storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, DEMO.tenantId) ?? ''
+
+  assert.match(message, /will not guess which of the two/)
+  assert.match(message, /the binding is simply unknown/)
+  assert.match(message, /everything it wrote went to the token's organisation/)
+  assert.match(message, /press Disconnect/, 'the one action that clears both halves')
+  assert.match(message, /connect again and choose the organisation this instance is meant to use/)
+  assert.doesNotMatch(message, /XERO_ALLOWED_TENANT_IDS/, 'an env edit cannot repair a split binding')
+})
+
+test('the split binding is reported BEFORE the allow-list, whose remedy it would invalidate', () => {
+  // storedTenantRefusalMessage offers "permit the stored organisation in the .env". An operator who does
+  // exactly that on a mismatched instance permits an organisation their own pin denies and lands in the
+  // mismatch refusal instead — a remedy whose faithful execution produces a new refusal.
+  const message = storedXeroConnectionRefusal(LIVE, DEMO_BY_ID, DEMO.tenantId) ?? ''
+
+  assert.match(message, /bound to two different Xero organisations at once/)
+  assert.doesNotMatch(message, /allow-list forbids/)
+})
+
+test('a self-contradictory .env is still reported first — no other remedy can take effect', () => {
+  const conflicted = readXeroTenantAllowList({
+    XERO_TENANT_ID: LIVE.tenantId,
+    XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
+  })
+  assert.notEqual(conflicted.conflict, null)
+
+  const message = storedXeroConnectionRefusal(LIVE, conflicted, DEMO.tenantId) ?? ''
+  assert.match(message, /contradict each other/)
+})
+
+test('NO pin beside a token is not a mismatch — it is the documented Demo-reset state', () => {
+  // provision-xero-demo.ts --clear-tenant-pin deliberately produces exactly this so a human can
+  // re-consent after a ~28-day reset, and every connection made before the pin existed is in it too.
+  // Refusing it would take a documented recovery procedure offline.
+  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, null), null)
+  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, undefined), null)
+  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, '   '), null, 'nor a blank one')
+})
+
+test('a pin that agrees with the token changes nothing', () => {
+  // The overwhelmingly common state, and the one this must not touch.
+  assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, LIVE.tenantId), null)
+  assert.equal(
+    storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, ` ${LIVE.tenantId.toUpperCase()} `), null,
+    'compared the way every other id here is compared — case and whitespace are not a disagreement',
+  )
 })
 
 

@@ -46,6 +46,22 @@ import test, { beforeEach, mock } from 'node:test'
  *   - `gateRefreshGrant` / `gateBindingTokenWrite` are what put those two in flight at once: the first
  *     holds the refresh at its call to Xero, the second holds a binding transaction with the token row
  *     staged and UNCOMMITTED.
+ *
+ * THE ROW HAS AN IDENTITY AND A GENERATION (o3d-9tbz r5), because a tenant is not a connection. Two
+ * states this double could not previously express are now the ones under test:
+ *
+ *   - TWO GENERATIONS OF ONE ORGANISATION. `accountingToken.deleteMany` really deletes and the following
+ *     `upsert` really INSERTS, with a NEW primary key — so disconnect-then-reconnect to the same
+ *     organisation produces a different row, as it does in Postgres. A double that recycled `row-1`
+ *     forever made the two generations indistinguishable and passed against the bug. The `upsert` also
+ *     keeps the existing id on the UPDATE path, which is what makes the in-place re-consent case (same
+ *     row, new generation) a genuinely different test rather than the same one twice.
+ *   - AN INSTANCE THAT STARTS SPLIT. `mismatched()` builds a database whose pin and token name different
+ *     organisations without any callback ever having run — the deployed state rounds 3 and 4 do nothing
+ *     about, and the one a restored dump arrives in.
+ *
+ * `fetchedUrls` records every call that reached Xero, so "no Xero request was made" can be asserted
+ * rather than assumed — the refusal claims it, and an expired token makes the claim load-bearing.
  */
 
 type TokenRow = {
@@ -58,6 +74,7 @@ type TokenRow = {
   tenantName: string | null
   grantedScopes: string | null
   tenantIsDemo: boolean | null
+  connectionGeneration: string | null
 }
 
 const LIVE = { id: 'c-live', tenantId: 'e7fb4378-live-org', tenantName: 'OneTwo3D Ltd', tenantType: 'ORGANISATION' }
@@ -81,6 +98,21 @@ let organisationBody: unknown = { Organisations: [{ BaseCurrency: 'GBP' }] }
 let organisationCalls = 0
 let notifications: Array<{ title: string; message: string }> = []
 let activity: Array<{ action: string; description: string }> = []
+/** Every URL that reached Xero, so a refusal that claims it made no request can be held to it. */
+let fetchedUrls: string[] = []
+/** Cached-lookup ids `disconnect()` clears, so the remedy can be exercised rather than simulated. */
+let clearedIdColumns: string[] = []
+
+/**
+ * Primary keys, minted as Postgres mints them: never reused, and a row that is deleted and re-inserted
+ * comes back with a different one. This is what makes two generations of a connection to ONE
+ * organisation distinguishable at all.
+ */
+let rowSequence = 0
+function newRowId(): string {
+  rowSequence += 1
+  return `row-${rowSequence}`
+}
 
 function jsonResponse(body: unknown) {
   return { ok: true, status: 200, json: async () => body, text: async () => JSON.stringify(body) }
@@ -230,10 +262,15 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
       },
     },
     accountingToken: {
-      upsert: async ({ create }: { create: Omit<TokenRow, 'id'> }) => {
+      upsert: async (
+        { create, update }: { create: Omit<TokenRow, 'id'>; update: Partial<TokenRow> },
+      ) => {
         // Taking the row lock: from here until this transaction ends, every writer outside it waits.
         pendingTokenWrite = settled
-        stagedToken = { id: 'row-1', ...create }
+        // INSERT mints a new primary key; UPDATE keeps the one the row already has. The two branches
+        // are the two ways a rebinding happens, and they are only different states if the double says
+        // so — which is why the row's own generation, not its id, is what has to decide the refresh.
+        stagedToken = tokenRow ? { ...tokenRow, ...update } as TokenRow : { id: newRowId(), ...create }
         if (bindingTokenWriteGate) await bindingTokenWriteGate()
         return stagedToken
       },
@@ -270,13 +307,26 @@ mock.module('@/lib/db', {
           tokenRow = { ...(tokenRow as TokenRow), ...data }
           return { count: 1 }
         },
-        upsert: async ({ create }: { create: Omit<TokenRow, 'id'> }) => {
+        upsert: async (
+          { create, update }: { create: Omit<TokenRow, 'id'>; update: Partial<TokenRow> },
+        ) => {
           await awaitTokenRowLock()
-          tokenRow = { id: 'row-1', ...create }
+          tokenRow = tokenRow ? { ...tokenRow, ...update } as TokenRow : { id: newRowId(), ...create }
           return tokenRow
         },
-        deleteMany: async () => ({ count: 0 }),
+        // It really deletes. `disconnect()` is the remedy the split-binding refusal tells operators to
+        // perform, and a no-op double would let that refusal recommend something unproven.
+        deleteMany: async () => {
+          const had = tokenRow ? 1 : 0
+          tokenRow = null
+          return { count: had }
+        },
       },
+      // The cached lookup ids disconnect() clears alongside the token. Recorded rather than modelled:
+      // what matters here is that the remedy runs to completion, which it cannot do without them.
+      customer: { updateMany: async () => { clearedIdColumns.push('customer'); return { count: 0 } } },
+      supplier: { updateMany: async () => { clearedIdColumns.push('supplier'); return { count: 0 } } },
+      product: { updateMany: async () => { clearedIdColumns.push('product'); return { count: 0 } } },
       setting: {
         findUnique: async ({ where }: { where: { key: string } }): Promise<SettingRow | null> => {
           const value = settings[where.key]
@@ -286,7 +336,13 @@ mock.module('@/lib/db', {
           settings[where.key] = create.value
           return { key: where.key, value: create.value }
         },
-        deleteMany: async () => ({ count: 0 }),
+        // It really deletes, for the same reason accountingToken.deleteMany does: disconnect() clearing
+        // BOTH halves of the binding is the whole content of the remedy the split-binding refusal gives.
+        deleteMany: async ({ where }: { where: { key: string } }) => {
+          const had = settings[where.key] != null ? 1 : 0
+          delete settings[where.key]
+          return { count: had }
+        },
       },
       // Both forms: disconnect() passes an array, the tenant binding passes a callback.
       $transaction: async (arg: unknown) =>
@@ -337,6 +393,7 @@ mock.module('@/lib/connectors/xero/api', {
 mock.module('@/lib/security/connector-fetch', {
   namedExports: {
     connectorFetch: async (url: string, init?: { headers?: Record<string, string>; body?: URLSearchParams }) => {
+      fetchedUrls.push(url)
       if (url.includes('identity.xero.com/connect/token')) {
         const code = init?.body?.get('code') ?? ''
         // A refresh is the LONG round trip: the token row was read before it, and the write comes after.
@@ -384,6 +441,9 @@ beforeEach(() => {
   pendingTokenWrite = null
   notifications = []
   activity = []
+  fetchedUrls = []
+  clearedIdColumns = []
+  rowSequence = 0
   delete process.env.XERO_REQUIRE_DEMO_ORG
   delete process.env.XERO_ALLOWED_TENANT_IDS
   delete process.env.XERO_ALLOWED_TENANT_NAMES
@@ -409,7 +469,7 @@ function twoConsents(a: { code: string; org: typeof DEMO }, b: { code: string; o
 function pinnedTo(conn: typeof DEMO) {
   settings.xero_expected_tenant_id = conn.tenantId
   tokenRow = {
-    id: 'row-1',
+    id: newRowId(),
     connector: 'xero',
     accessToken: 'stored-access',
     refreshToken: 'stored-refresh',
@@ -418,7 +478,36 @@ function pinnedTo(conn: typeof DEMO) {
     tenantName: conn.tenantName,
     grantedScopes: 'accounting.transactions',
     tenantIsDemo: null,
+    connectionGeneration: 'generation-before',
   }
+}
+
+/**
+ * An instance whose two halves name DIFFERENT organisations, with no callback in its history.
+ *
+ * This is not a race outcome — it is the state a machine is already in when this code ships: one that
+ * connected under a build predating the atomic binding, or one that was handed a database from another
+ * environment. Rounds 3 and 4 close the doors that create it and do nothing whatever for an instance
+ * standing on the other side of them.
+ */
+function mismatched(params: { pin: typeof DEMO; token: typeof DEMO }) {
+  pinnedTo(params.token)
+  settings.xero_expected_tenant_id = params.pin.tenantId
+}
+
+/**
+ * A split instance whose organisations belong to this test alone.
+ *
+ * The once-per-offending-tenant dedupe in auth.ts is MODULE state and the module is loaded once for the
+ * whole file, so two tests that refuse the same tenantId leave the second one silently un-logged. Every
+ * test here that looks at the record therefore names its own organisations — which is also closer to
+ * life, where one machine has one binding.
+ */
+function splitBinding(label: string): { pin: typeof DEMO; token: typeof DEMO } {
+  const pin = { ...DEMO, tenantId: `5c949ed5-demo-${label}` }
+  const token = { ...LIVE, tenantId: `e7fb4378-live-${label}` }
+  mismatched({ pin, token })
+  return { pin, token }
 }
 
 
@@ -1389,4 +1478,259 @@ test('a refresh that lands after a DISCONNECT does not resurrect the connection'
   assert.equal(await refreshing, null)
   assert.equal(tokenRow, null, 'no token row was re-created')
   assert.equal(settings.xero_expected_tenant_id, undefined, 'and nothing re-pinned')
+})
+
+/**
+ * AN INSTANCE THAT IS ALREADY SPLIT (o3d-9tbz r5 finding 1).
+ *
+ * Rounds 3 and 4 stopped a pin/token mismatch being CREATED — the binding is one transaction the
+ * database arbitrates, and the refresh names its organisation in the WHERE clause of its own write.
+ * Neither does anything for a machine that already has one, and nothing runs on deploy to look. Such an
+ * instance keeps syncing, off the token, into whichever ledger the token belongs to — which is the
+ * o3d-t74p incident exactly: not a consent going wrong, but days of ordinary syncs off a binding nobody
+ * had checked.
+ *
+ * The state is reachable without any race at all: every connection made under a build predating round 3,
+ * a database restored here from another environment, a settings table and an accounting_tokens table
+ * restored from different backups.
+ */
+
+test('an instance that ALREADY has a pin and a token for different organisations stops syncing', async () => {
+  splitBinding('halts-the-sync')
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null, 'no token is handed out')
+  assert.deepEqual(fetchedUrls, [], 'and nothing was asked of Xero')
+})
+
+test('a mismatch on an EXPIRED token is refused before the refresh, not after it', async () => {
+  // The refusal claims "No Xero request was made", and an expired token is where that claim earns its
+  // keep: the refresh path would otherwise present the live organisation's credentials to Xero and
+  // store what came back, extending the very binding that is in question.
+  splitBinding('expired-token')
+  tokenRow!.expiresAt = new Date(Date.now() - 1000)
+  const before = { ...tokenRow! }
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null)
+  assert.deepEqual(fetchedUrls, [], 'the identity endpoint was never called')
+  assert.deepEqual({ ...tokenRow! }, before, 'and the row was not touched')
+})
+
+test('the refusal names BOTH organisations, and where the posting actually went', async () => {
+  const { pin, token } = splitBinding('names-both')
+  const { getAccessToken } = await loadAuth()
+
+  await getAccessToken()
+
+  const refusal = activity.find((e) => e.action === 'xero_stored_tenant_refused')
+  assert.ok(refusal, 'the refusal is on the record, not only on somebody\'s screen')
+  assert.match(refusal.description, /bound to two different Xero organisations at once/)
+  assert.match(refusal.description, new RegExp(pin.tenantId), 'the pin')
+  assert.match(refusal.description, /OneTwo3D Ltd/, 'the token\'s organisation, by name')
+  assert.match(refusal.description, new RegExp(token.tenantId), 'and by id')
+  assert.match(refusal.description, /everything it wrote went to the token's organisation/)
+  assert.match(refusal.description, /press Disconnect/)
+  assert.equal(notifications.length, 1, 'and the operator is told once, not once per sync tick')
+})
+
+test('a split binding reports NOT connected, with the reason and a Disconnect button', async () => {
+  // The remedy is "press Disconnect on /sync", and /sync only draws that button when there is something
+  // to disconnect. A plain `connected: false` would hide it and make the remedy unperformable.
+  splitBinding('not-connected')
+  const { isConnected, getStoredTenantBlockReason } = await loadAuth()
+
+  const status = await isConnected()
+
+  assert.equal(status.connected, false)
+  assert.equal(status.hasStoredToken, true)
+  assert.match(status.blockedReason ?? '', /two different Xero organisations/)
+  assert.equal(notifications.length, 0, 'isConnected runs on every render and must not notify')
+  assert.match(await getStoredTenantBlockReason() ?? '', /two different Xero organisations/,
+    'and the reason travels with the api layer\'s failure too')
+})
+
+test('the remedy WORKS: disconnect clears both halves and the reconnect binds one organisation', async () => {
+  // A refusal is only as good as the instruction attached to it. This runs the instruction.
+  const { pin } = splitBinding('remedy-works')
+  const { getAccessToken, disconnect, exchangeCodeForTokens } = await loadAuth()
+  assert.equal(await getAccessToken(), null, 'halted to begin with')
+
+  await disconnect()
+  const afterDisconnect = tokenRow
+  assert.equal(afterDisconnect, null, 'the token is gone')
+  assert.equal(settings.xero_expected_tenant_id, undefined, 'and so is the pin — neither half survives')
+  assert.deepEqual(clearedIdColumns.sort(), ['customer', 'product', 'supplier'])
+
+  reconsentTo(pin, 'c2')
+  const reconnected = await exchangeCodeForTokens('c2', 'https://ims.example/cb')
+
+  assert.equal(reconnected.success, true)
+  assert.equal(tokenRow?.tenantId, pin.tenantId)
+  assert.equal(settings.xero_expected_tenant_id, pin.tenantId, 'one organisation, named twice')
+  assert.equal((await getAccessToken())?.tenantId, pin.tenantId, 'and the sync runs again')
+})
+
+test('a token with NO pin beside it keeps working — the Demo-reset runbook depends on it', async () => {
+  // provision-xero-demo.ts --clear-tenant-pin deletes the pin and leaves the token, deliberately, so a
+  // human can re-consent after a ~28-day reset. Every connection made before the pin existed is in the
+  // same state. Treating "no pin" as a mismatch would take a documented recovery procedure and an
+  // unknown number of working installations offline.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-no-pin' }
+  pinnedTo(demo)
+  delete settings.xero_expected_tenant_id
+  const { getAccessToken, isConnected } = await loadAuth()
+
+  assert.equal((await getAccessToken())?.tenantId, demo.tenantId)
+  assert.equal((await isConnected()).connected, true)
+  assert.equal(activity.length, 0)
+})
+
+test('an ordinary pinned instance is unaffected — pin and token name one organisation', async () => {
+  pinnedTo({ ...DEMO, tenantId: '5c949ed5-demo-ordinary-pinned' })
+  const { getAccessToken, isConnected } = await loadAuth()
+
+  assert.equal((await getAccessToken())?.accessToken, 'stored-access')
+  assert.equal((await isConnected()).connected, true)
+  assert.equal(notifications.length, 0)
+})
+
+test('a re-consent to the PINNED organisation is still allowed to repair a split instance', async () => {
+  // The blunt remedy is disconnect-then-reconnect, and it is what the message says. But an operator who
+  // simply reconnects to the organisation their pin already names must not be refused for doing the
+  // right thing: that consent ends with both halves naming one organisation, which is the whole point.
+  const { pin } = splitBinding('reconsent-repairs')
+  const { getAccessToken, exchangeCodeForTokens } = await loadAuth()
+
+  reconsentTo(pin, 'c2')
+  const result = await exchangeCodeForTokens('c2', 'https://ims.example/cb')
+
+  assert.equal(result.success, true)
+  assert.equal(tokenRow?.tenantId, pin.tenantId)
+  assert.equal(settings.xero_expected_tenant_id, pin.tenantId)
+  assert.equal((await getAccessToken())?.tenantId, pin.tenantId, 'and the halt lifts')
+})
+
+/**
+ * TWO GENERATIONS OF ONE ORGANISATION (o3d-9tbz r5 finding 2).
+ *
+ * Round 4 put the ORGANISATION in the WHERE clause of the refresh. That distinguishes organisation A
+ * from organisation B and nothing else — and the operation this rig performs most often is not a switch
+ * between organisations, it is a disconnect and reconnect to the SAME one, because Xero re-creates the
+ * Demo company with a new tenantId roughly every 28 days and somebody reconnects by hand. A re-consent
+ * without a disconnect — the usual way to widen a granted scope — is the same event again.
+ *
+ * A refresh in flight across either of those matches `connector + tenantId` perfectly, and writes: the
+ * new connection's tokens are replaced by a retired chain, `grantedScopes` reverts to the grant that was
+ * just widened, and `tenantIsDemo` reverts — which under XERO_REQUIRE_DEMO_ORG turns a verified
+ * connection back into an unverified one and halts every sync.
+ */
+
+test('a refresh that lands after a DISCONNECT AND RECONNECT to the SAME organisation is discarded', async () => {
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-two-generations' }
+  dueForRefresh(demo)
+  const { getAccessToken, disconnect, exchangeCodeForTokens } = await loadAuth()
+  const retired = { id: tokenRow!.id, generation: tokenRow!.connectionGeneration }
+
+  const refreshHeld = latch()
+  refreshGrantGate = refreshHeld.wait
+  const refreshing = getAccessToken()
+  await refreshHeld.reached
+
+  await disconnect()
+  reconsentTo(demo, 'c2')
+  assert.equal((await exchangeCodeForTokens('c2', 'https://ims.example/cb')).success, true)
+  assert.notEqual(tokenRow!.id, retired.id, 'a deleted row comes back with a new primary key')
+  assert.notEqual(tokenRow!.connectionGeneration, retired.generation, 'and a new generation')
+
+  refreshHeld.release()
+
+  assert.equal(await refreshing, null, 'the retired generation yields no usable token')
+  assert.equal(tokenRow?.accessToken, 'access-c2', 'the new connection still owns the row')
+  assert.equal(tokenRow?.tenantId, demo.tenantId, 'one organisation throughout — that is the point')
+  assert.ok(activity.some((e) => e.action === 'xero_refresh_discarded'), 'the blip is explainable')
+  assert.equal(notifications.length, 0, 'and it is not an incident to alarm anybody with')
+})
+
+test('a refresh that lands after an IN-PLACE re-consent is discarded, though the row never moved', async () => {
+  // The case the primary key cannot see. No disconnect, so the binding takes the update path: same
+  // organisation, same pin, SAME ROW. Only the generation changed, and only because a consent mints one.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-reconsent-in-place' }
+  dueForRefresh(demo)
+  const { getAccessToken, exchangeCodeForTokens } = await loadAuth()
+  const retired = { id: tokenRow!.id, generation: tokenRow!.connectionGeneration }
+
+  const refreshHeld = latch()
+  refreshGrantGate = refreshHeld.wait
+  const refreshing = getAccessToken()
+  await refreshHeld.reached
+
+  reconsentTo(demo, 'c2')
+  assert.equal((await exchangeCodeForTokens('c2', 'https://ims.example/cb')).success, true)
+  assert.equal(tokenRow!.id, retired.id, 'the row was updated in place: its id cannot tell the two apart')
+  assert.notEqual(tokenRow!.connectionGeneration, retired.generation, 'the generation can')
+
+  refreshHeld.release()
+
+  assert.equal(await refreshing, null)
+  assert.equal(tokenRow?.accessToken, 'access-c2', 'the consent the operator just gave still owns the row')
+  assert.ok(activity.some((e) => e.action === 'xero_refresh_discarded'))
+})
+
+test('the stale generation cannot revert the scopes or the demo proof the re-consent just recorded', async () => {
+  // Why a "same organisation, both tokens valid" overwrite is not harmless. The retired row was recorded
+  // before XERO_REQUIRE_DEMO_ORG had any evidence and with a narrower grant; letting it land would put
+  // both back, and under that key an unverified connection is an outage roughly every 30 minutes.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-grant-widened' }
+  dueForRefresh(demo)
+  tokenRow!.grantedScopes = 'accounting.transactions'
+  tokenRow!.tenantIsDemo = null
+  organisationBody = { Organisations: [{ BaseCurrency: 'GBP', IsDemoCompany: true }] }
+  const { getAccessToken, exchangeCodeForTokens } = await loadAuth()
+
+  const refreshHeld = latch()
+  refreshGrantGate = refreshHeld.wait
+  const refreshing = getAccessToken()
+  await refreshHeld.reached
+
+  reconsentTo(demo, 'c2')
+  assert.equal((await exchangeCodeForTokens('c2', 'https://ims.example/cb')).success, true)
+
+  refreshHeld.release()
+  assert.equal(await refreshing, null)
+
+  assert.equal(tokenRow?.grantedScopes, 'accounting.transactions accounting.contacts', 'the widened grant stands')
+  assert.equal(tokenRow?.tenantIsDemo, true, 'and the demo proof the consent read from Xero')
+})
+
+test('a row written before the generation column existed still refreshes', async () => {
+  // Every connected installation is in this state on the deploy that adds the column. A predicate that
+  // treated a null generation as "no longer matches" would be an outage at the next token expiry —
+  // roughly half an hour — everywhere at once.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-legacy-row' }
+  dueForRefresh(demo)
+  tokenRow!.connectionGeneration = null
+  const { getAccessToken } = await loadAuth()
+
+  const result = await getAccessToken()
+
+  assert.equal(result?.accessToken, 'access-1')
+  assert.equal(tokenRow?.accessToken, 'access-1', 'the row carries the refreshed token')
+  assert.equal(tokenRow?.connectionGeneration, null, 'and a refresh does not pretend to be a new consent')
+  assert.equal(activity.filter((e) => e.action === 'xero_refresh_discarded').length, 0)
+})
+
+test('a refresh carries its generation forward, so the NEXT refresh still matches', async () => {
+  // A refresh that minted a generation would make every refresh look like a rebinding to the one behind
+  // it, and re-open this hole from the other side — as a permanent outage rather than a race.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-consecutive-refreshes' }
+  dueForRefresh(demo)
+  const { getAccessToken } = await loadAuth()
+
+  assert.equal((await getAccessToken())?.accessToken, 'access-1')
+  assert.equal(tokenRow?.connectionGeneration, 'generation-before')
+
+  tokenRow!.expiresAt = new Date(Date.now() - 1000)
+  assert.equal((await getAccessToken())?.accessToken, 'access-1', 'and again')
+  assert.equal(activity.filter((e) => e.action === 'xero_refresh_discarded').length, 0)
 })

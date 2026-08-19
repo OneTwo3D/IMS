@@ -94,6 +94,12 @@
  * rewrites it defeats the guard rather than tripping it. `xeroTenantBindingRaceMessage` is the refusal
  * for the loser of that race; the atomicity itself is a PRIMARY KEY on `settings.key` and lives in
  * auth.ts, because no amount of checking in this file can make a check-then-write atomic.
+ *
+ * AND A BINDING THAT IS ALREADY SPLIT (the r5 finding). Closing the door that creates a mismatch does
+ * nothing for an instance that came through it before the door existed, or that arrived with one inside
+ * a restored database. `xeroBindingMismatchRefusal` is the read-time half: a pin and a token that name
+ * different organisations mean the binding is UNKNOWN — not that one of them is right — so the sync
+ * stops, both organisations are named, and the remedy is the one action that clears both halves at once.
  */
 
 export type XeroConnectionSummary = {
@@ -547,13 +553,87 @@ export function demoOrgStoredRefusal(
 export function storedXeroConnectionRefusal(
   stored: XeroConnectionSummary,
   allowList: XeroTenantAllowList,
+  pinnedTenantId: string | null | undefined,
 ): string | null {
+  // A configuration that contradicts itself permits NOTHING, so it is answered before every other
+  // refusal: no remedy below can be carried out while it stands, and offering one would send the
+  // operator to do work that cannot take effect.
+  if (allowList.conflict) return storedTenantRefusalMessage(stored, allowList)
+
+  // Then the binding itself, BEFORE the allow-list, because a split binding invalidates the allow-list's
+  // own remedy. `storedTenantRefusalMessage` offers "permit the stored organisation in the .env"; an
+  // operator who does exactly that on a mismatched instance permits an organisation their pin denies and
+  // lands straight in this refusal instead. A remedy whose faithful execution produces a new refusal is
+  // not a remedy, so the ambiguity is reported first and the allow-list question waits until there is a
+  // single organisation to ask it about.
+  const mismatch = xeroBindingMismatchRefusal(stored, pinnedTenantId)
+  if (mismatch !== null) return mismatch
+
   if (!isXeroTenantAllowed(stored, allowList)) return storedTenantRefusalMessage(stored, allowList)
   const demoVerdict = xeroDemoOrgVerdict(allowList, stored.isDemoCompany)
   if (demoVerdict === 'not-demo' || demoVerdict === 'unverified') {
     return demoOrgStoredRefusal(stored, demoVerdict)
   }
   return null
+}
+
+/**
+ * The two halves of one binding — the PIN and the stored TOKEN — naming different organisations, or
+ * null when they agree or there is nothing to compare (o3d-9tbz r5 finding 1).
+ *
+ * WHY THIS EXISTS AT ALL. Rounds 3 and 4 stopped a mismatch being CREATED: the binding is written in one
+ * transaction the database arbitrates, and a refresh names its organisation in the WHERE clause of its
+ * own UPDATE. Neither does anything for an instance that ALREADY has one. That state is reachable — by
+ * every instance that ran a version of this code from before those rounds, by a database restored from
+ * another environment, by a settings table and an accounting_tokens table restored from different
+ * dumps, and by the documented Demo-reset runbook if the pin is re-written by hand against a token that
+ * was not re-consented. Nothing on deploy notices it, and this branch exists because exactly this class
+ * of unnoticed misbinding invoiced 150 documents into a live ledger.
+ *
+ * WHICH SIDE IS RIGHT: NEITHER, and that is the point. It is tempting to prefer the pin (it is the
+ * operator's declared intent) or the token (it is what the syncs actually use). Both are guesses. The
+ * pin is an id somebody or something wrote into `settings`; the token is credentials somebody or
+ * something wrote into `accounting_tokens`; when they disagree the only certain fact is that this
+ * instance's binding is UNKNOWN. Choosing the pin would leave live credentials in place and go on
+ * posting with them anyway — the token, not the pin, is what every Xero call presents. Choosing the
+ * token would silently ratify whatever arrived in the database. So neither is trusted: the sync stops.
+ *
+ * AN ABSENT PIN IS NOT A MISMATCH. A token with no pin beside it is an ordinary, supported state — every
+ * connection made before the pin was written is in it, and `provision-xero-demo.ts --clear-tenant-pin`
+ * deliberately produces it so a human can re-consent after a ~28-day Demo reset. Refusing it would take
+ * a documented recovery procedure and an unknown number of working installations offline, which is a far
+ * larger outage than the one being prevented. Only a pin that EXISTS and DISAGREES is refused.
+ */
+export function xeroBindingMismatchRefusal(
+  stored: XeroConnectionSummary,
+  pinnedTenantId: string | null | undefined,
+): string | null {
+  const pinned = (pinnedTenantId ?? '').trim()
+  if (pinned.length === 0) return null
+  const storedId = (stored.tenantId ?? '').trim()
+  if (storedId.length === 0) return null
+  // Compared the way every other id in this file is compared: a tenantId that differs only in case or
+  // surrounding whitespace is the same organisation, and halting an instance over that would be a false
+  // alarm on the sync path.
+  if (normaliseId(storedId) === normaliseId(pinned)) return null
+
+  return (
+    `Xero sync is halted: this instance is bound to two different Xero organisations at once. Its pin `
+    + `(the xero_expected_tenant_id setting, which every reconnect is checked against) names tenantId `
+    + `${pinned}, while the stored token — which is what every sync actually presents to Xero, and so `
+    + `what decides which ledger is written to — belongs to ${describeXeroConnections([stored])}. `
+    + 'IMS will not guess which of the two this instance is meant to use, and will not treat either as '
+    + 'evidence for the other: while they disagree the binding is simply unknown, and an unknown binding '
+    + 'is not permission to post into a ledger. No Xero request was made. '
+    + `To fix it: on /sync press Disconnect — that clears the token and the pin together, so neither `
+    + `half survives to contradict the next one — then connect again and choose the organisation this `
+    + `instance is meant to use. Nothing else needs editing. `
+    + `If you are auditing what this instance has already posted, look in `
+    + `${describeXeroConnections([stored])} and not in ${pinned}: everything it wrote went to the token's `
+    + 'organisation. The usual causes are a database restored here from another environment with its '
+    + 'Xero token still in it, a settings table and an accounting_tokens table restored from different '
+    + 'backups, or the pin having been cleared or edited by hand while an older token was left in place.'
+  )
 }
 
 /**

@@ -2310,6 +2310,12 @@ model AccountingToken {
   // UNVERIFIED and refuses — not as "not a demo company", which is a different refusal with a
   // different remedy.
   tenantIsDemo Boolean?
+  // o3d-9tbz r5: which CONSENT this row belongs to. Re-minted on every binding, carried
+  // unchanged through every refresh, and named in the WHERE clause of the refresh UPDATE,
+  // so a refresh that began under one connection cannot write over the one that replaced
+  // it. NULL = a row written before this column existed (its generation is "the one with
+  // no generation", which the same predicate matches until something rebinds).
+  connectionGeneration String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

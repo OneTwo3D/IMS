@@ -71,6 +71,15 @@ type StoredAccountingToken = {
    * differs from the one for an organisation Xero has actually told us is not a demo company.
    */
   tenantIsDemo: boolean | null
+  /**
+   * Which CONSENT this row belongs to — re-minted at every binding, carried unchanged through every
+   * refresh (o3d-9tbz r5).
+   *
+   * Read here so the refresh can name it in the WHERE clause of its own write. Null is a generation
+   * like any other, not a missing value: it is what a row written before this column existed carries,
+   * and the predicate matches null to null so those instances keep refreshing without a reconnect.
+   */
+  connectionGeneration: string | null
 }
 
 type OAuthStatePayload = {
@@ -122,6 +131,7 @@ async function readStoredToken(): Promise<StoredAccountingToken | null> {
     tenantName: row.tenantName,
     grantedScopes: row.grantedScopes,
     tenantIsDemo: row.tenantIsDemo ?? null,
+    connectionGeneration: row.connectionGeneration ?? null,
   }
 }
 
@@ -135,7 +145,16 @@ type StoredTokenWrite = {
   tenantIsDemo: boolean | null
 }
 
-function storedTokenRow(params: StoredTokenWrite) {
+/**
+ * The row to write, for the ONE generation named.
+ *
+ * The generation is a separate argument rather than a field of `StoredTokenWrite` on purpose: the two
+ * writers answer it differently and neither answer is a default. A binding MINTS one, because a consent
+ * is a new connection; a refresh CARRIES THE READ ONE FORWARD, because a refresh is the same connection
+ * continuing. Folding it into the payload would let a future writer inherit whichever answer happened to
+ * be lying around, and the whole value of the marker is that it means exactly one thing.
+ */
+function storedTokenRow(params: StoredTokenWrite, connectionGeneration: string | null) {
   return {
     connector: XERO_CONNECTOR,
     accessToken: encryptSecret(params.accessToken),
@@ -145,7 +164,13 @@ function storedTokenRow(params: StoredTokenWrite) {
     tenantName: params.tenantName,
     grantedScopes: params.grantedScopes,
     tenantIsDemo: params.tenantIsDemo,
+    connectionGeneration,
   }
+}
+
+/** A new connection generation. One per binding, and never reused. */
+function newConnectionGeneration(): string {
+  return crypto.randomUUID()
 }
 
 /**
@@ -177,16 +202,56 @@ function storedTokenRow(params: StoredTokenWrite) {
  * re-insert a token row that `disconnect()` had just deleted, quietly reconnecting an instance to the
  * organisation an operator had just detached it from. There is no create branch here at all.
  *
- * ORDINARY REFRESH IS UNTOUCHED: the tenant asked for is the tenant on the row, the predicate matches,
- * one row is updated. Returning false means only that this token is stale — the caller fails THIS call
- * and the next one reads the new binding.
+ * A TENANT IS NOT A CONNECTION (o3d-9tbz r5). The organisation alone does not distinguish two
+ * GENERATIONS of a connection to the SAME organisation, and that is the ordinary case here rather than
+ * an exotic one: Xero re-creates the Demo company roughly every 28 days and the rig is disconnected and
+ * reconnected by hand when it does, and an operator who re-consents to widen the granted scopes does the
+ * same thing without the disconnect. A refresh in flight across either of those matches `connector +
+ * tenantId` perfectly well and writes — replacing the new connection's tokens with a retired chain,
+ * reverting `grantedScopes` to the narrower grant that was just widened, and reverting `tenantIsDemo`,
+ * which under XERO_REQUIRE_DEMO_ORG turns a verified connection back into an unverified one and halts
+ * every sync until somebody reconnects.
+ *
+ * So the GENERATION is in the predicate too. It is the marker that actually decides both cases: a binding
+ * mints a fresh one every time, on the INSERT after a disconnect and on the in-place UPDATE of a
+ * re-consent alike, so the value this refresh read is gone the moment anything rebinds. `id` is a second
+ * anchor rather than a load-bearing one — it is redundant while every binding mints a generation, and
+ * measurably so: removing it alone fails no test. It is kept because it costs nothing in the same
+ * statement and it fails CLOSED, so a future writer that replaces this row without minting a generation
+ * is refused rather than silently overwritten. Four facts, one statement, all evaluated by the database
+ * at the write.
+ *
+ * ORDINARY REFRESH IS UNTOUCHED: the row it read is the row that is there, with the tenant and the
+ * generation it read, the predicate matches, one row is updated. Returning false means only that this
+ * token is stale — the caller fails THIS call and the next one reads the new binding.
  */
-async function storeRefreshedToken(params: StoredTokenWrite): Promise<boolean> {
+async function storeRefreshedToken(previous: StoredAccountingToken, params: StoredTokenWrite): Promise<boolean> {
   const { count } = await db.accountingToken.updateMany({
-    where: { connector: XERO_CONNECTOR, tenantId: params.tenantId },
-    data: storedTokenRow(params),
+    where: {
+      connector: XERO_CONNECTOR,
+      tenantId: params.tenantId,
+      id: previous.id,
+      connectionGeneration: previous.connectionGeneration,
+    },
+    // A refresh is the same connection continuing, so it carries the generation it read rather than
+    // minting one. Writing a new value here would make every refresh look like a rebinding to the next
+    // refresh in flight, and re-open this hole from the other side.
+    data: storedTokenRow(params, previous.connectionGeneration),
   })
   return count > 0
+}
+
+/**
+ * The PIN, and only the pin (o3d-9tbz r5).
+ *
+ * Deliberately not `getExpectedTenantId()`, which falls back to the stored token's own tenantId when no
+ * pin is set. That fallback is right for the callback — an unpinned instance with a token should still
+ * re-consent to its own organisation — and it is exactly wrong for asking whether the pin and the token
+ * AGREE, because it makes them agree by construction. A question answered with one of its own inputs is
+ * not a check.
+ */
+async function readPinnedTenantId(): Promise<string | null> {
+  return await getSettingValue(XERO_EXPECTED_TENANT_KEY)
 }
 
 async function getExpectedTenantId(): Promise<string | null> {
@@ -253,7 +318,11 @@ async function bindXeroTenant(params: {
           throw new XeroBindingRace(null)
         }
       }
-      const data = storedTokenRow(token)
+      // A fresh generation, minted inside the transaction that establishes the binding. This is what
+      // makes "the connection a refresh belongs to" a thing the database can compare, rather than
+      // something only the tenant id stands in for — and it changes on the update path as well as the
+      // insert path, because a re-consent to the same organisation is a new connection too (r5).
+      const data = storedTokenRow(token, newConnectionGeneration())
       await tx.accountingToken.upsert({ where: { connector: XERO_CONNECTOR }, create: data, update: data })
     })
     return { ok: true }
@@ -378,7 +447,10 @@ async function warnNameOnlyGuard(allowList: XeroTenantAllowList, tenantId: strin
 async function storedTenantAllowed(token: StoredAccountingToken): Promise<boolean> {
   const allowList = readXeroTenantAllowList()
   const summary = storedSummary(token)
-  const message = storedXeroConnectionRefusal(summary, allowList)
+  // The pin is read HERE, on the path that decides whether a sync happens, because that is the only
+  // place a split binding can be acted on. Nothing runs on deploy, and an instance that already has one
+  // would otherwise go on syncing off the token forever (r5 finding 1).
+  const message = storedXeroConnectionRefusal(summary, allowList, await readPinnedTenantId())
   if (message === null) {
     allowListWarnedTenantId = null
     await warnNameOnlyGuard(allowList, token.tenantId)
@@ -413,14 +485,18 @@ async function storedTenantAllowed(token: StoredAccountingToken): Promise<boolea
  * failure instead of only into the notification.
  */
 export async function getStoredTenantBlockReason(): Promise<string | null> {
-  const row = await db.accountingToken.findUnique({
-    where: { connector: XERO_CONNECTOR },
-    select: { tenantId: true, tenantName: true, tenantIsDemo: true },
-  })
+  const [row, pinnedTenantId] = await Promise.all([
+    db.accountingToken.findUnique({
+      where: { connector: XERO_CONNECTOR },
+      select: { tenantId: true, tenantName: true, tenantIsDemo: true },
+    }),
+    readPinnedTenantId(),
+  ])
   if (!row) return null
   return storedXeroConnectionRefusal(
     { tenantId: row.tenantId, tenantName: row.tenantName, isDemoCompany: row.tenantIsDemo ?? null },
     readXeroTenantAllowList(),
+    pinnedTenantId,
   )
 }
 
@@ -755,7 +831,7 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
       const data: TokenResponse = await res.json()
       const expiresAt = new Date(Date.now() + data.expires_in * 1000)
 
-      const stored = await storeRefreshedToken({
+      const stored = await storeRefreshedToken(token, {
         accessToken: data.access_token,
         refreshToken: data.refresh_token ?? token.refreshToken,
         expiresAt,
@@ -901,7 +977,9 @@ export async function isConnected(): Promise<{
   const token = await readStoredToken()
   if (!token) return { connected: false }
 
-  const blockedReason = storedXeroConnectionRefusal(storedSummary(token), readXeroTenantAllowList())
+  const blockedReason = storedXeroConnectionRefusal(
+    storedSummary(token), readXeroTenantAllowList(), await readPinnedTenantId(),
+  )
   if (blockedReason !== null) {
     return {
       connected: false,

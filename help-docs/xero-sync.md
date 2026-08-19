@@ -48,6 +48,32 @@ So:
   one you chose is the one this instance should use. (Two consents to the **same** organisation both
   report success; there is nothing wrong with a double-clicked *Connect*, and the duplicate is simply
   discarded.)
+- **An instance that is already bound to two organisations at once stops syncing.** The two halves of a
+  binding are the *pin* (`xero_expected_tenant_id` in the database) and the *stored token*. They are
+  written together now, but an instance connected under an older build, or one handed a database from
+  another environment, can already hold a pin naming one organisation and a token belonging to another.
+  IMS refuses to sync in that state rather than guessing — the pin is what reconnects are checked
+  against, the **token** is what every Xero call actually presents, and while they disagree the binding
+  is simply unknown. `/sync` shows the connection as not connected with the reason, and the Activity log
+  records `xero_stored_tenant_refused`:
+
+  > Xero sync is halted: this instance is bound to two different Xero organisations at once. Its pin
+  > (the `xero_expected_tenant_id` setting, which every reconnect is checked against) names tenantId
+  > 5c949ed5-…, while the stored token — which is what every sync actually presents to Xero, and so what
+  > decides which ledger is written to — belongs to OneTwo3D Ltd [tenantId e7fb4378-…]. … To fix it: on
+  > `/sync` press **Disconnect** — that clears the token and the pin together — then connect again and
+  > choose the organisation this instance is meant to use.
+
+  If you are auditing what such an instance posted, look in the **token's** organisation: that is where
+  everything went. A token with **no pin beside it** is not this state and is not refused — that is the
+  ordinary state after `provision-xero-demo.ts --clear-tenant-pin`, and for any connection made before
+  the pin existed.
+- **A token refresh belongs to one connection, not just one organisation.** Each binding stamps the
+  token row with a connection generation, and a refresh only writes back if that generation is still
+  there. So a refresh that was in flight while somebody disconnected and reconnected — even to the
+  *same* organisation, which is what happens at every ~28-day Demo reset — is discarded instead of
+  overwriting the new connection's tokens, its granted scopes or its recorded demo status. It is
+  recorded as `xero_refresh_discarded` and does not raise a notification, because nothing is wrong.
 
 ### The organisation allow-list (`XERO_ALLOWED_TENANT_IDS`)
 
