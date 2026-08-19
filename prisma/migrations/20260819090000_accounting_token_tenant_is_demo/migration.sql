@@ -1,0 +1,23 @@
+-- o3d-9tbz Codex r3 finding 2: blocking ONE live tenantId never constrained the e2e rig to a Demo
+-- organisation.
+--
+-- The rig's prescribed guard was XERO_BLOCKED_TENANT_IDS=<the live org's id>, chosen because Xero
+-- re-issues the Demo company's tenantId at every ~28-day reset so an id ALLOW-list needs re-editing
+-- every cycle. But a deny-list refuses one organisation: a THIRD organisation an operator happens to
+-- administer is neither blocked nor allow-listed, and XERO_ALLOWED_TENANT_NAMES cannot close that
+-- because a Xero organisation name is mutable and non-unique.
+--
+-- XERO_REQUIRE_DEMO_ORG=true restricts the instance to a KIND of organisation instead of a list of
+-- ids, using Xero's own IsDemoCompany from GET /Organisation — asserted by Xero about how the
+-- organisation was created, so unlike a name it cannot be adopted by renaming, and unlike an id it
+-- survives every Demo rotation with no edit.
+--
+-- This column is what lets that restriction hold on the STORED token as well as at the callback. The
+-- o3d-t74p incident did its damage over days of syncs that never went near a callback, and a
+-- production database restored onto the rig arrives with a live token already in it and no callback
+-- in sight; only a read-time check sees that. NULL means the demo status was never read for this
+-- connection, and under XERO_REQUIRE_DEMO_ORG null is refused as UNVERIFIED: a restored dump and a
+-- token predating this column both carry no proof, and an unproven demo organisation is not a demo
+-- organisation. It is nullable rather than NOT NULL DEFAULT false precisely so those two states stay
+-- distinguishable from "Xero says this is not a demo company", which has a different remedy.
+ALTER TABLE "accounting_tokens" ADD COLUMN "tenantIsDemo" BOOLEAN;

@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
-  describeXeroConnections, isXeroTenantAllowed, nameOnlyGuardWarning, readXeroTenantAllowList,
-  selectXeroTenant, storedTenantRefusalMessage, xeroTenantVerdict, type XeroConnectionSummary,
+  demoOrgConnectRefusal, demoOrgStoredRefusal, describeXeroConnections, isXeroTenantAllowed,
+  nameOnlyGuardWarning, readXeroTenantAllowList, selectXeroTenant, storedTenantRefusalMessage,
+  storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroTenantBindingRaceMessage, xeroTenantVerdict,
+  type XeroConnectionSummary,
 } from '@/lib/connectors/xero/tenant-guard'
 
 /**
@@ -635,4 +637,158 @@ test('a name that matches NOTHING offered is none-allowed, not a contradiction',
   })
   const choice = selectXeroTenant({ connections: [LIVE, DEMO], expectedTenantId: null, allowList })
   assert.equal(choice.ok === false && choice.reason, 'none-allowed')
+})
+
+
+// --- XERO_REQUIRE_DEMO_ORG (r3 finding 2) ------------------------------------
+//
+// The finding: `XERO_BLOCKED_TENANT_IDS=<the live org>` was prescribed as the rig's whole answer to the
+// rotating Demo tenantId, and it refuses exactly ONE organisation. It never constrained the rig TO a
+// demo organisation — and `XERO_ALLOWED_TENANT_NAMES` cannot, because a name is not an identity.
+
+const DEMO_REQUIRED = readXeroTenantAllowList({ XERO_REQUIRE_DEMO_ORG: 'true' })
+
+test('a deny-list on the live org does NOT stop a third organisation — the gap being closed', () => {
+  const blockLive = readXeroTenantAllowList({ XERO_BLOCKED_TENANT_IDS: LIVE.tenantId })
+  const choice = selectXeroTenant({ connections: [THIRD], expectedTenantId: null, allowList: blockLive })
+  assert.equal(choice.ok, true, 'a bookkeeper sandbox is neither blocked nor allow-listed')
+  assert.equal(choice.ok === true && choice.connection.tenantId, THIRD.tenantId)
+})
+
+test('a name alongside the deny-list does not close it either — the org can be renamed', () => {
+  const guarded = readXeroTenantAllowList({
+    XERO_BLOCKED_TENANT_IDS: LIVE.tenantId,
+    XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
+  })
+  const renamed: XeroConnectionSummary = { ...THIRD, tenantName: 'Demo Company (UK)' }
+  const choice = selectXeroTenant({ connections: [renamed], expectedTenantId: null, allowList: guarded })
+  assert.equal(choice.ok, true, 'which is exactly why a name cannot be the anchor')
+})
+
+test('the demo requirement is answered by Xero, not by an id list or a name', () => {
+  assert.equal(xeroDemoOrgVerdict(DEMO_REQUIRED, true), 'demo')
+  assert.equal(xeroDemoOrgVerdict(DEMO_REQUIRED, false), 'not-demo')
+  assert.equal(xeroDemoOrgVerdict(DEMO_REQUIRED, null), 'unverified', 'never read is not "yes"')
+  assert.equal(xeroDemoOrgVerdict(DEMO_REQUIRED, undefined), 'unverified')
+  assert.equal(xeroDemoOrgVerdict(NO_ALLOW_LIST, false), 'not-required', 'opt-in, like every other key')
+})
+
+test('the requirement needs no maintenance when the Demo company is re-created', () => {
+  // The whole reason names were reached for. A rotated tenantId changes nothing here.
+  const rotated: XeroConnectionSummary = { tenantId: '5c949ed5-demo-cycle-9', tenantName: 'Demo Company (UK)' }
+  assert.equal(xeroDemoOrgVerdict(DEMO_REQUIRED, true), 'demo')
+  const choice = selectXeroTenant({ connections: [rotated], expectedTenantId: null, allowList: DEMO_REQUIRED })
+  assert.equal(choice.ok, true, 'and the id-based chain is untouched by it')
+})
+
+test('yes/no spellings are read, and anything else is a refusal rather than a silent "off"', () => {
+  for (const on of ['true', 'TRUE', '1', 'yes', 'on', ' true ']) {
+    assert.equal(readXeroTenantAllowList({ XERO_REQUIRE_DEMO_ORG: on }).requireDemoOrg, true, on)
+  }
+  for (const off of ['false', '0', 'no', 'off', '', '   ', undefined]) {
+    const list = readXeroTenantAllowList({ XERO_REQUIRE_DEMO_ORG: off })
+    assert.equal(list.requireDemoOrg, false, String(off))
+    assert.equal(list.conflict, null, String(off))
+  }
+  // The XERO_TENANT_ID mistake in a new place: a line that reads like a guard, and no guard.
+  const malformed = readXeroTenantAllowList({ XERO_REQUIRE_DEMO_ORG: 'Demo Company (UK)' })
+  assert.equal(malformed.requireDemoOrg, false)
+  assert.match(malformed.conflict ?? '', /is not a yes\/no value/)
+  assert.match(malformed.conflict ?? '', /XERO_REQUIRE_DEMO_ORG=true/, 'and says the value that works')
+  assert.equal(
+    selectXeroTenant({ connections: [DEMO], expectedTenantId: null, allowList: malformed }).ok, false,
+    'a configuration we cannot read is not permission',
+  )
+})
+
+test('the requirement counts as configured, and as an ANCHOR that clears the name-only warning', () => {
+  assert.equal(DEMO_REQUIRED.configured, true)
+  assert.equal(DEMO_REQUIRED.nameOnlyGuard, false)
+  const nameOnly = readXeroTenantAllowList({ XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' })
+  assert.equal(nameOnly.nameOnlyGuard, true)
+  const anchored = readXeroTenantAllowList({
+    XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
+    XERO_REQUIRE_DEMO_ORG: 'true',
+  })
+  assert.equal(anchored.nameOnlyGuard, false, 'Xero asserts it; the organisation’s admin cannot')
+})
+
+test('the name-only warning offers the maintenance-free anchor first, and says what a deny-list misses', () => {
+  const warning = nameOnlyGuardWarning(readXeroTenantAllowList({ XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' }))
+  assert.match(warning, /XERO_REQUIRE_DEMO_ORG=true/)
+  assert.match(warning, /any third organisation would still pass/)
+})
+
+test('the connect refusal distinguishes "Xero says no" from "we could not ask"', () => {
+  const saidNo = demoOrgConnectRefusal(THIRD, 'not-demo')
+  assert.match(saidNo, /Bookkeeper Sandbox/)
+  assert.match(saidNo, new RegExp(THIRD.tenantId))
+  assert.match(saidNo, /IsDemoCompany=false/)
+  assert.match(saidNo, /Nothing was stored/)
+  assert.match(saidNo, /choosing your Demo Company/)
+  assert.match(saidNo, /delete the XERO_REQUIRE_DEMO_ORG line/, 'the way out for a real organisation')
+
+  const couldNotAsk = demoOrgConnectRefusal(DEMO, 'unverified')
+  assert.match(couldNotAsk, /could not read whether/)
+  assert.match(couldNotAsk, /Try connecting again/)
+  assert.doesNotMatch(
+    couldNotAsk, /choosing your Demo Company/,
+    'telling an operator who already chose Demo to choose Demo sends them round the same loop',
+  )
+})
+
+test('the stored refusal names the reconnect, because only a consent can re-read the flag', () => {
+  const unverified = demoOrgStoredRefusal(LIVE, 'unverified')
+  assert.match(unverified, /never verified with Xero/)
+  assert.match(unverified, /Disconnect Xero on \/sync/)
+  assert.match(unverified, /restored here with its Xero token still in it/)
+  assert.match(demoOrgStoredRefusal(LIVE, 'not-demo'), /Xero reports is NOT a demo organisation/)
+})
+
+test('the stored check applies the allow-list FIRST, so the message names the binding reason', () => {
+  // Both would refuse this token. The allow-list is the more specific instruction and its remedy is the
+  // one that works, so it must not be shadowed by the demo requirement.
+  const allowList = readXeroTenantAllowList({
+    XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
+    XERO_REQUIRE_DEMO_ORG: 'true',
+  })
+  const refusal = storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: false }, allowList)
+  assert.match(refusal ?? '', /allow-list forbids/)
+
+  assert.equal(
+    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: true }, allowList), null,
+    'an allowed demo organisation passes both',
+  )
+  assert.match(
+    storedXeroConnectionRefusal({ ...DEMO, isDemoCompany: null }, allowList) ?? '',
+    /XERO_REQUIRE_DEMO_ORG/,
+    'and an allow-listed organisation with no proof is still refused',
+  )
+})
+
+test('with the requirement off, an unverified stored token is untouched', () => {
+  // Every installation that predates the column is in this state. It must not become an outage.
+  assert.equal(storedXeroConnectionRefusal({ ...LIVE, isDemoCompany: null }, NO_ALLOW_LIST), null)
+})
+
+
+// --- the binding race refusal (r3 finding 1) ----------------------------------
+
+test('the race refusal names both organisations and a remedy that does not loop', () => {
+  // "Try again" would be the wrong advice: the retry meets the winner's pin and is refused as
+  // pinned-not-offered — a true message about the wrong problem.
+  const message = xeroTenantBindingRaceMessage({ attempted: DEMO, boundTo: LIVE })
+  assert.match(message, /another Xero connection finished first/)
+  assert.match(message, /OneTwo3D Ltd/, 'who won')
+  assert.match(message, new RegExp(LIVE.tenantId))
+  assert.match(message, /Demo Company \(UK\)/, 'what this consent had chosen')
+  assert.match(message, /nothing from it was stored/)
+  assert.match(message, /disconnect Xero on \/sync/i)
+  assert.doesNotMatch(message, /try again/i)
+})
+
+test('a winner with no name still produces a usable refusal', () => {
+  // The pin can be committed before the winning token row is readable. An id alone is still actionable.
+  const message = xeroTenantBindingRaceMessage({ attempted: DEMO, boundTo: { tenantId: LIVE.tenantId } })
+  assert.match(message, /\(unnamed organisation\) \[tenantId e7fb4378-live-org\]/)
 })

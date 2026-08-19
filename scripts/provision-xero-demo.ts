@@ -127,10 +127,13 @@ async function guardTenant(db: Client) {
   // Re-pin from the LIVE connection every run. The Demo company resets ~4-weekly
   // and is re-created with a NEW tenantId, so a pin captured on a previous run goes
   // stale by design. That matters because the pin is ENFORCED on connect:
-  // selectTenantConnection() (lib/connectors/xero/auth.ts:134) does
-  // `find(c => c.tenantId === expected) ?? null`, so a stale pin makes the next
-  // reconnect fail to find any tenant — the safety feature locks you out of the very
-  // org it is protecting. Re-pinning here keeps it correct without weakening it: we
+  // selectXeroTenant() (lib/connectors/xero/tenant-guard.ts) refuses a consent that
+  // does not offer the pinned organisation, so a stale pin makes the next reconnect
+  // fail — the safety feature locks you out of the very org it is protecting. The
+  // callback now writes the pin and the token together in one transaction, so this
+  // only ever re-asserts a value that already matches the stored token's tenantId; it
+  // is kept because --clear-tenant-pin exists and a half-provisioned rig may have
+  // neither. Re-pinning here keeps it correct without weakening it: we
   // only reach this line after asserting the LIVE org name is REQUIRED_TENANT, so
   // the pin can never be moved onto a production org.
   // Never move another instance's pin: --remap-only may target stage.

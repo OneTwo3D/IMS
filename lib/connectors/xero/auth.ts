@@ -11,14 +11,15 @@ import { logActivity } from '@/lib/activity-log'
 import { setAuthToken, consumeAuthToken } from '@/lib/auth/token-store'
 import { notify } from '@/lib/notifications'
 import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from '@/lib/secrets'
-import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
+import { deserializeSettingValue, getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clearXeroReferenceCache } from './api'
 import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from './scopes'
 import {
-  isXeroTenantAllowed, nameOnlyGuardWarning, readXeroTenantAllowList, selectXeroTenant,
-  storedTenantRefusalMessage, type XeroTenantAllowList,
+  demoOrgConnectRefusal, nameOnlyGuardWarning, readXeroTenantAllowList, selectXeroTenant,
+  storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroTenantBindingRaceMessage,
+  type XeroConnectionSummary, type XeroTenantAllowList,
 } from './tenant-guard'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
@@ -60,6 +61,16 @@ type StoredAccountingToken = {
   tenantId: string
   tenantName: string | null
   grantedScopes: string | null
+  /**
+   * Xero's `IsDemoCompany` for this organisation, as read from GET /Organisation at the consent that
+   * established this connection — or null when it was never read (o3d-9tbz r3).
+   *
+   * Null is load-bearing and is NOT the same as false. A token stored before XERO_REQUIRE_DEMO_ORG
+   * existed, or one that arrived inside a restored dump from another environment, knows nothing about
+   * its own organisation; under that key it is refused as UNVERIFIED, with a remedy (reconnect) that
+   * differs from the one for an organisation Xero has actually told us is not a demo company.
+   */
+  tenantIsDemo: boolean | null
 }
 
 type OAuthStatePayload = {
@@ -105,18 +116,22 @@ async function readStoredToken(): Promise<StoredAccountingToken | null> {
     tenantId: row.tenantId,
     tenantName: row.tenantName,
     grantedScopes: row.grantedScopes,
+    tenantIsDemo: row.tenantIsDemo ?? null,
   }
 }
 
-async function upsertStoredToken(params: {
+type StoredTokenWrite = {
   accessToken: string
   refreshToken: string | null
   expiresAt: Date
   tenantId: string
   tenantName: string | null
   grantedScopes: string | null
-}): Promise<void> {
-  const data = {
+  tenantIsDemo: boolean | null
+}
+
+function storedTokenRow(params: StoredTokenWrite) {
+  return {
     connector: XERO_CONNECTOR,
     accessToken: encryptSecret(params.accessToken),
     refreshToken: params.refreshToken ? encryptSecret(params.refreshToken) : null,
@@ -124,7 +139,12 @@ async function upsertStoredToken(params: {
     tenantId: params.tenantId,
     tenantName: params.tenantName,
     grantedScopes: params.grantedScopes,
+    tenantIsDemo: params.tenantIsDemo,
   }
+}
+
+async function upsertStoredToken(params: StoredTokenWrite): Promise<void> {
+  const data = storedTokenRow(params)
   await db.accountingToken.upsert({
     where: { connector: XERO_CONNECTOR },
     create: data,
@@ -141,12 +161,99 @@ async function getExpectedTenantId(): Promise<string | null> {
   return stored ?? token?.tenantId ?? null
 }
 
-async function pinTenantId(tenantId: string): Promise<void> {
-  await db.setting.upsert({
-    where: { key: XERO_EXPECTED_TENANT_KEY },
-    create: { key: XERO_EXPECTED_TENANT_KEY, value: serializeSettingValue(XERO_EXPECTED_TENANT_KEY, tenantId) },
-    update: { value: serializeSettingValue(XERO_EXPECTED_TENANT_KEY, tenantId) },
-  })
+/**
+ * Bind this instance to ONE Xero organisation — token row and pin — atomically (o3d-9tbz r3).
+ *
+ * THE RACE. Everything upstream of here is a check against a SNAPSHOT: `getExpectedTenantId()` reads the
+ * pin, `selectXeroTenant` decides against it, and the write happens later. Two OAuth callbacks in flight
+ * at once — an operator who double-clicks Connect, two operators connecting at the same time, a browser
+ * that replays the redirect — both read "no pin" on a fresh database, both pass every check, and the
+ * second one's write lands on top of the first. The pin is the ONLY thing that makes a later consent to
+ * a different organisation refuse, so a race that rewrites it does not trip the guard, it removes it.
+ * That is the same shape as the incident this branch exists for: the rig invoiced into the live ledger
+ * because nothing had bound it to Demo first.
+ *
+ * WHAT MAKES IT ATOMIC is not a check. `settings.key` is a PRIMARY KEY, so of two concurrent INSERTs of
+ * `xero_expected_tenant_id` the database blocks the second until the first commits and then rejects it
+ * (P2002). No amount of read-then-write in this process can do that, because the window being closed is
+ * between the read and the write. The pin is therefore INSERTed first inside the transaction and the
+ * token row written after it: the loser's INSERT fails, the transaction rolls back, and its token never
+ * reaches the database at all — which is what lets the refusal say "nothing was stored" truthfully.
+ *
+ * A pin that already exists and names a DIFFERENT organisation is the same refusal by the other route:
+ * the winner committed before this transaction started reading. Reconnecting to the SAME organisation —
+ * the ordinary re-consent, and the one after a Demo reset — updates the pin and the token as before.
+ *
+ * `update` rather than "leave it alone" on the matching path is deliberate: it takes the row lock, so
+ * two concurrent consents to the same organisation are serialised and the token row ends up wholly one
+ * of them rather than a mixture.
+ */
+async function bindXeroTenant(params: {
+  connection: XeroConnectionSummary
+  token: StoredTokenWrite
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const { connection, token } = params
+  const pinValue = serializeSettingValue(XERO_EXPECTED_TENANT_KEY, token.tenantId)
+
+  try {
+    await db.$transaction(async (tx) => {
+      const existing = await tx.setting.findUnique({ where: { key: XERO_EXPECTED_TENANT_KEY } })
+      if (existing) {
+        const pinned = deserializeSettingValue(XERO_EXPECTED_TENANT_KEY, existing.value)
+        if (pinned !== token.tenantId) throw new XeroBindingRace(pinned)
+        await tx.setting.update({ where: { key: XERO_EXPECTED_TENANT_KEY }, data: { value: pinValue } })
+      } else {
+        // The arbiter. Not an upsert: an upsert is exactly the check-then-write this must not be.
+        await tx.setting.create({ data: { key: XERO_EXPECTED_TENANT_KEY, value: pinValue } })
+      }
+      const data = storedTokenRow(token)
+      await tx.accountingToken.upsert({ where: { connector: XERO_CONNECTOR }, create: data, update: data })
+    })
+    return { ok: true }
+  } catch (error) {
+    const lostTo = error instanceof XeroBindingRace ? error.boundTenantId : (isUniqueViolation(error) ? null : undefined)
+    if (lostTo === undefined) throw error
+    const boundTo = await readBoundTenant(lostTo)
+
+    // Losing the race to the SAME organisation is not a failure. An operator who double-clicks Connect
+    // fires two callbacks for one consent; this instance ends up bound to exactly the organisation they
+    // asked for, with a valid token, and the only thing discarded is a duplicate. Reporting that as an
+    // error would put a refusal on the screen of somebody whose connection worked — and a guard that
+    // cries wolf on the ordinary path is a guard that gets switched off, which is the failure mode this
+    // whole branch exists to avoid.
+    if (boundTo.tenantId === token.tenantId) return { ok: true }
+
+    return { ok: false, error: xeroTenantBindingRaceMessage({ attempted: connection, boundTo }) }
+  }
+}
+
+/** A concurrent callback bound this instance first, seen as a committed pin rather than as a P2002. */
+class XeroBindingRace extends Error {
+  constructor(readonly boundTenantId: string) {
+    super(`Xero tenant already bound to ${boundTenantId}`)
+    this.name = 'XeroBindingRace'
+  }
+}
+
+/**
+ * Prisma's unique-constraint code, duck-typed.
+ *
+ * Deliberately not `instanceof Prisma.PrismaClientKnownRequestError`: the same duplicate key arrives as
+ * a different class depending on which copy of the client raised it, and a test that cannot express "the
+ * database rejected this INSERT" cannot test the only thing here that is load-bearing.
+ */
+function isUniqueViolation(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { code?: string }).code === 'P2002'
+}
+
+/** Who actually holds the binding now, named as well as we can name it, for the loser's message. */
+async function readBoundTenant(knownTenantId: string | null): Promise<XeroConnectionSummary> {
+  const row = await db.accountingToken.findUnique({
+    where: { connector: XERO_CONNECTOR },
+    select: { tenantId: true, tenantName: true },
+  }).catch(() => null)
+  const pinned = knownTenantId ?? (await getSettingValue(XERO_EXPECTED_TENANT_KEY)) ?? row?.tenantId ?? '(unknown)'
+  return { tenantId: pinned, tenantName: row?.tenantId === pinned ? row.tenantName : null }
 }
 
 /**
@@ -218,14 +325,14 @@ async function warnNameOnlyGuard(allowList: XeroTenantAllowList, tenantId: strin
  */
 async function storedTenantAllowed(token: StoredAccountingToken): Promise<boolean> {
   const allowList = readXeroTenantAllowList()
-  const summary = { tenantId: token.tenantId, tenantName: token.tenantName }
-  if (isXeroTenantAllowed(summary, allowList)) {
+  const summary = storedSummary(token)
+  const message = storedXeroConnectionRefusal(summary, allowList)
+  if (message === null) {
     allowListWarnedTenantId = null
     await warnNameOnlyGuard(allowList, token.tenantId)
     return true
   }
 
-  const message = storedTenantRefusalMessage(summary, allowList)
   if (allowListWarnedTenantId !== token.tenantId) {
     allowListWarnedTenantId = token.tenantId
     try {
@@ -256,15 +363,46 @@ async function storedTenantAllowed(token: StoredAccountingToken): Promise<boolea
 export async function getStoredTenantBlockReason(): Promise<string | null> {
   const row = await db.accountingToken.findUnique({
     where: { connector: XERO_CONNECTOR },
-    select: { tenantId: true, tenantName: true },
+    select: { tenantId: true, tenantName: true, tenantIsDemo: true },
   })
   if (!row) return null
-  const allowList = readXeroTenantAllowList()
-  if (isXeroTenantAllowed(row, allowList)) return null
-  return storedTenantRefusalMessage(row, allowList)
+  return storedXeroConnectionRefusal(
+    { tenantId: row.tenantId, tenantName: row.tenantName, isDemoCompany: row.tenantIsDemo ?? null },
+    readXeroTenantAllowList(),
+  )
 }
 
-async function fetchOrganisationBaseCurrency(accessToken: string, tenantId: string): Promise<string | null> {
+/** The stored connection as the guard sees it — including what it knows about the organisation. */
+function storedSummary(token: StoredAccountingToken): XeroConnectionSummary {
+  return { tenantId: token.tenantId, tenantName: token.tenantName, isDemoCompany: token.tenantIsDemo }
+}
+
+/**
+ * What GET /Organisation says about the organisation behind this token.
+ *
+ * One call, two answers, because the callback already made this call for the base currency and
+ * `XERO_REQUIRE_DEMO_ORG` needs no second one (o3d-9tbz r3). Both fields are null when they could not be
+ * read; for the demo flag that null is a refusal under that key, not a pass.
+ */
+type XeroOrganisationFacts = { baseCurrency: string | null; isDemoCompany: boolean | null }
+
+/**
+ * Is this a Xero DEMO organisation, according to Xero?
+ *
+ * `IsDemoCompany` is the authoritative field. `Class: "DEMO"` on the same object says the same thing and
+ * is read as a second POSITIVE signal only — an unrecognised Class is not evidence either way, so it
+ * yields null (unverified) rather than false. Only Xero explicitly saying `IsDemoCompany: false` earns
+ * the "this is not a demo organisation" refusal, because that refusal tells the operator to go and pick
+ * a different organisation and it must not be aimed at someone who already picked the right one.
+ */
+function readIsDemoCompany(organisation: Record<string, unknown>): boolean | null {
+  if (typeof organisation.IsDemoCompany === 'boolean') return organisation.IsDemoCompany
+  if (typeof organisation.Class === 'string' && organisation.Class.trim().toUpperCase() === 'DEMO') return true
+  return null
+}
+
+async function fetchOrganisationFacts(accessToken: string, tenantId: string): Promise<XeroOrganisationFacts> {
+  const unknown: XeroOrganisationFacts = { baseCurrency: null, isDemoCompany: null }
   const res = await connectorFetch(XERO_ORGANISATION_URL, {
     headers: {
       'Authorization': `Bearer ${accessToken}`,
@@ -272,16 +410,20 @@ async function fetchOrganisationBaseCurrency(accessToken: string, tenantId: stri
       'Accept': 'application/json',
     },
   }, { connectorName: 'Xero' })
-  if (!res.ok) return null
+  if (!res.ok) return unknown
   const data = await res.json() as Record<string, unknown>
   const organisations =
     (Array.isArray(data.Organisations) ? data.Organisations : null)
     ?? (Array.isArray(data.Organisation) ? data.Organisation : null)
     ?? []
   const first = organisations[0]
-  if (!first || typeof first !== 'object') return null
-  const baseCurrency = (first as Record<string, unknown>).BaseCurrency
-  return typeof baseCurrency === 'string' && baseCurrency ? baseCurrency.toUpperCase() : null
+  if (!first || typeof first !== 'object') return unknown
+  const record = first as Record<string, unknown>
+  const baseCurrency = record.BaseCurrency
+  return {
+    baseCurrency: typeof baseCurrency === 'string' && baseCurrency ? baseCurrency.toUpperCase() : null,
+    isDemoCompany: readIsDemoCompany(record),
+  }
 }
 
 async function logRefreshFailure(reason: string): Promise<void> {
@@ -434,31 +576,55 @@ export async function exchangeCodeForTokens(
     // The moment the operator is actually watching, and the moment a name-only guard binds a ledger.
     await warnNameOnlyGuard(allowList, conn.tenantId)
 
-    const [organisationBaseCurrency, imsBaseCurrency] = await Promise.all([
-      fetchOrganisationBaseCurrency(tokenData.access_token, conn.tenantId),
+    const [organisation, imsBaseCurrency] = await Promise.all([
+      fetchOrganisationFacts(tokenData.access_token, conn.tenantId),
       getBaseCurrencyCode(),
     ])
-    if (organisationBaseCurrency && organisationBaseCurrency !== imsBaseCurrency) {
+
+    // The demo requirement is answered BEFORE the currency comparison. A rig pointed at a live
+    // organisation whose base currency happens to match would otherwise sail past, and one whose
+    // currency differs would be told about currencies when the real problem is the ledger it is about
+    // to invoice into (o3d-9tbz r3).
+    const demoVerdict = xeroDemoOrgVerdict(allowList, organisation.isDemoCompany)
+    if (demoVerdict === 'not-demo' || demoVerdict === 'unverified') {
+      const error = demoOrgConnectRefusal({ tenantId: conn.tenantId, tenantName: conn.tenantName }, demoVerdict)
+      await logTenantRefusal(demoVerdict === 'not-demo' ? 'not-demo-org' : 'demo-unverified', error)
+      return { success: false, error }
+    }
+
+    if (organisation.baseCurrency && organisation.baseCurrency !== imsBaseCurrency) {
       return {
         success: false,
-        error: `Xero organisation base currency (${organisationBaseCurrency}) must match the IMS base currency (${imsBaseCurrency}).`,
+        error: `Xero organisation base currency (${organisation.baseCurrency}) must match the IMS base currency (${imsBaseCurrency}).`,
       }
     }
 
     const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000)
-    await upsertStoredToken({
-      accessToken: tokenData.access_token,
-      refreshToken: tokenData.refresh_token ?? null,
-      expiresAt,
-      tenantId: conn.tenantId,
-      tenantName: conn.tenantName,
-      // What was actually GRANTED, which is not necessarily what we asked for: the operator can decline
-      // individual scopes on the consent screen, and Xero says so here rather than at the failing call.
-      // Read from the response field OR the access-token JWT claim — the top-level field is not
-      // guaranteed, and taking null from its absence would leave validation off on a fresh reconnect.
-      grantedScopes: scopesFromTokenResponse(tokenData),
+    // ONE write, and the database decides who wins it. Storing the token and pinning the tenant used to
+    // be two statements, so a concurrent callback could interleave them and leave a token for one
+    // organisation pinned to another — a binding that no longer names the ledger the syncs use.
+    const bound = await bindXeroTenant({
+      connection: { tenantId: conn.tenantId, tenantName: conn.tenantName },
+      token: {
+        accessToken: tokenData.access_token,
+        refreshToken: tokenData.refresh_token ?? null,
+        expiresAt,
+        tenantId: conn.tenantId,
+        tenantName: conn.tenantName,
+        // What was actually GRANTED, which is not necessarily what we asked for: the operator can decline
+        // individual scopes on the consent screen, and Xero says so here rather than at the failing call.
+        // Read from the response field OR the access-token JWT claim — the top-level field is not
+        // guaranteed, and taking null from its absence would leave validation off on a fresh reconnect.
+        grantedScopes: scopesFromTokenResponse(tokenData),
+        // Recorded whether or not XERO_REQUIRE_DEMO_ORG is set today, so switching the key on does not
+        // require a reconnect on an instance that was already connected to a demo organisation.
+        tenantIsDemo: organisation.isDemoCompany,
+      },
     })
-    await pinTenantId(conn.tenantId)
+    if (!bound.ok) {
+      await logTenantRefusal('binding-race', bound.error)
+      return { success: false, error: bound.error }
+    }
 
     return { success: true, tenantName: conn.tenantName }
   } catch (e) {
@@ -525,6 +691,11 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
         // It is also how a pre-existing connection FILLS IN its record without a reconnect: the JWT
         // fallback reads the grant off the new access token.
         grantedScopes: scopesFromTokenResponse(data) ?? token.grantedScopes,
+        // A refresh talks only to the identity endpoint — it learns nothing new about the organisation,
+        // so carry the recorded demo status forward. Overwriting it with null would turn a connection
+        // this instance HAS verified back into an unverified one at the next token expiry, and under
+        // XERO_REQUIRE_DEMO_ORG that is an outage roughly every 30 minutes.
+        tenantIsDemo: token.tenantIsDemo,
       })
 
       return { accessToken: data.access_token, tenantId: token.tenantId }
@@ -646,14 +817,13 @@ export async function isConnected(): Promise<{
   const token = await readStoredToken()
   if (!token) return { connected: false }
 
-  const summary = { tenantId: token.tenantId, tenantName: token.tenantName }
-  const allowList = readXeroTenantAllowList()
-  if (!isXeroTenantAllowed(summary, allowList)) {
+  const blockedReason = storedXeroConnectionRefusal(storedSummary(token), readXeroTenantAllowList())
+  if (blockedReason !== null) {
     return {
       connected: false,
       hasStoredToken: true,
       tenantName: token.tenantName ?? undefined,
-      blockedReason: storedTenantRefusalMessage(summary, allowList),
+      blockedReason,
     }
   }
 

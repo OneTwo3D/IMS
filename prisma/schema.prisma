@@ -2304,6 +2304,12 @@ model AccountingToken {
   // by the token endpoint. NULL = never recorded (a token stored before this existed),
   // which validation treats as UNKNOWN and lets through — not as "granted nothing".
   grantedScopes String?
+  // o3d-9tbz: Xero's own IsDemoCompany for this organisation, read from GET /Organisation at the
+  // consent that established this connection. NULL = never read (a token stored before this
+  // existed, or one that arrived inside a restored dump), which XERO_REQUIRE_DEMO_ORG treats as
+  // UNVERIFIED and refuses — not as "not a demo company", which is a different refusal with a
+  // different remedy.
+  tenantIsDemo Boolean?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

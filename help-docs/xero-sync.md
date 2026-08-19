@@ -40,6 +40,14 @@ So:
   organisations in Xero is the quicker one if you only ever want the single organisation.
 - **Once connected**, IMS pins that organisation and every later reconnect must match it, exactly as
   before. Disconnecting clears the pin.
+- **Two connections at once bind one organisation, not two.** The pin and the stored token are written
+  in a single database transaction, and the pin's key is a primary key, so if two OAuth callbacks are in
+  flight at the same time — two browser tabs, two operators, a replayed redirect — exactly one of them
+  establishes the binding. The other is refused with nothing stored: no token, no pin, no Xero data read
+  or written. Its message names the organisation that won and tells you to disconnect on `/sync` if the
+  one you chose is the one this instance should use. (Two consents to the **same** organisation both
+  report success; there is nothing wrong with a double-clicked *Connect*, and the duplicate is simply
+  discarded.)
 
 ### The organisation allow-list (`XERO_ALLOWED_TENANT_IDS`)
 
@@ -75,6 +83,7 @@ set can *remove* candidates; none of them can *add* one:
 | `XERO_BLOCKED_TENANT_IDS` | identity | Refused everywhere, checked first. |
 | `XERO_ALLOWED_TENANT_IDS` (and the deprecated `XERO_TENANT_ID`) | identity | The only key that **allows** an organisation. |
 | `XERO_ALLOWED_TENANT_NAMES` | **not** an identity | Only **narrows** what the ids already chose. |
+| `XERO_REQUIRE_DEMO_ORG` | identity, but **not an id** | Narrows to Xero **demo** organisations, using Xero's own flag. |
 
 Consequences worth knowing before you configure this:
 
@@ -91,24 +100,50 @@ Consequences worth knowing before you configure this:
   in `XERO_ALLOWED_TENANT_NAMES` at all — use its id.
 - **Do not use a name as your only tenant control.** IMS records
   `xero_tenant_guard_name_only` in the activity log when you do, because that configuration has no
-  anchor a rename cannot move.
+  anchor a rename cannot move. `XERO_REQUIRE_DEMO_ORG=true` counts as an anchor and clears the warning:
+  Xero asserts it, and the organisation's own administrators cannot.
 
-#### When the connected organisation's id keeps changing (`XERO_BLOCKED_TENANT_IDS`)
+- `XERO_REQUIRE_DEMO_ORG` **narrows like a name and anchors like an id**. It can never admit an
+  organisation the ids exclude; it can only remove non-demo organisations from what the other keys
+  already allowed.
+
+#### When the connected organisation's id keeps changing (`XERO_REQUIRE_DEMO_ORG`)
 
 Xero re-creates its **Demo company with a new tenantId** at every ~28-day reset, and any test
 organisation you rebuild behaves the same way. An id *allow*-list then has to be re-edited every cycle,
 which is exactly how a safety control ends up switched off.
 
-Block the **live** organisation instead. Its id is the stable one:
+**Require a demo organisation instead.** Xero's own `GET /Organisation` reports `IsDemoCompany` for the
+organisation behind a token, and that is a fact about how the organisation was *created*: unlike a name
+it cannot be adopted by renaming, and unlike an id it does not change when the Demo company is rebuilt.
 
 ```
-XERO_BLOCKED_TENANT_IDS=e7fb4378-…      # the live organisation, forever
-XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)   # optional, narrows the consent to Demo
+XERO_REQUIRE_DEMO_ORG=true              # a Xero demo organisation, whatever its id this cycle
+XERO_BLOCKED_TENANT_IDS=e7fb4378-…      # belt and braces: the live organisation, forever
 ```
 
-This is identity-strength, needs no maintenance across rotations, and covers **both** paths: a consent
-that offers the live organisation cannot bind it, and a production database restored onto the rig with a
-live token in it is refused at every sync.
+This costs no extra Xero call — the connection callback already reads `GET /Organisation` to check base
+currencies — and it covers **both** paths: a consent that offers a non-demo organisation cannot bind it,
+and a production database restored onto the rig is refused at every sync, because the demo status is
+recorded on the stored connection and re-checked on every use of it.
+
+> **A deny-list alone does not restrict you to a demo organisation.** `XERO_BLOCKED_TENANT_IDS` refuses
+> the organisations you thought to list. A **third** organisation — a bookkeeper's sandbox, a second
+> company, anything else the person authorising the connection can reach — is neither blocked nor
+> allow-listed, so it connects. `XERO_ALLOWED_TENANT_NAMES` cannot close that gap either, because any
+> organisation can be renamed to `Demo Company (UK)`. Only `XERO_REQUIRE_DEMO_ORG` constrains the
+> *kind* of organisation rather than enumerating ids.
+
+**Unverified is refused, not allowed.** A stored connection whose demo status was never read — a token
+from a restored dump, or one established before you switched this key on — has no proof attached, and
+under this key an unproven demo organisation is not treated as a demo organisation. The fix is to
+disconnect on `/sync` and connect again, which re-reads the flag from Xero. Connections made *after*
+this key existed record the flag whether or not the key is switched on, so turning it on later does not
+by itself force a reconnect.
+
+A value that is neither yes nor no (`XERO_REQUIRE_DEMO_ORG=Demo Company (UK)`, say) refuses **every**
+Xero connection rather than quietly meaning "off" — a line that reads like a guard and is not one is the
+mistake `XERO_TENANT_ID` made, and it is not repeated here.
 
 After a reset the database pin still names the *retired* tenantId, so the first reconnect is refused
 with `this instance is pinned to Xero tenantId …, which this consent did not include`. **Disconnect Xero
@@ -131,9 +166,12 @@ What it does when set:
 3. **Over the database pin** — the environment wins. A pin restored from another environment cannot
    smuggle its organisation past the allow-list.
 
-**Set an id-based control on every non-production instance** (e2e, staging, any restored copy) — either
-`XERO_ALLOWED_TENANT_IDS` naming the test organisation, or `XERO_BLOCKED_TENANT_IDS` naming the live one.
-Production may set `XERO_ALLOWED_TENANT_IDS` to the live organisation or leave it unset.
+**Set a control that does not depend on a name on every non-production instance** (e2e, staging, any
+restored copy): `XERO_REQUIRE_DEMO_ORG=true` when the instance uses a Xero demo organisation,
+`XERO_ALLOWED_TENANT_IDS` when it uses a specific non-demo test organisation, and
+`XERO_BLOCKED_TENANT_IDS` naming the live organisation alongside either. Production may set
+`XERO_ALLOWED_TENANT_IDS` to the live organisation or leave it unset — and must **not** set
+`XERO_REQUIRE_DEMO_ORG`, which would refuse its own ledger.
 
 Refusals are recorded in the **Activity log** (`xero_connect_refused`, `xero_stored_tenant_refused`), so
 a refusal that happened while nobody was watching the browser is still discoverable. A name-only

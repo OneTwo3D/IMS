@@ -65,11 +65,51 @@
  * spellings of one instruction, not two instructions. Only an empty intersection — each key selecting a
  * DIFFERENT organisation out of the same consent — is a genuine disagreement, and that can only be
  * decided against the connection list, so it is decided there.
+ *
+ * WHAT A DENY-LIST DOES NOT DO (the r3 finding). `XERO_BLOCKED_TENANT_IDS=<the live org>` was prescribed
+ * as the rig's whole answer to the rotating Demo tenantId, and it is not: it refuses ONE organisation.
+ * A THIRD organisation — a bookkeeper's sandbox, a second live company, an org an operator happens to
+ * also administer — is neither blocked nor named by any id, so it passes, and `XERO_ALLOWED_TENANT_NAMES`
+ * cannot close that because a name is not an identity. Blocking the live id constrains the rig AWAY FROM
+ * ONE LEDGER; it never constrained it TO a Demo organisation, and describing it as if it did was the same
+ * manufactured confidence as the phantom XERO_TENANT_ID.
+ *
+ * So `XERO_REQUIRE_DEMO_ORG=true` exists. Xero's own GET /Organisation reports `IsDemoCompany` (and
+ * `Class: DEMO`) for the organisation behind a token. That is identity-strength WITHOUT AN ID: it is
+ * asserted by Xero about how the organisation was created, not by the organisation's administrator, so
+ * unlike a name it cannot be adopted by renaming, and unlike an id it survives every ~28-day Demo
+ * rotation with no edit. It costs no extra API call on the connect path — the callback already reads
+ * GET /Organisation to compare base currencies — and it is enforced on the stored token too, from
+ * `AccountingToken.tenantIsDemo` recorded at that same callback. A stored connection whose demo status
+ * was never proven (a restored production dump, a token predating this key) is UNVERIFIED, and under
+ * this key unverified is refused: an unproven demo organisation is not a demo organisation.
+ *
+ * It is a NARROWING filter like the names, never a widening one — it can only remove candidates — but
+ * unlike the names it is an anchor, so a server that sets it is not warned about a name-only guard.
+ *
+ * THE BINDING IS ESTABLISHED IN THE DATABASE, NOT IN THIS FILE (the r3 finding on the callback). Every
+ * refusal above is computed from a snapshot — the pin as it was read moments ago — and two OAuth
+ * callbacks in flight at once both read "no pin", both pass, and the second one's write lands on top of
+ * the first. The pin is what makes a re-consent to a different organisation refuse, so a race that
+ * rewrites it defeats the guard rather than tripping it. `xeroTenantBindingRaceMessage` is the refusal
+ * for the loser of that race; the atomicity itself is a PRIMARY KEY on `settings.key` and lives in
+ * auth.ts, because no amount of checking in this file can make a check-then-write atomic.
  */
 
 export type XeroConnectionSummary = {
   tenantId: string
   tenantName?: string | null
+  /**
+   * Xero's own `IsDemoCompany` for this organisation, when it has been read from GET /Organisation.
+   *
+   * `undefined`/`null` means NOT KNOWN, and the two callers that legitimately do not know are different:
+   * GET /connections never reports it (so the whole filter chain over a consent runs without it), and a
+   * token row stored before `XERO_REQUIRE_DEMO_ORG` existed never recorded it. Under that key both are
+   * treated as unverified and refused, which is why this is deliberately not defaulted to `false`: the
+   * refusal for "Xero says this is not a demo org" and the refusal for "we never asked" have different
+   * remedies and must not be collapsed.
+   */
+  isDemoCompany?: boolean | null
 }
 
 export type XeroTenantAllowList = {
@@ -83,7 +123,16 @@ export type XeroTenantAllowList = {
   rawIds: string[]
   rawNames: string[]
   rawBlockedIds: string[]
-  /** True when at least one id, name or blocked id is configured. An empty/whitespace value is NOT configured. */
+  /**
+   * True when XERO_REQUIRE_DEMO_ORG is switched on: only a Xero DEMO organisation may be used (r3).
+   *
+   * The one control that constrains this instance to a KIND of organisation rather than to a list of
+   * ids, which is what a rig bound to Xero's Demo company actually needs — Demo's tenantId is re-issued
+   * at every ~28-day reset, and blocking the live org's id leaves every OTHER organisation admissible.
+   * Proven from Xero's own GET /Organisation, so it is not defeated by a rename the way a name is.
+   */
+  requireDemoOrg: boolean
+  /** True when at least one id, name, blocked id or the demo requirement is configured. An empty/whitespace value is NOT configured. */
   configured: boolean
   /**
    * True when NAMES are the only tenant control set — no allowed ids, no blocked ids (o3d-9tbz r2).
@@ -91,6 +140,9 @@ export type XeroTenantAllowList = {
    * An organisation name is not an identity: it is mutable, it is not unique, and "Demo Company (UK)" is
    * what Xero calls every demo company there is. A name-only configuration therefore has no anchor that
    * a rename cannot move, and IMS says so rather than letting it read as equivalent protection.
+   *
+   * XERO_REQUIRE_DEMO_ORG clears it as surely as an id does: it is an anchor Xero asserts, not one the
+   * organisation's administrator controls, so a server that sets it is not guarding by name alone.
    */
   nameOnlyGuard: boolean
   /**
@@ -133,6 +185,12 @@ export type XeroTenantRefusalReason =
   | 'pinned-not-offered'
   /** No pin, and more than one organisation is on the table. Never guess on a money path. */
   | 'ambiguous'
+  /** XERO_REQUIRE_DEMO_ORG is set and the chosen organisation is not a Xero demo company. */
+  | 'not-demo-org'
+  /** XERO_REQUIRE_DEMO_ORG is set and Xero did not tell us whether the organisation is a demo one. */
+  | 'demo-unverified'
+  /** A concurrent OAuth callback bound this instance first. The binding is decided by the database. */
+  | 'binding-race'
 
 export type XeroTenantChoice<T extends XeroConnectionSummary = XeroConnectionSummary> =
   | { ok: true; connection: T }
@@ -162,6 +220,23 @@ function splitEnvList(raw: string | undefined): string[] {
     .filter((entry) => entry.length > 0)
 }
 
+/**
+ * A switch that is either ON, OFF, or a value we refuse to guess at.
+ *
+ * Returning `false` for an unrecognised value is how XERO_TENANT_ID happened: a line in the .env that
+ * reads like a guard, and no guard. `XERO_REQUIRE_DEMO_ORG=demo` or `=Demo Company (UK)` is somebody
+ * reaching for this control and missing, so it is a conflict — the one outcome that cannot be mistaken
+ * for protection — rather than a silent off.
+ */
+function readEnvSwitch(raw: string | undefined): { value: boolean; malformed: string | null } {
+  const text = (raw ?? '').trim()
+  if (text.length === 0) return { value: false, malformed: null }
+  const lowered = text.toLowerCase()
+  if (['1', 'true', 'yes', 'on'].includes(lowered)) return { value: true, malformed: null }
+  if (['0', 'false', 'no', 'off'].includes(lowered)) return { value: false, malformed: null }
+  return { value: false, malformed: text }
+}
+
 function normaliseId(value: string): string {
   return value.trim().toLowerCase()
 }
@@ -188,6 +263,7 @@ export function readXeroTenantAllowList(env: Record<string, string | undefined> 
   const rawNames = splitEnvList(env.XERO_ALLOWED_TENANT_NAMES)
   const rawBlockedIds = splitEnvList(env.XERO_BLOCKED_TENANT_IDS)
   const legacyTenantId = (env.XERO_TENANT_ID ?? '').trim() || null
+  const demoSwitch = readEnvSwitch(env.XERO_REQUIRE_DEMO_ORG)
 
   // XERO_TENANT_ID is the deprecated spelling of a one-entry XERO_ALLOWED_TENANT_IDS. It is honoured
   // ONLY when it is the sole IDENTITY setting; where both are present they must agree exactly, and any
@@ -201,7 +277,15 @@ export function readXeroTenantAllowList(env: Record<string, string | undefined> 
   // id name the same organisation is only answerable against a real connection list, so it is answered
   // in selectXeroTenant instead of guessed here.
   let conflict: string | null = null
-  if (legacyTenantId && rawIds.length > 0) {
+  if (demoSwitch.malformed !== null) {
+    conflict =
+      `Refused: this server's Xero tenant settings cannot be read. XERO_REQUIRE_DEMO_ORG=`
+      + `${demoSwitch.malformed} is not a yes/no value, and IMS will not decide for itself whether a `
+      + 'switch it cannot read was meant to be on. No Xero request was made and nothing was stored. Set '
+      + 'XERO_REQUIRE_DEMO_ORG=true to restrict this instance to a Xero DEMO organisation, or delete the '
+      + 'line entirely to place no such restriction, and restart IMS.'
+  }
+  if (!conflict && legacyTenantId && rawIds.length > 0) {
     const equivalent = rawIds.length === 1 && normaliseId(rawIds[0]) === normaliseId(legacyTenantId)
     if (!equivalent) {
       conflict =
@@ -241,8 +325,10 @@ export function readXeroTenantAllowList(env: Record<string, string | undefined> 
     rawIds: effectiveRawIds,
     rawNames,
     rawBlockedIds,
-    configured: effectiveRawIds.length > 0 || rawNames.length > 0 || blockedIds.length > 0,
-    nameOnlyGuard: rawNames.length > 0 && effectiveRawIds.length === 0 && blockedIds.length === 0,
+    requireDemoOrg: demoSwitch.value,
+    configured: effectiveRawIds.length > 0 || rawNames.length > 0 || blockedIds.length > 0 || demoSwitch.value,
+    nameOnlyGuard: rawNames.length > 0 && effectiveRawIds.length === 0 && blockedIds.length === 0
+      && !demoSwitch.value,
     legacyTenantId,
     conflict,
   }
@@ -301,6 +387,7 @@ function describeAllowList(allowList: XeroTenantAllowList): string {
   }
   if (allowList.rawNames.length) parts.push(`XERO_ALLOWED_TENANT_NAMES=${allowList.rawNames.join(',')}`)
   if (allowList.rawBlockedIds.length) parts.push(`XERO_BLOCKED_TENANT_IDS=${allowList.rawBlockedIds.join(',')}`)
+  if (allowList.requireDemoOrg) parts.push('XERO_REQUIRE_DEMO_ORG=true (a Xero DEMO organisation only)')
   return parts.length ? parts.join(' and ') : '(nothing)'
 }
 
@@ -363,8 +450,134 @@ export function nameOnlyGuardWarning(allowList: XeroTenantAllowList): string {
     + `and anyone administering an organisation can rename it, so a different organisation that shares or `
     + `adopts that name would pass this check. Add an id-based control: XERO_ALLOWED_TENANT_IDS=<the `
     + `tenantId this instance may use>, or — on a test rig bound to Xero's Demo company, whose tenantId is `
-    + `re-issued at every ~28-day reset — XERO_BLOCKED_TENANT_IDS=<the live organisation's tenantId>, `
-    + `which never needs updating.`
+    + `re-issued at every ~28-day reset — XERO_REQUIRE_DEMO_ORG=true, which pins this instance to a Xero `
+    + `DEMO organisation by Xero's own IsDemoCompany flag rather than by an id, so it needs no updating `
+    + `at all. XERO_BLOCKED_TENANT_IDS=<the live organisation's tenantId> is worth adding alongside it, `
+    + `but on its own it only fences out that ONE organisation — any third organisation would still pass.`
+  )
+}
+
+
+/**
+ * Whether the organisation behind a token satisfies XERO_REQUIRE_DEMO_ORG (o3d-9tbz r3).
+ *
+ * Kept OUT of `xeroTenantVerdict` on purpose. That function runs over GET /connections, which does not
+ * report `IsDemoCompany` at all, so folding this in would make every organisation on every consent
+ * "unverified" and refuse first-time setup outright. Demo-ness is a fact about the ORGANISATION, read
+ * from GET /Organisation once the tenant has been chosen, and it is checked there.
+ */
+export type XeroDemoOrgVerdict = 'not-required' | 'demo' | 'not-demo' | 'unverified'
+
+export function xeroDemoOrgVerdict(
+  allowList: XeroTenantAllowList,
+  isDemoCompany: boolean | null | undefined,
+): XeroDemoOrgVerdict {
+  if (!allowList.requireDemoOrg) return 'not-required'
+  if (isDemoCompany === true) return 'demo'
+  if (isDemoCompany === false) return 'not-demo'
+  return 'unverified'
+}
+
+/** The shared tail: how to stop requiring a demo organisation, for an operator who meant a real one. */
+const DEMO_REQUIREMENT_OPT_OUT =
+  'or — if this server is genuinely meant to use a real organisation — delete the XERO_REQUIRE_DEMO_ORG '
+  + 'line from the server .env and restart IMS.'
+
+/**
+ * Refuse a CONSENT whose chosen organisation is not (provably) a Xero demo company.
+ *
+ * `unverified` gets its own sentence because it has a different remedy from `not-demo`: nothing is wrong
+ * with the operator's choice, IMS simply could not read the evidence, and telling them to "choose the
+ * Demo company" when they already did would send them round the same loop.
+ */
+export function demoOrgConnectRefusal(
+  connection: XeroConnectionSummary,
+  verdict: XeroDemoOrgVerdict,
+): string {
+  const who = describeXeroConnections([connection])
+  if (verdict === 'not-demo') {
+    return (
+      `Refused: this server is restricted to a Xero DEMO organisation (XERO_REQUIRE_DEMO_ORG=true), and `
+      + `${who} is not one — Xero's own GET /Organisation reports IsDemoCompany=false for it. Nothing was `
+      + 'stored and no Xero data was written. Re-authorise IMS (My Xero → Connected apps, then connect '
+      + `again on /sync) choosing your Demo Company, ${DEMO_REQUIREMENT_OPT_OUT}`
+    )
+  }
+  return (
+    `Refused: this server is restricted to a Xero DEMO organisation (XERO_REQUIRE_DEMO_ORG=true), and IMS `
+    + `could not read whether ${who} is one — Xero's GET /Organisation returned no IsDemoCompany flag for `
+    + 'it. An organisation whose demo status is unproven is not treated as proven, so nothing was stored '
+    + `and no Xero data was written. Try connecting again; if it keeps failing, ${DEMO_REQUIREMENT_OPT_OUT}`
+  )
+}
+
+/**
+ * Refuse a STORED token under the same requirement — the restored-dump half, where no callback runs.
+ *
+ * A production dump restored onto the rig arrives with a live token whose `tenantIsDemo` is either false
+ * (recorded elsewhere) or absent (never recorded), and both must stop the sync. The remedy is a
+ * reconnect, because the callback is the only place the claim can be checked against Xero.
+ */
+export function demoOrgStoredRefusal(
+  stored: XeroConnectionSummary,
+  verdict: XeroDemoOrgVerdict,
+): string {
+  const who = describeXeroConnections([stored])
+  const why = verdict === 'not-demo'
+    ? `${who}, which Xero reports is NOT a demo organisation`
+    : `${who}, and this instance has never verified with Xero that it is a demo organisation — a token `
+      + 'stored by another environment, or before this restriction was switched on, carries no such proof'
+  return (
+    `Xero sync is halted: this server is restricted to a Xero DEMO organisation `
+    + `(XERO_REQUIRE_DEMO_ORG=true) but the stored connection is to ${why}. No Xero request was made. `
+    + 'Disconnect Xero on /sync and connect again — the demo status is re-read from Xero at the consent — '
+    + `${DEMO_REQUIREMENT_OPT_OUT} This usually means a database from another environment was restored `
+    + 'here with its Xero token still in it.'
+  )
+}
+
+/**
+ * Every reason a STORED connection is unusable, in one place — or null when it is fine.
+ *
+ * The stored token is read from three call sites (the sync path, /sync's connection status, and the
+ * reason the api layer substitutes for "Not connected to Xero"). They had already drifted once; adding a
+ * second refusal condition to each of them independently is how they drift again, so the whole question
+ * is answered here and the call sites ask it once.
+ */
+export function storedXeroConnectionRefusal(
+  stored: XeroConnectionSummary,
+  allowList: XeroTenantAllowList,
+): string | null {
+  if (!isXeroTenantAllowed(stored, allowList)) return storedTenantRefusalMessage(stored, allowList)
+  const demoVerdict = xeroDemoOrgVerdict(allowList, stored.isDemoCompany)
+  if (demoVerdict === 'not-demo' || demoVerdict === 'unverified') {
+    return demoOrgStoredRefusal(stored, demoVerdict)
+  }
+  return null
+}
+
+/**
+ * The loser of a concurrent-callback race, told what happened and what is actually connected now.
+ *
+ * Two OAuth callbacks in flight at once both read "no pin" and both pass every check in this file,
+ * because every check in this file is computed from a snapshot. The database decides which one binds —
+ * `settings.key` is a primary key, so exactly one INSERT of the pin can succeed — and this is what the
+ * other one is told. The remedy is a DISCONNECT rather than "try again": trying again would find the
+ * winner's pin and be refused as pinned-not-offered, which is a true message about the wrong problem.
+ */
+export function xeroTenantBindingRaceMessage(params: {
+  attempted: XeroConnectionSummary
+  boundTo: XeroConnectionSummary
+}): string {
+  const { attempted, boundTo } = params
+  return (
+    `Refused: another Xero connection finished first and bound this instance to `
+    + `${describeXeroConnections([boundTo])}. Your consent selected `
+    + `${describeXeroConnections([attempted])}, and nothing from it was stored — no token, no pin, and no `
+    + 'Xero data was read or written. IMS binds to ONE organisation and will not move that binding '
+    + 'underneath a connection that is already established. If the organisation you chose is the one '
+    + 'this instance should use, disconnect Xero on /sync — which clears the binding — and connect '
+    + 'again, with only one connection in flight at a time.'
   )
 }
 

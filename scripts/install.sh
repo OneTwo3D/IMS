@@ -676,11 +676,14 @@ XERO_TOKEN_PATH=${DATA_DIR}/xero/token.json
 # tenant control that survives a database reset. A tenantId is an identity; an
 # organisation NAME is not (Xero names are neither unique nor fixed), so
 # XERO_ALLOWED_TENANT_NAMES only NARROWS the ids and must not be the only control.
-# On a test rig, XERO_BLOCKED_TENANT_IDS=<the live org's id> is the one that needs no
-# maintenance when the test organisation is re-created with a new tenantId.
+# On a test rig connected to Xero's Demo company, XERO_REQUIRE_DEMO_ORG=true is the
+# control to set: it is proven from Xero's own IsDemoCompany flag, so it needs no
+# maintenance when the Demo organisation is re-created with a new tenantId AND it does
+# not have to enumerate organisations in advance the way a deny-list does.
 # XERO_ALLOWED_TENANT_IDS=
 # XERO_BLOCKED_TENANT_IDS=
 # XERO_ALLOWED_TENANT_NAMES=
+# XERO_REQUIRE_DEMO_ORG=false
 
 CRON_SECRET=${CRON_SECRET}
 NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}
