@@ -105,9 +105,14 @@ import { liveDailyBatchDeferralWhere } from '@/lib/domain/accounting/daily-batch
 import { buildDiscountRestatement } from '@/lib/domain/accounting/discount-restatement'
 
 import { resolveWcOrderLevelDiscount } from './field-mapping'
+import { readPostedInvoiceOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
+
 import {
+  buildWcCouponDocumentPosition,
   buildWcCouponLedgerHandoff,
+  describeWcCouponDocumentPosition,
   isWcCouponOrderRefunded,
+  sameWcCouponDocumentPosition,
   wcCouponRemedySteps,
   wcCouponNetClaimSteps,
   type WcCouponLedgerHandoff,
@@ -1089,6 +1094,19 @@ export type WcCouponCorrectionResult =
        * is consequently no document to classify. See `coupon-discount-ledger-handoff.ts`.
        */
       handoff: WcCouponLedgerHandoff | null
+      /**
+       * THE DURABLE RECORD THIS CORRECTION WROTE (o3d-y14 r11 finding 2).
+       *
+       * Returned so the pre-print re-validation can RETRACT the claims in it when the position it
+       * described has moved. The ActivityLog entry is what somebody reads back weeks later; a
+       * console line that has scrolled away is not. Correcting only the printed output leaves the
+       * permanent record asserting a netting nobody would compute today.
+       *
+       * NULL for `stampWcCouponDiscountModel`, which writes a record that asserts no position: it
+       * changes no amount, derives no handoff and prescribes nothing, so there is nothing in it a
+       * later movement could falsify.
+       */
+      activityLogId: string | null
     }
   | {
       outcome: 'DECLINED'
@@ -1157,6 +1175,30 @@ async function readLivePostedEvidence(
     refunds: Array<{ id: string; accountingCreditNoteId: string | null }>
   },
 ): Promise<WcCouponPostedEvidence> {
+  return {
+    ...(await readLiveInvoiceEvidence(tx, orderId, order)),
+    refunds: await readLiveRefundEvidence(tx, orderId, order),
+  }
+}
+
+/**
+ * The INVOICE half of that evidence, split out for r11 finding 1.
+ *
+ * The re-validation that runs before a handoff is printed needs the invoice side on its own — it
+ * reads the refund side separately and must not issue the credit-note queries twice. Splitting the
+ * function rather than copying its query is the same rule the rest of this module follows: one
+ * derivation, two callers, so the two can never drift into disagreeing about what "the ledger holds
+ * this" means.
+ */
+async function readLiveInvoiceEvidence(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  order: {
+    accountingInvoiceId: string | null
+    revenueDeferredBatchRef: string | null
+    unearnedRevenueAmount: unknown
+  },
+): Promise<Omit<WcCouponPostedEvidence, 'refunds'>> {
   const syncedInvoices = await tx.accountingSyncLog.findMany({
     where: {
       referenceType: 'SalesOrder',
@@ -1177,7 +1219,6 @@ async function readLivePostedEvidence(
       order.unearnedRevenueAmount === null || order.unearnedRevenueAmount === undefined
         ? null
         : money(order.unearnedRevenueAmount as DecimalInput),
-    refunds: await readLiveRefundEvidence(tx, orderId, order),
   }
 }
 
@@ -1574,7 +1615,8 @@ export async function applyWcCouponCorrection(
       })
     : null
 
-  await tx.activityLog.create({
+  const logged = await tx.activityLog.create({
+    select: { id: true },
     data: {
       entityType: 'SYNC',
       entityId: entry.orderId,
@@ -1676,7 +1718,7 @@ export async function applyWcCouponCorrection(
     },
   })
 
-  return { outcome: 'CORRECTED', posted, handoff }
+  return { outcome: 'CORRECTED', posted, handoff, activityLogId: logged.id }
 }
 
 /**
@@ -1756,13 +1798,26 @@ export async function reprintWcCouponLedgerHandoff(
  * been refunded, and nothing revalidates it — not even before it is printed, because every
  * correction runs before anything is printed at all.
  *
- * WHAT THIS DOES, AND WHAT IT HONESTLY CANNOT. It re-reads the refund position OUTSIDE the
- * correction's transaction, immediately before the handoff is shown, and INVALIDATES any remedy
- * whose position has moved. That narrows the window from "the whole run" to "between this read and
- * that line reaching the operator's eye", which is as far as software on this side of a committed
- * transaction can go. The remainder is closed by `WcCouponRemedy`'s own precondition line, which
+ * WHAT THIS DOES, AND WHAT IT HONESTLY CANNOT. It re-reads the position OUTSIDE the correction's
+ * transaction, immediately before the handoff is shown, and INVALIDATES any remedy whose position
+ * has moved. That narrows the window from "the whole run" to "between this read and that line
+ * reaching the operator's eye", which is as far as software on this side of a committed transaction
+ * can go. The remainder is closed by `WcCouponRemedy`'s own precondition line, which
  * `wcCouponRemedySteps` prints FIRST and which no remedy can be rendered without: the operator is
  * told the exact position the instruction depends on and to re-check it before posting.
+ *
+ * BOTH SIDES OF THE POSITION, NOT JUST THE REFUNDS (o3d-y14 r11 finding 1). The first revision
+ * watched the refund side alone, because that is the side r7's finding named. The property is not
+ * about refunds: A REMEDY MUST DESCRIBE THE LEDGER AS IT IS WHEN THE OPERATOR READS IT, OR
+ * WITHDRAW. An invoice voided and re-posted in Xero, a second sales invoice raised against the
+ * order, or a back-reference repair attaching an id nobody had (o3d-9kek) all land in the same
+ * window and all leave the printed remedy describing a document set that has moved. So the whole
+ * invoice-side position travels on the handoff (`WcCouponDocumentPosition`) and is compared here as
+ * a value, exactly as the refund position already was.
+ *
+ * AND THE WITHDRAWAL REACHES THE DURABLE RECORD (o3d-y14 r11 finding 2). Correcting the console
+ * output and leaving the ActivityLog asserting the pre-withdrawal net is correcting the copy that
+ * scrolls away and not the copy anybody reads later. See `retractWcCouponHandoffClaims`.
  *
  * SUPERSEDING IS NOT A REFUSAL. The amount has already been corrected and that correction is right
  * either way — the coupon was duplicated whatever happened afterwards. What is withdrawn is the
@@ -1779,36 +1834,168 @@ export type WcCouponHandoffRevalidation =
   | { outcome: 'CURRENT'; handoff: WcCouponLedgerHandoff }
   | { outcome: 'SUPERSEDED'; handoff: WcCouponLedgerHandoff; detail: string }
 
+export type WcCouponRevalidationClient = Pick<
+  Prisma.TransactionClient,
+  'salesOrder' | 'accountingSyncLog' | 'shoppingSyncLog' | 'accountingEvent' | 'activityLog'
+>
+
 export async function revalidateWcCouponHandoff(
-  client: Pick<Prisma.TransactionClient, 'salesOrder' | 'accountingSyncLog' | 'shoppingSyncLog'>,
+  client: WcCouponRevalidationClient,
   orderId: string,
   handoff: WcCouponLedgerHandoff,
+  /**
+   * The ActivityLog row `applyWcCouponCorrection` wrote for this order (r11 finding 2). Passing it
+   * is what lets a withdrawal reach the DURABLE record as well as the printed one. Omitted by
+   * callers that never wrote one — nothing is retracted then, and nothing was asserted either.
+   */
+  options: { activityLogId?: string | null } = {},
 ): Promise<WcCouponHandoffRevalidation> {
   const order = await client.salesOrder.findUnique({
     where: { id: orderId },
-    select: { refundStatus: true, refunds: { select: { id: true, accountingCreditNoteId: true } } },
+    select: {
+      // r11 finding 1. The invoice side is re-derived here too, and the mirrored-document read is
+      // denominated in the ORDER's currency — so it is read live rather than carried from the file.
+      currency: true,
+      accountingInvoiceId: true,
+      revenueDeferredBatchRef: true,
+      unearnedRevenueAmount: true,
+      refundStatus: true,
+      refunds: { select: { id: true, accountingCreditNoteId: true } },
+    },
   })
   if (!order) {
-    return {
-      outcome: 'SUPERSEDED',
-      handoff: withdrawRemedy(
-        handoff,
-        'the order could not be re-read after the correction committed, so the refund position this ' +
-          'remedy depends on cannot be confirmed',
-      ),
-      detail: 'order could not be re-read',
-    }
+    const detail =
+      'the order could not be re-read after the correction committed, so neither the refund position ' +
+      'nor the ledger position this remedy depends on can be confirmed'
+    const withdrawn = withdrawRemedy(handoff, detail)
+    await retractWcCouponHandoffClaims(client, options.activityLogId, withdrawn, detail)
+    return { outcome: 'SUPERSEDED', handoff: withdrawn, detail: 'order could not be re-read' }
   }
 
-  const live = await readLiveRefundEvidence(client as Prisma.TransactionClient, orderId, order)
-  if (sameWcCouponRefundEvidence(live, handoff.refunds)) {
-    return { outcome: 'CURRENT', handoff }
+  const tx = client as Prisma.TransactionClient
+  // BOTH SIDES ARE COMPARED, AND BOTH ARE REPORTED. Stopping at the first difference would tell an
+  // operator that a refund landed on an order whose invoice had ALSO been re-posted, and send them
+  // to look at half of what moved.
+  const moved: string[] = []
+
+  const liveRefunds = await readLiveRefundEvidence(tx, orderId, order)
+  if (!sameWcCouponRefundEvidence(liveRefunds, handoff.refunds)) {
+    moved.push(
+      `the REFUND position is now ${describeWcCouponRefundEvidence(liveRefunds)}, not the ` +
+        `${describeWcCouponRefundEvidence(handoff.refunds)} this handoff was derived from`,
+    )
   }
+
+  // r11 finding 1 — THE INVOICE SIDE MOVES TOO.
+  //
+  // r7 gave this treatment to the refund side alone, because that is the side its finding named. The
+  // property is not about refunds: a remedy must describe the ledger AS IT IS WHEN THE OPERATOR
+  // READS IT, or withdraw. A document voided and re-posted in Xero, a second invoice raised against
+  // the order, or a back-reference repair attaching an id nobody had (o3d-9kek) all land after the
+  // correction commits and all leave the printed instruction naming a document set that has moved.
+  //
+  // Read through the SAME two functions the handoff was derived from, so "the position" means one
+  // thing on both sides of the comparison.
+  const liveInvoice = await readLiveInvoiceEvidence(tx, orderId, order)
+  const liveDocument = await readPostedInvoiceOrderDiscount(client, { id: orderId, currency: order.currency })
+  const liveDocuments = buildWcCouponDocumentPosition(liveDocument, {
+    currency: order.currency,
+    evidence: { ...liveInvoice, refunds: liveRefunds },
+  })
+  if (!sameWcCouponDocumentPosition(liveDocuments, handoff.documents)) {
+    moved.push(
+      `the INVOICE-SIDE ledger position is now ${describeWcCouponDocumentPosition(liveDocuments)}, ` +
+        `not the ${describeWcCouponDocumentPosition(handoff.documents)} this handoff was derived from`,
+    )
+  }
+
+  if (moved.length === 0) return { outcome: 'CURRENT', handoff }
+
   const detail =
-    `the refund position for this order is now ${describeWcCouponRefundEvidence(live)}, not the ` +
-    `${describeWcCouponRefundEvidence(handoff.refunds)} this handoff was derived from — it moved ` +
-    'AFTER the correction committed, so any remedy derived from the earlier position is withdrawn'
-  return { outcome: 'SUPERSEDED', handoff: withdrawRemedy(handoff, detail), detail }
+    `${moved.join('; AND ')} — ${moved.length > 1 ? 'they' : 'it'} moved AFTER the correction ` +
+    'committed, so any remedy or netted conclusion derived from the earlier position is withdrawn, ' +
+    'and the FACTS printed for this order describe the ledger as it stood at that moment rather ' +
+    'than as it stands now'
+  const withdrawn = withdrawRemedy(handoff, detail)
+  await retractWcCouponHandoffClaims(client, options.activityLogId, withdrawn, detail)
+  return { outcome: 'SUPERSEDED', handoff: withdrawn, detail }
+}
+
+/**
+ * o3d-y14 r11 finding 2 — THE WITHDRAWAL HAS TO REACH THE DURABLE RECORD.
+ *
+ * THE DEFECT. `applyWcCouponCorrection` writes its ActivityLog entry inside the correction
+ * transaction, and that entry carries the whole derived position: `netPosition`, `remedyKind`,
+ * `remedyAmount`, `handoffLines`, `needsAccountingAction`. The re-validation then corrected the
+ * PRINTED output and left that row exactly as it was — so a run could withdraw "THE TWO ERRORS
+ * CANCEL … there is NO ACCOUNTING ACTION" from the console while the permanent record went on
+ * asserting `netPosition: { net: 0 }` and `needsAccountingAction: false`. The console scrolls away.
+ * The record is what somebody reads in six weeks, and r10's rule — no netting claim reaches an
+ * operator except from a netting that ran — governs it exactly as it governs the printed line.
+ *
+ * WHAT IT WRITES. The claims are RETRACTED, not deleted: `netPosition` and the remedy fields go to
+ * NULL (which is already this schema's durable statement for "never established"),
+ * `needsAccountingAction` is forced TRUE, `handoffLines` becomes the withdrawn text — and everything
+ * the row used to say is preserved verbatim under `withdrawn`, together with why and when. Nothing
+ * is lost and nothing that was falsified is left standing.
+ *
+ * WHY IT IS AN UPDATE AND NOT A SECOND ROW. A second row only helps a reader who thinks to look for
+ * one. The claim and its retraction have to be the same statement, or the first row goes on being
+ * read on its own — which is the defect.
+ *
+ * IDEMPOTENT. A row already carrying `withdrawn` is left alone, so the per-print pass cannot
+ * overwrite the first withdrawal's snapshot with an already-retracted one.
+ */
+async function retractWcCouponHandoffClaims(
+  client: Pick<Prisma.TransactionClient, 'activityLog'>,
+  activityLogId: string | null | undefined,
+  withdrawn: WcCouponLedgerHandoff,
+  detail: string,
+): Promise<void> {
+  if (!activityLogId) return
+  const existing = await client.activityLog.findUnique({
+    where: { id: activityLogId },
+    select: { description: true, metadata: true },
+  })
+  if (!existing) return
+  const metadata =
+    existing.metadata && typeof existing.metadata === 'object' && !Array.isArray(existing.metadata)
+      ? (existing.metadata as Record<string, unknown>)
+      : {}
+  if (metadata.withdrawn) return
+  await client.activityLog.update({
+    where: { id: activityLogId },
+    data: {
+      // PREPENDED, not appended. The original sentence opens with the headline an activity feed
+      // renders and a reader skims — "NO ACCOUNTING ACTION REQUIRED" on precisely the orders whose
+      // conclusion is being withdrawn. A retraction bolted onto the end of that leaves the claim
+      // first and the correction after however many hundred characters the row happens to hold.
+      description:
+        `WITHDRAWN — ${detail}. AS ORIGINALLY RECORDED, at the moment of the correction: ` +
+        `${existing.description ?? '(no description)'}`,
+      metadata: {
+        ...metadata,
+        // The three fields that CLAIM something an operator would act on. NULL is this schema's
+        // durable statement that the claim was never established (r10 finding 1), which is now the
+        // truth: the position it was established against no longer exists.
+        netPosition: null,
+        remedyKind: null,
+        remedyAmount: null,
+        handoffLines: withdrawn.lines,
+        // A position nobody can currently vouch for is exactly a position a human has to look at.
+        needsAccountingAction: true,
+        withdrawn: {
+          at: new Date().toISOString(),
+          detail,
+          supersededNetPosition: metadata.netPosition ?? null,
+          supersededRemedyKind: metadata.remedyKind ?? null,
+          supersededRemedyAmount: metadata.remedyAmount ?? null,
+          supersededHandoffLines: metadata.handoffLines ?? null,
+          supersededNeedsAccountingAction: metadata.needsAccountingAction ?? null,
+        },
+      } as Prisma.InputJsonValue,
+    },
+  })
 }
 
 /**
@@ -1966,5 +2153,5 @@ export async function stampWcCouponDiscountModel(
   // nothing in the ledger has been made inconsistent and there is no manual adjustment to report.
   // Reporting posted documents here would put orders on the operator's must-fix list that this run
   // gave them no reason to fix. `handoff: null` follows for the same reason.
-  return { outcome: 'CORRECTED', posted: null, handoff: null }
+  return { outcome: 'CORRECTED', posted: null, handoff: null, activityLogId: null }
 }

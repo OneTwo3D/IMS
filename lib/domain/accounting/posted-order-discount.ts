@@ -97,7 +97,9 @@ import { readDiscountRestatement, restatementHadPostedInvoice } from './discount
  *   - several POSTED events are possible only with distinct (or NULL) external ids, i.e. distinct
  *     documents rather than revisions of one. They are all read: if they agree, that agreement is
  *     the posted figure whichever of them the credit note reverses; if they disagree, no ordering
- *     available here says which is current, so this REFUSES.
+ *     available here says which is current, so this REFUSES — and the refusal NAMES every one of
+ *     them (r11 finding 3), because "several documents disagree" is precisely the answer an
+ *     operator can act on only by opening them, and it says nothing about which.
  *
  * WHAT AGREEMENT DOES AND DOES NOT ESTABLISH (r8 finding 2). The agreement rule above answers the
  * RESOLVER's question — a credit note that mirrors one of these documents reverses this figure
@@ -365,6 +367,21 @@ export type PostedInvoiceOrderDiscount =
        * document", and every branch of a read-it-then-choose ladder ends in an instrument.
        */
       documentCount?: number
+      /**
+       * THE EXTERNAL ID OF EVERY DISAGREEING DOCUMENT, newest first (o3d-y14 r11 finding 3).
+       *
+       * r10 made the SUCCESS variant's reference plural so no call site could name one of several
+       * agreeing documents. The refusal kept only a COUNT — and disagreement is the case where the
+       * identifiers matter MOST: agreeing documents can be reasoned about collectively, whereas
+       * "2 posted documents carry different order-level discounts" tells an operator that they must
+       * open the documents and nothing whatever about WHICH ones. `documentCount` minus this
+       * array's length is the number that exist and record no external id (o3d-9kek), which is a
+       * fact to state rather than round away — exactly as on the success variant.
+       *
+       * Set by the same one branch that sets `documentCount`. Absent everywhere else, and absence
+       * is "not established", never "there are none".
+       */
+      externalIds?: string[]
     }
 
 export async function readPostedInvoiceOrderDiscount(
@@ -424,16 +441,32 @@ export async function readPostedInvoiceOrderDiscount(
     amounts.push(read.amount)
     bases.push(read.taxBasis)
   }
-  const distinct = [...new Set(amounts)]
+  // SORTED, so the refusal below reads the same on every re-read of the same rows. The netting and
+  // the revalidation compare these refusals as VALUES (r11 finding 1), and a message whose numbers
+  // arrive in row order would report a ledger that "moved" whenever the query came back the other
+  // way round. Sorting decides nothing here — the success path needs exactly one distinct amount.
+  const distinct = [...new Set(amounts)].sort((left, right) => left - right)
+  // Newest first, in the order the documents were read — the same order the success variant reports.
+  const externalIds = documents.map((document) => document.externalId).filter((id): id is string => id !== null)
   if (distinct.length > 1) {
+    // r11 finding 3. The identifiers travel with the refusal: an operator told that several
+    // documents disagree can do nothing at all with that unless they know which ones to open.
+    const unnamed = documents.length - externalIds.length
+    const named = [
+      externalIds.length ? externalIds.join(', ') : null,
+      unnamed > 0 ? `${unnamed} that record NO external id and cannot be named from here` : null,
+    ]
+      .filter(Boolean)
+      .join(', and ')
     return {
       ok: false,
       reason: 'UNRECOVERABLE',
       detail:
-        `${documents.length} posted documents exist for this order and they carry different ` +
-        `order-level discounts (${distinct.join(', ')} ${order.currency}); nothing here says which ` +
-        'one a credit note now reverses',
+        `${documents.length} posted documents exist for this order (${named}) and they carry ` +
+        `different order-level discounts (${distinct.join(', ')} ${order.currency}); nothing here ` +
+        'says which one a credit note now reverses',
       documentCount: documents.length,
+      externalIds,
     }
   }
   const [newest] = documents
@@ -450,7 +483,7 @@ export async function readPostedInvoiceOrderDiscount(
     externalSystem: newest.externalSystem,
     documentCount: documents.length,
     // Newest first, in the same order the documents were read. r10 finding 2.
-    externalIds: documents.map((document) => document.externalId).filter((id): id is string => id !== null),
+    externalIds,
     taxBasis: distinctBases.length === 1 ? distinctBases[0] : 'MIXED',
   }
 }

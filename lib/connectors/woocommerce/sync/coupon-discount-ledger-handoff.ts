@@ -2,6 +2,7 @@ import {
   readPostedInvoiceOrderDiscount,
   type PostedInvoiceEventClient,
   type PostedInvoiceOrderDiscount,
+  type PostedInvoiceTaxBasis,
 } from '@/lib/domain/accounting/posted-order-discount'
 import {
   readCreditNoteOrderDiscount,
@@ -240,6 +241,161 @@ export function isWcCouponOrderRefunded(refunds: WcCouponRefundEvidence): boolea
 }
 
 /**
+ * THE INVOICE SIDE OF THE LEDGER AS IT STOOD WHEN THIS HANDOFF WAS DERIVED (o3d-y14 r11 finding 1).
+ *
+ * THE DEFECT IT CLOSES. r7 finding 2 established that a remedy printed to a console is a LIVE
+ * directional instruction, worked through by a human minutes or hours after the transaction that
+ * produced it committed — so it is re-validated immediately before it is printed and withdrawn if
+ * the position it rests on has moved. That re-validation only ever watched the REFUND side, because
+ * that is what r7's finding named. The invoice side moves too, and by exactly the same mechanism:
+ * a document voided in Xero and re-posted, a second invoice raised for the order, a back-reference
+ * repair (o3d-9kek) attaching an id nobody had — any of which lands after the correction commits and
+ * leaves "edit invoice INV-778 down to 0" describing a ledger that no longer holds INV-778 in that
+ * shape.
+ *
+ * The property is one property, not two: A REMEDY MUST DESCRIBE THE LEDGER AS IT IS WHEN THE
+ * OPERATOR READS IT, OR WITHDRAW. So the whole invoice-side position travels on the handoff, in
+ * canonical form, and the re-validation compares it as a VALUE — the same shape `WcCouponRefundEvidence`
+ * already has for the other side, for the same reason.
+ *
+ * WHAT IS IN IT, and why each field:
+ *
+ *   the order's own back-references (`accountingInvoiceId`, the SYNCED sync-log ids, the deferral
+ *   batch and its stamp) — these are what `describeLedgerReference` names, what the ActivityLog
+ *   records, and what the deferral paragraph quotes;
+ *
+ *   the MIRRORED DOCUMENT DERIVATION — the answer `readPostedInvoiceOrderDiscount` gave, reduced to
+ *   the fields every downstream claim is built from: the amount, how many documents carried it,
+ *   which ones, which ledger, and which tax basis. A document that was voided, re-posted or joined
+ *   by a second one changes at least one of them.
+ *
+ * WHAT IT DELIBERATELY IS NOT. It is not a hash: a withdrawal has to be able to SAY what moved, and
+ * an operator who is told only that "something changed" learns to re-run rather than to look.
+ */
+export type WcCouponMirroredDocumentPosition =
+  | {
+      ok: true
+      amount: number
+      documentType: string
+      documentCount: number
+      /** Newest first, as the derivation reported them. COMPARED as a set; PRINTED in this order. */
+      externalIds: string[]
+      externalSystem: string | null
+      taxBasis: PostedInvoiceTaxBasis
+    }
+  | {
+      ok: false
+      reason: 'NO_POSTED_EVENT' | 'UNRECOVERABLE'
+      /** The refusal's own words. NULL for NO_POSTED_EVENT, which has none. */
+      detail: string | null
+      documentCount: number | null
+      externalIds: string[]
+    }
+
+export type WcCouponDocumentPosition = {
+  currency: string
+  accountingInvoiceId: string | null
+  postedInvoiceExternalIds: string[]
+  revenueDeferredBatchRef: string | null
+  unearnedRevenueAmount: number | null
+  document: WcCouponMirroredDocumentPosition
+}
+
+/** The canonical invoice-side position, from the two reads a handoff is derived from. */
+export function buildWcCouponDocumentPosition(
+  document: PostedInvoiceOrderDiscount,
+  input: { currency: string; evidence: WcCouponLedgerEvidence },
+): WcCouponDocumentPosition {
+  return {
+    currency: input.currency,
+    accountingInvoiceId: input.evidence.accountingInvoiceId,
+    postedInvoiceExternalIds: [...input.evidence.postedInvoiceExternalIds],
+    revenueDeferredBatchRef: input.evidence.revenueDeferredBatchRef,
+    unearnedRevenueAmount: input.evidence.unearnedRevenueAmount ?? null,
+    document: document.ok
+      ? {
+          ok: true,
+          amount: document.amount,
+          documentType: document.documentType,
+          documentCount: document.documentCount,
+          externalIds: [...document.externalIds],
+          externalSystem: document.externalSystem,
+          taxBasis: document.taxBasis,
+        }
+      : {
+          ok: false,
+          reason: document.reason,
+          detail: document.reason === 'UNRECOVERABLE' ? document.detail : null,
+          documentCount: document.reason === 'UNRECOVERABLE' ? (document.documentCount ?? null) : null,
+          externalIds: document.reason === 'UNRECOVERABLE' ? [...(document.externalIds ?? [])] : [],
+        },
+  }
+}
+
+/**
+ * Sorted and de-duplicated, for the same reason `sortedPostedInvoiceIds` is: the two sides of this
+ * comparison are read at different times by different queries, and neither Prisma nor PostgreSQL
+ * promises a stable order for either. A comparison that refused on row order would withdraw remedies
+ * at random, which teaches an operator to ignore the withdrawal that matters.
+ */
+function idSet(ids: readonly string[]): string {
+  return [...new Set(ids)].sort().join('|')
+}
+
+/** Is this the SAME invoice-side position the handoff was derived from? Field by field. */
+export function sameWcCouponDocumentPosition(left: WcCouponDocumentPosition, right: WcCouponDocumentPosition): boolean {
+  if (left.currency.toUpperCase() !== right.currency.toUpperCase()) return false
+  if (left.accountingInvoiceId !== right.accountingInvoiceId) return false
+  if (idSet(left.postedInvoiceExternalIds) !== idSet(right.postedInvoiceExternalIds)) return false
+  if (left.revenueDeferredBatchRef !== right.revenueDeferredBatchRef) return false
+  if (left.unearnedRevenueAmount !== right.unearnedRevenueAmount) return false
+  const a = left.document
+  const b = right.document
+  if (a.ok && b.ok) {
+    return (
+      a.amount === b.amount &&
+      a.documentType === b.documentType &&
+      a.documentCount === b.documentCount &&
+      a.externalSystem === b.externalSystem &&
+      a.taxBasis === b.taxBasis &&
+      idSet(a.externalIds) === idSet(b.externalIds)
+    )
+  }
+  if (!a.ok && !b.ok) {
+    // The REFUSAL's own words are compared too: an unverified document whose refusal changed from
+    // "an update never settled" to "two documents disagree" is a different ledger, and the sentence
+    // printed for it names the old reason.
+    return (
+      a.reason === b.reason &&
+      a.detail === b.detail &&
+      a.documentCount === b.documentCount &&
+      idSet(a.externalIds) === idSet(b.externalIds)
+    )
+  }
+  return false
+}
+
+/** Render an invoice-side position for an operator message. Says WHAT it is, never just "changed". */
+export function describeWcCouponDocumentPosition(position: WcCouponDocumentPosition): string {
+  const document = position.document
+  const documentPart = document.ok
+    ? `${document.documentCount} posted document(s) [${document.externalIds.join(', ') || 'none nameable'}] ` +
+      `carrying ${document.amount} ${position.currency} of order-level discount, ` +
+      `${document.taxBasis}, in ${systemName(document.externalSystem)}`
+    : document.reason === 'NO_POSTED_EVENT'
+      ? 'NO posted sales-invoice event'
+      : `an UNRECOVERABLE posted-document read${
+          document.documentCount !== null ? ` over ${document.documentCount} document(s)` : ''
+        }${document.externalIds.length ? ` [${document.externalIds.join(', ')}]` : ''} (${document.detail ?? 'no detail'})`
+  return (
+    `accountingInvoiceId=${position.accountingInvoiceId ?? 'none'}, ` +
+    `SYNCED sales invoice(s) [${[...position.postedInvoiceExternalIds].sort().join(', ')}], ` +
+    `revenue-deferral batch ${position.revenueDeferredBatchRef ?? 'none'} of ` +
+    `${position.unearnedRevenueAmount ?? 'nothing'}, and ${documentPart}`
+  )
+}
+
+/**
  * MAY `postedDiscount` BE SUBTRACTED FROM WHAT THE CREDIT NOTES REVERSED (o3d-y14 r8 findings 1, 2)?
  *
  * `postedDiscount` is a correct, useful fact about the invoice in every case — it is what the
@@ -323,11 +479,32 @@ export type WcCouponInvoiceHandoff =
        * NULL is "not established", never "one".
        */
       documentCount: number | null
+      /**
+       * THE IDENTIFIERS OF THOSE DOCUMENTS (o3d-y14 r11 finding 3).
+       *
+       * r10 made the refusal say HOW MANY documents disagree and drop WHICH — on the one case whose
+       * entire instruction to the operator is "open them and establish what the ledger holds". They
+       * travel here, and `documentRef` names them, so the sentence an operator reads is actionable.
+       *
+       * EMPTY where the derivation never established a document set (every other refusal), and
+       * SHORTER than `documentCount` where a posted document records no external id at all
+       * (o3d-9kek) — the difference is the number that exist and cannot be named.
+       */
+      externalIds: string[]
     }
 
 export type WcCouponLedgerHandoff = {
   invoice: WcCouponInvoiceHandoff
   deferral: { batchRef: string; unearnedRevenueAmount: number | null } | null
+  /**
+   * THE INVOICE-SIDE POSITION THE FINDING WAS DERIVED FROM (r11 finding 1).
+   *
+   * Carried for exactly the reason `refunds` is: a handoff is re-validated against the live position
+   * immediately before it is printed, and a comparison needs both sides. Without it the
+   * re-validation could only watch the refunds, so a document voided, re-posted or joined by a
+   * second one between the commit and the print left the printed remedy standing.
+   */
+  documents: WcCouponDocumentPosition
   /**
    * The refund position the invoice finding was judged against (r6 finding 1). Carried on the result
    * — not just consumed while rendering — so the durable ActivityLog record says WHY a corrected
@@ -402,14 +579,64 @@ function describePostedDocuments(
       ? `invoice ${document.externalId}`
       : (describeLedgerReference(evidence) ?? `the posted ${document.documentType}`)
   }
-  const unnamed = document.documentCount - document.externalIds.length
+  return (
+    `EACH of the ${document.documentCount} posted sales-invoice documents for this order ` +
+    `(${listPostedDocuments(document.documentCount, document.externalIds)})`
+  )
+}
+
+/**
+ * "invoice(s) INV-778, INV-779, and 1 further posted document(s) that record NO external id".
+ *
+ * The naming half of the plural reference, shared by the AGREEING reference above and the
+ * DISAGREEING one below (r11 finding 3). One producer, so a refusal cannot name its documents on
+ * different terms from a finding — and the unnameable ones are counted in both, never dropped.
+ */
+function listPostedDocuments(documentCount: number, externalIds: readonly string[]): string {
+  const unnamed = documentCount - externalIds.length
   const parts = [
-    document.externalIds.length ? `invoice(s) ${document.externalIds.join(', ')}` : null,
+    externalIds.length ? `invoice(s) ${externalIds.join(', ')}` : null,
     unnamed > 0
       ? `${unnamed} further posted document(s) that record NO external id and cannot be named from here`
       : null,
   ].filter(Boolean)
-  return `EACH of the ${document.documentCount} posted sales-invoice documents for this order (${parts.join(', and ')})`
+  return parts.length ? parts.join(', and ') : 'none of which this run could enumerate'
+}
+
+/**
+ * NAME THE DOCUMENTS A REFUSAL IS ABOUT (o3d-y14 r11 finding 3).
+ *
+ * r10 fixed the reference for documents that AGREE, on the argument that a refusal prescribes
+ * nothing so naming the newest was harmless. That argument does not survive the DISAGREEING case:
+ * the whole of what the operator is told is "open them, establish what the ledger holds in total,
+ * and act on that", and a count alone leaves them with no way to begin. So the refusal names them
+ * on exactly the same terms as the finding does.
+ */
+function describeDisagreeingDocuments(documentCount: number, externalIds: readonly string[]): string {
+  return (
+    `the ${documentCount} DISAGREEING posted sales-invoice documents for this order ` +
+    `(${listPostedDocuments(documentCount, externalIds)})`
+  )
+}
+
+/**
+ * The UNVERIFIED facts sentence, in whichever number the refusal is about (r11 finding 3).
+ *
+ * One producer for both the refunded and the unrefunded render, because the two used to write the
+ * same sentence twice and a plural reference dropped into a singular sentence reads as a document
+ * that does not exist.
+ */
+function unverifiedDocumentSentence(invoice: Extract<WcCouponInvoiceHandoff, { case: 'DOCUMENT_UNVERIFIED' }>): string {
+  if (invoice.documentCount !== null && invoice.documentCount > 1) {
+    return (
+      `${invoice.documentRef ?? `${invoice.documentCount} posted documents`} are in the ledger and ` +
+      `IMS CANNOT establish what order-level discount they carry: ${invoice.detail}.`
+    )
+  }
+  return (
+    `${invoice.documentRef ?? 'a document'} may exist for this order and IMS CANNOT establish what ` +
+    `order-level discount it carries: ${invoice.detail}.`
+  )
 }
 
 /** "that document", or "EACH of those documents" when the reference above named more than one. */
@@ -586,11 +813,20 @@ export function classifyWcCouponInvoiceHandoff(input: {
   }
 
   if (document.reason === 'UNRECOVERABLE') {
+    const documentCount = document.documentCount ?? null
+    const externalIds = document.externalIds ?? []
     return {
       case: 'DOCUMENT_UNVERIFIED',
       detail: document.detail,
-      documentRef: describeLedgerReference(evidence),
-      documentCount: document.documentCount ?? null,
+      // r11 finding 3. Where the derivation established WHICH documents disagree, they are the
+      // reference — the order's own back-reference columns are not, because those name at most the
+      // one document IMS happened to link and this refusal is about all of them.
+      documentRef:
+        documentCount !== null && documentCount > 1
+          ? describeDisagreeingDocuments(documentCount, externalIds)
+          : describeLedgerReference(evidence),
+      documentCount,
+      externalIds,
     }
   }
 
@@ -603,6 +839,7 @@ export function classifyWcCouponInvoiceHandoff(input: {
       detail: `the ledger holds ${reference} for this order but no posted accounting event records what it charged`,
       documentRef: reference,
       documentCount: null,
+      externalIds: [],
     }
   }
   return { case: 'NO_INVOICE_IN_LEDGER' }
@@ -1304,8 +1541,7 @@ function wcCouponRefundedInvoiceLines(
     case 'DOCUMENT_UNVERIFIED':
       return {
         lines: [
-          `${invoice.documentRef ?? 'a document'} may exist for this order and IMS CANNOT establish what ` +
-            `order-level discount it carries: ${invoice.detail}.`,
+          unverifiedDocumentSentence(invoice),
           `NO REMEDY IS PRESCRIBED, and ${refundLine} — ` +
             (creditSideKnown
               ? 'so the half of the position that CAN be read is printed below and the invoice half ' +
@@ -1456,8 +1692,7 @@ export function wcCouponInvoiceHandoffRender(
 
     case 'DOCUMENT_UNVERIFIED': {
       const facts = [
-        `${invoice.documentRef ?? 'a document'} may exist for this order and IMS CANNOT establish what ` +
-          `order-level discount it carries: ${invoice.detail}.`,
+        unverifiedDocumentSentence(invoice),
         'NO FIGURE IS PRESCRIBED — acting on an assumption here is what produces a wrong ledger entry.',
       ]
       // r10 finding 2, on the one refusal that still prescribed. READ_THEN_CHOOSE is a remedy — its
@@ -1472,7 +1707,10 @@ export function wcCouponInvoiceHandoffRender(
             ...facts,
             `NO REMEDY IS PRESCRIBED: the refusal above is that ${invoice.documentCount} posted ` +
               'sales-invoice documents disagree, so there is no single document to read the figure ' +
-              'off and no per-document correction that settles the ledger. Open all of them, ' +
+              'off and no per-document correction that settles the ledger. Open ' +
+              // r11 finding 3. "Open all of them" is not an instruction unless the operator knows
+              // which ones — and this is the ONE case where IMS cannot narrow it down for them.
+              `${listPostedDocuments(invoice.documentCount, invoice.externalIds)}, ` +
               'establish what the ledger holds in total, and act on that — IMS is deliberately ' +
               'naming nothing to perform. `--reprint <allowlist>` rebuilds this handoff from live ' +
               'state at any time, including for an order that has ALREADY been corrected.',
@@ -1553,6 +1791,9 @@ export async function buildWcCouponLedgerHandoff(
   },
 ): Promise<WcCouponLedgerHandoff> {
   const document = await readPostedInvoiceOrderDiscount(client, { id: input.orderId, currency: input.currency })
+  // r11 finding 1. The canonical form of what was just read, so the re-validation before printing
+  // can compare the invoice side as a value rather than assuming it stood still.
+  const documents = buildWcCouponDocumentPosition(document, { currency: input.currency, evidence: input.evidence })
   const invoice = classifyWcCouponInvoiceHandoff({
     document,
     evidence: input.evidence,
@@ -1628,6 +1869,7 @@ export async function buildWcCouponLedgerHandoff(
   return {
     invoice,
     deferral,
+    documents,
     refunds,
     refunded,
     reversal,

@@ -1936,3 +1936,84 @@ test('DISAGREEING posted documents get no read-it-off-the-document ladder either
   assert.match(single.lines.join('\n'), /Open the document and read its order-level discount line/)
   assert.notDeepEqual(disagreeing.lines, single.lines)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r11 finding 3 — the operator is told WHICH documents to open
+// ---------------------------------------------------------------------------
+
+/** Two posted documents that carry DIFFERENT order-level discounts — the refusal r10 left unnamed. */
+function twoDisagreeingInvoices(): EventRow[] {
+  return [
+    postedInvoice({ externalId: 'INV-A' }),
+    postedInvoice({
+      externalId: 'INV-B',
+      businessDate: '2026-05-03',
+      createdAt: '2026-05-03T09:00:00.000Z',
+      linesJson: documentPayload({ discount: { amount: 3, accountCode: '260' } }),
+    }),
+  ]
+}
+
+test('DISAGREEING documents are NAMED in the handoff, not merely counted (o3d-y14 r11 F3)', async () => {
+  // r10 stopped this case prescribing anything, which was right — and left the operator with
+  // "2 posted sales-invoice documents disagree, open all of them" and no way to know which two.
+  // `describeLedgerReference` names at most the ONE document the order happens to link, which on
+  // this order is INV-778: a document that is not even in this refusal's set.
+  const handoff = await handoffFor(twoDisagreeingInvoices(), 0)
+
+  assert.equal(handoff.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.deepEqual(handoff.invoice.case === 'DOCUMENT_UNVERIFIED' ? handoff.invoice.externalIds : null, [
+    'INV-B',
+    'INV-A',
+  ])
+  assert.equal(handoff.remedy, null, 'and still nothing is prescribed')
+  const text = handoff.lines.join('\n')
+  assert.match(text, /the 2 DISAGREEING posted sales-invoice documents for this order \(invoice\(s\) INV-B, INV-A\)/)
+  assert.match(text, /Open invoice\(s\) INV-B, INV-A, establish what the ledger holds in total/)
+  assert.doesNotMatch(text, /Open all of them/, 'the un-actionable phrasing is gone')
+})
+
+test('a disagreeing document with no external id is counted in the handoff too (o3d-y14 r11 F3)', async () => {
+  const handoff = await handoffFor(
+    [
+      postedInvoice({ externalId: 'INV-A' }),
+      postedInvoice({
+        externalId: null,
+        businessDate: '2026-05-03',
+        createdAt: '2026-05-03T09:00:00.000Z',
+        linesJson: documentPayload({ discount: { amount: 3, accountCode: '260' } }),
+      }),
+    ],
+    0,
+  )
+
+  const text = handoff.lines.join('\n')
+  assert.match(text, /invoice\(s\) INV-A, and 1 further posted document\(s\) that record NO external id/)
+})
+
+test('a REFUNDED order names its disagreeing documents too (o3d-y14 r11 F3)', async () => {
+  // The refunded render writes its own prose and used the same `documentRef`, so a fix confined to
+  // the unrefunded ladder would have left this path naming a document outside the refusal's set.
+  const handoff = await handoffFor(twoDisagreeingInvoices(), 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])
+
+  assert.equal(handoff.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.equal(handoff.remedy, null)
+  assert.equal(handoff.netPosition, null)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /the 2 DISAGREEING posted sales-invoice documents for this order \(invoice\(s\) INV-B, INV-A\)/)
+  assert.match(text, /are in the ledger and IMS CANNOT establish what order-level discount they carry/)
+})
+
+test('a refusal about ONE document still reads in the singular (o3d-y14 r11 F3)', async () => {
+  // The plural reference must not leak into the common refusal — an unsettled invoice UPDATE, whose
+  // count is NOT established — or the sentence claims a document set nothing here established.
+  const handoff = await handoffFor(
+    [postedInvoice(), postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null })],
+    0,
+  )
+
+  const text = handoff.lines.join('\n')
+  assert.match(text, /^invoice INV-778 may exist for this order and IMS CANNOT establish/m)
+  assert.doesNotMatch(text, /DISAGREEING/)
+  assert.deepEqual(handoff.invoice.case === 'DOCUMENT_UNVERIFIED' ? handoff.invoice.externalIds : null, [])
+})

@@ -953,3 +953,89 @@ test('a document that carries NO discount still reports its basis — 0 is a fig
 
   assert.deepEqual(read, { ok: true, amount: 0, taxBasis: 'INCLUSIVE' })
 })
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r11 finding 3 — a refusal about SEVERAL documents has to name them
+// ---------------------------------------------------------------------------
+
+/**
+ * r10 made the SUCCESS variant's reference plural, on the argument that a REFUSAL prescribes nothing
+ * so naming the newest document was harmless. That argument does not survive the disagreeing case:
+ * the whole of what an operator can do with "2 posted documents carry different order-level
+ * discounts" is open them, and the refusal told them how many there were and not which.
+ */
+
+test('a refusal because posted documents DISAGREE names every one of them (o3d-y14 r11 F3)', async () => {
+  // The NEWEST document carries the LARGER discount, so the amounts arrive in descending order —
+  // which is what makes the sorted refusal message below a property rather than a coincidence.
+  const { client } = makeClient({
+    events: [
+      postedInvoice({
+        externalId: 'INV-A',
+        linesJson: documentPayload({ discount: { amount: 3, accountCode: '260' } }),
+      }),
+      postedInvoice({ externalId: 'INV-B', businessDate: '2026-05-03', createdAt: '2026-05-03T09:00:00.000Z' }),
+    ],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(read.ok, false)
+  assert.equal(!read.ok && read.reason, 'UNRECOVERABLE')
+  assert.deepEqual(
+    !read.ok && read.reason === 'UNRECOVERABLE' ? read.externalIds : null,
+    ['INV-B', 'INV-A'],
+    'newest first, and BOTH of them — the count alone is not actionable',
+  )
+  const detail = !read.ok && read.reason === 'UNRECOVERABLE' ? read.detail : ''
+  assert.match(detail, /INV-B, INV-A/, 'and the message itself names them')
+  assert.match(detail, /2 posted documents exist for this order/)
+  // The amounts are sorted, so the same rows read twice produce the same sentence. The r11 F1
+  // re-validation compares these refusals as values; a message in row order would report a ledger
+  // that "moved" whenever the query came back the other way round.
+  assert.match(detail, /\(3, 10 GBP\)/)
+})
+
+test('a disagreeing document with NO external id is counted, not silently dropped (o3d-y14 r11 F3)', async () => {
+  // The write-back can fail after the post succeeds (o3d-9kek). "2 documents, 1 of which cannot be
+  // named" is the fact; naming one of two and saying nothing about the other is the r10 defect
+  // reintroduced on the refusal side.
+  const { client } = makeClient({
+    events: [
+      postedInvoice({ externalId: 'INV-A' }),
+      postedInvoice({
+        externalId: null,
+        businessDate: '2026-05-03',
+        createdAt: '2026-05-03T09:00:00.000Z',
+        linesJson: documentPayload({ discount: { amount: 3, accountCode: '260' } }),
+      }),
+    ],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(!read.ok && read.reason === 'UNRECOVERABLE' && read.documentCount, 2)
+  assert.deepEqual(!read.ok && read.reason === 'UNRECOVERABLE' ? read.externalIds : null, ['INV-A'])
+  assert.match(
+    !read.ok && read.reason === 'UNRECOVERABLE' ? read.detail : '',
+    /INV-A, and 1 that record NO external id and cannot be named from here/,
+  )
+})
+
+test('a refusal that established NO document set reports no ids at all (o3d-y14 r11 F3)', async () => {
+  // The pair. `externalIds` is absent, not empty-because-there-are-none: an unsettled invoice UPDATE
+  // refuses without ever establishing which documents the refusal is about, and a caller that read
+  // [] as "no documents exist" would print a reference to nothing.
+  const { client } = makeClient({
+    events: [
+      postedInvoice(),
+      postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null }),
+    ],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(!read.ok && read.reason, 'UNRECOVERABLE')
+  assert.equal(!read.ok && read.reason === 'UNRECOVERABLE' && read.externalIds, undefined)
+  assert.equal(!read.ok && read.reason === 'UNRECOVERABLE' && read.documentCount, undefined)
+})

@@ -45,6 +45,8 @@ type SyncLogRow = {
 
 type OrderRow = {
   id: string
+  /** o3d-y14 r11 finding 1 — the mirrored-document read is denominated in the ORDER's currency. */
+  currency?: string
   discountAmount: number
   discountModel: string | null
   /** o3d-y14 r4 finding 1 — the durable "this row was restated" record. */
@@ -111,7 +113,7 @@ type Store = {
     /** o3d-y14 r9 finding 1 — WHICH LEDGER it stands in. A netting needs both sides in one. */
     externalSystem?: string | null
   }>
-  activity: Array<{ action: string; entityId: string | null; description?: string; metadata: Record<string, unknown> }>
+  activity: Array<{ id?: string; action: string; entityId: string | null; description?: string; metadata: Record<string, unknown> }>
 }
 
 /** A PENDING/FAILED/QUARANTINED refund park on `order-1`, matching the partial unique index exactly. */
@@ -143,6 +145,7 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
         const snapshot = found
           ? {
               id: found.id,
+              currency: found.currency ?? 'GBP',
               discountAmount: found.discountAmount,
               discountModel: found.discountModel,
               accountingInvoiceId: found.accountingInvoiceId ?? null,
@@ -351,11 +354,39 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
         )
       },
     },
+    // o3d-y14 r11 finding 2 — the DURABLE record, and the retraction that has to reach it. The
+    // double gives every row an id and honours `where.id` on both reads and the update, because the
+    // property under test is that the withdrawal lands on THAT row: a double that returned the
+    // newest row, or accepted any id, could not tell a retracted record from an untouched one.
     activityLog: {
-      create: async ({ data }: { data: { action: string; entityId: string | null; description?: string; metadata: Record<string, unknown> } }) => {
+      create: async ({
+        data,
+      }: {
+        data: { action: string; entityId: string | null; description?: string; metadata: Record<string, unknown> }
+      }) => {
         events.push('activityLog:create')
-        store.activity.push(data)
-        return data
+        const row = { id: `log-${store.activity.length + 1}`, ...data }
+        store.activity.push(row)
+        return { id: row.id }
+      },
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        events.push(`activityLog:findUnique:${where.id}`)
+        const found = store.activity.find((row) => row.id === where.id)
+        return found ? { description: found.description, metadata: found.metadata } : null
+      },
+      update: async ({
+        where,
+        data,
+      }: {
+        where: { id: string }
+        data: { description: string; metadata: Record<string, unknown> }
+      }) => {
+        events.push(`activityLog:update:${where.id}`)
+        const found = store.activity.find((row) => row.id === where.id)
+        if (!found) throw new Error(`no ActivityLog row ${where.id}`)
+        found.description = data.description
+        found.metadata = data.metadata
+        return found
       },
     },
   } as never
@@ -420,7 +451,7 @@ test('a reviewed order is corrected and STAMPED in the same write (o3d-5ct/o3d-9
 
   const result = await applyWcCouponCorrection(makeTx(store), entry)
 
-  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS, handoff: null })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS, handoff: null, activityLogId: 'log-1' })
   assert.equal(store.orders[0].discountAmount, 0, 'the duplicated part is cleared')
   assert.equal(
     store.orders[0].discountModel,
@@ -605,7 +636,7 @@ test('a TERMINAL job does not block, and another order\'s job is not confused fo
 
   const result = await applyWcCouponCorrection(makeTx(store), entry)
 
-  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS, handoff: null })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS, handoff: null, activityLogId: 'log-1' })
 })
 
 test('the queue is never written to, only counted (o3d-5ct)', async () => {
@@ -967,7 +998,7 @@ test('the residual actually written comes from the LIVE evidence, not the file',
     partial: true,
   })
 
-  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS, handoff: null })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: NO_LEDGER_DOCUMENTS, handoff: null, activityLogId: 'log-1' })
   assert.equal(store.orders[0].discountAmount, 6)
 })
 
@@ -1049,7 +1080,7 @@ test('stamping records the model WITHOUT touching the amount (Codex r1 F3)', asy
 
   // `posted: null`, not an empty evidence set: stamping changes no amount, so it creates no ledger
   // inconsistency and must not add this order to the operator's manual-adjustment list.
-  assert.deepEqual(result, { outcome: 'CORRECTED', posted: null, handoff: null })
+  assert.deepEqual(result, { outcome: 'CORRECTED', posted: null, handoff: null, activityLogId: null })
   assert.equal(store.orders[0].discountAmount, 6, 'the manually corrected amount SURVIVES')
   assert.equal(store.orders[0].discountModel, WC_COUPON_DISCOUNT_MODEL)
   assert.equal(store.activity[0].action, WC_COUPON_STAMP_ACTION, 'a distinct action: a human assertion, not a computation')
@@ -1789,7 +1820,11 @@ test('the apply script re-validates PER PRINT, not once for the batch (o3d-y14 r
   const sectionAt = src.indexOf('async function printSection(')
   assert.ok(sectionAt > 0, 'printing goes through a section printer')
   const section = src.slice(sectionAt, src.indexOf('\n  }\n', sectionAt))
-  assert.match(section, /revalidateWcCouponHandoff\(db, entry\.orderId, handoff\)/, 'which re-validates each entry')
+  assert.match(
+    section,
+    /revalidateWcCouponHandoff\(db, entry\.orderId, handoff, \{ activityLogId \}\)/,
+    'which re-validates each entry, and carries the durable record so a withdrawal retracts it (r11 F2)',
+  )
   assert.match(section, /printHandoff\(entry, revalidated\.handoff\)/, 'and prints the RE-VALIDATED handoff')
   // Both lists go through it, so a "settled" entry is re-checked as hard as an actionable one.
   assert.match(src, /await printSection\(actionable\)/)
@@ -1950,4 +1985,334 @@ test('the netted position is recorded on the ActivityLog, so "nobody could tell"
   assert.equal(crossLedger.activity[0].metadata.netPosition, null)
   assert.equal(crossLedger.activity[0].metadata.creditNoteReversal !== null, true, 'the credit-note side derived')
   assert.equal(crossLedger.activity[0].metadata.needsAccountingAction, true)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r11 finding 1 — the INVOICE side moves too, and the remedy must withdraw
+// ---------------------------------------------------------------------------
+
+/**
+ * r7 finding 2 established the property: a remedy printed to a console is a live directional
+ * instruction, read by a human after every lock this backfill can take has been released — so it is
+ * re-validated immediately before it is printed and withdrawn if the position it rests on has moved.
+ * It watched the REFUND side alone, because that is what r7's finding named.
+ *
+ * The property was never about refunds. A REMEDY MUST DESCRIBE THE LEDGER AS IT IS WHEN THE OPERATOR
+ * READS IT, OR WITHDRAW. The three fixtures below are the three invoice-side movements that reach
+ * this window, and each of them is asserted NOT to be a refund-side change — a check that fired on
+ * both indiscriminately would prove nothing about which half is being watched.
+ */
+
+/** The SAME invoice event, voided in the accounting system and re-raised under a new id. */
+function reposted(store: Store) {
+  store.events![0].status = 'VOID'
+  store.events!.push({
+    ...store.events![0],
+    status: 'POSTED',
+    externalId: 'INV-900',
+    businessDate: '2026-06-01',
+    createdAt: '2026-06-01T09:00:00.000Z',
+  })
+}
+
+test('an invoice VOIDED and re-posted after the correction WITHDRAWS the remedy (o3d-y14 r11 F1)', async () => {
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  assert.equal(handoff?.remedy?.kind, 'INCREASE_RECEIVABLE')
+  assert.match(handoff?.lines.join('\n') ?? '', /invoice INV-778/)
+
+  // ... and now the document the instruction names stops existing, after the commit.
+  reposted(store)
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(revalidated.handoff.remedy, null)
+  assert.equal(revalidated.handoff.needsAccountingAction, true)
+  assert.match(revalidated.detail, /INVOICE-SIDE ledger position is now/)
+  assert.match(revalidated.detail, /INV-900/, 'and it says what the ledger holds NOW')
+  assert.doesNotMatch(
+    revalidated.detail,
+    /REFUND position is now/,
+    'and does not blame a refund side that never moved',
+  )
+  const text = revalidated.handoff.lines.join('\n')
+  assert.doesNotMatch(text, /raise a further invoice to the same contact for 10 GBP/)
+  assert.match(text, /THE REMEDY PRINTED FOR THIS ORDER IS WITHDRAWN/)
+})
+
+test('a SECOND posted document appearing after the correction withdraws it too (o3d-y14 r11 F1)', async () => {
+  // The duplicate is now held TWICE and an instruction naming one document leaves the other
+  // standing — which is r10 finding 2's defect, arriving through the window r7 finding 2 opened.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  assert.equal(handoff?.remedy?.kind, 'INCREASE_RECEIVABLE')
+
+  store.events!.push({
+    ...store.events![0],
+    externalId: 'INV-779',
+    businessDate: '2026-06-01',
+    createdAt: '2026-06-01T09:00:00.000Z',
+  })
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(revalidated.handoff.remedy, null)
+  assert.match(revalidated.detail, /INVOICE-SIDE ledger position is now/)
+  assert.match(revalidated.detail, /2 posted document\(s\)/)
+  assert.doesNotMatch(revalidated.detail, /REFUND position is now/)
+})
+
+test('a back-reference repair after the correction withdraws it as well (o3d-9kek, o3d-y14 r11 F1)', async () => {
+  // Nothing about the mirrored events changed here: what moved is the ORDER's own record of which
+  // documents exist, which is what `describeLedgerReference` and the ActivityLog print. A check that
+  // only re-read the accounting events would call this position unchanged.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  assert.deepEqual(handoff?.documents.postedInvoiceExternalIds, [])
+
+  store.syncLogs.push({
+    id: 'job-inv-2',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    type: 'SALES_INVOICE',
+    status: 'SYNCED',
+    externalTransactionId: 'INV-901',
+  })
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(revalidated.handoff.remedy, null)
+  assert.match(revalidated.detail, /SYNCED sales invoice\(s\) \[INV-901\]/)
+  assert.doesNotMatch(revalidated.detail, /REFUND position is now/)
+})
+
+test('an unchanged INVOICE side and an unchanged refund side stay CURRENT (o3d-y14 r11 F1)', async () => {
+  // The control that makes the three above mean something: a comparison that fired regardless would
+  // withdraw every remedy in the run and teach the operator to ignore the withdrawal that matters.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'CURRENT')
+  assert.equal(revalidated.handoff.remedy?.kind, 'INCREASE_RECEIVABLE')
+})
+
+test('a refund-side move is still reported as a REFUND move, not an invoice one (o3d-y14 r11 F1)', async () => {
+  // The other half of the distinction. Both sides are compared and both are REPORTED, so an order
+  // whose refund position moved is not sent to a human to go and look at an invoice that did not.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  store.parks = [park()]
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.match(revalidated.detail, /REFUND position is now/)
+  assert.doesNotMatch(revalidated.detail, /INVOICE-SIDE ledger position is now/)
+})
+
+test('BOTH sides moving names BOTH of them (o3d-y14 r11 F1)', async () => {
+  // Stopping at the first difference would send an operator to look at half of what moved.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  store.parks = [park()]
+  reposted(store)
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.match(revalidated.detail, /REFUND position is now/)
+  assert.match(revalidated.detail, /INVOICE-SIDE ledger position is now/)
+  assert.match(revalidated.detail, /; AND /)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r11 finding 2 — a withdrawal that only reaches the console reaches nobody
+// ---------------------------------------------------------------------------
+
+/**
+ * r10 finding 1 made a superseded netting take its CONCLUSION with it, out of the PRINTED lines. The
+ * ActivityLog row written inside the correction transaction went on asserting `netPosition: {net: 0}`
+ * and `needsAccountingAction: false` — the record somebody reads back weeks later, when the console
+ * output has long scrolled away. The rule is the same rule: no netting claim reaches an operator
+ * except from a netting that ran, and the durable record is that surface one step out.
+ */
+
+test('a withdrawal RETRACTS the netted claim on the durable ActivityLog record (o3d-y14 r11 F2)', async () => {
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = nettedToZeroStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, refunds: NETTED_ZERO_REFUNDS })
+  assert.equal(result.outcome, 'CORRECTED')
+  const activityLogId = result.outcome === 'CORRECTED' ? result.activityLogId : null
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  assert.equal(activityLogId, 'log-1', 'the correction returns the row it wrote')
+  const record = store.activity[0]
+  assert.deepEqual(record.metadata.netPosition, {
+    postedDiscount: 10,
+    reversedAmount: 10,
+    net: 0,
+    nettedAgainst: ['CN-501'],
+  })
+  assert.equal(record.metadata.needsAccountingAction, false)
+
+  // ... and now an unrecordable WooCommerce refund lands, after the commit.
+  store.parks = [park()]
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!, { activityLogId })
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(store.activity.length, 1, 'the claim is retracted IN PLACE, not left standing beside a second row')
+  assert.equal(record.metadata.netPosition, null, 'the durable record no longer asserts the net')
+  assert.equal(record.metadata.remedyKind, null)
+  assert.equal(record.metadata.remedyAmount, null)
+  assert.equal(record.metadata.needsAccountingAction, true, 'a position nobody can vouch for is one to look at')
+  assert.deepEqual(record.metadata.handoffLines, revalidated.handoff.lines)
+  // The retraction comes FIRST. The correction's own sentence opens "NO ACCOUNTING ACTION
+  // REQUIRED", which is the headline an activity feed renders and a reader skims — a withdrawal
+  // bolted onto the end of it leaves the claim standing for anyone who does not read to the end.
+  assert.match(record.description ?? '', /^WITHDRAWN — /)
+  assert.match(record.description ?? '', /AS ORIGINALLY RECORDED, at the moment of the correction:/)
+  assert.ok(
+    (record.description ?? '').indexOf('WITHDRAWN') < (record.description ?? '').indexOf('NO ACCOUNTING ACTION REQUIRED'),
+    'and it precedes the claim it withdraws',
+  )
+
+  // NOTHING is destroyed: what the row used to say is preserved verbatim, with why and when.
+  const withdrawn = record.metadata.withdrawn as Record<string, unknown>
+  assert.deepEqual(withdrawn.supersededNetPosition, {
+    postedDiscount: 10,
+    reversedAmount: 10,
+    net: 0,
+    nettedAgainst: ['CN-501'],
+  })
+  assert.equal(withdrawn.supersededNeedsAccountingAction, false)
+  assert.match(String(withdrawn.detail), /moved AFTER the correction committed/)
+  assert.match(String(withdrawn.at), /^\d{4}-\d{2}-\d{2}T/)
+})
+
+test('a withdrawn REMEDY is retracted from the record too, not only a netting (o3d-y14 r11 F2)', async () => {
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const activityLogId = result.outcome === 'CORRECTED' ? result.activityLogId : null
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  assert.equal(store.activity[0].metadata.remedyKind, 'INCREASE_RECEIVABLE')
+  assert.equal(store.activity[0].metadata.remedyAmount, 10)
+
+  store.parks = [park()]
+  await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!, { activityLogId })
+
+  assert.equal(store.activity[0].metadata.remedyKind, null)
+  assert.equal(store.activity[0].metadata.remedyAmount, null)
+  const withdrawn = store.activity[0].metadata.withdrawn as Record<string, unknown>
+  assert.equal(withdrawn.supersededRemedyKind, 'INCREASE_RECEIVABLE')
+  assert.equal(withdrawn.supersededRemedyAmount, 10)
+})
+
+test('the retraction is IDEMPOTENT and keeps the FIRST snapshot (o3d-y14 r11 F2)', async () => {
+  // The apply script re-validates twice — once to decide the two lists, once per print — so the
+  // second pass must not overwrite the original claim with the already-retracted nulls.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = nettedToZeroStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), { ...invoicedEntry, refunds: NETTED_ZERO_REFUNDS })
+  const activityLogId = result.outcome === 'CORRECTED' ? result.activityLogId : null
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  store.parks = [park()]
+
+  const first = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!, { activityLogId })
+  await revalidateWcCouponHandoff(makeTx(store), 'order-1', first.handoff, { activityLogId })
+
+  const withdrawn = store.activity[0].metadata.withdrawn as Record<string, unknown>
+  assert.deepEqual(withdrawn.supersededNetPosition, {
+    postedDiscount: 10,
+    reversedAmount: 10,
+    net: 0,
+    nettedAgainst: ['CN-501'],
+  })
+  assert.equal(withdrawn.supersededNeedsAccountingAction, false, 'still the state BEFORE the first withdrawal')
+})
+
+test('a CURRENT handoff leaves the durable record exactly as the correction wrote it (r11 F2)', async () => {
+  // Without this the retraction could fire on every entry and the record would say "withdrawn" for
+  // orders nothing happened to — which is the same information-destroying failure as a check that
+  // always withdraws.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const activityLogId = result.outcome === 'CORRECTED' ? result.activityLogId : null
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  const description = store.activity[0].description
+  events.length = 0
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!, { activityLogId })
+
+  assert.equal(revalidated.outcome, 'CURRENT')
+  assert.equal(store.activity[0].metadata.remedyKind, 'INCREASE_RECEIVABLE')
+  assert.equal(store.activity[0].metadata.withdrawn, undefined)
+  assert.equal(store.activity[0].description, description)
+  assert.equal(events.some((event) => event.startsWith('activityLog:update')), false)
+})
+
+test('a withdrawal with NO record id retracts nothing rather than guessing a row (o3d-y14 r11 F2)', async () => {
+  // `stampWcCouponDiscountModel` writes a record that asserts no position and returns no id. A
+  // retraction that went looking for "the newest row for this order" could land on it.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  store.parks = [park()]
+  events.length = 0
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED', 'the printed handoff is still corrected')
+  assert.equal(events.some((event) => event.startsWith('activityLog:')), false, 'and no row is touched')
+})
+
+test('the stamp path reports no record to retract — it asserts no position (o3d-y14 r11 F2)', async () => {
+  const { stampWcCouponDiscountModel } = await load()
+  reset()
+  const store = makeStore()
+
+  const result = await stampWcCouponDiscountModel(makeTx(store), entry)
+
+  assert.equal(result.outcome === 'CORRECTED' && result.activityLogId, null)
 })

@@ -309,12 +309,19 @@ async function apply(allowlistPath: string) {
   // And what it says about each of those documents is DERIVED from what that document carries
   // (o3d-y14 r5 finding 1), so the two lists below are genuinely different jobs rather than one
   // sentence printed twice.
-  const handoffs: Array<{ entry: WcCouponAllowlistEntry; handoff: WcCouponLedgerHandoff }> = []
+  // The ActivityLog row each correction wrote travels with its handoff (o3d-y14 r11 finding 2): a
+  // withdrawal has to retract the claims in the DURABLE record too, and that record is what somebody
+  // reads back weeks after this console output has gone.
+  const handoffs: Array<{
+    entry: WcCouponAllowlistEntry
+    handoff: WcCouponLedgerHandoff
+    activityLogId: string | null
+  }> = []
   for (const entry of allowlist.clear) {
     const result = await db.$transaction((tx) => applyWcCouponCorrection(tx, entry))
     if (result.outcome === 'CORRECTED') {
       corrected += 1
-      if (result.handoff) handoffs.push({ entry, handoff: result.handoff })
+      if (result.handoff) handoffs.push({ entry, handoff: result.handoff, activityLogId: result.activityLogId })
     } else {
       declined.push(`clear ${entry.orderNumber || entry.orderId}: ${result.reason} — ${result.detail}`)
     }
@@ -341,11 +348,11 @@ async function apply(allowlistPath: string) {
   // again at the end rather than silently printed under a heading that says it needs nothing.
   const supersededOrders = new Set<string>()
   for (let index = 0; index < handoffs.length; index += 1) {
-    const { entry, handoff } = handoffs[index]
-    const revalidated = await revalidateWcCouponHandoff(db, entry.orderId, handoff)
+    const { entry, handoff, activityLogId } = handoffs[index]
+    const revalidated = await revalidateWcCouponHandoff(db, entry.orderId, handoff, { activityLogId })
     if (revalidated.outcome === 'SUPERSEDED') {
       supersededOrders.add(entry.orderId)
-      handoffs[index] = { entry, handoff: revalidated.handoff }
+      handoffs[index] = { entry, handoff: revalidated.handoff, activityLogId }
       declined.push(
         `handoff ${entry.orderNumber || entry.orderId}: REMEDY WITHDRAWN — ${revalidated.detail}`,
       )
@@ -363,13 +370,15 @@ async function apply(allowlistPath: string) {
    * line and `needsAccountingAction`, and re-running the same comparison would append a second copy
    * of a sentence that is already true.
    */
-  async function printSection(section: Array<{ entry: WcCouponAllowlistEntry; handoff: WcCouponLedgerHandoff }>) {
-    for (const { entry, handoff } of section) {
+  async function printSection(
+    section: Array<{ entry: WcCouponAllowlistEntry; handoff: WcCouponLedgerHandoff; activityLogId: string | null }>,
+  ) {
+    for (const { entry, handoff, activityLogId } of section) {
       if (supersededOrders.has(entry.orderId)) {
         printHandoff(entry, handoff)
         continue
       }
-      const revalidated = await revalidateWcCouponHandoff(db, entry.orderId, handoff)
+      const revalidated = await revalidateWcCouponHandoff(db, entry.orderId, handoff, { activityLogId })
       if (revalidated.outcome === 'SUPERSEDED') {
         supersededOrders.add(entry.orderId)
         movedWhilePrinting.push(entry.orderNumber || entry.orderId)
@@ -386,9 +395,11 @@ async function apply(allowlistPath: string) {
     `${LOG} stamped ${stamped} order(s) as already-correct; corrected ${corrected} order(s). ` +
       'No queued or posted accounting payload was modified.' +
       (superseded
-        ? ` ${superseded} handoff(s) had their REMEDY WITHDRAWN because a refund was recorded after ` +
-          'the correction committed (more may be withdrawn below, as each entry is re-checked ' +
-          'immediately before it is printed) — re-derive those with --reprint.'
+        ? ` ${superseded} handoff(s) had their REMEDY WITHDRAWN because the position they were ` +
+          'derived from — a refund, or the invoice-side ledger itself — moved after the correction ' +
+          'committed (more may be withdrawn below, as each entry is re-checked immediately before ' +
+          'it is printed) — re-derive those with --reprint. Their ActivityLog records were ' +
+          'retracted in the same step, so nothing durable still asserts the withdrawn figure.'
         : ''),
   )
 
@@ -414,7 +425,7 @@ async function apply(allowlistPath: string) {
   if (movedWhilePrinting.length) {
     console.log('')
     console.log(
-      `${LOG} ${movedWhilePrinting.length} order(s) had their refund position MOVE WHILE THIS REPORT ` +
+      `${LOG} ${movedWhilePrinting.length} order(s) had their position MOVE WHILE THIS REPORT ` +
         'WAS BEING PRINTED, after the two lists above were decided. Their remedy is withdrawn in the ' +
         'lines printed for them, but the heading they appear under was already written — treat these ' +
         `as needing a look whichever list they are in: ${movedWhilePrinting.join(', ')}. ` +
