@@ -73,6 +73,12 @@ export type ShipmentTransitionResult =
 export type ShipmentReconciliationResult = {
   shouldGenerateInvoice: boolean
   orderId: string
+  /**
+   * o3d-0i5y: present only when every shipment on the order has SHIPPED but the order still owes
+   * quantity, in which case the order was deliberately NOT promoted to SHIPPED. Absent on the
+   * ordinary path, so a caller that ignores it is unchanged.
+   */
+  shortfall?: OrderShipmentShortfallLine[]
 }
 
 function canRunTransaction(
@@ -123,10 +129,31 @@ function hasSameShipmentLines(
   return currentFingerprints.every((fingerprint, index) => fingerprint === lockedFingerprints[index])
 }
 
-async function validateActiveShipmentTotalsWithinOrder(
+/**
+ * The order's quantities resolved to LEAF (component) units and keyed `${orderLineId}|${productId}`,
+ * which is the only basis on which shipment rows, ordered qty and refunded qty are comparable.
+ *
+ * Extracted so the dispatch cap (`validateActiveShipmentTotalsWithinOrder`, "may this shipment go
+ * out?") and the completion check (`findOrderShipmentShortfall`, "has everything gone out?") read
+ * the SAME numbers from the SAME statements. They are two halves of one question and previously only
+ * the first existed; computing the second independently is how the two would come to disagree about
+ * what a kit line or a refund means (o3d-0i5y).
+ */
+type OrderLeafQuantities = {
+  /** Order line id -> the SKU/description an operator will recognise. */
+  lineLabelById: Map<string, string>
+  orderedByLeaf: Map<string, Prisma.Decimal>
+  refundedByLeaf: Map<string, Prisma.Decimal>
+  /** Leaf qty on SHIPPED shipments — historical, and the only thing that counts as fulfilled. */
+  shippedByLeaf: Map<string, Prisma.Decimal>
+  /** Leaf qty on PICKING/PACKED shipments — committed, but not yet out of the door. */
+  plannedByLeaf: Map<string, { lineId: string; plannedQty: Prisma.Decimal }>
+}
+
+async function loadOrderLeafQuantities(
   client: ShipmentServiceClient,
   orderId: string,
-): Promise<string | null> {
+): Promise<OrderLeafQuantities> {
   // Non-PENDING shipment lines are already committed to the order's fulfilment
   // plan, so this check intentionally includes PICKING/PACKED rows as well as
   // SHIPPED rows. That makes concurrent dispatches race-safe for total-qty
@@ -240,6 +267,21 @@ async function validateActiveShipmentTotalsWithinOrder(
     }
   }
 
+  return { lineLabelById, orderedByLeaf, refundedByLeaf, shippedByLeaf, plannedByLeaf }
+}
+
+async function validateActiveShipmentTotalsWithinOrder(
+  client: ShipmentServiceClient,
+  orderId: string,
+): Promise<string | null> {
+  const {
+    lineLabelById,
+    orderedByLeaf,
+    refundedByLeaf,
+    shippedByLeaf,
+    plannedByLeaf,
+  } = await loadOrderLeafQuantities(client, orderId)
+
   for (const [key, { lineId, plannedQty }] of plannedByLeaf) {
     const label = lineLabelById.get(lineId)
     if (!label) {
@@ -269,6 +311,83 @@ async function validateActiveShipmentTotalsWithinOrder(
   }
 
   return null
+}
+
+/** One order line that has shipped less than it was ordered, net of refunds. */
+export type OrderShipmentShortfallLine = {
+  lineId: string
+  /** SKU (or description) of the ORDER line, so the operator can find it on the order. */
+  label: string
+  /** The LEAF product actually short — for a kit line this is a component, not the kit. */
+  productId: string
+  orderedQty: number
+  refundedQty: number
+  shippedQty: number
+  outstandingQty: number
+}
+
+/**
+ * o3d-0i5y — "every shipment we raised has shipped" is NOT "the order is complete".
+ *
+ * Partial fulfilment is a deliberate workflow here: PICKING needs only that SOME allocation exists,
+ * "Create Shipments" is offered whenever an ALLOCATED order has any allocation, and
+ * `confirmSalesOrderShipments` emits lines only for the allocations that exist. The stated intent is
+ * that you ship what you have and the rest stays outstanding. It did not: `reconcileOrderAfterShipment`
+ * promoted the order to SHIPPED as soon as every EXISTING shipment reached SHIPPED, and SHIPPED only
+ * goes on to COMPLETED/DELIVERED — so the unshipped remainder was declared complete and never revisited.
+ *
+ * Returns the lines still owed, or null when the order has shipped everything it owes.
+ *
+ * THE BASIS IS ORDERED MINUS REFUNDED, matching `selectOrdersNeedingAllocation` (o3d-jby) and the
+ * dispatch cap above, because those are what decide whether anything more will ever be allocated or
+ * dispatched. Comparing against GROSS ordered qty would make a partly-refunded order read as
+ * permanently short and never close — the exact mistake o3d-jby fixed in the coverage selector.
+ *
+ * A FULL refund is UNCONDITIONAL zero demand, short-circuited on `refundStatus` rather than netted,
+ * for the same reason `selectOrdersNeedingAllocation` does it: a monetary-only or shipping-only
+ * refund line nets nothing per-line, so a fully refunded order would otherwise read as short forever.
+ *
+ * Only SHIPPED quantity counts as fulfilled. A PICKING/PACKED shipment is committed but has not left,
+ * so it is still outstanding — which is the answer this function must give, since it exists to decide
+ * whether the order is DONE.
+ */
+export async function findOrderShipmentShortfall(
+  client: ShipmentServiceClient,
+  orderId: string,
+): Promise<OrderShipmentShortfallLine[] | null> {
+  const order = await client.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { refundStatus: true },
+  })
+  if (order?.refundStatus === 'FULL') return null
+
+  const { lineLabelById, orderedByLeaf, refundedByLeaf, shippedByLeaf } =
+    await loadOrderLeafQuantities(client, orderId)
+
+  const shortfall: OrderShipmentShortfallLine[] = []
+  for (const [key, orderedQty] of orderedByLeaf) {
+    const separator = key.lastIndexOf('|')
+    const lineId = key.slice(0, separator)
+    const productId = key.slice(separator + 1)
+    const refundedQty = refundedByLeaf.get(key) ?? new Prisma.Decimal(0)
+    const shippedQty = shippedByLeaf.get(key) ?? new Prisma.Decimal(0)
+    // Quantised to the Decimal(12,4) boundary the shipment rows persist at, and rounded AFTER the
+    // whole subtraction, exactly as the dispatch cap does (o3d-odu) — otherwise a fractional kit
+    // component reads as short by a rounding ulp on every order it appears on, and no such order
+    // could ever be completed automatically.
+    const outstandingQty = roundQuantity(orderedQty.sub(refundedQty).sub(shippedQty), 4)
+    if (outstandingQty.lte(SHIPMENT_QTY_EPSILON_DECIMAL)) continue
+    shortfall.push({
+      lineId,
+      label: lineLabelById.get(lineId) ?? lineId,
+      productId,
+      orderedQty: shipmentBoundaryNumber(orderedQty),
+      refundedQty: shipmentBoundaryNumber(refundedQty),
+      shippedQty: shipmentBoundaryNumber(shippedQty),
+      outstandingQty: shipmentBoundaryNumber(outstandingQty),
+    })
+  }
+  return shortfall.length > 0 ? shortfall : null
 }
 
 export async function confirmSalesOrderShipments(
@@ -475,7 +594,7 @@ export type DiscardedCancelledShipment = {
  *
  * PROPERTIES:
  *   - refuses unless the order really is CANCELLED (this is not a general per-shipment cancel;
- *     o3d-tv1q remains open);
+ *     o3d-q8r6 remains open);
  *   - NEVER touches a SHIPPED shipment. Those are dispatch evidence the accounting sub-ledger and
  *     any refund reversal resolve through; the remedy for one of those is a refund;
  *   - IDEMPOTENT. A cancelled order with nothing left to discard writes nothing at all and returns
@@ -941,14 +1060,44 @@ export async function reconcileOrderAfterShipment(
     .filter(Boolean)
     .join(', ')
 
-  await runInTransaction(client, async (tx) => {
+  const shortfall = await runInTransaction(client, async (tx) => {
     await lockSalesOrder(tx, shipment.orderId)
     const currentOrder = await tx.salesOrder.findUnique({
       where: { id: shipment.orderId },
       select: { status: true },
     })
-    if (!currentOrder) return
-    if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(currentOrder.status)) return
+    if (!currentOrder) return null
+    if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED'].includes(currentOrder.status)) return null
+
+    // o3d-0i5y: DO NOT let "all known shipments shipped" silently mean "order complete".
+    //
+    // Read under the order lock, alongside the status, so a shipment or refund committing between a
+    // caller's earlier read and this promotion is honoured — the same reason the status is re-read here.
+    //
+    // The order is deliberately left in whatever pre-shipment status it already holds (ALLOCATED /
+    // PICKING / PACKING) rather than moved to a new PARTIALLY_SHIPPED status or marked with a flag:
+    //
+    //  - those statuses already mean "in fulfilment, not out of the door", which is the truth, and they
+    //    are what the fulfilment queues already select on;
+    //  - a denormalised flag would be a second copy of a fact that is fully derivable from the shipment
+    //    and refund rows, so it could go stale against them. `findOrderShipmentShortfall` is derived,
+    //    so it cannot;
+    //  - and the schema deliberately RETIRED composite lifecycle statuses (see the note on
+    //    SalesOrderStatus where PARTIALLY_REFUNDED was replaced by the orthogonal refundStatus).
+    //    Reintroducing one would reopen that, and it would have to be threaded through every status
+    //    map, badge, filter, storefront mapping and state-machine table in the codebase.
+    //
+    // Closing an order short therefore remains possible, but only as an EXPLICIT operator decision:
+    // ALLOCATED/PICKING/PACKING -> SHIPPED are all legal manual transitions via updateSalesOrderStatus
+    // (permission `sales.process`). What is no longer possible is the system deciding it silently.
+    //
+    // NOTE the practical consequence, because it is the reason this is reported rather than merely
+    // skipped: nothing re-allocates such an order on its own. `selectOrdersNeedingAllocation`'s callers
+    // both pre-exclude orders that hold shipments (the sweep excludes ANY shipment, the backorder
+    // allocator any committed one), precisely because rebuilding allocations under a live ShipmentLine
+    // is unsafe. So a shipped-short order waits for a human, and the caller logs a WARNING saying so.
+    const outstanding = await findOrderShipmentShortfall(tx, shipment.orderId)
+    if (outstanding) return outstanding
 
     const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')
     if (!transition.success) throw new Error(transition.error)
@@ -960,11 +1109,15 @@ export async function reconcileOrderAfterShipment(
         trackingNumber: trackingNumbers || (extra?.trackingNumber ?? null),
       },
     })
+    return null
   })
 
   const trigger = await client.setting.findUnique({ where: { key: 'invoice_trigger' } })
   return {
-    shouldGenerateInvoice: trigger?.value === 'on_shipped',
+    // An order held short is not shipped, so the on_shipped invoice trigger must not fire for it:
+    // invoicing it would bill the customer for units that have not left and are still owed.
+    shouldGenerateInvoice: !shortfall && trigger?.value === 'on_shipped',
     orderId: shipment.orderId,
+    ...(shortfall ? { shortfall } : {}),
   }
 }

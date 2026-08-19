@@ -704,7 +704,7 @@ export async function clearDormantFulfillmentPinsInTx(
  * `cancelSalesOrderFulfillmentState` deletes the PENDING/PICKING/PACKED shipments in the same
  * transaction as the release, which is exactly the atomicity this path lacks. The refusal message
  * must therefore not tell the operator to "cancel the shipment": that button does not exist.
- * Filling that gap (o3d-tv1q) is a product decision, not part of this fix.
+ * Filling that gap (o3d-q8r6) is a product decision, not part of this fix.
  *
  * The caller MUST already hold the order's row lock (lockSalesOrder).
  */

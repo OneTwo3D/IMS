@@ -67,10 +67,16 @@ function matches(row: SyncLogRow, where: WhereNode): boolean {
 function makeTx(seed: {
   pushLink?: { state: string; externalOrderId: string | null; externalOrderNumber: string | null } | null
   /**
-   * Shipment ids, or full rows when the test cares about Group B staging (o3d-0qoo).
-   * A bare id means "never journalled", which is what every pre-existing test assumes.
+   * Shipment ids, or full rows when the test cares about Group B staging (o3d-0qoo) or about the
+   * committed-shipment blocker (o3d-2y1c). A bare id means "a never-journalled PENDING draft",
+   * which is what every pre-existing test assumes and is also the column's schema default.
    */
-  shipments?: Array<string | { id: string; shipmentJournalDate?: Date | null; shipmentJournalBatchRef?: string | null }>
+  shipments?: Array<string | {
+    id: string
+    status?: string
+    shipmentJournalDate?: Date | null
+    shipmentJournalBatchRef?: string | null
+  }>
   syncLogs?: SyncLogRow[]
   /** Durable external-document markers on the order itself — these survive log retention. */
   order?: { accountingInvoiceId?: string | null; invoicedAt?: Date | null }
@@ -96,10 +102,13 @@ function makeTx(seed: {
     },
     wmsOrderPushLink: { findUnique: async () => seed.pushLink ?? null },
     shipment: {
+      // `status` is served because the guard now SELECTS it (o3d-2y1c). It defaults to PENDING —
+      // the schema default, and the status at which a shipment is still only a draft — so a
+      // fixture has to say COMMITTED explicitly for the committed-shipment blocker to fire.
       findMany: async () => (seed.shipments ?? []).map((shipment) => (
         typeof shipment === 'string'
-          ? { id: shipment, shipmentJournalDate: null, shipmentJournalBatchRef: null }
-          : { shipmentJournalDate: null, shipmentJournalBatchRef: null, ...shipment }
+          ? { id: shipment, status: 'PENDING', shipmentJournalDate: null, shipmentJournalBatchRef: null }
+          : { status: 'PENDING', shipmentJournalDate: null, shipmentJournalBatchRef: null, ...shipment }
       )),
     },
     accountingSyncLog: {
@@ -387,8 +396,12 @@ test('o3d-0qoo: a Group B shipment batch staged across UTC midnight blocks', asy
   // order erases the only local record of what the journal was built from.
   const blocker = await findSalesOrderDeleteBlocker(
     makeTx({
+      // SHIPPED, because Group B stages a shipment only once it has despatched. That also makes
+      // this a ranking check: the batch blocker must outrank the committed-shipment one (o3d-2y1c),
+      // since "have finance reverse the batch entry" is the more binding remedy.
       shipments: [{
         id: 'ship-1',
+        status: 'SHIPPED',
         shipmentJournalDate: PAST_MIDNIGHT,
         shipmentJournalBatchRef: 'B-2026-07-20-abcd1234',
       }],
@@ -409,7 +422,7 @@ test('o3d-0qoo: a legacy row with no persisted reference still blocks via the de
   // derive-from-stamp path has to keep working exactly as it did.
   const blocker = await findSalesOrderDeleteBlocker(
     makeTx({
-      shipments: [{ id: 'ship-1', shipmentJournalDate: A2_STAGED_AT, shipmentJournalBatchRef: null }],
+      shipments: [{ id: 'ship-1', status: 'SHIPPED', shipmentJournalDate: A2_STAGED_AT, shipmentJournalBatchRef: null }],
       syncLogs: [syncLog({
         id: 'b', type: 'DAILY_BATCH_GROUP_B', status: 'SYNCED',
         referenceType: 'DailyBatch', referenceId: 'B-2026-07-20',
@@ -839,4 +852,99 @@ test('no parked refund leaves the other blockers ranked as before (o3d-7yf)', as
   )
 
   assert.equal(blocker?.code, 'wms_order_push_link')
+})
+
+// --- o3d-2y1c: a committed shipment is local evidence that fulfilment has started ----------------
+//
+// Before this, `tx.shipment.findMany` was read ONLY to collect ids for the accounting checks and
+// nothing here blocked on a shipment. deleteSalesOrder accepts ALLOCATED as deletable, shipment
+// confirmation leaves the order ALLOCATED, and `ShipmentLine.lineId` is ON DELETE RESTRICT — so the
+// `salesOrderLine.deleteMany` inside the delete transaction raised a raw foreign-key violation and
+// rolled the whole thing back. The operator saw a database error instead of a reason.
+
+test('o3d-2y1c: a PICKING shipment is refused with a reason instead of hitting the FK restrict', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ shipments: [{ id: 'ship-1', status: 'PICKING' }] }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'committed_shipment')
+  // Names WHAT blocks it...
+  assert.match(blocker!.message, /1 picking/)
+  // ...and what the operator can actually do about it. Cancellation is a real remedy here:
+  // cancelSalesOrderFulfillmentState deletes PICKING/PACKED shipments with the allocation release.
+  assert.match(blocker!.message, /Cancel the order instead/)
+})
+
+test('o3d-2y1c: a PACKED shipment blocks too, and several are summarised by status', async () => {
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({
+      shipments: [
+        { id: 'ship-1', status: 'PACKED' },
+        { id: 'ship-2', status: 'PICKING' },
+        { id: 'ship-3', status: 'PICKING' },
+        // A draft alongside them must not be counted — it is retired by the release, not a blocker.
+        { id: 'ship-4', status: 'PENDING' },
+      ],
+    }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'committed_shipment')
+  assert.match(blocker!.message, /1 packed, 2 picking/)
+  assert.doesNotMatch(blocker!.message, /pending/)
+})
+
+test('o3d-2y1c: a PENDING draft shipment alone does NOT block — the release retires it', async () => {
+  // Non-vacuity guard, and the reason the original report’s literal case can no longer be the
+  // regression test: releaseOrderAllocationsInTx deletes unbacked drafts (and their ShipmentLine
+  // rows cascade) before the order lines are deleted, so a PENDING-only order deletes cleanly.
+  // Blocking on it would make every ordinary confirmed-allocation order permanently undeletable.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ shipments: [{ id: 'ship-1', status: 'PENDING' }, 'ship-2'] }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker, null)
+})
+
+test('o3d-2y1c: a SHIPPED shipment blocks and is NOT offered cancellation as the remedy', async () => {
+  // Cancelling does not un-dispatch anything — cancelSalesOrderFulfillmentState leaves SHIPPED
+  // shipments alone — so advising it here would be advice that provably cannot work.
+  // Reachable on a status-deletable (ALLOCATED) order since o3d-0i5y stopped promoting an order
+  // that shipped short to SHIPPED.
+  const blocker = await findSalesOrderDeleteBlocker(
+    makeTx({ shipments: [{ id: 'ship-1', status: 'SHIPPED' }] }),
+    'order-1',
+    STAMPS,
+  )
+  assert.equal(blocker?.code, 'committed_shipment')
+  assert.match(blocker!.message, /1 shipped/)
+  assert.match(blocker!.message, /refund or return/)
+  assert.doesNotMatch(blocker!.message, /Cancel the order instead/)
+})
+
+test('o3d-2y1c: a committed shipment outranks WMS evidence but not a posted accounting document', async () => {
+  const overWms = await findSalesOrderDeleteBlocker(
+    makeTx({
+      shipments: [{ id: 'ship-1', status: 'PACKED' }],
+      pushLink: { state: 'SYNCED', externalOrderId: 'wms-9', externalOrderNumber: 'WN-9' },
+    }),
+    'order-1',
+    STAMPS,
+  )
+  // Physical stock the warehouse holds is a more binding fact than a WMS document record.
+  assert.equal(overWms?.code, 'committed_shipment')
+
+  const underPostedInvoice = await findSalesOrderDeleteBlocker(
+    makeTx({
+      shipments: [{ id: 'ship-1', status: 'PACKED' }],
+      order: { accountingInvoiceId: 'INV-1' },
+    }),
+    'order-1',
+    STAMPS,
+  )
+  // A posted invoice needs a finance reversal first; saying "cancel the order" would leave a live
+  // receivable behind, so the accounting blocker must still be the one shown.
+  assert.equal(underPostedInvoice?.code, 'accounting_document_exists')
 })

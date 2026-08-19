@@ -27,6 +27,11 @@ type Order = {
    */
   withdrawalHoldAt?: Date | null
   withdrawalApprovedAt?: Date | null
+  /**
+   * o3d-0i5y: the orthogonal refund disposition. FULL is UNCONDITIONAL zero demand in the
+   * completion check, matching selectOrdersNeedingAllocation (o3d-jby) — absent means NONE.
+   */
+  refundStatus?: string | null
 }
 type OrderLine = {
   id: string
@@ -1188,6 +1193,13 @@ test('reconcileOrderAfterShipment marks fully shipped order and returns invoice 
       { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
       { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'SHIPPED', trackingNumber: 'TRACK-2', shippingService: null },
     ],
+    // o3d-0i5y: the two shipments now carry the LINES that cover the ordered qty (2). The fixture
+    // previously had none at all, so it described two despatched shipments that shipped nothing —
+    // exactly the state the completion check now refuses, and it would have passed either way.
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 1 },
+      { id: 'shipment-line-2', shipmentId: 'shipment-2', lineId: 'line-1', productId: 'product-1', qty: 1 },
+    ],
     settings: { invoice_trigger: 'on_shipped' },
   })
 
@@ -1197,6 +1209,124 @@ test('reconcileOrderAfterShipment marks fully shipped order and returns invoice 
   assert.equal(state.orders[0].status, 'SHIPPED')
   assert.equal(state.orders[0].trackingNumber, 'TRACK-1, TRACK-2')
   assert.ok(state.orders[0].shippedAt instanceof Date)
+})
+
+// --- o3d-0i5y: "every shipment shipped" is not "order complete" ---------------------------------
+//
+// Partial fulfilment is intentional here — you ship what you have — but the remainder did NOT stay
+// outstanding: once every EXISTING shipment reached SHIPPED the whole order was promoted to SHIPPED
+// without ever comparing shipped qty against ordered demand, and SHIPPED only goes on to
+// COMPLETED/DELIVERED, so nothing ever revisited the unshipped lines.
+
+test('o3d-0i5y: an order that shipped short is NOT promoted to SHIPPED', async () => {
+  // 10 ordered, only 4 allocated and shipped, no further stock. The order must not read as complete.
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 4 }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 4 },
+    ],
+    settings: { invoice_trigger: 'on_shipped' },
+  })
+
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+
+  // Held in the pre-shipment status it already had, not moved to SHIPPED and not given a shippedAt.
+  assert.equal(state.orders[0].status, 'ALLOCATED')
+  assert.equal(state.orders[0].shippedAt, undefined)
+  assert.equal(state.orders[0].trackingNumber, undefined)
+  // and not invoiced on the on_shipped trigger — billing for units that never left.
+  assert.equal(result.shouldGenerateInvoice, false)
+  // The refusal is REPORTED, with the specific line and the specific outstanding quantity, so the
+  // caller can raise it for an operator. Nothing re-allocates a shipped-short order on its own.
+  assert.deepEqual(result.shortfall, [{
+    lineId: 'line-1',
+    label: 'SKU-1',
+    productId: 'product-1',
+    orderedQty: 10,
+    refundedQty: 0,
+    shippedQty: 4,
+    outstandingQty: 6,
+  }])
+})
+
+test('o3d-0i5y: the shortfall basis NETS REFUNDS, so a partly refunded order still completes', async () => {
+  // 10 ordered, 6 refunded, 4 shipped. Comparing against GROSS ordered qty would leave this order
+  // permanently short and never closeable — the mistake o3d-jby fixed in the coverage selector.
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED', refundStatus: 'PARTIAL' }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'product-1', qty: 6 }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 4 },
+    ],
+    settings: { invoice_trigger: 'on_shipped' },
+  })
+
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.shortfall, undefined)
+  assert.equal(result.shouldGenerateInvoice, true)
+  assert.equal(state.orders[0].status, 'SHIPPED')
+})
+
+test('o3d-0i5y: a FULL refund is unconditional zero demand, not a permanent shortfall', async () => {
+  // A monetary-only or shipping-only refund line nets NOTHING per line, so without the
+  // refundStatus short-circuit (the same one selectOrdersNeedingAllocation uses) a fully refunded
+  // order would read as short forever and could never be closed automatically.
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED', refundStatus: 'FULL' }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    // Deliberately unlinked: no salesOrderLineId, so per-line netting cancels nothing.
+    refundLines: [{ orderId: 'order-1', salesOrderLineId: null, productId: null, qty: 10 }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 4 },
+    ],
+  })
+
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.shortfall, undefined)
+  assert.equal(state.orders[0].status, 'SHIPPED')
+})
+
+test('o3d-0i5y: the shortfall is measured in LEAF units, so a half-shipped KIT is caught', async () => {
+  // 2 kits ordered, each 2xA + 1xB. A shipment carrying one whole kit's worth (2xA + 1xB) is a
+  // proportional, individually-valid set — the dispatch cap accepts it because no leaf EXCEEDS
+  // demand — but it is only half the order. Comparing parent-kit qty against component shipment
+  // rows would have made this read as complete.
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 2, sku: 'KIT-1', description: 'Kit 1' }],
+    kits: { 'kit-1': [{ componentId: 'product-a', qty: 2 }, { componentId: 'product-b', qty: 1 }] },
+    allocations: [],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-a', qty: 2 },
+      { id: 'shipment-line-2', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-b', qty: 1 },
+    ],
+  })
+
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(state.orders[0].status, 'ALLOCATED')
+  // Named per LEAF product — the components actually short, not the kit.
+  assert.deepEqual(
+    result.shortfall?.map((line) => [line.productId, line.outstandingQty]).sort(),
+    [['product-a', 2], ['product-b', 1]].sort(),
+  )
 })
 
 test('reconcileOrderAfterShipment does not rewrite terminal orders', async () => {
@@ -1827,7 +1957,7 @@ test('o3d-4kfh r6 (finding 4): the discard is IDEMPOTENT — a second run writes
 })
 
 test('o3d-4kfh r6 (finding 4): the discard REFUSES on an order that is not cancelled', async () => {
-  // This is not a general per-shipment cancel (o3d-tv1q is still open). Cancelling the order is the
+  // This is not a general per-shipment cancel (o3d-q8r6 is still open). Cancelling the order is the
   // route for a live one, and it releases the reservations in the same transaction.
   const state = baseState({
     orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],

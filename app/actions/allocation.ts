@@ -1189,6 +1189,28 @@ export async function updateShipmentStatus(
 
     if (targetStatus === 'SHIPPED') {
       const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra)
+      // o3d-0i5y: every shipment raised on this order has now shipped, but the order still owes
+      // quantity, so it was deliberately left in its pre-shipment status instead of being declared
+      // complete. Nothing re-allocates such an order automatically (both allocation sweeps exclude
+      // orders holding shipments), so this WARNING is the operator queue for it — same pattern as
+      // the paid_without_invoice warning. Logged on EVERY shipped transition, not only the one that
+      // first exposed the shortfall, so a retry after a crashed log still surfaces it.
+      if (reconciliation.shortfall) {
+        const orderRef = result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber
+        const outstandingSummary = reconciliation.shortfall
+          .map((line) => `${line.label} (${line.outstandingQty} outstanding)`)
+          .join(', ')
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: reconciliation.orderId,
+          action: 'shipped_short',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Order ${orderRef} has despatched every shipment raised against it but is still short: ${outstandingSummary}. `
+            + 'It has NOT been marked SHIPPED. Allocate and ship the remainder, or set the order to SHIPPED explicitly to close it short.',
+          metadata: { orderNumber: orderRef, shortfall: reconciliation.shortfall },
+        })
+      }
       if (reconciliation.shouldGenerateInvoice) {
         const { generateInvoiceNumber } = await import('./sales')
         await generateInvoiceNumber(reconciliation.orderId)
