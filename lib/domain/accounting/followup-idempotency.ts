@@ -521,3 +521,27 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   }
   return { action: 'create', payload: freshPayload }
 }
+
+/**
+ * DOES THIS LIVE ROW ALREADY OWN THE FOLLOW-UP WE ARE ABOUT TO ENQUEUE? (o3d-hbgo)
+ *
+ * `hasExistingSyncLog` decided that from (connector, type, referenceType, referenceId) alone, and the
+ * partial unique index was scoped the same way — neither consulted the external document the follow-up
+ * TARGETS. So a SalesOrder whose invoice was deleted and re-posted kept the SYNCED INVOICE_PAYMENT row
+ * from the FIRST invoice, the payment follow-up for the SECOND was skipped as already handled, and the
+ * new invoice was never settled. Silently: a skip logs nothing.
+ *
+ * o3d-h2wx had already made the remote TOKEN anchor-aware, so a follow-up targeting a different
+ * accountingInvoiceId derives a different Idempotency-Key rather than being deduped by the ledger. This
+ * closes the same gap one level down, using the SAME anchors — a row-level dedup that names less than
+ * the token it would post under can only ever throw away work the token was ready to distinguish.
+ *
+ * An unanchored stored payload counts as MATCHING, exactly as `couldHaveCommittedThis` treats it: we
+ * cannot tell what it targeted, and skipping a possibly-duplicate payment is recoverable where posting
+ * one is not. That is the OPPOSITE of the database index's null handling — the index groups unanchored
+ * rows into their own slot — and deliberately so: the application guard may be stricter than the
+ * constraint that backs it, never laxer.
+ */
+export function liveRowOccupiesFollowUpSlot(storedPayload: unknown, freshPayload: FollowUpPayload): boolean {
+  return couldHaveCommittedThis(asPayload(storedPayload), anchorsOf(freshPayload))
+}

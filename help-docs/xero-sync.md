@@ -1260,11 +1260,17 @@ A payment recorded on a sales order (**Add Payment**) is registered against the 
 
 - accounting sync is on and the invoice has already posted to Xero;
 - the payment method and currency resolve to a bank account in the mapping above;
-- no payment for that order has already been sent to Xero, and the receipt is not larger than the invoice Xero holds.
+- the receipt still **fits** in what is left of the invoice Xero holds, after everything already registered against it.
 
 If any of those does not hold, the receipt is still recorded in the IMS, nothing is sent, and a warning naming the order appears in the activity log — the order then shows **NOT SENT TO LEDGER** until it is registered.
 
-The third condition matters most for imported orders: a paid WooCommerce order registers its payment automatically without creating a payment row in the IMS, so recording "the" payment by hand afterwards would pay the Xero invoice twice. The IMS refuses that rather than doing it silently. It also means only **one** registration per order is sent automatically — record a second part payment and you will be asked to register it in Xero yourself.
+**Part payments.** Each receipt gets its own Xero payment, so a deposit followed by a balance settles the invoice in two steps without anyone touching Xero. The IMS keeps a running total instead of a one-at-a-time rule: the receipt that would take the total past the invoice is the one refused, and the warning names both figures. If a registration already on the invoice does not record its amount, the IMS cannot work out the room left and refuses rather than guess.
+
+**Imported orders.** A paid WooCommerce order registers its payment automatically without creating a payment row in the IMS. That registration cannot be matched to any particular receipt, so while it is there the IMS will not register a hand-recorded one on the same order — recording "the" payment afterwards would pay the Xero invoice twice.
+
+**A receipt recorded before the invoice posts** is no longer lost. A payment cannot attach to a document Xero has never seen, so it is refused at the time with a warning — but the IMS now re-registers it by itself as soon as the invoice reaches Xero, re-running the same checks. Only receipts with no registration attempt of their own are picked up this way; one that already failed is left to the retry path, since a failed attempt may still have reached Xero.
+
+**A re-issued invoice** (deleted in Xero and posted again) starts with a clean slate: payments registered against the old invoice no longer count against the new one, and the payment for the replacement is queued rather than skipped as already-done.
 
 Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there.
 

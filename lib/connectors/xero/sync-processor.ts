@@ -36,7 +36,13 @@ import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
-import { applyBackReference, followUpObligationClaim, releaseFollowUpObligation } from '@/lib/domain/accounting/back-reference'
+import {
+  applyBackReference,
+  backReferenceIsMissing,
+  followUpObligationClaim,
+  releaseFollowUpObligation,
+  syncTypeWritesBackReference,
+} from '@/lib/domain/accounting/back-reference'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import { claimHeldFrom, heldClaimWhere, releaseClaimForRetry, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import {
@@ -52,7 +58,12 @@ import {
   repairAccountingBackReferences,
   type BackReferenceRepairResult,
 } from '@/lib/domain/accounting/back-reference-sweep'
-import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import {
+  liveRowOccupiesFollowUpSlot,
+  planFollowUpEnqueue,
+  readFollowUpIdempotencyKey,
+  type FollowUpPayload,
+} from '@/lib/domain/accounting/followup-idempotency'
 import {
   buildCompactedFollowUpLossActivity,
   isCompactedFollowUpEvidence,
@@ -863,12 +874,23 @@ async function logFollowUpRetry(entryId: string, error: unknown): Promise<void> 
   })
 }
 
+/**
+ * o3d-hbgo: a live row only owns this follow-up when it targets the SAME external document. Counting
+ * rows by (connector, type, reference) alone made a re-invoiced order's payment look already-handled,
+ * so the replacement invoice was never settled — and a skip logs nothing. The anchor comparison lives
+ * in the follow-up idempotency module so the ROW dedup and the remote TOKEN are scoped by the same
+ * fields; a dedup that names less than the token can only discard work the token could distinguish.
+ *
+ * Payloads rather than a count: the anchors live inside the JSON, and the live rows for one scope are
+ * bounded by the partial unique index that backs this check.
+ */
 async function hasExistingSyncLog(
   type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
+  payload: SyncPayload,
 ): Promise<boolean> {
-  const count = await db.accountingSyncLog.count({
+  const liveRows = await db.accountingSyncLog.findMany({
     where: {
       connector: XERO_CONNECTOR,
       type,
@@ -876,8 +898,9 @@ async function hasExistingSyncLog(
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
     },
+    select: { payload: true },
   })
-  return count > 0
+  return liveRows.some((row) => liveRowOccupiesFollowUpSlot(row.payload, payload as FollowUpPayload))
 }
 
 /**
@@ -936,7 +959,7 @@ async function enqueueFollowUpSyncLog(
   ) as SyncPayload
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
-  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
+  const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId, payload)
   // o3d-h2wx: a FAILED row is REUSED rather than replaced. Xero's Idempotency-Key is
   // derived from the entry id, so creating a replacement row would post the retry under a
   // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
@@ -4356,6 +4379,18 @@ async function enqueueSalesInvoiceFollowUps(
     invoiceNumber: syncResult.invoiceNumber,
     sourceEntryId: entryId,
   }, { from: 'postedRow', payload })
+
+  // o3d-ekn8: receipts recorded BEFORE this invoice existed were refused with DOCUMENT_NOT_POSTED and
+  // nothing ever came back for them. This is the moment that refusal stops applying — the CREATE has
+  // posted and updateBackReference (which runs before enqueueFollowUps) has written accountingInvoiceId
+  // — so re-drive the same guarded decision here. Imported orders are unaffected: their receipt is
+  // registered by the `_registerPayment` branch above and has no local Payment row to re-drive.
+  //
+  // Imported dynamically so the connector does not take a static dependency on the sales domain, and
+  // awaited but never allowed to throw: the invoice HAS posted, and a receipt that could not be
+  // re-registered must not turn that into a failed sync entry.
+  const { registerDeferredOrderReceipts } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
+  await registerDeferredOrderReceipts(referenceId)
 }
 
 async function enqueuePurchaseInvoiceFollowUps(

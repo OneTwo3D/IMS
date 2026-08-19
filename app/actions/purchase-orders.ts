@@ -27,6 +27,7 @@ import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purcha
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
+import { supersededBillPaymentRows } from '@/lib/domain/accounting/payment-reversal'
 import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
@@ -3481,6 +3482,30 @@ export async function markBillPaid(
     })
     if (paidUpdate.count === 0) {
       return { success: false, error: 'Bill is already marked as paid' }
+    }
+
+    // o3d-a3wx: winning that transition means IMS held this bill as UNSETTLED, so any live BILL_PAYMENT
+    // row describes a payment the ledger no longer has (the poller's reversal pass is what clears
+    // paidAt). Retire it before queueing the replacement. Without this, the newly widened
+    // accounting_sync_logs_followup_live_unique would let the stale row hold the slot and REFUSE the
+    // legitimate re-payment — the bill paid in IMS with nothing queued, and the constraint that exists
+    // to stop a double payment stranding a real one instead.
+    const supersededBillPayments = supersededBillPaymentRows(
+      await db.accountingSyncLog.findMany({
+        where: { type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: invoice.id },
+        select: { id: true, status: true },
+      }),
+    )
+    if (supersededBillPayments.length > 0) {
+      await db.accountingSyncLog.updateMany({
+        where: { id: { in: supersededBillPayments.map((row) => row.id) } },
+        data: {
+          status: 'CANCELLED',
+          errorMessage:
+            'Superseded: the bill was marked unpaid (payment no longer present in the accounting ' +
+            'connector) and has been paid again, so this registration no longer describes the ledger.',
+        },
+      })
     }
 
     revalidatePath('/purchase-orders')
