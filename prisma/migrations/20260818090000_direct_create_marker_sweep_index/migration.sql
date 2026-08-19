@@ -7,7 +7,9 @@
 --    WHERE "entityType" = 'SALES_ORDER'
 --      AND action = 'fulfilment_entry_pending_verification'
 --      AND "createdAt" < NOW() - <grace>
---    GROUP BY "entityId" ORDER BY MIN("createdAt") ASC LIMIT <n>
+--    GROUP BY "entityId"
+--    ORDER BY GREATEST(MIN("createdAt"), MAX(("metadata"->>'lastFailedAt')::timestamp)) ASC
+--    LIMIT <n>
 --
 -- activity_logs has indexes on (entityType, entityId), (createdAt), (tag), (level) and
 -- (level, createdAt). NONE of them helps: the query knows no entityId, and every other predicate
@@ -22,8 +24,14 @@
 -- activity_logs takes, and turns the sweep's scan into a bounded index read.
 --
 -- ("createdAt", "entityId") in that order, matching the query: the ageing predicate is the range
--- scan and entityId comes along so the GROUP BY and ORDER BY MIN("createdAt") are answered from
--- the index alone.
+-- scan and entityId comes along with it, so the rows to group are identified from the index.
+--
+-- What the index does NOT do is answer the whole query. The ORDER BY defers a marker whose last
+-- attempt failed, so one unresolvable order cannot own the head of the queue (MARKER_DEFERRAL_KEY
+-- in lib/fulfillment/pre-fulfilment-reallocation.ts), and it reads that from `metadata` — a heap
+-- fetch, then a sort over the grouped rows. Neither is worth widening the index for: both run
+-- over the outstanding markers ALONE, which is the handful of rows this index exists to isolate,
+-- and the cost this migration is about is the 30-to-90-day table scan that finds them.
 --
 -- THE LITERAL IS LOAD-BEARING. A partial index predicate cannot reference a TypeScript constant,
 -- so this string and DIRECT_CREATE_PENDING_ACTION must stay in step; rename one and the sweep

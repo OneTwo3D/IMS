@@ -396,9 +396,11 @@ export async function assessDemandCoverage(
  * Resolve the marker: answer the coverage question under the order lock, record a shortfall when
  * the demand is genuinely uncovered, and clear the marker.
  *
- * THE MARKER IS THE PROVENANCE AND THE IDEMPOTENCY KEY. No marker means the question was already
- * answered once, so this is safe to call repeatedly, and the created status is read back from the
- * marker rather than inferred from the order's current one.
+ * THE MARKER IS THE PROVENANCE AND THE IDEMPOTENCY KEY — the marker SET, not the row: an order
+ * may carry more than one, they assert one fact, and one answer discharges all of them (Codex
+ * review r6, finding 2). No marker means the question was already answered once, so this is safe
+ * to call repeatedly, and the created status is read back from the OLDEST marker rather than
+ * inferred from the order's current one.
  *
  * "Already answered" is not the same as "answered correctly", though, which is why the no-marker
  * branch is a CORRECTION rather than a return: the answer may have been taken while this order's
@@ -423,9 +425,11 @@ export async function resolveDirectCreateMarker(params: {
 }): Promise<DirectCreateMarkerResolution> {
   const { tx, orderId } = params
 
+  // The OLDEST marker, because that is the one whose metadata records the creation this
+  // obligation is about; any later duplicate is another assertion of the same fact.
   const marker = await tx.activityLog.findFirst({
     where: { entityType: 'SALES_ORDER', entityId: orderId, action: DIRECT_CREATE_PENDING_ACTION },
-    select: { id: true, metadata: true },
+    select: { metadata: true },
     orderBy: { createdAt: 'asc' },
   })
   // Already resolved — by this order's own import, or by a concurrent resolver that got the lock
@@ -458,13 +462,23 @@ export async function resolveDirectCreateMarker(params: {
     }))
   }
 
-  // Cleared in the SAME transaction as the record, so if the record could not be written the
-  // marker survives with it and the two can never disagree.
+  // EVERY marker for this order, not the one row that was read (Codex review r6, finding 2).
   //
-  // deleteMany, NOT delete: a concurrent deletion of this row would make `delete` throw and
-  // roll back the shortfall record we just wrote, losing BOTH (Codex review). Clearing a marker
-  // that is already gone is exactly the no-op it should be.
-  await tx.activityLog.deleteMany({ where: { id: marker.id } })
+  // The obligation is "this order entered fulfilment with its coverage unverified", and an order
+  // has exactly ONE of those however many rows assert it. Clearing by row id left any duplicate
+  // standing, and a surviving marker is not inert: the next resolver finds it, re-asks a question
+  // already answered under this same lock, and writes a SECOND shortfall record for one event.
+  // Worse, because the late-allocation correction only runs on the no-marker branch, the leftover
+  // marker also keeps `retractSupersededShortfall` from ever withdrawing a record the late
+  // allocation has since made false — the duplicate defeats the retraction as well as the
+  // idempotency. Keyed on the obligation, both follow from one delete.
+  //
+  // deleteMany, NOT delete, for the older reason too: a concurrent deletion of a row named by id
+  // would make `delete` throw and roll back the shortfall record we just wrote, losing BOTH
+  // (Codex review). Clearing markers that are already gone is exactly the no-op it should be.
+  await tx.activityLog.deleteMany({
+    where: { entityType: 'SALES_ORDER', entityId: orderId, action: DIRECT_CREATE_PENDING_ACTION },
+  })
   return { recorded, resolved: true, retracted: 0, verdict }
 }
 
@@ -574,11 +588,54 @@ const DIRECT_CREATE_SWEEP_LIMIT = 200
  * writer is 200 x 5s before any useful work happens, on a job that runs every 15 minutes.
  *
  * The deadline is checked AFTER each marker, never before, so the budget can throttle the sweep
- * but can never stop it making progress — a zero budget still resolves one marker per tick, and
- * markers are taken oldest-first, so nothing starves. Worst-case overshoot is therefore one
- * marker: the 20s transaction timeout plus the 5s lock wait.
+ * but can never stop it making progress: a zero budget still attempts one marker per tick.
+ * Worst-case overshoot is therefore one marker: the 20s transaction timeout plus the 5s lock wait.
+ *
+ * That is progress through the LOOP. Progress through the QUEUE is a different claim and needs
+ * the deferral below — "oldest-first" alone guarantees it only while the oldest marker keeps
+ * being resolved (Codex review r6, finding 1).
  */
 const DIRECT_CREATE_SWEEP_BUDGET_MS = 120_000
+
+/**
+ * THE JSON KEY THAT LETS A FAILING MARKER YIELD ITS TURN (Codex review r6, finding 1).
+ *
+ * A tight budget spends the whole tick on the head of the queue. If that marker RESOLVES it
+ * leaves the queue, so the next tick starts on the next one and the page drains — which is why
+ * "a zero budget still resolves one marker, oldest-first" sounded like a starvation argument. It
+ * is not: a marker that FAILS is still there, still the oldest, and still the head next tick.
+ * A single order whose row lock is permanently held — or whose coverage read reliably times out —
+ * then consumes every tick forever and nothing behind it is ever reached. The markers behind it
+ * are the ones exempt from retention, so the exemption grows without bound again, which is the
+ * failure the sweep exists to prevent.
+ *
+ * A failed attempt therefore STAMPS this key on the order's markers and the queue is ordered by
+ * GREATEST(MIN(createdAt), MAX(lastFailedAt)) — when the marker became due, which is its creation
+ * until it fails and its last failure after that. So:
+ *
+ *   - it YIELDS: every marker currently queued was due before this one failed, so the failure
+ *     puts it behind all of them. No interval constant is involved and none would do, because a
+ *     backoff shorter than the cron's own period would put it straight back at the head.
+ *   - it does NOT LOSE ITS TURN: nothing is deleted, the obligation still stands, the grace
+ *     predicate still reads the untouched `createdAt`, and once its peers have had their turn it
+ *     is the oldest-due marker again and is retried.
+ *
+ * The invariant this restores is the one the budget check needs: EVERY marker leaves the head of
+ * the queue after one attempt — resolved and deleted, or deferred behind its peers.
+ *
+ * Written into the marker's own metadata rather than a column: it is state about the obligation,
+ * it dies with the marker, and it costs no migration on a table this size. The ORDER BY casts it
+ * back to a timestamp, so this key must never hold anything else — the ONE statement that writes
+ * it is `deferFailedMarker`, and the ONE that reads it is the candidate query. Both spell it as a
+ * SQL literal (a JSON path cannot reference a TS constant), and the pairing is asserted in
+ * tests/pre-fulfilment-reallocation.test.ts.
+ *
+ * Stored NAIVE UTC (`NOW() AT TIME ZONE 'UTC'`), which is how Prisma stores `createdAt` in this
+ * TIMESTAMP(3) column. The two are compared against each other in that ORDER BY, and a timestamptz
+ * on one side would have to be coerced through the session's TimeZone to meet a timestamp on the
+ * other — a correct ordering only as long as nobody sets one.
+ */
+export const MARKER_DEFERRAL_KEY = 'lastFailedAt'
 
 export type DirectCreateMarkerSweepResult = {
   scanned: number
@@ -613,8 +670,16 @@ export async function sweepUnresolvedDirectCreateMarkers(
   const now = options.now ?? Date.now
   const deadline = now() + Math.max(0, budgetMs)
 
-  // Aged on the DATABASE clock, not this process's. One row per order (an order can only be
-  // created once, but GROUP BY makes a duplicate marker one unit of work rather than two).
+  // Aged on the DATABASE clock, not this process's. One row per order — an order has ONE
+  // obligation however many marker rows assert it, and `resolveDirectCreateMarker` now answers
+  // and clears the whole group in one go, so GROUP BY is the unit of work AND the unit of
+  // resolution rather than just a way to avoid doing the same order twice in one tick.
+  //
+  // ORDER BY the DUE time, not the creation time: a marker whose last attempt FAILED is deferred
+  // behind every marker that has not, which is what stops one unresolvable order owning the head
+  // of the queue for good (see MARKER_DEFERRAL_KEY). GREATEST ignores NULLs in Postgres, so a
+  // marker that has never failed is ordered by its creation exactly as before. The ageing
+  // predicate is still `createdAt`: a failure must not re-open the import's grace window.
   const rows = await db.$queryRaw<Array<{ entityId: string }>>`
     SELECT "entityId"
     FROM "activity_logs"
@@ -622,7 +687,7 @@ export async function sweepUnresolvedDirectCreateMarkers(
       AND action = ${DIRECT_CREATE_PENDING_ACTION}
       AND "createdAt" < NOW() - make_interval(secs => CAST(${graceSeconds} AS double precision))
     GROUP BY "entityId"
-    ORDER BY MIN("createdAt") ASC
+    ORDER BY GREATEST(MIN("createdAt"), MAX(("metadata"->>'lastFailedAt')::timestamp)) ASC, "entityId" ASC
     LIMIT ${limit}
   `
 
@@ -655,6 +720,9 @@ export async function sweepUnresolvedDirectCreateMarkers(
       // One poison order must not stop the rest of the page; it is retried next tick.
       result.errors += 1
       console.error(`[direct-create-sweep] could not resolve the marker for ${row.entityId}:`, error)
+      // ...and it must not be retried FIRST next tick, or a tight budget spends every tick on it
+      // and the queue behind it is never reached (Codex review r6, finding 1).
+      await deferFailedMarker(row.entityId)
     }
     // AFTER the work, so a tight budget throttles the page instead of emptying it. `scanned`
     // counts markers this tick actually attempted, not the candidates the query returned.
@@ -665,6 +733,41 @@ export async function sweepUnresolvedDirectCreateMarkers(
   }
 
   return result
+}
+
+/**
+ * Send a marker that just failed to the back of the queue, without taking it out of the queue.
+ *
+ * Stamped on EVERY marker row for the order, because the candidate query orders groups by
+ * MAX(lastFailedAt) and the group is the obligation. Written outside any transaction, and
+ * deliberately so: the attempt that failed rolled back, and the one thing that must survive it is
+ * the record that it happened.
+ *
+ * It does NOT need the order's row lock, which matters because the most likely reason to be here
+ * is that the lock could not be taken — a deferral that queued behind the same lock would fail
+ * for the same reason and defer nothing.
+ *
+ * The stamp comes from the DATABASE clock, like the ageing predicate: two sweep processes with
+ * differently skewed clocks must not be able to order the queue differently. `createdAt` is left
+ * strictly alone — a failed attempt must not re-open the import's grace window.
+ *
+ * BEST EFFORT. A failure here is not a correctness failure: the marker keeps its place, the next
+ * tick retries it first, and the only thing lost is fairness for one cycle. Raising it would turn
+ * a fairness aid into a way to abort a sweep that is already dealing with a failure.
+ */
+async function deferFailedMarker(orderId: string): Promise<void> {
+  try {
+    await db.$executeRaw`
+      UPDATE "activity_logs"
+      SET "metadata" = COALESCE("metadata", '{}'::jsonb)
+                     || jsonb_build_object('lastFailedAt', NOW() AT TIME ZONE 'UTC')
+      WHERE "entityType" = 'SALES_ORDER'
+        AND action = ${DIRECT_CREATE_PENDING_ACTION}
+        AND "entityId" = ${orderId}
+    `
+  } catch (error) {
+    console.error(`[direct-create-sweep] could not defer the failed marker for ${orderId}:`, error)
+  }
 }
 
 /**

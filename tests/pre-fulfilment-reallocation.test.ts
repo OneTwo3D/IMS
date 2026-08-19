@@ -61,8 +61,22 @@ mock.module('@/app/actions/allocation', {
 
 /** Every `$queryRaw` the sweep issues, so its ageing predicate can be asserted rather than assumed. */
 const rawQueries: Array<{ sql: string; values: unknown[] }> = []
-/** Orders the sweep's candidate query should return, i.e. markers already past the grace window. */
+/** Every `$executeRaw` — i.e. every deferral the sweep stamps on a marker it could not resolve. */
+const rawUpdates: Array<{ sql: string; values: unknown[]; entityId: string; key: string }> = []
+/**
+ * Orders with an outstanding marker past the grace window, oldest FIRST — the array position is
+ * the marker's `createdAt`. A resolve deletes the marker (see `markerTx`), which takes the order
+ * out of here, exactly as it takes it out of the sweep's candidate query.
+ */
 const agedMarkerOrderIds: string[] = []
+/** Deferral stamps the sweep wrote, per entityId and per JSON key, on the modelled DB clock. */
+const markerDeferrals = new Map<string, Record<string, number>>()
+/** A monotonic stand-in for NOW(), always later than any seeded marker's creation. */
+let dbClock = 1_000
+/** The entityIds the last candidate query served, in the order it served them. */
+let servedQueue: string[] = []
+/** The markers the sweep actually spent a tick on, in order — including the ones that threw. */
+const attemptedOrders: string[] = []
 /** Orders whose row lock was taken, in order. */
 const lockedOrders: string[] = []
 /** Per-order transaction clients the sweep should be handed. */
@@ -83,13 +97,51 @@ mock.module('@/lib/db', {
         findUnique: async ({ where }: { where: { id: string } }) =>
           state.orders.find((order) => order.id === where.id) ?? null,
       },
+      // The candidate query is EVALUATED, not stubbed past: the sweep's ordering is the whole
+      // fairness argument, so this reads the ORDER BY the sweep actually sent and applies it —
+      // and throws on an ordering it does not model rather than quietly serving creation order.
       $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
-        rawQueries.push({ sql: strings.join('?'), values })
-        return agedMarkerOrderIds.map((entityId) => ({ entityId }))
+        const sql = strings.join('?')
+        rawQueries.push({ sql, values })
+        const orderBy = /ORDER BY ([^\n]*)/.exec(sql)?.[1] ?? ''
+        if (!/GREATEST\(\s*MIN\("createdAt"\)/.test(orderBy)) {
+          throw new Error(`the db double does not model this candidate ordering: ${orderBy}`)
+        }
+        const deferralKey = /MAX\(\("metadata"->>'(\w+)'\)::timestamp\)/.exec(orderBy)?.[1]
+        if (!deferralKey) {
+          throw new Error(`the candidate ordering must read a deferral stamp out of metadata: ${orderBy}`)
+        }
+        // GREATEST ignores NULLs, so a marker that has never failed is due at its creation.
+        const dueAt = (entityId: string) =>
+          Math.max(agedMarkerOrderIds.indexOf(entityId), markerDeferrals.get(entityId)?.[deferralKey] ?? -Infinity)
+        servedQueue = [...agedMarkerOrderIds].sort((a, b) => dueAt(a) - dueAt(b) || a.localeCompare(b))
+        sweepTxHandouts = 0
+        return servedQueue.map((entityId) => ({ entityId }))
+      },
+      // The deferral write. Modelled clause by clause for the same reason: a statement that
+      // stamped the wrong key, or was not scoped to one order, would still "work" here.
+      $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+        const sql = strings.join('?')
+        if (!/^\s*UPDATE "activity_logs"/.test(sql)) {
+          throw new Error(`the db double does not model this statement: ${sql}`)
+        }
+        const key = /jsonb_build_object\('(\w+)', NOW\(\) AT TIME ZONE 'UTC'\)/.exec(sql)?.[1]
+        if (!key) throw new Error(`the deferral must stamp one JSON key from the DATABASE clock, naive UTC: ${sql}`)
+        for (const clause of [/"entityType" = 'SALES_ORDER'/, /AND action = \?/, /AND "entityId" = \?/]) {
+          if (!clause.test(sql)) throw new Error(`the deferral must be scoped by ${clause}: ${sql}`)
+        }
+        assert.equal(values.length, 2, 'the action and the order, and nothing else')
+        assert.equal(values[0], 'fulfilment_entry_pending_verification', 'scoped to the marker action')
+        const entityId = String(values[1])
+        rawUpdates.push({ sql, values, entityId, key })
+        markerDeferrals.set(entityId, { ...(markerDeferrals.get(entityId) ?? {}), [key]: ++dbClock })
+        return 1
       },
       $transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
-        // One client per order, in the order the sweep asks for them.
-        const orderId = agedMarkerOrderIds[sweepTxHandouts++]
+        // One client per order, in the order the CANDIDATE QUERY served them — which is the
+        // order under test, so it must not be re-derived from the seeding order here.
+        const orderId = servedQueue[sweepTxHandouts++]
+        attemptedOrders.push(orderId)
         if (sweepTxThrows.has(orderId)) throw new Error(`lock timeout on ${orderId}`)
         return fn(sweepTxByOrder.get(orderId) ?? {})
       },
@@ -120,7 +172,12 @@ function seedOrder(id: string, shipments = 0, status = 'PICKING') {
 
 function reset() {
   rawQueries.length = 0
+  rawUpdates.length = 0
   agedMarkerOrderIds.length = 0
+  markerDeferrals.clear()
+  servedQueue = []
+  attemptedOrders.length = 0
+  dbClock = 1_000
   lockedOrders.length = 0
   sweepTxByOrder.clear()
   sweepTxThrows.clear()
@@ -478,22 +535,63 @@ test('the coverage selector reads EVERYTHING through one client (o3d-c9mi)', asy
 function markerTx(
   orderId: string,
   written: Row[],
-  marker: { id: string; metadata: unknown } | null = { id: 'm1', metadata: { orderId, createdAtStatus: 'PICKING' } },
+  marker: { id: string; metadata: unknown } | Array<{ id: string; metadata: unknown }> | null =
+    { id: 'm1', metadata: { orderId, createdAtStatus: 'PICKING' } },
 ) {
+  /**
+   * The order's marker rows, OLDEST FIRST — a list, not a row, because an order can carry more
+   * than one and the recorder has to answer the obligation rather than the row it happened to
+   * read. Resolving removes them here AND from the sweep's queue, which is what the real delete
+   * does: the candidate query only returns orders that still have a marker.
+   */
+  const markers = marker === null ? [] : Array.isArray(marker) ? [...marker] : [marker]
   const deleted: string[] = []
   const selects: Array<Record<string, unknown>> = []
   /** Every WHERE the code asked the sweep's selector with, so the ASK can be asserted. */
   const selectorWheres: Array<Record<string, unknown>> = []
   const tx = {
     activityLog: {
-      findFirst: async () => marker,
+      // `orderBy: { createdAt: 'asc' }` — the OLDEST marker, whose metadata is the creation this
+      // obligation is about.
+      findFirst: async () => markers[0] ?? null,
       findMany: async ({ where }: { where: { entityId: string; action: string } }) =>
         state.records.filter((row) => row.entityId === where.entityId && row.action === where.action),
       create: async ({ data }: { data: Row }) => { written.push(data); return data },
-      deleteMany: async ({ where }: { where: { id: string | { in: string[] } } }) => {
-        const ids = typeof where.id === 'string' ? [where.id] : where.id.in
-        deleted.push(...ids)
-        return { count: ids.length }
+      // Two shapes, evaluated rather than assumed: by id (the retraction withdrawing records it
+      // just read) and by the marker predicate (the resolution discharging the obligation). A
+      // third shape throws, so a delete that narrowed back to one row cannot pass unnoticed.
+      deleteMany: async ({ where }: { where: Record<string, unknown> }) => {
+        // An order with no marker left is an order the sweep's candidate query stops returning,
+        // whichever shape removed the last one — so the queue is maintained here and not by the
+        // test, and a delete that clears fewer rows than it should shows up as an order that
+        // keeps coming back.
+        const forgetIfAnswered = () => {
+          if (markers.length > 0) return
+          const queued = agedMarkerOrderIds.indexOf(orderId)
+          if (queued !== -1) agedMarkerOrderIds.splice(queued, 1)
+        }
+        if ('id' in where) {
+          const id = where.id as string | { in: string[] }
+          const ids = typeof id === 'string' ? [id] : id.in
+          for (const one of ids) {
+            const at = markers.findIndex((row) => row.id === one)
+            if (at !== -1) markers.splice(at, 1)
+          }
+          deleted.push(...ids)
+          forgetIfAnswered()
+          return { count: ids.length }
+        }
+        if (where.entityId !== undefined || where.action !== undefined) {
+          assert.equal(where.entityType, 'SALES_ORDER')
+          assert.equal(where.entityId, orderId, 'the obligation being discharged is THIS order\'s')
+          assert.equal(where.action, 'fulfilment_entry_pending_verification', 'and it is the marker action')
+          const ids = markers.map((row) => row.id)
+          markers.length = 0
+          deleted.push(...ids)
+          forgetIfAnswered()
+          return { count: ids.length }
+        }
+        throw new Error(`markerTx does not model this deleteMany: ${JSON.stringify(where)}`)
       },
     },
     salesOrder: {
@@ -973,6 +1071,51 @@ test('only the DIRECT-CREATE path\'s records may be withdrawn (o3d-z82a)', async
   assert.equal(selects.length, 0, 'and with nothing retractable there is no coverage read to pay for')
 })
 
+test('two markers for one order are ONE obligation: one record, and the retraction still fires (o3d-z82a)', async () => {
+  // FINDING 2, round 3. The resolution used to clear the marker it had READ, by row id. An order
+  // carrying a second marker therefore kept one after being answered, and a leftover marker is
+  // not inert:
+  //   - the next resolver finds it, re-asks a question already answered under this same lock, and
+  //     writes a SECOND shortfall record for one event; and
+  //   - because the late-allocation correction only runs on the NO-marker branch, that same
+  //     leftover stops a premature record from ever being withdrawn — so the duplicate defeats
+  //     the retraction as well as the idempotency.
+  // The obligation is "this order entered fulfilment unverified", and an order has one of those.
+  const { resolveDirectCreateMarker, SHORTFALL_RETRACTED_ACTION } = await loadHelper()
+  reset()
+  seedOrder('o80', 0, 'PICKING')
+  state.short.add('o80')
+  const written: Row[] = []
+  const { tx, deleted } = markerTx('o80', written, [
+    { id: 'm1', metadata: { orderId: 'o80', createdAtStatus: 'PICKING' } },
+    { id: 'm2', metadata: { orderId: 'o80', createdAtStatus: 'PICKING' } },
+  ])
+
+  const first = await resolveDirectCreateMarker({ tx, orderId: 'o80' })
+
+  assert.deepEqual(first, { recorded: true, resolved: true, retracted: 0, verdict: 'uncovered' })
+  assert.equal(written.length, 1, 'one crossing, one record')
+  assert.deepEqual(deleted, ['m1', 'm2'], 'the obligation is discharged, not one row of it')
+
+  // Now the importer's own pass, after its late allocation covered the demand — the same client,
+  // so it sees exactly what the first pass left behind. With a marker still standing it would
+  // take the resolve branch, record the shortfall a second time and never reach the withdrawal.
+  state.records.push({
+    id: 'r1',
+    entityId: 'o80',
+    action: String(written[0]?.action),
+    metadata: written[0]?.metadata,
+  })
+  state.short.delete('o80')
+
+  const late = await resolveDirectCreateMarker({ tx, orderId: 'o80' })
+
+  assert.deepEqual(late, { recorded: false, resolved: false, retracted: 1, verdict: 'no-marker' })
+  assert.deepEqual(deleted, ['m1', 'm2', 'r1'], 'the premature record is withdrawn, not duplicated')
+  assert.equal(written.length, 2)
+  assert.equal(written[1]?.action, SHORTFALL_RETRACTED_ACTION, 'and the withdrawal is itself recorded')
+})
+
 test('the marker sweep stops at its wall-clock budget, but never before one marker (o3d-z82a)', async () => {
   // FINDING 4. 200 markers is a count of units, not a duration: each is a transaction that can
   // block on a row lock for `maxWait` before doing anything, on a job that runs every 15 minutes.
@@ -1004,13 +1147,66 @@ test('the marker sweep stops at its wall-clock budget, but never before one mark
   assert.equal(whole.budgetExhausted, false)
 })
 
+test('a marker that FAILS yields the head of the queue instead of owning it forever (o3d-z82a)', async () => {
+  // FINDING 1, round 3. "A zero budget still resolves one marker, oldest-first, so nothing
+  // starves" is a guarantee about progress through the LOOP, not through the QUEUE. A resolved
+  // marker leaves the queue, so the next tick moves on; a marker that FAILS is still there, still
+  // the oldest, and still the head of the queue next tick. One order whose row lock is never
+  // available then eats every tick of a tight budget forever and the markers behind it — the rows
+  // that are exempt from retention — are never reached at all.
+  //
+  // The fix is not a longer budget and not a backoff interval (any interval shorter than the
+  // cron's own period puts it straight back at the head): a failed attempt is STAMPED on the
+  // marker, and the queue is ordered by when a marker became due, so the failure costs it its
+  // place in the queue and nothing else.
+  const { sweepUnresolvedDirectCreateMarkers, MARKER_DEFERRAL_KEY } = await loadHelper()
+  reset()
+  for (const id of ['f1', 'g2', 'g3']) {
+    seedOrder(id, 0, 'PICKING')
+    agedMarkerOrderIds.push(id) // f1 is the oldest
+    sweepTxByOrder.set(id, markerTx(id, []).tx)
+  }
+  sweepTxThrows.add('f1') // its lock is never available: it fails on every tick, forever
+
+  const ticks = []
+  for (let i = 0; i < 4; i += 1) {
+    ticks.push(await sweepUnresolvedDirectCreateMarkers({ budgetMs: 0, now: () => 0 }))
+  }
+
+  assert.deepEqual(
+    attemptedOrders,
+    ['f1', 'g2', 'g3', 'f1'],
+    'the two markers behind the failure must be reached — and the failure must come back after them',
+  )
+  assert.deepEqual(ticks.map((t) => t.errors), [1, 0, 0, 1])
+  assert.deepEqual(ticks.map((t) => t.resolved), [0, 1, 1, 0], 'a tight budget still drains the queue')
+  assert.ok(agedMarkerOrderIds.includes('f1'), 'and the marker it could not resolve is still owed')
+
+  // It yields by being STAMPED, and only the marker that failed is. The stamp is written from the
+  // database clock and touches nothing else on the row — re-ageing `createdAt` would re-open the
+  // import's grace window, which is a different question with a different answer.
+  assert.deepEqual(rawUpdates.map((u) => u.entityId), ['f1', 'f1'], 'only a failure defers, and only itself')
+  assert.deepEqual([...new Set(rawUpdates.map((u) => u.key))], [MARKER_DEFERRAL_KEY])
+  assert.match(
+    rawUpdates[0].sql,
+    /NOW\(\) AT TIME ZONE 'UTC'/,
+    'stamped on the database clock, and stored the way `createdAt` it is compared against is stored',
+  )
+  assert.ok(!/"createdAt"/.test(rawUpdates[0].sql), 'a failed attempt must not re-age the marker')
+  assert.ok(!/DELETE/i.test(rawUpdates[0].sql), 'and must never discharge the obligation it is deferring')
+})
+
 test('the sweep only takes markers past the import\'s grace window, aged on the DB clock (o3d-z82a)', async () => {
   // The window is a SCHEDULING gate, not a verdict. Between the create transaction committing and
   // the importer's own autoAllocateOrder finishing, the order has no allocation rows at all — a
   // resolver that looked then would read "short", record a shortfall for an order about to be
   // covered, and discharge the marker so the true answer could never be written. Aged with
   // NOW() in the statement, so a skewed application clock cannot shorten it.
-  const { sweepUnresolvedDirectCreateMarkers, DIRECT_CREATE_RESOLVE_GRACE_SECONDS } = await loadHelper()
+  const {
+    sweepUnresolvedDirectCreateMarkers,
+    DIRECT_CREATE_RESOLVE_GRACE_SECONDS,
+    MARKER_DEFERRAL_KEY,
+  } = await loadHelper()
   reset()
 
   const result = await sweepUnresolvedDirectCreateMarkers()
@@ -1021,7 +1217,14 @@ test('the sweep only takes markers past the import\'s grace window, aged on the 
   assert.match(sql, /NOW\(\) - make_interval/, 'the cutoff must come from the database clock')
   assert.match(sql, /action = /, 'scoped to the marker action')
   assert.match(sql, /"entityType" = 'SALES_ORDER'/)
-  assert.match(sql, /ORDER BY MIN\("createdAt"\) ASC/, 'oldest first, so nothing starves')
+  // Oldest DUE first, not oldest CREATED first: a marker whose last attempt failed is ordered by
+  // that failure instead, so it cannot own the head of the queue tick after tick.
+  assert.match(
+    sql,
+    new RegExp(`ORDER BY GREATEST\\(MIN\\("createdAt"\\), MAX\\(\\("metadata"->>'${MARKER_DEFERRAL_KEY}'\\)::timestamp\\)\\) ASC`),
+    'the queue is ordered by when a marker became due',
+  )
+  assert.match(sql, /GROUP BY "entityId"/, 'one unit of work per ORDER, however many markers assert it')
   assert.match(sql, /LIMIT /, 'bounded per tick')
   assert.ok(values.includes(DIRECT_CREATE_RESOLVE_GRACE_SECONDS), 'the grace window is the bound parameter')
   assert.ok(DIRECT_CREATE_RESOLVE_GRACE_SECONDS > 20, 'it must exceed the import\'s own 20s transaction budget')
@@ -1279,7 +1482,13 @@ test('clearing the marker cannot roll back the record it was written with (o3d-z
     !/tx\.activityLog\.delete\(/.test(source),
     'the marker must be cleared with deleteMany, so an already-removed row is a no-op',
   )
-  assert.match(source, /tx\.activityLog\.deleteMany\(\{ where: \{ id: marker\.id \} \}\)/)
+  // ...and by the OBLIGATION rather than by the row that was read, so a duplicate marker cannot
+  // survive an answer and go on to produce a second record for the same event.
+  assert.match(
+    source,
+    /deleteMany\(\{\s*where: \{ entityType: 'SALES_ORDER', entityId: orderId, action: DIRECT_CREATE_PENDING_ACTION \},\s*\}\)/,
+  )
+  assert.ok(!/where: \{ id: marker\.id \}/.test(source), 'never by the row id')
 })
 
 test('retention cleanup cannot age out an unresolved marker (o3d-z82a)', async () => {
