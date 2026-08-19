@@ -62,6 +62,13 @@
  *                        appending to it can settle over each other's records, and a dispatched
  *                        write nobody accounted for then sits in a file the next run reads as
  *                        clean — the guarantee inverted by the very thing meant to provide it.
+ *                        THAT LOCK IS KEYED ON THE LEDGER, NOT ON A FILENAME. The log path used to
+ *                        come off the command line, so two runs given two paths took two locks and
+ *                        read two logs: nothing excluded either from the other, and the second
+ *                        started with an EMPTY recovery fence over a ledger the first may already
+ *                        have changed. The default was cwd-relative too, so the same command typed
+ *                        in two directories was already two logs. Both files are now derived from
+ *                        the tenant id, absolutely; `--write-log` is refused, not ignored.
  *   AN AUTHORISATION DOES NOT SURVIVE A WAIT.  A write is authorised by a re-read taken next to
  *                        it, so nothing may re-dispatch that write after a delay. Xero
  *                        rate-limiting a write (HTTP 429) is therefore a REFUSAL, not a retry:
@@ -117,8 +124,11 @@
  *     --manifest ./xero-live-e2e-footprint-<date>.csv --apply                          # writes
  *   ... --steps 1,2,3        run only some phases (default: all)
  *   ... --plan-out <path>    where to persist the reviewed plan (default ./xero-live-cleanup-plan-<date>.json)
- *   ... --write-log <path>   the durable write-intent log (default ./xero-live-cleanup-write-log.jsonl).
- *                            NOT date-stamped on purpose: the run after a crash has to find it.
+ *
+ * THE WRITE-INTENT LOG has no flag. It is /var/lib/o3d/xero-cleanup/write-log-<tenantId>.jsonl,
+ * with <tenantId>.jsonl.lock beside it, and every run against this ledger uses that pair whatever
+ * directory it was started from. It is not date-stamped, because the run after a crash has to find
+ * it. To start a clean one, account for every write already in it and move it aside.
  */
 import { createServer } from 'node:http'
 import { createInterface } from 'node:readline'
@@ -137,6 +147,7 @@ import {
   assertPlanAuthorizedByManifest,
   assertStillFixtureContact,
   assertUnchanged,
+  assertWriteLogNotRelocated,
   classifyContactName,
   classifyItemCode,
   createXeroTransport,
@@ -144,6 +155,7 @@ import {
   invoiceBlockers,
   isFixtureContactName,
   isFixtureItemCode,
+  LEGACY_WRITE_LOG_PATHS,
   MutationJournal,
   NULL_WRITE_INTENT_LOG,
   openWriteIntentLog,
@@ -153,6 +165,7 @@ import {
   PlanDivergedError,
   runOutcome,
   SafetyViolationError,
+  writeLogTargetForTenant,
   writeUnitsIndividually,
   type PlannedObject,
   type TransportToken,
@@ -201,11 +214,27 @@ const WRITE_TOKEN_FILE = arg('write-token', '/root/.xero-cleanup-token.json')!
 const MANIFEST_PATH = arg('manifest')
 const PLAN_OUT = arg('plan-out', `./xero-live-cleanup-plan-${new Date().toISOString().slice(0, 10)}.json`)!
 /**
- * Deliberately NOT date-stamped. This file is how a run that was KILLED tells the next run that a
+ * The write-intent log and its lock. Both are derived from EXPECTED_TENANT_ID — the ledger this
+ * script exists to clean — and neither is a path anyone can pass in.
+ *
+ * Deliberately NOT date-stamped: this file is how a run that was KILLED tells the next run that a
  * write was dispatched and never accounted for, and a log named after the day the dead run started
  * is a log the next day's run walks straight past.
+ *
+ * Deliberately NOT the operator's choice either, which is the same argument one turn further out.
+ * A run told to use a different file takes a different lock and reads a different log, so two runs
+ * exclude nothing and the second one's fence is empty. The key is the tenant because the tenant is
+ * what is being protected; it is available HERE, before any token is read, precisely because this
+ * script refuses to touch any other organisation.
+ *
+ * `--write-log` is still READ, only so that passing it is an error rather than a silent no-op: an
+ * operator who typed it believes the log moved, and that belief is how a second apply gets started
+ * against a ledger a first apply is part-way through. Detected by its PRESENCE on argv, not by its
+ * value: `--write-log` with nothing after it is a typed relocation too, and reading the value alone
+ * would answer undefined and let exactly that form through without a word.
  */
-const WRITE_LOG_PATH = arg('write-log', './xero-live-cleanup-write-log.jsonl')!
+const REQUESTED_WRITE_LOG = process.argv.includes('--write-log') ? (arg('write-log') ?? '') : undefined
+const WRITE_LOG = writeLogTargetForTenant({ tenantId: EXPECTED_TENANT_ID })
 const CALLBACK_PORT = Number(arg('port', '53100'))
 const REDIRECT_URI = `http://localhost:${CALLBACK_PORT}/callback`
 const MAX_CALLS = Number(arg('max-calls', '3000'))
@@ -606,9 +635,19 @@ async function main() {
   // sits in a log the next run reads as clean. A dry run takes no lock — it cannot dispatch a
   // write, so it has nothing to record and nothing to hide — but it still reads the log, and an
   // apply run in flight will show up as an unresolved intent and stop it.
-  if (APPLY) writeLogLock = acquireWriteLogLock({ path: WRITE_LOG_PATH })
-  if (existsSync(WRITE_LOG_PATH)) {
-    assertNoUnresolvedWrites({ path: WRITE_LOG_PATH, text: readFileSync(WRITE_LOG_PATH, 'utf8') })
+  // Before either: the log is not relocatable, and saying so is louder than ignoring it. This runs
+  // in BOTH modes — a dry run pointed at an empty file builds the plan the next --apply is
+  // authorised by, so the fence has to hold one step earlier than the writing does.
+  assertWriteLogNotRelocated({ requestedPath: REQUESTED_WRITE_LOG, target: WRITE_LOG })
+  if (APPLY) writeLogLock = acquireWriteLogLock({ tenantId: EXPECTED_TENANT_ID })
+  // The tenant's log, plus the paths older versions of this script wrote to. The legacy paths are
+  // read IN ADDITION, never instead: on the first run after this change the tenant-keyed file does
+  // not exist yet, and an unaccounted-for write from a round-5 run is sitting in the cwd. An empty
+  // fence in exactly the situation the fence is for.
+  for (const logPath of [WRITE_LOG.logPath, ...LEGACY_WRITE_LOG_PATHS]) {
+    if (existsSync(logPath)) {
+      assertNoUnresolvedWrites({ path: logPath, text: readFileSync(logPath, 'utf8') })
+    }
   }
 
   if (!existsSync(READ_TOKEN_FILE)) throw new Error(`No read token at ${READ_TOKEN_FILE}`)
@@ -654,9 +693,12 @@ async function main() {
   if (APPLY) {
     // Opened before the first write and flushed on every record. A dry run keeps the null log,
     // because the transport refuses to dispatch a non-GET without --apply at all.
-    writeLog = openWriteIntentLog({ path: WRITE_LOG_PATH, tenantId: token.tenantId, lock: writeLogLock! })
-    console.log(`  write-intent log: ${WRITE_LOG_PATH} — every write is recorded here, and flushed, BEFORE it is dispatched`)
-    console.log(`  held exclusively via ${writeLogLock!.path} for the duration of this run`)
+    // token.tenantId, not the constant: assertExpectedTenant has just proved they are the same, and
+    // openWriteIntentLog refuses a lock that does not guard the log it is opening — so if that
+    // proof ever weakened, this would refuse rather than write an unguarded log.
+    writeLog = openWriteIntentLog({ tenantId: token.tenantId, lock: writeLogLock! })
+    console.log(`  write-intent log: ${WRITE_LOG.logPath} — every write is recorded here, and flushed, BEFORE it is dispatched`)
+    console.log(`  held exclusively via ${writeLogLock!.path} for the duration of this run — one lock per LEDGER, not per file`)
   }
 
   // =========================================================================
@@ -1096,9 +1138,10 @@ function report(aborted: boolean, error?: unknown): number {
       '  scripts/audit-xero-live-e2e-footprint.ts, and compare its status against the plan in\n' +
       `  ${PLAN_OUT}. Only once every one of them is accounted for is a new manifest — and a new\n` +
       '  --apply — safe. Re-running against the OLD manifest would plan from a state nobody confirmed.\n' +
-      `  The same writes are recorded in ${WRITE_LOG_PATH}, which is the copy that survives if this\n` +
-      '  process dies before you read this. The NEXT RUN REFUSES TO START while they are in it: once\n' +
-      `  each one is accounted for, move it aside (mv ${WRITE_LOG_PATH} ${WRITE_LOG_PATH}.resolved-<date>).`,
+      `  The same writes are recorded in ${WRITE_LOG.logPath}, which is the copy that survives if this\n` +
+      '  process dies before you read this. The NEXT RUN REFUSES TO START while they are in it — and it\n' +
+      '  cannot be pointed at a different file to get around that. Once each one is accounted for, move\n' +
+      `  it aside (mv ${WRITE_LOG.logPath} ${WRITE_LOG.logPath}.resolved-<date>).`,
     )
   }
   if (failures.length) {

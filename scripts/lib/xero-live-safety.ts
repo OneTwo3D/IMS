@@ -46,9 +46,15 @@
  *                     in-memory record of an unknown write dies with the process, and a killed
  *                     process is the same class of event that produces one. An intent with no
  *                     settlement stops the NEXT run rather than being lost.
+ *   9. EXCLUSION      that log, and the exclusive lock over it, are keyed on THE LEDGER — the
+ *                     tenant id — at an absolute path derived from it. Neither is a path anyone
+ *                     can supply. A log path taken off the command line makes both guarantees
+ *                     conditional on what was typed: two runs given two paths take two locks (so
+ *                     nothing is excluded) and read two logs (so a run can start with an empty
+ *                     fence over a ledger a dead run may have changed).
  */
 import { createHash, randomBytes } from 'node:crypto'
-import { closeSync, fsyncSync, openSync, unlinkSync, writeSync } from 'node:fs'
+import { closeSync, fsyncSync, mkdirSync, openSync, unlinkSync, writeSync } from 'node:fs'
 
 // ---------------------------------------------------------------------------
 // Errors. All safety aborts share a base class so a caller can tell a refusal
@@ -1500,6 +1506,126 @@ export function createWriteIntentLog(args: {
  */
 export class WriteLogLockedError extends SafetyViolationError {}
 
+/**
+ * WHERE THE LOG LIVES IS NOT THE OPERATOR'S CHOICE, and that is the whole of this section.
+ *
+ * The lock above makes two runs collide — but only when they are pointed at the SAME file. The log
+ * path used to come off the command line (`--write-log <path>`), and a path is not a fact about
+ * the thing being protected; it is a fact about what somebody typed. Two runs handed two different
+ * paths took two different locks and read two different logs, and BOTH guarantees went with it:
+ *
+ *   • THE SINGLE-APPLY LOCK. Run-scoped ids stop one run's settlement from HIDING another's
+ *     intent. They do not stop two runs both applying the same plan to the same ledger — only
+ *     mutual exclusion does that, and mutual exclusion keyed on a path excludes nothing when the
+ *     path is an input.
+ *   • THE RECOVERY FENCE. A run pointed at a fresh path reads an EMPTY log, finds no unaccounted
+ *     write, and starts — which is precisely the "plan over a ledger nobody has confirmed" the
+ *     fence exists to refuse. The dead run's evidence is still on disk, in the file this run was
+ *     told not to look at.
+ *
+ * And it was never only `--write-log`. The old default `./xero-live-cleanup-write-log.jsonl` is
+ * CWD-RELATIVE, so the same command typed in the repo root and in /root already meant two logs and
+ * two locks, with nobody having asked for anything unusual.
+ *
+ * So the lock and the log are keyed on THE LEDGER — the tenant id — at an absolute path derived
+ * from it. The tenant is the thing being protected; it is knowable before any I/O (the remover
+ * refuses every tenant but one, by constant, so the key exists before a token is even read); and
+ * no flag, no cwd and no call site can move it. The path is an OUTPUT of the tenant, never an
+ * input from an operator. `openWriteIntentLog` takes no path at all — an argument that cannot be
+ * expressed is an argument no future call site can get wrong.
+ *
+ * Keyed on the TENANT rather than on the PLAN because two different plans against one ledger must
+ * still not run at once, and because the fence asks a question about the LEDGER's state, not about
+ * any one plan's: a plan-keyed lock would let two runs of two overlapping plans proceed together,
+ * and would give a second plan a fence that had never seen the first plan's dispatched writes.
+ *
+ * It fails closed at every step, which is why this shape was chosen over the alternatives. The
+ * directory is created before the lock is taken; if it cannot be created — no permission, a
+ * read-only filesystem, a plain file in the way — then the lock cannot be taken either, and a lock
+ * that could not be established is treated exactly like one somebody else is holding. Resolving
+ * the realpath of an operator-supplied path was rejected: it makes two names for one file collide,
+ * but a genuinely NEW path still resolves cleanly, takes a free lock and starts with an empty
+ * fence. Merely refusing a non-default path was rejected too: the default was itself cwd-relative,
+ * so "the default" is not one file.
+ */
+export const XERO_CLEANUP_STATE_DIR = '/var/lib/o3d/xero-cleanup'
+
+/**
+ * Where earlier versions of this tool wrote, before the log was keyed on the ledger. The fence
+ * reads these IN ADDITION to the tenant's log, never instead of it: an operator who upgrades
+ * mid-incident has a round-5 log sitting in some cwd and a tenant-keyed file that is empty on its
+ * first run — an empty fence in exactly the situation the fence exists for. Relative on purpose;
+ * it is resolved against the cwd the run is started in, which is the cwd the old default meant.
+ */
+export const LEGACY_WRITE_LOG_PATHS: readonly string[] = ['./xero-live-cleanup-write-log.jsonl']
+
+/** A run tried to put the write-intent log somewhere other than where the ledger says it goes. */
+export class WriteLogRelocationError extends SafetyViolationError {}
+
+export type WriteLogTarget = {
+  /** The directory both files live in. Created 0700 before the lock is taken. */
+  stateDir: string
+  /** The write-intent log for this ledger. The ONLY log an apply run can append to. */
+  logPath: string
+  /** The exclusive lock guarding it. One per ledger, whatever any run was told. */
+  lockPath: string
+}
+
+/**
+ * Xero tenant ids are uuids. The check is not pedantry: this value is pasted into a filesystem
+ * path, so anything it can contain is a way to move the log — a separator, a `..`, an empty string
+ * — and moving the log is the defect this whole section closes. It is the one remaining input to
+ * the derivation, so it is the one remaining way back in, and it is refused rather than sanitised.
+ */
+const TENANT_ID_FORM = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+export function writeLogTargetForTenant(args: {
+  tenantId: string
+  /**
+   * TEST SEAM ONLY, so a test does not write to a machine-wide directory. No CLI flag reaches it,
+   * and `tests/scripts/xero-live-safety.test.ts` asserts the remover never passes one — otherwise
+   * this parameter would be `--write-log` under a new name.
+   */
+  stateDir?: string
+}): WriteLogTarget {
+  const stateDir = args.stateDir ?? XERO_CLEANUP_STATE_DIR
+  if (!TENANT_ID_FORM.test(args.tenantId)) {
+    throw new WriteLogRelocationError(
+      `ABORT: refusing to derive the write-intent log path from a tenant id that is not a uuid ` +
+        `(${JSON.stringify(args.tenantId)}). The log path is keyed on the ledger it protects, so anything this ` +
+        `value can contain is a way to move the log out of ${stateDir} — and a moved log means a fresh, empty ` +
+        `recovery fence and a lock nobody else takes.`,
+    )
+  }
+  const logPath = `${stateDir}/write-log-${args.tenantId.toLowerCase()}.jsonl`
+  return { stateDir, logPath, lockPath: `${logPath}.lock` }
+}
+
+/**
+ * The command-line half. `--write-log` is REFUSED rather than ignored: an operator who typed it
+ * believes the log moved, and a flag that silently does nothing is how somebody ends up running a
+ * second apply in the belief that it is isolated from the first.
+ *
+ * It is refused in a DRY RUN too. A dry run cannot dispatch a write, but it reads the log to
+ * decide whether the ledger is in a state anyone has confirmed, and a dry run pointed at an empty
+ * file builds the very plan the next `--apply` is authorised by. The fence has to hold one step
+ * earlier than the writing does.
+ */
+export function assertWriteLogNotRelocated(args: { requestedPath?: string; target: WriteLogTarget }): void {
+  if (args.requestedPath === undefined) return
+  throw new WriteLogRelocationError(
+    `ABORT: --write-log is no longer accepted (you passed it ${args.requestedPath ? `as ${JSON.stringify(args.requestedPath)}` : 'with no value'}).\n` +
+      `The write-intent log is keyed on the LEDGER, not on a path: ${args.target.logPath}, locked by ` +
+      `${args.target.lockPath}. That is what makes "only one apply run at a time" and "a dispatched write is ` +
+      `never invisible to the next run" true regardless of what anyone types — two runs given two paths took two ` +
+      `locks and read two logs, and neither guarantee survived it.\n` +
+      `If you wanted a clean log: account for every write already in ${args.target.logPath} (open each object in ` +
+      `Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts) and move it aside — ` +
+      `mv ${args.target.logPath} ${args.target.logPath}.resolved-<date>. That is the same resolution the ` +
+      `unaccounted-write refusal asks for, and it requires reading the ledger rather than renaming a file.`,
+  )
+}
+
 export type WriteLogLock = {
   /** The lock file, so the message that tells an operator to remove it can name it. */
   path: string
@@ -1508,38 +1634,52 @@ export type WriteLogLock = {
 }
 
 export function acquireWriteLogLock(args: {
-  /** The LOG path. The lock is `<path>.lock`, so it travels with the log a run is told to use. */
-  path: string
+  /**
+   * The LEDGER being protected. The lock path is derived from it — there is no path parameter,
+   * because a path parameter is what let two runs of this script miss each other entirely.
+   */
+  tenantId: string
+  /** TEST SEAM ONLY. See `writeLogTargetForTenant`. */
+  stateDir?: string
   /** Injected for tests, and so a caller can make the mechanism itself fail. */
+  ensureDir?: (dir: string) => void
   openLock?: (lockPath: string) => number
   removeLock?: (lockPath: string) => void
   now?: () => Date
 }): WriteLogLock {
-  const lockPath = `${args.path}.lock`
+  const target = writeLogTargetForTenant({ tenantId: args.tenantId, stateDir: args.stateDir })
+  const lockPath = target.lockPath
+  const ensureDir = args.ensureDir ?? ((d: string) => { mkdirSync(d, { recursive: true, mode: 0o700 }) })
   const openLock = args.openLock ?? ((p: string) => openSync(p, 'wx'))
   const removeLock = args.removeLock ?? ((p: string) => unlinkSync(p))
   const now = args.now ?? (() => new Date())
 
   let fd: number
   try {
+    // Inside the try on purpose. A directory that cannot be made is a lock that cannot be taken,
+    // and this refuses on both for the same reason: neither outcome tells this process that no
+    // other run is live.
+    ensureDir(target.stateDir)
     fd = openLock(lockPath)
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     throw new WriteLogLockedError(
       `ABORT: could not take the exclusive lock on the write-intent log (${lockPath}): ${message}\n` +
-        `Either another run of this script is writing to ${args.path} right now, or one died holding the lock.\n` +
-        `TWO RUNS MUST NOT SHARE THIS LOG: the log is what proves no dispatched write went unaccounted for, and ` +
-        `one run's records appended over another's destroy that proof.\n` +
+        `Either another run of this script is writing to ${target.logPath} right now, or one died holding the ` +
+        `lock, or the lock could not be established at all (${target.stateDir} unwritable or missing).\n` +
+        `THIS LOCK IS PER-LEDGER, not per-file: every run against this tenant takes this same lock however it ` +
+        `was invoked and from whatever directory. The log is what proves no dispatched write went unaccounted ` +
+        `for, and one run's records appended over another's destroy that proof.\n` +
         `If no other run is live: read ${lockPath} to see which run left it, account for every write in ` +
-        `${args.path} (open each object in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts), and only ` +
-        `then remove the lock file.`,
+        `${target.logPath} (open each object in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts), and ` +
+        `only then remove the lock file.`,
     )
   }
   try {
     // Best effort identity for the human who has to decide whether this lock is live. It is not
     // part of the exclusion — O_EXCL already did that — but a lock nobody can attribute is a lock
     // nobody dares clear.
-    writeSync(fd, `${JSON.stringify({ pid: process.pid, at: now().toISOString(), log: args.path })}\n`)
+    writeSync(fd, `${JSON.stringify({ pid: process.pid, at: now().toISOString(), log: target.logPath })}\n`)
     fsyncSync(fd)
   } catch {
     /* the exclusion is the file's existence, not its contents */
@@ -1570,17 +1710,32 @@ export function acquireWriteLogLock(args: {
  * hands it in.
  */
 export function openWriteIntentLog(args: {
-  path: string
+  /** The LEDGER. There is no `path`: see `XERO_CLEANUP_STATE_DIR` for why it was taken away. */
   tenantId: string
+  /** TEST SEAM ONLY. See `writeLogTargetForTenant`. */
+  stateDir?: string
   now?: () => Date
   /** An already-held lock, for a caller that locked before scanning. Released by `close()`. */
   lock?: WriteLogLock
   runId?: string
 }): WriteIntentLog {
-  const lock = args.lock ?? acquireWriteLogLock({ path: args.path, now: args.now })
+  const target = writeLogTargetForTenant({ tenantId: args.tenantId, stateDir: args.stateDir })
+  // A lock for one ledger cannot guard the log of another. The remover takes its lock from a
+  // CONSTANT tenant id, before any token is read, and opens the log under the tenant the token
+  // turned out to carry; those are two different values arriving by two different routes, and
+  // "locked one thing, wrote another" is the same defect this section exists to close, one layer
+  // in. It is refused rather than re-locked: a mismatch means somebody's assumption is wrong.
+  if (args.lock && args.lock.path !== target.lockPath) {
+    throw new WriteLogLockedError(
+      `ABORT: the lock this run holds (${args.lock.path}) does not guard the write-intent log it is about to ` +
+        `open (${target.logPath}, locked by ${target.lockPath}). The lock was taken for a different ledger, so ` +
+        `nothing excludes a second run from this one. Both must be keyed on the same tenant.`,
+    )
+  }
+  const lock = args.lock ?? acquireWriteLogLock({ tenantId: args.tenantId, stateDir: args.stateDir, now: args.now })
   let fd: number
   try {
-    fd = openSync(args.path, 'a')
+    fd = openSync(target.logPath, 'a')
   } catch (e) {
     lock.release()
     throw e

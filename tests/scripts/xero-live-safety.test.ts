@@ -44,6 +44,7 @@ import {
   assertRetirementAuthorized,
   assertStillFixtureContact,
   assertUnchanged,
+  assertWriteLogNotRelocated,
   classifyContactName,
   classifyItemCode,
   createWriteIntentLog,
@@ -53,6 +54,7 @@ import {
   formatBlockers,
   invoiceBlockers,
   isFixtureContactName,
+  LEGACY_WRITE_LOG_PATHS,
   isFixtureItemCode,
   ManifestViolationError,
   MutationJournal,
@@ -76,8 +78,11 @@ import {
   TenantMismatchError,
   UnresolvedWriteError,
   versionFromWriteResponse,
+  writeLogTargetForTenant,
   WriteLogLockedError,
+  WriteLogRelocationError,
   WriteOutcomeUnknownError,
+  XERO_CLEANUP_STATE_DIR,
   WriteRateLimitedError,
   writeUnitsIndividually,
   WriteWithoutApplyError,
@@ -1029,6 +1034,12 @@ class FakeLedger {
 }
 
 const TENANT = 'tenant-live'
+/**
+ * The log path is derived from the tenant id, so the tests that touch a real file need a real
+ * tenant SHAPE. Not the production one: nothing here should read as an instruction about the live
+ * organisation.
+ */
+const TENANT_UUID = '11111111-2222-4333-8444-555555555555'
 
 /** A SUBMITTED credit note: not posted to the GL, no VAT effect, hard-deletable. */
 const submittedCreditNote: LedgerObject = {
@@ -1986,13 +1997,13 @@ describe('the evidence of a dispatched write outlives the process that dispatche
 
   test('the file-backed log appends real lines that the next run can read', () => {
     const dir = mkdtempSync(join(tmpdir(), 'xero-write-log-'))
-    const path = join(dir, 'write-log.jsonl')
-    const log = openWriteIntentLog({ path, tenantId: TENANT })
+    const { logPath } = writeLogTargetForTenant({ tenantId: TENANT_UUID, stateDir: dir })
+    const log = openWriteIntentLog({ tenantId: TENANT_UUID, stateDir: dir })
     log.intend({ kind: 'item deleted', label: 'E2E-FC-A-SMOKE', method: 'DELETE', path: 'Items/item-1' })
     log.close()
-    const scan = scanWriteIntentLog(readFileSync(path, 'utf8'))
+    const scan = scanWriteIntentLog(readFileSync(logPath, 'utf8'))
     assert.equal(scan.unresolved.length, 1)
-    assert.equal(scan.unresolved[0].tenantId, TENANT)
+    assert.equal(scan.unresolved[0].tenantId, TENANT_UUID)
     rmSync(dir, { recursive: true, force: true })
   })
 })
@@ -2288,11 +2299,10 @@ describe('two runs cannot share the write log, and cannot erase each other in it
 
   test('a second run cannot take the lock a first run holds, and gets it once that run releases', () => {
     const dir = mkdtempSync(join(tmpdir(), 'xero-write-lock-'))
-    const path = join(dir, 'write-log.jsonl')
-    const first = acquireWriteLogLock({ path })
+    const first = acquireWriteLogLock({ tenantId: TENANT_UUID, stateDir: dir })
     assert.equal(existsSync(first.path), true)
     assert.throws(
-      () => acquireWriteLogLock({ path }),
+      () => acquireWriteLogLock({ tenantId: TENANT_UUID, stateDir: dir }),
       (e: Error) => e instanceof WriteLogLockedError && /another run/i.test(e.message),
     )
     // It names itself, so the operator deciding whether to clear it has something to decide on.
@@ -2300,7 +2310,7 @@ describe('two runs cannot share the write log, and cannot erase each other in it
     first.release()
     first.release() // idempotent: the log's close() and the caller's finally both call it
     assert.equal(existsSync(first.path), false)
-    const second = acquireWriteLogLock({ path })
+    const second = acquireWriteLogLock({ tenantId: TENANT_UUID, stateDir: dir })
     second.release()
     rmSync(dir, { recursive: true, force: true })
   })
@@ -2310,29 +2320,47 @@ describe('two runs cannot share the write log, and cannot erase each other in it
     // as far as its own knowledge goes, indistinguishable from one somebody else is holding.
     assert.throws(
       () => acquireWriteLogLock({
-        path: './write-log.jsonl',
-        openLock: () => { throw Object.assign(new Error("EACCES: permission denied, open './write-log.jsonl.lock'"), { code: 'EACCES' }) },
+        tenantId: TENANT_UUID,
+        stateDir: '/nowhere',
+        openLock: () => { throw Object.assign(new Error('EACCES: permission denied, open lock'), { code: 'EACCES' }) },
       }),
       (e: Error) => e instanceof WriteLogLockedError && /EACCES/.test(e.message),
     )
   })
 
+  test('a state directory that cannot be created is a refusal too, not an unlocked run', () => {
+    // The lock lives in a directory this run may have to make. "I could not make it" says nothing
+    // about whether another run is live, so it is treated exactly like a held lock — and, crucially,
+    // the lock is never attempted after it.
+    let opened = 0
+    assert.throws(
+      () => acquireWriteLogLock({
+        tenantId: TENANT_UUID,
+        stateDir: '/proc/definitely-not-writable',
+        ensureDir: () => { throw Object.assign(new Error('EROFS: read-only file system, mkdir'), { code: 'EROFS' }) },
+        openLock: () => { opened++; return 1 },
+      }),
+      (e: Error) => e instanceof WriteLogLockedError && /EROFS/.test(e.message),
+    )
+    assert.equal(opened, 0, 'a directory that could not be made must not be followed by a lock attempt')
+  })
+
   test('opening the file-backed log is itself exclusive, and closing it hands the lock back', () => {
     const dir = mkdtempSync(join(tmpdir(), 'xero-write-log-excl-'))
-    const path = join(dir, 'write-log.jsonl')
-    const log = openWriteIntentLog({ path, tenantId: TENANT })
-    assert.throws(() => openWriteIntentLog({ path, tenantId: TENANT }), WriteLogLockedError)
+    const { lockPath } = writeLogTargetForTenant({ tenantId: TENANT_UUID, stateDir: dir })
+    const log = openWriteIntentLog({ tenantId: TENANT_UUID, stateDir: dir })
+    assert.throws(() => openWriteIntentLog({ tenantId: TENANT_UUID, stateDir: dir }), WriteLogLockedError)
     log.close()
-    const again = openWriteIntentLog({ path, tenantId: TENANT })
+    const again = openWriteIntentLog({ tenantId: TENANT_UUID, stateDir: dir })
     again.close()
-    assert.equal(existsSync(`${path}.lock`), false)
+    assert.equal(existsSync(lockPath), false)
     rmSync(dir, { recursive: true, force: true })
   })
 
   test('the remover locks BEFORE it reads the log, and gives the lock back on every exit path', () => {
     const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
     const lockAt = code.indexOf('writeLogLock = acquireWriteLogLock(')
-    const scanAt = code.indexOf('assertNoUnresolvedWrites({ path: WRITE_LOG_PATH')
+    const scanAt = code.indexOf('assertNoUnresolvedWrites({ path: logPath')
     assert.ok(lockAt > 0 && scanAt > 0)
     assert.ok(
       lockAt < scanAt,
@@ -2340,6 +2368,143 @@ describe('two runs cannot share the write log, and cannot erase each other in it
     )
     // closeWriteLog runs from report(), which runs on the normal path AND the abort path.
     assert.match(code, /writeLogLock\?\.release\(\)/)
-    assert.match(code, /openWriteIntentLog\(\{ path: WRITE_LOG_PATH, tenantId: token\.tenantId, lock: writeLogLock! \}\)/)
+    assert.match(code, /openWriteIntentLog\(\{ tenantId: token\.tenantId, lock: writeLogLock! \}\)/)
+  })
+})
+
+// ===========================================================================
+/**
+ * Round 6. The lock and the fence above are only worth what their KEY is worth.
+ *
+ * They were keyed on the write log's path, and the path came off the command line
+ * (`--write-log <path>`) with a cwd-relative default. Two runs given two paths took two locks and
+ * read two logs: nothing excluded either from the other, and the second started with an empty
+ * recovery fence over a ledger the first may already have changed. Run-scoped ids do not cover
+ * this — they stop one run's settlement from HIDING another's intent, not two runs from both
+ * applying the same plan, and a fresh file has nothing in it to hide.
+ *
+ * The double therefore has to express TWO RUNS THAT WERE POINTED AT DIFFERENT PATHS, and check
+ * both halves on that footing: that the second run cannot start, and that if the lock were cleared
+ * by hand it would still see the first run's dispatched write.
+ */
+describe('the write log is keyed on the LEDGER, not on a path anybody chose', () => {
+  /** What a run knows: which ledger it is for, and whatever was typed on its command line. */
+  const startRun = (stateDir: string, requestedPath?: string) => {
+    const target = writeLogTargetForTenant({ tenantId: TENANT_UUID, stateDir })
+    assertWriteLogNotRelocated({ requestedPath, target })
+    return target
+  }
+
+  test('two runs pointed at different logs cannot miss each other', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'xero-write-log-ledger-'))
+    const canonical = writeLogTargetForTenant({ tenantId: TENANT_UUID, stateDir: dir })
+
+    // Run A and run B are each told to use their own file. Refused, not ignored: an operator who
+    // typed the flag believes the log moved, and that belief is how a second --apply gets started
+    // against a ledger a first --apply is part-way through.
+    for (const requestedPath of [join(dir, 'run-a.jsonl'), join(dir, 'run-b.jsonl'), '']) {
+      assert.throws(
+        () => startRun(dir, requestedPath),
+        (e: Error) => e instanceof WriteLogRelocationError && e.message.includes(canonical.logPath),
+        `--write-log ${requestedPath} must be refused, and the refusal must name the real log`,
+      )
+    }
+
+    // With no file to name, both runs resolve to the same pair — so run A's lock IS the lock run B
+    // has to take.
+    assert.deepEqual(startRun(dir), startRun(dir))
+
+    const runA = acquireWriteLogLock({ tenantId: TENANT_UUID, stateDir: dir })
+    const logA = openWriteIntentLog({ tenantId: TENANT_UUID, stateDir: dir, lock: runA })
+    logA.intend({ kind: 'invoice voided', label: 'INV-A-0042', method: 'POST', path: 'Invoices/inv-42' })
+    // <<< run A is killed here. The write is dispatched and nothing settled it. >>>
+
+    assert.throws(
+      () => acquireWriteLogLock({ tenantId: TENANT_UUID, stateDir: dir }),
+      (e: Error) => e instanceof WriteLogLockedError && /PER-LEDGER/.test(e.message),
+      'the second run must be excluded however it was invoked',
+    )
+
+    // And the fence does not rest on the lock. Clear the lock by hand — the documented recovery
+    // for a run that died holding it — and run B still reads run A's file, because it has no other
+    // file it could be reading.
+    runA.release()
+    const fenceB = startRun(dir)
+    assert.equal(fenceB.logPath, canonical.logPath)
+    assert.throws(
+      () => assertNoUnresolvedWrites({ path: fenceB.logPath, text: readFileSync(fenceB.logPath, 'utf8') }),
+      (e: Error) => e instanceof UnresolvedWriteError && /INV-A-0042/.test(e.message),
+      "run B's fence must contain run A's dispatched-and-unaccounted-for write",
+    )
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('the log path is absolute, so the same command in two directories is not two logs', () => {
+    const target = writeLogTargetForTenant({ tenantId: TENANT_UUID })
+    assert.equal(target.logPath, `${XERO_CLEANUP_STATE_DIR}/write-log-${TENANT_UUID}.jsonl`)
+    assert.equal(target.lockPath, `${target.logPath}.lock`)
+    assert.ok(
+      XERO_CLEANUP_STATE_DIR.startsWith('/'),
+      'the previous default was cwd-relative, which was already two logs for one ledger',
+    )
+  })
+
+  test('two ledgers get two logs, and a lock for one cannot guard the other', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'xero-write-log-two-'))
+    const other = '99999999-8888-4777-8666-555555555555'
+    assert.notEqual(
+      writeLogTargetForTenant({ tenantId: TENANT_UUID, stateDir: dir }).logPath,
+      writeLogTargetForTenant({ tenantId: other, stateDir: dir }).logPath,
+    )
+    const lock = acquireWriteLogLock({ tenantId: TENANT_UUID, stateDir: dir })
+    // The remover locks from a CONSTANT tenant id before any token is read, and opens the log under
+    // the tenant the token turned out to carry. Two values, two routes: "locked one thing, wrote
+    // another" is the same defect one layer in, and it is refused rather than quietly re-locked.
+    assert.throws(
+      () => openWriteIntentLog({ tenantId: other, stateDir: dir, lock }),
+      (e: Error) => e instanceof WriteLogLockedError && /does not guard/.test(e.message),
+    )
+    lock.release()
+    rmSync(dir, { recursive: true, force: true })
+  })
+
+  test('a tenant id that is not a uuid cannot walk the log out of its directory', () => {
+    // The tenant is the one input left to the derivation, so it is the one way back in.
+    for (const bad of ['../../tmp/elsewhere', '', 'tenant-live', 'dd2af957-3438-4010-8e85-7841c33c8328/x']) {
+      assert.throws(
+        () => writeLogTargetForTenant({ tenantId: bad, stateDir: '/var/lib/o3d/xero-cleanup' }),
+        (e: Error) => e instanceof WriteLogRelocationError,
+        `${JSON.stringify(bad)} must be refused, not pasted into a path`,
+      )
+    }
+  })
+
+  test('the fence also reads where older versions of this script wrote', () => {
+    // On the first run after this change the tenant-keyed file does not exist, and a round-5 run's
+    // unaccounted-for write is sitting under the old cwd-relative default. An empty fence in
+    // exactly the situation the fence exists for.
+    assert.deepEqual([...LEGACY_WRITE_LOG_PATHS], ['./xero-live-cleanup-write-log.jsonl'])
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    assert.match(code, /for \(const logPath of \[WRITE_LOG\.logPath, \.\.\.LEGACY_WRITE_LOG_PATHS\]\)/)
+  })
+
+  test('the remover refuses --write-log in BOTH modes, and never names a directory of its own', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    // Read only so that passing it is an error. Nothing else may consume it.
+    // By PRESENCE, not by value: `--write-log` with nothing after it is a typed relocation too, and
+    // reading the value alone answers undefined and lets that form through in silence.
+    assert.match(code, /const REQUESTED_WRITE_LOG = process\.argv\.includes\('--write-log'\)/)
+    assert.equal(code.match(/arg\('write-log'/g)?.length, 1)
+    const refuseAt = code.indexOf('assertWriteLogNotRelocated({ requestedPath: REQUESTED_WRITE_LOG')
+    const applyGateAt = code.indexOf('if (APPLY) writeLogLock = acquireWriteLogLock(')
+    assert.ok(refuseAt > 0 && applyGateAt > 0)
+    assert.ok(
+      refuseAt < applyGateAt,
+      'a dry run pointed at an empty log builds the plan the next --apply is authorised by, so the refusal ' +
+        'cannot sit behind the --apply gate',
+    )
+    // `stateDir` is a test seam. A production call site that passed one would be `--write-log` back
+    // under a different name.
+    assert.equal(code.includes('stateDir'), false, 'the remover must not choose where the log lives')
   })
 })
