@@ -204,16 +204,25 @@ async function bindXeroTenant(params: {
         await tx.setting.update({ where: { key: XERO_EXPECTED_TENANT_KEY }, data: { value: pinValue } })
       } else {
         // The arbiter. Not an upsert: an upsert is exactly the check-then-write this must not be.
-        await tx.setting.create({ data: { key: XERO_EXPECTED_TENANT_KEY, value: pinValue } })
+        //
+        // The P2002 is caught HERE rather than around the whole transaction. The token upsert below has
+        // unique constraints of its own, and a duplicate-key error from that statement means something
+        // entirely different; treating any P2002 in this block as "another callback won the race" would
+        // report the wrong cause with a remedy that does not fit it.
+        try {
+          await tx.setting.create({ data: { key: XERO_EXPECTED_TENANT_KEY, value: pinValue } })
+        } catch (error) {
+          if (!isUniqueViolation(error)) throw error
+          throw new XeroBindingRace(null)
+        }
       }
       const data = storedTokenRow(token)
       await tx.accountingToken.upsert({ where: { connector: XERO_CONNECTOR }, create: data, update: data })
     })
     return { ok: true }
   } catch (error) {
-    const lostTo = error instanceof XeroBindingRace ? error.boundTenantId : (isUniqueViolation(error) ? null : undefined)
-    if (lostTo === undefined) throw error
-    const boundTo = await readBoundTenant(lostTo)
+    if (!(error instanceof XeroBindingRace)) throw error
+    const boundTo = await readBoundTenant(error.boundTenantId)
 
     // Losing the race to the SAME organisation is not a failure. An operator who double-clicks Connect
     // fires two callbacks for one consent; this instance ends up bound to exactly the organisation they
@@ -227,10 +236,16 @@ async function bindXeroTenant(params: {
   }
 }
 
-/** A concurrent callback bound this instance first, seen as a committed pin rather than as a P2002. */
+/**
+ * A concurrent callback bound this instance first.
+ *
+ * `boundTenantId` is the pin this transaction READ when the winner had already committed, and null when
+ * the unique index rejected the INSERT instead — in that case the winner's pin is only readable after
+ * this transaction has rolled back, which is what `readBoundTenant` does.
+ */
 class XeroBindingRace extends Error {
-  constructor(readonly boundTenantId: string) {
-    super(`Xero tenant already bound to ${boundTenantId}`)
+  constructor(readonly boundTenantId: string | null) {
+    super(`Xero tenant already bound${boundTenantId ? ` to ${boundTenantId}` : ''}`)
     this.name = 'XeroBindingRace'
   }
 }
