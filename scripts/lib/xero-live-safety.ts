@@ -1210,19 +1210,41 @@ export function runOutcome(args: {
    * story.
    */
   unrecordedSettlements?: number
+  /**
+   * Writes that LEFT THIS PROCESS while the ledger could not be shown to be held (r10 finding 1).
+   * They may be perfectly well accounted for as writes; what is not accounted for is whether a
+   * second run was writing to the same organisation at the same time. A run with one of these may
+   * never print a label that ends the story either.
+   */
+  unexcludedDispatches?: number
 }): RunOutcome {
   const {
     apply, failed, incomplete = false, aborted = false, writesMade = 0, unknownWrites = 0,
-    unrecordedSettlements = 0,
+    unrecordedSettlements = 0, unexcludedDispatches = 0,
   } = args
   const unknownSuffix = unknownWrites > 0 ? `${unknownWrites} WRITE(S) OF UNKNOWN OUTCOME` : ''
   const unrecordedSuffix = unrecordedSettlements > 0 ? `${unrecordedSettlements} UNRECORDED SETTLEMENT(S)` : ''
+  /**
+   * ITS OWN SUFFIX, not folded into the one above, because the sentence attached to that one —
+   * "that only this output records" — is not true of this fact and must not be printed over it.
+   * An unexcluded dispatch usually IS recorded durably, in both stores; what is missing is not the
+   * record but the exclusion. Saying otherwise would send the operator looking for a row that is
+   * sitting right there.
+   */
+  const unexcludedSuffix = unexcludedDispatches > 0
+    ? `${unexcludedDispatches} WRITE(S) DISPATCHED WITHOUT A CONFIRMED EXCLUSION`
+    : ''
+  /** Everything that stops a label ending the story, each in its own words. */
+  const graveTail = [
+    unrecordedSuffix ? `${unrecordedSuffix} THAT ONLY THIS OUTPUT RECORDS` : '',
+    unexcludedSuffix,
+  ].filter(Boolean).join(' AND ')
   if (!apply) {
     // A dry run cannot write at all — the transport throws on any non-GET without --apply — so an
     // unknown write here means the write gate itself has been bypassed. It is reported, loudly,
     // rather than being unrepresentable.
     if (aborted) {
-      const dryTail = [unknownSuffix, unrecordedSuffix].filter(Boolean).join(' AND ')
+      const dryTail = [unknownSuffix, unrecordedSuffix, unexcludedSuffix].filter(Boolean).join(' AND ')
       return { label: dryTail ? `DRY RUN — ABORTED WITH ${dryTail}` : 'DRY RUN — ABORTED', exitCode: 1 }
     }
     if (unknownSuffix) return { label: `DRY RUN — INCOMPLETE, ${unknownSuffix}`, exitCode: 1 }
@@ -1231,7 +1253,7 @@ export function runOutcome(args: {
   if (aborted) {
     // Appended rather than folded in, so every existing label keeps its exact wording: this is an
     // ADDITIONAL fact about the run, not a different reading of the ledger.
-    const tail = unrecordedSuffix ? ` — AND ${unrecordedSuffix} THAT ONLY THIS OUTPUT RECORDS` : ''
+    const tail = graveTail ? ` — AND ${graveTail}` : ''
     if (writesMade > 0 && unknownSuffix) {
       return { label: `PARTIALLY APPLIED — ABORTED AFTER ${writesMade} IRREVERSIBLE WRITE(S) AND ${unknownSuffix}${tail}`, exitCode: 1 }
     }
@@ -1243,15 +1265,20 @@ export function runOutcome(args: {
     // but the durable stores now hold an intent nobody settled, and the next run will refuse over
     // it. Saying only "NOTHING WAS WRITTEN" would send the operator to that refusal with no idea
     // what it is about.
-    if (unrecordedSuffix) {
+    if (unrecordedSuffix && !unexcludedSuffix) {
       return { label: `ABORTED — NOTHING WAS WRITTEN, BUT ${unrecordedSuffix} EXIST ONLY IN THIS OUTPUT`, exitCode: 1 }
+    }
+    // A request that Xero REFUSED changes nothing, so "nothing was written" is still true of the
+    // ledger's CONTENT — but it left this process during a window nobody could show was excluded,
+    // and that is a fact about the ORGANISATION, not about the object. It cannot be dropped here.
+    if (unexcludedSuffix) {
+      return { label: `ABORTED — NOTHING WAS WRITTEN BY THIS RUN, BUT ${graveTail}`, exitCode: 1 }
     }
     return { label: 'ABORTED — NOTHING WAS WRITTEN', exitCode: 1 }
   }
-  if (unrecordedSuffix) {
+  if (graveTail) {
     return {
-      label: `PARTIALLY APPLIED — ${unrecordedSuffix} THAT ONLY THIS OUTPUT RECORDS` +
-        (unknownSuffix ? ` AND ${unknownSuffix}` : ''),
+      label: `PARTIALLY APPLIED — ${graveTail}` + (unknownSuffix ? ` AND ${unknownSuffix}` : ''),
       exitCode: 1,
     }
   }
@@ -1299,11 +1326,31 @@ export type UnrecordedSettlement = MutationRecord & {
   /** Which durable store(s) refused the settlement, and why. */
   failures: string[]
 }
+/**
+ * A write that WENT OUT while the ledger could not be shown to be held (r10 finding 1).
+ *
+ * A third fact again, and not a version of either of the other two. An unknown write means nobody
+ * knows what happened to the object. An unrecorded settlement means this run knows and the stores
+ * do not. This one means the OBJECT's story may be perfectly clear and the LEDGER's is not: from
+ * some point inside the window this request was dispatched in, nothing excluded a second run, so
+ * every conclusion the rest of this run draws about the organisation rests on a state somebody else
+ * may have been changing.
+ */
+export type UnexcludedDispatch = MutationRecord & {
+  intentId: string
+  method: HttpMethod
+  path: string
+  /** What this run established about the object, which does NOT settle the question above. */
+  state: WriteCommitState
+  /** Why the exclusion could not be confirmed: a reaped session, a restart, a pooler. */
+  reason: string
+}
 
 export class MutationJournal {
   private readonly writes: MutationRecord[] = []
   private readonly unknown: UnknownWriteRecord[] = []
   private readonly unrecorded: UnrecordedSettlement[] = []
+  private readonly unexcluded: UnexcludedDispatch[] = []
   private readonly releases = new Map<string, Set<string>>()
   /**
    * Per object: the version Xero reported for it IN THE RESPONSE TO OUR OWN WRITE, or `null` when
@@ -1342,6 +1389,18 @@ export class MutationJournal {
    */
   recordUnrecordedSettlement(entry: UnrecordedSettlement): void {
     this.unrecorded.push(entry)
+  }
+
+  /**
+   * A write that was dispatched while the ledger could not be shown to be held.
+   *
+   * IN ADDITION to the write itself and to whatever became of it — never instead of either. The
+   * durable stores are asked to hold the same fact, but the store most likely to refuse it is the
+   * shared one, and the reason it refuses is usually the very session loss being reported. Memory
+   * is what still has it when that happens, and the banner is where memory gets printed.
+   */
+  recordUnexcludedDispatch(entry: UnexcludedDispatch): void {
+    this.unexcluded.push(entry)
   }
 
   /**
@@ -1396,6 +1455,8 @@ export class MutationJournal {
   get unknownRecords(): readonly UnknownWriteRecord[] { return this.unknown }
   get unrecordedSettlementCount(): number { return this.unrecorded.length }
   get unrecordedSettlements(): readonly UnrecordedSettlement[] { return this.unrecorded }
+  get unexcludedDispatchCount(): number { return this.unexcluded.length }
+  get unexcludedDispatches(): readonly UnexcludedDispatch[] { return this.unexcluded }
   get failureCount(): number { return this.failures.length }
   get failureMessages(): readonly string[] { return this.failures }
 }
@@ -1538,6 +1599,13 @@ export type WriteIntent = {
   path: string
   at: string
   tenantId: string
+  /**
+   * Set when the log carries an `unexcluded` event for this intent: the request went out and the
+   * ledger could not be shown to have been held across it (r10 finding 1). It HOLDS the intent on
+   * the fence whatever the settlement says, because the two are different facts — what became of
+   * the write, and whether anybody else could have been writing at the same time.
+   */
+  unexcludedReason?: string
 }
 
 export type WriteIntentLog = {
@@ -1552,6 +1620,22 @@ export type WriteIntentLog = {
   intend(entry: { kind: string; label: string; method: HttpMethod; path: string }): string
   /** Durably record what became of it. */
   settle(id: string, state: WriteCommitState, reason: string): void
+  /**
+   * Durably record that this write was dispatched into a window in which the ledger lock could not
+   * be shown to have been held (r10 finding 1).
+   *
+   * ITS OWN EVENT, not a field on the settlement, and that is deliberate twice over:
+   *   • it is a POSITIVE claim. A log written by a version that never asked the question carries no
+   *     such line, and must go on reading exactly as it did — an absent field would otherwise
+   *     retroactively re-open every settled write in every legacy log, including the ones under
+   *     LEGACY_WRITE_LOG_PATHS, and brick the fence on state nobody can reconcile;
+   *   • an OLDER reader of a NEWER log fails closed. `scanWriteIntentLog` counts an event it does
+   *     not recognise as an unreadable line, and an unreadable line already holds the fence. A
+   *     field it did not know about would simply have been ignored.
+   *
+   * Written BEFORE the settlement, so a process killed between the two leaves the graver record.
+   */
+  recordUnexcludedDispatch(id: string, reason: string): void
   close(): void
 }
 
@@ -1572,6 +1656,7 @@ export const NULL_WRITE_INTENT_LOG: WriteIntentLog = {
   runId: 'not-logged',
   intend: () => 'not-logged',
   settle: () => {},
+  recordUnexcludedDispatch: () => {},
   close: () => {},
 }
 
@@ -1609,6 +1694,9 @@ export function createWriteIntentLog(args: {
     },
     settle(id, state, reason) {
       append(JSON.stringify({ event: 'settled', id, runId, state, reason, at: now().toISOString(), tenantId }))
+    },
+    recordUnexcludedDispatch(id, reason) {
+      append(JSON.stringify({ event: 'unexcluded', id, runId, reason, at: now().toISOString(), tenantId }))
     },
     close() {},
   }
@@ -1904,16 +1992,30 @@ export type WriteLogScan = { unresolved: WriteIntent[]; unreadableLines: number 
 /**
  * What a previous run left behind, and could not account for.
  *
- * THREE things count, and they are all the same fact about the ledger — it may have changed and
+ * FOUR things count, and they are all the same fact about the ledger — it may have changed and
  * nothing knows how:
  *   • an intent with no settlement at all — the process died between dispatching and recording;
  *   • an intent settled as UNKNOWN — the answer was lost, and the banner that says so may never
  *     have been printed, let alone read;
  *   • a line that cannot be parsed — a half-written final record is exactly what a process dying
- *     mid-append looks like, and "I could not read it" is not "there was nothing there".
+ *     mid-append looks like, and "I could not read it" is not "there was nothing there";
+ *   • an intent marked UNEXCLUDED (r10 finding 1) — the request went out and the ledger could not
+ *     be shown to have been held across it. This one is INDEPENDENT of the settlement and outranks
+ *     it: a write may be perfectly well accounted for as `committed` and still have been dispatched
+ *     into a window in which a second run could have been writing to the same organisation. The
+ *     outcome answers "what became of this object"; it does not answer "was anybody else in here",
+ *     and only the second question is what the lock was for.
  */
 export function scanWriteIntentLog(text: string): WriteLogScan {
   const open = new Map<string, WriteIntent>()
+  /**
+   * Every intent ever seen, so an `unexcluded` line can put one BACK on the pile after its
+   * settlement took it off. The order of the two events in the file is not something a reader may
+   * depend on: the writer emits the unexcluded line first, but a log is also concatenated,
+   * hand-edited and read after a crash mid-append.
+   */
+  const everySeen = new Map<string, WriteIntent>()
+  const unexcluded = new Map<string, string>()
   let unreadableLines = 0
   for (const line of text.split(/\r?\n/)) {
     const trimmed = line.trim()
@@ -1930,7 +2032,7 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
     const id = typeof record.id === 'string' ? record.id : null
     if (!id) { unreadableLines++; continue }
     if (record.event === 'intent') {
-      open.set(id, {
+      const intent: WriteIntent = {
         id,
         runId: String(record.runId ?? ''),
         kind: String(record.kind ?? '(unnamed)'),
@@ -1939,7 +2041,13 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
         path: String(record.path ?? '(unknown path)'),
         at: String(record.at ?? ''),
         tenantId: String(record.tenantId ?? ''),
-      })
+      }
+      open.set(id, intent)
+      everySeen.set(id, intent)
+    } else if (record.event === 'unexcluded') {
+      // Recorded, never weighed. This line says a request went out over a ledger nobody could show
+      // was held, and no later line — a settlement, a second run's tidy-up — may take it off.
+      unexcluded.set(id, String(record.reason ?? '(no reason recorded)'))
     } else if (record.event === 'settled') {
       // A settlement RESOLVES the intent only when it says what happened, IN WORDS THIS TOOL
       // RECOGNISES. 'unknown' is the answer that does not, so it stays on the pile: the run that
@@ -1961,6 +2069,14 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
       unreadableLines++
     }
   }
+  // An unexcluded dispatch holds its intent whatever the settlement said, and says why. An
+  // `unexcluded` line for an id this log has no intent for is not silently dropped either: it is an
+  // unreadable line, because it describes a dispatched write whose own record is missing.
+  for (const [id, reason] of unexcluded) {
+    const intent = everySeen.get(id)
+    if (!intent) { unreadableLines++; continue }
+    open.set(id, { ...intent, unexcludedReason: reason })
+  }
   return { unresolved: [...open.values()], unreadableLines }
 }
 
@@ -1972,7 +2088,14 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
 export function assertNoUnresolvedWrites(args: { path: string; text: string }): void {
   const { unresolved, unreadableLines } = scanWriteIntentLog(args.text)
   if (unresolved.length === 0 && unreadableLines === 0) return
-  const shown = unresolved.slice(0, 20).map((u) => `${u.kind}: ${u.label} — ${u.method} ${u.path} at ${u.at}`)
+  const shown = unresolved.slice(0, 20).map((u) =>
+    `${u.kind}: ${u.label} — ${u.method} ${u.path} at ${u.at}` +
+    // Named separately, because the operator's next move is different: this one is not resolved by
+    // reading the object at all — it is resolved by establishing that nobody else was writing.
+    (u.unexcludedReason
+      ? `\n      DISPATCHED WITHOUT A CONFIRMED EXCLUSION — ${u.unexcludedReason}\n` +
+        exclusionRecoveryInstruction({ intentId: u.id, reason: u.unexcludedReason, subject: `${u.kind} ${u.label}`, indent: '      ' })
+      : ''))
   throw new UnresolvedWriteError(
     `ABORT: ${args.path} records ${unresolved.length} write(s) that were DISPATCHED and never accounted for` +
       (unreadableLines ? `, plus ${unreadableLines} line(s) that could not be read` : '') +
@@ -1981,7 +2104,9 @@ export function assertNoUnresolvedWrites(args: { path: string; text: string }): 
       `about:\n  ` +
       shown.join('\n  ') +
       (unresolved.length > shown.length ? `\n  ... and ${unresolved.length - shown.length} more` : '') +
-      `\nResolve by READING: open each object in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts, and ` +
+      `\nA row that says DISPATCHED WITHOUT A CONFIRMED EXCLUSION is not resolved by reading the object at all; ` +
+      `its own instruction is printed above it, and both halves have to be answered before it lets go.\n` +
+      `Otherwise, resolve by READING: open each object in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts, and` +
       `establish what actually happened to it. Once every one is accounted for, move the log aside ` +
       `(mv ${args.path} ${args.path}.resolved-<date>) and plan again from a FRESH manifest. Continuing on the old ` +
       `plan would treat these objects as untouched.`,
@@ -2111,6 +2236,81 @@ export class SessionDiscontinuityError extends SafetyViolationError {}
  * is the ONLY one (r9 finding 2). See `assertCoordinatorAttested`.
  */
 export class CoordinatorNotAttestedError extends SafetyViolationError {}
+/**
+ * A WRITE LEFT THIS PROCESS AND THE LEDGER WAS NOT CONFIRMABLY HELD ACROSS IT (r10 finding 1).
+ *
+ * Distinct from `SharedFenceLostError`, which says "the lock is gone and therefore nothing further
+ * may be dispatched". This says something narrower and worse: a request has ALREADY gone, and the
+ * window it went in cannot be shown to have been excluded. Nothing can recall it, so the fact is
+ * recorded rather than prevented — in both durable stores and in this run's own account — and the
+ * next run, on this host or any other, refuses to start until a human accounts for it.
+ */
+export class WriteDispatchedWithoutExclusionError extends SafetyViolationError {}
+
+/**
+ * WHAT REMAINS BETWEEN THE ASSERT AND THE DISPATCH, AND WHY IT IS NOT A CHECK-THEN-ACT HOLE.
+ *
+ * `fence.intend` asks PostgreSQL whether this session still holds the ledger and then INSERTs the
+ * intent; `transport.request` dispatches. Those are two moments, and no amount of moving the check
+ * closer to the call makes them one: the act is a remote call to Xero and the check is a remote
+ * call to PostgreSQL, and nothing can make a pair of remote calls atomic with respect to each
+ * other. Round 5 settled that argument for the verdict/post pair and the answer was that the
+ * residual must be DETECTABLE AND RECOVERABLE rather than eliminated. The same answer, applied one
+ * layer down and sharpened:
+ *
+ *   1. THE ASSERT THAT COVERS AN ACT COMES AFTER IT. Every dispatch is bracketed — the fence is
+ *      established before the request leaves (which is what stops a write going out over a ledger
+ *      already known to be unexcluded) and asked AGAIN once the request has settled. The second
+ *      question is not a fresher version of the first; it is a question about the INTERVAL.
+ *   2. A PASS IS RETROACTIVE EVIDENCE, not a point observation. A PostgreSQL SESSION advisory lock
+ *      cannot be released and silently re-acquired: the only ways to stop holding one are the
+ *      session ending, an explicit `pg_advisory_unlock` FROM THAT SESSION, or — under a pooler —
+ *      the statement landing on a backend that never held it. This file issues no unlock until
+ *      `release()`; a session that ended takes its `pg_temp` relation and its session GUC with it,
+ *      and no other backend can forge them; and a statement that lands elsewhere answers with a
+ *      different pid, a NULL nonce and `tempPresent = false`. So "held, by this backend, carrying
+ *      the marks this run planted" observed on BOTH sides of the dispatch means held THROUGHOUT
+ *      it — there is no trajectory in which it went and came back. The window is not shrunk; it is
+ *      covered.
+ *   3. A FAILURE IS THE IRREDUCIBLE PART, AND IT IS RECORDED. What cannot be eliminated is that the
+ *      request has already gone. So the run does not pretend otherwise: the write's OUTCOME is
+ *      settled normally (it is the scarcest thing in the run and is never withheld to make a row
+ *      stick), and ALONGSIDE it both stores record that the exclusion could not be confirmed —
+ *      `heldThrough = false` on the shared row, an `unexcluded` event in the fsynced log. Both
+ *      hold the row on the recovery fence no matter what the outcome says, the run aborts naming
+ *      the write, and the banner prints it. The next run refuses to start until a human establishes
+ *      that nobody else was writing in that window.
+ *
+ * It is deliberately not a boolean. "Could not be confirmed" has to carry WHY — a reaped session, a
+ * coordinator restart, a pooler that started routing — because that is what the operator has to act
+ * on, and because "I could not ask" and "somebody else had it" are the same state from in here.
+ */
+export type ExclusionOutcome =
+  | { confirmed: true }
+  | { confirmed: false; reason: string }
+
+/**
+ * Ask the fence, AFTER an irreversible act, whether the ledger was held across it — and never
+ * throw. Throwing here would abort before the outcome of the dispatched write had been recorded
+ * anywhere, which is the one thing this file will not trade away: the answer to "what became of it"
+ * is scarcer than the answer to "was anybody else allowed to be writing".
+ *
+ * Anything the assertion throws — the latched loss, an unreachable coordinator, a bug — reads the
+ * same way: unconfirmed. That is the conservative direction and the only honest one; a run cannot
+ * distinguish "the exclusion held and I could not verify it" from "the exclusion went" any more
+ * than it can anywhere else in this file.
+ */
+export async function confirmExclusionAcross(
+  fence: Pick<SharedWriteFence, 'assertStillHeld'>,
+  context: string,
+): Promise<ExclusionOutcome> {
+  try {
+    await fence.assertStillHeld(context)
+    return { confirmed: true }
+  } catch (e) {
+    return { confirmed: false, reason: errText(e) }
+  }
+}
 
 /**
  * THE SETTLEMENT VOCABULARY, and it is closed.
@@ -2220,6 +2420,45 @@ export function settlementRecoveryInstruction(args: {
 }
 
 /**
+ * How an operator clears the OTHER half of a row's account: the write went out, and nothing could
+ * confirm that this run still held the ledger across it (r10 finding 1).
+ *
+ * It is a separate question from the outcome and gets a separate instruction, because settling the
+ * outcome does not answer it and never could. The outcome is about the object; this is about
+ * whether anybody ELSE could have been writing to the organisation in the same window — which is
+ * exactly what the lock existed to rule out, and exactly what stopped being ruled out.
+ *
+ * The recovery is a read, like every other recovery in this file, and the honest third answer —
+ * "I cannot tell" — has a home: the row stays as it is and no further --apply runs.
+ */
+export function exclusionRecoveryInstruction(args: {
+  intentId: string
+  /** Why it could not be confirmed: a reaped session, a coordinator restart, a pooler. */
+  reason: string
+  subject?: string
+  indent?: string
+}): string {
+  const pad = args.indent ?? ''
+  const where = args.subject ? `${args.subject} ` : ''
+  return [
+    `${pad}THE LEDGER WAS NOT CONFIRMABLY HELD ACROSS THIS DISPATCH: ${args.reason}`,
+    `${pad}The request had already left this process when that was established, so it cannot be recalled,`,
+    `${pad}and from some point in that window nothing excluded a second run — an --apply on any host`,
+    `${pad}could have been writing to this organisation at the same time.`,
+    `${pad}SETTLING THE OUTCOME DOES NOT CLEAR THIS. Establish, separately, that nobody else was writing:`,
+    `${pad}  * SELECT * FROM "xero_live_write_intents" WHERE "tenantId" = <this ledger> ORDER BY "intendedAt"`,
+    `${pad}    — look for a DIFFERENT "runId" with an "intendedAt" anywhere near this row's;`,
+    `${pad}  * check every host that can run this script for a run that was live in that window;`,
+    `${pad}  * read ${where}in Xero, including its history, for a change this run cannot account for.`,
+    `${pad}If all three say no other run touched it, record that — and record WHO established it:`,
+    `${pad}  UPDATE "xero_live_write_intents" SET "heldThrough" = true,`,
+    `${pad}    "heldThroughReason" = '<who established no concurrent run, and how>' WHERE "id" = '${args.intentId}';`,
+    `${pad}If you cannot tell, STOP and leave the row exactly as it is. An unresolved row is then the`,
+    `${pad}correct description of the world, and no further --apply may run against this ledger.`,
+  ].join('\n')
+}
+
+/**
  * The slice of a PostgreSQL client this file needs. Deliberately tiny, and deliberately NOT
  * `pg.Client`: the fence must be exercisable against a double that models one database shared by
  * two hosts, which is the only way to test the thing this section exists for.
@@ -2244,6 +2483,14 @@ export type SharedUnresolvedWrite = {
   intendedAt: string
   /** `null` — dispatched and never settled. `'unknown'` — settled, and the answer was lost. */
   state: string | null
+  /**
+   * Was the ledger confirmably held across the moment this write was dispatched (r10 finding 1)?
+   * `false` holds the row whatever `state` says. `null` means the question was never asked — a row
+   * written before the column existed — and is not read as a no.
+   */
+  heldThrough: boolean | null
+  /** Why it could not be confirmed, or who established afterwards that it had been. */
+  heldThroughReason: string | null
 }
 
 /**
@@ -2286,8 +2533,21 @@ export type SharedWriteFence = {
   scanUnresolved(): Promise<SharedUnresolvedWrite[]>
   /** Durably record — COMMITTED — that a write is about to be dispatched. Throws to refuse it. */
   intend(entry: { id: string; runId: string; kind: string; label: string; method: HttpMethod; path: string }): Promise<void>
-  /** Durably record what became of it. Throws if it did not land. */
-  settle(entry: { id: string; runId: string; state: WriteCommitState; reason: string }): Promise<void>
+  /**
+   * Durably record what became of it, AND whether the ledger was held across its dispatch. Throws
+   * if it did not land.
+   *
+   * `exclusion` is required rather than optional for the reason the fence itself is a value rather
+   * than an `if (fence)`: a caller that may omit it is a caller that can forget it, and a row
+   * settled without it looks exactly like a row settled under an unbroken fence.
+   */
+  settle(entry: {
+    id: string
+    runId: string
+    state: WriteCommitState
+    reason: string
+    exclusion: ExclusionOutcome
+  }): Promise<void>
   release(): Promise<void>
 }
 
@@ -2447,17 +2707,43 @@ export const SHARED_FENCE_SQL = {
    * spelled separately because `NULL NOT IN (...)` is NULL, not true, and a three-valued predicate
    * that quietly answers "unknown" for the most dangerous row is exactly the bug.
    */
+  /**
+   * TWO independent reasons a row stays on the fence, and the second is r10 finding 1.
+   *
+   * `heldThrough = false` is a POSITIVE record that a request went out while the ledger could not
+   * be shown to be held — so the row holds even when the outcome is perfectly well accounted for.
+   * The two facts are orthogonal: `committed` says what became of the object, and says nothing
+   * about whether a second run was writing to the organisation in the same window.
+   *
+   * It is `= false`, not `IS NOT TRUE`, and that is the whole care in this predicate. NULL means
+   * the question was never asked — every row written before the column existed, and every row an
+   * older version of this script settles — and reading NULL as "not confirmed" would put every
+   * historical write back on the fence at once, in an incident where the fence being trustworthy is
+   * the only thing that lets an operator move. From this migration forward every settlement writes
+   * true or false, so a NULL beside a settlement can only be a pre-migration row. Contrast the
+   * STATE clause, which is stated as the complement of the resolved vocabulary precisely because
+   * there an unrecognised value IS a claim somebody made and could not be interpreted.
+   */
   scan:
-    'SELECT "id", "runId", "host", "kind", "label", "method", "path", "intendedAt", "state" ' +
+    'SELECT "id", "runId", "host", "kind", "label", "method", "path", "intendedAt", "state", ' +
+    '"heldThrough", "heldThroughReason" ' +
     'FROM "xero_live_write_intents" ' +
-    'WHERE "tenantId" = $1 AND ("state" IS NULL OR "state" NOT IN (\'committed\', \'not-committed\')) ' +
+    'WHERE "tenantId" = $1 AND ("state" IS NULL OR "state" NOT IN (\'committed\', \'not-committed\') ' +
+    'OR "heldThrough" = false) ' +
     'ORDER BY "intendedAt"',
   intend:
     'INSERT INTO "xero_live_write_intents" ' +
     '("id", "runId", "tenantId", "host", "kind", "label", "method", "path", "intendedAt") ' +
     'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING "id"',
+  /**
+   * ONE statement, carrying both halves of the account: what became of the write, and whether the
+   * ledger was held across the moment it was dispatched. They are written together because they are
+   * established together and because a second UPDATE is a second chance for the connection — the
+   * very connection whose health is in question — to go away between them.
+   */
   settle:
-    'UPDATE "xero_live_write_intents" SET "state" = $3, "reason" = $4, "settledAt" = $5 ' +
+    'UPDATE "xero_live_write_intents" SET "state" = $3, "reason" = $4, "settledAt" = $5, ' +
+    '"heldThrough" = $6, "heldThroughReason" = $7 ' +
     'WHERE "id" = $1 AND "runId" = $2 RETURNING "id"',
 } as const
 
@@ -2507,6 +2793,26 @@ export const SHARED_FENCE_SQL = {
  * and the run was then refused by the coordinator check, as it must be. Afterwards: no advisory
  * lock and no `o3d_xero_fence_session` relation anywhere in the cluster. Nothing was left behind
  * by either pass, and no row in that database was written.
+ *
+ * ROUND 10 ADDED THE EXCLUSION COLUMNS, measured the same way against the same database, and this
+ * one MATTERS MORE THAN THE OTHERS because the in-memory double cannot substitute for it: the
+ * double carries its own copy of the scan predicate, so reverting the predicate here does not make
+ * the double's behavioural tests fail. Only PostgreSQL can answer whether this SQL means what it
+ * says. Both migrations were applied in order, then:
+ *   • `heldThrough boolean NULL` and `heldThroughReason text NULL` exist and are nullable, so the
+ *     ALTER is safe on a table that already has rows and nothing is back-filled;
+ *   • `settle` writes the outcome AND the exclusion in one statement — a row settled with
+ *     `heldThrough = true` reads back `committed / true / null`;
+ *   • THE SCAN, run verbatim from this module, held EXACTLY the `committed` row whose
+ *     `heldThrough` is `false`, and let go of both the `committed / true` row and the
+ *     PRE-MIGRATION row whose `heldThrough` is NULL. That is the whole of the three-valued
+ *     argument, executed rather than asserted;
+ *   • an operator's `UPDATE ... SET "heldThrough" = true` takes the row off the fence, so the
+ *     recovery the banner prints is the recovery that works;
+ *   • the r8 CHECK constraint still refuses `commited` alongside the new columns.
+ * Inside a transaction that was ROLLED BACK. Afterwards: `to_regclass` NULL for the table, no
+ * advisory lock held by that backend, no `o3d_xero_fence_session` relation, and no row anywhere.
+ * The probe took no advisory lock at all and wrote nothing outside the aborted transaction.
  *
  * The Xero side of this file has no equivalent check available: the stored audit token expired
  * 2026-08-18T14:49Z and refreshing it rotates the refresh token out of band.
@@ -3181,6 +3487,10 @@ export async function acquireSharedWriteFence(args: {
         path: String(r.path ?? '(unknown path)'),
         intendedAt: r.intendedAt instanceof Date ? r.intendedAt.toISOString() : String(r.intendedAt ?? ''),
         state: r.state == null ? null : String(r.state),
+        // Only a real boolean answers. Anything else — a NULL from a pre-migration row, a value
+        // some other tool put there — is "nobody asked", which is what `null` means here.
+        heldThrough: typeof r.heldThrough === 'boolean' ? r.heldThrough : null,
+        heldThroughReason: r.heldThroughReason == null ? null : String(r.heldThroughReason),
       }))
     },
     async intend(entry) {
@@ -3210,7 +3520,11 @@ export async function acquireSharedWriteFence(args: {
       // and `recordSettlement` reports it as an unrecorded settlement, which is the honest outcome.
       let rows: Array<Record<string, unknown>>
       try {
-        rows = (await client.query(SHARED_FENCE_SQL.settle, [entry.id, entry.runId, entry.state, entry.reason, now()])).rows
+        rows = (await client.query(SHARED_FENCE_SQL.settle, [
+          entry.id, entry.runId, entry.state, entry.reason, now(),
+          entry.exclusion.confirmed,
+          entry.exclusion.confirmed ? null : entry.exclusion.reason,
+        ])).rows
       } catch (e) {
         return fail('record the outcome of a write', e)
       }
@@ -3344,9 +3658,38 @@ function defaultCoordinationClient(): CoordinationClient {
  * has something to do about it, and it is not the same something as "the lock was lost".
  */
 export class StagedArtefactStrandedError extends SafetyViolationError {}
+/**
+ * The artefact took its consumed name, and the fence could not be shown to have held across the
+ * rename (r10 finding 1, applied to the artefact). Its own class for the same reason: what the
+ * operator has to do about it — go and look at a file that now exists — is specific.
+ */
+export class PublishedArtefactUnfencedError extends SafetyViolationError {}
 
-/** What `persistUnderFence` appends to make the staging name. Exported so the tests name one thing. */
+/** What `persistUnderFence` ends the staging name with. Exported so the tests name one thing. */
 export const STAGED_ARTEFACT_SUFFIX = '.partial'
+
+/**
+ * THE STAGING NAME IS PER-RUN, NOT PER-TARGET (r10 finding 2).
+ *
+ * Round 9 staged every artefact at `<path>.partial`, which is a name derived only from the target —
+ * so two runs writing the same target share it. Dry runs take the ledger lock in SHARE mode, and
+ * two of them coexist by design; the default `--plan-out` is derived from the DATE, so on any given
+ * day two dry runs are pointed at the same target without anybody doing anything unusual. They then
+ * open the same staging file: the second `writeFileSync` TRUNCATES the first's bytes, and what the
+ * first run renames into place is whatever the interleaving left — the exact torn artefact staging
+ * was introduced to make impossible, reintroduced between runs instead of within one.
+ *
+ * The token is random and per-call, for the same reason `runId` is: it must not be derivable from
+ * anything two runs could agree on. A pid collides across containers and is reused; a timestamp
+ * collides at any resolution two processes can both round to; a hostname is shared by every run on
+ * the machine. Randomness is the only source with no such story.
+ *
+ * Same directory as the target, always, because the publish step is a rename and a rename across
+ * filesystems is not atomic — which would put the torn file back under the consumed name.
+ */
+export function stagedArtefactName(path: string): string {
+  return `${path}.${randomBytes(8).toString('hex')}${STAGED_ARTEFACT_SUFFIX}`
+}
 
 /**
  * WRITE AN ARTEFACT ONLY IF THE FENCE HELD ACROSS THE WHOLE WRITE (r9 finding 3).
@@ -3369,8 +3712,18 @@ export const STAGED_ARTEFACT_SUFFIX = '.partial'
  *     cannot destroy a good artefact;
  *   • a crash during the write itself cannot leave half a JSON document under the real name.
  *
- * If the staged file cannot be removed the run does NOT quietly swallow it: a `.partial` nobody
- * mentioned is a plan waiting to be renamed by a tired operator.
+ * THE STAGING NAME IS PER-CALL (r10 finding 2). A name derived only from the target is shared by
+ * every run pointed at that target, and two dry runs are pointed at one target by default — so
+ * round 9's single `<path>.partial` let one run truncate another's staging file and reintroduced,
+ * between runs, the torn artefact it abolished within one. See `stagedArtefactName`.
+ *
+ * AND THE FENCE IS ASKED ONCE MORE AFTER THE RENAME (r10 finding 1). The second assertion covers
+ * the write; the rename is the act that makes the artefact real, and an act is covered by the
+ * assertion that comes AFTER it. A failure there does not unlink — by then the name may be another
+ * run's — it says so and stops.
+ *
+ * If the staged file cannot be removed the run does NOT quietly swallow it: a stray staging file
+ * nobody mentioned is a plan waiting to be renamed by a tired operator.
  */
 export async function persistUnderFence(args: {
   /** The live fence. Both assertions are made against it; nothing here can substitute for one. */
@@ -3392,7 +3745,8 @@ export async function persistUnderFence(args: {
     publish: (from: string, to: string) => { renameSync(from, to) },
     discard: (path: string) => { unlinkSync(path) },
   }
-  const staged = `${args.path}${STAGED_ARTEFACT_SUFFIX}`
+  // PER-CALL, so two runs staging the same target cannot truncate each other (r10 finding 2).
+  const staged = stagedArtefactName(args.path)
 
   // Before a byte is written. Everything the artefact is made of was read under the fence, and if
   // the fence went during those reads none of it may be written down at all.
@@ -3417,6 +3771,36 @@ export async function persistUnderFence(args: {
     throw e
   }
   io.publish(staged, args.path)
+  /**
+   * AND ONCE MORE, ON THE FAR SIDE OF THE PUBLISH (r10 finding 1, applied here).
+   *
+   * The assertion above covers the write; it does not cover the rename, and the rename is the act
+   * that makes the artefact real. The same reasoning as the dispatch applies, and lands in a
+   * different place because the act is different: a lock lost during the rename cannot be
+   * prevented, and the question is what evidence exists afterwards. A pass here is retroactive
+   * evidence over the rename, for the same reason it is over a dispatch — a session lock cannot go
+   * and come back.
+   *
+   * A FAILURE DOES NOT UNLINK, and that is a deliberate refusal. By this point the name belongs to
+   * whatever is under it, and two dry runs may legitimately publish the same target; removing it
+   * would let a run that lost its own fence destroy another run's good plan — the exact defect
+   * staging was introduced to fix, committed with more confidence. So it is named, loudly, and left
+   * for a human, who is the only party that can tell the two files apart.
+   */
+  const published = await confirmExclusionAcross(
+    args.fence,
+    `having published ${args.what} to ${args.path}`,
+  )
+  if (!published.confirmed) {
+    throw new PublishedArtefactUnfencedError(
+      `ABORT: ${published.reason}\n` +
+        `AND ${args.path} ALREADY EXISTS: the rename had happened when that was established, so ${args.what} is ` +
+        `on disk under the name --apply is pointed at, and this run cannot vouch for it.\n` +
+        `GO AND LOOK AT IT, and do not feed it to --apply until you have. Nothing here removed it: on a shared ` +
+        `target that file may be another run's, and a run that has just lost its own fence is the last thing that ` +
+        `should be deleting plans. If it is this run's, delete it and plan again from a fresh read.`,
+    )
+  }
 }
 
 /**
@@ -3434,6 +3818,17 @@ export function assertNoUnresolvedSharedWrites(args: {
   // stopped started instead. It now holds the fence like any other unaccounted-for write, and it
   // says so in its own words rather than being reported as one of the other two.
   const describe = (u: SharedUnresolvedWrite): string => {
+    // ASKED FIRST, because it is the reason a row can be here while its outcome is fully accounted
+    // for (r10 finding 1). Reading the outcome first would land a `committed` row on the
+    // 'this row should not be on the fence; report it' branch — telling the operator the fence is
+    // broken about the one row where it is doing something new.
+    if (u.heldThrough === false) {
+      const why = u.heldThroughReason ?? '(no reason recorded)'
+      return `DISPATCHED WITHOUT A CONFIRMED EXCLUSION — ${why}\n` +
+        `      its outcome is ${u.state === null ? 'not settled either' : `settled as ${JSON.stringify(u.state)}`}, ` +
+        `which does not clear this: the outcome is about the object, and this is about whether a ` +
+        `second run could have been writing to the organisation at the same time`
+    }
     switch (readSettlementState(u.state)) {
       case 'never-settled': return 'never settled — the run died between dispatching it and recording the answer'
       case 'unknown-outcome': return 'settled as UNKNOWN — the answer was lost'
@@ -3447,7 +3842,17 @@ export function assertNoUnresolvedSharedWrites(args: {
     .slice(0, 20)
     .map((u) => `${u.kind}: ${u.label} — ${u.method} ${u.path} at ${u.intendedAt}, dispatched from ${u.host} by run ` +
       `${u.runId}\n      intent ${u.id}: ${describe(u)}\n` +
-      settlementRecoveryInstruction({ intentId: u.id, state: null, subject: `${u.kind} ${u.label}`, indent: '      ' }))
+      // A row can need BOTH: an outcome nobody recorded, and an exclusion nobody could confirm.
+      // They are printed together because clearing either one alone leaves the row on the fence,
+      // and an operator who runs one UPDATE and sees the refusal persist concludes it is broken.
+      (u.heldThrough === false
+        ? exclusionRecoveryInstruction({
+            intentId: u.id,
+            reason: u.heldThroughReason ?? '(no reason recorded)',
+            subject: `${u.kind} ${u.label}`,
+            indent: '      ',
+          }) + (settlementResolvesIntent(u.state) ? '' : `\n${settlementRecoveryInstruction({ intentId: u.id, state: null, subject: `${u.kind} ${u.label}`, indent: '      ' })}`)
+        : settlementRecoveryInstruction({ intentId: u.id, state: null, subject: `${u.kind} ${u.label}`, indent: '      ' })))
   throw new SharedUnresolvedWriteError(
     `ABORT: the shared write fence records ${args.unresolved.length} write(s) against ledger ${args.tenantId} that ` +
       `were DISPATCHED and are not accounted for. These come from the IMS database, not from this machine's disk, ` +
@@ -3573,8 +3978,9 @@ export async function performWrite<T>(args: {
     // delivered as a refusal to retry rather than as a result. Everything else is settled as
     // unknown: over-reporting costs the operator one manual read, and under-reporting loses an
     // irreversible write.
+    const refusedBeforeTheNetwork = e instanceof WriteWithoutApplyError || e instanceof CallCeilingError
     const commit: WriteCommit =
-      e instanceof WriteWithoutApplyError || e instanceof CallCeilingError
+      refusedBeforeTheNetwork
         ? { state: 'not-committed', reason: `the request never left this process: ${message}` }
         : e instanceof WriteRateLimitedError
           ? e.commit
@@ -3584,19 +3990,42 @@ export async function performWrite<T>(args: {
     // `recordUnknown` with it: the run then reported "nothing was written" about a request that
     // had already left the process. What the durable stores refuse to hold, memory still has to.
     journalWriteOutcome({ commit, journal, kind, label })
-    const failures = await recordSettlement({ writeLog, fence, intentId, runId: writeLog.runId, commit })
+    // ONLY IF A REQUEST ACTUALLY LEFT. The write gate and the call ceiling refuse BEFORE the
+    // network, so there is no window and nothing to have been excluded from; asking would
+    // manufacture a false alarm out of a request that was never made. A 429 is the other way round
+    // — Xero itself refusing — so it counts as dispatched and is bracketed like any other.
+    const exclusion: ExclusionOutcome = refusedBeforeTheNetwork
+      ? { confirmed: true }
+      : await confirmExclusionAcross(fence, `having dispatched ${method} ${path} for ${kind} ${label}`)
+    const failures = await recordSettlement({ writeLog, fence, intentId, runId: writeLog.runId, commit, exclusion })
     if (failures.length > 0) {
       journal.recordUnrecordedSettlement({ intentId, kind, label, method, path, state: commit.state, reason: commit.reason, failures })
     }
-    // The transport's own error is the cause and stays the thrown one; the settlement failure is
-    // carried on the journal, which is what the end-of-run banner prints from on every path.
+    if (!exclusion.confirmed) {
+      journal.recordUnexcludedDispatch({ intentId, kind, label, method, path, state: commit.state, reason: exclusion.reason })
+    }
+    // The transport's own error is the cause and stays the thrown one; the settlement failure and
+    // the unconfirmed exclusion are carried on the journal, which is what the end-of-run banner
+    // prints from on every path.
     throw e
   }
   const commit = commitOf(res)
+  /**
+   * THE ASSERT THAT COVERS THE DISPATCH (r10 finding 1). The one in `fence.intend` runs BEFORE the
+   * request and can only say the ledger was held before it left; this one is asked once the request
+   * has settled, and because a session advisory lock cannot go and come back, an answer of "still
+   * held, by this backend, carrying this run's marks" is evidence about the whole INTERVAL rather
+   * than about this instant. See `ExclusionOutcome` for why that is not the same as moving the
+   * check closer to the call, and for what happens when the answer is no.
+   *
+   * It cannot throw: the outcome of a write that has already gone is the scarcest thing in the run,
+   * and it has to be recorded before anything is allowed to abort over the exclusion.
+   */
+  const exclusion = await confirmExclusionAcross(fence, `having dispatched ${method} ${path} for ${kind} ${label}`)
   // Settled BEFORE settleWrite, because settleWrite throws on an unknown outcome and the record has
   // to survive that throw as surely as it has to survive a kill. Both stores are attempted even if
   // the first refuses: a settlement that reached one of them is not nothing.
-  const failures = await recordSettlement({ writeLog, fence, intentId, runId: writeLog.runId, commit })
+  const failures = await recordSettlement({ writeLog, fence, intentId, runId: writeLog.runId, commit, exclusion })
   if (commit.state === 'committed') {
     for (const subject of args.subjects ?? []) {
       journal.recordOwnWriteVersion(
@@ -3605,12 +4034,26 @@ export async function performWrite<T>(args: {
       )
     }
   }
-  if (failures.length > 0) {
+  if (failures.length > 0 || !exclusion.confirmed) {
     // The mutation is recorded EXPLICITLY here rather than by falling through to settleWrite,
     // because the throw below would otherwise skip it — which is the defect: a write that landed,
     // whose settlement could not be stored, vanished from the run's account of what it destroyed.
     journalWriteOutcome({ commit, journal, kind, label })
-    journal.recordUnrecordedSettlement({ intentId, kind, label, method, path, state: commit.state, reason: commit.reason, failures })
+    if (failures.length > 0) {
+      journal.recordUnrecordedSettlement({ intentId, kind, label, method, path, state: commit.state, reason: commit.reason, failures })
+    }
+    if (!exclusion.confirmed) {
+      journal.recordUnexcludedDispatch({ intentId, kind, label, method, path, state: commit.state, reason: exclusion.reason })
+    }
+  }
+  // The unconfirmed exclusion is a PARAGRAPH on whichever error is thrown, never an error that
+  // replaces one: an operator with both problems must be told both, and the settlement one is the
+  // time-critical half — that answer exists nowhere but the screen in front of them.
+  const exclusionParagraph = exclusion.confirmed
+    ? ''
+    : `\nAND THE LEDGER WAS NOT CONFIRMABLY HELD ACROSS THIS DISPATCH.\n` +
+      exclusionRecoveryInstruction({ intentId, reason: exclusion.reason, subject: `${kind} ${label}` })
+  if (failures.length > 0) {
     throw new WriteSettlementNotRecordedError(
       `ABORT: ${kind} — ${label}: the write was DISPATCHED (${method} ${path}) and its outcome is ` +
         `${commit.state.toUpperCase()} (${commit.reason}), but that outcome could not be recorded — ${failures.join('; ')}.\n` +
@@ -3620,7 +4063,21 @@ export async function performWrite<T>(args: {
         // An UNKNOWN outcome gets investigation, not an UPDATE: there is nothing to transcribe,
         // because nobody established anything. That decision lives in one place, below.
         settlementRecoveryInstruction({ intentId, state: commit.state, subject: `${kind} ${label}` }) +
-        `\nAccount for the same intent in the on-disk log before the next run.`,
+        `\nAccount for the same intent in the on-disk log before the next run.` +
+        exclusionParagraph,
+    )
+  }
+  if (!exclusion.confirmed) {
+    throw new WriteDispatchedWithoutExclusionError(
+      `ABORT: ${kind} — ${label}: the write was DISPATCHED (${method} ${path}) and its outcome is ` +
+        `${commit.state.toUpperCase()} (${commit.reason}) — and this run could not establish that it still held ` +
+        `the ledger across the moment it went.\n` +
+        `NOTHING FURTHER IS DISPATCHED, and this one cannot be recalled. The exclusion is what made every ` +
+        `conclusion in this run a conclusion about a ledger nobody else was changing; from some point inside ` +
+        `that window, it was not.\n` +
+        `Both durable stores have been told, so the next run — on this host or any other — refuses to start over ` +
+        `intent ${intentId} until a human accounts for it.\n` +
+        exclusionParagraph,
     )
   }
   return { committed: settleWrite({ res, journal, kind, label }), res }
@@ -3642,16 +4099,33 @@ async function recordSettlement(args: {
   intentId: string
   runId: string
   commit: WriteCommit
+  /**
+   * Whether the ledger was held across the dispatch this settles (r10 finding 1). It travels WITH
+   * the settlement rather than after it because a second round of writes is a second chance for the
+   * connection whose health is in question to go away in between.
+   */
+  exclusion: ExclusionOutcome
 }): Promise<string[]> {
-  const { writeLog, fence, intentId, runId, commit } = args
+  const { writeLog, fence, intentId, runId, commit, exclusion } = args
   const failures: string[] = []
+  // THE GRAVER LINE FIRST, and on disk first. A process killed between these appends leaves the
+  // record that holds the fence hardest rather than the one that lets it go, and the fsynced file
+  // is the store that does NOT depend on the coordinator session — which is the very thing whose
+  // loss is usually being reported here.
+  if (!exclusion.confirmed) {
+    try {
+      writeLog.recordUnexcludedDispatch(intentId, exclusion.reason)
+    } catch (e) {
+      failures.push(`the durable log would not record the unconfirmed exclusion: ${e instanceof Error ? e.message : String(e)}`)
+    }
+  }
   try {
     writeLog.settle(intentId, commit.state, commit.reason)
   } catch (e) {
     failures.push(`the durable log refused it: ${e instanceof Error ? e.message : String(e)}`)
   }
   try {
-    await fence.settle({ id: intentId, runId, state: commit.state, reason: commit.reason })
+    await fence.settle({ id: intentId, runId, state: commit.state, reason: commit.reason, exclusion })
   } catch (e) {
     failures.push(`the shared fence refused it: ${e instanceof Error ? e.message : String(e)}`)
   }

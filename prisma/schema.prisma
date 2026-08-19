@@ -3509,7 +3509,28 @@ model XeroLiveWriteIntent {
   reason     String?
   settledAt  DateTime?
 
-  /// The fence's only query: everything for this ledger that is not accounted for.
+  /// WAS THE LEDGER HELD ACROSS THE MOMENT THIS WRITE WAS DISPATCHED?
+  ///
+  /// A second, independent account of the same write, and the row is resolved only when BOTH
+  /// are given. `state` says what became of the OBJECT; this says whether anybody else could
+  /// have been writing to the ORGANISATION in the same window — which is the question the
+  /// advisory lock exists to answer, and the one a settlement cannot.
+  ///
+  /// `false` HOLDS the row on the fence whatever `state` says. `null` means the question was
+  /// never asked: every row written before this column existed, and every row a version of
+  /// the script without it settles. That is deliberately NOT read as "not confirmed" — doing
+  /// so would put every historical write back on the fence at once, during an incident in
+  /// which the fence being trustworthy is the only thing that lets an operator move. From
+  /// here forward every settlement writes true or false in the same statement as the state.
+  heldThrough       Boolean?
+  /// Why it could not be confirmed — a reaped session, a coordinator restart, a pooler that
+  /// started routing — or, once an operator has cleared it by hand, who established that no
+  /// concurrent run existed and how.
+  heldThroughReason String?
+
+  /// The fence's only query: everything for this ledger that is not accounted for. It reads
+  /// `state` and `heldThrough` together; the index leads on the state half, which is the
+  /// selective one, and the table holds one row per dispatched write against one ledger.
   @@index([tenantId, state])
   @@map("xero_live_write_intents")
 }

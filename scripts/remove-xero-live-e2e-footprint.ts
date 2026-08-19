@@ -176,20 +176,34 @@
  *
  * A LOCK LOST MID-RUN IS A REFUSAL. The lock is a SESSION advisory lock, so a reaped session or a
  * coordinator restart frees it silently. Every --apply dispatch re-establishes it before the request
- * leaves; a DRY RUN, which dispatches nothing, re-establishes it before it stages the plan, again
- * before that staged file is given the name --apply is pointed at, and again before it reports
- * success, because the plan is the artefact the next --apply is authorised by. The plan is written
- * to <plan-out>.partial first for exactly that reason: a lock lost while the bytes are landing must
- * leave NO plan behind, not a plan that looks like every other one. A loss is latched permanently:
- * a lock that came back is not the lock that was held.
+ * leaves AND ASKS AGAIN ONCE THE REQUEST HAS SETTLED; a DRY RUN, which dispatches nothing,
+ * re-establishes it before it stages the plan, again before that staged file is given the name
+ * --apply is pointed at, again once it has that name, and again before it reports success, because
+ * the plan is the artefact the next --apply is authorised by. The plan is staged under a random
+ * per-run name ending .partial for exactly that reason: a lock lost while the bytes are landing must
+ * leave NO plan behind, not a plan that looks like every other one — and the name is per-run because
+ * two dry runs may legitimately share a --plan-out and must not truncate each other's staging file.
+ * A loss is latched permanently: a lock that came back is not the lock that was held.
+ *
+ * THE SECOND ASK IS THE POINT, and it is not a fresher version of the first. A check before a remote
+ * call and the call itself are two moments and cannot be made one; asking afterwards is what makes
+ * the WINDOW answerable, because a session advisory lock cannot be released and silently
+ * re-acquired — held on both sides, by the same backend, carrying the marks this run planted, means
+ * held throughout. When the answer is no the request has already gone and nothing can recall it, so
+ * the run records that fact in both durable stores (`heldThrough = false` on the shared row, an
+ * `unexcluded` event in the log), prints it, and stops. The next run refuses over it wherever it
+ * starts.
  *
  * Unresolved rows in that table are cleared the same way the log is: by READING Xero, then
  * settling each row by hand. Nothing expires them, because only Xero can say what became of a
- * dispatched write.
+ * dispatched write. A row held because its exclusion could not be confirmed is cleared differently
+ * — by establishing that no OTHER run was writing in that window — and the banner prints the
+ * separate instruction for it.
  *
- * BEFORE THE FIRST RUN ON A DATABASE that has not seen this table, apply the migration —
- * `npm run db:migrate:deploy` (prisma/migrations/20260819090000_xero_live_write_intents). Until it
- * is applied the fence cannot be read, and this script refuses to start rather than proceeding
+ * BEFORE THE FIRST RUN ON A DATABASE that has not seen this table, apply the migrations —
+ * `npm run db:migrate:deploy` (prisma/migrations/20260819090000_xero_live_write_intents and
+ * 20260819160000_xero_live_write_intent_exclusion). Until they are applied the fence cannot be read
+ * or written as this script expects, and this script refuses to start rather than proceeding
  * without it; that is the intended direction, but the refusal names a missing relation rather than
  * a missing migration, so it is worth doing first.
  */
@@ -222,6 +236,7 @@ import {
   isFixtureItemCode,
   LEGACY_WRITE_LOG_PATHS,
   MutationJournal,
+  exclusionRecoveryInstruction,
   NULL_SHARED_WRITE_FENCE,
   NULL_WRITE_INTENT_LOG,
   openWriteIntentLog,
@@ -1258,6 +1273,7 @@ async function report(aborted: boolean, error?: unknown): Promise<number> {
     writesMade: journal.writeCount,
     unknownWrites: journal.unknownCount,
     unrecordedSettlements: journal.unrecordedSettlementCount,
+    unexcludedDispatches: journal.unexcludedDispatchCount,
   })
   console.log(`\n=== ${outcome.label} ===`)
   if (aborted) {
@@ -1280,6 +1296,7 @@ async function report(aborted: boolean, error?: unknown): Promise<number> {
   console.log(`  failed:              ${stats.failed}`)
   console.log(`  UNKNOWN OUTCOME:     ${journal.unknownCount}`)
   console.log(`  OUTCOME KNOWN BUT NOT RECORDED: ${journal.unrecordedSettlementCount}`)
+  console.log(`  DISPATCHED WITHOUT A CONFIRMED EXCLUSION: ${journal.unexcludedDispatchCount}`)
   if (stats.versionBoundToOurWrite > 0) {
     console.log(`  held to the version XERO REPORTED FOR THIS RUN'S OWN WRITE rather than to the reviewed one: ${stats.versionBoundToOurWrite}`)
   }
@@ -1328,6 +1345,24 @@ async function report(aborted: boolean, error?: unknown): Promise<number> {
           indent: '      ',
         }) + `\n      Account for the same intent in ${WRITE_LOG.logPath}.`,
       )
+    }
+  }
+  if (journal.unexcludedDispatchCount > 0) {
+    // A DIFFERENT fact from either list above, and the only one that is about the ORGANISATION
+    // rather than about an object: these requests left this process during a window in which
+    // nothing could be shown to be excluding a second run. Both durable stores are told — the
+    // shared row carries `heldThrough = false`, the fsynced log an `unexcluded` event — so the
+    // next run refuses over them wherever it starts; this section is what says why.
+    console.log('\nWRITES DISPATCHED WITHOUT A CONFIRMED EXCLUSION — the ledger may have had a second writer:')
+    for (const u of journal.unexcludedDispatches) {
+      console.log(`  - ${u.kind}: ${u.label} — ${u.method} ${u.path}`)
+      console.log(`      intent ${u.intentId}: its outcome is ${u.state.toUpperCase()}, which does not settle this`)
+      console.log(exclusionRecoveryInstruction({
+        intentId: u.intentId,
+        reason: u.reason,
+        subject: `${u.kind} ${u.label}`,
+        indent: '      ',
+      }) + `\n      The same intent is marked in ${WRITE_LOG.logPath}; account for it there too.`)
     }
   }
   if (failures.length) {

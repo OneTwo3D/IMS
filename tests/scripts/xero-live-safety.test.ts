@@ -25,7 +25,7 @@
  * id-only manifest check and a state-bound one identically, and prove nothing about either.
  */
 import assert from 'node:assert/strict'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, test } from 'node:test'
@@ -97,7 +97,11 @@ import {
   SESSION_MARK_TABLE,
   SessionDiscontinuityError,
   STAGED_ARTEFACT_SUFFIX,
+  stagedArtefactName,
   StagedArtefactStrandedError,
+  PublishedArtefactUnfencedError,
+  WriteDispatchedWithoutExclusionError,
+  exclusionRecoveryInstruction,
   xeroCoordinatorFingerprint,
   readSettlementState,
   RESOLVED_SETTLEMENT_STATES,
@@ -121,6 +125,7 @@ import {
   type CoordinationClient,
   type PlannedObject,
   type RetirementGuardInput,
+  type ExclusionOutcome,
   type SharedWriteFence,
   type VersionExpectation,
   type XeroResult,
@@ -177,10 +182,22 @@ function pageServer(opts: {
 function fence(behaviour: {
   intend?: (id: string) => void
   settle?: (id: string) => void
-} = {}): SharedWriteFence & { intents: string[]; settlements: Array<{ id: string; state: string }> } {
+  /**
+   * Called for EVERY `assertStillHeld`, with the context and the 1-based ordinal. Throwing is how a
+   * test expresses a lock that went at a particular moment — including the one moment this file
+   * could not express before r10: AFTER the intent was accepted and the request was dispatched.
+   */
+  assertStillHeld?: (context: string, nth: number) => void
+} = {}): SharedWriteFence & {
+  intents: string[]
+  settlements: Array<{ id: string; state: string; exclusion: ExclusionOutcome }>
+  assertions: string[]
+} {
   const intents: string[] = []
-  const settlements: Array<{ id: string; state: string }> = []
+  const settlements: Array<{ id: string; state: string; exclusion: ExclusionOutcome }> = []
+  const assertions: string[] = []
   return {
+    assertions,
     tenantId: LEDGER_UUID,
     hostId: 'test-host',
     lockId: 1,
@@ -191,7 +208,10 @@ function fence(behaviour: {
       database: 'ims_test', databaseOid: '1', clusterId: 'cluster-test',
       connectionId: 'conn-test', tenantName: 'Test Org', fingerprint: 'coord-test',
     },
-    assertStillHeld: async () => {},
+    async assertStillHeld(context: string) {
+      assertions.push(context)
+      behaviour.assertStillHeld?.(context, assertions.length)
+    },
     scanUnresolved: async () => [],
     async intend(entry) {
       behaviour.intend?.(entry.id)
@@ -199,7 +219,7 @@ function fence(behaviour: {
     },
     async settle(entry) {
       behaviour.settle?.(entry.id)
-      settlements.push({ id: entry.id, state: entry.state })
+      settlements.push({ id: entry.id, state: entry.state, exclusion: entry.exclusion })
     },
     release: async () => {},
   }
@@ -469,7 +489,15 @@ class FakeCoordinationDatabase {
               // The production predicate, verbatim: the COMPLEMENT of the resolved vocabulary.
               // Modelling it as `state == null || state === 'unknown'` is what let a state outside
               // the vocabulary disappear, so the double must not paraphrase it either.
-              .filter((r) => r.tenantId === params[0] && (r.state == null || (r.state !== 'committed' && r.state !== 'not-committed')))
+              // And the SECOND, independent reason a row stays (r10 finding 1): `heldThrough` is
+              // three-valued, and only a positive `false` holds. `!r.heldThrough` would sweep every
+              // NULL — every pre-migration row — onto the fence, which is the direction the
+              // production predicate deliberately does not take.
+              .filter((r) => r.tenantId === params[0] && (
+                r.state == null
+                || (r.state !== 'committed' && r.state !== 'not-committed')
+                || r.heldThrough === false
+              ))
               .sort((a, b) => String(a.intendedAt).localeCompare(String(b.intendedAt))),
           }
         }
@@ -479,12 +507,14 @@ class FakeCoordinationDatabase {
           this.rows.set(String(rowId), {
             id: rowId, runId, tenantId, host: rowHost, kind, label, method, path,
             intendedAt: intendedAt instanceof Date ? intendedAt.toISOString() : intendedAt,
-            state: null, reason: null, settledAt: null,
+            // NULL, exactly as the ALTER leaves it: an intent that has been recorded and not yet
+            // dispatched has nothing to say about whether the ledger was held across it.
+            state: null, reason: null, settledAt: null, heldThrough: null, heldThroughReason: null,
           })
           return { rows: [{ id: rowId }] }
         }
         if (sql === SHARED_FENCE_SQL.settle) {
-          const [rowId, runId, state, reason, settledAt] = params
+          const [rowId, runId, state, reason, settledAt, heldThrough, heldThroughReason] = params
           const row = this.rows.get(String(rowId))
           // Predicated on the RUN as well as the id, exactly as the real UPDATE is: one run's
           // settlement may never resolve another run's dispatched write.
@@ -492,6 +522,9 @@ class FakeCoordinationDatabase {
           row.state = state
           row.reason = reason
           row.settledAt = settledAt
+          // ONE statement carries both halves of the account, as the production UPDATE does.
+          row.heldThrough = heldThrough
+          row.heldThroughReason = heldThroughReason
           return { rows: [{ id: rowId }] }
         }
         throw new Error(`the double was asked a statement it does not model: ${sql}`)
@@ -2976,7 +3009,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
       tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => session, setKeepalive: noKeepalive,
     })
     await f.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
-    await f.settle({ id: 'runA-w1', runId: 'runA', state: 'committed', reason: 'Xero answered HTTP 200' })
+    await f.settle({ id: 'runA-w1', runId: 'runA', state: 'committed', reason: 'Xero answered HTTP 200', exclusion: { confirmed: true } })
     assert.deepEqual(await f.scanUnresolved(), [])
     assert.doesNotThrow(() => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved: [] }))
     await f.release()
@@ -2988,7 +3021,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
       tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED, createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
     })
     await f.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
-    await f.settle({ id: 'runA-w1', runId: 'runA', state: 'unknown', reason: 'no usable response came back' })
+    await f.settle({ id: 'runA-w1', runId: 'runA', state: 'unknown', reason: 'no usable response came back', exclusion: { confirmed: true } })
     const unresolved = await f.scanUnresolved()
     assert.equal(unresolved.length, 1)
     assert.equal(unresolved[0].state, 'unknown')
@@ -3005,7 +3038,7 @@ describe('the coordination lives where the LEDGER is, not where the filesystem i
     })
     await f.intend({ id: 'shared-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
     await assert.rejects(
-      () => f.settle({ id: 'shared-w1', runId: 'runB', state: 'committed', reason: 'not mine to settle' }),
+      () => f.settle({ id: 'shared-w1', runId: 'runB', state: 'committed', reason: 'not mine to settle', exclusion: { confirmed: true } }),
       (e: Error) => e instanceof SharedCoordinatorUnavailableError && /matched 0 row\(s\)/.test(e.message),
     )
     assert.equal((await f.scanUnresolved()).length, 1, "run A's evidence is still on the pile")
@@ -3280,6 +3313,7 @@ describe('a settlement that cannot be recorded must not suppress the mutation', 
       runId: inner.runId,
       intend: inner.intend,
       settle: () => { throw new Error('ENOSPC: no space left on device, write') },
+      recordUnexcludedDispatch: inner.recordUnexcludedDispatch,
       close: () => {},
     }
   }
@@ -3337,7 +3371,9 @@ describe('a settlement that cannot be recorded must not suppress the mutation', 
       }),
       WriteSettlementNotRecordedError,
     )
-    assert.deepEqual(f.settlements, [{ id: f.intents[0], state: 'committed' }])
+    // The exclusion travels WITH the settlement (r10 finding 1): one statement, both halves of
+            // the account, so a connection that dies between them cannot leave one without the other.
+    assert.deepEqual(f.settlements, [{ id: f.intents[0], state: 'committed', exclusion: { confirmed: true } }])
   })
 
   test('a write whose ANSWER WAS LOST survives a settlement the SHARED fence refuses', async () => {
@@ -3384,6 +3420,7 @@ describe('a settlement that cannot be recorded must not suppress the mutation', 
       runId: inner.runId,
       intend: inner.intend,
       settle: () => { throw new Error('ENOSPC: no space left on device, write') },
+      recordUnexcludedDispatch: () => {},
       close: () => {},
     }
     const { impl, calls } = fakeFetch(() => response(429, '', { 'Retry-After': '30' }))
@@ -3407,7 +3444,7 @@ describe('a settlement that cannot be recorded must not suppress the mutation', 
     assert.equal(journal.unrecordedSettlements[0].label, 'INV-0001')
     assert.match(journal.unrecordedSettlements[0].failures[0], /ENOSPC/)
     // And the second store was still asked, so only one copy needs reconciling by hand.
-    assert.deepEqual(f.settlements, [{ id: f.intents[0], state: 'not-committed' }])
+    assert.deepEqual(f.settlements, [{ id: f.intents[0], state: 'not-committed', exclusion: { confirmed: true } }])
   })
 
   test('a transport that throws an outcome nobody can determine still records the unknown write', async () => {
@@ -3420,6 +3457,7 @@ describe('a settlement that cannot be recorded must not suppress the mutation', 
       runId: inner.runId,
       intend: inner.intend,
       settle: () => { throw new Error('ENOSPC: no space left on device, write') },
+      recordUnexcludedDispatch: () => {},
       close: () => {},
     }
     const journal = new MutationJournal()
@@ -3918,13 +3956,13 @@ describe('a settlement nobody can interpret is not a settlement', () => {
     assert.equal((await never.fence.scanUnresolved()).length, 1)
     assert.throws(
       () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved: [{
-        id: 'i', runId: 'r', host: 'h', kind: 'k', label: 'l', method: 'POST', path: 'p', intendedAt: 't', state: 'unknown',
+        id: 'i', runId: 'r', host: 'h', kind: 'k', label: 'l', method: 'POST', path: 'p', intendedAt: 't', state: 'unknown', heldThrough: true, heldThroughReason: null,
       }] }),
       /settled as UNKNOWN — the answer was lost/,
     )
     assert.throws(
       () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved: [{
-        id: 'i', runId: 'r', host: 'h', kind: 'k', label: 'l', method: 'POST', path: 'p', intendedAt: 't', state: null,
+        id: 'i', runId: 'r', host: 'h', kind: 'k', label: 'l', method: 'POST', path: 'p', intendedAt: 't', state: null, heldThrough: null, heldThroughReason: null,
       }] }),
       /never settled — the run died between dispatching it and recording the answer/,
     )
@@ -4076,6 +4114,7 @@ describe('the printed recovery is executable only when somebody established the 
       () => assertNoUnresolvedSharedWrites({ tenantId: TENANT_UUID, unresolved: [{
         id: 'runA-w1', runId: 'runA', host: 'host-a', kind: 'invoice voided', label: 'INV-1',
         method: 'POST', path: 'Invoices/inv-1', intendedAt: 't', state: 'unknown',
+        heldThrough: true, heldThroughReason: null,
       }] }),
       (e: Error) => /NOBODY ESTABLISHED WHAT BECAME OF THIS WRITE/.test(e.message)
         && /SET "state" = '<committed\|not-committed>'/.test(e.message)
@@ -4613,7 +4652,10 @@ describe('a plan exists only if the fence held across the whole of writing it', 
     )
     assert.equal(contexts.length, 2, 'the fence is asked on BOTH sides of the write, or the window is still open')
     assert.equal(existsSync(path), false, 'a plan assembled while the lock was going away must not exist')
-    assert.equal(existsSync(`${path}${STAGED_ARTEFACT_SUFFIX}`), false, 'and neither must the staged copy')
+    // Measured over the DIRECTORY, not over one predicted name: the staging name is per-run now
+    // (r10 finding 2), so an assertion that only checked `<path>.partial` would pass while a file
+    // called anything else sat beside it.
+    assert.deepEqual(readdirSync(d), [], 'and neither must the staged copy, whatever it was called')
     cleanup()
   })
 
@@ -4638,7 +4680,7 @@ describe('a plan exists only if the fence held across the whole of writing it', 
     )
     assert.deepEqual(touched, [], 'the fence is established before a byte is written, not after')
     assert.equal(existsSync(path), false)
-    assert.equal(existsSync(`${path}${STAGED_ARTEFACT_SUFFIX}`), false)
+    assert.deepEqual(readdirSync(d), [])
     cleanup()
   })
 
@@ -4648,10 +4690,13 @@ describe('a plan exists only if the fence held across the whole of writing it', 
     const { fence, contexts } = failingFence(99)
     await persistUnderFence({ fence, path, body: '{"plan":["one"]}', what: 'the reviewed plan' })
     assert.equal(readFileSync(path, 'utf8'), '{"plan":["one"]}')
-    assert.equal(existsSync(`${path}${STAGED_ARTEFACT_SUFFIX}`), false, 'and the staging name is not left behind')
+    assert.deepEqual(readdirSync(d), ['plan.json'], 'and no staging file is left behind')
     assert.deepEqual(contexts, [
       'about to persist the reviewed plan',
       `about to publish the reviewed plan to ${path}`,
+      // THE THIRD ONE (r10 finding 1). The second assertion covers the write; the rename is the act
+      // that makes the artefact real, and an act is covered by the assertion that comes AFTER it.
+      `having published the reviewed plan to ${path}`,
     ])
     cleanup()
   })
@@ -4682,10 +4727,14 @@ describe('a plan exists only if the fence held across the whole of writing it', 
         discard: (p) => { order.push(`discard ${p}`) },
       },
     })
-    assert.deepEqual(order, [
-      `write /nowhere/plan.json${STAGED_ARTEFACT_SUFFIX}`,
-      `publish /nowhere/plan.json${STAGED_ARTEFACT_SUFFIX} -> /nowhere/plan.json`,
-    ], 'nothing may be written under the consumed name before the fence has been re-established')
+    assert.equal(order.length, 2)
+    // The staging name is `<target>.<random>.partial` now, so it is matched rather than predicted —
+    // and matched STRICTLY, because the two things that must hold are that it lives beside the
+    // target (a rename across filesystems is not atomic) and that it is not the target itself.
+    const staged = order[0].slice('write '.length)
+    assert.match(staged, new RegExp(`^/nowhere/plan\\.json\\.[0-9a-f]{16}\\${STAGED_ARTEFACT_SUFFIX}$`))
+    assert.equal(order[1], `publish ${staged} -> /nowhere/plan.json`,
+      'nothing may be written under the consumed name before the fence has been re-established')
   })
 
   test('a staged file that cannot be removed is named, not swallowed', async () => {
@@ -4709,5 +4758,422 @@ describe('a plan exists only if the fence held across the whole of writing it', 
         // The reason the fence went is still in the message: the operator needs both facts.
         && /lost at/.test(e.message),
     )
+  })
+
+  // -------------------------------------------------------------------------
+  // r10 finding 2 — TWO RUNS STAGING AT ONCE
+  // -------------------------------------------------------------------------
+  test('two runs staging the SAME target do not truncate each other', async () => {
+    // The case is not exotic: dry runs take the ledger lock in SHARE mode and coexist by design,
+    // and the default --plan-out is derived from the DATE, so two dry runs on one day are pointed
+    // at one target without anybody doing anything unusual. With a staging name derived only from
+    // the target they open the same file, and the second write truncates the first's bytes.
+    const d = dir()
+    const path = join(d, 'plan.json')
+    let releaseA = () => {}
+    const parked = new Promise<void>((resolve) => { releaseA = resolve })
+    // Run A stages its bytes and is then held at the publish assertion, which is exactly the
+    // window in which round 9's shared `<path>.partial` was sitting on disk waiting to be
+    // overwritten.
+    const fenceA = { assertStillHeld: async (context: string) => { if (context.startsWith('about to publish')) await parked } }
+    const fenceB = { assertStillHeld: async () => {} }
+
+    const a = persistUnderFence({ fence: fenceA, path, body: '{"run":"A"}', what: "run A's plan" })
+    await new Promise((r) => setImmediate(r))
+    assert.equal(readdirSync(d).length, 1, 'run A has staged, and is parked before publishing')
+
+    // Run B goes all the way through while A is parked: stage, publish, done.
+    await persistUnderFence({ fence: fenceB, path, body: '{"run":"B"}', what: "run B's plan" })
+    releaseA()
+    await a
+
+    // A published last, so A's bytes are what is under the name — INTACT. Under one shared staging
+    // name B's write truncated A's staged file (and B's rename took it away entirely), so A either
+    // published B's bytes or failed to publish at all.
+    assert.equal(readFileSync(path, 'utf8'), '{"run":"A"}', "run A published its OWN plan, not run B's")
+    assert.deepEqual(readdirSync(d), ['plan.json'], 'and neither run left a staging file behind')
+    cleanup()
+  })
+
+  test('the staging name is minted per call, never derived from the target alone', () => {
+    // The property under test is separation, so it is measured as separation: two names for one
+    // target, differing, both beside the target and both still recognisable as staging files.
+    const first = stagedArtefactName('/var/lib/o3d/plan.json')
+    const second = stagedArtefactName('/var/lib/o3d/plan.json')
+    assert.notEqual(first, second, 'a name two runs can both compute is a name two runs both write')
+    for (const name of [first, second]) {
+      assert.ok(name.startsWith('/var/lib/o3d/plan.json.'), 'staged beside the target: a rename across filesystems is not atomic')
+      assert.ok(name.endsWith(STAGED_ARTEFACT_SUFFIX))
+      assert.notEqual(name, `/var/lib/o3d/plan.json${STAGED_ARTEFACT_SUFFIX}`)
+    }
+  })
+
+  // -------------------------------------------------------------------------
+  // r10 finding 1, applied to the artefact — THE RENAME IS AN ACT TOO
+  // -------------------------------------------------------------------------
+  test('a fence lost across the PUBLISH names the file that now exists, and does not remove it', async () => {
+    const d = dir()
+    const path = join(d, 'plan.json')
+    const { fence, contexts } = failingFence(2)
+    await assert.rejects(
+      () => persistUnderFence({ fence, path, body: '{"plan":["one"]}', what: 'the reviewed plan' }),
+      (e: Error) => e instanceof PublishedArtefactUnfencedError
+        && /ALREADY EXISTS/.test(e.message)
+        && /GO AND LOOK AT IT/.test(e.message)
+        && /lost at/.test(e.message),
+    )
+    assert.equal(contexts.length, 3, 'the assertion that covers the rename comes AFTER it')
+    // NOT removed, deliberately: on a shared target that file may be another run's, and a run that
+    // has just lost its own fence is the last thing that should be deleting plans.
+    assert.equal(readFileSync(path, 'utf8'), '{"plan":["one"]}')
+    cleanup()
+  })
+})
+
+// ===========================================================================
+/**
+ * r10 FINDING 1 — THE ASSERT AND THE DISPATCH ARE TWO MOMENTS, AND THE SECOND ONE IS NOT COVERED.
+ *
+ * Round 9 folded the session marks into the pg_locks question so that ONE tuple answers "this
+ * backend holds the ledger in this mode, and it is the backend this run planted its marks on", and
+ * asked it before every dispatch. What that establishes is the state BEFORE the request leaves.
+ * The request then leaves, and between the two the session can be reaped, the coordinator can
+ * restart, or a proxy can start routing statements to a backend that never held anything — and
+ * round 9 asked nobody afterwards. A run whose LAST write went out in that window finished
+ * cleanly, printed APPLIED, and left a plan and a set of rows indistinguishable from a run nothing
+ * was interleaved with.
+ *
+ * It cannot be made atomic: a check against PostgreSQL and a call to Xero are two remote calls.
+ * So the residual is made answerable instead. The fence is asked AGAIN once the request has
+ * settled, and that question is about the INTERVAL rather than the instant, because a session
+ * advisory lock cannot be released and silently re-acquired — a session that ended takes its GUC
+ * and its pg_temp relation with it, an unlock is only ever issued by this file at release, and a
+ * routed statement answers with a different pid. When the answer is no, the request has already
+ * gone: the fact is written to both durable stores, printed, and the run stops.
+ *
+ * THE DOUBLES EXPRESS THE ROTATION ITSELF. The loss happens INSIDE the fetch — the ledger goes, or
+ * the connection starts pooling, while the request is in flight — because a double that can only
+ * lose the lock before or after the call cannot tell a bracket from a re-assert.
+ */
+describe('a write dispatched while the ledger went is recorded as such', () => {
+  const LEDGER = LEDGER_UUID
+  const voidOk = () => response(200, { Invoices: [{ InvoiceID: 'inv-1', UpdatedDateUTC: '/Date(2000)/' }] })
+
+  /**
+   * An --apply fence over a real coordination double, plus a transport whose in-flight handler is
+   * the window: `duringRequest` runs after the intent has been accepted and before the response
+   * comes back, which is the only place this defect lives.
+   */
+  const applyRun = async (duringRequest: (db: FakeCoordinationDatabase, session: ReturnType<FakeCoordinationDatabase['session']>) => void) => {
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('apply-host')
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED,
+      createClient: () => session, setKeepalive: noKeepalive, hostId: 'apply-host',
+    })
+    const { impl, calls } = fakeFetch(() => { duringRequest(db, session); return voidOk() })
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+    const disk: string[] = []
+    const writeLog = createWriteIntentLog({ tenantId: TENANT, append: (l) => disk.push(l) })
+    return { db, session, fence, transport, journal, disk, writeLog, calls }
+  }
+
+  const dispatch = (r: Awaited<ReturnType<typeof applyRun>>) => performWrite({
+    transport: r.transport, token: TOKEN, journal: r.journal, writeLog: r.writeLog, fence: r.fence,
+    method: 'POST' as const, path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+    kind: 'invoice voided', label: 'INV-0001',
+  })
+
+  test('a lock that goes WHILE THE REQUEST IS IN FLIGHT stops the run at that write', async () => {
+    // The sharp version: the session still answers every statement. Only the exclusion is gone,
+    // which is what a reaped lock or an out-of-band unlock looks like from in here.
+    const r = await applyRun((db, session) => db.dropLocksOf(session))
+
+    await assert.rejects(dispatch(r), (e: Error) =>
+      e instanceof WriteDispatchedWithoutExclusionError
+      && /was DISPATCHED \(POST Invoices\/inv-1\)/.test(e.message)
+      && /outcome is COMMITTED/.test(e.message)
+      && /could not establish that it still held the ledger across the moment it went/.test(e.message)
+      && /NOTHING FURTHER IS DISPATCHED/.test(e.message))
+
+    assert.equal(r.calls.length, 1, 'the request DID go out — that is the whole reason this is not preventable')
+    assert.equal(r.session.alive, true, 'and the connection is fine; it is the EXCLUSION that went')
+    // It stopped at THIS write. Round 9 would have carried on and only noticed at the NEXT
+    // dispatch's intent — and if there was no next dispatch, never.
+    assert.equal(r.db.rows.size, 1)
+    await r.fence.release()
+  })
+
+  test('a connection that STARTS POOLING mid-request is the same loss, and is caught the same way', async () => {
+    // Not a lost lock at all: the lock is still held, by the backend that took it. What changed is
+    // that this run's statements no longer land there — so it can no longer establish that it is
+    // the holder, and "I cannot tell" is the same state as "somebody else has it".
+    const r = await applyRun((_db, session) => session.divert())
+
+    await assert.rejects(dispatch(r), WriteDispatchedWithoutExclusionError)
+    assert.equal(r.calls.length, 1)
+    await r.fence.release()
+  })
+
+  test('the ledger holding throughout is settled as such, and the run goes on', async () => {
+    // The refusal is not simply always on: the same rig, with nothing happening during the flight.
+    const r = await applyRun(() => {})
+    const { committed } = await dispatch(r)
+    assert.equal(committed, true)
+    const row = [...r.db.rows.values()][0]
+    assert.equal(row.state, 'committed')
+    assert.equal(row.heldThrough, true, 'a run that held it throughout says so, positively')
+    assert.equal(row.heldThroughReason, null)
+    assert.deepEqual(await r.fence.scanUnresolved(), [], 'and the row is off the fence')
+    assert.equal(r.journal.unexcludedDispatchCount, 0)
+    await r.fence.release()
+  })
+
+  test('the SHARED row holds the fence even though its outcome is COMMITTED', async () => {
+    const r = await applyRun((db, session) => db.dropLocksOf(session))
+    await assert.rejects(dispatch(r), WriteDispatchedWithoutExclusionError)
+
+    const row = [...r.db.rows.values()][0]
+    assert.equal(row.state, 'committed', 'the outcome is known and is NEVER withheld to make a row stick')
+    assert.equal(row.heldThrough, false)
+    assert.match(String(row.heldThroughReason), /no longer holds the lock on ledger/)
+
+    // AND A SECOND HOST REFUSES OVER IT. This is the half a file on one machine cannot do, and the
+    // half a `committed` state alone would have let go of.
+    const other = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED,
+      createClient: () => r.db.session('host-b'), setKeepalive: noKeepalive, hostId: 'host-b',
+    })
+    const unresolved = await other.scanUnresolved()
+    assert.equal(unresolved.length, 1, 'a committed write with an unconfirmed exclusion is still unaccounted for')
+    assert.equal(unresolved[0].heldThrough, false)
+    assert.throws(
+      () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved }),
+      (e: Error) => e instanceof SharedUnresolvedWriteError
+        && /DISPATCHED WITHOUT A CONFIRMED EXCLUSION/.test(e.message)
+        // And the operator is told that settling the outcome is NOT what clears it.
+        && /SETTLING THE OUTCOME DOES NOT CLEAR THIS/.test(e.message)
+        && /SET "heldThrough" = true/.test(e.message),
+    )
+    await other.release()
+  })
+
+  test('the ON-DISK log holds the same write, so the next run on THIS host refuses too', async () => {
+    const r = await applyRun((db, session) => db.dropLocksOf(session))
+    await assert.rejects(dispatch(r), WriteDispatchedWithoutExclusionError)
+
+    const text = r.disk.join('\n')
+    const scan = scanWriteIntentLog(text)
+    assert.equal(scan.unresolved.length, 1, 'a settled intent stays on the pile when its exclusion could not be confirmed')
+    assert.match(String(scan.unresolved[0].unexcludedReason), /no longer holds the lock on ledger/)
+    assert.throws(
+      () => assertNoUnresolvedWrites({ path: '/var/lib/o3d/xero-cleanup/log.jsonl', text }),
+      (e: Error) => e instanceof UnresolvedWriteError && /DISPATCHED WITHOUT A CONFIRMED EXCLUSION/.test(e.message),
+    )
+    // The graver line is written FIRST, so a process killed between the two appends leaves the
+    // record that holds the fence rather than the one that lets it go.
+    const events = r.disk.map((l) => JSON.parse(l).event)
+    assert.deepEqual(events, ['intent', 'unexcluded', 'settled'])
+    await r.fence.release()
+  })
+
+  test("the run's own account carries it, alongside what it destroyed", async () => {
+    const r = await applyRun((db, session) => db.dropLocksOf(session))
+    await assert.rejects(dispatch(r), WriteDispatchedWithoutExclusionError)
+
+    assert.equal(r.journal.writeCount, 1, 'the mutation is still recorded — the throw must not swallow it')
+    assert.equal(r.journal.unexcludedDispatchCount, 1)
+    const [u] = r.journal.unexcludedDispatches
+    assert.equal(u.state, 'committed')
+    assert.equal(u.method, 'POST')
+    assert.equal(u.path, 'Invoices/inv-1')
+    assert.match(u.reason, /no longer holds the lock/)
+    await r.fence.release()
+  })
+
+  test('a request that never left the process is NOT reported as unexcluded', async () => {
+    // The write gate and the call ceiling refuse BEFORE the network, so there is no window and
+    // nothing to have been excluded from. Asking anyway would manufacture an alarm out of a
+    // request that was never made — here, on a fence that has lost everything.
+    const f = fence({ assertStillHeld: () => { throw new SharedFenceLostError('ABORT: gone') } })
+    const { impl, calls } = fakeFetch(() => voidOk())
+    const transport = createXeroTransport({ apply: false, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: NULL_WRITE_INTENT_LOG, fence: f,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      WriteWithoutApplyError,
+    )
+    assert.deepEqual(calls, [], 'nothing was dispatched')
+    assert.equal(journal.unexcludedDispatchCount, 0)
+    assert.deepEqual(f.settlements, [{ id: 'not-logged', state: 'not-committed', exclusion: { confirmed: true } }])
+    assert.deepEqual(f.assertions, [], 'and the fence was not asked about a window that does not exist')
+  })
+
+  test('a write REFUSED BY XERO is bracketed like any other — the request did leave', async () => {
+    // A 429 is Xero refusing, not this process refusing: the request reached Xero, so the window
+    // is real and the same question has to be asked about it.
+    const f = fence({ assertStillHeld: () => { throw new SharedFenceLostError('ABORT: gone mid-flight') } })
+    const { impl } = fakeFetch(() => response(429, '', { 'Retry-After': '30' }))
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: NULL_WRITE_INTENT_LOG, fence: f,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      // The transport's own refusal stays the reported cause; the exclusion rides on the journal.
+      WriteRateLimitedError,
+    )
+    assert.equal(journal.unexcludedDispatchCount, 1)
+    assert.equal(f.settlements[0].exclusion.confirmed, false)
+  })
+
+  test('the fence is asked AFTER the dispatch, not only before it', async () => {
+    // Ordering, measured rather than paraphrased: the assertion that covers a dispatch is the one
+    // that comes after it, and moving the pre-dispatch one closer to the call is not the same thing.
+    const order: string[] = []
+    const f = fence({ assertStillHeld: (context) => { order.push(`assert: ${context}`) } })
+    const { impl } = fakeFetch(() => { order.push('dispatch'); return voidOk() })
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+
+    await performWrite({
+      transport, token: TOKEN, journal: new MutationJournal(), writeLog: NULL_WRITE_INTENT_LOG, fence: f,
+      method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+      kind: 'invoice voided', label: 'INV-0001',
+    })
+    assert.deepEqual(order, ['dispatch', 'assert: having dispatched POST Invoices/inv-1 for invoice voided INV-0001'])
+  })
+})
+
+// ===========================================================================
+describe('the two halves of a write\'s account are recorded together and read separately', () => {
+  test('the settle statement carries the outcome and the exclusion in ONE UPDATE', () => {
+    // Two statements would be a second chance for the connection whose health is in question to go
+    // away between them, leaving a row that says what became of the write and nothing about the
+    // window it went in.
+    const sql = SHARED_FENCE_SQL.settle
+    assert.equal(sql.split('UPDATE').length - 1, 1, 'one statement')
+    for (const column of ['"state"', '"reason"', '"settledAt"', '"heldThrough"', '"heldThroughReason"']) {
+      assert.ok(sql.includes(`${column} = $`), `${column} is set by the same UPDATE`)
+    }
+  })
+
+  test('the scan holds a row for a POSITIVE false, never for a NULL', () => {
+    // The one place this file deliberately does not fail closed, and the reason is in the SQL: a
+    // NULL is a row written before the column existed, not a claim nobody can interpret. Reading it
+    // as "not confirmed" would put every historical write back on the fence in the same instant.
+    assert.ok(SHARED_FENCE_SQL.scan.includes('"heldThrough" = false'))
+    assert.ok(!/heldThrough"\s+IS NOT TRUE/.test(SHARED_FENCE_SQL.scan))
+    assert.ok(!/NOT\s+"heldThrough"/.test(SHARED_FENCE_SQL.scan))
+    // And the STATE half is still the complement of the resolved vocabulary, which is the opposite
+    // rule for the opposite reason. Both are present, and neither has replaced the other.
+    assert.ok(SHARED_FENCE_SQL.scan.includes(`"state" NOT IN ('committed', 'not-committed')`))
+  })
+
+  test('a row from before the column existed reads exactly as it did', async () => {
+    const db = new FakeCoordinationDatabase()
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER_UUID, mode: 'exclusive', attestedCoordinator: ATTESTED,
+      createClient: () => db.session('host-a'), setKeepalive: noKeepalive, hostId: 'host-a',
+    })
+    await fence.intend({ id: 'old-w1', runId: 'old', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1' })
+    // Settled by a version that never asked: state written, heldThrough left NULL.
+    Object.assign(db.rows.get('old-w1')!, { state: 'committed', heldThrough: null })
+    assert.deepEqual(await fence.scanUnresolved(), [], 'a legacy resolved row is still resolved')
+
+    // And a legacy UNRESOLVED row is still unresolved, for its own reason.
+    await fence.intend({ id: 'old-w2', runId: 'old', kind: 'invoice voided', label: 'INV-2', method: 'POST', path: 'Invoices/inv-2' })
+    Object.assign(db.rows.get('old-w2')!, { state: 'unknown', heldThrough: null })
+    const unresolved = await fence.scanUnresolved()
+    assert.equal(unresolved.length, 1)
+    assert.equal(unresolved[0].heldThrough, null, 'null is "nobody asked", and it is reported as null, not as false')
+    await fence.release()
+  })
+
+  test('an UNEXCLUDED event outranks a settlement in the on-disk log, in either order', () => {
+    const base = { runId: 'runA', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1', tenantId: TENANT, at: 't' }
+    const intent = JSON.stringify({ event: 'intent', id: 'runA-w1', ...base })
+    const settled = JSON.stringify({ event: 'settled', id: 'runA-w1', runId: 'runA', state: 'committed', reason: 'HTTP 200', at: 't', tenantId: TENANT })
+    const unexcluded = JSON.stringify({ event: 'unexcluded', id: 'runA-w1', runId: 'runA', reason: 'the coordinator restarted', at: 't', tenantId: TENANT })
+
+    // A log is appended to, concatenated, hand-edited and read after a crash mid-append, so the
+    // order of the two lines is not something a reader may lean on.
+    for (const text of [[intent, unexcluded, settled].join('\n'), [intent, settled, unexcluded].join('\n')]) {
+      const scan = scanWriteIntentLog(text)
+      assert.equal(scan.unresolved.length, 1, 'a settlement does not take an unexcluded dispatch off the pile')
+      assert.equal(scan.unresolved[0].unexcludedReason, 'the coordinator restarted')
+      assert.equal(scan.unreadableLines, 0)
+    }
+  })
+
+  test('a log with no unexcluded events reads exactly as it always did', () => {
+    // The event is a POSITIVE claim. Every legacy log — including the ones under
+    // LEGACY_WRITE_LOG_PATHS — carries none, and must go on resolving as it did; a rule stated as
+    // "an absent field means unconfirmed" would have re-opened every settled write ever recorded.
+    const base = { runId: 'runA', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1', tenantId: TENANT, at: 't' }
+    const text = [
+      JSON.stringify({ event: 'intent', id: 'runA-w1', ...base }),
+      JSON.stringify({ event: 'settled', id: 'runA-w1', runId: 'runA', state: 'committed', reason: 'HTTP 200', at: 't', tenantId: TENANT }),
+    ].join('\n')
+    assert.deepEqual(scanWriteIntentLog(text), { unresolved: [], unreadableLines: 0 })
+    assert.doesNotThrow(() => assertNoUnresolvedWrites({ path: '/log', text }))
+  })
+
+  test('an unexcluded line for an intent this log does not have is not silently dropped', () => {
+    const text = JSON.stringify({ event: 'unexcluded', id: 'runA-w1', runId: 'runA', reason: 'gone', at: 't', tenantId: TENANT })
+    const scan = scanWriteIntentLog(text)
+    assert.equal(scan.unreadableLines, 1, 'it describes a dispatched write whose own record is missing')
+    assert.throws(() => assertNoUnresolvedWrites({ path: '/log', text }), UnresolvedWriteError)
+  })
+
+  test('an OLDER reader of a NEWER log fails closed', () => {
+    // The forward-compatibility argument for making it an event rather than a field: a reader that
+    // does not know `unexcluded` counts it as an unreadable line, and an unreadable line already
+    // holds the fence. A field it did not know about would simply have been ignored.
+    const text = JSON.stringify({ event: 'some-event-a-later-version-writes', id: 'runA-w1' })
+    assert.equal(scanWriteIntentLog(text).unreadableLines, 1)
+  })
+
+  test('the run label can say it, and never claims it exists only in this output', () => {
+    const label = runOutcome({ apply: true, failed: 0, aborted: true, writesMade: 1, unexcludedDispatches: 1 }).label
+    assert.match(label, /PARTIALLY APPLIED — ABORTED AFTER 1 IRREVERSIBLE WRITE\(S\)/)
+    assert.match(label, /1 WRITE\(S\) DISPATCHED WITHOUT A CONFIRMED EXCLUSION/)
+    // That phrase belongs to the unrecorded-settlement fact, which is a different one: an
+    // unexcluded dispatch IS recorded, in both stores. Printing it here would send an operator
+    // looking for a row that is sitting right there.
+    assert.ok(!/DISPATCHED WITHOUT A CONFIRMED EXCLUSION THAT ONLY THIS OUTPUT RECORDS/.test(label))
+    // A refused write changes nothing, and still may not be printed as a clean nothing.
+    assert.match(
+      runOutcome({ apply: true, failed: 1, aborted: true, writesMade: 0, unexcludedDispatches: 1 }).label,
+      /ABORTED — NOTHING WAS WRITTEN BY THIS RUN, BUT 1 WRITE\(S\) DISPATCHED WITHOUT A CONFIRMED EXCLUSION/,
+    )
+    // And the existing labels are untouched when there are none.
+    assert.equal(runOutcome({ apply: true, failed: 0, aborted: true, writesMade: 3 }).label,
+      'PARTIALLY APPLIED — ABORTED AFTER 3 IRREVERSIBLE WRITE(S)')
+    assert.equal(runOutcome({ apply: true, failed: 0 }).label, 'APPLIED')
+  })
+
+  test('the recovery for an unconfirmed exclusion is a READ, and names the third answer', () => {
+    const text = exclusionRecoveryInstruction({ intentId: 'runA-w1', reason: 'the coordinator restarted', subject: 'invoice INV-1' })
+    assert.match(text, /SETTLING THE OUTCOME DOES NOT CLEAR THIS/)
+    assert.match(text, /xero_live_write_intents" WHERE "tenantId"/)
+    assert.match(text, /check every host that can run this script/)
+    assert.match(text, /If you cannot tell, STOP and leave the row exactly as it is/)
+    assert.match(text, /SET "heldThrough" = true/)
+  })
+
+  test('the remover reports it, and hands it to the run label', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    assert.match(code, /unexcludedDispatches: journal\.unexcludedDispatchCount,/)
+    assert.match(code, /WRITES DISPATCHED WITHOUT A CONFIRMED EXCLUSION/)
+    assert.match(code, /exclusionRecoveryInstruction\(\{/)
   })
 })
