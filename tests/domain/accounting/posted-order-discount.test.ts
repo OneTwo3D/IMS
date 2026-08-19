@@ -39,6 +39,12 @@ import {
  */
 
 type EventRow = {
+  /**
+   * The primary key (o3d-y14 r13 finding 2). REQUIRED, because the posted read is ordered by it as
+   * a last resort and a fixture without one would let a clause this double cannot honour look
+   * honoured — the ordering would test as total while no fixture ever exercised the tie.
+   */
+  id: string
   sourceEntityType: string
   sourceEntityId: string
   type: string
@@ -118,9 +124,17 @@ function makeClient(
         // is a property of the code rather than of the fixture's array order.
         const sorted = [...matched].sort((a, b) => {
           for (const clause of orderBy) {
-            const [field, direction] = Object.entries(clause)[0] as ['businessDate' | 'createdAt', 'desc' | 'asc']
-            if (a[field] === b[field]) continue
-            const compare = a[field] < b[field] ? -1 : 1
+            const [field, direction] = Object.entries(clause)[0] as [keyof EventRow, 'desc' | 'asc']
+            // r13 finding 2. A clause this double cannot honour must fail LOUDLY: silently skipping
+            // one would make the ordering look total while the tie-break was never applied at all,
+            // which is precisely the state the finding is about.
+            if (!(field in a) || !(field in b)) {
+              throw new Error(`the double has no ${String(field)} column to order by`)
+            }
+            const left = a[field] as string
+            const right = b[field] as string
+            if (left === right) continue
+            const compare = left < right ? -1 : 1
             return direction === 'desc' ? -compare : compare
           }
           return 0
@@ -155,7 +169,8 @@ function documentPayload(over: Record<string, unknown> = {}) {
 }
 
 function postedInvoice(over: Partial<EventRow> = {}): EventRow {
-  return {
+  const row = {
+    id: '',
     sourceEntityType: 'SalesOrder',
     sourceEntityId: 'order-1',
     type: 'SALES_INVOICE',
@@ -169,6 +184,12 @@ function postedInvoice(over: Partial<EventRow> = {}): EventRow {
     linesJson: documentPayload({ discount: { amount: 10, accountCode: '260' } }),
     ...over,
   }
+  // r13 finding 2. DISTINCT by default, derived from what distinguishes the fixture, because
+  // `AccountingEvent.id` is a primary key: two fixture rows sharing one would model a state the
+  // database cannot hold, and would hide the very tie-break the ordering now depends on. Two rows
+  // that differ in NOTHING — the o3d-9kek pair, no external id, mirrored at the same instant — do
+  // collide, which is the residual the derivation's own header states rather than rounds away.
+  return { ...row, id: row.id || `evt-${row.type}-${row.externalId ?? row.createdAt}` }
 }
 
 function restatement(
@@ -1209,11 +1230,12 @@ test('a SUCCESSFUL read fingerprints its documents too — agreement is not iden
   assert.notDeepEqual(documentSetOf(first), documentSetOf(second), 'and the documents are different documents')
 })
 
-test('the fingerprint is ORDER-INSENSITIVE — the same rows the other way round are one set (r12 F1)', async () => {
-  // The r11 lesson, on the new field: neither Prisma nor PostgreSQL promises a stable order for rows
-  // that tie on the ordering columns, and a comparison that refused on row order would withdraw
-  // remedies at random. `externalIds` is deliberately in ROW order — it is presentational, newest
-  // first — so the pair also proves the fingerprint is not simply inheriting that order.
+test('the fingerprint is SORTED, not in row order — and the row order is now fixed (r12 F1, r13 F2)', async () => {
+  // r12's version of this asserted that two TIED documents come back either way round and
+  // fingerprint the same. r13 finding 2 removed the premise rather than the property: the read is
+  // ordered by the primary key as a last resort, so a tie decides nothing and the SAME rows present
+  // identically however the store holds them. Both halves are asserted, because a fingerprint that
+  // merely inherited row order would now look correct for the wrong reason.
   const tied = { businessDate: '2026-05-02', createdAt: '2026-05-02T09:00:00.000Z' }
   const oneWay = makeClient({
     events: [postedInvoice({ ...tied, externalId: 'INV-A' }), postedInvoice({ ...tied, externalId: 'INV-B' })],
@@ -1225,12 +1247,20 @@ test('the fingerprint is ORDER-INSENSITIVE — the same rows the other way round
   const first = await readPostedInvoiceOrderDiscount(oneWay.client, { id: 'order-1', currency: 'GBP' })
   const second = await readPostedInvoiceOrderDiscount(otherWay.client, { id: 'order-1', currency: 'GBP' })
 
-  assert.notDeepEqual(
+  // r13 finding 2: the presentation no longer depends on which way the store held them.
+  assert.deepEqual(
     first.ok ? first.externalIds : null,
     second.ok ? second.externalIds : null,
-    'the query really did come back the other way round',
+    'a tie on businessDate and createdAt no longer decides which document is named',
   )
-  assert.deepEqual(documentSetOf(first), documentSetOf(second), 'and the fingerprint does not care')
+  assert.deepEqual(documentSetOf(first), documentSetOf(second))
+  // r12 finding 1: and the fingerprint is in SORTED order, which is NOT the presentational one —
+  // otherwise "sorted" would be an untested word.
+  assert.deepEqual(first.ok ? first.externalIds : null, ['INV-B', 'INV-A'], 'newest-first, id desc')
+  assert.ok(
+    documentSetOf(first)[0].includes('INV-A'),
+    'the fingerprint does not inherit the row order it was built from',
+  )
 })
 
 test('NO_POSTED_EVENT reports an EMPTY set, and it is empty because nothing was there (r12 F1)', async () => {
@@ -1272,4 +1302,161 @@ test('a document that records NO connector or id still fingerprints as itself (o
       'the mirrored event names no connector whose posting rule can be replayed (externalSystem null), ' +
       'so whether the document carried the 10 it requested is unknown',
   ])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r13 finding 2 — a NON-TOTAL ordering manufactures a withdrawal
+// ---------------------------------------------------------------------------
+
+/**
+ * `businessDate desc, createdAt desc` does not order two documents that tie on BOTH columns, and
+ * Postgres is free to return them either way round on two reads of rows that never moved. That
+ * ordering decides which document every refusal and every success NAMES — and since r11 finding 1
+ * those names are part of a VALUE compared before a remedy is printed, so the swap presents as a
+ * SPURIOUS WITHDRAWAL: exactly the noise this module argues teaches an operator to ignore the
+ * withdrawal that matters.
+ *
+ * Each fixture below is ONE set of tied rows, read from two stores that differ only in the order
+ * they hold them. Every assertion is `deepEqual` on what a withdrawal compares.
+ */
+const TIED = { businessDate: '2026-05-02', createdAt: '2026-05-02T09:00:00.000Z' }
+
+test('two documents tied on businessDate AND createdAt name the same refusal (o3d-y14 r13 F2)', async () => {
+  // The sharpest shape: both documents are unreadable, for DIFFERENT reasons, so the refusal's own
+  // words are whichever one the ordering happened to put first.
+  const a = () => unreadableInvoice({ ...TIED, externalId: 'INV-A' })
+  const b = () =>
+    postedInvoice({
+      ...TIED,
+      externalId: 'INV-B',
+      linesJson: documentPayload({ currency: 'USD', discount: { amount: 10, accountCode: '260' } }),
+    })
+  const oneWay = makeClient({ events: [a(), b()] })
+  const otherWay = makeClient({ events: [b(), a()] })
+
+  const first = await readPostedInvoiceOrderDiscount(oneWay.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(otherWay.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(!first.ok && first.reason, 'UNRECOVERABLE')
+  assert.deepEqual(refusalFacts(first), refusalFacts(second), 'the refusal is the same refusal both ways')
+  assert.deepEqual(documentSetOf(first), documentSetOf(second), 'over the same rows, said the same way')
+})
+
+test('two DISAGREEING documents tied on both columns name them in one order (o3d-y14 r13 F2)', async () => {
+  // The refusal that lists its documents. Its ids are deliberately in ROW order — newest first, the
+  // same order the success variant reports — so a tie put them in the sentence either way round,
+  // and the compared `detail` and `externalIds` both moved while the ledger stood still.
+  const a = () => postedInvoice({ ...TIED, externalId: 'INV-A' })
+  const b = () =>
+    postedInvoice({
+      ...TIED,
+      externalId: 'INV-B',
+      linesJson: documentPayload({ discount: { amount: 3, accountCode: '260' } }),
+    })
+  const oneWay = makeClient({ events: [a(), b()] })
+  const otherWay = makeClient({ events: [b(), a()] })
+
+  const first = await readPostedInvoiceOrderDiscount(oneWay.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(otherWay.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(!first.ok && first.reason === 'UNRECOVERABLE' && first.documentCount, 2)
+  assert.deepEqual(refusalFacts(first), refusalFacts(second))
+  assert.deepEqual(
+    !first.ok && first.reason === 'UNRECOVERABLE' ? first.externalIds : null,
+    ['INV-B', 'INV-A'],
+    'and the one order they are named in is the total one',
+  )
+})
+
+test('two AGREEING documents tied on both columns report the same document (o3d-y14 r13 F2)', async () => {
+  // The success variant names the newest document's TYPE and CONNECTOR, and both travel in the
+  // compared position. Two tied documents posted to different connectors — an order invoiced in
+  // Xero and re-raised in QuickBooks, which `connector-orphans.ts` exists for — swapped which
+  // ledger the whole handoff claimed to be about.
+  const a = () => postedInvoice({ ...TIED, externalId: 'INV-A' })
+  const b = () => postedInvoice({ ...TIED, externalId: 'INV-B', externalSystem: 'quickbooks' })
+  const oneWay = makeClient({ events: [a(), b()] })
+  const otherWay = makeClient({ events: [b(), a()] })
+
+  const first = await readPostedInvoiceOrderDiscount(oneWay.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(otherWay.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(first.ok && second.ok, true)
+  assert.equal(first.ok && first.externalId, second.ok && second.externalId)
+  assert.equal(first.ok && first.externalSystem, second.ok && second.externalSystem)
+  assert.deepEqual(first.ok ? first.externalIds : null, second.ok ? second.externalIds : null)
+  assert.equal(first.ok && first.detail, second.ok && second.detail)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r13 finding 1 — every refusal says HOW MANY posted documents it is about
+// ---------------------------------------------------------------------------
+
+test('an UNREADABLE-payload refusal carries the posted document set, not a disagreement (r13 F1)', async () => {
+  // `documentCount` stays NULL — nothing here established that these documents disagree, and saying
+  // so would be a false statement about the ledger — while `postedDocuments` says there are two of
+  // them and names both, which is what stops a caller prescribing against "the document".
+  const { client } = makeClient({
+    events: [
+      unreadableInvoice({ externalId: 'INV-A' }),
+      unreadableInvoice({ externalId: 'INV-B', businessDate: '2026-05-01', createdAt: '2026-05-01T09:00:00.000Z' }),
+    ],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(!read.ok && read.reason, 'UNRECOVERABLE')
+  assert.equal(!read.ok && read.reason === 'UNRECOVERABLE' && read.documentCount, undefined)
+  assert.deepEqual(!read.ok && read.reason === 'UNRECOVERABLE' ? read.externalIds : 'set', undefined)
+  assert.deepEqual(
+    !read.ok && read.reason === 'UNRECOVERABLE' ? read.postedDocuments : null,
+    { count: 2, externalIds: ['INV-A', 'INV-B'] },
+  )
+})
+
+test('an UNSETTLED-UPDATE refusal counts the posted documents it never read (o3d-y14 r13 F1)', async () => {
+  // The worst of them for this purpose: the refusal returns BEFORE the posted documents decide
+  // anything, so nothing in its own words says whether the ledger holds one invoice or five.
+  const { client } = makeClient({
+    events: [
+      postedInvoice({ externalId: 'INV-A' }),
+      postedInvoice({ externalId: null, businessDate: '2026-05-01', createdAt: '2026-05-01T09:00:00.000Z' }),
+      postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: 'UPD-1' }),
+    ],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.match(!read.ok && read.reason === 'UNRECOVERABLE' ? read.detail : '', /never reached POSTED/)
+  assert.deepEqual(
+    !read.ok && read.reason === 'UNRECOVERABLE' ? read.postedDocuments : null,
+    // Two posted documents, one of which recorded no external id (o3d-9kek): the count and the
+    // names are separate facts, exactly as on the success variant.
+    { count: 2, externalIds: ['INV-A'] },
+  )
+})
+
+test('a DISAGREEMENT carries both the claim and the evidence, and they agree (o3d-y14 r13 F1)', async () => {
+  // The one refusal where the two coincide. They are still two different statements — a renderer
+  // that says "DISAGREEING" must read the claim — so this pins that the evidence is populated here
+  // too, and that nothing had to be inferred from the claim's presence.
+  const { client } = makeClient({
+    events: [
+      postedInvoice({ externalId: 'INV-A' }),
+      postedInvoice({
+        externalId: 'INV-B',
+        businessDate: '2026-05-01',
+        createdAt: '2026-05-01T09:00:00.000Z',
+        linesJson: documentPayload({ discount: { amount: 3, accountCode: '260' } }),
+      }),
+    ],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(!read.ok && read.reason === 'UNRECOVERABLE' && read.documentCount, 2)
+  assert.deepEqual(
+    !read.ok && read.reason === 'UNRECOVERABLE' ? read.postedDocuments : null,
+    { count: 2, externalIds: ['INV-A', 'INV-B'] },
+  )
 })

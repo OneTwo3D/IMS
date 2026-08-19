@@ -46,6 +46,12 @@ mock.module('@/lib/domain/sales/allocation-service', {
 })
 
 type EventRow = {
+  /**
+   * The primary key (o3d-y14 r13 finding 2). REQUIRED: the posted read is ordered by it as a last
+   * resort, and a fixture without one would let a clause this double cannot honour look honoured —
+   * the ordering would test as total while no fixture ever exercised a tie.
+   */
+  id: string
   sourceEntityType: string
   sourceEntityId: string
   type: string
@@ -137,7 +143,12 @@ function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = [], creditN
         // named is a property of the code rather than of this array's order.
         return [...matched].sort((a, b) => {
           for (const clause of orderBy) {
-            const [field, direction] = Object.entries(clause)[0] as ['businessDate' | 'createdAt', 'desc' | 'asc']
+            const [field, direction] = Object.entries(clause)[0] as [keyof EventRow, 'desc' | 'asc']
+            // r13 finding 2. A clause this double cannot honour fails LOUDLY: skipping one would
+            // make the ordering look total while the tie-break was never applied.
+            if (!(field in a) || !(field in b)) {
+              throw new Error(`the double has no ${String(field)} column to order by`)
+            }
             const left = String(a[field])
             const right = String(b[field])
             if (left !== right) return (left < right ? -1 : 1) * (direction === 'desc' ? -1 : 1)
@@ -216,7 +227,8 @@ function documentPayload(over: Record<string, unknown> = {}) {
 }
 
 function postedInvoice(over: Partial<EventRow> = {}): EventRow {
-  return {
+  const row = {
+    id: '',
     sourceEntityType: 'SalesOrder',
     sourceEntityId: 'order-1',
     type: 'SALES_INVOICE',
@@ -229,6 +241,10 @@ function postedInvoice(over: Partial<EventRow> = {}): EventRow {
     linesJson: documentPayload({ discount: { amount: 10, accountCode: '260' } }),
     ...over,
   }
+  // r13 finding 2. DISTINCT by default, derived from what distinguishes the fixture: the column is
+  // a primary key, so two rows sharing one would model a state the database cannot hold — and would
+  // hide the tie-break the ordering now depends on.
+  return { ...row, id: row.id || `evt-${row.type}-${row.externalId ?? row.createdAt}` }
 }
 
 /** THE r5 FIXTURE: the same requested 10, with NO account code — Xero appended no discount line. */
@@ -1467,9 +1483,20 @@ function instrumentIsForbidden(line: string): boolean {
   return prohibition >= 0 && prohibition < instrument
 }
 
+type InvoiceHandoff = import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff').WcCouponInvoiceHandoff
+
 /** Every shape the handoff can take, as (name, builder) — enumerated so none can be forgotten. */
 const MATRIX: Array<
-  [string, () => Promise<{ lines: string[]; remedy: unknown; netPosition: unknown; documents: unknown }>]
+  [
+    string,
+    () => Promise<{
+      lines: string[]
+      remedy: unknown
+      netPosition: unknown
+      documents: unknown
+      invoice: InvoiceHandoff
+    }>,
+  ]
 > = [
   ['unrefunded / no invoice', () => handoffFor([], 0, { ...LINKED_INVOICE, accountingInvoiceId: null })],
   ['unrefunded / agrees', () => handoffFor([invoiceWithNoDiscountAccount()], 0)],
@@ -1539,6 +1566,15 @@ const MATRIX: Array<
   ['unrefunded / two posted documents, discounts less', () => handoffFor(twoAgreeingInvoices(), 14)],
   // r10 finding 2. A second document that reached the ledger and never recorded its external id.
   ['unrefunded / a posted document that cannot be named', () => handoffFor(twoInvoicesOneUnnamed(), 0)],
+  // r13 finding 1. THE REFUSALS r10 DID NOT REACH: several posted documents, and a refusal that
+  // established no disagreement between them. These are the shapes that were still being handed the
+  // read-it-off-the-document ladder, whose every branch names an instrument.
+  ['unrefunded / several posted documents, none readable', () => handoffFor(twoUnreadableInvoices(), 4)],
+  ['unrefunded / unsettled update over several documents', () => handoffFor(unsettledUpdateOverTwoInvoices(), 4)],
+  [
+    'refunded / several posted documents, none readable',
+    () => handoffFor(twoUnreadableInvoices(), 4, FULLY_REVERSED_INVOICE, [chargebackReversing(10)]),
+  ],
 ]
 
 test('NO instrument reaches an operator except through a WcCouponRemedy (o3d-y14 r7 F3)', async () => {
@@ -2167,4 +2203,236 @@ test('the precondition renderer cannot be called without an invoice position (o3
   assert.match(steps[0], /SYNCED sales invoice\(s\) \[INV-901\]/)
   assert.match(steps[0], /an UNRECOVERABLE posted-document read \(an update never settled\)/)
   assert.match(steps[0], /UNSETTLED SALES_INVOICE_UPDATE xero\/UPD-1 .* status PENDING/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r13 finding 1 — a refusal that is NOT a disagreement can still be
+// about several documents
+// ---------------------------------------------------------------------------
+
+/**
+ * THE DEFECT. r10 withheld the READ_THEN_CHOOSE ladder wherever the derivation returned a document
+ * count above one — and that count is set by ONE branch, the one that read several documents and
+ * found them DISAGREEING. The unreadable-payload and unsettled-update refusals leave it NULL by
+ * design, because they establish no disagreement at all, and the ledger behind either of them may
+ * hold several posted invoices. Both went on printing "Open the document and read its order-level
+ * discount line", then "raise a further invoice for it" or "credit the difference" — an instrument,
+ * chosen from one document's figure, for a set of documents with no "the".
+ *
+ * THE FIXTURES BELOW DIFFER FROM THE SINGLE-DOCUMENT ONES ON THE NUMBER OF POSTED DOCUMENTS ALONE,
+ * and each pair is asserted to render different text and a different remedy. They are also asserted
+ * NOT to say the documents disagree — which is the reason the count could not simply be populated,
+ * and would be a false statement about a ledger IMS could not read.
+ */
+
+/** A POSTED document whose payload is not an accounting document at all. */
+function unreadableInvoice(over: Partial<EventRow> = {}): EventRow {
+  return postedInvoice({ linesJson: { kind: 'not-a-document' }, ...over })
+}
+
+/** TWO posted documents, NEITHER of them readable: several documents, and no disagreement. */
+function twoUnreadableInvoices(): EventRow[] {
+  return [
+    unreadableInvoice({ externalId: 'INV-A' }),
+    unreadableInvoice({ externalId: 'INV-B', businessDate: '2026-05-01', createdAt: '2026-05-01T09:00:00.000Z' }),
+  ]
+}
+
+/** An unsettled SALES_INVOICE_UPDATE over TWO posted documents — the other unestablished count. */
+function unsettledUpdateOverTwoInvoices(): EventRow[] {
+  return [
+    postedInvoice(),
+    postedInvoice({ externalId: 'INV-779', businessDate: '2026-05-01', createdAt: '2026-05-01T09:00:00.000Z' }),
+    postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null }),
+  ]
+}
+
+test('several UNREADABLE documents get no read-it-off-the-document ladder (o3d-y14 r13 F1)', async () => {
+  const several = await handoffFor(twoUnreadableInvoices(), 4)
+  // The pair: the SAME refusal, over ONE document. It keeps the ladder, because one document is
+  // what it is about — so the two fixtures differ on the posted count alone.
+  const one = await handoffFor([unreadableInvoice()], 4)
+
+  assert.equal(several.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.equal(
+    several.invoice.case === 'DOCUMENT_UNVERIFIED' && several.invoice.documentCount,
+    null,
+    'no disagreement was established, and null must keep meaning that',
+  )
+  assert.deepEqual(
+    several.invoice.case === 'DOCUMENT_UNVERIFIED' ? several.invoice.postedDocuments : null,
+    { count: 2, externalIds: ['INV-A', 'INV-B'] },
+  )
+  assert.equal(several.remedy, null, 'no instrument may be chosen from one of two unreadable documents')
+  assert.equal(several.needsAccountingAction, true)
+
+  const text = several.lines.join('\n')
+  assert.doesNotMatch(text, /Open the document and read its order-level discount line/)
+  assert.doesNotMatch(text, /raise a further invoice for the difference/)
+  assert.doesNotMatch(text, /credit the difference/)
+  // The documents are NAMED, and not called disagreeing — the false statement r12 refused to make.
+  assert.match(text, /the 2 posted sales-invoice documents for this order \(invoice\(s\) INV-A, INV-B\)/)
+  assert.doesNotMatch(text, /DISAGREEING/)
+  assert.match(text, /are in the ledger and IMS CANNOT establish what order-level discount they carry/)
+  assert.match(text, /the refusal above is NOT that they disagree/)
+  assert.match(text, /Open invoice\(s\) INV-A, INV-B, establish what the ledger holds in total/)
+  // And the reference is no longer the ONE document the order happens to link, which need not even
+  // be in the refusal's set — INV-778 is this order's `accountingInvoiceId` and is not posted here.
+  assert.doesNotMatch(text, /invoice INV-778/)
+
+  assert.equal(one.remedy?.kind, 'READ_THEN_CHOOSE')
+  assert.match(one.lines.join('\n'), /Open the document and read its order-level discount line/)
+  assert.match(one.lines.join('\n'), /invoice INV-778 may exist for this order and IMS CANNOT establish/)
+  assert.notDeepEqual(several.lines, one.lines)
+})
+
+test('an unsettled UPDATE over several documents drops the ladder too (o3d-y14 r13 F1)', async () => {
+  // The other refusal with no established count, and the one reached BEFORE the posted documents are
+  // read at all — so nothing in its own words says whether the ledger holds one invoice or five.
+  const several = await handoffFor(unsettledUpdateOverTwoInvoices(), 4)
+  const one = await handoffFor(
+    [postedInvoice(), postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null })],
+    4,
+  )
+
+  assert.equal(several.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.equal(several.remedy, null)
+  const text = several.lines.join('\n')
+  assert.match(text, /the 2 posted sales-invoice documents for this order \(invoice\(s\) INV-778, INV-779\)/)
+  assert.match(text, /never reached POSTED/, 'and the refusal itself is still the update, not a disagreement')
+  assert.doesNotMatch(text, /DISAGREEING/)
+  assert.doesNotMatch(text, /Open the document and read its order-level discount line/)
+
+  assert.equal(one.remedy?.kind, 'READ_THEN_CHOOSE', 'one document still gets the ladder')
+  assert.notDeepEqual(several.lines, one.lines)
+})
+
+test('a REFUNDED order with several unreadable documents names them too (o3d-y14 r13 F1)', async () => {
+  // The refunded render writes its own prose off the same `documentRef`, so a fix confined to the
+  // unrefunded ladder would have left this path naming one document that is not in the set.
+  const handoff = await handoffFor(twoUnreadableInvoices(), 4, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])
+
+  assert.equal(handoff.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.equal(handoff.remedy, null)
+  assert.equal(handoff.netPosition, null)
+  const text = handoff.lines.join('\n')
+  assert.match(text, /the 2 posted sales-invoice documents for this order \(invoice\(s\) INV-A, INV-B\)/)
+  assert.match(text, /are in the ledger and IMS CANNOT establish what order-level discount they carry/)
+  assert.doesNotMatch(text, /DISAGREEING/)
+})
+
+test('a document that cannot be NAMED is counted in the unreadable refusal too (o3d-y14 r13 F1)', async () => {
+  // o3d-9kek, on the new field: the id write-back can fail after the post succeeds. "2 documents,
+  // one of which cannot be named" is the fact, and naming the one that can while going quiet about
+  // the other is the defect in a shape that looks tidier.
+  const handoff = await handoffFor(
+    [
+      unreadableInvoice({ externalId: 'INV-A' }),
+      unreadableInvoice({ externalId: null, businessDate: '2026-05-01', createdAt: '2026-05-01T09:00:00.000Z' }),
+    ],
+    4,
+  )
+
+  assert.equal(handoff.remedy, null)
+  assert.deepEqual(
+    handoff.invoice.case === 'DOCUMENT_UNVERIFIED' ? handoff.invoice.postedDocuments : null,
+    { count: 2, externalIds: ['INV-A'] },
+  )
+  assert.match(
+    handoff.lines.join('\n'),
+    /invoice\(s\) INV-A, and 1 further posted document\(s\) that record NO external id/,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r13 finding 2 — no withdrawal may be manufactured out of unchanged rows
+// ---------------------------------------------------------------------------
+
+/**
+ * The posted read was ordered by `businessDate desc, createdAt desc`, which does not order two
+ * documents that tie on BOTH — and that order decides which document every sentence NAMES. Since
+ * r11 finding 1 the invoice-side position is compared as a VALUE before a remedy is printed, so two
+ * reads of rows that never moved could differ and present as a WITHDRAWAL. A withdrawal an operator
+ * cannot trace to anything is the noise this module argues teaches them to ignore the withdrawal
+ * that matters.
+ *
+ * Each pair below is ONE set of tied rows held by two stores in opposite order.
+ */
+test('TIED posted documents do not manufacture a withdrawal (o3d-y14 r13 F2)', async () => {
+  const { sameWcCouponDocumentPosition } = await import(
+    '@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
+  )
+  const tied = { businessDate: '2026-05-02', createdAt: '2026-05-02T09:00:00.000Z' }
+
+  // A REFUSAL, whose own words are the reason the FIRST document failed — two documents unreadable
+  // for different reasons swapped the sentence, and the sentence is compared.
+  const unreadable = () => unreadableInvoice({ ...tied, externalId: 'INV-A' })
+  const wrongCurrency = () =>
+    postedInvoice({
+      ...tied,
+      externalId: 'INV-B',
+      linesJson: documentPayload({ currency: 'USD', discount: { amount: 10, accountCode: '260' } }),
+    })
+  const oneWay = await handoffFor([unreadable(), wrongCurrency()], 4)
+  const otherWay = await handoffFor([wrongCurrency(), unreadable()], 4)
+
+  assert.equal(oneWay.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.ok(
+    sameWcCouponDocumentPosition(oneWay.documents, otherWay.documents),
+    'the same rows read twice are the same position, whichever way round they come back',
+  )
+  assert.deepEqual(oneWay.lines, otherWay.lines)
+
+  // A SUCCESS, whose named document decides which ACCOUNTING SYSTEM the whole position claims to be
+  // in: an order invoiced in Xero and re-raised in QuickBooks is a shape `connector-orphans.ts`
+  // exists for, and the tie swapped the answer.
+  const inXero = () => postedInvoice({ ...tied, externalId: 'INV-A' })
+  const inQuickBooks = () => postedInvoice({ ...tied, externalId: 'INV-B', externalSystem: 'quickbooks' })
+  const xeroFirst = await handoffFor([inXero(), inQuickBooks()], 0)
+  const quickBooksFirst = await handoffFor([inQuickBooks(), inXero()], 0)
+
+  assert.equal(xeroFirst.invoice.case, 'DOCUMENT_DISCOUNTS_MORE')
+  assert.ok(
+    sameWcCouponDocumentPosition(xeroFirst.documents, quickBooksFirst.documents),
+    'nor may a tie decide which ledger the position names',
+  )
+  assert.deepEqual(xeroFirst.lines, quickBooksFirst.lines)
+})
+
+/**
+ * HOW MANY POSTED SALES-INVOICE DOCUMENTS THE LEDGER HOLDS, whatever the case (r10 F2, r13 F1).
+ *
+ * On a successful derivation that is `documentCount`; on a refusal it is the posted set, which is a
+ * different field precisely because the refusal's count is a claim about DISAGREEMENT and not every
+ * refusal is one. Both are read here, so no future refusal can be about several documents in a way
+ * the property below cannot see.
+ */
+function postedDocumentsInLedger(invoice: InvoiceHandoff): number {
+  if (invoice.case === 'NO_INVOICE_IN_LEDGER') return 0
+  if (invoice.case === 'DOCUMENT_UNVERIFIED') {
+    return Math.max(invoice.postedDocuments.count, invoice.documentCount ?? 0)
+  }
+  return invoice.documentCount
+}
+
+test('NO remedy is prescribed where the ledger holds SEVERAL posted documents (r10 F2, r13 F1)', async () => {
+  // THE PROPERTY, over the whole matrix rather than case by case — which is the only form that
+  // would have caught this. r10 asserted it of the cases it had in front of it and wrote the guard
+  // in terms of the DISAGREEMENT count, so two refusals that leave that count null went on
+  // prescribing against "the document" on ledgers holding several. Every remedy this module can
+  // produce is chosen from ONE document's figure: a per-document instrument settles one document's
+  // worth of a mis-statement the ledger holds N times over, and multiplying it is equally unfounded
+  // because nothing IMS records says whether those documents each bill the whole order or divide it.
+  let seen = 0
+  for (const [name, build] of MATRIX) {
+    const handoff = await build()
+    if (postedDocumentsInLedger(handoff.invoice) <= 1) continue
+    seen += 1
+    assert.equal(
+      handoff.remedy,
+      null,
+      `${name}: a remedy computed from ONE document reached an order whose ledger holds several`,
+    )
+  }
+  assert.ok(seen >= 4, `the matrix must exercise several-document shapes; it exercised ${seen}`)
 })

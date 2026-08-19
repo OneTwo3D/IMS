@@ -113,7 +113,12 @@ import { readDiscountRestatement, restatementHadPostedInvoice } from './discount
  * where the remaining balance is ambiguous (prior refunds, no discount account configured). A
  * refusal describes a FAILURE and not the rows it happened over, so every answer — refusals
  * included — also carries `documentSet`, the fingerprint of the rows it was derived from
- * (r12 finding 1; see the block above `PostedOrderDiscountClient`).
+ * (r12 finding 1; see the block above `PostedOrderDiscountClient`), and every refusal carries
+ * `postedDocuments`: HOW MANY posted documents it was derived over and which of them can be named
+ * (r13 finding 1). That is evidence and not a claim — it is emphatically NOT the disagreement
+ * count, which stays confined to the one branch that established a disagreement — and it exists
+ * because a caller that reads "the disagreement count is null" as "there is one document" goes on
+ * to prescribe against "the document" on an order whose ledger holds several.
  *
  * WHAT THE CALLER DOES WITH A RECOVERED FIGURE THAT DISAGREES. It refuses too, and that is a
  * deliberate limit on this function rather than a failure of it. Recovering the posted figure is
@@ -372,11 +377,16 @@ function readDocumentTaxBasis(payload: Record<string, unknown>): PostedDocumentT
  * THE RESIDUAL, stated rather than rounded away. Two POSTED documents that record NO external id
  * (o3d-9kek), were mirrored at the same instant and read identically are indistinguishable here, so
  * swapping one for the other is not detected. The unique constraint makes that impossible for any
- * document that DID record an id, and adding or removing one still moves the entry count. Likewise
- * the failure the refusal NAMES is the first in the presentational order, and two documents tied on
- * both `businessDate` and `createdAt` could swap which one that is between reads — which the
- * fingerprint neither causes nor fixes, and which fails SAFE: it presents as a withdrawal, never as
- * a remedy that should have been withdrawn and was not.
+ * document that DID record an id, and adding or removing one still moves the entry count.
+ *
+ * THE OTHER RESIDUAL IS GONE (o3d-y14 r13 finding 2). The failure a refusal NAMES is the first in
+ * the presentational order, and this block used to record that two documents tied on both
+ * `businessDate` and `createdAt` could swap which one that is between reads — arguing it failed
+ * SAFE because it presents as a withdrawal rather than as a remedy that should have been withdrawn.
+ * That argument was wrong on its own terms: a withdrawal manufactured out of rows that never moved
+ * is noise, and this module's whole case for the fingerprint is that noise teaches an operator to
+ * ignore the withdrawal that matters. The read is ordered by the primary key as a last resort, so
+ * the order is TOTAL and no tie can present as movement.
  */
 function fingerprintInstant(value: unknown): string {
   if (value instanceof Date) return value.toISOString()
@@ -494,6 +504,29 @@ export type PostedInvoiceOrderDiscount =
        */
       externalIds?: string[]
       /**
+       * HOW MANY POSTED DOCUMENTS THIS REFUSAL WAS DERIVED OVER, AND WHICH (o3d-y14 r13 finding 1).
+       *
+       * REQUIRED, like `documentSet` below and unlike the two fields above, and the difference is
+       * the whole finding. `documentCount`/`externalIds` are a CLAIM — "the derivation established
+       * that THESE documents DISAGREE" — which is why only the disagreement branch sets them and
+       * why their absence has to keep meaning "not established". r12 declined to populate them on
+       * the other refusals for exactly that reason: it would make an unreadable-payload refusal
+       * render through `describeDisagreeingDocuments`, which is a FALSE statement to an operator.
+       *
+       * This is not a claim. It is the same category as `documentSet` — evidence, present on every
+       * refusal, prescribing nothing — reduced to the two things a caller needs to STOP prescribing
+       * against "the document": how many posted documents are in the ledger for this order, and
+       * which of them can be named. The unreadable-payload and unsettled-update refusals leave
+       * `documentCount` null BY DESIGN while the ledger may hold several posted invoices, and a
+       * caller reading null as "one" told the operator to open "the document", read its
+       * order-level discount line and raise a further invoice or credit the difference — for a set
+       * of documents with no "the".
+       *
+       * `count` minus `externalIds.length` is the number that exist and record no external id
+       * (o3d-9kek), exactly as on the success variant.
+       */
+      postedDocuments: { count: number; externalIds: string[] }
+      /**
        * THE ROWS THIS REFUSAL WAS DERIVED OVER, sorted (o3d-y14 r12 finding 1).
        *
        * REQUIRED here, unlike the two fields above, and that difference is the finding. Those two
@@ -525,7 +558,10 @@ export async function readPostedInvoiceOrderDiscount(
       type: 'SALES_INVOICE_UPDATE',
       status: { notIn: [...SETTLED_INVOICE_UPDATE_EVENT_STATUSES] },
     },
-    orderBy: [{ createdAt: 'desc' }],
+    // TOTAL, like the posted read below (r13 finding 2). Nothing downstream of this read depends on
+    // the order today — its refusal states a COUNT and its fingerprint entries are sorted — and the
+    // tie-break is here so that nothing can start depending on an order that is not total.
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     select: { type: true, status: true, externalSystem: true, externalId: true, createdAt: true },
   })) as UnsettledInvoiceUpdate[]
 
@@ -539,10 +575,23 @@ export async function readPostedInvoiceOrderDiscount(
       type: { in: [...POSTED_SALES_INVOICE_EVENT_TYPES] },
       status: POSTED_ACCOUNTING_EVENT_STATUS,
     },
-    // PRESENTATIONAL ONLY — the newest document names the refusal or the recovery in the operator's
-    // message. It decides no amount: every posted document must AGREE below, so no ordering
-    // guarantee is being relied on (and, per the header, none exists).
-    orderBy: [{ businessDate: 'desc' }, { createdAt: 'desc' }],
+    // PRESENTATIONAL, AND TOTAL (o3d-y14 r13 finding 2).
+    //
+    // It decides no amount — every posted document must AGREE below — but it decides which document
+    // every refusal and every success NAMES, and r11 finding 1 made those names part of a VALUE that
+    // is compared before a remedy is printed. `businessDate desc, createdAt desc` is not a total
+    // order: two POSTED documents tied on BOTH columns may come back either way round, and then
+    // "a SALES_INVOICE was posted for this order but <the newest one's reason>" and the disagreement
+    // refusal's id list swap between two reads of rows that never moved. That presents as a
+    // WITHDRAWAL — a spurious one, of exactly the kind this module argues teaches operators to
+    // ignore withdrawals.
+    //
+    // `id` is the primary key, so appending it makes the order total and the presentation
+    // reproducible. It is NOT thereby fit to be SHOWN to anyone (the fingerprint block above is
+    // explicit that a surrogate id means nothing to an operator); it is a deterministic last
+    // resort for two rows that are otherwise indistinguishable to the ordering, and it is read by
+    // nothing but this ORDER BY.
+    orderBy: [{ businessDate: 'desc' }, { createdAt: 'desc' }, { id: 'desc' }],
     select: {
       type: true,
       status: true,
@@ -584,6 +633,13 @@ export async function readPostedInvoiceOrderDiscount(
     ...postedEntries,
     ...unsettledUpdates.map((update) => `UNSETTLED ${describeMirroredRow(update)} status ${update.status}`),
   ].sort()
+  // Newest first, in the order the documents were read — the same order the success variant reports.
+  const externalIds = documents.map((document) => document.externalId).filter((id): id is string => id !== null)
+  // r13 finding 1. The POSTED DOCUMENT SET, carried by every refusal, so no caller has to read a
+  // null disagreement count as "one document". Computed before the first refusal below rather than
+  // beside the one branch that claims a disagreement — it is evidence about the ledger, and every
+  // branch here is about the same ledger.
+  const postedDocuments = { count: documents.length, externalIds }
 
   if (unsettledUpdates.length > 0) {
     return {
@@ -593,6 +649,7 @@ export async function readPostedInvoiceOrderDiscount(
         `${unsettledUpdates.length} SALES_INVOICE_UPDATE event(s) for this order never reached POSTED — ` +
         'which is the state an update that DID modify the ledger document is left in, because it ' +
         'cannot record its own external id against the original invoice event',
+      postedDocuments,
       documentSet,
     }
   }
@@ -604,6 +661,7 @@ export async function readPostedInvoiceOrderDiscount(
       ok: false,
       reason: 'UNRECOVERABLE',
       detail: `a ${firstFailure.type} was posted for this order but ${firstFailure.detail}`,
+      postedDocuments,
       documentSet,
     }
   }
@@ -612,8 +670,6 @@ export async function readPostedInvoiceOrderDiscount(
   // arrive in row order would report a ledger that "moved" whenever the query came back the other
   // way round. Sorting decides nothing here — the success path needs exactly one distinct amount.
   const distinct = [...new Set(amounts)].sort((left, right) => left - right)
-  // Newest first, in the order the documents were read — the same order the success variant reports.
-  const externalIds = documents.map((document) => document.externalId).filter((id): id is string => id !== null)
   if (distinct.length > 1) {
     // r11 finding 3. The identifiers travel with the refusal: an operator told that several
     // documents disagree can do nothing at all with that unless they know which ones to open.
@@ -631,8 +687,14 @@ export async function readPostedInvoiceOrderDiscount(
         `${documents.length} posted documents exist for this order (${named}) and they carry ` +
         `different order-level discounts (${distinct.join(', ')} ${order.currency}); nothing here ` +
         'says which one a credit note now reverses',
+      // THE CLAIM: these documents were read and they disagree. Only this branch may make it.
       documentCount: documents.length,
       externalIds,
+      // AND THE EVIDENCE, which every refusal carries. They coincide here — this is the one refusal
+      // whose claim is about the whole posted set — and they are still two different statements:
+      // a caller that renders "N DISAGREEING documents" must read the first, and a caller that only
+      // needs to know whether "the document" exists must read the second (r13 finding 1).
+      postedDocuments,
       documentSet,
     }
   }

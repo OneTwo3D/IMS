@@ -125,6 +125,27 @@ import {
  * DISAGREE — its branches end in instruments and it is written against "the document", of which
  * there is then no such thing.
  *
+ * AND "SEVERAL DOCUMENTS" IS NOT ONLY THE DISAGREEMENT (r13 finding 1).
+ *
+ * r10 withheld the ladder on the count the derivation returns — and that count is set by ONE branch,
+ * the one that read several documents and found them in disagreement. The other two refusals leave
+ * it NULL by design: the unreadable-payload refusal names a TYPE and a reason, the unsettled-update
+ * refusal is reached before the posted documents are read at all, and neither establishes any
+ * disagreement. Null is "not established", never "there is one document" — but the ladder was
+ * printed for both, so an order whose ledger holds three posted invoices IMS could not read was
+ * told to "open the document and read its order-level discount line", and then to raise a further
+ * invoice or credit the difference, for a set of documents with no "the".
+ *
+ * The obvious repair — populate `documentCount` on those refusals too — is the one thing that must
+ * NOT be done: every renderer that reads it says the documents DISAGREE, and telling an operator
+ * that three documents disagree when what happened is that none of them could be read is a false
+ * statement about their ledger. So the derivation carries a SEPARATE field, `postedDocuments` — how
+ * many posted documents the refusal was derived over and which of them can be named, present on
+ * EVERY refusal because it is evidence rather than a claim — and the classifier branches on that.
+ * What the operator gets instead is their documents NAMED (not the one document the order happens
+ * to link, which need not even be in the refusal's set), the sentence in the plural, the reason
+ * stated as the unreadability it is, and NO instrument at all.
+ *
  * AND NO REMEDY REACHES AN OPERATOR EXCEPT AS A `WcCouponRemedy` (r7 finding 3). Three consecutive
  * rounds shipped a remedy pointing the wrong way, each time in prose that a case-by-case reading had
  * missed — r6's own refusal text still ended "settle THAT figure as an ordinary receivable", which
@@ -552,6 +573,26 @@ export type WcCouponInvoiceHandoff =
        * (o3d-9kek) — the difference is the number that exist and cannot be named.
        */
       externalIds: string[]
+      /**
+       * HOW MANY POSTED DOCUMENTS THE REFUSAL IS ABOUT, WHATEVER THE REFUSAL IS (r13 finding 1).
+       *
+       * The two fields above are the DISAGREEMENT — a claim the derivation makes only where it
+       * established that several documents carry different figures. This is the posted document set
+       * itself: evidence, present on every refusal, and the field every "is there a `the document`
+       * here?" decision below branches on.
+       *
+       * WHY NOT JUST POPULATE `documentCount` EVERYWHERE. Because `documentCount` is read as
+       * "several documents DISAGREE" — `describeDisagreeingDocuments` and the paragraph beside it
+       * say so in those words — and an unreadable-payload refusal over three documents is not a
+       * disagreement. Telling an operator that three documents disagree when what actually happened
+       * is that IMS could not read any of them is a false statement about their ledger, and this
+       * backfill's standing rule is that where a claim cannot be computed the facts are stated and
+       * nothing is prescribed.
+       *
+       * `count` is 0 for the NO_POSTED_EVENT-derived refusal, which is established: that variant
+       * exists only where the ledger holds no posted sales-invoice event at all.
+       */
+      postedDocuments: { count: number; externalIds: string[] }
     }
 
 export type WcCouponLedgerHandoff = {
@@ -674,10 +715,49 @@ function listPostedDocuments(documentCount: number, externalIds: readonly string
  * on exactly the same terms as the finding does.
  */
 function describeDisagreeingDocuments(documentCount: number, externalIds: readonly string[]): string {
+  return describePostedDocumentGroup(documentCount, externalIds, 'DISAGREEING ')
+}
+
+/**
+ * NAME THE DOCUMENTS A REFUSAL THAT IS **NOT** A DISAGREEMENT IS ABOUT (o3d-y14 r13 finding 1).
+ *
+ * The unreadable-payload and unsettled-update refusals establish no disagreement — they establish
+ * that nothing could be read at all — while the ledger may hold several posted sales invoices. The
+ * reference for those used to be `describeLedgerReference`, i.e. the ONE document the order happens
+ * to link, which is r11 finding 3's defect in a place r11 did not reach: it names a document that
+ * need not even be in the refusal's set, and it reads as a singular where there is no "the".
+ *
+ * It says nothing about the documents AGREEING or DISAGREEING, because the derivation established
+ * neither. Same naming terms as the other two references, from the one producer, so an operator is
+ * never told about their documents on two different footings.
+ */
+function describeUnreadPostedDocuments(documentCount: number, externalIds: readonly string[]): string {
+  return describePostedDocumentGroup(documentCount, externalIds, '')
+}
+
+/** "the N [DISAGREEING ]posted sales-invoice documents for this order (invoice(s) …)". */
+function describePostedDocumentGroup(
+  documentCount: number,
+  externalIds: readonly string[],
+  qualifier: 'DISAGREEING ' | '',
+): string {
   return (
-    `the ${documentCount} DISAGREEING posted sales-invoice documents for this order ` +
+    `the ${documentCount} ${qualifier}posted sales-invoice documents for this order ` +
     `(${listPostedDocuments(documentCount, externalIds)})`
   )
+}
+
+/**
+ * HOW MANY POSTED DOCUMENTS AN UNVERIFIED FINDING IS ABOUT (o3d-y14 r13 finding 1).
+ *
+ * The disagreement count where there is one, the posted set's size otherwise — and never null,
+ * because "the derivation did not establish a DISAGREEMENT" was being read as "there is one
+ * document" on refusals whose ledger holds several. Anything above 1 means no sentence below may
+ * say "the document", and no ladder branching on one document's figure may be printed.
+ */
+function unverifiedDocumentCount(invoice: Extract<WcCouponInvoiceHandoff, { case: 'DOCUMENT_UNVERIFIED' }>): number {
+  if (invoice.documentCount !== null && invoice.documentCount > 1) return invoice.documentCount
+  return invoice.postedDocuments.count
 }
 
 /**
@@ -688,9 +768,13 @@ function describeDisagreeingDocuments(documentCount: number, externalIds: readon
  * that does not exist.
  */
 function unverifiedDocumentSentence(invoice: Extract<WcCouponInvoiceHandoff, { case: 'DOCUMENT_UNVERIFIED' }>): string {
-  if (invoice.documentCount !== null && invoice.documentCount > 1) {
+  // r13 finding 1. PLURAL for a refusal about several posted documents, whether or not the
+  // derivation established that they disagree — "a document may exist ... what order-level discount
+  // IT carries" is a singular about a ledger holding three of them.
+  const documentCount = unverifiedDocumentCount(invoice)
+  if (documentCount > 1) {
     return (
-      `${invoice.documentRef ?? `${invoice.documentCount} posted documents`} are in the ledger and ` +
+      `${invoice.documentRef ?? `${documentCount} posted documents`} are in the ledger and ` +
       `IMS CANNOT establish what order-level discount they carry: ${invoice.detail}.`
     )
   }
@@ -876,18 +960,31 @@ export function classifyWcCouponInvoiceHandoff(input: {
   if (document.reason === 'UNRECOVERABLE') {
     const documentCount = document.documentCount ?? null
     const externalIds = document.externalIds ?? []
+    const postedDocuments = {
+      count: document.postedDocuments.count,
+      externalIds: [...document.postedDocuments.externalIds],
+    }
     return {
       case: 'DOCUMENT_UNVERIFIED',
       detail: document.detail,
       // r11 finding 3. Where the derivation established WHICH documents disagree, they are the
       // reference — the order's own back-reference columns are not, because those name at most the
       // one document IMS happened to link and this refusal is about all of them.
+      //
+      // r13 finding 1. And where it established no disagreement but the ledger holds several posted
+      // documents anyway — an unreadable payload, an unsettled update — the reference is those
+      // documents, WITHOUT calling them disagreeing. `describeLedgerReference` is reached only when
+      // the refusal really is about at most one document, which is the only case its singular
+      // "invoice INV-778" describes.
       documentRef:
         documentCount !== null && documentCount > 1
           ? describeDisagreeingDocuments(documentCount, externalIds)
-          : describeLedgerReference(evidence),
+          : postedDocuments.count > 1
+            ? describeUnreadPostedDocuments(postedDocuments.count, postedDocuments.externalIds)
+            : describeLedgerReference(evidence),
       documentCount,
       externalIds,
+      postedDocuments,
     }
   }
 
@@ -901,6 +998,11 @@ export function classifyWcCouponInvoiceHandoff(input: {
       documentRef: reference,
       documentCount: null,
       externalIds: [],
+      // NO_POSTED_EVENT is returned only where the ledger holds no posted sales-invoice event, so
+      // zero is ESTABLISHED here rather than unknown (r13 finding 1). The reference above comes from
+      // the order's own back-references for exactly that reason: there is no posted document set to
+      // name instead of them.
+      postedDocuments: { count: 0, externalIds: [] },
     }
   }
   return { case: 'NO_INVOICE_IN_LEDGER' }
@@ -1664,9 +1766,10 @@ function wcCouponRefundedInvoiceLines(
               ? 'so the half of the position that CAN be read is printed below and the invoice half ' +
                 'cannot be, which is why no subtraction is offered.'
               : 'so there are TWO unknowns here, not one.') +
-            ' The read-it-off-the-document ladder printed for an unrefunded order deliberately is ' +
-            'NOT printed here: each of its branches ends in an instrument, and on a refunded order ' +
-            'neither instrument can be chosen from the invoice alone.',
+            ' The read-it-off-the-document ladder an unrefunded order gets when the refusal is ' +
+            'about ONE document deliberately is NOT printed here: each of its branches ends in an ' +
+            'instrument, and on a refunded order neither instrument can be chosen from the invoice ' +
+            'alone.',
           ...refundNetPositionSteps(invoice.documentRef, refunds, reversal, nettingRefusals),
         ],
         remedy: null,
@@ -1838,6 +1941,38 @@ export function wcCouponInvoiceHandoffRender(
               'establish what the ledger holds in total, and act on that — IMS is deliberately ' +
               'naming nothing to perform. `--reprint <allowlist>` rebuilds this handoff from live ' +
               'state at any time, including for an order that has ALREADY been corrected.',
+          ],
+          remedy: null,
+          netPosition: null,
+        }
+      }
+      // r13 finding 1 — THE SAME PROHIBITION ON THE REFUSALS r10 DID NOT REACH.
+      //
+      // The ladder is written against ONE document and every branch of it compares ONE document's
+      // figure against the residual. `documentCount` is NULL on the unreadable-payload and
+      // unsettled-update refusals BY DESIGN — the derivation sets it only where it established a
+      // DISAGREEMENT, and null is "not established", never "one" — while the ledger behind either
+      // of them may hold several posted invoices. Prescribing there tells an operator to open "the
+      // document", read its order-level discount line, and then raise a further invoice or credit
+      // the difference, for a set of documents with no "the".
+      //
+      // It is NOT folded into the branch above: that paragraph says the documents DISAGREE, which is
+      // a different and false statement about a ledger IMS simply could not read.
+      if (invoice.postedDocuments.count > 1) {
+        const { count, externalIds } = invoice.postedDocuments
+        return {
+          lines: [
+            ...facts,
+            `NO REMEDY IS PRESCRIBED: the ledger holds ${count} posted sales-invoice documents for ` +
+              'this order, and the refusal above is NOT that they disagree — it is that IMS could ' +
+              'not establish what ANY of them carries. So there is no single document to read the ' +
+              'figure off, and no per-document correction that settles the ledger: what the ledger ' +
+              'holds in total depends on whether those documents each bill the whole order or ' +
+              'divide it between them, which nothing IMS records says. Open ' +
+              `${listPostedDocuments(count, externalIds)}, establish what the ledger holds in ` +
+              'total, and act on that — IMS is deliberately naming nothing to perform. `--reprint ' +
+              '<allowlist>` rebuilds this handoff from live state at any time, including for an ' +
+              'order that has ALREADY been corrected.',
           ],
           remedy: null,
           netPosition: null,
