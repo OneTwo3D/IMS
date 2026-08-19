@@ -85,7 +85,17 @@
  * so their VAT is inside the Σ. createSalesOrder does the same, with one exception: it also SUBTRACTS
  * the VAT on an order-level discount. Where that discount exists the residue is `shipping VAT − discount
  * VAT`, two figures IMS cannot separate, so the derivation refuses rather than reporting the mixture as
- * shipping's rate. (Base currency is not usable at all: taxBase is one conversion of the aggregate and
+ * shipping's rate.
+ *
+ * Codex r6 #3: WHICH writer built the total is knowable, so that refusal is scoped to the writer it
+ * belongs to. r5 refused on any non-zero `SalesOrder.discountAmount` on the grounds that nothing on the
+ * row says who wrote the totals — but something does: a WooCommerce-imported order is created WITH its
+ * `ShoppingOrderLink`, in the same write, and the codebase already reads `shoppingLinks: { none: {} }`
+ * as "a manual order" elsewhere. On a WC order the discount leg is a coupon RESIDUAL (Woo allocates
+ * coupon money into the line totals, o3d-y14) that `computeWcOrderForeignTotals` never subtracts any
+ * VAT for, so the residue is shipping's VAT and refusing it was a false refusal — on exactly the orders
+ * this path exists to service. The caller passes `orderTaxIsSumOfComponents`; absent, the conservative
+ * createSalesOrder reading still applies. (Base currency is not usable at all: taxBase is one conversion of the aggregate and
  * each line's taxBase is converted independently, so the residue there carries FX rounding that is not
  * shipping VAT — the same trap Codex r3 #3 found in refund-sync.)
  *
@@ -101,9 +111,31 @@
  *
  * So each figure is given the rounding it can actually carry, read off the figure itself: one that
  * carries sub-penny digits cannot have been rounded to the penny (0.0583 of VAT was computed at 4dp and
- * is worth ±0.00005), and one that does not may have been (£1.00 of VAT is worth ±0.005). Never coarser
- * than the penny — a 0-decimal currency (JPY) quantises coarser still and its lines get a bound that is
- * too TIGHT, which refuses, never over-accepts.
+ * is worth ±0.00005), and one that does not may have been (£1.00 of VAT is worth ±0.005).
+ *
+ * Codex r6 #2: "the penny" is not a universal floor. r5 hard-coded 2 decimals as the coarsest a source
+ * could have quantised to and noted that a 0-decimal currency (JPY, KRW, ISK) would then get a bound
+ * that is too TIGHT — fail-closed, but wrong: ¥1,000 of VAT on ¥5,000 is a perfectly ordinary 20% line
+ * whose figures were quantised to the YEN, worth ±0.5 each, and pricing it against a ±0.005 bound
+ * refuses it with nothing whatever for an operator to fix. The coarsest quantisation is the CURRENCY's
+ * minor unit (`currencyMinorUnits`), so the snapshot carries the currency its figures are in and the
+ * bound follows from that — still clamped at the storage scale, since a 4-decimal currency (CLF) is
+ * stored at 4dp anyway.
+ *
+ * ---------------------------------------------------------------------------------------------------
+ * Codex r6 #1: THIS CHECK IS FOR EVERY ROUTE A SHIPPING AMOUNT TAKES, NOT ONLY THE HAND-RECORDED ONE.
+ *
+ * r5 guarded the exception inbox's Record-manually path and left the WooCommerce refund sync's ITEMISED
+ * route — `wcRefund.shipping_lines`, which is what a storefront shipping refund actually arrives as —
+ * pushing an unlinked `lineKind: 'shipping'` line straight into `createRefund` with nothing checking
+ * what it would be re-grossed at. The amount is already NET there, so no gross→net conversion draws
+ * attention to the rate; the divergence lands entirely on the credit note's TOTAL. Zero-rated postage
+ * on a 20%-default order credits £12 against a £10 refund and the sync reports success.
+ *
+ * That route does not have to derive shipping's VAT, because WooCommerce states it: each refunded
+ * shipping line carries its own `total` and `total_tax`. `shippingTaxForeign` is how a caller supplies
+ * a VAT figure it did not have to derive, and the rest of the check — resolve the identity the way the
+ * posting resolves it, price it from the tax table, compare — is shared verbatim.
  * ---------------------------------------------------------------------------------------------------
  *
  * Every refusal names a remedy an operator (or an admin) can carry out — mapping the tax rate to an
@@ -113,7 +145,7 @@
  */
 
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
-import { toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { currencyMinorUnits, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
  * TaxRate.rate is Decimal(5,4), so two STORED rates that differ by less than half of the last stored
@@ -125,23 +157,34 @@ export const RATE_EPSILON = 0.00005
 
 /** Decimal(18,4) — the storage scale of every money figure in this module. */
 const STORAGE_DECIMALS = 4
+
 /**
- * The finest quantisation a SOURCE of these figures is assumed to use: the currency's minor unit, which
- * is what WooCommerce rounds every line and shipping tax to before IMS stores it (Codex r5 #2).
+ * The COARSEST quantisation a source of these figures could have used: the currency's own minor unit,
+ * which is what WooCommerce rounds every line and shipping tax to before IMS stores it (Codex r5 #2)
+ * and what createSalesOrder's own inputs are entered in. Clamped at the storage scale, because a
+ * currency with more minor-unit digits than Decimal(18,4) holds (CLF, UYW) is stored at 4dp regardless.
+ *
+ * Codex r6 #2: read from the currency rather than assumed to be the penny. A zero-decimal currency
+ * quantises to the whole unit and a 3-decimal one to the thousandth; hard-coding 2 gives the first a
+ * bound a hundred times too tight (a refusal an operator cannot act on) and the second one four times
+ * too loose.
  */
-const SOURCE_DECIMALS = 2
+function sourceDecimalsFor(currency: string): number {
+  return Math.min(currencyMinorUnits(currency), STORAGE_DECIMALS)
+}
 
 /**
  * Half of the last digit this figure can actually carry — its rounding exposure.
  *
  * Read off the figure itself rather than assumed, because the two sources quantise differently and the
- * row does not say which wrote it. A figure with sub-penny digits (0.0583) was computed at the storage
- * scale and is worth ±0.00005; one without (1.00, 0.6, 3) may have been rounded to the penny by
- * WooCommerce and is worth ±0.005. Decimal drops trailing zeros — 0.6000 reads as 1 decimal place — so
- * the count is clamped at both ends: never finer than the storage scale, never coarser than the penny.
+ * row does not say which wrote it. A figure with sub-minor-unit digits (0.0583 in GBP) was computed at
+ * the storage scale and is worth ±0.00005; one without (1.00, 0.6, 3) may have been rounded to the
+ * minor unit and is worth ±0.005 in GBP, ±0.5 in JPY. Decimal drops trailing zeros — 0.6000 reads as 1
+ * decimal place — so the count is clamped at both ends: never finer than the storage scale, never
+ * coarser than the currency's minor unit.
  */
-function moneyHalfUnit(amount: Decimal): Decimal {
-  const decimals = Math.min(Math.max(amount.decimalPlaces(), SOURCE_DECIMALS), STORAGE_DECIMALS)
+function moneyHalfUnit(amount: Decimal, sourceDecimals: number): Decimal {
+  const decimals = Math.min(Math.max(amount.decimalPlaces(), sourceDecimals), STORAGE_DECIMALS)
   return toDecimal(5).div(toDecimal(10).pow(decimals + 1))
 }
 
@@ -187,6 +230,12 @@ export type PostedRefundTaxRate = {
  * be read as "no VAT was charged".
  */
 export type ChargedLineSnapshot = {
+  /**
+   * The currency both figures are in — SalesOrder.currency. Required (Codex r6 #2): it is what says how
+   * coarsely they may have been quantised, and therefore how much rounding a rate derived from them
+   * inherits. Defaulting it to the penny is what refused ordinary zero-decimal-currency lines.
+   */
+  currency: string
   netForeign?: DecimalInput
   taxForeign?: DecimalInput
 }
@@ -205,14 +254,42 @@ export type ChargedLineSnapshot = {
  * `undefined` anywhere means the caller did not read it, which is never the same as zero.
  */
 export type ChargedShippingSnapshot = {
-  /** SalesOrder.shippingForeign — the NET shipping charge (both writers store it net of VAT). */
+  /** The currency every figure below is in — SalesOrder.currency. See ChargedLineSnapshot.currency. */
+  currency: string
+  /**
+   * The NET shipping amount whose rate is being read — SalesOrder.shippingForeign for a target on the
+   * ORDER (both writers store it net of VAT), or the net shipping amount of the storefront refund being
+   * checked, when the caller is pricing that instead (see shippingTaxForeign).
+   */
   netForeign?: DecimalInput
+  /**
+   * Codex r6 #1: shipping's VAT stated DIRECTLY, when the caller has a source that carries one. IMS's
+   * own SalesOrder does not — which is the whole reason for the residue below — but a WooCommerce
+   * refund payload states the VAT it returned on each shipping line (`shipping_lines[].total_tax`), and
+   * on an ITEMISED refund that figure, against that line's own net, is exactly what the credit note has
+   * to restate. Supplied together with `netForeign` it replaces the residue entirely: the discount,
+   * every-line-read and negative-residue refusals below do not apply to a figure nobody had to derive.
+   */
+  shippingTaxForeign?: DecimalInput
   /** SalesOrder.taxForeign — the order's TOTAL VAT, in its own currency. */
   orderTaxForeign?: DecimalInput
   /** SalesOrderLine.taxForeign for EVERY line on the order, including imported fee lines. */
   lineTaxForeign?: readonly DecimalInput[]
-  /** SalesOrder.discountAmount — an order-level discount whose VAT is netted off orderTaxForeign. */
+  /** SalesOrder.discountAmount — an order-level discount whose VAT may be netted off orderTaxForeign. */
   orderDiscountAmount?: DecimalInput
+  /**
+   * Codex r6 #3: TRUE when `orderTaxForeign` is the plain SUM of every component's VAT — each line's
+   * plus each shipping line's — with nothing netted off it. That is what the WooCommerce importer
+   * builds (`computeWcOrderForeignTotals`), and it makes the residue shipping's VAT whatever
+   * `orderDiscountAmount` says: Woo allocates coupon money INTO the lines, so a WC order's order-level
+   * discount is a residual that no VAT was ever subtracted for.
+   *
+   * Absent or false is the conservative reading — `createSalesOrder` DOES subtract an order-level
+   * discount's VAT from the same total — so an unknown writer with a non-zero discount still refuses.
+   * The caller establishes it from the order's own provenance (a WooCommerce ShoppingOrderLink), never
+   * from the size of a number.
+   */
+  orderTaxIsSumOfComponents?: boolean
 }
 
 /**
@@ -285,13 +362,17 @@ type ChargedRate =
  * error. That is the tolerance the comparison is entitled to — no wider (which would hide a real rate
  * difference) and no narrower (which would refuse a legitimate amount for rounding it did not choose).
  */
-function chargedRateFromMoney(net: Decimal, tax: Decimal, netNoun: string): ChargedRate {
+function chargedRateFromMoney(net: Decimal, tax: Decimal, netNoun: string, currency: string): ChargedRate {
   if (net.lte(0)) {
     return { ok: false, detail: `it carries no ${netNoun} (${net.toFixed(4)}), so no rate can be read off it` }
   }
+  const sourceDecimals = sourceDecimalsFor(currency)
   const rate = tax.div(net)
   // Evaluated with the derived rate itself rather than the true one — accurate enough for a bound.
-  const tolerance = moneyHalfUnit(tax).add(rate.abs().mul(moneyHalfUnit(net))).div(net).toNumber()
+  const tolerance = moneyHalfUnit(tax, sourceDecimals)
+    .add(rate.abs().mul(moneyHalfUnit(net, sourceDecimals)))
+    .div(net)
+    .toNumber()
   if (tolerance > MAX_DERIVED_RATE_TOLERANCE) {
     return {
       ok: false,
@@ -308,7 +389,12 @@ function chargedRateFromSnapshot(snapshot: ChargedLineSnapshot | null | undefine
   if (snapshot?.netForeign == null || snapshot.taxForeign == null) {
     return { ok: false, detail: 'IMS holds no record of the net it was sold at and the VAT taken on it' }
   }
-  return chargedRateFromMoney(toDecimal(snapshot.netForeign), toDecimal(snapshot.taxForeign), 'net amount')
+  return chargedRateFromMoney(
+    toDecimal(snapshot.netForeign),
+    toDecimal(snapshot.taxForeign),
+    'net amount',
+    snapshot.currency,
+  )
 }
 
 /**
@@ -316,6 +402,16 @@ function chargedRateFromSnapshot(snapshot: ChargedLineSnapshot | null | undefine
  * default rate. See ChargedShippingSnapshot for why the VAT half is a residue and what makes it unusable.
  */
 function chargedShippingRateFromSnapshot(snapshot: ChargedShippingSnapshot | null | undefined): ChargedRate {
+  // Codex r6 #1: a caller that HAS shipping's VAT does not derive it. The residue exists only because
+  // SalesOrder stores no shipping-VAT column; a WooCommerce refund's own shipping line states one.
+  if (snapshot?.netForeign != null && snapshot.shippingTaxForeign != null) {
+    return chargedRateFromMoney(
+      toDecimal(snapshot.netForeign),
+      toDecimal(snapshot.shippingTaxForeign),
+      'shipping charge',
+      snapshot.currency,
+    )
+  }
   if (snapshot?.netForeign == null || snapshot.orderTaxForeign == null || snapshot.lineTaxForeign == null) {
     return {
       ok: false,
@@ -333,7 +429,11 @@ function chargedShippingRateFromSnapshot(snapshot: ChargedShippingSnapshot | nul
     }
   }
   const orderDiscount = toDecimal(snapshot.orderDiscountAmount ?? 0)
-  if (!orderDiscount.isZero()) {
+  // Codex r6 #3: only for a writer that MIGHT have netted the discount's VAT off the same total.
+  // createSalesOrder does; the WooCommerce importer does not (it sums the components and allocates
+  // coupon money into the lines), so on a WC order the residue is shipping's VAT discount or no
+  // discount, and refusing there was a false refusal on the commonest kind of order there is.
+  if (!orderDiscount.isZero() && !snapshot.orderTaxIsSumOfComponents) {
     return {
       ok: false,
       detail:
@@ -353,7 +453,7 @@ function chargedShippingRateFromSnapshot(snapshot: ChargedShippingSnapshot | nul
         `(${lineTax.toFixed(4)}), so no shipping VAT can be read out of the difference`,
     }
   }
-  return chargedRateFromMoney(toDecimal(snapshot.netForeign), shippingTax, 'shipping charge')
+  return chargedRateFromMoney(toDecimal(snapshot.netForeign), shippingTax, 'shipping charge', snapshot.currency)
 }
 
 /**

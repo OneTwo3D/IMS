@@ -23,9 +23,9 @@ import {
  */
 
 /** £10.00 net with £2.00 of VAT on it: this line was sold at 20%, whatever the tax table says now. */
-const CHARGED_20 = { netForeign: 10, taxForeign: 2 }
+const CHARGED_20 = { currency: 'GBP', netForeign: 10, taxForeign: 2 }
 /** £20.00 net with no VAT: sold zero-rated. */
-const CHARGED_0 = { netForeign: 20, taxForeign: 0 }
+const CHARGED_0 = { currency: 'GBP', netForeign: 20, taxForeign: 0 }
 
 /**
  * Codex r5 #1: what the ORDER records about its SHIPPING leg. IMS has no shipping-VAT column, so the
@@ -38,6 +38,7 @@ const CHARGED_0 = { netForeign: 20, taxForeign: 0 }
  */
 /** £10 of postage carrying NO VAT (zero-rated delivery) on 20% goods: order VAT 20.00 is all the line's. */
 const SHIPPING_CHARGED_0 = {
+  currency: 'GBP',
   netForeign: 10,
   orderTaxForeign: 20,
   lineTaxForeign: [20],
@@ -45,6 +46,7 @@ const SHIPPING_CHARGED_0 = {
 }
 /** £10 of postage carrying £2.00 of VAT on ZERO-rated goods: every penny of the order's VAT is shipping's. */
 const SHIPPING_CHARGED_20 = {
+  currency: 'GBP',
   netForeign: 10,
   orderTaxForeign: 2,
   lineTaxForeign: [0],
@@ -96,7 +98,7 @@ test('a line with no money snapshot is refused, not priced from the live table (
     resolvePostedRefundTaxIdentity({
       kind: 'sale',
       lineTaxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
-      chargedLine,
+      chargedLine: chargedLine && { currency: 'GBP', ...chargedLine },
       orderDefaultTaxType: 'OUTPUT2',
         rateByTaxType: index([{ accountingTaxType: 'OUTPUT2', rate: 0.2 }]),
       label: 'Widget',
@@ -123,7 +125,7 @@ test('the derived rate is given the rounding its figures were ACTUALLY rounded a
     resolvePostedRefundTaxIdentity({
       kind: 'sale',
       lineTaxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
-      chargedLine,
+      chargedLine: { currency: 'GBP', ...chargedLine },
       orderDefaultTaxType: 'OUTPUT2',
       rateByTaxType: index([{ accountingTaxType: 'OUTPUT2', rate: postedRate }]),
       label: 'Line',
@@ -187,7 +189,7 @@ test('an UNMAPPED reverse-charge code is refused, not assumed to be 0% (o3d-w00 
   const unmapped = resolvePostedRefundTaxIdentity({
     kind: 'sale',
     lineTaxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: true },
-    chargedLine: { netForeign: 10, taxForeign: 0 },
+    chargedLine: { currency: 'GBP', netForeign: 10, taxForeign: 0 },
     orderDefaultTaxType: 'OUTPUT2',
     reverseChargeSalesTaxType: 'REVERSECHARGE',
     rateByTaxType: index([{ accountingTaxType: 'OUTPUT2', rate: 0.2 }]),
@@ -203,7 +205,7 @@ test('an UNMAPPED reverse-charge code is refused, not assumed to be 0% (o3d-w00 
   const mapped = resolvePostedRefundTaxIdentity({
     kind: 'sale',
     lineTaxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: true },
-    chargedLine: { netForeign: 10, taxForeign: 0 },
+    chargedLine: { currency: 'GBP', netForeign: 10, taxForeign: 0 },
     orderDefaultTaxType: 'OUTPUT2',
     reverseChargeSalesTaxType: 'REVERSECHARGE',
     rateByTaxType: index([
@@ -221,7 +223,7 @@ test('a reverse-charge code mapped to a VAT-bearing rate cannot be picked from (
   const identity = resolvePostedRefundTaxIdentity({
     kind: 'sale',
     lineTaxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: true },
-    chargedLine: { netForeign: 10, taxForeign: 0 },
+    chargedLine: { currency: 'GBP', netForeign: 10, taxForeign: 0 },
     orderDefaultTaxType: 'OUTPUT2',
     reverseChargeSalesTaxType: 'REVERSECHARGE',
     rateByTaxType: index([
@@ -305,11 +307,11 @@ test("shipping's charged rate comes from ITS OWN money, not the order's header r
 })
 
 test('shipping is refused when its VAT cannot be separated out of the order (o3d-w00 Codex r5 #1)', () => {
-  const resolve = (chargedShipping: Parameters<typeof chargedRateFromShippingSnapshot>[0]) =>
+  const resolve = (chargedShipping: Omit<NonNullable<Parameters<typeof chargedRateFromShippingSnapshot>[0]>, 'currency'>) =>
     resolvePostedRefundTaxIdentity({
       kind: 'shipping',
       orderDefaultTaxType: 'OUTPUT2',
-      chargedShipping,
+      chargedShipping: { currency: 'GBP', ...chargedShipping },
       rateByTaxType: index([{ accountingTaxType: 'OUTPUT2', rate: 0.2 }]),
       label: 'Shipping',
     })
@@ -429,8 +431,8 @@ test('a fully reverse-charged order keeps its single identity, a part-reverse-ch
 test('the displayed charged rate is the order line, or nothing (o3d-w00 Codex r4 #1)', () => {
   assert.equal(chargedRateFromLineSnapshot(CHARGED_20)?.toString(), '0.2')
   assert.equal(chargedRateFromLineSnapshot(CHARGED_0)?.toString(), '0')
-  assert.equal(chargedRateFromLineSnapshot({ netForeign: 0, taxForeign: 0 }), null)
-  assert.equal(chargedRateFromLineSnapshot({ netForeign: 10 }), null)
+  assert.equal(chargedRateFromLineSnapshot({ currency: 'GBP', netForeign: 0, taxForeign: 0 }), null)
+  assert.equal(chargedRateFromLineSnapshot({ currency: 'GBP', netForeign: 10 }), null)
   assert.equal(chargedRateFromLineSnapshot(null), null)
 })
 
@@ -440,7 +442,143 @@ test('the displayed charged rate for shipping is the order, or nothing (o3d-w00 
   assert.equal(chargedRateFromShippingSnapshot(SHIPPING_CHARGED_0)?.toString(), '0')
   assert.equal(chargedRateFromShippingSnapshot(SHIPPING_CHARGED_20)?.toString(), '0.2')
   assert.equal(chargedRateFromShippingSnapshot({ ...SHIPPING_CHARGED_20, orderDiscountAmount: 5 }), null)
-  assert.equal(chargedRateFromShippingSnapshot({ netForeign: 10, lineTaxForeign: [0] }), null)
+  assert.equal(chargedRateFromShippingSnapshot({ currency: 'GBP', netForeign: 10, lineTaxForeign: [0] }), null)
   assert.equal(chargedRateFromShippingSnapshot({ ...SHIPPING_CHARGED_20, netForeign: 0 }), null)
   assert.equal(chargedRateFromShippingSnapshot(null), null)
+})
+
+test('a zero-decimal currency is priced against ITS minor unit, not the penny (o3d-w00 Codex r6 #2)', () => {
+  const at = (chargedLine: { currency: string; netForeign: number; taxForeign: number }, postedRate: number) =>
+    resolvePostedRefundTaxIdentity({
+      kind: 'sale',
+      lineTaxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
+      chargedLine,
+      orderDefaultTaxType: 'OUTPUT2',
+      rateByTaxType: index([{ accountingTaxType: 'OUTPUT2', rate: postedRate }]),
+      label: 'Line',
+    })
+
+  // ---------------------------------------------------------------------------------------------
+  // r5 sized a figure's rounding exposure to "the penny or finer" and noted that a 0-decimal currency
+  // would then get a bound that is too TIGHT — fail-closed, but a refusal with NOTHING an operator can
+  // do about it, which the epic treats as a defect in its own right.
+  //
+  // JPY has no minor unit, so a source quantises ¥499.50 to ¥500. ¥500 of VAT on ¥4,995 of net is an
+  // entirely ordinary 10% Japanese line and reads as 10.01% — 1.0e-4 from the rate its code carries.
+  // Priced as if the source had rounded to 0.01 the bound is (0.005 + 0.1 x 0.005) / 4995 = 1.1e-6, a
+  // hundredfold too tight. Priced against the YEN it is (0.5 + 0.1 x 0.5) / 4995 = 1.10e-4, and the
+  // line records.
+  // ---------------------------------------------------------------------------------------------
+  const yen = at({ currency: 'JPY', netForeign: 4995, taxForeign: 500 }, 0.1)
+  assert.equal(yen.ok, true, 'a real 10% JPY line: 500 of VAT on 4,995 reads as 10.01%')
+  assert.equal(yen.ok && yen.vatRate.toString(), '0.1')
+
+  // The SAME two numbers in a 2-decimal currency are NOT that line: £500.00 of VAT on £4,995.00 of net
+  // could not have been rounded to more than half a penny, so 10.01% really is a different rate from
+  // the 10% its code carries and the refusal stands. Nothing but the currency separates the two — which
+  // is what makes the currency, not the magnitude of the figures, the thing that has to be read.
+  const sterling = at({ currency: 'GBP', netForeign: 4995, taxForeign: 500 }, 0.1)
+  assert.equal(sterling.ok, false, 'the same figures in GBP are a genuine 0.01pp divergence')
+  assert.match(sterling.ok ? '' : sterling.reason, /was charged at 10\.01% but/)
+
+  // Widening the bound is not a licence: a genuinely different rate on the same yen figures is still
+  // caught, so the fix did not blunt the check it belongs to.
+  const wrongRate = at({ currency: 'JPY', netForeign: 4995, taxForeign: 500 }, 0.08)
+  assert.equal(wrongRate.ok, false)
+  assert.match(wrongRate.ok ? '' : wrongRate.reason, /which is 8%/)
+
+  // And the coarser minor unit makes SMALL amounts less able to pin a rate down, not more: ±0.5 on ¥100
+  // of net leaves the rate uncertain by 0.0055, past the 0.002 cap, so the amount is treated as
+  // carrying no usable snapshot rather than waved through.
+  const tiny = at({ currency: 'JPY', netForeign: 100, taxForeign: 10 }, 0.1)
+  assert.equal(tiny.ok, false, '¥100 of net cannot fix a rate when its figures are worth ±0.5 each')
+  assert.match(tiny.ok ? '' : tiny.reason, /too small to fix the rate it was charged at/)
+})
+
+test("a WooCommerce order's shipping VAT survives an order-level discount (o3d-w00 Codex r6 #3)", () => {
+  // £100 of 20% goods (£20 of VAT), £10 of postage bearing £2, and £12 of coupon that Woo could not
+  // allocate to a line. The residue — 22.00 recorded less the 20.00 on the lines — is 2.00 on 10.00 of
+  // postage, i.e. 20%, because computeWcOrderForeignTotals SUMS the components and subtracts no VAT for
+  // the discount leg (Woo puts coupon money INSIDE the line totals). The identical figures written by
+  // createSalesOrder mean something else entirely: it DOES net the discount's VAT off the same total,
+  // so the residue there is shipping's VAT and the discount's mixed together.
+  const snapshot = {
+    currency: 'GBP',
+    netForeign: 10,
+    orderTaxForeign: 22,
+    lineTaxForeign: [20],
+    orderDiscountAmount: 12,
+  }
+  const resolve = (chargedShipping: typeof snapshot & { orderTaxIsSumOfComponents?: boolean }) =>
+    resolvePostedRefundTaxIdentity({
+      kind: 'shipping',
+      orderDefaultTaxType: 'OUTPUT2',
+      chargedShipping,
+      rateByTaxType: index([{ accountingTaxType: 'OUTPUT2', rate: 0.2 }]),
+      label: 'Shipping',
+    })
+
+  const wooCommerce = resolve({ ...snapshot, orderTaxIsSumOfComponents: true })
+  assert.equal(wooCommerce.ok, true, 'a WC order states its shipping VAT in the residue, discount or no discount')
+  assert.equal(wooCommerce.ok && wooCommerce.vatRate.toString(), '0.2')
+  assert.equal(
+    chargedRateFromShippingSnapshot({ ...snapshot, orderTaxIsSumOfComponents: true })?.toString(),
+    '0.2',
+    'and a refused row still displays it',
+  )
+
+  // Unstated provenance keeps the conservative reading, so the refusal is narrowed, not removed.
+  const unknownWriter = resolve(snapshot)
+  assert.equal(unknownWriter.ok, false)
+  assert.match(unknownWriter.ok ? '' : unknownWriter.reason, /order-level discount \(12\.0000\)/)
+  assert.equal(chargedRateFromShippingSnapshot(snapshot), null)
+})
+
+test('a STATED shipping VAT is used instead of the residue (o3d-w00 Codex r6 #1)', () => {
+  // The residue exists only because SalesOrder stores no shipping-VAT column. A WooCommerce refund
+  // payload states one per refunded shipping line, so the itemised route has a figure it did not have
+  // to derive — and none of the residue's refusals (an unread line, an order-level discount, a negative
+  // difference) can apply to it, because there is no order aggregate underneath it.
+  const resolve = (chargedShipping: {
+    currency: string
+    netForeign: number
+    shippingTaxForeign: number
+  }, postedRate: number) =>
+    resolvePostedRefundTaxIdentity({
+      kind: 'shipping',
+      orderDefaultTaxType: 'OUTPUT2',
+      chargedShipping,
+      rateByTaxType: index([{ accountingTaxType: 'OUTPUT2', rate: postedRate }]),
+      label: 'Shipping',
+    })
+
+  const taxed = resolve({ currency: 'GBP', netForeign: 10, shippingTaxForeign: 2 }, 0.2)
+  assert.equal(taxed.ok, true)
+  assert.equal(taxed.ok && taxed.vatRate.toString(), '0.2')
+
+  // £10 of postage that bore NO VAT, against a code worth 20%: the credit note would come to £12.00
+  // for a £10.00 refund. This is the divergence the stated figure exists to catch.
+  const zeroRated = resolve({ currency: 'GBP', netForeign: 10, shippingTaxForeign: 0 }, 0.2)
+  assert.equal(zeroRated.ok, false)
+  assert.match(zeroRated.ok ? '' : zeroRated.reason, /Shipping was charged at 0% but/)
+  assert.match(zeroRated.ok ? '' : zeroRated.reason, /OUTPUT2, which is 20%/)
+
+  // A stated figure is not a residue, so supplying an order aggregate alongside it changes nothing —
+  // and in particular an order-level discount cannot refuse a figure nobody derived.
+  const withOrderAggregate = resolvePostedRefundTaxIdentity({
+    kind: 'shipping',
+    orderDefaultTaxType: 'OUTPUT2',
+    chargedShipping: {
+      currency: 'GBP',
+      netForeign: 10,
+      shippingTaxForeign: 2,
+      orderTaxForeign: 999,
+      lineTaxForeign: [0],
+      orderDiscountAmount: 12,
+    },
+    rateByTaxType: index([{ accountingTaxType: 'OUTPUT2', rate: 0.2 }]),
+    label: 'Shipping',
+  })
+  assert.equal(withOrderAggregate.ok, true)
+  assert.equal(withOrderAggregate.ok && withOrderAggregate.vatRate.toString(), '0.2')
 })

@@ -11,6 +11,11 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { REFUND_TOTAL_EPSILON } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
+import {
+  buildTaxTypeRateIndex,
+  resolvePostedRefundTaxIdentity,
+  type TaxTypeRateIndex,
+} from '@/lib/domain/sales/refund-posted-tax-identity'
 import { FULL_REFUND_RATIO } from '@/lib/domain/sales/refund-thresholds'
 import type { WcRefund, WcRefundLineItem } from './types'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
@@ -18,7 +23,9 @@ import type { createRefund as createRefundAction } from '@/app/actions/sales'
 type CreateRefundAction = typeof createRefundAction
 
 export type WcRefundSyncDependencies = {
-  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | '$transaction'>
+  // o3d-w00 (Codex r6 #1): `taxRate` is read to price the identity an ITEMISED shipping refund line
+  // will be re-grossed under. A double that omits it cannot exercise that path at all.
+  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | 'taxRate' | '$transaction'>
   createRefund?: CreateRefundAction
   logActivity?: typeof logActivity
 }
@@ -385,6 +392,39 @@ export function resolveMonetaryRefundVatRate(order: MonetaryRefundBasisOrder): M
   return { ok: true, vatRate: rate }
 }
 
+/**
+ * o3d-w00 (Codex r6 #1): what is needed to price the identity an unlinked SHIPPING refund line will
+ * post under — resolved exactly the way `createSalesOrderRefund` and the credit-note staging resolve
+ * it, or the pre-flight and the posting disagree by construction:
+ *
+ *   - the order-default identity is the accountingTaxType of the ACTIVE TaxRate whose NAME is
+ *     `SalesOrder.taxRateName` (no `usedFor` filter — that is the lookup `stageRefundAccountingReversals`
+ *     makes for its own shipping fallback), and
+ *   - the PRICE of a code is what SALES-usable tax rates map to it. A PURCHASE-only rate sharing an
+ *     accountingTaxType string with an output code would otherwise look like an ambiguous mapping.
+ *
+ * Mirrors `loadRefundPostingTaxContext` in app/actions/sync-exceptions.ts, which does the same for the
+ * hand-recording path; the reverse-charge swap is deliberately absent because shipping never takes it
+ * (resolveRefundLineTaxIdentity passes the order default through unswapped for a shipping line).
+ */
+async function loadShippingPostingTaxContext(
+  client: Pick<typeof db, 'taxRate'>,
+  orderTaxRateName: string | null,
+): Promise<{ orderDefaultTaxType: string | null; rateByTaxType: TaxTypeRateIndex }> {
+  const taxRates = await client.taxRate.findMany({
+    select: { name: true, rate: true, accountingTaxType: true, active: true, usedFor: true },
+  })
+  const activeTaxTypeByName = new Map<string, string | null>()
+  for (const taxRate of taxRates) {
+    if (!taxRate.active || activeTaxTypeByName.has(taxRate.name)) continue
+    activeTaxTypeByName.set(taxRate.name, taxRate.accountingTaxType ?? null)
+  }
+  return {
+    orderDefaultTaxType: orderTaxRateName ? activeTaxTypeByName.get(orderTaxRateName) ?? null : null,
+    rateByTaxType: buildTaxTypeRateIndex(taxRates.filter((taxRate) => taxRate.usedFor !== 'PURCHASE')),
+  }
+}
+
 // o3d-7yf: when a refund finally lands (a successful retry or a verified same-order dedup), RESOLVE this
 // order's lingering actionable park instead of only appending a separate SYNCED log. The partial unique
 // index excludes SYNCED rows, so a fresh SYNCED log never collides with — nor clears — the old PENDING/
@@ -498,6 +538,11 @@ export async function syncWcRefund(
         id: true,
         externalOrderNumber: true,
         fxRateToBase: true,
+        // o3d-w00 (Codex r6 #1/#2): the order's currency sizes the rounding a derived rate inherits (a
+        // zero-decimal currency quantises to the whole unit, not the penny), and taxRateName resolves the
+        // ORDER-DEFAULT VAT identity an unlinked shipping refund line posts under.
+        currency: true,
+        taxRateName: true,
         totalBase: true,
         // o3d-w00: taxBase is what makes the gross->net conversion basis CHECKABLE — the header rate is
         // only trusted when it reproduces the order's own VAT (resolveMonetaryRefundVatRate).
@@ -624,18 +669,74 @@ export async function syncWcRefund(
       }
     }
 
-    for (const shippingLine of wcRefund.shipping_lines ?? []) {
-      const shippingRefundTotal = parseDecimalAbs(shippingLine.total)
-      if (shippingRefundTotal.lte(0.000001)) continue
-      mappedGrossForeign = mappedGrossForeign.add(shippingRefundTotal).add(parseDecimalAbs(shippingLine.total_tax))
-      refundLines.push({
-        productId: null,
-        description: shippingLine.method_title || 'Shipping refund',
-        qty: 0,
-        totalForeign: roundDecimalNumber(shippingRefundTotal, 4),
-        totalBase: divideRoundedNumber(shippingRefundTotal, fxRate, 4),
-        lineKind: 'shipping',
-      })
+    // ---------------------------------------------------------------------------------------------
+    // o3d-w00 (Codex r6 #1): an ITEMISED shipping refund is the route a storefront shipping refund
+    // actually arrives by, and until now nothing checked what its credit note would be re-grossed at.
+    //
+    // Unlike a monetary-only refund the amount is already NET here, so no gross->net conversion draws
+    // attention to the rate — and the divergence lands entirely on the credit note's TOTAL. The line is
+    // unlinked, so createSalesOrderRefund posts it under the ORDER-DEFAULT VAT identity (the ACTIVE
+    // TaxRate named SalesOrder.taxRateName) and the connector grosses the stored net up by whatever
+    // that code is worth. On an order with zero-rated postage and a 20% default, GBP 10.00 of returned
+    // postage becomes a GBP 12.00 credit note — against a GBP 10.00 storefront refund that reconciled
+    // to the penny, with `success: true` reported.
+    //
+    // WooCommerce states the VAT it returned on each shipping line, so nothing has to be derived from
+    // the order's residue here: `total_tax` on `total` IS the rate this money bore, and the posted
+    // identity has to carry it. Where it cannot be established the refund is QUARANTINED for hand
+    // recording rather than credited at a rate nobody checked — the same derivation-or-refusal the
+    // exception inbox's Record-manually path applies to the very same target.
+    // ---------------------------------------------------------------------------------------------
+    const refundedShippingLines = (wcRefund.shipping_lines ?? [])
+      .filter((shippingLine) => parseDecimalAbs(shippingLine.total).gt(0.000001))
+    if (refundedShippingLines.length > 0) {
+      const shippingTaxContext = await loadShippingPostingTaxContext(client, so.taxRateName)
+      for (const shippingLine of refundedShippingLines) {
+        const shippingRefundTotal = parseDecimalAbs(shippingLine.total)
+        const label = shippingLine.method_title || 'The refunded shipping'
+        const identity = resolvePostedRefundTaxIdentity({
+          kind: 'shipping',
+          orderDefaultTaxType: shippingTaxContext.orderDefaultTaxType,
+          chargedShipping: {
+            currency: so.currency,
+            netForeign: shippingRefundTotal,
+            // The VAT WooCommerce actually returned on this shipping line — a stated figure, not a
+            // residue, so none of the residue's refusals apply to it.
+            shippingTaxForeign: parseDecimalAbs(shippingLine.total_tax),
+          },
+          rateByTaxType: shippingTaxContext.rateByTaxType,
+          label,
+        })
+        if (!identity.ok) {
+          const error =
+            `WooCommerce refund ${wcRefund.id} returned ${shippingRefundTotal.toDecimalPlaces(2).toFixed(2)} of ` +
+            `shipping (plus ${parseDecimalAbs(shippingLine.total_tax).toDecimalPlaces(2).toFixed(2)} of VAT), and ` +
+            `no credit note has been raised: ${identity.reason} The money has ALREADY been returned in ` +
+            'WooCommerce — do NOT issue another WooCommerce refund. ' +
+            REFUND_PARK_MANUAL_RESOLUTION_HINT
+          // Deliberate and non-transient, exactly like the monetary-only basis refusal: retrying re-runs
+          // the identical decision against the identical order, so QUARANTINE it for an operator.
+          await upsertRefundPark(client, {
+            soId: so.id,
+            externalId: String(wcRefund.id),
+            status: 'QUARANTINED',
+            errorMessage: error,
+            // The Record-manually path reconciles its allocation against the GROSS amount in this
+            // payload, so the completion path this message advertises cannot run without it.
+            payload: wcRefund,
+          })
+          return { success: false, error }
+        }
+        mappedGrossForeign = mappedGrossForeign.add(shippingRefundTotal).add(parseDecimalAbs(shippingLine.total_tax))
+        refundLines.push({
+          productId: null,
+          description: shippingLine.method_title || 'Shipping refund',
+          qty: 0,
+          totalForeign: roundDecimalNumber(shippingRefundTotal, 4),
+          totalBase: divideRoundedNumber(shippingRefundTotal, fxRate, 4),
+          lineKind: 'shipping',
+        })
+      }
     }
 
     if (refundLines.length === 0) {

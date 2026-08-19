@@ -52,6 +52,11 @@ const ORDER = {
   subtotalForeign: 30,
   taxForeign: 3,
   discountAmount: 0,
+  // Codex r6 #3: a WooCommerce park belongs to a WooCommerce-imported order, and the link is created in
+  // the same write as the order. It is how production knows `taxForeign` is the plain SUM of the
+  // components' VAT (nothing netted off it for an order-level discount), which is what makes the
+  // shipping residue readable on a discounted order.
+  shoppingLinks: [{ connector: 'woocommerce' }],
   totalForeign: 38,
   lines: [
     // Codex r4 #1: each line carries its OWN money — the net it was sold at and the VAT taken on it.

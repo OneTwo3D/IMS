@@ -34,6 +34,11 @@ const ORDER = {
   // total. The order's header rate is deliberately NOT in this fixture — production must not read it.
   taxForeign: 3,
   discountAmount: 0,
+  // Codex r6 #3: this park is a WooCommerce refund, so the order it belongs to was written by the
+  // WooCommerce importer — which sums the component VAT figures and nets nothing off them for an
+  // order-level discount. The link is how production knows that, and it is created in the same write
+  // as the order, so a fixture without it is not an imported order at all.
+  shoppingLinks: [{ connector: 'woocommerce' }],
   lines: [
     { id: 'line-1', description: 'Widget', sku: 'WIDGET', totalForeign: 10, taxForeign: 2, taxRate: { name: 'UK Standard Rate', rate: 0.2, reverseCharge: false, accountingTaxType: 'OUTPUT2' as string | null } },
     { id: 'line-2', description: 'Book', sku: 'BOOK', totalForeign: 20, taxForeign: 0, taxRate: { name: 'UK Zero Rate', rate: 0, reverseCharge: false, accountingTaxType: 'ZERORATEDOUTPUT' as string | null } },

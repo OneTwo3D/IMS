@@ -131,6 +131,25 @@ type RefundPostingTaxContext = {
   activeTaxTypeByName: Map<string, string | null>
 }
 
+/**
+ * o3d-w00 (Codex r6 #3): whether this order's `taxForeign` is the plain SUM of its components' VAT,
+ * with nothing netted off it for an order-level discount — which is what makes
+ * `taxForeign − Σ line.taxForeign` shipping's VAT even on a discounted order.
+ *
+ * The WooCommerce importer builds it that way (computeWcOrderForeignTotals sums the line tax it writes
+ * and the shipping tax lines, and allocates coupon money INTO the lines — o3d-y14), and a WC-imported
+ * order is created WITH its ShoppingOrderLink in the same write, so the link's presence is the writer's
+ * own mark. `createSalesOrder` instead SUBTRACTS the order discount's VAT from the same total, and it
+ * creates no link — the same discriminator the Xero/QuickBooks payment pollers read as "a manual order"
+ * (`shoppingLinks: { none: {} }`).
+ *
+ * Fails closed: any other provenance (no link, or a link from a connector whose import arithmetic is
+ * not known to be a plain sum) keeps the conservative reading and a discounted order is still refused.
+ */
+function orderTaxIsSumOfComponents(shoppingLinks: readonly { connector: string }[]): boolean {
+  return shoppingLinks.some((link) => link.connector === 'woocommerce')
+}
+
 async function loadRefundPostingTaxContext(): Promise<RefundPostingTaxContext> {
   const [taxRates, accountingSettings] = await Promise.all([
     db.taxRate.findMany({ select: { name: true, rate: true, accountingTaxType: true, active: true, usedFor: true } }),
@@ -758,6 +777,12 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             taxRateName: true,
             shippingForeign: true,
             shippingService: true,
+            // Codex r6 #3: WHO wrote this order's totals. A WooCommerce-imported order is created with
+            // its ShoppingOrderLink in the same write, and its taxForeign is the plain sum of the
+            // component VAT figures — nothing is netted off it for an order-level discount, the way
+            // createSalesOrder does. Without this the shipping derivation refused every WC order
+            // carrying an unallocated coupon residual.
+            shoppingLinks: { select: { connector: true } },
             // o3d-w00 (Codex r5 #1): shipping's CHARGED rate is derived from the order's own money —
             // the VAT it records over and above its lines, on the net shipping charge. taxRatePercent
             // is deliberately NOT read: it is the order's header default, which is shipping's rate only
@@ -836,10 +861,12 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     // What the ORDER says its shipping leg was charged (Codex r5 #1): the net shipping charge, and the
     // VAT the order records over and above every one of its lines. IMS has no shipping-VAT column.
     const chargedShipping = {
+      currency: order.currency,
       netForeign: order.shippingForeign,
       orderTaxForeign: order.taxForeign,
       lineTaxForeign: order.lines.map((line) => line.taxForeign),
       orderDiscountAmount: order.discountAmount,
+      orderTaxIsSumOfComponents: orderTaxIsSumOfComponents(order.shoppingLinks),
     }
     const targets: RefundParkAllocationTarget[] = order.lines.map((line) => {
       // o3d-w00 (Codex r3 #1): the rate the credit note will RE-GROSS this line at, resolved from the
@@ -849,7 +876,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       const identity = resolvePostedRefundTaxIdentity({
         kind: 'sale',
         lineTaxRate: line.taxRate,
-        chargedLine: { netForeign: line.totalForeign, taxForeign: line.taxForeign },
+        chargedLine: { currency: order.currency, netForeign: line.totalForeign, taxForeign: line.taxForeign },
         orderDefaultTaxType,
         orderUniform,
         reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
@@ -860,7 +887,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       // so the row still reads truthfully — and say why it cannot be allocated to.
       const vatRate = identity.ok
         ? identity.vatRate
-        : (chargedRateFromLineSnapshot({ netForeign: line.totalForeign, taxForeign: line.taxForeign }) ?? toDecimal(0))
+        : (chargedRateFromLineSnapshot({ currency: order.currency, netForeign: line.totalForeign, taxForeign: line.taxForeign }) ?? toDecimal(0))
       const remainingNet = toDecimal(line.totalForeign).sub(priorRefundedByLineId.get(line.id) ?? toDecimal(0))
       return {
         lineId: line.id,
@@ -1436,6 +1463,8 @@ export async function recordRefundParkManually(
         // off that same total and would otherwise be counted as shipping's.
         taxForeign: true,
         discountAmount: true,
+        // Codex r6 #3: the writer's own mark — see orderTaxIsSumOfComponents.
+        shoppingLinks: { select: { connector: true } },
         lines: {
           select: {
             id: true,
@@ -1497,10 +1526,12 @@ export async function recordRefundParkManually(
     // What the ORDER says its shipping leg was charged (Codex r5 #1) — its own money, not the header
     // default rate, which is shipping's rate only on a uniformly taxed order.
     const chargedShipping = {
+      currency: order.currency,
       netForeign: order.shippingForeign,
       orderTaxForeign: order.taxForeign,
       lineTaxForeign: order.lines.map((line) => line.taxForeign),
       orderDiscountAmount: order.discountAmount,
+      orderTaxIsSumOfComponents: orderTaxIsSumOfComponents(order.shoppingLinks),
     }
     const refundLines: {
       lineId: string | null
@@ -1540,7 +1571,7 @@ export async function recordRefundParkManually(
       const identity = resolvePostedRefundTaxIdentity({
         kind: allocation.lineKind,
         lineTaxRate: line?.taxRate ?? null,
-        chargedLine: line ? { netForeign: line.totalForeign, taxForeign: line.taxForeign } : null,
+        chargedLine: line ? { currency: order.currency, netForeign: line.totalForeign, taxForeign: line.taxForeign } : null,
         chargedShipping,
         orderDefaultTaxType,
         orderUniform,

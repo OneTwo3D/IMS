@@ -70,10 +70,18 @@ type OrderLineDouble = {
   taxRate: { rate: number; reverseCharge: boolean } | null
 }
 type OrderDouble = {
+  // o3d-w00 (Codex r6 #1/#2): the order's CURRENCY (which says how coarsely its money figures could
+  // have been quantised, and so how much rounding a rate derived from them inherits) and its
+  // taxRateName (which RESOLVES the order-default VAT identity an unlinked shipping refund line posts
+  // under). A double without them cannot exercise the itemised shipping route at all.
+  currency: string
+  taxRateName: string | null
   totalBase: number
   taxBase: number
   taxRatePercent: number | null
   shippingBase: number
+  taxForeign?: number
+  shippingForeign?: number
   lines: OrderLineDouble[]
 }
 const DEFAULT_ORDER_LINE: OrderLineDouble = {
@@ -87,6 +95,8 @@ const DEFAULT_ORDER_LINE: OrderLineDouble = {
   taxRate: { rate: 0.2, reverseCharge: false },
 }
 const DEFAULT_ORDER_DOUBLE: OrderDouble = {
+  currency: 'GBP',
+  taxRateName: 'UK Standard Rate',
   totalBase: 15,
   taxBase: 2.5,
   taxRatePercent: 0.2,
@@ -139,6 +149,8 @@ function makeOrder(input: {
   const netPerLine = round4(linesNetTotal / lineCount)
   const taxPerLine = round4(netPerLine * input.rate + driftPerComponent)
   return {
+    currency: 'GBP',
+    taxRateName: input.rate > 0 ? 'UK Standard Rate' : null,
     totalBase: input.grossTotal,
     taxBase: input.taxBase,
     taxRatePercent: input.rate > 0 ? input.rate : null,
@@ -159,10 +171,23 @@ function makeOrder(input: {
   }
 }
 
+/**
+ * o3d-w00 (Codex r6 #1): what IMS knows an accounting tax code to be worth. The credit note posts a NET
+ * shipping line under the order-default code and the connector re-grosses it at that code's rate, so
+ * these rows are what decide whether an itemised shipping refund can be recorded at all. A double with
+ * no tax rates would make every shipping refund unpriceable and every assertion below vacuous.
+ */
+type TaxRateDouble = { name: string; rate: number; accountingTaxType: string | null; active: boolean; usedFor: string }
+const DEFAULT_TAX_RATES: TaxRateDouble[] = [
+  { name: 'UK Standard Rate', rate: 0.2, accountingTaxType: 'OUTPUT2', active: true, usedFor: 'SALES' },
+  { name: 'UK Zero Rate', rate: 0, accountingTaxType: 'ZERORATEDOUTPUT', active: true, usedFor: 'SALES' },
+]
+
 function makeDependencies(options: {
   alwaysMissExistingRefund?: boolean
   refuseWithQuarantine?: boolean
   order?: Partial<OrderDouble>
+  taxRates?: TaxRateDouble[]
 } = {}) {
   const refunds: Array<{ id: string; externalRefundId: number; orderId: string }> = []
   const syncLogs: unknown[] = []
@@ -271,6 +296,11 @@ function makeDependencies(options: {
       warehouse: {
         async findFirst() {
           return { id: 'return-wh' }
+        },
+      },
+      taxRate: {
+        async findMany() {
+          return options.taxRates ?? DEFAULT_TAX_RATES
         },
       },
       shoppingSyncLog: shoppingSyncLogMock,
@@ -1308,4 +1338,191 @@ test('a refund that LANDS concurrently (seen under the per-refund lock) is not a
   assert.equal(result.success, false, 'the refusal still surfaces')
   const parks = state.syncLogs.filter((log) => (log as { data?: { externalId?: string } }).data?.externalId === '7018')
   assert.equal(parks.length, 0, 'no park was written because the refund had already landed under the lock')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-w00 Codex r6 #1: an ITEMISED WooCommerce shipping refund.
+//
+// This is the route a storefront shipping refund actually arrives by, and it is NOT the monetary-only
+// route the basis checks above guard. The amount is already NET here — WooCommerce reports
+// `shipping_lines[].total` ex-tax with `total_tax` beside it — so no gross->net conversion draws
+// attention to the rate, and the divergence lands entirely on the credit note's TOTAL: the line is
+// unlinked, so createSalesOrderRefund posts it under the ORDER-DEFAULT VAT identity and the connector
+// grosses the stored net up by whatever that code carries.
+// ---------------------------------------------------------------------------
+
+/**
+ * An order whose SHIPPING was taxed unlike BOTH its goods and its header default — the only shape in
+ * which the three figures can be told apart, and the one the earlier fixtures on this branch could not
+ * express because they taxed shipping at the header rate.
+ *
+ * £50.00 of 20% goods bearing £10.00 of VAT, and £10.00 of postage bearing NOTHING (zero-rated
+ * delivery). Net 60.00 + VAT 10.00 = 70.00 gross, and the order's VAT is its lines' VAT exactly,
+ * because the postage carried none. `taxRateName` is "UK Standard Rate" — order-import names the order
+ * after the standard rate among its tax lines whether or not the postage bore it — so the credit note
+ * for that postage would post under OUTPUT2 at 20%.
+ */
+const ZERO_RATED_POSTAGE_ORDER: OrderDouble = {
+  currency: 'GBP',
+  taxRateName: 'UK Standard Rate',
+  totalBase: 70,
+  taxBase: 10,
+  taxRatePercent: 0.2,
+  shippingBase: 10,
+  shippingForeign: 10,
+  taxForeign: 10,
+  lines: [{
+    id: 'line-1',
+    productId: 'product-1',
+    externalLineItemId: 501,
+    description: 'Widget',
+    qty: 1,
+    totalBase: 50,
+    taxBase: 10,
+    taxRate: { rate: 0.2, reverseCharge: false },
+  }],
+}
+
+/** The mirror: £50.00 of ZERO-rated goods and £10.00 of postage that DID bear 20% (£2.00). */
+const TAXED_POSTAGE_ORDER: OrderDouble = {
+  currency: 'GBP',
+  taxRateName: 'UK Standard Rate',
+  totalBase: 62,
+  taxBase: 2,
+  taxRatePercent: 0.2,
+  shippingBase: 10,
+  shippingForeign: 10,
+  taxForeign: 2,
+  lines: [{
+    id: 'line-1',
+    productId: 'product-1',
+    externalLineItemId: 501,
+    description: 'Book',
+    qty: 1,
+    totalBase: 50,
+    taxBase: 0,
+    taxRate: { rate: 0, reverseCharge: false },
+  }],
+}
+
+function shippingRefundLine(total: string, totalTax: string) {
+  return { id: 9001, method_title: 'Royal Mail', method_id: 'flat_rate', total, total_tax: totalTax, taxes: [] }
+}
+
+test('the fixtures tax shipping unlike the goods AND unlike the header (o3d-w00 Codex r6 #1)', () => {
+  // A fixture where the header rate, the goods rate and the shipping rate are the same number cannot
+  // tell which of the three production read — every earlier order double on this branch was that
+  // fixture. In each of these shipping is taxed unlike the goods; ACROSS the pair the two shipping
+  // rates differ while the header rate is the same 20% in both, so no reading of the header (and none
+  // of the goods) could produce the opposite verdicts the two refund tests below assert.
+  const shippingRateOf = (order: OrderDouble) => {
+    const linesNet = order.lines.reduce((sum, line) => sum + line.totalBase, 0)
+    const linesVat = order.lines.reduce((sum, line) => sum + line.taxBase, 0)
+    assert.equal(linesNet + order.shippingBase + order.taxBase, order.totalBase, 'the money adds up')
+    assert.notEqual((order.taxBase - linesVat) / order.shippingBase, order.lines[0].taxRate!.rate, 'shipping is taxed unlike the goods')
+    return (order.taxBase - linesVat) / order.shippingBase
+  }
+
+  assert.equal(shippingRateOf(ZERO_RATED_POSTAGE_ORDER), 0, 'postage bearing nothing on 20% goods')
+  assert.equal(shippingRateOf(TAXED_POSTAGE_ORDER), 0.2, 'postage bearing 20% on zero-rated goods')
+  assert.equal(ZERO_RATED_POSTAGE_ORDER.taxRatePercent, TAXED_POSTAGE_ORDER.taxRatePercent, 'one header rate, two shipping rates')
+  assert.equal(ZERO_RATED_POSTAGE_ORDER.taxRateName, TAXED_POSTAGE_ORDER.taxRateName, 'and one order-default identity')
+})
+
+test('an itemised shipping refund whose VAT the credit note would restate is QUARANTINED (o3d-w00 Codex r6 #1)', async () => {
+  // £50.00 of goods + £10.00 of VAT on them, and the £10.00 of postage that bore none: £70.00 returned.
+  // The postage line is unlinked, so its credit posts under the order default (OUTPUT2, 20%) and the
+  // connector grosses £10.00 back up to £12.00 — a £72.00 credit note against a £70.00 storefront
+  // refund, reported as a success.
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: ZERO_RATED_POSTAGE_ORDER })
+  const refund = makeRefund({
+    id: 7401,
+    amount: '70.00',
+    line_items: [{
+      id: 601, name: 'Widget', product_id: 10, variation_id: 0, quantity: -1, tax_class: '',
+      subtotal: '-50.00', subtotal_tax: '-10.00', total: '-50.00', total_tax: '-10.00', sku: 'WIDGET',
+      meta_data: [{ id: 1, key: '_refunded_item_id', value: '501' }], refund_total: 50,
+    }],
+    shipping_lines: [shippingRefundLine('-10.00', '0.00')],
+  })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /Royal Mail was charged at 0% but/)
+  assert.match(result.error ?? '', /OUTPUT2, which is 20%/)
+  // The WHOLE refund is refused, not just its shipping half: a credit note covering only the goods
+  // would leave the storefront refund half-settled with nothing recording the rest.
+  assert.equal(state.createRefundCalls, 0, 'no credit note is raised for any part of it')
+  // And it is parked the way a deliberate refusal is parked — QUARANTINED (so the sweep does not
+  // re-refuse it every run) and carrying the payload the Record-manually path reconciles against.
+  const park = state.syncLogs.map((log) => (log as { data: Record<string, unknown> }).data).at(-1)
+  assert.equal(park?.status, 'QUARANTINED')
+  assert.equal(park?.externalId, '7401')
+  assert.equal((park?.payload as { id?: number })?.id, 7401)
+  assert.match(String(park?.errorMessage), /do NOT issue another WooCommerce refund/)
+  assert.match(String(park?.errorMessage), /Record manually/)
+})
+
+test('an itemised shipping refund at the rate its credit will post at is recorded (o3d-w00 Codex r6 #1)', async () => {
+  // The mirror image, and the one a check reading the order's GOODS would have refused for nothing:
+  // zero-rated goods with standard-rated postage. WooCommerce returned £10.00 of postage plus the
+  // £2.00 of VAT it bore; the credit note posts under OUTPUT2 at 20% and comes to exactly that.
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TAXED_POSTAGE_ORDER })
+  const refund = makeRefund({
+    id: 7402,
+    amount: '12.00',
+    line_items: [],
+    shipping_lines: [shippingRefundLine('-10.00', '-2.00')],
+  })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.deepEqual(result, { success: true })
+  assert.equal(state.createRefundCalls, 1)
+  // Stored NET, as an unlinked shipping line — the shape the credit note re-grosses.
+  assert.deepEqual(
+    state.createRefundLines.map((line) => ({ productId: line.productId, totalForeign: line.totalForeign })),
+    [{ productId: null, totalForeign: 10 }],
+  )
+})
+
+test('an itemised shipping refund is refused when the order default cannot be priced (o3d-w00 Codex r6 #1)', async () => {
+  // The order's default rate has been deactivated since the sale, so nothing resolves the identity the
+  // shipping credit would post under — and an unresolved identity is not a 0% one: the connector would
+  // apply its own account default to a line nobody had priced.
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: TAXED_POSTAGE_ORDER,
+    taxRates: DEFAULT_TAX_RATES.map((taxRate) =>
+      taxRate.name === 'UK Standard Rate' ? { ...taxRate, active: false } : taxRate),
+  })
+  const refund = makeRefund({
+    id: 7403,
+    amount: '12.00',
+    line_items: [],
+    shipping_lines: [shippingRefundLine('-10.00', '-2.00')],
+  })
+
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /missing, renamed or deactivated/)
+  // The remedy is one an admin can actually carry out, and it re-opens the same row.
+  assert.match(result.error ?? '', /Restore\/map that tax rate in Settings → Tax Rates/)
+  assert.equal(state.createRefundCalls, 0)
+  const park = state.syncLogs.map((log) => (log as { data: Record<string, unknown> }).data).at(-1)
+  assert.equal(park?.status, 'QUARANTINED')
+})
+
+test('the sync READS what the shipping identity is resolved from (o3d-w00 Codex r6 #1)', async () => {
+  // taxRateName resolves the order-default identity and currency sizes the rounding a derived rate
+  // inherits. Neither is visible in the returned double, so without asserting on the SELECT a missing
+  // column would leave the check silently reading `undefined` and refusing every shipping refund.
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TAXED_POSTAGE_ORDER })
+  await syncWcRefund(1001, makeRefund({ id: 7404, amount: '12.00', line_items: [], shipping_lines: [shippingRefundLine('-10.00', '-2.00')] }), state.dependencies)
+
+  const select = state.orderSelect as { taxRateName?: boolean; currency?: boolean }
+  assert.equal(select?.taxRateName, true, "the order-default identity's name")
+  assert.equal(select?.currency, true, "the currency its money figures are quantised in")
 })
