@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   classifyPersistedRefundLineKind,
   creditNoteDocumentStanding,
+  creditNoteLedger,
   readCreditNoteOrderDiscount,
 } from '@/lib/domain/accounting/credit-note-order-discount'
 
@@ -56,7 +57,14 @@ function mirroringChargeback(over: Partial<RefundRow> = {}): RefundRow {
  * refund names — i.e. "the document still stands exactly as IMS recorded it", which is the world
  * r7's premise silently assumed. Every finding-3 fixture departs from it on one field.
  */
-type CreditNoteEventRow = { sourceEntityId: string; type: string; status: string; externalId: string | null }
+type CreditNoteEventRow = {
+  sourceEntityId: string
+  type: string
+  status: string
+  externalId: string | null
+  /** r9 finding 1: WHICH LEDGER the document was posted to. */
+  externalSystem: string | null
+}
 
 function standingCreditNote(refund: RefundRow): CreditNoteEventRow {
   return {
@@ -64,6 +72,7 @@ function standingCreditNote(refund: RefundRow): CreditNoteEventRow {
     type: 'CREDIT_NOTE',
     status: 'POSTED',
     externalId: refund.accountingCreditNoteId,
+    externalSystem: 'xero',
   }
 }
 
@@ -400,15 +409,116 @@ test('a refund carrying an accounting WARNING refuses', async () => {
 test('the standing check is PURE and reachable from a plain value, in both directions', () => {
   const refund = { id: 'refund-1', accountingCreditNoteId: 'CN-501' }
   assert.deepEqual(
-    creditNoteDocumentStanding(refund, [{ sourceEntityId: 'refund-1', status: 'POSTED', externalId: 'CN-501' }]),
-    { ok: true },
+    creditNoteDocumentStanding(refund, [
+      { sourceEntityId: 'refund-1', status: 'POSTED', externalId: 'CN-501', externalSystem: 'xero' },
+    ]),
+    { ok: true, externalSystem: 'xero' },
   )
   // A POSTED event with a NULL external id is still the document IMS named: the back-reference can
   // be written where the mirror's id was not (o3d-9kek), and refusing that would suppress the very
   // shape the rest of this file is careful to keep derivable.
   assert.deepEqual(
-    creditNoteDocumentStanding(refund, [{ sourceEntityId: 'refund-1', status: 'POSTED', externalId: null }]),
-    { ok: true },
+    creditNoteDocumentStanding(refund, [
+      { sourceEntityId: 'refund-1', status: 'POSTED', externalId: null, externalSystem: 'xero' },
+    ]),
+    { ok: true, externalSystem: 'xero' },
   )
   assert.equal(creditNoteDocumentStanding(refund, []).ok, false)
+})
+
+// ---------------------------------------------------------------------------
+// r9 finding 1 — WHICH SET OF BOOKS these documents are in
+// ---------------------------------------------------------------------------
+
+/**
+ * THE FIXTURES DISTINGUISH TWO LEDGERS FROM ONE, and nothing else.
+ *
+ * Every fixture below is the derivable two-chargeback position with exactly ONE field changed —
+ * `externalSystem` on a mirrored credit-note event — because the whole finding is that a figure was
+ * being subtracted from another without either document saying which books it belonged to. A fixture
+ * set where one ledger and two rendered the same answer would prove nothing, so each is asserted to
+ * differ from the one-ledger case rather than merely to individually refuse.
+ */
+function secondChargeback(over: Partial<RefundRow> = {}): RefundRow {
+  return mirroringChargeback({
+    id: 'refund-2',
+    accountingCreditNoteId: 'CN-502',
+    lines: [{ salesOrderLineId: null, totalBase: -4, totalForeign: -4, lineKind: 'discount' }],
+    ...over,
+  })
+}
+
+const TWO_CREDIT_NOTES = {
+  refundIds: ['refund-1', 'refund-2'],
+  postedCreditNoteExternalIds: ['CN-501', 'CN-502'],
+}
+
+test('the derived leg carries the LEDGER its credit note was posted to (o3d-y14 r9 F1)', async () => {
+  const result = await read([mirroringChargeback()])
+
+  assert.equal(result.ok, true)
+  assert.equal(result.ok && result.externalSystem, 'xero')
+  assert.equal(result.legs[0].externalSystem, 'xero')
+})
+
+test('TWO credit notes in DIFFERENT accounting systems do not jointly reverse one invoice (r9 F1)', async () => {
+  // The connector-switch shape. `connector-orphans.ts` exists because the active accounting
+  // connector CAN be switched (Xero → QuickBooks), and IMS keeps each historical document under the
+  // connector that posted it — so these two credit notes reduce balances in two separate sets of
+  // books and their totals do not add up to a reversal of anything.
+  const rows = [mirroringChargeback(), secondChargeback()]
+  const split = await read(rows, TWO_CREDIT_NOTES, [
+    standingCreditNote(rows[0]),
+    { ...standingCreditNote(rows[1]), externalSystem: 'quickbooks' },
+  ])
+  const oneLedger = await read(rows, TWO_CREDIT_NOTES)
+
+  assert.equal(split.ok, false)
+  assert.match(split.detail, /posted by DIFFERENT accounting systems \(quickbooks, xero\)/)
+  // Both legs still DERIVED — this is a refusal of the SUBTRACTION, not of the facts.
+  assert.deepEqual(
+    split.legs.map((leg) => leg.amount),
+    [10, 4],
+  )
+  // The pair differs on `externalSystem` alone, and the two answers are opposite.
+  assert.equal(oneLedger.ok, true)
+  assert.equal(oneLedger.ok && oneLedger.amount, 14)
+  assert.notEqual(split.ok, oneLedger.ok)
+  assert.notEqual(split.detail, oneLedger.detail)
+})
+
+test('a mirrored credit note that names NO accounting system establishes no ledger (r9 F1)', async () => {
+  const refund = mirroringChargeback()
+  const unnamed = await read([refund], {}, [{ ...standingCreditNote(refund), externalSystem: null }])
+  const named = await read([refund])
+
+  assert.equal(unnamed.ok, false)
+  assert.match(unnamed.detail, /record NO accounting system/)
+  assert.equal(unnamed.legs[0].amount, 10, 'the leg is still a fact and is still reported')
+  assert.equal(unnamed.legs[0].externalSystem, null)
+  assert.equal(named.ok, true)
+  assert.notEqual(unnamed.ok, named.ok)
+})
+
+test('the ledger check is PURE and reachable from plain legs, in every direction (r9 F1)', () => {
+  const leg = (over: Partial<import('@/lib/domain/accounting/credit-note-order-discount').CreditNoteDiscountLeg>) => ({
+    refundId: 'refund-1',
+    externalCreditNoteId: 'CN-501',
+    chargeback: true,
+    externalSystem: 'xero' as string | null,
+    amount: 10 as number | null,
+    detail: '',
+    ...over,
+  })
+
+  assert.deepEqual(creditNoteLedger([leg({})]), { ok: true, externalSystem: 'xero' })
+  assert.equal(creditNoteLedger([leg({}), leg({ externalSystem: 'quickbooks' })]).ok, false)
+  assert.equal(creditNoteLedger([leg({ externalSystem: null })]).ok, false)
+  // A leg that REFUSED contributes no ledger, so a position made only of refusals establishes none.
+  assert.equal(creditNoteLedger([leg({ amount: null })]).ok, false)
+  // ...and a refused leg does not drag a derived one into a false disagreement either.
+  assert.deepEqual(creditNoteLedger([leg({}), leg({ amount: null, externalSystem: null })]), {
+    ok: true,
+    externalSystem: 'xero',
+  })
 })

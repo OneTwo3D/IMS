@@ -226,6 +226,14 @@ export function isWcCouponOrderRefunded(refunds: WcCouponRefundEvidence): boolea
  *   TYPE, not a rate, and the order's live `taxRatePercent` is not evidence of what it was when the
  *   refund was created. So an INCLUSIVE (or UNKNOWN, or MIXED) basis withdraws the netting.
  *
+ *   THE LEDGER (r9 finding 1). Both figures have to be balances in the SAME set of books. The
+ *   active accounting connector can be SWITCHED (see `connector-orphans.ts`, which exists for that
+ *   event), and IMS keeps every historical document under the connector that posted it — so an order
+ *   invoiced in Xero and credited in QuickBooks has an ACCREC invoice standing at full value that
+ *   the credit memo reduces by nothing. `wcCouponLedgerMembership` requires the invoice's
+ *   `externalSystem` and the credit notes' to be the SAME non-null value, and withdraws the net
+ *   otherwise.
+ *
  *   HOW MANY DOCUMENTS. `readPostedInvoiceOrderDiscount` returns one amount when every posted
  *   document AGREES on it — which is exactly what a mirroring credit note needs, and is NOT a claim
  *   that there is one document. Two agreeing invoices charged that discount twice, and netting one
@@ -346,6 +354,61 @@ export function wcCouponNettingBasis(document: Extract<PostedInvoiceOrderDiscoun
           : `the tax basis of that invoice's order-level discount is ${document.taxBasis}, so whether ` +
             'it is on the same NET footing as the credit-note lines cannot be established, and a ' +
             'subtraction across two possibly-different bases is not a figure',
+    }
+  }
+  return { ok: true }
+}
+
+/**
+ * DO THE TWO SIDES LIVE IN THE SAME SET OF BOOKS (o3d-y14 r9 finding 1)?
+ *
+ * `wcCouponNettingBasis` above asks whether the invoice figure is the right KIND of number. This
+ * asks the question that needs BOTH documents, and it is the one the netting was missing entirely:
+ * `postedDiscount - reversal.amount` was subtracting a figure off a Xero invoice from a figure off a
+ * QuickBooks credit memo whenever the accounting connector had been switched between the two
+ * postings — an event this codebase already has a module for (`connector-orphans.ts`: "when the
+ * active accounting connector is switched (e.g. Xero → QuickBooks) ... rows for the OUTGOING
+ * connector become invisible to both processors"). The Xero invoice in that position is outstanding
+ * at its full posted value, and a net of 0 declares the customer square against it.
+ *
+ * SEPARATE from the case classification, and PURE, for the same reason the tax-basis check is: the
+ * invoice case is a true statement about the invoice whatever the answer here, and only the
+ * SUBTRACTION depends on it.
+ *
+ * WHAT IT CANNOT ESTABLISH — the organisation/realm inside one connector. Nothing IMS stores records
+ * it per document: `AccountingToken` is one row per connector, overwritten on reconnect, and the
+ * per-realm provenance column on `AccountingSyncLog` was tried and reverted (o3d-gt8r/o3d-s36z).
+ * That residual travels in the netted precondition rather than being assumed away.
+ */
+export function wcCouponLedgerMembership(
+  invoiceExternalSystem: string | null,
+  reversal: CreditNoteOrderDiscountReversal,
+): WcCouponNettingBasis {
+  if (!reversal.ok) {
+    return {
+      ok: false,
+      detail: 'the credit-note side established no posted document, so there is no ledger to compare against',
+    }
+  }
+  if (!invoiceExternalSystem) {
+    return {
+      ok: false,
+      detail:
+        "the mirrored event for that invoice records NO accounting system, so which set of books it " +
+        `was posted to is not established — and the credit note(s) are in ${systemName(reversal.externalSystem)}. ` +
+        'A subtraction between a figure in an unidentified ledger and one in a named ledger is not a net',
+    }
+  }
+  if (invoiceExternalSystem !== reversal.externalSystem) {
+    return {
+      ok: false,
+      detail:
+        `that invoice was posted to ${systemName(invoiceExternalSystem)} and this order's credit ` +
+        `note(s) to ${systemName(reversal.externalSystem)} — TWO SEPARATE LEDGERS. The active ` +
+        'accounting connector can be switched, and IMS keeps every historical document under the ' +
+        `connector that posted it, so the invoice is still outstanding at its full posted value in ` +
+        `${systemName(invoiceExternalSystem)} and nothing in ${systemName(reversal.externalSystem)} ` +
+        'reduces it. Their difference describes no balance that exists',
     }
   }
   return { ok: true }
@@ -563,25 +626,58 @@ function describeRefundPrecondition(refunds: WcCouponRefundEvidence): string {
  * instruction to bill a customer who has just been refunded, and the only defence available on the
  * far side of a committed transaction is to tell the operator what the instruction depends on.
  */
-export function wcCouponRemedySteps(remedy: WcCouponRemedy): string[] {
-  const { currency, amount, keptOrderLevel: kept } = remedy
-  const steps: string[] = [
-    `REMEDY (${systemName(remedy.externalSystem)}) — VALID ONLY WHILE this order's refund position is ` +
-      `${describeRefundPrecondition(remedy.validAgainst)}, as read ${remedy.derivedAt}. RE-CHECK THAT ` +
-      'IMMEDIATELY BEFORE POSTING: a refund recorded since voids this remedy. Re-derive it with ' +
-      '`--reprint <allowlist>`, which rebuilds this handoff from live state for an order that has ' +
-      'ALREADY been corrected (a plain report will not — a corrected order is skipped by every later ' +
-      'scan).',
+export function wcCouponPreconditionSteps(input: {
+  /** How the block opens — "REMEDY (Xero)" for an instruction, its own heading for a bare finding. */
+  heading: string
+  /** The act the re-check must happen before. "POSTING" for a remedy; a zero net posts nothing. */
+  beforeWhat: string
+  externalSystem: string | null
+  validAgainst: WcCouponRefundEvidence
+  derivedAt: string
+  /** The credit notes the figure was NETTED against, or empty when it depends on none. */
+  nettedAgainst: string[]
+  /** What is void if the position has moved — "this remedy", "this conclusion". */
+  whatIsVoid: string
+}): string[] {
+  const steps = [
+    `${input.heading} — VALID ONLY WHILE this order's refund position is ` +
+      `${describeRefundPrecondition(input.validAgainst)}, as read ${input.derivedAt}. RE-CHECK THAT ` +
+      `IMMEDIATELY BEFORE ${input.beforeWhat}: a refund recorded since voids ${input.whatIsVoid}. ` +
+      'Re-derive it with `--reprint <allowlist>`, which rebuilds this handoff from live state for an ' +
+      'order that has ALREADY been corrected (a plain report will not — a corrected order is skipped ' +
+      'by every later scan).',
   ]
-  if (remedy.nettedAgainst.length) {
-    // r8 finding 3. This figure is a DIFFERENCE, and one half of it is a document IMS cannot watch.
+  if (input.nettedAgainst.length) {
+    // r8 finding 3 and r9 finding 1. This figure is a DIFFERENCE between two documents, and IMS can
+    // watch NEITHER of the two things that would invalidate it: a credit note voided or edited by
+    // hand writes nothing back (the payment poller reads ACCREC invoice statuses, never ACCRECCREDIT),
+    // and no row IMS keeps records WHICH ORGANISATION inside the connector a document was posted to
+    // (AccountingToken is one row per connector, overwritten on reconnect; the per-realm provenance
+    // column was tried and reverted, o3d-gt8r/o3d-s36z). Both are one glance for the operator, who is
+    // being sent to open both documents anyway.
     steps.push(
-      `THIS FIGURE IS THE INVOICE NETTED AGAINST CREDIT NOTE(S) ${remedy.nettedAgainst.join(', ')}. ` +
-        `CONFIRM IN ${systemName(remedy.externalSystem)} THAT THEY ARE STILL POSTED AND UNCHANGED: a ` +
-        'credit note voided or edited by hand there writes nothing back to IMS, and the net above ' +
-        'is wrong by exactly whatever was changed.',
+      `THIS FIGURE IS THE INVOICE NETTED AGAINST CREDIT NOTE(S) ${input.nettedAgainst.join(', ')}. ` +
+        `CONFIRM IN ${systemName(input.externalSystem)} THAT THEY ARE STILL POSTED AND UNCHANGED, AND ` +
+        'THAT THEY AND THE INVOICE ARE IN THE SAME ORGANISATION: a credit note voided or edited by ' +
+        'hand writes nothing back to IMS, and IMS records which CONNECTOR posted each document but ' +
+        'never which organisation inside it. The net above is wrong by exactly whatever was changed, ' +
+        'and means nothing at all if the two documents are in different books.',
     )
   }
+  return steps
+}
+
+export function wcCouponRemedySteps(remedy: WcCouponRemedy): string[] {
+  const { currency, amount, keptOrderLevel: kept } = remedy
+  const steps: string[] = wcCouponPreconditionSteps({
+    heading: `REMEDY (${systemName(remedy.externalSystem)})`,
+    beforeWhat: 'POSTING',
+    externalSystem: remedy.externalSystem,
+    validAgainst: remedy.validAgainst,
+    derivedAt: remedy.derivedAt,
+    nettedAgainst: remedy.nettedAgainst,
+    whatIsVoid: 'this remedy',
+  })
 
   switch (remedy.kind) {
     case 'INCREASE_RECEIVABLE':
@@ -769,10 +865,24 @@ function wcCouponRefundedInvoiceLines(
     invoice.case === 'NO_INVOICE_IN_LEDGER' || invoice.case === 'DOCUMENT_UNVERIFIED'
       ? { ok: false, detail: 'no readable invoice figure to net against' }
       : invoice.netting
-  // r8 findings 1 and 2. `reversal.ok` says the credit-note side is established; `nettingBasis.ok`
-  // says the two sides are the same kind of number and describe one document each. Both are
-  // required, and the second is NOT implied by the first.
-  if (reversal.ok && invoice.case !== 'NO_INVOICE_IN_LEDGER' && invoice.case !== 'DOCUMENT_UNVERIFIED' && nettingBasis.ok) {
+  // r9 finding 1. The third condition, and the only one that needs BOTH documents: are they in the
+  // same set of books at all? Computed here rather than in `classifyWcCouponInvoiceHandoff`, which
+  // runs before the credit-note side has been read.
+  const membership: WcCouponNettingBasis =
+    invoice.case === 'NO_INVOICE_IN_LEDGER' || invoice.case === 'DOCUMENT_UNVERIFIED'
+      ? { ok: false, detail: 'no readable invoice ledger to compare against' }
+      : wcCouponLedgerMembership(invoice.externalSystem, reversal)
+  // r8 findings 1 and 2, r9 finding 1. `reversal.ok` says the credit-note side is established;
+  // `nettingBasis.ok` says the two sides are the same kind of number and describe one document each;
+  // `membership.ok` says they are balances in the same ledger. All three are required, and none of
+  // them is implied by the others.
+  if (
+    reversal.ok &&
+    invoice.case !== 'NO_INVOICE_IN_LEDGER' &&
+    invoice.case !== 'DOCUMENT_UNVERIFIED' &&
+    nettingBasis.ok &&
+    membership.ok
+  ) {
     const net = money(invoice.postedDiscount - reversal.amount)
     const facts = [
       `${invoice.documentRef} carries an order-level discount of ${invoice.postedDiscount} ${currency}, ` +
@@ -781,12 +891,43 @@ function wcCouponRefundedInvoiceLines(
         `${currency}.`,
     ]
     if (net === 0) {
+      // r9 finding 2 — A ZERO NET CARRIES THE SAME PRECONDITION AS A NON-ZERO ONE, AND NEEDS IT MORE.
+      //
+      // r8 gave the netted REMEDY a precondition naming the credit notes it rests on, because IMS
+      // cannot see one voided or edited by hand in Xero or QuickBooks — the pollers read ACCREC
+      // invoice statuses, never ACCRECCREDIT. A zero net rests on exactly the same documents and had
+      // no precondition at all, because the block that prints one only ever runs for a remedy.
+      //
+      // That is the wrong way round. A hand-voided credit note does not merely change this figure:
+      // it means the reversal never happened, the invoice stands at its full posted value, and the
+      // customer still owes it — while this order is the ONE outcome that tells the operator there
+      // is nothing to look at and takes it off the must-fix list. The precondition is therefore
+      // printed FIRST, before the conclusion it governs, and the conclusion is stated as the
+      // CONDITIONAL it actually is.
+      //
+      // It is not a remedy and does not become one: `wcCouponPreconditionSteps` names no instrument,
+      // and `remedy` stays NULL, so "no instrument reaches an operator except through the
+      // classifier" is untouched.
       return {
         lines: [
+          ...wcCouponPreconditionSteps({
+            heading: `THIS "NOTHING TO DO" IS CONDITIONAL (${systemName(invoice.externalSystem)})`,
+            beforeWhat: 'FILING THIS ORDER AS SETTLED',
+            externalSystem: invoice.externalSystem,
+            validAgainst: refunds,
+            derivedAt: context.derivedAt,
+            nettedAgainst: [...refunds.postedCreditNoteExternalIds],
+            whatIsVoid: 'this conclusion',
+          }),
           ...facts,
-          'THE TWO ERRORS CANCEL: the credit note reversed the same mis-stated discount the invoice ' +
-            'charged, so this customer is square. NO ACCOUNTING ACTION for this order — this run only ' +
-            'removed the duplicate from IMS.',
+          'THE TWO ERRORS CANCEL, PROVIDED THOSE CREDIT NOTES STILL STAND: the credit note reversed ' +
+            'the same mis-stated discount the invoice charged, so on the documents IMS can see this ' +
+            'customer is square, and there is NO ACCOUNTING ACTION for this order — this run only ' +
+            'removed the duplicate from IMS. If any of the credit notes named above has been voided ' +
+            'or edited by hand, or turns out to sit in a different organisation from the invoice, ' +
+            `then that reversal did not happen: ${invoice.documentRef} stands at its full posted ` +
+            'value and this order is NOT settled. Re-derive it with `--reprint <allowlist>` and ' +
+            'escalate rather than acting on this line.',
         ],
         remedy: null,
         nettedToNothing: true,
@@ -826,7 +967,12 @@ function wcCouponRefundedInvoiceLines(
 
   // Everything below is a refusal. The netting reason is carried into the fallback so the operator
   // is told WHICH half could not be established, and never left to infer it (r8 findings 1 and 2).
-  const nettingRefusals = reversal.ok && !nettingBasis.ok ? [nettingBasis.detail] : []
+  // The membership refusal is added only where the invoice side itself was fine: on an unverified or
+  // absent invoice `nettingBasis` is already the placeholder refusal for exactly that, and printing
+  // "and also the ledgers cannot be compared" beside it names one failure twice.
+  const nettingRefusals = reversal.ok
+    ? [...(nettingBasis.ok ? (membership.ok ? [] : [membership.detail]) : [nettingBasis.detail])]
+    : []
   // AND THE PROSE HAS TO MATCH WHICH HALF FAILED (r8). "What the credit notes carry could not be
   // established" is simply false where the legs derived and only the SUBTRACTION was withdrawn, and
   // a sentence an operator can see is wrong is a sentence they start discounting.

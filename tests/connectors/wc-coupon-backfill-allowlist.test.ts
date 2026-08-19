@@ -13,6 +13,7 @@ import {
   decideWcCouponBackfill,
   isNearWcCouponCutoff,
   parseWcCouponAllowlist,
+  parseWcCouponCliFlags,
   parseWcCouponCutoff,
   type WcCouponAllowlistEntry,
   type WcCouponBackfillRow,
@@ -695,4 +696,121 @@ test('APPLY still parses with the signature required — the gate did not move (
   assert.match(applyFn, /parseWcCouponAllowlist\(parsedJson\)/)
   assert.doesNotMatch(applyFn, /requireSignature/, 'apply must never relax the signature')
   assert.match(reprintFn, /parseWcCouponAllowlist\(parsedJson, \{ requireSignature: false \}\)/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r9 finding 3 — the COMMAND LINE cannot silently select a mode
+// ---------------------------------------------------------------------------
+
+/**
+ * THE DEFECT, AND WHY THE WHOLE SURFACE IS TESTED RATHER THAN THE ONE FLAG REPORTED.
+ *
+ * The script read every flag as `argv[argv.indexOf('--' + name) + 1] ?? null`, which cannot tell a
+ * flag from its own value or a missing value from an absent flag. The reported case was `--reprint`
+ * with nothing after it falling through to `--apply` — the read-only mode, deliberately checked
+ * first and made mutually exclusive with apply, silently becoming the WRITING one. The identical
+ * shape was found on a sibling branch this session (`--write-log` with nothing after it reading as
+ * `undefined`), so every flag on this script is covered below, not just the one that was found.
+ */
+function flags(...argv: string[]) {
+  return parseWcCouponCliFlags(argv)
+}
+
+test('--apply --reprint no longer silently WRITES (o3d-y14 r9 F3)', () => {
+  // The reported defect, in the order that made it dangerous: `--reprint` has nothing after it, so
+  // it read as absent, the read-only branch was never entered and the run applied.
+  const parsed = flags('--apply', '--reprint')
+
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.ok ? '' : parsed.detail, /"--reprint" needs a value and nothing follows it/)
+})
+
+test('--reprint --apply does not consume the apply flag as a file name (o3d-y14 r9 F3)', () => {
+  const parsed = flags('--reprint', '--apply')
+
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.ok ? '' : parsed.detail, /the next argument is the flag "--apply"/)
+})
+
+test('EVERY value flag refuses an empty tail, not just the one that was reported (r9 F3)', () => {
+  // The same shape on each. `--allowlist-out` alone silently produced no proposal file; the operator
+  // reviews a file that was never written. `--imported-before` alone silently became "no cutoff",
+  // which classifies every unstamped order as UNPROVEN — the input the whole allowlist is built on.
+  for (const flag of ['--imported-before', '--csv', '--allowlist', '--allowlist-out', '--reprint']) {
+    const parsed = flags(flag)
+    assert.equal(parsed.ok, false, flag)
+    assert.match(parsed.ok ? '' : parsed.detail, /needs a value/, flag)
+  }
+})
+
+test('a value flag followed by another flag refuses rather than eating it (r9 F3)', () => {
+  const parsed = flags('--imported-before', '--csv', 'out.csv')
+
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.ok ? '' : parsed.detail, /BOTH would be lost/)
+})
+
+test('an unknown flag is refused instead of ignored in silence (r9 F3)', () => {
+  // `--reprnt list.json` used to run a full REPORT with no cutoff and print nothing about it.
+  const parsed = flags('--reprnt', 'list.json')
+
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.ok ? '' : parsed.detail, /unknown flag "--reprnt"/)
+})
+
+test('--flag=value is refused rather than dropped (r9 F3)', () => {
+  const parsed = flags('--csv=out.csv')
+
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.ok ? '' : parsed.detail, /does not accept and used to IGNORE in silence/)
+})
+
+test('a bare positional argument is refused (r9 F3)', () => {
+  // `tsx script.ts y14-allowlist.json --apply` used to refuse for the RIGHT reason by luck (no
+  // --allowlist), but `tsx script.ts y14-allowlist.json` ran a full scan the operator never asked for.
+  const parsed = flags('y14-allowlist.json')
+
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.ok ? '' : parsed.detail, /unexpected argument "y14-allowlist.json"/)
+})
+
+test('a repeated flag is refused — only the first would ever have been read (r9 F3)', () => {
+  const parsed = flags('--reprint', 'a.json', '--reprint', 'b.json')
+
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.ok ? '' : parsed.detail, /was given more than once/)
+})
+
+test('an empty value is refused (r9 F3)', () => {
+  const parsed = flags('--allowlist', '   ')
+
+  assert.equal(parsed.ok, false)
+  assert.match(parsed.ok ? '' : parsed.detail, /empty value/)
+})
+
+test('the three legitimate invocations still parse exactly as documented (r9 F3)', () => {
+  // A parser that refused everything would satisfy every assertion above and break the script, so
+  // the three commands in the file header are asserted to survive it unchanged.
+  const propose = flags('--imported-before', '2026-07-25T14:00:00Z', '--allowlist-out', 'y14.json', '--csv', 'y14.csv')
+  assert.equal(propose.ok, true)
+  assert.deepEqual(propose.ok && propose.flags, {
+    apply: false,
+    'imported-before': '2026-07-25T14:00:00Z',
+    csv: 'y14.csv',
+    allowlist: null,
+    'allowlist-out': 'y14.json',
+    reprint: null,
+  })
+
+  const apply = flags('--allowlist', 'y14.json', '--apply')
+  assert.equal(apply.ok, true)
+  assert.equal(apply.ok && apply.flags.apply, true)
+  assert.equal(apply.ok && apply.flags.allowlist, 'y14.json')
+
+  const reprint = flags('--reprint', 'y14.json')
+  assert.equal(reprint.ok, true)
+  assert.equal(reprint.ok && reprint.flags.reprint, 'y14.json')
+  assert.equal(reprint.ok && reprint.flags.apply, false)
+
+  assert.equal(flags().ok, true, 'no arguments at all is a plain report, and still legal')
 })

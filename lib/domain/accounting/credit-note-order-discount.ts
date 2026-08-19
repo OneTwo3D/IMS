@@ -74,6 +74,33 @@ import type { Prisma } from '@/app/generated/prisma/client'
  *     credit-note staging did not complete. What the rows describe is then a document IMS is still
  *     trying to produce.
  *
+ * AND BOTH DOCUMENTS MUST LIVE IN THE SAME LEDGER (r9 finding 1).
+ *
+ * A subtraction between an invoice's order-level discount and a credit note's is only arithmetic if
+ * the two documents are in the same set of books. IMS does not guarantee that. `AccountingEvent`
+ * stamps every mirrored document with the connector that posted it (`externalSystem`), and the
+ * ACTIVE accounting connector can be SWITCHED — `lib/domain/accounting/connector-orphans.ts` exists
+ * for precisely that event ("when the active accounting connector is switched (e.g. Xero →
+ * QuickBooks)"). An order invoiced before a switch and credited after it therefore has an ACCREC
+ * invoice standing at full value in Xero and an unrelated credit memo in QuickBooks, and the
+ * difference between their two discount legs describes no ledger that exists. Netting them declares
+ * a customer square while the invoice they actually owe against is untouched.
+ *
+ * So the connector is READ OFF EACH DOCUMENT'S OWN mirrored event and required to agree: this module
+ * establishes that every credit note in the position names ONE non-null system, and the handoff
+ * (`wcCouponLedgerMembership`) requires the invoice to name that same one. Either failing withdraws
+ * the NET; the legs are still reported, as always.
+ *
+ * WHAT THAT ESTABLISHES AND WHAT IT DOES NOT. It establishes the CONNECTOR. It does not establish
+ * the ORGANISATION/REALM within that connector: no row IMS keeps records the tenant a document was
+ * posted to — `AccountingToken` holds one row per connector (`@@unique([connector])`), so a reconnect
+ * to a different Xero organisation OVERWRITES it and says nothing about a historical document, and
+ * the per-realm provenance column on `AccountingSyncLog` was tried and REVERTED (o3d-gt8r/o3d-s36z).
+ * That residual is NOT silently assumed away: it is named in the precondition the netted outcome
+ * carries, next to the hand-void warning, because it has the same shape — a fact about the
+ * accounting system that IMS cannot read, and that the operator can, in the same glance they already
+ * have to make at both documents.
+ *
  * WHAT IT STILL CANNOT SEE, stated rather than papered over: a credit note VOIDED OR EDITED IN XERO
  * OR QUICKBOOKS BY HAND. Nothing writes back to IMS when that happens — the payment poller reads
  * ACCREC invoice statuses, never ACCRECCREDIT — so no query here can detect it. That is why the
@@ -131,6 +158,13 @@ export type CreditNoteDiscountLeg = {
   externalCreditNoteId: string | null
   /** Was this refund built by MIRRORING the invoice (`chargeback: true`)? */
   chargeback: boolean
+  /**
+   * WHICH ACCOUNTING SYSTEM this credit note was posted BY, as its standing mirrored event records
+   * it (r9 finding 1). NULL where the leg refused before the document was established, or where the
+   * mirrored event names no connector at all. A netted position requires ONE non-null value here,
+   * shared with the invoice.
+   */
+  externalSystem: string | null
   /** The order-level discount this credit note reversed, or NULL when it could not be established. */
   amount: number | null
   /** Why it is what it is — printed to the operator verbatim. */
@@ -145,7 +179,14 @@ export type CreditNoteDiscountLeg = {
  * amount` the net. Anything less returns the legs as facts and refuses the total.
  */
 export type CreditNoteOrderDiscountReversal =
-  | { ok: true; amount: number; legs: CreditNoteDiscountLeg[]; detail: string }
+  | {
+      ok: true
+      amount: number
+      /** The ONE accounting system every netted credit note was posted by (r9 finding 1). */
+      externalSystem: string
+      legs: CreditNoteDiscountLeg[]
+      detail: string
+    }
   | { ok: false; legs: CreditNoteDiscountLeg[]; detail: string }
 
 export type CreditNoteOrderDiscountClient = Pick<Prisma.TransactionClient, 'salesOrderRefund' | 'accountingEvent'>
@@ -157,7 +198,13 @@ export const CREDIT_NOTE_EVENT_TYPE = 'CREDIT_NOTE'
 export const POSTED_CREDIT_NOTE_EVENT_STATUS = 'POSTED'
 
 /** One mirrored CREDIT_NOTE event, as the standing-document check reads it. */
-type MirroredCreditNote = { sourceEntityId: string; status: string; externalId: string | null }
+type MirroredCreditNote = {
+  sourceEntityId: string
+  status: string
+  externalId: string | null
+  /** The connector that posted the document — the ledger it lives in (r9 finding 1). */
+  externalSystem: string | null
+}
 
 /**
  * Does the mirror say this refund's credit note is STANDING, exactly as the persisted rows describe
@@ -166,7 +213,7 @@ type MirroredCreditNote = { sourceEntityId: string; status: string; externalId: 
 export function creditNoteDocumentStanding(
   refund: { id: string; accountingCreditNoteId: string | null; accountingRetryRequired?: boolean | null; accountingWarning?: string | null },
   events: readonly MirroredCreditNote[],
-): { ok: true } | { ok: false; detail: string } {
+): { ok: true; externalSystem: string | null } | { ok: false; detail: string } {
   if (refund.accountingRetryRequired) {
     return {
       ok: false,
@@ -221,7 +268,54 @@ export function creditNoteDocumentStanding(
         'do not agree',
     }
   }
-  return { ok: true }
+  // r9 finding 1. The one document that stands, and the LEDGER it stands in — returned rather than
+  // discarded, because the netting is a subtraction across two documents and a figure from another
+  // set of books is not one of its terms.
+  return { ok: true, externalSystem: posted.externalSystem }
+}
+
+/** The one ledger every derived credit-note leg was posted to, or why that could not be said. */
+export type CreditNoteLedger = { ok: true; externalSystem: string } | { ok: false; detail: string }
+
+/**
+ * WHICH LEDGER THIS ORDER'S CREDIT NOTES LIVE IN (r9 finding 1). Pure, so every branch is reachable
+ * from plain values.
+ *
+ * Two credit notes posted by two different connectors do not jointly reverse one invoice: each one
+ * reduces a balance in its own set of books, and their sum is not a quantity in either. And a
+ * mirrored event that names NO connector places its document in no ledger at all, which is the same
+ * refusal the invoice side already makes when it has no posting rule to replay.
+ */
+export function creditNoteLedger(legs: readonly CreditNoteDiscountLeg[]): CreditNoteLedger {
+  const derived = legs.filter((leg) => leg.amount !== null)
+  if (derived.length === 0) {
+    return {
+      ok: false,
+      detail: 'no credit-note leg established a posted document, so no ledger is established either',
+    }
+  }
+  const systems = [...new Set(derived.map((leg) => leg.externalSystem))]
+  if (systems.length > 1) {
+    return {
+      ok: false,
+      detail:
+        `this order's credit notes were posted by DIFFERENT accounting systems ` +
+        `(${systems.map((system) => system ?? '(none recorded)').sort().join(', ')}) — the active ` +
+        'accounting connector can be switched, and each document reduces a balance only in the books ' +
+        'that hold it, so their totals do not add up to a reversal of one invoice',
+    }
+  }
+  const [only] = systems
+  if (!only) {
+    return {
+      ok: false,
+      detail:
+        "the mirrored credit-note event(s) for this order record NO accounting system, so which set of " +
+        'books these documents live in is not established — and an invoice figure may only be netted ' +
+        'against a credit note posted to the SAME ledger',
+    }
+  }
+  return { ok: true, externalSystem: only }
 }
 
 /**
@@ -272,7 +366,7 @@ export async function readCreditNoteOrderDiscount(
       sourceEntityId: { in: [...evidence.refundIds] },
       type: CREDIT_NOTE_EVENT_TYPE,
     },
-    select: { sourceEntityId: true, status: true, externalId: true },
+    select: { sourceEntityId: true, status: true, externalId: true, externalSystem: true },
   })) as MirroredCreditNote[]
   const mirroredByRefund = new Map<string, MirroredCreditNote[]>()
   for (const event of mirrored) {
@@ -289,6 +383,7 @@ export async function readCreditNoteOrderDiscount(
         refundId,
         externalCreditNoteId: null,
         chargeback: false,
+        externalSystem: null,
         amount: null,
         detail: `refund ${refundId} could not be read back`,
       })
@@ -322,6 +417,12 @@ export async function readCreditNoteOrderDiscount(
     )
   }
 
+  // THE LEDGER BOTH SIDES MUST SHARE (r9 finding 1). Checked only once every leg has derived: with
+  // a refusal already recorded the position is refused anyway, and "and their ledgers disagree" over
+  // a subset of the documents is a sentence about a set that is not the position.
+  const ledger = creditNoteLedger(legs)
+  if (!ledger.ok && legs.every((leg) => leg.amount !== null)) refusals.push(ledger.detail)
+
   if (evidence.disposition !== 'FULL') {
     refusals.push(
       `this order's refund position is ${evidence.disposition}, and netting one invoice against credit ` +
@@ -334,15 +435,23 @@ export async function readCreditNoteOrderDiscount(
     return { ok: false, legs, detail: refusals.join('; ') }
   }
 
+  // Narrowed rather than asserted. `refusals` being empty already implies this — every leg derived,
+  // so the `creditNoteLedger` refusal above would have been pushed — but the compiler cannot see
+  // that, and an `as` here is exactly the kind of claim this file exists to stop making.
+  if (!ledger.ok) {
+    return { ok: false, legs, detail: ledger.detail }
+  }
+
   const amount = money(legs.reduce((sum, leg) => sum + (leg.amount ?? 0), 0))
   return {
     ok: true,
     amount,
+    externalSystem: ledger.externalSystem,
     legs,
     detail:
       `credit note(s) ${inLedger.join(', ')} fully reverse this order and carry ${amount} of ` +
-      'order-level discount between them, replayed from the persisted refund lines of documents the ' +
-      'mirror still records as POSTED and unaltered',
+      `order-level discount between them, all posted to ${ledger.externalSystem}, replayed from the ` +
+      'persisted refund lines of documents the mirror still records as POSTED and unaltered',
   }
 }
 
@@ -362,6 +471,8 @@ function deriveLeg(
     refundId: refund.id,
     externalCreditNoteId: refund.accountingCreditNoteId,
     chargeback: refund.chargeback,
+    // Unknown until the standing check has picked out the ONE document these lines went to.
+    externalSystem: null as string | null,
   }
 
   if (!refund.accountingCreditNoteId) {
@@ -401,6 +512,10 @@ function deriveLeg(
   if (!standing.ok) {
     return { ...base, amount: null, detail: standing.detail }
   }
+  // r9 finding 1. From here the document is established, so the ledger it lives in is too — carried
+  // on every leg below, refused or not, because "which books is this in" is a fact the operator
+  // needs whether or not the subtraction survives.
+  const posted = { ...base, externalSystem: standing.externalSystem }
 
   const discountLines = refund.lines.filter((line) => classifyPersistedRefundLineKind(line) === 'discount')
   let total = 0
@@ -408,11 +523,11 @@ function deriveLeg(
     const totalBase = round4(numeric(line.totalBase))
     const totalForeign = round4(numeric(line.totalForeign))
     if (!Number.isFinite(totalBase) || !Number.isFinite(totalForeign)) {
-      return { ...base, amount: null, detail: `refund ${refund.id} has a discount line with an unreadable amount` }
+      return { ...posted, amount: null, detail: `refund ${refund.id} has a discount line with an unreadable amount` }
     }
     if (totalBase !== totalForeign) {
       return {
-        ...base,
+        ...posted,
         amount: null,
         detail:
           `refund ${refund.id} has a discount line whose base (${totalBase}) and foreign ` +
@@ -427,7 +542,7 @@ function deriveLeg(
 
   const amount = money(total)
   return {
-    ...base,
+    ...posted,
     amount,
     detail:
       discountLines.length === 0

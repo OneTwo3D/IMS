@@ -76,14 +76,18 @@
  *     COULD derive so the netting starts from figures rather than from documents. Apply compares
  *     this whole position against live state and refuses if it has moved.
  *
- *     AND THE NET IS WITHDRAWN WHERE THE SUBTRACTION IS NOT DEFINED (o3d-y14 r8 findings 1-3), even
- *     when both sides derive: a TAX-INCLUSIVE invoice states its order-level discount GROSS while
- *     every credit-note refund line IMS stores is NET, and nothing persisted inverts the conversion
- *     (a refund line records a tax TYPE, never a rate); TWO POSTED INVOICES that AGREE hold that
- *     discount twice, and agreement is a rule built for the chargeback resolver rather than a
- *     statement that there is one document; and a credit note the mirror shows as VOID, REVERSED,
- *     re-posted or never posted is not a document whose persisted lines describe what stands. Each
- *     names the condition that failed and prescribes nothing.
+ *     AND THE NET IS WITHDRAWN WHERE THE SUBTRACTION IS NOT DEFINED (o3d-y14 r8 findings 1-3, r9
+ *     finding 1), even when both sides derive: a TAX-INCLUSIVE invoice states its order-level
+ *     discount GROSS while every credit-note refund line IMS stores is NET, and nothing persisted
+ *     inverts the conversion (a refund line records a tax TYPE, never a rate); TWO POSTED INVOICES
+ *     that AGREE hold that discount twice, and agreement is a rule built for the chargeback resolver
+ *     rather than a statement that there is one document; a credit note the mirror shows as VOID,
+ *     REVERSED, re-posted or never posted is not a document whose persisted lines describe what
+ *     stands; and the invoice and the credit notes must have been posted to THE SAME LEDGER — the
+ *     active accounting connector can be switched, IMS keeps every historical document under the
+ *     connector that posted it, and an order invoiced in Xero and credited in QuickBooks has an
+ *     invoice standing at full value that the credit memo reduces by nothing. Each names the
+ *     condition that failed and prescribes nothing.
  *
  *   • A REMEDY CAN BE WITHDRAWN AFTER THE FACT (o3d-y14 r7 finding 2, r8 finding 4). Every remedy
  *     printed at the end of an apply run is re-validated against the live refund position TWICE:
@@ -98,11 +102,15 @@
  *     that check is not optional, and it is the only thing that closes the window between this
  *     report being printed and you acting on it.
  *
- *     A netted remedy additionally names THE CREDIT NOTES ITS FIGURE WAS DERIVED AGAINST (o3d-y14 r8
- *     finding 3). IMS can see a credit note it never posted, one it re-posted and one it retired —
- *     all of those suppress the netting — but NOT one voided or edited by hand in Xero or QuickBooks,
- *     because nothing writes that back. Confirming those documents still stand is part of the
- *     instruction, not an optional extra.
+ *     EVERY netted outcome names THE CREDIT NOTES ITS FIGURE WAS DERIVED AGAINST (o3d-y14 r8
+ *     finding 3, r9 finding 2) — including the one that nets to ZERO. IMS can see a credit note it
+ *     never posted, one it re-posted and one it retired — all of those suppress the netting — but
+ *     NOT one voided or edited by hand in Xero or QuickBooks, because nothing writes that back, and
+ *     it records which CONNECTOR posted a document but never which ORGANISATION inside it. Confirming
+ *     those documents still stand, and are in the same organisation as the invoice, is part of the
+ *     output rather than an optional extra. A zero net needs it MOST: a hand-voided credit note
+ *     there means the reversal never happened, the invoice stands at its full posted value and the
+ *     customer still owes it — and a zero is the one answer that says there is nothing to look at.
  *   • Anything you are not sure about: DELETE the entry. Skipping is re-runnable; a wrong correction
  *     is not.
  *
@@ -149,6 +157,13 @@
  * WooCommerce link. It never touches the accounting queue: an order with unposted invoice work
  * (o3d-5ct) or an unposted daily revenue-deferral journal is DECLINED and reported.
  *
+ * THE COMMAND LINE IS PARSED STRICTLY (o3d-y14 r9 finding 3). Every flag above must be spelled
+ * exactly, appear at most once, and be followed by its own value — an unknown flag, a `--flag=value`,
+ * a bare path, or a flag with nothing after it REFUSES the run rather than being ignored. The old
+ * reader could not tell a flag from a value, so `--apply --reprint` silently ran the WRITING mode
+ * the operator had asked to avoid, and `--allowlist-out` with nothing after it silently produced no
+ * proposal at all. Refusal costs a retyped command; the alternative cost real writes.
+ *
  * --imported-before is the moment the o3d-y14 importer fix went LIVE on this instance. It is dated
  * against ShoppingOrderLink.createdAt — when IMS imported the order — and never against
  * SalesOrder.createdAt, which the initial import backdates to the historical Woo order date.
@@ -174,6 +189,7 @@ import {
   isNearWcCouponCutoff,
   normalizeWcCouponRefundDisposition,
   parseWcCouponAllowlist,
+  parseWcCouponCliFlags,
   parseWcCouponCutoff,
   reprintWcCouponLedgerHandoff,
   revalidateWcCouponHandoff,
@@ -198,12 +214,11 @@ import { liveDailyBatchDeferralWhere } from '../lib/domain/accounting/daily-batc
 config({ path: '.env.local', quiet: true })
 config({ quiet: true })
 
-const APPLY = process.argv.includes('--apply')
-
-function flagValue(name: string): string | null {
-  const index = process.argv.indexOf(`--${name}`)
-  return index >= 0 ? (process.argv[index + 1] ?? null) : null
-}
+// NO ad-hoc argv reading anywhere in this file (o3d-y14 r9 finding 3). `parseWcCouponCliFlags` is
+// the ONLY thing that looks at the command line, it refuses everything it does not exactly
+// understand, and it is unit-tested — the previous `indexOf(flag) + 1` reader turned `--apply
+// --reprint` into a WRITING run, because a flag with nothing after it read as absent and the
+// read-only branch was never entered.
 
 const LOG = '[backfill-wc-coupon-order-discount]'
 
@@ -926,11 +941,18 @@ async function reprint(allowlistPath: string) {
 }
 
 async function main() {
-  const importedBeforeRaw = flagValue('imported-before')
-  const csvPath = flagValue('csv')
-  const allowlistPath = flagValue('allowlist')
-  const allowlistOut = flagValue('allowlist-out')
-  const reprintPath = flagValue('reprint')
+  const parsedFlags = parseWcCouponCliFlags(process.argv.slice(2))
+  if (!parsedFlags.ok) {
+    console.error(`${LOG} REFUSING to run: ${parsedFlags.detail}.`)
+    process.exitCode = 1
+    return
+  }
+  const APPLY = parsedFlags.flags.apply
+  const importedBeforeRaw = parsedFlags.flags['imported-before']
+  const csvPath = parsedFlags.flags.csv
+  const allowlistPath = parsedFlags.flags.allowlist
+  const allowlistOut = parsedFlags.flags['allowlist-out']
+  const reprintPath = parsedFlags.flags.reprint
 
   if (reprintPath) {
     // Deliberately checked BEFORE --apply, and mutually exclusive with it: this mode exists to be

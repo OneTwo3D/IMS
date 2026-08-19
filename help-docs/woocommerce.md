@@ -102,6 +102,8 @@ With the initial import complete, new and updated WooCommerce orders are importe
   npm run wc:coupon-discount:backfill -- --reprint y14.json
   ```
 
+  The command line is parsed strictly: a misspelled flag, a `--flag=value`, a bare path, a repeated flag, or a flag with nothing after it **refuses the run** instead of being ignored. That matters most for `--reprint`, which used to fall through to `--apply` when given no value — the read-only mode silently becoming the writing one.
+
   It writes nothing, takes no lock and re-verifies nothing — it re-derives each order's handoff against **live** state and prints it. The file does not need to be signed, because nothing is decided; `--apply` still refuses an unsigned file and always will, and the two flags cannot be combined. Anywhere the tool tells you a position can be re-derived, this is the command it means.
 
   Verdicts in the report and the CSV:
@@ -118,9 +120,12 @@ With the initial import complete, new and updated WooCommerce orders are importe
 
   - the invoice must have been sent **tax-exclusive**. A tax-inclusive invoice states its order-level discount gross while every refund line IMS stores is net, and nothing recorded lets one be converted into the other (a refund line records a tax *type*, never a rate), so the subtraction is not defined;
   - there must be exactly **one** posted sales invoice. Two invoices that agree on the discount charged it twice, and netting one credit-note total against one of them describes a set of documents the ledger does not hold;
-  - each credit note must still **stand as IMS recorded it** — mirrored as posted, once, under the id the refund names, with no retry pending. A credit note IMS retired or re-posted no longer carries the lines its refund rows describe.
+  - each credit note must still **stand as IMS recorded it** — mirrored as posted, once, under the id the refund names, with no retry pending. A credit note IMS retired or re-posted no longer carries the lines its refund rows describe;
+  - the invoice and the credit notes must have been posted to the **same accounting system**. The active accounting connector can be switched (Xero → QuickBooks), and IMS keeps every historical document under the connector that posted it — so an order invoiced before a switch and credited after it has an invoice standing at its full value in one ledger and an unrelated credit memo in the other, and the difference between their discount lines describes no balance that exists.
 
-  In every other shape IMS reports the invoice finding, prints every credit-note leg it *could* derive, names the exact condition that stopped it, and prescribes **nothing**. And a netted remedy names the credit notes its figure was derived against and tells you to confirm they still stand: a credit note voided or edited by hand in Xero or QuickBooks writes nothing back to IMS, so that check is yours.
+  In every other shape IMS reports the invoice finding, prints every credit-note leg it *could* derive, names the exact condition that stopped it, and prescribes **nothing**.
+
+  **Every netted answer names the credit notes it was derived against — including the one that nets to nothing.** IMS cannot see a credit note voided or edited by hand in Xero or QuickBooks (nothing writes that back), and it records which *connector* posted each document but never which *organisation* inside it. So both netted outcomes tell you to open those documents and confirm they still stand, in the same organisation as the invoice, before you act on the figure. A net of **zero** carries that warning most heavily: it is the one answer that says there is nothing to look at, and if one of the credit notes was voided by hand then the reversal never happened, the invoice stands at its full posted value and the customer still owes it.
 
   The revenue-deferral journal is deliberately left alone in all cases: IMS recognises back out the same stamped figure, so adjusting one half of that pair by hand would strand the difference in unearned revenue permanently.
 

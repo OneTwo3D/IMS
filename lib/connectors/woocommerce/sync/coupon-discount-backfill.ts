@@ -503,6 +503,140 @@ export function parseWcCouponCutoff(raw: string, now: Date): WcCouponCutoffResul
   return { ok: true, cutoff }
 }
 
+// ---------------------------------------------------------------------------
+// THE COMMAND LINE (o3d-y14 r9 finding 3)
+// ---------------------------------------------------------------------------
+
+/**
+ * PARSE THIS SCRIPT'S FLAGS STRICTLY, and REFUSE anything not exactly understood.
+ *
+ * THE DEFECT. The script read its flags with `argv[argv.indexOf('--' + name) + 1] ?? null`, which
+ * cannot tell a flag from its own value or a missing value from an absent flag. Every failure it
+ * produces is SILENT and lands on the mode selection:
+ *
+ *   • `--apply --reprint` — `--reprint` has nothing after it, so it reads as absent, the read-only
+ *     branch that is deliberately checked FIRST and made mutually exclusive with `--apply` is never
+ *     entered, and the run WRITES. The operator asked for the mode that cannot write and got the one
+ *     that does.
+ *   • `--reprint --apply` — `--reprint`'s "value" is the literal string `--apply`, so the run tries
+ *     to open a file called `--apply` and, having consumed it as a value, does not see the apply
+ *     flag either.
+ *   • `--allowlist-out` with nothing after it — the proposal file the operator believes they just
+ *     produced is never written, and the report otherwise looks identical.
+ *   • `--imported-before` with nothing after it — the cutoff silently becomes "none", which
+ *     classifies every unstamped order as UNPROVEN. A read-only wrong answer, but it is the answer
+ *     the whole reviewed allowlist is built from.
+ *   • `--csv=out.csv`, `--reprnt list.json`, or a bare path with no flag at all — all ignored in
+ *     silence, all leaving the operator with a run that did something other than what they typed.
+ *
+ * The identical shape was found on a sibling branch this session (`--write-log` with nothing after
+ * it), so this parser is deliberately whole-surface rather than a patch to the one flag reported:
+ * it validates EVERY flag the script accepts, rejects every token it does not recognise, and refuses
+ * duplicates and `--flag=value` (which this script has never supported and silently dropped).
+ *
+ * REFUSAL IS ALWAYS RECOVERABLE: nothing has run, and the operator retypes the command.
+ */
+export const WC_COUPON_BOOLEAN_FLAGS = ['apply'] as const
+export const WC_COUPON_VALUE_FLAGS = ['imported-before', 'csv', 'allowlist', 'allowlist-out', 'reprint'] as const
+
+export type WcCouponCliFlags = {
+  apply: boolean
+  'imported-before': string | null
+  csv: string | null
+  allowlist: string | null
+  'allowlist-out': string | null
+  reprint: string | null
+}
+
+export type WcCouponCliParse = { ok: true; flags: WcCouponCliFlags } | { ok: false; detail: string }
+
+const WC_COUPON_CLI_USAGE =
+  'Usage: --imported-before <ISO instant> [--csv <path>] [--allowlist-out <path>] | ' +
+  '--allowlist <path> --apply | --reprint <path>'
+
+/**
+ * @param argv the arguments AFTER the interpreter and script path (i.e. `process.argv.slice(2)`).
+ */
+export function parseWcCouponCliFlags(argv: readonly string[]): WcCouponCliParse {
+  const booleans = new Set<string>(WC_COUPON_BOOLEAN_FLAGS)
+  const values = new Set<string>(WC_COUPON_VALUE_FLAGS)
+  const flags: WcCouponCliFlags = {
+    apply: false,
+    'imported-before': null,
+    csv: null,
+    allowlist: null,
+    'allowlist-out': null,
+    reprint: null,
+  }
+  const seen = new Set<string>()
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const token = argv[index]
+    if (!token.startsWith('--')) {
+      return {
+        ok: false,
+        detail:
+          `unexpected argument "${token}" — every input to this script is named by a flag, and a bare ` +
+          `path is not read as one. ${WC_COUPON_CLI_USAGE}`,
+      }
+    }
+    if (token.includes('=')) {
+      return {
+        ok: false,
+        detail:
+          `"${token}" uses --flag=value, which this script does not accept and used to IGNORE in ` +
+          `silence. Write the value as the next argument instead. ${WC_COUPON_CLI_USAGE}`,
+      }
+    }
+    const name = token.slice(2)
+    if (!booleans.has(name) && !values.has(name)) {
+      return {
+        ok: false,
+        detail: `unknown flag "${token}" — it would otherwise be ignored in silence. ${WC_COUPON_CLI_USAGE}`,
+      }
+    }
+    if (seen.has(name)) {
+      return {
+        ok: false,
+        detail:
+          `"${token}" was given more than once, and only the FIRST would have been read — the second ` +
+          'value would be dropped without a word',
+      }
+    }
+    seen.add(name)
+
+    if (booleans.has(name)) {
+      flags.apply = true
+      continue
+    }
+
+    const raw = argv[index + 1]
+    if (raw === undefined) {
+      return {
+        ok: false,
+        detail:
+          `"${token}" needs a value and nothing follows it. It would otherwise read as ABSENT, which ` +
+          'silently selects a different mode from the one you typed',
+      }
+    }
+    if (raw.startsWith('--')) {
+      return {
+        ok: false,
+        detail:
+          `"${token}" needs a value and the next argument is the flag "${raw}". Reading that as the ` +
+          `value would consume "${raw}" as well, so BOTH would be lost`,
+      }
+    }
+    if (!raw.trim()) {
+      return { ok: false, detail: `"${token}" was given an empty value` }
+    }
+    flags[name as (typeof WC_COUPON_VALUE_FLAGS)[number]] = raw
+    index += 1
+  }
+
+  return { ok: true, flags }
+}
+
 /** Was this row's verdict decided by the cutoff choice rather than by a comfortable margin? */
 export function isNearWcCouponCutoff(importedAt: Date | null, cutoff: Date | null): boolean {
   if (!importedAt || !cutoff) return false

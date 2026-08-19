@@ -76,6 +76,9 @@ function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = [], creditN
       type: 'CREDIT_NOTE',
       status: 'POSTED',
       externalId: refund.accountingCreditNoteId,
+      // The DEFAULT is the same connector `postedInvoice()` names, i.e. ONE ledger. Every r9
+      // finding 1 fixture departs from that on this field alone.
+      externalSystem: 'xero',
     }))
   return {
     accountingEvent: {
@@ -164,8 +167,17 @@ type RefundRow = {
   lines: Array<{ salesOrderLineId: string | null; totalBase: number; totalForeign: number; lineKind: string | null }>
 }
 
-/** One mirrored CREDIT_NOTE event — the r8 finding 3 evidence that the document still stands. */
-type CreditNoteEventRow = { sourceEntityId: string; type: string; status: string; externalId: string | null }
+/**
+ * One mirrored CREDIT_NOTE event — the r8 finding 3 evidence that the document still stands, and
+ * (r9 finding 1) the record of WHICH LEDGER it stands in.
+ */
+type CreditNoteEventRow = {
+  sourceEntityId: string
+  type: string
+  status: string
+  externalId: string | null
+  externalSystem: string | null
+}
 
 /** A chargeback that MIRRORED the invoice: full goods, and the invoice's discount as a negative leg. */
 function mirroringChargeback(over: Partial<RefundRow> = {}): RefundRow {
@@ -1151,7 +1163,7 @@ test('a VOIDED credit note stops the position netting (o3d-y14 r8 F3)', async ()
   // r7's premise — the persisted lines ARE what the document carried — holds at posting time and
   // says nothing about a document retired afterwards. Here the mirror says it was.
   const voided = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], [
-    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501' },
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501', externalSystem: 'xero' },
   ])
   const live = await NETTED_TO_ZERO()
 
@@ -1170,7 +1182,10 @@ test('a netted remedy NAMES the credit notes it depends on and says IMS cannot w
   assert.deepEqual(handoff.remedy?.nettedAgainst, ['CN-501'])
   const text = handoff.lines.join('\n')
   assert.match(text, /THIS FIGURE IS THE INVOICE NETTED AGAINST CREDIT NOTE\(S\) CN-501/)
-  assert.match(text, /voided or edited by hand there writes nothing back to IMS/)
+  assert.match(text, /voided or edited by hand writes nothing back to IMS/)
+  // r9 finding 1: the OTHER thing IMS cannot see about a document it named. The connector is
+  // recorded and checked; the organisation inside it is not recorded anywhere, so it travels here.
+  assert.match(text, /THEY AND THE INVOICE ARE IN THE SAME ORGANISATION/)
 })
 
 test('a NON-netted remedy names no credit note to confirm — it depends on none (r8 F3)', async () => {
@@ -1250,6 +1265,173 @@ test('a parked refund is named in the operator text where a recorded one would b
 })
 
 // ---------------------------------------------------------------------------
+// o3d-y14 r9 finding 1 — the two figures must be balances in the SAME set of books
+// ---------------------------------------------------------------------------
+
+/**
+ * TWO LEDGERS versus ONE, and nothing else varies.
+ *
+ * `NETTED_TO_ZERO` is the whole fixture: a Xero invoice carrying 10, one mirroring chargeback that
+ * reversed 10, a corrected residual of 0. Each fixture below changes exactly one field that says
+ * WHICH LEDGER a document is in — the credit-note event's `externalSystem`, or the invoice's — and
+ * is asserted to render different text and a different `needsAccountingAction`. A pair that rendered
+ * the same answer would prove nothing, which is the trap every earlier round in this file guards.
+ */
+const CREDIT_NOTE_IN_QUICKBOOKS: CreditNoteEventRow[] = [
+  { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'quickbooks' },
+]
+
+test('a Xero invoice is NOT netted against a QuickBooks credit note (o3d-y14 r9 F1)', async () => {
+  // The connector-switch shape. `connector-orphans.ts` exists because the active accounting
+  // connector can be switched (Xero → QuickBooks) and IMS keeps every historical document under the
+  // connector that posted it. The Xero invoice here is outstanding at its full posted value and the
+  // QuickBooks credit memo reduces nothing in Xero — so "10 - 10 = 0, this customer is square" is a
+  // statement about a balance that exists in neither ledger.
+  const split = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_QUICKBOOKS)
+  const oneLedger = await NETTED_TO_ZERO()
+
+  assert.equal(split.reversal.ok, true, 'the credit-note side is still perfectly derivable')
+  assert.equal(split.remedy, null)
+  assert.equal(split.needsAccountingAction, true, 'and it is NOT settled')
+  const text = split.lines.join('\n')
+  assert.doesNotMatch(text, /THE POSITION NETS/)
+  assert.doesNotMatch(text, /THE TWO ERRORS CANCEL/)
+  assert.match(text, /posted to Xero and this order's credit note\(s\) to QuickBooks Online — TWO SEPARATE LEDGERS/)
+  assert.match(text, /IMS CANNOT NET THE TWO FOR YOU here/)
+  // The invoice finding itself is still reported — it is a fact about the invoice either way.
+  assert.match(text, /carries an order-level discount of 10 GBP/)
+  // The pair differs on the credit note's `externalSystem` ALONE, and the answers are opposite.
+  assert.equal(oneLedger.needsAccountingAction, false)
+  assert.notDeepEqual(split.lines, oneLedger.lines)
+})
+
+test('a cross-ledger position would otherwise have PRESCRIBED a fabricated instrument (r9 F1)', async () => {
+  // The dangerous shape, not merely the mislabelled one. A Xero invoice carrying 10 against a
+  // QuickBooks credit memo that reversed only 6 reads as "the customer still owes 4" and prescribes
+  // a further Xero invoice for it — while the Xero invoice they actually owe against is untouched
+  // and the QuickBooks document was never a reversal of it at all.
+  const handoff = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(6)], CREDIT_NOTE_IN_QUICKBOOKS)
+
+  assert.equal(handoff.remedy, null)
+  const text = handoff.lines.join('\n')
+  assert.doesNotMatch(text, /THE CUSTOMER STILL OWES/)
+  assert.doesNotMatch(text, /Raise a further invoice/)
+})
+
+test('an invoice whose mirrored event names NO accounting system is not netted either (r9 F1)', async () => {
+  // Reachable without any exotic data: a mirrored document with no `externalSystem` and no discount
+  // in its payload derives a posted figure of 0 (there is no connector rule to replay for 0), so the
+  // classification succeeds and the subtraction has an unidentified ledger on one side. Netting it
+  // reads as "the credit note gave back 10 more than the invoice charged" and prescribes a credit
+  // note for 10 — against a document nobody can say the ledger of.
+  const noSystem = await handoffFor(
+    [postedInvoice({ externalSystem: null, linesJson: documentPayload() })],
+    0,
+    FULLY_REVERSED_INVOICE,
+    [chargebackReversing(10)],
+  )
+
+  assert.equal(noSystem.invoice.case, 'DOCUMENT_AGREES')
+  assert.equal(noSystem.reversal.ok, true)
+  assert.equal(noSystem.remedy, null)
+  assert.equal(noSystem.needsAccountingAction, true)
+  const text = noSystem.lines.join('\n')
+  assert.doesNotMatch(text, /THE CUSTOMER IS OWED/)
+  assert.doesNotMatch(text, /Raise a credit note for 10 GBP/)
+  assert.match(text, /records NO accounting system/)
+})
+
+test('the ledger membership check is PURE and reachable from plain values (r9 F1)', async () => {
+  const { wcCouponLedgerMembership } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+  const derived = { ok: true as const, amount: 10, externalSystem: 'xero', legs: [], detail: '' }
+
+  assert.deepEqual(wcCouponLedgerMembership('xero', derived), { ok: true })
+  assert.equal(wcCouponLedgerMembership('quickbooks', derived).ok, false)
+  assert.equal(wcCouponLedgerMembership(null, derived).ok, false)
+  assert.equal(wcCouponLedgerMembership('xero', { ok: false, legs: [], detail: 'nope' }).ok, false)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r9 finding 2 — a net of ZERO depends on the same unwatchable documents
+// ---------------------------------------------------------------------------
+
+test('a netted-to-ZERO order carries the credit-note precondition too (o3d-y14 r9 F2)', async () => {
+  // THE DEFECT. r8 gave the netted REMEDY a precondition naming the credit notes it rests on,
+  // because IMS cannot see one voided or edited by hand in Xero or QuickBooks. The ZERO outcome
+  // rests on the same documents, carried no precondition at all — the block that prints one only ran
+  // for a remedy — and is the one outcome that tells the operator there is nothing to look at.
+  const handoff = await NETTED_TO_ZERO()
+
+  assert.equal(handoff.remedy, null, 'nothing to do is still not a remedy')
+  const text = handoff.lines.join('\n')
+  assert.match(text, /THIS "NOTHING TO DO" IS CONDITIONAL \(Xero\)/)
+  assert.match(text, /THIS FIGURE IS THE INVOICE NETTED AGAINST CREDIT NOTE\(S\) CN-501/)
+  assert.match(text, /voided or edited by hand writes nothing back to IMS/)
+  assert.match(text, /THEY AND THE INVOICE ARE IN THE SAME ORGANISATION/)
+  // And the conclusion it governs is stated as the CONDITIONAL it is, naming what follows if the
+  // condition fails — the invoice standing at full value, i.e. the customer still owing.
+  assert.match(text, /THE TWO ERRORS CANCEL, PROVIDED THOSE CREDIT NOTES STILL STAND/)
+  assert.match(text, /invoice INV-778 stands at its full posted value and this order is NOT settled/)
+})
+
+test('the precondition comes BEFORE the "nothing to do" it governs (o3d-y14 r9 F2)', async () => {
+  // Positional, for the same reason the r7 finding 3 prohibition test is: a caveat printed after the
+  // conclusion does not govern it, and the conclusion here is the sentence that takes the order off
+  // the must-fix list.
+  const handoff = await NETTED_TO_ZERO()
+  const condition = handoff.lines.findIndex((line) => /IS CONDITIONAL/.test(line))
+  const conclusion = handoff.lines.findIndex((line) => /THE TWO ERRORS CANCEL/.test(line))
+
+  assert.ok(condition >= 0 && conclusion >= 0)
+  assert.ok(condition < conclusion, 'the precondition must precede the conclusion it qualifies')
+})
+
+test('a HAND-VOIDED credit note is exactly what that precondition is for (o3d-y14 r9 F2)', async () => {
+  // IMS cannot detect this one — nothing writes a Xero hand-void back, and the payment poller reads
+  // ACCREC invoice statuses, never ACCRECCREDIT. What it CAN do is refuse to let the zero outcome
+  // reach an operator without naming the document it depends on. The mirror-visible void (r8 F3) is
+  // the same failure IMS happens to be able to see, and it refuses outright:
+  const seen = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], [
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501', externalSystem: 'xero' },
+  ])
+  const unseen = await NETTED_TO_ZERO()
+
+  assert.equal(seen.needsAccountingAction, true, 'a void IMS can see refuses the netting outright')
+  // ...and the one it cannot see is carried to the operator instead of being silently assumed away.
+  assert.equal(unseen.needsAccountingAction, false)
+  assert.match(unseen.lines.join('\n'), /CONFIRM IN Xero THAT THEY ARE STILL POSTED AND UNCHANGED/)
+})
+
+test('BOTH netted outcomes carry the same precondition — zero and non-zero (o3d-y14 r9 F2)', async () => {
+  // The pair the finding turns on: the two differ ONLY in what the credit note reversed, and the
+  // gap was that one of them printed the precondition and the other did not.
+  const zero = await NETTED_TO_ZERO()
+  const nonZero = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(6)])
+
+  for (const [name, handoff] of [['zero', zero], ['non-zero', nonZero]] as const) {
+    const text = handoff.lines.join('\n')
+    assert.match(text, /VALID ONLY WHILE this order's refund position is/, name)
+    assert.match(text, /THIS FIGURE IS THE INVOICE NETTED AGAINST CREDIT NOTE\(S\) CN-501/, name)
+  }
+  // And they are still DIFFERENT outcomes — one prescribes, the other does not.
+  assert.equal(zero.remedy, null)
+  assert.equal(nonZero.remedy?.kind, 'INCREASE_RECEIVABLE')
+  assert.notDeepEqual(zero.lines, nonZero.lines)
+})
+
+test('a NON-netted settled order is given no credit-note precondition it does not depend on (r9 F2)', async () => {
+  // The precondition names credit notes. An unrefunded order whose invoice is already right depends
+  // on none, and printing a "confirm the credit notes" line there would send an operator to look for
+  // documents that do not exist.
+  const handoff = await handoffFor([invoiceWithNoDiscountAccount()], 0)
+
+  assert.equal(handoff.needsAccountingAction, false)
+  const text = handoff.lines.join('\n')
+  assert.doesNotMatch(text, /NETTED AGAINST CREDIT NOTE/)
+  assert.doesNotMatch(text, /IS CONDITIONAL/)
+})
+
+// ---------------------------------------------------------------------------
 // o3d-y14 r7 finding 3 — NO REMEDY REACHES AN OPERATOR EXCEPT THROUGH THE CLASSIFIER
 // ---------------------------------------------------------------------------
 
@@ -1318,6 +1500,13 @@ const MATRIX: Array<[string, () => Promise<{ lines: string[]; remedy: unknown }>
   ['netted / settled', () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])],
   ['netted / customer owes', () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(6)])],
   ['netted / customer owed', () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(14)])],
+  // r9 finding 1: the invoice and the credit note in DIFFERENT ledgers. It renders the netted
+  // branch's facts and none of its arithmetic, so it is its own shape and belongs in the matrix.
+  [
+    'netting withdrawn / cross-ledger',
+    () =>
+      handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_QUICKBOOKS),
+  ],
 ]
 
 test('NO instrument reaches an operator except through a WcCouponRemedy (o3d-y14 r7 F3)', async () => {

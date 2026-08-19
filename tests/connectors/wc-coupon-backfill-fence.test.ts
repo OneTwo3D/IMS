@@ -1798,9 +1798,31 @@ test('the script implements --reprint, and it cannot be combined with --apply (o
   const { join } = await import('node:path')
   const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
 
-  assert.match(src, /flagValue\('reprint'\)/)
+  assert.match(src, /parsedFlags\.flags\.reprint/)
   assert.match(src, /reprintWcCouponLedgerHandoff\(db/)
   assert.match(src, /--reprint is read-only and cannot be combined with --apply/)
+})
+
+test('the script reads the command line ONLY through the strict parser (o3d-y14 r9 F3)', async () => {
+  // A SOURCE assertion, because the property is about the absence of a second reader. The mode
+  // selection is decided by these flags, and the old `argv.indexOf(flag) + 1` helper turned
+  // `--apply --reprint` into a WRITING run — a flag with nothing after it read as absent, so the
+  // read-only branch that is checked first and made mutually exclusive with apply was never
+  // entered. Re-introducing any ad-hoc argv read anywhere in this file re-opens that.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
+
+  assert.match(src, /parseWcCouponCliFlags\(process\.argv\.slice\(2\)\)/)
+  assert.match(src, /REFUSING to run: \$\{parsedFlags\.detail\}/)
+  // The one other `process.argv` use is the run-vs-import guard at the bottom of the file, which
+  // reads argv[1] (the script path) and decides nothing about mode.
+  const argvUses = src.match(/process\.argv/g) ?? []
+  assert.equal(argvUses.length, 2, `the script reads process.argv ${argvUses.length} times, not 2`)
+  assert.match(src, /process\.argv\[1\]\?\.includes\('backfill-wc-coupon-order-discount'\)/)
+  assert.doesNotMatch(src, /function flagValue/, 'the reader that could not tell a flag from a value is gone')
+  assert.doesNotMatch(src, /argv\.indexOf/)
+  assert.doesNotMatch(src, /argv\.includes\('--apply'\)/)
 })
 
 test('every "re-derive this" sentence an operator reads names --reprint, not the report (r8 F4)', async () => {
