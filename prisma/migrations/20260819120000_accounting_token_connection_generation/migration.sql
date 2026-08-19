@@ -1,0 +1,26 @@
+-- o3d-9tbz Codex r5 finding 2: the refresh's write-time predicate named the TENANT, and a tenant is not
+-- a connection.
+--
+-- Round 4 put the organisation in the WHERE clause of the token refresh, which stops a refresh that
+-- began under organisation A from landing on a row that now belongs to organisation B. It does not stop
+-- a refresh that began under one connection to organisation A from landing on a LATER connection to the
+-- same organisation A — and disconnect-then-reconnect to the same organisation is the ordinary
+-- operation here, because Xero re-creates the Demo company roughly every 28 days and the rig is
+-- reconnected by hand when it does. A re-consent without a disconnect (the operator who reconnects to
+-- widen the granted scopes) is the same thing again.
+--
+-- The stale write is not harmless just because both sides name one organisation. It replaces the new
+-- connection's access and refresh tokens with a retired chain, reverts `grantedScopes` to the narrower
+-- grant the operator had just re-consented to widen, and reverts `tenantIsDemo` to whatever the retired
+-- row recorded — which, if that was NULL, is an outage roughly every 30 minutes under
+-- XERO_REQUIRE_DEMO_ORG.
+--
+-- This column is the generation marker: a fresh value at every binding, carried unchanged through every
+-- refresh, and compared AT THE WRITE alongside the connector and the tenant. A refresh whose generation
+-- is gone matches nothing, writes nothing, and is recorded rather than notified.
+--
+-- NULLABLE, and null is a generation like any other rather than a missing value: rows written before
+-- this column existed carry NULL, the refresh predicate compares NULL to NULL and matches, and ordinary
+-- refresh on an already-connected instance therefore keeps working with no reconnect. The first
+-- rebinding after this ships mints a real value and the NULL generation is retired for good.
+ALTER TABLE "accounting_tokens" ADD COLUMN "connectionGeneration" TEXT;

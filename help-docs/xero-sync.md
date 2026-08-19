@@ -14,6 +14,309 @@ One Two Inventory integrates with Xero to keep your accounting records in sync. 
 
 Before connection or sync can be enabled, the Xero organisation base currency must match the IMS base currency configured in **Settings > Company**.
 
+### Which organisation this instance may connect to
+
+**IMS will not guess which Xero organisation to invoice into.** If the person authorising the
+connection has access to more than one organisation — very common for an accountant, a bookkeeper, or
+anyone who also has the Xero Demo company — the consent hands IMS a *list*, and picking one silently is
+how test data ends up in a real ledger. It has happened: a test instance connected to the live
+organisation and posted 150 invoices, 111 contacts, 217 items and 14 payments into it before anyone
+noticed.
+
+So:
+
+- **One organisation on the consent** — the ordinary case — connects exactly as before. Nothing changes.
+- **More than one, and this instance has never been connected** — the connection is **refused**, nothing
+  is stored, and the message names every organisation offered with its tenant id, e.g.
+
+  > Refused: this instance has no pinned Xero organisation and the consent returned 2 organisations, so
+  > IMS will not guess which ledger to invoice into. Offered: Demo Company (UK) [tenantId 5c949ed5-…],
+  > OneTwo3D Ltd [tenantId e7fb4378-…]. Nothing was stored. Choose explicitly: set
+  > `XERO_ALLOWED_TENANT_IDS` to exactly one of the tenantIds above in the server `.env`, restart IMS and
+  > connect again — or remove IMS's access to the other organisations in Xero (My Xero → Connected apps)
+  > so that a single organisation is offered.
+
+  Either route works. The allow-list is the durable one; removing the app's access to the other
+  organisations in Xero is the quicker one if you only ever want the single organisation.
+- **Once connected**, IMS pins that organisation and every later reconnect must match it, exactly as
+  before. Disconnecting clears the pin.
+- **Two connections at once bind one organisation, not two.** The pin and the stored token are written
+  in a single database transaction, and the pin's key is a primary key, so if two OAuth callbacks are in
+  flight at the same time — two browser tabs, two operators, a replayed redirect — exactly one of them
+  establishes the binding. The other is refused with nothing stored: no token, no pin, no Xero data read
+  or written. Its message names the organisation that won and tells you to disconnect on `/sync` if the
+  one you chose is the one this instance should use. (Two consents to the **same** organisation both
+  report success; there is nothing wrong with a double-clicked *Connect*, and the duplicate is simply
+  discarded.)
+- **An instance that is already bound to two organisations at once stops syncing.** The two halves of a
+  binding are the *pin* (`xero_expected_tenant_id` in the database) and the *stored token*. They are
+  written together now, but an instance connected under an older build, or one handed a database from
+  another environment, can already hold a pin naming one organisation and a token belonging to another.
+  IMS refuses to sync in that state rather than guessing — the pin is what reconnects are checked
+  against, the **token** is what every Xero call actually presents, and while they disagree the binding
+  is simply unknown. `/sync` shows the connection as not connected with the reason, and the Activity log
+  records `xero_stored_tenant_refused`:
+
+  > Xero sync is halted: this instance is bound to two different Xero organisations at once. Its pin
+  > (the `xero_expected_tenant_id` setting, which every reconnect is checked against) names tenantId
+  > 5c949ed5-…, while the stored token — which is what every sync actually presents to Xero, and so what
+  > decides which ledger is written to — belongs to OneTwo3D Ltd [tenantId e7fb4378-…]. … To fix it: on
+  > `/sync` press **Disconnect** — that clears the token and the pin together — then connect again and
+  > choose the organisation this instance is meant to use.
+
+  If you are auditing what such an instance posted, look in the **token's** organisation: that is where
+  everything went.
+- **Deleting the pin is not a way out of that refusal.** A token with **no pin beside it** used to be
+  exempt, which made the refusal above one `DELETE FROM settings` away from being switched off — and a
+  `settings` table restored from a different backup than `accounting_tokens` arrives in the same state
+  without anybody deleting anything. IMS now asks what the *token row* says about its own history:
+
+  | State of the token row | Meaning | Result |
+  | --- | --- | --- |
+  | No token row at all | A first connection | Connects normally |
+  | No connection marker | Connected before this shipped | Keeps working, as before |
+  | Released by `--clear-tenant-pin` | Deliberately unpinned, awaiting a re-consent | Keeps working |
+  | Carries a connection marker, pin gone | The pin was deleted or lost | **Sync halted** |
+  | Carries a release for a *different* connection | Paperwork that came apart from its row | **Sync halted** |
+  | Carries a release that says only *when* | Recorded before IMS logged what a release was for | **Sync halted** |
+  | Carries a release this instance never wrote | A token row that arrived from somewhere else | **Sync halted** |
+
+  The marker is minted by the connect that wrote the pin, in the same transaction, and **Disconnect**
+  removes the token and the pin together — so a token that has outlived its pin can only mean the pin
+  went away on its own. The halt says so and tells you to press **Disconnect** on `/sync` and connect
+  again; nothing in the `.env` needs editing, and writing the setting back by hand is deliberately *not*
+  offered as a remedy (a pin typed in beside a token that came from somewhere else only makes the two
+  agree, which is not the same as the binding being right).
+
+  To be unpinned **on purpose** — the ~28-day Demo reset — use
+  `provision-xero-demo.ts --clear-tenant-pin`, which deletes the pin and records the release on the
+  token row in one transaction, or simply press **Disconnect**. A release ends by itself at the next
+  connect, and while it is outstanding the consent is free to land on the rebuilt organisation's new
+  tenantId — but it still will not guess between two organisations.
+
+  **A release describes one connection, and stops applying when that connection changes.** The receipt
+  records which connection it released and which pin it deleted, so it cannot be inherited by a
+  different binding: an `accounting_tokens` table restored from a backup taken while a release was
+  outstanding lands on a connection the release knows nothing about, and IMS halts rather than honouring
+  it. Two consequences worth knowing:
+
+  - Run `--clear-tenant-pin` **before** the pin goes. It records a release only when it is the statement
+    that deletes the pin, so running it on an instance whose pin has already vanished changes nothing
+    and does not lift the halt — that is **Disconnect**'s job.
+  - Releasing one half of an instance that is *already* bound to two organisations does not end that
+    refusal. The receipt names the pin it deleted, which is not the token's organisation, so the
+    contradiction stays visible instead of being deleted away.
+
+  **A release is recorded in two places, and both are checked.** Everything the receipt is compared
+  against is a column on the same token row, so a row restored *wholesale* from a dump would arrive
+  carrying its own corroboration and agree with itself. `--clear-tenant-pin` therefore writes the
+  release twice in one transaction — on the token row, and as a `xero_pin_release_witness` setting
+  beside the pin it deletes — and IMS honours a release only when both halves describe the same one. A
+  token row copied from another environment cannot bring the second half with it. **Disconnect** and the
+  next connect both clear the pair together.
+
+  What this does *not* catch, said plainly: a restore or copy of the **whole database** brings both
+  halves and every other fact with them, and nothing stored in that database can tell a faithful copy of
+  an instance from the instance. The controls that survive a restore are the ones in the server's
+  `.env` — `XERO_ALLOWED_TENANT_IDS`, `XERO_BLOCKED_TENANT_IDS`, `XERO_REQUIRE_DEMO_ORG` — which is why
+  they are checked against the *stored* token on every use and not only at the consent.
+
+  **Upgrading with a release outstanding.** Releases recorded before IMS logged what they were for
+  carry only a timestamp. Those are **not** filled in on upgrade and they do not exempt anything: the
+  older `--clear-tenant-pin` also stamped a release when it deleted no pin at all, so a receipt in that
+  shape cannot be told apart from a pin that went missing, and qualifying one would qualify both. If a
+  rig was mid-recovery over the upgrade it is halted with that reason, and the fix is the step it was
+  already waiting for — press **Disconnect** on `/sync`, then connect and choose the organisation.
+  Nothing is lost by doing so: the token was unusable until that consent anyway.
+- **A full database reset removes both halves together.** Settings → *Reset database* at the *full*
+  level deletes the token and the pin in one transaction, so it can never leave a token whose pin has
+  gone — the state above, which would otherwise be reported as tampering to somebody who had merely
+  reset an instance. If a reset fails part-way, the connection is left whole rather than half-deleted.
+- **A token refresh belongs to one connection, not just one organisation.** Each binding stamps the
+  token row with a connection generation, and a refresh only writes back if that generation is still
+  there. So a refresh that was in flight while somebody disconnected and reconnected — even to the
+  *same* organisation, which is what happens at every ~28-day Demo reset — is discarded instead of
+  overwriting the new connection's tokens, its granted scopes or its recorded demo status. It is
+  recorded as `xero_refresh_discarded` and does not raise a notification, because nothing is wrong.
+
+### The organisation allow-list (`XERO_ALLOWED_TENANT_IDS`)
+
+The pin above lives in the **database**. A fresh database has none — a new instance, a reset, a restored
+dump — which is precisely the state the incident happened in. Three environment variables give the same
+protection at a level a database reset cannot erase:
+
+```
+XERO_ALLOWED_TENANT_IDS=5c949ed5-…,e7fb4378-…
+XERO_BLOCKED_TENANT_IDS=e7fb4378-…
+XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)
+```
+
+- **Blank or absent means no restriction.** The control is opt-in, so an empty line in `.env` cannot
+  accidentally disable every Xero connection.
+- Changing any of them needs an **IMS restart**.
+
+#### A tenant id is an identity. An organisation name is not.
+
+The three keys are deliberately **not** equivalent, and this is the most important thing on this page.
+
+A Xero **tenantId** is issued by Xero, is unique, and nobody in your organisation can change it. A Xero
+**organisation name** is a label: it is not unique — `Demo Company (UK)` is what Xero calls *every*
+demo company there is — and anyone administering an organisation can rename it from Xero's own settings
+screen at any time. A check that a rename can satisfy is not an identity check, and the whole point of
+this page is that a test rig once wrote 150 invoices into a live ledger.
+
+So the keys compose as a chain of **filters** over the organisations on the consent. Every key that is
+set can *remove* candidates; none of them can *add* one:
+
+| Key | What it is | What it does |
+|-----|-----------|--------------|
+| `XERO_BLOCKED_TENANT_IDS` | identity | Refused everywhere, checked first. |
+| `XERO_ALLOWED_TENANT_IDS` (and the deprecated `XERO_TENANT_ID`) | identity | The only key that **allows** an organisation. |
+| `XERO_ALLOWED_TENANT_NAMES` | **not** an identity | Only **narrows** what the ids already chose. |
+| `XERO_REQUIRE_DEMO_ORG` | identity, but **not an id** | Narrows to Xero **demo** organisations, using Xero's own flag. |
+
+Consequences worth knowing before you configure this:
+
+- Ids and names are **not a union**. `XERO_ALLOWED_TENANT_IDS=5c949ed5-…` together with
+  `XERO_ALLOWED_TENANT_NAMES=Demo Company (UK)` allows one organisation — the one that is *both*. An
+  organisation renamed to `Demo Company (UK)` does not get in on the strength of its new name.
+- A name that matches **two** organisations on one consent is **refused**, not used to choose between
+  them. It has just demonstrated, on that very consent, that it identifies neither.
+- Naming the same organisation two ways is **not** a contradiction. `XERO_TENANT_ID=5c949ed5-…` plus
+  that organisation's own name is one instruction spelled twice, and connects. Only an *empty
+  intersection* — each key selecting a different organisation out of the same consent — is refused as a
+  contradiction, and the message names what each key selected.
+- Names ignore extra spacing and case. An organisation whose name contains a comma cannot be expressed
+  in `XERO_ALLOWED_TENANT_NAMES` at all — use its id.
+- **Do not use a name as your only tenant control.** IMS records
+  `xero_tenant_guard_name_only` in the activity log when you do, because that configuration has no
+  anchor a rename cannot move. `XERO_REQUIRE_DEMO_ORG=true` counts as an anchor and clears the warning:
+  Xero asserts it, and the organisation's own administrators cannot.
+
+- `XERO_REQUIRE_DEMO_ORG` **narrows like a name and anchors like an id**. It can never admit an
+  organisation the ids exclude; it can only remove non-demo organisations from what the other keys
+  already allowed.
+
+#### When the connected organisation's id keeps changing (`XERO_REQUIRE_DEMO_ORG`)
+
+Xero re-creates its **Demo company with a new tenantId** at every ~28-day reset, and any test
+organisation you rebuild behaves the same way. An id *allow*-list then has to be re-edited every cycle,
+which is exactly how a safety control ends up switched off.
+
+**Require a demo organisation instead.** Xero's own `GET /Organisation` reports `IsDemoCompany` for the
+organisation behind a token, and that is a fact about how the organisation was *created*: unlike a name
+it cannot be adopted by renaming, and unlike an id it does not change when the Demo company is rebuilt.
+
+```
+XERO_REQUIRE_DEMO_ORG=true              # a Xero demo organisation, whatever its id this cycle
+XERO_BLOCKED_TENANT_IDS=e7fb4378-…      # belt and braces: the live organisation, forever
+```
+
+This costs no extra Xero call — the connection callback already reads `GET /Organisation` to check base
+currencies — and it covers **both** paths: a consent that offers a non-demo organisation cannot bind it,
+and a production database restored onto the rig is refused at every sync, because the demo status is
+recorded on the stored connection and re-checked on every use of it.
+
+> **A deny-list alone does not restrict you to a demo organisation.** `XERO_BLOCKED_TENANT_IDS` refuses
+> the organisations you thought to list. A **third** organisation — a bookkeeper's sandbox, a second
+> company, anything else the person authorising the connection can reach — is neither blocked nor
+> allow-listed, so it connects. `XERO_ALLOWED_TENANT_NAMES` cannot close that gap either, because any
+> organisation can be renamed to `Demo Company (UK)`. Only `XERO_REQUIRE_DEMO_ORG` constrains the
+> *kind* of organisation rather than enumerating ids.
+
+**Unverified is refused, not allowed.** A stored connection whose demo status was never read — a token
+from a restored dump, or one established before you switched this key on — has no proof attached, and
+under this key an unproven demo organisation is not treated as a demo organisation. The fix is to
+disconnect on `/sync` and connect again, which re-reads the flag from Xero. Connections made *after*
+this key existed record the flag whether or not the key is switched on, so turning it on later does not
+by itself force a reconnect.
+
+A value that is neither yes nor no (`XERO_REQUIRE_DEMO_ORG=Demo Company (UK)`, say) refuses **every**
+Xero connection rather than quietly meaning "off" — a line that reads like a guard and is not one is the
+mistake `XERO_TENANT_ID` made, and it is not repeated here.
+
+After a reset the database pin still names the *retired* tenantId, so the first reconnect is refused
+with `this instance is pinned to Xero tenantId …, which this consent did not include`. **Disconnect Xero
+on `/sync` first** — that clears the pin — then connect again.
+
+Listing the same id on both `XERO_ALLOWED_TENANT_IDS` and `XERO_BLOCKED_TENANT_IDS` is refused as a
+contradiction rather than silently resolved: it is two deliberate instructions that cannot both be
+obeyed, and IMS will not pick one for you.
+
+What it does when set:
+
+1. **At connection time** — a consent offering no allowed organisation is refused, nothing is stored,
+   and no Xero data is read or written. If the allow-list names exactly one of the organisations
+   offered, that one is used even without a pin, so a rig can be connected safely without anyone having
+   to pick from a list.
+2. **Every time the stored token is used** — a stored connection to a disallowed organisation stops
+   every Xero sync with a notification naming the organisation. This is what catches a **production
+   database restored onto a test instance**: the token comes with the dump, no consent screen is ever
+   shown, and without this check the instance would carry on syncing into the live ledger.
+3. **Over the database pin** — the environment wins. A pin restored from another environment cannot
+   smuggle its organisation past the allow-list.
+
+**Set a control that does not depend on a name on every non-production instance** (e2e, staging, any
+restored copy): `XERO_REQUIRE_DEMO_ORG=true` when the instance uses a Xero demo organisation,
+`XERO_ALLOWED_TENANT_IDS` when it uses a specific non-demo test organisation, and
+`XERO_BLOCKED_TENANT_IDS` naming the live organisation alongside either. Production may set
+`XERO_ALLOWED_TENANT_IDS` to the live organisation or leave it unset — and must **not** set
+`XERO_REQUIRE_DEMO_ORG`, which would refuse its own ledger.
+
+Refusals are recorded in the **Activity log** (`xero_connect_refused`, `xero_stored_tenant_refused`), so
+a refusal that happened while nobody was watching the browser is still discoverable. A name-only
+configuration is recorded there too, as `xero_tenant_guard_name_only` — once per connected organisation
+rather than once per sync — because it is permitted but weaker than it looks.
+
+#### Reconnecting to a different organisation
+
+Only one organisation can be bound at a time, and IMS refuses a consent to a second one while the first
+is still connected — so moving to a different organisation means **Disconnect on /sync, then Connect**.
+That is also what the Demo company needs roughly every 28 days, because Xero re-creates it with a new
+organisation id.
+
+A reconnect is safe to do at any moment, including while a sync is running. IMS refreshes its Xero
+access token about every half hour, and a refresh that was already in flight when you rebound the
+connection is **discarded rather than stored**: the organisation is part of the database write, so a
+token belonging to the organisation you just left cannot land on the connection you just made. It is
+recorded as `xero_refresh_discarded` in the Activity log and deliberately does *not* raise a
+notification — the connection is healthy, and one sync may simply have to be retried. If you see a
+single Xero failure at the exact moment somebody reconnected, that is what it was.
+
+#### If you already set `XERO_TENANT_ID`
+
+`XERO_TENANT_ID` is **deprecated**. It appeared in `.env.example`, in the installer and in the
+environment-variable reference for a long time, describing itself as the Xero organisation id and
+saying the app would fill it in after connecting — and no part of IMS ever read it. If you set it to
+your live organisation and assumed the tenant was pinned, it was not: you had no protection at all,
+which is worse than having no setting, because the name alone was enough to stop people looking harder.
+
+It is now read, as a single-organisation form of `XERO_ALLOWED_TENANT_IDS`, and enforced on exactly the
+same paths — the callback, the stored token, and over the database pin. **An instance whose only tenant
+setting is `XERO_TENANT_ID` is genuinely restricted to that organisation from this release on.** If
+that is not what you wanted, remove the line before upgrading.
+
+Rename it when convenient:
+
+```
+# before
+XERO_TENANT_ID=5c949ed5-…
+# after
+XERO_ALLOWED_TENANT_IDS=5c949ed5-…
+```
+
+Do not leave both `XERO_TENANT_ID` and `XERO_ALLOWED_TENANT_IDS` in place with different values. Two
+*identity* settings that disagree are refused outright — every Xero connection and every sync stops with
+a message naming both values — rather than IMS silently preferring one of two instructions you gave on
+purpose. Setting both to the *same* single organisation is fine, so you can migrate without a gap, and
+`XERO_TENANT_ID` alongside `XERO_ALLOWED_TENANT_NAMES` is fine too: a name narrows what the id chose
+rather than competing with it.
+
+**QuickBooks** does not have this control. It does not share the same defect — Intuit sends the company
+(`realmId`) in the callback itself, so there is no list to pick from and nothing is chosen silently —
+but it also has no environment allow-list, so a restored database with a QuickBooks token in it is not
+stopped the way a Xero one is.
+
 ### How to get your Xero Client ID and Secret
 
 The Client ID and Client Secret come from a **Xero app** you create in the Xero Developer portal:

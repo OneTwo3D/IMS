@@ -155,7 +155,6 @@ async function clearFullScope() {
   await db.externalWmsBinding.deleteMany({})
   await db.wmsConnection.deleteMany({})
   await db.accountingAccount.deleteMany({})
-  await db.accountingToken.deleteMany({})
 
   // Core company configuration / reference data
   await db.purchaseUnit.deleteMany({})
@@ -164,14 +163,41 @@ async function clearFullScope() {
   await db.taxRate.deleteMany({})
   await db.adjustmentReason.deleteMany({})
   await db.documentTemplate.deleteMany({})
-  // Under the plugin-selection lock: this deletes the plugin_* rows too, which is a connector
-  // change (to "none") for anything reading them — the third of the three real bypasses the
-  // orphan-cancel sweep's row locks had to fence (o3d-osl8 round 6, finding 2). A concurrent
-  // cancel then either commits before this or waits for it, instead of deciding what to discard
-  // from a selection this is deleting underneath it.
+  // THE TWO HALVES OF A CONNECTOR BINDING GO TOGETHER — ONE TRANSACTION, PIN BEFORE TOKEN (o3d-9tbz r7).
+  //
+  // A binding is two rows in two tables: the token in `accounting_tokens`, and the
+  // `xero_expected_tenant_id` pin in `settings`. Since r6 the sync READS ONE AS EVIDENCE ABOUT THE
+  // OTHER — a token row carrying a connection generation with no pin beside it means the pin was
+  // removed on its own, so the binding is unverifiable and every Xero sync halts, with a message about
+  // restored backups and hand-run deletes. That inference is only sound while every writer moves both
+  // halves together, and this one did not: the token was deleted six statements earlier, outside the
+  // transaction that deleted the settings.
+  //
+  // A reset cannot be told from tampering by a MARKER — a marker is a thing the tamper case can arrive
+  // carrying too. What distinguishes it is that a reset removes BOTH halves, so it leaves no token row
+  // for the halt to ask about. Two things make that true of every interleaving, not just the quiet one:
+  //
+  //   ONE TRANSACTION, so a failure between the two deletes cannot commit half of it.
+  //   THE PIN FIRST, because under READ COMMITTED each statement takes its OWN snapshot, and a
+  //   concurrent OAuth callback can still commit a whole binding between them. Deleting the pin first
+  //   makes every outcome a safe one. If the callback committed early enough for the wipe to take its
+  //   pin, it committed early enough for the delete below to take its token as well, so both go. If it
+  //   commits after the wipe, its pin survives; its token then either survives with it (a row inserted
+  //   after the delete's snapshot is outside it) or is deleted, leaving a PIN WITH NO TOKEN — an
+  //   instance that reports "not connected" and is repaired by connecting again, not one that halts.
+  //   The old order guaranteed the opposite and only the opposite: the callback's pin was always the
+  //   one wiped and its token always the one left behind, which is exactly the state the halt refuses,
+  //   reported to an operator who had done nothing but reset a database.
+  //
+  // Still under the plugin-selection lock: deleting the settings rows deletes the plugin_* rows, which
+  // is a connector change (to "none") for anything reading them — the third of the three real bypasses
+  // the orphan-cancel sweep's row locks had to fence (o3d-osl8 round 6, finding 2). A concurrent cancel
+  // then either commits before this or waits for it, instead of deciding what to discard from a
+  // selection this is deleting underneath it.
   await db.$transaction(async (tx) => {
     await lockIntegrationPluginSelection(tx)
     await tx.setting.deleteMany({})
+    await tx.accountingToken.deleteMany({})
   })
   await db.warehouse.deleteMany({})
   await db.organisation.deleteMany({})

@@ -2304,6 +2304,54 @@ model AccountingToken {
   // by the token endpoint. NULL = never recorded (a token stored before this existed),
   // which validation treats as UNKNOWN and lets through — not as "granted nothing".
   grantedScopes String?
+  // o3d-9tbz: Xero's own IsDemoCompany for this organisation, read from GET /Organisation at the
+  // consent that established this connection. NULL = never read (a token stored before this
+  // existed, or one that arrived inside a restored dump), which XERO_REQUIRE_DEMO_ORG treats as
+  // UNVERIFIED and refuses — not as "not a demo company", which is a different refusal with a
+  // different remedy.
+  tenantIsDemo Boolean?
+  // o3d-9tbz r5: which CONSENT this row belongs to. Re-minted on every binding, carried
+  // unchanged through every refresh, and named in the WHERE clause of the refresh UPDATE,
+  // so a refresh that began under one connection cannot write over the one that replaced
+  // it. NULL = a row written before this column existed (its generation is "the one with
+  // no generation", which the same predicate matches until something rebinds).
+  connectionGeneration String?
+  // o3d-9tbz r6: set ONLY by the documented Demo-reset recovery
+  // (scripts/provision-xero-demo.ts --clear-tenant-pin), which deletes the pin and stamps this
+  // column in ONE transaction. It is what separates a pin that was deliberately released from a
+  // pin that was DELETED or lost: with `connectionGeneration` present the token row proves a
+  // binding once wrote a pin beside it, so an absent pin means the pin went away on its own and
+  // the sync halts. NULL = never released. Cleared by the next binding, which writes a pin again.
+  pinReleasedAt DateTime?
+  // o3d-9tbz r7: WHAT that release was for. A bare timestamp says only "a release happened once",
+  // so it outlives the connection it released — a token row restored from a dump taken while a
+  // release was outstanding carries the exemption onto whatever binding is there now, which is the
+  // same cross-backup restore r6 exists to catch, arriving through the receipt instead of round it.
+  // These two say WHICH state was released: the generation the token row carried at the moment the
+  // pin was deleted, and the organisation that deleted pin named. The release counts only while
+  // BOTH still describe this row, so any rebinding, any restored token and any tenant change makes
+  // it stale by construction rather than by a clock. NULL alongside a NULL pinReleasedAt means
+  // "never released".
+  //
+  // o3d-9tbz r8: NOT backfilled. Filling these in from the row's own values for releases outstanding
+  // at the deploy would have qualified, in the same migration, every receipt the pre-r7 recovery
+  // stamped for a pin it never deleted — those are indistinguishable from a genuine outstanding
+  // release by the row they sit on, which is what made them a laundering path. A receipt with neither
+  // qualifier therefore exempts nothing; a rig mid-recovery finishes with Disconnect-then-connect.
+  // These are also only the half of the receipt that travels with the row: the release is witnessed
+  // in `settings` too (key xero_pin_release_witness), so a wholesale-restored row cannot corroborate
+  // itself.
+  //
+  // o3d-9tbz r9: CLEARED BY THE DATABASE whenever a pin is written, not only by bindXeroTenant. All
+  // three columns above are wiped — and the witness row deleted — by the trigger installed in
+  // 20260819210000_xero_pin_write_consumes_release, which fires on any INSERT or UPDATE of the
+  // `xero_expected_tenant_id` settings row. r7 gave the receipt no expiry on the ground that "the next
+  // binding consumes it"; the pin has other writers (provision-xero-demo.ts re-pins directly), so a
+  // completed re-provision left a row pinned AND carrying an outstanding release — one hand-run DELETE
+  // away from the exemption r6 closed. The rule now belongs to the pin rather than to a call site,
+  // which is why a writer that never heard of these columns cannot leave one behind.
+  pinReleasedGeneration String?
+  pinReleasedTenantId   String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

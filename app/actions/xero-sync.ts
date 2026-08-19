@@ -260,6 +260,8 @@ export async function saveXeroConnectionSettings(
 export async function getXeroConnectionStatus(): Promise<{
   connected: boolean
   tenantName?: string
+  blockedReason?: string
+  hasStoredToken?: boolean
 }> {
   return isConnected()
 }

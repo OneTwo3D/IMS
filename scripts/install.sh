@@ -667,8 +667,23 @@ WC_POLL_INTERVAL_MINUTES=5
 
 XERO_CLIENT_ID=${XERO_CLIENT_ID}
 XERO_CLIENT_SECRET=${XERO_CLIENT_SECRET}
-XERO_TENANT_ID=
 XERO_TOKEN_PATH=${DATA_DIR}/xero/token.json
+# XERO_TENANT_ID is DEPRECATED and no longer written by the installer (o3d-9tbz). It is
+# still read, as a single-organisation form of XERO_ALLOWED_TENANT_IDS, so that existing
+# installs that set it are protected — new installs should use the allow-list below.
+# Which Xero organisations this instance may use (o3d-9tbz). Comma-separated, blank =
+# unrestricted. Set an ID-based control on every non-production install: it is the only
+# tenant control that survives a database reset. A tenantId is an identity; an
+# organisation NAME is not (Xero names are neither unique nor fixed), so
+# XERO_ALLOWED_TENANT_NAMES only NARROWS the ids and must not be the only control.
+# On a test rig connected to Xero's Demo company, XERO_REQUIRE_DEMO_ORG=true is the
+# control to set: it is proven from Xero's own IsDemoCompany flag, so it needs no
+# maintenance when the Demo organisation is re-created with a new tenantId AND it does
+# not have to enumerate organisations in advance the way a deny-list does.
+# XERO_ALLOWED_TENANT_IDS=
+# XERO_BLOCKED_TENANT_IDS=
+# XERO_ALLOWED_TENANT_NAMES=
+# XERO_REQUIRE_DEMO_ORG=false
 
 CRON_SECRET=${CRON_SECRET}
 NEXT_PUBLIC_TURNSTILE_SITE_KEY=${NEXT_PUBLIC_TURNSTILE_SITE_KEY}

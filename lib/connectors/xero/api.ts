@@ -2,7 +2,7 @@
  * Xero HTTP client with automatic token refresh and rate-limit handling.
  */
 
-import { getAccessToken } from './auth'
+import { getAccessToken, getStoredTenantBlockReason } from './auth'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
@@ -242,6 +242,16 @@ export function formatIfModifiedSince(value: Date | string): string {
   return date.toISOString().slice(0, 19)
 }
 
+/**
+ * "Not connected to Xero" is the truth but rarely the whole of it: when the stored connection has been
+ * refused by the XERO_ALLOWED_TENANT_IDS/_NAMES allow-list (o3d-9tbz) the operator needs to know THAT,
+ * or they go looking for a lost token. Only consulted on the already-failing path.
+ */
+async function notConnectedResponse<T = unknown>(): Promise<XeroResponse<T>> {
+  const blocked = await getStoredTenantBlockReason().catch(() => null)
+  return { ok: false, status: 0, error: blocked ?? 'Not connected to Xero' }
+}
+
 async function xeroFetch<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
@@ -249,7 +259,7 @@ async function xeroFetch<T = unknown>(
   opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
 ): Promise<XeroResponse<T>> {
   const auth = await getAccessToken()
-  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  if (!auth) return await notConnectedResponse()
   return xeroFetchWithAuth<T>(auth, method, path, body, opts)
 }
 
@@ -396,7 +406,7 @@ export async function xeroGetCached<T = unknown>(
   // disconnected — no read from and no write to a 'no-tenant' key, so a disconnected call can neither
   // serve nor create connected data.
   const auth = await getAccessToken()
-  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  if (!auth) return await notConnectedResponse()
 
   const key = `${auth.tenantId}:${path}`
   const now = Date.now()
@@ -440,7 +450,7 @@ export async function xeroGetRaw(
   accept: string = 'application/pdf',
 ): Promise<{ ok: boolean; status: number; buffer?: Buffer; error?: string }> {
   const auth = await getAccessToken()
-  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  if (!auth) return await notConnectedResponse()
 
   const url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
 
@@ -478,7 +488,7 @@ export async function xeroUploadAttachment(
   contentType: string,
 ): Promise<XeroResponse> {
   const auth = await getAccessToken()
-  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+  if (!auth) return await notConnectedResponse()
 
   const url = `${XERO_BASE_URL}/${endpoint}/${objectId}/Attachments/${encodeURIComponent(filename)}`
 
