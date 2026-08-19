@@ -618,6 +618,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       resolveWcOrderLevelDiscount({
         couponTotalForeign: orderDiscount.discountAmount,
         lineDiscountTotalForeign,
+        // o3d-5tf: the allocation tolerance is half a MINOR UNIT of this order's currency, not a
+        // hard-coded half-penny — a WooCommerce store can run a 0- or 3-decimal currency.
+        currency,
       })
     if (unallocatedCouponForeign > 0) {
       // A coupon shape we do not model. The residual is kept (dropping it would overstate the

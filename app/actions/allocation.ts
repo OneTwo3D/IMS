@@ -331,8 +331,14 @@ export async function autoAllocateOrder(
   // stranded-reservation failure; a post-commit throw must NOT raise a false stale-reservation warning.
   let allocationCommitted = false
   try {
+    // o3d-6zr2: the acting user for the in-transaction pending-shipment retirement record, which
+    // `reconcilePendingShipments` writes through the transaction client and so cannot resolve a
+    // session for itself. The internal-bypass callers (the reallocation sweep, stock-event re-runs,
+    // the backorder allocator) genuinely have no user and stay null.
+    let actingUserId: string | null = null
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
-      await requirePermission('sales.process')
+      const session = await requirePermission('sales.process')
+      actingUserId = session.user.id ?? null
     }
     const allocationResult = await allocateSalesOrder(db, {
       orderId,
@@ -340,6 +346,7 @@ export async function autoAllocateOrder(
       refuseIfCommittedShipmentsExist: options?.refuseIfCommittedShipmentsExist,
       onReconciledInTx: options?.onReconciledInTx,
       requireStatusUnderLock: options?.requireStatusUnderLock,
+      userId: actingUserId,
     })
     allocationCommitted = true
 

@@ -34,6 +34,7 @@ import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accou
 import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
+import { resolveSalesOrderDeleteBlock } from '@/lib/domain/sales/order-delete-affordance'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
@@ -902,6 +903,15 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const nextActions = (STATUS_FLOW_SHIPMENTS[so.status] ?? []).filter((a) => a.target !== 'DELIVERED' || deliveryTrackingEnabled)
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
+  // o3d-0zy: predict the o3d-5r8 delete refusal instead of letting the operator walk into it. Every
+  // non-draft order queues a sales invoice, so with accounting sync on, Delete on a PENDING_PAYMENT
+  // order always refuses and Cancel is the actual path. Disabled-with-a-reason rather than hidden:
+  // other blockers (WMS push link, daily batch, refunds) are still only known to the server.
+  const deleteBlock = resolveSalesOrderDeleteBlock({
+    status: so.status,
+    accountingInvoiceId: so.accountingInvoiceId ?? null,
+    accountingSyncEnabled,
+  })
   // Refund is allowed once shipped, or to top up an already partially-refunded order.
   // Reads the orthogonal refundStatus so it keeps working once a partial refund no
   // longer forces the lifecycle status to PARTIALLY_REFUNDED (epic stage 3).
@@ -990,6 +1000,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   }
 
   function handleDelete() {
+    // Belt and braces with the disabled button: the server refuses anyway, but there is no reason to
+    // send a request whose answer we already have.
+    if (deleteBlock) { setError(deleteBlock.reason); return }
     if (!confirm('Permanently delete this order?')) return
     startTransition(async () => {
       const result = await deleteSalesOrder(so.id)
@@ -1230,9 +1243,19 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             </Button>
           )}
           {canDelete && (
-            <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={handleDelete} disabled={isPending}>
-              <Trash2 className="h-4 w-4 mr-1" />Delete
-            </Button>
+            // The title lives on the wrapper, not the button: a disabled button swallows pointer
+            // events in several browsers and would never show its own tooltip.
+            <span title={deleteBlock?.reason} className="inline-flex">
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-destructive hover:text-destructive"
+                onClick={handleDelete}
+                disabled={isPending || deleteBlock !== null}
+              >
+                <Trash2 className="h-4 w-4 mr-1" />Delete
+              </Button>
+            </span>
           )}
 
           {/* More actions dropdown (PDF, Email, Clone) */}

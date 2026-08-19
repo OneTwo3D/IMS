@@ -179,6 +179,12 @@ type SalesOrderRow = {
   shoppingLinks: Array<{ connector: string }>
 }
 
+type MarginProductRef = {
+  sku: string
+  name: string
+  category: { name: string } | null
+}
+
 type CogsEntryRow = {
   id: string
   totalCostBase: DecimalInput
@@ -187,12 +193,27 @@ type CogsEntryRow = {
     referenceId: string | null
     productId: string
     createdAt: Date
-    product: {
-      sku: string
-      name: string
-      category: { name: string } | null
-    }
+    product: MarginProductRef
+    /**
+     * o3d-7r6x: the sales line the dispatch was for. For a KIT the movement's own product is a leaf
+     * COMPONENT, so this is the only way to bucket the cost under the product the order line —
+     * and therefore the revenue — is denominated in. Null for unlinked/legacy rows.
+     */
+    shipmentLine: {
+      line: { productId: string | null; product: MarginProductRef | null } | null
+    } | null
   }
+}
+
+/**
+ * o3d-7r6x: which product a COGS row belongs to for REVENUE-COMPARABLE bucketing. A linked dispatch
+ * reports the sales line's product (the kit), everything else the movement's own product. For a
+ * SIMPLE product the two are the same id, so non-kit bucketing is byte-for-byte unchanged.
+ */
+function marginCogsBucket(row: CogsEntryRow): { productId: string; product: MarginProductRef } {
+  const line = row.movement.shipmentLine?.line
+  if (line?.productId && line.product) return { productId: line.productId, product: line.product }
+  return { productId: row.movement.productId, product: row.movement.product }
 }
 
 type RefundLineRow = {
@@ -213,6 +234,16 @@ type RefundLineRow = {
       lines: Array<{ productId: string | null; qty: DecimalInput }>
     }
   }
+}
+
+/**
+ * A SALE_DISPATCH movement as the returns reader needs it: `productId` is the leaf component that
+ * physically left, `shipmentLine.line.productId` the parent product its sales line is priced in.
+ */
+type DispatchMovementRow = {
+  productId: string
+  qty: DecimalInput
+  shipmentLine: { lineId: string; line: { productId: string | null } | null } | null
 }
 
 type ShipmentRow = {
@@ -697,15 +728,31 @@ export type MarginLineRef = {
  * unlinked residual for an (order, product) is distributed across that order's
  * lines of the product proportionally to line quantity — never worse than the
  * old full-revenue behaviour, and exact once every movement is linked.
+ *
+ * o3d-7r6x: LINKED DISPATCH IS IN COMPONENT UNITS, THE LINE IS IN PARENT UNITS.
+ * A KIT line's dispatch movements carry the leaf component productIds, so keying
+ * the linked quantity on `(lineId, movement.productId)` and reading it back with
+ * `(lineId, salesOrderLine.productId)` never matched: every kit line contributed
+ * ZERO dispatched quantity and silently dropped out of margin altogether. Linked
+ * quantities are now converted to WHOLE ORDERED units through the same
+ * fulfillment-requirement graph the fill-rate and backorder readers use
+ * (`requirementsByLine`), i.e. min over components of qty/factor. A non-kit line
+ * is one self-requirement of factor 1, so its arithmetic is unchanged.
+ *
+ * The unlinked residual stays keyed on the movement's own productId: with no
+ * shipment-line link there is nothing to convert through, so a kit's legacy
+ * unlinked component rows still find no matching line and contribute nothing —
+ * exactly as before, and the only remaining gap here.
  */
 export function computeInWindowDispatchedQtyByLine(
   dispatchRows: MarginDispatchLinkRow[],
   orderLines: MarginLineRef[],
+  requirementsByLine: Map<string, DecimalFulfillmentRequirement[]>,
 ): Map<string, Prisma.Decimal> {
   const lineKey = (lineId: string, productId: string) => `${lineId}|${productId}`
   const orderProductKey = (orderId: string, productId: string) => `${orderId}|${productId}`
 
-  const linkedByLineProduct = new Map<string, Prisma.Decimal>()
+  const linkedRows: Array<{ lineId: string; productId: string; qty: DecimalInput }> = []
   const totalByOrderProduct = new Map<string, Prisma.Decimal>()
   const linkedByOrderProduct = new Map<string, Prisma.Decimal>()
   for (const row of dispatchRows) {
@@ -718,10 +765,25 @@ export function computeInWindowDispatchedQtyByLine(
       }
     }
     if (row.shipmentLineLineId) {
-      const k = lineKey(row.shipmentLineLineId, row.productId)
-      linkedByLineProduct.set(k, (linkedByLineProduct.get(k) ?? new Prisma.Decimal(0)).add(qty))
+      linkedRows.push({ lineId: row.shipmentLineLineId, productId: row.productId, qty })
     }
   }
+
+  // Fall back to a factor-1 self-requirement for any line the caller did not
+  // resolve through the graph, so the conversion is total and a non-kit line
+  // behaves identically to the pre-o3d-7r6x arithmetic.
+  const effectiveRequirements = new Map<string, DecimalFulfillmentRequirement[]>()
+  for (const line of orderLines) {
+    if (!line.productId) continue
+    const requirements = requirementsByLine.get(line.id)
+    effectiveRequirements.set(
+      line.id,
+      requirements && requirements.length > 0
+        ? requirements
+        : [{ productId: line.productId, factor: new Prisma.Decimal(1) }],
+    )
+  }
+  const linkedCoverageByLine = calculateDecimalCoverageByLine(effectiveRequirements, linkedRows)
 
   const lineQtySumByOrderProduct = new Map<string, Prisma.Decimal>()
   for (const line of orderLines) {
@@ -734,7 +796,7 @@ export function computeInWindowDispatchedQtyByLine(
   for (const line of orderLines) {
     if (!line.productId) continue
     const opk = orderProductKey(line.orderId, line.productId)
-    let qty = linkedByLineProduct.get(lineKey(line.id, line.productId)) ?? new Prisma.Decimal(0)
+    let qty = linkedCoverageByLine.get(line.id) ?? new Prisma.Decimal(0)
     const residual = (totalByOrderProduct.get(opk) ?? new Prisma.Decimal(0))
       .sub(linkedByOrderProduct.get(opk) ?? new Prisma.Decimal(0))
     if (residual.gt(0)) {
@@ -765,6 +827,19 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
           productId: true,
           createdAt: true,
           product: { select: { sku: true, name: true, category: { select: { name: true } } } },
+          // o3d-7r6x: a KIT dispatches its leaf components, so movement.productId is a component
+          // and never matches the sales line's kit product. Carry the line's product through so
+          // cost and revenue land in the SAME bucket.
+          shipmentLine: {
+            select: {
+              line: {
+                select: {
+                  productId: true,
+                  product: { select: { sku: true, name: true, category: { select: { name: true } } } },
+                },
+              },
+            },
+          },
         },
       },
     },
@@ -774,7 +849,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   const cogsOrderIds = cogsRows
     .map((row) => row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
-  const cogsProductIds = new Set(cogsRows.map((row) => row.movement.productId))
+  const cogsProductIds = new Set(cogsRows.map((row) => marginCogsBucket(row).productId))
   const orders = await loadSalesOrdersByIds(client, cogsOrderIds)
   // In-window dispatch movements carry the line-granularity link (scjz.51/4pz6):
   // we prorate each line's revenue to the units it actually dispatched in the
@@ -789,6 +864,23 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     take: SOURCE_ROW_LIMIT + 1,
   }) as Array<{ qty: DecimalInput; referenceId: string | null; productId: string; shipmentLine: { lineId: string } | null }>
   assertSourceLimit(dispatchRows.length, SOURCE_ROW_LIMIT, 'Margin analytics dispatch source rows')
+  // o3d-7r6x: a KIT line's dispatch movements are denominated in leaf components, the line in
+  // parent units. Resolve each line's component requirements so the linked dispatch can be
+  // converted to whole ordered units before it is matched back to the line.
+  const marginGraph = await loadFulfillmentProductGraph(
+    client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
+    [...new Set(orders.flatMap((order) => order.lines.map((line) => line.productId)).filter((id): id is string => Boolean(id)))],
+  )
+  const marginRequirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
+  for (const order of orders) {
+    for (const line of order.lines) {
+      if (!line.productId || marginRequirementsByLine.has(line.id)) continue
+      marginRequirementsByLine.set(
+        line.id,
+        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, marginGraph)),
+      )
+    }
+  }
   const dispatchedQtyByLine = computeInWindowDispatchedQtyByLine(
     dispatchRows.map((row) => ({
       orderId: row.referenceId,
@@ -802,6 +894,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
       productId: line.productId,
       qty: line.qty,
     }))),
+    marginRequirementsByLine,
   )
   const groups = new Map<string, MarginReportRow & { revenue: Prisma.Decimal; cogs: Prisma.Decimal; lineIds: Set<string> }>()
   for (const order of orders) {
@@ -833,12 +926,13 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     }
   }
   for (const row of cogsRows) {
-    const key = row.movement.productId
+    const bucket = marginCogsBucket(row)
+    const key = bucket.productId
     const current = groups.get(key) ?? {
       productId: key,
-      sku: row.movement.product.sku,
-      productName: row.movement.product.name,
-      categoryName: row.movement.product.category?.name ?? null,
+      sku: bucket.product.sku,
+      productName: bucket.product.name,
+      categoryName: bucket.product.category?.name ?? null,
       lineCount: 0,
       revenueBase: '0',
       cogsBase: '0',
@@ -887,8 +981,9 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     },
     notices: [
       'Gross margin is anchored to CogsEntry.createdAt, matches the inventory COGS report period semantics, and uses source SalesOrderLine revenue without recalculating FIFO.',
-      'Margin rows are product-level buckets: COGS is grouped by movement productId and revenue is grouped from sales-order lines for COGS-linked orders. Duplicate SKU lines share the same product bucket; this report is not line-level COGS attribution.',
+      'Margin rows are product-level buckets: COGS is grouped by the sales line product behind the dispatch (the movement product for unlinked rows) and revenue is grouped from sales-order lines for COGS-linked orders. Duplicate SKU lines share the same product bucket; this report is not line-level COGS attribution.',
       'Line revenue is prorated to the quantity each line dispatched within the window (via the shipment-line link on dispatch movements), so a line shipped across periods books only its in-window revenue against in-window COGS.',
+    'Kit lines are converted from component dispatch quantities to whole ordered units through the fulfillment-requirement graph, so a kit contributes revenue in the same units its line is priced in.',
     ],
   }
 }
@@ -926,13 +1021,65 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
         type: StockMovementType.SALE_DISPATCH,
         createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       },
-      select: { productId: true, qty: true },
+      // o3d-7r6x: productId is the DISPATCHED (leaf component) product; the sales line behind the
+      // shipment line carries the PARENT product the refund line is denominated in. Both are needed
+      // to state the denominator in the numerator's units.
+      select: {
+        productId: true,
+        qty: true,
+        shipmentLine: { select: { lineId: true, line: { select: { productId: true } } } },
+      },
       take: SOURCE_ROW_LIMIT + 1,
-    }) as Promise<Array<{ productId: string; qty: DecimalInput }>>,
+    }) as Promise<DispatchMovementRow[]>,
   ])
   assertSourceLimit(Math.max(refundLines.length, shippedMovements.length), SOURCE_ROW_LIMIT, 'Returns analytics source rows')
-  const shippedByProduct = new Map<string, Prisma.Decimal>()
+
+  // o3d-7r6x: RETURN RATE DIVIDED PARENT UNITS BY COMPONENT UNITS.
+  //
+  // `SalesOrderRefundLine.qty` is in the sales line's PARENT product units, while a SALE_DISPATCH
+  // movement for a kit is in LEAF COMPONENT units keyed on the component's productId. Summing the
+  // movements by movement.productId therefore produced a denominator that a kit refund line could
+  // never match: `shippedByProduct.get(kitProductId)` was 0, so every kit's return rate read 0%
+  // (and its "Shipped qty" column read 0) no matter how much had shipped or come back.
+  //
+  // Linked movements are converted to WHOLE ORDERED units through the same fulfillment-requirement
+  // graph as the fill-rate reader — coverage is min over components of qty/factor — and then
+  // attributed to the parent product of the sales line they shipped against. A non-kit line is one
+  // self-requirement of factor 1, so non-kit arithmetic is unchanged.
+  const parentProductIdByShipmentLine = new Map<string, string>()
   for (const movement of shippedMovements) {
+    const lineId = movement.shipmentLine?.lineId
+    const parentProductId = movement.shipmentLine?.line?.productId
+    if (lineId && parentProductId) parentProductIdByShipmentLine.set(lineId, parentProductId)
+  }
+  const returnsGraph = await loadFulfillmentProductGraph(
+    client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
+    [...new Set(parentProductIdByShipmentLine.values())],
+  )
+  const returnsRequirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
+  for (const [lineId, parentProductId] of parentProductIdByShipmentLine) {
+    returnsRequirementsByLine.set(
+      lineId,
+      requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(parentProductId, 1, returnsGraph)),
+    )
+  }
+  const dispatchedCoverageByLine = calculateDecimalCoverageByLine(
+    returnsRequirementsByLine,
+    shippedMovements.flatMap((movement) => movement.shipmentLine
+      ? [{ lineId: movement.shipmentLine.lineId, productId: movement.productId, qty: movement.qty }]
+      : []),
+  )
+  const shippedByProduct = new Map<string, Prisma.Decimal>()
+  for (const [lineId, coverage] of dispatchedCoverageByLine) {
+    const parentProductId = parentProductIdByShipmentLine.get(lineId)
+    if (!parentProductId) continue
+    shippedByProduct.set(parentProductId, (shippedByProduct.get(parentProductId) ?? new Prisma.Decimal(0)).add(coverage))
+  }
+  // Legacy/unlinked dispatch rows (no shipment-line link, so nothing to convert through) keep the
+  // historical raw attribution on the movement's own product. Correct for the simple products these
+  // rows are in practice; a kit's unlinked rows still cannot reach their parent line.
+  for (const movement of shippedMovements) {
+    if (movement.shipmentLine) continue
     shippedByProduct.set(movement.productId, (shippedByProduct.get(movement.productId) ?? new Prisma.Decimal(0)).add(toDecimal(movement.qty)))
   }
   const groups = new Map<string, ReturnsReportRow & { refundIds: Set<string>; returned: Prisma.Decimal; refundValue: Prisma.Decimal }>()
@@ -992,7 +1139,10 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
       returnedQty: qtyString(totalReturned),
       refundValueBase: moneyString(totalRefund, baseCurrency),
     },
-    notices: ['Returns analysis uses SalesOrderRefundLine values and compares returned quantity with SALE_DISPATCH quantity in the same period. Return rate is a same-period returned ÷ same-period dispatched metric, not an order-cohort return rate.'],
+    notices: [
+      'Returns analysis uses SalesOrderRefundLine values and compares returned quantity with SALE_DISPATCH quantity in the same period. Return rate is a same-period returned ÷ same-period dispatched metric, not an order-cohort return rate.',
+      'Dispatched quantity for kit products is converted from component movements to whole ordered units via the fulfillment-requirement graph, so the return rate divides like units by like units.',
+    ],
   }
 }
 

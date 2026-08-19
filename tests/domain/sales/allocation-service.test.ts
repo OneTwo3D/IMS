@@ -2830,6 +2830,46 @@ test('o3d-4kfh r5: the retirement audit row is written through the SAME client, 
   )
 })
 
+test('o3d-6zr2: the retirement record carries the acting user when the caller has one', async () => {
+  // The record used to be written after the commit by logActivity, which resolved the session for
+  // itself. Written through the transaction client it cannot, so the identity has to be threaded
+  // down from the action boundary — otherwise a draft shipment (and the tracking number an operator
+  // must cancel with the carrier) retired by a user-triggered re-allocation is attributed to nobody.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 10,
+    dispatchedQty: 10,
+    shipmentStatus: 'PENDING',
+    otherOrderQty: 3,
+    quantity: 8,
+    reservedQty: 13,
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1', userId: 'user-7' })
+
+  assert.equal(activityLogWrites.length, 1)
+  assert.equal((activityLogWrites[0] as { userId: string | null }).userId, 'user-7')
+})
+
+test('o3d-6zr2: a cron/batch caller with no session records no user, rather than a wrong one', async () => {
+  // The reallocation sweep and the overallocation rebalancer genuinely have no acting user. Null is
+  // the honest answer there; the shipment identity and tracking number are recorded either way.
+  const state = partiallyDispatchedScope({
+    lineQty: 10,
+    allocatedQty: 10,
+    dispatchedQty: 10,
+    shipmentStatus: 'PENDING',
+    otherOrderQty: 3,
+    quantity: 8,
+    reservedQty: 13,
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(activityLogWrites.length, 1)
+  assert.equal((activityLogWrites[0] as { userId: string | null }).userId, null)
+})
+
 test('o3d-4kfh r5: a rewrite that retires nothing writes no audit row', async () => {
   // The o3d-i5it property, restated for the audit trail: a run that changed nothing must say
   // nothing. An unconditional record would drown the real ones every 15 minutes.

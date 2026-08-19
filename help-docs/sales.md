@@ -324,4 +324,6 @@ Delete is a **hard** delete: the order row and its lines are removed outright, s
 
 Deleting in any of these cases would strand the external document with nothing in IMS referencing it. Drafts, which never queue an accounting invoice, stay freely deletable.
 
+**On the order screen, Delete is greyed out once the refusal is predictable.** The order page knows about the accounting leg, so it disables the button and puts the reason (and the remedy) in its tooltip rather than letting you press it and read a refusal: "an accounting invoice is queued — cancel the order instead" while the invoice is only queued, and "finance has to raise a credit note or reversal" once one has actually been posted. The button stays visible, greyed, so the action is still discoverable. The other blockers in the list — the WMS push link, a daily batch, refunds and payments — are only known to the server, so those still come back as a refusal message when you press Delete.
+
 The check, the allocation release and the delete all run under a single lock on the order row, and the posting workers claim their work under that same lock before making a remote call — so no worker can start posting an order in the window between the check and the delete.
