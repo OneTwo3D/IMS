@@ -2148,7 +2148,16 @@ export async function createRefund(
 
     const refundResult = await createSalesOrderRefund(db, {
       orderId,
-      lines,
+      // o3d-w00 (Codex r7 #1/#4): `chargedTaxForeign` is what the SOURCE OF THE REFUND states this line
+      // bore, and the writer's posted-VAT fence checks the posting identity against it INSTEAD of
+      // against the order's own snapshot — so a forged value from a public caller could wave a divergent
+      // credit note straight through. Like chargeback/externalRefundId it is provenance-bearing, and
+      // like them it is honoured only from the trusted internal entry points (the WooCommerce sync).
+      // Stripped rather than rejected: a public caller has no way to send it deliberately, and the
+      // refund itself is still perfectly recordable against the order's own figures.
+      lines: isInternal
+        ? lines
+        : lines.map((line) => ({ ...line, chargedTaxForeign: undefined })),
       reason,
       returnWarehouseId,
       externalRefundId: options?.externalRefundId,

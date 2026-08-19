@@ -55,6 +55,10 @@ import {
   type RefundParkView,
   type WcOrderRefundEvidence,
 } from '@/lib/domain/sales/refund-park-recovery'
+// o3d-w00 (Codex r7 #3): the pure payload→order-line link, imported from its own module rather than
+// through the sync — the inbox needs the link, not a WooCommerce client.
+import { refundedOrderLineId } from '@/lib/connectors/woocommerce/sync/refund-line-link'
+import type { WcRefundLineItem } from '@/lib/connectors/woocommerce/sync/types'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
@@ -665,6 +669,39 @@ function readParkedRefundGross(payload: unknown): string | null {
   if (typeof amount === 'string' && amount.trim()) return amount.trim()
   if (typeof amount === 'number' && Number.isFinite(amount)) return String(amount)
   return null
+}
+
+/**
+ * o3d-w00 (Codex r7 #3): the UNITS the parked WooCommerce refund returned, keyed by the ORDER line item
+ * they came off.
+ *
+ * A quarantine stops the refund BEFORE `createRefund`, so the restock the itemised route would have
+ * performed never happens — and until now the Record-manually path that resolves the quarantine sent
+ * `qty: 0` for every allocation and no return warehouse, so the units were not merely un-restocked but
+ * unrecorded: nothing on the refund, nothing in the activity log, no way to find them afterwards. The
+ * refusal was therefore not a refusal at all for the inventory half of the refund, it was a silent
+ * write-off — and it now happens on more refunds, because the posted-VAT fence quarantines itemised
+ * refunds, which are exactly the ones that carry quantities.
+ *
+ * The payload is the refund WooCommerce sent, so the quantities are read from it rather than typed in:
+ * they are the same figures the automatic route would have restocked (`refundedOrderLineId` resolves
+ * the `_refunded_item_id` meta, since Woo mints a fresh item id per refund line). The operator still
+ * attributes the MONEY; the units are a fact of the payload, not an opinion.
+ */
+function readParkedRefundedQuantities(payload: unknown): Map<number, number> {
+  const quantities = new Map<number, number>()
+  if (payload == null || typeof payload !== 'object') return quantities
+  const lineItems = (payload as { line_items?: unknown }).line_items
+  if (!Array.isArray(lineItems)) return quantities
+  for (const lineItem of lineItems) {
+    if (lineItem == null || typeof lineItem !== 'object') continue
+    const quantity = Math.abs(Number((lineItem as { quantity?: unknown }).quantity ?? 0))
+    if (!Number.isFinite(quantity) || quantity <= 0) continue
+    const orderLineId = refundedOrderLineId(lineItem as WcRefundLineItem)
+    if (!Number.isFinite(orderLineId) || orderLineId <= 0) continue
+    quantities.set(orderLineId, (quantities.get(orderLineId) ?? 0) + quantity)
+  }
+  return quantities
 }
 
 export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
@@ -1470,6 +1507,9 @@ export async function recordRefundParkManually(
             id: true,
             productId: true,
             description: true,
+            // o3d-w00 (Codex r7 #3): how the parked payload's refunded QUANTITIES are matched back to
+            // IMS lines — the same link the automatic itemised route matches on.
+            externalLineItemId: true,
             // The line's own money snapshot — what it was sold at and the VAT taken on it. Codex r4 #1:
             // the CHARGED rate is read from these, never from the live TaxRate row, which an admin can
             // edit at any time and which would then make the divergence check compare today's rate
@@ -1492,6 +1532,55 @@ export async function recordRefundParkManually(
     const orderShippingForeign = toDecimal(order.shippingForeign)
     if (cleaned.some((allocation) => allocation.lineKind === 'shipping') && orderShippingForeign.lte(0)) {
       return { success: false, error: 'This order carries no shipping charge, so a shipping refund cannot be recorded against it.' }
+    }
+
+    // -----------------------------------------------------------------------------------------------
+    // o3d-w00 (Codex r7 #3): the UNITS the quarantined refund returned come back with it.
+    //
+    // Recording the money by hand used to send `qty: 0` and no return warehouse, on the reasoning that a
+    // hand-recorded MONETARY refund must not invent an inventory movement. That reasoning is right for a
+    // monetary-only park and wrong for an itemised one: WooCommerce stated a refunded quantity per line,
+    // the automatic route would have restocked exactly those units, and the quarantine is the only
+    // reason it did not. Dropping them here made the sole remedy for a quarantine a permanent, silent
+    // inventory loss — and the posted-VAT fence quarantines itemised refunds, so it would have made
+    // that loss commoner.
+    //
+    // So the units are carried through from the payload, matched to IMS lines the same way the automatic
+    // route matches them, and restocked to the default return warehouse. A monetary-only park states no
+    // quantities and is unaffected — it still records as money alone.
+    // -----------------------------------------------------------------------------------------------
+    const refundedQtyByExternalLineId = readParkedRefundedQuantities(park.payload)
+    const refundedQtyByLineId = new Map<string, number>()
+    for (const line of order.lines) {
+      const qty = line.externalLineItemId == null ? 0 : refundedQtyByExternalLineId.get(line.externalLineItemId) ?? 0
+      if (qty > 0) refundedQtyByLineId.set(line.id, qty)
+    }
+    // Only the units on lines the operator is actually attributing money to: an allocation is what says
+    // this part of the order is being refunded, and a line nobody credits must not have stock returned
+    // against it either.
+    const restockedLineIds = cleaned
+      .filter((allocation) => allocation.lineKind === 'sale' && refundedQtyByLineId.has(allocation.lineId!))
+      .map((allocation) => allocation.lineId!)
+    let returnWarehouseId: string | undefined
+    if (restockedLineIds.length > 0) {
+      const returnWarehouse = await db.warehouse.findFirst({
+        where: { defaultReturnWarehouse: true, active: true },
+        select: { id: true },
+      })
+      if (!returnWarehouse) {
+        // Refuse rather than record the money and drop the units — that is the data loss this block
+        // exists to end, and it would be indistinguishable from a correct recording afterwards. The
+        // remedy is one setting, and the park stays QUARANTINED and recordable once it is made.
+        return {
+          success: false,
+          error:
+            `This refund returned ${restockedLineIds
+              .reduce((sum, lineId) => sum + (refundedQtyByLineId.get(lineId) ?? 0), 0)} unit(s), but no ` +
+            'active default return warehouse is configured, so they cannot be brought back into stock. ' +
+            'Set one in Settings → Warehouses, then record this refund.',
+        }
+      }
+      returnWarehouseId = returnWarehouse.id
     }
 
     // What is still refundable, per target. createSalesOrderRefund caps the ORDER total; it does not stop
@@ -1596,9 +1685,11 @@ export async function recordRefundParkManually(
         lineId: line?.id ?? null,
         productId: line?.productId ?? null,
         description: line?.description ?? 'Shipping refund',
-        // qty 0 — a monetary refund returns no goods. createSalesOrderRefund keeps amount-only lines
-        // (its filter is qty > 0 OR totalBase > 0) and derives a 0 unit price for them.
-        qty: 0,
+        // o3d-w00 (Codex r7 #3): the units the storefront refund returned on THIS line, as WooCommerce
+        // stated them. Zero for a monetary allocation — an amount that returns no goods — and
+        // createSalesOrderRefund keeps amount-only lines (its filter is qty > 0 OR totalBase > 0) and
+        // derives a 0 unit price for them.
+        qty: line ? refundedQtyByLineId.get(line.id) ?? 0 : 0,
         totalForeign: net.toNumber(),
         totalBase: roundQuantity(net.div(fxRate), 4).toNumber(),
         lineKind: allocation.lineKind,
@@ -1634,6 +1725,7 @@ export async function recordRefundParkManually(
       }
     }
 
+    const restockedUnits = refundLines.reduce((sum, line) => sum + line.qty, 0)
     const { createRefund } = await import('@/app/actions/sales')
     const result = await createRefund(
       order.id,
@@ -1648,9 +1740,12 @@ export async function recordRefundParkManually(
         lineKind: line.lineKind,
       })),
       reason.trim(),
-      // No return warehouse: nothing physically came back, and a hand-recorded monetary refund must not
-      // invent an inventory movement.
-      undefined,
+      // o3d-w00 (Codex r7 #3): set only when the parked refund states returned QUANTITIES on the lines
+      // being credited — the units the automatic route would have restocked, which a quarantine
+      // otherwise loses for good. A monetary-only park states none, so it still records with no return
+      // warehouse: nothing physically came back, and a hand-recorded monetary refund must not invent an
+      // inventory movement.
+      returnWarehouseId,
       {
         internalBypassToken: INTERNAL_ACTION_BYPASS,
         externalRefundId,
@@ -1686,17 +1781,27 @@ export async function recordRefundParkManually(
       description:
         `WooCommerce refund ${park.externalId} could not be converted automatically and was recorded by hand ` +
         `against ${refundLines.length} part(s) of the order, reconciled to the ${parkedGross.toFixed(2)} ` +
-        `${order.currency ?? ''} the storefront refunded: ${reason.trim()}`.replace(/\s+/g, ' '),
+        `${order.currency ?? ''} the storefront refunded: ${reason.trim()}` +
+        // o3d-w00 (Codex r7 #3): say what happened to the GOODS as well as the money. A hand-recorded
+        // itemised refund now brings its units back; the reader has to be able to tell that from a
+        // monetary one that brought none back, without opening the metadata.
+        (restockedUnits > 0
+          ? ` ${restockedUnits} unit(s) were returned to stock.`
+          : ' No units were returned (monetary refund).')
+      .replace(/\s+/g, ' '),
       // The evidence: exactly which parts of the order the operator attributed the money to, gross and
-      // net, and the storefront figure they were checked against.
+      // net, the units returned against each, and the storefront figure they were checked against.
       metadata: {
         shoppingSyncLogId: park.id,
         externalRefundId,
         userId: session.user.id,
         parkedGrossForeign: parkedGross.toFixed(2),
+        returnWarehouseId: returnWarehouseId ?? null,
+        restockedUnits,
         allocations: refundLines.map((line) => ({
           lineId: line.lineId,
           lineKind: line.lineKind,
+          qty: line.qty,
           grossForeign: line.grossForeign,
           totalForeign: line.totalForeign,
           totalBase: line.totalBase,

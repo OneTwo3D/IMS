@@ -19,7 +19,13 @@ import { refundDispositionForStatus } from '@/lib/domain/sales/refund-dispositio
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { findOverAllocatedRefundTarget, overAllocatedRefundTargetMessage } from '@/lib/domain/sales/refund-target-balances'
-import { RATE_EPSILON, buildTaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
+import {
+  RATE_EPSILON,
+  buildTaxTypeRateIndex,
+  chargedShippingMoney,
+  postedCreditNoteTotalCheck,
+  priceRefundTaxIdentity,
+} from '@/lib/domain/sales/refund-posted-tax-identity'
 import { scheduleRefundReservationReleaseOutbox, scheduleRefundUnmatchedWarningOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import { calculateCoverageByLine, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
@@ -114,6 +120,23 @@ export type RefundRequestLine = {
   totalForeign?: number | null
   totalBase: number
   lineKind?: 'sale' | 'shipping' | 'discount'
+  /**
+   * o3d-w00 (Codex r7 #1): the VAT the SOURCE OF THIS REFUND states it returned on this very line, in
+   * the order's currency, against `totalForeign` as its net.
+   *
+   * WooCommerce states it on every refunded line — `line_items[].total_tax` and
+   * `shipping_lines[].total_tax` — so a refund arriving from a storefront does not have to derive what
+   * this money bore from anything: it is stated, and restating it is what the credit note has to do.
+   * That statement is what the posted-VAT fence checks the posting identity's price against, and it
+   * needs no accounting-tax-code mapping of its own to produce.
+   *
+   * Absent, the fence falls back to the ORDER's own snapshot for this target (the linked line's
+   * net/VAT, or the shipping residue). Never inferred from a rate — a rate is what is being checked.
+   *
+   * PROVENANCE-BEARING: it can only ever WEAKEN the fence (it replaces the order's own figure), so the
+   * server-action layer accepts it from internal sync callers only.
+   */
+  chargedTaxForeign?: number | null
 }
 
 /**
@@ -2846,7 +2869,14 @@ export async function createSalesOrderRefund(
      * payment-poller when a payment reversal (chargeback) is detected.
      */
     chargeback?: boolean
-    /** Active accounting connector (scopes the prior-reversal guard); resolved by the caller. */
+    /**
+     * Active accounting connector (scopes the prior-reversal guard); resolved by the caller.
+     *
+     * o3d-w00 (Codex r7): it also says whether a CREDIT NOTE will be queued at all, which is what gates
+     * the posted-VAT fence below. Absent, nothing re-grosses the stored net lines, so there is no
+     * credit-note total that could disagree with the refund — and refusing would strand every refund on
+     * a store that keeps no accounting integration and therefore maps no accounting tax codes.
+     */
     activeAccountingConnector?: 'xero' | 'quickbooks'
     /**
      * o3d-w00 (Codex r3 #2): also cap each TARGET — every order line, and the shipping charge — at what
@@ -2944,6 +2974,16 @@ export async function createSalesOrderRefund(
         // o3d-w00 (Codex r3 #2): the per-target refundable balances are computed HERE, under the order
         // lock, so shippingForeign and each line's net foreign total are part of the locked read.
         shippingForeign: true,
+        // o3d-w00 (Codex r7 #1/#2/#5): the order's own money snapshot, in the currency it was taxed in
+        // — what every part of this order was CHARGED. It is the only historical record of that (the
+        // TaxRate rows are live and mutable), and it is read under the same lock as the identity the
+        // credit note will post under, so the posted-VAT fence below compares two figures that cannot
+        // move relative to one another. currency sizes the rounding a derived rate inherits;
+        // discountAmount + shoppingLinks say whether the shipping-VAT residue is separable.
+        currency: true,
+        taxForeign: true,
+        discountAmount: true,
+        shoppingLinks: { select: { connector: true } },
         lines: {
           select: {
             id: true,
@@ -2951,6 +2991,8 @@ export async function createSalesOrderRefund(
             description: true,
             qty: true,
             totalForeign: true,
+            // The VAT this line actually bore, as the order recorded it once at creation/import.
+            taxForeign: true,
             taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
           },
         },
@@ -3413,6 +3455,167 @@ export async function createSalesOrderRefund(
       const remainingRefundable = originalQty - alreadyRefunded
       if (refundLine.qty > remainingRefundable + 0.001) {
         return { error: `Refund qty ${refundLine.qty} for product ${refundLine.productId} exceeds remaining refundable qty ${remainingRefundable.toFixed(2)}` } as const
+      }
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // o3d-w00 (Codex r7 #1/#2/#4/#5): THE POSTED-VAT FENCE, AT THE WRITER.
+    //
+    // Every refund line is stored NET and the credit note posts it under the tax identity snapshotted
+    // three blocks below, with `lineAmountsIncludeTax: false` — so the ledger re-grosses it at whatever
+    // rate THAT accounting tax code is worth. When that rate is not the rate the money was actually
+    // charged at, the credit note's TOTAL silently disagrees with the refund it settles: zero-rated
+    // postage on a 20%-default order credits 12.00 against a 10.00 refund that reconciled to the penny.
+    //
+    // r6 checked exactly one caller (the WooCommerce sync's itemised SHIPPING route) for exactly that.
+    // Three things were wrong with checking it there:
+    //
+    //   #5  it guarded a CALLER, not the operation. A check outside the transaction that resolves the
+    //       identity is a pre-flight by construction: it reads the tax table in one snapshot and the
+    //       posting reads it in another.
+    //   #4  the route enumeration it was sized against was derived from a call graph rather than from
+    //       the exports, and came up one short — `createRefund` (app/actions/sales.ts) is an entry
+    //       point in its own right, not merely the sync's callee.
+    //   #1  it covered SHIPPING and left the itemised SALE route beside it discarding the same stated
+    //       figure. A sale line whose TaxRate carries no accounting code falls back to the ORDER
+    //       DEFAULT, which is the identical substitution one column over.
+    //
+    // So the check belongs HERE: one place, inside the transaction that holds the order row lock, on
+    // the operation every entry point funnels through — createRefund, the chargeback poller, the
+    // exception inbox's Record-manually, the refund dialog, and every WooCommerce route.
+    //
+    // #2 — WHY THE CHARGEBACK IS NOT EXEMPT. It was argued to be symmetric by construction: the invoice
+    // posted shipping under the order default and the reversal unwinds it under the order default, so
+    // whatever that code is worth, the two cancel. That holds only while the tax configuration is
+    // unchanged between the two moments. An admin editing the rate of the TaxRate mapped to that code,
+    // remapping the code, or deactivating/renaming the order's default rate breaks it — and this branch
+    // has already established (Codex r4 #1) that tax rates are mutable and must never be read as a
+    // historical fact. The invoice's rate is only recoverable from the ORDER's own money, which is what
+    // this compares against, so a chargeback raised after such an edit is refused rather than posted at
+    // the new rate. The payment poller holds paidAt and re-attempts, so restoring the mapping completes
+    // it (raiseChargebackForReversedOrder returns the message verbatim).
+    //
+    // Placed LAST among the transaction's refusals — after the conflict guards, the refund ceiling, the
+    // per-target caps and the quantity caps — so a refund that has nothing left to refund is still told
+    // so, rather than being quarantined for a tax question about money it was never going to credit.
+    //
+    // Gated on an ACTIVE accounting connector because that is exactly when a credit note is queued
+    // (queueRefundAccountingActions). With no ledger to post to there is no credit-note total to be
+    // wrong about, and refusing would strand refunds on stores that keep no accounting integration and
+    // therefore map no tax codes at all — a refusal with nothing for anyone to fix.
+    //
+    // `discount` lines are out of the fence deliberately: a mirrored order-level discount has no VAT
+    // figure of its own anywhere in IMS (its VAT is netted into the same order total the shipping
+    // residue is read out of), so there is nothing to check it against — see ChargedShippingSnapshot.
+    // ---------------------------------------------------------------------------------------------
+    if (input.activeAccountingConnector) {
+      const postingRates = buildTaxTypeRateIndex(
+        await tx.taxRate.findMany({
+          // Priced from SALES-usable rates only: a PURCHASE-only rate sharing an accountingTaxType with
+          // an output code would otherwise read as an ambiguous mapping (mirrors the inbox's context).
+          where: { usedFor: { not: 'PURCHASE' } },
+          select: { accountingTaxType: true, rate: true },
+        }),
+      )
+      // The order's shipping leg, from its own money. IMS stores no shipping-VAT column, so the VAT half
+      // is the money on the order that is on none of its lines — see ChargedShippingSnapshot.
+      const chargedShipping = {
+        currency: so.currency,
+        netForeign: so.shippingForeign,
+        orderTaxForeign: so.taxForeign,
+        lineTaxForeign: so.lines.map((salesLine) => salesLine.taxForeign),
+        orderDiscountAmount: so.discountAmount,
+        // Codex r6 #3: a WooCommerce-imported order's total VAT is the plain sum of its components, so
+        // its coupon residual has no VAT netted off it. Read from the order's own provenance.
+        orderTaxIsSumOfComponents: so.shoppingLinks.some((link) => link.connector === 'woocommerce'),
+      }
+      const salesLineMoneyById = new Map(so.lines.map((salesLine) => [salesLine.id, salesLine]))
+      // An UNLINKED sale amount (a monetary-only storefront refund, an itemised line that matched no
+      // IMS line) posts under the order's SINGLE SAFE identity — which exists only because every line
+      // resolves to it, and which the block above has already refused to proceed without. The money
+      // that identity describes is therefore the order's GOODS AS A WHOLE, so that aggregate is the
+      // honest record of what such an amount was charged at. Using the refund's own small amount
+      // instead would refuse ordinary sub-£3 zero-rated refunds for carrying too little information to
+      // pin a rate down, with nothing for anyone to fix.
+      const orderGoodsAggregate = {
+        currency: so.currency,
+        netForeign: so.lines.reduce((sum, salesLine) => sum.add(toDecimal(salesLine.totalForeign)), toDecimal(0)),
+        taxForeign: so.lines.reduce((sum, salesLine) => sum.add(toDecimal(salesLine.taxForeign)), toDecimal(0)),
+      }
+      for (const refundLine of refundLines) {
+        const lineKind: 'sale' | 'shipping' | 'discount' =
+          refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
+        if (lineKind === 'discount') continue
+        const linkedLine = refundLine.lineId ? salesLineMoneyById.get(refundLine.lineId) : undefined
+        // The net THIS money came off, in the order's currency — the same figure the refund line is
+        // stored at, so a stated VAT is priced against the amount it was stated for.
+        const refundNetForeign = refundLine.totalForeign != null
+          ? Math.round(refundLine.totalForeign * 10000) / 10000
+          : Math.round(refundLine.totalBase * fxRate * 10000) / 10000
+        // What the SOURCE says this money bore, when it says anything (Codex r7 #1). A WooCommerce
+        // refund states it per refunded line; restating it needs no tax-code mapping at all, and it is
+        // the only record of what an itemised line that matched no IMS order line was charged.
+        const stated = refundLine.chargedTaxForeign
+        const label = lineKind === 'shipping'
+          ? 'The refunded shipping'
+          : (refundLine.description || linkedLine?.description || 'The refunded line')
+        const refuse = (reason: string) => ({
+          error:
+            `No credit note has been raised: ${reason}` +
+            (input.externalRefundId != null
+              ? ` The money has ALREADY been returned in the storefront (refund ${input.externalRefundId}) — ` +
+                'do NOT issue another storefront refund. ' + REFUND_PARK_MANUAL_RESOLUTION_HINT
+              : ''),
+          // Deliberate and non-transient: a retry re-runs the identical decision against the identical
+          // order, so the WooCommerce sync parks it QUARANTINED for an operator rather than FAILED.
+          quarantine: true as const,
+        } as const)
+
+        const priced = priceRefundTaxIdentity({
+          kind: lineKind,
+          // Resolved from the SAME map resolveRefundLineTaxIdentity resolves from, so the identity
+          // checked here and the identity snapshotted below cannot differ by construction.
+          lineTaxRate: refundLine.lineId ? salesLineTaxById.get(refundLine.lineId) ?? null : null,
+          orderDefaultTaxType,
+          orderUniform: {
+            singleSafeTaxType: orderSingleSafeTaxType,
+            uniformlyReverseCharged: orderUniformlyReverseCharged,
+          },
+          reverseChargeSalesTaxType,
+          rateByTaxType: postingRates,
+          label,
+        })
+        // An identity that cannot be established or priced is refused whatever the money says: an
+        // unmapped accounting tax code is not a 0% one, it is a code IMS cannot say the value of.
+        if (!priced.ok) return refuse(priced.reason)
+
+        // What the ORDER (or the storefront) says THIS money bore, against the net it came off.
+        const chargedMoney: { netForeign: DecimalInput; taxForeign: DecimalInput } | null =
+          stated != null
+            ? { netForeign: refundNetForeign, taxForeign: stated }
+            : lineKind === 'sale'
+              ? (linkedLine
+                  ? { netForeign: linkedLine.totalForeign, taxForeign: linkedLine.taxForeign }
+                  : orderGoodsAggregate)
+              : (() => {
+                  const shippingMoney = chargedShippingMoney(chargedShipping)
+                  // Not derivable (an order-level discount netted off the same total, a negative
+                  // remainder): IMS has no record of what shipping bore, so there is nothing to check
+                  // the posting against. Left unchecked rather than refused — refusing here would name
+                  // no remedy anyone could carry out.
+                  return shippingMoney.ok
+                    ? { netForeign: shippingMoney.netForeign, taxForeign: shippingMoney.taxForeign }
+                    : null
+                })()
+        const total = postedCreditNoteTotalCheck({
+          currency: so.currency,
+          netForeign: chargedMoney?.netForeign,
+          taxForeign: chargedMoney?.taxForeign,
+          postedRate: priced.vatRate,
+          kind: lineKind,
+          label,
+        })
+        if (!total.ok) return refuse(total.reason)
       }
     }
 

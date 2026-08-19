@@ -402,15 +402,32 @@ function chargedRateFromSnapshot(snapshot: ChargedLineSnapshot | null | undefine
  * default rate. See ChargedShippingSnapshot for why the VAT half is a residue and what makes it unusable.
  */
 function chargedShippingRateFromSnapshot(snapshot: ChargedShippingSnapshot | null | undefined): ChargedRate {
+  const money = chargedShippingMoney(snapshot)
+  if (!money.ok) return money
+  return chargedRateFromMoney(money.netForeign, money.taxForeign, 'shipping charge', money.currency)
+}
+
+/**
+ * o3d-w00 (Codex r7): the shipping leg's NET and its VAT, before either is turned into a rate.
+ *
+ * Split out of the rate derivation because the writer's fence compares in money (see
+ * `postedCreditNoteTotalCheck`) and needs the same two figures — and, more importantly, the same
+ * REFUSALS: an order-level discount whose VAT is netted off the same total, a partial read of the
+ * order's lines, or a negative remainder all mean the residue is not shipping's VAT and must not be
+ * used as if it were, whatever is then done with it.
+ */
+export function chargedShippingMoney(snapshot: ChargedShippingSnapshot | null | undefined):
+  | { ok: true; currency: string; netForeign: Decimal; taxForeign: Decimal }
+  | { ok: false; detail: string } {
   // Codex r6 #1: a caller that HAS shipping's VAT does not derive it. The residue exists only because
   // SalesOrder stores no shipping-VAT column; a WooCommerce refund's own shipping line states one.
   if (snapshot?.netForeign != null && snapshot.shippingTaxForeign != null) {
-    return chargedRateFromMoney(
-      toDecimal(snapshot.netForeign),
-      toDecimal(snapshot.shippingTaxForeign),
-      'shipping charge',
-      snapshot.currency,
-    )
+    return {
+      ok: true,
+      currency: snapshot.currency,
+      netForeign: toDecimal(snapshot.netForeign),
+      taxForeign: toDecimal(snapshot.shippingTaxForeign),
+    }
   }
   if (snapshot?.netForeign == null || snapshot.orderTaxForeign == null || snapshot.lineTaxForeign == null) {
     return {
@@ -453,7 +470,7 @@ function chargedShippingRateFromSnapshot(snapshot: ChargedShippingSnapshot | nul
         `(${lineTax.toFixed(4)}), so no shipping VAT can be read out of the difference`,
     }
   }
-  return chargedRateFromMoney(toDecimal(snapshot.netForeign), shippingTax, 'shipping charge', snapshot.currency)
+  return { ok: true, currency: snapshot.currency, netForeign: toDecimal(snapshot.netForeign), taxForeign: shippingTax }
 }
 
 /**
@@ -477,12 +494,10 @@ export function chargedRateFromShippingSnapshot(snapshot: ChargedShippingSnapsho
 }
 
 /**
- * Resolve the tax identity — and therefore the rate — a refund allocation against this target will post
- * under. Mirrors `resolveRefundLineTaxIdentity` in refund-service exactly, prices the identity it lands
- * on from the TaxRate table, and checks that price against what the ORDER says this part of it was
- * charged.
+ * Everything needed to say which accounting tax identity a refund allocation against this target will
+ * post under, what that identity is worth, and what the ORDER says this part of it was charged.
  */
-export function resolvePostedRefundTaxIdentity(input: {
+export type PostedRefundTaxIdentityInput = {
   kind: 'sale' | 'shipping'
   /** The TaxRate ROW linked to the order line, for a `sale` target. Null when the line has none. */
   lineTaxRate?: PostedRefundTaxRate | null
@@ -505,7 +520,107 @@ export function resolvePostedRefundTaxIdentity(input: {
   rateByTaxType: TaxTypeRateIndex
   /** For the refusal messages: what this target is called on screen. */
   label: string
-}): PostedRefundTaxIdentity {
+}
+
+/**
+ * o3d-w00 (Codex r7 #5): the identity and its PRICE, with no comparison against what the target was
+ * charged — steps 1 and 3 of `resolvePostedRefundTaxIdentity` without step 2.
+ *
+ * Split out because the two consumers ask genuinely different questions of the same identity:
+ *
+ *   - the hand-recording path has to DIVIDE an operator's gross by this rate, so an amount whose own
+ *     figures cannot pin a rate down to inside the gap between two real VAT rates is unusable to it,
+ *     and refusing is the only safe answer (`resolvePostedRefundTaxIdentity`);
+ *   - the WRITER's fence already holds a NET amount. Nothing is divided; only the credit note's TOTAL
+ *     can come out wrong. Asking it to pin the rate down would refuse every refund of a line under
+ *     about £3 — where two figures each rounded to the penny leave the rate uncertain by more than
+ *     0.2pp — and the remedy that refusal names (record it by hand against the same line) refuses for
+ *     the identical reason. A refusal with no performable remedy is a defect in its own right (r5 #2),
+ *     so the writer prices the identity here and then compares in MONEY, via
+ *     `postedCreditNoteTotalCheck`, which needs no rate to be pinned down at all.
+ *
+ * Both still refuse an identity that cannot be established or priced — an unmapped code is not a 0%
+ * one, whichever question is being asked of it.
+ */
+export function priceRefundTaxIdentity(input: PostedRefundTaxIdentityInput): PostedRefundTaxIdentity {
+  const code = resolveIdentityCode(input)
+  if (!code.ok) return code
+  const priced = priceIdentityCode(code, input)
+  if (!priced.ok) return priced
+  return {
+    ok: true,
+    accountingTaxType: code.accountingTaxType,
+    reverseCharge: code.reverseCharge,
+    vatRate: priced.rate,
+  }
+}
+
+/**
+ * o3d-w00 (Codex r7): does the credit note COME TO what the refund settles?
+ *
+ * The rate comparison above asks whether two rates are the same number. This asks the question the
+ * money actually poses: the ledger will re-gross this NET amount at `postedRate`, so it will produce
+ * `net x (1 + postedRate)` — and what the customer's money says the same amount is worth, gross, is
+ * `net + tax`. If those agree to within the currency's minor unit, the credit note settles the refund
+ * whatever either figure implies about a rate; if they do not, it does not, and by exactly the
+ * difference reported here.
+ *
+ * Why this and not the rate comparison, at the writer: a £2.00 line bearing £0.40 of VAT is an
+ * entirely ordinary 20% line, but two figures rounded to the penny leave its DERIVED rate uncertain by
+ * (0.005 + 0.2 x 0.005) / 2 = 0.3pp — past the cap a divided gross needs — so the rate comparison
+ * treats it as carrying no usable snapshot. In money there is no uncertainty worth the name: 2.00 +
+ * 0.40 against 2.00 x 1.2 is 2.40 against 2.40. The same line zero-rated against a 20% code is 2.00
+ * against 2.40, which is the divergence the fence exists for, and it is caught at any size.
+ *
+ * The tolerance is ONE minor unit: the charged VAT reached IMS rounded to it (± half), and the ledger
+ * rounds its own computed VAT to it (± half). `{ ok: true }` with no snapshot supplied means there is
+ * nothing to check the posting against — never that it agrees.
+ */
+export function postedCreditNoteTotalCheck(input: {
+  /** The currency both figures are in, which fixes the minor unit the tolerance is measured in. */
+  currency: string
+  /** The NET amount whose posting is being checked, and the VAT the order/refund records on THAT net. */
+  netForeign?: DecimalInput | null
+  taxForeign?: DecimalInput | null
+  /** The rate the identity this money posts under is worth, from `priceRefundTaxIdentity`. */
+  postedRate: Decimal
+  /** Which target this is, so the refusal names the remedy that actually applies to it. */
+  kind: 'sale' | 'shipping'
+  /** For the refusal message: what this target is called on screen. */
+  label: string
+}): { ok: true } | { ok: false; reason: string } {
+  if (input.netForeign == null || input.taxForeign == null) return { ok: true }
+  const net = toDecimal(input.netForeign)
+  const tax = toDecimal(input.taxForeign)
+  if (!net.isFinite() || !tax.isFinite() || net.lte(0)) return { ok: true }
+  const chargedGross = net.add(tax)
+  const postedGross = net.mul(toDecimal(1).add(input.postedRate))
+  const tolerance = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(input.currency)))
+  if (postedGross.sub(chargedGross).abs().lte(tolerance)) return { ok: true }
+  return {
+    ok: false,
+    reason:
+      `${input.label} returned ${chargedGross.toDecimalPlaces(2).toFixed(2)} of the customer's money ` +
+      `(${net.toDecimalPlaces(2).toFixed(2)} plus ${tax.toDecimalPlaces(2).toFixed(2)} of VAT), but its ` +
+      `credit note would come to ${postedGross.toDecimalPlaces(2).toFixed(2)} — the accounting tax code ` +
+      `it posts under is worth ${input.postedRate.mul(100).toString()}%, which is not the VAT this money ` +
+      'bore. ' +
+      (input.kind === 'sale'
+        ? "Map this line's tax rate to an accounting tax code carrying the rate it was sold at " +
+          '(Settings → Tax Rates), then record this refund.'
+        : "Shipping posts under the ORDER's default VAT identity, which is not the rate this order " +
+          'charged shipping at: give that rate an accounting tax code carrying the rate shipping was ' +
+          'actually charged (Settings → Tax Rates), or allocate this refund to the order lines it came ' +
+          'off, then record it.'),
+  }
+}
+
+type ResolvedIdentityCode =
+  | { ok: true; accountingTaxType: string; reverseCharge: boolean; unlinkedSale: boolean }
+  | { ok: false; reason: string }
+
+/** Step 1: WHICH accounting tax code this target posts under. Mirrors resolveRefundLineTaxIdentity. */
+function resolveIdentityCode(input: PostedRefundTaxIdentityInput): ResolvedIdentityCode {
   const isSale = input.kind === 'sale'
   // A sale line with NO TaxRate row is not line-linked for tax at all: refund-service falls through to
   // the order's single safe identity for it, so the pre-flight must too, or the two reads disagree by
@@ -547,25 +662,15 @@ export function resolvePostedRefundTaxIdentity(input: {
           'Restore/map that tax rate in Settings → Tax Rates, then record this refund.',
     }
   }
+  return { ok: true, accountingTaxType, reverseCharge, unlinkedSale }
+}
 
-  // What this part of the order was actually CHARGED — read from the ORDER's own money, never from the
-  // tax table and never from the order's header default rate (Codex r4 #1 / r5 #1).
-  const charged: ChargedRate = isSale
-    ? chargedRateFromSnapshot(input.chargedLine)
-    : chargedShippingRateFromSnapshot(input.chargedShipping)
-  if (!charged.ok) {
-    return {
-      ok: false,
-      reason:
-        `${input.label} does not record what VAT was charged on it — ${charged.detail} — so IMS cannot ` +
-        'check that its credit note would post at the rate the customer actually paid, and will not ' +
-        'guess from the current tax table or from the rate on the order header. ' +
-        (isSale
-          ? 'Allocate this refund to the parts of the order that carry the money it came off, then record it.'
-          : 'Allocate this refund to the order lines it came off instead, then record it.'),
-    }
-  }
-
+/** Step 3: WHAT that code is worth, from the SALES-usable tax rates mapped to it. */
+function priceIdentityCode(
+  code: Extract<ResolvedIdentityCode, { ok: true }>,
+  input: PostedRefundTaxIdentityInput,
+): { ok: true; rate: Decimal } | { ok: false; reason: string } {
+  const { accountingTaxType, reverseCharge } = code
   const knownRates = input.rateByTaxType.get(accountingTaxType)
   if (!knownRates || knownRates.size === 0) {
     // Codex r4 #3: including — especially — the reverse-charge code. That the code is unmapped is not
@@ -595,7 +700,47 @@ export function resolvePostedRefundTaxIdentity(input: {
         'Tax Rates, then record this refund.',
     }
   }
-  const postedRate = toDecimal([...knownRates][0])
+  return { ok: true, rate: toDecimal([...knownRates][0]) }
+}
+
+/**
+ * Resolve the tax identity — and therefore the rate — a refund allocation against this target will post
+ * under. Mirrors `resolveRefundLineTaxIdentity` in refund-service exactly, prices the identity it lands
+ * on from the TaxRate table, and checks that price against what the ORDER says this part of it was
+ * charged.
+ *
+ * The three steps run in this order deliberately: an amount whose own money cannot say what it was
+ * charged is reported as such BEFORE its code is priced, because that is the refusal whose remedy
+ * ("allocate this refund to the parts of the order that carry the money it came off") the operator can
+ * act on without touching the tax table at all.
+ */
+export function resolvePostedRefundTaxIdentity(input: PostedRefundTaxIdentityInput): PostedRefundTaxIdentity {
+  const isSale = input.kind === 'sale'
+  const code = resolveIdentityCode(input)
+  if (!code.ok) return code
+
+  // What this part of the order was actually CHARGED — read from the ORDER's own money, never from the
+  // tax table and never from the order's header default rate (Codex r4 #1 / r5 #1).
+  const charged: ChargedRate = isSale
+    ? chargedRateFromSnapshot(input.chargedLine)
+    : chargedShippingRateFromSnapshot(input.chargedShipping)
+  if (!charged.ok) {
+    return {
+      ok: false,
+      reason:
+        `${input.label} does not record what VAT was charged on it — ${charged.detail} — so IMS cannot ` +
+        'check that its credit note would post at the rate the customer actually paid, and will not ' +
+        'guess from the current tax table or from the rate on the order header. ' +
+        (isSale
+          ? 'Allocate this refund to the parts of the order that carry the money it came off, then record it.'
+          : 'Allocate this refund to the order lines it came off instead, then record it.'),
+    }
+  }
+
+  const priced = priceIdentityCode(code, input)
+  if (!priced.ok) return priced
+  const { accountingTaxType, reverseCharge } = code
+  const postedRate = priced.rate
   if (postedRate.sub(charged.rate).abs().gt(charged.tolerance)) {
     const reverseChargeSwapMissing = reverseCharge && !input.reverseChargeSalesTaxType
     return {

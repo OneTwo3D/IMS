@@ -31,6 +31,16 @@ type Order = {
   // o3d-w00 (Codex r3 #2): the shipping charge is a refund TARGET with its own remaining balance,
   // enforced under the order lock, so the locked read of the order carries it.
   shippingForeign?: number
+  /**
+   * o3d-w00 (Codex r7 #1/#2): the order's own money snapshot, in the currency it was taxed in — what
+   * the posted-VAT fence checks the credit note against. `currency` fixes the minor unit the check's
+   * tolerance is measured in; `taxForeign` is the order's TOTAL VAT, from which shipping's is the
+   * residue; `discountAmount` + `shoppingConnectors` say whether that residue is separable.
+   */
+  currency?: string
+  taxForeign?: number
+  discountAmount?: number
+  shoppingConnectors?: string[]
   revenueDeferredDate: Date | null
   unearnedRevenueAmount: number | null
   inventoryAllocatedDate: Date | null
@@ -63,6 +73,12 @@ type SalesLine = {
   totalBase: number
   /** The line's NET total in the order's currency — what it has to refund against (Codex r3 #2). */
   totalForeign?: number
+  /**
+   * The VAT this line actually bore, in the order's currency (Codex r7 #1). Defaults to 0 in the
+   * projection below — which is a REAL zero, not a missing read: SalesOrderLine.taxForeign is
+   * non-nullable with a 0 default, so a line the fixture says nothing about is a line that bore no VAT.
+   */
+  taxForeign?: number
   taxRate?: LineTaxRate | null
   /**
    * o3d-kouj: the line's PINNED fulfilment recipe. The refund's component factors — how many
@@ -409,6 +425,14 @@ function createClient(state: State): RefundServiceClient {
         if (select.fxRateToBase) {
           return {
             ...order,
+            // o3d-w00 (Codex r7): the columns the posted-VAT fence reads. Defaulted the way the schema
+            // defaults them (currency GBP, taxForeign/discountAmount 0, no shopping link) so an existing
+            // fixture keeps meaning what it meant — never left undefined, which would make the fence
+            // read a missing column as a figure and quietly stop checking anything.
+            currency: order.currency ?? 'GBP',
+            taxForeign: order.taxForeign ?? 0,
+            discountAmount: order.discountAmount ?? 0,
+            shoppingLinks: (order.shoppingConnectors ?? []).map((connector) => ({ connector })),
             lines: state.lines
               .filter((line) => line.orderId === order.id)
               .map((line) => ({
@@ -418,6 +442,7 @@ function createClient(state: State): RefundServiceClient {
                 qty: line.qty,
                 // Defaults to the base total, i.e. an fx-1 order — the fixtures that care set it.
                 totalForeign: line.totalForeign ?? line.totalBase,
+                taxForeign: line.taxForeign ?? 0,
                 taxRate: line.taxRate ?? null,
               })),
             shipments: state.shipments
@@ -1310,6 +1335,337 @@ test('a reverse-charge line snapshots the SWAPPED tax type (o3d-w00)', async () 
 
   assert.equal(state.refundLines[0].accountingTaxType, 'REVERSECHARGE', 'reverse-charge swap is captured in the snapshot')
   assert.equal(state.refundLines[0].reverseCharge, true)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-w00 Codex r7 #1/#2/#4/#5: THE POSTED-VAT FENCE, AT THE WRITER.
+//
+// Every refund line is stored NET and its credit note is re-grossed by whatever the accounting tax
+// code it posts under is worth. r6 checked exactly one caller (the WooCommerce sync's itemised
+// SHIPPING route); these exercise the check where it now lives — inside the refund transaction, on the
+// operation every entry point funnels through — and on the two targets r6 left open: the itemised SALE
+// line, and the chargeback.
+// ---------------------------------------------------------------------------------------------
+
+/**
+ * An order of ONE line whose own TaxRate carries no accounting code, so its credit note falls back to
+ * the ORDER-DEFAULT identity — the substitution the fence exists to catch. `lineTaxForeign` is what the
+ * line actually bore; £0 makes it zero-rated goods on a 20%-default order.
+ */
+function fallsBackToOrderDefaultState(lineTaxForeign: number) {
+  const base = baseState()
+  const state = baseState({
+    orders: [{
+      ...base.orders[0],
+      totalBase: 10 + lineTaxForeign,
+      taxBase: lineTaxForeign,
+      taxRatePercent: lineTaxForeign > 0 ? 0.2 : 0,
+      taxRateName: 'Standard',
+      currency: 'GBP',
+      taxForeign: lineTaxForeign,
+      shippingForeign: 0,
+    }],
+    lines: [{
+      id: 'line-1',
+      orderId: 'order-1',
+      productId: 'product-1',
+      description: 'Widget',
+      qty: 1,
+      totalBase: 10,
+      totalForeign: 10,
+      taxForeign: lineTaxForeign,
+      // A TaxRate row with NO accounting code: refund-service falls through to the order default for it,
+      // exactly as the invoice did.
+      taxRate: { accountingTaxType: null, reverseCharge: false },
+    }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', rate: 0.2, active: true, usedFor: 'SALES' }],
+  })
+  return state
+}
+
+const ITEMISED_SALE_REFUND = {
+  lineId: 'line-1',
+  productId: 'product-1',
+  description: 'Widget',
+  qty: 1,
+  totalForeign: 10,
+  totalBase: 10,
+  lineKind: 'sale' as const,
+}
+
+test('an ITEMISED SALE refund whose credit note would restate VAT is refused (o3d-w00 Codex r7 #1)', async () => {
+  // £10.00 of zero-rated goods returned. The line's own tax rate carries no accounting code, so the
+  // credit note posts under the order default (OUTPUT2, 20%) and comes to £12.00 — against a £10.00
+  // storefront refund that reconciled to the penny. r6 caught this for postage and left it here.
+  const state = fallsBackToOrderDefaultState(0)
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    // The VAT WooCommerce STATES it returned on this line: none. Restating a stated figure needs no
+    // tax-code mapping of its own, which is why the route can be checked at all.
+    lines: [{ ...ITEMISED_SALE_REFUND, chargedTaxForeign: 0 }],
+    reason: 'Customer return',
+    externalRefundId: 8801,
+    creditNotePrefix: 'CN-',
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.quarantine, true, 'a deliberate, non-transient refusal')
+  const error = result.success === false ? result.error : ''
+  assert.match(error, /returned 10\.00 of the customer's money/)
+  assert.match(error, /credit note would come to 12\.00/)
+  // A storefront refund is money that has ALREADY left, so the message must not read as "try again".
+  assert.match(error, /do NOT issue another storefront refund/)
+  assert.equal(state.refunds.length, 0, 'nothing was created')
+  assert.equal(state.refundLines.length, 0)
+})
+
+test('the same line at the rate its credit will post at is recorded (o3d-w00 Codex r7 #1)', async () => {
+  // The mirror image, and the one a fence that simply refused unmapped lines would have blocked: £10.00
+  // of goods that DID bear the £2.00 of VAT the order default is worth. 10.00 + 2.00 against
+  // 10.00 x 1.2 is 12.00 against 12.00, so there is nothing to refuse.
+  const state = fallsBackToOrderDefaultState(2)
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ ...ITEMISED_SALE_REFUND, chargedTaxForeign: 2 }],
+    reason: 'Customer return',
+    externalRefundId: 8802,
+    creditNotePrefix: 'CN-',
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.refundLines[0].accountingTaxType, 'OUTPUT2')
+})
+
+test('a SMALL itemised sale refund is not refused for being small (o3d-w00 Codex r7 #1)', async () => {
+  // £2.00 of goods bearing £0.40 is an entirely ordinary 20% line, but two figures rounded to the penny
+  // leave its DERIVED rate uncertain by 0.3pp — past the cap a DIVIDED gross needs. Asking the writer's
+  // fence to pin the rate down would quarantine it, and the remedy that quarantine names (record it by
+  // hand against the same line) refuses for the identical reason: a refusal with nothing anyone can do.
+  // In money there is no uncertainty worth the name, which is why the fence compares totals.
+  const state = fallsBackToOrderDefaultState(0.4)
+  state.orders[0].totalBase = 2.4
+  state.orders[0].taxBase = 0.4
+  state.orders[0].taxForeign = 0.4
+  state.lines[0].totalBase = 2
+  state.lines[0].totalForeign = 2
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ ...ITEMISED_SALE_REFUND, totalForeign: 2, totalBase: 2, chargedTaxForeign: 0.4 }],
+    reason: 'Customer return',
+    externalRefundId: 8803,
+    creditNotePrefix: 'CN-',
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true, 'a £2.00 line at 20% records')
+
+  // And the tolerance bought nothing: the SAME small line zero-rated against the same 20% code is still
+  // 2.00 against 2.40, and is still refused.
+  const zeroRated = fallsBackToOrderDefaultState(0)
+  zeroRated.orders[0].totalBase = 2
+  zeroRated.lines[0].totalBase = 2
+  zeroRated.lines[0].totalForeign = 2
+  const refused = await createSalesOrderRefund(createClient(zeroRated), {
+    orderId: 'order-1',
+    lines: [{ ...ITEMISED_SALE_REFUND, totalForeign: 2, totalBase: 2, chargedTaxForeign: 0 }],
+    reason: 'Customer return',
+    externalRefundId: 8804,
+    creditNotePrefix: 'CN-',
+    activeAccountingConnector: 'xero',
+  })
+  assert.equal(refused.success, false)
+  assert.match(refused.success === false ? refused.error : '', /credit note would come to 2\.40/)
+})
+
+test('an itemised sale line that matched no IMS line is checked against the STATED VAT (o3d-w00 Codex r7 #1)', async () => {
+  // An unlinked sale amount posts under the order's single safe identity, and the only record of what
+  // the ORDER's goods bore says 20% — so a fence reading the order aggregate would wave this through.
+  // WooCommerce states that THIS refund returned £10.00 bearing nothing, and that statement is the only
+  // thing that can price a line IMS never matched. It is what has to be restated, and it is refused.
+  const base = baseState()
+  const state = baseState({
+    orders: [{
+      ...base.orders[0],
+      totalBase: 120, taxBase: 20, taxRatePercent: 0.2, taxRateName: 'Standard',
+      currency: 'GBP', taxForeign: 20, shippingForeign: 0,
+    }],
+    lines: [{
+      id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget',
+      qty: 1, totalBase: 100, totalForeign: 100, taxForeign: 20,
+      taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
+    }],
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', rate: 0.2, active: true, usedFor: 'SALES' }],
+  })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{
+      lineId: null, productId: null, description: 'Unmatched item', qty: 0,
+      totalForeign: 10, totalBase: 10, lineKind: 'sale', chargedTaxForeign: 0,
+    }],
+    reason: 'Customer return',
+    externalRefundId: 8805,
+    creditNotePrefix: 'CN-',
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /credit note would come to 12\.00/)
+})
+
+test('with no accounting connector the fence does not run (o3d-w00 Codex r7)', async () => {
+  // The fence protects a CREDIT NOTE. With no ledger to post one to nothing re-grosses the stored net
+  // lines, so there is no total that could disagree — and refusing would strand every refund on a store
+  // that keeps no accounting integration and therefore maps no accounting tax codes at all: a refusal
+  // with nothing for anyone to fix. This is the gate, stated so a change to it is visible.
+  const state = fallsBackToOrderDefaultState(0)
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ ...ITEMISED_SALE_REFUND, chargedTaxForeign: 0 }],
+    reason: 'Customer return',
+    externalRefundId: 8806,
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+})
+
+/**
+ * A chargeback fixture: £100.00 of goods bearing £20.00 under their OWN code, and £10.00 of postage
+ * bearing £2.00 under the ORDER DEFAULT — the identity the invoice posted shipping under. Shipping's
+ * VAT is stored in no column of its own, so it is the £2.00 the order records over and above its lines.
+ */
+function chargebackState(orderDefaultRate: number, overrides: Partial<Order> = {}) {
+  const base = baseState()
+  return baseState({
+    orders: [{
+      ...base.orders[0],
+      totalBase: 132, taxBase: 22, taxRatePercent: 0.2, taxRateName: 'Standard',
+      currency: 'GBP', taxForeign: 22, shippingForeign: 10,
+      ...overrides,
+    }],
+    lines: [{
+      id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Widget',
+      qty: 2, totalBase: 100, totalForeign: 100, taxForeign: 20,
+      taxRate: { accountingTaxType: 'OUTPUTGOODS', reverseCharge: false },
+    }],
+    taxRates: [
+      { name: 'Standard', accountingTaxType: 'OUTPUT2', rate: orderDefaultRate, active: true, usedFor: 'SALES' },
+      { name: 'Goods', accountingTaxType: 'OUTPUTGOODS', rate: 0.2, active: true, usedFor: 'SALES' },
+    ],
+  })
+}
+
+const CHARGEBACK_LINES = [
+  { lineId: 'line-1', productId: 'product-1', description: 'Widget', qty: 2, totalForeign: 100, totalBase: 100, lineKind: 'sale' as const },
+  { lineId: null, productId: null, description: 'Shipping', qty: 0, totalForeign: 10, totalBase: 10, lineKind: 'shipping' as const },
+]
+
+test('a chargeback posted at the rates the invoice used is raised (o3d-w00 Codex r7 #2)', async () => {
+  const state = chargebackState(0.2)
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: CHARGEBACK_LINES,
+    reason: 'Payment reversed (chargeback)',
+    creditNotePrefix: 'CN-',
+    chargeback: true,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true, 'an unchanged tax configuration reverses symmetrically')
+  assert.equal(state.refundLines.find((line) => line.lineKind === 'shipping')?.accountingTaxType, 'OUTPUT2')
+})
+
+test('a chargeback raised after the order-default RATE was edited is refused (o3d-w00 Codex r7 #2)', async () => {
+  // The symmetry argument for leaving the chargeback unchecked was that the invoice posts shipping under
+  // the order default and the reversal unwinds it under the same default, so whatever that code is worth
+  // the two cancel. They cancel only while the tax configuration is UNCHANGED. Here an admin has edited
+  // the rate mapped to OUTPUT2 from 20% to 5% since the sale — the mutability this branch has already
+  // established (Codex r4 #1) — so the credit note would unwind £10.50 of postage against the £12.00 the
+  // invoice charged, and the whole reversal is refused rather than posted at the new rate.
+  const state = chargebackState(0.05)
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: CHARGEBACK_LINES,
+    reason: 'Payment reversed (chargeback)',
+    creditNotePrefix: 'CN-',
+    chargeback: true,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, false)
+  const error = result.success === false ? result.error : ''
+  assert.match(error, /The refunded shipping returned 12\.00 of the customer's money/)
+  assert.match(error, /credit note would come to 10\.50/)
+  // Not a storefront refund, so it must NOT claim money has already left the business.
+  assert.doesNotMatch(error, /storefront/)
+  assert.equal(state.refunds.length, 0, 'no chargeback row, so the poller holds paidAt and re-attempts')
+  // The goods leg was untouched by the edit and is not what refused it — the shipping leg is, and the
+  // remedy named is the SHIPPING one (the order's default rate), not "map this line's tax rate".
+  assert.match(error, /refunded shipping/)
+  assert.match(error, /Shipping posts under the ORDER's default VAT identity/)
+})
+
+test("a chargeback's shipping leg is unchecked when its VAT is inseparable (o3d-w00 Codex r7 #2)", async () => {
+  // The residue is shipping's VAT only when nothing else was netted off the same total. createSalesOrder
+  // DOES subtract an order-level discount's VAT from it, so on such an order IMS holds no record of what
+  // shipping bore and there is nothing to check the posting against. Left UNCHECKED rather than refused:
+  // a refusal here would name no remedy anyone could carry out. Stated as a test so the gap is a
+  // decision on the record and not an accident.
+  const state = chargebackState(0.05, { discountAmount: 12 })
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: CHARGEBACK_LINES,
+    reason: 'Payment reversed (chargeback)',
+    creditNotePrefix: 'CN-',
+    chargeback: true,
+    activeAccountingConnector: 'xero',
+  })
+
+  assert.equal(result.success, true)
+
+  // On a WOOCOMMERCE order the identical figures mean something else: Woo allocates coupon money INTO
+  // the line totals and the importer subtracts no VAT for the discount leg, so the residue IS shipping's
+  // VAT (Codex r6 #3) and the same edit is caught. Provenance, never the size of a number.
+  const wooState = chargebackState(0.05, { discountAmount: 12, shoppingConnectors: ['woocommerce'] })
+  const wooResult = await createSalesOrderRefund(createClient(wooState), {
+    orderId: 'order-1',
+    lines: CHARGEBACK_LINES,
+    reason: 'Payment reversed (chargeback)',
+    creditNotePrefix: 'CN-',
+    chargeback: true,
+    activeAccountingConnector: 'xero',
+  })
+  assert.equal(wooResult.success, false)
+  assert.match(wooResult.success === false ? wooResult.error : '', /credit note would come to 10\.50/)
+})
+
+test('a public caller cannot state the VAT the fence checks against (o3d-w00 Codex r7 #1/#4)', async () => {
+  // chargedTaxForeign REPLACES the order's own snapshot, so a forged value would wave a divergent credit
+  // note straight through. createRefund (app/actions/sales.ts) strips it from a non-internal caller —
+  // this is the writer half: the fence must act on it when it IS supplied, which is what makes stripping
+  // it upstream load-bearing rather than decorative.
+  const state = fallsBackToOrderDefaultState(0)
+  const forged = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    // "This £10.00 bore £2.00" — false, the line's own snapshot says it bore nothing.
+    lines: [{ ...ITEMISED_SALE_REFUND, chargedTaxForeign: 2 }],
+    reason: 'Customer return',
+    creditNotePrefix: 'CN-',
+    activeAccountingConnector: 'xero',
+  })
+  assert.equal(forged.success, true, 'a stated figure is believed — which is why only internal callers may state one')
+
+  const honest = await createSalesOrderRefund(createClient(fallsBackToOrderDefaultState(0)), {
+    orderId: 'order-1',
+    lines: [ITEMISED_SALE_REFUND],
+    reason: 'Customer return',
+    creditNotePrefix: 'CN-',
+    activeAccountingConnector: 'xero',
+  })
+  assert.equal(honest.success, false, "and without one the line's OWN money is what it is checked against")
+  assert.match(honest.success === false ? honest.error : '', /credit note would come to 12\.00/)
 })
 
 test('createSalesOrderRefund converts refund totals from base to foreign currency', async () => {

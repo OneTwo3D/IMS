@@ -5,9 +5,13 @@ import {
   buildTaxTypeRateIndex,
   chargedRateFromLineSnapshot,
   chargedRateFromShippingSnapshot,
+  chargedShippingMoney,
+  postedCreditNoteTotalCheck,
+  priceRefundTaxIdentity,
   resolveOrderUniformTaxIdentity,
   resolvePostedRefundTaxIdentity,
 } from '@/lib/domain/sales/refund-posted-tax-identity'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 /**
  * o3d-w00 (Codex r4 #1 / #3): the two rates this module has to keep apart.
@@ -581,4 +585,80 @@ test('a STATED shipping VAT is used instead of the residue (o3d-w00 Codex r6 #1)
   })
   assert.equal(withOrderAggregate.ok, true)
   assert.equal(withOrderAggregate.ok && withOrderAggregate.vatRate.toString(), '0.2')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-w00 Codex r7 #5: TWO QUESTIONS, TWO ANSWERS.
+//
+// The hand-recording path DIVIDES an operator's gross by the identity's rate, so a snapshot that
+// cannot pin that rate down is unusable to it. The writer's fence already holds a NET amount and only
+// the credit note's TOTAL can come out wrong, so it prices the identity and compares in money. Same
+// identity, same refusals for an identity that cannot be established or priced — different question
+// about the money underneath.
+// ---------------------------------------------------------------------------------------------
+
+test('pricing an identity is separable from checking what it was charged (o3d-w00 Codex r7 #5)', () => {
+  const input = {
+    kind: 'sale' as const,
+    lineTaxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
+    // £2.00 bearing £0.40 is an ordinary 20% line whose DERIVED rate is uncertain by 0.3pp.
+    chargedLine: { currency: 'GBP', netForeign: 2, taxForeign: 0.4 },
+    orderDefaultTaxType: 'OUTPUT2',
+    rateByTaxType: index([{ accountingTaxType: 'OUTPUT2', rate: 0.2 }]),
+    label: 'Line',
+  }
+
+  const forDivision = resolvePostedRefundTaxIdentity(input)
+  assert.equal(forDivision.ok, false, 'a gross may not be divided by a rate this pair cannot fix')
+  assert.match(forDivision.ok ? '' : forDivision.reason, /too small to fix the rate it was charged at/)
+
+  const forPosting = priceRefundTaxIdentity(input)
+  assert.equal(forPosting.ok, true, 'but the identity itself is perfectly well established and priced')
+  assert.equal(forPosting.ok && forPosting.vatRate.toString(), '0.2')
+
+  // And pricing still refuses what it must: an unmapped code is not a 0% one.
+  const unpriced = priceRefundTaxIdentity({ ...input, rateByTaxType: index([]) })
+  assert.equal(unpriced.ok, false)
+  assert.match(unpriced.ok ? '' : unpriced.reason, /no IMS tax rate is\s+mapped to/)
+})
+
+test('the credit-note total check compares money, not rates (o3d-w00 Codex r7 #5)', () => {
+  const check = (netForeign: number, taxForeign: number, postedRate: number, currency = 'GBP') =>
+    postedCreditNoteTotalCheck({ currency, netForeign, taxForeign, postedRate: toDecimal(postedRate), kind: 'sale', label: 'The refunded line' })
+
+  // The £2.00 line the rate comparison could not judge: 2.00 + 0.40 against 2.00 x 1.2 is exact.
+  assert.equal(check(2, 0.4, 0.2).ok, true)
+  // Zero-rated against a 20% code, at the SAME size: 2.00 against 2.40, and the tolerance bought nothing.
+  const diverges = check(2, 0, 0.2)
+  assert.equal(diverges.ok, false)
+  assert.match(diverges.ok ? '' : diverges.reason, /returned 2\.00 of the customer's money/)
+  assert.match(diverges.ok ? '' : diverges.reason, /credit note would come to 2\.40/)
+
+  // A penny of rounding is not a divergence — the charged VAT reached IMS rounded to the minor unit and
+  // the ledger rounds its own the same way.
+  assert.equal(check(4.99, 1, 0.2).ok, true, '4.99 x 1.2 = 5.988 against a penny-rounded 5.99')
+  // The minor unit is the CURRENCY's, not the penny: ¥4,995 + ¥500 against ¥4,995 x 1.1 = ¥5,494.5.
+  assert.equal(check(4995, 500, 0.1, 'JPY').ok, true)
+  // …and it is not a licence: a genuinely different rate on the same yen figures is still caught.
+  assert.equal(check(4995, 500, 0.08, 'JPY').ok, false)
+
+  // No snapshot means there is NOTHING to check the posting against — never that it agrees.
+  assert.equal(postedCreditNoteTotalCheck({ currency: 'GBP', netForeign: 10, postedRate: toDecimal(0.2), kind: 'sale', label: 'x' }).ok, true)
+  assert.equal(postedCreditNoteTotalCheck({ currency: 'GBP', netForeign: 0, taxForeign: 0, postedRate: toDecimal(0.2), kind: 'sale', label: 'x' }).ok, true)
+})
+
+test('the shipping residue and its refusals are shared with the money check (o3d-w00 Codex r7 #5)', () => {
+  // Whatever is done with shipping's VAT afterwards, it is only shipping's VAT when nothing else was
+  // netted off the same total — so the refusals belong to the extraction, not to one consumer of it.
+  const derived = chargedShippingMoney(SHIPPING_CHARGED_20)
+  assert.equal(derived.ok, true)
+  assert.equal(derived.ok && derived.taxForeign.toString(), '2')
+  assert.equal(derived.ok && derived.netForeign.toString(), '10')
+
+  const discounted = chargedShippingMoney({ ...SHIPPING_CHARGED_20, orderDiscountAmount: 5 })
+  assert.equal(discounted.ok, false, "a discount's VAT is netted off the same total by createSalesOrder")
+
+  const stated = chargedShippingMoney({ currency: 'GBP', netForeign: 10, shippingTaxForeign: 0, orderDiscountAmount: 5 })
+  assert.equal(stated.ok, true, 'a STATED figure is not a residue, so no residue refusal applies to it')
+  assert.equal(stated.ok && stated.taxForeign.toString(), '0')
 })

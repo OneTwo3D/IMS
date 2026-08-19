@@ -64,8 +64,8 @@ const ORDER = {
     // figure an admin editing the tax table cannot rewrite. `rate` is still on the taxRate object
     // because the real row has one; production must not read it, and the r4 tests below prove it does
     // not by moving it away from the money.
-    { id: 'line-1', productId: 'product-1', description: 'Widget @ 20%', totalForeign: 10, taxForeign: 2, taxRate: { rate: 0.2, reverseCharge: false, accountingTaxType: 'OUTPUT2' } },
-    { id: 'line-2', productId: 'product-2', description: 'Book @ 0%', totalForeign: 20, taxForeign: 0, taxRate: { rate: 0, reverseCharge: false, accountingTaxType: 'ZERORATEDOUTPUT' as string | null } },
+    { id: 'line-1', productId: 'product-1', externalLineItemId: 501, description: 'Widget @ 20%', totalForeign: 10, taxForeign: 2, taxRate: { rate: 0.2, reverseCharge: false, accountingTaxType: 'OUTPUT2' } },
+    { id: 'line-2', productId: 'product-2', externalLineItemId: 502, description: 'Book @ 0%', totalForeign: 20, taxForeign: 0, taxRate: { rate: 0, reverseCharge: false, accountingTaxType: 'ZERORATEDOUTPUT' as string | null } },
   ],
 }
 
@@ -108,6 +108,7 @@ const state: {
   parkUpdates: Array<{ where: Record<string, unknown>; data: Record<string, unknown> }>
   activity: Array<Record<string, unknown>>
   syncRefundsCalls: number
+  returnWarehouse: { id: string } | null
 } = {
   park: null,
   parkQueryStatus: null,
@@ -121,6 +122,7 @@ const state: {
   parkUpdates: [],
   activity: [],
   syncRefundsCalls: 0,
+  returnWarehouse: { id: 'return-wh' },
 }
 
 mock.module('@/lib/db', {
@@ -172,6 +174,10 @@ mock.module('@/lib/db', {
       // How an accounting tax code is priced (Codex r3 #1). Returned in full so a production query that
       // forgot to filter deactivated / purchase-only rates would show up here rather than pass silently.
       taxRate: { async findMany() { return state.taxRates } },
+      // Codex r7 #3: where returned UNITS go. A quarantine stops the automatic restock, so the hand
+      // recording has to perform it — and an org with no default return warehouse has nowhere to put
+      // them, which is a refusal with a one-setting remedy rather than a silent write-off.
+      warehouse: { async findFirst() { return state.returnWarehouse } },
     },
   },
 })
@@ -288,6 +294,7 @@ test.beforeEach(() => {
   state.parkUpdates = []
   state.activity = []
   state.syncRefundsCalls = 0
+  state.returnWarehouse = { id: 'return-wh' }
 })
 
 test('recording a quarantined refund raises a LINE-LINKED credit note carrying the WooCommerce refund id (o3d-w00 Codex r1 #3)', async () => {
@@ -340,6 +347,91 @@ test('a refund that included SHIPPING can be expressed, and posts as a shipping 
     logged?.metadata?.allocations?.map((allocation) => ({ lineKind: allocation.lineKind, grossForeign: allocation.grossForeign })),
     [{ lineKind: 'shipping', grossForeign: 6 }, { lineKind: 'sale', grossForeign: 12 }],
   )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-w00 Codex r7 #3: A QUARANTINE MUST NOT LOSE THE UNITS THAT CAME BACK.
+//
+// A quarantine stops the refund BEFORE createRefund, so the restock the itemised route would have
+// performed never happens. This path — the only remedy a quarantine offers — used to send qty: 0 and no
+// return warehouse for every allocation, so the returned units were not merely un-restocked: nothing on
+// the refund, nothing in the activity log and nothing in the park recorded that any had been returned
+// at all. That is a silent inventory write-off dressed as a refusal, and the posted-VAT fence
+// quarantines ITEMISED refunds, which are precisely the ones that carry quantities.
+// ---------------------------------------------------------------------------------------------
+
+/** The same £18.00 refund, but ITEMISED: WooCommerce states 2 widgets came back off order line 501. */
+const ITEMISED_PARK: ParkRow = {
+  ...QUARANTINED_PARK,
+  payload: {
+    id: 7101,
+    amount: PARKED_GROSS,
+    reason: 'Damaged item',
+    line_items: [{
+      id: 9001,
+      quantity: -2,
+      total: '-10.00',
+      total_tax: '-2.00',
+      // Woo mints a fresh order-item id per refund line, so the ORDER line is named in the meta — the
+      // same link the automatic route matches on.
+      meta_data: [{ id: 1, key: '_refunded_item_id', value: '501' }],
+    }],
+  },
+}
+
+test('recording an ITEMISED park brings its units back into stock (o3d-w00 Codex r7 #3)', async () => {
+  state.park = { ...ITEMISED_PARK }
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'WC refund 7101 — 2 widgets returned')
+
+  assert.equal(result.success, true)
+  const call = state.createRefundCalls[0]
+  const lines = call.lines as Array<{ lineId?: string | null; qty: number; lineKind?: string }>
+  // The units are the payload's, matched to the IMS line by its external id — the same figures the
+  // automatic route would have restocked, not a number the operator typed.
+  assert.equal(lines.find((refundLine) => refundLine.lineId === 'line-1')?.qty, 2)
+  // Shipping returns no goods however the money was allocated.
+  assert.equal(lines.find((refundLine) => refundLine.lineKind === 'shipping')?.qty, 0)
+  // And they have somewhere to go: without a return warehouse createSalesOrderRefund performs no
+  // inbound movement at all, so the qty alone would still have lost them.
+  assert.equal(call.returnWarehouseId, 'return-wh')
+  const logged = state.activity[0] as { description?: string; metadata?: { restockedUnits?: number; returnWarehouseId?: string | null } }
+  assert.equal(logged?.metadata?.restockedUnits, 2)
+  assert.equal(logged?.metadata?.returnWarehouseId, 'return-wh')
+  assert.match(String(logged?.description), /2 unit\(s\) were returned to stock/)
+})
+
+test('units on a line nobody credited are not returned (o3d-w00 Codex r7 #3)', async () => {
+  // The allocation is what says which part of the order is being refunded. Restocking a line the
+  // operator attributed no money to would put stock back against a credit that was never raised.
+  state.park = {
+    ...ITEMISED_PARK,
+    payload: {
+      ...(ITEMISED_PARK.payload as Record<string, unknown>),
+      line_items: [{ id: 9002, quantity: -1, total: '-20.00', total_tax: '0.00', meta_data: [{ id: 1, key: '_refunded_item_id', value: '502' }] }],
+    },
+  }
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'only the widget and the postage')
+
+  assert.equal(result.success, true)
+  const call = state.createRefundCalls[0]
+  assert.deepEqual((call.lines as Array<{ qty: number }>).map((refundLine) => refundLine.qty), [0, 0])
+  assert.equal(call.returnWarehouseId, undefined, 'nothing to return, so no inventory movement is invented')
+})
+
+test('an itemised park with no default return warehouse is REFUSED, not silently written off (o3d-w00 Codex r7 #3)', async () => {
+  // The one outcome that must not be available: recording the money and dropping the units, which
+  // afterwards is indistinguishable from a correct recording. The remedy is one setting, and the park
+  // stays QUARANTINED and recordable once it is made.
+  state.park = { ...ITEMISED_PARK }
+  state.returnWarehouse = null
+  const result = await recordRefundParkManually('park-1', SETTLING_ALLOCATION, 'WC refund 7101')
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /returned 2 unit\(s\)/)
+  assert.match(result.error ?? '', /no active default return warehouse/)
+  assert.match(result.error ?? '', /Settings → Warehouses/)
+  assert.equal(state.createRefundCalls.length, 0, 'no credit note either — the whole recording is refused')
+  assert.equal(state.park?.status, 'QUARANTINED', 'and the park is still there to record once it is fixed')
 })
 
 test('a shipping allocation on an order with no shipping charge is refused (o3d-w00 Codex r2 #3)', async () => {
@@ -437,15 +529,19 @@ test('recording a quarantined refund RESOLVES the park so it stops blocking dele
   assert.equal(state.parkUpdates[0].where.entityId, 'so-1')
   // The evidence an auditor needs: who, which refund, what it was checked against, and exactly what was
   // attributed where — gross as entered and net as stored.
-  const logged = state.activity[0] as { action?: string; metadata?: { externalRefundId?: number; allocations?: unknown[]; userId?: string; parkedGrossForeign?: string } }
+  const logged = state.activity[0] as { action?: string; metadata?: { externalRefundId?: number; allocations?: unknown[]; userId?: string; parkedGrossForeign?: string; restockedUnits?: number } }
   assert.equal(logged?.action, 'wc_refund_park_recorded_manually')
   assert.equal(logged?.metadata?.externalRefundId, 7101)
   assert.equal(logged?.metadata?.userId, 'user-1')
   assert.equal(logged?.metadata?.parkedGrossForeign, '18.00')
+  // Codex r7 #3: `qty` is part of the evidence now — a hand-recorded refund that brought units back has
+  // to be distinguishable from one that did not, and this park's payload states none.
   assert.deepEqual(logged?.metadata?.allocations, [
-    { lineId: 'line-1', lineKind: 'sale', grossForeign: 12, totalForeign: 10, totalBase: 10 },
-    { lineId: null, lineKind: 'shipping', grossForeign: 6, totalForeign: 5, totalBase: 5 },
+    { lineId: 'line-1', lineKind: 'sale', qty: 0, grossForeign: 12, totalForeign: 10, totalBase: 10 },
+    { lineId: null, lineKind: 'shipping', qty: 0, grossForeign: 6, totalForeign: 5, totalBase: 5 },
   ])
+  assert.equal(logged?.metadata?.restockedUnits, 0)
+  assert.equal(state.createRefundCalls[0].returnWarehouseId, undefined, 'a monetary refund invents no inventory movement')
 })
 
 test('only a QUARANTINED park can be hand-recorded — a retryable one is left to Retry (o3d-w00 Codex r1 #3)', async () => {

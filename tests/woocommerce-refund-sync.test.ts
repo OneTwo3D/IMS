@@ -171,28 +171,18 @@ function makeOrder(input: {
   }
 }
 
-/**
- * o3d-w00 (Codex r6 #1): what IMS knows an accounting tax code to be worth. The credit note posts a NET
- * shipping line under the order-default code and the connector re-grosses it at that code's rate, so
- * these rows are what decide whether an itemised shipping refund can be recorded at all. A double with
- * no tax rates would make every shipping refund unpriceable and every assertion below vacuous.
- */
-type TaxRateDouble = { name: string; rate: number; accountingTaxType: string | null; active: boolean; usedFor: string }
-const DEFAULT_TAX_RATES: TaxRateDouble[] = [
-  { name: 'UK Standard Rate', rate: 0.2, accountingTaxType: 'OUTPUT2', active: true, usedFor: 'SALES' },
-  { name: 'UK Zero Rate', rate: 0, accountingTaxType: 'ZERORATEDOUTPUT', active: true, usedFor: 'SALES' },
-]
-
 function makeDependencies(options: {
   alwaysMissExistingRefund?: boolean
   refuseWithQuarantine?: boolean
   order?: Partial<OrderDouble>
-  taxRates?: TaxRateDouble[]
 } = {}) {
   const refunds: Array<{ id: string; externalRefundId: number; orderId: string }> = []
   const syncLogs: unknown[] = []
   const activityLogs: unknown[] = []
-  const createRefundLines: Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }> = []
+  // o3d-w00 (Codex r7 #1): chargedTaxForeign is the VAT WooCommerce STATED on each refunded line, and
+  // it is the only thing this sync now contributes to the posted-VAT fence — a capture that dropped it
+  // could not tell a line that states it from one that does not.
+  const createRefundLines: Array<{ lineId?: string; productId: string | null; qty?: number; totalForeign?: number | null; totalBase?: number; lineKind?: string; chargedTaxForeign?: number | null }> = []
   let createRefundCalls = 0
   let nextLogId = 1
   // o3d-w00 (Codex r3 #3): what the production query actually asks for. The foreign-currency shipping
@@ -298,11 +288,10 @@ function makeDependencies(options: {
           return { id: 'return-wh' }
         },
       },
-      taxRate: {
-        async findMany() {
-          return options.taxRates ?? DEFAULT_TAX_RATES
-        },
-      },
+      // o3d-w00 (Codex r7 #5): NO taxRate double. The sync no longer reads the tax table at all — the
+      // identity an itemised refund line posts under is resolved and priced by the writer, from its own
+      // read inside the refund transaction. A double that still offered one would let a regression
+      // reintroduce the stale second read here without a single test noticing.
       shoppingSyncLog: shoppingSyncLogMock,
     } as unknown as WcRefundSyncDependencies['db'],
     async createRefund(_orderId, lines, _reason, _returnWarehouseId, createOptions) {
@@ -310,7 +299,7 @@ function makeDependencies(options: {
       // Capture the lines. Without this nothing could assert that a refund line was
       // actually LINKED to its IMS order line, which is how the _refunded_item_id bug
       // survived: createRefund was only ever checked for being called.
-      createRefundLines.push(...(lines as unknown as Array<{ lineId?: string; productId: string | null; totalForeign?: number | null; totalBase?: number }>))
+      createRefundLines.push(...(lines as unknown as typeof createRefundLines))
       if (options.refuseWithQuarantine) {
         // o3d-w00 #2/#5: a monetary-only refund on a non-uniform order is refused for quarantine.
         return { success: false, error: 'not uniformly taxed; parked for manual resolution', quarantine: true }
@@ -1429,11 +1418,12 @@ test('the fixtures tax shipping unlike the goods AND unlike the header (o3d-w00 
   assert.equal(ZERO_RATED_POSTAGE_ORDER.taxRateName, TAXED_POSTAGE_ORDER.taxRateName, 'and one order-default identity')
 })
 
-test('an itemised shipping refund whose VAT the credit note would restate is QUARANTINED (o3d-w00 Codex r6 #1)', async () => {
+test('an itemised refund states the VAT WooCommerce returned on EVERY line (o3d-w00 Codex r7 #1/#5)', async () => {
   // £50.00 of goods + £10.00 of VAT on them, and the £10.00 of postage that bore none: £70.00 returned.
-  // The postage line is unlinked, so its credit posts under the order default (OUTPUT2, 20%) and the
-  // connector grosses £10.00 back up to £12.00 — a £72.00 credit note against a £70.00 storefront
-  // refund, reported as a success.
+  // What this sync owes the writer's posted-VAT fence is the one fact only WooCommerce has — the VAT it
+  // states it returned on each refunded line — and it owes it for the SALE line as much as the shipping
+  // one. r6 stated it for shipping alone, so a zero-rated GOODS line falling back to a 20% order default
+  // went to the ledger with nothing to check it against, which is the identical defect one column over.
   const state = makeDependencies({ alwaysMissExistingRefund: true, order: ZERO_RATED_POSTAGE_ORDER })
   const refund = makeRefund({
     id: 7401,
@@ -1448,20 +1438,22 @@ test('an itemised shipping refund whose VAT the credit note would restate is QUA
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
-  assert.equal(result.success, false)
-  assert.match(result.error ?? '', /Royal Mail was charged at 0% but/)
-  assert.match(result.error ?? '', /OUTPUT2, which is 20%/)
-  // The WHOLE refund is refused, not just its shipping half: a credit note covering only the goods
-  // would leave the storefront refund half-settled with nothing recording the rest.
-  assert.equal(state.createRefundCalls, 0, 'no credit note is raised for any part of it')
-  // And it is parked the way a deliberate refusal is parked — QUARANTINED (so the sweep does not
-  // re-refuse it every run) and carrying the payload the Record-manually path reconciles against.
-  const park = state.syncLogs.map((log) => (log as { data: Record<string, unknown> }).data).at(-1)
-  assert.equal(park?.status, 'QUARANTINED')
-  assert.equal(park?.externalId, '7401')
-  assert.equal((park?.payload as { id?: number })?.id, 7401)
-  assert.match(String(park?.errorMessage), /do NOT issue another WooCommerce refund/)
-  assert.match(String(park?.errorMessage), /Record manually/)
+  assert.deepEqual(result, { success: true })
+  assert.deepEqual(
+    state.createRefundLines.map((line) => ({
+      lineKind: line.lineKind,
+      totalForeign: line.totalForeign,
+      chargedTaxForeign: line.chargedTaxForeign,
+    })),
+    [
+      // The goods: £50.00 net bearing the £10.00 of VAT WooCommerce returned with it.
+      { lineKind: 'sale', totalForeign: 50, chargedTaxForeign: 10 },
+      // The postage: £10.00 net that bore NOTHING. Stating the zero is the whole point — an absent
+      // figure would leave the fence deriving the rate from the order's residue instead, and a stated
+      // zero is what makes "this money bore no VAT" a fact rather than a missing read.
+      { lineKind: 'shipping', totalForeign: 10, chargedTaxForeign: 0 },
+    ],
+  )
 })
 
 test('an itemised shipping refund at the rate its credit will post at is recorded (o3d-w00 Codex r6 #1)', async () => {
@@ -1487,42 +1479,54 @@ test('an itemised shipping refund at the rate its credit will post at is recorde
   )
 })
 
-test('an itemised shipping refund is refused when the order default cannot be priced (o3d-w00 Codex r6 #1)', async () => {
-  // The order's default rate has been deactivated since the sale, so nothing resolves the identity the
-  // shipping credit would post under — and an unresolved identity is not a 0% one: the connector would
-  // apply its own account default to a line nobody had priced.
+test("the writer's posted-VAT refusal is QUARANTINED, and says the units are not back (o3d-w00 Codex r7 #3/#5)", async () => {
+  // The refusal itself now belongs to createSalesOrderRefund (it is the operation, not this caller), so
+  // what this sync is responsible for is what it does with one: park it QUARANTINED rather than FAILED
+  // (a retry re-runs the identical decision), keep the payload the Record-manually path reconciles
+  // against, and say what became of the GOODS. The money is on the storefront and reconciles; the units
+  // are simply not on hand, and nothing else in the system will ever mention them.
   const state = makeDependencies({
     alwaysMissExistingRefund: true,
-    order: TAXED_POSTAGE_ORDER,
-    taxRates: DEFAULT_TAX_RATES.map((taxRate) =>
-      taxRate.name === 'UK Standard Rate' ? { ...taxRate, active: false } : taxRate),
+    order: ZERO_RATED_POSTAGE_ORDER,
+    refuseWithQuarantine: true,
   })
   const refund = makeRefund({
     id: 7403,
-    amount: '12.00',
-    line_items: [],
-    shipping_lines: [shippingRefundLine('-10.00', '-2.00')],
+    amount: '70.00',
+    line_items: [{
+      id: 601, name: 'Widget', product_id: 10, variation_id: 0, quantity: -2, tax_class: '',
+      subtotal: '-50.00', subtotal_tax: '-10.00', total: '-50.00', total_tax: '-10.00', sku: 'WIDGET',
+      meta_data: [{ id: 1, key: '_refunded_item_id', value: '501' }], refund_total: 50,
+    }],
+    shipping_lines: [shippingRefundLine('-10.00', '0.00')],
   })
 
   const result = await syncWcRefund(1001, refund, state.dependencies)
 
   assert.equal(result.success, false)
-  assert.match(result.error ?? '', /missing, renamed or deactivated/)
-  // The remedy is one an admin can actually carry out, and it re-opens the same row.
-  assert.match(result.error ?? '', /Restore\/map that tax rate in Settings → Tax Rates/)
-  assert.equal(state.createRefundCalls, 0)
   const park = state.syncLogs.map((log) => (log as { data: Record<string, unknown> }).data).at(-1)
   assert.equal(park?.status, 'QUARANTINED')
+  assert.equal(park?.externalId, '7403')
+  assert.equal((park?.payload as { id?: number })?.id, 7403)
+  // The units, counted from the refund's own SALE lines — shipping carries none and must not inflate it.
+  assert.match(String(park?.errorMessage), /returned 2 unit\(s\), which are NOT back on hand/)
+  assert.match(String(park?.errorMessage), /recording it manually restocks them/)
+  assert.match(result.error ?? '', /returned 2 unit\(s\), which are NOT back on hand/)
 })
 
-test('the sync READS what the shipping identity is resolved from (o3d-w00 Codex r6 #1)', async () => {
-  // taxRateName resolves the order-default identity and currency sizes the rounding a derived rate
-  // inherits. Neither is visible in the returned double, so without asserting on the SELECT a missing
-  // column would leave the check silently reading `undefined` and refusing every shipping refund.
-  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TAXED_POSTAGE_ORDER })
-  await syncWcRefund(1001, makeRefund({ id: 7404, amount: '12.00', line_items: [], shipping_lines: [shippingRefundLine('-10.00', '-2.00')] }), state.dependencies)
+test('a monetary-only quarantine claims no units (o3d-w00 Codex r7 #3)', async () => {
+  // The counterpart that keeps the sentence honest: a refund with no quantity lines returns no goods, so
+  // the park must not tell an operator to expect a restock that nothing will perform.
+  const state = makeDependencies({
+    alwaysMissExistingRefund: true,
+    order: ZERO_RATED_POSTAGE_ORDER,
+    refuseWithQuarantine: true,
+  })
+  const refund = makeRefund({ id: 7405, amount: '10.00', line_items: [], shipping_lines: [shippingRefundLine('-10.00', '0.00')] })
 
-  const select = state.orderSelect as { taxRateName?: boolean; currency?: boolean }
-  assert.equal(select?.taxRateName, true, "the order-default identity's name")
-  assert.equal(select?.currency, true, "the currency its money figures are quantised in")
+  await syncWcRefund(1001, refund, state.dependencies)
+
+  const park = state.syncLogs.map((log) => (log as { data: Record<string, unknown> }).data).at(-1)
+  assert.equal(park?.status, 'QUARANTINED')
+  assert.doesNotMatch(String(park?.errorMessage), /unit\(s\)/)
 })
