@@ -17,9 +17,10 @@ import { connectorFetch } from '@/lib/security/connector-fetch'
 import { clearXeroReferenceCache } from './api'
 import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from './scopes'
 import {
-  demoOrgConnectRefusal, nameOnlyGuardWarning, readXeroTenantAllowList, selectXeroTenant,
-  storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroPinAbsenceVerdict, xeroTenantBindingRaceMessage,
-  type XeroConnectionSummary, type XeroStoredBinding, type XeroTenantAllowList,
+  demoOrgConnectRefusal, nameOnlyGuardWarning, parseXeroReleaseWitness, readXeroTenantAllowList,
+  selectXeroTenant, storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroPinAbsenceVerdict,
+  xeroTenantBindingRaceMessage,
+  type XeroConnectionSummary, type XeroReleaseWitness, type XeroStoredBinding, type XeroTenantAllowList,
 } from './tenant-guard'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
@@ -104,6 +105,17 @@ type OAuthStatePayload = {
 }
 
 const XERO_EXPECTED_TENANT_KEY = 'xero_expected_tenant_id'
+/**
+ * The half of a pin-release receipt that stays with the INSTANCE (o3d-9tbz r8 finding 2).
+ *
+ * Written into `settings` by the transaction that deletes the pin and stamps the token row, so a
+ * release is recorded in both tables or in neither; deleted by `bindXeroTenant`, which writes a pin
+ * again and ends the release, and by `disconnect()`, which removes the binding entirely. It exists
+ * because everything r7 checks the receipt against is a column on the same row as the receipt: a
+ * restored `accounting_tokens` row brings its own corroboration and agrees with itself. This does not
+ * travel with that row.
+ */
+const XERO_PIN_RELEASE_WITNESS_KEY = 'xero_pin_release_witness'
 const REFRESH_EARLY_MS = 2 * 60 * 1000
 
 let refreshInFlight: Promise<{ accessToken: string; tenantId: string } | null> | null = null
@@ -296,6 +308,17 @@ async function readPinnedTenantId(): Promise<string | null> {
 }
 
 /**
+ * The release witness, or null when this instance has no record of releasing a pin (o3d-9tbz r8).
+ *
+ * A value that is absent, blank or unparseable is all the same answer — no witness — because failing
+ * open on a malformed one would make "put anything in that row" the exemption. The parsing lives in
+ * tenant-guard.ts beside the check that uses it, so the format has exactly one owner.
+ */
+async function readReleaseWitness(): Promise<XeroReleaseWitness | null> {
+  return parseXeroReleaseWitness(await getSettingValue(XERO_PIN_RELEASE_WITNESS_KEY))
+}
+
+/**
  * What the next consent must match: the pin, or the organisation an unpinned token already belongs to.
  *
  * THE TOKEN FALLBACK IS RIGHT, EXCEPT AFTER A RELEASE (o3d-9tbz r6). Falling back to the stored token's
@@ -319,6 +342,10 @@ async function getExpectedTenantId(): Promise<string | null> {
   const stored = await getSettingValue(XERO_EXPECTED_TENANT_KEY)
   if (stored) return stored
   if (!token) return null
+  // The witness is read on this path too, and for the same reason the halt reads it: suspending the
+  // fallback is a PRIVILEGE — it is what lets a consent name an organisation this instance has never
+  // been bound to — so it is granted on exactly the evidence the exemption is granted on, never on a
+  // weaker subset of it. A restored token row that carries a receipt gets neither.
   // Only a release that still DESCRIBES this row suspends the fallback (r7). The suspension is a
   // privilege — it is what lets a consent name an organisation this instance has never been bound to —
   // so it is granted on the same evidence the halt is, and by the same function, rather than on the
@@ -330,7 +357,7 @@ async function getExpectedTenantId(): Promise<string | null> {
     pinReleasedAt: token.pinReleasedAt ?? null,
     pinReleasedGeneration: token.pinReleasedGeneration ?? null,
     pinReleasedTenantId: token.pinReleasedTenantId ?? null,
-  }, token.tenantId)
+  }, token.tenantId, await readReleaseWitness())
   if (verdict === 'released') return null
   return token.tenantId ?? null
 }
@@ -404,6 +431,11 @@ async function bindXeroTenant(params: {
         pinReleasedTenantId: null,
       })
       await tx.accountingToken.upsert({ where: { connector: XERO_CONNECTOR }, create: data, update: data })
+      // ...and the witness in `settings` goes with the receipt it corroborates, inside the same
+      // transaction (r8). Both halves of a release are written together and cleared together; a writer
+      // that cleared only one would leave the other to be read as evidence about a state that has ended,
+      // which is the whole shape of r7 and r8.
+      await tx.setting.deleteMany({ where: { key: XERO_PIN_RELEASE_WITNESS_KEY } })
     })
     return { ok: true }
   } catch (error) {
@@ -530,8 +562,9 @@ async function storedTenantAllowed(token: StoredAccountingToken): Promise<boolea
   // The pin is read HERE, on the path that decides whether a sync happens, because that is the only
   // place a split binding can be acted on. Nothing runs on deploy, and an instance that already has one
   // would otherwise go on syncing off the token forever (r5 finding 1).
+  const [pinnedTenantId, releaseWitness] = await Promise.all([readPinnedTenantId(), readReleaseWitness()])
   const message = storedXeroConnectionRefusal(
-    summary, allowList, await readPinnedTenantId(), storedBinding(token),
+    summary, allowList, pinnedTenantId, storedBinding(token), releaseWitness,
   )
   if (message === null) {
     allowListWarnedTenantId = null
@@ -567,7 +600,7 @@ async function storedTenantAllowed(token: StoredAccountingToken): Promise<boolea
  * failure instead of only into the notification.
  */
 export async function getStoredTenantBlockReason(): Promise<string | null> {
-  const [row, pinnedTenantId] = await Promise.all([
+  const [row, pinnedTenantId, releaseWitness] = await Promise.all([
     db.accountingToken.findUnique({
       where: { connector: XERO_CONNECTOR },
       select: {
@@ -577,6 +610,7 @@ export async function getStoredTenantBlockReason(): Promise<string | null> {
       },
     }),
     readPinnedTenantId(),
+    readReleaseWitness(),
   ])
   if (!row) return null
   return storedXeroConnectionRefusal(
@@ -589,6 +623,7 @@ export async function getStoredTenantBlockReason(): Promise<string | null> {
       pinReleasedGeneration: row.pinReleasedGeneration ?? null,
       pinReleasedTenantId: row.pinReleasedTenantId ?? null,
     },
+    releaseWitness,
   )
 }
 
@@ -1045,6 +1080,9 @@ export async function disconnect(): Promise<void> {
   await db.$transaction([
     db.accountingToken.deleteMany({ where: { connector: XERO_CONNECTOR } }),
     db.setting.deleteMany({ where: { key: XERO_EXPECTED_TENANT_KEY } }),
+    // The release witness goes with them (r8): a disconnect ends the binding, and a witness left behind
+    // would be a half-receipt waiting for a token row to corroborate.
+    db.setting.deleteMany({ where: { key: XERO_PIN_RELEASE_WITNESS_KEY } }),
     db.customer.updateMany({
       where: { accountingContactId: { not: null } },
       data: { accountingContactId: null, accountingContactProvenance: null },
@@ -1091,8 +1129,9 @@ export async function isConnected(): Promise<{
   const token = await readStoredToken()
   if (!token) return { connected: false }
 
+  const [pinnedTenantId, releaseWitness] = await Promise.all([readPinnedTenantId(), readReleaseWitness()])
   const blockedReason = storedXeroConnectionRefusal(
-    storedSummary(token), readXeroTenantAllowList(), await readPinnedTenantId(), storedBinding(token),
+    storedSummary(token), readXeroTenantAllowList(), pinnedTenantId, storedBinding(token), releaseWitness,
   )
   if (blockedReason !== null) {
     return {

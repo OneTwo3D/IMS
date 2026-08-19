@@ -68,6 +68,14 @@ import test, { beforeEach, mock } from 'node:test'
  * any of it). A double that only ever deleted the pin would pass against the bug, because under r5 all
  * three are the same state.
  *
+ * AND THE TOKEN ROW CAN ARRIVE FROM SOMEWHERE ELSE (o3d-9tbz r8), which the same independence expresses
+ * without any new machinery. `restoredMidReleaseTokenRow()` puts a whole released row — receipt,
+ * qualifiers, generation and tenant, all internally consistent because they came from one dump — onto an
+ * instance that never performed that release, which is the case the r7 checks cannot see: every value
+ * they compare travelled together. `legacyUnqualifiedRelease()` is the other one, a receipt written by
+ * a version of IMS that recorded only a timestamp — the shape the r7 migration was asked to backfill,
+ * and the shape the OLD `--clear-tenant-pin` also left behind when it deleted no pin at all.
+ *
  * `fetchedUrls` records every call that reached Xero, so "no Xero request was made" can be asserted
  * rather than assumed — the refusal claims it, and an expired token makes the claim load-bearing.
  */
@@ -704,6 +712,38 @@ function stampReleaseReceipt(deletedPinTenantId: string, at: Date) {
   tokenRow!.pinReleasedAt = at
   tokenRow!.pinReleasedGeneration = tokenRow!.connectionGeneration
   tokenRow!.pinReleasedTenantId = deletedPinTenantId
+  // ...and the half that stays in `settings`, written by the same transaction (o3d-9tbz r8). It is what
+  // a copied token row cannot bring with it, so it is what separates a release this instance performed
+  // from one it merely inherited.
+  settings.xero_pin_release_witness = JSON.stringify({
+    generation: tokenRow!.connectionGeneration, tenantId: deletedPinTenantId,
+  })
+}
+
+/**
+ * A WHOLESALE-RESTORED TOKEN ROW (o3d-9tbz r8 finding 2).
+ *
+ * `accounting_tokens` put back from a dump taken while a release was outstanding, onto an instance that
+ * never performed it. Everything r7 compares is on that row and came out of that one dump, so the row
+ * corroborates itself perfectly — this helper writes the release exactly as the recovery would and then
+ * removes only the half that lives in the other table, which is precisely what a restore of one table
+ * does. A double that also removed something from the token row would be testing a different bug.
+ */
+function restoredMidReleaseTokenRow(conn: typeof DEMO) {
+  releasedPin(conn)
+  delete settings.xero_pin_release_witness
+}
+
+/**
+ * A RECEIPT FROM BEFORE THE QUALIFIERS EXISTED (o3d-9tbz r8 finding 1).
+ *
+ * A timestamp and nothing else — which is what every release recorded before r7 looks like, AND what
+ * the pre-r7 `--clear-tenant-pin` stamped when it deleted no pin at all. The two are the same row, and
+ * that is why the r7 migration cannot fill the qualifiers in from it.
+ */
+function legacyUnqualifiedRelease(conn: typeof DEMO) {
+  pinDeleted(conn)
+  tokenRow!.pinReleasedAt = new Date('2026-08-19T09:00:00.000Z')
 }
 
 /**
@@ -1961,6 +2001,7 @@ test('THE DEMO-RESET RECOVERY, end to end: release, re-consent to the NEW tenant
   releasedPin(retired)
   const { getAccessToken, exchangeCodeForTokens, isConnected } = await loadAuth()
   assert.equal((await isConnected()).connected, true, 'released, not halted, while it waits')
+  assert.ok(settings.xero_pin_release_witness, 'and the release is recorded in BOTH tables (r8)')
 
   reconsentTo(rebuilt, 'c2')
   const result = await exchangeCodeForTokens('c2', 'https://ims.example/cb')
@@ -1973,6 +2014,8 @@ test('THE DEMO-RESET RECOVERY, end to end: release, re-consent to the NEW tenant
   assert.equal(tokenRow?.pinReleasedTenantId, null,
     'the whole receipt goes, not just its timestamp — a half-cleared one would be paperwork for a '
     + 'connection that no longer exists')
+  assert.equal(settings.xero_pin_release_witness, undefined,
+    'and so does the half in settings — both halves are written together and cleared together (r8)')
   assert.equal((await getAccessToken())?.tenantId, rebuilt.tenantId)
 })
 
@@ -2117,6 +2160,134 @@ test('releasing one half of a SPLIT binding does not end the split-binding refus
   const reason = await getStoredTenantBlockReason() ?? ''
   assert.match(reason, new RegExp(pin.tenantId), 'the organisation whose pin was deleted')
   assert.match(reason, /OneTwo3D Ltd/, 'and the one the token actually belongs to')
+})
+
+/**
+ * A RECEIPT CANNOT BE ITS OWN WITNESS (o3d-9tbz r8).
+ *
+ * r7 qualified the receipt with the connection it released and the pin it deleted — and put both on the
+ * SAME ROW as the receipt. That closes the case where something removed the pin, because a deletion in
+ * `settings` cannot write a value into `accounting_tokens`. It closes nothing at all in the case where
+ * the token row itself arrives from elsewhere: a wholesale restore brings the receipt, the qualifiers,
+ * the generation and the tenant together, so every comparison r7 makes is the dump against itself.
+ *
+ * And the receipts that predate r7 have no qualifiers to compare. They cannot be filled in from the row
+ * either, because the pre-r7 recovery stamped one for a pin it never deleted — the laundering r7 found —
+ * and on the row alone that is the same state as an honest outstanding release.
+ */
+
+test('a token row restored WHOLESALE mid-release is halted, not exempted', async () => {
+  // The r8 finding. The row is internally perfect: the receipt names the generation the row carries and
+  // the pin names the organisation the token belongs to. What it cannot produce is the half that never
+  // left the instance that performed the release.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-restored-row' }
+  restoredMidReleaseTokenRow(demo)
+  const { getAccessToken, isConnected } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null, 'the sync is halted')
+  assert.deepEqual(fetchedUrls, [], 'and no Xero request was made on the way to refusing')
+  const status = await isConnected()
+  assert.equal(status.connected, false)
+  assert.equal(status.hasStoredToken, true, 'or /sync would not draw the Disconnect the remedy names')
+  assert.match(status.blockedReason ?? '', /no record of writing/)
+})
+
+test('the same row WITH its witness is the legitimate recovery, and keeps syncing', async () => {
+  // The control for the test above: identical token row, one settings row apart. If both were halted the
+  // guard would simply have broken the runbook, and if neither were the finding would be unfixed.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-restored-control' }
+  releasedPin(demo)
+  const { getAccessToken, isConnected } = await loadAuth()
+
+  assert.equal((await getAccessToken())?.tenantId, demo.tenantId)
+  assert.equal((await isConnected()).connected, true)
+  assert.equal(activity.length, 0, 'and it is not an event worth recording')
+})
+
+test('a restored released row does not get the unpinned privilege either', async () => {
+  // A valid release suspends the "fall back to the token's own organisation" rule, which is what lets
+  // the Demo re-consent land on a tenantId this instance has never seen. Granting that to a restored row
+  // would leave it not merely unhalted but UNPINNED and free to bind whatever the next consent offered —
+  // the o3d-t74p incident. The privilege is granted on exactly the evidence the exemption is.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-restored-consent' }
+  const stranger = { ...LIVE, tenantId: 'e7fb4378-live-restored-stranger' }
+  restoredMidReleaseTokenRow(demo)
+  const { exchangeCodeForTokens, getAccessToken } = await loadAuth()
+
+  reconsentTo(stranger, 'c2')
+  assert.equal((await exchangeCodeForTokens('c2', 'https://ims.example/cb')).success, false)
+  assert.equal(tokenRow?.tenantId, demo.tenantId, 'nothing was rebound')
+
+  // And the remedy in the message runs: re-consent to the organisation the token names repairs it.
+  reconsentTo(demo, 'c3')
+  assert.equal((await exchangeCodeForTokens('c3', 'https://ims.example/cb')).success, true)
+  assert.equal(settings.xero_expected_tenant_id, demo.tenantId, 'the pin is back')
+  assert.equal(tokenRow?.pinReleasedAt, null, 'and the inherited receipt is gone with it')
+  assert.equal((await getAccessToken())?.tenantId, demo.tenantId)
+})
+
+test('a pre-r7 receipt is halted rather than backfilled into an exemption', async () => {
+  // The migration could have stamped this row's own generation and tenant into its receipt so that a rig
+  // mid-recovery stayed exempt across the deploy. It must not: the old --clear-tenant-pin wrote this
+  // exact row when it deleted no pin at all, so qualifying it re-legitimises the laundering r7 closed.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-unqualified-receipt' }
+  legacyUnqualifiedRelease(demo)
+  const { getAccessToken, isConnected, getStoredTenantBlockReason } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null, 'the sync is halted')
+  assert.deepEqual(fetchedUrls, [], 'and no Xero request was made')
+  assert.equal((await isConnected()).connected, false)
+  const reason = await getStoredTenantBlockReason() ?? ''
+  assert.match(reason, /but not WHAT was released/)
+  assert.doesNotMatch(reason, /has lost its pin/, 'a different history from a pin that vanished')
+})
+
+test('the mid-recovery operator can finish with Disconnect and one consent', async () => {
+  // The bounded cost of not backfilling, run end to end. It is the step the release was waiting for, and
+  // the message says so; if it did not work, the honest default would be an unrecoverable instance.
+  const retired = { ...DEMO, tenantId: '5c949ed5-demo-unqualified-retired' }
+  const rebuilt = { ...DEMO, tenantId: '5c949ed5-demo-unqualified-rebuilt' }
+  legacyUnqualifiedRelease(retired)
+  const { disconnect, exchangeCodeForTokens, getAccessToken, getStoredTenantBlockReason } = await loadAuth()
+  const reason = await getStoredTenantBlockReason() ?? ''
+  assert.match(reason, /but not WHAT was released/, 'halted for the reason this round introduces...')
+  assert.match(reason, /press Disconnect/, '...and told the step that ends it')
+
+  await disconnect()
+  assert.equal(tokenRow, null, 'both halves go')
+  reconsentTo(rebuilt, 'c2')
+
+  assert.equal((await exchangeCodeForTokens('c2', 'https://ims.example/cb')).success, true,
+    'and the consent is free to land on the REBUILT organisation, which the retired pin never named')
+  assert.equal(settings.xero_expected_tenant_id, rebuilt.tenantId)
+  assert.equal((await getAccessToken())?.tenantId, rebuilt.tenantId)
+})
+
+test('Disconnect removes the release witness too', async () => {
+  // A witness left behind is half a receipt waiting for a token row to corroborate, and the next restore
+  // would supply one. Disconnect is the remedy every one of these refusals names, so it has to end the
+  // whole state and not most of it.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-witness-disconnect' }
+  releasedPin(demo)
+  const { disconnect } = await loadAuth()
+
+  await disconnect()
+
+  assert.equal(settings.xero_pin_release_witness, undefined)
+  assert.equal(settings.xero_expected_tenant_id, undefined)
+  assert.equal(tokenRow, null)
+})
+
+test('a witness with no receipt on the token row is still a LOST pin', async () => {
+  // The r6 bypass, re-tried with the r8 machinery: deleting the pin and writing a witness beside it does
+  // not exempt anything, because the exemption needs BOTH halves. The witness only ever narrows.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-witness-only' }
+  pinDeleted(demo)
+  settings.xero_pin_release_witness = JSON.stringify({ generation: 'generation-before', tenantId: demo.tenantId })
+  const { getAccessToken, getStoredTenantBlockReason } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null)
+  assert.match(await getStoredTenantBlockReason() ?? '', /has lost its pin/)
 })
 
 /**

@@ -127,6 +127,18 @@
  * generation the row carried and the organisation the deleted pin named. Both are checked against the
  * row the receipt is on, every time, so the exemption expires when the state does rather than on a
  * clock, and a receipt that no longer fits its row is `stale-release` — refused on its own terms.
+ *
+ * AND A RECEIPT CANNOT BE ITS OWN WITNESS (the r8 finding). r7 left the argument circular in two ways.
+ * A receipt written before r7 carries no qualifiers, and the migration that added them could only have
+ * filled them in from the row itself — which would have qualified, in the same deploy, exactly the
+ * receipts the old recovery stamped for pins it never deleted. Nothing is backfilled: an unqualified
+ * receipt exempts nothing (`unqualified-release`), and an instance mid-recovery when this deploys
+ * finishes it with Disconnect-then-connect. And every r7 qualifier is a column on the same row as the
+ * receipt, so a wholesale-restored `accounting_tokens` row carries its own proof and validates itself;
+ * the release is therefore also witnessed in `settings`, by the transaction that deletes the pin, and a
+ * receipt with no witness beside it is `unwitnessed-release`. What that still cannot see is a copy of
+ * the WHOLE database, which reproduces both halves — there is no in-database answer to that, and the
+ * env allow-list of layer 1 is the only control that survives it. Which is why layer 1 is first.
  */
 
 export type XeroConnectionSummary = {
@@ -582,6 +594,7 @@ export function storedXeroConnectionRefusal(
   allowList: XeroTenantAllowList,
   pinnedTenantId: string | null | undefined,
   binding: XeroStoredBinding,
+  releaseWitness: XeroReleaseWitness | null,
 ): string | null {
   // A configuration that contradicts itself permits NOTHING, so it is answered before every other
   // refusal: no remedy below can be carried out while it stands, and offering one would send the
@@ -595,11 +608,12 @@ export function storedXeroConnectionRefusal(
   // refusal is not a remedy, so the ambiguity is reported first and the allow-list question waits until
   // there is a single organisation to ask it about.
   //
-  // `binding` is a REQUIRED argument rather than an optional one with a permissive default, for the
-  // reason this round exists: the r5 hole was an absent value read as permission. A call site that
-  // forgets it does not compile, which is the only version of this check that cannot be switched off by
-  // omission.
-  const broken = xeroBindingRefusal(stored, pinnedTenantId, binding)
+  // `binding` and `releaseWitness` are REQUIRED arguments rather than optional ones with a permissive
+  // default, for the reason these rounds exist: the r5 hole was an absent value read as permission, and
+  // a witness that defaulted to "present" would be the same hole in the r8 shape. A call site that
+  // forgets either does not compile, which is the only version of this check that cannot be switched
+  // off by omission.
+  const broken = xeroBindingRefusal(stored, pinnedTenantId, binding, releaseWitness)
   if (broken !== null) return broken
 
   if (!isXeroTenantAllowed(stored, allowList)) return storedTenantRefusalMessage(stored, allowList)
@@ -651,7 +665,10 @@ export type XeroStoredBinding = {
 
 /** Why this instance has no pin — which decides whether that is a supported state or a halt. */
 export type XeroPinAbsenceVerdict =
-  /** Deliberately released by the documented recovery, and the receipt still describes THIS row. */
+  /**
+   * Deliberately released by the documented recovery: the receipt describes THIS row, and the half of
+   * it that stayed behind in `settings` describes the same release.
+   */
   | 'released'
   /** A token row that predates the binding marker. No evidence a pin was ever written. Supported. */
   | 'never-established'
@@ -664,18 +681,132 @@ export type XeroPinAbsenceVerdict =
    * looking at a different thing and the two have different histories.
    */
   | 'stale-release'
+  /**
+   * A receipt that records only THAT a release happened — no generation, no released pin (r8).
+   *
+   * Every receipt written before r7 is in this state, and so is every hand-inserted `pinReleasedAt`.
+   * It cannot be qualified after the fact: the pre-r7 `--clear-tenant-pin` stamped a receipt even when
+   * it deleted no pin, which is how a halted instance was laundered into an exempt one by following
+   * the runbook, and such a receipt is indistinguishable from a legitimate outstanding release BY THE
+   * ROW IT SITS ON. Any rule that qualifies one qualifies the other, so neither is qualified: an
+   * unqualified receipt says nothing about what it released and therefore exempts nothing.
+   *
+   * Its own verdict rather than `stale-release`, because `stale-release` asserts the receipt came apart
+   * from its row and so did not get here through IMS — untrue of a receipt written by a version of IMS
+   * that had nothing to qualify it with, and it would send the operator to look for a restore that
+   * never happened.
+   */
+  | 'unqualified-release'
+  /**
+   * A qualified receipt on the token row with no matching half in `settings` (r8 finding 2).
+   *
+   * The r7 qualifiers live on the same row as the receipt, so a wholesale-restored `accounting_tokens`
+   * row arrives carrying all of them at once and validates itself: generation matches generation and
+   * released pin matches tenant because every one of those values came out of the same dump. A release
+   * is therefore also witnessed OUTSIDE the token row — in the `settings` table the recovery is already
+   * deleting the pin from, in the same transaction — and a token row that brought its own paperwork
+   * with it cannot bring that too.
+   */
+  | 'unwitnessed-release'
+
+/**
+ * The half of the release receipt that does NOT live on the token row (o3d-9tbz r8 finding 2).
+ *
+ * WHY A SECOND HALF EXISTS. Every qualifier r7 added — the generation released, the pin released, and
+ * the row's own generation and tenant they are compared against — is a column on `accounting_tokens`.
+ * That is exactly right for the case r6 and r7 were about, where something DELETED the pin: a deletion
+ * in `settings` cannot forge a value in a table it never touches. It is worth nothing at all for the
+ * other half of the same scenario. Restore an `accounting_tokens` dump taken while a release was
+ * outstanding and the whole row arrives together — receipt, qualifiers, generation, tenant — so the
+ * receipt is compared against the row it came with and agrees with itself by construction. A
+ * self-validating receipt is not evidence; it is a copy of the thing it is meant to prove.
+ *
+ * So the recovery writes the release in TWO places, in the one transaction it already had: the receipt
+ * on the token row, and this witness in `settings` — the table it is deleting the pin from. Neither
+ * half is believed alone. A token row that arrives from somewhere else brings its receipt with it and
+ * cannot bring this, because this stays with the instance; and this alone exempts nothing, because the
+ * exemption still requires the receipt (which is what kept the r6 bypass — a bare `DELETE FROM
+ * settings` — closed, and it stays closed: deleting the pin and writing a witness is still a token row
+ * with no receipt on it).
+ *
+ * WHAT IT STILL CANNOT SEE, said plainly rather than left to be discovered. A restore of the WHOLE
+ * database — or a file-level copy of one instance onto another — reproduces every fact in it, both
+ * halves included, and no evidence stored in that database can distinguish a faithful copy of an
+ * instance from the instance. There is no in-database answer to that case and this does not pretend to
+ * be one. What survives a restore is the ENV: `XERO_ALLOWED_TENANT_IDS`, `XERO_BLOCKED_TENANT_IDS` and
+ * `XERO_REQUIRE_DEMO_ORG` are read from the server's own configuration, they are enforced on the
+ * STORED token on every use, and they are the only reason a production dump restored onto the e2e rig
+ * is refused rather than used. That is the whole point of layer 1 at the top of this file, and it is
+ * why a server with no tenant control in its env has no defence against a copied database — which
+ * `nameOnlyGuardWarning` and the demo requirement exist to keep saying out loud.
+ */
+export type XeroReleaseWitness = {
+  /** The connection generation the released token row carried — null on a row that predates it. */
+  generation: string | null
+  /** The organisation the DELETED pin named. Never blank: no pin deleted, no witness written. */
+  tenantId: string
+}
+
+/**
+ * Read the witness back, refusing anything that is not one.
+ *
+ * A value that cannot be parsed, or that names no organisation, is NOT a witness and is treated as an
+ * absent one. Failing open on a malformed value would make "write junk into that settings row" a way
+ * to satisfy the check, which is the shape of every finding this file is made of.
+ */
+export function parseXeroReleaseWitness(raw: string | null | undefined): XeroReleaseWitness | null {
+  const text = (raw ?? '').trim()
+  if (text.length === 0) return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch {
+    return null
+  }
+  if (typeof parsed !== 'object' || parsed === null) return null
+  const record = parsed as Record<string, unknown>
+  const tenantId = typeof record.tenantId === 'string' ? record.tenantId.trim() : ''
+  if (tenantId.length === 0) return null
+  const generation = typeof record.generation === 'string' ? record.generation : null
+  return { generation, tenantId }
+}
+
+/** The witness as it is stored — one JSON object, written by the transaction that deletes the pin. */
+export function serializeXeroReleaseWitness(witness: XeroReleaseWitness): string {
+  return JSON.stringify({ generation: witness.generation, tenantId: witness.tenantId })
+}
+
+/**
+ * Does the receipt say WHAT it released at all (o3d-9tbz r8 finding 1)?
+ *
+ * A receipt with neither qualifier records only that a release happened once. That is the r7 finding
+ * itself — exempt-by-presence — and it is also every receipt stamped before r7, including the ones the
+ * old `--clear-tenant-pin` wrote for a pin it had not deleted. Those cannot be told apart from a
+ * legitimate outstanding release by anything on the row, so nothing on the row may qualify them.
+ *
+ * ONE qualifier is enough to be "qualified" here, because a legitimate release on a token row that
+ * predates `connectionGeneration` records a null generation quite properly — the released pin is the
+ * qualifier that is always written. It then has to survive `releaseDescribesRow` like any other.
+ */
+function releaseIsQualified(binding: XeroStoredBinding): boolean {
+  return (binding.pinReleasedGeneration ?? '').trim().length > 0
+    || (binding.pinReleasedTenantId ?? '').trim().length > 0
+}
 
 /**
  * Does the receipt describe the row it is sitting on?
  *
  * Both halves are compared, and neither is redundant. The GENERATION catches a row that has been
- * rebound or replaced since the release — the restored-dump case, and any future writer that mints a
- * generation without clearing the receipt. The released PIN'S ORGANISATION catches the case the
- * generation cannot see: a release performed on an instance whose pin and token already named
- * DIFFERENT organisations, where deleting the pin does not resolve the split and must not be allowed
- * to end the refusal for it. The legitimate recovery satisfies both by construction — the Demo reset
- * re-creates the organisation with a new tenantId, but the pin being deleted is still the one this
- * token was bound with, and the release does not rebind anything.
+ * rebound or replaced since the release — and any future writer that mints a generation without
+ * clearing the receipt. The released PIN'S ORGANISATION catches the case the generation cannot see: a
+ * release performed on an instance whose pin and token already named DIFFERENT organisations, where
+ * deleting the pin does not resolve the split and must not be allowed to end the refusal for it. The
+ * legitimate recovery satisfies both by construction — the Demo reset re-creates the organisation with
+ * a new tenantId, but the pin being deleted is still the one this token was bound with, and the release
+ * does not rebind anything.
+ *
+ * It does NOT, on its own, catch a wholesale-restored row: every value it compares came out of the same
+ * dump. That is what the witness is for.
  */
 function releaseDescribesRow(binding: XeroStoredBinding, storedTenantId: string | null | undefined): boolean {
   const sameGeneration = (binding.pinReleasedGeneration ?? '').trim() === (binding.connectionGeneration ?? '').trim()
@@ -685,23 +816,45 @@ function releaseDescribesRow(binding: XeroStoredBinding, storedTenantId: string 
 }
 
 /**
+ * Does the half that stayed behind describe the same release as the half that travels?
+ *
+ * Compared against the RECEIPT rather than against the row, deliberately. The receipt has already been
+ * checked against the row by the time this is asked, so comparing here would only repeat that; what is
+ * being asked now is whether this instance is the one that performed this release, and the answer is
+ * whether the release it remembers performing is this one.
+ */
+function witnessDescribesRelease(binding: XeroStoredBinding, witness: XeroReleaseWitness | null): boolean {
+  if (!witness) return false
+  const sameGeneration = (witness.generation ?? '').trim() === (binding.pinReleasedGeneration ?? '').trim()
+  return sameGeneration && normaliseId(witness.tenantId) === normaliseId(binding.pinReleasedTenantId ?? '')
+}
+
+/**
  * @param storedTenantId the organisation the TOKEN ROW names, which is what the receipt is checked
  *   against. It is a required argument for the same reason `binding` is one in
  *   `storedXeroConnectionRefusal`: a receipt that is validated against nothing is a receipt that is
  *   simply believed, and that was the r7 finding.
+ * @param witness the release witness from `settings`, or null when there is none. Required for the
+ *   same reason again (r8): a receipt validated only against the row it arrived on is a receipt
+ *   validated against a copy of itself.
  */
 export function xeroPinAbsenceVerdict(
   binding: XeroStoredBinding,
   storedTenantId: string | null | undefined,
+  witness: XeroReleaseWitness | null,
 ): XeroPinAbsenceVerdict {
   // The release is checked FIRST and beats the generation, because a released connection has both: it
   // was bound (so it has a generation) and then deliberately unpinned (so it has a receipt). Reading
   // them the other way round would halt the recovery this branch is required to keep working.
   //
-  // But it is only checked first — never simply believed. A receipt that no longer describes this row
-  // is not evidence about this row, and the state it does describe is gone.
+  // But it is only checked first — never simply believed. Three questions, in the order that gives the
+  // operator the message about the situation they are actually in: does the receipt say what it
+  // released, does what it says still describe this row, and did THIS instance perform that release.
   if (binding.pinReleasedAt != null) {
-    return releaseDescribesRow(binding, storedTenantId) ? 'released' : 'stale-release'
+    if (!releaseIsQualified(binding)) return 'unqualified-release'
+    if (!releaseDescribesRow(binding, storedTenantId)) return 'stale-release'
+    if (!witnessDescribesRelease(binding, witness)) return 'unwitnessed-release'
+    return 'released'
   }
   if ((binding.connectionGeneration ?? '').trim().length > 0) return 'lost'
   return 'never-established'
@@ -742,13 +895,32 @@ export function xeroPinAbsenceVerdict(
  * organisation the deleted pin named, both are checked against the row they are sitting on, and one
  * that no longer describes it is `stale-release`: refused, with its own message, because the operator
  * is looking at a different situation from a pin that simply vanished.
+ *
+ * AND A RECEIPT IS NOT EVIDENCE ABOUT ITSELF (o3d-9tbz r8). Two things were wrong with reading the r7
+ * receipt off the token row alone, and they are one thing seen from two directions:
+ *
+ *   UNQUALIFIED. A receipt from before r7 records only that a release happened. It cannot be qualified
+ *   retrospectively — the pre-r7 recovery stamped one even when it deleted no pin, so ON THE ROW ALONE
+ *   a laundered receipt and a genuine outstanding release are the same bytes. Neither is qualified.
+ *   UNWITNESSED. Every r7 qualifier is a column on the same row as the receipt, so a wholesale-restored
+ *   `accounting_tokens` row agrees with itself. The release is therefore witnessed in `settings` too,
+ *   by the same transaction, and a row that travelled here on its own cannot have brought that with it.
+ *
+ * Four refusals now, each about the state it describes: a pin that was lost, a receipt that describes
+ * another state, a receipt that describes no state, and a receipt this instance never wrote. They share
+ * one remedy — Disconnect, which clears both halves — because there is only one action that cannot
+ * leave a fresh contradiction behind. They do not share a message, because they send the operator to
+ * look at four different things.
  */
 export function xeroMissingPinRefusal(
   stored: XeroConnectionSummary,
   binding: XeroStoredBinding,
+  witness: XeroReleaseWitness | null,
 ): string | null {
-  const verdict = xeroPinAbsenceVerdict(binding, stored.tenantId)
+  const verdict = xeroPinAbsenceVerdict(binding, stored.tenantId, witness)
+  if (verdict === 'unqualified-release') return xeroUnqualifiedReleaseRefusal(stored, binding)
   if (verdict === 'stale-release') return xeroStaleReleaseRefusal(stored, binding)
+  if (verdict === 'unwitnessed-release') return xeroUnwitnessedReleaseRefusal(stored, binding)
   if (verdict !== 'lost') return null
   const who = describeXeroConnections([stored])
   return (
@@ -825,6 +997,90 @@ function xeroStaleReleaseRefusal(stored: XeroConnectionSummary, binding: XeroSto
 }
 
 /**
+ * A release receipt that records only that a release HAPPENED (o3d-9tbz r8 finding 1).
+ *
+ * WHY THESE ARE NOT SIMPLY BACKFILLED. The migration that added the qualifiers could have stamped every
+ * outstanding release with the values on its own row — the generation it carries and the tenant it
+ * names — and that is what the first cut did, so that no rig mid-recovery was halted by the columns
+ * arriving. It is the wrong trade, and not by a small margin. r7 established that the OLD recovery path
+ * stamped a receipt even when it deleted no pin, which converted a halted (tamper-evident) instance
+ * into an exempt one by running the documented runbook. Such a receipt is indistinguishable from a
+ * legitimate outstanding one BY THE ROW IT SITS ON — that is precisely what made it laundering rather
+ * than a mistake — so a backfill computed from the row qualifies both or neither. Qualifying both would
+ * have re-legitimised the exact bypass r7 closed, in the migration that closed it.
+ *
+ * So neither is qualified, and the honest default is the one r7 already chose for a pin whose history
+ * cannot be established: halt, and let a human say what this instance is bound to. The cost is real and
+ * is bounded — an instance that was mid-recovery when this deployed is halted rather than exempt, and
+ * its remedy is Disconnect-then-connect, which is the step the release was waiting for anyway.
+ */
+function xeroUnqualifiedReleaseRefusal(stored: XeroConnectionSummary, binding: XeroStoredBinding): string {
+  const who = describeXeroConnections([stored])
+  const when = binding.pinReleasedAt ? binding.pinReleasedAt.toISOString() : 'an unrecorded time'
+  return (
+    `Xero sync is halted: this instance's Xero token row records that its pin was released (at ${when}), `
+    + `but not WHAT was released — no connection and no organisation. The stored token belongs to ${who} `
+    + `and there is no xero_expected_tenant_id setting beside it. `
+    + `A release means "this exact connection is waiting to be told which organisation it belongs to", `
+    + `and a receipt that names no connection makes that claim about everything and nothing: it cannot `
+    + `be checked, so it stops being evidence and becomes a permanent exemption from the check. IMS `
+    + `will not treat it as one. `
+    + `This is what every release recorded by an older version of IMS looks like, and those versions `
+    + `also stamped a release when they deleted no pin at all — so a receipt in this shape cannot be `
+    + `told apart from one left behind by a pin that was removed some other way. `
+    + `No Xero request was made. `
+    + `To fix it: on /sync press Disconnect — that clears the token and the pin together — then connect `
+    + `again and choose the organisation this instance is meant to use. Nothing in the server .env needs `
+    + `editing. If you had cleared the pin deliberately and were waiting to re-consent (a Xero Demo `
+    + `reset), that is the same step you were about to take and nothing is lost: the token was already `
+    + `unusable until the re-consent. Re-running scripts/provision-xero-demo.ts --clear-tenant-pin will `
+    + `not clear this — it records a release only when it is the statement that deletes the pin, and `
+    + `there is no pin here to delete. `
+    + `If you are auditing what this instance has already posted, look in ${who}: everything it wrote `
+    + `went to the token's organisation.`
+  )
+}
+
+/**
+ * A release the TOKEN ROW remembers and this INSTANCE does not (o3d-9tbz r8 finding 2).
+ *
+ * The r7 receipt and everything it is compared against are columns on one row, so a restored
+ * `accounting_tokens` row carries the whole argument with it and wins it. The witness in `settings` is
+ * the half that does not travel: written by the same transaction that deletes the pin, deleted by the
+ * binding that ends the release, and left behind by any copy of the token row alone.
+ *
+ * The message says which half is missing rather than "your database was restored", because the other
+ * way to reach this is a token row edited by hand, and because the operator's next question is where to
+ * look.
+ */
+function xeroUnwitnessedReleaseRefusal(stored: XeroConnectionSummary, binding: XeroStoredBinding): string {
+  const who = describeXeroConnections([stored])
+  const when = binding.pinReleasedAt ? binding.pinReleasedAt.toISOString() : 'an unrecorded time'
+  return (
+    `Xero sync is halted: this instance's Xero token row carries a pin-release receipt (from ${when}) `
+    + `that this instance has no record of writing. The stored token belongs to ${who} and has no `
+    + `xero_expected_tenant_id setting beside it. `
+    + `IMS records a release in two places in one transaction — on the token row, and beside the pin it `
+    + `deletes — precisely so that the receipt cannot be the only witness to itself. A token row copied `
+    + `from somewhere else brings its receipt and its own connection marker with it, and they agree with `
+    + `each other because they came from the same place; what it cannot bring is the half that stays `
+    + `behind with the instance that performed the release. That half is not here, so this release was `
+    + `not performed here. `
+    + `No Xero request was made. `
+    + `The usual causes are an accounting_tokens table restored from a backup taken while a release was `
+    + `outstanding, a token row copied from another environment, or a hand-edited row. `
+    + `To fix it: on /sync press Disconnect — that clears the token and the pin together — then connect `
+    + `again and choose the organisation this instance is meant to use. Nothing in the server .env needs `
+    + `editing to clear this halt. Note that a copy of the WHOLE database brings both halves and cannot `
+    + `be detected here at all: on a server that must never reach a live ledger, `
+    + `XERO_BLOCKED_TENANT_IDS / XERO_REQUIRE_DEMO_ORG are what refuse a restored token, and this halt `
+    + `does not stand in for them. `
+    + `If you are auditing what this instance has already posted, look in ${who}: everything it wrote `
+    + `went to the token's organisation.`
+  )
+}
+
+/**
  * The one question the sync path asks about the binding: is it whole?
  *
  * Two refusals, one per state of the pin, and they cannot both apply — a pin either exists and is
@@ -836,9 +1092,10 @@ export function xeroBindingRefusal(
   stored: XeroConnectionSummary,
   pinnedTenantId: string | null | undefined,
   binding: XeroStoredBinding,
+  witness: XeroReleaseWitness | null,
 ): string | null {
   if ((pinnedTenantId ?? '').trim().length > 0) return xeroBindingMismatchRefusal(stored, pinnedTenantId)
-  return xeroMissingPinRefusal(stored, binding)
+  return xeroMissingPinRefusal(stored, binding, witness)
 }
 
 /**

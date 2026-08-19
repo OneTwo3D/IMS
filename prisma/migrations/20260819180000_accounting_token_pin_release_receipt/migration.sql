@@ -1,4 +1,4 @@
--- o3d-9tbz Codex r7: a RELEASE RECEIPT that cannot outlive the state it was written for.
+-- o3d-9tbz Codex r7/r8: a RELEASE RECEIPT that cannot outlive the state it was written for.
 --
 -- Round 6 closed the deleted-pin bypass and gave the documented Demo-reset recovery a legitimate
 -- escape: `provision-xero-demo.ts --clear-tenant-pin` deletes the pin and stamps `pinReleasedAt` in
@@ -32,16 +32,40 @@
 -- was fresh when it was taken. Binding the receipt to the state removes the exemption exactly when
 -- the state stops being true, which is what a timer was standing in for.
 --
--- BACKFILL. Every release outstanding when this deploys is stamped with the values it would have
--- recorded had these columns existed: this row's own generation and tenant. So a rig that is mid-
--- recovery today stays exempt today, and becomes stale the moment anything else moves it.
+-- NOTHING IS BACKFILLED, and that is the whole of the r8 finding on this file.
+--
+-- The first cut of this migration stamped every outstanding release with the values on its own row —
+-- this row's generation and this row's tenant — so that a rig mid-recovery on the day of the deploy
+-- stayed exempt. It reads like the conservative choice and it is the opposite of one. r7 established
+-- that the OLD recovery path stamped `pinReleasedAt` even when it deleted no pin, which turned a
+-- halted (tamper-evident) instance into an exempt one BY FOLLOWING THE RUNBOOK. A receipt written
+-- that way is indistinguishable from a legitimate outstanding release by the row it sits on — that is
+-- exactly what made it laundering rather than an accident — so a backfill computed from the row
+-- qualifies both or neither. Qualifying both would have re-legitimised, in the migration that closed
+-- the hole, every receipt the hole produced.
+--
+-- So the columns arrive NULL for every existing release, and a receipt with neither qualifier exempts
+-- nothing: the guard calls it `unqualified-release` and halts, which is the same answer r7 already
+-- gave for a pin whose history cannot be established. Manufacturing the evidence would have been the
+-- one thing a guard about forged evidence must not do.
+--
+-- WHAT AN OPERATOR MID-RECOVERY MUST DO. On /sync press Disconnect, then connect again and choose the
+-- organisation. That is the step the release was waiting for in any case — a released connection is
+-- one that has been told to expect a re-consent — and nothing is lost by taking it: the token was
+-- already unusable until that consent happened. Re-running `--clear-tenant-pin` will NOT lift the
+-- halt and is not meant to; it records a release only when it is the statement that deletes the pin,
+-- and on such an instance the pin is already gone. Releases recorded AFTER this deploy are qualified
+-- when they are written and are not affected.
+--
+-- These two columns are also not the whole receipt. They live on the same row as `pinReleasedAt`, so
+-- a wholesale-restored accounting_tokens row carries them along with everything they are compared
+-- against and corroborates itself; the release is therefore witnessed in `settings` as well, written
+-- by the same transaction that deletes the pin. That half needs no schema change — it is one settings
+-- row — and it is described in lib/connectors/xero/tenant-guard.ts. A copy of the WHOLE database
+-- carries both halves and cannot be detected in the database at all; the env tenant controls are what
+-- survive a restore, which is why they are enforced against the stored token on every use.
 --
 -- NULLABLE, because "never released" is what every other row means, and what every QuickBooks row
 -- keeps meaning (its equivalents are tracked in o3d-8prh).
 ALTER TABLE "accounting_tokens" ADD COLUMN "pinReleasedGeneration" TEXT;
 ALTER TABLE "accounting_tokens" ADD COLUMN "pinReleasedTenantId" TEXT;
-
-UPDATE "accounting_tokens"
-   SET "pinReleasedGeneration" = "connectionGeneration",
-       "pinReleasedTenantId" = "tenantId"
- WHERE "pinReleasedAt" IS NOT NULL;

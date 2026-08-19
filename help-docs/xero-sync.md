@@ -78,6 +78,8 @@ So:
   | Released by `--clear-tenant-pin` | Deliberately unpinned, awaiting a re-consent | Keeps working |
   | Carries a connection marker, pin gone | The pin was deleted or lost | **Sync halted** |
   | Carries a release for a *different* connection | Paperwork that came apart from its row | **Sync halted** |
+  | Carries a release that says only *when* | Recorded before IMS logged what a release was for | **Sync halted** |
+  | Carries a release this instance never wrote | A token row that arrived from somewhere else | **Sync halted** |
 
   The marker is minted by the connect that wrote the pin, in the same transaction, and **Disconnect**
   removes the token and the pin together — so a token that has outlived its pin can only mean the pin
@@ -104,6 +106,28 @@ So:
   - Releasing one half of an instance that is *already* bound to two organisations does not end that
     refusal. The receipt names the pin it deleted, which is not the token's organisation, so the
     contradiction stays visible instead of being deleted away.
+
+  **A release is recorded in two places, and both are checked.** Everything the receipt is compared
+  against is a column on the same token row, so a row restored *wholesale* from a dump would arrive
+  carrying its own corroboration and agree with itself. `--clear-tenant-pin` therefore writes the
+  release twice in one transaction — on the token row, and as a `xero_pin_release_witness` setting
+  beside the pin it deletes — and IMS honours a release only when both halves describe the same one. A
+  token row copied from another environment cannot bring the second half with it. **Disconnect** and the
+  next connect both clear the pair together.
+
+  What this does *not* catch, said plainly: a restore or copy of the **whole database** brings both
+  halves and every other fact with them, and nothing stored in that database can tell a faithful copy of
+  an instance from the instance. The controls that survive a restore are the ones in the server's
+  `.env` — `XERO_ALLOWED_TENANT_IDS`, `XERO_BLOCKED_TENANT_IDS`, `XERO_REQUIRE_DEMO_ORG` — which is why
+  they are checked against the *stored* token on every use and not only at the consent.
+
+  **Upgrading with a release outstanding.** Releases recorded before IMS logged what they were for
+  carry only a timestamp. Those are **not** filled in on upgrade and they do not exempt anything: the
+  older `--clear-tenant-pin` also stamped a release when it deleted no pin at all, so a receipt in that
+  shape cannot be told apart from a pin that went missing, and qualifying one would qualify both. If a
+  rig was mid-recovery over the upgrade it is halted with that reason, and the fix is the step it was
+  already waiting for — press **Disconnect** on `/sync`, then connect and choose the organisation.
+  Nothing is lost by doing so: the token was unusable until that consent anyway.
 - **A full database reset removes both halves together.** Settings → *Reset database* at the *full*
   level deletes the token and the pin in one transaction, so it can never leave a token whose pin has
   gone — the state above, which would otherwise be reported as tampering to somebody who had merely

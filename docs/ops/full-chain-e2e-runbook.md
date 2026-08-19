@@ -226,8 +226,20 @@ it will **not** restore stage on the new owner's behalf.
      deleting the pin, and the receipt names the connection and the pin it released, so it stops
      applying the moment either changes (o3d-9tbz r7). On a rig whose pin has already vanished the flag
      records nothing and does not lift the halt — press **Disconnect** on `/sync`, which clears both
-     halves. `full-chain-preflight` names both states explicitly rather than letting the run discover
-     them on the first posting spec.
+     halves. `full-chain-preflight` names each of these states explicitly rather than letting the run
+     discover them on the first posting spec.
+
+     The release is written **twice in one transaction** (o3d-9tbz r8): on the token row, and as a
+     `xero_pin_release_witness` settings row beside the pin it deletes. A release counts only while both
+     halves describe it, so restoring `accounting_tokens` alone from a rig backup — a token row that
+     brings its own receipt and its own connection marker — is halted here rather than inherited. A copy
+     of the whole database brings both and is *not* detected: on this rig that case is what
+     `XERO_BLOCKED_TENANT_IDS` and `XERO_REQUIRE_DEMO_ORG` are for, and neither may be switched off.
+
+     A release recorded by a build older than r7 carries only a timestamp and is **not** backfilled into
+     a qualified one — the old flag stamped a release even when it deleted no pin, so the two shapes are
+     indistinguishable. A rig that was mid-recovery across the upgrade is halted: **Disconnect**, then
+     re-consent, which is the step it was waiting for.
   2. Re-consent the connection (Settings → Accounting → Xero → Connect).
   3. Re-run the **Demo provisioner** so the accounts/currencies/bank accounts/VAT rates the specs
      expect exist again (o3d-lgo.9).

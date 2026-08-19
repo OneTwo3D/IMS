@@ -21,7 +21,7 @@
  */
 import { Client } from 'pg'
 import { xeroGet } from '../../../lib/connectors/xero/api.ts'
-import { xeroPinAbsenceVerdict } from '../../../lib/connectors/xero/tenant-guard.ts'
+import { parseXeroReleaseWitness, xeroPinAbsenceVerdict } from '../../../lib/connectors/xero/tenant-guard.ts'
 import { checkBuildFreshness } from './build-freshness.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
@@ -140,13 +140,20 @@ export async function preflight(): Promise<PreflightReport> {
       // Asked through the SAME function the sync path uses, rather than re-stated in SQL: a preflight
       // that diagnoses the halt with its own copy of the rule can disagree with the rule, and the
       // failure mode is a green preflight in front of an instance that will not post (o3d-9tbz r7).
+      // The release witness is the half of the receipt that lives in `settings` (o3d-9tbz r8), so it
+      // is read from the database here exactly as the sync path reads it — a preflight that supplied a
+      // witness of its own, or none at all, would answer a different question from the one that halts
+      // the run.
+      const witnessRow = await db.query<{ value: string }>(
+        `select value from settings where key = 'xero_pin_release_witness'`,
+      )
       const verdict = !pin.rows.length
         ? xeroPinAbsenceVerdict({
           connectionGeneration: tok.rows[0].connectionGeneration,
           pinReleasedAt: tok.rows[0].pinReleasedAt,
           pinReleasedGeneration: tok.rows[0].pinReleasedGeneration,
           pinReleasedTenantId: tok.rows[0].pinReleasedTenantId,
-        }, tenantId)
+        }, tenantId, parseXeroReleaseWitness(witnessRow.rows[0]?.value ?? null))
         : null
       if (verdict === 'lost') {
         problems.push(
@@ -157,6 +164,28 @@ export async function preflight(): Promise<PreflightReport> {
             `the pin goes, which records the release on the token row in the same transaction. Running that ` +
             `flag now will not lift the halt: it records a release only when it is the statement that ` +
             `deletes the pin.`,
+        )
+      }
+      if (verdict === 'unqualified-release') {
+        problems.push(
+          `The Xero tenant pin is missing and the token row carries a pin-release receipt that does not `
+            + `say what it released — no connection, no organisation. That is what every release recorded `
+            + `before o3d-9tbz r7 looks like, and those versions also stamped one when they deleted no pin, `
+            + `so it cannot be told apart from a pin that went missing. IMS halts every Xero sync in that `
+            + `state. Fix it by disconnecting on /sync and connecting again; re-running `
+            + `provision-xero-demo.ts --clear-tenant-pin will not lift it, because there is no pin left `
+            + `for it to delete.`,
+        )
+      }
+      if (verdict === 'unwitnessed-release') {
+        problems.push(
+          `The Xero tenant pin is missing and the token row carries a pin-release receipt that this `
+            + `instance has no record of writing — the settings row (xero_pin_release_witness) that the `
+            + `release writes beside the deleted pin is not there. A release is recorded in both tables in `
+            + `one transaction, so a receipt with no witness beside it arrived on a token row from `
+            + `somewhere else. The usual cause here is an accounting_tokens table restored from another `
+            + `environment. IMS halts every Xero sync in that state; fix it by disconnecting on /sync and `
+            + `connecting again.`,
         )
       }
       if (verdict === 'stale-release') {

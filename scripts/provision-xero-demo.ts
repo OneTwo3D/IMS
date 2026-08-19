@@ -66,6 +66,7 @@ import { readFileSync } from 'node:fs'
 import { xeroGet, xeroPost, xeroPut } from '../lib/connectors/xero/api.ts'
 import { syncChartOfAccounts } from '../lib/connectors/xero/accounts.ts'
 import { xeroReportTaxType } from '../lib/connectors/xero/tax-rate-report-type.ts'
+import { serializeXeroReleaseWitness } from '../lib/connectors/xero/tenant-guard.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
 const TEMPLATE_PATH = new URL('./xero-demo-template.json', import.meta.url).pathname
@@ -272,11 +273,25 @@ async function remapOnly(db: Client) {
  * organisation and the token another, the receipt records the pin's organisation, which
  * does not match the token's — so IMS keeps refusing. Deleting one half of a
  * contradiction does not resolve it, and the remedy for that state is Disconnect.
+ *
+ * AND THE RELEASE IS WITNESSED IN BOTH TABLES (o3d-9tbz r8). Everything r7 checks the
+ * receipt against — the connection generation, the token's own tenant — is a column on
+ * the SAME ROW as the receipt, so an accounting_tokens row restored from a dump taken
+ * while a release was outstanding arrives carrying its own corroboration and passes.
+ * The receipt cannot be the only witness to itself, so this transaction writes a third
+ * statement: the `xero_pin_release_witness` settings row, naming the same connection and
+ * the same released pin. It stays with the INSTANCE — a copied token row cannot bring it
+ * — and IMS honours a release only when both halves describe the same one. It is deleted
+ * by the connect that writes a pin again, and by Disconnect.
+ *
+ * Three statements, still one transaction, still all-or-nothing: a crash cannot leave a
+ * receipt with no witness (a halt nobody caused) or a witness with no receipt (a
+ * half-record waiting for a token row to corroborate).
  */
 async function clearTenantPin(db: Client) {
   await db.query('begin')
   let cleared: string | null = null
-  let stampedRows: Array<{ tenantId: string; pinReleasedTenantId: string | null }> = []
+  let stampedRows: Array<{ tenantId: string; pinReleasedTenantId: string | null; pinReleasedGeneration: string | null }> = []
   try {
     const before = await db.query<{ value: string }>(
       `delete from settings where key = 'xero_expected_tenant_id' returning value`,
@@ -287,17 +302,28 @@ async function clearTenantPin(db: Client) {
       // generation is copied from the row's own column inside the same statement, so it cannot be a
       // value read a moment ago and gone stale; the tenant id is the pin that was actually deleted,
       // taken from the DELETE's own RETURNING rather than from anything this script assumes.
-      const stamped = await db.query<{ tenantId: string; pinReleasedTenantId: string | null }>(
+      const stamped = await db.query<{ tenantId: string; pinReleasedTenantId: string | null; pinReleasedGeneration: string | null }>(
         `update accounting_tokens
             set "pinReleasedAt" = now(),
                 "pinReleasedGeneration" = "connectionGeneration",
                 "pinReleasedTenantId" = $1,
                 "updatedAt" = now()
           where connector = 'xero'
-          returning "tenantId", "pinReleasedTenantId"`,
+          returning "tenantId", "pinReleasedTenantId", "pinReleasedGeneration"`,
         [cleared],
       )
       stampedRows = stamped.rows
+      // The half that stays behind. Built from what the UPDATE actually wrote rather than from
+      // anything this script assumed, and serialised by the same function the guard parses with, so
+      // the two cannot drift into disagreeing about the format. No token row means no receipt to
+      // witness — and nothing halted, because the halt is a question about a token row.
+      for (const row of stamped.rows) {
+        await db.query(
+          `insert into settings (key, value, "updatedAt") values ('xero_pin_release_witness', $1, now())
+             on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+          [serializeXeroReleaseWitness({ generation: row.pinReleasedGeneration, tenantId: cleared })],
+        )
+      }
     }
     await db.query('commit')
   } catch (e) {
@@ -316,8 +342,10 @@ async function clearTenantPin(db: Client) {
   const split = stampedRows.filter((row) => row.tenantId !== row.pinReleasedTenantId)
   console.log(
     stampedRows.length > 0
-      ? 'recorded the release on the Xero token row (accounting_tokens.pinReleasedAt, and the connection\n' +
-        'and pin it released), so IMS treats the missing pin as deliberate instead of halting the sync.'
+      ? 'recorded the release in BOTH halves — on the Xero token row (accounting_tokens.pinReleasedAt,\n' +
+        'and the connection and pin it released) and beside the deleted pin (settings\n' +
+        'xero_pin_release_witness) — so IMS treats the missing pin as deliberate instead of halting the\n' +
+        'sync. A token row copied elsewhere does not carry the second half, and is not exempt there.'
       : cleared === null
         ? 'nothing was released.'
         : 'no Xero token row to record the release on — there is no connection, so nothing was halted.',
