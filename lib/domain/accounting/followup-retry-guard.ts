@@ -3,6 +3,7 @@ import {
   readFollowUpIdempotencyKey,
   type FollowUpPayload,
 } from './followup-idempotency'
+import { documentAnchorFields } from './money-post-document'
 import {
   classifyLedgerSettlement,
   describeAttempt,
@@ -103,7 +104,7 @@ export type ManualRetryPlan =
  * operator can click, not just follow-ups. Using the narrower set let two failed bill payments
  * with distinct tokens sail through, and "Retry All" re-queue both (Codex review).
  */
-const MONEY_MOVING_SYNC_TYPES = new Set([
+export const MONEY_MOVING_SYNC_TYPES = new Set([
   'INVOICE_PAYMENT',
   'BILL_PAYMENT',
   'PURCHASE_CREDIT_NOTE_ALLOCATION',
@@ -199,8 +200,6 @@ export function attemptCouldHaveReachedTheLedger(type: string, payload: unknown)
   return couldHaveReachedTheLedger(type, payload)
 }
 
-const ANCHOR_FIELDS = ['accountingInvoiceId', 'creditNoteId'] as const
-
 function asPayload(value: unknown): FollowUpPayload | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as FollowUpPayload)
@@ -214,10 +213,19 @@ function asPayload(value: unknown): FollowUpPayload | null {
  * this filter exists to prevent, wearing a different spelling. Folding is injective over the ids
  * either connector issues (hex GUIDs, decimal strings), so it cannot merge two real documents;
  * see money-post-document.ts.
+ *
+ * ANCHORED PER TYPE (Codex round 9, HIGH #1). This used to compare the UNION of every anchor a
+ * money payload can hold — `accountingInvoiceId` AND `creditNoteId` — whatever the type. On a
+ * PAYMENT, `creditNoteId` is not part of the document: it is in no payment body either connector
+ * sends, and neither probe dereferences it on a payment branch. So a rival row that happened to
+ * carry one, compared against a row that did not, came out UNEQUAL and was dropped from the
+ * contender list — the same split the lock key suffered, ending in the same double post.
+ * `documentAnchorFields` is the single definition of what identifies a document, shared with the
+ * lock key, the probe cache key and the sibling query's document arms.
  */
-function anchorsOf(payload: unknown): string[] {
+function anchorsOf(type: string, payload: unknown): string[] {
   const record = asPayload(payload)
-  return ANCHOR_FIELDS.map((field) => {
+  return documentAnchorFields(type).map((field) => {
     const value = record?.[field]
     return typeof value === 'string' ? value.trim().toLowerCase() : ''
   })
@@ -231,19 +239,20 @@ function anchorsOf(payload: unknown): string[] {
  * against a replacement invoice. A row with no recorded anchor is treated as MATCHING, because
  * "unknown target" has to read as "possibly this one" where money is concerned.
  */
-function couldBeTheSameDocument(left: unknown, right: unknown): boolean {
-  const a = anchorsOf(left)
-  const b = anchorsOf(right)
+function couldBeTheSameDocument(type: string, left: unknown, right: unknown): boolean {
+  const a = anchorsOf(type, left)
+  const b = anchorsOf(type, right)
   if (a.every((value) => value === '') || b.every((value) => value === '')) return true
   return a.every((value, index) => value === b[index])
 }
 
 /**
- * Exported for the POST fence, which judges the same rival attempts this planner does and must
- * not disagree with it about which of them could have settled the document being posted to.
+ * Exported for the POST fence, which judges the same rival attempts this planner does and must not
+ * disagree with it about which of them could have settled the document being posted to — including
+ * about WHICH FIELDS make two rows one document, which is why it takes the type.
  */
-export function attemptCouldBeTheSameDocument(left: unknown, right: unknown): boolean {
-  return couldBeTheSameDocument(left, right)
+export function attemptCouldBeTheSameDocument(type: string, left: unknown, right: unknown): boolean {
+  return couldBeTheSameDocument(type, left, right)
 }
 
 /**
@@ -281,7 +290,7 @@ export function planManualRetry(params: {
     // this, one malformed row permanently strands the good one through the only manual route
     // available (Codex review).
     .filter((row) => couldHaveReachedTheLedger(type, row.payload))
-    .filter((row) => couldBeTheSameDocument(row.payload, target.payload))
+    .filter((row) => couldBeTheSameDocument(type, row.payload, target.payload))
   const tokens = new Set(contenders.map((row) => row.effectiveToken))
 
   if (moneyMoving && tokens.size > 1) {
@@ -316,7 +325,7 @@ export function planManualRetry(params: {
     const live = siblings.filter((row) =>
       row.id !== target.id
       && isLiveStatus(row.status)
-      && (isLiveUniqueFollowUpType(type) || couldBeTheSameDocument(row.payload, target.payload)))
+      && (isLiveUniqueFollowUpType(type) || couldBeTheSameDocument(type, row.payload, target.payload)))
     if (live.length > 0) {
       return {
         action: 'refuse',

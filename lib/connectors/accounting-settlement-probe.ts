@@ -14,7 +14,7 @@
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import type { LedgerSettlementProbe, LedgerSettlementRecord } from '@/lib/domain/accounting/ledger-settlement-evidence'
-import { settlementDocumentIdFilter, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
+import { settlementDocumentAnchorFilters, settlementDocumentKey } from '@/lib/domain/accounting/money-post-document'
 import type { MoneyPostLock } from '@/lib/domain/accounting/money-post-lock'
 
 export type SettlementProbeTarget = {
@@ -652,9 +652,10 @@ export type MoneyPostFenceParams = {
           id: { not: string }
           /**
            * BOTH KEYS, IN A DEFINED ORDER (round 6, Codex CRITICAL #2): the local scope this row
-           * sits in, then the external document it names — the latter as a CASE-INSENSITIVE match,
-           * because `equals` on a JSON path is byte-exact and an enumeration of spellings cannot
-           * cover mixed case (round 8, HIGH #1). See the query below.
+           * sits in, then the external document it names — one arm per anchor THIS TYPE is
+           * identified by (round 9, HIGH #1), each a CASE-INSENSITIVE match, because `equals` on a
+           * JSON path is byte-exact and an enumeration of spellings cannot cover mixed case
+           * (round 8, HIGH #1). See the query below.
            */
           OR: Array<
             | { referenceType: string; referenceId: string }
@@ -714,8 +715,16 @@ export async function authoriseMoneyPost(
   // Both arms, in a defined order. The scope arm is first and is unconditional: it is indexed, and
   // it keeps a row with NO recorded anchor a contender of its own scope, which is what
   // `attemptCouldBeTheSameDocument` has always treated as "possibly this document". The document
-  // arm is added only when this row names one — with no id there is nothing to match, and the
-  // probe below refuses such a post outright anyway.
+  // arms follow, one per anchor THIS TYPE is identified by that this row actually names — with no
+  // id there is nothing to match, and the probe below refuses such a post outright anyway.
+  //
+  // AND THE ARMS ARE THE TYPE'S OWN ANCHORS (round 9, Codex HIGH #1). They come from
+  // `documentAnchorFields`, the same definition the lock key, the probe cache key and the contender
+  // comparison use — so a type identified by something other than `accountingInvoiceId` cannot
+  // leave this pre-filter looking somewhere the decision does not. They are OR'd, not AND'd: a row
+  // that really is this document matches EVERY anchor and so matches the OR, whereas an AND would
+  // drop a rival whose payload merely omits one of them. Over-fetching is free here and
+  // under-fetching is the double post.
   //
   // AND CASE-FOLDED — FOR EVERY CASING, NOT THREE OF THEM (round 8, Codex HIGH #1). `equals` on a
   // JSON path is byte-exact in PostgreSQL, so a rival row holding the SAME Xero GUID in another
@@ -725,7 +734,7 @@ export async function authoriseMoneyPost(
   // one spelling further along. Enumerating spellings can never be complete; the fold has to be in
   // the predicate, so the arm is a case-insensitive match the database performs
   // (`LOWER(payload#>>…) LIKE LOWER(…)`, verified against the dev database — see
-  // settlementDocumentIdFilter). The returned rows are still put through
+  // settlementDocumentAnchorFilters). The returned rows are still put through
   // `attemptCouldBeTheSameDocument` below, which folds case the same way, so this pre-filter can
   // only add contenders and never decides anything on its own.
   //
@@ -736,7 +745,7 @@ export async function authoriseMoneyPost(
   // therefore fail at runtime, inside the money-post lock. What pins it instead is the pair of
   // checks that can: this exact filter was run against the dev database, and the tests assert the
   // arm's shape literally.
-  const documentFilter = settlementDocumentIdFilter(params.payload)
+  const documentFilters = settlementDocumentAnchorFilters(params.type, params.payload)
   const attemptedSiblings = await params.db.accountingSyncLog.findMany({
     where: {
       connector: params.connector,
@@ -745,7 +754,7 @@ export async function authoriseMoneyPost(
       id: { not: params.entryId },
       OR: [
         { referenceType: params.referenceType, referenceId: params.referenceId },
-        ...(documentFilter === null ? [] : [{ payload: documentFilter }]),
+        ...documentFilters.map((filter) => ({ payload: filter })),
       ],
     },
     select: { id: true, payload: true },
@@ -780,7 +789,7 @@ export async function authoriseMoneyPost(
     // An attempt against a different document cannot have settled this one, and is not covered by
     // the probe below either — so judging this post against it would be comparing an attempt with
     // a ledger reading that says nothing about it.
-    .filter((row) => attemptCouldBeTheSameDocument(row.payload, params.payload))
+    .filter((row) => attemptCouldBeTheSameDocument(params.type, row.payload, params.payload))
 
   const probe = await probeLedgerSettlement(params.connector, { type: params.type, payload: params.payload })
 

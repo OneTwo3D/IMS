@@ -781,3 +781,52 @@ test('a sibling naming the target document in ANOTHER CASE is still a contender 
     'a genuinely different id is still a different document — folding case has not made everything match',
   )
 })
+
+test('a sibling carrying a creditNoteId a PAYMENT does not have is still a contender (o3d-0m56 r9, HIGH 1)', () => {
+  // The same disagreement as the case bug, in a different field. `couldBeTheSameDocument` compared
+  // the UNION of every anchor a money payload can hold, so a PAYMENT row that happened to record a
+  // `creditNoteId` — a field no payment body sends and no payment probe reads — was declared a
+  // DIFFERENT document from a payment row without one. The rival was dropped, the retry was planned
+  // as though nothing else had ever targeted the invoice, and the rival's committed payment carries
+  // ITS token's mark, not the target's, so nothing else would have caught it either.
+  //
+  // The target's own numbers match nothing in the ledger, so only the rival can produce a refusal.
+  const target = {
+    id: 'log-new', effectiveToken: 'log-new',
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 25, paymentDate: '2026-09-20' },
+  }
+  const rival = {
+    id: 'log-old', effectiveToken: 'log-old',
+    payload: { accountingInvoiceId: 'inv-9', creditNoteId: 'cn-7', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' },
+  }
+  const verdict = plan({
+    ...scopeArgs,
+    target,
+    siblings: [target, rival],
+    ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', id: 'PAY-OLD', reference: null }] },
+  })
+  assert.notEqual(verdict.action, 'allow', 'both rows pay inv-9; the ledger already holds the rival\'s payment')
+
+  // The other direction, and the reason the rule is per TYPE rather than "ignore creditNoteId": for
+  // an ALLOCATION the credit note IS half the document, so a rival drawn on a different credit note
+  // is a different settlement and must not strand this one.
+  const allocTarget = {
+    id: 'log-1', effectiveToken: 'log-1',
+    payload: { accountingInvoiceId: 'bill-1', creditNoteId: 'cn-1', amount: 25, date: '2026-09-20' },
+  }
+  const allocRival = {
+    id: 'log-2', effectiveToken: 'log-2',
+    payload: { accountingInvoiceId: 'bill-1', creditNoteId: 'cn-2', amount: 10, date: '2026-08-01' },
+  }
+  assert.deepEqual(
+    plan({
+      type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+      reference: 'SupplierCreditNote scn-1',
+      target: allocTarget,
+      siblings: [allocTarget, allocRival],
+      ledger: { ok: true, records: [{ amount: 10, date: '2026-08-01', reference: null }] },
+    }),
+    { action: 'allow' },
+    'two credit notes offsetting one bill are two legitimate settlements',
+  )
+})

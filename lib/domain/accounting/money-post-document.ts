@@ -56,15 +56,88 @@ function documentIdentity(value: unknown): string {
   return str(value).toLowerCase()
 }
 
-/** The invoice/bill a post settles, or '' when the row records none (which no post survives). */
-export function settlementDocumentId(payload: unknown): string {
-  return str(asRecord(payload).accountingInvoiceId)
+/**
+ * WHICH PAYLOAD FIELDS IDENTIFY THE DOCUMENT — PER TYPE (Codex round 9, HIGH #1).
+ *
+ * THE HOLE. The key was the UNION of every anchor a money payload can hold: `accountingInvoiceId`
+ * AND `creditNoteId`, for every type. For a PAYMENT `creditNoteId` is not part of the document's
+ * identity at all — it is not in the body the connector sends, and neither probe dereferences it
+ * on a payment branch (Xero fetches `Invoices/{accountingInvoiceId}`, QuickBooks
+ * `bill|invoice/{accountingInvoiceId}`). So two payment rows settling ONE invoice, one of which
+ * happens to carry a `creditNoteId` and one of which does not, produced two DIFFERENT keys: two
+ * advisory locks, two cached probe readings, and — through `attemptCouldBeTheSameDocument`, which
+ * compared the same union — two disjoint contender sets. That is precisely the cross-scope double
+ * post the document key was introduced to close, reopened by an irrelevant field. `payload` is
+ * untyped JSON that IMS does not validate on the way in, so "no writer sets it today" is a
+ * statement about the current call sites, not about the data.
+ *
+ * THE RULE. A key carries exactly the anchors that identify THE DOCUMENT THIS POST WILL SETTLE:
+ * a payment against an invoice or a bill is identified by that invoice or bill; a credit-note
+ * allocation is identified by the PAIR, because two allocations of DIFFERENT credit notes onto one
+ * bill are two legitimate settlements rather than a duplicate. Stated the checkable way: a type's
+ * anchors are exactly the payload fields its probe dereferences to address and filter the ledger
+ * reading. That is what makes one rule serve both consumers — under-keying is safe for the LOCK
+ * (extra serialization) and dangerous for the probe CACHE (one document handed another's reading),
+ * over-keying is the reverse, and the anchors-are-what-the-probe-reads rule is the fixed point of
+ * the two.
+ *
+ * A type absent from the table falls back to the invoice/bill alone, which is what both probes do
+ * for every non-allocation type. That is a floor, not a licence: `money-post-lock.test.ts` asserts
+ * every money-moving type has an EXPLICIT entry, so a new one cannot inherit the default by
+ * accident.
+ */
+const DOCUMENT_ANCHOR_FIELDS: Record<string, readonly string[]> = {
+  INVOICE_PAYMENT: ['accountingInvoiceId'],
+  BILL_PAYMENT: ['accountingInvoiceId'],
+  PURCHASE_CREDIT_NOTE_ALLOCATION: ['accountingInvoiceId', 'creditNoteId'],
+}
+
+const DEFAULT_DOCUMENT_ANCHOR_FIELDS: readonly string[] = ['accountingInvoiceId']
+
+/**
+ * The payload fields that identify the document a post of `type` settles.
+ *
+ * The ONE definition: the lock key, the probe cache key, the sibling query's document arm and the
+ * contender comparison all read it, so none of them can decide "same document?" on a different set
+ * of fields from the others.
+ */
+export function documentAnchorFields(type: string): readonly string[] {
+  return DOCUMENT_ANCHOR_FIELDS[str(type).toUpperCase()] ?? DEFAULT_DOCUMENT_ANCHOR_FIELDS
 }
 
 /**
- * The document arm of the sibling query: how a rival row holding THIS document's id is fetched
- * whatever case it is stored in — or `null` when this row names no document, in which case there
- * is nothing to match and the arm is left off entirely (an empty needle would match every row).
+ * Whether `type` states its anchors rather than inheriting the default.
+ *
+ * Exported for the test that holds the table against `MONEY_MOVING_SYNC_TYPES`: the default is a
+ * floor for types nothing here has had to think about, and a money type reaching it by accident is
+ * exactly the failure this rule was written to end.
+ */
+export function hasExplicitDocumentAnchors(type: string): boolean {
+  return Object.hasOwn(DOCUMENT_ANCHOR_FIELDS, str(type).toUpperCase())
+}
+
+/** One anchor's value on a payload, trimmed — '' when the row records none. */
+function anchorValue(payload: unknown, field: string): string {
+  return str(asRecord(payload)[field])
+}
+
+/**
+ * The document arms of the sibling query: how a rival row holding THIS document's anchors is
+ * fetched whatever case they are stored in — one arm per anchor this row actually names, OR'd
+ * together, and empty when it names none (an empty needle would match every row).
+ *
+ * ONE ARM PER ANCHOR, OR'D, AND THAT IS DELIBERATE (round 9, HIGH #1). The arms are the same
+ * per-type anchors the key and the comparison use, so a type anchored somewhere other than
+ * `accountingInvoiceId` cannot leave this pre-filter blind. They are OR'd rather than AND'd
+ * because this is a PRE-FILTER whose only job is never to miss a rival: a row that really is this
+ * document matches EVERY anchor, so it matches the OR — while an AND would silently drop rivals
+ * whenever one anchor is absent from the rival's payload but present on ours. The extras the OR
+ * lets through are rejected by `attemptCouldBeTheSameDocument`, which is the thing that decides.
+ *
+ * A BLANK anchor contributes NO arm rather than an empty needle: `string_contains: ''` matches
+ * every row that stores a string there and no row that omits the field, which would be a filter
+ * pretending to be a match. With no anchor at all there is nothing to fetch on, and such a post is
+ * refused by the probe anyway ('the row records no document id to check').
  *
  * WHY NOT `equals`, AND WHY NOT A LIST OF SPELLINGS (Codex round 8, HIGH #1). Round 7 emitted
  * three spellings — as-stored, lower, upper — and a MIXED-case id is in none of them, so a rival
@@ -95,11 +168,16 @@ export function settlementDocumentId(payload: unknown): string {
  * runs over is already narrow — one connector, one type, `remoteAttemptedAt` set, which the
  * partial index covers.
  */
-export function settlementDocumentIdFilter(
+export type SettlementDocumentAnchorFilter = { path: string[]; string_contains: string; mode: 'insensitive' }
+
+export function settlementDocumentAnchorFilters(
+  type: string,
   payload: unknown,
-): { path: string[]; string_contains: string; mode: 'insensitive' } | null {
-  const id = settlementDocumentId(payload)
-  return id === '' ? null : { path: ['accountingInvoiceId'], string_contains: id, mode: 'insensitive' }
+): SettlementDocumentAnchorFilter[] {
+  return documentAnchorFields(type)
+    .map((field) => ({ field, id: anchorValue(payload, field) }))
+    .filter(({ id }) => id !== '')
+    .map(({ field, id }) => ({ path: [field], string_contains: id, mode: 'insensitive' as const }))
 }
 
 /**
@@ -113,13 +191,15 @@ export function settlementDocumentIdFilter(
  * a CACHE key for the probe as well as a lock key — two different documents sharing it would hand
  * one of them the other's ledger reading, which is a false clear rather than merely extra
  * serialization.
+ *
+ * THE ANCHORS ARE THIS TYPE'S, not every anchor the payload happens to hold (round 9, HIGH #1) —
+ * see DOCUMENT_ANCHOR_FIELDS. The type is the FIRST element and a type's anchor list has a fixed
+ * length, so two types cannot produce the same array even where their anchor values coincide.
  */
 export function settlementDocumentKey(type: string, payload: unknown): string {
-  const record = asRecord(payload)
   return JSON.stringify([
     str(type).toLowerCase(),
-    documentIdentity(record.accountingInvoiceId),
-    documentIdentity(record.creditNoteId),
+    ...documentAnchorFields(type).map((field) => documentIdentity(anchorValue(payload, field))),
   ])
 }
 

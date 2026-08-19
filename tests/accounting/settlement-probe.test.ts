@@ -550,3 +550,23 @@ test('xero: an ordinary unsettled invoice is still a positive, empty answer (o3d
     { ok: true, records: [] },
   )
 })
+
+test('the probe key is not split by an anchor the TYPE does not have (o3d-0m56 r9, HIGH 1)', () => {
+  // This key caches the ledger reading AND keys the money-post lock, so splitting it splits both.
+  // A payment is identified by the invoice or bill it pays; `creditNoteId` is not in its request
+  // body and is not read back on either connector's payment branch, so a payment row that carries
+  // one must share the lock and the reading with one that does not.
+  const key = (type: string, payload: unknown) => settlementProbeKey({ type, payload })
+  for (const type of ['INVOICE_PAYMENT', 'BILL_PAYMENT']) {
+    assert.equal(
+      key(type, { accountingInvoiceId: 'a', bankAccountId: 'bank-1', amount: 10 }),
+      key(type, { accountingInvoiceId: 'a', bankAccountId: 'bank-1', amount: 10, creditNoteId: 'c' }),
+      `${type}: one document, one reading`,
+    )
+  }
+  // ...while an allocation still splits on the credit note, which is half of what it settles.
+  assert.notEqual(
+    key('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'a', creditNoteId: 'c1' }),
+    key('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'a', creditNoteId: 'c2' }),
+  )
+})

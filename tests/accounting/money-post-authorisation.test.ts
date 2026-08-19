@@ -1216,7 +1216,7 @@ test('a lost exclusion leaves a DURABLE incident, not just a stderr line (o3d-0m
   assert.equal(entry.entityType, 'SYNC')
   assert.equal(entry.entityId, 'log-1')
   const metadata = entry.metadata as Record<string, unknown>
-  assert.equal(metadata.documentKey, '["invoice_payment","inv-1",""]',
+  assert.equal(metadata.documentKey, '["invoice_payment","inv-1"]',
     'and name the document, or it cannot be reconciled')
   assert.equal(metadata.externalId, 'PAY-A', 'and the payment id a reversal would need')
   assert.equal(metadata.outcome, 'committed')
@@ -1494,7 +1494,7 @@ test('an incident the activity log REFUSES is retried, then announced as unpersi
   assert.equal(activityEntries.length, 2, 'a refused write is retried once — the usual cause is a transient blip')
   const announced = lines.join('\n')
   assert.match(announced, /INCIDENT NOT PERSISTED/, 'silence here is a durable record that does not exist')
-  assert.ok(announced.includes('"documentKey":"[\\"invoice_payment\\",\\"inv-1\\",\\"\\"]"'),
+  assert.ok(announced.includes('"documentKey":"[\\"invoice_payment\\",\\"inv-1\\"]"'),
     'and the stream is now the only copy, so it has to carry the incident, not point at it')
 })
 
@@ -1714,4 +1714,92 @@ test('a throw with the lock INTACT is rethrown exactly as it came (o3d-0m56 r8, 
   assert.equal(thrown, original, 'the very same error, not a wrapper')
   assert.equal(thrown === original ? original.message : '', 'socket hang up')
   assert.deepEqual(activityEntries, [], 'and no incident, because the exclusion held')
+})
+
+/* ------------------- round 9, HIGH 1: the anchors are the TYPE'S, not the payload's ------------------ */
+
+test('a rival payment row carrying a stray creditNoteId is still a contender (o3d-0m56 r9, HIGH 1)', async () => {
+  // THE DOUBLE. Both rows pay bill-1. The rival's payload happens to record a `creditNoteId` — a
+  // field no payment body sends and neither probe reads on a payment branch — and the fence
+  // compared the UNION of every anchor a money payload can hold, so it declared the rival a
+  // DIFFERENT document and dropped it from the contenders. Its committed payment carries ITS
+  // token's mark, not this row's, so the amount-and-date fallback misses it too: nothing refuses,
+  // and the bill is paid twice. Same field, same split, in the LOCK as well — see
+  // money-post-lock.test.ts.
+  const { settlementMarkerFor } = await import('@/lib/domain/accounting/ledger-settlement-evidence')
+  xeroCalls.length = 0
+  xeroResponse = {
+    Invoices: [{
+      InvoiceID: 'bill-1',
+      Total: 25,
+      AmountDue: 13.5,
+      AmountPaid: 11.5,
+      Payments: [{ PaymentID: 'PAY-OLD', Date: '2026-08-04', Amount: 11.5, Reference: settlementMarkerFor('log-old') }],
+    }],
+  }
+  const newPayload = { accountingInvoiceId: 'bill-1', bankAccountId: 'bank-1', amount: 25, paymentDate: '2026-09-20' }
+  const { db } = dbDouble([
+    { id: 'log-new', remoteAttemptedAt: null, payload: newPayload, scope: 'BILL_PAYMENT PurchaseInvoice pi-1' },
+    {
+      id: 'log-old',
+      remoteAttemptedAt: new Date('2026-08-01T00:00:00Z'),
+      scope: 'BILL_PAYMENT PurchaseOrder po-1',
+      // The ONLY difference from the round-6 cross-scope rival: it records a credit note as well.
+      payload: { accountingInvoiceId: 'bill-1', creditNoteId: 'cn-7', bankAccountId: 'bank-1', amount: 10, paymentDate: '2026-08-01' },
+    },
+  ])
+
+  const verdict = await (await load())({
+    connector: 'xero',
+    type: 'BILL_PAYMENT',
+    referenceType: 'PurchaseInvoice',
+    referenceId: 'pi-1',
+    entryId: 'log-new',
+    payload: newPayload,
+    postingDate: '2026-09-20',
+    db,
+  })
+
+  assert.equal(verdict.proceed, false, 'the rival settled this bill; a field the post never sends must not hide it')
+  assert.match(verdict.proceed === false ? verdict.error : '', /log-old/)
+})
+
+test('an allocation asks on BOTH its anchors, and one credit on another bill is another document (o3d-0m56 r9, HIGH 1)', async () => {
+  // The query arms are the TYPE's anchors now, so an allocation pre-filters on the bill AND the
+  // credit note. They are OR'd, not AND'd: a row that really is this allocation matches both, while
+  // an AND would drop a rival whose payload omits either. The extras an OR lets in are rejected by
+  // `attemptCouldBeTheSameDocument` — one credit note allocated to TWO bills is two settlements,
+  // and refusing on the second would strand a legitimate offset.
+  xeroCalls.length = 0
+  xeroResponse = { CreditNotes: [{ CreditNoteID: 'cn-1', Total: 40, RemainingCredit: 40, Allocations: [] }] }
+  const payload = { creditNoteId: 'cn-1', accountingInvoiceId: 'bill-1', amount: 25, date: '2026-09-20' }
+  const { db, counts } = dbDouble([
+    { id: 'log-new', remoteAttemptedAt: null, payload, scope: 'PURCHASE_CREDIT_NOTE_ALLOCATION SupplierCreditNote scn-1' },
+    {
+      id: 'log-other',
+      remoteAttemptedAt: new Date('2026-08-01T00:00:00Z'),
+      scope: 'PURCHASE_CREDIT_NOTE_ALLOCATION SupplierCreditNote scn-9',
+      payload: { creditNoteId: 'cn-1', accountingInvoiceId: 'bill-OTHER', amount: 10, date: '2026-08-01' },
+    },
+  ])
+
+  const verdict = await (await load())({
+    connector: 'xero',
+    type: 'PURCHASE_CREDIT_NOTE_ALLOCATION',
+    referenceType: 'SupplierCreditNote',
+    referenceId: 'scn-1',
+    entryId: 'log-new',
+    payload,
+    postingDate: '2026-09-20',
+    db,
+  })
+
+  const where = counts[0] as { OR: Array<Record<string, unknown>> }
+  assert.deepEqual(where.OR, [
+    { referenceType: 'SupplierCreditNote', referenceId: 'scn-1' },
+    { payload: { path: ['accountingInvoiceId'], string_contains: 'bill-1', mode: 'insensitive' } },
+    { payload: { path: ['creditNoteId'], string_contains: 'cn-1', mode: 'insensitive' } },
+  ], 'scope arm first, then one arm per anchor this TYPE is identified by')
+  assert.deepEqual(verdict, { proceed: true }, 'the same credit on ANOTHER bill is another settlement, not this one')
+  assert.deepEqual(xeroCalls, ['CreditNotes/cn-1'])
 })

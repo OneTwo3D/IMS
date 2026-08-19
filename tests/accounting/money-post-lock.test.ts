@@ -177,3 +177,62 @@ test('the key cannot run two DIFFERENT documents together (o3d-0m56 r7, HIGH 2)'
     settlementDocumentKey('BILL_PAYMENT', { accountingInvoiceId: '4d8a1f2e-0000-4c11-9a3b-7e5d2c9b1a45' }),
   )
 })
+
+test('an irrelevant creditNoteId does not SPLIT a payment\'s lock (o3d-0m56 r9, HIGH 1)', async () => {
+  // THE HOLE. The key was the UNION of every anchor a money payload can hold, whatever the type.
+  // For a PAYMENT `creditNoteId` is not part of the document at all — it is in no payment body
+  // either connector sends, and neither probe dereferences it on a payment branch — so a payment
+  // row that happened to carry one keyed a DIFFERENT document from a payment row that did not.
+  // Two locks on one invoice, two cached ledger readings, two contender sets: the cross-scope
+  // double post the document key was written to close, reopened by an irrelevant field. `payload`
+  // is untyped JSON IMS does not validate on the way in, so "nothing writes it today" is a claim
+  // about the current call sites, not about the data.
+  const { moneyPostDocumentLockId } = await import('@/lib/domain/accounting/money-post-document')
+  for (const type of ['INVOICE_PAYMENT', 'BILL_PAYMENT']) {
+    const bare = settlementDocumentKey(type, { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', amount: 10 })
+    const carrying = settlementDocumentKey(type, { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', amount: 10, creditNoteId: 'cn-9' })
+    assert.equal(bare, carrying, `${type}: a payment is identified by the document it pays, and by nothing else`)
+    assert.equal(
+      moneyPostDocumentLockId({ connector: 'xero', type, referenceType: 'SalesOrder', referenceId: 'so-1', documentKey: bare }),
+      moneyPostDocumentLockId({ connector: 'xero', type, referenceType: 'PurchaseInvoice', referenceId: 'pi-1', documentKey: carrying }),
+      `${type}: one document, one lock, whatever else the payload happens to hold`,
+    )
+  }
+  // The other direction, and it is why the rule is per TYPE rather than "drop creditNoteId": for an
+  // ALLOCATION the credit note IS half the document, so it must still key and still split.
+  assert.notEqual(
+    settlementDocumentKey('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'bill-1', creditNoteId: 'cn-1' }),
+    settlementDocumentKey('PURCHASE_CREDIT_NOTE_ALLOCATION', { accountingInvoiceId: 'bill-1' }),
+    'an allocation is identified by the PAIR — dropping the anchor would merge two real documents',
+  )
+})
+
+test('every money-moving type states its anchors EXPLICITLY (o3d-0m56 r9, HIGH 1)', async () => {
+  // The rule is per type, so the danger is a NEW money type inheriting the default. The default is
+  // the invoice alone: for a type identified by a pair that would hand two real documents one
+  // cached ledger reading, which is a false clear rather than merely extra serialization. Adding a
+  // money type without deciding its anchors has to fail here rather than in the ledger.
+  const { documentAnchorFields, hasExplicitDocumentAnchors } = await import('@/lib/domain/accounting/money-post-document')
+  const { MONEY_MOVING_SYNC_TYPES, attemptCouldHaveReachedTheLedger } = await import('@/lib/domain/accounting/followup-retry-guard')
+
+  // Every required id field of all three money types at once, so one fixture is postable as any of
+  // them and blanking a field is the only thing that changes the answer below.
+  const FULL = { accountingInvoiceId: 'inv-1', bankAccountId: 'bank-1', creditNoteId: 'cn-1', amount: 10 }
+  assert.ok(MONEY_MOVING_SYNC_TYPES.size > 0)
+  for (const type of MONEY_MOVING_SYNC_TYPES) {
+    assert.ok(hasExplicitDocumentAnchors(type), `${type} moves money and has no explicit anchor rule`)
+    const anchors = documentAnchorFields(type)
+    assert.ok(anchors.length > 0, `${type} must be identified by something`)
+    assert.ok(attemptCouldHaveReachedTheLedger(type, FULL), `${type}: the fixture must be a body that could post`)
+    // AND EVERY ANCHOR MUST BE A FIELD THE CONNECTOR REQUIRES. That is what makes the key sound in
+    // both directions: a row missing an anchor provably never posted (so nothing is keyed on a
+    // value a real attempt could have omitted), and an anchor cannot be a decorative field like
+    // `creditNoteId` on a payment, which is what produced the split.
+    for (const anchor of anchors) {
+      assert.equal(
+        attemptCouldHaveReachedTheLedger(type, { ...FULL, [anchor]: '' }), false,
+        `${type} is keyed on ${anchor}, so a body without it must be one the connector refuses to send`,
+      )
+    }
+  }
+})
