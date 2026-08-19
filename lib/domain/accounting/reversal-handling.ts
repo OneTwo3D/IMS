@@ -60,6 +60,11 @@ export type ReversalEffects = {
    * IMS showing an order paid after Xero has proved the payment is gone, indefinitely and silently.
    */
   raiseChargeback: (orderId: string) => Promise<{ raised?: boolean; error?: string; manualResolutionRequired?: boolean }>
+  /**
+   * Reconcile the payment. Run LAST (Codex r10 #1): the poller selects reversal candidates on
+   * `paidAt: { not: null }`, so this is the write that retires the order from every future poll. Until
+   * it succeeds the whole decision is re-runnable; after it, nothing is.
+   */
   clearPaidAt: (orderId: string) => Promise<void>
   // Alert + audit ALWAYS fire on a completed reversal (status is never auto-reverted).
   // `wcHandled` carries whether a recent WC refund may already cover the revenue side,
@@ -74,12 +79,6 @@ export type ReversalEffects = {
 export type ReversalContext = {
   wcHandled: boolean
   chargebackManualReason?: string
-  /**
-   * o3d-w00 (Codex r9 #4): whether paidAt was ACTUALLY cleared before this alert/audit entry was
-   * written. The notification fires even when the clear failed — it is the only thing that makes a
-   * permanent refusal visible — so the message must not claim a reconciliation that did not happen.
-   */
-  paidAtCleared: boolean
 }
 
 export type ReversalOutcome =
@@ -102,13 +101,15 @@ export type ReversalOutcome =
  *     Xero), no recent WC refund covers it, and the ledger is not still holding a
  *     payment against the invoice. A TRANSIENTLY failed chargeback HOLDS paidAt;
  *     one refused for a reason polling cannot clear does not.
- *  3. Clear paidAt unconditionally (payment is gone in Xero) once no chargeback is
- *     owed, the chargeback succeeded, or it was refused non-transiently.
- *  4. Alert + audit ALWAYS fire (status is never auto-reverted). A WC-handled
+ *  3. Alert + audit ALWAYS fire (status is never auto-reverted). A WC-handled
  *     reversal is alerted too — the refund may only partially cover a full payment
- *     removal — with WC context so finance can distinguish it. Steps 3 and 4 are
- *     attempted INDEPENDENTLY (Codex r9 #4): one failing never suppresses the others,
- *     and any failure returns `reversal-incomplete` rather than a clean outcome.
+ *     removal — with WC context so finance can distinguish it. They are attempted
+ *     INDEPENDENTLY (Codex r9 #4): one failing never suppresses the other.
+ *  4. Clear paidAt (payment is gone in Xero) once no chargeback is owed, the
+ *     chargeback succeeded, or it was refused non-transiently — and LAST (Codex
+ *     r10 #1), because paidAt is what puts the order in the next poll's window.
+ *     Clearing it before the alert landed is what loses the alert permanently.
+ *     Any failure returns `reversal-incomplete` rather than a clean outcome.
  */
 export async function handleDetectedReversal(
   order: DetectedReversalOrder,
@@ -166,8 +167,8 @@ export async function handleDetectedReversal(
   }
 
   // -----------------------------------------------------------------------------------------------
-  // o3d-w00 (Codex r9 #4): THE THREE CLOSING EFFECTS ARE INDEPENDENT, AND ONE FAILING MUST NOT TAKE
-  // THE OTHERS WITH IT.
+  // o3d-w00 (Codex r9 #4 / r10 #1): THE THREE CLOSING EFFECTS ARE INDEPENDENT, AND paidAt IS CLEARED
+  // LAST BECAUSE IT IS THE POLLER'S RE-DETECTION CURSOR.
   //
   // r8 #3 made a PERMANENT chargeback refusal reconcile paidAt, alert and audit on the first failure,
   // precisely because holding paidAt forever would leave the outstanding revenue unwind invisible.
@@ -175,26 +176,30 @@ export async function handleDetectedReversal(
   // paidAt update, an alert that cannot be delivered — threw straight out of this function, past the
   // notification and the audit entry. The part that goes missing is then the alert that was the whole
   // point of the branch, and the poller's surrounding catch abandons every remaining order in the
-  // pass as well.
+  // pass as well. So r9 attempted each effect on its own and recorded its failure rather than throwing.
   //
-  // So each effect is attempted on its own and its failure recorded rather than thrown. paidAt is
-  // still cleared FIRST (the message says what happened, in the order it happened), but whether it
-  // succeeded is carried into the context so the alert and the audit entry cannot claim a
-  // reconciliation that did not occur. Any failure makes the outcome `reversal-incomplete`: not
-  // counted as reversed, always reported. A failed paidAt clear is self-healing — the order still has
-  // paidAt set, so the next poll re-detects it and re-runs the whole decision.
+  // r9 then defended clearing paidAt FIRST with "a failed paidAt clear is self-healing — the order
+  // still has paidAt set, so the next poll re-detects it". That argument only covers the case where
+  // the CLEAR is what failed. The poller selects reversal candidates with `paidAt: { not: null }`, so
+  // the clear SUCCEEDING is precisely what removes the order from every future poll — and when the
+  // alert then failed, nothing re-ran and the alert was lost for good, which is the one outcome the
+  // whole branch exists to prevent. r9's own self-healing claim is what made it reachable.
+  //
+  // paidAt is therefore the CURSOR, and the cursor is retired last: the alert and the audit entry are
+  // written while the order is still re-detectable, and paidAt is cleared only once both have landed.
+  // Every failure — including the clear's own — leaves paidAt set, so the next poll re-runs the whole
+  // decision (raiseChargeback is idempotent, so a re-run raises no second credit note; the price of a
+  // failed audit write is one duplicate alert, not a lost one). Nothing is attempted after the clear,
+  // so nothing can be lost by it. Any failure makes the outcome `reversal-incomplete`: not counted as
+  // reversed, always reported.
+  //
+  // The alert and the audit entry therefore describe paidAt as what it is when they are written —
+  // still set, being reconciled — and say how the reader can tell the run did not finish. r9 #4's rule
+  // is unchanged and now holds by construction: neither message can claim a reconciliation that has
+  // not happened, because neither is written after one.
   // -----------------------------------------------------------------------------------------------
   const failures: string[] = []
-  let paidAtCleared = true
-  try {
-    // Payment is genuinely gone in Xero → reconcile paidAt regardless of channel.
-    await effects.clearPaidAt(order.id)
-  } catch (clearError) {
-    paidAtCleared = false
-    failures.push(`clearing paidAt failed: ${String(clearError)}`)
-  }
-
-  const ctx: ReversalContext = { wcHandled, chargebackManualReason, paidAtCleared }
+  const ctx: ReversalContext = { wcHandled, chargebackManualReason }
   // Always surface for manual review — a WC-handled reversal is flagged too (it may
   // only partially explain the removal), just with WC context.
   try {
@@ -206,6 +211,21 @@ export async function handleDetectedReversal(
     await effects.logReversalDetected(order, ctx)
   } catch (logError) {
     failures.push(`recording the audit entry failed: ${String(logError)}`)
+  }
+
+  if (failures.length === 0) {
+    try {
+      // Payment is genuinely gone in Xero → reconcile paidAt regardless of channel. Last, because
+      // this is what makes the order invisible to the next poll.
+      await effects.clearPaidAt(order.id)
+    } catch (clearError) {
+      failures.push(`clearing paidAt failed: ${String(clearError)}`)
+    }
+  } else {
+    failures.push(
+      'paidAt was NOT cleared, so the order stays in the next poll\'s window and the whole reversal is ' +
+      're-run',
+    )
   }
 
   if (failures.length > 0) {

@@ -417,7 +417,7 @@ function chargedShippingRateFromSnapshot(snapshot: ChargedShippingSnapshot | nul
  * used as if it were, whatever is then done with it.
  */
 export function chargedShippingMoney(snapshot: ChargedShippingSnapshot | null | undefined):
-  | { ok: true; currency: string; netForeign: Decimal; taxForeign: Decimal }
+  | { ok: true; currency: string; netForeign: Decimal; taxForeign: Decimal; sourceCount: number }
   | { ok: false; detail: string } {
   // Codex r6 #1: a caller that HAS shipping's VAT does not derive it. The residue exists only because
   // SalesOrder stores no shipping-VAT column; a WooCommerce refund's own shipping line states one.
@@ -427,6 +427,8 @@ export function chargedShippingMoney(snapshot: ChargedShippingSnapshot | null | 
       currency: snapshot.currency,
       netForeign: toDecimal(snapshot.netForeign),
       taxForeign: toDecimal(snapshot.shippingTaxForeign),
+      // ONE stated pair, quantised once — see `sourceCount` on postedCreditNoteTotalCheck.
+      sourceCount: 1,
     }
   }
   if (snapshot?.netForeign == null || snapshot.orderTaxForeign == null || snapshot.lineTaxForeign == null) {
@@ -470,7 +472,25 @@ export function chargedShippingMoney(snapshot: ChargedShippingSnapshot | null | 
         `(${lineTax.toFixed(4)}), so no shipping VAT can be read out of the difference`,
     }
   }
-  return { ok: true, currency: snapshot.currency, netForeign: toDecimal(snapshot.netForeign), taxForeign: shippingTax }
+  return {
+    ok: true,
+    currency: snapshot.currency,
+    netForeign: toDecimal(snapshot.netForeign),
+    taxForeign: shippingTax,
+    // o3d-w00 (Codex r10 #4): ONE, even though this VAT is a residue over n + 1 figures.
+    //
+    // The review proposed n + 1, on the reading that each of the order's total and its n line VATs was
+    // quantised independently. They were — but not independently of EACH OTHER: both writers build
+    // `SalesOrder.taxForeign` as `Σ (the same stored line taxForeign) + shipping's own VAT` (see the
+    // r5 #1 note at the top of this file), and a sum of Decimal(18,4) figures is exact at 4dp. Every
+    // line term therefore cancels identically and the residue IS shipping's own recorded VAT figure,
+    // quantised exactly once — by WooCommerce's `shipping_lines[].total_tax`, or by createSalesOrder.
+    //
+    // Sizing it as n + 1 would be a real loosening with nothing behind it: on a 44-line order it would
+    // put £0.45 of slack on a shipping leg, which is more than the whole VAT of an ordinary postage
+    // charge, and a zero-rated posting of £2.00 of 20% shipping would stop being refused.
+    sourceCount: 1,
+  }
 }
 
 /**
@@ -589,6 +609,23 @@ export function postedCreditNoteTotalCheck(input: {
   /** For the refusal message: what this target is called on screen. */
   label: string
   /**
+   * o3d-w00 (Codex r10 #4): HOW MANY independently-quantised money figures the charged pair above was
+   * composed from.
+   *
+   * The tolerance is one minor unit because a pair that reached IMS rounded once can disagree with an
+   * exactly-computed gross by one. Not every charged pair is one pair: an UNLINKED sale amount is
+   * checked against the order's GOODS AS A WHOLE — n line nets and n line VATs, each rounded on its own
+   * — and a shipping leg's VAT is the residue of the order total over those same n lines, so it carries
+   * n + 1 roundings. Sizing either as one rounding refuses an ordinary order of ordinary lines for
+   * arithmetic nobody can change: 20% goods sold tax-inclusive quantise to ~0.006 of residue EACH, so
+   * two such lines already exceed a flat 0.01 while both are exactly what they claim to be.
+   *
+   * 1 for a line-linked pair or a source-stated one. The value comes from where the charged figures are
+   * built (`chargedShippingMoney().sourceCount`, the order's line count for a goods aggregate), never
+   * from a guess at the call site.
+   */
+  chargedSourceCount: number
+  /**
    * o3d-w00 (Codex r8 #5): check a leg whose NET is zero or NEGATIVE as well.
    *
    * A single refund line's net is never negative, and one of zero credits nothing, so the default is to
@@ -608,7 +645,11 @@ export function postedCreditNoteTotalCheck(input: {
   if (net.isZero() && tax.isZero()) return { ok: true }
   const chargedGross = net.add(tax)
   const postedGross = net.mul(toDecimal(1).add(input.postedRate))
-  const tolerance = toDecimal(1).div(toDecimal(10).pow(currencyMinorUnits(input.currency)))
+  // Codex r10 #4: one minor unit PER quantised source, because that is how many roundings the charged
+  // pair actually carries. Identical to the old flat bound for the one-pair case, which is every
+  // line-linked and every source-stated leg.
+  const tolerance = toDecimal(Math.max(1, Math.trunc(input.chargedSourceCount) || 1))
+    .div(toDecimal(10).pow(currencyMinorUnits(input.currency)))
   if (postedGross.sub(chargedGross).abs().lte(tolerance)) return { ok: true }
   return {
     ok: false,
@@ -643,6 +684,13 @@ export type PostedCreditNoteLeg = {
   chargedTaxForeign: DecimalInput
   /** What the accounting tax code this leg posts under is worth, from `priceRefundTaxIdentity`. */
   postedRate: Decimal
+  /**
+   * o3d-w00 (Codex r10 #4): how many independently-quantised money figures the charged pair was
+   * composed from — 1 for a line-linked or source-stated pair, n for an order's goods aggregate, n + 1
+   * for a shipping residue. Same quantity, same reason, as on `postedCreditNoteTotalCheck`: the leg's
+   * rounding allowance is one pair's rounding TIMES this, because that is how many roundings are in it.
+   */
+  chargedSourceCount: number
 }
 
 /**
@@ -690,6 +738,23 @@ export type PostedCreditNoteLeg = {
  * is half a minor unit of net times the rate GAP, which is bounded by the gap itself and cannot hide a
  * systematic error — a leg out by a whole minor unit still contributes ~0.004 of unexplained drift.
  *
+ * HOW MANY ROUNDINGS A LEG'S CHARGED PAIR ACTUALLY HAS (o3d-w00, Codex r10 #4). Everything above sizes
+ * a leg's allowance as ONE quantised pair. Two legs are not one pair: an UNLINKED sale amount is priced
+ * against the order's GOODS AS A WHOLE (n line nets and n line VATs, each rounded on its own) and a
+ * shipping leg against the residue of the order's total VAT over those same n lines (n + 1 figures). So
+ * the per-leg rounding term is multiplied by `chargedSourceCount`, and the per-leg money check's
+ * tolerance with it — otherwise an ordinary order refuses for arithmetic nobody can change:
+ *
+ *     GBP. Two 20% goods lines sold tax-inclusive at 0.15 and 0.20 store (0.13 + 0.02) and
+ *     (0.17 + 0.03): goods aggregate 0.30 net, 0.05 VAT, whose derived rate is 16.667% though every
+ *     line is exactly 20%. A refund of 1.00 across two unlinked lines (the order also carries 1.00 of
+ *     shipping, so the ceiling permits it) posts at the correct 20%. Per leg: 0.30 x 1.2 = 0.36 against
+ *     0.35 — 0.01, inside the flat one-unit bound, twice. In aggregate: drift 2 x 0.50 x
+ *     (0.20 - 0.16667) = 0.0333 against an allowance of 0.01 + 2 x (0.5/0.3) x 0.006 = 0.03. Refused,
+ *     with nothing for an operator to change — the tax codes are already right. Counting the aggregate
+ *     leg as the two pairs it is doubles its term (0.0417) and it passes, while a leg genuinely posting
+ *     at the wrong rate still contributes a fixed fraction of its whole net and is still refused.
+ *
  * The result: a leg whose figures merely round awkwardly contributes at most its own rounding and never
  * accumulates past the slack, while a systematic rate error contributes a fixed fraction of every leg
  * and crosses the bound by the third one.
@@ -722,7 +787,12 @@ export function postedCreditNoteAggregateCheck(input: {
     // rate. Pricing it at the derived rate alone under-allows every leg whose pair rounded down, by
     // exactly the amount that made it round down — see the worked case above.
     const netSideRate = chargedRate.abs().gte(leg.postedRate.abs()) ? chargedRate.abs() : leg.postedRate.abs()
-    allowance = allowance.add(scale.mul(
+    // Codex r10 #4: once per QUANTISED SOURCE in the charged pair, not once per leg. A leg checked
+    // against the order's goods as a whole is checked against n pairs summed, and a shipping leg
+    // against a residue over n + 1 figures; allowing one pair's rounding for either understates it by
+    // exactly the factor that makes an ordinary multi-line order refuse. See `chargedSourceCount`.
+    const sources = toDecimal(Math.max(1, Math.trunc(leg.chargedSourceCount) || 1))
+    allowance = allowance.add(scale.mul(sources).mul(
       moneyHalfUnit(chargedTax, sourceDecimals).add(netSideRate.mul(moneyHalfUnit(chargedNet, sourceDecimals))),
     ))
     chargedGross = chargedGross.add(postedNet.mul(toDecimal(1).add(chargedRate)))
@@ -830,6 +900,69 @@ function priceIdentityCode(
     }
   }
   return { ok: true, rate: toDecimal([...knownRates][0]) }
+}
+
+/**
+ * o3d-w00 (Codex r10 #2): THE accounting tax code a refund line's credit-note line will carry.
+ *
+ * One definition, called by the payload builder that actually posts the credit note
+ * (`queueRefundAccountingActions`) and by the retry fence that checks it. It exists because the two
+ * disagreed: the fence skipped every line with no snapshot ("the poster refuses those"), while the
+ * poster refuses nothing — it falls back to the line's own re-derived sales tax type, then to the
+ * order's default, and finally posts the line with no tax code at all, which Xero takes as its
+ * zero-rated `NONE`. The gap was exactly the rows the fence could not see: legacy lines written before
+ * the snapshot column existed, and lines created while credit-note posting was switched off.
+ *
+ * Returning null means the credit-note line will carry NO tax code, i.e. it posts at 0% — not that
+ * nothing is posted. The fence prices null at zero for that reason, and the money check then decides.
+ *
+ * The SNAPSHOT still wins wherever there is one (Codex r9 #2): a re-derivation can differ from what was
+ * posted, and what was posted is what the credit note has to settle.
+ */
+export function creditNoteLineTaxTypeResolver(input: {
+  /** The ORDER's lines, each with the TaxRate the invoice resolved for it. */
+  orderLines: readonly { id: string; taxRate?: PostedRefundTaxRate | null }[]
+  /** Settings → Accounting. Applies the same per-line reverse-charge swap the invoice applied. */
+  reverseChargeSalesTaxType?: string | null
+  /** accountingTaxType of the ACTIVE TaxRate named `SalesOrder.taxRateName`, or null — the fallback. */
+  orderDefaultTaxType?: string | null
+}): (refundLine: { accountingTaxType?: string | null; lineId?: string | null }) => string | null {
+  const bySalesLineId = new Map(input.orderLines.map((line) => [
+    line.id,
+    resolveSalesLineTaxType({
+      baseTaxType: line.taxRate?.accountingTaxType,
+      reverseCharge: line.taxRate?.reverseCharge,
+      reverseChargeSalesTaxType: input.reverseChargeSalesTaxType,
+    }) ?? null,
+  ]))
+  return (refundLine) => refundLine.accountingTaxType
+    ?? (refundLine.lineId ? bySalesLineId.get(refundLine.lineId) ?? null : null)
+    ?? input.orderDefaultTaxType
+    ?? null
+}
+
+/**
+ * o3d-w00 (Codex r10 #3): THE net a refund line's credit-note line will be posted for, in the ORDER's
+ * currency.
+ *
+ * One definition, for the same reason as `creditNoteLineTaxTypeResolver`: the payload builder posts the
+ * BASE column when the order is in the base currency and the FOREIGN column otherwise, while both
+ * fences read the foreign column unconditionally. A row carrying real base money against a zero
+ * `totalForeign` — `SalesOrderRefundLine.totalForeign` is `Decimal @default(0)`, so every legacy row and
+ * every caller that states only base money writes one — is therefore credited in full and weighed as
+ * nothing: its per-leg check passes on a zero net and the aggregate drops it outright.
+ *
+ * Both columns are in the same currency exactly when the order is in the base currency, which is the
+ * only case where the base column is the one posted, so the figure this returns is always comparable to
+ * the order's own `*Foreign` money.
+ */
+export function creditNotePostedNet(input: {
+  totalForeign: DecimalInput
+  totalBase: DecimalInput
+  orderCurrency: string
+  baseCurrency: string
+}): Decimal {
+  return toDecimal(input.orderCurrency === input.baseCurrency ? input.totalBase : input.totalForeign)
 }
 
 /**

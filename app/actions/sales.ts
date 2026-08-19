@@ -58,6 +58,7 @@ import {
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
+import { creditNoteLineTaxTypeResolver } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata, pushSalesOrderStatus } from '@/lib/shopping'
@@ -1905,27 +1906,23 @@ async function queueRefundAccountingActions(input: {
         select: { accountingTaxType: true },
       })
     : null
-  // Credit-note PRODUCT lines must apply the SAME per-line reverse-charge swap
-  // the original invoice did (audit H1), keyed on each sales line's own
-  // TaxRate.reverseCharge — or a refund of a reverse-charged sale posts under
-  // the standard code and the VAT return no longer balances.
-  const taxTypeBySalesLineId = new Map(
-    (orderForCN?.lines ?? []).map((line) => [
-      line.id,
-      resolveSalesLineTaxType({
-        baseTaxType: line.taxRate?.accountingTaxType,
-        reverseCharge: line.taxRate?.reverseCharge,
-        reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-      }),
-    ]),
-  )
-  // Fallback for refund lines with no mapped sales line (shipping, ad-hoc):
-  // the order-level tax type WITHOUT the swap, mirroring exactly how the
-  // invoice posts its shipping/discount lines (shippingTaxType =
-  // orderDefaultTaxType, no swap). Swapping here would post credit-note
-  // shipping under the reverse-charge code while the invoice posted it under
-  // the standard code — an asymmetry the VAT return would flag.
-  const fallbackCnTaxType = cnTaxRate?.accountingTaxType ?? undefined
+  // The code each credit-note line carries, from the ONE definition the retry fence also reads
+  // (o3d-w00, Codex r10 #2) — the snapshot where there is one, else the line's own re-derived sales tax
+  // type, else the order default, else no code at all. Two definitions of this is a fence that checks a
+  // different set of lines from the set that posts.
+  //
+  // Credit-note PRODUCT lines must apply the SAME per-line reverse-charge swap the original invoice did
+  // (audit H1), keyed on each sales line's own TaxRate.reverseCharge — or a refund of a reverse-charged
+  // sale posts under the standard code and the VAT return no longer balances. The fallback for a line
+  // with no mapped sales line (shipping, ad-hoc) is the order-level tax type WITHOUT the swap, mirroring
+  // exactly how the invoice posts its shipping/discount lines (shippingTaxType = orderDefaultTaxType, no
+  // swap): swapping there would post credit-note shipping under the reverse-charge code while the
+  // invoice posted it under the standard code — an asymmetry the VAT return would flag.
+  const creditNoteTaxTypeOf = creditNoteLineTaxTypeResolver({
+    orderLines: orderForCN?.lines ?? [],
+    reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
+    orderDefaultTaxType: cnTaxRate?.accountingTaxType ?? null,
+  })
 
   await queueAccountingSync({
     type: 'CREDIT_NOTE',
@@ -1954,9 +1951,7 @@ async function queueRefundAccountingActions(input: {
         // actually validated — instead of re-predicting it from the order default here, which mis-taxed
         // deactivated-rate/reverse-charge/mixed-rate refunds. Fall back to the old prediction only for
         // legacy rows with no snapshot (created before the column existed).
-        taxType: line.accountingTaxType
-          ?? (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined)
-          ?? fallbackCnTaxType,
+        taxType: creditNoteTaxTypeOf(line) ?? undefined,
       })),
       // Every stored refund line is NET (o3d-w00): the WooCommerce monetary-only refund — the one caller
       // that had a gross amount — is now netted at source, so this correctly grosses every line up.

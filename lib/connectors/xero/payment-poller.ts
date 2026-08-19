@@ -112,14 +112,14 @@ async function notifyReversalAdmins(
   // The alert has to say so on the FIRST failure — this is the only thing that will tell anyone the
   // credit note is outstanding, since no further poll can raise it.
   chargebackManualReason?: string,
-  // o3d-w00 (Codex r9 #4): the alert now fires even when clearing paidAt FAILED, so it must say which
-  // of the two happened. `false` means IMS still shows the order paid; the next poll re-detects it.
-  paidAtCleared: boolean = true,
 ): Promise<void> {
   const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
-  const paidAtClause = paidAtCleared
-    ? 'paidAt was cleared'
-    : 'paidAt could NOT be cleared and the order still shows as paid in IMS'
+  // o3d-w00 (Codex r10 #1): this alert is written BEFORE paidAt is cleared, because clearing it is what
+  // takes the order out of the next poll's window and would strand a failed alert forever. So it says
+  // what is true as it is written — and how the reader can tell the run did not finish.
+  const paidAtClause =
+    'IMS is clearing its paid flag to match (if the order still shows as paid, this poll did not ' +
+    'finish and the next one repeats the whole reversal)'
   const message = (chargebackManualReason
     ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). ${paidAtClause}, but the revenue unwind was REFUSED and NO credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the payment poller.`
     : wcHandled
@@ -862,25 +862,35 @@ async function processDeltaChunk(
           // required chargeback succeeded — a failed chargeback holds paidAt so the
           // order stays in the next poll's paidOrders window and the reversal is
           // re-attempted (Codex P1) rather than left unpaid-and-unreversed.
+          //
+          // Codex r10 #1: this is also why it runs LAST of the closing effects. `paidOrders` above
+          // selects on `paidAt: { not: null }`, so this write is the one that takes the order out of
+          // every future poll — the alert and the audit entry are landed first, while re-detection is
+          // still possible.
           clearPaidAt: async (orderId) => {
             await db.salesOrder.update({ where: { id: orderId }, data: { paidAt: null } })
           },
-          notifyNeedsAttention: (o, { wcHandled, chargebackManualReason, paidAtCleared }) =>
-            notifyReversalAdmins(o, wcHandled, registeredPaymentGone, chargebackManualReason, paidAtCleared),
-          logReversalDetected: (o, { wcHandled, chargebackManualReason, paidAtCleared }) => logActivity({
+          notifyNeedsAttention: (o, { wcHandled, chargebackManualReason }) =>
+            notifyReversalAdmins(o, wcHandled, registeredPaymentGone, chargebackManualReason),
+          logReversalDetected: (o, { wcHandled, chargebackManualReason }) => logActivity({
             entityType: 'SALES_ORDER',
             entityId: o.id,
             action: 'payment_reversal_detected',
             tag: 'sync',
             level: 'WARNING',
             // o3d-w00 (Codex r8 #3): a reversal whose revenue unwind was REFUSED is not a clean one, and
-            // the audit entry is the durable record that it is outstanding — paidAt has been cleared
-            // (the payment really is gone) but no credit note exists, and no poll will make one.
+            // the audit entry is the durable record that it is outstanding — the payment really is gone
+            // but no credit note exists, and no poll will make one.
+            //
+            // Codex r10 #1: written BEFORE paidAt is cleared, since clearing it is what retires the
+            // order from the poller's window — so it states the clear as the step that follows, not as
+            // one that already happened. An entry with no matching clear is a run that did not finish,
+            // and the next poll repeats the whole decision.
             description: (chargebackManualReason
-              ? `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — ${paidAtCleared ? 'cleared paidAt' : 'FAILED to clear paidAt'}, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
+              ? `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — clearing paidAt, but the revenue unwind was REFUSED and no credit note has been raised: ${chargebackManualReason} Raise the credit note manually, or fix the tax mapping and re-run the poller.`
               : wcHandled
-                ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); ${paidAtCleared ? 'cleared paidAt' : 'FAILED to clear paidAt'}. Verify the WC refund fully covers the reversal and whether the order status should revert.`
-                : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — ${paidAtCleared ? 'cleared paidAt' : 'FAILED to clear paidAt'}. Review whether the order status should revert.`)
+                ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); clearing paidAt. Verify the WC refund fully covers the reversal and whether the order status should revert.`
+                : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — clearing paidAt. Review whether the order status should revert.`)
               + (registeredPaymentGone
                 ? ` The payment IMS registered (${salesResidual.provenGone.get(o.accountingInvoiceId ?? '')?.paymentIds.join(', ')}) is no longer among the payments Xero lists on this invoice, but the invoice still carries another payment or an amount Xero did not state — so NO chargeback credit note was raised automatically. Unwind revenue by hand if that is what the removal means.`
                 : ''),

@@ -625,7 +625,7 @@ test('pricing an identity is separable from checking what it was charged (o3d-w0
 
 test('the credit-note total check compares money, not rates (o3d-w00 Codex r7 #5)', () => {
   const check = (netForeign: number, taxForeign: number, postedRate: number, currency = 'GBP') =>
-    postedCreditNoteTotalCheck({ currency, netForeign, taxForeign, postedRate: toDecimal(postedRate), kind: 'sale', label: 'The refunded line' })
+    postedCreditNoteTotalCheck({ currency, netForeign, taxForeign, postedRate: toDecimal(postedRate), kind: 'sale', label: 'The refunded line', chargedSourceCount: 1 })
 
   // The £2.00 line the rate comparison could not judge: 2.00 + 0.40 against 2.00 x 1.2 is exact.
   assert.equal(check(2, 0.4, 0.2).ok, true)
@@ -644,15 +644,15 @@ test('the credit-note total check compares money, not rates (o3d-w00 Codex r7 #5
   assert.equal(check(4995, 500, 0.08, 'JPY').ok, false)
 
   // No snapshot means there is NOTHING to check the posting against — never that it agrees.
-  assert.equal(postedCreditNoteTotalCheck({ currency: 'GBP', netForeign: 10, postedRate: toDecimal(0.2), kind: 'sale', label: 'x' }).ok, true)
-  assert.equal(postedCreditNoteTotalCheck({ currency: 'GBP', netForeign: 0, taxForeign: 0, postedRate: toDecimal(0.2), kind: 'sale', label: 'x' }).ok, true)
+  assert.equal(postedCreditNoteTotalCheck({ currency: 'GBP', netForeign: 10, postedRate: toDecimal(0.2), kind: 'sale', label: 'x', chargedSourceCount: 1 }).ok, true)
+  assert.equal(postedCreditNoteTotalCheck({ currency: 'GBP', netForeign: 0, taxForeign: 0, postedRate: toDecimal(0.2), kind: 'sale', label: 'x', chargedSourceCount: 1 }).ok, true)
 
   // o3d-w00 (Codex r8 #5): a chargeback's shipping and order-discount legs are checked as ONE amount,
   // and the discount leg is negative by construction, so the pair's net can be either sign. One refund
   // LINE is never negative and one of zero credits nothing, so both stay unchecked by default.
   const combined = (netForeign: number, taxForeign: number, postedRate: number) => postedCreditNoteTotalCheck({
     currency: 'GBP', netForeign, taxForeign, postedRate: toDecimal(postedRate),
-    kind: 'shipping', label: 'The pair', allowNonPositiveNet: true,
+    kind: 'shipping', label: 'The pair', allowNonPositiveNet: true, chargedSourceCount: 1,
   })
   // £4.00 of postage less a £10.00 discount is −£6.00 net bearing −£1.20 of VAT: −7.20 either way.
   assert.equal(combined(-6, -1.2, 0.2).ok, true)
@@ -660,7 +660,7 @@ test('the credit-note total check compares money, not rates (o3d-w00 Codex r7 #5
   // Without the flag the same figures are waved through, which is why the two chargeback legs cannot
   // simply be handed to the per-line check.
   assert.equal(postedCreditNoteTotalCheck({
-    currency: 'GBP', netForeign: -6, taxForeign: -1.2, postedRate: toDecimal(0.05), kind: 'shipping', label: 'The pair',
+    currency: 'GBP', netForeign: -6, taxForeign: -1.2, postedRate: toDecimal(0.05), kind: 'shipping', label: 'The pair', chargedSourceCount: 1,
   }).ok, true)
 })
 
@@ -687,6 +687,8 @@ test('the aggregate check catches a drift every leg hides inside its own toleran
     chargedNetForeign: postedNet,
     chargedTaxForeign: chargedTax,
     postedRate: toDecimal(postedRate),
+    // Codex r10 #4: one quantised pair, which is what every leg in this test is.
+    chargedSourceCount: 1,
   })
   const check = (legs: ReturnType<typeof leg>[], currency = 'GBP') =>
     postedCreditNoteAggregateCheck({ currency, legs })
@@ -695,7 +697,7 @@ test('the aggregate check catches a drift every leg hides inside its own toleran
   // per-leg check passes it every time, at any number of repetitions. Each of these legs passes on its
   // own; a hundred of them add up to a credit note £1.00 over the refund it settles.
   const perLeg = postedCreditNoteTotalCheck({
-    currency: 'GBP', netForeign: 1, taxForeign: 0.19, postedRate: toDecimal(0.2), kind: 'sale', label: 'line',
+    currency: 'GBP', netForeign: 1, taxForeign: 0.19, postedRate: toDecimal(0.2), kind: 'sale', label: 'line', chargedSourceCount: 1,
   })
   assert.equal(perLeg.ok, true, 'the premise: no single leg is refusable')
 
@@ -731,6 +733,7 @@ test('the aggregate check catches a drift every leg hides inside its own toleran
         chargedNetForeign: 1,
         chargedTaxForeign: 0.19,
         postedRate: toDecimal(0.2),
+        chargedSourceCount: 1,
       })),
     }).ok,
     false,
@@ -756,6 +759,8 @@ test("the aggregate prices the net side's rounding at the rate the credit note p
     chargedNetForeign: postedNet,
     chargedTaxForeign: chargedTax,
     postedRate: toDecimal(postedRate),
+    // Codex r10 #4: one quantised pair, which is what every leg in this test is.
+    chargedSourceCount: 1,
   })
   const check = (legs: ReturnType<typeof leg>[], currency = 'GBP') =>
     postedCreditNoteAggregateCheck({ currency, legs })
@@ -776,7 +781,7 @@ test("the aggregate prices the net side's rounding at the rate the credit note p
   const roundedDown = leg(0.13, 0.02, 0.2)
   assert.equal(
     postedCreditNoteTotalCheck({
-      currency: 'GBP', netForeign: 0.13, taxForeign: 0.02, postedRate: toDecimal(0.2), kind: 'sale', label: 'line',
+      currency: 'GBP', netForeign: 0.13, taxForeign: 0.02, postedRate: toDecimal(0.2), kind: 'sale', label: 'line', chargedSourceCount: 1,
     }).ok,
     true,
     'the premise: each leg passes on its own — this is ordinary penny rounding, not a rate difference',
@@ -799,4 +804,90 @@ test("the aggregate prices the net side's rounding at the rate the credit note p
   // A rate error on the CHARGED side is symmetrical: the larger of the two rates prices the net side,
   // so a leg charged ABOVE what it posts under is allowed no more than r8 allowed it.
   assert.equal(check(Array.from({ length: 3 }, () => leg(1, 0.21, 0.2))).ok, false)
+})
+
+test('a charged pair made of MANY quantised pairs is allowed many roundings (o3d-w00 Codex r10 #4)', () => {
+  // ---------------------------------------------------------------------------------------------
+  // Both checks size a leg's rounding as ONE quantised pair. Two legs are not one pair: an UNLINKED
+  // sale amount is priced against the order's GOODS AS A WHOLE, and a shipping leg against the residue
+  // of the order's total VAT over its lines. r9 argued the per-leg check binds first in every shape,
+  // so the aggregate could never refuse alone. It does — this is the case.
+  //
+  // GBP. Two 20% goods lines sold TAX-INCLUSIVE at 0.15 and 0.20. Each stores net = round(gross / 1.2)
+  // and tax = gross − net: (0.13 + 0.02) and (0.17 + 0.03). Both are exactly 20% items; the aggregate
+  // they make, 0.30 net bearing 0.05, derives 16.667%. The order also carries 1.00 of shipping, so a
+  // refund of 1.00 across two ad-hoc lines that matched no IMS line is inside the ceiling, and each of
+  // those lines posts under the order's single safe identity — the correct 20%.
+  // ---------------------------------------------------------------------------------------------
+  const goodsAggregateLeg = {
+    label: 'Unmatched item',
+    postedNetForeign: 0.5,
+    chargedNetForeign: 0.3,
+    chargedTaxForeign: 0.05,
+    postedRate: toDecimal(0.2),
+    chargedSourceCount: 2,
+  }
+  // The premise, and it holds under the OLD flat bound too: no leg is refusable on its own.
+  assert.equal(
+    postedCreditNoteTotalCheck({
+      currency: 'GBP', netForeign: 0.3, taxForeign: 0.05, postedRate: toDecimal(0.2),
+      kind: 'sale', label: 'Unmatched item', chargedSourceCount: 1,
+    }).ok,
+    true,
+    '0.30 x 1.2 = 0.36 against 0.35 — one penny, inside the one-unit tolerance',
+  )
+  // Two of them: drift 2 x 0.50 x (0.20 − 0.16667) = 0.0333 against the 0.03 that one pair's rounding
+  // per leg allows. Refused, with every tax code already correctly mapped and nothing for an operator
+  // to change — a refusal with no remedy, which is the one thing the fence must never produce.
+  assert.equal(
+    postedCreditNoteAggregateCheck({ currency: 'GBP', legs: [goodsAggregateLeg, goodsAggregateLeg] }).ok,
+    true,
+    'counting the aggregate as the two pairs it is allows 0.05 and it passes',
+  )
+  // The per-leg bound moves with it, on the same quantity: two 20% tax-inclusive lines whose residues
+  // fall the same way make a pair 0.012 out of an exactly-computed gross — more than one rounding, and
+  // exactly two.
+  const twoRoundedDownLines = {
+    currency: 'GBP', netForeign: 0.36, taxForeign: 0.06, postedRate: toDecimal(0.2),
+    kind: 'sale' as const, label: 'Unmatched item',
+  }
+  assert.equal(postedCreditNoteTotalCheck({ ...twoRoundedDownLines, chargedSourceCount: 1 }).ok, false)
+  assert.equal(postedCreditNoteTotalCheck({ ...twoRoundedDownLines, chargedSourceCount: 2 }).ok, true)
+
+  // ---------------------------------------------------------------------------------------------
+  // AND IT IS NOT A LICENCE. A leg genuinely posting at a rate the money was not charged at drifts by
+  // a fixed fraction of its whole net, which outruns any number of half-pennies.
+  // ---------------------------------------------------------------------------------------------
+  const wrongRateLeg = {
+    label: 'Unmatched item',
+    postedNetForeign: 2,
+    chargedNetForeign: 2,
+    // Two lines of 1.00 bearing 0.19: a real 19% aggregate, posting under a 20% code.
+    chargedTaxForeign: 0.38,
+    postedRate: toDecimal(0.2),
+    chargedSourceCount: 2,
+  }
+  assert.equal(
+    postedCreditNoteTotalCheck({
+      currency: 'GBP', netForeign: 2, taxForeign: 0.38, postedRate: toDecimal(0.2),
+      kind: 'sale', label: 'Unmatched item', chargedSourceCount: 2,
+    }).ok,
+    true,
+    'the premise again: 2.40 against 2.38 is inside two roundings, so no leg refuses alone',
+  )
+  const drifting = postedCreditNoteAggregateCheck({
+    currency: 'GBP',
+    legs: [wrongRateLeg, wrongRateLeg, wrongRateLeg],
+  })
+  assert.equal(drifting.ok, false)
+  assert.match(drifting.ok ? '' : drifting.reason, /across 3 parts of the order/)
+
+  // A shipping leg's VAT LOOKS like a residue over n + 1 figures and is not: both writers build the
+  // order total from the SAME stored line figures, so every line term cancels exactly and what is left
+  // is shipping's own recorded VAT, quantised once. Sizing it as n + 1 would put 0.45 of slack on a
+  // 44-line order's postage, which is more than an ordinary postage charge's whole VAT.
+  const shipping = chargedShippingMoney(SHIPPING_CHARGED_20)
+  assert.equal(shipping.ok && shipping.sourceCount, 1, 'the line terms cancel; one recorded figure is left')
+  const stated = chargedShippingMoney({ currency: 'GBP', netForeign: 10, shippingTaxForeign: 2 })
+  assert.equal(stated.ok && stated.sourceCount, 1, 'a STATED pair is one pair, quantised once')
 })

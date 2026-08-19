@@ -217,6 +217,10 @@ type State = {
   // many fixtures that never fence an identity never read them — the double below REFUSES to answer a
   // pricing query from a row that does not carry a rate, rather than silently pricing it at 0%.
   taxRates?: Array<{ name: string; accountingTaxType: string | null; active?: boolean; rate?: number; usedFor?: string }>
+  // o3d-w00 (Codex r10 #3): the org's base currency, which is what decides whether a credit-note line
+  // is posted for its BASE column or its foreign one — and therefore what "the net this refund posts"
+  // means to the fence. Defaults to GBP, the same fallback production uses when there is no row.
+  baseCurrency?: string
   executeRawCalls: number
   nextRefundId: number
   nextRefundLineId: number
@@ -368,6 +372,9 @@ function createClient(state: State): RefundServiceClient {
         }
         throw error
       }
+    },
+    organisation: {
+      findFirst: async () => ({ baseCurrency: state.baseCurrency ?? 'GBP' }),
     },
     taxRate: {
       findFirst: async ({ where }: { where: { name?: string; active?: boolean } }) => {
@@ -6566,4 +6573,145 @@ test('the SAME inexact apportionment on a FULL refund is not refused — cap and
   assert.equal(findAllocatedInventoryCredit(result), 40, 'the £10 blended line plus the £30 residue — exactly the recorded debit')
   assert.equal(findInventoryReversalDebit(result), 40)
   assert.equal(state.orders[0].inventoryAllocatedDate, null, 'the accounted-for debit allows the un-stage')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-w00 (Codex r10 #2): THE FENCE'S SCOPE AND THE POSTER'S SCOPE ARE THE SAME SET OF LINES.
+//
+// r8/r9 skipped every refund line with no tax snapshot on the stated ground that "the credit-note
+// poster refuses those on its own". It refuses nothing: queueRefundAccountingActions falls back to the
+// line's re-derived sales tax type, then to the order's default, and finally posts the line with no tax
+// code at all. The blind spot was exactly the rows the fence could not see — every legacy line written
+// before the snapshot column existed, and every line created while credit-note posting was off.
+// ---------------------------------------------------------------------------------------------
+
+test('the retry fence prices a line with NO snapshot the way the poster will post it (o3d-w00 Codex r10 #2)', async () => {
+  // OUTPUT2 edited to 5% since the refund was created, and this line carries no snapshot. The poster
+  // re-derives OUTPUT2 from the sales line's own TaxRate and posts under it, so the credit note comes
+  // to £10.50 against the £12.00 the customer's money says this line is worth — and the fence has to
+  // see the same line the poster does.
+  const state = retryFenceState(0.05)
+  state.refundLines[0].accountingTaxType = null
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+    creditNotePostingEnabled: true,
+  })
+  assert.equal(result.success, false)
+  const error = result.success === false ? result.error : ''
+  assert.match(error, /This refund is recorded, but its credit note has NOT been raised/)
+  assert.match(error, /returned 12\.00 of the customer's money/)
+  assert.match(error, /credit note would come to 10\.50/, 're-derived at the code the poster will use')
+  assert.equal(state.refunds[0].accountingRetryRequired, true, 'and stays visible for an operator')
+})
+
+test("a snapshot-less UNLINKED line is priced at the order default, as the poster prices it (o3d-w00 Codex r10 #2)", async () => {
+  // No snapshot AND no sales line to re-derive from: the poster's last fallback is the accounting code
+  // of the order's own default rate, which is the identity the invoice posted such a line under.
+  const state = retryFenceState(0.05)
+  state.refundLines[0].accountingTaxType = null
+  state.refundLines[0].salesOrderLineId = null
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+    creditNotePostingEnabled: true,
+  })
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /credit note would come to 10\.50/)
+})
+
+test('the SNAPSHOT still wins wherever there is one (o3d-w00 Codex r9 #2 / r10 #2)', async () => {
+  // The scopes are identical; the VALUES are not interchangeable. This line was snapshotted under a
+  // zero-rated code and that is what its credit note posts under — re-deriving would find OUTPUT2 at
+  // the 20% the line was sold at and wave through a credit note that comes to £10.00 against £12.00.
+  const state = retryFenceState(0.2)
+  state.refundLines[0].accountingTaxType = 'ZERORATEDOUTPUT'
+  state.taxRates = [
+    { name: 'Standard', accountingTaxType: 'OUTPUT2', rate: 0.2, active: true, usedFor: 'SALES' },
+    { name: 'Zero', accountingTaxType: 'ZERORATEDOUTPUT', rate: 0, active: true, usedFor: 'SALES' },
+  ]
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+    creditNotePostingEnabled: true,
+  })
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /credit note would come to 10\.00/)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-w00 (Codex r10 #3): A BASE-ONLY ROW IS CREDITED IN FULL, SO IT IS WEIGHED IN FULL.
+//
+// The credit-note payload posts each line's BASE column when the order is in the base currency and its
+// FOREIGN column otherwise, while both fences read the foreign column unconditionally.
+// SalesOrderRefundLine.totalForeign is `Decimal @default(0)`, so a legacy row — or any caller that
+// states only base money — is credited for real money the fence measured as zero: its per-leg check
+// passed on a net of nothing and the aggregate dropped it outright.
+// ---------------------------------------------------------------------------------------------
+
+test('a base-only refund line is checked against what its credit note posts (o3d-w00 Codex r10 #3)', async () => {
+  // £10.00 of zero-rated goods, stated as base money only. The order is in the base currency, so the
+  // credit note posts that £10.00 under the order default (OUTPUT2, 20%) and comes to £12.00.
+  const state = fallsBackToOrderDefaultState(0)
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ ...ITEMISED_SALE_REFUND, totalForeign: 0, chargedTaxForeign: 0 }],
+    reason: 'Customer return',
+    externalRefundId: 8811,
+    creditNotePrefix: 'CN-',
+    activeAccountingConnector: 'xero',
+    creditNotePostingEnabled: true,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.quarantine, true)
+  const error = result.success === false ? result.error : ''
+  assert.match(error, /returned 10\.00 of the customer's money/)
+  assert.match(error, /credit note would come to 12\.00/)
+  assert.equal(state.refunds.length, 0, 'nothing was created')
+})
+
+test('base-only rows reach the AGGREGATE drift check too (o3d-w00 Codex r10 #3)', async () => {
+  // Three £1.00 lines charged at 19% posting under a 20% code: each is out by exactly one penny, which
+  // the per-leg tolerance passes every time, and the three together are the drift the aggregate exists
+  // to catch. Every refund line states base money only, so before this they weighed nothing at all.
+  const base = baseState()
+  const state = baseState({
+    orders: [{
+      ...base.orders[0],
+      status: 'REFUNDED', refundStatus: 'FULL',
+      totalBase: 3.57, taxBase: 0.57, taxRateName: 'Standard', currency: 'GBP',
+      taxForeign: 0.57, shippingForeign: 0,
+      revenueDeferredDate: new Date('2026-01-01'), unearnedRevenueAmount: 3.57,
+    }],
+    lines: [1, 2, 3].map((n) => ({
+      id: `line-${n}`, orderId: 'order-1', productId: `product-${n}`, description: `Widget ${n}`,
+      qty: 1, totalBase: 1, totalForeign: 1, taxForeign: 0.19,
+      taxRate: { accountingTaxType: 'OUTPUT2', reverseCharge: false },
+    })),
+    refunds: [{
+      id: 'refund-1', orderId: 'order-1', creditNoteNumber: 'CN-2026-00001', externalRefundId: null,
+      reason: 'Customer return', totalForeign: 3, totalBase: 3, returnWarehouseId: null,
+      accountingRetryRequired: true, accountingWarning: 'Previous accounting queueing failed',
+      accountingRetrySyncs: null,
+    }],
+    refundLines: [1, 2, 3].map((n) => ({
+      id: `refund-line-${n}`, refundId: 'refund-1', salesOrderLineId: `line-${n}`, productId: `product-${n}`,
+      description: `Widget ${n}`, qty: 1, unitPriceForeign: 0, unitPriceBase: 1,
+      // The defect in one field: real base money against the `@default(0)` foreign column.
+      totalForeign: 0, totalBase: 1,
+      accountingTaxType: 'OUTPUT2', reverseCharge: false, lineKind: 'sale',
+    })),
+    taxRates: [{ name: 'Standard', accountingTaxType: 'OUTPUT2', rate: 0.2, active: true, usedFor: 'SALES' }],
+  })
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+    creditNotePostingEnabled: true,
+  })
+
+  assert.equal(result.success, false)
+  const error = result.success === false ? result.error : ''
+  assert.match(error, /across 3 parts of the order/, 'all three were weighed, not dropped')
+  assert.match(error, /No single part is out by enough to be refused on its own/)
 })
