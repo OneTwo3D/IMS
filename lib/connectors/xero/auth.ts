@@ -96,8 +96,13 @@ async function readStoredToken(): Promise<StoredAccountingToken | null> {
 
   if (hasEncryptionKey() && (!isEncryptedValue(row.accessToken) || (row.refreshToken && !isEncryptedValue(row.refreshToken)))) {
     try {
-      await db.accountingToken.update({
-        where: { connector: XERO_CONNECTOR },
+      // Scoped to the exact row that was READ — same organisation, same ciphertext (o3d-9tbz r4). This
+      // is the refresh defect's smaller twin: it re-writes token material read a moment ago, so keyed on
+      // `connector` alone it could re-encrypt a retired organisation's tokens on top of a connection
+      // that had since been rebound. A miss means the row moved on and the migration is simply not
+      // needed; it was always best-effort.
+      await db.accountingToken.updateMany({
+        where: { connector: XERO_CONNECTOR, tenantId: row.tenantId, accessToken: row.accessToken },
         data: {
           accessToken: encryptSecret(accessToken),
           refreshToken: refreshToken ? encryptSecret(refreshToken) : null,
@@ -143,13 +148,45 @@ function storedTokenRow(params: StoredTokenWrite) {
   }
 }
 
-async function upsertStoredToken(params: StoredTokenWrite): Promise<void> {
-  const data = storedTokenRow(params)
-  await db.accountingToken.upsert({
-    where: { connector: XERO_CONNECTOR },
-    create: data,
-    update: data,
+/**
+ * Write a REFRESHED token — and only while the row still names the organisation it was refreshed for
+ * (o3d-9tbz r4).
+ *
+ * THE RACE THIS CLOSES. Round 3 made the BINDING atomic, so of two consents only one leaves a pin and a
+ * token behind. The refresh path went straight round it. A refresh is a long round trip to Xero that
+ * began by READING the token row; by the time it comes back to write, an operator may have disconnected
+ * and re-consented to a different organisation, and that binding may already have committed. An upsert
+ * keyed on `connector` alone has no idea any of that happened: it overwrites the winner's token with the
+ * old organisation's. The instance is then bound to one organisation by its PIN and to another by its
+ * TOKEN — the exact split round 3 closed, reached through a different door, and the one that decides
+ * where invoices are actually posted is the token.
+ *
+ * WHAT MAKES IT SAFE is again not a check in this process — a check would sit on the wrong side of the
+ * same window. The organisation is put in the WHERE clause, so the database evaluates it AT THE WRITE:
+ *
+ *     UPDATE accounting_tokens SET ... WHERE connector = 'xero' AND tenant_id = <the one we refreshed>
+ *
+ * If a rebinding has already committed, the predicate no longer matches and nothing is written. If the
+ * rebinding is still IN FLIGHT, this statement waits on its row lock rather than racing it, and under
+ * READ COMMITTED Postgres re-evaluates the predicate against the row the winner committed — so the
+ * outcome is the same whichever order the two arrive in. `updateMany` rather than `update` because a
+ * miss must be an ANSWER (count 0) rather than an exception to classify; round 3 already paid for the
+ * lesson that catching the wrong P-code reports the wrong cause.
+ *
+ * IT ALSO STOPS A REFRESH RESURRECTING A DISCONNECTED CONNECTION. The upsert's `create` branch would
+ * re-insert a token row that `disconnect()` had just deleted, quietly reconnecting an instance to the
+ * organisation an operator had just detached it from. There is no create branch here at all.
+ *
+ * ORDINARY REFRESH IS UNTOUCHED: the tenant asked for is the tenant on the row, the predicate matches,
+ * one row is updated. Returning false means only that this token is stale — the caller fails THIS call
+ * and the next one reads the new binding.
+ */
+async function storeRefreshedToken(params: StoredTokenWrite): Promise<boolean> {
+  const { count } = await db.accountingToken.updateMany({
+    where: { connector: XERO_CONNECTOR, tenantId: params.tenantId },
+    data: storedTokenRow(params),
   })
+  return count > 0
 }
 
 async function getExpectedTenantId(): Promise<string | null> {
@@ -458,6 +495,30 @@ async function logRefreshFailure(reason: string): Promise<void> {
 }
 
 /**
+ * A refreshed token was thrown away because it was no longer this instance's organisation (o3d-9tbz r4).
+ *
+ * Deliberately NOT logRefreshFailure: that one notifies, and this is not a failure anybody needs to act
+ * on. It is still recorded, because "a sync failed once, at the moment somebody rebound the connector"
+ * is otherwise an unexplainable blip in the activity log.
+ */
+async function logStaleRefreshDiscarded(token: StoredAccountingToken): Promise<void> {
+  try {
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'sync',
+      action: 'xero_refresh_discarded',
+      level: 'WARNING',
+      description:
+        `A Xero token refresh for ${token.tenantName ?? token.tenantId} was discarded: this instance is `
+        + 'no longer connected to that organisation. Nothing was overwritten.',
+      metadata: { connector: XERO_CONNECTOR, tenantId: token.tenantId },
+    })
+  } catch {
+    // Best-effort only.
+  }
+}
+
+/**
  * Get a valid access token. Auto-refreshes if expired.
  * Returns null if not connected.
  */
@@ -694,7 +755,7 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
       const data: TokenResponse = await res.json()
       const expiresAt = new Date(Date.now() + data.expires_in * 1000)
 
-      await upsertStoredToken({
+      const stored = await storeRefreshedToken({
         accessToken: data.access_token,
         refreshToken: data.refresh_token ?? token.refreshToken,
         expiresAt,
@@ -712,6 +773,14 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
         // XERO_REQUIRE_DEMO_ORG that is an outage roughly every 30 minutes.
         tenantIsDemo: token.tenantIsDemo,
       })
+      if (!stored) {
+        // The binding moved underneath this refresh. Not an outage and not the operator's problem: the
+        // instance is connected, to the organisation they just chose, with that organisation's own
+        // token. Recorded rather than notified for exactly that reason — "Xero connection needs
+        // attention" would be a false alarm, and a guard that cries wolf gets switched off.
+        await logStaleRefreshDiscarded(token)
+        return null
+      }
 
       return { accessToken: data.access_token, tenantId: token.tenantId }
     } catch (error) {

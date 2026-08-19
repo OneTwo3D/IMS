@@ -178,6 +178,21 @@ a refusal that happened while nobody was watching the browser is still discovera
 configuration is recorded there too, as `xero_tenant_guard_name_only` — once per connected organisation
 rather than once per sync — because it is permitted but weaker than it looks.
 
+#### Reconnecting to a different organisation
+
+Only one organisation can be bound at a time, and IMS refuses a consent to a second one while the first
+is still connected — so moving to a different organisation means **Disconnect on /sync, then Connect**.
+That is also what the Demo company needs roughly every 28 days, because Xero re-creates it with a new
+organisation id.
+
+A reconnect is safe to do at any moment, including while a sync is running. IMS refreshes its Xero
+access token about every half hour, and a refresh that was already in flight when you rebound the
+connection is **discarded rather than stored**: the organisation is part of the database write, so a
+token belonging to the organisation you just left cannot land on the connection you just made. It is
+recorded as `xero_refresh_discarded` in the Activity log and deliberately does *not* raise a
+notification — the connection is healthy, and one sync may simply have to be retried. If you see a
+single Xero failure at the exact moment somebody reconnected, that is what it was.
+
 #### If you already set `XERO_TENANT_ID`
 
 `XERO_TENANT_ID` is **deprecated**. It appeared in `.env.example`, in the installer and in the

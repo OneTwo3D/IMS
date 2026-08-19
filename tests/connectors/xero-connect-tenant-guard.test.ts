@@ -29,6 +29,23 @@ import test, { beforeEach, mock } from 'node:test'
  * after the other: it holds every in-transaction pin read until N of them have arrived, so both
  * callbacks have provably read "no pin" before either writes. Without it the second callback simply
  * runs after the first has committed, which is a different (and much easier) case.
+ *
+ * THE TOKEN ROW HAS A LOCK AND A WRITE-TIME PREDICATE (o3d-9tbz r4), for exactly the same reason the
+ * settings key has a primary key. The race being fixed there is a REFRESH in flight across a rebinding:
+ * it read the token row minutes ago, went to Xero, and comes back to write. What decides it is that the
+ * organisation is in the WHERE clause of the UPDATE, so:
+ *
+ *   - `accountingToken.updateMany` matches the row AS IT IS AT THE WRITE, not as the caller last saw it,
+ *     and answers `{ count: 0 }` when it no longer matches. Every field in the `where` is compared, so
+ *     the same double covers the encryption migration's compare-and-swap on the ciphertext it read.
+ *   - a write from OUTSIDE a transaction — `updateMany` or `upsert` alike — WAITS while an uncommitted
+ *     transaction holds the token row, and then re-evaluates its predicate against what that transaction
+ *     committed. This is what tells the fix from the bug: without the wait, the reverted upsert simply
+ *     lands first and the binding overwrites it, so the test passes against the bug too. The lock belongs
+ *     to the ROW, not to the API used to write it, which is why the doubled `upsert` waits as well.
+ *   - `gateRefreshGrant` / `gateBindingTokenWrite` are what put those two in flight at once: the first
+ *     holds the refresh at its call to Xero, the second holds a binding transaction with the token row
+ *     staged and UNCOMMITTED.
  */
 
 type TokenRow = {
@@ -77,6 +94,32 @@ function jsonResponse(body: unknown) {
  */
 let settingReadGate: ((key: string) => Promise<void>) | null = null
 let organisationFetchGate: (() => Promise<void>) | null = null
+/** Holds a REFRESH grant at the identity endpoint — the long round trip the stale write comes back from. */
+let refreshGrantGate: (() => Promise<void>) | null = null
+/** Holds a binding transaction with the token row written but NOT committed, i.e. holding its row lock. */
+let bindingTokenWriteGate: (() => Promise<void>) | null = null
+
+/**
+ * A one-shot gate a test drives by hand: `reached` resolves when the code under test arrives at it, and
+ * nothing continues past it until `release()` is called. Two of these are what interleave a refresh and
+ * a rebinding deterministically instead of hoping the timings fall the right way.
+ */
+function latch(): { reached: Promise<void>; release: () => void; wait: () => Promise<void> } {
+  let arrive: () => void = () => {}
+  const reached = new Promise<void>((resolve) => { arrive = resolve })
+  let open: () => void = () => {}
+  const opened = new Promise<void>((resolve) => { open = resolve })
+  return {
+    reached,
+    release: open,
+    wait: async () => { arrive(); await opened },
+  }
+}
+
+/** Let every pending continuation run, so "still blocked" means blocked rather than merely not yet run. */
+async function drainMicrotasks(): Promise<void> {
+  for (let i = 0; i < 25; i += 1) await new Promise((resolve) => setImmediate(resolve))
+}
 
 /** Hold every arrival until `count` of them have arrived, then let them all go. */
 function barrier(count: number): () => Promise<void> {
@@ -133,6 +176,27 @@ type SettingRow = { key: string; value: string }
  */
 const pendingSettingInserts = new Map<string, Promise<boolean>>()
 
+/**
+ * The token row's WRITE LOCK, held by an uncommitted transaction (o3d-9tbz r4).
+ *
+ * Resolves when that transaction commits or rolls back. Any writer outside it waits here first — which
+ * is what a real UPDATE does, and the only reason a test can tell "the refresh was rejected because the
+ * rebinding won" from "the refresh happened to run first and was overwritten".
+ */
+let pendingTokenWrite: Promise<boolean> | null = null
+
+async function awaitTokenRowLock(): Promise<void> {
+  const held = pendingTokenWrite
+  if (held) await held
+}
+
+/** Every field in the `where` compared against the row AS IT IS NOW — the write-time predicate. */
+function tokenRowMatches(where: Record<string, unknown>): boolean {
+  if (!tokenRow) return false
+  const row = tokenRow as unknown as Record<string, unknown>
+  return Object.entries(where).every(([field, value]) => row[field] === value)
+}
+
 /** One interactive transaction: staged writes, committed together, discarded on throw. */
 async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
   const staged: Record<string, string> = {}
@@ -167,7 +231,10 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
     },
     accountingToken: {
       upsert: async ({ create }: { create: Omit<TokenRow, 'id'> }) => {
+        // Taking the row lock: from here until this transaction ends, every writer outside it waits.
+        pendingTokenWrite = settled
         stagedToken = { id: 'row-1', ...create }
+        if (bindingTokenWriteGate) await bindingTokenWriteGate()
         return stagedToken
       },
     },
@@ -185,6 +252,7 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
     for (const key of claimed) {
       if (pendingSettingInserts.get(key) === settled) pendingSettingInserts.delete(key)
     }
+    if (pendingTokenWrite === settled) pendingTokenWrite = null
   }
 }
 
@@ -193,7 +261,17 @@ mock.module('@/lib/db', {
     db: {
       accountingToken: {
         findUnique: async () => tokenRow,
+        // The compare-and-swap the refresh now writes through. The predicate is evaluated HERE, after
+        // the lock is released, against whatever the winner committed — never against the caller's
+        // snapshot. No create branch, because there is none in the statement it doubles.
+        updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Partial<TokenRow> }) => {
+          await awaitTokenRowLock()
+          if (!tokenRowMatches(where)) return { count: 0 }
+          tokenRow = { ...(tokenRow as TokenRow), ...data }
+          return { count: 1 }
+        },
         upsert: async ({ create }: { create: Omit<TokenRow, 'id'> }) => {
+          await awaitTokenRowLock()
           tokenRow = { id: 'row-1', ...create }
           return tokenRow
         },
@@ -261,6 +339,8 @@ mock.module('@/lib/security/connector-fetch', {
     connectorFetch: async (url: string, init?: { headers?: Record<string, string>; body?: URLSearchParams }) => {
       if (url.includes('identity.xero.com/connect/token')) {
         const code = init?.body?.get('code') ?? ''
+        // A refresh is the LONG round trip: the token row was read before it, and the write comes after.
+        if (init?.body?.get('grant_type') === 'refresh_token' && refreshGrantGate) await refreshGrantGate()
         return jsonResponse({
           access_token: accessTokenByCode[code] ?? 'access-1',
           refresh_token: 'refresh-1',
@@ -298,7 +378,10 @@ beforeEach(() => {
   organisationCalls = 0
   settingReadGate = null
   organisationFetchGate = null
+  refreshGrantGate = null
+  bindingTokenWriteGate = null
   pendingSettingInserts.clear()
+  pendingTokenWrite = null
   notifications = []
   activity = []
   delete process.env.XERO_REQUIRE_DEMO_ORG
@@ -1174,4 +1257,136 @@ test('XERO_REQUIRE_DEMO_ORG is an anchor, so a name alongside it is not a name-O
 
   assert.equal((await getAccessToken())?.tenantId, demo.tenantId)
   assert.equal(activity.filter((e) => e.action === 'xero_tenant_guard_name_only').length, 0)
+})
+
+/**
+ * THE REFRESH PATH WENT ROUND THE ATOMIC BINDING (o3d-9tbz r4).
+ *
+ * Round 3 made the binding itself atomic: of two consents, only one leaves a pin and a token behind. A
+ * REFRESH is not a consent and never touched that machinery — it read the token row, spent a round trip
+ * at Xero, and then wrote back keyed on `connector` alone. Anything that rebound this instance in
+ * between was simply overwritten, leaving the pin naming one organisation and the token naming another.
+ *
+ * The token is the half that decides where invoices are posted, so that state is the o3d-t74p incident
+ * again: 150 invoices into a live ledger from a rig that believed it was pointed at the Demo company.
+ *
+ * A rebinding to a DIFFERENT organisation only gets past the pin after a disconnect, so that is the
+ * shape these tests use — and it is the ordinary one, because Xero re-creates the Demo company with a
+ * new tenantId roughly every 28 days and the rig is reconnected by hand when it does.
+ */
+
+/** A second consent, offering the Demo company, with a token of its own so the two are never confused. */
+function reconsentTo(conn: typeof DEMO, code: string) {
+  connectionsByCode = { [code]: [conn] }
+  accessTokenByCode = { [code]: `access-${code}` }
+}
+
+/** A connection that is due a refresh: pinned, stored, and past its expiry. */
+function dueForRefresh(conn: typeof DEMO) {
+  pinnedTo(conn)
+  tokenRow!.expiresAt = new Date(Date.now() - 1000)
+}
+
+test('an ordinary refresh still writes the refreshed token to the row it refreshed', async () => {
+  // This case outranks the bug, and it runs every ~30 minutes on every connected instance. A refresh
+  // that stops storing anything is an outage at the next expiry, not a guard.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-ordinary-refresh' }
+  dueForRefresh(demo)
+  const { getAccessToken } = await loadAuth()
+
+  const result = await getAccessToken()
+
+  assert.equal(result?.accessToken, 'access-1')
+  assert.equal(result?.tenantId, demo.tenantId)
+  assert.equal(tokenRow?.accessToken, 'access-1', 'the row carries the refreshed access token')
+  assert.equal(tokenRow?.refreshToken, 'refresh-1', 'and the rotated refresh token')
+  assert.ok((tokenRow?.expiresAt.getTime() ?? 0) > Date.now(), 'with an expiry in the future')
+  assert.equal(tokenRow?.tenantId, demo.tenantId, 'still the same organisation')
+  assert.equal(activity.filter((e) => e.action === 'xero_refresh_discarded').length, 0)
+  assert.equal(notifications.length, 0)
+})
+
+test('a refresh that lands AFTER a rebinding cannot overwrite the new organisation', async () => {
+  const live = { ...LIVE, tenantId: 'e7fb4378-live-rotated-away' }
+  dueForRefresh(live)
+  const { getAccessToken, exchangeCodeForTokens } = await loadAuth()
+
+  // The refresh is now AT XERO, holding a token for the live organisation and nothing else.
+  const refreshHeld = latch()
+  refreshGrantGate = refreshHeld.wait
+  const refreshing = getAccessToken()
+  await refreshHeld.reached
+
+  // Meanwhile the operator disconnects (token row and pin both go) and re-consents to the Demo company.
+  freshDatabase()
+  reconsentTo(DEMO, 'c2')
+  const reconnected = await exchangeCodeForTokens('c2', 'https://ims.example/cb')
+  assert.equal(reconnected.success, true, 'the rebinding committed')
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId)
+
+  refreshHeld.release()
+
+  assert.equal(await refreshing, null, 'the stale refresh yields no usable token')
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId, 'the row still names the organisation just bound')
+  assert.equal(tokenRow?.accessToken, 'access-c2', "and still holds THAT organisation's token")
+  assert.equal(settings.xero_expected_tenant_id, DEMO.tenantId, 'pin and token name the same ledger')
+  assert.ok(activity.some((e) => e.action === 'xero_refresh_discarded'), 'the blip is explainable')
+  assert.equal(notifications.length, 0, 'a rebinding is not an incident to alarm the operator with')
+})
+
+test('a refresh whose write meets an UNCOMMITTED rebinding waits for it, then finds itself stale', async () => {
+  // The genuinely concurrent case, and the one a check in this process cannot close: the refresh reaches
+  // its write while the rebinding transaction is still open. It must not race the lock, and it must be
+  // judged against what that transaction COMMITS rather than against the row it saw on the way in.
+  const live = { ...LIVE, tenantId: 'e7fb4378-live-locked-out' }
+  dueForRefresh(live)
+  const { getAccessToken, exchangeCodeForTokens } = await loadAuth()
+
+  const refreshHeld = latch()
+  refreshGrantGate = refreshHeld.wait
+  const refreshing = getAccessToken()
+  let refreshSettled = false
+  void refreshing.then(() => { refreshSettled = true }, () => { refreshSettled = true })
+  await refreshHeld.reached
+
+  // A consent that gets as far as writing the token row and stops there, holding its row lock.
+  freshDatabase()
+  reconsentTo(DEMO, 'c2')
+  const bindingHeld = latch()
+  bindingTokenWriteGate = bindingHeld.wait
+  const binding = exchangeCodeForTokens('c2', 'https://ims.example/cb')
+  await bindingHeld.reached
+
+  refreshHeld.release()
+  await drainMicrotasks()
+  assert.equal(refreshSettled, false, 'the refresh is waiting on the row the binding holds, not racing it')
+
+  bindingHeld.release()
+
+  assert.equal((await binding).success, true)
+  assert.equal(await refreshing, null, 'and once it can see the committed row, it is stale')
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId)
+  assert.equal(tokenRow?.accessToken, 'access-c2', 'the winner of the binding still owns the token row')
+  assert.equal(settings.xero_expected_tenant_id, DEMO.tenantId)
+})
+
+test('a refresh that lands after a DISCONNECT does not resurrect the connection', async () => {
+  // The upsert had a `create` branch. A refresh completing seconds after Disconnect re-inserted the row
+  // it had just deleted — reconnecting the instance to the organisation somebody had just detached it
+  // from, with no pin to constrain what the next sync did with it.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-disconnected' }
+  dueForRefresh(demo)
+  const { getAccessToken } = await loadAuth()
+
+  const refreshHeld = latch()
+  refreshGrantGate = refreshHeld.wait
+  const refreshing = getAccessToken()
+  await refreshHeld.reached
+
+  freshDatabase() // exactly what disconnect() leaves behind: no token row, no pin
+  refreshHeld.release()
+
+  assert.equal(await refreshing, null)
+  assert.equal(tokenRow, null, 'no token row was re-created')
+  assert.equal(settings.xero_expected_tenant_id, undefined, 'and nothing re-pinned')
 })
