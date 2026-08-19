@@ -77,7 +77,7 @@
  *                     ledger.
  */
 import { createHash, randomBytes } from 'node:crypto'
-import { closeSync, fsyncSync, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
+import { closeSync, fsyncSync, linkSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync, writeSync } from 'node:fs'
 import { hostname } from 'node:os'
 import pg from 'pg'
 import { XERO_LIVE_CLEANUP_LOCK_NAMESPACE } from '../../lib/db/advisory-locks.ts'
@@ -1606,6 +1606,20 @@ export type WriteIntent = {
    * the write, and whether anybody else could have been writing at the same time.
    */
   unexcludedReason?: string
+  /**
+   * WHICH ERA WROTE THIS INTENT LINE (r11 finding 1), and the exact counterpart of the shared row's
+   * `exclusionProtocol`. Absent on every legacy log, which is what keeps those logs reading as they
+   * always did; present on every line this version writes, which is what makes a settlement with no
+   * exclusion verdict on it a MISSING VERDICT rather than a log from before the question existed.
+   */
+  protocol?: string
+  /**
+   * Set when a settlement for THIS ERA'S intent carried no positive exclusion verdict: the outcome
+   * was recorded and the answer to "was anybody else writing" was not. It is a different sentence
+   * from `unexcludedReason` — that one is somebody's answer of no, this one is nobody's answer at
+   * all — and the operator's next move is the same for both.
+   */
+  settledWithoutExclusion?: boolean
 }
 
 export type WriteIntentLog = {
@@ -1618,8 +1632,16 @@ export type WriteIntentLog = {
   readonly runId: string
   /** Durably record that a write is ABOUT to be dispatched. Returns the id used to settle it. */
   intend(entry: { kind: string; label: string; method: HttpMethod; path: string }): string
-  /** Durably record what became of it. */
-  settle(id: string, state: WriteCommitState, reason: string): void
+  /**
+   * Durably record what became of it, AND the exclusion verdict for the window it went in.
+   *
+   * `exclusion` is REQUIRED, exactly as it is on the shared fence's settle and for the same reason
+   * (r11 finding 1): a settlement written without one is indistinguishable, to the next run's scan,
+   * from a settlement written before the question existed — so a caller that may omit it is a
+   * caller that can fail this log open. The `unexcluded` event is still written first and still
+   * outranks everything; this is the POSITIVE half of the same fact, and a stamped intent needs it.
+   */
+  settle(id: string, state: WriteCommitState, reason: string, exclusion: ExclusionOutcome): void
   /**
    * Durably record that this write was dispatched into a window in which the ledger lock could not
    * be shown to have been held (r10 finding 1).
@@ -1688,12 +1710,22 @@ export function createWriteIntentLog(args: {
       const record: WriteIntent & { event: 'intent' } = {
         event: 'intent', id, runId, kind: entry.kind, label: entry.label,
         method: entry.method, path: entry.path, at: now().toISOString(), tenantId,
+        // WHICH ERA WROTE THIS LINE (r11 finding 1). On the intent, not on the settlement, because
+        // the settlement is the line that may be missing a verdict and a claim about what a line
+        // ought to carry cannot be made by that line itself.
+        protocol: WRITE_EXCLUSION_PROTOCOL,
       }
       append(JSON.stringify(record))
       return id
     },
-    settle(id, state, reason) {
-      append(JSON.stringify({ event: 'settled', id, runId, state, reason, at: now().toISOString(), tenantId }))
+    settle(id, state, reason, exclusion) {
+      append(JSON.stringify({
+        event: 'settled', id, runId, state, reason, at: now().toISOString(), tenantId,
+        // THE POSITIVE HALF (r11 finding 1). The `unexcluded` event says no; this says yes, and a
+        // stamped intent needs one of them said out loud. Without it a settlement written by
+        // something that never asked would read exactly like this one.
+        heldThrough: exclusion.confirmed,
+      }))
     },
     recordUnexcludedDispatch(id, reason) {
       append(JSON.stringify({ event: 'unexcluded', id, runId, reason, at: now().toISOString(), tenantId }))
@@ -2041,6 +2073,9 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
         path: String(record.path ?? '(unknown path)'),
         at: String(record.at ?? ''),
         tenantId: String(record.tenantId ?? ''),
+        // Carried through verbatim, including a stamp some later version writes: what is asked of
+        // it is only whether it is THERE (r11 finding 1).
+        ...(typeof record.protocol === 'string' ? { protocol: record.protocol } : {}),
       }
       open.set(id, intent)
       everySeen.set(id, intent)
@@ -2064,6 +2099,22 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
       // carries a run, they are from the same (pre-run-id) writer and still match.
       const intent = open.get(id)
       if (intent && intent.runId !== String(record.runId ?? '')) continue
+      /**
+       * AND ONLY WITH THE EXCLUSION VERDICT IT OWES (r11 finding 1). The `unexcluded` event is a
+       * positive no and outranks everything, which covers the case where somebody asked and was
+       * told no. It does NOT cover the case where nobody asked: a settlement with no verdict on it
+       * looked exactly like a settlement from a log written before the question existed, so a write
+       * dispatched today and settled by something that never asks read as accounted for.
+       *
+       * The stamp on the INTENT line is what separates the two. An intent this era wrote is owed a
+       * verdict, and a settlement that does not carry `heldThrough: true` does not pay it — so the
+       * intent stays on the pile and the operator is told which half is missing. An intent with no
+       * stamp is from a log that could not have carried one, and resolves exactly as it always did.
+       */
+      if (intent?.protocol != null && record.heldThrough !== true) {
+        open.set(id, { ...intent, settledWithoutExclusion: true })
+        continue
+      }
       open.delete(id)
     } else {
       unreadableLines++
@@ -2085,6 +2136,20 @@ export function scanWriteIntentLog(text: string): WriteLogScan {
  * the plan for the next apply is planning from a ledger nobody has confirmed, which is the same
  * mistake one step earlier.
  */
+/**
+ * Why the exclusion half holds an ON-DISK intent, in the operator's words — or `null` where it does
+ * not hold it at all. The two cases are different sentences and the same recovery (r11 finding 1):
+ * an `unexcluded` event is somebody's answer of NO, and a settlement with no verdict on a stamped
+ * intent is NOBODY'S ANSWER, which round 10 could not tell apart from a legacy log.
+ */
+function unexcludedReasonFor(u: WriteIntent): string | null {
+  if (u.unexcludedReason) return u.unexcludedReason
+  if (!u.settledWithoutExclusion) return null
+  return `NO VERDICT WAS RECORDED. The intent line carries protocol ${JSON.stringify(u.protocol)}, so this ` +
+    `log is one that records exclusion verdicts — the settlement simply does not carry one. An older build ` +
+    `of this script appending to the same log, or a hand-edited settlement, both look like this`
+}
+
 export function assertNoUnresolvedWrites(args: { path: string; text: string }): void {
   const { unresolved, unreadableLines } = scanWriteIntentLog(args.text)
   if (unresolved.length === 0 && unreadableLines === 0) return
@@ -2092,9 +2157,9 @@ export function assertNoUnresolvedWrites(args: { path: string; text: string }): 
     `${u.kind}: ${u.label} — ${u.method} ${u.path} at ${u.at}` +
     // Named separately, because the operator's next move is different: this one is not resolved by
     // reading the object at all — it is resolved by establishing that nobody else was writing.
-    (u.unexcludedReason
-      ? `\n      DISPATCHED WITHOUT A CONFIRMED EXCLUSION — ${u.unexcludedReason}\n` +
-        exclusionRecoveryInstruction({ intentId: u.id, reason: u.unexcludedReason, subject: `${u.kind} ${u.label}`, indent: '      ' })
+    (unexcludedReasonFor(u)
+      ? `\n      DISPATCHED WITHOUT A CONFIRMED EXCLUSION — ${unexcludedReasonFor(u)}\n` +
+        exclusionRecoveryInstruction({ intentId: u.id, reason: unexcludedReasonFor(u) as string, subject: `${u.kind} ${u.label}`, indent: '      ' })
       : ''))
   throw new UnresolvedWriteError(
     `ABORT: ${args.path} records ${unresolved.length} write(s) that were DISPATCHED and never accounted for` +
@@ -2354,6 +2419,47 @@ export const settlementResolvesIntent = (state: string | null | undefined): bool
   readSettlementState(state) === 'resolved'
 
 /**
+ * THE OTHER HALF OF A ROW'S ACCOUNT, READ THE SAME WAY (r11 finding 1).
+ *
+ * `heldThrough` is three-valued and the third value is not one thing. A NULL beside a row this era
+ * recorded means NOBODY WROTE THE VERDICT DOWN — a dispatch by a build that does not ask, a
+ * hand-written UPDATE that set only `state`, a settlement that reached the column half-applied. A
+ * NULL beside a row that carries no protocol stamp means the row predates the column, and there is
+ * no answer to be had for it because nobody could have recorded one.
+ *
+ * The two readings differ in exactly one way, and it is the one that matters: the first holds the
+ * fence and the second does not. Distinguishing them by the ABSENCE of the verdict was impossible,
+ * which is r11 finding 1; distinguishing them by the presence of a stamp on the row is what this
+ * reads. Stated here in TypeScript AND in `SHARED_FENCE_SQL.scan`, because the SQL decides which
+ * rows come back and this decides what the operator is told about each one — and the tests hold the
+ * two to the same answers.
+ */
+export type ExclusionReading =
+  /** A run asked and was told yes. The only reading that lets this half of the row go. */
+  | 'confirmed'
+  /** A run asked and was told no. The request had already gone; the row holds whatever `state` says. */
+  | 'refuted'
+  /** This era recorded the row and no verdict is on it. Nobody asked, and somebody should have. */
+  | 'unrecorded'
+  /** No stamp, no verdict: a row from before the question existed. Not read as a no. */
+  | 'not-asked'
+
+export function readExclusion(row: {
+  heldThrough: boolean | null | undefined
+  exclusionProtocol: string | null | undefined
+}): ExclusionReading {
+  if (row.heldThrough === true) return 'confirmed'
+  if (row.heldThrough === false) return 'refuted'
+  return row.exclusionProtocol == null ? 'not-asked' : 'unrecorded'
+}
+
+/** Does this half of the row hold it on the fence? Only a positive confirmation, or a legacy row, does not. */
+export const exclusionHoldsIntent = (row: {
+  heldThrough: boolean | null | undefined
+  exclusionProtocol: string | null | undefined
+}): boolean => readExclusion(row) === 'refuted' || readExclusion(row) === 'unrecorded'
+
+/**
  * How an operator actually recovers ONE unaccounted-for intent — and, for the outcomes nobody
  * established, the statement that there is nothing to run yet.
  *
@@ -2485,12 +2591,20 @@ export type SharedUnresolvedWrite = {
   state: string | null
   /**
    * Was the ledger confirmably held across the moment this write was dispatched (r10 finding 1)?
-   * `false` holds the row whatever `state` says. `null` means the question was never asked — a row
-   * written before the column existed — and is not read as a no.
+   * `false` holds the row whatever `state` says. `null` is read against `exclusionProtocol`: on a
+   * stamped row it means the verdict was never recorded and it holds; on an unstamped one it means
+   * the row predates the column. See `readExclusion`.
    */
   heldThrough: boolean | null
   /** Why it could not be confirmed, or who established afterwards that it had been. */
   heldThroughReason: string | null
+  /**
+   * WHICH ERA RECORDED THIS ROW (r11 finding 1). Non-null — any value — means the row was inserted
+   * by something that lives in the world where verdicts are recorded, so a missing verdict on it is
+   * a missing verdict rather than ancient history. `null` only for rows that existed before the
+   * column did. See `WRITE_EXCLUSION_PROTOCOL`.
+   */
+  exclusionProtocol: string | null
 }
 
 /**
@@ -2622,6 +2736,51 @@ export const SESSION_MARK_TABLE = 'o3d_xero_fence_session'
 export const SESSION_CONTINUITY_PROBES = 3
 
 /**
+ * WHAT MAKES A NEW ROW DISTINGUISHABLE FROM A LEGACY ONE (r11 finding 1).
+ *
+ * Round 10 gave the shared row a second, independent account — was the ledger held across the
+ * moment this write was dispatched — and then read `heldThrough IS NULL` as "a row written before
+ * the column existed" rather than as "not confirmed". The reasoning was that reading NULL as a no
+ * would put every historical write back on the fence at once, which is true, and the leniency was
+ * scoped to rows the new code could not have written. IT WAS NOT SO SCOPED. A write dispatched
+ * TODAY whose verdict never reaches the column — an older build of this script still running on
+ * another host and settling with the three-column UPDATE, a hand-written UPDATE that sets only
+ * `state`, a partially applied recovery — leaves exactly the same NULL, and the fence read it as
+ * ancient history and let the row go. The one predicate in this file where absence read as fine was
+ * the one place the fail-open case could reach.
+ *
+ * The absence of a value cannot carry that distinction, so it no longer has to: the ROW carries it.
+ * Every intent this version records is stamped, IN THE INSERT ITSELF, with the protocol it was
+ * recorded under. A row that carries a stamp belongs to the era in which verdicts are recorded, so
+ * a NULL verdict beside it means NOT CONFIRMED and holds the fence. A row with no stamp at all can
+ * only predate the column, and goes on reading exactly as it did.
+ *
+ * IT IS A LITERAL IN THE STATEMENT, not a parameter, for the reason the fence itself is a value
+ * rather than an `if (fence)`: a stamp a call site passes is a stamp a call site can omit, and an
+ * omitted stamp is precisely the fail-open this closes.
+ *
+ * AND THE COLUMN HAS A DATABASE DEFAULT, which covers the case the literal cannot: an INSERT issued
+ * by a build from before this migration names nine columns, not ten, so PostgreSQL fills the tenth.
+ * The default is `unstamped` — a non-NULL value, therefore an era-bearing one — so an old build's
+ * row is held to the new rule rather than passing as pre-migration. Only rows that existed BEFORE
+ * the column did carry NULL, because `ADD COLUMN` without a default is what left them that way and
+ * the default was attached in a second statement afterwards. See the migration.
+ *
+ * Any non-NULL value reads as "this row belongs to the era", including a value from some later
+ * version of this file: the predicate is `IS NOT NULL` rather than a match against this constant,
+ * so an unrecognised stamp holds the fence instead of dropping off it. That is the same
+ * complement-of-the-known rule the state clause is stated in, and for the same reason.
+ */
+export const WRITE_EXCLUSION_PROTOCOL = 'exclusion-v1'
+
+/**
+ * What PostgreSQL puts in the column when the INSERT does not name it — i.e. what an older build of
+ * this script writes without knowing it. Exported so the tests name one thing, and so the migration
+ * and this file cannot drift.
+ */
+export const UNSTAMPED_EXCLUSION_PROTOCOL = 'unstamped'
+
+/**
  * The exact SQL the fence issues. Exported so the test double is measured against the statements
  * that actually run rather than against a paraphrase of them, and so that a change to one without
  * the other fails a test instead of a production run.
@@ -2715,26 +2874,39 @@ export const SHARED_FENCE_SQL = {
    * The two facts are orthogonal: `committed` says what became of the object, and says nothing
    * about whether a second run was writing to the organisation in the same window.
    *
-   * It is `= false`, not `IS NOT TRUE`, and that is the whole care in this predicate. NULL means
-   * the question was never asked — every row written before the column existed, and every row an
-   * older version of this script settles — and reading NULL as "not confirmed" would put every
-   * historical write back on the fence at once, in an incident where the fence being trustworthy is
-   * the only thing that lets an operator move. From this migration forward every settlement writes
-   * true or false, so a NULL beside a settlement can only be a pre-migration row. Contrast the
-   * STATE clause, which is stated as the complement of the resolved vocabulary precisely because
-   * there an unrecognised value IS a claim somebody made and could not be interpreted.
+   * It is `= false`, not `IS NOT TRUE`, and that is the whole care in this clause. A positive
+   * `false` is a run that ASKED and was told no, and it holds the row whatever the outcome says.
+   *
+   * AND THE THIRD CLAUSE IS WHERE A NULL VERDICT IS READ AS A NO (r11 finding 1). Round 10 stopped
+   * at `= false` and let every NULL through as "a row written before the column existed" — which is
+   * true of a row with no protocol stamp and false of everything else. A write dispatched by THIS
+   * version whose verdict never reached the column is also NULL, and read as ancient history it
+   * dropped off the fence: the fail-open the leniency was scoped to exclude, reachable after all.
+   * A stamped row is one this era recorded, so a missing verdict beside it is a MISSING VERDICT and
+   * holds. Only an unstamped row — one that can only predate the column — still reads as it did.
+   *
+   * `"exclusionProtocol" IS NOT NULL` rather than a match against the current stamp, deliberately:
+   * an unrecognised stamp is still an era-bearing one, so it holds the fence rather than dropping
+   * off it. Same rule as the STATE clause, which is stated as the complement of the resolved
+   * vocabulary because there too an unrecognised value must never read as a settlement.
    */
   scan:
     'SELECT "id", "runId", "host", "kind", "label", "method", "path", "intendedAt", "state", ' +
-    '"heldThrough", "heldThroughReason" ' +
+    '"heldThrough", "heldThroughReason", "exclusionProtocol" ' +
     'FROM "xero_live_write_intents" ' +
     'WHERE "tenantId" = $1 AND ("state" IS NULL OR "state" NOT IN (\'committed\', \'not-committed\') ' +
-    'OR "heldThrough" = false) ' +
+    'OR "heldThrough" = false ' +
+    'OR ("exclusionProtocol" IS NOT NULL AND "heldThrough" IS NULL)) ' +
     'ORDER BY "intendedAt"',
+  /**
+   * THE STAMP IS PART OF THE STATEMENT (r11 finding 1). A literal, not a parameter: what it records
+   * is which VERSION OF THIS FILE inserted the row, and a version cannot be passed in by a caller
+   * that might pass the wrong one or none at all. See `WRITE_EXCLUSION_PROTOCOL`.
+   */
   intend:
     'INSERT INTO "xero_live_write_intents" ' +
-    '("id", "runId", "tenantId", "host", "kind", "label", "method", "path", "intendedAt") ' +
-    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING "id"',
+    '("id", "runId", "tenantId", "host", "kind", "label", "method", "path", "intendedAt", "exclusionProtocol") ' +
+    `VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, '${WRITE_EXCLUSION_PROTOCOL}') RETURNING "id"`,
   /**
    * ONE statement, carrying both halves of the account: what became of the write, and whether the
    * ledger was held across the moment it was dispatched. They are written together because they are
@@ -2814,6 +2986,32 @@ export const SHARED_FENCE_SQL = {
  * advisory lock held by that backend, no `o3d_xero_fence_session` relation, and no row anywhere.
  * The probe took no advisory lock at all and wrote nothing outside the aborted transaction.
  *
+ * ROUND 10'S FIRST SENTENCE IS NO LONGER TRUE, AND THAT IS A ROUND 11 CHANGE. The double no longer
+ * carries a copy of the scan predicate: `runSelect` / `runInsert` / `runUpdate` in the test file
+ * PARSE AND EXECUTE these strings, three-valued logic included, so reverting the predicate here now
+ * moves every behavioural answer downstream of it. The dev-database probes remain the only thing
+ * that can say PostgreSQL agrees with that evaluator's reading; the two together are the cover.
+ *
+ * ROUND 11 ADDED THE PROTOCOL STAMP, measured the same way against the same database, with the
+ * table built as the first two migrations leave it and the third applied on top of rows that were
+ * already there:
+ *   • `ADD COLUMN "exclusionProtocol" TEXT` left both existing rows NULL, and attaching the DEFAULT
+ *     in a SECOND statement did NOT back-fill them — which is the entire safety argument for the
+ *     migration, and the thing PostgreSQL 11+ would have done differently had the two been one
+ *     statement;
+ *   • the nine-column INSERT an OLDER BUILD issues got `unstamped` from that default rather than
+ *     NULL, so a row this file never touched is still era-bearing;
+ *   • the production INSERT, run verbatim from this module, stamped `exclusion-v1`;
+ *   • THE SCAN, run verbatim, held exactly four rows: the pre-migration row that was never settled,
+ *     the old build's settled row, the row settled with `heldThrough = false`, and the row this era
+ *     recorded whose verdict was never written. It let go of the PRE-MIGRATION SETTLED row — the
+ *     r10 leniency, intact — and of the row settled with a positive verdict;
+ *   • PostgreSQL was asked directly, and confirmed, that `NULL NOT IN ('committed','not-committed')`
+ *     and `NULL = false` are both UNKNOWN, which is what the predicate is built on;
+ *   • the `UPDATE ... SET "heldThrough" = true` the banner prints took the new row off the fence.
+ * Inside a transaction that was ROLLED BACK; `to_regclass` answered NULL afterwards, no advisory
+ * lock was held anywhere in the cluster and no `o3d_xero%` relation was left behind.
+ *
  * The Xero side of this file has no equivalent check available: the stored audit token expired
  * 2026-08-18T14:49Z and refreshing it rotates the refresh token out of band.
  */
@@ -2827,6 +3025,118 @@ export const SHARED_FENCE_SQL = {
  * loss, so it is discovered by the next thing the run does rather than by nothing at all.
  */
 export const SHARED_FENCE_HELD_CHECK_MS = 30_000
+
+/**
+ * HOW LONG ANY ONE STATEMENT TO THE COORDINATOR MAY TAKE BEFORE IT IS AN ANSWER OF "I CANNOT ASK"
+ * (r11 finding 2).
+ *
+ * Round 10 filed this rather than fixing it, and round 10 also added a per-write round trip on
+ * which it can happen. The shape of the defect: `confirmExclusionAcross` is called AFTER a request
+ * has already gone to Xero, and it awaits a query on a connection whose health is exactly what is
+ * in doubt. A connection that is dead in the way TCP is dead — a reaped backend behind a firewall
+ * that drops rather than resets, a coordinator restarted mid-statement, a pooler holding the
+ * statement in a queue forever — never answers and never errors. The await does not return, so the
+ * run does not abort, does not print, and does not settle: it PARKS, indefinitely, immediately
+ * after an irreversible write, with the outcome of that write recorded nowhere but its own memory.
+ * A silent park is the worst of the available failures — worse than a wrong answer, because a wrong
+ * answer is at least written down somewhere a human can find it.
+ *
+ * So every statement this fence issues is bounded, and a statement that exceeds the bound throws.
+ * The throw lands where every other unanswerable question in this file lands: `checkHeld` latches
+ * the loss, `confirmExclusionAcross` turns it into `{ confirmed: false }` — never a throw, because
+ * the outcome must be recorded first — and both durable stores record the dispatch as unexcluded
+ * before the run aborts naming the write. The write's own outcome is settled on the same path; if
+ * the settle statement times out too, that is reported as an unrecorded settlement with the answer
+ * printed on the screen, which is the honest floor. NOTHING here waits forever any more.
+ *
+ * THE BOUND IS APPLIED IN THIS FILE, not only in `defaultCoordinationClient`'s pg options, and that
+ * is the whole reason it works: `statement_timeout` and `query_timeout` are properties of the
+ * client a caller HANDS US, and a caller that supplies its own client — every test here, and any
+ * future caller — would silently have no bound at all. The pg options are still set, because they
+ * are what makes PostgreSQL cancel the statement server-side rather than leaving it running after
+ * we have stopped waiting for it. Two mechanisms, and only the local one is guaranteed to be there.
+ *
+ * The value is far longer than any statement here can legitimately take — they are single-row reads
+ * and writes on an indexed table — and far shorter than the time a human would take to notice a
+ * parked process.
+ */
+export const COORDINATION_STATEMENT_TIMEOUT_MS = 15_000
+
+/**
+ * THE LOCAL BOUND, and it is deliberately the LAST of the three to fire.
+ *
+ * `statement_timeout` (server) and `query_timeout` (node-postgres) both produce a better error than
+ * a local stopwatch does — the first names PostgreSQL's own cancellation, the second names a socket
+ * that stopped delivering — so each is given its chance first. This one exists for the case neither
+ * can reach: a client this file did not construct, on which neither option was ever set. Equal
+ * values would race and the run would sometimes report the least informative of the three.
+ */
+export const COORDINATION_STATEMENT_BOUND_MS = COORDINATION_STATEMENT_TIMEOUT_MS + 5_000
+
+/**
+ * A statement to the coordinator did not answer inside `COORDINATION_STATEMENT_TIMEOUT_MS`.
+ *
+ * Its own class, under the unreachable-coordinator one, because it is a DIFFERENT thing to fix — a
+ * connection that answers slowly or not at all is not a connection that refused — and because the
+ * timing is what an operator needs to know: whether the statement was still running on the server
+ * when this process stopped waiting for it is not knowable from here.
+ */
+export class CoordinationStatementTimeoutError extends SharedCoordinatorUnavailableError {}
+
+/**
+ * Put a ceiling on every statement a `CoordinationClient` is asked, whoever supplied it.
+ *
+ * It is a WRAPPER rather than an option on the client for the reason above: the guarantee has to
+ * hold for a client this file did not construct. `onTimeout` is how the fence learns that its
+ * session can no longer be vouched for — a statement that timed out may still be running on the
+ * server, so nothing after it can claim continuity — and it is called before the throw so the latch
+ * is set no matter which caller catches.
+ *
+ * The underlying promise is not abandoned silently: a rejection that arrives after the bound has
+ * fired would otherwise be an unhandled rejection that takes the process down at exactly the wrong
+ * moment, so it is swallowed deliberately, after the fact, having already been reported as a
+ * timeout.
+ */
+export function boundCoordinationClient(args: {
+  client: CoordinationClient
+  timeoutMs: number
+  /** Called with the reason the moment a statement exceeds the bound, before the throw. */
+  onTimeout?: (reason: string) => void
+  /** Injected so tests do not depend on wall-clock timers. */
+  schedule?: (fn: () => void, ms: number) => { clear: () => void }
+}): CoordinationClient {
+  const schedule =
+    args.schedule ??
+    ((fn: () => void, ms: number) => {
+      const handle = setTimeout(fn, ms)
+      handle.unref?.()
+      return { clear: () => { clearTimeout(handle) } }
+    })
+  const bound = <T>(inFlight: Promise<T>, what: string): Promise<T> =>
+    new Promise<T>((resolve, reject) => {
+      const timer = schedule(() => {
+        const reason =
+          `a statement to the shared coordinator did not answer within ${args.timeoutMs}ms, so this run ` +
+          `stopped waiting for it. It may still be running on the server. The statement was: ${what}`
+        args.onTimeout?.(reason)
+        reject(new CoordinationStatementTimeoutError(`ABORT: ${reason}`))
+      }, args.timeoutMs)
+      // The handlers below settle this promise; if the bound fired first that settlement is a
+      // no-op, and the rejection it may carry has already been CONSUMED here rather than left to
+      // become an unhandled rejection that takes the process down after an irreversible write.
+      inFlight.then(
+        (res) => { timer.clear(); resolve(res) },
+        (e) => { timer.clear(); reject(e) },
+      )
+    })
+  return {
+    // The connection too, and for the same reason one step earlier: a connect that never answers
+    // parks the run before it starts, which is no more discoverable than parking it after.
+    connect: () => bound(args.client.connect(), 'connect'),
+    end: () => args.client.end(),
+    query: (sql: string, params?: unknown[]) => bound(args.client.query(sql, params), sql),
+  }
+}
 
 /** What pg_locks calls the two lock modes this fence takes. */
 export const SHARED_FENCE_LOCK_MODE: Record<SharedFenceMode, string> = {
@@ -3249,6 +3559,15 @@ export async function acquireSharedWriteFence(args: {
   sessionNonce?: string
   /** Injected so tests leave no timers behind. */
   setKeepalive?: (fn: () => void, ms: number) => { clear: () => void }
+  /**
+   * The ceiling on ANY ONE statement to the coordinator (r11 finding 2). Defaults to
+   * `COORDINATION_STATEMENT_BOUND_MS`; injectable so a test can make a statement exceed it
+   * without waiting for it, and so an operator on a pathologically slow link has somewhere to go
+   * other than removing the bound.
+   */
+  statementTimeoutMs?: number
+  /** Injected so the statement bound does not depend on wall-clock timers in tests. */
+  scheduleStatementTimeout?: (fn: () => void, ms: number) => { clear: () => void }
 }): Promise<SharedWriteFence> {
   const lockId = xeroLedgerLockId(args.tenantId)
   const hostId = args.hostId ?? `${hostname()}#${process.pid}`
@@ -3263,9 +3582,33 @@ export async function acquireSharedWriteFence(args: {
       return { clear: () => { clearInterval(handle) } }
     })
 
+  /**
+   * THE LOSS LATCH (r8 finding 1).
+   *
+   * Once this is set the fence is finished: every method refuses, and it is never cleared. A lock
+   * that came back is not the lock that was held — the window in between is a window in which
+   * another run could take the ledger, do anything to it, and give it back — so "it is held again"
+   * is not the question. The question is whether it has been held CONTINUOUSLY since the reads this
+   * run's conclusions rest on, and once the answer is no, nothing later can make it yes.
+   *
+   * DECLARED BEFORE THE CONNECTION because the statement bound latches it too (r11 finding 2): a
+   * statement that stopped being waited for may still be running on the server, so nothing after it
+   * can claim to know what this session holds.
+   */
+  let lost: string | null = null
+
   let client: CoordinationClient
   try {
-    client = createClient()
+    // EVERY statement through this fence is bounded, including the ones on the way in (r11 finding
+    // 2). It wraps whatever `createClient` returned rather than relying on that client's own
+    // options, because a client this file did not construct — every test, and any future caller —
+    // would otherwise have no ceiling at all.
+    client = boundCoordinationClient({
+      client: createClient(),
+      timeoutMs: args.statementTimeoutMs ?? COORDINATION_STATEMENT_BOUND_MS,
+      schedule: args.scheduleStatementTimeout,
+      onTimeout: (reason) => { if (!lost) lost = reason },
+    })
     await client.connect()
   } catch (e) {
     throw new SharedCoordinatorUnavailableError(
@@ -3380,16 +3723,7 @@ export async function acquireSharedWriteFence(args: {
     )
   }
 
-  /**
-   * THE LOSS LATCH (r8 finding 1).
-   *
-   * Once this is set the fence is finished: every method refuses, and it is never cleared. A lock
-   * that came back is not the lock that was held — the window in between is a window in which
-   * another run could take the ledger, do anything to it, and give it back — so "it is held again"
-   * is not the question. The question is whether it has been held CONTINUOUSLY since the reads this
-   * run's conclusions rest on, and once the answer is no, nothing later can make it yes.
-   */
-  let lost: string | null = null
+  /** The latch is declared above, before the connection: see there for why. */
   const checkHeld = async (): Promise<void> => {
     if (lost) return
     try {
@@ -3491,6 +3825,9 @@ export async function acquireSharedWriteFence(args: {
         // some other tool put there — is "nobody asked", which is what `null` means here.
         heldThrough: typeof r.heldThrough === 'boolean' ? r.heldThrough : null,
         heldThroughReason: r.heldThroughReason == null ? null : String(r.heldThroughReason),
+        // Read as an ERA, not as a value: anything non-null says the row was recorded by something
+        // that knows about verdicts, which is the only thing this field is asked (r11 finding 1).
+        exclusionProtocol: r.exclusionProtocol == null ? null : String(r.exclusionProtocol),
       }))
     },
     async intend(entry) {
@@ -3641,6 +3978,39 @@ async function readClusterId(client: CoordinationClient): Promise<string | null>
  * establishes session continuity against whatever answers, on the wire. See
  * `proveSessionContinuity`.
  */
+/**
+ * THE SERVER-SIDE HALF OF THE STATEMENT BOUND (r11 finding 2). Exported so it can be read in a test
+ * rather than inferred from a live connection, which is the only way to check it without one.
+ *
+ * `boundCoordinationClient` is what guarantees this process stops waiting. These three do the part
+ * it cannot: `statement_timeout` travels in the startup packet and makes POSTGRESQL cancel a
+ * statement we have stopped waiting for, instead of leaving it running against the ledger's
+ * coordinator; `query_timeout` is node-postgres's own read timeout, which is what fires when the
+ * socket is a black hole and the server's own cancellation notice can never arrive either; and
+ * `connectionTimeoutMillis` bounds the one call that happens before any statement exists.
+ *
+ * The two timeouts are deliberately not equal. `statement_timeout` is the SHORTEST, so that when
+ * the server is reachable it is PostgreSQL's own error — "canceling statement due to statement
+ * timeout" — that comes back, which tells an operator far more than a local stopwatch does. The
+ * local bound in `boundCoordinationClient` is last, so it only ever fires when neither of these
+ * could.
+ */
+export function coordinationClientConfig(connectionString: string): {
+  connectionString: string
+  application_name: string
+  statement_timeout: number
+  query_timeout: number
+  connectionTimeoutMillis: number
+} {
+  return {
+    connectionString,
+    application_name: 'o3d_xero_live_cleanup_fence',
+    statement_timeout: COORDINATION_STATEMENT_TIMEOUT_MS,
+    query_timeout: COORDINATION_STATEMENT_TIMEOUT_MS + 2_000,
+    connectionTimeoutMillis: COORDINATION_STATEMENT_TIMEOUT_MS,
+  }
+}
+
 function defaultCoordinationClient(): CoordinationClient {
   const connectionString = process.env.DATABASE_URL
   if (!connectionString) {
@@ -3650,7 +4020,7 @@ function defaultCoordinationClient(): CoordinationClient {
         'connection IS this ledger, which is checked once the connection is open.',
     )
   }
-  return new pg.Client({ connectionString, application_name: 'o3d_xero_live_cleanup_fence' }) as unknown as CoordinationClient
+  return new pg.Client(coordinationClientConfig(connectionString)) as unknown as CoordinationClient
 }
 
 /**
@@ -3664,6 +4034,13 @@ export class StagedArtefactStrandedError extends SafetyViolationError {}
  * operator has to do about it — go and look at a file that now exists — is specific.
  */
 export class PublishedArtefactUnfencedError extends SafetyViolationError {}
+/**
+ * THE TARGET WAS CLAIMED BY SOMEBODY ELSE WHILE THIS RUN WAS ASSEMBLING ITS ARTEFACT (r11 finding
+ * 3). Its own class because what the operator has to do about it is specific and is not a repair:
+ * two runs were pointed at one plan file, both plans exist, and which one gets reviewed is a
+ * decision only a human can make.
+ */
+export class ArtefactTargetChangedError extends SafetyViolationError {}
 
 /** What `persistUnderFence` ends the staging name with. Exported so the tests name one thing. */
 export const STAGED_ARTEFACT_SUFFIX = '.partial'
@@ -3736,17 +4113,58 @@ export async function persistUnderFence(args: {
   /** Injected so a test can measure the ORDER of write/assert/publish rather than a paraphrase. */
   io?: {
     write: (path: string, body: string) => void
+    /** REPLACE whatever is under the target name. Used only where this run established there was something of its own to replace. */
     publish: (from: string, to: string) => void
+    /**
+     * TAKE the target name only if nothing holds it — one atomic operation, and a refusal if
+     * somebody got there first (r11 finding 3). `link(2)` is what makes this a claim rather than a
+     * check followed by a hope.
+     */
+    claim: (from: string, to: string) => void
     discard: (path: string) => void
+    /**
+     * What is under the target name right now, as a value two observations can be compared by, or
+     * `null` if nothing is. A hash rather than a timestamp: two runs publishing inside one
+     * filesystem timestamp tick is exactly the case this is for.
+     */
+    snapshot: (path: string) => string | null
   }
 }): Promise<void> {
   const io = args.io ?? {
     write: (path: string, body: string) => { writeFileSync(path, body) },
     publish: (from: string, to: string) => { renameSync(from, to) },
+    claim: (from: string, to: string) => { linkSync(from, to) },
     discard: (path: string) => { unlinkSync(path) },
+    snapshot: (path: string) => {
+      try {
+        // Size and mtime as well as the bytes: an artefact rewritten with identical content by a
+        // different run is still a different run's artefact, and the operator should be told.
+        const stat = statSync(path)
+        return `${stat.size}:${stat.mtimeMs}:${createHash('sha256').update(readFileSync(path)).digest('hex')}`
+      } catch {
+        // Absent is an answer, and it is the one that lets this run TAKE the name atomically below.
+        // Unreadable-but-present would also land here, and lands on the same side as "something is
+        // there": the claim then fails EEXIST and the run refuses, which is the correct reading of
+        // a target this run cannot account for.
+        return null
+      }
+    },
   }
   // PER-CALL, so two runs staging the same target cannot truncate each other (r10 finding 2).
   const staged = stagedArtefactName(args.path)
+  /**
+   * WHAT WAS UNDER THE TARGET NAME WHEN THIS RUN STARTED PUBLISHING (r11 finding 3).
+   *
+   * Round 10 stopped two runs TEARING each other's staging file and left the published plan
+   * last-writer-wins. That is not a small residue: dry runs share the ledger in SHARE mode by
+   * design and the default `--plan-out` is derived from the DATE, so two of them are pointed at one
+   * target routinely. Run A publishes, an operator opens the file and reads it, run B finishes two
+   * seconds later and silently replaces it — and the operator then points `--apply --manifest` at a
+   * plan that is not the one they reviewed, with nothing anywhere recording that a substitution
+   * happened. Every other artefact guarantee in this file survives that scenario intact and is
+   * beside the point, because the bytes under the reviewed name are somebody else's.
+   */
+  const targetBefore = io.snapshot(args.path)
 
   // Before a byte is written. Everything the artefact is made of was read under the fence, and if
   // the fence went during those reads none of it may be written down at all.
@@ -3770,7 +4188,88 @@ export async function persistUnderFence(args: {
     }
     throw e
   }
-  io.publish(staged, args.path)
+  /**
+   * AND THE TARGET IS STILL THE TARGET THIS RUN WAS ENTITLED TO WRITE (r11 finding 3).
+   *
+   * Two cases, and they are not the same act:
+   *
+   *   • NOTHING WAS THERE when this run started publishing, so this run may TAKE the name — with
+   *     `link(2)`, which either succeeds or reports that somebody else already holds it, in one
+   *     operation. There is no window at all in this case, which matters because it is the common
+   *     one: two dry runs started this morning against today's default `--plan-out`.
+   *   • SOMETHING WAS THERE — this run's own earlier plan, yesterday's, a file the operator put
+   *     there — so publishing means REPLACING it, and replacing is only honest if what is there is
+   *     still what was there. It is compared, and a difference refuses.
+   *
+   * The second case keeps a residual window between the comparison and the rename, and it is not
+   * closable with POSIX: an atomic conditional replace does not exist, and `rename(2)` is the only
+   * atomic replace there is. Refusing to replace ANYTHING would close it, and would also refuse the
+   * legitimate re-run that overwrites its own plan an hour later, which is the normal way this
+   * tooling is used. So the window is stated rather than hidden: two runs must both reach these
+   * five lines inside the same instant, having both already found the same bytes there.
+   *
+   * NOTHING IS DELETED ON REFUSAL. The staged file is this run's own plan and is named in the
+   * error: it cost a full read of the ledger, the other run's file is somebody else's, and choosing
+   * between two plans is exactly the decision this file never makes on an operator's behalf.
+   */
+  const targetNow = io.snapshot(args.path)
+  if (targetNow !== targetBefore) {
+    throw new ArtefactTargetChangedError(
+      `ABORT: ${args.path} is not what it was when this run began publishing ${args.what}, so this run did not ` +
+        `overwrite it.\n` +
+        (targetBefore === null
+          ? `Nothing was under that name when this run started; something is now. `
+          : `A DIFFERENT file is under that name now. `) +
+        `Another run — on this host or any other — is pointed at the same target. Two dry runs share the ledger ` +
+        `by design and the default plan name is derived from the DATE, so this needs nobody to have done anything ` +
+        `unusual.\n` +
+        `THIS RUN'S ${args.what.toUpperCase()} IS AT: ${staged}\n` +
+        `Neither file has been removed and neither is the obvious survivor. Look at both, decide which read of ` +
+        `the ledger you want to authorise --apply from, and move it into place by hand — remembering that the ` +
+        `plan somebody has already reviewed is the one under ${args.path}, and that a plan is only as good as ` +
+        `the moment it was read.`,
+    )
+  }
+  if (targetBefore === null) {
+    try {
+      io.claim(staged, args.path)
+    } catch (e) {
+      // EEXIST is the finding; anything else is a filesystem the run could not write to, and the
+      // two are different problems with different fixes. Matched on the errno AND on the text,
+      // because the injectable io is not obliged to carry a `code`.
+      const code = (e as NodeJS.ErrnoException).code ?? ''
+      if (code === 'EEXIST' || /EEXIST/.test(errText(e))) {
+        throw new ArtefactTargetChangedError(
+          `ABORT: ${args.path} was taken while this run was publishing ${args.what}: ${errText(e)}\n` +
+            `The name is claimed in one atomic operation precisely so that this is a refusal rather than a silent ` +
+            `replacement of whatever got there first.\n` +
+            `THIS RUN'S ${args.what.toUpperCase()} IS AT: ${staged}\n` +
+            `Nothing has been removed. Look at both files before deciding which one --apply may be pointed at.`,
+        )
+      }
+      throw new StagedArtefactStrandedError(
+        `ABORT: ${args.what} could not be published to ${args.path}: ${errText(e)}\n` +
+          `Nothing holds that name and this run could not take it, so this is the filesystem refusing rather than ` +
+          `another run getting there first.\n` +
+          `THIS RUN'S ${args.what.toUpperCase()} IS AT: ${staged}\n` +
+          `It is complete and it is not removed. Fix the permissions or the directory and move it into place, or ` +
+          `delete it and plan again from a fresh read.`,
+      )
+    }
+    try {
+      io.discard(staged)
+    } catch (e) {
+      throw new StagedArtefactStrandedError(
+        `ABORT: ${args.what} WAS published to ${args.path} — that part succeeded — but the staged copy it was ` +
+          `published from could not be removed: ${staged} (${errText(e)}).\n` +
+          `DELETE IT BY HAND. It is byte-for-byte the published plan, so nothing is lost by deleting it and ` +
+          `nothing is gained by keeping it; what it must not do is sit next to the target waiting to be renamed ` +
+          `over a LATER plan by a tired operator.`,
+      )
+    }
+  } else {
+    io.publish(staged, args.path)
+  }
   /**
    * AND ONCE MORE, ON THE FAR SIDE OF THE PUBLISH (r10 finding 1, applied here).
    *
@@ -3794,7 +4293,7 @@ export async function persistUnderFence(args: {
   if (!published.confirmed) {
     throw new PublishedArtefactUnfencedError(
       `ABORT: ${published.reason}\n` +
-        `AND ${args.path} ALREADY EXISTS: the rename had happened when that was established, so ${args.what} is ` +
+        `AND ${args.path} ALREADY EXISTS: the artefact had taken that name when that was established, so ${args.what} is ` +
         `on disk under the name --apply is pointed at, and this run cannot vouch for it.\n` +
         `GO AND LOOK AT IT, and do not feed it to --apply until you have. Nothing here removed it: on a shared ` +
         `target that file may be another run's, and a run that has just lost its own fence is the last thing that ` +
@@ -3817,14 +4316,39 @@ export function assertNoUnresolvedSharedWrites(args: {
   // outside the vocabulary used to make the row VANISH from this list, so the run it should have
   // stopped started instead. It now holds the fence like any other unaccounted-for write, and it
   // says so in its own words rather than being reported as one of the other two.
+  /**
+   * IS THE EXCLUSION THE THING TO TELL THE OPERATOR ABOUT THIS ROW?
+   *
+   * Two rows hold the fence on their exclusion half — `refuted` and `unrecorded` — and only one of
+   * them is always worth leading with. A row whose SETTLEMENT is still outstanding has no verdict
+   * for the plainest of reasons: nothing has settled it yet. Describing that as "no verdict was
+   * recorded" would send an operator off to establish that no concurrent run existed, about a write
+   * that has not even come back — when what they actually have to do is find out what became of it.
+   *
+   * So the exclusion leads when a run ASKED AND WAS TOLD NO (which round 10 established outranks
+   * everything, because the outcome can be perfectly well accounted for and the window still
+   * unexcluded), or when the outcome IS accounted for and the missing verdict is the only thing
+   * left holding the row. Both are cases the settlement cannot explain.
+   */
+  const exclusionIsTheReason = (u: SharedUnresolvedWrite): boolean =>
+    readExclusion(u) === 'refuted' || (readExclusion(u) === 'unrecorded' && settlementResolvesIntent(u.state))
+  // Why the exclusion half holds this row, in the words that tell an operator what happened. The
+  // two readings need different first sentences: one is a run that asked and was told no, the other
+  // is a row this era recorded with nobody's answer on it at all (r11 finding 1).
+  const whyUnexcluded = (u: SharedUnresolvedWrite): string =>
+    readExclusion(u) === 'refuted'
+      ? u.heldThroughReason ?? '(no reason recorded)'
+      : `NO VERDICT WAS RECORDED. This row was written by a run that records them (protocol ` +
+        `${JSON.stringify(u.exclusionProtocol)}), so the empty column is not a row from before the ` +
+        `question existed — it is a dispatched write whose exclusion nobody wrote down. An older build ` +
+        `of this script settling from another host, or an UPDATE that set only "state", both look like this`
   const describe = (u: SharedUnresolvedWrite): string => {
     // ASKED FIRST, because it is the reason a row can be here while its outcome is fully accounted
     // for (r10 finding 1). Reading the outcome first would land a `committed` row on the
     // 'this row should not be on the fence; report it' branch — telling the operator the fence is
     // broken about the one row where it is doing something new.
-    if (u.heldThrough === false) {
-      const why = u.heldThroughReason ?? '(no reason recorded)'
-      return `DISPATCHED WITHOUT A CONFIRMED EXCLUSION — ${why}\n` +
+    if (exclusionIsTheReason(u)) {
+      return `DISPATCHED WITHOUT A CONFIRMED EXCLUSION — ${whyUnexcluded(u)}\n` +
         `      its outcome is ${u.state === null ? 'not settled either' : `settled as ${JSON.stringify(u.state)}`}, ` +
         `which does not clear this: the outcome is about the object, and this is about whether a ` +
         `second run could have been writing to the organisation at the same time`
@@ -3845,10 +4369,10 @@ export function assertNoUnresolvedSharedWrites(args: {
       // A row can need BOTH: an outcome nobody recorded, and an exclusion nobody could confirm.
       // They are printed together because clearing either one alone leaves the row on the fence,
       // and an operator who runs one UPDATE and sees the refusal persist concludes it is broken.
-      (u.heldThrough === false
+      (exclusionIsTheReason(u)
         ? exclusionRecoveryInstruction({
             intentId: u.id,
-            reason: u.heldThroughReason ?? '(no reason recorded)',
+            reason: whyUnexcluded(u),
             subject: `${u.kind} ${u.label}`,
             indent: '      ',
           }) + (settlementResolvesIntent(u.state) ? '' : `\n${settlementRecoveryInstruction({ intentId: u.id, state: null, subject: `${u.kind} ${u.label}`, indent: '      ' })}`)
@@ -3956,7 +4480,11 @@ export async function performWrite<T>(args: {
     // dangling here would stop the next run over a ledger that provably did not change.
     const message = e instanceof Error ? e.message : String(e)
     try {
-      writeLog.settle(intentId, 'not-committed', `the request never left this process: ${message}`)
+      // `confirmed: true` because NOTHING WAS DISPATCHED: there is no window, so there is nothing
+      // to have been excluded from. It is the same rule the dispatch path applies to a refusal that
+      // happens before the network, and the same one that stops a never-made request being reported
+      // as an unexcluded one.
+      writeLog.settle(intentId, 'not-committed', `the request never left this process: ${message}`, { confirmed: true })
     } catch (settleError) {
       journal.recordUnrecordedSettlement({
         intentId, kind, label, method, path,
@@ -4120,7 +4648,7 @@ async function recordSettlement(args: {
     }
   }
   try {
-    writeLog.settle(intentId, commit.state, commit.reason)
+    writeLog.settle(intentId, commit.state, commit.reason, exclusion)
   } catch (e) {
     failures.push(`the durable log refused it: ${e instanceof Error ? e.message : String(e)}`)
   }

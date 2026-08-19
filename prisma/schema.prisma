@@ -3509,6 +3509,27 @@ model XeroLiveWriteIntent {
   reason     String?
   settledAt  DateTime?
 
+  /// WHICH ERA RECORDED THIS ROW — asked ONLY as "is it NULL?".
+  ///
+  /// `heldThrough IS NULL` cannot say on its own whether nobody asked the exclusion question or
+  /// whether the row predates the column, and the fence must read those two oppositely. So the row
+  /// says it positively instead: a STAMPED row was inserted by something that lives in the world
+  /// where verdicts are recorded, so a NULL `heldThrough` beside it is a MISSING verdict and holds
+  /// the fence; an UNSTAMPED row can only predate the column and reads exactly as it did before.
+  ///
+  /// ANY non-NULL value counts, including one a later version writes — hence no CHECK constraint,
+  /// the opposite decision from `state`, whose vocabulary is closed because an uninterpretable
+  /// value there is an uninterpretable claim.
+  ///
+  /// The DEFAULT was attached in a SECOND ALTER so PostgreSQL back-filled nothing: historical rows
+  /// stay NULL. That default is also what catches an OLDER BUILD still deployed elsewhere — its
+  /// INSERT names nine columns and not this one, so the database stamps it `unstamped`, which is
+  /// non-NULL and therefore era-bearing, and its dispatched write is held to the new rule without
+  /// that build knowing this column exists.
+  exclusionProtocol String? @default("unstamped")
+
+
+
   /// WAS THE LEDGER HELD ACROSS THE MOMENT THIS WRITE WAS DISPATCHED?
   ///
   /// A second, independent account of the same write, and the row is resolved only when BOTH

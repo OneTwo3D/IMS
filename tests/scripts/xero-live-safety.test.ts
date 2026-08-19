@@ -96,6 +96,16 @@ import {
   SESSION_MARK_SETTING,
   SESSION_MARK_TABLE,
   SessionDiscontinuityError,
+  UNSTAMPED_EXCLUSION_PROTOCOL,
+  WRITE_EXCLUSION_PROTOCOL,
+  readExclusion,
+  exclusionHoldsIntent,
+  ArtefactTargetChangedError,
+  boundCoordinationClient,
+  coordinationClientConfig,
+  CoordinationStatementTimeoutError,
+  COORDINATION_STATEMENT_BOUND_MS,
+  COORDINATION_STATEMENT_TIMEOUT_MS,
   STAGED_ARTEFACT_SUFFIX,
   stagedArtefactName,
   StagedArtefactStrandedError,
@@ -243,6 +253,279 @@ const ATTESTED = xeroCoordinatorFingerprint({
   databaseOid: '16385',
   connectionId: 'conn-ims',
 })
+
+// ===========================================================================
+/**
+ * THE DOUBLE EXECUTES THE PRODUCTION SQL. IT DOES NOT PARAPHRASE IT.
+ *
+ * The gap this closes, stated by the previous round's own report: the behavioural tests could not
+ * exercise the production SQL. `FakeCoordinationDatabase` recognised each statement by its exact
+ * text and then answered it with a hand-written JavaScript re-statement of what that text was
+ * believed to mean — the scan predicate as a `.filter(...)`, the settle as an `Object.assign`.
+ * Two copies of one rule, and only one of them ships. Reverting the real `SHARED_FENCE_SQL.scan`
+ * therefore broke a single grammar assertion and NOTHING ELSE: every behavioural test went on
+ * passing, because every behavioural test was measuring the copy in this file.
+ *
+ * So the copy is gone. These functions parse the statement string that production issues and
+ * evaluate it — including PostgreSQL's three-valued logic, which is the entire subject of r10
+ * finding 1 and r11 finding 1 and cannot be modelled by JavaScript's `&&` — against the rows this
+ * double holds. Change the predicate in the production file and the double's ANSWERS change, so
+ * every behavioural test downstream of it moves.
+ *
+ * WHAT IT IS NOT. It is a model of PostgreSQL, not PostgreSQL: it proves the double is not a
+ * paraphrase, and it cannot prove that PostgreSQL agrees with my reading of `NULL NOT IN (...)`.
+ * That is what the rolled-back probes against the dev database are for, and the note above
+ * `SHARED_FENCE_SQL` records each one. The two together are the cover; neither alone is.
+ *
+ * IT FAILS LOUDLY ON ANYTHING IT DOES NOT UNDERSTAND, which is what keeps it honest as the SQL
+ * grows. A construct outside this grammar throws rather than being skipped, so a production
+ * statement that outgrows the evaluator stops the tests instead of quietly passing them.
+ */
+type Sql3 = true | false | null
+
+/** SQL's AND and OR over the three values. `null` is "unknown", and it is contagious in one direction only. */
+const sqlAnd = (a: Sql3, b: Sql3): Sql3 => (a === false || b === false ? false : a === null || b === null ? null : true)
+const sqlOr = (a: Sql3, b: Sql3): Sql3 => (a === true || b === true ? true : a === null || b === null ? null : false)
+
+/**
+ * Split a statement into the tokens this grammar knows, and REFUSE the ones it does not. The gap
+ * check is the important half: a regex that simply collects what it recognises would skip an
+ * operator it had never seen and evaluate a predicate that is not the one in the file.
+ */
+function tokenizeSql(sql: string): string[] {
+  const pattern = /"[^"]+"|'[^']*'|\$\d+|[(),=]|[A-Za-z_][A-Za-z_0-9]*|\d+/g
+  const tokens: string[] = []
+  let consumed = 0
+  for (let m = pattern.exec(sql); m !== null; m = pattern.exec(sql)) {
+    if (sql.slice(consumed, m.index).trim() !== '') {
+      throw new Error(`the SQL evaluator does not understand ${JSON.stringify(sql.slice(consumed, m.index))} in: ${sql}`)
+    }
+    tokens.push(m[0])
+    consumed = m.index + m[0].length
+  }
+  if (sql.slice(consumed).trim() !== '') {
+    throw new Error(`the SQL evaluator does not understand ${JSON.stringify(sql.slice(consumed))} in: ${sql}`)
+  }
+  return tokens
+}
+
+/** A cursor over the tokens, with the assertions a hand-rolled parser needs to fail loudly. */
+function sqlCursor(tokens: string[]) {
+  let at = 0
+  const peek = (): string | undefined => tokens[at]
+  const upper = (): string => (tokens[at] ?? '').toUpperCase()
+  const take = (): string => {
+    const token = tokens[at]
+    if (token === undefined) throw new Error('the SQL evaluator ran off the end of the statement')
+    at++
+    return token
+  }
+  const expect = (word: string): void => {
+    const token = take()
+    if (token.toUpperCase() !== word.toUpperCase()) {
+      throw new Error(`the SQL evaluator expected ${word} and found ${JSON.stringify(token)}`)
+    }
+  }
+  const accept = (word: string): boolean => {
+    if (upper() !== word.toUpperCase()) return false
+    at++
+    return true
+  }
+  const done = (): boolean => at >= tokens.length
+  return { peek, upper, take, expect, accept, done }
+}
+
+type SqlCursor = ReturnType<typeof sqlCursor>
+
+/** `"name"` -> name. Anything else is not a column reference and is refused. */
+function readIdentifier(cursor: SqlCursor): string {
+  const token = cursor.take()
+  if (!token.startsWith('"')) throw new Error(`the SQL evaluator expected a quoted identifier and found ${JSON.stringify(token)}`)
+  return token.slice(1, -1)
+}
+
+/** A literal, a bound parameter, or a boolean keyword — resolved to the JavaScript value it stands for. */
+function readValue(cursor: SqlCursor, params: readonly unknown[]): unknown {
+  const token = cursor.take()
+  if (token.startsWith("'")) return token.slice(1, -1).replace(/''/g, "'")
+  if (token.startsWith('$')) return params[Number(token.slice(1)) - 1]
+  if (token.toUpperCase() === 'TRUE') return true
+  if (token.toUpperCase() === 'FALSE') return false
+  if (token.toUpperCase() === 'NULL') return null
+  if (/^\d+$/.test(token)) return Number(token)
+  throw new Error(`the SQL evaluator does not understand the value ${JSON.stringify(token)}`)
+}
+
+/** `=` under three-valued logic: a comparison involving NULL is UNKNOWN, never false. */
+const sqlEquals = (a: unknown, b: unknown): Sql3 => (a == null || b == null ? null : a === b)
+
+function parsePredicate(cursor: SqlCursor, params: readonly unknown[]): (row: Record<string, unknown>) => Sql3 {
+  const parseAtom = (): ((row: Record<string, unknown>) => Sql3) => {
+    if (cursor.accept('(')) {
+      const inner = parsePredicate(cursor, params)
+      cursor.expect(')')
+      return inner
+    }
+    const column = readIdentifier(cursor)
+    if (cursor.accept('IS')) {
+      const negated = cursor.accept('NOT')
+      cursor.expect('NULL')
+      return (row) => (row[column] == null) !== negated
+    }
+    const negated = cursor.accept('NOT')
+    if (cursor.accept('IN')) {
+      cursor.expect('(')
+      const values: unknown[] = [readValue(cursor, params)]
+      while (cursor.accept(',')) values.push(readValue(cursor, params))
+      cursor.expect(')')
+      return (row) => {
+        const left = row[column]
+        // NULL NOT IN (...) is NULL, not true — which is the entire reason the state clause spells
+        // `state IS NULL` out separately instead of relying on the NOT IN to catch it.
+        if (left == null) return null
+        const matched = values.some((v) => v === left)
+        return negated ? !matched : matched
+      }
+    }
+    if (negated) throw new Error('the SQL evaluator only understands NOT before IN')
+    cursor.expect('=')
+    const value = readValue(cursor, params)
+    return (row) => sqlEquals(row[column], value)
+  }
+
+  const parseAnd = (): ((row: Record<string, unknown>) => Sql3) => {
+    let left = parseAtom()
+    while (cursor.accept('AND')) {
+      const right = parseAtom()
+      const previous = left
+      left = (row) => sqlAnd(previous(row), right(row))
+    }
+    return left
+  }
+
+  let left = parseAnd()
+  while (cursor.accept('OR')) {
+    const right = parseAnd()
+    const previous = left
+    left = (row) => sqlOr(previous(row), right(row))
+  }
+  return left
+}
+
+/**
+ * Run the production SELECT. The projection is executed too, not just the WHERE: a column the
+ * statement forgets to select is a column the production mapper reads as null, and reading a
+ * three-valued exclusion column as null is exactly how a row falls off the fence.
+ */
+function runSelect(sql: string, params: readonly unknown[], rows: Iterable<Record<string, unknown>>): Array<Record<string, unknown>> {
+  const cursor = sqlCursor(tokenizeSql(sql))
+  cursor.expect('SELECT')
+  const columns: string[] = [readIdentifier(cursor)]
+  while (cursor.accept(',')) columns.push(readIdentifier(cursor))
+  cursor.expect('FROM')
+  readIdentifier(cursor)
+  cursor.expect('WHERE')
+  const predicate = parsePredicate(cursor, params)
+  cursor.expect('ORDER')
+  cursor.expect('BY')
+  const orderBy = readIdentifier(cursor)
+  if (!cursor.done()) throw new Error(`the SQL evaluator did not consume all of: ${sql}`)
+  return [...rows]
+    // A WHERE keeps only TRUE. FALSE and UNKNOWN both drop the row, and conflating them is the bug
+    // class this whole evaluator exists to be able to express.
+    .filter((row) => predicate(row) === true)
+    .sort((a, b) => String(a[orderBy]).localeCompare(String(b[orderBy])))
+    .map((row) => Object.fromEntries(columns.map((c) => [c, row[c]])))
+}
+
+/** Run the production INSERT, and return the row it builds — defaults included, for the columns it does not name. */
+function runInsert(
+  sql: string,
+  params: readonly unknown[],
+  defaults: Record<string, unknown>,
+): Record<string, unknown> {
+  const cursor = sqlCursor(tokenizeSql(sql))
+  cursor.expect('INSERT')
+  cursor.expect('INTO')
+  readIdentifier(cursor)
+  cursor.expect('(')
+  const columns: string[] = [readIdentifier(cursor)]
+  while (cursor.accept(',')) columns.push(readIdentifier(cursor))
+  cursor.expect(')')
+  cursor.expect('VALUES')
+  cursor.expect('(')
+  const values: unknown[] = [readValue(cursor, params)]
+  while (cursor.accept(',')) values.push(readValue(cursor, params))
+  cursor.expect(')')
+  cursor.expect('RETURNING')
+  readIdentifier(cursor)
+  if (!cursor.done()) throw new Error(`the SQL evaluator did not consume all of: ${sql}`)
+  if (columns.length !== values.length) throw new Error(`the INSERT names ${columns.length} columns and ${values.length} values`)
+  const row = { ...defaults }
+  for (const [i, column] of columns.entries()) {
+    if (!(column in defaults)) throw new Error(`the INSERT names a column this table does not have: ${column}`)
+    row[column] = values[i]
+  }
+  return row
+}
+
+/** Run the production UPDATE against one table, and return the rows it matched. */
+function runUpdate(
+  sql: string,
+  params: readonly unknown[],
+  rows: Iterable<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  const cursor = sqlCursor(tokenizeSql(sql))
+  cursor.expect('UPDATE')
+  readIdentifier(cursor)
+  cursor.expect('SET')
+  const assignments: Array<[string, unknown]> = []
+  do {
+    const column = readIdentifier(cursor)
+    cursor.expect('=')
+    assignments.push([column, readValue(cursor, params)])
+  } while (cursor.accept(','))
+  cursor.expect('WHERE')
+  const predicate = parsePredicate(cursor, params)
+  cursor.expect('RETURNING')
+  readIdentifier(cursor)
+  if (!cursor.done()) throw new Error(`the SQL evaluator did not consume all of: ${sql}`)
+  const matched = [...rows].filter((row) => predicate(row) === true)
+  for (const row of matched) {
+    for (const [column, value] of assignments) row[column] = value
+  }
+  return matched
+}
+
+/**
+ * The table, as the two migrations leave it. The VALUES are the column DEFAULTs, which is not
+ * decoration: `exclusionProtocol` defaults to a NON-NULL value, and that default is the whole of
+ * what happens when an older build of the script — one whose INSERT names nine columns, not ten —
+ * records an intent (r11 finding 1).
+ */
+/**
+ * WHAT THE PREVIOUS VERSION OF THIS FILE ISSUED, kept verbatim so the tests can put a row in the
+ * table the way a host still running that build would (r11 finding 1). They are the statements from
+ * 20260819090000/20260819160000 with nothing added: nine columns and no protocol stamp, and a
+ * settlement that names `state`, `reason` and `settledAt` and nothing about the exclusion.
+ *
+ * Copied rather than derived: they are a fact about a build that has shipped, so they must not
+ * follow `SHARED_FENCE_SQL` when it changes.
+ */
+const LEGACY_INTEND_SQL =
+  'INSERT INTO "xero_live_write_intents" ' +
+  '("id", "runId", "tenantId", "host", "kind", "label", "method", "path", "intendedAt") ' +
+  'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING "id"'
+const LEGACY_SETTLE_SQL =
+  'UPDATE "xero_live_write_intents" SET "state" = $3, "reason" = $4, "settledAt" = $5 ' +
+  'WHERE "id" = $1 AND "runId" = $2 RETURNING "id"'
+
+const INTENT_TABLE_DEFAULTS: Record<string, unknown> = {
+  id: null, runId: null, tenantId: null, host: null, kind: null, label: null, method: null, path: null,
+  intendedAt: null, state: null, reason: null, settledAt: null,
+  heldThrough: null, heldThroughReason: null,
+  exclusionProtocol: UNSTAMPED_EXCLUSION_PROTOCOL,
+}
 
 /**
  * ONE PostgreSQL, reached by any number of SESSIONS — which is the whole point of the double.
@@ -483,49 +766,40 @@ class FakeCoordinationDatabase {
           entry.shared.delete(id)
           return { rows: [{ unlocked: true }] }
         }
+        // THE THREE STATEMENTS AGAINST THE TABLE ARE EXECUTED, NOT PARAPHRASED. Which rows come
+        // back, which row is written and what lands in it are all decided by the production string
+        // — so reverting any part of it moves the answers these tests are measuring. See the note
+        // on `runSelect` for what this does and does not prove.
         if (sql === SHARED_FENCE_SQL.scan) {
-          return {
-            rows: [...this.rows.values()]
-              // The production predicate, verbatim: the COMPLEMENT of the resolved vocabulary.
-              // Modelling it as `state == null || state === 'unknown'` is what let a state outside
-              // the vocabulary disappear, so the double must not paraphrase it either.
-              // And the SECOND, independent reason a row stays (r10 finding 1): `heldThrough` is
-              // three-valued, and only a positive `false` holds. `!r.heldThrough` would sweep every
-              // NULL — every pre-migration row — onto the fence, which is the direction the
-              // production predicate deliberately does not take.
-              .filter((r) => r.tenantId === params[0] && (
-                r.state == null
-                || (r.state !== 'committed' && r.state !== 'not-committed')
-                || r.heldThrough === false
-              ))
-              .sort((a, b) => String(a.intendedAt).localeCompare(String(b.intendedAt))),
-          }
+          return { rows: runSelect(sql, params, this.rows.values()) }
         }
         if (sql === SHARED_FENCE_SQL.intend) {
-          const [rowId, runId, tenantId, rowHost, kind, label, method, path, intendedAt] = params
-          if (this.rows.has(String(rowId))) throw new Error('duplicate key value violates unique constraint')
-          this.rows.set(String(rowId), {
-            id: rowId, runId, tenantId, host: rowHost, kind, label, method, path,
-            intendedAt: intendedAt instanceof Date ? intendedAt.toISOString() : intendedAt,
-            // NULL, exactly as the ALTER leaves it: an intent that has been recorded and not yet
-            // dispatched has nothing to say about whether the ledger was held across it.
-            state: null, reason: null, settledAt: null, heldThrough: null, heldThroughReason: null,
-          })
-          return { rows: [{ id: rowId }] }
+          const row = runInsert(sql, params, INTENT_TABLE_DEFAULTS)
+          if (row.intendedAt instanceof Date) row.intendedAt = row.intendedAt.toISOString()
+          if (this.rows.has(String(row.id))) throw new Error('duplicate key value violates unique constraint')
+          this.rows.set(String(row.id), row)
+          return { rows: [{ id: row.id }] }
         }
         if (sql === SHARED_FENCE_SQL.settle) {
-          const [rowId, runId, state, reason, settledAt, heldThrough, heldThroughReason] = params
-          const row = this.rows.get(String(rowId))
-          // Predicated on the RUN as well as the id, exactly as the real UPDATE is: one run's
-          // settlement may never resolve another run's dispatched write.
-          if (!row || row.runId !== runId) return { rows: [] }
-          row.state = state
-          row.reason = reason
-          row.settledAt = settledAt
-          // ONE statement carries both halves of the account, as the production UPDATE does.
-          row.heldThrough = heldThrough
-          row.heldThroughReason = heldThroughReason
-          return { rows: [{ id: rowId }] }
+          return { rows: runUpdate(sql, params, this.rows.values()).map((row) => ({ id: row.id })) }
+        }
+        /**
+         * AN INSERT FROM A BUILD THAT PREDATES THE PROTOCOL COLUMN (r11 finding 1).
+         *
+         * Not a statement production issues — that is the point of it. It is the nine-column INSERT
+         * the version before this one issues, and it is here because the case the fix is FOR is a
+         * host still running that version. It goes through the same evaluator, so the column it
+         * does not name is filled from the table's DEFAULT exactly as PostgreSQL would fill it.
+         */
+        if (sql === LEGACY_INTEND_SQL) {
+          const row = runInsert(sql, params, INTENT_TABLE_DEFAULTS)
+          if (row.intendedAt instanceof Date) row.intendedAt = row.intendedAt.toISOString()
+          this.rows.set(String(row.id), row)
+          return { rows: [{ id: row.id }] }
+        }
+        /** Likewise: the three-column settlement a build without the exclusion columns issues. */
+        if (sql === LEGACY_SETTLE_SQL) {
+          return { rows: runUpdate(sql, params, this.rows.values()).map((row) => ({ id: row.id })) }
         }
         throw new Error(`the double was asked a statement it does not model: ${sql}`)
       },
@@ -2329,7 +2603,7 @@ describe('the evidence of a dispatched write outlives the process that dispatche
   test('a write that SETTLED leaves nothing behind — the refusal is not simply always on', () => {
     const { disk, log } = inMemoryLog()
     const id = log.intend({ kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
-    log.settle(id, 'committed', 'Xero answered HTTP 200')
+    log.settle(id, 'committed', 'Xero answered HTTP 200', { confirmed: true })
     assert.deepEqual(scanWriteIntentLog(disk.join('\n')), { unresolved: [], unreadableLines: 0 })
     assert.doesNotThrow(() => assertNoUnresolvedWrites({ path: './write-log.jsonl', text: disk.join('\n') }))
   })
@@ -2340,7 +2614,7 @@ describe('the evidence of a dispatched write outlives the process that dispatche
     // past a note saying the ledger may have changed.
     const { disk, log } = inMemoryLog()
     const id = log.intend({ kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
-    log.settle(id, 'unknown', 'the request left this process and no usable response came back')
+    log.settle(id, 'unknown', 'the request left this process and no usable response came back', { confirmed: true })
     assert.equal(scanWriteIntentLog(disk.join('\n')).unresolved.length, 1)
     assert.throws(() => assertNoUnresolvedWrites({ path: './write-log.jsonl', text: disk.join('\n') }), UnresolvedWriteError)
   })
@@ -2389,7 +2663,7 @@ describe('the evidence of a dispatched write outlives the process that dispatche
     // What a process dying mid-append actually leaves on disk.
     const { disk, log } = inMemoryLog()
     const id = log.intend({ kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
-    log.settle(id, 'committed', 'Xero answered HTTP 200')
+    log.settle(id, 'committed', 'Xero answered HTTP 200', { confirmed: true })
     const truncated = `${disk.join('\n')}\n{"event":"intent","id":"w2","kind":"invoice voi`
     assert.equal(scanWriteIntentLog(truncated).unreadableLines, 1)
     assert.throws(
@@ -2660,7 +2934,7 @@ describe('two runs cannot share the write log, and cannot erase each other in it
     // settle; B is on its first write of its own and finishes it cleanly.
     runA.intend({ kind: 'invoice voided', label: 'INV-A-0042', method: 'POST', path: 'Invoices/inv-42' })
     const b1 = runB.intend({ kind: 'invoice voided', label: 'INV-B-0007', method: 'POST', path: 'Invoices/inv-7' })
-    runB.settle(b1, 'committed', 'Xero answered HTTP 200')
+    runB.settle(b1, 'committed', 'Xero answered HTTP 200', { confirmed: true })
     // <<< run A was killed here; its write may be in the ledger and only this file can say so >>>
 
     const scan = scanWriteIntentLog(disk.join('\n'))
@@ -3912,7 +4186,7 @@ describe('the coordinator is identified by the LEDGER, not by whichever database
 describe('a settlement nobody can interpret is not a settlement', () => {
   const LEDGER = LEDGER_UUID
 
-  const withIntent = async (state: string | null) => {
+  const withIntent = async (state: string | null, heldThrough: boolean | null = null) => {
     const db = new FakeCoordinationDatabase()
     const session = db.session('host-a')
     const fence = await acquireSharedWriteFence({
@@ -3920,8 +4194,11 @@ describe('a settlement nobody can interpret is not a settlement', () => {
     })
     await fence.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
     // Set by hand, exactly as an operator settling a row by hand would: this is the route the
-    // vocabulary check exists for, and the one no application code guards.
+    // vocabulary check exists for, and the one no application code guards. The row was inserted by
+    // THIS version, so it carries a protocol stamp — which is what makes the exclusion half of a
+    // hand settlement something the operator has to answer too (r11 finding 1).
     if (state !== null) db.rows.get('runA-w1')!.state = state
+    if (heldThrough !== null) db.rows.get('runA-w1')!.heldThrough = heldThrough
     return { db, fence }
   }
 
@@ -3943,10 +4220,34 @@ describe('a settlement nobody can interpret is not a settlement', () => {
 
   test('a RECOGNISED settlement still resolves the row — the fence is not simply always on', async () => {
     for (const good of ['committed', 'not-committed']) {
-      const { fence } = await withIntent(good)
+      // BOTH halves, because a stamped row is owed both (r11 finding 1): the state says what became
+      // of the object and the verdict says whether anybody else could have been writing. The
+      // printed recovery prints an UPDATE for each, and a row that has had only one of them applied
+      // is a half-applied recovery — which is one of the three ways the old NULL-is-legacy reading
+      // let a live write off the fence.
+      const { fence } = await withIntent(good, true)
       assert.deepEqual(await fence.scanUnresolved(), [], `${good} accounts for the write`)
       await fence.release()
     }
+  })
+
+  test('a recognised settlement with NO exclusion verdict does NOT resolve a row this era recorded', async () => {
+    // r11 finding 1, at the level the fence actually decides things. This is the shape an older
+    // build on another host leaves, and the shape an operator's half-applied recovery leaves: the
+    // outcome is fully accounted for, and nobody ever said whether the ledger was held.
+    const { fence } = await withIntent('committed')
+    const unresolved = await fence.scanUnresolved()
+    assert.equal(unresolved.length, 1, 'a settled state is not the whole account of a write')
+    assert.equal(unresolved[0].heldThrough, null)
+    assert.equal(unresolved[0].exclusionProtocol, WRITE_EXCLUSION_PROTOCOL, 'and the row itself says which era recorded it')
+    assert.equal(readExclusion(unresolved[0]), 'unrecorded')
+    assert.throws(
+      () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved }),
+      (e: Error) => e instanceof SharedUnresolvedWriteError
+        && /DISPATCHED WITHOUT A CONFIRMED EXCLUSION — NO VERDICT WAS RECORDED/.test(e.message)
+        && /SET "heldThrough" = true/.test(e.message),
+    )
+    await fence.release()
   })
 
   test("'unknown' and a never-settled row hold the fence, and say so in their own words", async () => {
@@ -3957,12 +4258,16 @@ describe('a settlement nobody can interpret is not a settlement', () => {
     assert.throws(
       () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved: [{
         id: 'i', runId: 'r', host: 'h', kind: 'k', label: 'l', method: 'POST', path: 'p', intendedAt: 't', state: 'unknown', heldThrough: true, heldThroughReason: null,
+        exclusionProtocol: WRITE_EXCLUSION_PROTOCOL,
       }] }),
       /settled as UNKNOWN — the answer was lost/,
     )
     assert.throws(
       () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved: [{
         id: 'i', runId: 'r', host: 'h', kind: 'k', label: 'l', method: 'POST', path: 'p', intendedAt: 't', state: null, heldThrough: null, heldThroughReason: null,
+        // Unstamped, so its NULL verdict is read as 'from before the column' and the row is here
+        // for its SETTLEMENT alone — which is the sentence under test.
+        exclusionProtocol: null,
       }] }),
       /never settled — the run died between dispatching it and recording the answer/,
     )
@@ -4114,7 +4419,7 @@ describe('the printed recovery is executable only when somebody established the 
       () => assertNoUnresolvedSharedWrites({ tenantId: TENANT_UUID, unresolved: [{
         id: 'runA-w1', runId: 'runA', host: 'host-a', kind: 'invoice voided', label: 'INV-1',
         method: 'POST', path: 'Invoices/inv-1', intendedAt: 't', state: 'unknown',
-        heldThrough: true, heldThroughReason: null,
+        heldThrough: true, heldThroughReason: null, exclusionProtocol: WRITE_EXCLUSION_PROTOCOL,
       }] }),
       (e: Error) => /NOBODY ESTABLISHED WHAT BECAME OF THIS WRITE/.test(e.message)
         && /SET "state" = '<committed\|not-committed>'/.test(e.message)
@@ -4673,12 +4978,16 @@ describe('a plan exists only if the fence held across the whole of writing it', 
         io: {
           write: (p) => { touched.push(`write ${p}`) },
           publish: () => { touched.push('publish') },
+          claim: () => { touched.push('claim') },
           discard: (p) => { touched.push(`discard ${p}`) },
+          snapshot: () => { touched.push('snapshot'); return null },
         },
       }),
       SharedFenceLostError,
     )
-    assert.deepEqual(touched, [], 'the fence is established before a byte is written, not after')
+    // A snapshot of the target is a READ, and it is taken as early as possible so that the window
+    // it covers is the whole of publishing (r11 finding 3). What must not have happened is a WRITE.
+    assert.deepEqual(touched, ['snapshot'], 'the fence is established before a byte is written, not after')
     assert.equal(existsSync(path), false)
     assert.deepEqual(readdirSync(d), [])
     cleanup()
@@ -4724,17 +5033,24 @@ describe('a plan exists only if the fence held across the whole of writing it', 
       io: {
         write: (p) => { order.push(`write ${p}`) },
         publish: (from, to) => { order.push(`publish ${from} -> ${to}`) },
+        claim: (from, to) => { order.push(`claim ${from} -> ${to}`) },
         discard: (p) => { order.push(`discard ${p}`) },
+        // Nothing under the target name, which is the branch that TAKES it rather than replacing it.
+        snapshot: () => null,
       },
     })
-    assert.equal(order.length, 2)
+    assert.equal(order.length, 3)
     // The staging name is `<target>.<random>.partial` now, so it is matched rather than predicted —
     // and matched STRICTLY, because the two things that must hold are that it lives beside the
     // target (a rename across filesystems is not atomic) and that it is not the target itself.
     const staged = order[0].slice('write '.length)
     assert.match(staged, new RegExp(`^/nowhere/plan\\.json\\.[0-9a-f]{16}\\${STAGED_ARTEFACT_SUFFIX}$`))
-    assert.equal(order[1], `publish ${staged} -> /nowhere/plan.json`,
+    // CLAIM, not publish (r11 finding 3): where nothing held the target name, taking it is one
+    // atomic operation that fails if somebody else got there first — a replacement of another run's
+    // published plan is not something this can do by accident.
+    assert.equal(order[1], `claim ${staged} -> /nowhere/plan.json`,
       'nothing may be written under the consumed name before the fence has been re-established')
+    assert.equal(order[2], `discard ${staged}`, 'and the staged copy goes once the name is held')
   })
 
   test('a staged file that cannot be removed is named, not swallowed', async () => {
@@ -4748,7 +5064,9 @@ describe('a plan exists only if the fence held across the whole of writing it', 
         io: {
           write: () => {},
           publish: () => { throw new Error('must not publish') },
+          claim: () => { throw new Error('must not claim') },
           discard: () => { throw new Error('EACCES: permission denied, unlink') },
+          snapshot: () => null,
         },
       }),
       (e: Error) => e instanceof StagedArtefactStrandedError
@@ -4763,11 +5081,16 @@ describe('a plan exists only if the fence held across the whole of writing it', 
   // -------------------------------------------------------------------------
   // r10 finding 2 — TWO RUNS STAGING AT ONCE
   // -------------------------------------------------------------------------
-  test('two runs staging the SAME target do not truncate each other', async () => {
+  test('two runs staging the SAME target do not truncate each other, and the second REFUSES to replace the first', async () => {
     // The case is not exotic: dry runs take the ledger lock in SHARE mode and coexist by design,
     // and the default --plan-out is derived from the DATE, so two dry runs on one day are pointed
     // at one target without anybody doing anything unusual. With a staging name derived only from
     // the target they open the same file, and the second write truncates the first's bytes.
+    //
+    // r10 fixed the tearing and stopped there, which left the published plan last-writer-wins: the
+    // run that renamed LAST won silently, and an operator who had already opened and reviewed the
+    // file was reviewing bytes that were about to be replaced by a different read of the ledger
+    // (r11 finding 3). So the second run now refuses, keeps its own plan, and names both files.
     const d = dir()
     const path = join(d, 'plan.json')
     let releaseA = () => {}
@@ -4785,14 +5108,87 @@ describe('a plan exists only if the fence held across the whole of writing it', 
     // Run B goes all the way through while A is parked: stage, publish, done.
     await persistUnderFence({ fence: fenceB, path, body: '{"run":"B"}', what: "run B's plan" })
     releaseA()
-    await a
 
-    // A published last, so A's bytes are what is under the name — INTACT. Under one shared staging
-    // name B's write truncated A's staged file (and B's rename took it away entirely), so A either
-    // published B's bytes or failed to publish at all.
-    assert.equal(readFileSync(path, 'utf8'), '{"run":"A"}', "run A published its OWN plan, not run B's")
-    assert.deepEqual(readdirSync(d), ['plan.json'], 'and neither run left a staging file behind')
+    await assert.rejects(
+      () => a,
+      (e: Error) => e instanceof ArtefactTargetChangedError
+        && /is not what it was when this run began publishing/.test(e.message)
+        && /Nothing was under that name when this run started; something is now/.test(e.message)
+        // The refusal is only useful if it says where run A's own plan went.
+        && new RegExp(`RUN A'S PLAN IS AT: ${d.replace(/[.*+?^$()|[\]\\]/g, '\\$&')}/plan\\.json\\.[0-9a-f]{16}\\${STAGED_ARTEFACT_SUFFIX}`).test(e.message),
+    )
+
+    // B's plan is under the name, UNREPLACED and untorn — and A's is beside it, intact, under its
+    // own staging name. Neither run destroyed the other's read of the ledger, and no run silently
+    // substituted a plan somebody may already have reviewed.
+    assert.equal(readFileSync(path, 'utf8'), '{"run":"B"}', "the plan that got there first is the one that is still there")
+    const left = readdirSync(d).sort()
+    assert.equal(left.length, 2, 'run A kept its own plan rather than throwing away a full read of the ledger')
+    const stagedA = left.find((f) => f !== 'plan.json') as string
+    assert.match(stagedA, new RegExp(`^plan\\.json\\.[0-9a-f]{16}\\${STAGED_ARTEFACT_SUFFIX}$`))
+    assert.equal(readFileSync(join(d, stagedA), 'utf8'), '{"run":"A"}', "run A's bytes were never truncated by run B")
     cleanup()
+  })
+
+  test('a run that publishes over its OWN earlier plan is not refused — the check is not simply always on', async () => {
+    // The normal way this tooling is used: plan in the morning, plan again after lunch, same
+    // date-derived target. Refusing to replace ANYTHING would close r11 finding 3 by making the
+    // tool unusable, so what is refused is replacing something that CHANGED under this run.
+    const d = dir()
+    const path = join(d, 'plan.json')
+    writeFileSync(path, '{"run":"earlier"}')
+    const { fence } = failingFence(99)
+    await persistUnderFence({ fence, path, body: '{"run":"later"}', what: 'the reviewed plan' })
+    assert.equal(readFileSync(path, 'utf8'), '{"run":"later"}')
+    assert.deepEqual(readdirSync(d), ['plan.json'], 'and no staging file is left behind')
+    cleanup()
+  })
+
+  test('a plan REPLACED under this run mid-flight is refused too, not only one that appeared', async () => {
+    // The other half of the same finding: something WAS under the name when this run started, so
+    // this run is entitled to replace it — but not after somebody else has replaced it first.
+    const d = dir()
+    const path = join(d, 'plan.json')
+    writeFileSync(path, '{"run":"the one this run saw"}')
+    const fence = {
+      assertStillHeld: async (context: string) => {
+        // Another run publishes inside the window this run is staging in.
+        if (context.startsWith('about to publish')) writeFileSync(path, '{"run":"somebody else"}')
+      },
+    }
+    await assert.rejects(
+      () => persistUnderFence({ fence, path, body: '{"run":"mine"}', what: 'the reviewed plan' }),
+      (e: Error) => e instanceof ArtefactTargetChangedError
+        && /A DIFFERENT file is under that name now/.test(e.message),
+    )
+    assert.equal(readFileSync(path, 'utf8'), '{"run":"somebody else"}', "the other run's plan is not overwritten")
+    assert.equal(readdirSync(d).length, 2, "and this run's own plan is kept, not thrown away")
+    cleanup()
+  })
+
+  test('the target name is TAKEN atomically, so a plan that appears between the check and the rename is not overwritten', async () => {
+    // The check-then-act residue, closed for the case it can be closed for. Nothing was under the
+    // name when this run looked; another run publishes in the instant between that look and this
+    // run taking the name. `link(2)` either succeeds or reports EEXIST — there is no third outcome
+    // in which this run silently replaces the file that got there first.
+    const { fence } = failingFence(99)
+    const claimed: string[] = []
+    await assert.rejects(
+      () => persistUnderFence({
+        fence, path: '/nowhere/plan.json', body: '{"run":"mine"}', what: 'the reviewed plan',
+        io: {
+          write: () => {},
+          publish: () => { throw new Error('a target nothing held must be CLAIMED, never replaced') },
+          claim: (from, to) => { claimed.push(`${from} -> ${to}`); throw new Error("EEXIST: file already exists, link -> '/nowhere/plan.json'") },
+          discard: () => { throw new Error('nothing may be discarded when the name was not taken') },
+          snapshot: () => null,
+        },
+      }),
+      (e: Error) => e instanceof ArtefactTargetChangedError
+        && /was taken while this run was publishing/.test(e.message)
+        && /EEXIST/.test(e.message),
+    )
+    assert.equal(claimed.length, 1, 'the claim was attempted exactly once, and its failure is the refusal')
   })
 
   test('the staging name is minted per call, never derived from the target alone', () => {
@@ -5066,15 +5462,23 @@ describe('the two halves of a write\'s account are recorded together and read se
     }
   })
 
-  test('the scan holds a row for a POSITIVE false, never for a NULL', () => {
-    // The one place this file deliberately does not fail closed, and the reason is in the SQL: a
-    // NULL is a row written before the column existed, not a claim nobody can interpret. Reading it
-    // as "not confirmed" would put every historical write back on the fence in the same instant.
+  test('the scan holds a row for a POSITIVE false, and for a NULL only where the ROW says it owes one', () => {
+    // Three clauses, three different rules, and the third is r11 finding 1. `= false` is a positive
+    // record. A NULL is read against the protocol stamp rather than on its own: on a row this era
+    // wrote it means nobody recorded the verdict and it holds; on an unstamped row it means the row
+    // predates the column, which is the case the leniency exists for and the only one it now covers.
     assert.ok(SHARED_FENCE_SQL.scan.includes('"heldThrough" = false'))
     assert.ok(!/heldThrough"\s+IS NOT TRUE/.test(SHARED_FENCE_SQL.scan))
     assert.ok(!/NOT\s+"heldThrough"/.test(SHARED_FENCE_SQL.scan))
+    assert.ok(SHARED_FENCE_SQL.scan.includes('"exclusionProtocol" IS NOT NULL AND "heldThrough" IS NULL'))
+    // IS NOT NULL, not a match against this version's stamp: a stamp from a later version is still
+    // an era-bearing one, and must hold the fence rather than dropping off it.
+    assert.ok(!SHARED_FENCE_SQL.scan.includes(`"exclusionProtocol" = '`))
+    // And the column is SELECTed, not merely predicated on — a column the statement forgets to
+    // select reads back as null, which is exactly how the fence would fail open again.
+    assert.ok(SHARED_FENCE_SQL.scan.includes('"heldThroughReason", "exclusionProtocol" '))
     // And the STATE half is still the complement of the resolved vocabulary, which is the opposite
-    // rule for the opposite reason. Both are present, and neither has replaced the other.
+    // rule for the opposite reason. All three are present, and none has replaced another.
     assert.ok(SHARED_FENCE_SQL.scan.includes(`"state" NOT IN ('committed', 'not-committed')`))
   })
 
@@ -5085,16 +5489,20 @@ describe('the two halves of a write\'s account are recorded together and read se
       createClient: () => db.session('host-a'), setKeepalive: noKeepalive, hostId: 'host-a',
     })
     await fence.intend({ id: 'old-w1', runId: 'old', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1' })
-    // Settled by a version that never asked: state written, heldThrough left NULL.
-    Object.assign(db.rows.get('old-w1')!, { state: 'committed', heldThrough: null })
+    // A row from BEFORE the columns existed: settled by a version that never asked, and — the part
+    // that makes it genuinely pre-migration rather than merely unanswered — carrying no protocol
+    // stamp either, because `ADD COLUMN` with no default is what left every existing row NULL.
+    // This is the row the leniency exists for, and it must go on reading exactly as it did.
+    Object.assign(db.rows.get('old-w1')!, { state: 'committed', heldThrough: null, exclusionProtocol: null })
     assert.deepEqual(await fence.scanUnresolved(), [], 'a legacy resolved row is still resolved')
 
     // And a legacy UNRESOLVED row is still unresolved, for its own reason.
     await fence.intend({ id: 'old-w2', runId: 'old', kind: 'invoice voided', label: 'INV-2', method: 'POST', path: 'Invoices/inv-2' })
-    Object.assign(db.rows.get('old-w2')!, { state: 'unknown', heldThrough: null })
+    Object.assign(db.rows.get('old-w2')!, { state: 'unknown', heldThrough: null, exclusionProtocol: null })
     const unresolved = await fence.scanUnresolved()
     assert.equal(unresolved.length, 1)
     assert.equal(unresolved[0].heldThrough, null, 'null is "nobody asked", and it is reported as null, not as false')
+    assert.equal(readExclusion(unresolved[0]), 'not-asked', 'and it is not read as a refusal')
     await fence.release()
   })
 
@@ -5175,5 +5583,524 @@ describe('the two halves of a write\'s account are recorded together and read se
     assert.match(code, /unexcludedDispatches: journal\.unexcludedDispatchCount,/)
     assert.match(code, /WRITES DISPATCHED WITHOUT A CONFIRMED EXCLUSION/)
     assert.match(code, /exclusionRecoveryInstruction\(\{/)
+  })
+})
+
+// ===========================================================================
+/**
+ * r11 FINDING 1 — A NEW WRITE WITH NO EXCLUSION VERDICT WAS INDISTINGUISHABLE FROM A LEGACY ROW.
+ *
+ * Round 10 decided, deliberately, that `heldThrough IS NULL` means "a row written before the column
+ * existed" and not "not confirmed", so that applying the migration would not put every historical
+ * write back on the fence at once. The argument for the leniency was that only a pre-migration row
+ * could carry a NULL, and the compiler guarded the only route that could produce one otherwise.
+ *
+ * It does not hold. A write dispatched TODAY leaves the same NULL whenever its verdict does not
+ * reach the column — an older build still deployed on another host settling with the statement it
+ * knows about, an operator's recovery UPDATE that sets `state` and stops there, a settlement that
+ * arrives by any route this tooling does not own. The fence read the silence as ancient history and
+ * let the row go: fail-open, in the one predicate in the file where absence read as fine.
+ *
+ * The row now says which ERA recorded it, positively, in the INSERT itself — and the column's
+ * DEFAULT says it for a build too old to know the column exists. So a NULL verdict can mean "not
+ * confirmed" for a stamped row without a single historical row moving.
+ */
+describe('a write recorded by this era owes a verdict; a row from before the column does not', () => {
+  const LEDGER = LEDGER_UUID
+
+  const openFence = async (db: FakeCoordinationDatabase, host = 'host-a') =>
+    acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED,
+      createClient: () => db.session(host), setKeepalive: noKeepalive, hostId: host,
+    })
+
+  test('the INSERT stamps the row itself, so no call site can forget to', async () => {
+    // A literal in the statement, not a parameter: what it records is which version of the file
+    // inserted the row, and a version is not something a caller can be trusted to supply.
+    assert.match(SHARED_FENCE_SQL.intend, /"exclusionProtocol"/)
+    assert.ok(SHARED_FENCE_SQL.intend.includes(`'${WRITE_EXCLUSION_PROTOCOL}'`))
+    assert.doesNotMatch(SHARED_FENCE_SQL.intend, /\$10/, 'a stamp a caller passes is a stamp a caller can omit')
+
+    const db = new FakeCoordinationDatabase()
+    const fence = await openFence(db)
+    await fence.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1' })
+    assert.equal(db.rows.get('runA-w1')!.exclusionProtocol, WRITE_EXCLUSION_PROTOCOL)
+    await fence.release()
+  })
+
+  test('an OLDER BUILD\'s nine-column INSERT is stamped by the DATABASE, and its settled row still holds', async () => {
+    // The case the fix is for, and the one no amount of care in this file could have covered on its
+    // own: another host is running the previous build. Its INSERT does not name the column, so the
+    // DEFAULT fills it — with a non-NULL value, which is what puts its rows under the new rule.
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('old-host')
+    await session.connect()
+    await session.query(LEGACY_INTEND_SQL, [
+      'old-w1', 'oldRun', LEDGER, 'old-host', 'invoice voided', 'INV-9', 'POST', 'Invoices/inv-9', new Date('2026-08-19T09:00:00Z'),
+    ])
+    assert.equal(db.rows.get('old-w1')!.exclusionProtocol, UNSTAMPED_EXCLUSION_PROTOCOL,
+      'PostgreSQL fills the column the old build does not know about')
+    // And it settles with the statement it knows about: outcome recorded, exclusion never asked.
+    await session.query(LEGACY_SETTLE_SQL, ['old-w1', 'oldRun', 'committed', 'HTTP 200', new Date()])
+    assert.equal(db.rows.get('old-w1')!.heldThrough, null)
+
+    const fence = await openFence(db, 'host-b')
+    const unresolved = await fence.scanUnresolved()
+    assert.equal(unresolved.length, 1, "an old build's dispatched write does not sail past the new fence")
+    assert.equal(unresolved[0].exclusionProtocol, UNSTAMPED_EXCLUSION_PROTOCOL)
+    assert.equal(readExclusion(unresolved[0]), 'unrecorded')
+    assert.throws(
+      () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved }),
+      (e: Error) => e instanceof SharedUnresolvedWriteError && /NO VERDICT WAS RECORDED/.test(e.message),
+    )
+    await fence.release()
+  })
+
+  test('an operator who settles the OUTCOME and forgets the verdict does not clear the row', async () => {
+    // A half-applied recovery, which is a normal event in an incident: the printed instructions
+    // carry an UPDATE for each half, and running one of them is easier than running both.
+    const db = new FakeCoordinationDatabase()
+    const fence = await openFence(db)
+    await fence.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1' })
+    Object.assign(db.rows.get('runA-w1')!, { state: 'committed', reason: 'I checked it in Xero', settledAt: new Date() })
+    assert.equal((await fence.scanUnresolved()).length, 1)
+
+    // The second UPDATE — the one the exclusion instruction prints — is what lets it go.
+    Object.assign(db.rows.get('runA-w1')!, { heldThrough: true, heldThroughReason: 'checked every host; no other run was live' })
+    assert.deepEqual(await fence.scanUnresolved(), [], 'and BOTH halves answered does clear it')
+    await fence.release()
+  })
+
+  test('the SQL and the TypeScript reading of a row agree on every combination', async () => {
+    // Two statements of one rule — the scan decides which rows come back, `readExclusion` decides
+    // what the operator is told about each — so they are held to the same answers here rather than
+    // being allowed to drift into disagreeing about the row that matters.
+    const db = new FakeCoordinationDatabase()
+    const fence = await openFence(db)
+    let n = 0
+    const expectations: Array<{ id: string; holds: boolean }> = []
+    for (const state of [null, 'committed', 'not-committed', 'unknown', 'commited']) {
+      for (const heldThrough of [null, true, false]) {
+        for (const exclusionProtocol of [null, WRITE_EXCLUSION_PROTOCOL, UNSTAMPED_EXCLUSION_PROTOCOL, 'something-later']) {
+          const id = `row-${++n}`
+          await fence.intend({ id, runId: 'runA', kind: 'k', label: 'l', method: 'POST', path: 'p' })
+          Object.assign(db.rows.get(id)!, { state, heldThrough, exclusionProtocol, intendedAt: String(n).padStart(4, '0') })
+          expectations.push({
+            id,
+            holds: !settlementResolvesIntent(state) || exclusionHoldsIntent({ heldThrough, exclusionProtocol }),
+          })
+        }
+      }
+    }
+    const returned = new Set((await fence.scanUnresolved()).map((u) => u.id))
+    for (const { id, holds } of expectations) {
+      assert.equal(returned.has(id), holds, `${id}: ${JSON.stringify(db.rows.get(id))}`)
+    }
+    // And it is not vacuous in either direction.
+    assert.ok(expectations.some((e) => e.holds) && expectations.some((e) => !e.holds))
+    await fence.release()
+  })
+
+  // -------------------------------------------------------------------------
+  // THE SAME HOLE, IN THE OTHER STORE
+  // -------------------------------------------------------------------------
+  test('the on-disk log stamps its intent line and its settlement carries the verdict', () => {
+    const disk: string[] = []
+    const log = createWriteIntentLog({ tenantId: TENANT, append: (l) => disk.push(l), runId: 'runA' })
+    const id = log.intend({ kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1' })
+    log.settle(id, 'committed', 'HTTP 200', { confirmed: true })
+    const [intent, settled] = disk.map((l) => JSON.parse(l) as Record<string, unknown>)
+    assert.equal(intent.protocol, WRITE_EXCLUSION_PROTOCOL)
+    assert.equal(settled.heldThrough, true, 'the positive half is said out loud, not inferred from a missing line')
+    assert.deepEqual(scanWriteIntentLog(disk.join('\n')), { unresolved: [], unreadableLines: 0 })
+  })
+
+  test('a settlement with NO verdict does not resolve a STAMPED intent, and says which half is missing', () => {
+    // The log's counterpart of the shared row: an older build appending to the same file, or a
+    // hand-edited settlement. Round 10 read the absent verdict as "a log from before the question
+    // existed", which is true of a log whose INTENT line carries no stamp and false of this one.
+    const base = { runId: 'runA', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1', tenantId: TENANT, at: 't' }
+    const text = [
+      JSON.stringify({ event: 'intent', id: 'runA-w1', ...base, protocol: WRITE_EXCLUSION_PROTOCOL }),
+      JSON.stringify({ event: 'settled', id: 'runA-w1', runId: 'runA', state: 'committed', reason: 'HTTP 200', at: 't', tenantId: TENANT }),
+    ].join('\n')
+    const scan = scanWriteIntentLog(text)
+    assert.equal(scan.unresolved.length, 1, 'the outcome is accounted for and the exclusion is not')
+    assert.equal(scan.unresolved[0].settledWithoutExclusion, true)
+    assert.equal(scan.unreadableLines, 0, 'it is a readable line that says too little, not an unreadable one')
+    assert.throws(
+      () => assertNoUnresolvedWrites({ path: '/log', text }),
+      (e: Error) => e instanceof UnresolvedWriteError
+        && /DISPATCHED WITHOUT A CONFIRMED EXCLUSION — NO VERDICT WAS RECORDED/.test(e.message)
+        && /SET "heldThrough" = true/.test(e.message),
+    )
+  })
+
+  test('an UNSTAMPED intent settles exactly as it always did, verdict or no verdict', () => {
+    // The property the whole stamp exists to preserve: every legacy log, including the ones under
+    // LEGACY_WRITE_LOG_PATHS, goes on resolving. A rule stated as "an absent verdict is a no" would
+    // have re-opened every settled write ever recorded, which is the outcome r10 refused and this
+    // round does not reintroduce by the back door.
+    const base = { runId: 'runA', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1', tenantId: TENANT, at: 't' }
+    const text = [
+      JSON.stringify({ event: 'intent', id: 'runA-w1', ...base }),
+      JSON.stringify({ event: 'settled', id: 'runA-w1', runId: 'runA', state: 'committed', reason: 'HTTP 200', at: 't', tenantId: TENANT }),
+    ].join('\n')
+    assert.deepEqual(scanWriteIntentLog(text), { unresolved: [], unreadableLines: 0 })
+    assert.doesNotThrow(() => assertNoUnresolvedWrites({ path: '/log', text }))
+  })
+
+  test('a stamped intent settled with heldThrough FALSE holds too, even with the unexcluded line lost', () => {
+    // A log truncated between the two appends, or concatenated from a crash. The graver line is
+    // written first precisely so this is rare — and when it is gone, the settlement's own verdict
+    // still refuses to account for the write.
+    const base = { runId: 'runA', kind: 'invoice voided', label: 'INV-1', method: 'POST', path: 'Invoices/inv-1', tenantId: TENANT, at: 't' }
+    const text = [
+      JSON.stringify({ event: 'intent', id: 'runA-w1', ...base, protocol: WRITE_EXCLUSION_PROTOCOL }),
+      JSON.stringify({ event: 'settled', id: 'runA-w1', runId: 'runA', state: 'committed', reason: 'HTTP 200', at: 't', tenantId: TENANT, heldThrough: false }),
+    ].join('\n')
+    assert.equal(scanWriteIntentLog(text).unresolved.length, 1)
+  })
+
+  test('a full write through performWrite settles BOTH stores with a positive verdict', async () => {
+    // End to end, so that the two stores cannot be shown to agree only when a test writes them by
+    // hand. Nothing goes wrong here: this is the run that must NOT be held.
+    const db = new FakeCoordinationDatabase()
+    const fence = await openFence(db)
+    const { impl } = fakeFetch(() => response(200, { Invoices: [{ InvoiceID: 'inv-1', UpdatedDateUTC: '/Date(2000)/' }] }))
+    const disk: string[] = []
+    const writeLog = createWriteIntentLog({ tenantId: TENANT, append: (l) => disk.push(l) })
+    await performWrite({
+      transport: createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep }),
+      token: TOKEN, journal: new MutationJournal(), writeLog, fence,
+      method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+      kind: 'invoice voided', label: 'INV-1',
+    })
+    const row = [...db.rows.values()][0]
+    assert.equal(row.exclusionProtocol, WRITE_EXCLUSION_PROTOCOL)
+    assert.equal(row.heldThrough, true)
+    assert.deepEqual(await fence.scanUnresolved(), [])
+    assert.deepEqual(scanWriteIntentLog(disk.join('\n')), { unresolved: [], unreadableLines: 0 })
+    await fence.release()
+  })
+})
+
+// ===========================================================================
+/**
+ * r11 FINDING 2 — THE POST-DISPATCH SAFETY CHECK COULD WAIT FOREVER BEFORE RECORDING THE
+ * IRREVERSIBLE OUTCOME.
+ *
+ * Round 10 bracketed every dispatch: the fence is asked again once the request has settled, and a
+ * "no" is written to both durable stores. What it did not do is bound the ASKING. The coordination
+ * client had no statement timeout of any kind, so a connection that is dead in the way TCP is dead
+ * — a reaped backend behind a firewall that drops rather than resets, a pooler queueing forever —
+ * answers neither yes nor no. The await does not return; the run does not abort, does not print and
+ * does not settle. It parks, immediately AFTER an irreversible write, with the outcome of that
+ * write recorded nowhere but its own memory. Round 10 also added one more per-write round trip on
+ * which that can happen.
+ *
+ * Every statement is now bounded IN THIS FILE — not only through pg's options, which are properties
+ * of a client a caller supplies — and a statement that exceeds the bound is an answer of "I cannot
+ * ask", which this file has always treated as "somebody else may have it".
+ */
+describe('a coordinator that never answers is an answer, and it is recorded', () => {
+  const LEDGER = LEDGER_UUID
+
+  /**
+   * A timer that fires at the end of the current macrotask. Deterministic against this file's
+   * doubles rather than merely fast: a query that CAN answer resolves in microtasks, which always
+   * drain before the check phase, so this bound never fires for one that answers and always fires
+   * for one that does not.
+   */
+  const scheduleAtEndOfTurn = (fn: () => void) => {
+    const handle = setImmediate(fn)
+    return { clear: () => { clearImmediate(handle) } }
+  }
+
+  /** A client that swallows the statements a test names, and passes everything else through. */
+  const parkingClient = (inner: CoordinationClient, park: { matches: (sql: string) => boolean }) => ({
+    connect: () => inner.connect(),
+    end: () => inner.end(),
+    query: (sql: string, params?: unknown[]) =>
+      park.matches(sql) ? new Promise<{ rows: Array<Record<string, unknown>> }>(() => {}) : inner.query(sql, params),
+  })
+
+  test('a statement that never answers rejects, names itself, and latches before it throws', async () => {
+    const reasons: string[] = []
+    const bounded = boundCoordinationClient({
+      client: { connect: async () => {}, end: async () => {}, query: () => new Promise(() => {}) },
+      timeoutMs: 5,
+      onTimeout: (reason) => reasons.push(reason),
+      schedule: scheduleAtEndOfTurn,
+    })
+    await assert.rejects(
+      () => bounded.query('SELECT the_statement_under_test'),
+      (e: Error) => e instanceof CoordinationStatementTimeoutError
+        && /did not answer within 5ms/.test(e.message)
+        && /It may still be running on the server/.test(e.message)
+        && /SELECT the_statement_under_test/.test(e.message),
+    )
+    assert.equal(reasons.length, 1, 'the latch is set once, before the throw, whoever catches it')
+  })
+
+  test('a statement that DOES answer is not bounded, and its timer does not outlive it', async () => {
+    let cleared = 0
+    const bounded = boundCoordinationClient({
+      client: { connect: async () => {}, end: async () => {}, query: async () => ({ rows: [{ ok: true }] }) },
+      timeoutMs: 5,
+      schedule: (fn) => { const h = setImmediate(fn); return { clear: () => { cleared++; clearImmediate(h) } } },
+    })
+    assert.deepEqual((await bounded.query('SELECT 1')).rows, [{ ok: true }])
+    assert.equal(cleared, 1, 'a bound left armed after the answer is a timer leak per statement')
+  })
+
+  test('a rejection that arrives AFTER the bound has fired does not become an unhandled rejection', async () => {
+    // The process is about to abort over an irreversible write; taking it down with an unhandled
+    // rejection instead would lose the banner, which is the only place the outcome exists.
+    let failLate: (e: Error) => void = () => {}
+    const bounded = boundCoordinationClient({
+      client: {
+        connect: async () => {}, end: async () => {},
+        query: () => new Promise((_resolve, reject) => { failLate = reject }),
+      },
+      timeoutMs: 5,
+      schedule: scheduleAtEndOfTurn,
+    })
+    const unhandled: unknown[] = []
+    const onUnhandled = (e: unknown) => unhandled.push(e)
+    process.on('unhandledRejection', onUnhandled)
+    try {
+      await assert.rejects(() => bounded.query('SELECT 1'), CoordinationStatementTimeoutError)
+      failLate(new Error('the socket finally reset, long after anybody was listening'))
+      await new Promise((r) => setImmediate(r))
+      await new Promise((r) => setImmediate(r))
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+    }
+    assert.deepEqual(unhandled, [])
+  })
+
+  test('the pg client is told to give up too, and the three bounds are ordered', () => {
+    const config = coordinationClientConfig('postgres://example/ims')
+    assert.equal(config.statement_timeout, COORDINATION_STATEMENT_TIMEOUT_MS)
+    assert.ok(config.query_timeout > config.statement_timeout,
+      "PostgreSQL's own error is more use than a local stopwatch, so it is given the first chance")
+    assert.ok(COORDINATION_STATEMENT_BOUND_MS > config.query_timeout,
+      'and the local bound is last: it exists for the client on which neither option was ever set')
+    assert.equal(config.connectionTimeoutMillis, COORDINATION_STATEMENT_TIMEOUT_MS)
+    assert.equal(config.application_name, 'o3d_xero_live_cleanup_fence')
+  })
+
+  test('a held check that never answers AFTER a dispatch records the write instead of parking', async () => {
+    // The defect in one test. The request has gone; the coordinator then stops answering. Round 10
+    // awaited that answer forever, so the outcome of a write against a live ledger existed nowhere.
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('apply-host')
+    const park: { matches: (sql: string) => boolean } = { matches: () => false }
+    const fence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED,
+      createClient: () => parkingClient(session, park),
+      setKeepalive: noKeepalive, hostId: 'apply-host',
+      statementTimeoutMs: 5, scheduleStatementTimeout: scheduleAtEndOfTurn,
+    })
+    // Armed from INSIDE the request: before it, nothing would be dispatched at all, and after it
+    // the window this covers would already be closed.
+    const { impl, calls } = fakeFetch(() => {
+      park.matches = (sql: string) => sql === SHARED_FENCE_SQL.held
+      return response(200, { Invoices: [{ InvoiceID: 'inv-1', UpdatedDateUTC: '/Date(2000)/' }] })
+    })
+    const journal = new MutationJournal()
+    const disk: string[] = []
+    const writeLog = createWriteIntentLog({ tenantId: TENANT, append: (l) => disk.push(l) })
+
+    await assert.rejects(
+      () => performWrite({
+        transport: createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep }),
+        token: TOKEN, journal, writeLog, fence,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      (e: Error) => e instanceof WriteDispatchedWithoutExclusionError
+        && /outcome is COMMITTED/.test(e.message),
+    )
+    assert.equal(calls.length, 1, 'the request went out — that is why this cannot be prevented, only recorded')
+
+    // THE OUTCOME IS RECORDED. In the shared row, in the on-disk log, and in the run's own account.
+    const row = [...db.rows.values()][0]
+    assert.equal(row.state, 'committed', 'the scarcest thing in the run is not withheld')
+    assert.equal(row.heldThrough, false, 'and the window it went in is recorded as unconfirmed')
+    assert.match(String(row.heldThroughReason), /did not answer within 5ms/)
+    assert.equal(journal.unexcludedDispatchCount, 1)
+    assert.deepEqual(disk.map((l) => JSON.parse(l).event), ['intent', 'unexcluded', 'settled'])
+    assert.equal(scanWriteIntentLog(disk.join('\n')).unresolved.length, 1)
+
+    // And a second host refuses over it, which is the whole point of writing it down. This run
+    // lets the ledger go first, so what stops the next one is the ROW and not the lock.
+    await fence.release()
+    const other = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED,
+      createClient: () => db.session('host-b'), setKeepalive: noKeepalive, hostId: 'host-b',
+    })
+    assert.equal((await other.scanUnresolved()).length, 1)
+    await other.release()
+  })
+
+  test('a statement that never answers DURING acquisition refuses the run rather than parking it', async () => {
+    // The same bound, on the way in. Nothing has been dispatched here, so the outcome is simply a
+    // refusal — but a run that hangs before it starts is no more discoverable than one that hangs
+    // after, and both were possible.
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('host-a')
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', attestedCoordinator: ATTESTED,
+        createClient: () => parkingClient(session, { matches: (sql) => sql === SHARED_FENCE_SQL.session.recall }),
+        setKeepalive: noKeepalive, hostId: 'host-a',
+        statementTimeoutMs: 5, scheduleStatementTimeout: scheduleAtEndOfTurn,
+      }),
+      (e: Error) => e instanceof SharedCoordinatorUnavailableError && /did not answer within 5ms/.test(e.message),
+    )
+  })
+})
+
+// ===========================================================================
+/**
+ * THE GAP THE PREVIOUS ROUND REPORTED IN ITS OWN COVER: the behavioural tests could not exercise
+ * the production SQL, because the double paraphrased both the scan predicate and the settle
+ * statement in JavaScript. Reverting the real SQL broke one grammar assertion and nothing else.
+ *
+ * The paraphrase is gone — `runSelect`, `runInsert` and `runUpdate` execute the production strings
+ * — and these tests are the evidence for that claim rather than an assertion of it. They do the
+ * revert HERE, in the test, on a copy of the statement, and show that the answers move.
+ */
+describe('the double executes the production SQL, so reverting it moves the answers', () => {
+  /** One row per interesting shape, all for one ledger, so a predicate change is visible as a set difference. */
+  const rows = (): Array<Record<string, unknown>> => [
+    // A pre-migration row that was never settled: it holds on the STATE clause alone, which is the
+    // only row that can isolate the three-valued reading of `NOT IN` from the r11 clause.
+    { id: 'legacy-never-settled', tenantId: 'L', intendedAt: '0', state: null, heldThrough: null, heldThroughReason: null, exclusionProtocol: null },
+    { id: 'legacy-resolved', tenantId: 'L', intendedAt: '1', state: 'committed', heldThrough: null, heldThroughReason: null, exclusionProtocol: null },
+    { id: 'new-no-verdict', tenantId: 'L', intendedAt: '2', state: 'committed', heldThrough: null, heldThroughReason: null, exclusionProtocol: WRITE_EXCLUSION_PROTOCOL },
+    { id: 'new-confirmed', tenantId: 'L', intendedAt: '3', state: 'committed', heldThrough: true, heldThroughReason: null, exclusionProtocol: WRITE_EXCLUSION_PROTOCOL },
+    { id: 'new-refuted', tenantId: 'L', intendedAt: '4', state: 'committed', heldThrough: false, heldThroughReason: 'gone', exclusionProtocol: WRITE_EXCLUSION_PROTOCOL },
+    { id: 'never-settled', tenantId: 'L', intendedAt: '5', state: null, heldThrough: null, heldThroughReason: null, exclusionProtocol: WRITE_EXCLUSION_PROTOCOL },
+    { id: 'uninterpretable', tenantId: 'L', intendedAt: '6', state: 'commited', heldThrough: true, heldThroughReason: null, exclusionProtocol: WRITE_EXCLUSION_PROTOCOL },
+    { id: 'another-ledger', tenantId: 'OTHER', intendedAt: '7', state: null, heldThrough: null, heldThroughReason: null, exclusionProtocol: WRITE_EXCLUSION_PROTOCOL },
+  ]
+  const held = (sql: string) => runSelect(sql, ['L'], rows()).map((r) => r.id)
+
+  test('the production predicate holds exactly the rows nobody has accounted for', () => {
+    assert.deepEqual(held(SHARED_FENCE_SQL.scan),
+      ['legacy-never-settled', 'new-no-verdict', 'new-refuted', 'never-settled', 'uninterpretable'])
+  })
+
+  test('REVERTING r11 finding 1 in the predicate changes what the double returns', () => {
+    // Round 10's scan, reconstructed by removing the clause this round added. A double that
+    // paraphrased the rule would answer identically for both, which is precisely why reverting the
+    // production SQL used to break nothing.
+    const roundTen = SHARED_FENCE_SQL.scan.replace(' OR ("exclusionProtocol" IS NOT NULL AND "heldThrough" IS NULL)', '')
+    assert.notEqual(roundTen, SHARED_FENCE_SQL.scan, 'the clause must be there to be removed')
+    assert.deepEqual(held(roundTen), ['legacy-never-settled', 'new-refuted', 'never-settled', 'uninterpretable'])
+    // THE ROW THE FINDING IS ABOUT: a write this era dispatched, settled, and never given a
+    // verdict. Round 10 let it go; this round holds it.
+    assert.ok(!held(roundTen).includes('new-no-verdict'))
+    assert.ok(held(SHARED_FENCE_SQL.scan).includes('new-no-verdict'))
+  })
+
+  test('REVERTING r8 finding 3 in the predicate changes what the double returns', () => {
+    // The other rule in the same statement, checked the same way: the complement of the resolved
+    // vocabulary. Round 7 asked `state = 'unknown'`, which dropped every value nobody can interpret.
+    const roundSeven = SHARED_FENCE_SQL.scan
+      .replace(`"state" NOT IN ('committed', 'not-committed')`, `"state" = 'unknown'`)
+    assert.ok(!held(roundSeven).includes('uninterpretable'), "a settlement nobody can read used to vanish")
+    assert.ok(held(SHARED_FENCE_SQL.scan).includes('uninterpretable'))
+  })
+
+  test('three-valued logic is executed, not JavaScript truthiness', () => {
+    // `NULL NOT IN (...)` is NULL and a WHERE keeps only TRUE, which is the entire reason the state
+    // clause spells `"state" IS NULL` out separately. Removing that spelling must lose the row.
+    const withoutNullClause = SHARED_FENCE_SQL.scan.replace('"state" IS NULL OR ', '')
+    assert.ok(!held(withoutNullClause).includes('legacy-never-settled'),
+      'a NULL state does not satisfy NOT IN — it answers UNKNOWN, and UNKNOWN is not kept')
+    assert.ok(held(SHARED_FENCE_SQL.scan).includes('legacy-never-settled'))
+    // And the row that also carries a stamp survives the same removal, on the OTHER clause — the
+    // two rules are independent, and a test that could not tell them apart would be measuring one.
+    assert.ok(held(withoutNullClause).includes('never-settled'))
+  })
+
+  test('the SELECT list is executed too, so a column the statement forgets is a column the fence loses', () => {
+    const withoutProtocol = SHARED_FENCE_SQL.scan.replace(', "exclusionProtocol" FROM', ' FROM')
+    const [row] = runSelect(withoutProtocol, ['L'], rows().filter((r) => r.id === 'new-no-verdict'))
+    assert.ok(!('exclusionProtocol' in row), 'the projection is real, not an afterthought')
+  })
+
+  test('the settle statement is executed, and its run predicate is the real one', () => {
+    const table = rows()
+    const settled = runUpdate(SHARED_FENCE_SQL.settle, ['new-no-verdict', 'runA', 'committed', 'HTTP 200', 'now', true, null], table)
+    assert.deepEqual(settled, [], "no row has runId 'runA', so a settlement predicated on the run matches nothing")
+    const target = table.find((r) => r.id === 'new-no-verdict') as Record<string, unknown>
+    target.runId = 'runA'
+    assert.equal(runUpdate(SHARED_FENCE_SQL.settle, ['new-no-verdict', 'runA', 'committed', 'HTTP 200', 'now', true, 'why'], table).length, 1)
+    assert.equal(target.heldThrough, true, 'both halves land in the one statement')
+    assert.equal(target.heldThroughReason, 'why')
+  })
+
+  test('the INSERT is executed, so the stamp is the one in the statement and the rest come from DEFAULTs', () => {
+    const row = runInsert(SHARED_FENCE_SQL.intend, ['i', 'r', 'L', 'h', 'k', 'l', 'POST', 'p', 'when'], INTENT_TABLE_DEFAULTS)
+    assert.equal(row.exclusionProtocol, WRITE_EXCLUSION_PROTOCOL, 'read out of the statement, not hard-coded here')
+    assert.equal(row.heldThrough, null, 'an intent that has not been dispatched has nothing to say about the window')
+    assert.equal(row.state, null)
+  })
+
+  test('a statement the evaluator does not understand FAILS, rather than being skipped', () => {
+    // The property that keeps this honest as the SQL grows: a construct outside the grammar stops
+    // the tests instead of quietly evaluating to something else.
+    assert.throws(() => runSelect('SELECT "a" FROM "t" WHERE "a" >= $1 ORDER BY "a"', [1], []), /does not understand/)
+    assert.throws(() => runSelect('SELECT "a" FROM "t" WHERE lower("a") = $1 ORDER BY "a"', ['x'], []), /expected a quoted identifier/)
+    assert.throws(() => runSelect(`${SHARED_FENCE_SQL.scan} LIMIT 5`, ['L'], []), /did not consume all of/)
+  })
+})
+
+// ===========================================================================
+describe('publishing an artefact says WHICH failure it hit, because the fixes differ', () => {
+  test('a filesystem that refuses the claim is not reported as another run taking the name', async () => {
+    // EEXIST is r11 finding 3; EACCES is a directory this run cannot write to. Reporting the second
+    // as the first would send an operator hunting for a concurrent run that does not exist.
+    const fence = { assertStillHeld: async () => {} }
+    await assert.rejects(
+      () => persistUnderFence({
+        fence, path: '/nowhere/plan.json', body: 'x', what: 'the reviewed plan',
+        io: {
+          write: () => {},
+          publish: () => { throw new Error('must not publish') },
+          claim: () => { throw Object.assign(new Error('permission denied'), { code: 'EACCES' }) },
+          discard: () => { throw new Error('must not discard: the artefact was never published') },
+          snapshot: () => null,
+        },
+      }),
+      (e: Error) => e instanceof StagedArtefactStrandedError
+        && !(e instanceof ArtefactTargetChangedError)
+        && /this is the filesystem refusing rather than/.test(e.message)
+        && /THIS RUN'S THE REVIEWED PLAN IS AT: \/nowhere\/plan\.json\./.test(e.message),
+    )
+  })
+
+  test('a published artefact whose staged copy will not go is named, and says it WAS published', async () => {
+    const fence = { assertStillHeld: async () => {} }
+    await assert.rejects(
+      () => persistUnderFence({
+        fence, path: '/nowhere/plan.json', body: 'x', what: 'the reviewed plan',
+        io: {
+          write: () => {},
+          publish: () => { throw new Error('must not publish') },
+          claim: () => {},
+          discard: () => { throw new Error('EACCES: permission denied, unlink') },
+          snapshot: () => null,
+        },
+      }),
+      (e: Error) => e instanceof StagedArtefactStrandedError
+        && /WAS published to \/nowhere\/plan\.json — that part succeeded/.test(e.message)
+        && /DELETE IT BY HAND/.test(e.message),
+    )
   })
 })

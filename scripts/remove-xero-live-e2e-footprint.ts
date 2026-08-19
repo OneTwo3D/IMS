@@ -200,9 +200,29 @@
  * — by establishing that no OTHER run was writing in that window — and the banner prints the
  * separate instruction for it.
  *
+ * A MISSING VERDICT IS ALSO A HELD ROW (r11 finding 1), and this is the case to know about if an
+ * OLDER BUILD of this script is still deployed anywhere. Every intent recorded from here on is
+ * stamped with the protocol that recorded it, and a stamped row whose `heldThrough` is NULL is a
+ * dispatched write whose exclusion nobody wrote down — held, and cleared by the same reading as a
+ * refuted one. Rows written before the column existed carry no stamp and are unaffected. An old
+ * build's INSERT does not name the column, so the DEFAULT stamps it anyway and its writes are held
+ * to the same rule; an operator's UPDATE that settles `state` and stops there is held for the same
+ * reason, and the banner prints both statements it needs.
+ *
+ * NOTHING WAITS FOREVER FOR THE COORDINATOR (r11 finding 2). Every statement to it is bounded, in
+ * this process as well as through PostgreSQL's own `statement_timeout`, and a statement that
+ * exceeds the bound is read as "I could not ask" — which for a check that follows a dispatch means
+ * the write is recorded as unexcluded rather than the run parking with the outcome unrecorded.
+ *
+ * TWO RUNS POINTED AT ONE --plan-out DO NOT REPLACE EACH OTHER'S PLAN (r11 finding 3). The name is
+ * TAKEN atomically when nothing holds it, and replaced only when what is under it is still what
+ * this run found there; otherwise the run refuses and names both files, because an operator may
+ * already have reviewed the one on disk.
+ *
  * BEFORE THE FIRST RUN ON A DATABASE that has not seen this table, apply the migrations —
- * `npm run db:migrate:deploy` (prisma/migrations/20260819090000_xero_live_write_intents and
- * 20260819160000_xero_live_write_intent_exclusion). Until they are applied the fence cannot be read
+ * `npm run db:migrate:deploy` (prisma/migrations/20260819090000_xero_live_write_intents,
+ * 20260819160000_xero_live_write_intent_exclusion and
+ * 20260819200000_xero_live_write_intent_protocol). Until they are applied the fence cannot be read
  * or written as this script expects, and this script refuses to start rather than proceeding
  * without it; that is the intended direction, but the refusal names a missing relation rather than
  * a missing migration, so it is worth doing first.
