@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
@@ -10,19 +11,62 @@ import {
 } from '@/lib/connectors/xero/tenant-guard'
 
 /**
- * What the TOKEN ROW says about its own binding (o3d-9tbz r6) — the three states an absent pin can be in.
+ * What the TOKEN ROW says about its own binding (o3d-9tbz r6, r7) — the states an absent pin can be in.
  *
  * These are not decoration. `storedXeroConnectionRefusal` now takes them as a required argument, because
- * the hole this round closes was an absent value being read as permission: BOUND with no pin beside it
- * is the bypass, and the other two are the states that must keep working.
+ * the hole r6 closed was an absent value being read as permission: BOUND with no pin beside it is the
+ * bypass, and the other two are the states that must keep working.
+ *
+ * r7 adds the one the receipt itself can be wrong in. A release is exempt because of what it says about
+ * THIS row, so the same timestamp on a row it does not describe is not a smaller version of the same
+ * evidence — it is evidence about something else, and STALE_RELEASE_* are what tell them apart.
  */
 /** Written by a binding: the transaction that minted this marker wrote the pin in the same breath. */
-const BOUND: XeroStoredBinding = { connectionGeneration: 'gen-a1b2', pinReleasedAt: null }
+const BOUND: XeroStoredBinding = {
+  connectionGeneration: 'gen-a1b2', pinReleasedAt: null,
+  pinReleasedGeneration: null, pinReleasedTenantId: null,
+}
 /** A row from before the marker existed. Evidence of nothing — every pre-pin installation is here. */
-const PRE_MARKER: XeroStoredBinding = { connectionGeneration: null, pinReleasedAt: null }
-/** The documented recovery's receipt: --clear-tenant-pin deleted the pin and stamped this together. */
+const PRE_MARKER: XeroStoredBinding = {
+  connectionGeneration: null, pinReleasedAt: null,
+  pinReleasedGeneration: null, pinReleasedTenantId: null,
+}
+/**
+ * The documented recovery's receipt: --clear-tenant-pin deleted the pin and stamped all three columns
+ * in one transaction. The receipt names the connection it released and the pin it deleted — which, on a
+ * whole binding, is this row's generation and this row's organisation.
+ */
 const RELEASED: XeroStoredBinding = {
   connectionGeneration: 'gen-a1b2', pinReleasedAt: new Date('2026-08-19T09:00:00.000Z'),
+  pinReleasedGeneration: 'gen-a1b2', pinReleasedTenantId: 'e7fb4378-live-org',
+}
+/**
+ * A receipt that has OUTLIVED the connection it was written for: released under gen-a1b2, and the row
+ * has since been rebound. Nothing in IMS produces this — a binding clears the receipt and a refresh
+ * carries it with the row it belongs to — which is the point: it is what a restored accounting_tokens
+ * dump, taken while a release was outstanding, looks like on top of a connection made afterwards.
+ */
+const STALE_RELEASE_OTHER_CONNECTION: XeroStoredBinding = {
+  connectionGeneration: 'gen-c3d4', pinReleasedAt: new Date('2026-08-19T09:00:00.000Z'),
+  pinReleasedGeneration: 'gen-a1b2', pinReleasedTenantId: 'e7fb4378-live-org',
+}
+/**
+ * A receipt for a pin that named a DIFFERENT organisation from the token it is sitting beside — what
+ * releasing one half of an already-SPLIT binding leaves behind. Deleting one side of a contradiction
+ * does not resolve it, so this must not end the refusal.
+ */
+const STALE_RELEASE_OTHER_ORG: XeroStoredBinding = {
+  connectionGeneration: 'gen-a1b2', pinReleasedAt: new Date('2026-08-19T09:00:00.000Z'),
+  pinReleasedGeneration: 'gen-a1b2', pinReleasedTenantId: '5c949ed5-demo-org',
+}
+/**
+ * A release stamped with no record of WHICH pin it released: what a pre-r7 receipt looks like if it
+ * arrives without the backfill (a row inserted by hand, or restored from a dump of the old shape into
+ * the new table). Exempt-by-presence was the finding, so an unqualified receipt cannot be honoured.
+ */
+const UNQUALIFIED_RELEASE: XeroStoredBinding = {
+  connectionGeneration: 'gen-a1b2', pinReleasedAt: new Date('2026-08-19T09:00:00.000Z'),
+  pinReleasedGeneration: null, pinReleasedTenantId: null,
 }
 
 /**
@@ -862,7 +906,7 @@ test('NO pin beside a token is not a MISMATCH — there is nothing to compare', 
 test('a pin that was DELETED is refused: the token row still carries its binding marker', () => {
   const message = xeroMissingPinRefusal(LIVE, BOUND) ?? ''
 
-  assert.equal(xeroPinAbsenceVerdict(BOUND), 'lost')
+  assert.equal(xeroPinAbsenceVerdict(BOUND, LIVE.tenantId), 'lost')
   assert.match(message, /has lost its pin/)
   assert.match(message, /OneTwo3D Ltd/, 'the organisation the token belongs to, by name')
   assert.match(message, new RegExp(LIVE.tenantId), 'and by id')
@@ -885,7 +929,7 @@ test('the deleted-pin refusal is performable, and does not send the operator rou
 test('a RELEASED connection is not refused — the documented recovery must still work', () => {
   // scripts/provision-xero-demo.ts --clear-tenant-pin deletes the pin and stamps the token row in one
   // transaction. That receipt is the whole difference between a deliberate release and a deletion.
-  assert.equal(xeroPinAbsenceVerdict(RELEASED), 'released')
+  assert.equal(xeroPinAbsenceVerdict(RELEASED, LIVE.tenantId), 'released')
   assert.equal(xeroMissingPinRefusal(LIVE, RELEASED), null)
   assert.equal(storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, null, RELEASED), null)
 })
@@ -893,18 +937,108 @@ test('a RELEASED connection is not refused — the documented recovery must stil
 test('a token row from before the marker existed is exempt, exactly as it was in r5', () => {
   // Every installation connected before this column shipped is in this state, and none of them may go
   // offline on the deploy that adds it. The row is evidence of nothing, so it is not read as evidence.
-  assert.equal(xeroPinAbsenceVerdict(PRE_MARKER), 'never-established')
+  assert.equal(xeroPinAbsenceVerdict(PRE_MARKER, LIVE.tenantId), 'never-established')
   assert.equal(xeroMissingPinRefusal(LIVE, PRE_MARKER), null)
 })
 
 test('a blank generation is not a marker — an empty string proves nothing', () => {
-  assert.equal(xeroPinAbsenceVerdict({ connectionGeneration: '  ', pinReleasedAt: null }), 'never-established')
+  assert.equal(
+    xeroPinAbsenceVerdict(
+      { connectionGeneration: '  ', pinReleasedAt: null, pinReleasedGeneration: null, pinReleasedTenantId: null },
+      LIVE.tenantId,
+    ),
+    'never-established',
+  )
 })
 
 test('a release outranks the generation, or the recovery would halt the instance it recovers', () => {
   // A released connection has BOTH markers: it was bound (generation) and then deliberately unpinned
   // (receipt). Reading them the other way round refuses every rig that follows the runbook.
-  assert.equal(xeroPinAbsenceVerdict({ ...BOUND, pinReleasedAt: new Date() }), 'released')
+  assert.equal(
+    xeroPinAbsenceVerdict(
+      { ...BOUND, pinReleasedAt: new Date(), pinReleasedGeneration: BOUND.connectionGeneration, pinReleasedTenantId: LIVE.tenantId },
+      LIVE.tenantId,
+    ),
+    'released',
+  )
+})
+
+// --- a release receipt cannot outlive what it released (r7) --------------------
+//
+// r6's receipt recorded only THAT a release happened. Nothing that happened to the row afterwards
+// could contradict it, so it was exempt-by-presence: restore an accounting_tokens dump taken while a
+// release was outstanding, and the exemption lands on whatever binding is there now — the cross-backup
+// restore this refusal exists for, arriving through the escape hatch instead of round it.
+
+test('a receipt for ANOTHER connection is stale, and does not exempt the row it is sitting on', () => {
+  // The restored-dump case: released under gen-a1b2, and this row has been bound since (gen-c3d4).
+  assert.equal(xeroPinAbsenceVerdict(STALE_RELEASE_OTHER_CONNECTION, LIVE.tenantId), 'stale-release')
+  assert.notEqual(xeroMissingPinRefusal(LIVE, STALE_RELEASE_OTHER_CONNECTION), null)
+})
+
+test('the stale-release refusal is its own message, not the lost-pin one', () => {
+  // Different history, different thing to go and look at: "a pin was written beside this token and
+  // something removed it" would send the operator to check the settings table, and the settings table
+  // is not where this went wrong.
+  const message = xeroMissingPinRefusal(LIVE, STALE_RELEASE_OTHER_CONNECTION) ?? ''
+
+  assert.match(message, /release receipt that does not describe it/)
+  assert.doesNotMatch(message, /has lost its pin/)
+  assert.match(message, /gen-a1b2/, 'the connection the receipt released')
+  assert.match(message, /gen-c3d4/, 'and the connection this token actually belongs to')
+  assert.match(message, /No Xero request was made/)
+})
+
+test('the stale-release refusal is performable, and says why re-running the recovery will not help', () => {
+  const message = xeroMissingPinRefusal(LIVE, STALE_RELEASE_OTHER_CONNECTION) ?? ''
+
+  assert.match(message, /press Disconnect/, 'the one action that clears both halves')
+  assert.match(message, /nothing in the server .env needs editing/i)
+  assert.match(message, /--clear-tenant-pin will not clear this/,
+    'the obvious next thing to try, refused before it is tried')
+  assert.match(message, /OneTwo3D Ltd/, 'and where the posting went, for the audit')
+})
+
+test('releasing one half of a SPLIT binding does not end the refusal', () => {
+  // --clear-tenant-pin on an instance whose pin named one organisation and whose token names another.
+  // The pin is gone, but the contradiction is not resolved — the receipt records the organisation the
+  // deleted pin named, and it is not this token's.
+  assert.equal(xeroPinAbsenceVerdict(STALE_RELEASE_OTHER_ORG, LIVE.tenantId), 'stale-release')
+  const message = xeroMissingPinRefusal(LIVE, STALE_RELEASE_OTHER_ORG) ?? ''
+  assert.match(message, /released a pin naming organisation 5c949ed5-demo-org/)
+  assert.match(message, /OneTwo3D Ltd/)
+})
+
+test('a receipt that does not say WHAT it released is not honoured', () => {
+  // Exempt-by-presence was the finding, so the absence of the qualifying half cannot be read as
+  // "qualified for everything". This is also the shape a hand-inserted row arrives in.
+  assert.equal(xeroPinAbsenceVerdict(UNQUALIFIED_RELEASE, LIVE.tenantId), 'stale-release')
+  assert.match(xeroMissingPinRefusal(LIVE, UNQUALIFIED_RELEASE) ?? '', /does not record which pin it released/)
+})
+
+test('a valid release is compared the way every other id here is — case and space are not a change', () => {
+  assert.equal(
+    xeroPinAbsenceVerdict({ ...RELEASED, pinReleasedTenantId: ` ${LIVE.tenantId.toUpperCase()} ` }, LIVE.tenantId),
+    'released',
+  )
+})
+
+test('a stale release is refused BEFORE the allow-list, exactly as a lost pin is', () => {
+  // Same reason: "permit the stored organisation in the .env" is not a remedy for a token row whose
+  // binding record belongs to something else, and performing it faithfully changes nothing.
+  const message = storedXeroConnectionRefusal(LIVE, DEMO_BY_ID, null, STALE_RELEASE_OTHER_CONNECTION) ?? ''
+
+  assert.match(message, /release receipt that does not describe it/)
+  assert.doesNotMatch(message, /allow-list forbids/)
+})
+
+test('a PRESENT pin is still compared first, stale receipt or not', () => {
+  // The receipt only ever answers the question "why is there no pin". An instance that HAS one gets the
+  // mismatch message, which is about the two organisations rather than about the paperwork.
+  assert.match(
+    storedXeroConnectionRefusal(LIVE, NO_ALLOW_LIST, DEMO.tenantId, STALE_RELEASE_OTHER_CONNECTION) ?? '',
+    /bound to two different Xero organisations at once/,
+  )
 })
 
 test('the lost pin is refused BEFORE the allow-list, whose remedy would not repair it', () => {
@@ -954,4 +1088,25 @@ test('a winner with no name still produces a usable refusal', () => {
   // The pin can be committed before the winning token row is readable. An id alone is still actionable.
   const message = xeroTenantBindingRaceMessage({ attempted: DEMO, boundTo: { tenantId: LIVE.tenantId } })
   assert.match(message, /\(unnamed organisation\) \[tenantId e7fb4378-live-org\]/)
+})
+
+test('the receipt migration BACKFILLS outstanding releases, so the deploy halts nobody', () => {
+  // The new columns qualify the receipt, and a release that is outstanding when they arrive would
+  // otherwise be unqualified — i.e. stale — the moment the code that reads them ships. That would halt
+  // exactly the rigs that had followed the runbook and were waiting for a human to re-consent. The
+  // backfill stamps each of them with its own row's values, which is what they would have recorded had
+  // the columns existed, so today's state is preserved and tomorrow's change still makes it stale.
+  const sql = readFileSync(
+    new URL('../../prisma/migrations/20260819180000_accounting_token_pin_release_receipt/migration.sql', import.meta.url),
+    'utf8',
+  )
+  const statements = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n')
+
+  assert.match(statements, /ADD COLUMN "pinReleasedGeneration"/)
+  assert.match(statements, /ADD COLUMN "pinReleasedTenantId"/)
+  assert.match(
+    statements.replace(/\s+/g, ' '),
+    /UPDATE "accounting_tokens" SET "pinReleasedGeneration" = "connectionGeneration", "pinReleasedTenantId" = "tenantId" WHERE "pinReleasedAt" IS NOT NULL/,
+    'an outstanding release must be stamped with its own row\'s values, not left unqualified',
+  )
 })

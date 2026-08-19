@@ -18,7 +18,7 @@ import { clearXeroReferenceCache } from './api'
 import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from './scopes'
 import {
   demoOrgConnectRefusal, nameOnlyGuardWarning, readXeroTenantAllowList, selectXeroTenant,
-  storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroTenantBindingRaceMessage,
+  storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroPinAbsenceVerdict, xeroTenantBindingRaceMessage,
   type XeroConnectionSummary, type XeroStoredBinding, type XeroTenantAllowList,
 } from './tenant-guard'
 
@@ -87,8 +87,15 @@ type StoredAccountingToken = {
    * before a release must not carry a stale "not released" back over a row that has since been
    * released, because that would silently re-arm the missing-pin halt about half an hour after an
    * operator performed a documented recovery correctly.
+   *
+   * The two fields beside it are what the release was FOR (r7) — the generation this row carried at the
+   * release, and the organisation the deleted pin named. They travel with `pinReleasedAt` everywhere:
+   * written together, carried together, cleared together, and compared together at the write. A receipt
+   * that can be separated from the state it describes is the r7 finding.
    */
   pinReleasedAt: Date | null
+  pinReleasedGeneration: string | null
+  pinReleasedTenantId: string | null
 }
 
 type OAuthStatePayload = {
@@ -142,6 +149,8 @@ async function readStoredToken(): Promise<StoredAccountingToken | null> {
     tenantIsDemo: row.tenantIsDemo ?? null,
     connectionGeneration: row.connectionGeneration ?? null,
     pinReleasedAt: row.pinReleasedAt ?? null,
+    pinReleasedGeneration: row.pinReleasedGeneration ?? null,
+    pinReleasedTenantId: row.pinReleasedTenantId ?? null,
   }
 }
 
@@ -177,6 +186,8 @@ function storedTokenRow(params: StoredTokenWrite, markers: XeroStoredBinding) {
     tenantIsDemo: params.tenantIsDemo,
     connectionGeneration: markers.connectionGeneration,
     pinReleasedAt: markers.pinReleasedAt,
+    pinReleasedGeneration: markers.pinReleasedGeneration,
+    pinReleasedTenantId: markers.pinReleasedTenantId,
   }
 }
 
@@ -251,6 +262,11 @@ async function storeRefreshedToken(previous: StoredAccountingToken, params: Stor
       // the missing-pin halt roughly half an hour after an operator performed the documented recovery
       // correctly — a refusal manufactured by the fix, aimed at somebody who did the right thing.
       pinReleasedAt: previous.pinReleasedAt,
+      // ...and the receipt's two halves with it (r7). They move only when `pinReleasedAt` moves, so
+      // comparing them adds no new way for an ordinary refresh to miss; what it adds is that a refresh
+      // can never be the writer that separates a receipt from the state it describes.
+      pinReleasedGeneration: previous.pinReleasedGeneration,
+      pinReleasedTenantId: previous.pinReleasedTenantId,
     },
     // A refresh is the same connection continuing, so it carries the markers it read rather than minting
     // or clearing them. Writing a new generation here would make every refresh look like a rebinding to
@@ -259,6 +275,8 @@ async function storeRefreshedToken(previous: StoredAccountingToken, params: Stor
     data: storedTokenRow(params, {
       connectionGeneration: previous.connectionGeneration,
       pinReleasedAt: previous.pinReleasedAt,
+      pinReleasedGeneration: previous.pinReleasedGeneration,
+      pinReleasedTenantId: previous.pinReleasedTenantId,
     }),
   })
   return count > 0
@@ -293,12 +311,28 @@ async function readPinnedTenantId(): Promise<string | null> {
 async function getExpectedTenantId(): Promise<string | null> {
   const token = await db.accountingToken.findUnique({
     where: { connector: XERO_CONNECTOR },
-    select: { tenantId: true, pinReleasedAt: true },
+    select: {
+      tenantId: true, connectionGeneration: true,
+      pinReleasedAt: true, pinReleasedGeneration: true, pinReleasedTenantId: true,
+    },
   })
   const stored = await getSettingValue(XERO_EXPECTED_TENANT_KEY)
   if (stored) return stored
-  if (token?.pinReleasedAt != null) return null
-  return token?.tenantId ?? null
+  if (!token) return null
+  // Only a release that still DESCRIBES this row suspends the fallback (r7). The suspension is a
+  // privilege — it is what lets a consent name an organisation this instance has never been bound to —
+  // so it is granted on the same evidence the halt is, and by the same function, rather than on the
+  // presence of a timestamp. A row whose receipt has come apart from it is refused by
+  // `xeroMissingPinRefusal` anyway; answering with its own organisation here keeps the two consistent,
+  // so a reconnect to the organisation the token names still repairs it.
+  const verdict = xeroPinAbsenceVerdict({
+    connectionGeneration: token.connectionGeneration ?? null,
+    pinReleasedAt: token.pinReleasedAt ?? null,
+    pinReleasedGeneration: token.pinReleasedGeneration ?? null,
+    pinReleasedTenantId: token.pinReleasedTenantId ?? null,
+  }, token.tenantId)
+  if (verdict === 'released') return null
+  return token.tenantId ?? null
 }
 
 /**
@@ -363,7 +397,12 @@ async function bindXeroTenant(params: {
       // ...and no release: a binding writes a pin, so whatever release was outstanding is over. It is
       // cleared HERE, in the transaction that writes the pin, rather than by the recovery script, so the
       // exemption lasts exactly as long as the state it describes (r6).
-      const data = storedTokenRow(token, { connectionGeneration: newConnectionGeneration(), pinReleasedAt: null })
+      const data = storedTokenRow(token, {
+        connectionGeneration: newConnectionGeneration(),
+        pinReleasedAt: null,
+        pinReleasedGeneration: null,
+        pinReleasedTenantId: null,
+      })
       await tx.accountingToken.upsert({ where: { connector: XERO_CONNECTOR }, create: data, update: data })
     })
     return { ok: true }
@@ -534,6 +573,7 @@ export async function getStoredTenantBlockReason(): Promise<string | null> {
       select: {
         tenantId: true, tenantName: true, tenantIsDemo: true,
         connectionGeneration: true, pinReleasedAt: true,
+        pinReleasedGeneration: true, pinReleasedTenantId: true,
       },
     }),
     readPinnedTenantId(),
@@ -543,7 +583,12 @@ export async function getStoredTenantBlockReason(): Promise<string | null> {
     { tenantId: row.tenantId, tenantName: row.tenantName, isDemoCompany: row.tenantIsDemo ?? null },
     readXeroTenantAllowList(),
     pinnedTenantId,
-    { connectionGeneration: row.connectionGeneration ?? null, pinReleasedAt: row.pinReleasedAt ?? null },
+    {
+      connectionGeneration: row.connectionGeneration ?? null,
+      pinReleasedAt: row.pinReleasedAt ?? null,
+      pinReleasedGeneration: row.pinReleasedGeneration ?? null,
+      pinReleasedTenantId: row.pinReleasedTenantId ?? null,
+    },
   )
 }
 
@@ -560,7 +605,12 @@ function storedSummary(token: StoredAccountingToken): XeroConnectionSummary {
  * token.
  */
 function storedBinding(token: StoredAccountingToken): XeroStoredBinding {
-  return { connectionGeneration: token.connectionGeneration, pinReleasedAt: token.pinReleasedAt }
+  return {
+    connectionGeneration: token.connectionGeneration,
+    pinReleasedAt: token.pinReleasedAt,
+    pinReleasedGeneration: token.pinReleasedGeneration,
+    pinReleasedTenantId: token.pinReleasedTenantId,
+  }
 }
 
 /**

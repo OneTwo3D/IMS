@@ -21,6 +21,7 @@
  */
 import { Client } from 'pg'
 import { xeroGet } from '../../../lib/connectors/xero/api.ts'
+import { xeroPinAbsenceVerdict } from '../../../lib/connectors/xero/tenant-guard.ts'
 import { checkBuildFreshness } from './build-freshness.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
@@ -85,8 +86,10 @@ export async function preflight(): Promise<PreflightReport> {
     // --- Xero connection + tenant identity
     const tok = await db.query<{
       tenantName: string; tenantId: string; connectionGeneration: string | null; pinReleasedAt: Date | null
+      pinReleasedGeneration: string | null; pinReleasedTenantId: string | null
     }>(
-      `select "tenantName", "tenantId", "connectionGeneration", "pinReleasedAt"
+      `select "tenantName", "tenantId", "connectionGeneration", "pinReleasedAt",
+              "pinReleasedGeneration", "pinReleasedTenantId"
          from accounting_tokens where connector = 'xero'`,
     )
     if (!tok.rows.length) {
@@ -134,14 +137,36 @@ export async function preflight(): Promise<PreflightReport> {
       // as far as a spec is concerned: the failures land later, on whatever posts first. Diagnosed here
       // instead, because the state is one hand-run DELETE (or one settings-only restore) away and the
       // rig is exactly where somebody does that.
-      const { connectionGeneration, pinReleasedAt } = tok.rows[0]
-      if (!pin.rows.length && connectionGeneration !== null && pinReleasedAt === null) {
+      // Asked through the SAME function the sync path uses, rather than re-stated in SQL: a preflight
+      // that diagnoses the halt with its own copy of the rule can disagree with the rule, and the
+      // failure mode is a green preflight in front of an instance that will not post (o3d-9tbz r7).
+      const verdict = !pin.rows.length
+        ? xeroPinAbsenceVerdict({
+          connectionGeneration: tok.rows[0].connectionGeneration,
+          pinReleasedAt: tok.rows[0].pinReleasedAt,
+          pinReleasedGeneration: tok.rows[0].pinReleasedGeneration,
+          pinReleasedTenantId: tok.rows[0].pinReleasedTenantId,
+        }, tenantId)
+        : null
+      if (verdict === 'lost') {
         problems.push(
           `The Xero tenant pin (xero_expected_tenant_id) is missing, but the token row still carries the ` +
             `connection marker its binding minted — so the pin was deleted rather than released, and IMS ` +
             `halts every Xero sync until it is resolved. Fix it by disconnecting on /sync and connecting ` +
-            `again, or — to be unpinned on purpose — run provision-xero-demo.ts --clear-tenant-pin, which ` +
-            `records the release on the token row in the same transaction.`,
+            `again, or — to be unpinned on purpose — run provision-xero-demo.ts --clear-tenant-pin BEFORE ` +
+            `the pin goes, which records the release on the token row in the same transaction. Running that ` +
+            `flag now will not lift the halt: it records a release only when it is the statement that ` +
+            `deletes the pin.`,
+        )
+      }
+      if (verdict === 'stale-release') {
+        problems.push(
+          `The Xero tenant pin is missing and the token row carries a pin-release receipt that does not ` +
+            `describe it — it released connection ${tok.rows[0].pinReleasedGeneration ?? '(none)'} / pin ` +
+            `${tok.rows[0].pinReleasedTenantId ?? '(none recorded)'}, and this token is connection ` +
+            `${tok.rows[0].connectionGeneration ?? '(none)'} on ${tenantId}. IMS halts every Xero sync in ` +
+            `that state. The usual cause here is an accounting_tokens table restored from a backup taken ` +
+            `while a release was outstanding. Fix it by disconnecting on /sync and connecting again.`,
         )
       }
     }

@@ -77,6 +77,7 @@ So:
   | No connection marker | Connected before this shipped | Keeps working, as before |
   | Released by `--clear-tenant-pin` | Deliberately unpinned, awaiting a re-consent | Keeps working |
   | Carries a connection marker, pin gone | The pin was deleted or lost | **Sync halted** |
+  | Carries a release for a *different* connection | Paperwork that came apart from its row | **Sync halted** |
 
   The marker is minted by the connect that wrote the pin, in the same transaction, and **Disconnect**
   removes the token and the pin together — so a token that has outlived its pin can only mean the pin
@@ -90,6 +91,23 @@ So:
   token row in one transaction, or simply press **Disconnect**. A release ends by itself at the next
   connect, and while it is outstanding the consent is free to land on the rebuilt organisation's new
   tenantId — but it still will not guess between two organisations.
+
+  **A release describes one connection, and stops applying when that connection changes.** The receipt
+  records which connection it released and which pin it deleted, so it cannot be inherited by a
+  different binding: an `accounting_tokens` table restored from a backup taken while a release was
+  outstanding lands on a connection the release knows nothing about, and IMS halts rather than honouring
+  it. Two consequences worth knowing:
+
+  - Run `--clear-tenant-pin` **before** the pin goes. It records a release only when it is the statement
+    that deletes the pin, so running it on an instance whose pin has already vanished changes nothing
+    and does not lift the halt — that is **Disconnect**'s job.
+  - Releasing one half of an instance that is *already* bound to two organisations does not end that
+    refusal. The receipt names the pin it deleted, which is not the token's organisation, so the
+    contradiction stays visible instead of being deleted away.
+- **A full database reset removes both halves together.** Settings → *Reset database* at the *full*
+  level deletes the token and the pin in one transaction, so it can never leave a token whose pin has
+  gone — the state above, which would otherwise be reported as tampering to somebody who had merely
+  reset an instance. If a reset fails part-way, the connection is left whole rather than half-deleted.
 - **A token refresh belongs to one connection, not just one organisation.** Each binding stamps the
   token row with a connection generation, and a refresh only writes back if that generation is still
   there. So a refresh that was in flight while somebody disconnected and reconnected — even to the

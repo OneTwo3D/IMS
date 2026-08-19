@@ -221,6 +221,13 @@ it will **not** restore stage on the new owner's behalf.
      the token row in one transaction. Deleting the `xero_expected_tenant_id` row by hand does not,
      and IMS halts the sync on a token that has outlived its pin (o3d-9tbz r6): an absent pin used to
      be an exemption from the split-binding refusal, i.e. a way to switch it off.
+
+     Run the flag **before** the pin goes. The release is recorded only when that statement is the one
+     deleting the pin, and the receipt names the connection and the pin it released, so it stops
+     applying the moment either changes (o3d-9tbz r7). On a rig whose pin has already vanished the flag
+     records nothing and does not lift the halt — press **Disconnect** on `/sync`, which clears both
+     halves. `full-chain-preflight` names both states explicitly rather than letting the run discover
+     them on the first posting spec.
   2. Re-consent the connection (Settings → Accounting → Xero → Connect).
   3. Re-run the **Demo provisioner** so the accounts/currencies/bank accounts/VAT rates the specs
      expect exist again (o3d-lgo.9).

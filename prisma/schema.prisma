@@ -2323,6 +2323,18 @@ model AccountingToken {
   // binding once wrote a pin beside it, so an absent pin means the pin went away on its own and
   // the sync halts. NULL = never released. Cleared by the next binding, which writes a pin again.
   pinReleasedAt DateTime?
+  // o3d-9tbz r7: WHAT that release was for. A bare timestamp says only "a release happened once",
+  // so it outlives the connection it released — a token row restored from a dump taken while a
+  // release was outstanding carries the exemption onto whatever binding is there now, which is the
+  // same cross-backup restore r6 exists to catch, arriving through the receipt instead of round it.
+  // These two say WHICH state was released: the generation the token row carried at the moment the
+  // pin was deleted, and the organisation that deleted pin named. The release counts only while
+  // BOTH still describe this row, so any rebinding, any restored token and any tenant change makes
+  // it stale by construction rather than by a clock. NULL alongside a NULL pinReleasedAt means
+  // "never released"; backfilled from this row's own values for releases outstanding at deploy, so
+  // no rig mid-recovery is halted by the column arriving.
+  pinReleasedGeneration String?
+  pinReleasedTenantId   String?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

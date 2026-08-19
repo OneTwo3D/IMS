@@ -84,6 +84,8 @@ type TokenRow = {
   tenantIsDemo: boolean | null
   connectionGeneration: string | null
   pinReleasedAt: Date | null
+  pinReleasedGeneration: string | null
+  pinReleasedTenantId: string | null
 }
 
 const LIVE = { id: 'c-live', tenantId: 'e7fb4378-live-org', tenantName: 'OneTwo3D Ltd', tenantType: 'ORGANISATION' }
@@ -218,6 +220,18 @@ type SettingRow = { key: string; value: string }
 const pendingSettingInserts = new Map<string, Promise<boolean>>()
 
 /**
+ * Holds the FULL RESET between its two binding deletes — the window an OAuth callback commits into.
+ *
+ * Hooked on the token delete, which both versions of the code perform: a gate that only exists in the
+ * fixed version cannot show what the bug did. In the fixed version it fires INSIDE the reset's
+ * transaction, after the settings wipe; in the reverted one it fires six statements earlier and outside
+ * any transaction, which is the whole difference the test is measuring.
+ */
+let resetTokenDeleteGate: (() => Promise<void>) | null = null
+/** Makes the full reset's settings wipe fail, so a reset that dies part-way is a testable state. */
+let settingsWipeFails = false
+
+/**
  * The token row's WRITE LOCK, held by an uncommitted transaction (o3d-9tbz r4).
  *
  * Resolves when that transaction commits or rolls back. Any writer outside it waits here first — which
@@ -251,25 +265,43 @@ function tokenRowMatches(where: Record<string, unknown>): boolean {
   })
 }
 
-/** One interactive transaction: staged writes, committed together, discarded on throw. */
+/**
+ * One interactive transaction: staged writes, committed together, discarded on throw.
+ *
+ * It now stages DELETIONS as well as writes (o3d-9tbz r7), because the second writer of a binding is
+ * `resetDatabase`, which removes both halves rather than replacing them. A double that could only stage
+ * writes had to let the reset delete straight through, which is exactly the non-atomic behaviour under
+ * test — the test would then be asserting the bug.
+ */
 async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
   const staged: Record<string, string> = {}
+  const stagedDeletes = new Set<string>()
   let stagedToken: TokenRow | null | undefined
+  /** The primary key a staged DELETE saw, so the commit removes that row and not a later one. */
+  let stagedTokenDeleteId: string | null | undefined
   let settle: (committed: boolean) => void = () => {}
   const settled = new Promise<boolean>((resolve) => { settle = resolve })
   const claimed: string[] = []
+  const visibleSetting = (key: string): string | undefined =>
+    staged[key] ?? (stagedDeletes.has(key) ? undefined : settings[key])
   const tx = {
+    // The raw SQL the plugin-selection lock issues on its way past: an advisory lock, a materialising
+    // INSERT and a `FOR UPDATE` read of the plugin_* keys. Inert here — that lock has its own tests
+    // (tests/accounting/plugin-selection-lock), and what this file is measuring is the ORDER of the two
+    // binding deletes, which no lock takes part in.
+    $executeRaw: async () => 0,
+    $queryRaw: async () => [],
     setting: {
       findUnique: async ({ where }: { where: { key: string } }): Promise<SettingRow | null> => {
         if (settingReadGate) await settingReadGate(where.key)
         // READ COMMITTED: a row another transaction has already committed IS visible here.
-        const value = staged[where.key] ?? settings[where.key]
+        const value = visibleSetting(where.key)
         return value == null ? null : { key: where.key, value }
       },
       create: async ({ data }: { data: SettingRow }) => {
         // The primary key. This is the statement the whole fix rests on: the loser of the race is
         // rejected here, by the database, not by anything the process checked earlier.
-        if (staged[data.key] != null || settings[data.key] != null) throw uniqueViolation(data.key)
+        if (visibleSetting(data.key) != null) throw uniqueViolation(data.key)
         const inFlight = pendingSettingInserts.get(data.key)
         if (inFlight && (await inFlight)) throw uniqueViolation(data.key)
         if (settings[data.key] != null) throw uniqueViolation(data.key)
@@ -282,8 +314,60 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
         staged[where.key] = data.value
         return { key: where.key, value: data.value }
       },
+      // The whole settings table, as the full reset deletes it.
+      //
+      // STAGED, so nothing outside this transaction sees the rows go until it commits — and scoped to
+      // the keys this STATEMENT can see, which is the part that decides the reset race. `DELETE FROM
+      // settings` removes the rows visible to its own snapshot; a row another transaction commits
+      // afterwards is not retroactively deleted by it. A double that applied the wipe at COMMIT time
+      // would swallow a pin written in between, i.e. it would produce the bug's outcome no matter which
+      // order the production code deletes in, and the test would be measuring the double.
+      deleteMany: async (args?: { where?: { key?: unknown } }) => {
+        if (args?.where?.key == null && settingsWipeFails) {
+          // A reset that dies part-way is a state, not a story: with both deletes in one transaction
+          // it must leave the binding WHOLE, and with them apart it leaves half of it behind.
+          throw new Error('settings wipe failed (injected)')
+        }
+        if (args?.where?.key != null) {
+          const keys = typeof args.where.key === 'string'
+            ? [args.where.key]
+            : ((args.where.key as { in?: string[] }).in ?? [])
+          let count = 0
+          for (const key of keys) {
+            if (visibleSetting(key) == null) continue
+            delete staged[key]
+            stagedDeletes.add(key)
+            count += 1
+          }
+          return { count }
+        }
+        let count = 0
+        for (const key of new Set([...Object.keys(settings), ...Object.keys(staged)])) {
+          if (visibleSetting(key) == null) continue
+          delete staged[key]
+          stagedDeletes.add(key)
+          count += 1
+        }
+        return { count }
+      },
     },
     accountingToken: {
+      // The row lock, taken by a delete exactly as it is by a write: from here until this transaction
+      // ends, every writer outside it waits.
+      //
+      // And it deletes THE ROW THIS STATEMENT SAW, identified by its primary key — not "whatever is
+      // there at commit". A binding committed by a concurrent callback after this point inserts a row
+      // with a new id (r5 models that faithfully), and Postgres would not delete it; a double that
+      // cleared the table at commit would, and would then report the reset race as broken whichever
+      // order the production code used.
+      deleteMany: async () => {
+        pendingTokenWrite = settled
+        const seen = stagedToken === undefined ? tokenRow : stagedToken
+        stagedTokenDeleteId = seen ? seen.id : null
+        stagedToken = null
+        if (resetTokenDeleteGate) await resetTokenDeleteGate()
+        return { count: seen ? 1 : 0 }
+      },
       upsert: async (
         { create, update }: { create: Omit<TokenRow, 'id'>; update: Partial<TokenRow> },
       ) => {
@@ -300,8 +384,13 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
   }
   try {
     const result = await fn(tx)
+    for (const key of stagedDeletes) delete settings[key]
     for (const [key, value] of Object.entries(staged)) settings[key] = value
-    if (stagedToken !== undefined) tokenRow = stagedToken
+    if (stagedTokenDeleteId !== undefined) {
+      if (tokenRow && tokenRow.id === stagedTokenDeleteId) tokenRow = null
+    } else if (stagedToken !== undefined) {
+      tokenRow = stagedToken
+    }
     settle(true)
     return result
   } catch (error) {
@@ -315,63 +404,106 @@ async function runTransaction<T>(fn: (tx: unknown) => Promise<T>): Promise<T> {
   }
 }
 
+/**
+ * EVERY MODEL THE FULL RESET SWEEPS, and the four this file actually models (o3d-9tbz r7).
+ *
+ * `resetDatabase('full')` deletes from about fifty tables, and the interesting thing it does is delete
+ * TWO of them — the token row and the settings table — as the two halves of one binding. Modelling the
+ * other forty-eight would be noise, but stubbing the db per-test would lose the only property under
+ * test: that the OAuth callback and the reset are writing to the SAME database and can be interleaved.
+ * So the models this file cares about are real, and everything else answers "deleted nothing".
+ */
+const inertModel = {
+  deleteMany: async () => ({ count: 0 }),
+  updateMany: async () => ({ count: 0 }),
+}
+
+const dbDouble: Record<string, unknown> = {
+    accountingToken: {
+      findUnique: async () => tokenRow,
+      // The compare-and-swap the refresh now writes through. The predicate is evaluated HERE, after
+      // the lock is released, against whatever the winner committed — never against the caller's
+      // snapshot. No create branch, because there is none in the statement it doubles.
+      updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Partial<TokenRow> }) => {
+        await awaitTokenRowLock()
+        if (!tokenRowMatches(where)) return { count: 0 }
+        tokenRow = { ...(tokenRow as TokenRow), ...data }
+        return { count: 1 }
+      },
+      upsert: async (
+        { create, update }: { create: Omit<TokenRow, 'id'>; update: Partial<TokenRow> },
+      ) => {
+        await awaitTokenRowLock()
+        tokenRow = tokenRow ? { ...tokenRow, ...update } as TokenRow : { id: newRowId(), ...create }
+        return tokenRow
+      },
+      // It really deletes. `disconnect()` is the remedy the split-binding refusal tells operators to
+      // perform, and a no-op double would let that refusal recommend something unproven.
+      //
+      // The reset gate is honoured HERE as well as inside a transaction, deliberately: the version of
+      // `resetDatabase` this round replaces deleted the token row from outside any transaction, and a
+      // gate that only existed on the transactional path would let the reverted code sail past the
+      // interleaving instead of demonstrating it.
+      deleteMany: async () => {
+        const had = tokenRow ? 1 : 0
+        tokenRow = null
+        // AFTER the delete, because outside a transaction the delete is COMMITTED the moment it runs —
+        // and it is that committed gap, with the settings wipe still to come, that the callback used to
+        // land in. Pausing before the statement would model a different (and harmless) interleaving.
+        if (resetTokenDeleteGate) await resetTokenDeleteGate()
+        return { count: had }
+      },
+    },
+    // The cached lookup ids disconnect() clears alongside the token. Recorded rather than modelled:
+    // what matters here is that the remedy runs to completion, which it cannot do without them.
+    // They spread `inertModel` because the full reset DELETES from these same tables: a model that
+    // answered only the call this file was written for would make the reset throw rather than run.
+    customer: { ...inertModel, updateMany: async () => { clearedIdColumns.push('customer'); return { count: 0 } } },
+    supplier: { ...inertModel, updateMany: async () => { clearedIdColumns.push('supplier'); return { count: 0 } } },
+    product: { ...inertModel, updateMany: async () => { clearedIdColumns.push('product'); return { count: 0 } } },
+    setting: {
+      findUnique: async ({ where }: { where: { key: string } }): Promise<SettingRow | null> => {
+        const value = settings[where.key]
+        return value == null ? null : { key: where.key, value }
+      },
+      upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => {
+        settings[where.key] = create.value
+        return { key: where.key, value: create.value }
+      },
+      // It really deletes, for the same reason accountingToken.deleteMany does: disconnect() clearing
+      // BOTH halves of the binding is the whole content of the remedy the split-binding refusal gives.
+      deleteMany: async (args?: { where?: { key?: unknown } }) => {
+        const key = args?.where?.key
+        const keys = key == null
+          ? Object.keys(settings)
+          : typeof key === 'string' ? [key] : ((key as { in?: string[] }).in ?? [])
+        let count = 0
+        for (const k of keys) {
+          if (settings[k] == null) continue
+          delete settings[k]
+          count += 1
+        }
+        return { count }
+      },
+    },
+  // Both forms: disconnect() passes an array, the tenant binding passes a callback.
+  $transaction: async (arg: unknown) =>
+    typeof arg === 'function'
+      ? runTransaction(arg as (tx: unknown) => Promise<unknown>)
+      : Promise.all(arg as Array<Promise<unknown>>),
+}
+
 mock.module('@/lib/db', {
   namedExports: {
-    db: {
-      accountingToken: {
-        findUnique: async () => tokenRow,
-        // The compare-and-swap the refresh now writes through. The predicate is evaluated HERE, after
-        // the lock is released, against whatever the winner committed — never against the caller's
-        // snapshot. No create branch, because there is none in the statement it doubles.
-        updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Partial<TokenRow> }) => {
-          await awaitTokenRowLock()
-          if (!tokenRowMatches(where)) return { count: 0 }
-          tokenRow = { ...(tokenRow as TokenRow), ...data }
-          return { count: 1 }
-        },
-        upsert: async (
-          { create, update }: { create: Omit<TokenRow, 'id'>; update: Partial<TokenRow> },
-        ) => {
-          await awaitTokenRowLock()
-          tokenRow = tokenRow ? { ...tokenRow, ...update } as TokenRow : { id: newRowId(), ...create }
-          return tokenRow
-        },
-        // It really deletes. `disconnect()` is the remedy the split-binding refusal tells operators to
-        // perform, and a no-op double would let that refusal recommend something unproven.
-        deleteMany: async () => {
-          const had = tokenRow ? 1 : 0
-          tokenRow = null
-          return { count: had }
-        },
+    db: new Proxy(dbDouble, {
+      get: (target, prop) => {
+        if (prop in target) return target[prop as string]
+        // A `$`-prefixed member this double does not implement is a REAL gap — returning an inert model
+        // for it would turn "the code called something we never modelled" into a silent no-op.
+        if (typeof prop !== 'string' || prop.startsWith('$') || prop === 'then') return undefined
+        return inertModel
       },
-      // The cached lookup ids disconnect() clears alongside the token. Recorded rather than modelled:
-      // what matters here is that the remedy runs to completion, which it cannot do without them.
-      customer: { updateMany: async () => { clearedIdColumns.push('customer'); return { count: 0 } } },
-      supplier: { updateMany: async () => { clearedIdColumns.push('supplier'); return { count: 0 } } },
-      product: { updateMany: async () => { clearedIdColumns.push('product'); return { count: 0 } } },
-      setting: {
-        findUnique: async ({ where }: { where: { key: string } }): Promise<SettingRow | null> => {
-          const value = settings[where.key]
-          return value == null ? null : { key: where.key, value }
-        },
-        upsert: async ({ where, create }: { where: { key: string }; create: { value: string } }) => {
-          settings[where.key] = create.value
-          return { key: where.key, value: create.value }
-        },
-        // It really deletes, for the same reason accountingToken.deleteMany does: disconnect() clearing
-        // BOTH halves of the binding is the whole content of the remedy the split-binding refusal gives.
-        deleteMany: async ({ where }: { where: { key: string } }) => {
-          const had = settings[where.key] != null ? 1 : 0
-          delete settings[where.key]
-          return { count: had }
-        },
-      },
-      // Both forms: disconnect() passes an array, the tenant binding passes a callback.
-      $transaction: async (arg: unknown) =>
-        typeof arg === 'function'
-          ? runTransaction(arg as (tx: unknown) => Promise<unknown>)
-          : Promise.all(arg as Array<Promise<unknown>>),
-    },
+    }),
   },
 })
 mock.module('@/lib/settings-store', {
@@ -408,6 +540,28 @@ mock.module('@/lib/notifications', {
 })
 mock.module('@/lib/auth/token-store', {
   namedExports: { setAuthToken: async () => {}, consumeAuthToken: async () => null },
+})
+// `resetDatabase` is the OTHER writer of both halves of a binding, and it is exercised here rather than
+// against a database of its own precisely so that it and the OAuth callback write to the SAME one.
+// These are its scaffolding — an authenticated admin, a consumed confirmation code, a revalidate and
+// the plugin-selection lock (which has its own tests) — none of which is what the reset tests are about.
+mock.module('next/cache', { namedExports: { revalidatePath: () => {} } })
+mock.module('@/lib/auth/server', {
+  namedExports: {
+    requireFreshAdmin: async () => ({ user: { id: 'admin-1', email: 'admin@example.com' } }),
+    freshAuthFailureResult: () => null,
+  },
+})
+mock.module('@/lib/destructive-action-confirm', {
+  namedExports: {
+    issueDestructiveActionCode: async () => ({ success: true, email: 'admin@example.com', expiresInSec: 600 }),
+    consumeDestructiveActionCode: async () => true,
+  },
+})
+mock.module('@/lib/integration-plugin-selection-lock', {
+  namedExports: {
+    lockIntegrationPluginSelection: async () => ({ xero: false, quickbooks: false, woocommerce: false }),
+  },
 })
 mock.module('@/lib/connectors/xero/api', {
   namedExports: { clearXeroReferenceCache: () => {} },
@@ -457,6 +611,8 @@ beforeEach(() => {
   organisationCalls = 0
   settingReadGate = null
   organisationFetchGate = null
+  resetTokenDeleteGate = null
+  settingsWipeFails = false
   refreshGrantGate = null
   bindingTokenWriteGate = null
   pendingSettingInserts.clear()
@@ -502,6 +658,8 @@ function pinnedTo(conn: typeof DEMO) {
     tenantIsDemo: null,
     connectionGeneration: 'generation-before',
     pinReleasedAt: null,
+    pinReleasedGeneration: null,
+    pinReleasedTenantId: null,
   }
 }
 
@@ -525,10 +683,58 @@ function pinDeleted(conn: typeof DEMO) {
  * It deletes the pin and stamps the token row in ONE transaction, so the release leaves a receipt that
  * a deletion cannot. Written here as the script writes it, because the point under test is that the two
  * states are distinguishable — not that some flag can be set.
+ *
+ * ALL THREE COLUMNS, as one statement writes them (r7): the timestamp, the connection the row carried
+ * at the release, and the organisation the DELETED pin named. A receipt with only the timestamp is not
+ * a smaller version of this — it is the r7 defect, and it has its own state below.
  */
 function releasedPin(conn: typeof DEMO) {
   pinDeleted(conn)
-  tokenRow!.pinReleasedAt = new Date('2026-08-19T09:00:00.000Z')
+  stampReleaseReceipt(conn.tenantId, new Date('2026-08-19T09:00:00.000Z'))
+}
+
+/**
+ * The UPDATE `--clear-tenant-pin` issues, in the same transaction as the DELETE above it.
+ *
+ * One helper rather than three hand-written literals, because the point of the receipt is that its
+ * fields are written TOGETHER and copied from the row itself — a test that set them independently could
+ * write a combination the script cannot produce and then prove something about it.
+ */
+function stampReleaseReceipt(deletedPinTenantId: string, at: Date) {
+  tokenRow!.pinReleasedAt = at
+  tokenRow!.pinReleasedGeneration = tokenRow!.connectionGeneration
+  tokenRow!.pinReleasedTenantId = deletedPinTenantId
+}
+
+/**
+ * A RECEIPT THAT OUTLIVED WHAT IT RELEASED (o3d-9tbz r7) — the state r6 could not express at all,
+ * because its receipt recorded only that a release had happened.
+ *
+ * Reached the way the r6 bypass was reached: not by anyone forging anything, but by a RESTORE. A dump
+ * of accounting_tokens taken while a release was outstanding, put back over an instance that has been
+ * re-consented since, brings the exemption with it and leaves it sitting on a connection it knows
+ * nothing about — while the pin, which lives in the other table, does not come back with it.
+ *
+ * The token row here is therefore a LATER connection (a different generation) carrying an EARLIER
+ * release's paperwork.
+ */
+function staleReleaseFromRestore(conn: typeof DEMO) {
+  releasedPin(conn)
+  tokenRow!.connectionGeneration = 'generation-after-restore'
+}
+
+/**
+ * A release performed on an instance whose two halves ALREADY named different organisations.
+ *
+ * `--clear-tenant-pin` deletes the pin, so the split-binding refusal (r5) has nothing left to compare —
+ * and under r6 the receipt then exempted the row from the missing-pin refusal too, which is a way to
+ * end a refusal by deleting one side of the contradiction it is about. The receipt records the pin it
+ * actually deleted, so the two organisations stay visibly different.
+ */
+function releasedSplitBinding(params: { pin: typeof DEMO; token: typeof DEMO }) {
+  mismatched(params)
+  delete settings.xero_expected_tenant_id
+  stampReleaseReceipt(params.pin.tenantId, new Date('2026-08-19T09:00:00.000Z'))
 }
 
 /**
@@ -1763,6 +1969,10 @@ test('THE DEMO-RESET RECOVERY, end to end: release, re-consent to the NEW tenant
   assert.equal(tokenRow?.tenantId, rebuilt.tenantId, 'the token now belongs to the rebuilt organisation')
   assert.equal(settings.xero_expected_tenant_id, rebuilt.tenantId, 'and the pin is re-established')
   assert.equal(tokenRow?.pinReleasedAt, null, 'the release ends at the connect that answers it')
+  assert.equal(tokenRow?.pinReleasedGeneration, null, 'and so does the receipt that qualified it (r7)')
+  assert.equal(tokenRow?.pinReleasedTenantId, null,
+    'the whole receipt goes, not just its timestamp — a half-cleared one would be paperwork for a '
+    + 'connection that no longer exists')
   assert.equal((await getAccessToken())?.tenantId, rebuilt.tenantId)
 })
 
@@ -1810,9 +2020,9 @@ test('a refresh in flight across a RELEASE cannot un-release the connection', as
   const refreshing = getAccessToken()
   await refreshHeld.reached
 
-  // --clear-tenant-pin, mid-flight: one transaction, both halves.
+  // --clear-tenant-pin, mid-flight: one transaction, the pin and the whole receipt.
   delete settings.xero_expected_tenant_id
-  tokenRow!.pinReleasedAt = new Date('2026-08-19T10:00:00.000Z')
+  stampReleaseReceipt(demo.tenantId, new Date('2026-08-19T10:00:00.000Z'))
 
   refreshHeld.release()
 
@@ -1822,6 +2032,171 @@ test('a refresh in flight across a RELEASE cannot un-release the connection', as
   assert.equal((await isConnected()).connected, true, 'so the recovery is not halted by its own refresh')
   assert.ok(activity.some((e) => e.action === 'xero_refresh_discarded'), 'the blip is explainable')
   assert.equal(notifications.length, 0, 'and it is not an incident to alarm anybody with')
+})
+
+/**
+ * A RELEASE RECEIPT CANNOT OUTLIVE WHAT IT RELEASED (o3d-9tbz r7).
+ *
+ * r6 made the release a receipt on the token row, which is what a deletion in another table cannot
+ * forge. But the receipt recorded only THAT a release happened — never what it was for — so nothing
+ * that happened to the row afterwards could invalidate it. Restore an accounting_tokens dump taken
+ * while a release was outstanding and the exemption comes back with it, onto whatever binding is here
+ * now, while the pin (in the other table) does not: the cross-backup restore r6 exists to catch,
+ * arriving through the escape hatch r6 built.
+ */
+
+test('a receipt from a RESTORED dump does not exempt the connection it landed on', async () => {
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-stale-receipt' }
+  staleReleaseFromRestore(demo)
+  const { getAccessToken, isConnected } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null, 'the sync is halted')
+  assert.deepEqual(fetchedUrls, [], 'and no Xero request was made on the way to refusing')
+  const status = await isConnected()
+  assert.equal(status.connected, false)
+  assert.equal(status.hasStoredToken, true, 'or /sync would not draw the Disconnect the remedy names')
+  assert.match(status.blockedReason ?? '', /release receipt that does not describe it/)
+})
+
+test('the stale receipt is refused in ITS OWN words, and the remedy runs', async () => {
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-stale-receipt-remedy' }
+  staleReleaseFromRestore(demo)
+  const { getStoredTenantBlockReason, disconnect, exchangeCodeForTokens, getAccessToken } = await loadAuth()
+
+  const reason = await getStoredTenantBlockReason() ?? ''
+  assert.match(reason, /generation-after-restore/, 'the connection this token belongs to')
+  assert.match(reason, /generation-before/, 'and the one the receipt released')
+  assert.match(reason, /press Disconnect/)
+  assert.match(reason, /--clear-tenant-pin will not clear this/,
+    'the next thing an operator would try, answered before they try it')
+
+  // Run the instruction, exactly as written.
+  await disconnect()
+  reconsentTo(demo, 'c2')
+  assert.equal((await exchangeCodeForTokens('c2', 'https://ims.example/cb')).success, true)
+  assert.equal(tokenRow?.pinReleasedAt, null, 'the receipt is gone with the row it was stuck to')
+  assert.equal((await getAccessToken())?.tenantId, demo.tenantId, 'and the sync runs again')
+})
+
+test('a stale receipt does not let the next consent name ANY organisation it likes', async () => {
+  // A valid release suspends the "fall back to the token's own organisation" rule — that is what lets
+  // the Demo-reset re-consent land on a tenantId this instance has never seen. The suspension is a
+  // privilege, so it is granted on the same evidence the exemption is: a receipt that no longer
+  // describes this row buys neither. Otherwise a restored dump would arrive not merely unhalted but
+  // UNPINNED, free to bind whatever the next consent offered — which is the o3d-t74p incident.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-stale-receipt-consent' }
+  const stranger = { ...LIVE, tenantId: 'e7fb4378-live-stranger' }
+  staleReleaseFromRestore(demo)
+  const { exchangeCodeForTokens, getAccessToken } = await loadAuth()
+
+  reconsentTo(stranger, 'c2')
+  const refused = await exchangeCodeForTokens('c2', 'https://ims.example/cb')
+
+  assert.equal(refused.success, false, 'the consent to a stranger is refused')
+  assert.equal(tokenRow?.tenantId, demo.tenantId, 'and nothing was rebound')
+
+  // Re-consenting to the organisation the token names still repairs it, exactly as a lost pin does.
+  reconsentTo(demo, 'c3')
+  assert.equal((await exchangeCodeForTokens('c3', 'https://ims.example/cb')).success, true)
+  assert.equal(settings.xero_expected_tenant_id, demo.tenantId, 'the pin is back')
+  assert.equal(tokenRow?.pinReleasedAt, null, 'and the stale receipt is gone with it')
+  assert.equal((await getAccessToken())?.tenantId, demo.tenantId)
+})
+
+test('releasing one half of a SPLIT binding does not end the split-binding refusal', async () => {
+  // --clear-tenant-pin on an instance whose pin and token already named different organisations. The
+  // pin is gone, so r5 has nothing left to compare — and under r6 the receipt exempted the row from the
+  // missing-pin refusal as well, which made "delete one side of the contradiction" a way out of a
+  // refusal about the contradiction.
+  const pin = { ...DEMO, tenantId: '5c949ed5-demo-released-split' }
+  const token = { ...LIVE, tenantId: 'e7fb4378-live-released-split' }
+  releasedSplitBinding({ pin, token })
+  const { getAccessToken, getStoredTenantBlockReason } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null, 'still halted')
+  const reason = await getStoredTenantBlockReason() ?? ''
+  assert.match(reason, new RegExp(pin.tenantId), 'the organisation whose pin was deleted')
+  assert.match(reason, /OneTwo3D Ltd/, 'and the one the token actually belongs to')
+})
+
+/**
+ * THE OTHER WRITER OF BOTH HALVES: `resetDatabase('full')` (o3d-9tbz r7, finding 2).
+ *
+ * The missing-pin halt reads a token row carrying a connection generation, with no pin beside it, as
+ * evidence that something removed the pin on its own. That is only sound while every writer moves the
+ * two halves together — and the full reset did not: it deleted `accounting_tokens` six statements
+ * before it deleted `settings`, outside the transaction. A consent committing in between wrote a whole
+ * binding and then had its pin wiped, leaving the tamper state on an instance where nobody had tampered
+ * with anything.
+ *
+ * A reset is not told apart from tampering by a marker — the tamper case can carry a marker too. It is
+ * told apart by leaving NO TOKEN ROW, so the halt has nothing to ask about; and by ordering the two
+ * deletes so that no interleaving can leave the dangerous half.
+ */
+
+const RESET_CODE = '123456'
+
+test('a full reset removes BOTH halves, so the halt has nothing to ask about', async () => {
+  pinnedTo({ ...DEMO, tenantId: '5c949ed5-demo-reset-clean' })
+  const { getStoredTenantBlockReason } = await loadAuth()
+  const { resetDatabase } = await import('@/app/actions/reset')
+
+  const outcome = await resetDatabase('full', RESET_CODE)
+  assert.equal(outcome.success, true, outcome.error)
+
+  assert.equal(tokenRow, null, 'no token row')
+  assert.equal(settings.xero_expected_tenant_id, undefined, 'and no pin')
+  assert.equal(await getStoredTenantBlockReason(), null, 'so nothing to halt')
+})
+
+test('a reset that DIES part-way leaves the binding whole, not half of one', async () => {
+  // Both deletes in one transaction, so a failure rolls back to a coherent instance. With them apart
+  // the token was already gone when the settings wipe failed, and the operator was left holding a pin
+  // for a connection that no longer existed.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-reset-failed' }
+  pinnedTo(demo)
+  settingsWipeFails = true
+  const { resetDatabase } = await import('@/app/actions/reset')
+
+  const result = await resetDatabase('full', RESET_CODE)
+
+  assert.equal(result.success, false, 'the reset reports the failure')
+  assert.equal(tokenRow?.tenantId, demo.tenantId, 'and the token row is still here')
+  assert.equal(settings.xero_expected_tenant_id, demo.tenantId, 'beside the pin it was bound with')
+})
+
+test('A CONSENT COMMITTING MID-RESET is never left as a token whose pin was wiped', async () => {
+  // The two legitimate operations that produced the tamper state between them. The consent lands in the
+  // window between the reset's two binding deletes — the only place it can do any harm — and both
+  // finish. Whatever survives, the two halves must agree.
+  const demo = { ...DEMO, tenantId: '5c949ed5-demo-reset-race' }
+  pinnedTo(demo)
+  const { exchangeCodeForTokens, getStoredTenantBlockReason, isConnected } = await loadAuth()
+  const { resetDatabase } = await import('@/app/actions/reset')
+
+  const held = latch()
+  resetTokenDeleteGate = held.wait
+  const resetting = resetDatabase('full', RESET_CODE)
+  await held.reached
+
+  // A human finishes connecting Xero, right now, while the reset is mid-flight.
+  reconsentTo(demo, 'c2')
+  const consent = await exchangeCodeForTokens('c2', 'https://ims.example/cb')
+  assert.equal(consent.success, true, 'the consent itself succeeds — it did nothing wrong')
+
+  held.release()
+  assert.equal((await resetting).success, true)
+
+  assert.equal(
+    await getStoredTenantBlockReason(), null,
+    'the reset must not manufacture the tamper halt on an instance nobody tampered with',
+  )
+  const pinned = settings.xero_expected_tenant_id
+  assert.ok(
+    (tokenRow === null && pinned === undefined) || (tokenRow !== null && pinned === tokenRow.tenantId),
+    `the two halves must agree: token=${tokenRow?.tenantId ?? 'none'} pin=${pinned ?? 'none'}`,
+  )
+  assert.equal((await isConnected()).blockedReason, undefined, 'and nothing is blocked')
 })
 
 test('an ordinary pinned instance is unaffected — pin and token name one organisation', async () => {

@@ -36,6 +36,11 @@
  *      Deleting the settings row by hand does NOT do that and halts the sync
  *      (o3d-9tbz r6) — use this flag, or press Disconnect on /sync, which
  *      clears both halves and needs no script at all.
+ *      RUN IT BEFORE THE PIN IS GONE. The release is recorded only when this is
+ *      the statement that deletes the pin, and the receipt names the connection
+ *      and the pin it released so it stops applying the moment either changes
+ *      (o3d-9tbz r7). On an instance whose pin has already vanished it records
+ *      nothing and does not lift the halt — that is Disconnect's job.
  *   2. A human re-consents at <public_app_url>/sync?connector=xero and picks
  *      "Demo Company (UK)". OAuth is interactive; it cannot be scripted.
  *   3. Re-run this script normally. It rebuilds the org and RE-PINS the new
@@ -246,23 +251,54 @@ async function remapOnly(db: Client) {
  * nothing to explain it. The receipt is cleared by the next connect, which writes a
  * pin again — the exemption lasts exactly as long as the state it describes.
  *
- * `pinReleasedAt is null` in the UPDATE keeps a re-run idempotent: it does not move a
- * release that is already outstanding.
+ * THE RECEIPT NAMES WHAT IT RELEASED (o3d-9tbz r7), and it is stamped ONLY when this
+ * statement is the thing that removes the pin. Two changes, both closing the same
+ * shape of hole — a receipt that outlives its state:
+ *
+ *   - It records the connection generation the token row carried and the tenant id the
+ *     DELETED pin named, so IMS can check the receipt still describes the row it is on.
+ *     A token row restored from a dump taken while a release was outstanding lands on a
+ *     different connection and is refused as a stale release instead of being believed.
+ *   - No pin deleted, no receipt. Running this flag against an instance whose pin is
+ *     ALREADY gone used to stamp a release for a pin it had not removed, which turned a
+ *     halted (tamper-evident) rig into an exempt one — i.e. the very bypass r6 closed,
+ *     reachable by running the documented recovery. It now reports that there was
+ *     nothing to release and changes nothing.
+ *
+ * A re-run is idempotent for the same reason: the second run finds no pin, so it stamps
+ * nothing and leaves the outstanding release exactly where it was.
+ *
+ * ON A SPLIT BINDING it deliberately does NOT unlock the sync. If the pin named one
+ * organisation and the token another, the receipt records the pin's organisation, which
+ * does not match the token's — so IMS keeps refusing. Deleting one half of a
+ * contradiction does not resolve it, and the remedy for that state is Disconnect.
  */
 async function clearTenantPin(db: Client) {
   await db.query('begin')
   let cleared: string | null = null
-  let released = 0
+  let stampedRows: Array<{ tenantId: string; pinReleasedTenantId: string | null }> = []
   try {
     const before = await db.query<{ value: string }>(
       `delete from settings where key = 'xero_expected_tenant_id' returning value`,
     )
     cleared = before.rows.length ? before.rows[0].value : null
-    const stamped = await db.query(
-      `update accounting_tokens set "pinReleasedAt" = now(), "updatedAt" = now()
-         where connector = 'xero' and "pinReleasedAt" is null`,
-    )
-    released = stamped.rowCount ?? 0
+    if (cleared !== null) {
+      // The receipt describes THIS release: when, on which connection, and for which pin. The
+      // generation is copied from the row's own column inside the same statement, so it cannot be a
+      // value read a moment ago and gone stale; the tenant id is the pin that was actually deleted,
+      // taken from the DELETE's own RETURNING rather than from anything this script assumes.
+      const stamped = await db.query<{ tenantId: string; pinReleasedTenantId: string | null }>(
+        `update accounting_tokens
+            set "pinReleasedAt" = now(),
+                "pinReleasedGeneration" = "connectionGeneration",
+                "pinReleasedTenantId" = $1,
+                "updatedAt" = now()
+          where connector = 'xero'
+          returning "tenantId", "pinReleasedTenantId"`,
+        [cleared],
+      )
+      stampedRows = stamped.rows
+    }
     await db.query('commit')
   } catch (e) {
     await db.query('rollback')
@@ -271,16 +307,29 @@ async function clearTenantPin(db: Client) {
 
   console.log(
     cleared === null
-      ? 'tenant pin already absent — nothing to clear.'
+      ? 'tenant pin already absent — nothing to clear, and NO release was recorded. A release is only\n' +
+        'meaningful when this is the statement that removes the pin; stamping one for a pin that was\n' +
+        'already gone would turn a halted instance into an exempt one. If the sync is halted, the\n' +
+        'remedy is Disconnect on /sync, which clears both halves together.'
       : `cleared stale tenant pin (was ${cleared}).`,
   )
+  const split = stampedRows.filter((row) => row.tenantId !== row.pinReleasedTenantId)
   console.log(
-    released > 0
-      ? 'recorded the release on the Xero token row (accounting_tokens.pinReleasedAt), so IMS treats\n' +
-        'the missing pin as deliberate instead of halting the sync.'
-      : 'no Xero token row needed a release marker (either there is no connection, or it was already\n' +
-        'released).',
+    stampedRows.length > 0
+      ? 'recorded the release on the Xero token row (accounting_tokens.pinReleasedAt, and the connection\n' +
+        'and pin it released), so IMS treats the missing pin as deliberate instead of halting the sync.'
+      : cleared === null
+        ? 'nothing was released.'
+        : 'no Xero token row to record the release on — there is no connection, so nothing was halted.',
   )
+  for (const row of split) {
+    console.warn(
+      `  ! the pin released (${row.pinReleasedTenantId}) named a DIFFERENT organisation from the stored\n` +
+        `    token (${row.tenantId}). This instance's binding was already split, and releasing one half\n` +
+        '    does not resolve it: IMS will keep refusing until you press Disconnect on /sync, which\n' +
+        '    clears the token and the pin together.',
+    )
+  }
   console.log(
     '\nNext: reconnect at <public_app_url>/sync?connector=xero, choose "Demo Company (UK)",\n' +
       'then re-run this script WITHOUT --clear-tenant-pin to rebuild the org and re-pin.',
