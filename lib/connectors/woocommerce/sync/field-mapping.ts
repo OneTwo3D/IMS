@@ -4,7 +4,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
+import { currencyMinorUnits, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine } from './types'
 
@@ -256,9 +256,24 @@ export function mapWcOrderDiscount(couponLines: WcCouponLine[]): {
   }
 }
 
-// Coupon money below this is allocation rounding (Woo splitting a coupon across lines), not a
-// real order-level discount. Half a penny, so it can never round up to a posted 0.01.
-const COUPON_ALLOCATION_TOLERANCE = 0.005
+/**
+ * Coupon money strictly below HALF ONE MINOR UNIT of the order currency is allocation rounding (Woo
+ * splitting a coupon across lines), not a real order-level discount.
+ *
+ * o3d-5tf, two defects in the previous hard-coded `0.005`:
+ *
+ *   1. The constant assumed a 2-decimal currency. A WooCommerce store can run a 0-decimal currency
+ *      (JPY, KRW) where 0.005 is a meaningless sliver, or a 3-decimal one (KWD, BHD) where it
+ *      silently swallowed FIVE whole minor units of real customer discount.
+ *   2. The comparison was `residual <= tolerance`, and the comment claimed a residual at the
+ *      threshold "can never round up to a posted 0.01" — wrong at exactly the boundary, since
+ *      ordinary HALF_UP money rounding turns 0.005 into a posted 0.01. Discarding it understated
+ *      the discount by a posted minor unit. The comparison is now STRICT, so a residual that would
+ *      round up to a posted minor unit is always retained.
+ */
+function couponAllocationTolerance(currency: string): Decimal {
+  return toDecimal(10).pow(-currencyMinorUnits(currency)).div(2)
+}
 
 /**
  * Split a WooCommerce coupon total into the part already carried by the line items and the
@@ -282,14 +297,18 @@ const COUPON_ALLOCATION_TOLERANCE = 0.005
 export function resolveWcOrderLevelDiscount(input: {
   couponTotalForeign: DecimalInput
   lineDiscountTotalForeign: DecimalInput
+  /** The ORDER currency, which sets the minor unit the tolerance is measured in (o3d-5tf). */
+  currency: string
 }): { orderLevelDiscount: number; unallocated: number } {
-  const couponTotal = roundDecimalNumber(input.couponTotalForeign, 4)
-  const lineDiscountTotal = roundDecimalNumber(input.lineDiscountTotalForeign, 4)
-  const residual = roundDecimalNumber(couponTotal - lineDiscountTotal, 4)
+  const couponTotal = roundQuantity(input.couponTotalForeign, 4)
+  const lineDiscountTotal = roundQuantity(input.lineDiscountTotalForeign, 4)
+  const residual = roundQuantity(couponTotal.sub(lineDiscountTotal), 4)
   // Clamped at zero: per-line markdowns can legitimately exceed the coupon (a sale price plus a
-  // coupon), and a negative order-level discount would post as a POSITIVE invoice line.
-  if (residual <= COUPON_ALLOCATION_TOLERANCE) return { orderLevelDiscount: 0, unallocated: 0 }
-  return { orderLevelDiscount: residual, unallocated: residual }
+  // coupon), and a negative order-level discount would post as a POSITIVE invoice line. STRICT `<`
+  // so a residual at exactly half a minor unit — which HALF_UP rounding posts as a whole one — is
+  // kept rather than discarded.
+  if (residual.lt(couponAllocationTolerance(input.currency))) return { orderLevelDiscount: 0, unallocated: 0 }
+  return { orderLevelDiscount: residual.toNumber(), unallocated: residual.toNumber() }
 }
 
 // ---------------------------------------------------------------------------

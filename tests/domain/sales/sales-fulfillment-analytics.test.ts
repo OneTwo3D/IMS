@@ -138,33 +138,61 @@ test('sales analytics formats base amounts with the configured base currency min
   assert.equal(report.totals.revenue, '101')
 })
 
+const selfRequirement = (lineId: string, productId: string) =>
+  new Map([[lineId, [{ productId, factor: decimal('1') }]]])
+
 test('computeInWindowDispatchedQtyByLine attributes linked dispatch exactly to its line', () => {
   const result = computeInWindowDispatchedQtyByLine(
     [{ orderId: 'order-1', productId: 'product-1', qty: 4, shipmentLineLineId: 'line-1' }],
     [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10 }],
+    selfRequirement('line-1', 'product-1'),
   )
   assert.equal(result.get('line-1|product-1')?.toString(), '4')
 })
 
-test('computeInWindowDispatchedQtyByLine does not attribute kit-component dispatch to the kit line', () => {
-  // A kit SalesOrderLine (product = kit) ships at component granularity: the
-  // dispatch movements link to the kit lineId but carry component productIds.
-  // The kit line keys on (lineId, kitProduct), so no component qty leaks in.
+test('o3d-7r6x: computeInWindowDispatchedQtyByLine converts kit-component dispatch into ORDERED kit units', () => {
+  // A kit SalesOrderLine (product = kit) ships at component granularity: the dispatch movements
+  // link to the kit lineId but carry component productIds. Keying the linked qty on the movement
+  // product meant the kit line matched nothing and contributed ZERO dispatched quantity, so it
+  // dropped out of margin entirely. kit = 2 x component-a + 1 x component-b; 6 x A and 3 x B
+  // dispatched is min(6/2, 3/1) = 3 whole kits.
   const result = computeInWindowDispatchedQtyByLine(
     [
       { orderId: 'order-1', productId: 'component-a', qty: 6, shipmentLineLineId: 'kit-line' },
       { orderId: 'order-1', productId: 'component-b', qty: 3, shipmentLineLineId: 'kit-line' },
     ],
     [{ id: 'kit-line', orderId: 'order-1', productId: 'kit-product', qty: 3 }],
+    new Map([['kit-line', [
+      { productId: 'component-a', factor: decimal('2') },
+      { productId: 'component-b', factor: decimal('1') },
+    ]]]),
   )
-  assert.equal(result.get('kit-line|kit-product'), undefined)
-  assert.equal(result.size, 0)
+  assert.equal(result.get('kit-line|kit-product')?.toString(), '3')
+  assert.equal(result.size, 1)
+})
+
+test('o3d-7r6x: a short kit dispatch is capped by its scarcest component, not summed', () => {
+  // 4 x A but only 1 x B: min(4/2, 1/1) = 1 whole kit. Summing the raw component units would have
+  // said 5, i.e. more kits dispatched than were ever ordered.
+  const result = computeInWindowDispatchedQtyByLine(
+    [
+      { orderId: 'order-1', productId: 'component-a', qty: 4, shipmentLineLineId: 'kit-line' },
+      { orderId: 'order-1', productId: 'component-b', qty: 1, shipmentLineLineId: 'kit-line' },
+    ],
+    [{ id: 'kit-line', orderId: 'order-1', productId: 'kit-product', qty: 3 }],
+    new Map([['kit-line', [
+      { productId: 'component-a', factor: decimal('2') },
+      { productId: 'component-b', factor: decimal('1') },
+    ]]]),
+  )
+  assert.equal(result.get('kit-line|kit-product')?.toString(), '1')
 })
 
 test('computeInWindowDispatchedQtyByLine drops unlinked residual when no line qty to share against', () => {
   const result = computeInWindowDispatchedQtyByLine(
     [{ orderId: 'order-1', productId: 'product-1', qty: 5, shipmentLineLineId: null }],
     [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 0 }],
+    selfRequirement('line-1', 'product-1'),
   )
   assert.equal(result.size, 0)
 })
@@ -579,4 +607,158 @@ test('o3d-4kfh r3: fill rate counts KIT shipments in ORDERED units, not componen
   assert.equal(report.rows.find((row) => row.metric === 'Fill rate')?.denominator, '4')
   assert.equal(report.totals.shippedQty, '2', 'the "Shipped qty" total and its CSV export are in kits too')
   assert.equal(report.rows.find((row) => row.metric === 'Partial ship rate')?.value, '100%')
+})
+
+const kitGraphProducts = {
+  findMany: async (args?: unknown) => (args as { where: { id: { in: string[] } } }).where.id.in
+    .map((id) => (id === 'kit-1'
+      ? {
+        id,
+        type: 'KIT',
+        productComponents: [
+          { componentId: 'comp-a', qty: decimal('2'), component: { sku: 'COMP-A', type: 'SIMPLE', oversellAllowed: false } },
+          { componentId: 'comp-b', qty: decimal('1'), component: { sku: 'COMP-B', type: 'SIMPLE', oversellAllowed: false } },
+        ],
+      }
+      : { id, type: 'SIMPLE', productComponents: [] })),
+}
+
+const kitProductRef = { sku: 'KIT-1', name: 'Starter kit', category: { name: 'Kits' } }
+
+test('o3d-7r6x: margin report books kit revenue and kit COGS in the SAME bucket, in ordered units', async () => {
+  // kit-1 = 2 x COMP-A + 1 x COMP-B. Four kits ordered at GBP200 each; two kits dispatched and
+  // costed in-window (4 x A + 2 x B). Before the fix the dispatch was keyed on the COMPONENT
+  // productId while the line was keyed on the KIT, so the kit line matched no dispatch AND was
+  // filtered out by the COGS-product gate: the kit contributed zero revenue and its cost sat in
+  // orphan component rows. Honest answer: revenue GBP400 against COGS GBP140 in one kit-1 row.
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...unusedClient(),
+    product: kitGraphProducts,
+    salesOrder: {
+      findMany: async () => [{
+        id: 'order-1',
+        status: SalesOrderStatus.PROCESSING,
+        currency: 'GBP',
+        customerId: null,
+        customerName: 'Customer A',
+        customerEmail: null,
+        createdAt: new Date('2026-06-01T12:00:00.000Z'),
+        expectedDelivery: null,
+        paidAt: null,
+        totalForeign: decimal('800'),
+        totalBase: decimal('800'),
+        taxForeign: decimal('0'),
+        taxBase: decimal('0'),
+        shippingForeign: decimal('0'),
+        shippingBase: decimal('0'),
+        discountAmount: decimal('0'),
+        shoppingLinks: [],
+        lines: [{
+          id: 'line-1',
+          productId: 'kit-1',
+          sku: 'KIT-1',
+          description: 'Starter kit',
+          qty: decimal('4'),
+          totalForeign: decimal('800'),
+          totalBase: decimal('800'),
+          taxForeign: decimal('0'),
+          taxBase: decimal('0'),
+          discountAmount: decimal('0'),
+          product: { id: 'kit-1', sku: 'KIT-1', name: 'Starter kit', type: ProductType.KIT, category: { name: 'Kits' } },
+        }],
+      }],
+    },
+    cogsEntry: {
+      findMany: async () => [
+        {
+          id: 'cogs-a',
+          totalCostBase: decimal('100'),
+          movement: {
+            referenceType: 'SalesOrder',
+            referenceId: 'order-1',
+            productId: 'comp-a',
+            createdAt: new Date('2026-06-01T13:00:00.000Z'),
+            product: { sku: 'COMP-A', name: 'Component A', category: null },
+            shipmentLine: { line: { productId: 'kit-1', product: kitProductRef } },
+          },
+        },
+        {
+          id: 'cogs-b',
+          totalCostBase: decimal('40'),
+          movement: {
+            referenceType: 'SalesOrder',
+            referenceId: 'order-1',
+            productId: 'comp-b',
+            createdAt: new Date('2026-06-01T13:00:00.000Z'),
+            product: { sku: 'COMP-B', name: 'Component B', category: null },
+            shipmentLine: { line: { productId: 'kit-1', product: kitProductRef } },
+          },
+        },
+      ],
+    },
+    stockMovement: {
+      findMany: async () => [
+        { qty: decimal('4'), referenceId: 'order-1', productId: 'comp-a', shipmentLine: { lineId: 'line-1' } },
+        { qty: decimal('2'), referenceId: 'order-1', productId: 'comp-b', shipmentLine: { lineId: 'line-1' } },
+      ],
+    },
+  }
+
+  const report = await getMarginAnalyticsReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-01' },
+    { client, now: () => new Date('2026-06-01T15:00:00.000Z') },
+  )
+
+  assert.equal(report.rows.length, 1, 'component COGS must not become orphan rows beside the kit')
+  assert.equal(report.rows[0]?.productId, 'kit-1')
+  assert.equal(report.rows[0]?.sku, 'KIT-1')
+  assert.equal(report.rows[0]?.revenueBase, '400', '2 of 4 kits dispatched at GBP200 each')
+  assert.equal(report.rows[0]?.cogsBase, '140')
+  assert.equal(report.rows[0]?.grossProfitBase, '260')
+  assert.equal(report.totals.revenueBase, '400')
+  assert.equal(report.totals.cogsBase, '140')
+})
+
+test('o3d-7r6x: returns report states kit dispatched quantity in ordered units, not component units', async () => {
+  // One kit refunded out of two kits dispatched (4 x COMP-A + 2 x COMP-B). The refund line is in
+  // KIT units and the dispatch movements in COMPONENT units, so summing movements by their own
+  // productId left the kit's denominator at zero and pinned every kit's return rate to 0%.
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...unusedClient(),
+    product: kitGraphProducts,
+    salesOrderRefundLine: {
+      findMany: async () => [{
+        id: 'refund-line-1',
+        refundId: 'refund-1',
+        productId: 'kit-1',
+        description: 'Starter kit',
+        qty: decimal('1'),
+        totalBase: decimal('200'),
+        product: { id: 'kit-1', sku: 'KIT-1', name: 'Starter kit' },
+        refund: {
+          id: 'refund-1',
+          reason: 'Damaged',
+          totalBase: decimal('200'),
+          refundedAt: new Date('2026-06-01T12:00:00.000Z'),
+          order: { customerName: 'Customer A', lines: [{ productId: 'kit-1', qty: decimal('4') }] },
+        },
+      }],
+    },
+    stockMovement: {
+      findMany: async () => [
+        { productId: 'comp-a', qty: decimal('4'), shipmentLine: { lineId: 'sl-1', line: { productId: 'kit-1' } } },
+        { productId: 'comp-b', qty: decimal('2'), shipmentLine: { lineId: 'sl-1', line: { productId: 'kit-1' } } },
+      ],
+    },
+  }
+
+  const report = await getReturnsAnalyticsReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-01' },
+    { client, now: () => new Date('2026-06-01T15:00:00.000Z') },
+  )
+
+  assert.equal(report.rows[0]?.sku, 'KIT-1')
+  assert.equal(report.rows[0]?.returnedQty, '1')
+  assert.equal(report.rows[0]?.shippedQty, '2', 'min(4/2, 2/1) = 2 whole kits dispatched')
+  assert.equal(report.rows[0]?.returnRatePct, '50')
 })

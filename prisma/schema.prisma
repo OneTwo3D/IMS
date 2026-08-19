@@ -548,7 +548,7 @@ model TaxRateComponent {
 
 model Warehouse {
   id                    String        @id @default(cuid())
-  code                  String        @unique // EAR2, CBG, RES, QUA
+  code                  String        @unique // e.g. MIL1, CBG, RES, QUA (o3d-0o3y: EAR2/Earith retired when Fulfillable moved us to MIL1/Mildenhall)
   name                  String
   type                  WarehouseType @default(STANDARD)
   availableForSale      Boolean       @default(true)

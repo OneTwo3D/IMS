@@ -39,6 +39,7 @@ test('the coupon a WC order actually carries is deducted ONCE end-to-end', () =>
   const { orderLevelDiscount } = resolveWcOrderLevelDiscount({
     couponTotalForeign: 10,
     lineDiscountTotalForeign: 10,
+    currency: 'GBP',
   })
 
   const payload = buildSalesInvoicePayload(
@@ -73,6 +74,7 @@ test('coupon money Woo left off the lines still reaches the invoice', () => {
   const { orderLevelDiscount } = resolveWcOrderLevelDiscount({
     couponTotalForeign: 10,
     lineDiscountTotalForeign: 0,
+    currency: 'GBP',
   })
 
   const payload = buildSalesInvoicePayload(

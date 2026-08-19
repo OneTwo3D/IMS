@@ -9,6 +9,7 @@ import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { assertSupplierOwnsResource, SupplierPortalAccessError } from '@/lib/security/supplier-portal-boundary'
 import { applyHeaderOrderDiscount, resolveHeaderOrderDiscountForeign } from '@/lib/domain/purchasing/order-discount'
+import { calcRequotedLineAmounts } from '@/lib/domain/purchasing/quote-line-amounts'
 import { z } from 'zod'
 
 // ---------------------------------------------------------------------------
@@ -289,6 +290,9 @@ export async function submitSupplierQuote(
         select: {
           id: true, supplierId: true, reference: true, currency: true, fxRateToBase: true,
           discountStr: true, discountAmount: true, pricesIncludeVat: true,
+          // o3d-4rp: the order-level fallback rate for lines with no per-line taxRate override,
+          // mirroring createPurchaseOrder's orderDefaultCtx.rate.
+          taxRatePercent: true,
         },
       })
       if (!lockedPo) throw new Error('RFQ not found or not accessible')
@@ -301,23 +305,36 @@ export async function submitSupplierQuote(
       const effectiveFxRate = fxRate
       for (const line of safeData.lines) {
         // Verify line belongs to this PO (prevent cross-PO manipulation)
-        const poLine = await tx.purchaseOrderLine.findFirst({ where: { id: line.lineId, poId } })
+        const poLine = await tx.purchaseOrderLine.findFirst({
+          where: { id: line.lineId, poId },
+          // o3d-4rp: the line's own rate, falling back to the order rate — the same precedence
+          // resolvePurchaseLineTaxRates gives createPurchaseOrder.
+          select: { id: true, taxRate: { select: { rate: true } } },
+        })
         if (!poLine) continue
 
-        const qty = toDecimal(line.qty)
-        const unitPriceForeign = toDecimal(line.unitPrice)
-        const totalForeign = qty.mul(unitPriceForeign)
-        const unitCostBase = unitPriceForeign.div(effectiveFxRate)
-        const totalBase = totalForeign.div(effectiveFxRate)
+        // o3d-4rp: RECOMPUTE THE LINE TAX ON THE REQUOTED PRICE. Previously qty/unitCost/total were
+        // rewritten here and taxForeign/taxBase were left at the ORIGINAL RFQ prices, then summed
+        // into the PO tax totals and consumed by the o3d-lx1 header-discount split. See
+        // calcRequotedLineAmounts for the conventions.
+        const amounts = calcRequotedLineAmounts({
+          qty: line.qty,
+          quotedUnitPriceForeign: line.unitPrice,
+          taxRate: poLine.taxRate?.rate ?? lockedPo.taxRatePercent ?? 0,
+          pricesIncludeVat: lockedPo.pricesIncludeVat,
+          fxRateToBase: effectiveFxRate,
+        })
 
         await tx.purchaseOrderLine.update({
           where: { id: line.lineId },
           data: {
-            qty: roundDecimalString(qty, 4),
-            unitCostForeign: roundDecimalString(unitPriceForeign, 6),
-            unitCostBase: roundDecimalString(unitCostBase, 6),
-            totalForeign: roundDecimalString(totalForeign, 4),
-            totalBase: roundDecimalString(totalBase, 4),
+            qty: roundDecimalString(toDecimal(line.qty), 4),
+            unitCostForeign: roundDecimalString(amounts.unitCostForeign, 6),
+            unitCostBase: roundDecimalString(amounts.unitCostBase, 6),
+            totalForeign: roundDecimalString(amounts.totalForeign, 4),
+            totalBase: roundDecimalString(amounts.totalBase, 4),
+            taxForeign: roundDecimalString(amounts.taxForeign, 4),
+            taxBase: roundDecimalString(amounts.taxBase, 4),
           },
         })
       }

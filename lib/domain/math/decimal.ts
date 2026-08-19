@@ -54,6 +54,16 @@ function assertValidPrecision(precision: number): void {
   }
 }
 
+/**
+ * ISO 4217 minor-unit digits for a currency code — 2 for most, 0 for JPY/KRW/ISK, 3 for the Gulf
+ * dinars. Exported (o3d-5tf) so money tolerances can be expressed as a fraction of ONE MINOR UNIT
+ * instead of hard-coding a penny: a 0.005 threshold is half a minor unit in GBP, five whole minor
+ * units in KWD and a meaningless sliver in JPY.
+ */
+export function currencyMinorUnits(currency: string): number {
+  return currencyPrecision(currency)
+}
+
 function currencyPrecision(currency: string): number {
   const normalizedCurrency = currency.trim().toUpperCase()
   if (!normalizedCurrency) return 2

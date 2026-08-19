@@ -2758,7 +2758,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
 
 export async function deleteSalesOrder(id: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('sales.create')
+    const session = await requirePermission('sales.create')
 
     // o3d-5r8: read the guards, release the allocations and delete the row under ONE
     // order-row lock. A hard delete destroys the only IMS handle on anything a posting
@@ -2798,7 +2798,14 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       })
       if (blocker) return { error: blocker.message }
 
-      const released = await releaseOrderAllocationsInTx(tx, id, { cause: 'deleting the sales order' })
+      // o3d-6zr2: the pending-shipment retirement record is written through the transaction client,
+      // which cannot resolve a session, so the acting user has to be handed down from the action
+      // boundary. Without it, a draft shipment (and its tracking number) retired by an operator's
+      // delete was attributed to nobody.
+      const released = await releaseOrderAllocationsInTx(tx, id, {
+        cause: 'deleting the sales order',
+        userId: session.user.id,
+      })
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
       await tx.salesOrder.delete({ where: { id } })
       return { so, released }

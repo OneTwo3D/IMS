@@ -117,6 +117,14 @@ export type AllocateSalesOrderInput = {
    * must not turn it into a no-op that strands reservations on a cancelled order.
    */
   requireStatusUnderLock?: readonly SalesOrderStatus[]
+  /**
+   * o3d-6zr2: the acting user, for the pending-shipment retirement record this allocation may write.
+   * That record is written through the transaction client (`reconcilePendingShipments`), which
+   * cannot resolve a session, so the identity has to arrive from the action boundary. Leave null on
+   * the cron/batch paths (the reallocation sweep, the overallocation rebalancer): they genuinely
+   * have no user, and inventing one would be worse than recording none.
+   */
+  userId?: string | null
 }
 
 export type AllocateSalesOrderResult = {
@@ -1943,6 +1951,7 @@ export async function allocateSalesOrder(
       // worth judging against.
       pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
         cause: 'a re-allocation of the order',
+        userId: input.userId ?? null,
       })
     } else {
       // o3d-4kfh r6 (Codex finding 3): THE UNCHANGED PATH RECONCILES TOO.
@@ -1968,6 +1977,7 @@ export async function allocateSalesOrder(
       // unbacked the draft came before it.
       pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
         cause: 'an earlier allocation change (this re-allocation computed the same set)',
+        userId: input.userId ?? null,
       })
 
       // o3d-4kfh r7 (Codex finding 3): AND IT RE-STAMPS.
