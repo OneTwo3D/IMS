@@ -62,7 +62,7 @@ mock.module('@/app/actions/allocation', {
 /** Every `$queryRaw` the sweep issues, so its ageing predicate can be asserted rather than assumed. */
 const rawQueries: Array<{ sql: string; values: unknown[] }> = []
 /** Every `$executeRaw` — i.e. every deferral the sweep stamps on a marker it could not resolve. */
-const rawUpdates: Array<{ sql: string; values: unknown[]; entityId: string; key: string }> = []
+const rawUpdates: Array<{ sql: string; values: unknown[]; entityId: string; key: string; stamped: number }> = []
 /**
  * Orders with an outstanding marker past the grace window, oldest FIRST — the array position is
  * the marker's `createdAt`. A resolve deletes the marker (see `markerTx`), which takes the order
@@ -71,8 +71,41 @@ const rawUpdates: Array<{ sql: string; values: unknown[]; entityId: string; key:
 const agedMarkerOrderIds: string[] = []
 /** Deferral stamps the sweep wrote, per entityId and per JSON key, on the modelled DB clock. */
 const markerDeferrals = new Map<string, Record<string, number>>()
-/** A monotonic stand-in for NOW(), always later than any seeded marker's creation. */
+/**
+ * A stand-in for NOW() on the DATABASE clock. Tests may move it, INCLUDING BACKWARDS — an NTP
+ * correction, a restored snapshot or a failover to a host that was never in step all do that, and
+ * round 4 finding 2 is that the fairness ordering must not depend on it not happening.
+ */
 let dbClock = 1_000
+/** Every `SET LOCAL` the sweep issues, so the deferral's server-side bound is asserted, not assumed. */
+const rawSettings: Array<{ sql: string; timeoutMs: number }> = []
+/** Statement kinds issued since the last transaction boundary, so a batch is checked as a unit. */
+let pendingStatements: string[] = []
+/** Every batch `$transaction` the sweep issued, as the statement kinds it grouped. */
+const batchedStatements: string[][] = []
+/**
+ * Shapes this double refused to model. Recorded as well as thrown because `deferFailedMarker` is
+ * best-effort and SWALLOWS what it throws — without this, a deferral the double rejected would
+ * look to a test exactly like a deferral production never attempted.
+ */
+const doubleViolations: string[] = []
+
+function refuse(message: string): never {
+  doubleViolations.push(message)
+  throw new Error(message)
+}
+
+/**
+ * When a marker becomes due on the modelled DB clock: its creation — its position in
+ * `agedMarkerOrderIds` — unless a later failure deferred it. GREATEST ignores NULLs in Postgres,
+ * so a marker that has never failed is due at its creation.
+ */
+function dueAt(entityId: string, deferralKey: string): number {
+  return Math.max(
+    agedMarkerOrderIds.indexOf(entityId),
+    markerDeferrals.get(entityId)?.[deferralKey] ?? -Infinity,
+  )
+}
 /** The entityIds the last candidate query served, in the order it served them. */
 let servedQueue: string[] = []
 /** The markers the sweep actually spent a tick on, in order — including the ones that threw. */
@@ -111,39 +144,78 @@ mock.module('@/lib/db', {
         if (!deferralKey) {
           throw new Error(`the candidate ordering must read a deferral stamp out of metadata: ${orderBy}`)
         }
-        // GREATEST ignores NULLs, so a marker that has never failed is due at its creation.
-        const dueAt = (entityId: string) =>
-          Math.max(agedMarkerOrderIds.indexOf(entityId), markerDeferrals.get(entityId)?.[deferralKey] ?? -Infinity)
-        servedQueue = [...agedMarkerOrderIds].sort((a, b) => dueAt(a) - dueAt(b) || a.localeCompare(b))
+        servedQueue = [...agedMarkerOrderIds]
+          .sort((a, b) => dueAt(a, deferralKey) - dueAt(b, deferralKey) || a.localeCompare(b))
         sweepTxHandouts = 0
         return servedQueue.map((entityId) => ({ entityId }))
       },
+      // The statement timeout that bounds the deferral. Only this one shape is modelled: an
+      // unbounded deferral can spend the sweep's whole wall-clock budget waiting on a row lock
+      // (round 4, finding 3), so a double that accepted any SET would accept the defect.
+      $executeRawUnsafe: async (sql: string) => {
+        const bound = /^SET LOCAL statement_timeout = (\d+)$/.exec(sql)
+        if (!bound) refuse(`the db double does not model this statement: ${sql}`)
+        rawSettings.push({ sql, timeoutMs: Number(bound[1]) })
+        pendingStatements.push('set-timeout')
+        return 0
+      },
       // The deferral write. Modelled clause by clause for the same reason: a statement that
-      // stamped the wrong key, or was not scoped to one order, would still "work" here.
+      // stamped the wrong key, or was not scoped to one order, would still "work" here. The
+      // STAMPED VALUE is modelled too — which value gets written is the whole of finding 2, so a
+      // double that just took its own clock would pass the defect and the fix alike.
       $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
         const sql = strings.join('?')
         if (!/^\s*UPDATE "activity_logs"/.test(sql)) {
-          throw new Error(`the db double does not model this statement: ${sql}`)
+          refuse(`the db double does not model this statement: ${sql}`)
         }
-        const key = /jsonb_build_object\('(\w+)', NOW\(\) AT TIME ZONE 'UTC'\)/.exec(sql)?.[1]
-        if (!key) throw new Error(`the deferral must stamp one JSON key from the DATABASE clock, naive UTC: ${sql}`)
+        // SET LOCAL is scoped to a transaction; issued outside one it silently binds nothing.
+        if (pendingStatements[0] !== 'set-timeout') {
+          refuse(`the deferral must be bounded by a statement timeout in the SAME transaction: ${sql}`)
+        }
+        pendingStatements.push('defer')
+        const stamp = /jsonb_build_object\('(\w+)', GREATEST\(\s*NOW\(\) AT TIME ZONE 'UTC',\s*\(SELECT MAX\(GREATEST\(q\."createdAt", \(q\."metadata"->>'(\w+)'\)::timestamp\)\)[\s\S]*?\)\s*\+ interval '1 millisecond'\s*\)\)/.exec(sql)
+        if (!stamp) {
+          refuse(
+            'the deferral must stamp one JSON key, naive UTC, as the LATER of the database clock and '
+            + `one millisecond past the latest due time in the queue: ${sql}`,
+          )
+        }
+        const [, key, orderedBy] = stamp
+        if (orderedBy !== key) {
+          refuse(`the stamp must be taken over the same key it writes (${key} vs ${orderedBy})`)
+        }
         for (const clause of [/"entityType" = 'SALES_ORDER'/, /AND action = \?/, /AND "entityId" = \?/]) {
-          if (!clause.test(sql)) throw new Error(`the deferral must be scoped by ${clause}: ${sql}`)
+          if (!clause.test(sql)) refuse(`the deferral must be scoped by ${clause}: ${sql}`)
         }
-        assert.equal(values.length, 2, 'the action and the order, and nothing else')
-        assert.equal(values[0], 'fulfilment_entry_pending_verification', 'scoped to the marker action')
-        const entityId = String(values[1])
-        rawUpdates.push({ sql, values, entityId, key })
-        markerDeferrals.set(entityId, { ...(markerDeferrals.get(entityId) ?? {}), [key]: ++dbClock })
+        assert.equal(values.length, 3, 'the action twice — the sub-select and the filter — and the order')
+        assert.equal(values[0], 'fulfilment_entry_pending_verification', 'the queue sub-select reads the markers')
+        assert.equal(values[1], 'fulfilment_entry_pending_verification', 'scoped to the marker action')
+        const entityId = String(values[2])
+        // GREATEST over ROWS, which can only over-estimate the per-group maximum the candidate
+        // query orders by — so it can only put this marker further back, never in front.
+        const queueMax = agedMarkerOrderIds.reduce((max, id) => Math.max(max, dueAt(id, key)), -Infinity)
+        const stamped = Math.max(dbClock, queueMax + 1)
+        rawUpdates.push({ sql, values, entityId, key, stamped })
+        markerDeferrals.set(entityId, { ...(markerDeferrals.get(entityId) ?? {}), [key]: stamped })
         return 1
       },
-      $transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
+      $transaction: async (
+        argument: ((tx: unknown) => Promise<unknown>) | Array<Promise<unknown>>,
+      ) => {
+        // The BATCH form is the deferral's. Its statements have already run in this double (a real
+        // PrismaPromise is lazy and would start here instead), so what is left to check — and what
+        // the fix turns on — is that they were grouped into ONE transaction.
+        if (Array.isArray(argument)) {
+          batchedStatements.push(pendingStatements)
+          pendingStatements = []
+          return Promise.all(argument)
+        }
         // One client per order, in the order the CANDIDATE QUERY served them — which is the
         // order under test, so it must not be re-derived from the seeding order here.
         const orderId = servedQueue[sweepTxHandouts++]
         attemptedOrders.push(orderId)
         if (sweepTxThrows.has(orderId)) throw new Error(`lock timeout on ${orderId}`)
-        return fn(sweepTxByOrder.get(orderId) ?? {})
+        return argument(sweepTxByOrder.get(orderId) ?? {})
       },
     },
   },
@@ -173,6 +245,10 @@ function seedOrder(id: string, shipments = 0, status = 'PICKING') {
 function reset() {
   rawQueries.length = 0
   rawUpdates.length = 0
+  rawSettings.length = 0
+  batchedStatements.length = 0
+  pendingStatements = []
+  doubleViolations.length = 0
   agedMarkerOrderIds.length = 0
   markerDeferrals.clear()
   servedQueue = []
@@ -1185,6 +1261,7 @@ test('a marker that FAILS yields the head of the queue instead of owning it fore
   // It yields by being STAMPED, and only the marker that failed is. The stamp is written from the
   // database clock and touches nothing else on the row — re-ageing `createdAt` would re-open the
   // import's grace window, which is a different question with a different answer.
+  assert.deepEqual(doubleViolations, [], 'the deferral statement must be one the double models')
   assert.deepEqual(rawUpdates.map((u) => u.entityId), ['f1', 'f1'], 'only a failure defers, and only itself')
   assert.deepEqual([...new Set(rawUpdates.map((u) => u.key))], [MARKER_DEFERRAL_KEY])
   assert.match(
@@ -1192,8 +1269,100 @@ test('a marker that FAILS yields the head of the queue instead of owning it fore
     /NOW\(\) AT TIME ZONE 'UTC'/,
     'stamped on the database clock, and stored the way `createdAt` it is compared against is stored',
   )
-  assert.ok(!/"createdAt"/.test(rawUpdates[0].sql), 'a failed attempt must not re-age the marker')
+  // It READS `createdAt` — that is half of the due time it has to outrank — but it must never
+  // assign to it: re-ageing the marker would re-open the import's grace window.
+  assert.ok(!/"createdAt"\s*=[^=]/.test(rawUpdates[0].sql), 'a failed attempt must not re-age the marker')
+  assert.match(rawUpdates[0].sql, /SET "metadata" =/, 'the stamp touches metadata and nothing else')
   assert.ok(!/DELETE/i.test(rawUpdates[0].sql), 'and must never discharge the obligation it is deferring')
+})
+
+test('the deferral is ordered against the QUEUE, so a backwards clock cannot re-starve it (o3d-z82a)', async () => {
+  // FINDING 2, round 4. The fairness guarantee — every marker leaves the head of the queue after
+  // one attempt — rested on a property NOW() does not have. Every queued marker's due time is a
+  // NOW() read from the PAST, so stamping NOW() puts a failure behind them only while the database
+  // clock runs forward. An NTP correction, a restored snapshot or a failover to a host that was
+  // never in step all move it backwards, and then the stamp lands BEFORE the peers it was supposed
+  // to yield to: the marker keeps the head it just failed at, for as long as the clock is behind,
+  // and the markers behind it — the rows exempt from retention — are never reached at all.
+  //
+  // So the stamp is taken from the queue: one millisecond past the latest due time outstanding,
+  // which is a strict inequality against every peer with no clock reading in it. NOW() stays only
+  // as a floor, so a sane clock still writes the real time of the failure.
+  const { sweepUnresolvedDirectCreateMarkers, MARKER_DEFERRAL_KEY } = await loadHelper()
+  reset()
+  for (const id of ['k1', 'k2', 'k3']) {
+    seedOrder(id, 0, 'PICKING')
+    agedMarkerOrderIds.push(id) // k1 is the oldest, and its due times are 0, 1, 2
+    sweepTxByOrder.set(id, markerTx(id, []).tx)
+  }
+  sweepTxThrows.add('k1') // its lock is never available
+  // The database clock has stepped back to long before any of these markers was even created.
+  dbClock = -1_000
+
+  const ticks = []
+  for (let i = 0; i < 4; i += 1) {
+    ticks.push(await sweepUnresolvedDirectCreateMarkers({ budgetMs: 0, now: () => 0 }))
+  }
+
+  assert.deepEqual(doubleViolations, [], 'the deferral statement must be one the double models')
+  assert.deepEqual(
+    attemptedOrders,
+    ['k1', 'k2', 'k3', 'k1'],
+    'a clock that went backwards must not hand the head of the queue back to the failure',
+  )
+  assert.deepEqual(ticks.map((t) => t.resolved), [0, 1, 1, 0], 'the queue still drains behind it')
+  assert.ok(
+    rawUpdates[0].stamped > 2,
+    'the stamp must land past every peer\'s due time (0, 1, 2), not on a clock reading of -1000',
+  )
+  assert.equal(
+    markerDeferrals.get('k1')?.[MARKER_DEFERRAL_KEY],
+    rawUpdates[rawUpdates.length - 1].stamped,
+    'and what the marker carries is what the statement computed, not the test\'s own idea of now',
+  )
+  assert.ok(
+    rawUpdates[1].stamped > rawUpdates[0].stamped,
+    'and a second failure must move it again — the stamp is strictly increasing per marker',
+  )
+})
+
+test('the deferral is bounded by a statement timeout the DATABASE enforces (o3d-z82a)', async () => {
+  // FINDING 3, round 4. The deferral is best effort and runs inside the sweep's per-tick
+  // wall-clock budget, but an UPDATE has no time limit of its own: it takes row locks on marker
+  // rows a concurrent resolver may hold for the whole of its own transaction. Waiting there spends
+  // the budget the same review round added, once per failed marker.
+  //
+  // SET LOCAL is the bound, and it is the database that enforces it — the connection comes back
+  // instead of being left in flight. SET LOCAL is scoped to a transaction, which is the ONE reason
+  // this statement takes one; issued outside a transaction it silently binds nothing.
+  const { sweepUnresolvedDirectCreateMarkers, DIRECT_CREATE_DEFERRAL_TIMEOUT_MS } = await loadHelper()
+  reset()
+  for (const id of ['t1', 't2']) {
+    seedOrder(id, 0, 'PICKING')
+    agedMarkerOrderIds.push(id)
+    sweepTxByOrder.set(id, markerTx(id, []).tx)
+  }
+  sweepTxThrows.add('t1')
+
+  const result = await sweepUnresolvedDirectCreateMarkers()
+
+  assert.deepEqual(doubleViolations, [], 'an unbounded deferral is not a statement this double will run')
+  assert.equal(result.errors, 1)
+  assert.equal(result.resolved, 1, 'and the order behind the failure is still resolved')
+  assert.deepEqual(
+    rawSettings.map((setting) => setting.timeoutMs),
+    [DIRECT_CREATE_DEFERRAL_TIMEOUT_MS],
+    'one bound, per deferral',
+  )
+  assert.deepEqual(
+    batchedStatements,
+    [['set-timeout', 'defer']],
+    'in ONE transaction, or SET LOCAL is scoped to nothing at all',
+  )
+  assert.ok(
+    DIRECT_CREATE_DEFERRAL_TIMEOUT_MS > 0 && DIRECT_CREATE_DEFERRAL_TIMEOUT_MS < 20_000,
+    'and below the resolve transaction it most likely queues behind, so losing that race is cheap',
+  )
 })
 
 test('the sweep only takes markers past the import\'s grace window, aged on the DB clock (o3d-z82a)', async () => {
@@ -1247,11 +1416,55 @@ test('the sweep\'s candidate query is backed by a partial index on the marker ac
     'utf8',
   )
 
-  assert.match(migration, /CREATE INDEX "activity_logs_direct_create_marker_idx"/)
+  assert.match(migration, /CREATE INDEX CONCURRENTLY "activity_logs_direct_create_marker_idx"/)
   assert.match(migration, /ON "activity_logs" \("createdAt", "entityId"\)/, 'ordered for the ageing scan and the GROUP BY')
   assert.ok(
     migration.includes(`WHERE action = '${DIRECT_CREATE_PENDING_ACTION}'`),
     'the partial predicate must be the SAME action string the sweep queries for',
+  )
+})
+
+test('the index is built without blocking writes to activity_logs (o3d-z82a)', async () => {
+  // FINDING 1, round 4. A plain CREATE INDEX holds a SHARE lock for the whole build, and that
+  // blocks INSERTs into the one table essentially every action in IMS writes to — an outage for
+  // the length of the deploy, on the very table whose size is the reason this index exists.
+  // docs/migration-conventions.md names activity_logs as a table that must build concurrently.
+  //
+  // CONCURRENTLY cannot run inside a transaction block, and Postgres puts a multi-statement
+  // simple-query string into an implicit one — so the file must carry no BEGIN/COMMIT and exactly
+  // ONE statement. That is not a style rule: a second statement makes the build fail outright.
+  const { readFile } = await import('node:fs/promises')
+  const path = await import('node:path')
+  const read = async (dir: string) =>
+    readFile(path.join(process.cwd(), 'prisma/migrations', dir, 'migration.sql'), 'utf8')
+  const withoutComments = (sql: string) =>
+    sql.split('\n').filter((line) => !/^\s*--/.test(line)).join('\n')
+  const statementsOf = (sql: string) =>
+    withoutComments(sql).split(';').map((statement) => statement.trim()).filter(Boolean)
+
+  const migration = await read('20260818090000_direct_create_marker_sweep_index')
+  const statements = statementsOf(migration)
+
+  assert.equal(statements.length, 1, 'a concurrent build cannot share a file with anything else')
+  assert.match(statements[0], /^CREATE INDEX CONCURRENTLY /, 'writers must not be blocked for the build')
+  assert.ok(
+    !/\bBEGIN\b|\bCOMMIT\b/i.test(withoutComments(migration)),
+    'CREATE INDEX CONCURRENTLY cannot run inside a transaction block',
+  )
+  // An interrupted concurrent build leaves the index behind INVALID: unusable by the planner, so
+  // the sweep silently keeps the table scan, yet still maintained by every activity_logs write.
+  // IF NOT EXISTS would no-op against that leftover and make the state permanent and invisible.
+  assert.ok(!/IF NOT EXISTS/i.test(statements[0]), 'a retry must not silently accept an invalid leftover')
+
+  // ...and the invalid case is asserted at deploy time rather than left to be noticed.
+  const validate = await read('20260818090100_direct_create_marker_sweep_index_validate')
+  assert.match(validate, /indisvalid/, 'the follow-up migration checks the build actually completed')
+  assert.match(validate, /activity_logs_direct_create_marker_idx/)
+  assert.match(validate, /RAISE EXCEPTION/, 'and fails the deploy rather than logging')
+  assert.match(
+    validate,
+    /DROP INDEX CONCURRENTLY IF EXISTS/,
+    'naming the remediation, which must not take the lock the build avoided',
   )
 })
 

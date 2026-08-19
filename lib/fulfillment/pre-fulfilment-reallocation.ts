@@ -589,13 +589,30 @@ const DIRECT_CREATE_SWEEP_LIMIT = 200
  *
  * The deadline is checked AFTER each marker, never before, so the budget can throttle the sweep
  * but can never stop it making progress: a zero budget still attempts one marker per tick.
- * Worst-case overshoot is therefore one marker: the 20s transaction timeout plus the 5s lock wait.
+ * Worst-case overshoot is therefore one marker: the 20s transaction timeout, the 5s lock wait, and
+ * — only when that marker failed — the deferral's own bounded stamp below.
  *
  * That is progress through the LOOP. Progress through the QUEUE is a different claim and needs
  * the deferral below — "oldest-first" alone guarantees it only while the oldest marker keeps
  * being resolved (Codex review r6, finding 1).
  */
 const DIRECT_CREATE_SWEEP_BUDGET_MS = 120_000
+
+/**
+ * How long the deferral stamp may take before the DATABASE cancels it (Codex review r4, finding 3).
+ *
+ * The stamp is best-effort and runs inside the per-tick budget above, so it needs a bound of its
+ * own or it can spend that budget on one order: the UPDATE takes row locks on marker rows that a
+ * concurrent resolver may be holding for the length of its own transaction, and nothing about an
+ * UPDATE limits how long it waits. Cancelled by `SET LOCAL statement_timeout`, so the bound is
+ * enforced by Postgres and the connection comes back rather than being left in flight.
+ *
+ * Below the resolve transaction's own 20s timeout on purpose: the likeliest blocker IS a resolver
+ * discharging this order's obligation, and losing the race to it costs nothing — the marker it is
+ * deleting will not need deferring. One cycle of fairness is the whole downside, and the next tick
+ * simply retries.
+ */
+export const DIRECT_CREATE_DEFERRAL_TIMEOUT_MS = 5_000
 
 /**
  * THE JSON KEY THAT LETS A FAILING MARKER YIELD ITS TURN (Codex review r6, finding 1).
@@ -613,9 +630,11 @@ const DIRECT_CREATE_SWEEP_BUDGET_MS = 120_000
  * GREATEST(MIN(createdAt), MAX(lastFailedAt)) — when the marker became due, which is its creation
  * until it fails and its last failure after that. So:
  *
- *   - it YIELDS: every marker currently queued was due before this one failed, so the failure
- *     puts it behind all of them. No interval constant is involved and none would do, because a
- *     backoff shorter than the cron's own period would put it straight back at the head.
+ *   - it YIELDS: the stamp is one millisecond past the LATEST due time outstanding, so the failure
+ *     puts it strictly behind every marker queued at that moment. No interval constant is involved
+ *     and none would do, because a backoff shorter than the cron's own period would put it
+ *     straight back at the head. Nor is a clock reading involved — see `deferFailedMarker`, which
+ *     takes the bound from the queue precisely so a clock that steps backwards cannot undo this.
  *   - it does NOT LOSE ITS TURN: nothing is deleted, the obligation still stands, the grace
  *     predicate still reads the untouched `createdAt`, and once its peers have had their turn it
  *     is the oldest-due marker again and is retried.
@@ -624,16 +643,18 @@ const DIRECT_CREATE_SWEEP_BUDGET_MS = 120_000
  * the queue after one attempt — resolved and deleted, or deferred behind its peers.
  *
  * Written into the marker's own metadata rather than a column: it is state about the obligation,
- * it dies with the marker, and it costs no migration on a table this size. The ORDER BY casts it
- * back to a timestamp, so this key must never hold anything else — the ONE statement that writes
- * it is `deferFailedMarker`, and the ONE that reads it is the candidate query. Both spell it as a
- * SQL literal (a JSON path cannot reference a TS constant), and the pairing is asserted in
- * tests/pre-fulfilment-reallocation.test.ts.
+ * it dies with the marker, and it costs no migration on a table this size. Every read of it casts
+ * it back to a timestamp, so this key must never hold anything else — the ONE statement that
+ * writes it is `deferFailedMarker`, and it is read in exactly two places: the candidate query's
+ * ORDER BY, and that same deferral statement, which has to know the queue's current maximum to
+ * outrank it. All of them spell the key as a SQL literal (a JSON path cannot reference a TS
+ * constant), and the pairing is asserted in tests/pre-fulfilment-reallocation.test.ts.
  *
- * Stored NAIVE UTC (`NOW() AT TIME ZONE 'UTC'`), which is how Prisma stores `createdAt` in this
- * TIMESTAMP(3) column. The two are compared against each other in that ORDER BY, and a timestamptz
- * on one side would have to be coerced through the session's TimeZone to meet a timestamp on the
- * other — a correct ordering only as long as nobody sets one.
+ * Stored NAIVE UTC, which is how Prisma stores `createdAt` in this TIMESTAMP(3) column. The two are
+ * compared against each other in that ORDER BY, and a timestamptz on one side would have to be
+ * coerced through the session's TimeZone to meet a timestamp on the other — a correct ordering only
+ * as long as nobody sets one. Every term the stamp is built from is naive UTC for that reason:
+ * `NOW() AT TIME ZONE 'UTC'`, `createdAt`, and the previous stamps themselves.
  */
 export const MARKER_DEFERRAL_KEY = 'lastFailedAt'
 
@@ -739,32 +760,84 @@ export async function sweepUnresolvedDirectCreateMarkers(
  * Send a marker that just failed to the back of the queue, without taking it out of the queue.
  *
  * Stamped on EVERY marker row for the order, because the candidate query orders groups by
- * MAX(lastFailedAt) and the group is the obligation. Written outside any transaction, and
- * deliberately so: the attempt that failed rolled back, and the one thing that must survive it is
- * the record that it happened.
+ * MAX(lastFailedAt) and the group is the obligation. Written outside the transaction whose failure
+ * it records, and deliberately so: that attempt rolled back, and the one thing that must survive it
+ * is the record that it happened.
  *
  * It does NOT need the order's row lock, which matters because the most likely reason to be here
  * is that the lock could not be taken — a deferral that queued behind the same lock would fail
  * for the same reason and defer nothing.
  *
- * The stamp comes from the DATABASE clock, like the ageing predicate: two sweep processes with
- * differently skewed clocks must not be able to order the queue differently. `createdAt` is left
- * strictly alone — a failed attempt must not re-open the import's grace window.
+ * `createdAt` is left strictly alone — a failed attempt must not re-open the import's grace window.
  *
- * BEST EFFORT. A failure here is not a correctness failure: the marker keeps its place, the next
- * tick retries it first, and the only thing lost is fairness for one cycle. Raising it would turn
- * a fairness aid into a way to abort a sweep that is already dealing with a failure.
+ * THE STAMP IS TAKEN FROM THE QUEUE, NOT FROM THE CLOCK (Codex review r4, finding 2).
+ *
+ * It used to be plain `NOW()`, and the fairness argument rested on a property NOW() does not have.
+ * What the ordering needs is that a failed marker ends up strictly BEHIND every marker outstanding
+ * at that moment; NOW() delivers that only while the database clock runs forward, because every
+ * queued marker's due time is a NOW() read from the past. Let the clock step backwards — an NTP
+ * correction, a restored snapshot, a failover to a host that was never in step — and the stamp can
+ * land BEFORE the peers it was supposed to yield to, or before this marker's own previous stamp.
+ * The marker then keeps the head of the queue it just failed at, which is exactly the starvation
+ * this mechanism exists to prevent, and it keeps it for as long as the clock is behind.
+ *
+ * So the stamp asks the queue instead: one millisecond later than the LATEST due time among all
+ * outstanding markers — the same GREATEST(createdAt, lastFailedAt) the candidate query orders by,
+ * maximised over rows rather than per group, which can only over-estimate and so can only order
+ * this marker further back. That is a strict inequality against every peer and against this
+ * marker's own previous stamp, and it holds whatever the clock is doing, because no term in it is
+ * a clock reading. One millisecond because the column it is compared against is TIMESTAMP(3), so
+ * that is the smallest increment both sides of the comparison can represent.
+ *
+ * NOW() survives as a FLOOR, which is what keeps the value meaningful: with a sane clock the stamp
+ * is the real time of the failure (and already later than every peer), and only when the clock has
+ * gone backwards does the queue term take over. The sub-select is not a new cost either — it reads
+ * precisely the rows the partial index from 20260818090000 isolates, which is the same handful the
+ * sweep's own candidate query walks.
+ *
+ * (The ageing predicate still reads NOW() directly, and that is fine: a backwards clock there
+ * DELAYS a marker becoming eligible, which is safe. It is only the ORDER BY that a stale reading
+ * could corrupt.)
+ *
+ * BOUNDED, in its own transaction and by the server (Codex review r4, finding 3).
+ *
+ * This runs inside the sweep's per-tick wall-clock budget, and an UPDATE has no time limit of its
+ * own: it can queue behind a row lock on the very marker rows a concurrent resolver is deleting,
+ * and there is no bound on how long that resolver's transaction takes. Waiting there would blow
+ * the budget the same review round added, once per failed marker. `SET LOCAL statement_timeout`
+ * makes Postgres itself cancel the statement, which is the only bound that also releases the
+ * connection; it needs a transaction to be scoped to, so this is the ONE reason the deferral takes
+ * one. It is its own transaction and commits on its own — nothing about "survives the attempt that
+ * failed" changes.
+ *
+ * BEST EFFORT. A failure here — timeout included — is not a correctness failure: the marker keeps
+ * its place, the next tick retries it first, and the only thing lost is fairness for one cycle.
+ * Raising it would turn a fairness aid into a way to abort a sweep that is already dealing with a
+ * failure.
  */
 async function deferFailedMarker(orderId: string): Promise<void> {
   try {
-    await db.$executeRaw`
-      UPDATE "activity_logs"
-      SET "metadata" = COALESCE("metadata", '{}'::jsonb)
-                     || jsonb_build_object('lastFailedAt', NOW() AT TIME ZONE 'UTC')
-      WHERE "entityType" = 'SALES_ORDER'
-        AND action = ${DIRECT_CREATE_PENDING_ACTION}
-        AND "entityId" = ${orderId}
-    `
+    await db.$transaction([
+      // $executeRawUnsafe because SET takes no bind parameters — it is a utility statement, and a
+      // placeholder here is a syntax error. The interpolated value is a numeric module constant,
+      // never anything a caller supplies.
+      db.$executeRawUnsafe(`SET LOCAL statement_timeout = ${DIRECT_CREATE_DEFERRAL_TIMEOUT_MS}`),
+      db.$executeRaw`
+        UPDATE "activity_logs"
+        SET "metadata" = COALESCE("metadata", '{}'::jsonb)
+                       || jsonb_build_object('lastFailedAt', GREATEST(
+                            NOW() AT TIME ZONE 'UTC',
+                            (SELECT MAX(GREATEST(q."createdAt", (q."metadata"->>'lastFailedAt')::timestamp))
+                               FROM "activity_logs" q
+                              WHERE q."entityType" = 'SALES_ORDER'
+                                AND q.action = ${DIRECT_CREATE_PENDING_ACTION})
+                            + interval '1 millisecond'
+                          ))
+        WHERE "entityType" = 'SALES_ORDER'
+          AND action = ${DIRECT_CREATE_PENDING_ACTION}
+          AND "entityId" = ${orderId}
+      `,
+    ])
   } catch (error) {
     console.error(`[direct-create-sweep] could not defer the failed marker for ${orderId}:`, error)
   }

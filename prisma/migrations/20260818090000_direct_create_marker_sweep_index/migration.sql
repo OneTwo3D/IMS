@@ -24,7 +24,10 @@
 -- activity_logs takes, and turns the sweep's scan into a bounded index read.
 --
 -- ("createdAt", "entityId") in that order, matching the query: the ageing predicate is the range
--- scan and entityId comes along with it, so the rows to group are identified from the index.
+-- scan and entityId comes along with it, so the rows to group are identified from the index. It is
+-- also what makes the DEFERRAL statement cheap — `deferFailedMarker` stamps a marker with a time
+-- strictly later than every outstanding marker's due time, and the sub-select that finds that
+-- maximum reads exactly this index's rows and nothing else.
 --
 -- What the index does NOT do is answer the whole query. The ORDER BY defers a marker whose last
 -- attempt failed, so one unresolvable order cannot own the head of the queue (MARKER_DEFERRAL_KEY
@@ -42,12 +45,41 @@
 -- represented there — the same as hs_code_proposals_one_pending_per_product.
 -- prisma-schema-scope-ok: db-native partial index | reason: Prisma schema has no way to express an index WHERE predicate, so a partial index cannot be modelled in schema.prisma
 --
--- ONE EXPLICIT TRANSACTION, for the reason 20260721150000_refund_park_unique_index documents:
--- Prisma does NOT auto-wrap a migration file.
-BEGIN;
+-- CONCURRENTLY, AND THIS FILE HOLDS EXACTLY ONE STATEMENT (Codex review r4, finding 1).
+--
+-- A plain CREATE INDEX takes a SHARE lock on activity_logs for the whole build, which blocks every
+-- INSERT into it — and activity_logs is written by essentially every action IMS takes, so on a
+-- table with real history that is an outage for the duration of the deploy, on a table this
+-- migration exists precisely because it is large. docs/migration-conventions.md names activity_logs
+-- as one of the tables that should use a concurrent build for exactly this reason.
+--
+-- CREATE INDEX CONCURRENTLY takes SHARE UPDATE EXCLUSIVE instead: readers and WRITERS both carry
+-- on throughout, at the cost of two table passes and of waiting for transactions that predate each
+-- pass to finish. It cannot run inside a transaction block, and Postgres puts a multi-statement
+-- simple-query string into an implicit one — so this file must contain this ONE statement and
+-- nothing else. No BEGIN/COMMIT (unlike the sibling migrations here, which need one), and the
+-- post-build validity check is a SEPARATE migration, 20260818090100, for the same reason. A second
+-- statement added to this file would not merely be untidy: it would make the build fail with
+-- "CREATE INDEX CONCURRENTLY cannot run inside a transaction block". A test asserts the file stays
+-- a single statement.
+--
+-- NO `IF NOT EXISTS`, deliberately. A concurrent build that is interrupted — cancelled, a deploy
+-- timeout, a lost connection, or a deadlock against a long-running transaction — leaves an INVALID
+-- index behind at this name. An invalid index is the worst of both worlds: the planner refuses to
+-- use it, so the sweep silently keeps the table scan this migration exists to remove, while every
+-- INSERT into activity_logs still pays to maintain it. `IF NOT EXISTS` would quietly no-op against
+-- that leftover and make the state permanent and invisible. Without it the retry fails loudly with
+-- "relation already exists", and 20260818090100 fails the deploy if an invalid index is ever
+-- reached by any other route.
+--
+-- Operator remediation if this migration is interrupted and leaves an INVALID index:
+--   psql "$DATABASE_URL" -c 'DROP INDEX CONCURRENTLY IF EXISTS "activity_logs_direct_create_marker_idx";'
+--   npx prisma migrate resolve --rolled-back 20260818090000_direct_create_marker_sweep_index
+--   npx prisma migrate deploy
+-- DROP INDEX CONCURRENTLY, not a plain DROP, so the cleanup does not take the exclusive lock the
+-- build was written to avoid. It is safe to drop at any time: this index is a performance index
+-- only, nothing reads it for correctness, and until it exists the sweep merely runs the slow plan.
 
-CREATE INDEX "activity_logs_direct_create_marker_idx"
+CREATE INDEX CONCURRENTLY "activity_logs_direct_create_marker_idx"
   ON "activity_logs" ("createdAt", "entityId")
   WHERE action = 'fulfilment_entry_pending_verification';
-
-COMMIT;

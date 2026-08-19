@@ -977,6 +977,11 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'e2e/woocommerce-xero-bundle-refund.spec.ts': 'inline-sql-cli',
   'lib/backup-manifest.ts': 'runtime-assembled-sql',
   'lib/cost-layers.ts': 'runtime-assembled-sql',
+  // The direct-create marker deferral (o3d-z82a r4). Raw because `SET LOCAL statement_timeout`
+  // takes no bind parameters; the interpolated value is a numeric module constant, and the UPDATE
+  // itself is parameterised. It touches only `activity_logs` marker rows — never `settings`, so it
+  // cannot move a plugin key — and runs in its own transaction rather than the sweep's.
+  'lib/fulfillment/pre-fulfilment-reallocation.ts': 'runtime-assembled-sql',
   'lib/db/savepoint.ts': 'runtime-assembled-sql',
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
   'scripts/backup.sh': 'dump-only',
