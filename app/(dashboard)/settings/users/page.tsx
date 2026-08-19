@@ -1,6 +1,6 @@
 import type { Metadata } from 'next'
-import { redirect } from 'next/navigation'
-import { requireAuth } from '@/lib/auth/server'
+import { authorizePage } from '@/lib/auth/server'
+import { AccessDenied } from '@/components/auth/access-denied'
 import { getUsers } from '@/app/actions/users'
 import { getSuppliers } from '@/app/actions/suppliers'
 import { UsersClient } from './users-client'
@@ -8,8 +8,13 @@ import { UsersClient } from './users-client'
 export const metadata: Metadata = { title: 'User Management' }
 
 export default async function UsersPage() {
-  const session = await requireAuth()
-  if (session.user.role !== 'ADMIN') redirect('/dashboard')
+  // o3d-512h: was `role !== 'ADMIN' -> redirect('/dashboard')`. Two changes:
+  // it now checks the PERMISSION rather than the role (so the matrix in
+  // lib/permissions.ts stays the single source of truth), and it renders an
+  // explicit denial instead of bouncing to /dashboard, which is indistinguishable
+  // from the page not existing.
+  const gate = await authorizePage('settings.users')
+  if (!gate.authorized) return <AccessDenied permission={gate.permission} />
 
   const [users, suppliers] = await Promise.all([
     getUsers(),

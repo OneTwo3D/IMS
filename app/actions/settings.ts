@@ -19,7 +19,7 @@ import type { SettingSaveResult } from '@/lib/domain/settings/setting-save-outco
 import { reconcileCrontab } from '@/lib/crontab-reconcile'
 import { normalizePublicAppUrl } from '@/lib/domain/settings/public-app-url-input'
 import { toIsoCountryCode } from '@/lib/countries'
-import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
+import { getSettingValue, serializeSettingValue, SENSITIVE_SETTING_KEYS } from '@/lib/settings-store'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
 import { maybeQueueTaxRateSync } from '@/lib/accounting/tax-rate-sync-trigger'
 import {
@@ -845,6 +845,18 @@ export async function getAccountCodes(): Promise<AccountCodeOption[]> {
 
 export async function getSetting(key: string): Promise<string | null> {
   await requireAuth()
+  // o3d-512h: getSetting takes an arbitrary key and getSettingValue DECRYPTS the
+  // sensitive ones (lib/settings-store.ts:deserializeSettingValue), so with only
+  // requireAuth this 'use server' export handed any authenticated principal —
+  // WAREHOUSE, READONLY, even SUPPLIER — the SMTP password, the WooCommerce
+  // consumer secret, the Xero client secret and every other stored credential,
+  // just by naming the key.
+  //
+  // Gating the settings PAGES does not close this: a Server Action is its own
+  // addressable endpoint and is reached without going through any page. The
+  // legitimate callers of the sensitive keys are the backup and sales settings
+  // pages, which are ADMIN-only, so 'settings' costs them nothing.
+  if (SENSITIVE_SETTING_KEYS.has(key)) await requirePermission('settings')
   return getSettingValue(key)
 }
 

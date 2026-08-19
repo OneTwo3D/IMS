@@ -52,6 +52,9 @@ async function requireFreshAdmin() {
 // ---------------------------------------------------------------------------
 
 export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMasked: boolean }> {
+  // o3d-1fel: returns xero_client_id in clear plus every account-mapping code.
+  // Only xero_client_secret is masked, so masking is not the access control.
+  await requireSyncPermission()
   const settings = await getXeroSettings()
   const masked = maskSecret(settings.xero_client_secret)
   return { ...settings, xero_client_secret: masked, secretMasked: !!settings.xero_client_secret }
@@ -263,6 +266,8 @@ export async function getXeroConnectionStatus(): Promise<{
   blockedReason?: string
   hasStoredToken?: boolean
 }> {
+  // o3d-1fel: leaks the connected tenant NAME, not just a boolean.
+  await requireSyncPermission()
   return isConnected()
 }
 
@@ -373,6 +378,10 @@ export async function syncAccountingAccountBalanceSnapshots(balanceDate?: string
 }
 
 export async function getAccountingAccounts(): Promise<Array<{ id: string; externalAccountId: string; code: string | null; name: string; type: string }>> {
+  // o3d-1fel: this reads the chart of accounts straight out of the database. A
+  // single-statement `return db.<model>.findMany(...)` is NOT a delegating
+  // facade — there is no downstream guard to inherit.
+  await requireSyncPermission()
   return db.accountingAccount.findMany({
     where: { connector: 'xero', active: true },
     select: { id: true, externalAccountId: true, code: true, name: true, type: true },
@@ -383,6 +392,9 @@ export async function getAccountingAccounts(): Promise<Array<{ id: string; exter
 export async function fetchXeroTaxRates(
   opts?: { allowCache?: boolean },
 ): Promise<Array<{ taxType: string; name: string; rate: number }>> {
+  // o3d-1fel: makes a LIVE outbound call to the tenant's Xero org, so leaving
+  // it open is request amplification as well as a data leak.
+  await requireSyncPermission()
   const result = await getXeroTaxRates(opts)
   return result?.taxRates ?? []
 }
@@ -411,6 +423,8 @@ export type XeroSyncLogRow = {
 }
 
 export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
+  // o3d-1fel: sync-log rows carry referenceId / externalTransactionId / errorMessage.
+  await requireSyncPermission()
   const rows = await db.accountingSyncLog.findMany({
     where: { connector: 'xero' },
     orderBy: { createdAt: 'desc' },
@@ -529,6 +543,8 @@ const REQUIRED_ACCOUNTS: Array<{ key: keyof XeroSettings; label: string }> = [
 ]
 
 export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
+  // o3d-1fel: reads settings + tax rates + the granted OAuth scopes.
+  await requireSyncPermission()
   const [settings, connStatus, taxRates, granted] = await Promise.all([
     getXeroSettings(),
     isConnected(),

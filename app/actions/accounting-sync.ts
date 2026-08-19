@@ -409,6 +409,8 @@ async function cancelOrphanedRowsUnderLock(
 }
 
 export async function getAccountingIntegrationConnector() {
+  // o3d-1fel: not a facade — resolves plugin state (a DB-backed read) itself.
+  await requireAuth()
   const connector = await getActiveConnector()
   if (!connector) return null
   return {
@@ -426,6 +428,11 @@ export async function getAccountingSettingsMasked(): Promise<AccountingConnector
 }
 
 export async function saveAccountingSettings(data: Record<string, string>): Promise<{ success: boolean; error?: string }> {
+  // o3d-1fel: the delegate (saveXeroSettings) is guarded, but this body reads the
+  // CURRENT account-mapping settings and can return a validation error BEFORE
+  // ever reaching that delegate — so unguarded it is both a read of the mapping
+  // and an oracle for the validator. Guard matches the delegate's own gate.
+  await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   const resolved = connector ?? getAccountingConnector('xero')
 

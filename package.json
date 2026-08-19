@@ -16,7 +16,7 @@
     "check:connector-fetch-boundaries": "node scripts/check-connector-fetch-boundaries.mjs",
     "check:wms-connector-boundary": "node scripts/check-wms-connector-boundary.mjs",
     "check:migration-conventions": "node scripts/check-migration-conventions.mjs",
-    "check:all": "npm run check:decimal-boundaries && npm run check:connector-fetch-boundaries && npm run check:wms-connector-boundary && npm run check:migration-conventions && npm run check:server-action-auth-bypass",
+    "check:all": "npm run check:decimal-boundaries && npm run check:connector-fetch-boundaries && npm run check:wms-connector-boundary && npm run check:migration-conventions && npm run check:server-action-guards",
     "test:concurrency": "RUN_DB_CONCURRENCY_TESTS=1 tsx --test \"tests/concurrency/**/*.test.ts\"",
     "docs:workflows": "tsx scripts/generate-workflow-docs.ts",
     "docs:workflows:check": "tsx scripts/generate-workflow-docs.ts --check",
@@ -48,7 +48,9 @@
     "e2e:headed": "NODE_OPTIONS='--import tsx' playwright test --headed",
     "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui",
     "refunds:basis:backfill": "tsx scripts/backfill-refund-basis.ts",
-    "check:server-action-auth-bypass": "node scripts/check-server-action-auth-bypass.mjs"
+    "check:server-action-auth-bypass": "node scripts/check-server-action-auth-bypass.mjs",
+    "check:server-action-guard-coverage": "tsx --test --experimental-test-module-mocks tests/security/server-action-guard-coverage.test.ts",
+    "check:server-action-guards": "npm run check:server-action-auth-bypass && npm run check:server-action-guard-coverage"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.110.0",

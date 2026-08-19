@@ -1,3 +1,5 @@
+import { AccessDenied } from '@/components/auth/access-denied'
+import { authorizePage } from '@/lib/auth/server'
 import type { Metadata } from 'next'
 import { AlertTriangle, FileText, Mail, ShieldAlert, Truck } from 'lucide-react'
 import { Card } from '@/components/ui/card'
@@ -13,6 +15,13 @@ import { getDisplayTimeZone } from '@/lib/display-timezone'
 export const metadata: Metadata = { title: 'Sales Settings' }
 
 export default async function SalesSettingsPage() {
+  // o3d-512h: page-level authorization. The (dashboard) layout establishes only
+  // AUTHENTICATION, and the sidebar hiding a link is not a boundary — without
+  // this, any authenticated role that types the URL renders the page and its
+  // reads run. Must stay the FIRST statement so a denial performs no read.
+  const gate = await authorizePage('settings.company')
+  if (!gate.authorized) return <AccessDenied permission={gate.permission} />
+
   const [
     invoiceTrigger,
     dispatchEmailEnabled,

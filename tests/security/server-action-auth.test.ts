@@ -29,3 +29,12 @@ test('payment-method combos server action rejects unauthenticated callers', asyn
   // combos with no authorization guard.
   await assert.rejects(() => getPaymentMethodCombos(), rejectsAuthGate)
 })
+
+test('WooCommerce product-URL server action rejects unauthenticated callers', async () => {
+  // o3d-hic9: lib/connectors/woocommerce/products.ts carries a 'use server'
+  // directive, so this export is a callable endpoint even though no UI imports
+  // it. Unguarded it was an unauthenticated SKU-existence oracle against the
+  // store, using the tenant's own WooCommerce credentials.
+  const { fetchWcProductUrl } = await import('@/lib/connectors/woocommerce/products')
+  await assert.rejects(() => fetchWcProductUrl('SKU-1'), rejectsAuthGate)
+})

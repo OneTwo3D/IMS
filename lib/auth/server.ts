@@ -16,14 +16,19 @@ import {
   type AuthSession,
 } from '@/lib/auth/session-gates'
 import { loginPathForSessionInvalidReason } from '@/lib/auth/session-state'
+import { isAuthorizationDenial } from '@/lib/auth/session-gates'
 
 export type { Permission }
 export type { AuthSession } from '@/lib/auth/session-gates'
+// o3d-m3gy: ONE denial type and ONE predicate, re-exported here so callers that reach for them
+// through `@/lib/auth/server` — as the whole app does — do not have to know which module declares
+// them. `@/lib/auth/authorization-denial` re-exports the same symbols for the same reason.
 export {
   FreshAuthRequiredError,
   freshAuthFailureResult,
   PermissionDeniedError,
   isAuthorizationDenial,
+  type AuthorizationDenial,
 } from '@/lib/auth/session-gates'
 
 /**
@@ -90,9 +95,48 @@ export async function requirePermission(permission: Permission): Promise<AuthSes
   if (!hasPermission(session.user.role, permission)) {
     // Typed, not a bare Error: callers that aggregate several reads must be able to tell a denial
     // from an unavailable dependency without matching on this message. See isAuthorizationDenial.
+    //
+    // o3d-m3gy: the message is spelt out here rather than derived by the constructor, which is how
+    // the sibling `AuthorizationDenialError(permission)` did it. It is byte-identical to what that
+    // produced, so nothing matching on 'Forbidden: missing permission …' changes — and the survivor's
+    // constructor has to take a message because a ROLE denial has no permission to derive one from.
     throw new PermissionDeniedError(`Forbidden: missing permission ${permission}`, permission)
   }
   return session
+}
+
+/**
+ * Page-boundary authorization (o3d-512h).
+ *
+ * A page is the entrance a principal reaches by typing the URL, so it needs a
+ * gate of its own: the sidebar hiding a link is not a boundary, and the
+ * (dashboard) layout only establishes AUTHENTICATION. This resolves the gate
+ * into a value so the page can render an explicit access-denied state instead
+ * of throwing into app/(dashboard)/error.tsx, which answers a stable role
+ * denial with "Go to Login" / "Try Again".
+ *
+ * Only an authorization denial is converted. Everything else keeps
+ * propagating — notably the NEXT_REDIRECT that requireAuth throws for an
+ * unauthenticated or 2FA-pending session, which MUST NOT be swallowed here or
+ * an anonymous visitor would be shown "access denied" instead of the login
+ * page.
+ *
+ * NOTE: this is a page-level control only. It does not protect the Server
+ * Actions the page calls — each of those is a separately addressable endpoint
+ * and needs its own guard.
+ */
+export type PageAuthorization =
+  | { authorized: true; session: AuthSession }
+  | { authorized: false; permission: Permission }
+
+export async function authorizePage(permission: Permission): Promise<PageAuthorization> {
+  try {
+    const session = await requirePermission(permission)
+    return { authorized: true, session }
+  } catch (error) {
+    if (isAuthorizationDenial(error)) return { authorized: false, permission }
+    throw error
+  }
 }
 
 export async function requireFreshPermission(
