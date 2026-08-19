@@ -50,6 +50,35 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * Every one of those refuses with a NAMED reason, and the per-refund legs are returned either way —
  * a fact the operator would otherwise have to go and find by hand is still worth printing even when
  * the total cannot be trusted to prescribe from.
+ *
+ * AND THE ROWS ONLY DESCRIBE A DOCUMENT THAT STILL STANDS AS POSTED (r8 finding 3).
+ *
+ * The premise above — the persisted lines ARE what the credit note carried — is a statement about
+ * POSTING TIME. It says nothing about a document retired or re-posted afterwards, and the whole
+ * netting rests on it, so the mirrored CREDIT_NOTE event is now read for every refund and the leg is
+ * derived ONLY where that event says the document is standing exactly as IMS recorded it:
+ *
+ *   • exactly one CREDIT_NOTE `AccountingEvent` for the refund, and its status is POSTED. Anything
+ *     else — VOID (the credit-note work was retired unposted), REVERSED, or a PENDING/FAILED event
+ *     sitting beside a refund that already names a credit note — is the trace of a document that was
+ *     retired or re-posted, and under `@@unique([externalSystem, externalId])` a re-post of the same
+ *     document is exactly what CANNOT reach POSTED a second time. Same argument as the invoice
+ *     side's unsettled SALES_INVOICE_UPDATE, and the same conclusion: refuse.
+ *   • the POSTED event's `externalId`, when it has one, is the credit note the refund names. A
+ *     mirrored document with a different id is not the document being netted.
+ *   • NO mirrored CREDIT_NOTE event at all is a refusal, not a pass. The mirror is best-effort, so
+ *     its silence is not proof the document is wrong — but it is equally not the confirmation this
+ *     arithmetic needs, and the governing rule for this backfill is that an unestablished net is
+ *     suppressed and reported rather than guessed.
+ *   • `accountingRetryRequired` / `accountingWarning` on the refund: IMS's own record that the
+ *     credit-note staging did not complete. What the rows describe is then a document IMS is still
+ *     trying to produce.
+ *
+ * WHAT IT STILL CANNOT SEE, stated rather than papered over: a credit note VOIDED OR EDITED IN XERO
+ * OR QUICKBOOKS BY HAND. Nothing writes back to IMS when that happens — the payment poller reads
+ * ACCREC invoice statuses, never ACCRECCREDIT — so no query here can detect it. That is why the
+ * netted remedy carries the credit notes it was derived against in its precondition line and tells
+ * the operator to confirm they still stand before posting anything (see `WcCouponRemedy`).
  */
 
 /** The kind of a refund line, as production resolves it. */
@@ -119,7 +148,81 @@ export type CreditNoteOrderDiscountReversal =
   | { ok: true; amount: number; legs: CreditNoteDiscountLeg[]; detail: string }
   | { ok: false; legs: CreditNoteDiscountLeg[]; detail: string }
 
-export type CreditNoteOrderDiscountClient = Pick<Prisma.TransactionClient, 'salesOrderRefund'>
+export type CreditNoteOrderDiscountClient = Pick<Prisma.TransactionClient, 'salesOrderRefund' | 'accountingEvent'>
+
+/** The mirrored-event type that describes a refund's credit note. */
+export const CREDIT_NOTE_EVENT_TYPE = 'CREDIT_NOTE'
+
+/** The one mirrored-event status that says the credit note reached the ledger as IMS recorded it. */
+export const POSTED_CREDIT_NOTE_EVENT_STATUS = 'POSTED'
+
+/** One mirrored CREDIT_NOTE event, as the standing-document check reads it. */
+type MirroredCreditNote = { sourceEntityId: string; status: string; externalId: string | null }
+
+/**
+ * Does the mirror say this refund's credit note is STANDING, exactly as the persisted rows describe
+ * it (r8 finding 3)? Pure, so every branch is reachable from a plain value.
+ */
+export function creditNoteDocumentStanding(
+  refund: { id: string; accountingCreditNoteId: string | null; accountingRetryRequired?: boolean | null; accountingWarning?: string | null },
+  events: readonly MirroredCreditNote[],
+): { ok: true } | { ok: false; detail: string } {
+  if (refund.accountingRetryRequired) {
+    return {
+      ok: false,
+      detail:
+        `refund ${refund.id} is flagged for an accounting RETRY, so its credit-note staging did not ` +
+        'complete — its lines describe a document IMS is still trying to produce',
+    }
+  }
+  if (refund.accountingWarning) {
+    return {
+      ok: false,
+      detail:
+        `refund ${refund.id} carries an accounting warning (${refund.accountingWarning}), so what its ` +
+        'credit note posted is not what these rows describe',
+    }
+  }
+  if (events.length === 0) {
+    return {
+      ok: false,
+      detail:
+        `no mirrored CREDIT_NOTE event exists for refund ${refund.id}, so nothing here confirms that ` +
+        `credit note ${refund.accountingCreditNoteId} still carries the lines IMS recorded — the rows ` +
+        'are what was posted, not proof of what stands now',
+    }
+  }
+  const unsettled = events.filter((event) => event.status !== POSTED_CREDIT_NOTE_EVENT_STATUS)
+  if (unsettled.length > 0) {
+    return {
+      ok: false,
+      detail:
+        `refund ${refund.id} has ${unsettled.length} mirrored CREDIT_NOTE event(s) in status ` +
+        `${[...new Set(unsettled.map((event) => event.status))].sort().join('/')} — a credit note that ` +
+        'was retired or re-posted after it was first written, so its persisted lines no longer ' +
+        'establish what the document carries',
+    }
+  }
+  if (events.length > 1) {
+    return {
+      ok: false,
+      detail:
+        `refund ${refund.id} mirrors ${events.length} POSTED credit notes, so more than one document ` +
+        'carries these lines and netting one of them against the invoice leaves the rest out',
+    }
+  }
+  const [posted] = events
+  if (posted.externalId && refund.accountingCreditNoteId && posted.externalId !== refund.accountingCreditNoteId) {
+    return {
+      ok: false,
+      detail:
+        `refund ${refund.id} names credit note ${refund.accountingCreditNoteId} but the mirrored ` +
+        `document is ${posted.externalId} — IMS's two records of which document these lines went to ` +
+        'do not agree',
+    }
+  }
+  return { ok: true }
+}
 
 /**
  * Read what this order's posted credit notes reversed of its order-level discount.
@@ -153,9 +256,28 @@ export async function readCreditNoteOrderDiscount(
       chargeback: true,
       totalsBasis: true,
       accountingCreditNoteId: true,
+      // r8 finding 3: IMS's own record that the credit-note staging did not complete.
+      accountingRetryRequired: true,
+      accountingWarning: true,
       lines: { select: { salesOrderLineId: true, totalBase: true, totalForeign: true, lineKind: true } },
     },
   })
+
+  // THE MIRRORED DOCUMENTS (r8 finding 3). One query for every refund named, because the persisted
+  // lines are what was POSTED and this is the only record IMS keeps of whether that document was
+  // retired or re-posted afterwards.
+  const mirrored = (await client.accountingEvent.findMany({
+    where: {
+      sourceEntityType: 'SalesOrderRefund',
+      sourceEntityId: { in: [...evidence.refundIds] },
+      type: CREDIT_NOTE_EVENT_TYPE,
+    },
+    select: { sourceEntityId: true, status: true, externalId: true },
+  })) as MirroredCreditNote[]
+  const mirroredByRefund = new Map<string, MirroredCreditNote[]>()
+  for (const event of mirrored) {
+    mirroredByRefund.set(event.sourceEntityId, [...(mirroredByRefund.get(event.sourceEntityId) ?? []), event])
+  }
 
   const legs: CreditNoteDiscountLeg[] = []
   const refusals: string[] = []
@@ -174,7 +296,7 @@ export async function readCreditNoteOrderDiscount(
       continue
     }
 
-    const leg = deriveLeg(refund)
+    const leg = deriveLeg(refund, mirroredByRefund.get(refundId) ?? [])
     legs.push(leg)
     if (leg.amount === null) refusals.push(leg.detail)
   }
@@ -219,17 +341,23 @@ export async function readCreditNoteOrderDiscount(
     legs,
     detail:
       `credit note(s) ${inLedger.join(', ')} fully reverse this order and carry ${amount} of ` +
-      'order-level discount between them, replayed from the persisted refund lines',
+      'order-level discount between them, replayed from the persisted refund lines of documents the ' +
+      'mirror still records as POSTED and unaltered',
   }
 }
 
-function deriveLeg(refund: {
-  id: string
-  chargeback: boolean
-  totalsBasis: string | null
-  accountingCreditNoteId: string | null
-  lines: PersistedRefundLine[]
-}): CreditNoteDiscountLeg {
+function deriveLeg(
+  refund: {
+    id: string
+    chargeback: boolean
+    totalsBasis: string | null
+    accountingCreditNoteId: string | null
+    accountingRetryRequired?: boolean | null
+    accountingWarning?: string | null
+    lines: PersistedRefundLine[]
+  },
+  mirroredEvents: readonly MirroredCreditNote[],
+): CreditNoteDiscountLeg {
   const base = {
     refundId: refund.id,
     externalCreditNoteId: refund.accountingCreditNoteId,
@@ -265,6 +393,13 @@ function deriveLeg(refund: {
         `refund ${refund.id} stores GROSS totals (totalsBasis ${JSON.stringify(refund.totalsBasis)}), ` +
         "which is not the unit the invoice's posted discount is in",
     }
+  }
+
+  // r8 finding 3. Checked AFTER the shape gates above and BEFORE any arithmetic: the rows may be
+  // perfectly readable and still describe a document that no longer stands.
+  const standing = creditNoteDocumentStanding(refund, mirroredEvents)
+  if (!standing.ok) {
+    return { ...base, amount: null, detail: standing.detail }
   }
 
   const discountLines = refund.lines.filter((line) => classifyPersistedRefundLineKind(line) === 'discount')

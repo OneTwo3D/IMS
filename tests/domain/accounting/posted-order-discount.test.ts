@@ -6,6 +6,7 @@ import { buildDiscountRestatement } from '@/lib/domain/accounting/discount-resta
 import {
   decideChargebackOrderDiscount,
   readPostedDocumentDiscount,
+  readPostedInvoiceOrderDiscount,
   resolvePostedOrderDiscount,
   type PostedOrderDiscountClient,
 } from '@/lib/domain/accounting/posted-order-discount'
@@ -710,7 +711,7 @@ test('a blank discount account code is no account code at all', () => {
     'GBP',
   )
 
-  assert.deepEqual(read, { ok: true, amount: 0 })
+  assert.deepEqual(read, { ok: true, amount: 0, taxBasis: 'EXCLUSIVE' })
 })
 
 test('QuickBooks rounds its discount line to 2dp, and so does the figure recovered for it', () => {
@@ -719,7 +720,7 @@ test('QuickBooks rounds its discount line to 2dp, and so does the figure recover
     'GBP',
   )
 
-  assert.deepEqual(read, { ok: true, amount: 10.01 })
+  assert.deepEqual(read, { ok: true, amount: 10.01, taxBasis: 'EXCLUSIVE' })
 })
 
 // ---------------------------------------------------------------------------
@@ -823,4 +824,103 @@ test('the chargeback path actually CONSUMES this decision — it does not read t
     /decimalToNumber\(order\.discountAmount\)/,
     'the live column must not be what the credit note mirrors',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r8 findings 1 and 2 — what the recovered figure does NOT establish
+// ---------------------------------------------------------------------------
+
+/**
+ * The figure this function recovers answers the RESOLVER's question: a mirroring credit note
+ * reverses it whichever posted document it reverses. Two things a NETTING caller needs are not the
+ * same question, and neither was reported at all before r8 — so both now travel with the amount.
+ */
+test('the recovered figure reports HOW MANY documents agreed on it (o3d-y14 r8 F2)', async () => {
+  const { client } = makeClient({
+    events: [postedInvoice(), postedInvoice({ externalId: 'INV-779', createdAt: '2026-05-03T09:00:00.000Z' })],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(read.ok, true)
+  assert.equal(read.ok && read.amount, 10, 'agreement still resolves the amount, exactly as before')
+  assert.equal(read.ok && read.documentCount, 2, 'and it no longer implies there is only one of them')
+})
+
+test('one posted document reports a count of one — the pair differs on the count alone', async () => {
+  const { client } = makeClient({ events: [postedInvoice()] })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(read.ok, true)
+  assert.equal(read.ok && read.documentCount, 1)
+})
+
+test('the recovered figure reports the TAX BASIS it is denominated in (o3d-y14 r8 F1)', async () => {
+  const inclusive = makeClient({
+    events: [
+      postedInvoice({
+        linesJson: documentPayload({
+          lineAmountMode: 'INCLUSIVE',
+          lineAmountsIncludeTax: true,
+          discount: { amount: 10, accountCode: '260' },
+        }),
+      }),
+    ],
+  })
+  const exclusive = makeClient({ events: [postedInvoice()] })
+
+  const gross = await readPostedInvoiceOrderDiscount(inclusive.client, { id: 'order-1', currency: 'GBP' })
+  const net = await readPostedInvoiceOrderDiscount(exclusive.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(gross.ok && gross.taxBasis, 'INCLUSIVE')
+  assert.equal(net.ok && net.taxBasis, 'EXCLUSIVE')
+  // The two carry the SAME amount and mean different things by it — which is the finding.
+  assert.equal(gross.ok && gross.amount, net.ok && net.amount)
+})
+
+test('a payload stating neither tax field reports UNKNOWN, never EXCLUSIVE (o3d-y14 r8 F1)', () => {
+  const bare = documentPayload({ discount: { amount: 10, accountCode: '260' } }) as Record<string, unknown>
+  delete bare.lineAmountsIncludeTax
+  delete bare.lineAmountMode
+
+  const read = readPostedDocumentDiscount({ currency: 'GBP', externalSystem: 'xero', linesJson: bare }, 'GBP')
+
+  assert.equal(read.ok, true)
+  assert.equal(read.ok && read.taxBasis, 'UNKNOWN')
+})
+
+test('documents whose bases disagree report MIXED (o3d-y14 r8 F1)', async () => {
+  const { client } = makeClient({
+    events: [
+      postedInvoice(),
+      postedInvoice({
+        externalId: 'INV-779',
+        createdAt: '2026-05-03T09:00:00.000Z',
+        linesJson: documentPayload({
+          lineAmountMode: 'INCLUSIVE',
+          lineAmountsIncludeTax: true,
+          discount: { amount: 10, accountCode: '260' },
+        }),
+      }),
+    ],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(read.ok, true)
+  assert.equal(read.ok && read.taxBasis, 'MIXED')
+})
+
+test('a document that carries NO discount still reports its basis — 0 is a figure with a unit', () => {
+  const read = readPostedDocumentDiscount(
+    {
+      currency: 'GBP',
+      externalSystem: 'xero',
+      linesJson: documentPayload({ lineAmountsIncludeTax: true, lineAmountMode: 'INCLUSIVE' }),
+    },
+    'GBP',
+  )
+
+  assert.deepEqual(read, { ok: true, amount: 0, taxBasis: 'INCLUSIVE' })
 })

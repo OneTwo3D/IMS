@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   classifyPersistedRefundLineKind,
+  creditNoteDocumentStanding,
   readCreditNoteOrderDiscount,
 } from '@/lib/domain/accounting/credit-note-order-discount'
 
@@ -48,12 +49,46 @@ function mirroringChargeback(over: Partial<RefundRow> = {}): RefundRow {
   }
 }
 
-/** A client that HONOURS `where.id.in` — a double that returned everything would net the wrong set. */
-function makeClient(rows: RefundRow[]) {
+/**
+ * ONE mirrored CREDIT_NOTE event, as the r8 finding 3 standing check reads it.
+ *
+ * The DEFAULT for every fixture below is a single POSTED event naming the same credit note the
+ * refund names — i.e. "the document still stands exactly as IMS recorded it", which is the world
+ * r7's premise silently assumed. Every finding-3 fixture departs from it on one field.
+ */
+type CreditNoteEventRow = { sourceEntityId: string; type: string; status: string; externalId: string | null }
+
+function standingCreditNote(refund: RefundRow): CreditNoteEventRow {
+  return {
+    sourceEntityId: refund.id,
+    type: 'CREDIT_NOTE',
+    status: 'POSTED',
+    externalId: refund.accountingCreditNoteId,
+  }
+}
+
+/**
+ * A client that HONOURS `where.id.in` — a double that returned everything would net the wrong set —
+ * and that serves the mirrored CREDIT_NOTE events, filtered the way production filters them.
+ */
+function makeClient(rows: RefundRow[], events?: CreditNoteEventRow[]) {
+  const eventRows = events ?? rows.map(standingCreditNote)
   return {
     salesOrderRefund: {
       findMany: async ({ where }: { where: { id: { in: string[] } } }) =>
         rows.filter((row) => where.id.in.includes(row.id)),
+    },
+    accountingEvent: {
+      findMany: async ({
+        where,
+      }: {
+        where: { sourceEntityType: string; sourceEntityId: { in: string[] }; type: string }
+      }) => {
+        if (where.sourceEntityType !== 'SalesOrderRefund') throw new Error('unexpected sourceEntityType')
+        return eventRows.filter(
+          (row) => where.sourceEntityId.in.includes(row.sourceEntityId) && row.type === where.type,
+        )
+      },
     },
   } as never
 }
@@ -70,8 +105,12 @@ const FULLY_REVERSED: {
   unresolvedRefundParkExternalIds: [] as string[],
 }
 
-async function read(rows: RefundRow[], evidence: Partial<typeof FULLY_REVERSED> = {}) {
-  return await readCreditNoteOrderDiscount(makeClient(rows), { ...FULLY_REVERSED, ...evidence })
+async function read(
+  rows: RefundRow[],
+  evidence: Partial<typeof FULLY_REVERSED> = {},
+  events?: CreditNoteEventRow[],
+) {
+  return await readCreditNoteOrderDiscount(makeClient(rows, events), { ...FULLY_REVERSED, ...evidence })
 }
 
 // ---------------------------------------------------------------------------
@@ -236,20 +275,26 @@ test('no refund rows at all is a refusal, not a derived zero', async () => {
 
 test('two mirroring chargebacks SUM, and the query asks for exactly the ids named', async () => {
   const asked: string[][] = []
+  const rows = [
+    mirroringChargeback(),
+    mirroringChargeback({
+      id: 'refund-2',
+      accountingCreditNoteId: 'CN-502',
+      lines: [{ salesOrderLineId: null, totalBase: -4, totalForeign: -4, lineKind: 'discount' }],
+    }),
+  ]
+  const inner = makeClient(rows) as unknown as {
+    salesOrderRefund: { findMany: (args: { where: { id: { in: string[] } } }) => Promise<RefundRow[]> }
+    accountingEvent: unknown
+  }
   const client = {
     salesOrderRefund: {
-      findMany: async ({ where }: { where: { id: { in: string[] } } }) => {
-        asked.push(where.id.in)
-        return [
-          mirroringChargeback(),
-          mirroringChargeback({
-            id: 'refund-2',
-            accountingCreditNoteId: 'CN-502',
-            lines: [{ salesOrderLineId: null, totalBase: -4, totalForeign: -4, lineKind: 'discount' }],
-          }),
-        ].filter((row) => where.id.in.includes(row.id))
+      findMany: async (args: { where: { id: { in: string[] } } }) => {
+        asked.push(args.where.id.in)
+        return await inner.salesOrderRefund.findMany(args)
       },
     },
+    accountingEvent: inner.accountingEvent,
   } as never
 
   const result = await readCreditNoteOrderDiscount(client, {
@@ -262,4 +307,108 @@ test('two mirroring chargebacks SUM, and the query asks for exactly the ids name
   assert.equal(result.ok, true)
   assert.equal(result.ok && result.amount, 14)
   assert.deepEqual(asked, [['refund-1', 'refund-2']])
+})
+
+// ---------------------------------------------------------------------------
+// r8 finding 3 — the rows describe a document that must still STAND
+// ---------------------------------------------------------------------------
+
+/**
+ * The premise r7 established is about POSTING TIME: the persisted lines are what the credit note
+ * carried, because neither adapter omits one. It says nothing about a document retired or re-posted
+ * afterwards, and the whole netting rests on it — so every fixture below is the derivable one with
+ * exactly ONE thing changed about what the mirror says now, and each is asserted to differ from it.
+ */
+test('a VOIDED credit note is not treated as still carrying its persisted lines (o3d-y14 r8 F3)', async () => {
+  const refund = mirroringChargeback()
+  const voided = await read([refund], {}, [{ ...standingCreditNote(refund), status: 'VOID' }])
+  const live = await read([refund])
+
+  assert.equal(voided.ok, false)
+  assert.equal(voided.legs[0].amount, null)
+  assert.match(voided.detail, /status VOID — a credit note that was retired or re-posted/)
+  // The pair differs on the mirrored STATUS alone, and the two answers are opposite.
+  assert.equal(live.ok, true)
+  assert.equal(live.ok && live.amount, 10)
+  assert.notEqual(voided.ok, live.ok)
+})
+
+test('a REVERSED credit note refuses for the same reason a voided one does (o3d-y14 r8 F3)', async () => {
+  const refund = mirroringChargeback()
+  const result = await read([refund], {}, [{ ...standingCreditNote(refund), status: 'REVERSED' }])
+
+  assert.equal(result.ok, false)
+  assert.match(result.detail, /status REVERSED/)
+})
+
+test('a credit note being RE-POSTED (an unsettled event beside it) refuses (o3d-y14 r8 F3)', async () => {
+  // Under `@@unique([externalSystem, externalId])` a re-post of the SAME document cannot reach
+  // POSTED a second time, so a PENDING/FAILED event sitting beside a refund that already names a
+  // credit note is exactly the trace of a document that was changed after it was first written.
+  const refund = mirroringChargeback()
+  const result = await read([refund], {}, [
+    standingCreditNote(refund),
+    { ...standingCreditNote(refund), status: 'FAILED', externalId: null },
+  ])
+
+  assert.equal(result.ok, false)
+  assert.match(result.detail, /status FAILED/)
+})
+
+test('TWO posted credit notes for one refund refuse — netting one leaves the other out', async () => {
+  const refund = mirroringChargeback()
+  const result = await read([refund], {}, [
+    standingCreditNote(refund),
+    { ...standingCreditNote(refund), externalId: 'CN-999' },
+  ])
+
+  assert.equal(result.ok, false)
+  assert.match(result.detail, /mirrors 2 POSTED credit notes/)
+})
+
+test('NO mirrored credit-note event at all is a refusal, not a pass (o3d-y14 r8 F3)', async () => {
+  // The mirror is best-effort, so its silence is not proof the document is wrong — and it is equally
+  // not the confirmation this arithmetic needs. Suppressing and reporting is the safe fallback.
+  const result = await read([mirroringChargeback()], {}, [])
+
+  assert.equal(result.ok, false)
+  assert.match(result.detail, /no mirrored CREDIT_NOTE event exists for refund refund-1/)
+})
+
+test('the mirrored document naming a DIFFERENT credit note refuses (o3d-y14 r8 F3)', async () => {
+  const refund = mirroringChargeback()
+  const result = await read([refund], {}, [{ ...standingCreditNote(refund), externalId: 'CN-OTHER' }])
+
+  assert.equal(result.ok, false)
+  assert.match(result.detail, /but the mirrored document is CN-OTHER/)
+})
+
+test('a refund flagged for an accounting RETRY refuses — its staging did not complete', async () => {
+  const result = await read([{ ...mirroringChargeback(), accountingRetryRequired: true } as never])
+
+  assert.equal(result.ok, false)
+  assert.match(result.detail, /flagged for an accounting RETRY/)
+})
+
+test('a refund carrying an accounting WARNING refuses', async () => {
+  const result = await read([{ ...mirroringChargeback(), accountingWarning: 'credit note failed' } as never])
+
+  assert.equal(result.ok, false)
+  assert.match(result.detail, /carries an accounting warning \(credit note failed\)/)
+})
+
+test('the standing check is PURE and reachable from a plain value, in both directions', () => {
+  const refund = { id: 'refund-1', accountingCreditNoteId: 'CN-501' }
+  assert.deepEqual(
+    creditNoteDocumentStanding(refund, [{ sourceEntityId: 'refund-1', status: 'POSTED', externalId: 'CN-501' }]),
+    { ok: true },
+  )
+  // A POSTED event with a NULL external id is still the document IMS named: the back-reference can
+  // be written where the mirror's id was not (o3d-9kek), and refusing that would suppress the very
+  // shape the rest of this file is careful to keep derivable.
+  assert.deepEqual(
+    creditNoteDocumentStanding(refund, [{ sourceEntityId: 'refund-1', status: 'POSTED', externalId: null }]),
+    { ok: true },
+  )
+  assert.equal(creditNoteDocumentStanding(refund, []).ok, false)
 })

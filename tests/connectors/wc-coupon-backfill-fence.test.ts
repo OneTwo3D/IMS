@@ -98,6 +98,12 @@ type Store = {
   events?: EventRow[]
   parks?: ParkRow[]
   refundRows?: RefundRow[]
+  /**
+   * Mirrored CREDIT_NOTE events (o3d-y14 r8 finding 3) — IMS's only record of whether a credit note
+   * still STANDS as its persisted lines describe. Undefined means "the mirror says nothing", which
+   * is itself a refusal, so a store that forgets them cannot accidentally net.
+   */
+  creditNoteEvents?: Array<{ sourceEntityId: string; type: string; status: string; externalId: string | null }>
   activity: Array<{ action: string; entityId: string | null; description?: string; metadata: Record<string, unknown> }>
 }
 
@@ -303,14 +309,37 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
       findMany: async ({
         where,
       }: {
-        where: { sourceEntityType: string; sourceEntityId: string; type: { in: string[] }; status: string }
+        where: {
+          sourceEntityType: string
+          sourceEntityId: string | { in: string[] }
+          type: { in: string[] } | string
+          status?: string
+        }
       }) => {
-        events.push(`event:findMany:${where.sourceEntityId}`)
+        // The CREDIT-NOTE standing read (o3d-y14 r8 finding 3): a different entity type, an `in`
+        // list of refund ids, a scalar type and NO status filter. Served on its own branch rather
+        // than by loosening the invoice one, so a query of the wrong shape still fails loudly — the
+        // previous double answered it by comparing `event.status === undefined` and returned [] for
+        // everything, which is a refusal that looks like a considered one.
+        if (where.sourceEntityType === 'SalesOrderRefund') {
+          const ids = typeof where.sourceEntityId === 'string' ? [where.sourceEntityId] : where.sourceEntityId.in
+          if (typeof where.type !== 'string') throw new Error('the credit-note read filters on a scalar type')
+          events.push(`event:creditNotes:${ids.join('|')}`)
+          return (store.creditNoteEvents ?? []).filter(
+            (event) => ids.includes(event.sourceEntityId) && event.type === where.type,
+          )
+        }
+        if (typeof where.sourceEntityId !== 'string' || typeof where.type === 'string') {
+          throw new Error('the double only implements the invoice read in this shape')
+        }
+        const typeIn = where.type.in
+        const sourceEntityId = where.sourceEntityId
+        events.push(`event:findMany:${sourceEntityId}`)
         return (store.events ?? []).filter(
           (event) =>
             event.sourceEntityType === where.sourceEntityType &&
-            event.sourceEntityId === where.sourceEntityId &&
-            where.type.in.includes(event.type) &&
+            event.sourceEntityId === sourceEntityId &&
+            typeIn.includes(event.type) &&
             event.status === where.status,
         )
       },
@@ -1368,6 +1397,10 @@ function invoicedStore(over: Partial<Store> = {}): Store {
         schemaVersion: 1,
         documentType: 'SALES_INVOICE',
         currency: 'GBP',
+        // The basis the builder always stamps. Production payloads carry it, so a fixture without it
+        // would be testing a shape that does not occur (o3d-y14 r8 finding 1).
+        lineAmountMode: 'EXCLUSIVE',
+        lineAmountsIncludeTax: false,
         lines: [{ description: 'Widget', quantity: 2, unitAmount: 50, accountCode: '200' }],
         discount: { amount: 10, accountCode: '260' },
       },
@@ -1606,4 +1639,188 @@ test('the apply script REVALIDATES every handoff before it prints any of them (o
   assert.ok(revalidateAt > 0, 'the apply path revalidates')
   assert.ok(printAt > revalidateAt, 'and it does so BEFORE anything is printed')
   assert.match(src, /REMEDY WITHDRAWN/, 'and a withdrawal is reported, not silently swallowed')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r8 finding 4 — the revalidation's two promises, made true
+// ---------------------------------------------------------------------------
+
+/**
+ * r7 promised that every remedy is re-validated "immediately before each handoff is printed" and
+ * that "re-running the report reproduces the whole handoff". Neither held. The first was one pass
+ * over every handoff followed, much later, by the printing; the second is impossible for exactly the
+ * rows that carry a handoff, because a CORRECTED order is stamped and marked and therefore SKIPPED
+ * by every later scan.
+ */
+
+test('a CORRECTED order is skipped by the report, so no report can reproduce its handoff (r8 F4)', async () => {
+  // The premise of the finding, asserted rather than assumed: after apply, the decision for this
+  // order is SKIP and the report only builds handoffs for CORRECT rows.
+  const { applyWcCouponCorrection, decideWcCouponBackfill } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  assert.equal(result.outcome, 'CORRECTED')
+  assert.equal(result.outcome === 'CORRECTED' && !!result.handoff, true, 'and it carried a handoff')
+
+  const decision = decideWcCouponBackfill(
+    {
+      orderId: 'order-1',
+      orderNumber: 'SO-1',
+      externalOrderNumber: '1001',
+      currency: 'GBP',
+      storedOrderDiscount: store.orders[0].discountAmount,
+      lineDiscountTotal: 10,
+      accountingInvoiceId: 'INV-778',
+      postedInvoiceExternalIds: [],
+      discountModel: store.orders[0].discountModel,
+      importedAt: new Date('2026-05-01T00:00:00.000Z'),
+      // The ActivityLog marker apply just wrote.
+      alreadyBackfilled: true,
+      liveInvoiceJobs: 0,
+      revenueDeferredBatchRef: null,
+      liveBatchDeferralJobs: 0,
+      refunds: { disposition: 'NONE', refundIds: [], postedCreditNoteExternalIds: [], unresolvedRefundParkExternalIds: [] },
+    },
+    { importedBefore: new Date('2026-07-25T14:00:00.000Z') },
+  )
+
+  assert.equal(decision.action, 'SKIP')
+  assert.equal(decision.action === 'SKIP' && decision.reason, 'ALREADY_BACKFILLED')
+})
+
+test('REPRINT re-derives that same handoff from live state, after the correction (o3d-y14 r8 F4)', async () => {
+  const { applyWcCouponCorrection, reprintWcCouponLedgerHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const applied = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const original = applied.outcome === 'CORRECTED' ? applied.handoff : null
+  assert.ok(original)
+
+  const reprinted = await reprintWcCouponLedgerHandoff(makeTx(store), { orderId: 'order-1', currency: 'GBP' })
+
+  assert.equal(reprinted.outcome, 'REPRINTED')
+  assert.equal(reprinted.outcome === 'REPRINTED' && reprinted.corrected, true)
+  // The residual is taken from the CORRECTED column, not re-derived — re-deriving a corrected row is
+  // the "10 -> 6 -> 2 -> 0" bug this whole script is built to avoid.
+  assert.equal(reprinted.outcome === 'REPRINTED' && reprinted.keptOrderLevel, 0)
+  // The remedy's precondition line stamps the moment the position was READ, so the two derivations
+  // differ by whatever milliseconds separate them. That is the one thing that is SUPPOSED to differ
+  // — it is the point of the line — so it is normalised out rather than the comparison weakened.
+  const withoutReadAt = (lines: string[]) => lines.map((line) => line.replace(/\d{4}-\d{2}-\d{2}T[\d:.]+Z/g, '<at>'))
+  assert.deepEqual(
+    withoutReadAt(reprinted.outcome === 'REPRINTED' ? (reprinted.handoff?.lines ?? []) : []),
+    withoutReadAt(original.lines),
+    'the same handoff, from live state',
+  )
+  assert.match(
+    (reprinted.outcome === 'REPRINTED' ? reprinted.handoff?.lines : [])?.join('\n') ?? '',
+    /as read \d{4}-\d{2}-\d{2}T/,
+    'and it stamps its OWN read time, not the one the correction recorded',
+  )
+  assert.match(
+    reprinted.outcome === 'REPRINTED' ? reprinted.detail : '',
+    /corrected by an earlier run .*IS the residual it retains/,
+  )
+})
+
+test('REPRINT writes NOTHING and takes no lock — it is a query (o3d-y14 r8 F4)', async () => {
+  const { applyWcCouponCorrection, reprintWcCouponLedgerHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const activityAfterApply = store.activity.length
+  const amountAfterApply = store.orders[0].discountAmount
+  events.length = 0
+  locked.length = 0
+
+  await reprintWcCouponLedgerHandoff(makeTx(store), { orderId: 'order-1', currency: 'GBP' })
+
+  assert.deepEqual(locked, [], 'no row lock')
+  assert.equal(store.activity.length, activityAfterApply, 'no ActivityLog row')
+  assert.equal(store.orders[0].discountAmount, amountAfterApply, 'no write')
+  assert.equal(events.some((event) => event.startsWith('updateMany')), false)
+})
+
+test('REPRINT on an UNCORRECTED order derives the residual a correction would keep (r8 F4)', async () => {
+  // The other world: a declined entry, or a reprint run before apply. `discountAmount` is still the
+  // duplicated coupon there, so the residual has to be re-derived exactly as apply re-derives it.
+  const { reprintWcCouponLedgerHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const reprinted = await reprintWcCouponLedgerHandoff(makeTx(store), { orderId: 'order-1', currency: 'GBP' })
+
+  assert.equal(reprinted.outcome === 'REPRINTED' && reprinted.corrected, false)
+  assert.equal(reprinted.outcome === 'REPRINTED' && reprinted.keptOrderLevel, 0)
+  assert.match(reprinted.outcome === 'REPRINTED' ? reprinted.detail : '', /has NOT been corrected/)
+})
+
+test('REPRINT on a deleted order says so rather than inventing a position', async () => {
+  const { reprintWcCouponLedgerHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+  store.orders = []
+
+  const reprinted = await reprintWcCouponLedgerHandoff(makeTx(store), { orderId: 'order-1', currency: 'GBP' })
+
+  assert.equal(reprinted.outcome, 'ORDER_GONE')
+})
+
+test('the apply script re-validates PER PRINT, not once for the batch (o3d-y14 r8 F4)', async () => {
+  // A source assertion, because the ORDERING is the whole property and no unit test of a pure
+  // function can express it. r7's own test asserted only that SOME revalidation preceded SOME print,
+  // which the batch-then-print shape satisfied while leaving order 1 re-read and printed an
+  // unbounded number of queries apart.
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
+
+  const sectionAt = src.indexOf('async function printSection(')
+  assert.ok(sectionAt > 0, 'printing goes through a section printer')
+  const section = src.slice(sectionAt, src.indexOf('\n  }\n', sectionAt))
+  assert.match(section, /revalidateWcCouponHandoff\(db, entry\.orderId, handoff\)/, 'which re-validates each entry')
+  assert.match(section, /printHandoff\(entry, revalidated\.handoff\)/, 'and prints the RE-VALIDATED handoff')
+  // Both lists go through it, so a "settled" entry is re-checked as hard as an actionable one.
+  assert.match(src, /await printSection\(actionable\)/)
+  assert.match(src, /await printSection\(settled\)/)
+  // And an entry that moves after the two lists were decided is named again, because its heading
+  // had already been written.
+  assert.match(src, /movedWhilePrinting/)
+  assert.match(src, /MOVE WHILE THIS REPORT/)
+})
+
+test('the script implements --reprint, and it cannot be combined with --apply (o3d-y14 r8 F4)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
+
+  assert.match(src, /flagValue\('reprint'\)/)
+  assert.match(src, /reprintWcCouponLedgerHandoff\(db/)
+  assert.match(src, /--reprint is read-only and cannot be combined with --apply/)
+})
+
+test('every "re-derive this" sentence an operator reads names --reprint, not the report (r8 F4)', async () => {
+  // The claim and the mechanism have to agree. Three separate places told the operator to re-run the
+  // report for a position only --reprint can produce.
+  const { wcCouponRemedySteps } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+
+  const steps = wcCouponRemedySteps({
+    kind: 'INCREASE_RECEIVABLE',
+    amount: 4,
+    currency: 'GBP',
+    externalSystem: 'xero',
+    documentRef: 'invoice INV-778',
+    keptOrderLevel: 0,
+    documentIsAllocated: true,
+    nettedAgainst: ['CN-501'],
+    validAgainst: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'], unresolvedRefundParkExternalIds: [] },
+    derivedAt: '2026-08-01T00:00:00.000Z',
+  }).join('\n')
+
+  assert.match(steps, /--reprint <allowlist>/)
+  assert.doesNotMatch(steps, /re-running the report reproduces/)
 })

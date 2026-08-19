@@ -464,6 +464,10 @@ test('apply refuses to run without an allowlist, and never re-scans (Codex r1 F3
   const applyFn = src.slice(src.indexOf('async function apply('), src.indexOf('async function report('))
 
   assert.ok(applyFn.length > 0, 'apply() exists as its own function')
+  // The slice has to BE apply(), or a function inserted between the two would widen it and the two
+  // assertions below would be about somebody else's code. Adding `reprint()` between them did
+  // exactly that once.
+  assert.doesNotMatch(applyFn.slice(1), /^async function /m, 'the slice contains apply() and nothing else')
   assert.doesNotMatch(applyFn, /db\.salesOrder\.findMany/, 'apply must not select its own candidates')
   assert.doesNotMatch(applyFn, /decideWcCouponBackfill/, 'apply must not re-decide what was reviewed')
   assert.match(applyFn, /parseWcCouponAllowlist/, 'apply validates the signed file')
@@ -653,4 +657,42 @@ test('a version-1 file is refused with an instruction to re-run the report (o3d-
   assert.equal(parsed.ok, false)
   assert.equal(!parsed.ok && parsed.reason, 'UNSUPPORTED_VERSION')
   assert.match(!parsed.ok ? parsed.detail : '', /Re-run the dry run/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r8 finding 4 — the signature gate, and the ONE path it does not stand in
+// ---------------------------------------------------------------------------
+
+test('an UNSIGNED file parses for the read-only reprint path, and only when asked (r8 F4)', () => {
+  const unsigned = file({ reviewed: false, reviewedBy: null })
+
+  // The default is unchanged, and it is what apply uses.
+  assert.equal(parseWcCouponAllowlist(unsigned).ok, false)
+  assert.equal(!parseWcCouponAllowlist(unsigned).ok && (parseWcCouponAllowlist(unsigned) as { reason: string }).reason, 'NOT_REVIEWED')
+  assert.equal(parseWcCouponAllowlist(unsigned, { requireSignature: true }).ok, false)
+
+  // The relaxation has to be asked for explicitly, and it relaxes NOTHING else.
+  const lenient = parseWcCouponAllowlist(unsigned, { requireSignature: false })
+  assert.equal(lenient.ok, true)
+  assert.equal(lenient.ok && lenient.allowlist.reviewed, false, 'and it does not pretend the file was signed')
+  assert.equal(lenient.ok && lenient.allowlist.reviewedBy, null)
+  assert.equal(parseWcCouponAllowlist(file({ version: 5 }), { requireSignature: false }).ok, false, 'version still gates')
+  assert.equal(
+    parseWcCouponAllowlist({ version: 4, reviewed: true, reviewedBy: 'Jan' }, { requireSignature: false }).ok,
+    false,
+    'structure still gates',
+  )
+})
+
+test('APPLY still parses with the signature required — the gate did not move (r8 F4)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const src = readFileSync(join(process.cwd(), 'scripts/backfill-wc-coupon-order-discount.ts'), 'utf8')
+
+  const applyFn = src.slice(src.indexOf('async function apply('), src.indexOf('async function report('))
+  const reprintFn = src.slice(src.indexOf('async function reprint('), src.indexOf('async function main('))
+
+  assert.match(applyFn, /parseWcCouponAllowlist\(parsedJson\)/)
+  assert.doesNotMatch(applyFn, /requireSignature/, 'apply must never relax the signature')
+  assert.match(reprintFn, /parseWcCouponAllowlist\(parsedJson, \{ requireSignature: false \}\)/)
 })

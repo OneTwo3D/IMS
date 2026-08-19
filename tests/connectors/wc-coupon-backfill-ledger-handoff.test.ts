@@ -65,7 +65,18 @@ type EventRow = {
  * SALES_INVOICE_UPDATE — and those two produce OPPOSITE instructions here ("nothing to do" versus
  * "no remedy is prescribed"), which is most of what this file asserts.
  */
-function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = []) {
+function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = [], creditNoteEvents?: CreditNoteEventRow[]) {
+  // r8 finding 3: by DEFAULT every refund's credit note is mirrored as one POSTED document naming
+  // the id the refund names — "the document still stands as IMS recorded it". Fixtures that are
+  // about a retired or re-posted credit note pass their own rows.
+  const cnEvents =
+    creditNoteEvents ??
+    refundRows.map((refund) => ({
+      sourceEntityId: refund.id,
+      type: 'CREDIT_NOTE',
+      status: 'POSTED',
+      externalId: refund.accountingCreditNoteId,
+    }))
   return {
     accountingEvent: {
       count: async ({
@@ -86,14 +97,31 @@ function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = []) {
         where,
         orderBy,
       }: {
-        where: { sourceEntityType: string; sourceEntityId: string; type: { in: string[] }; status: string }
-        orderBy: Array<Record<string, 'desc' | 'asc'>>
+        where: {
+          sourceEntityType: string
+          sourceEntityId: string | { in: string[] }
+          type: { in: string[] } | string
+          status?: string
+        }
+        orderBy?: Array<Record<string, 'desc' | 'asc'>>
       }) => {
+        // The credit-note read (r8 finding 3): a different entity type, an `in` list of refund ids,
+        // a scalar type and NO status filter. Served separately rather than by loosening the invoice
+        // branch, so a query of the wrong shape still fails loudly here.
+        if (where.sourceEntityType === 'SalesOrderRefund') {
+          const ids = typeof where.sourceEntityId === 'string' ? [where.sourceEntityId] : where.sourceEntityId.in
+          if (typeof where.type !== 'string') throw new Error('the credit-note read filters on a scalar type')
+          return cnEvents.filter((row) => ids.includes(row.sourceEntityId) && row.type === where.type)
+        }
+        if (typeof where.sourceEntityId !== 'string' || typeof where.type === 'string' || !orderBy) {
+          throw new Error('the double only implements the invoice read in this shape')
+        }
+        const typeIn = where.type.in
         const matched = rows.filter(
           (row) =>
             row.sourceEntityType === where.sourceEntityType &&
             row.sourceEntityId === where.sourceEntityId &&
-            where.type.in.includes(row.type) &&
+            typeIn.includes(row.type) &&
             row.status === where.status,
         )
         // Honours the ordering production asks for, so a case that depends on WHICH document is
@@ -131,8 +159,13 @@ type RefundRow = {
   chargeback: boolean
   totalsBasis: string | null
   accountingCreditNoteId: string | null
+  accountingRetryRequired?: boolean
+  accountingWarning?: string | null
   lines: Array<{ salesOrderLineId: string | null; totalBase: number; totalForeign: number; lineKind: string | null }>
 }
+
+/** One mirrored CREDIT_NOTE event — the r8 finding 3 evidence that the document still stands. */
+type CreditNoteEventRow = { sourceEntityId: string; type: string; status: string; externalId: string | null }
 
 /** A chargeback that MIRRORED the invoice: full goods, and the invoice's discount as a negative leg. */
 function mirroringChargeback(over: Partial<RefundRow> = {}): RefundRow {
@@ -214,11 +247,12 @@ async function handoffFor(
   keptOrderLevel: number,
   evidence: LedgerEvidence = LINKED_INVOICE,
   refundRows: RefundRow[] = [],
+  creditNoteEvents?: CreditNoteEventRow[],
 ) {
   const { buildWcCouponLedgerHandoff } = await import(
     '@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
   )
-  return await buildWcCouponLedgerHandoff(makeEventClient(rows, refundRows), {
+  return await buildWcCouponLedgerHandoff(makeEventClient(rows, refundRows, creditNoteEvents), {
     orderId: 'order-1',
     currency: 'GBP',
     keptOrderLevel,
@@ -1006,6 +1040,176 @@ const PARKED_ONLY: RefundEvidence = {
   postedCreditNoteExternalIds: [],
   unresolvedRefundParkExternalIds: ['9001'],
 }
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r8 findings 1, 2 and 3 — when the SUBTRACTION itself is not defined
+// ---------------------------------------------------------------------------
+
+/**
+ * THE THREE WAYS r7's NETTING NETTED THE WRONG THING.
+ *
+ * Every fixture below is the netted-to-zero fixture — `postedInvoice()` at 10, one mirroring
+ * chargeback that reversed 10, a corrected residual of 0 — with exactly ONE thing changed, and each
+ * is asserted to render DIFFERENT text and a DIFFERENT `needsAccountingAction` from it. A fixture
+ * set where the suppressed and the netted cases looked alike would prove nothing, which is the trap
+ * the r5 and r6 pairs in this file were already written to avoid.
+ */
+const NETTED_TO_ZERO = () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])
+
+/** The SAME invoice, enqueued TAX-INCLUSIVE: its order-discount line is a GROSS figure. */
+function inclusiveInvoice(over: Partial<EventRow> = {}): EventRow {
+  return postedInvoice({
+    linesJson: documentPayload({
+      lineAmountMode: 'INCLUSIVE',
+      lineAmountsIncludeTax: true,
+      discount: { amount: 10, accountCode: '260' },
+    }),
+    ...over,
+  })
+}
+
+test('a TAX-INCLUSIVE invoice is NOT netted against NET refund lines (o3d-y14 r8 F1)', async () => {
+  // The invoice's 10 is GROSS; the credit note's 10 is NET (the chargeback divides by 1 + the tax
+  // rate before storing the mirrored leg, and the credit note posts lineAmountsIncludeTax: false).
+  // Their difference is not a number, and r7 printed it as "THE POSITION NETS: 10 - 10 = 0" —
+  // declaring an order square whose two figures had never been compared at all.
+  const inclusive = await handoffFor([inclusiveInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])
+  const exclusive = await NETTED_TO_ZERO()
+
+  assert.equal(inclusive.reversal.ok, true, 'the credit-note side is still perfectly derivable')
+  assert.equal(inclusive.remedy, null)
+  assert.equal(inclusive.needsAccountingAction, true, 'and it is NOT settled')
+  const text = inclusive.lines.join('\n')
+  assert.doesNotMatch(text, /THE POSITION NETS/)
+  assert.match(text, /enqueued TAX-INCLUSIVE, so its order-level discount is a GROSS figure/)
+  assert.match(text, /IMS CANNOT NET THE TWO FOR YOU here/)
+  // The pair differs on `lineAmountsIncludeTax` ALONE, and the two answers are opposite.
+  assert.equal(exclusive.needsAccountingAction, false)
+  assert.notDeepEqual(inclusive.lines, exclusive.lines)
+})
+
+test('a tax-inclusive invoice would otherwise have PRESCRIBED a fabricated receivable (o3d-y14 r8 F1)', async () => {
+  // The dangerous shape, not merely the mislabelled one: a gross 12 against a net 10 reads as "the
+  // customer still owes 2" and prescribes an invoice for it, against a fully refunded customer.
+  const handoff = await handoffFor(
+    [inclusiveInvoice({ linesJson: documentPayload({ lineAmountsIncludeTax: true, lineAmountMode: 'INCLUSIVE', discount: { amount: 12, accountCode: '260' } }) })],
+    0,
+    FULLY_REVERSED_INVOICE,
+    [chargebackReversing(10)],
+  )
+
+  assert.equal(handoff.remedy, null)
+  const text = handoff.lines.join('\n')
+  assert.doesNotMatch(text, /THE CUSTOMER STILL OWES/)
+  assert.doesNotMatch(text, /Raise a further invoice/)
+  // The invoice finding itself is still reported — it is a fact and the operator needs it.
+  assert.match(text, /carries an order-level discount of 12 GBP/)
+})
+
+test('a payload that states NEITHER tax field is not read as EXCLUSIVE (o3d-y14 r8 F1)', async () => {
+  const bare = documentPayload({ discount: { amount: 10, accountCode: '260' } }) as Record<string, unknown>
+  delete bare.lineAmountsIncludeTax
+  delete bare.lineAmountMode
+  const handoff = await handoffFor([postedInvoice({ linesJson: bare })], 0, FULLY_REVERSED_INVOICE, [
+    chargebackReversing(10),
+  ])
+
+  assert.equal(handoff.remedy, null)
+  assert.equal(handoff.needsAccountingAction, true)
+  assert.match(handoff.lines.join('\n'), /tax basis of that invoice's order-level discount is UNKNOWN/)
+})
+
+test('TWO AGREEING posted invoices are not collapsed into one netting leg (o3d-y14 r8 F2)', async () => {
+  // The agreement rule was built for the RESOLVER: a mirroring credit note reverses this figure
+  // whichever document it reverses. It is not a statement that there is ONE document — the ledger
+  // holds that discount twice here — so netting one credit-note total against one of them is
+  // arithmetic over a set that is not the ledger's.
+  const two = await handoffFor(
+    [postedInvoice(), postedInvoice({ externalId: 'INV-779', createdAt: '2026-05-03T09:00:00.000Z' })],
+    0,
+    FULLY_REVERSED_INVOICE,
+    [chargebackReversing(10)],
+  )
+  const one = await NETTED_TO_ZERO()
+
+  // Both documents carry 10 against a corrected residual of 0, so the CASE is the same one the
+  // netted fixture produces — the difference is purely that there are two of them.
+  assert.equal(two.invoice.case, 'DOCUMENT_DISCOUNTS_MORE')
+  assert.equal(one.invoice.case, 'DOCUMENT_DISCOUNTS_MORE', 'the pair differs only in the document count')
+  assert.equal(two.reversal.ok, true)
+  assert.equal(two.remedy, null)
+  assert.equal(two.needsAccountingAction, true)
+  const text = two.lines.join('\n')
+  assert.doesNotMatch(text, /THE POSITION NETS/)
+  assert.match(text, /2 posted sales-invoice documents exist for this order and they AGREE/)
+  // The pair differs on the NUMBER of posted documents alone.
+  assert.equal(one.needsAccountingAction, false)
+  assert.notDeepEqual(two.lines, one.lines)
+})
+
+test('a VOIDED credit note stops the position netting (o3d-y14 r8 F3)', async () => {
+  // r7's premise — the persisted lines ARE what the document carried — holds at posting time and
+  // says nothing about a document retired afterwards. Here the mirror says it was.
+  const voided = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], [
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'VOID', externalId: 'CN-501' },
+  ])
+  const live = await NETTED_TO_ZERO()
+
+  assert.equal(voided.reversal.ok, false)
+  assert.equal(voided.remedy, null)
+  assert.equal(voided.needsAccountingAction, true)
+  assert.match(voided.lines.join('\n'), /status VOID — a credit note that was retired or re-posted/)
+  assert.notDeepEqual(voided.lines, live.lines)
+  assert.notEqual(voided.needsAccountingAction, live.needsAccountingAction)
+})
+
+test('a netted remedy NAMES the credit notes it depends on and says IMS cannot watch them (r8 F3)', async () => {
+  const handoff = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(6)])
+
+  assert.equal(handoff.remedy?.kind, 'INCREASE_RECEIVABLE')
+  assert.deepEqual(handoff.remedy?.nettedAgainst, ['CN-501'])
+  const text = handoff.lines.join('\n')
+  assert.match(text, /THIS FIGURE IS THE INVOICE NETTED AGAINST CREDIT NOTE\(S\) CN-501/)
+  assert.match(text, /voided or edited by hand there writes nothing back to IMS/)
+})
+
+test('a NON-netted remedy names no credit note to confirm — it depends on none (r8 F3)', async () => {
+  const handoff = await handoffFor([postedInvoice()], 0)
+
+  assert.equal(handoff.remedy?.kind, 'INCREASE_RECEIVABLE')
+  assert.deepEqual(handoff.remedy?.nettedAgainst, [])
+  assert.doesNotMatch(handoff.lines.join('\n'), /NETTED AGAINST CREDIT NOTE/)
+})
+
+test('the refusal prose says WHICH half failed, and never denies a half it just derived (r8)', async () => {
+  // A sentence an operator can see is wrong is a sentence they start discounting. Two cases used to
+  // assert flatly that the credit-note side was unreadable, on orders where it had just been read.
+  const agreesInclusive = await handoffFor([inclusiveInvoice()], 10, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])
+  assert.equal(agreesInclusive.invoice.case, 'DOCUMENT_AGREES')
+  assert.equal(agreesInclusive.reversal.ok, true)
+  const agreesText = agreesInclusive.lines.join('\n')
+  assert.doesNotMatch(agreesText, /what they carry could not be established here/)
+  assert.match(agreesText, /what could not be established is the NET/)
+
+  const unverified = await handoffFor(
+    [postedInvoice(), postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null })],
+    0,
+    FULLY_REVERSED_INVOICE,
+    [chargebackReversing(10)],
+  )
+  assert.equal(unverified.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.equal(unverified.reversal.ok, true)
+  const unverifiedText = unverified.lines.join('\n')
+  assert.doesNotMatch(unverifiedText, /TWO unknowns here/)
+  assert.match(unverifiedText, /the half of the position that CAN be read is printed below/)
+
+  // And where the credit-note side really IS unreadable, the original wording stands.
+  const opaque = await handoffFor([postedInvoice()], 10, FULLY_REVERSED_INVOICE, [
+    mirroringChargeback({ chargeback: false }),
+  ])
+  assert.equal(opaque.reversal.ok, false)
+  assert.match(opaque.lines.join('\n'), /what they carry could not be established here/)
+})
 
 test('a PARKED WooCommerce refund suppresses the remedy on its own (o3d-y14 r7 F1)', async () => {
   // THE FINDING. A refund that arrived and could not be recorded writes no SalesOrderRefund, no

@@ -809,7 +809,20 @@ function isRefundEvidence(value: unknown): value is WcCouponRefundEvidence {
  * Validate a reviewed allowlist. Everything here is a REFUSAL, never a repair: a file this cannot
  * fully understand is one a human's review cannot be trusted to describe.
  */
-export function parseWcCouponAllowlist(value: unknown): WcCouponAllowlistParse {
+/**
+ * `requireSignature: false` is for the READ-ONLY reprint path only (o3d-y14 r8 finding 4).
+ *
+ * The signature is what makes a file the ONLY thing that decides which posted invoices get
+ * rewritten, so apply requires it and always will. `--reprint` writes nothing and decides nothing —
+ * it re-runs a query and prints the answer — and refusing to answer a question until a file is
+ * signed would just leave the operator without the position they were told to go and check. The
+ * flag is explicit at every call site, so no future caller acquires the relaxation by default.
+ */
+export function parseWcCouponAllowlist(
+  value: unknown,
+  options: { requireSignature?: boolean } = {},
+): WcCouponAllowlistParse {
+  const requireSignature = options.requireSignature ?? true
   if (!value || typeof value !== 'object') {
     return { ok: false, reason: 'MALFORMED', detail: 'the allowlist is not a JSON object' }
   }
@@ -835,7 +848,8 @@ export function parseWcCouponAllowlist(value: unknown): WcCouponAllowlistParse {
   if (bad !== undefined) {
     return { ok: false, reason: 'MALFORMED', detail: `an entry is missing required evidence: ${JSON.stringify(bad)}` }
   }
-  if (raw.reviewed !== true || typeof raw.reviewedBy !== 'string' || raw.reviewedBy.trim() === '') {
+  const signed = raw.reviewed === true && typeof raw.reviewedBy === 'string' && raw.reviewedBy.trim() !== ''
+  if (requireSignature && !signed) {
     return {
       ok: false,
       reason: 'NOT_REVIEWED',
@@ -862,8 +876,8 @@ export function parseWcCouponAllowlist(value: unknown): WcCouponAllowlistParse {
       version: 4,
       generatedAt: typeof raw.generatedAt === 'string' ? raw.generatedAt : '',
       cutoff: typeof raw.cutoff === 'string' ? raw.cutoff : '',
-      reviewed: true,
-      reviewedBy: raw.reviewedBy as string,
+      reviewed: signed,
+      reviewedBy: signed ? (raw.reviewedBy as string) : null,
       reviewedAt: typeof raw.reviewedAt === 'string' ? raw.reviewedAt : null,
       stampOnly: stampOnly as WcCouponAllowlistEntry[],
       clear: clear as WcCouponAllowlistEntry[],
@@ -1518,6 +1532,70 @@ export async function applyWcCouponCorrection(
 }
 
 /**
+ * o3d-y14 r8 finding 4 — RE-DERIVE ONE ORDER'S HANDOFF, READ-ONLY, AFTER IT HAS BEEN CORRECTED.
+ *
+ * THE CLAIM THIS MAKES TRUE. Every refusal, every withdrawn remedy and the refund-netting fallback
+ * all end in "re-run the report and nothing is lost". That was true of a row apply DECLINED — the
+ * next scan re-proposes it — and FALSE of a row apply CORRECTED, which is precisely the row that
+ * carries a handoff. A corrected order is stamped `discountModel` and marked in the ActivityLog, so
+ * `decideWcCouponBackfill` answers SKIP for it and the report builds handoffs only for CORRECT rows.
+ * The handoff an operator was told they could reproduce could not be reproduced by ANY invocation.
+ *
+ * So this is the reproduction path, and `--reprint <allowlist>` is the invocation the operator text
+ * now names. It is the SAME derivation apply performs — the same live evidence read, the same
+ * `buildWcCouponLedgerHandoff` — with no lock, no write and no allowlist re-verification, because it
+ * decides nothing: it only re-answers "what does the ledger hold for this order, and what does that
+ * mean now". Running it twice is running a query twice.
+ *
+ * WHAT `keptOrderLevel` MEANS IN EACH WORLD, and why it is not read from the file. On an order this
+ * run already corrected, `discountAmount` IS the residual and the marker says so. On one it has not
+ * (a declined entry, or a reprint before apply) the residual is what the correction WOULD keep, so
+ * it is re-derived from the live amount and lines exactly as `applyWcCouponCorrection` re-derives
+ * it. The file's copy of the figure is never used for either — the allowlist decides WHICH orders,
+ * never WHAT is reported, which is the same rule apply follows.
+ */
+export type WcCouponHandoffReprint =
+  | { outcome: 'REPRINTED'; handoff: WcCouponLedgerHandoff | null; corrected: boolean; keptOrderLevel: number; detail: string }
+  | { outcome: 'ORDER_GONE' }
+
+export async function reprintWcCouponLedgerHandoff(
+  client: Prisma.TransactionClient,
+  order: { orderId: string; currency: string },
+): Promise<WcCouponHandoffReprint> {
+  const row = await readLockedEvidence(client, order.orderId)
+  if (!row) return { outcome: 'ORDER_GONE' }
+
+  const live = money(row.discountAmount)
+  const liveLines = sumLineDiscounts(row.lines)
+  const corrected = row.discountModel === WC_COUPON_DISCOUNT_MODEL
+  const keptOrderLevel = corrected
+    ? live
+    : money(resolveWcOrderLevelDiscount({ couponTotalForeign: live, lineDiscountTotalForeign: liveLines }).orderLevelDiscount)
+
+  const posted = await readLivePostedEvidence(client, order.orderId, row)
+  const handoff = wcCouponCorrectionNeedsLedgerAdjustment(posted)
+    ? await buildWcCouponLedgerHandoff(client, {
+        orderId: order.orderId,
+        currency: order.currency,
+        keptOrderLevel,
+        evidence: posted,
+      })
+    : null
+
+  return {
+    outcome: 'REPRINTED',
+    handoff,
+    corrected,
+    keptOrderLevel,
+    detail: corrected
+      ? `this order was corrected by an earlier run (discountModel=${row.discountModel}); its ` +
+        `discountAmount ${live} IS the residual it retains`
+      : `this order has NOT been corrected: it still carries ${live} order-level against ${liveLines} ` +
+        `on its lines, so the residual a correction would keep is ${keptOrderLevel}`,
+  }
+}
+
+/**
  * o3d-y14 r7 finding 2 — A REMEDY THAT WAS TRUE AT COMMIT AND IS NOT TRUE NOW.
  *
  * THE DEFECT. `applyWcCouponCorrection` derives its handoff inside the correction transaction,
@@ -1540,7 +1618,14 @@ export async function applyWcCouponCorrection(
  *
  * SUPERSEDING IS NOT A REFUSAL. The amount has already been corrected and that correction is right
  * either way — the coupon was duplicated whatever happened afterwards. What is withdrawn is the
- * REMEDY, and re-running the report reproduces the whole handoff against the new position.
+ * REMEDY, and `reprintWcCouponLedgerHandoff` re-derives the whole handoff against the new position.
+ * NOT the report: the correction has committed, so every later scan SKIPS this order (o3d-y14 r8
+ * finding 4) — that is the whole reason the reprint path exists.
+ *
+ * WHEN IT RUNS (r8 finding 4). Once per handoff, IMMEDIATELY BEFORE THAT HANDOFF'S OWN LINES ARE
+ * PRINTED, not once for the batch before any of them are. The batch shape re-read order 1 and then
+ * printed order 70 an unbounded number of queries later, which is the same "narrow the window"
+ * argument applied to a window it was leaving open.
  */
 export type WcCouponHandoffRevalidation =
   | { outcome: 'CURRENT'; handoff: WcCouponLedgerHandoff }
@@ -1600,7 +1685,8 @@ function withdrawRemedy(handoff: WcCouponLedgerHandoff, detail: string): WcCoupo
     lines: [
       ...handoff.lines.filter((line) => !remedyLines.has(line)),
       `THE REMEDY PRINTED FOR THIS ORDER IS WITHDRAWN: ${detail}. Post NOTHING on the strength of it. ` +
-        'Re-run the report to re-derive the position.',
+        'Re-derive the position with `--reprint <allowlist>` — the correction has already committed, ' +
+        'so a plain report will skip this order and print nothing for it.',
     ],
   }
 }

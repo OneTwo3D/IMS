@@ -99,6 +99,13 @@ import { readDiscountRestatement, restatementHadPostedInvoice } from './discount
  *     the posted figure whichever of them the credit note reverses; if they disagree, no ordering
  *     available here says which is current, so this REFUSES.
  *
+ * WHAT AGREEMENT DOES AND DOES NOT ESTABLISH (r8 finding 2). The agreement rule above answers the
+ * RESOLVER's question — a credit note that mirrors one of these documents reverses this figure
+ * whichever one it is — and it is not an answer to "how much order-level discount does the ledger
+ * hold for this order". Two agreeing invoices hold it TWICE. So `documentCount` is returned beside
+ * the amount, and the o3d-y14 netting refuses on it; nothing here silently promotes agreement to
+ * singularity. The same applies to `taxBasis`: see `PostedDocumentTaxBasis` below.
+ *
  * WHEN IT CANNOT BE RECOVERED. Every branch that cannot establish the figure reports UNRECOVERABLE,
  * and the caller refuses and surfaces — which is what that path already does for the other cases
  * where the remaining balance is ambiguous (prior refunds, no discount account configured).
@@ -212,11 +219,14 @@ function postedDiscountForConnector(
 export function readPostedDocumentDiscount(
   document: { currency: string; externalSystem: string | null; linesJson: unknown },
   expectedCurrency: string,
-): { ok: true; amount: number } | { ok: false; detail: string } {
+): { ok: true; amount: number; taxBasis: PostedDocumentTaxBasis } | { ok: false; detail: string } {
   const payload = document.linesJson
   if (!isRecord(payload) || payload.kind !== 'accounting-document') {
     return { ok: false, detail: 'the mirrored event does not carry a document payload' }
   }
+  // Read BEFORE any of the early returns below, because a 0 discount is still a document with a
+  // basis and the netting has to be able to say which one it was.
+  const taxBasis = readDocumentTaxBasis(payload)
   const documentCurrency = typeof payload.currency === 'string' ? payload.currency : document.currency
   if (documentCurrency.toUpperCase() !== expectedCurrency.toUpperCase()) {
     // The discount is a bare number in the document's own currency. Reversing it into an order of a
@@ -227,7 +237,7 @@ export function readPostedDocumentDiscount(
     }
   }
   if (payload.discount === undefined || payload.discount === null) {
-    return { ok: true, amount: 0 }
+    return { ok: true, amount: 0, taxBasis }
   }
   if (!isRecord(payload.discount)) {
     return { ok: false, detail: 'the posted document carries an unreadable discount adjustment' }
@@ -241,12 +251,47 @@ export function readPostedDocumentDiscount(
   }
   // Both adapters skip a non-positive adjustment, and `normalizeAdjustment` never records one, so
   // there is no connector rule to replay: the document carried no order-level discount line.
-  if (amount === 0) return { ok: true, amount: 0 }
+  if (amount === 0) return { ok: true, amount: 0, taxBasis }
 
   const accountCode = typeof payload.discount.accountCode === 'string' && payload.discount.accountCode.trim()
     ? payload.discount.accountCode.trim()
     : undefined
-  return postedDiscountForConnector(document.externalSystem, amount, accountCode)
+  const replayed = postedDiscountForConnector(document.externalSystem, amount, accountCode)
+  return replayed.ok ? { ok: true, amount: replayed.amount, taxBasis } : replayed
+}
+
+/**
+ * WHICH TAX BASIS THE DOCUMENT'S ORDER-DISCOUNT LINE IS DENOMINATED IN (o3d-y14 r8 finding 1).
+ *
+ * A sales invoice is enqueued in the ORDER's own convention: `queueSalesInvoiceForOrder` passes
+ * `SalesOrder.discountAmount` through verbatim and stamps `lineAmountsIncludeTax` beside it, so on a
+ * tax-inclusive order the negative "Order discount" line Xero appends is a GROSS figure. Every
+ * credit-note refund line IMS stores is NET (`SalesOrderRefundLine` amounts are net for every
+ * caller, and the credit-note payload sets `lineAmountsIncludeTax: false`).
+ *
+ * The chargeback path knows this — it divides by `(1 + taxRatePercent)` before storing the mirrored
+ * discount leg — so the two figures are on DIFFERENT BASES whenever the order is inclusive, and
+ * their difference is not a number. Nothing IMS persists lets the division be inverted: the refund
+ * line records a tax TYPE, never a rate, and the order's live `taxRatePercent` is not evidence of
+ * what it was when the refund was created. So the basis is REPORTED here and the netting refuses on
+ * it, rather than being silently assumed to be NET.
+ *
+ * `UNKNOWN` is a payload that states neither `lineAmountsIncludeTax` nor `lineAmountMode` — a
+ * hand-built or pre-schema mirror. It is not read as EXCLUSIVE: "the builder defaults to false" is a
+ * statement about the builder, not about a row that never went through it.
+ */
+export type PostedDocumentTaxBasis = 'EXCLUSIVE' | 'INCLUSIVE' | 'UNKNOWN'
+
+/** Several documents whose bases disagree. Only reachable with more than one posted document. */
+export type PostedInvoiceTaxBasis = PostedDocumentTaxBasis | 'MIXED'
+
+function readDocumentTaxBasis(payload: Record<string, unknown>): PostedDocumentTaxBasis {
+  if (typeof payload.lineAmountsIncludeTax === 'boolean') {
+    return payload.lineAmountsIncludeTax ? 'INCLUSIVE' : 'EXCLUSIVE'
+  }
+  if (payload.lineAmountMode === 'INCLUSIVE') return 'INCLUSIVE'
+  if (payload.lineAmountMode === 'EXCLUSIVE') return 'EXCLUSIVE'
+  return 'UNKNOWN'
 }
 
 export type PostedOrderDiscountClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingSyncLog'>
@@ -272,6 +317,22 @@ export type PostedInvoiceOrderDiscount =
       documentType: string
       externalId: string | null
       externalSystem: string | null
+      /**
+       * HOW MANY POSTED DOCUMENTS AGREED ON `amount` (o3d-y14 r8 finding 2).
+       *
+       * `amount` is what EACH of them carries, and agreement is all a mirroring credit note needs:
+       * whichever one it reverses, it reverses this figure. It is NOT what a caller NETTING the
+       * ledger needs — two agreeing invoices charged that discount TWICE, and subtracting one
+       * credit-note total from one of them describes a set of documents that is not the ledger's.
+       * So the count travels with the figure and the netting caller refuses on it, instead of the
+       * resolver's agreement rule being silently reused as a singularity rule.
+       */
+      documentCount: number
+      /**
+       * The tax convention those documents' order-discount lines are denominated in (r8 finding 1).
+       * MIXED only where several documents disagree about it.
+       */
+      taxBasis: PostedInvoiceTaxBasis
     }
   /** No POSTED mirrored sales-invoice event exists. NOT the same as "no document exists". */
   | { ok: false; reason: 'NO_POSTED_EVENT' }
@@ -322,6 +383,7 @@ export async function readPostedInvoiceOrderDiscount(
   if (documents.length === 0) return { ok: false, reason: 'NO_POSTED_EVENT' }
 
   const amounts: number[] = []
+  const bases: PostedDocumentTaxBasis[] = []
   for (const document of documents) {
     const read = readPostedDocumentDiscount(document, order.currency)
     if (!read.ok) {
@@ -332,6 +394,7 @@ export async function readPostedInvoiceOrderDiscount(
       }
     }
     amounts.push(read.amount)
+    bases.push(read.taxBasis)
   }
   const distinct = [...new Set(amounts)]
   if (distinct.length > 1) {
@@ -346,6 +409,7 @@ export async function readPostedInvoiceOrderDiscount(
   }
   const [newest] = documents
   const amount = distinct[0]
+  const distinctBases = [...new Set(bases)]
   return {
     ok: true,
     amount,
@@ -355,6 +419,8 @@ export async function readPostedInvoiceOrderDiscount(
     documentType: newest.type,
     externalId: newest.externalId,
     externalSystem: newest.externalSystem,
+    documentCount: documents.length,
+    taxBasis: distinctBases.length === 1 ? distinctBases[0] : 'MIXED',
   }
 }
 
