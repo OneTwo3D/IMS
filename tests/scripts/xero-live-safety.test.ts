@@ -31,6 +31,7 @@ import { join } from 'node:path'
 import { describe, test } from 'node:test'
 
 import {
+  acquireSharedWriteFence,
   acquireWriteLogLock,
   allowedStatusesAfterRun,
   AmbiguousSelectionError,
@@ -39,6 +40,7 @@ import {
   classifyWriteOutcome,
   assertManifestTenant,
   assertNoNearMisses,
+  assertNoUnresolvedSharedWrites,
   assertNoUnresolvedWrites,
   assertPlanAuthorizedByManifest,
   assertRetirementAuthorized,
@@ -57,6 +59,7 @@ import {
   LEGACY_WRITE_LOG_PATHS,
   isFixtureItemCode,
   ManifestViolationError,
+  journalWriteOutcome,
   MutationJournal,
   NULL_WRITE_INTENT_LOG,
   openWriteIntentLog,
@@ -74,6 +77,10 @@ import {
   runOutcome,
   scanWriteIntentLog,
   settleWrite,
+  SHARED_FENCE_SQL,
+  SharedCoordinatorUnavailableError,
+  SharedRunInProgressError,
+  SharedUnresolvedWriteError,
   statusesAfterReleasingBlockers,
   TenantMismatchError,
   UnresolvedWriteError,
@@ -82,12 +89,16 @@ import {
   WriteLogLockedError,
   WriteLogRelocationError,
   WriteOutcomeUnknownError,
+  WriteSettlementNotRecordedError,
+  xeroLedgerLockId,
   XERO_CLEANUP_STATE_DIR,
   WriteRateLimitedError,
   writeUnitsIndividually,
   WriteWithoutApplyError,
+  type CoordinationClient,
   type PlannedObject,
   type RetirementGuardInput,
+  type SharedWriteFence,
   type VersionExpectation,
   type XeroResult,
 } from '@/scripts/lib/xero-live-safety'
@@ -132,6 +143,145 @@ function pageServer(opts: {
     return response(200, { [opts.key]: opts.pages[page - 1] ?? [] })
   })
 }
+
+/**
+ * A shared write fence that records what it was told, and can be made to refuse.
+ *
+ * It is the collaborator every `performWrite` needs, so the ordering guarantees the existing tests
+ * assert about the on-disk log are also asserted about the cross-host record: an intent reaches
+ * BOTH stores before the request is dispatched, or the request is not dispatched.
+ */
+function fence(behaviour: {
+  intend?: (id: string) => void
+  settle?: (id: string) => void
+} = {}): SharedWriteFence & { intents: string[]; settlements: Array<{ id: string; state: string }> } {
+  const intents: string[] = []
+  const settlements: Array<{ id: string; state: string }> = []
+  return {
+    tenantId: LEDGER_UUID,
+    hostId: 'test-host',
+    lockId: 1,
+    mode: 'exclusive',
+    intents,
+    settlements,
+    scanUnresolved: async () => [],
+    async intend(entry) {
+      behaviour.intend?.(entry.id)
+      intents.push(entry.id)
+    },
+    async settle(entry) {
+      behaviour.settle?.(entry.id)
+      settlements.push({ id: entry.id, state: entry.state })
+    },
+    release: async () => {},
+  }
+}
+/** The organisation every fence test coordinates over. Same value as `TENANT_UUID` below, named
+ *  here because the doubles are declared before it. */
+const LEDGER_UUID = '11111111-2222-4333-8444-555555555555'
+
+/**
+ * ONE PostgreSQL, reached by any number of SESSIONS — which is the whole point of the double.
+ *
+ * The defect under test is that a lock FILE and a log FILE describe one machine, so two runs on two
+ * machines miss each other entirely. Modelling that needs a store the two runs SHARE and
+ * filesystems they do NOT, so each simulated host gets its own `stateDir` from `mkdtempSync` and
+ * its own session on this one object.
+ *
+ * The advisory-lock semantics are the real ones, because the fix depends on them: exclusive is
+ * granted only when nobody holds the key, share is granted to any number of holders but not
+ * alongside an exclusive one, and every lock a session holds is freed the instant that session
+ * ends — which is exactly what happens when a host dies mid-run.
+ */
+class FakeCoordinationDatabase {
+  /** The `xero_live_write_intents` table. */
+  readonly rows = new Map<string, Record<string, unknown>>()
+  /** key -> the sessions holding it, and how. */
+  private readonly locks = new Map<number, { exclusive: symbol | null; shared: Set<symbol> }>()
+  /** Statements this database should refuse, by substring, for as long as it is set. */
+  refuse: { match: string; message: string } | null = null
+
+  private held(key: number) {
+    const entry = this.locks.get(key) ?? { exclusive: null, shared: new Set<symbol>() }
+    this.locks.set(key, entry)
+    return entry
+  }
+
+  /** One connection. `end()` — or `kill()` — frees everything it holds, as a real session does. */
+  session = (host: string): CoordinationClient & { kill: () => void; alive: boolean } => {
+    const id = Symbol(host)
+    let alive = false
+    const free = () => {
+      for (const entry of this.locks.values()) {
+        if (entry.exclusive === id) entry.exclusive = null
+        entry.shared.delete(id)
+      }
+      alive = false
+    }
+    return {
+      get alive() { return alive },
+      kill: free,
+      connect: async () => { alive = true },
+      end: async () => { free() },
+      query: async (sql: string, params: unknown[] = []) => {
+        if (!alive) throw new Error('Connection terminated unexpectedly')
+        if (this.refuse && sql.includes(this.refuse.match)) throw new Error(this.refuse.message)
+        if (sql === SHARED_FENCE_SQL.keepalive) return { rows: [{ ok: 1 }] }
+        const key = Number(params[1])
+        if (sql === SHARED_FENCE_SQL.lock.exclusive) {
+          const entry = this.held(key)
+          if (entry.exclusive !== null || entry.shared.size > 0) return { rows: [{ locked: false }] }
+          entry.exclusive = id
+          return { rows: [{ locked: true }] }
+        }
+        if (sql === SHARED_FENCE_SQL.lock.shared) {
+          const entry = this.held(key)
+          if (entry.exclusive !== null && entry.exclusive !== id) return { rows: [{ locked: false }] }
+          entry.shared.add(id)
+          return { rows: [{ locked: true }] }
+        }
+        if (sql === SHARED_FENCE_SQL.unlock.exclusive || sql === SHARED_FENCE_SQL.unlock.shared) {
+          const entry = this.held(key)
+          if (entry.exclusive === id) entry.exclusive = null
+          entry.shared.delete(id)
+          return { rows: [{ unlocked: true }] }
+        }
+        if (sql === SHARED_FENCE_SQL.scan) {
+          return {
+            rows: [...this.rows.values()]
+              .filter((r) => r.tenantId === params[0] && (r.state == null || r.state === 'unknown'))
+              .sort((a, b) => String(a.intendedAt).localeCompare(String(b.intendedAt))),
+          }
+        }
+        if (sql === SHARED_FENCE_SQL.intend) {
+          const [rowId, runId, tenantId, rowHost, kind, label, method, path, intendedAt] = params
+          if (this.rows.has(String(rowId))) throw new Error('duplicate key value violates unique constraint')
+          this.rows.set(String(rowId), {
+            id: rowId, runId, tenantId, host: rowHost, kind, label, method, path,
+            intendedAt: intendedAt instanceof Date ? intendedAt.toISOString() : intendedAt,
+            state: null, reason: null, settledAt: null,
+          })
+          return { rows: [{ id: rowId }] }
+        }
+        if (sql === SHARED_FENCE_SQL.settle) {
+          const [rowId, runId, state, reason, settledAt] = params
+          const row = this.rows.get(String(rowId))
+          // Predicated on the RUN as well as the id, exactly as the real UPDATE is: one run's
+          // settlement may never resolve another run's dispatched write.
+          if (!row || row.runId !== runId) return { rows: [] }
+          row.state = state
+          row.reason = reason
+          row.settledAt = settledAt
+          return { rows: [{ id: rowId }] }
+        }
+        throw new Error(`the double was asked a statement it does not model: ${sql}`)
+      },
+    }
+  }
+}
+
+/** Keepalive timers would outlive the test process; the fence takes its scheduler by injection. */
+const noKeepalive = () => ({ clear: () => {} })
 
 const reader = (impl: typeof fetch, apply = false) =>
   createXeroTransport({ apply, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep }).reader(TOKEN)
@@ -1888,7 +2038,7 @@ describe('the evidence of a dispatched write outlives the process that dispatche
     const journal = new MutationJournal()
 
     const { committed } = await performWrite({
-      transport, token: TOKEN, journal, writeLog: log,
+      transport, token: TOKEN, journal, writeLog: log, fence: fence(),
       method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
       kind: 'invoice voided', label: 'INV-0001',
       subjects: [{ key: 'invoice:inv-1', collectionKey: 'Invoices', idField: 'InvoiceID', id: 'inv-1' }],
@@ -1949,7 +2099,7 @@ describe('the evidence of a dispatched write outlives the process that dispatche
     const journal = new MutationJournal()
     await assert.rejects(
       () => performWrite({
-        transport, token: TOKEN, journal, writeLog: log,
+        transport, token: TOKEN, journal, writeLog: log, fence: fence(),
         method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
         kind: 'invoice voided', label: 'INV-0001',
       }),
@@ -1970,7 +2120,7 @@ describe('the evidence of a dispatched write outlives the process that dispatche
     const journal = new MutationJournal()
     await assert.rejects(
       () => performWrite({
-        transport, token: TOKEN, journal, writeLog: log,
+        transport, token: TOKEN, journal, writeLog: log, fence: fence(),
         method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
         kind: 'invoice voided', label: 'INV-0001',
       }),
@@ -2187,7 +2337,7 @@ describe('a rate-limited WRITE is refused, because its authorisation is behind t
 
     await assert.rejects(
       () => performWrite({
-        transport, token: TOKEN, journal, writeLog: log,
+        transport, token: TOKEN, journal, writeLog: log, fence: fence(),
         method: 'POST', path: 'CreditNotes/cn-1', body: { Status: 'VOIDED' },
         kind: 'credit note voided', label: 'CN-0001',
       }),
@@ -2216,7 +2366,7 @@ describe('a rate-limited WRITE is refused, because its authorisation is behind t
         write: async (unit) => {
           written.push(unit)
           await performWrite({
-            transport, token: TOKEN, journal, writeLog: NULL_WRITE_INTENT_LOG,
+            transport, token: TOKEN, journal, writeLog: NULL_WRITE_INTENT_LOG, fence: fence(),
             method: 'DELETE', path: `CreditNotes/cn-1/Allocations/${unit}`,
             kind: 'allocation deleted', label: unit,
           })
@@ -2506,5 +2656,653 @@ describe('the write log is keyed on the LEDGER, not on a path anybody chose', ()
     // `stateDir` is a test seam. A production call site that passed one would be `--write-log` back
     // under a different name.
     assert.equal(code.includes('stateDir'), false, 'the remover must not choose where the log lives')
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 7, FINDING 1. Round 6 keyed the lock and the log on the tenant, at an absolute path, which
+ * closed "two paths on one host" — and left the residual stated but unfixed: nothing under
+ * /var/lib/o3d survives a different FILESYSTEM. A second host, a container, or a VM restored from a
+ * snapshot takes a free lock and reads an empty recovery fence.
+ *
+ * The residual IS the finding. The thing being protected is ONE LEDGER; the coordination was ONE
+ * HOST. So both halves move to the authority every host shares — a PostgreSQL advisory lock keyed
+ * on the tenant, and the `xero_live_write_intents` table.
+ *
+ * Every test below gives its two runs SEPARATE `mkdtempSync` directories, because a double where
+ * both runs can see each other's files would be a test of the thing that already worked.
+ */
+describe('the coordination lives where the LEDGER is, not where the filesystem is', () => {
+  const LEDGER = LEDGER_UUID
+  const dirs: string[] = []
+  const host = () => {
+    const dir = mkdtempSync(join(tmpdir(), 'xero-fence-host-'))
+    dirs.push(dir)
+    return dir
+  }
+  const cleanup = () => { for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }) }
+
+  test('two runs on hosts that SHARE NO FILESYSTEM still exclude each other', async () => {
+    const db = new FakeCoordinationDatabase()
+    const dirA = host()
+    const dirB = host()
+    assert.notEqual(dirA, dirB, 'the double must give the two runs different filesystems, or it proves nothing')
+
+    const lockA = acquireWriteLogLock({ tenantId: LEDGER, stateDir: dirA })
+    const fenceA = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+    })
+
+    // THE FINDING, demonstrated first: host B's FILE lock is free. Everything round 6 built is
+    // happily letting a second apply start against the same live ledger.
+    const lockB = acquireWriteLogLock({ tenantId: LEDGER, stateDir: dirB })
+    assert.ok(lockB.path.startsWith(dirB), 'host B took its own lock file and nothing stopped it')
+
+    // And what stops it now.
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-b'), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof SharedRunInProgressError && /another run holds this LEDGER/i.test(e.message),
+    )
+
+    lockA.release()
+    lockB.release()
+    await fenceA.release()
+    cleanup()
+  })
+
+  test('a write ANOTHER HOST dispatched and never settled stops this run', async () => {
+    const db = new FakeCoordinationDatabase()
+    const dirA = host()
+    const dirB = host()
+
+    // Host A: intent recorded, request dispatched, and then the machine goes away.
+    const sessionA = db.session('host-a')
+    const fenceA = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => sessionA, setKeepalive: noKeepalive, hostId: 'host-a',
+    })
+    await fenceA.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
+    sessionA.kill() // <<< the host dies: its session ends, so its advisory lock is freed too >>>
+
+    // Host B, on its own filesystem, sees nothing at all locally — no lock, no log, no evidence.
+    const targetB = writeLogTargetForTenant({ tenantId: LEDGER, stateDir: dirB })
+    assert.equal(existsSync(targetB.logPath), false, 'host B has no local log, which is exactly the problem')
+    assert.notEqual(dirA, dirB)
+
+    const fenceB = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-b'), setKeepalive: noKeepalive,
+    })
+    const unresolved = await fenceB.scanUnresolved()
+    assert.equal(unresolved.length, 1)
+    assert.equal(unresolved[0].label, 'INV-0042')
+    assert.equal(unresolved[0].host, 'host-a')
+    assert.throws(
+      () => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved }),
+      (e: Error) => e instanceof SharedUnresolvedWriteError
+        && /DISPATCHED and never accounted for/.test(e.message)
+        && /host-a/.test(e.message),
+    )
+    await fenceB.release()
+    cleanup()
+  })
+
+  test('a write that WAS settled leaves nothing behind — the cross-host refusal is not always on', async () => {
+    const db = new FakeCoordinationDatabase()
+    const session = db.session('host-a')
+    const f = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => session, setKeepalive: noKeepalive,
+    })
+    await f.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
+    await f.settle({ id: 'runA-w1', runId: 'runA', state: 'committed', reason: 'Xero answered HTTP 200' })
+    assert.deepEqual(await f.scanUnresolved(), [])
+    assert.doesNotThrow(() => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved: [] }))
+    await f.release()
+  })
+
+  test('a write settled as UNKNOWN still stops the next run, on any host', async () => {
+    const db = new FakeCoordinationDatabase()
+    const f = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+    })
+    await f.intend({ id: 'runA-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
+    await f.settle({ id: 'runA-w1', runId: 'runA', state: 'unknown', reason: 'no usable response came back' })
+    const unresolved = await f.scanUnresolved()
+    assert.equal(unresolved.length, 1)
+    assert.equal(unresolved[0].state, 'unknown')
+    assert.throws(() => assertNoUnresolvedSharedWrites({ tenantId: LEDGER, unresolved }), SharedUnresolvedWriteError)
+    await f.release()
+  })
+
+  test("one run's settlement cannot resolve another run's dispatched write", async () => {
+    // The database enforces the rule the on-disk scan applies: the UPDATE is predicated on the run
+    // as well as the id, so a colliding id cannot make somebody else's evidence disappear.
+    const db = new FakeCoordinationDatabase()
+    const f = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+    })
+    await f.intend({ id: 'shared-w1', runId: 'runA', kind: 'invoice voided', label: 'INV-0042', method: 'POST', path: 'Invoices/inv-42' })
+    await assert.rejects(
+      () => f.settle({ id: 'shared-w1', runId: 'runB', state: 'committed', reason: 'not mine to settle' }),
+      (e: Error) => e instanceof SharedCoordinatorUnavailableError && /matched 0 row\(s\)/.test(e.message),
+    )
+    assert.equal((await f.scanUnresolved()).length, 1, "run A's evidence is still on the pile")
+    await f.release()
+  })
+
+  test('an --apply run excludes a DRY RUN on another host, and a dry run excludes an apply', async () => {
+    // A dry run writes nothing — but the plan it builds is what the next --apply is authorised by,
+    // so building it while an apply mutates the ledger underneath is planning from a moving state.
+    const db = new FakeCoordinationDatabase()
+    const applyRun = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+    })
+    await assert.rejects(
+      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'shared', createClient: () => db.session('host-b'), setKeepalive: noKeepalive }),
+      SharedRunInProgressError,
+    )
+    await applyRun.release()
+
+    const dryRun = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'shared', createClient: () => db.session('host-b'), setKeepalive: noKeepalive,
+    })
+    await assert.rejects(
+      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-c'), setKeepalive: noKeepalive }),
+      SharedRunInProgressError,
+    )
+    // Two dry runs may coexist: neither can change anything the other reads.
+    const secondDryRun = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'shared', createClient: () => db.session('host-d'), setKeepalive: noKeepalive,
+    })
+    await dryRun.release()
+    await secondDryRun.release()
+  })
+
+  test('two DIFFERENT ledgers do not exclude each other', async () => {
+    const db = new FakeCoordinationDatabase()
+    const other = '99999999-8888-4777-a666-555555555555'
+    const a = await acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('h1'), setKeepalive: noKeepalive })
+    const b = await acquireSharedWriteFence({ tenantId: other, mode: 'exclusive', createClient: () => db.session('h2'), setKeepalive: noKeepalive })
+    assert.notEqual(a.lockId, b.lockId)
+    await a.release()
+    await b.release()
+  })
+
+  test('an unreachable coordinator REFUSES the run — in a dry run as well as an apply', async () => {
+    // There is no reading of "I cannot reach the coordinator" that distinguishes it from "another
+    // host is writing to this ledger right now".
+    for (const mode of ['exclusive', 'shared'] as const) {
+      await assert.rejects(
+        () => acquireSharedWriteFence({
+          tenantId: LEDGER, mode,
+          createClient: () => { throw new Error('DATABASE_URL is not set') },
+          setKeepalive: noKeepalive,
+        }),
+        (e: Error) => e instanceof SharedCoordinatorUnavailableError && /refuses/.test(e.message),
+      )
+      await assert.rejects(
+        () => acquireSharedWriteFence({
+          tenantId: LEDGER, mode,
+          createClient: () => ({
+            connect: async () => { throw new Error('ECONNREFUSED 10.0.3.20:5432') },
+            query: async () => ({ rows: [] }),
+            end: async () => {},
+          }),
+          setKeepalive: noKeepalive,
+        }),
+        (e: Error) => e instanceof SharedCoordinatorUnavailableError && /ECONNREFUSED/.test(e.message),
+      )
+    }
+  })
+
+  test('a coordinator that cannot ANSWER the lock question is treated as one that said no', async () => {
+    const db = new FakeCoordinationDatabase()
+    db.refuse = { match: 'pg_try_advisory_lock', message: 'terminating connection due to administrator command' }
+    await assert.rejects(
+      () => acquireSharedWriteFence({ tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive }),
+      (e: Error) => e instanceof SharedCoordinatorUnavailableError
+        && /treated exactly like one another run is holding/.test(e.message),
+    )
+  })
+
+  test('the ledger lock id is derived from the LEDGER and from nothing else', () => {
+    const other = '99999999-8888-4777-a666-555555555555'
+    assert.equal(xeroLedgerLockId(LEDGER), xeroLedgerLockId(LEDGER.toUpperCase()), 'the same ledger is the same lock')
+    assert.notEqual(xeroLedgerLockId(LEDGER), xeroLedgerLockId(other))
+    for (const t of [LEDGER, other]) {
+      const id = xeroLedgerLockId(t)
+      // int4: the two-int advisory lock form takes signed 32-bit arguments.
+      assert.ok(Number.isSafeInteger(id) && id > 0 && id < 2 ** 31, `${t} -> ${id}`)
+    }
+    // A key derived from something that is not a tenant id is a lock over something else.
+    for (const bad of ['', '../../etc', 'tenant-live']) {
+      assert.throws(() => xeroLedgerLockId(bad), WriteLogRelocationError)
+    }
+  })
+
+  test('the lock namespace comes from the central registry, not from a literal in this tool', async () => {
+    // lib/db/advisory-locks.ts exists because two pairs of features silently shared a key. A
+    // cleanup that writes irreversibly to a live ledger is the last place to reintroduce that.
+    const registry = await import('@/lib/db/advisory-locks')
+    assert.ok(Number.isSafeInteger(registry.XERO_LIVE_CLEANUP_LOCK_NAMESPACE))
+    assert.ok(
+      Object.values(registry.TWO_INT_ADVISORY_LOCK_NAMESPACES).includes(registry.XERO_LIVE_CLEANUP_LOCK_NAMESPACE),
+      'the namespace must be registered, or the uniqueness test cannot see it',
+    )
+    const code = readFileSync('scripts/lib/xero-live-safety.ts', 'utf8')
+    assert.match(code, /import \{ XERO_LIVE_CLEANUP_LOCK_NAMESPACE \} from '\.\.\/\.\.\/lib\/db\/advisory-locks/)
+    assert.equal(
+      /(?:const|let|var)\s+\w*LOCK_(?:KEY|NAMESPACE)\w*\s*(?::\s*number\s*)?=\s*(?:0x)?[\da-fA-F_]+/.test(code),
+      false,
+      'declare advisory keys in lib/db/advisory-locks.ts, never here',
+    )
+  })
+
+  test('the SQL the fence issues is the SQL the double is measured against', () => {
+    // The double models statements by exact text. If the two drift, this fails rather than a
+    // production run — and the statements themselves are the contract worth pinning: the settle is
+    // predicated on the RUN, and the scan treats NULL and 'unknown' alike.
+    assert.match(SHARED_FENCE_SQL.lock.exclusive, /^SELECT pg_try_advisory_lock\(\$1, \$2\)/)
+    assert.match(SHARED_FENCE_SQL.lock.shared, /^SELECT pg_try_advisory_lock_shared\(\$1, \$2\)/)
+    assert.match(SHARED_FENCE_SQL.unlock.exclusive, /^SELECT pg_advisory_unlock\(\$1, \$2\)/)
+    assert.match(SHARED_FENCE_SQL.unlock.shared, /^SELECT pg_advisory_unlock_shared\(\$1, \$2\)/)
+    assert.match(SHARED_FENCE_SQL.scan, /"state" IS NULL OR "state" = 'unknown'/)
+    assert.match(SHARED_FENCE_SQL.settle, /WHERE "id" = \$1 AND "runId" = \$2 RETURNING "id"/)
+    assert.match(SHARED_FENCE_SQL.intend, /RETURNING "id"/)
+  })
+
+  test('the shared store and the on-disk log record the SAME run and the SAME intent', async () => {
+    // They are two copies of one fact, and a settlement has to be able to find its intent in
+    // either. Ids minted for one store and not the other would leave a permanently unsettleable
+    // row in the other.
+    const db = new FakeCoordinationDatabase()
+    const dir = host()
+    const sharedFence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+    })
+    const log = openWriteIntentLog({ tenantId: LEDGER, stateDir: dir })
+    const { impl } = fakeFetch(() => response(200, { Invoices: [{ InvoiceID: 'inv-1', UpdatedDateUTC: '/Date(2000)/' }] }))
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    await performWrite({
+      transport, token: TOKEN, journal: new MutationJournal(), writeLog: log, fence: sharedFence,
+      method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+      kind: 'invoice voided', label: 'INV-0001',
+    })
+    const target = writeLogTargetForTenant({ tenantId: LEDGER, stateDir: dir })
+    const lines = readFileSync(target.logPath, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
+    assert.equal(lines.length, 2)
+    const [row] = [...db.rows.values()]
+    assert.equal(row.id, lines[0].id)
+    assert.equal(row.runId, lines[0].runId)
+    assert.equal(row.runId, log.runId)
+    assert.equal(row.state, 'committed', 'and the shared copy is settled too')
+    log.close()
+    await sharedFence.release()
+    cleanup()
+  })
+
+  test('an intent the SHARED store will not accept is never dispatched', async () => {
+    // Both stores, then dispatch. A write recorded only on this machine's disk is a write a run on
+    // another machine cannot see — which is the whole defect, one step earlier.
+    const disk: string[] = []
+    const log = createWriteIntentLog({ tenantId: LEDGER, append: (l) => disk.push(l) })
+    const { impl, calls } = fakeFetch(() => response(200, {}))
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: log,
+        fence: fence({ intend: () => { throw new SharedCoordinatorUnavailableError('the coordinator went away') } }),
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      SharedCoordinatorUnavailableError,
+    )
+    assert.equal(calls.length, 0, 'nothing may leave the process once the fence has refused the intent')
+    // And the local fence is left honest: this write provably never left, so it must not block the
+    // next run the way a genuinely dispatched one does.
+    assert.equal(disk.length, 2)
+    assert.match(disk[1], /"state":"not-committed"/)
+    assert.deepEqual(scanWriteIntentLog(disk.join('\n')).unresolved, [])
+    assert.equal(journal.writeCount, 0)
+    assert.equal(journal.unknownCount, 0)
+  })
+
+  test('the intent reaches the shared store BEFORE the request is dispatched', async () => {
+    const db = new FakeCoordinationDatabase()
+    const sharedFence = await acquireSharedWriteFence({
+      tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host-a'), setKeepalive: noKeepalive,
+    })
+    let rowsAtDispatch = -1
+    const { impl } = fakeFetch(() => {
+      rowsAtDispatch = db.rows.size
+      return response(200, {})
+    })
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    await performWrite({
+      transport, token: TOKEN, journal: new MutationJournal(), writeLog: NULL_WRITE_INTENT_LOG, fence: sharedFence,
+      method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+      kind: 'invoice voided', label: 'INV-0001',
+    })
+    assert.equal(rowsAtDispatch, 1, 'recording it after the request is the defect a dead host exposes')
+    await sharedFence.release()
+  })
+
+  test('the remover takes the SHARED fence before it reads any log, in BOTH modes', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    const fenceAt = code.indexOf('sharedFence = await acquireSharedWriteFence({')
+    const fileLockAt = code.indexOf('if (APPLY) writeLogLock = acquireWriteLogLock(')
+    const sharedScanAt = code.indexOf('assertNoUnresolvedSharedWrites({ tenantId: EXPECTED_TENANT_ID')
+    const localScanAt = code.indexOf('assertNoUnresolvedWrites({ path: logPath')
+    assert.ok(fenceAt > 0 && fileLockAt > 0 && sharedScanAt > 0 && localScanAt > 0)
+    assert.ok(fenceAt < fileLockAt, 'the only lock that spans hosts is taken first')
+    assert.ok(fenceAt < sharedScanAt && sharedScanAt < localScanAt,
+      'reading the fence before holding it is a window a second run can append into')
+    // Not behind the --apply gate: a dry run's plan is what the next --apply is authorised by.
+    assert.match(code, /mode: APPLY \? 'exclusive' : 'shared'/)
+    assert.equal(
+      /if \(APPLY\)[^\n]*acquireSharedWriteFence/.test(code), false,
+      'a fence only apply runs take leaves the dry run planning over a ledger nobody has confirmed',
+    )
+  })
+
+  test('every performWrite in the remover is handed the shared fence', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    const performed = code.match(/performWrite\(\{/g) ?? []
+    const fenced = code.match(/fence: sharedFence,/g) ?? []
+    assert.ok(performed.length > 0)
+    assert.equal(fenced.length, performed.length, 'a write that skips the fence is a write another host cannot see')
+    assert.equal(code.includes('NULL_SHARED_WRITE_FENCE'), true, 'and the pre-acquire placeholder is the null fence')
+  })
+})
+
+// ===========================================================================
+/**
+ * ROUND 7, FINDING 2. The intent is fsynced BEFORE dispatch, which is round 4's guarantee and it
+ * holds. What did not hold is the other end: if writing the SETTLEMENT failed after the request had
+ * already gone out, the throw travelled straight past the journal, so the mutation — known to have
+ * committed, or known to be unknown — was suppressed.
+ *
+ * The durable record then says a write was ATTEMPTED and says nothing about what became of it, and
+ * the one thing that still knew, the process's own memory, threw it away. That is precisely the
+ * half an operator needs: the intent is what BLOCKS the next run, and the outcome is what UNBLOCKS
+ * it.
+ *
+ * The doubles here settle successfully at the durable-log or fence layer and then fail the OTHER
+ * one, or fail both, always AFTER the request has left — a double that failed before dispatch would
+ * be testing the intent path, which is a different guarantee.
+ */
+describe('a settlement that cannot be recorded must not suppress the mutation', () => {
+  const dispatched = { count: 0 }
+  const voidOk = () => response(200, { Invoices: [{ InvoiceID: 'inv-1', UpdatedDateUTC: '/Date(2000)/' }] })
+
+  /** A durable log that accepts the intent and refuses the settlement — i.e. fails after dispatch. */
+  function logThatCannotSettle(disk: string[]) {
+    const inner = createWriteIntentLog({ tenantId: TENANT, append: (l) => disk.push(l) })
+    return {
+      runId: inner.runId,
+      intend: inner.intend,
+      settle: () => { throw new Error('ENOSPC: no space left on device, write') },
+      close: () => {},
+    }
+  }
+
+  test('a COMMITTED write is still in the journal when the durable log refuses its settlement', async () => {
+    const disk: string[] = []
+    dispatched.count = 0
+    const { impl } = fakeFetch(() => { dispatched.count++; return voidOk() })
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+    const f = fence()
+
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: logThatCannotSettle(disk), fence: f,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+        subjects: [{ key: 'invoice:inv-1', collectionKey: 'Invoices', idField: 'InvoiceID', id: 'inv-1' }],
+      }),
+      (e: Error) => e instanceof WriteSettlementNotRecordedError
+        && /was DISPATCHED \(POST Invoices\/inv-1\)/.test(e.message)
+        && /outcome is COMMITTED/.test(e.message)
+        && /ENOSPC/.test(e.message),
+    )
+
+    assert.equal(dispatched.count, 1, 'the double must really dispatch, or this is a test about the intent path')
+    // THE FINDING: this used to be 0. The write landed, and the run forgot it.
+    assert.equal(journal.writeCount, 1, 'a write that committed may never vanish because its settlement did not store')
+    assert.deepEqual([...journal.writeRecords], [{ kind: 'invoice voided', label: 'INV-0001' }])
+    assert.equal(journal.unrecordedSettlementCount, 1)
+    const [u] = journal.unrecordedSettlements
+    assert.equal(u.state, 'committed')
+    assert.equal(u.method, 'POST')
+    assert.equal(u.path, 'Invoices/inv-1')
+    assert.match(u.intentId, /-w1$/)
+    assert.equal(u.failures.length, 1)
+    assert.match(u.failures[0], /the durable log refused it/)
+    // The version Xero reported for our own write is still captured: the later steps' authorisation
+    // must not silently weaken because the settlement could not be stored.
+    assert.equal(journal.ownWriteVersion('invoice:inv-1'), '/Date(2000)/')
+  })
+
+  test('the OTHER store is still attempted when the first one refuses', async () => {
+    // A settlement that reached one store narrows what has to be reconciled by hand; giving up on
+    // the second because the first threw would throw that away for nothing.
+    const disk: string[] = []
+    const { impl } = fakeFetch(() => voidOk())
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const f = fence()
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal: new MutationJournal(), writeLog: logThatCannotSettle(disk), fence: f,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      WriteSettlementNotRecordedError,
+    )
+    assert.deepEqual(f.settlements, [{ id: f.intents[0], state: 'committed' }])
+  })
+
+  test('a write whose ANSWER WAS LOST survives a settlement the SHARED fence refuses', async () => {
+    // The worst combination: the request left, no answer came back, and the record of THAT cannot
+    // be stored either. A write whose response is lost does not throw out of the transport — a
+    // write is never allowed to surface as `{ ok: false }` — so this is the ordinary settlement
+    // path carrying an unknown outcome, and the unknown write must survive the settlement failure.
+    const disk: string[] = []
+    const log = createWriteIntentLog({ tenantId: TENANT, append: (l) => disk.push(l) })
+    const { impl } = fakeFetch(() => { throw new Error('socket hang up') })
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: log,
+        fence: fence({ settle: () => { throw new Error('Connection terminated unexpectedly') } }),
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      (e: Error) => e instanceof WriteSettlementNotRecordedError
+        && /outcome is UNKNOWN/.test(e.message) && /socket hang up/.test(e.message),
+    )
+
+    // THE FINDING: recordUnknown sat behind the settle, so a settle that threw took it with it and
+    // the run reported "nothing was written" about a request that had already left the process.
+    assert.equal(journal.unknownCount, 1)
+    assert.equal(journal.unknownRecords[0].label, 'INV-0001')
+    assert.equal(journal.unrecordedSettlementCount, 1)
+    assert.equal(journal.unrecordedSettlements[0].state, 'unknown')
+    assert.match(journal.unrecordedSettlements[0].failures[0], /the shared fence refused it/)
+    // The durable log took its half, so only the shared copy needs reconciling.
+    assert.match(disk[1], /"state":"unknown"/)
+  })
+
+  test("a REFUSED write's own error stays the reported cause when its settlement cannot be stored", async () => {
+    // The path where the TRANSPORT throws. For a write that is exactly three things — the write
+    // gate, the call ceiling, and a 429, which is Xero declining before applying. Settling used to
+    // come first here, so a settlement that threw REPLACED the transport's error: the operator was
+    // told the disk was full and never told that Xero had rate-limited an irreversible write.
+    const disk: string[] = []
+    const inner = createWriteIntentLog({ tenantId: TENANT, append: (l) => disk.push(l) })
+    const cannotSettle = {
+      runId: inner.runId,
+      intend: inner.intend,
+      settle: () => { throw new Error('ENOSPC: no space left on device, write') },
+      close: () => {},
+    }
+    const { impl, calls } = fakeFetch(() => response(429, '', { 'Retry-After': '30' }))
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+    const f = fence()
+
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: cannotSettle, fence: f,
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      (e: Error) => e instanceof WriteRateLimitedError,
+    )
+
+    assert.equal(calls.length, 1, 'the request has to have left, or this is not the case under test')
+    // The cause is unchanged, and the lost settlement is on the journal rather than in its place.
+    assert.equal(journal.unrecordedSettlementCount, 1)
+    assert.equal(journal.unrecordedSettlements[0].state, 'not-committed')
+    assert.equal(journal.unrecordedSettlements[0].label, 'INV-0001')
+    assert.match(journal.unrecordedSettlements[0].failures[0], /ENOSPC/)
+    // And the second store was still asked, so only one copy needs reconciling by hand.
+    assert.deepEqual(f.settlements, [{ id: f.intents[0], state: 'not-committed' }])
+  })
+
+  test('a transport that throws an outcome nobody can determine still records the unknown write', async () => {
+    // The defensive branch of the same catch: an error that is neither the write gate, nor the
+    // ceiling, nor a 429 says nothing about whether the bytes landed, so it is UNKNOWN — and the
+    // journal has to learn that before anything that can throw runs.
+    const disk: string[] = []
+    const inner = createWriteIntentLog({ tenantId: TENANT, append: (l) => disk.push(l) })
+    const cannotSettle = {
+      runId: inner.runId,
+      intend: inner.intend,
+      settle: () => { throw new Error('ENOSPC: no space left on device, write') },
+      close: () => {},
+    }
+    const journal = new MutationJournal()
+    const transport = {
+      request: async () => { throw new Error('the process was interrupted mid-request') },
+      reader: () => async () => ({ ok: false, status: 0 }),
+      get callCount() { return 1 },
+    } as unknown as Parameters<typeof performWrite>[0]['transport']
+
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: cannotSettle, fence: fence(),
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      (e: Error) => /interrupted mid-request/.test(e.message),
+    )
+
+    // THE FINDING on this path: this used to be 0, because the settle threw first.
+    assert.equal(journal.unknownCount, 1)
+    assert.equal(journal.unknownRecords[0].label, 'INV-0001')
+    assert.equal(journal.unrecordedSettlementCount, 1)
+    assert.equal(journal.unrecordedSettlements[0].state, 'unknown')
+  })
+
+  test('a write XERO REFUSED whose settlement is lost is not reported as a clean nothing', async () => {
+    // The ledger genuinely did not change, so "nothing was written" is TRUE — and the stores now
+    // hold an intent nobody settled, so the next run will refuse over it. A banner that said only
+    // "NOTHING WAS WRITTEN" would send the operator to that refusal with nothing to act on.
+    const disk: string[] = []
+    const { impl } = fakeFetch(() => response(400, { Message: 'Invoice not of valid status for modification' }))
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+    await assert.rejects(
+      () => performWrite({
+        transport, token: TOKEN, journal, writeLog: logThatCannotSettle(disk),
+        fence: fence({ settle: () => { throw new Error('Connection terminated unexpectedly') } }),
+        method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+        kind: 'invoice voided', label: 'INV-0001',
+      }),
+      (e: Error) => e instanceof WriteSettlementNotRecordedError && /outcome is NOT-COMMITTED/.test(e.message),
+    )
+    assert.equal(journal.writeCount, 0)
+    assert.equal(journal.unknownCount, 0)
+    assert.equal(journal.unrecordedSettlementCount, 1)
+    assert.equal(journal.unrecordedSettlements[0].failures.length, 2, 'both stores refused, and both are named')
+
+    const outcome = runOutcome({
+      apply: true, failed: 1, aborted: true,
+      writesMade: journal.writeCount,
+      unknownWrites: journal.unknownCount,
+      unrecordedSettlements: journal.unrecordedSettlementCount,
+    })
+    assert.equal(outcome.exitCode, 1)
+    assert.equal(outcome.label, 'ABORTED — NOTHING WAS WRITTEN, BUT 1 UNRECORDED SETTLEMENT(S) EXIST ONLY IN THIS OUTPUT')
+  })
+
+  test('the run label says an unrecorded settlement exists, alongside what was destroyed', () => {
+    // Every other line of the banner has a durable copy somewhere. These do not, and the label is
+    // the first thing an operator reads.
+    assert.equal(
+      runOutcome({ apply: true, failed: 0, aborted: true, writesMade: 3, unrecordedSettlements: 1 }).label,
+      'PARTIALLY APPLIED — ABORTED AFTER 3 IRREVERSIBLE WRITE(S) — AND 1 UNRECORDED SETTLEMENT(S) THAT ONLY THIS OUTPUT RECORDS',
+    )
+    assert.equal(
+      runOutcome({ apply: true, failed: 0, aborted: true, writesMade: 3, unknownWrites: 2, unrecordedSettlements: 1 }).label,
+      'PARTIALLY APPLIED — ABORTED AFTER 3 IRREVERSIBLE WRITE(S) AND 2 WRITE(S) OF UNKNOWN OUTCOME — AND 1 UNRECORDED SETTLEMENT(S) THAT ONLY THIS OUTPUT RECORDS',
+    )
+    // A run that finished cleanly may not call itself APPLIED with one outstanding.
+    assert.deepEqual(
+      runOutcome({ apply: true, failed: 0, unrecordedSettlements: 1 }),
+      { label: 'PARTIALLY APPLIED — 1 UNRECORDED SETTLEMENT(S) THAT ONLY THIS OUTPUT RECORDS', exitCode: 1 },
+    )
+    // And with none, every existing label is untouched.
+    assert.deepEqual(runOutcome({ apply: true, failed: 0 }), { label: 'APPLIED', exitCode: 0 })
+    assert.equal(runOutcome({ apply: true, failed: 0, aborted: true }).label, 'ABORTED — NOTHING WAS WRITTEN')
+    assert.equal(
+      runOutcome({ apply: true, failed: 0, aborted: true, writesMade: 3 }).label,
+      'PARTIALLY APPLIED — ABORTED AFTER 3 IRREVERSIBLE WRITE(S)',
+    )
+  })
+
+  test('journalWriteOutcome records without throwing, so the throwing path can still use it', () => {
+    // settleWrite has to throw on an unknown outcome; the settlement-failure path has to record the
+    // same fact and then throw something else. Splitting the recording out is what lets both.
+    const journal = new MutationJournal()
+    assert.equal(journalWriteOutcome({ commit: { state: 'committed', reason: 'HTTP 200' }, journal, kind: 'k', label: 'l' }), true)
+    assert.equal(journalWriteOutcome({ commit: { state: 'unknown', reason: 'lost' }, journal, kind: 'k', label: 'u' }), false)
+    assert.equal(journalWriteOutcome({ commit: { state: 'not-committed', reason: 'HTTP 400' }, journal, kind: 'k', label: 'n' }), false)
+    assert.equal(journal.writeCount, 1)
+    assert.equal(journal.unknownCount, 1)
+  })
+
+  test('a settlement that stores normally records nothing unrecorded — the report is not always on', async () => {
+    const disk: string[] = []
+    const log = createWriteIntentLog({ tenantId: TENANT, append: (l) => disk.push(l) })
+    const { impl } = fakeFetch(() => voidOk())
+    const transport = createXeroTransport({ apply: true, fetchImpl: impl, minIntervalMs: 0, sleep: noSleep })
+    const journal = new MutationJournal()
+    const { committed } = await performWrite({
+      transport, token: TOKEN, journal, writeLog: log, fence: fence(),
+      method: 'POST', path: 'Invoices/inv-1', body: { Status: 'VOIDED' },
+      kind: 'invoice voided', label: 'INV-0001',
+    })
+    assert.equal(committed, true)
+    assert.equal(journal.writeCount, 1)
+    assert.equal(journal.unrecordedSettlementCount, 0)
+  })
+
+  test('the banner prints the outcomes that exist nowhere else, and how to settle them', () => {
+    const code = readFileSync('scripts/remove-xero-live-e2e-footprint.ts', 'utf8')
+    assert.match(code, /unrecordedSettlements: journal\.unrecordedSettlementCount/)
+    assert.match(code, /THIS OUTPUT IS THE ONLY COPY/)
+    assert.match(code, /for \(const u of journal\.unrecordedSettlements\)/)
+    // Naming the intent id is the point: it is what the next run refuses over.
+    assert.match(code, /WHERE "id" = '\$\{u\.intentId\}'/)
+    // And the block is reachable from the abort path, which is how this run always ends.
+    const reportAt = code.indexOf('async function report(')
+    const blockAt = code.indexOf('if (journal.unrecordedSettlementCount > 0) {')
+    assert.ok(reportAt > 0 && blockAt > reportAt)
   })
 })

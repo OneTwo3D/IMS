@@ -129,6 +129,26 @@
  * with <tenantId>.jsonl.lock beside it, and every run against this ledger uses that pair whatever
  * directory it was started from. It is not date-stamped, because the run after a crash has to find
  * it. To start a clean one, account for every write already in it and move it aside.
+ *
+ * THE SHARED FENCE — DATABASE_URL IS REQUIRED, IN BOTH MODES. Those two files coordinate ONE
+ * MACHINE, and the thing they protect is ONE LEDGER: a second host, a container or a restored VM
+ * finds no lock file and an empty log, so it takes the single-apply lock for free and plans over a
+ * ledger another machine's dead run may already have changed. So the same exclusion and the same
+ * recovery fence also live in the IMS database — a PostgreSQL advisory lock keyed on the tenant,
+ * and the `xero_live_write_intents` table — and this script REFUSES TO START if it cannot reach
+ * them. That includes a dry run: a dry run writes nothing, but the plan it produces is what the
+ * next --apply is authorised by, so it takes the lock in SHARE mode and is refused while an apply
+ * is in flight anywhere. Two dry runs may run together; an apply excludes everything.
+ *
+ * Unresolved rows in that table are cleared the same way the log is: by READING Xero, then
+ * settling each row by hand. Nothing expires them, because only Xero can say what became of a
+ * dispatched write.
+ *
+ * BEFORE THE FIRST RUN ON A DATABASE that has not seen this table, apply the migration —
+ * `npm run db:migrate:deploy` (prisma/migrations/20260819090000_xero_live_write_intents). Until it
+ * is applied the fence cannot be read, and this script refuses to start rather than proceeding
+ * without it; that is the intended direction, but the refusal names a missing relation rather than
+ * a missing migration, so it is worth doing first.
  */
 import { createServer } from 'node:http'
 import { createInterface } from 'node:readline'
@@ -137,12 +157,14 @@ import { readFileSync, writeFileSync, existsSync, chmodSync } from 'node:fs'
 import { Client } from 'pg'
 
 import {
+  acquireSharedWriteFence,
   acquireWriteLogLock,
   allocationBlocker,
   allowedStatusesAfterRun,
   assertExpectedTenant,
   assertManifestTenant,
   assertNoNearMisses,
+  assertNoUnresolvedSharedWrites,
   assertNoUnresolvedWrites,
   assertPlanAuthorizedByManifest,
   assertStillFixtureContact,
@@ -157,6 +179,7 @@ import {
   isFixtureItemCode,
   LEGACY_WRITE_LOG_PATHS,
   MutationJournal,
+  NULL_SHARED_WRITE_FENCE,
   NULL_WRITE_INTENT_LOG,
   openWriteIntentLog,
   pageAllComplete,
@@ -168,6 +191,7 @@ import {
   writeLogTargetForTenant,
   writeUnitsIndividually,
   type PlannedObject,
+  type SharedWriteFence,
   type TransportToken,
   type VersionExpectation,
   type WriteIntentLog,
@@ -465,14 +489,30 @@ let writeLog: WriteIntentLog = NULL_WRITE_INTENT_LOG
  * can append into. `openWriteIntentLog` is handed this lock rather than taking its own.
  */
 let writeLogLock: WriteLogLock | null = null
+/**
+ * The CROSS-HOST half of both guarantees (round 7, finding 1). The file lock and the file log above
+ * coordinate this machine; the ledger can be reached from any machine. This is the same exclusion
+ * and the same recovery fence, held in the IMS database, keyed on the same tenant.
+ *
+ * Taken in BOTH modes — exclusively for --apply, in share mode for a dry run. A dry run writes
+ * nothing, but the plan it produces is what the next --apply is authorised by, so it must not be
+ * built while an apply is mutating the ledger underneath it.
+ *
+ * It starts as the null fence only so that the abort path has something to release before it is
+ * taken; nothing that can dispatch a write ever sees the null one.
+ */
+let sharedFence: SharedWriteFence = NULL_SHARED_WRITE_FENCE
 let writeLogClosed = false
-function closeWriteLog(): void {
+async function closeWriteLog(): Promise<void> {
   if (writeLogClosed) return
   writeLogClosed = true
   try { writeLog.close() } catch { /* closing the evidence file must not mask the run's own error */ }
   // Also on the path where the lock was taken but the log was never opened — an abort in planning
   // still has to give the lock back, or the next run refuses for no reason.
   try { writeLogLock?.release() } catch { /* releasing the lock must not mask the run's own error */ }
+  // The shared lock is a SESSION lock: ending the connection is what releases it, so a failure
+  // here cannot strand it the way a leftover lock file can.
+  try { await sharedFence.release() } catch { /* the session ends with this process regardless */ }
 }
 
 /** Journal keys. A single allocation delete releases both sides, so both are recorded. */
@@ -639,7 +679,25 @@ async function main() {
   // in BOTH modes — a dry run pointed at an empty file builds the plan the next --apply is
   // authorised by, so the fence has to hold one step earlier than the writing does.
   assertWriteLogNotRelocated({ requestedPath: REQUESTED_WRITE_LOG, target: WRITE_LOG })
+  // THE SHARED FENCE FIRST, because it is the only one of the two that spans hosts. A lock file
+  // and a log file are facts about THIS MACHINE, and the thing being protected is ONE LEDGER: a
+  // second host, a container or a restored VM finds no lock file and an empty log, so it takes the
+  // single-apply lock for free and plans over a ledger another machine's dead run may already have
+  // changed. Both modes take it — exclusively for --apply, in share mode for a dry run, because
+  // the plan a dry run builds is what the next --apply is authorised by and must not be read out
+  // of a ledger somebody is mutating.
+  //
+  // Keyed on EXPECTED_TENANT_ID, before any token is read, for the same reason the file lock is:
+  // this script refuses every other organisation, so the key exists before there is a token to
+  // disagree with it.
+  sharedFence = await acquireSharedWriteFence({
+    tenantId: EXPECTED_TENANT_ID,
+    mode: APPLY ? 'exclusive' : 'shared',
+  })
   if (APPLY) writeLogLock = acquireWriteLogLock({ tenantId: EXPECTED_TENANT_ID })
+  // And the cross-host half of the recovery refusal, asked BEFORE the local one: a write dispatched
+  // from another machine that nobody accounted for is invisible to every file on this one.
+  assertNoUnresolvedSharedWrites({ tenantId: EXPECTED_TENANT_ID, unresolved: await sharedFence.scanUnresolved() })
   // The tenant's log, plus the paths older versions of this script wrote to. The legacy paths are
   // read IN ADDITION, never instead: on the first run after this change the tenant-keyed file does
   // not exist yet, and an unaccounted-for write from a round-5 run is sitting in the cwd. An empty
@@ -857,7 +915,7 @@ async function main() {
             act(`delete allocation ${unit.allocationId} (${unit.amount}) on ${live.CreditNoteNumber} -> invoice ${unit.invoiceId}`)
             if (!APPLY) { stats.allocationsDeleted++; return }
             const { committed, res } = await performWrite({
-              transport, token, journal, writeLog,
+              transport, token, journal, writeLog, fence: sharedFence,
               method: 'DELETE',
               path: `CreditNotes/${live.CreditNoteID}/Allocations/${unit.allocationId}`,
               kind: 'allocation deleted',
@@ -893,7 +951,7 @@ async function main() {
           act(`delete refund payment ${unit.paymentId} (${unit.amount}) on ${live.CreditNoteNumber}`)
           if (!APPLY) { stats.refundsDeleted++; return }
           const { committed, res } = await performWrite({
-            transport, token, journal, writeLog,
+            transport, token, journal, writeLog, fence: sharedFence,
             method: 'POST',
             path: `Payments/${unit.paymentId}`,
             body: { Status: 'DELETED' },
@@ -931,7 +989,7 @@ async function main() {
       act(`${target === 'DELETED' ? 'delete' : 'void'} credit note ${current.CreditNoteNumber} (${current.Status}, ${current.Total})`)
       if (!APPLY) { stats.creditNotesVoided++; continue }
       const { committed, res } = await performWrite({
-        transport, token, journal, writeLog,
+        transport, token, journal, writeLog, fence: sharedFence,
         method: 'POST',
         path: `CreditNotes/${current.CreditNoteID}`,
         body: { Status: target },
@@ -982,7 +1040,7 @@ async function main() {
       act(`${target === 'DELETED' ? 'delete' : 'void'} invoice ${current.InvoiceNumber} (${current.Status}, ${current.Total})`)
       if (!APPLY) { stats.invoicesVoided++; continue }
       const { committed, res } = await performWrite({
-        transport, token, journal, writeLog,
+        transport, token, journal, writeLog, fence: sharedFence,
         method: 'POST',
         path: `Invoices/${current.InvoiceID}`,
         body: { Status: target },
@@ -1020,7 +1078,7 @@ async function main() {
       act(`archive contact ${current.Name}`)
       if (!APPLY) { stats.contactsArchived++; continue }
       const { committed, res } = await performWrite({
-        transport, token, journal, writeLog,
+        transport, token, journal, writeLog, fence: sharedFence,
         method: 'POST',
         path: `Contacts/${current.ContactID}`,
         body: { ContactStatus: 'ARCHIVED' },
@@ -1062,7 +1120,7 @@ async function main() {
       act(`delete item ${planned.Code}`)
       if (!APPLY) { stats.itemsDeleted++; continue }
       const { committed, res } = await performWrite({
-        transport, token, journal, writeLog,
+        transport, token, journal, writeLog, fence: sharedFence,
         method: 'DELETE',
         path: `Items/${planned.ItemID}`,
         kind: 'item deleted',
@@ -1091,14 +1149,15 @@ async function main() {
  * partial" was bypassed by the exception. So: same summary, both paths, and when the run aborted
  * after writing, the banner leads with PARTIALLY APPLIED and the count of irreversible writes.
  */
-function report(aborted: boolean, error?: unknown): number {
-  closeWriteLog()
+async function report(aborted: boolean, error?: unknown): Promise<number> {
+  await closeWriteLog()
   const outcome = runOutcome({
     apply: APPLY,
     failed: stats.failed,
     aborted,
     writesMade: journal.writeCount,
     unknownWrites: journal.unknownCount,
+    unrecordedSettlements: journal.unrecordedSettlementCount,
   })
   console.log(`\n=== ${outcome.label} ===`)
   if (aborted) {
@@ -1120,6 +1179,7 @@ function report(aborted: boolean, error?: unknown): number {
   console.log(`  skipped (already terminal): ${stats.skipped}`)
   console.log(`  failed:              ${stats.failed}`)
   console.log(`  UNKNOWN OUTCOME:     ${journal.unknownCount}`)
+  console.log(`  OUTCOME KNOWN BUT NOT RECORDED: ${journal.unrecordedSettlementCount}`)
   if (stats.versionBoundToOurWrite > 0) {
     console.log(`  held to the version XERO REPORTED FOR THIS RUN'S OWN WRITE rather than to the reviewed one: ${stats.versionBoundToOurWrite}`)
   }
@@ -1144,6 +1204,25 @@ function report(aborted: boolean, error?: unknown): number {
       `  it aside (mv ${WRITE_LOG.logPath} ${WRITE_LOG.logPath}.resolved-<date>).`,
     )
   }
+  if (journal.unrecordedSettlementCount > 0) {
+    // The one thing on this banner that exists NOWHERE ELSE. Every other line has a durable copy;
+    // these are writes whose outcome this process established and neither the on-disk log nor the
+    // shared fence would accept, so the intent is recorded and the answer is not. The next run —
+    // on this host or any other — refuses to start until each of them is settled by hand, and this
+    // output is the only thing that can say what to settle it as.
+    console.log('\nWRITES WHOSE OUTCOME COULD NOT BE RECORDED — THIS OUTPUT IS THE ONLY COPY. WRITE IT DOWN:')
+    for (const u of journal.unrecordedSettlements) {
+      console.log(`  - ${u.kind}: ${u.label} — ${u.method} ${u.path}`)
+      console.log(`      intent ${u.intentId}: ${u.state.toUpperCase()} (${u.reason})`)
+      for (const f of u.failures) console.log(`      NOT RECORDED — ${f}`)
+      console.log(
+        `      settle it once you have confirmed the object in Xero:\n` +
+        `        UPDATE "xero_live_write_intents" SET "state" = '${u.state}', "reason" = '<who checked, and how>', ` +
+        `"settledAt" = now() WHERE "id" = '${u.intentId}';\n` +
+        `      and account for the same intent in ${WRITE_LOG.logPath}.`,
+      )
+    }
+  }
   if (failures.length) {
     console.log('\nfailures:')
     for (const f of failures.slice(0, 40)) console.log(`  - ${f}`)
@@ -1163,8 +1242,17 @@ function report(aborted: boolean, error?: unknown): number {
 }
 
 main()
-  .then(() => { process.exitCode = report(false) })
+  .then(
+    () => report(false),
+    async (e) => {
+      console.error(`\nFAILED: ${e instanceof Error ? e.message : String(e)}`)
+      return report(true, e)
+    },
+  )
+  .then((code) => { process.exitCode = code })
   .catch((e) => {
-    console.error(`\nFAILED: ${e instanceof Error ? e.message : String(e)}`)
-    process.exitCode = report(true, e)
+    // The banner itself failed. Exit non-zero rather than let an unhandled rejection decide it:
+    // the one thing that must never happen is a run that destroyed part of a ledger exiting 0.
+    console.error(`\nFAILED while reporting: ${e instanceof Error ? e.message : String(e)}`)
+    process.exitCode = 1
   })

@@ -41,7 +41,10 @@
  *                     delay. A rate-limited write is refused and the operator re-runs.
  *   7. OUTCOME        a run with any failure exits non-zero and does not report success; a run that
  *                     THREW after writing says how much it had already destroyed; and a write whose
- *                     outcome cannot be determined is reported as UNKNOWN, never as nothing.
+ *                     outcome cannot be determined is reported as UNKNOWN, never as nothing. A
+ *                     settlement that could not be STORED does not suppress the mutation it was
+ *                     about: the process still knows what happened, and once the durable stores
+ *                     have refused it, that knowledge is the only copy of the answer left.
  *   8. DURABILITY     every write is recorded on disk, and flushed, BEFORE it is dispatched. An
  *                     in-memory record of an unknown write dies with the process, and a killed
  *                     process is the same class of event that produces one. An intent with no
@@ -52,9 +55,18 @@
  *                     conditional on what was typed: two runs given two paths take two locks (so
  *                     nothing is excluded) and read two logs (so a run can start with an empty
  *                     fence over a ledger a dead run may have changed).
+ *  10. COORDINATION   and because a lock FILE and a log FILE coordinate ONE HOST while the thing
+ *                     they protect is ONE LEDGER, the same exclusion and the same fence also live
+ *                     in a shared authority: a PostgreSQL advisory lock and the
+ *                     `xero_live_write_intents` table in the IMS database, both keyed on the same
+ *                     tenant. Otherwise a second host, a container or a restored VM takes a free
+ *                     lock and reads an empty fence. Unreachable is REFUSED, in both modes.
  */
 import { createHash, randomBytes } from 'node:crypto'
 import { closeSync, fsyncSync, mkdirSync, openSync, unlinkSync, writeSync } from 'node:fs'
+import { hostname } from 'node:os'
+import pg from 'pg'
+import { XERO_LIVE_CLEANUP_LOCK_NAMESPACE } from '../../lib/db/advisory-locks.ts'
 
 // ---------------------------------------------------------------------------
 // Errors. All safety aborts share a base class so a caller can tell a refusal
@@ -89,6 +101,19 @@ export class CallCeilingError extends SafetyViolationError {}
  * because the run must stop: after this, nothing in the process knows what the ledger contains.
  */
 export class WriteOutcomeUnknownError extends SafetyViolationError {}
+/**
+ * A write was DISPATCHED and this process knows what became of it, but could not record that
+ * anywhere durable.
+ *
+ * It is its own class because it is the one failure where the process's own memory is the last
+ * copy of the answer. The intent is on disk and in the shared fence with no settlement against it,
+ * so the next run — on this host or any other — will refuse to start; what it needs in order to be
+ * unblocked is the outcome, and the outcome exists only in this run's banner. Suppressing it, which
+ * is what a settlement failure used to do by throwing past the journal, leaves the durable record
+ * saying that something was attempted and nothing about what happened to it.
+ */
+export class WriteSettlementNotRecordedError extends SafetyViolationError {}
+
 /**
  * Xero rate-limited a WRITE, and the write is therefore refused rather than retried.
  *
@@ -1163,26 +1188,58 @@ export function runOutcome(args: {
    * can account for succeeded.
    */
   unknownWrites?: number
+  /**
+   * Writes whose outcome THIS PROCESS ESTABLISHED but could not record durably. They are not
+   * unknown — the answer is known — and they are not clean either: the durable stores hold an
+   * intent with no settlement, so the next run is blocked and the answer that unblocks it exists
+   * only in this run's output. A run with one of these may never print a label that ends the
+   * story.
+   */
+  unrecordedSettlements?: number
 }): RunOutcome {
-  const { apply, failed, incomplete = false, aborted = false, writesMade = 0, unknownWrites = 0 } = args
+  const {
+    apply, failed, incomplete = false, aborted = false, writesMade = 0, unknownWrites = 0,
+    unrecordedSettlements = 0,
+  } = args
   const unknownSuffix = unknownWrites > 0 ? `${unknownWrites} WRITE(S) OF UNKNOWN OUTCOME` : ''
+  const unrecordedSuffix = unrecordedSettlements > 0 ? `${unrecordedSettlements} UNRECORDED SETTLEMENT(S)` : ''
   if (!apply) {
     // A dry run cannot write at all — the transport throws on any non-GET without --apply — so an
     // unknown write here means the write gate itself has been bypassed. It is reported, loudly,
     // rather than being unrepresentable.
-    if (aborted) return { label: unknownSuffix ? `DRY RUN — ABORTED WITH ${unknownSuffix}` : 'DRY RUN — ABORTED', exitCode: 1 }
+    if (aborted) {
+      const dryTail = [unknownSuffix, unrecordedSuffix].filter(Boolean).join(' AND ')
+      return { label: dryTail ? `DRY RUN — ABORTED WITH ${dryTail}` : 'DRY RUN — ABORTED', exitCode: 1 }
+    }
     if (unknownSuffix) return { label: `DRY RUN — INCOMPLETE, ${unknownSuffix}`, exitCode: 1 }
     return { label: failed || incomplete ? 'DRY RUN — INCOMPLETE' : 'DRY RUN', exitCode: failed || incomplete ? 1 : 0 }
   }
   if (aborted) {
+    // Appended rather than folded in, so every existing label keeps its exact wording: this is an
+    // ADDITIONAL fact about the run, not a different reading of the ledger.
+    const tail = unrecordedSuffix ? ` — AND ${unrecordedSuffix} THAT ONLY THIS OUTPUT RECORDS` : ''
     if (writesMade > 0 && unknownSuffix) {
-      return { label: `PARTIALLY APPLIED — ABORTED AFTER ${writesMade} IRREVERSIBLE WRITE(S) AND ${unknownSuffix}`, exitCode: 1 }
+      return { label: `PARTIALLY APPLIED — ABORTED AFTER ${writesMade} IRREVERSIBLE WRITE(S) AND ${unknownSuffix}${tail}`, exitCode: 1 }
     }
-    if (writesMade > 0) return { label: `PARTIALLY APPLIED — ABORTED AFTER ${writesMade} IRREVERSIBLE WRITE(S)`, exitCode: 1 }
+    if (writesMade > 0) return { label: `PARTIALLY APPLIED — ABORTED AFTER ${writesMade} IRREVERSIBLE WRITE(S)${tail}`, exitCode: 1 }
     // The lie this closes: a write that committed remotely and lost its response used to leave
     // `writesMade` at zero, so the last thing on screen said the run was a no-op.
-    if (unknownSuffix) return { label: `PARTIALLY APPLIED — ABORTED WITH ${unknownSuffix}`, exitCode: 1 }
+    if (unknownSuffix) return { label: `PARTIALLY APPLIED — ABORTED WITH ${unknownSuffix}${tail}`, exitCode: 1 }
+    // A write Xero REFUSED leaves the ledger unchanged, so "nothing was written" is still true —
+    // but the durable stores now hold an intent nobody settled, and the next run will refuse over
+    // it. Saying only "NOTHING WAS WRITTEN" would send the operator to that refusal with no idea
+    // what it is about.
+    if (unrecordedSuffix) {
+      return { label: `ABORTED — NOTHING WAS WRITTEN, BUT ${unrecordedSuffix} EXIST ONLY IN THIS OUTPUT`, exitCode: 1 }
+    }
     return { label: 'ABORTED — NOTHING WAS WRITTEN', exitCode: 1 }
+  }
+  if (unrecordedSuffix) {
+    return {
+      label: `PARTIALLY APPLIED — ${unrecordedSuffix} THAT ONLY THIS OUTPUT RECORDS` +
+        (unknownSuffix ? ` AND ${unknownSuffix}` : ''),
+      exitCode: 1,
+    }
   }
   if (unknownSuffix) return { label: `PARTIALLY APPLIED — ${failed} FAILURE(S) AND ${unknownSuffix}`, exitCode: 1 }
   if (failed || incomplete) return { label: `PARTIALLY APPLIED — ${failed} FAILURE(S)`, exitCode: 1 }
@@ -1207,10 +1264,32 @@ export function runOutcome(args: {
 export type MutationRecord = { kind: string; label: string }
 /** A write that may or may not have changed the ledger, and the reason nobody can say which. */
 export type UnknownWriteRecord = MutationRecord & { reason: string }
+/**
+ * A write whose OUTCOME THIS PROCESS KNOWS but could not record anywhere durable.
+ *
+ * It is a different fact from an unknown write and must not be folded into one. An unknown write
+ * means nobody knows what happened; this means THIS RUN knows, and the two stores that were
+ * supposed to remember do not. The consequence for the operator is specific: the intent is on disk
+ * and in the shared fence with no settlement, so the next run refuses to start — and the only
+ * place the answer exists is the banner this run is about to print. If that answer is dropped, the
+ * log records that something was attempted and loses what became of it, which is the half needed
+ * to reconcile.
+ */
+export type UnrecordedSettlement = MutationRecord & {
+  intentId: string
+  method: HttpMethod
+  path: string
+  /** What this process established: committed, not-committed, or unknown. */
+  state: WriteCommitState
+  reason: string
+  /** Which durable store(s) refused the settlement, and why. */
+  failures: string[]
+}
 
 export class MutationJournal {
   private readonly writes: MutationRecord[] = []
   private readonly unknown: UnknownWriteRecord[] = []
+  private readonly unrecorded: UnrecordedSettlement[] = []
   private readonly releases = new Map<string, Set<string>>()
   /**
    * Per object: the version Xero reported for it IN THE RESPONSE TO OUR OWN WRITE, or `null` when
@@ -1235,6 +1314,20 @@ export class MutationJournal {
    */
   recordUnknown(kind: string, label: string, reason: string): void {
     this.unknown.push({ kind, label, reason })
+  }
+
+  /**
+   * A write whose outcome could not be written to the durable log or to the shared fence AFTER it
+   * had already been dispatched.
+   *
+   * This is recorded IN ADDITION to the write itself — never instead of it. The failure being
+   * closed here is that a throwing settlement used to skip the journal entirely, so a mutation
+   * that had definitely landed (or definitely might have) disappeared from the run's own account
+   * of what it did to the ledger. The durable record then said a write was attempted and said
+   * nothing about what became of it, and the in-memory record, which still knew, threw it away.
+   */
+  recordUnrecordedSettlement(entry: UnrecordedSettlement): void {
+    this.unrecorded.push(entry)
   }
 
   /**
@@ -1287,6 +1380,8 @@ export class MutationJournal {
   get writeRecords(): readonly MutationRecord[] { return this.writes }
   get unknownCount(): number { return this.unknown.length }
   get unknownRecords(): readonly UnknownWriteRecord[] { return this.unknown }
+  get unrecordedSettlementCount(): number { return this.unrecorded.length }
+  get unrecordedSettlements(): readonly UnrecordedSettlement[] { return this.unrecorded }
   get failureCount(): number { return this.failures.length }
   get failureMessages(): readonly string[] { return this.failures }
 }
@@ -1345,6 +1440,31 @@ export function commitOf(res: XeroResult<unknown>): WriteCommit {
   }
 }
 
+/**
+ * Put the outcome of a dispatched write into the run's own account of what it did to the ledger.
+ *
+ * Split out of `settleWrite` because it must also run on the path where the DURABLE settlement
+ * failed — the run still knows what happened, and the in-memory record is then the only thing that
+ * does. Returns whether Xero committed it.
+ */
+export function journalWriteOutcome(args: {
+  commit: WriteCommit
+  journal: MutationJournal
+  kind: string
+  label: string
+}): boolean {
+  const { commit, journal, kind, label } = args
+  if (commit.state === 'unknown') {
+    journal.recordUnknown(kind, label, commit.reason)
+    return false
+  }
+  if (commit.state === 'committed') {
+    journal.recordWrite(kind, label)
+    return true
+  }
+  return false
+}
+
 export function settleWrite(args: {
   res: XeroResult<unknown>
   journal: MutationJournal
@@ -1353,8 +1473,8 @@ export function settleWrite(args: {
 }): boolean {
   const { res, journal, kind, label } = args
   const commit = commitOf(res)
+  const committed = journalWriteOutcome({ commit, journal, kind, label })
   if (commit.state === 'unknown') {
-    journal.recordUnknown(kind, label, commit.reason)
     throw new WriteOutcomeUnknownError(
       `ABORT: ${kind} — ${label}: ${commit.reason}.\n` +
         `THIS WRITE MAY HAVE COMMITTED. It is not being reported as a failure, because "it failed" would mean ` +
@@ -1363,11 +1483,7 @@ export function settleWrite(args: {
         `what actually happened to it. A re-run started from the old plan would otherwise treat it as untouched.`,
     )
   }
-  if (commit.state === 'committed') {
-    journal.recordWrite(kind, label)
-    return true
-  }
-  return false
+  return committed
 }
 
 // ---------------------------------------------------------------------------
@@ -1411,6 +1527,13 @@ export type WriteIntent = {
 }
 
 export type WriteIntentLog = {
+  /**
+   * Which RUN this log is minting ids for. Exposed because the SHARED fence has to record the same
+   * run against the same intent: a settlement is predicated on the run in both stores, so a
+   * settlement from one run can never resolve another's dispatched write — on disk or in the
+   * database.
+   */
+  readonly runId: string
   /** Durably record that a write is ABOUT to be dispatched. Returns the id used to settle it. */
   intend(entry: { kind: string; label: string; method: HttpMethod; path: string }): string
   /** Durably record what became of it. */
@@ -1432,6 +1555,7 @@ export class UnresolvedWriteError extends SafetyViolationError {}
  * call site can forget, and the forgetting is invisible.
  */
 export const NULL_WRITE_INTENT_LOG: WriteIntentLog = {
+  runId: 'not-logged',
   intend: () => 'not-logged',
   settle: () => {},
   close: () => {},
@@ -1457,6 +1581,7 @@ export function createWriteIntentLog(args: {
   const { tenantId, append, now = () => new Date(), runId = randomBytes(8).toString('hex') } = args
   let seq = 0
   return {
+    runId,
     intend(entry) {
       // Scoped to the run. `w1` from a bare counter is the same string in every process that ever
       // opens this file, which is exactly how one run's settlement erased another run's evidence.
@@ -1751,6 +1876,9 @@ export function openWriteIntentLog(args: {
   })
   return {
     ...log,
+    // Spread carries `runId` through, and it must: the shared fence records the same run against
+    // the same intent id, and a mismatch between the two stores would make one of them unable to
+    // settle its own write.
     close: () => {
       try { closeSync(fd) } finally { lock.release() }
     },
@@ -1841,6 +1969,409 @@ export function assertNoUnresolvedWrites(args: { path: string; text: string }): 
   )
 }
 
+// ---------------------------------------------------------------------------
+// 10. WHERE THE COORDINATION LIVES — the ledger is one thing; a host is not
+// ---------------------------------------------------------------------------
+/**
+ * THE LOCK AND THE FENCE ABOVE COORDINATE ONE FILESYSTEM. THE THING THEY PROTECT IS ONE LEDGER.
+ *
+ * Round 6 took the log path away from the operator and derived it from the tenant, which closed
+ * "two paths on one host". What it could not close, and said so rather than closing, is that
+ * `/var/lib/o3d/xero-cleanup` is a fact about a MACHINE. A second host, a container, or a VM
+ * restored from a snapshot finds no lock file and an empty log. It therefore:
+ *
+ *   • takes the single-apply lock for free, and applies the same plan to the same organisation
+ *     while another host is part-way through applying it; and
+ *   • starts with an EMPTY RECOVERY FENCE, so a write that another machine dispatched and never
+ *     accounted for — the exact evidence the fence exists to act on — is invisible to it.
+ *
+ * Two runs on two hosts against one Xero organisation is not an exotic case; it is the case the
+ * lock was built for, seen from one machine over.
+ *
+ * SO THE COORDINATION MOVES TO A SHARED AUTHORITY: the IMS PostgreSQL database, which every host
+ * that can run these scripts already has to reach. Two mechanisms, one key:
+ *
+ *   • MUTUAL EXCLUSION is a SESSION advisory lock in the XERO_LIVE_CLEANUP namespace, whose second
+ *     int is derived from the tenant id. `--apply` takes it EXCLUSIVELY; a dry run takes it in
+ *     SHARE mode. A dry run writes nothing, but the plan it produces is what the next `--apply` is
+ *     authorised by, so it must not be built while an apply is mutating the ledger underneath it.
+ *     Two dry runs coexist; an apply excludes everything.
+ *   • THE RECOVERY FENCE is the `xero_live_write_intents` table: the same intent-before-dispatch,
+ *     settlement-after record as the on-disk log, kept where another host can read it.
+ *
+ * BOTH ARE KEPT, disk AND database, and that is deliberate rather than belt-and-braces. They fail
+ * in different directions and only the pair covers both: the FILE is what survives when the
+ * DATABASE is what went away (and it is fsynced, so it survives a kill in the same millisecond),
+ * and the ROW is what survives when the HOST is what went away. An intent is not considered
+ * recorded until it is in both, and a write is not dispatched until its intent is recorded.
+ *
+ * IT FAILS CLOSED, IN BOTH MODES. If the database cannot be reached, if the lock cannot be taken,
+ * or if the lock is held by another run, the script REFUSES TO START — including in a dry run,
+ * because a plan built without the fence is what authorises the next irreversible apply. "The
+ * coordinator is down" is indistinguishable, from inside this process, from "another host is
+ * writing to the ledger right now", and there is only one safe reading of that.
+ *
+ * A LOST LOCK CANNOT GO UNNOTICED FOR MORE THAN ONE WRITE, which is the property that makes a
+ * session lock adequate here. PostgreSQL frees a session advisory lock the instant its connection
+ * dies. Every dispatch in this tooling is preceded by an INSERT of its intent on that same
+ * session, so a dead session throws before the request leaves rather than after: the liveness
+ * check is not a heartbeat that might be stale, it is the write the run cannot skip.
+ *
+ * WHY NOT A MARKER IN THE LEDGER ITSELF, which is the other thing both runs can see. It was
+ * considered and is UNAVAILABLE, for three independent reasons, any one of which is fatal:
+ *
+ *   1. TAKING IT WOULD BE A WRITE TO A REAL ACCOUNTING LEDGER. This entire incident is test
+ *      artefacts that ended up in a live Xero organisation; adding coordination artefacts to that
+ *      organisation to clean it up is the same defect with a better motive. There is no scratch
+ *      space in Xero — every object is ledger data.
+ *   2. A DRY RUN COULD NOT TAKE ONE. The transport refuses every non-GET without `--apply`, and
+ *      the fence has to hold for a dry run too. A coordinator only half the runs can participate
+ *      in is not a coordinator.
+ *   3. XERO HAS NO CONDITIONAL CREATE. No If-Match, no compare-and-swap, no unique-constraint
+ *      create that distinguishes "I made it" from "it was already there" for the object kinds this
+ *      tooling can reach. Two hosts POSTing a marker both succeed, and arbitrating afterwards
+ *      needs a total order over server-assigned timestamps that Xero does not promise. Mutual
+ *      exclusion built on that is exclusion in name only.
+ *
+ *      This one is asserted rather than measured, and the reason is worth recording: the stored
+ *      audit token expired on 2026-08-18T14:49Z and refreshing it rotates the refresh token out of
+ *      band, so no live call could be made to test it. It rests on Xero's published API surface,
+ *      not on an observation from this session. Reasons 1 and 2 need no live check — they are
+ *      properties of this tooling's own contract — and either alone disqualifies the option.
+ */
+/** The shared coordinator could not be reached, or refused to answer. Never "carry on". */
+export class SharedCoordinatorUnavailableError extends SafetyViolationError {}
+/** Another run — possibly on another host — holds the ledger. */
+export class SharedRunInProgressError extends SafetyViolationError {}
+/** A previous run, on this host or any other, dispatched a write nobody has accounted for. */
+export class SharedUnresolvedWriteError extends SafetyViolationError {}
+
+/**
+ * The slice of a PostgreSQL client this file needs. Deliberately tiny, and deliberately NOT
+ * `pg.Client`: the fence must be exercisable against a double that models one database shared by
+ * two hosts, which is the only way to test the thing this section exists for.
+ */
+export type CoordinationClient = {
+  connect(): Promise<void>
+  query(sql: string, params?: unknown[]): Promise<{ rows: Array<Record<string, unknown>> }>
+  end(): Promise<void>
+}
+
+export type SharedFenceMode = 'exclusive' | 'shared'
+
+/** A write another run left unaccounted for, as the shared store has it. */
+export type SharedUnresolvedWrite = {
+  id: string
+  runId: string
+  host: string
+  kind: string
+  label: string
+  method: string
+  path: string
+  intendedAt: string
+  /** `null` — dispatched and never settled. `'unknown'` — settled, and the answer was lost. */
+  state: string | null
+}
+
+export type SharedWriteFence = {
+  readonly tenantId: string
+  readonly hostId: string
+  readonly lockId: number
+  readonly mode: SharedFenceMode
+  /** Every write against this LEDGER that no run, on any host, has accounted for. */
+  scanUnresolved(): Promise<SharedUnresolvedWrite[]>
+  /** Durably record — COMMITTED — that a write is about to be dispatched. Throws to refuse it. */
+  intend(entry: { id: string; runId: string; kind: string; label: string; method: HttpMethod; path: string }): Promise<void>
+  /** Durably record what became of it. Throws if it did not land. */
+  settle(entry: { id: string; runId: string; state: WriteCommitState; reason: string }): Promise<void>
+  release(): Promise<void>
+}
+
+/**
+ * For tests, and for the read-only audits that cannot dispatch a write at all. It is a VALUE and
+ * not an optional parameter for the same reason `NULL_WRITE_INTENT_LOG` is: a fence a call site
+ * can omit is a fence a call site can forget, and the forgetting is invisible. The remover passes
+ * its real fence in both modes.
+ */
+export const NULL_SHARED_WRITE_FENCE: SharedWriteFence = {
+  tenantId: '(none)',
+  hostId: '(none)',
+  lockId: 0,
+  mode: 'shared',
+  scanUnresolved: async () => [],
+  intend: async () => {},
+  settle: async () => {},
+  release: async () => {},
+}
+
+/**
+ * The second int of the advisory lock, derived from the LEDGER.
+ *
+ * Hashed rather than parsed out of the uuid: an arbitrary 32 bits of a tenant id are as likely to
+ * collide as any other, and a hash makes the derivation total. Forced positive and below 2^31
+ * because the two-int lock takes int4 arguments, and away from 0 so that a defaulted-to-zero key
+ * can never look like a real one.
+ */
+export function xeroLedgerLockId(tenantId: string): number {
+  if (!TENANT_ID_FORM.test(tenantId)) {
+    throw new WriteLogRelocationError(
+      `ABORT: refusing to derive the shared cleanup lock from a tenant id that is not a uuid ` +
+        `(${JSON.stringify(tenantId)}). The lock is keyed on the ledger it protects; a key derived from ` +
+        `something else is a lock over something else.`,
+    )
+  }
+  const digest = createHash('sha256').update(tenantId.toLowerCase()).digest()
+  const value = digest.readUInt32BE(0) % 0x7fff_ffff
+  return value === 0 ? 1 : value
+}
+
+/**
+ * The exact SQL the fence issues. Exported so the test double is measured against the statements
+ * that actually run rather than against a paraphrase of them, and so that a change to one without
+ * the other fails a test instead of a production run.
+ */
+export const SHARED_FENCE_SQL = {
+  lock: {
+    exclusive: 'SELECT pg_try_advisory_lock($1, $2) AS locked',
+    shared: 'SELECT pg_try_advisory_lock_shared($1, $2) AS locked',
+  },
+  unlock: {
+    exclusive: 'SELECT pg_advisory_unlock($1, $2) AS unlocked',
+    shared: 'SELECT pg_advisory_unlock_shared($1, $2) AS unlocked',
+  },
+  keepalive: 'SELECT 1',
+  scan:
+    'SELECT "id", "runId", "host", "kind", "label", "method", "path", "intendedAt", "state" ' +
+    'FROM "xero_live_write_intents" ' +
+    'WHERE "tenantId" = $1 AND ("state" IS NULL OR "state" = \'unknown\') ' +
+    'ORDER BY "intendedAt"',
+  intend:
+    'INSERT INTO "xero_live_write_intents" ' +
+    '("id", "runId", "tenantId", "host", "kind", "label", "method", "path", "intendedAt") ' +
+    'VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING "id"',
+  settle:
+    'UPDATE "xero_live_write_intents" SET "state" = $3, "reason" = $4, "settledAt" = $5 ' +
+    'WHERE "id" = $1 AND "runId" = $2 RETURNING "id"',
+} as const
+
+/**
+ * VERIFIED AGAINST A REAL POSTGRESQL, not only against the double. On the IMS dev database, two
+ * sessions were used to confirm every semantic this design leans on: an exclusive holder refuses
+ * both a second exclusive taker and a share taker; two share holders coexist and together refuse
+ * an exclusive one; ending a session frees what it held (the dead-host case); the intend/settle/
+ * scan statements below run as written; a settlement predicated on a DIFFERENT run matches zero
+ * rows; and `unknown` puts a settled row back on the fence. The table was created and the rows
+ * written inside a transaction that was ROLLED BACK, so nothing was left behind.
+ *
+ * The Xero side of this file has no equivalent check available: the stored audit token expired
+ * 2026-08-18T14:49Z and refreshing it rotates the refresh token out of band.
+ */
+
+/** How often the fence's session says hello, so an idle-session reaper cannot quietly free the lock. */
+export const SHARED_FENCE_KEEPALIVE_MS = 30_000
+
+/**
+ * Take the ledger's cross-host fence, or refuse.
+ *
+ * Every failure here is a refusal, and they are deliberately not distinguished into "safe" and
+ * "unsafe" ones: a database that cannot be reached, a lock that cannot be taken and a lock somebody
+ * else holds all leave this process unable to say that no other run is live against this ledger.
+ */
+export async function acquireSharedWriteFence(args: {
+  tenantId: string
+  /** `--apply` takes the ledger exclusively; a dry run shares it with other dry runs. */
+  mode: SharedFenceMode
+  /** Injected for tests, and so a caller can make the coordinator itself fail. */
+  createClient?: () => CoordinationClient
+  hostId?: string
+  now?: () => Date
+  /** Injected so tests leave no timers behind. */
+  setKeepalive?: (fn: () => void, ms: number) => { clear: () => void }
+}): Promise<SharedWriteFence> {
+  const lockId = xeroLedgerLockId(args.tenantId)
+  const hostId = args.hostId ?? `${hostname()}#${process.pid}`
+  const now = args.now ?? (() => new Date())
+  const createClient = args.createClient ?? defaultCoordinationClient
+  const setKeepalive =
+    args.setKeepalive ??
+    ((fn: () => void, ms: number) => {
+      const handle = setInterval(fn, ms)
+      handle.unref?.()
+      return { clear: () => { clearInterval(handle) } }
+    })
+
+  let client: CoordinationClient
+  try {
+    client = createClient()
+    await client.connect()
+  } catch (e) {
+    throw new SharedCoordinatorUnavailableError(
+      `ABORT: could not reach the shared coordinator for this ledger (${args.tenantId}): ${errText(e)}\n` +
+        `The single-apply lock and the crash-recovery fence for this Xero organisation live in the IMS ` +
+        `database, because a lock FILE coordinates one host and this ledger can be reached from any of them. ` +
+        `With the coordinator unreachable, nothing in this process can tell "no other run is live" from ` +
+        `"another host is writing to the ledger right now", so it refuses — in a dry run too, because the plan ` +
+        `a dry run produces is what the next --apply is authorised by.\n` +
+        `Set DATABASE_URL to the IMS database and try again. Do NOT work around this by running the script ` +
+        `somewhere the database is unreachable.`,
+    )
+  }
+
+  const end = async () => { try { await client.end() } catch { /* the session is going away regardless */ } }
+
+  let locked: boolean
+  try {
+    const res = await client.query(SHARED_FENCE_SQL.lock[args.mode], [XERO_LIVE_CLEANUP_LOCK_NAMESPACE, lockId])
+    locked = res.rows[0]?.locked === true
+  } catch (e) {
+    await end()
+    throw new SharedCoordinatorUnavailableError(
+      `ABORT: the shared coordinator could not be asked for the ledger lock (${args.tenantId}): ${errText(e)}\n` +
+        `A lock that could not be established is treated exactly like one another run is holding.`,
+    )
+  }
+  if (!locked) {
+    await end()
+    throw new SharedRunInProgressError(
+      `ABORT: another run holds this LEDGER (${args.tenantId}).\n` +
+        `The lock is a PostgreSQL advisory lock in the IMS database — namespace ` +
+        `${XERO_LIVE_CLEANUP_LOCK_NAMESPACE}, key ${lockId} — so it is held across HOSTS, not just across ` +
+        `processes on this one. ${args.mode === 'exclusive'
+          ? 'An --apply run excludes every other run against this organisation, including dry runs.'
+          : 'A dry run is refused while an --apply is in flight: the plan it would build is a plan over a ledger that is being mutated as it reads it.'}\n` +
+        `Find the run that holds it — SELECT * FROM pg_locks WHERE locktype = 'advisory' AND classid = ` +
+        `${XERO_LIVE_CLEANUP_LOCK_NAMESPACE} AND objid = ${lockId}, joined to pg_stat_activity — and wait for it ` +
+        `or establish that it died. A session lock is released the instant its connection ends, so there is ` +
+        `nothing to clear by hand.`,
+    )
+  }
+
+  const keepalive = setKeepalive(() => { void client.query(SHARED_FENCE_SQL.keepalive).catch(() => {}) }, SHARED_FENCE_KEEPALIVE_MS)
+
+  const fail = (what: string, e: unknown): never => {
+    throw new SharedCoordinatorUnavailableError(
+      `ABORT: the shared write fence could not ${what} for ledger ${args.tenantId}: ${errText(e)}\n` +
+        `This session is also what holds the ledger's advisory lock, so a failure here means the exclusion ` +
+        `may be gone as well — PostgreSQL frees a session lock the instant its connection dies. Nothing may ` +
+        `be dispatched after it.`,
+    )
+  }
+
+  return {
+    tenantId: args.tenantId,
+    hostId,
+    lockId,
+    mode: args.mode,
+    async scanUnresolved() {
+      let rows: Array<Record<string, unknown>>
+      try {
+        rows = (await client.query(SHARED_FENCE_SQL.scan, [args.tenantId])).rows
+      } catch (e) {
+        return fail('read the unaccounted-for writes', e)
+      }
+      return rows.map((r) => ({
+        id: String(r.id ?? ''),
+        runId: String(r.runId ?? ''),
+        host: String(r.host ?? '(unknown host)'),
+        kind: String(r.kind ?? '(unnamed)'),
+        label: String(r.label ?? '(unlabelled)'),
+        method: String(r.method ?? '(unknown method)'),
+        path: String(r.path ?? '(unknown path)'),
+        intendedAt: r.intendedAt instanceof Date ? r.intendedAt.toISOString() : String(r.intendedAt ?? ''),
+        state: r.state == null ? null : String(r.state),
+      }))
+    },
+    async intend(entry) {
+      let rows: Array<Record<string, unknown>>
+      try {
+        rows = (await client.query(SHARED_FENCE_SQL.intend, [
+          entry.id, entry.runId, args.tenantId, hostId, entry.kind, entry.label, entry.method, entry.path, now(),
+        ])).rows
+      } catch (e) {
+        return fail('record a write intent', e)
+      }
+      // An INSERT that reported success without inserting is not evidence of anything, and this is
+      // the record another host reads to learn that this write ever happened.
+      if (rows.length !== 1) {
+        return fail('record a write intent', new Error(`the insert affected ${rows.length} row(s), not 1`))
+      }
+    },
+    async settle(entry) {
+      let rows: Array<Record<string, unknown>>
+      try {
+        rows = (await client.query(SHARED_FENCE_SQL.settle, [entry.id, entry.runId, entry.state, entry.reason, now()])).rows
+      } catch (e) {
+        return fail('record the outcome of a write', e)
+      }
+      // Predicated on the RUN as well as the id, so a settlement can never resolve another run's
+      // intent — the same rule the on-disk scan applies, enforced by the database.
+      if (rows.length !== 1) {
+        return fail(
+          'record the outcome of a write',
+          new Error(`the update matched ${rows.length} row(s), not 1 — intent ${entry.id} of run ${entry.runId}`),
+        )
+      }
+    },
+    async release() {
+      keepalive.clear()
+      // Best effort, and unlike the lock FILE this fails OPEN — deliberately. A session advisory
+      // lock exists only for as long as its session, so the connection ending IS the release;
+      // there is nothing that can be left behind for an operator to clear.
+      try { await client.query(SHARED_FENCE_SQL.unlock[args.mode], [XERO_LIVE_CLEANUP_LOCK_NAMESPACE, lockId]) } catch { /* the end() below releases it */ }
+      await end()
+    },
+  }
+}
+
+const errText = (e: unknown): string => (e instanceof Error ? e.message : String(e))
+
+/**
+ * The real client. A dedicated session, never a pooled one: `pg_try_advisory_lock` lives on the
+ * connection that took it, and a pool would hand the unlock — or the next intent INSERT — to a
+ * different socket that never held the lock. Injectable, so every test in this file runs against a
+ * double that models one database shared by two hosts instead of against a socket.
+ */
+function defaultCoordinationClient(): CoordinationClient {
+  const connectionString = process.env.DATABASE_URL
+  if (!connectionString) {
+    throw new Error(
+      'DATABASE_URL is not set. The live-Xero cleanup coordinates through the IMS database because a lock ' +
+        'file only coordinates one host.',
+    )
+  }
+  return new pg.Client({ connectionString, application_name: 'o3d_xero_live_cleanup_fence' }) as unknown as CoordinationClient
+}
+
+/**
+ * The cross-host half of the recovery refusal. Same rule as `assertNoUnresolvedWrites`, asked of
+ * the shared store: a write that was dispatched and never accounted for stops the next run whether
+ * the machine that dispatched it still exists or not.
+ */
+export function assertNoUnresolvedSharedWrites(args: {
+  tenantId: string
+  unresolved: readonly SharedUnresolvedWrite[]
+}): void {
+  if (args.unresolved.length === 0) return
+  const shown = args.unresolved
+    .slice(0, 20)
+    .map((u) => `${u.kind}: ${u.label} — ${u.method} ${u.path} at ${u.intendedAt}, dispatched from ${u.host} by run ${u.runId}` +
+      (u.state === 'unknown' ? ' (settled as UNKNOWN — the answer was lost)' : ' (never settled — the run died)'))
+  throw new SharedUnresolvedWriteError(
+    `ABORT: the shared write fence records ${args.unresolved.length} write(s) against ledger ${args.tenantId} that ` +
+      `were DISPATCHED and never accounted for. These come from the IMS database, not from this machine's disk, ` +
+      `so they include runs on OTHER HOSTS — which is the case a lock file and a log file could not see at all:\n  ` +
+      shown.join('\n  ') +
+      (args.unresolved.length > shown.length ? `\n  ... and ${args.unresolved.length - shown.length} more` : '') +
+      `\nResolve by READING: open each object in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts, and ` +
+      `establish what actually happened to it. Then settle each row by hand —\n` +
+      `  UPDATE "xero_live_write_intents" SET "state" = '<committed|not-committed>', "reason" = '<who checked, and how>', ` +
+      `"settledAt" = now() WHERE "id" = '<id>';\n` +
+      `— and plan again from a FRESH manifest. Nothing expires these rows on a timer: the only thing that can say ` +
+      `what became of a dispatched write is Xero, and a fence that cleared itself would hand the next run exactly ` +
+      `the empty state it exists to refuse.`,
+  )
+}
+
 /**
  * A step that makes SEVERAL irreversible writes against ONE object, with the guarantee that every
  * one of them is authorised by a revalidation of its own.
@@ -1897,6 +2428,13 @@ export async function performWrite<T>(args: {
   body?: unknown
   journal: MutationJournal
   writeLog: WriteIntentLog
+  /**
+   * The CROSS-HOST half of the same record. Required, not optional, for the reason the null log is
+   * a value rather than an `if (log)`: a coordinator a call site can omit is one a call site can
+   * forget, and the forgetting is invisible until two hosts have already interleaved. Pass
+   * `NULL_SHARED_WRITE_FENCE` only where a write provably cannot be dispatched.
+   */
+  fence: SharedWriteFence
   kind: string
   label: string
   /**
@@ -1906,9 +2444,36 @@ export async function performWrite<T>(args: {
    */
   subjects?: Array<{ key: string; collectionKey: string; idField: string; id: string }>
 }): Promise<{ committed: boolean; res: XeroResult<T> }> {
-  const { transport, token, method, path, body, journal, writeLog, kind, label } = args
+  const { transport, token, method, path, body, journal, writeLog, fence, kind, label } = args
   // BEFORE the request, not after. This is the whole point of the log.
   const intentId = writeLog.intend({ kind, label, method, path })
+  // And before the request in the SHARED store too, for the same reason one turn further out: the
+  // fsynced file is invisible to a run on another host, so a write recorded only there is a write
+  // that a second machine's recovery fence cannot see. Both stores, then dispatch.
+  //
+  // It doubles as the liveness check on the exclusion. This INSERT runs on the very session that
+  // holds the ledger's advisory lock, and PostgreSQL frees that lock the instant the session dies
+  // — so a lost lock throws HERE, before the request leaves, rather than being discovered after
+  // another host has already written.
+  try {
+    await fence.intend({ id: intentId, runId: writeLog.runId, kind, label, method, path })
+  } catch (e) {
+    // The request has NOT been dispatched: this failed before the network, exactly like the write
+    // gate and the call ceiling. Saying so keeps the local log's fence honest — an intent left
+    // dangling here would stop the next run over a ledger that provably did not change.
+    const message = e instanceof Error ? e.message : String(e)
+    try {
+      writeLog.settle(intentId, 'not-committed', `the request never left this process: ${message}`)
+    } catch (settleError) {
+      journal.recordUnrecordedSettlement({
+        intentId, kind, label, method, path,
+        state: 'not-committed',
+        reason: `the request never left this process: ${message}`,
+        failures: [`the durable log: ${settleError instanceof Error ? settleError.message : String(settleError)}`],
+      })
+    }
+    throw e
+  }
   let res: XeroResult<T>
   try {
     res = await transport.request<T>(token, method, path, body)
@@ -1926,14 +2491,24 @@ export async function performWrite<T>(args: {
         : e instanceof WriteRateLimitedError
           ? e.commit
           : { state: 'unknown', reason: message }
-    writeLog.settle(intentId, commit.state, commit.reason)
-    if (commit.state === 'unknown') journal.recordUnknown(kind, label, message)
+    // THE JOURNAL FIRST, and that ordering is the fix. Settling used to come first, so a
+    // settlement that threw — a full disk, a dropped coordinator session — took the
+    // `recordUnknown` with it: the run then reported "nothing was written" about a request that
+    // had already left the process. What the durable stores refuse to hold, memory still has to.
+    journalWriteOutcome({ commit, journal, kind, label })
+    const failures = await recordSettlement({ writeLog, fence, intentId, runId: writeLog.runId, commit })
+    if (failures.length > 0) {
+      journal.recordUnrecordedSettlement({ intentId, kind, label, method, path, state: commit.state, reason: commit.reason, failures })
+    }
+    // The transport's own error is the cause and stays the thrown one; the settlement failure is
+    // carried on the journal, which is what the end-of-run banner prints from on every path.
     throw e
   }
   const commit = commitOf(res)
-  // Settled on disk BEFORE settleWrite, because settleWrite throws on an unknown outcome and the
-  // record has to survive that throw as surely as it has to survive a kill.
-  writeLog.settle(intentId, commit.state, commit.reason)
+  // Settled BEFORE settleWrite, because settleWrite throws on an unknown outcome and the record has
+  // to survive that throw as surely as it has to survive a kill. Both stores are attempted even if
+  // the first refuses: a settlement that reached one of them is not nothing.
+  const failures = await recordSettlement({ writeLog, fence, intentId, runId: writeLog.runId, commit })
   if (commit.state === 'committed') {
     for (const subject of args.subjects ?? []) {
       journal.recordOwnWriteVersion(
@@ -1942,7 +2517,57 @@ export async function performWrite<T>(args: {
       )
     }
   }
+  if (failures.length > 0) {
+    // The mutation is recorded EXPLICITLY here rather than by falling through to settleWrite,
+    // because the throw below would otherwise skip it — which is the defect: a write that landed,
+    // whose settlement could not be stored, vanished from the run's account of what it destroyed.
+    journalWriteOutcome({ commit, journal, kind, label })
+    journal.recordUnrecordedSettlement({ intentId, kind, label, method, path, state: commit.state, reason: commit.reason, failures })
+    throw new WriteSettlementNotRecordedError(
+      `ABORT: ${kind} — ${label}: the write was DISPATCHED (${method} ${path}) and its outcome is ` +
+        `${commit.state.toUpperCase()} (${commit.reason}), but that outcome could not be recorded — ${failures.join('; ')}.\n` +
+        `The intent for it is durable; the ANSWER is not. So the next run, on this host or any other, will refuse ` +
+        `to start over intent ${intentId} — and the only place the answer now exists is this run's output.\n` +
+        `WRITE THIS DOWN, then reconcile it: confirm the object in Xero (or re-run ` +
+        `scripts/audit-xero-live-e2e-footprint.ts), settle the row by hand —\n` +
+        `  UPDATE "xero_live_write_intents" SET "state" = '${commit.state}', "reason" = '<who checked, and how>', ` +
+        `"settledAt" = now() WHERE "id" = '${intentId}';\n` +
+        `— and account for the same intent in the on-disk log before the next run.`,
+    )
+  }
   return { committed: settleWrite({ res, journal, kind, label }), res }
+}
+
+/**
+ * Settle one dispatched write in BOTH durable stores, and report which of them refused rather than
+ * throwing out of the first failure.
+ *
+ * Neither store may be skipped because the other failed: they answer different questions — the
+ * file is what a next run ON THIS HOST reads, the row is what a next run ANYWHERE reads — and a
+ * settlement that reached one of them still narrows what the operator has to reconcile. The
+ * failures are returned instead of thrown so the caller can record the outcome in memory first;
+ * throwing from here is what used to suppress the mutation.
+ */
+async function recordSettlement(args: {
+  writeLog: WriteIntentLog
+  fence: SharedWriteFence
+  intentId: string
+  runId: string
+  commit: WriteCommit
+}): Promise<string[]> {
+  const { writeLog, fence, intentId, runId, commit } = args
+  const failures: string[] = []
+  try {
+    writeLog.settle(intentId, commit.state, commit.reason)
+  } catch (e) {
+    failures.push(`the durable log refused it: ${e instanceof Error ? e.message : String(e)}`)
+  }
+  try {
+    await fence.settle({ id: intentId, runId, state: commit.state, reason: commit.reason })
+  } catch (e) {
+    failures.push(`the shared fence refused it: ${e instanceof Error ? e.message : String(e)}`)
+  }
+  return failures
 }
 
 // ---------------------------------------------------------------------------

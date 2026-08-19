@@ -3453,3 +3453,55 @@ model WcWithdrawalSuppression {
   @@id([connector, externalOrderId])
   @@map("wc_withdrawal_suppressions")
 }
+
+/// The CROSS-HOST half of the live-Xero cleanup write fence (o3d-t74p round 7, finding 1).
+///
+/// scripts/remove-xero-live-e2e-footprint.ts writes irreversibly to a REAL Xero
+/// organisation. Before every dispatch it records an INTENT, and after the request
+/// settles it records the OUTCOME; a run that finds an intent with no outcome — or one
+/// settled as `unknown` — refuses to start, because the ledger may have changed in ways
+/// nothing can describe.
+///
+/// That evidence used to live only in an fsynced file under /var/lib/o3d/xero-cleanup,
+/// which is a fact about ONE HOST. The thing it protects is ONE LEDGER. A second host, a
+/// container, or a restored VM sees no lock file and an empty log, so it takes the fence
+/// for free and plans over a ledger a dead run on another machine may have mutated. This
+/// table is the same record kept where every host that can run the script can see it.
+///
+/// It is ADDITIONAL to the fsynced file, never a replacement: the file is what survives
+/// when the DATABASE is the thing that went away, and the row is what survives when the
+/// HOST is. Both are written, and flushed/committed, BEFORE the request is dispatched;
+/// if either cannot be written the write is not dispatched at all.
+///
+/// Rows are never deleted by the script. An operator resolves them by READING the ledger
+/// (open each object in Xero, or re-run scripts/audit-xero-live-e2e-footprint.ts) and then
+/// settling the row by hand — the same resolution the file-based fence asks for, and for
+/// the same reason: the only thing that can answer "what happened to that write" is Xero.
+model XeroLiveWriteIntent {
+  /// `<runId>-w<n>`, minted by the run that dispatched the write. The runId is 8 bytes of
+  /// fresh randomness per run, so ids from two runs — on any hosts — cannot collide, and
+  /// a settlement can only ever resolve an intent from its own run.
+  id         String    @id
+  /// The run that minted it. Kept alongside the composite id so a settlement arriving from
+  /// a DIFFERENT run can be refused rather than silently resolving somebody else's write.
+  runId      String
+  /// The Xero organisation this write was aimed at. The fence is keyed on the ledger.
+  tenantId   String
+  /// Which host dispatched it, so an operator facing an unresolved row knows where to look.
+  host       String
+  kind       String
+  label      String
+  method     String
+  path       String
+  intendedAt DateTime
+  /// NULL means DISPATCHED AND NEVER ACCOUNTED FOR — the run died between sending the
+  /// request and recording what became of it. `unknown` means the answer was lost. Both
+  /// stop the next run, anywhere; only `committed` and `not-committed` resolve a row.
+  state      String?
+  reason     String?
+  settledAt  DateTime?
+
+  /// The fence's only query: everything for this ledger that is not accounted for.
+  @@index([tenantId, state])
+  @@map("xero_live_write_intents")
+}

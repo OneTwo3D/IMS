@@ -169,10 +169,35 @@ export const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
  */
 export const BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE = 411_220_868
 
+/**
+ * Per-LEDGER exclusion for the live-Xero incident cleanup (o3d-t74p round 7, finding 1).
+ *
+ * The cleanup scripts write irreversibly to a real Xero organisation, and their
+ * single-apply lock and crash-recovery fence used to be a lock FILE and a log
+ * FILE under /var/lib/o3d/xero-cleanup. That coordinates one HOST. The thing
+ * being protected is ONE LEDGER, and a second host, a container, or a restored
+ * VM takes a free lock file and reads an empty log — which is exactly the two
+ * concurrent applies, and exactly the invisible dispatched write, that the two
+ * files exist to prevent.
+ *
+ * So the exclusion also lives here, in the one store every host that can run
+ * these scripts already shares. The second int is derived from the TENANT ID
+ * (`xeroLedgerLockId`), because the tenant is what is being protected: two
+ * plans against one ledger must still not run at once, and a plan-keyed lock
+ * would let them.
+ *
+ * Taken EXCLUSIVELY by an --apply run and in SHARE mode by a dry run. A dry run
+ * writes nothing, but the plan it plans IS what the next --apply is authorised
+ * by, so it must not be built while an apply is part-way through mutating the
+ * ledger underneath it. Two dry runs may coexist; an apply excludes both.
+ */
+export const XERO_LIVE_CLEANUP_LOCK_NAMESPACE = 411_220_869
+
 
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
   BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
+  XERO_LIVE_CLEANUP_LOCK_NAMESPACE,
 } as const
