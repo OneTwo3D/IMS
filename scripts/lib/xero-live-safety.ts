@@ -2680,6 +2680,20 @@ export function readHeldAnswer(args: {
  * `pg_control_system()` is REVOKEd from PUBLIC on some installations. `null` is folded in as a
  * named absence rather than skipped, so a fingerprint taken with it and one taken without it can
  * never collide, and the attestation prompt says which of the two it is offering.
+ *
+ * WHAT IT SEPARATES, AND WHAT IT DOES NOT. Stated exactly, because "restored snapshot" covers two
+ * quite different things and this only catches one of them:
+ *   • a LOGICAL restore — a dump reloaded into another cluster — gets that cluster's own
+ *     `system_identifier` and its own database oid, so it fingerprints differently. Caught.
+ *   • a second IMS installation authorised against the same organisation has its own cluster, its
+ *     own database and its own connection row id. Caught.
+ *   • a PHYSICAL clone — pg_basebackup, a filesystem snapshot, a promoted standby, PITR — carries
+ *     the source cluster's `system_identifier` and every oid with it. It fingerprints IDENTICALLY,
+ *     and no field readable from inside either copy would distinguish them. NOT caught, and it is
+ *     the single case that survives. What stands in front of it is the human the attestation asks:
+ *     "is this the only store that claims this ledger" is precisely the question a promoted standby
+ *     makes false, and it is asked of somebody who can see both machines.
+ * That last bullet is why this is an attestation and not a proof, and why the refusal names it.
  */
 export function xeroCoordinatorFingerprint(args: {
   tenantId: string
@@ -2788,6 +2802,12 @@ export function assertCoordinatorAttested(args: {
         `connection row for the same organisation answers every check in this script identically, takes its ` +
         `own free lock, and excludes nobody — and nothing inside either database can see the other. A human ` +
         `can. This is that check, and there is no version of it that runs unattended.\n` +
+        `AND THE FINGERPRINT DOES NOT DO IT FOR YOU. It separates a dump-and-restore and a second ` +
+        `installation, which get their own cluster identifier and oids. It does NOT separate a PHYSICAL ` +
+        `copy — pg_basebackup, a filesystem snapshot, a promoted standby, PITR — which carries this ` +
+        `cluster's identifier with it and fingerprints exactly like this store. If a standby of this ` +
+        `database has been promoted anywhere, or a snapshot of the machine is running, this value cannot ` +
+        `tell you which one you are talking to. That is the thing you are being asked to check.\n` +
         (c.clusterId === null
           ? `NOTE: pg_control_system() is not readable by this role, so the fingerprint does not name the ` +
             `PostgreSQL cluster — it separates stores only by database name, oid and connection row. Two ` +

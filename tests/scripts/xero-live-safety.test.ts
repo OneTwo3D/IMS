@@ -4489,6 +4489,29 @@ describe('two stores can both claim the ledger, so a human names the one that ma
     assert.equal(xeroCoordinatorFingerprint({ ...base, tenantId: LEDGER.toUpperCase() }), xeroCoordinatorFingerprint(base))
   })
 
+  test('a PHYSICAL clone fingerprints identically, and the refusal says so', async () => {
+    // The one case that survives, and it must not be quietly implied to be covered. pg_basebackup,
+    // a filesystem snapshot, a promoted standby and PITR all carry the source cluster's
+    // system_identifier and every oid with it — so both copies compute the SAME fingerprint and no
+    // field readable from inside either one separates them. The attestation is a question put to
+    // somebody who can see both machines, and the refusal has to say that out loud or it is
+    // claiming a guarantee it does not have.
+    const source = { tenantId: LEDGER, clusterId: 'cluster-prod', database: 'ims_prod', databaseOid: '16400', connectionId: 'conn-1' }
+    assert.equal(
+      xeroCoordinatorFingerprint(source), xeroCoordinatorFingerprint({ ...source }),
+      'a physical clone is identical in every field this can read',
+    )
+    const db = new FakeCoordinationDatabase({ name: 'ims_prod', oid: '16400', clusterId: 'cluster-prod', connectionId: 'conn-1' })
+    await assert.rejects(
+      () => acquireSharedWriteFence({
+        tenantId: LEDGER, mode: 'exclusive', createClient: () => db.session('host'), setKeepalive: noKeepalive,
+      }),
+      (e: Error) => e instanceof CoordinatorNotAttestedError
+        && /THE FINGERPRINT DOES NOT DO IT FOR YOU/.test(e.message)
+        && /promoted standby/.test(e.message),
+    )
+  })
+
   test('a role that may not read pg_control_system still coordinates, and is told the gap', async () => {
     // Refusing here would trade a real capability for a missing GRANT. The absence travels on the
     // coordinator instead, and the attestation prompt says which of the two fingerprints it means.
