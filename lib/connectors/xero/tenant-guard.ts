@@ -139,6 +139,18 @@
  * receipt with no witness beside it is `unwitnessed-release`. What that still cannot see is a copy of
  * the WHOLE database, which reproduces both halves — there is no in-database answer to that, and the
  * env allow-list of layer 1 is the only control that survives it. Which is why layer 1 is first.
+ *
+ * AND THE RECEIPT IS CONSUMED BY THE PIN, NOT BY THE WRITER THAT HAPPENS TO WRITE IT (the r9 finding).
+ * r7's whole argument for a receipt with no expiry is that the next binding consumes it, and r8 added
+ * the witness on the same understanding. Both were true of `bindXeroTenant` and false of the system:
+ * the pin has other writers, and `provision-xero-demo.ts` re-pins on every ordinary run by writing the
+ * settings row directly. A completed re-provision therefore left an instance PINNED and still carrying
+ * an outstanding release — harmless while the pin is there, and exactly one `DELETE FROM settings` from
+ * the bypass r6 closed, because the receipt still names this connection and this token's organisation
+ * and the witness is still beside it. So the rule is attached to the pin instead of to a code path:
+ * the trigger in `20260819210000_xero_pin_write_consumes_release` clears both halves on ANY write of
+ * the `xero_expected_tenant_id` row, and `xeroPinEstablishmentStatements` is the same rule spelled for
+ * the raw-SQL writer that must not depend on the trigger being installed yet.
  */
 
 export type XeroConnectionSummary = {
@@ -774,6 +786,87 @@ export function parseXeroReleaseWitness(raw: string | null | undefined): XeroRel
 /** The witness as it is stored — one JSON object, written by the transaction that deletes the pin. */
 export function serializeXeroReleaseWitness(witness: XeroReleaseWitness): string {
   return JSON.stringify({ generation: witness.generation, tenantId: witness.tenantId })
+}
+
+/**
+ * The two settings rows a Xero binding is made of, named once (o3d-9tbz r9).
+ *
+ * They were spelled as literals in four places — `auth.ts`, the recovery script, the e2e preflight and
+ * the migration — and the rule below is a statement ABOUT those two keys, so it cannot be expressed
+ * against a string that each writer spells for itself.
+ */
+export const XERO_TENANT_PIN_SETTING_KEY = 'xero_expected_tenant_id'
+export const XERO_PIN_RELEASE_WITNESS_SETTING_KEY = 'xero_pin_release_witness'
+
+/** One parameterised statement, in the shape both `pg` and a test double take it. */
+export type XeroPinSqlStatement = { text: string; values: unknown[] }
+
+/**
+ * ESTABLISHING A PIN ENDS ANY OUTSTANDING RELEASE — as one operation, not as a habit (o3d-9tbz r9).
+ *
+ * THE FINDING. r7 gave the receipt no expiry on the explicit ground that it is CONSUMED BY THE NEXT
+ * BINDING, and r8 added the witness alongside it on the same understanding. Both statements were true
+ * of `bindXeroTenant`, which clears the receipt and deletes the witness in the transaction that writes
+ * the pin — and false of the system, because the pin has more than one writer. `provision-xero-demo.ts`
+ * re-pins from the live connection on every ordinary run, by writing the settings row directly rather
+ * than going through the binding, so a completed re-provision left the instance PINNED and still
+ * carrying an outstanding release. Nothing was wrong while the pin was there: the receipt is only ever
+ * read to answer "why is there no pin". But the halt r6 built is what stands between this instance and
+ * one `DELETE FROM settings`, and on such a row that deletion is not refused — the receipt is qualified
+ * (r7: it names this connection and this token's organisation, neither of which a re-pin changes) and
+ * the witness is still beside it (r8), so the verdict is `released` and the bypass r6 closed is open
+ * again, on an instance that reached the state by running the documented provisioner.
+ *
+ * WHY IT IS FIXED HERE RATHER THAN THERE. Three writers have now been found doing this by hand, and
+ * r8's own lesson was that evidence maintained per-writer is fragile. So the consumption follows the
+ * PIN: it is enforced by the database, in the trigger installed by
+ * `20260819210000_xero_pin_write_consumes_release`, which fires on any INSERT or UPDATE of the
+ * `xero_expected_tenant_id` row and clears both halves of the release. That rule covers writers this
+ * file has never heard of — a migration, a seed, `setSettings()` with the wrong key in it, an operator
+ * at a SQL prompt —
+ * because it is attached to the row rather than to a code path, and it cannot be forgotten by the next
+ * writer for the same reason.
+ *
+ * THIS FUNCTION IS THE SAME RULE, SPELLED FOR A RAW-SQL WRITER, and it is not redundant: the script is
+ * run by hand against whatever instance is in front of the operator, including one whose migrations
+ * predate the trigger, and a reader of the script has to be able to SEE that re-pinning ends a release
+ * rather than take it on trust from a file they are not reading. The statements are idempotent against
+ * each other — with the trigger installed, the two clears find nothing left to do.
+ *
+ * ORDER IS PART OF IT. The pin is written FIRST, so that on a database that has the trigger the whole
+ * consumption is already committed by the time the clears run, and on one that does not the clears
+ * follow a pin that is definitely there. Run them in ONE transaction: a pin written without the
+ * clears is precisely the state being removed.
+ */
+export function xeroPinEstablishmentStatements(tenantId: string): XeroPinSqlStatement[] {
+  return [
+    {
+      text:
+        `insert into settings (key, value, "updatedAt") values ($1, $2, now())\n` +
+        `   on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
+      values: [XERO_TENANT_PIN_SETTING_KEY, tenantId],
+    },
+    {
+      // The receipt, all three columns together. They are written together and cleared together
+      // everywhere else (r7), and a half-cleared receipt is `stale-release` — a refusal that would send
+      // the operator looking for a restore that never happened.
+      text:
+        `update accounting_tokens\n` +
+        `      set "pinReleasedAt" = null,\n` +
+        `          "pinReleasedGeneration" = null,\n` +
+        `          "pinReleasedTenantId" = null,\n` +
+        `          "updatedAt" = now()\n` +
+        `    where connector = 'xero'\n` +
+        `      and ("pinReleasedAt" is not null or "pinReleasedGeneration" is not null or "pinReleasedTenantId" is not null)`,
+      values: [],
+    },
+    {
+      // ...and the half that stayed in `settings`. A witness left behind is a half-record waiting for a
+      // token row to corroborate, which is the shape of every finding in this file.
+      text: `delete from settings where key = $1`,
+      values: [XERO_PIN_RELEASE_WITNESS_SETTING_KEY],
+    },
+  ]
 }
 
 /**

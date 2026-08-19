@@ -2341,6 +2341,15 @@ model AccountingToken {
   // These are also only the half of the receipt that travels with the row: the release is witnessed
   // in `settings` too (key xero_pin_release_witness), so a wholesale-restored row cannot corroborate
   // itself.
+  //
+  // o3d-9tbz r9: CLEARED BY THE DATABASE whenever a pin is written, not only by bindXeroTenant. All
+  // three columns above are wiped — and the witness row deleted — by the trigger installed in
+  // 20260819210000_xero_pin_write_consumes_release, which fires on any INSERT or UPDATE of the
+  // `xero_expected_tenant_id` settings row. r7 gave the receipt no expiry on the ground that "the next
+  // binding consumes it"; the pin has other writers (provision-xero-demo.ts re-pins directly), so a
+  // completed re-provision left a row pinned AND carrying an outstanding release — one hand-run DELETE
+  // away from the exemption r6 closed. The rule now belongs to the pin rather than to a call site,
+  // which is why a writer that never heard of these columns cannot leave one behind.
   pinReleasedGeneration String?
   pinReleasedTenantId   String?
   createdAt    DateTime @default(now())

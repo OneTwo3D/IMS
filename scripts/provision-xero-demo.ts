@@ -44,7 +44,12 @@
  *   2. A human re-consents at <public_app_url>/sync?connector=xero and picks
  *      "Demo Company (UK)". OAuth is interactive; it cannot be scripted.
  *   3. Re-run this script normally. It rebuilds the org and RE-PINS the new
- *      tenantId automatically.
+ *      tenantId automatically — and re-pinning CONSUMES the release from step 1,
+ *      both halves of it, in the same transaction (o3d-9tbz r9). A release is a
+ *      receipt for having no pin; it must not outlive the pin coming back, or a
+ *      later `DELETE FROM settings` reads as a deliberate release instead of
+ *      halting the sync. Step 2 normally consumes it first; this is what makes
+ *      the state impossible whichever of the two happens.
  *
  * SAFETY: refuses to run unless the connected tenant is literally
  * 'Demo Company (UK)', re-read live from GET /Organisation — a stale token row is
@@ -66,7 +71,7 @@ import { readFileSync } from 'node:fs'
 import { xeroGet, xeroPost, xeroPut } from '../lib/connectors/xero/api.ts'
 import { syncChartOfAccounts } from '../lib/connectors/xero/accounts.ts'
 import { xeroReportTaxType } from '../lib/connectors/xero/tax-rate-report-type.ts'
-import { serializeXeroReleaseWitness } from '../lib/connectors/xero/tenant-guard.ts'
+import { serializeXeroReleaseWitness, xeroPinEstablishmentStatements } from '../lib/connectors/xero/tenant-guard.ts'
 
 const REQUIRED_TENANT = 'Demo Company (UK)'
 const TEMPLATE_PATH = new URL('./xero-demo-template.json', import.meta.url).pathname
@@ -148,13 +153,29 @@ async function guardTenant(db: Client) {
   // only reach this line after asserting the LIVE org name is REQUIRED_TENANT, so
   // the pin can never be moved onto a production org.
   // Never move another instance's pin: --remap-only may target stage.
+  //
+  // AND RE-PINNING ENDS ANY OUTSTANDING RELEASE (o3d-9tbz r9). This used to be a bare INSERT of the
+  // settings row, which is a different route to the pin from `bindXeroTenant` — and `bindXeroTenant`
+  // was the only writer clearing the release receipt and its witness. So a completed provision left
+  // this rig PINNED and still carrying a receipt for a pin that is no longer missing: invisible while
+  // the pin is there, and one `DELETE FROM settings` from being read as a deliberate release, which is
+  // the exemption r6/r7/r8 spent three rounds narrowing. The statements come from tenant-guard.ts so
+  // that the pin write and the consumption cannot be separated by a writer that forgets one of them,
+  // and they run in ONE transaction because a pin written without them is the state being removed.
+  // The database enforces the same rule on every writer (migration 20260819210000); this is what makes
+  // the script correct against an instance whose migrations predate it, and visible to whoever reads it.
   if (!DRY_RUN && !REMAP_ONLY) {
-    await db.query(
-      `insert into settings (key, value, "updatedAt") values ('xero_expected_tenant_id', $1, now())
-         on conflict (key) do update set value = excluded.value, "updatedAt" = now()`,
-      [tenantId],
-    )
-    log(`tenant pin refreshed -> ${tenantId}`)
+    await db.query('begin')
+    try {
+      for (const statement of xeroPinEstablishmentStatements(tenantId)) {
+        await db.query(statement.text, statement.values)
+      }
+      await db.query('commit')
+    } catch (e) {
+      await db.query('rollback')
+      throw e
+    }
+    log(`tenant pin refreshed -> ${tenantId} (any outstanding pin release is consumed with it)`)
   }
 
   return live.BaseCurrency

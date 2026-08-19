@@ -19,7 +19,7 @@ import { parseGrantedScopes, scopesFromTokenResponse, XERO_SCOPE_STRING } from '
 import {
   demoOrgConnectRefusal, nameOnlyGuardWarning, parseXeroReleaseWitness, readXeroTenantAllowList,
   selectXeroTenant, storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroPinAbsenceVerdict,
-  xeroTenantBindingRaceMessage,
+  xeroTenantBindingRaceMessage, XERO_PIN_RELEASE_WITNESS_SETTING_KEY, XERO_TENANT_PIN_SETTING_KEY,
   type XeroConnectionSummary, type XeroReleaseWitness, type XeroStoredBinding, type XeroTenantAllowList,
 } from './tenant-guard'
 
@@ -104,7 +104,11 @@ type OAuthStatePayload = {
   returnPath: string | null
 }
 
-const XERO_EXPECTED_TENANT_KEY = 'xero_expected_tenant_id'
+// Both keys are owned by tenant-guard.ts (r9). The rule that a pin write consumes an outstanding
+// release is a statement ABOUT these two rows — enforced in the database by the trigger in
+// `20260819210000_xero_pin_write_consumes_release`, and spelled for raw-SQL writers by
+// `xeroPinEstablishmentStatements` — so they cannot be spelled independently by each writer.
+const XERO_EXPECTED_TENANT_KEY = XERO_TENANT_PIN_SETTING_KEY
 /**
  * The half of a pin-release receipt that stays with the INSTANCE (o3d-9tbz r8 finding 2).
  *
@@ -115,7 +119,7 @@ const XERO_EXPECTED_TENANT_KEY = 'xero_expected_tenant_id'
  * restored `accounting_tokens` row brings its own corroboration and agrees with itself. This does not
  * travel with that row.
  */
-const XERO_PIN_RELEASE_WITNESS_KEY = 'xero_pin_release_witness'
+const XERO_PIN_RELEASE_WITNESS_KEY = XERO_PIN_RELEASE_WITNESS_SETTING_KEY
 const REFRESH_EARLY_MS = 2 * 60 * 1000
 
 let refreshInFlight: Promise<{ accessToken: string; tenantId: string } | null> | null = null
@@ -435,6 +439,12 @@ async function bindXeroTenant(params: {
       // transaction (r8). Both halves of a release are written together and cleared together; a writer
       // that cleared only one would leave the other to be read as evidence about a state that has ended,
       // which is the whole shape of r7 and r8.
+      //
+      // Since r9 this is no longer the only thing keeping that true, and it was never enough on its
+      // own: the `setting.create`/`update` above ALSO fires the trigger that consumes the release
+      // (20260819210000), because r7's "the receipt is consumed by the next binding" was a promise
+      // about the pin that only this writer was keeping. Both statements are kept — this one is what a
+      // reader of the binding sees, and they are idempotent with each other.
       await tx.setting.deleteMany({ where: { key: XERO_PIN_RELEASE_WITNESS_KEY } })
     })
     return { ok: true }

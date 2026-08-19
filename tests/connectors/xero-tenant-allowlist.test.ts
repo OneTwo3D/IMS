@@ -7,8 +7,9 @@ import {
   nameOnlyGuardWarning, readXeroTenantAllowList, selectXeroTenant, storedTenantRefusalMessage,
   parseXeroReleaseWitness, serializeXeroReleaseWitness,
   storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroMissingPinRefusal, xeroPinAbsenceVerdict,
-  xeroTenantBindingRaceMessage, xeroTenantVerdict,
-  type XeroConnectionSummary, type XeroReleaseWitness, type XeroStoredBinding,
+  xeroPinEstablishmentStatements, xeroTenantBindingRaceMessage, xeroTenantVerdict,
+  XERO_PIN_RELEASE_WITNESS_SETTING_KEY, XERO_TENANT_PIN_SETTING_KEY,
+  type XeroConnectionSummary, type XeroPinSqlStatement, type XeroReleaseWitness, type XeroStoredBinding,
 } from '@/lib/connectors/xero/tenant-guard'
 
 /**
@@ -1335,4 +1336,196 @@ test('a token row that predates the generation column can still be released and 
     'unwitnessed-release',
     'and it is the witness, not the generation, doing the work',
   )
+})
+
+
+// --- a release is consumed by the PIN, not by one writer's good manners (r9) ---
+//
+// r7 gave the receipt no expiry on one explicit ground: the next binding consumes it. r8 added the
+// witness on the same ground. Both were true of `bindXeroTenant` and false of the system, because the
+// pin has more than one writer — `provision-xero-demo.ts` re-pins from the live connection on every
+// ordinary run, by writing the settings row directly. A completed provision therefore left the rig
+// PINNED and still carrying an outstanding release: invisible while the pin is there, because the
+// receipt is only ever read to answer "why is there no pin", and one `DELETE FROM settings` from being
+// read as a deliberate release instead of the halt r6 built.
+
+/**
+ * THE DOUBLE: an instance mid-recovery, as the two tables that hold a release.
+ *
+ * `--clear-tenant-pin` has run — no pin row, a qualified receipt on the token row, the witness beside
+ * where the pin was. This is the state a re-provision arrives at, and expressing it as tables rather
+ * than as a verdict is the point: the r9 defect is not in what the verdict says about a row, it is in
+ * which rows a writer leaves behind.
+ */
+type ReleasedInstance = {
+  settings: Map<string, string>
+  token: {
+    tenantId: string
+    connectionGeneration: string | null
+    pinReleasedAt: Date | null
+    pinReleasedGeneration: string | null
+    pinReleasedTenantId: string | null
+  }
+}
+
+function instanceMidRelease(): ReleasedInstance {
+  return {
+    settings: new Map([[XERO_PIN_RELEASE_WITNESS_SETTING_KEY, serializeXeroReleaseWitness(RELEASE_WITNESS)]]),
+    token: {
+      tenantId: LIVE.tenantId,
+      connectionGeneration: 'gen-a1b2',
+      pinReleasedAt: new Date('2026-08-19T09:00:00.000Z'),
+      pinReleasedGeneration: 'gen-a1b2',
+      pinReleasedTenantId: LIVE.tenantId,
+    },
+  }
+}
+
+/** What the guard would decide about this instance, right now, if it were asked. */
+function verdictOf(instance: ReleasedInstance) {
+  const binding: XeroStoredBinding = {
+    connectionGeneration: instance.token.connectionGeneration,
+    pinReleasedAt: instance.token.pinReleasedAt,
+    pinReleasedGeneration: instance.token.pinReleasedGeneration,
+    pinReleasedTenantId: instance.token.pinReleasedTenantId,
+  }
+  return xeroPinAbsenceVerdict(
+    binding,
+    instance.token.tenantId,
+    parseXeroReleaseWitness(instance.settings.get(XERO_PIN_RELEASE_WITNESS_SETTING_KEY) ?? null),
+  )
+}
+
+/**
+ * Apply the statements to the double.
+ *
+ * The effect of the UPDATE is read OUT of the statement — which receipt columns it names — rather than
+ * assumed, because a model that clears all three whatever the SQL says cannot notice the SQL dropping
+ * one, and a half-cleared receipt is `stale-release`: a live refusal with the wrong message on it. An
+ * unrecognised statement fails the test rather than being ignored.
+ */
+function applyStatements(instance: ReleasedInstance, statements: XeroPinSqlStatement[]) {
+  for (const { text, values } of statements) {
+    if (/^insert into settings/.test(text)) {
+      instance.settings.set(String(values[0]), String(values[1]))
+    } else if (/^update accounting_tokens/.test(text)) {
+      const nulled = [...text.matchAll(/"(pinReleased[A-Za-z]*)" = null/g)].map((m) => m[1])
+      for (const column of nulled) {
+        instance.token[column as 'pinReleasedGeneration' | 'pinReleasedTenantId'] = null
+      }
+      if (nulled.includes('pinReleasedAt')) instance.token.pinReleasedAt = null
+    } else if (/^delete from settings/.test(text)) {
+      instance.settings.delete(String(values[0]))
+    } else {
+      assert.fail(`the double does not model this statement, so it cannot vouch for it: ${text}`)
+    }
+  }
+}
+
+test('re-pinning consumes the release, so a later hand-run DELETE halts instead of exempting', () => {
+  // The finding, end to end. Before: a legitimate outstanding release. After a re-provision the pin is
+  // back — and with the receipt still under it, deleting that pin used to read as `released`, which is
+  // the bypass r6 closed, reachable by running the documented provisioner.
+  const instance = instanceMidRelease()
+  assert.equal(verdictOf(instance), 'released', 'the state the recovery legitimately leaves')
+
+  applyStatements(instance, xeroPinEstablishmentStatements(LIVE.tenantId))
+
+  assert.equal(instance.settings.get(XERO_TENANT_PIN_SETTING_KEY), LIVE.tenantId, 'the pin is written')
+  assert.equal(instance.settings.has(XERO_PIN_RELEASE_WITNESS_SETTING_KEY), false, 'the witness goes with it')
+  assert.deepEqual(
+    [instance.token.pinReleasedAt, instance.token.pinReleasedGeneration, instance.token.pinReleasedTenantId],
+    [null, null, null],
+    'and the receipt on the token row, all three columns together',
+  )
+
+  // Now the r6 bypass, run against the re-provisioned instance: one DELETE of the pin row.
+  instance.settings.delete(XERO_TENANT_PIN_SETTING_KEY)
+  assert.equal(verdictOf(instance), 'lost', 'the halt, not an exemption inherited from a spent release')
+})
+
+test('the pin is written FIRST, and the consumption cannot be split off from it', () => {
+  // Order is load-bearing: on a database carrying the trigger the pin write has already consumed the
+  // release by the time the explicit clears run, and on one that predates it the clears follow a pin
+  // that is definitely there. Three statements, one operation — a caller that runs a subset writes the
+  // state this removes, which is why they are handed over together rather than as advice.
+  const statements = xeroPinEstablishmentStatements(DEMO.tenantId)
+
+  assert.equal(statements.length, 3)
+  assert.match(statements[0].text, /^insert into settings/)
+  assert.deepEqual(statements[0].values, [XERO_TENANT_PIN_SETTING_KEY, DEMO.tenantId])
+  assert.match(statements[1].text, /^update accounting_tokens/)
+  assert.match(statements[1].text, /where connector = 'xero'/, 'this connector only')
+  assert.match(statements[2].text, /^delete from settings where key = \$1/)
+  assert.deepEqual(statements[2].values, [XERO_PIN_RELEASE_WITNESS_SETTING_KEY])
+})
+
+test('the two settings keys have ONE owner, and it is the file that reasons about them', () => {
+  // They were spelled as literals in auth.ts, the recovery script, the preflight and the migration. The
+  // r9 rule is a statement about those two rows, so it cannot be written against a string each writer
+  // spells for itself.
+  assert.equal(XERO_TENANT_PIN_SETTING_KEY, 'xero_expected_tenant_id')
+  assert.equal(XERO_PIN_RELEASE_WITNESS_SETTING_KEY, 'xero_pin_release_witness')
+
+  const auth = readFileSync(new URL('../../lib/connectors/xero/auth.ts', import.meta.url), 'utf8')
+  assert.match(auth, /const XERO_EXPECTED_TENANT_KEY = XERO_TENANT_PIN_SETTING_KEY/)
+  assert.match(auth, /const XERO_PIN_RELEASE_WITNESS_KEY = XERO_PIN_RELEASE_WITNESS_SETTING_KEY/)
+})
+
+test('the provisioner re-pins through that statement set, in one transaction', () => {
+  // Read out of the script rather than asserted about a double, for the reason the r8 test says: the
+  // double is a model of this text, and a model cannot notice the text changing. What is being checked
+  // is that the pin write is no longer a bare INSERT of its own.
+  const script = readFileSync(new URL('../../scripts/provision-xero-demo.ts', import.meta.url), 'utf8')
+  const body = script.slice(script.indexOf('async function guardTenant'), script.indexOf('async function remapOnly'))
+  const transaction = body.slice(body.indexOf("db.query('begin')"), body.indexOf("db.query('commit')"))
+
+  assert.match(transaction, /xeroPinEstablishmentStatements\(tenantId\)/,
+    'the pin and the consumption arrive together, from the file that owns the rule')
+  assert.doesNotMatch(body, /insert into settings \(key, value, "updatedAt"\) values \('xero_expected_tenant_id'/,
+    'and not as a bare INSERT of the pin, which is the r9 defect itself')
+  assert.match(body, /db\.query\('rollback'\)/, 'a failure leaves neither the pin nor a spent release')
+})
+
+test('the STORE consumes the release on any pin write, not just the ones this repo knows about', () => {
+  // Three writers have now been found maintaining this evidence by hand. The rule is therefore attached
+  // to the row: a trigger on the pin covers a migration, a seed, setSettings() with the wrong key in it,
+  // and psql — none of which can be made to remember anything.
+  const sql = readFileSync(
+    new URL('../../prisma/migrations/20260819210000_xero_pin_write_consumes_release/migration.sql', import.meta.url),
+    'utf8',
+  )
+  const statements = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n')
+
+  assert.match(statements, /CREATE TRIGGER xero_pin_write_consumes_release/)
+  assert.match(statements, /AFTER INSERT OR UPDATE ON "settings"/, 'both ways a pin can appear')
+  assert.match(statements, new RegExp(`WHEN \\(NEW\\."key" = '${XERO_TENANT_PIN_SETTING_KEY}'\\)`),
+    'fired by the pin row, and costing every other settings write nothing but a key comparison')
+  for (const column of ['pinReleasedAt', 'pinReleasedGeneration', 'pinReleasedTenantId']) {
+    assert.match(statements, new RegExp(`"${column}" = NULL`), `${column} is cleared with the rest`)
+  }
+  assert.match(statements, new RegExp(`DELETE FROM "settings" WHERE "key" = '${XERO_PIN_RELEASE_WITNESS_SETTING_KEY}'`),
+    'and the witness with it — both halves are cleared together or neither is')
+})
+
+test('the migration repairs the instances already in that state, and ONLY those', () => {
+  // Not the backfill r8 refused, and the direction is the difference: that one would have QUALIFIED
+  // receipts, granting exemptions to rows that could not be told apart from laundered ones. This one
+  // clears them, and only where a pin is already present — a row whose receipt is currently read by
+  // nothing, so no instance changes behaviour today and only a future exemption is removed. An instance
+  // genuinely mid-recovery has no pin row, so it is not touched.
+  const sql = readFileSync(
+    new URL('../../prisma/migrations/20260819210000_xero_pin_write_consumes_release/migration.sql', import.meta.url),
+    'utf8',
+  )
+  const statements = sql.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n')
+  const backfill = statements.slice(statements.lastIndexOf('EXECUTE FUNCTION'))
+
+  assert.match(backfill, /UPDATE "accounting_tokens"/)
+  assert.match(backfill, new RegExp(`EXISTS \\(SELECT 1 FROM "settings" WHERE "key" = '${XERO_TENANT_PIN_SETTING_KEY}'\\)`),
+    'a released instance has no pin row, so its receipt is left exactly where it is')
+  assert.doesNotMatch(backfill, /"connectionGeneration"/,
+    'the row\'s own values are still exactly what must never be copied into its receipt')
+  assert.doesNotMatch(backfill, /= NOW\(\)|pinReleasedAt" = '/i,
+    'nothing is written into a receipt by a migration — the only value it may set is NULL')
 })

@@ -240,9 +240,18 @@ it will **not** restore stage on the new owner's behalf.
      a qualified one — the old flag stamped a release even when it deleted no pin, so the two shapes are
      indistinguishable. A rig that was mid-recovery across the upgrade is halted: **Disconnect**, then
      re-consent, which is the step it was waiting for.
+
+     **A release ends when a pin comes back, whoever writes it** (o3d-9tbz r9). Both halves are cleared
+     by the database on any write of the `xero_expected_tenant_id` row — the re-consent in step 2, the
+     provisioner's re-pin in step 3, or anything else that writes that row. Until r9 only the re-consent
+     did it, so a rig re-provisioned while a release was outstanding stayed pinned with a live receipt
+     under the pin, and the next hand-run `DELETE` of that row read as a deliberate release instead of
+     halting. Nothing to do about it on the rig: the migration clears any receipt sitting under a pin,
+     and no step of this runbook changes.
   2. Re-consent the connection (Settings → Accounting → Xero → Connect).
   3. Re-run the **Demo provisioner** so the accounts/currencies/bank accounts/VAT rates the specs
-     expect exist again (o3d-lgo.9).
+     expect exist again (o3d-lgo.9). It re-pins the new tenantId, and that re-pin consumes any
+     outstanding release with it, in one transaction.
 
 ## Rate budget
 

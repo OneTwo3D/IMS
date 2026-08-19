@@ -1160,6 +1160,16 @@ const MIGRATIONS_THAT_MUTATE_SETTINGS: Record<string, string> = {
   '20260410180000_generic_payment_account_map':
     'Renames ONE key by exact literal match (xero_payment_account_map → accounting_payment_account_map). '
     + 'Touches no plugin key and no other row.',
+  '20260819210000_xero_pin_write_consumes_release':
+    'Deletes ONE key by exact literal match (xero_pin_release_witness), in two places: the backfill, '
+    + 'and the body of the trigger it installs. Neither can reach a plugin key — the literal is the '
+    + 'whole WHERE clause, there is no pattern and no wholesale form. The trigger outlives the '
+    + 'migration and therefore fires at APPLICATION runtime, which is the part worth reviewing rather '
+    + 'than the deploy: it fires only from a write of xero_expected_tenant_id, inside that writer\'s '
+    + 'own transaction, and its only other statement clears three columns on the Xero accounting_tokens '
+    + 'row. A caller writing that key while the orphan-cancel sweep runs is serialized the way any two '
+    + 'writers of that row are; it takes no lock of its own and needs none, because the rows it '
+    + 'touches are not the ones the selection lock fences (o3d-9tbz r9).',
 }
 
 test('no migration performs a WHOLESALE settings mutation', () => {
