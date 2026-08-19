@@ -15,6 +15,8 @@ import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+import { directCreateMarker, isFulfilmentStatus, resolveDirectCreateMarker } from '@/lib/fulfillment/pre-fulfilment-reallocation'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import { addMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
@@ -358,6 +360,50 @@ async function updateExistingWcOrderFromPayload(
   })
 }
 
+/**
+ * Resolve the direct-create marker THIS import just wrote: answer the coverage question under
+ * the order lock, record a shortfall if the demand is genuinely uncovered, and clear the marker.
+ *
+ * CALLED ONLY BY THE PATH THAT CREATED THE MARKER, and only after that path's own
+ * `autoAllocateOrder` has finished. That ordering is the correctness argument: before the
+ * allocation runs the order has no allocation rows at all, so anything that answered the
+ * coverage question in that window would read "short", record a shortfall for an order about to
+ * be covered, and clear the marker so the true answer could never be written. The redelivery
+ * path used to do exactly that (Codex review r4); marker recovery now belongs to
+ * `sweepUnresolvedDirectCreateMarkers`, which waits out the import's grace window first.
+ *
+ * IT ALSO CORRECTS A PREMATURE VERDICT. If this import was delayed past the marker sweep's grace
+ * window, the sweep may already have answered the coverage question — against an order that had
+ * not been allocated yet — and cleared the marker. Finding no marker is therefore not a reason to
+ * stop: `resolveDirectCreateMarker` re-asks the question with the allocation now in place and
+ * withdraws the record if it has been superseded. Both sides answer under this same row lock, so
+ * they cannot interleave, and this one runs strictly after the allocation, which makes it the
+ * later and better-informed of the two (Codex review r5).
+ *
+ * It is also why the hot webhook path pays nothing: an import that wrote no marker never calls
+ * this, and a redelivery never calls it at all — cheaper than the lock-free pre-check this
+ * replaces, which still cost one indexed query on every import of every order.
+ *
+ * NON-FATAL BY DESIGN. The order and its allocation are already committed by the time this runs,
+ * so failing the import undoes nothing — it only produces a retry that returns from the
+ * already-imported branch without repairing anything. The MARKER is what makes that safe: it is
+ * written atomically with the order, so if this never succeeds the marker still stands as a
+ * visible WARNING that coverage was never verified, and the sweep picks it up.
+ *
+ * A longer budget than Prisma's 5s default, matching the transition path: the coverage check
+ * loads the fulfilment product graph and a KIT-heavy order can genuinely take longer.
+ */
+async function resolveDirectCreateShortfall(orderId: string): Promise<void> {
+  try {
+    await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      await resolveDirectCreateMarker({ tx, orderId })
+    }, { maxWait: 5_000, timeout: 20_000 })
+  } catch (error) {
+    console.error(`[wc-import] could not verify fulfilment coverage for ${orderId}:`, error)
+  }
+}
+
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
   try {
     // Skip if already imported
@@ -374,6 +420,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     if (existing) {
       await updateExistingWcOrderFromPayload(existing.id, wcOrder)
       if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, existing.id)
+      // o3d-z82a: deliberately NO marker resolution here. A redelivery can arrive while the
+      // import that created the order is still between its create transaction and its
+      // allocation, and resolving then answers the coverage question against an order that has
+      // no allocations YET — recording a shortfall that was about to be covered and discharging
+      // the marker permanently (Codex review r4). An unresolved marker is recovered by
+      // sweepUnresolvedDirectCreateMarkers instead, which waits out the import's grace window.
+      // It also keeps this, the hot path, free of the feature entirely.
       return { success: true, orderId: existing.id }
     }
 
@@ -666,7 +719,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // Create the sales order
     let so
     try {
-      so = await db.salesOrder.create({
+      so = await db.$transaction(async (tx) => {
+        const created = await tx.salesOrder.create({
         data: {
           externalOrderNumber: wcOrder.number,
           orderNumber,
@@ -715,7 +769,20 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           },
           lines: { create: lineData },
         },
-      })
+        })
+
+        // o3d-z82a: the marker is written in the SAME transaction as the order, so it cannot be
+        // lost. It carries the CREATION status as durable provenance — the retry path used to
+        // infer that from the order's current status, which is unsound in both directions: an
+        // order created PROCESSING and later moved to PICKING by a transition (which has its
+        // own recorder) would get a false "created directly at PICKING", and a genuinely
+        // direct-created order that reached SHIPPED first would be skipped and lose its record
+        // permanently (Codex review).
+        if (isFulfilmentStatus(lifecycleStatus)) {
+          await tx.activityLog.create({ data: directCreateMarker(created.id, lifecycleStatus) })
+        }
+        return created
+      }, { maxWait: 5_000, timeout: 20_000 })
     } catch (error) {
       if (!isUniqueConstraintError(error)) throw error
       const concurrent = await db.salesOrder.findFirst({
@@ -762,6 +829,34 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       if (!allocation.success && allocation.error !== 'No stock available for allocation') {
         throw new Error(`WooCommerce order imported but auto-allocation failed: ${allocation.error ?? 'Unknown error'}`)
       }
+    }
+
+    // o3d-z82a: the status written above is operator-configured via ShoppingStatusMapping, and
+    // the mapping UI offers PICKING and PACKING. An order CREATED in fulfilment never
+    // transitions, so o3d-c9mi's authoritative shortfall record — which hangs off the status
+    // transition — never sees it. Yet it is in exactly the state that record exists for:
+    // outside the reallocation sweep's set (PROCESSING + ALLOCATED), with nothing to revisit
+    // it, and the allocation above can legitimately leave it short ('No stock available' is
+    // tolerated by the allocation block above, and partial coverage returns success when every
+    // uncovered line is backorderEligible -- which requires a shortage AND oversellAllowed, not
+    // either one).
+    //
+    // No allocation attempt here — the importer already made one. What was missing is the
+    // record. Resolves the marker written with the order above, under the order lock and in one
+    // transaction, so the record and the clearing of the marker can never disagree.
+    //
+    // The guarantee is deliberately WEAKER than the transition path's, and the difference is
+    // worth naming. There, the record is atomic with the crossing: if it cannot be written, the
+    // crossing does not happen. Here the order is already committed by the time this runs, so
+    // failing the import undoes nothing — this is non-fatal, and what carries the obligation
+    // forward is the MARKER, which was written atomically with the order and survives as a
+    // visible WARNING until the sweep resolves it.
+    //
+    // Guarded by the SAME condition that wrote the marker, so an import that wrote none does no
+    // work at all rather than querying to discover that. It runs AFTER the allocation above:
+    // resolving before it would read an order that has no allocation rows yet.
+    if (isFulfilmentStatus(lifecycleStatus)) {
+      await resolveDirectCreateShortfall(so.id)
     }
 
     // Queue accounting sales invoice — only for PROCESSING orders and when
