@@ -302,19 +302,10 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
     // POSTED document from an unsettled invoice UPDATE, and those two produce OPPOSITE operator
     // instructions ("nothing to do" versus "no remedy is prescribed").
     accountingEvent: {
-      count: async ({
-        where,
-      }: {
-        where: { sourceEntityType: string; sourceEntityId: string; type: string; status: { notIn: string[] } }
-      }) => {
-        events.push(`event:count:${where.sourceEntityId}`)
-        return (store.events ?? []).filter(
-          (event) =>
-            event.sourceEntityType === where.sourceEntityType &&
-            event.sourceEntityId === where.sourceEntityId &&
-            event.type === where.type &&
-            !where.status.notIn.includes(event.status),
-        ).length
+      // r12 finding 1 — the unsettled-UPDATE read selects ROWS now (they go into the document-set
+      // fingerprint), so a `count` here would be dead code a regression could quietly pass.
+      count: async () => {
+        throw new Error('the unsettled invoice-UPDATE read must select rows, not count them (r12 F1)')
       },
       findMany: async ({
         where,
@@ -323,7 +314,7 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
           sourceEntityType: string
           sourceEntityId: string | { in: string[] }
           type: { in: string[] } | string
-          status?: string
+          status?: string | { notIn: string[] }
         }
       }) => {
         // The CREDIT-NOTE standing read (o3d-y14 r8 finding 3): a different entity type, an `in`
@@ -337,6 +328,20 @@ function makeTx(store: Store, hooks: { afterRead?: () => void } = {}) {
           events.push(`event:creditNotes:${ids.join('|')}`)
           return (store.creditNoteEvents ?? []).filter(
             (event) => ids.includes(event.sourceEntityId) && event.type === where.type,
+          )
+        }
+        // The UNSETTLED invoice-UPDATE read (r12 finding 1): a scalar type and a `notIn` on status.
+        if (typeof where.type === 'string' && typeof where.status === 'object' && where.status !== null) {
+          if (typeof where.sourceEntityId !== 'string') throw new Error('the unsettled read filters one order')
+          const notIn = where.status.notIn
+          const orderId = where.sourceEntityId
+          events.push(`event:unsettled:${orderId}`)
+          return (store.events ?? []).filter(
+            (event) =>
+              event.sourceEntityType === where.sourceEntityType &&
+              event.sourceEntityId === orderId &&
+              event.type === where.type &&
+              !notIn.includes(event.status),
           )
         }
         if (typeof where.sourceEntityId !== 'string' || typeof where.type === 'string') {
@@ -1882,6 +1887,23 @@ test('every "re-derive this" sentence an operator reads names --reprint, not the
     documentIsAllocated: true,
     nettedAgainst: ['CN-501'],
     validAgainst: { disposition: 'FULL', refundIds: ['refund-1'], postedCreditNoteExternalIds: ['CN-501'], unresolvedRefundParkExternalIds: [] },
+    validAgainstDocuments: {
+      currency: 'GBP',
+      accountingInvoiceId: 'INV-778',
+      postedInvoiceExternalIds: [],
+      revenueDeferredBatchRef: null,
+      unearnedRevenueAmount: null,
+      document: {
+        ok: true,
+        amount: 10,
+        documentType: 'SALES_INVOICE',
+        documentCount: 1,
+        externalIds: ['INV-778'],
+        externalSystem: 'xero',
+        taxBasis: 'EXCLUSIVE',
+        documentSet: ['POSTED SALES_INVOICE xero/INV-778 mirrored 2026-05-02T09:00:00.000Z GBP carries 10 GBP (EXCLUSIVE)'],
+      },
+    },
     derivedAt: '2026-08-01T00:00:00.000Z',
   }).join('\n')
 
@@ -2315,4 +2337,122 @@ test('the stamp path reports no record to retract — it asserts no position (o3
   const result = await stampWcCouponDiscountModel(makeTx(store), entry)
 
   assert.equal(result.outcome === 'CORRECTED' && result.activityLogId, null)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r12 finding 1 — a ledger that moves under an IDENTICAL refusal
+// ---------------------------------------------------------------------------
+
+/**
+ * r11 finding 1 made this re-validation compare the invoice side as a VALUE, refusal text included.
+ * A refusal describes a FAILURE, though, and not the rows it failed over — so two entirely different
+ * document sets can present the same value. The fixture below is the sharpest of them: an unsettled
+ * SALES_INVOICE_UPDATE refuses the derivation BEFORE the posted documents are read at all, so its
+ * sentence is a count of updates and the whole posted set can be replaced underneath it.
+ *
+ * `documentCount` and `externalIds` are NULL/empty on that refusal by design (the derivation sets
+ * them only where it established which documents DISAGREE, so a caller can name them), and nothing
+ * on the order's own back-reference columns moves when a mirrored event appears. Every field the
+ * comparison looked at was therefore equal, and the remedy stood.
+ */
+
+/** `invoicedStore`, plus a SALES_INVOICE_UPDATE that never settled — the refusal that reads as a count. */
+function unsettledUpdateStore(): Store {
+  const store = invoicedStore()
+  store.events!.push({
+    ...store.events![0],
+    type: 'SALES_INVOICE_UPDATE',
+    status: 'PENDING',
+    externalId: null,
+    businessDate: '2026-05-04',
+    createdAt: '2026-05-04T09:00:00.000Z',
+  })
+  return store
+}
+
+test('a SECOND document under an UNCHANGED refusal still WITHDRAWS the remedy (o3d-y14 r12 F1)', async () => {
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = unsettledUpdateStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  // The refusal path, with the one remedy it still prescribes: read the document, then choose.
+  assert.equal(handoff?.invoice.case, 'DOCUMENT_UNVERIFIED')
+  assert.equal(handoff?.remedy?.kind, 'READ_THEN_CHOOSE')
+  const refusalBefore = handoff?.documents.document
+
+  // A second sales invoice reaches the ledger after the commit. The refusal is unchanged — it never
+  // looked at the posted documents — and so are the order's own back-references.
+  store.events!.push({
+    ...store.events![0],
+    externalId: 'INV-779',
+    businessDate: '2026-06-01',
+    createdAt: '2026-06-01T09:00:00.000Z',
+  })
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(revalidated.handoff.remedy, null)
+  assert.equal(revalidated.handoff.needsAccountingAction, true)
+  assert.match(revalidated.detail, /INVOICE-SIDE ledger position is now/)
+  assert.match(revalidated.detail, /INV-779/, 'and it names the document that appeared')
+  assert.doesNotMatch(revalidated.detail, /REFUND position is now/, 'nothing on the refund side moved')
+
+  // The refusal really is byte-for-byte what it was: this is a movement no other field records.
+  const refusalAfter = revalidated.handoff.documents.document
+  assert.equal(refusalBefore?.ok, false)
+  assert.equal(refusalAfter.ok, false)
+  assert.equal(
+    refusalBefore && !refusalBefore.ok ? refusalBefore.detail : 'a',
+    !refusalAfter.ok ? refusalAfter.detail : 'b',
+  )
+  assert.deepEqual(
+    refusalBefore && !refusalBefore.ok ? refusalBefore.externalIds : null,
+    !refusalAfter.ok ? refusalAfter.externalIds : undefined,
+  )
+  assert.equal(
+    refusalBefore && !refusalBefore.ok ? refusalBefore.documentCount : 'a',
+    !refusalAfter.ok ? refusalAfter.documentCount : 'b',
+  )
+})
+
+test('an UNCHANGED document set under that same refusal stays CURRENT (o3d-y14 r12 F1)', async () => {
+  // The control that makes the fingerprint mean something. It reaches further into the ledger than
+  // any earlier field, so a fingerprint that varied between two reads of the same rows would
+  // withdraw every remedy in the run and teach the operator to ignore the withdrawal that matters.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = unsettledUpdateStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'CURRENT')
+  assert.equal(revalidated.handoff.remedy?.kind, 'READ_THEN_CHOOSE')
+})
+
+test('a RE-MIRRORED document withdraws it too, though nothing it says changed (o3d-y14 r12 F1)', async () => {
+  // The other shape, on the SUCCESS variant. One document, the same id, the same figure, the same
+  // basis, the same ledger — mirrored again. Amount, count, ids, system and basis are all equal, so
+  // this is a movement only the fingerprint records.
+  const { applyWcCouponCorrection, revalidateWcCouponHandoff } = await load()
+  reset()
+  const store = invoicedStore()
+
+  const result = await applyWcCouponCorrection(makeTx(store), invoicedEntry)
+  const handoff = result.outcome === 'CORRECTED' ? result.handoff : null
+  assert.equal(handoff?.documents.document.ok, true)
+
+  store.events![0].createdAt = '2026-06-09T09:00:00.000Z'
+
+  const revalidated = await revalidateWcCouponHandoff(makeTx(store), 'order-1', handoff!)
+
+  assert.equal(revalidated.outcome, 'SUPERSEDED')
+  assert.equal(revalidated.handoff.remedy, null)
+  assert.match(revalidated.detail, /over the mirrored event\(s\)/, 'and the withdrawal SAYS what moved')
+  assert.match(revalidated.detail, /2026-06-09T09:00:00\.000Z/)
 })

@@ -135,6 +135,15 @@ import {
  * carries an instruction is asserted over the whole case x refund-shape matrix rather than case by
  * case, which is what the last three rounds' review-by-inspection kept missing.
  *
+ * AND EVERY REMEDY NAMES EVERY POSITION IT DEPENDS ON (r12 finding 2). The precondition
+ * `wcCouponPreconditionSteps` prints first — the one defence over the residual window between the
+ * last re-validation and the line reaching a human's eye — named the REFUND position only, because
+ * that is the side r7 finding 2 was about. r11 finding 1 then established that the INVOICE side
+ * moves in the same window by the same mechanism and made the re-validation watch it, which closes
+ * the window up to the last check and not the residual one this line exists for. So the invoice-side
+ * position (`WcCouponDocumentPosition`, the same value the re-validation compares) travels on the
+ * remedy and on the net position, and the line names both and tells the operator to re-check both.
+ *
  * THE REVENUE-DEFERRAL JOURNAL IS A SEPARATE DOCUMENT WITH A SEPARATE — AND EMPTY — REMEDY.
  * Group A1 posts a manual journal deferring `subtotalBase + shippingBase − discountBase`, stamps the
  * result on `SalesOrder.unearnedRevenueAmount`, and the daily batch later RECOGNISES that same
@@ -269,8 +278,18 @@ export function isWcCouponOrderRefunded(refunds: WcCouponRefundEvidence): boolea
  *   which ones, which ledger, and which tax basis. A document that was voided, re-posted or joined
  *   by a second one changes at least one of them.
  *
+ *   AND THE DOCUMENT SET ITSELF (r12 finding 1). The fields above are what a SUCCESSFUL derivation
+ *   claims; a REFUSAL claims none of them, and carries only the sentence saying why it failed. That
+ *   sentence is not a description of the rows it failed over — "2 SALES_INVOICE_UPDATE event(s)
+ *   never reached POSTED" is reached before the posted documents are read at all, and "a
+ *   SALES_INVOICE was posted but the mirrored event does not carry a document payload" names a type
+ *   and a reason, never a document. So the derivation's own `documentSet` fingerprint travels here
+ *   and is compared, on every variant. See `posted-order-discount.ts` for what is in it and why.
+ *
  * WHAT IT DELIBERATELY IS NOT. It is not a hash: a withdrawal has to be able to SAY what moved, and
- * an operator who is told only that "something changed" learns to re-run rather than to look.
+ * an operator who is told only that "something changed" learns to re-run rather than to look. That
+ * governs the fingerprint too — every one of its entries is a sentence, and
+ * `describeWcCouponDocumentPosition` prints them.
  */
 export type WcCouponMirroredDocumentPosition =
   | {
@@ -282,6 +301,8 @@ export type WcCouponMirroredDocumentPosition =
       externalIds: string[]
       externalSystem: string | null
       taxBasis: PostedInvoiceTaxBasis
+      /** The rows the derivation was computed over, sorted (r12 finding 1). */
+      documentSet: string[]
     }
   | {
       ok: false
@@ -290,6 +311,13 @@ export type WcCouponMirroredDocumentPosition =
       detail: string | null
       documentCount: number | null
       externalIds: string[]
+      /**
+       * The rows the refusal was derived over, sorted (r12 finding 1). Unlike `documentCount` and
+       * `externalIds` — which the derivation sets only where it ESTABLISHED which documents disagree,
+       * so that a caller can name them — this is present on every refusal, because it is evidence
+       * rather than a claim and prescribes nothing.
+       */
+      documentSet: string[]
     }
 
 export type WcCouponDocumentPosition = {
@@ -321,6 +349,7 @@ export function buildWcCouponDocumentPosition(
           externalIds: [...document.externalIds],
           externalSystem: document.externalSystem,
           taxBasis: document.taxBasis,
+          documentSet: [...document.documentSet],
         }
       : {
           ok: false,
@@ -328,6 +357,9 @@ export function buildWcCouponDocumentPosition(
           detail: document.reason === 'UNRECOVERABLE' ? document.detail : null,
           documentCount: document.reason === 'UNRECOVERABLE' ? (document.documentCount ?? null) : null,
           externalIds: document.reason === 'UNRECOVERABLE' ? [...(document.externalIds ?? [])] : [],
+          // Carried on BOTH refusal reasons, unlike the two fields above: NO_POSTED_EVENT's set is
+          // empty because there is nothing to fingerprint, not because nothing was looked at.
+          documentSet: [...document.documentSet],
         },
   }
 }
@@ -340,6 +372,17 @@ export function buildWcCouponDocumentPosition(
  */
 function idSet(ids: readonly string[]): string {
   return [...new Set(ids)].sort().join('|')
+}
+
+/**
+ * The document-set fingerprint in canonical form (r12 finding 1).
+ *
+ * Sorted for the same reason `idSet` is, and NOT de-duplicated for the opposite one: two documents
+ * identical in every field are two documents, and collapsing them would hide exactly the duplication
+ * r8 finding 2 refuses the netting over.
+ */
+function documentSetKey(entries: readonly string[]): string {
+  return [...entries].sort().join('\n')
 }
 
 /** Is this the SAME invoice-side position the handoff was derived from? Field by field. */
@@ -358,7 +401,10 @@ export function sameWcCouponDocumentPosition(left: WcCouponDocumentPosition, rig
       a.documentCount === b.documentCount &&
       a.externalSystem === b.externalSystem &&
       a.taxBasis === b.taxBasis &&
-      idSet(a.externalIds) === idSet(b.externalIds)
+      idSet(a.externalIds) === idSet(b.externalIds) &&
+      // r12 finding 1. Two POSTED documents that both record NO external id agree on the amount, the
+      // count and the (empty) id list, so swapping one for another moves nothing above this line.
+      documentSetKey(a.documentSet) === documentSetKey(b.documentSet)
     )
   }
   if (!a.ok && !b.ok) {
@@ -369,13 +415,26 @@ export function sameWcCouponDocumentPosition(left: WcCouponDocumentPosition, rig
       a.reason === b.reason &&
       a.detail === b.detail &&
       a.documentCount === b.documentCount &&
-      idSet(a.externalIds) === idSet(b.externalIds)
+      idSet(a.externalIds) === idSet(b.externalIds) &&
+      // r12 finding 1 — AND THE WORDS ARE NOT THE ROWS. Everything above this line is what the
+      // refusal SAYS, and a refusal says why the derivation failed, not which documents it failed
+      // over: the unsettled-update refusal is reached before the posted set is read at all, and the
+      // unreadable-payload one names a TYPE and a reason. The rows themselves are compared here.
+      documentSetKey(a.documentSet) === documentSetKey(b.documentSet)
     )
   }
   return false
 }
 
-/** Render an invoice-side position for an operator message. Says WHAT it is, never just "changed". */
+/**
+ * Render an invoice-side position for an operator message. Says WHAT it is, never just "changed".
+ *
+ * THE FINGERPRINT IS PRINTED, NOT JUST COMPARED (r12 finding 1). A position can move on the document
+ * set ALONE — an unreadable payload behind the one the refusal names, a re-mirrored event, an
+ * unsettled update swapped for another — and a withdrawal that read "the position is now X, not the
+ * X it was derived from" is the "something changed" message this whole type was built to avoid. It
+ * is one line per row and it is what an operator opens the accounting system with.
+ */
 export function describeWcCouponDocumentPosition(position: WcCouponDocumentPosition): string {
   const document = position.document
   const documentPart = document.ok
@@ -387,11 +446,13 @@ export function describeWcCouponDocumentPosition(position: WcCouponDocumentPosit
       : `an UNRECOVERABLE posted-document read${
           document.documentCount !== null ? ` over ${document.documentCount} document(s)` : ''
         }${document.externalIds.length ? ` [${document.externalIds.join(', ')}]` : ''} (${document.detail ?? 'no detail'})`
+  const set = [...position.document.documentSet].sort()
   return (
     `accountingInvoiceId=${position.accountingInvoiceId ?? 'none'}, ` +
     `SYNCED sales invoice(s) [${[...position.postedInvoiceExternalIds].sort().join(', ')}], ` +
     `revenue-deferral batch ${position.revenueDeferredBatchRef ?? 'none'} of ` +
-    `${position.unearnedRevenueAmount ?? 'nothing'}, and ${documentPart}`
+    `${position.unearnedRevenueAmount ?? 'nothing'}, and ${documentPart}` +
+    `, over the mirrored event(s) {${set.length ? set.join(' | ') : 'none'}}`
   )
 }
 
@@ -917,7 +978,22 @@ export type WcCouponRemedy = {
    * travel with the instruction, so no operator can read the instruction without it.
    */
   validAgainst: WcCouponRefundEvidence
-  /** When the position above was read. */
+  /**
+   * THE INVOICE-SIDE POSITION THIS REMEDY IS ONLY VALID AGAINST (o3d-y14 r12 finding 2).
+   *
+   * The same argument as `validAgainst`, one layer in. r11 finding 1 established that the invoice
+   * side moves in exactly the same window as the refund side and by the same mechanism — a document
+   * voided and re-posted in Xero, a second invoice raised, a back-reference repair (o3d-9kek) — and
+   * made the RE-VALIDATION watch both. That closes the window up to the last check. The RESIDUAL
+   * window, between that check and the line reaching the operator's eye, is closed by nothing but
+   * this precondition, and it named the refund position alone: an operator was told to re-check
+   * whether a refund had landed, and told nothing about the document their instruction names.
+   *
+   * The property is one property: A REMEDY NAMES EVERY POSITION IT DEPENDS ON. It depends on both,
+   * so it carries both, and `wcCouponPreconditionSteps` prints both before any instrument.
+   */
+  validAgainstDocuments: WcCouponDocumentPosition
+  /** When the positions above were read. */
   derivedAt: string
 }
 
@@ -990,6 +1066,24 @@ function describeRefundPrecondition(refunds: WcCouponRefundEvidence): string {
  * moment a human reads the console. A refund committed a minute after the correction leaves a live
  * instruction to bill a customer who has just been refunded, and the only defence available on the
  * far side of a committed transaction is to tell the operator what the instruction depends on.
+ *
+ * AND IT NAMES EVERY POSITION THE INSTRUCTION DEPENDS ON, NOT ONLY THE REFUNDS (o3d-y14 r12
+ * finding 2).
+ *
+ * THE DEFECT THIS REPLACES. r11 finding 1 established that the invoice side moves in the same window
+ * and by the same mechanism as the refund side — a document voided and re-posted in the accounting
+ * system, a second invoice raised for the order, a back-reference repair (o3d-9kek) — and made the
+ * re-validation re-read BOTH before printing. That narrows the window to "between this read and that
+ * line reaching the operator's eye". The residual is closed by this line and by nothing else, and it
+ * was still written as though the refunds were the only thing that could move: an operator was told
+ * to re-check whether a refund had landed, and told nothing whatever about the DOCUMENT their
+ * instruction names — the one thing they are about to open, in the system where it moves.
+ *
+ * Both positions are therefore stated, both as read at the same instant, and the re-check covers
+ * both. The document half is rendered by `describeWcCouponDocumentPosition`, the same function the
+ * WITHDRAWAL uses, so the sentence an operator re-checks against is the sentence a withdrawal would
+ * contradict — and its document-set fingerprint (r12 finding 1) is in there, because "the ledger
+ * holds these two documents carrying these two figures" is precisely what they are re-checking.
  */
 export function wcCouponPreconditionSteps(input: {
   /** How the block opens — "REMEDY (Xero)" for an instruction, its own heading for a bare finding. */
@@ -998,6 +1092,8 @@ export function wcCouponPreconditionSteps(input: {
   beforeWhat: string
   externalSystem: string | null
   validAgainst: WcCouponRefundEvidence
+  /** r12 finding 2. The invoice-side half of the same precondition — never defaulted, never omitted. */
+  validAgainstDocuments: WcCouponDocumentPosition
   derivedAt: string
   /** The credit notes the figure was NETTED against, or empty when it depends on none. */
   nettedAgainst: string[]
@@ -1006,8 +1102,12 @@ export function wcCouponPreconditionSteps(input: {
 }): string[] {
   const steps = [
     `${input.heading} — VALID ONLY WHILE this order's refund position is ` +
-      `${describeRefundPrecondition(input.validAgainst)}, as read ${input.derivedAt}. RE-CHECK THAT ` +
-      `IMMEDIATELY BEFORE ${input.beforeWhat}: a refund recorded since voids ${input.whatIsVoid}. ` +
+      `${describeRefundPrecondition(input.validAgainst)}, AND its INVOICE-SIDE ledger position is ` +
+      `${describeWcCouponDocumentPosition(input.validAgainstDocuments)} — both as read ` +
+      `${input.derivedAt}. RE-CHECK BOTH IMMEDIATELY BEFORE ${input.beforeWhat}: a refund recorded ` +
+      'since, OR a sales-invoice document voided, re-posted, added or newly linked since, voids ' +
+      `${input.whatIsVoid}. IMS is as blind to the second as to the first once this run has exited, ` +
+      'and the document half is the half you are about to open. ' +
       'Re-derive it with `--reprint <allowlist>`, which rebuilds this handoff from live state for an ' +
       'order that has ALREADY been corrected (a plain report will not — a corrected order is skipped ' +
       'by every later scan).',
@@ -1039,6 +1139,7 @@ export function wcCouponRemedySteps(remedy: WcCouponRemedy): string[] {
     beforeWhat: 'POSTING',
     externalSystem: remedy.externalSystem,
     validAgainst: remedy.validAgainst,
+    validAgainstDocuments: remedy.validAgainstDocuments,
     derivedAt: remedy.derivedAt,
     nettedAgainst: remedy.nettedAgainst,
     whatIsVoid: 'this remedy',
@@ -1144,6 +1245,13 @@ export type WcCouponNetPosition = {
   nettedAgainst: string[]
   /** The refund position the netting was performed against (r7 finding 2). */
   validAgainst: WcCouponRefundEvidence
+  /**
+   * The INVOICE-SIDE position it was performed against (r12 finding 2). A net is
+   * `invoice − credit notes`, so a document voided, re-posted or joined by a second one between the
+   * check and the operator's eye invalidates it exactly as a refund does — and a net of ZERO, whose
+   * whole message is that there is nothing to look at, is the outcome that most needs saying so.
+   */
+  validAgainstDocuments: WcCouponDocumentPosition
   derivedAt: string
 }
 
@@ -1178,6 +1286,7 @@ export function wcCouponNetClaimSteps(position: WcCouponNetPosition): string[] {
         beforeWhat: 'FILING THIS ORDER AS SETTLED',
         externalSystem: position.externalSystem,
         validAgainst: position.validAgainst,
+        validAgainstDocuments: position.validAgainstDocuments,
         derivedAt: position.derivedAt,
         nettedAgainst: position.nettedAgainst,
         whatIsVoid: 'this conclusion',
@@ -1345,6 +1454,12 @@ function wcCouponRefundedInvoiceLines(
     keptOrderLevel: number
     refunds: WcCouponRefundEvidence
     reversal: CreditNoteOrderDiscountReversal
+    /**
+     * The invoice-side position this render was derived from (r12 finding 2). It travels into every
+     * remedy and every net position so their precondition can name it — REQUIRED, because a default
+     * would let a caller that never read the invoice side assert one on the operator's behalf.
+     */
+    documents: WcCouponDocumentPosition
     derivedAt: string
   },
 ): WcCouponHandoffRender {
@@ -1393,6 +1508,7 @@ function wcCouponRefundedInvoiceLines(
       documentRef: invoice.documentRef,
       nettedAgainst: [...refunds.postedCreditNoteExternalIds],
       validAgainst: refunds,
+      validAgainstDocuments: context.documents,
       derivedAt: context.derivedAt,
     }
     // The two documents' FACTS. The subtraction over them — and every conclusion drawn from it — is
@@ -1426,6 +1542,7 @@ function wcCouponRefundedInvoiceLines(
         // still stand.
         nettedAgainst: [...refunds.postedCreditNoteExternalIds],
         validAgainst: refunds,
+        validAgainstDocuments: context.documents,
         derivedAt: context.derivedAt,
       },
       netPosition,
@@ -1571,6 +1688,12 @@ export function wcCouponInvoiceHandoffRender(
     keptOrderLevel: number
     refunds: WcCouponRefundEvidence
     reversal: CreditNoteOrderDiscountReversal
+    /**
+     * The invoice-side position this render was derived from (r12 finding 2). It travels into every
+     * remedy and every net position so their precondition can name it — REQUIRED, because a default
+     * would let a caller that never read the invoice side assert one on the operator's behalf.
+     */
+    documents: WcCouponDocumentPosition
     derivedAt: string
   },
 ): WcCouponHandoffRender {
@@ -1592,6 +1715,7 @@ export function wcCouponInvoiceHandoffRender(
     // Nothing was netted on an unrefunded order — there is no credit note to depend on.
     nettedAgainst: [] as string[],
     validAgainst: refunds,
+    validAgainstDocuments: context.documents,
     derivedAt: context.derivedAt,
   }
 
@@ -1728,13 +1852,21 @@ export function wcCouponInvoiceHandoffRender(
   }
 }
 
-/** Backwards-compatible line-only view. The remedy travels on the handoff. */
+/**
+ * Backwards-compatible line-only view. The remedy travels on the handoff.
+ *
+ * `documents` is REQUIRED even though `reversal` and `derivedAt` are not (r12 finding 2). The two
+ * optional ones have honest "not read" values — `NO_CREDIT_NOTE_REVERSAL` says so in words, and a
+ * missing read time is a clock. An invoice-side position has no such value: every default would be a
+ * claim about the ledger, printed inside a precondition an operator is told to re-check.
+ */
 export function wcCouponInvoiceHandoffLines(
   invoice: WcCouponInvoiceHandoff,
   context: {
     currency: string
     keptOrderLevel: number
     refunds: WcCouponRefundEvidence
+    documents: WcCouponDocumentPosition
     reversal?: CreditNoteOrderDiscountReversal
     derivedAt?: string
   },
@@ -1824,6 +1956,9 @@ export async function buildWcCouponLedgerHandoff(
     currency: input.currency,
     keptOrderLevel: input.keptOrderLevel,
     refunds,
+    // r12 finding 2. The SAME value the re-validation compares against, so the position a remedy's
+    // precondition tells an operator to re-check is exactly the position a withdrawal contradicts.
+    documents,
     reversal,
     derivedAt: (input.derivedAt ?? new Date()).toISOString(),
   })

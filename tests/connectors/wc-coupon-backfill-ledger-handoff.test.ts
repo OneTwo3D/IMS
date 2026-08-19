@@ -82,19 +82,11 @@ function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = [], creditN
     }))
   return {
     accountingEvent: {
-      count: async ({
-        where,
-      }: {
-        where: { sourceEntityType: string; sourceEntityId: string; type: string; status: { notIn: string[] } }
-      }) => {
-        if (!('notIn' in where.status)) throw new Error('the double only implements { notIn } on status')
-        return rows.filter(
-          (row) =>
-            row.sourceEntityType === where.sourceEntityType &&
-            row.sourceEntityId === where.sourceEntityId &&
-            row.type === where.type &&
-            !where.status.notIn.includes(row.status),
-        ).length
+      // r12 finding 1 — the unsettled-UPDATE read is a findMany now, because the refusal it produces
+      // states only a COUNT and the ROWS have to reach the document-set fingerprint. A `count` here
+      // would be dead, and a dead double is one a regression can quietly pass, so it throws.
+      count: async () => {
+        throw new Error('the unsettled invoice-UPDATE read must select rows, not count them (r12 F1)')
       },
       findMany: async ({
         where,
@@ -104,7 +96,7 @@ function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = [], creditN
           sourceEntityType: string
           sourceEntityId: string | { in: string[] }
           type: { in: string[] } | string
-          status?: string
+          status?: string | { notIn: string[] }
         }
         orderBy?: Array<Record<string, 'desc' | 'asc'>>
       }) => {
@@ -115,6 +107,20 @@ function makeEventClient(rows: EventRow[], refundRows: RefundRow[] = [], creditN
           const ids = typeof where.sourceEntityId === 'string' ? [where.sourceEntityId] : where.sourceEntityId.in
           if (typeof where.type !== 'string') throw new Error('the credit-note read filters on a scalar type')
           return cnEvents.filter((row) => ids.includes(row.sourceEntityId) && row.type === where.type)
+        }
+        // The UNSETTLED invoice-UPDATE read (r12 finding 1): a scalar type and a `notIn` on status.
+        // Its own branch for the same reason the credit-note one has its own — a query of the wrong
+        // shape must fail loudly rather than be answered by a loosened invoice filter.
+        if (typeof where.type === 'string' && typeof where.status === 'object' && where.status !== null) {
+          if (typeof where.sourceEntityId !== 'string') throw new Error('the unsettled read filters one order')
+          const notIn = where.status.notIn
+          return rows.filter(
+            (row) =>
+              row.sourceEntityType === where.sourceEntityType &&
+              row.sourceEntityId === where.sourceEntityId &&
+              row.type === where.type &&
+              !notIn.includes(row.status),
+          )
         }
         if (typeof where.sourceEntityId !== 'string' || typeof where.type === 'string' || !orderBy) {
           throw new Error('the double only implements the invoice read in this shape')
@@ -1462,7 +1468,9 @@ function instrumentIsForbidden(line: string): boolean {
 }
 
 /** Every shape the handoff can take, as (name, builder) — enumerated so none can be forgotten. */
-const MATRIX: Array<[string, () => Promise<{ lines: string[]; remedy: unknown; netPosition: unknown }>]> = [
+const MATRIX: Array<
+  [string, () => Promise<{ lines: string[]; remedy: unknown; netPosition: unknown; documents: unknown }>]
+> = [
   ['unrefunded / no invoice', () => handoffFor([], 0, { ...LINKED_INVOICE, accountingInvoiceId: null })],
   ['unrefunded / agrees', () => handoffFor([invoiceWithNoDiscountAccount()], 0)],
   ['unrefunded / discounts more', () => handoffFor([postedInvoice()], 0)],
@@ -1601,17 +1609,34 @@ test('with NO posted credit note the fallback does not send the operator to open
   assert.doesNotMatch(text, /every credit note above/)
 })
 
-test('every remedy carries the refund position it depends on, and says to re-check it (o3d-y14 r7 F2)', async () => {
+test('every remedy carries BOTH positions it depends on, and says to re-check both (r7 F2, r12 F2)', async () => {
   // r7 finding 2: the correction's lock proves the position at the moment the amount was rewritten
   // and nothing about the moment a human reads the line. The precondition is printed FIRST and by
   // the same function that prints the instrument, so no remedy can be rendered without it.
+  //
+  // r12 finding 2: and it names the INVOICE side as well. r11 finding 1 established that the ledger
+  // side moves in the same window and by the same mechanism, and made the re-validation watch it —
+  // which closes the window up to the last check and not the residual one this line exists for. The
+  // invoice half was missing from exactly the sentence that closes it, on the one thing the operator
+  // is about to open.
+  const { describeWcCouponDocumentPosition } = await import(
+    '@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
+  )
+
   for (const [name, build] of MATRIX) {
     const handoff = await build()
     if (!handoff.remedy) continue
     const first = handoff.lines.find((line) => /^REMEDY \(/.test(line))
     assert.ok(first, `${name}: a remedy with no precondition line`)
     assert.match(first, /VALID ONLY WHILE this order's refund position is/, name)
-    assert.match(first, /RE-CHECK THAT IMMEDIATELY BEFORE POSTING/, name)
+    assert.match(first, /AND its INVOICE-SIDE ledger position is/, name)
+    assert.match(first, /RE-CHECK BOTH IMMEDIATELY BEFORE POSTING/, name)
+    // Not merely "some invoice-side words": the position it names is the one the handoff was
+    // derived from and the one a withdrawal would contradict, rendered by the same function.
+    assert.ok(
+      first.includes(describeWcCouponDocumentPosition(handoff.documents as never)),
+      `${name}: the precondition names an invoice position that is not the one this handoff carries`,
+    )
   }
 })
 
@@ -2016,4 +2041,130 @@ test('a refusal about ONE document still reads in the singular (o3d-y14 r11 F3)'
   assert.match(text, /^invoice INV-778 may exist for this order and IMS CANNOT establish/m)
   assert.doesNotMatch(text, /DISAGREEING/)
   assert.deepEqual(handoff.invoice.case === 'DOCUMENT_UNVERIFIED' ? handoff.invoice.externalIds : null, [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r12 finding 2 — a remedy names EVERY position it depends on
+// ---------------------------------------------------------------------------
+
+/**
+ * r7 finding 2 established the residual window: a remedy is re-validated immediately before it is
+ * printed, and everything between that check and the line reaching the operator's eye is closed by
+ * the precondition line and by nothing else. r11 finding 1 then established that the INVOICE side
+ * moves in that window too, and made the RE-VALIDATION watch it — leaving the precondition, the one
+ * defence over the residual, still saying "re-check the refunds" and nothing about the document the
+ * instruction names.
+ *
+ * The pair below differs on the invoice side ALONE and on a field that changes NO other sentence:
+ * the same document, the same id, the same figure, re-mirrored at a different moment. Every line of
+ * the two handoffs is identical except the precondition — which is the point. A precondition that
+ * did not carry the invoice position would render the two the same, and an operator holding the
+ * first would have no way to tell it had been derived against a ledger that has since moved.
+ */
+
+test('the precondition names the INVOICE-side position, not only the refunds (o3d-y14 r12 F2)', async () => {
+  const handoff = await handoffFor([postedInvoice()], 0)
+  const precondition = handoff.lines.find((line) => /^REMEDY \(/.test(line)) ?? ''
+
+  assert.equal(handoff.remedy?.kind, 'INCREASE_RECEIVABLE')
+  assert.match(precondition, /AND its INVOICE-SIDE ledger position is accountingInvoiceId=INV-778/)
+  assert.match(precondition, /1 posted document\(s\) \[INV-778\] carrying 10 GBP of order-level discount/)
+  assert.match(precondition, /over the mirrored event\(s\) \{POSTED SALES_INVOICE xero\/INV-778 mirrored /)
+  assert.match(
+    precondition,
+    /a sales-invoice document voided, re-posted, added or newly linked since, voids this remedy/,
+  )
+  assert.match(precondition, /RE-CHECK BOTH IMMEDIATELY BEFORE POSTING/)
+})
+
+test('two orders differing ONLY on the invoice side get different preconditions (o3d-y14 r12 F2)', async () => {
+  // The pair. The event is re-mirrored — same document, same id, same figure, a later `createdAt` —
+  // so the remedy, the facts and the refund half are word-for-word identical and the ONLY thing that
+  // can distinguish them is the invoice position the precondition carries.
+  const before = await handoffFor([postedInvoice()], 0)
+  const after = await handoffFor([postedInvoice({ createdAt: '2026-06-09T09:00:00.000Z' })], 0)
+
+  assert.equal(before.remedy?.kind, after.remedy?.kind)
+  assert.equal(before.remedy?.amount, after.remedy?.amount)
+  const differing = before.lines.filter((line, index) => line !== after.lines[index])
+  assert.equal(differing.length, 1, 'exactly one line may differ, and it is the precondition')
+  assert.match(differing[0], /^REMEDY \(Xero\) — VALID ONLY WHILE/)
+  assert.notDeepEqual(before.lines, after.lines)
+})
+
+test('a netted-to-ZERO conclusion carries the invoice-side precondition too (o3d-y14 r12 F2)', async () => {
+  // The outcome that takes an order OFF the operator's list rests on the invoice as much as on the
+  // credit notes — a net is `invoice - credit notes` — and it is the one whose whole message is that
+  // there is nothing to look at. r9 finding 2 made it carry the refund precondition for exactly this
+  // reason; the invoice half was missing from the same line.
+  const handoff = await NETTED_TO_ZERO()
+  const conditional = handoff.lines.find((line) => /IS CONDITIONAL/.test(line)) ?? ''
+
+  assert.equal(handoff.netPosition?.net, 0)
+  assert.equal(handoff.needsAccountingAction, false)
+  assert.match(conditional, /AND its INVOICE-SIDE ledger position is/)
+  assert.match(conditional, /1 posted document\(s\) \[INV-778\] carrying 10 GBP of order-level discount/)
+  assert.match(conditional, /RE-CHECK BOTH IMMEDIATELY BEFORE FILING THIS ORDER AS SETTLED/)
+})
+
+test('every netting claim carries both positions too, over the whole matrix (o3d-y14 r12 F2)', async () => {
+  // The same property as the remedy one, asserted the same way: over the matrix rather than case by
+  // case, because both r10 finding 1 and r7 finding 3 were things a case-by-case reading walked past
+  // for several rounds.
+  const { describeWcCouponDocumentPosition } = await import(
+    '@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
+  )
+
+  let seen = 0
+  for (const [name, build] of MATRIX) {
+    const handoff = await build()
+    if (!handoff.netPosition) continue
+    const precondition = handoff.lines.find((line) => /VALID ONLY WHILE/.test(line))
+    if (!precondition) continue
+    seen += 1
+    assert.ok(
+      precondition.includes(describeWcCouponDocumentPosition(handoff.documents as never)),
+      `${name}: a netting claim's precondition names an invoice position that is not the one it ran over`,
+    )
+  }
+  assert.ok(seen > 0, 'the matrix contains netted positions — otherwise this asserts nothing')
+})
+
+test('the precondition renderer cannot be called without an invoice position (o3d-y14 r12 F2)', async () => {
+  // A TYPE-level property made visible: `validAgainstDocuments` is required, so no future caller can
+  // print a precondition that quietly omits the half r11 finding 1 established moves. The runtime
+  // half of the assertion is that the position it is given is the one that reaches the text.
+  const { wcCouponPreconditionSteps } = await import(
+    '@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff'
+  )
+
+  const steps = wcCouponPreconditionSteps({
+    heading: 'REMEDY (Xero)',
+    beforeWhat: 'POSTING',
+    externalSystem: 'xero',
+    validAgainst: NO_REFUNDS,
+    validAgainstDocuments: {
+      currency: 'GBP',
+      accountingInvoiceId: 'INV-778',
+      postedInvoiceExternalIds: ['INV-901'],
+      revenueDeferredBatchRef: null,
+      unearnedRevenueAmount: null,
+      document: {
+        ok: false,
+        reason: 'UNRECOVERABLE',
+        detail: 'an update never settled',
+        documentCount: null,
+        externalIds: [],
+        documentSet: ['UNSETTLED SALES_INVOICE_UPDATE xero/UPD-1 mirrored 2026-05-02T09:00:00.000Z status PENDING'],
+      },
+    },
+    derivedAt: '2026-08-01T00:00:00.000Z',
+    nettedAgainst: [],
+    whatIsVoid: 'this remedy',
+  })
+
+  assert.equal(steps.length, 1)
+  assert.match(steps[0], /SYNCED sales invoice\(s\) \[INV-901\]/)
+  assert.match(steps[0], /an UNRECOVERABLE posted-document read \(an update never settled\)/)
+  assert.match(steps[0], /UNSETTLED SALES_INVOICE_UPDATE xero\/UPD-1 .* status PENDING/)
 })

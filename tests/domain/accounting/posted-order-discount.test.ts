@@ -1039,3 +1039,237 @@ test('a refusal that established NO document set reports no ids at all (o3d-y14 
   assert.equal(!read.ok && read.reason === 'UNRECOVERABLE' && read.externalIds, undefined)
   assert.equal(!read.ok && read.reason === 'UNRECOVERABLE' && read.documentCount, undefined)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-y14 r12 finding 1 — a refusal has to fingerprint the rows it happened over
+// ---------------------------------------------------------------------------
+
+/**
+ * r11 finding 1 made the backfill's re-validation compare the invoice position as a VALUE, refusal
+ * text included, and r11 removed one source of non-determinism from that text so the comparison
+ * could mean something. This is the other half.
+ *
+ * A REFUSAL DESCRIBES A FAILURE, NOT THE ROWS IT FAILED OVER. Every fixture pair below is two
+ * DIFFERENT document sets that produce the SAME refusal, byte for byte, with the same
+ * `documentCount` and the same `externalIds` — so a comparison over what the refusal SAYS sees a
+ * ledger that never moved, and leaves a live instruction standing against documents that are gone.
+ * Each pair is asserted to be identical in all of that and to differ ONLY in `documentSet`, which is
+ * what makes it a test of the fingerprint rather than of some other field that came along with it.
+ */
+
+/** A POSTED event whose payload is not an accounting document at all. */
+function unreadableInvoice(over: Partial<EventRow> = {}): EventRow {
+  return postedInvoice({ linesJson: { kind: 'something-else' }, ...over })
+}
+
+function refusalFacts(read: Awaited<ReturnType<typeof readPostedInvoiceOrderDiscount>>) {
+  return {
+    reason: read.ok ? 'ok' : read.reason,
+    detail: !read.ok && read.reason === 'UNRECOVERABLE' ? read.detail : null,
+    documentCount: !read.ok && read.reason === 'UNRECOVERABLE' ? read.documentCount : undefined,
+    externalIds: !read.ok && read.reason === 'UNRECOVERABLE' ? read.externalIds : undefined,
+  }
+}
+
+function documentSetOf(read: Awaited<ReturnType<typeof readPostedInvoiceOrderDiscount>>): string[] {
+  return read.ok ? read.documentSet : read.documentSet
+}
+
+test('an UNSETTLED-UPDATE refusal fingerprints the posted documents it never read (o3d-y14 r12 F1)', async () => {
+  // The worst of them: this branch returns BEFORE the posted documents are consulted, so its
+  // sentence is a count of unsettled updates and nothing else. The whole posted set can be replaced
+  // underneath it — here a second invoice is raised for the order, which is r10 finding 2's defect
+  // arriving through r7 finding 2's window — and every field the re-validation compares is equal.
+  const update = postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: null })
+  const before = makeClient({ events: [postedInvoice(), update] })
+  const after = makeClient({
+    events: [
+      postedInvoice(),
+      postedInvoice({ externalId: 'INV-779', businessDate: '2026-05-03', createdAt: '2026-05-03T09:00:00.000Z' }),
+      update,
+    ],
+  })
+
+  const first = await readPostedInvoiceOrderDiscount(before.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(after.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.deepEqual(refusalFacts(first), refusalFacts(second), 'the refusal itself is word-for-word the same')
+  assert.notDeepEqual(documentSetOf(first), documentSetOf(second), 'and the ledger it is about is not')
+  assert.equal(documentSetOf(first).length, 2, 'one posted document and the unsettled update')
+  assert.equal(documentSetOf(second).length, 3)
+  assert.ok(
+    documentSetOf(second).some((entry) => entry.includes('INV-779')),
+    'the document that appeared is named, so a withdrawal can say what moved',
+  )
+})
+
+test('an UNSETTLED-UPDATE refusal fingerprints the updates themselves too (o3d-y14 r12 F1)', async () => {
+  // The count is what the sentence states, so one update settling to VOID while another arrives
+  // leaves it identical — while an update is now in flight against the document the operator is
+  // being sent to read.
+  const before = makeClient({
+    events: [
+      postedInvoice(),
+      postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: 'UPD-1' }),
+    ],
+  })
+  const after = makeClient({
+    events: [
+      postedInvoice(),
+      postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'VOID', externalId: 'UPD-1' }),
+      postedInvoice({ type: 'SALES_INVOICE_UPDATE', status: 'PENDING', externalId: 'UPD-2' }),
+    ],
+  })
+
+  const first = await readPostedInvoiceOrderDiscount(before.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(after.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.deepEqual(refusalFacts(first), refusalFacts(second), 'still "1 SALES_INVOICE_UPDATE event(s)"')
+  assert.notDeepEqual(documentSetOf(first), documentSetOf(second))
+  assert.ok(documentSetOf(second).some((entry) => entry.includes('UPD-2')))
+  // VOID is a SETTLED status, so the retired update is not in the set at all — the fingerprint is
+  // the rows the derivation consulted, not every row that exists.
+  assert.equal(documentSetOf(second).some((entry) => entry.includes('UPD-1')), false)
+})
+
+test('an UNREADABLE-payload refusal fingerprints WHICH document it was (o3d-y14 r12 F1)', async () => {
+  // That sentence names a TYPE and a reason. The same one covers INV-778 today and the invoice that
+  // replaced it after a void-and-re-raise tomorrow — a movement that leaves the remedy naming a
+  // document the ledger no longer holds.
+  const before = makeClient({ events: [unreadableInvoice({ externalId: 'INV-778' })] })
+  const after = makeClient({ events: [unreadableInvoice({ externalId: 'INV-900' })] })
+
+  const first = await readPostedInvoiceOrderDiscount(before.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(after.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.match(
+    refusalFacts(first).detail ?? '',
+    /a SALES_INVOICE was posted for this order but the mirrored event does not carry a document payload/,
+  )
+  assert.deepEqual(refusalFacts(first), refusalFacts(second))
+  assert.notDeepEqual(documentSetOf(first), documentSetOf(second))
+  assert.deepEqual(documentSetOf(second), [
+    'POSTED SALES_INVOICE xero/INV-900 mirrored 2026-05-02T09:00:00.000Z GBP UNREADABLE: the mirrored ' +
+      'event does not carry a document payload',
+  ])
+})
+
+test('EVERY posted document is read, so a change behind the first failure moves the set (r12 F1)', async () => {
+  // The loop used to RETURN on the first unreadable document, so nothing after it was ever looked
+  // at. Here the newest document is unreadable in both worlds — it is what the refusal names — and
+  // the one behind it fails for a DIFFERENT reason in each. Same sentence, same ids, same count.
+  const newest = { externalId: 'INV-A', businessDate: '2026-05-03', createdAt: '2026-05-03T09:00:00.000Z' }
+  const before = makeClient({
+    events: [
+      unreadableInvoice(newest),
+      postedInvoice({ externalId: 'INV-B', linesJson: documentPayload({ currency: 'USD', discount: { amount: 10, accountCode: '260' } }) }),
+    ],
+  })
+  const after = makeClient({
+    events: [
+      unreadableInvoice(newest),
+      postedInvoice({ externalId: 'INV-B', linesJson: documentPayload({ discount: { amount: 'ten', accountCode: '260' } }) }),
+    ],
+  })
+
+  const first = await readPostedInvoiceOrderDiscount(before.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(after.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.deepEqual(refusalFacts(first), refusalFacts(second), 'the refusal still names INV-A and its reason')
+  assert.notDeepEqual(documentSetOf(first), documentSetOf(second))
+  assert.ok(documentSetOf(first).some((entry) => entry.includes('the posted document is in USD but the order is in GBP')))
+  assert.ok(documentSetOf(second).some((entry) => entry.includes('is not a usable number')))
+})
+
+test('a SUCCESSFUL read fingerprints its documents too — agreement is not identity (o3d-y14 r12 F1)', async () => {
+  // The success variant's hole. Two POSTED documents that never recorded an external id (o3d-9kek)
+  // agree on the amount, the count, the ledger, the basis and the (empty) id list, so replacing one
+  // of them with another moves nothing the r11 comparison looks at.
+  const before = makeClient({
+    events: [
+      postedInvoice({ externalId: null }),
+      postedInvoice({ externalId: null, businessDate: '2026-05-01', createdAt: '2026-05-01T09:00:00.000Z' }),
+    ],
+  })
+  const after = makeClient({
+    events: [
+      postedInvoice({ externalId: null }),
+      postedInvoice({ externalId: null, businessDate: '2026-06-01', createdAt: '2026-06-01T09:00:00.000Z' }),
+    ],
+  })
+
+  const first = await readPostedInvoiceOrderDiscount(before.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(after.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(first.ok && second.ok, true)
+  assert.equal(first.ok && first.amount, second.ok && second.amount)
+  assert.equal(first.ok && first.documentCount, second.ok && second.documentCount)
+  assert.deepEqual(first.ok ? first.externalIds : null, second.ok ? second.externalIds : null)
+  assert.equal(first.ok && first.taxBasis, second.ok && second.taxBasis)
+  assert.notDeepEqual(documentSetOf(first), documentSetOf(second), 'and the documents are different documents')
+})
+
+test('the fingerprint is ORDER-INSENSITIVE — the same rows the other way round are one set (r12 F1)', async () => {
+  // The r11 lesson, on the new field: neither Prisma nor PostgreSQL promises a stable order for rows
+  // that tie on the ordering columns, and a comparison that refused on row order would withdraw
+  // remedies at random. `externalIds` is deliberately in ROW order — it is presentational, newest
+  // first — so the pair also proves the fingerprint is not simply inheriting that order.
+  const tied = { businessDate: '2026-05-02', createdAt: '2026-05-02T09:00:00.000Z' }
+  const oneWay = makeClient({
+    events: [postedInvoice({ ...tied, externalId: 'INV-A' }), postedInvoice({ ...tied, externalId: 'INV-B' })],
+  })
+  const otherWay = makeClient({
+    events: [postedInvoice({ ...tied, externalId: 'INV-B' }), postedInvoice({ ...tied, externalId: 'INV-A' })],
+  })
+
+  const first = await readPostedInvoiceOrderDiscount(oneWay.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(otherWay.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.notDeepEqual(
+    first.ok ? first.externalIds : null,
+    second.ok ? second.externalIds : null,
+    'the query really did come back the other way round',
+  )
+  assert.deepEqual(documentSetOf(first), documentSetOf(second), 'and the fingerprint does not care')
+})
+
+test('NO_POSTED_EVENT reports an EMPTY set, and it is empty because nothing was there (r12 F1)', async () => {
+  // The pair for the branch that has nothing to fingerprint. It is carried rather than left absent
+  // so no caller has to distinguish "no documents" from "the field does not exist on this variant".
+  const { client } = makeClient({ events: [] })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(!read.ok && read.reason, 'NO_POSTED_EVENT')
+  assert.deepEqual(documentSetOf(read), [])
+})
+
+test('every fingerprint entry is a SENTENCE, not a digest (o3d-y14 r12 F1)', async () => {
+  // A withdrawal has to be able to say WHAT moved — an operator told only that "something changed"
+  // learns to re-run rather than to look — so the entries are printed, and they name the connector,
+  // the external id, when the event was mirrored and what this derivation read out of it.
+  const { client } = makeClient({ events: [postedInvoice()] })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.deepEqual(documentSetOf(read), [
+    'POSTED SALES_INVOICE xero/INV-778 mirrored 2026-05-02T09:00:00.000Z GBP carries 10 GBP (EXCLUSIVE)',
+  ])
+})
+
+test('a document that records NO connector or id still fingerprints as itself (o3d-y14 r12 F1)', async () => {
+  // o3d-9kek and the un-replayable connector, in one row. Neither is a reason to drop it from the
+  // set: an unnameable document is exactly the one nothing else in the position distinguishes.
+  const { client } = makeClient({
+    events: [postedInvoice({ externalSystem: null, externalId: null })],
+  })
+
+  const read = await readPostedInvoiceOrderDiscount(client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(!read.ok && read.reason, 'UNRECOVERABLE')
+  assert.deepEqual(documentSetOf(read), [
+    'POSTED SALES_INVOICE NO-SYSTEM/NO-EXTERNAL-ID mirrored 2026-05-02T09:00:00.000Z GBP UNREADABLE: ' +
+      'the mirrored event names no connector whose posting rule can be replayed (externalSystem null), ' +
+      'so whether the document carried the 10 it requested is unknown',
+  ])
+})

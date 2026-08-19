@@ -110,7 +110,10 @@ import { readDiscountRestatement, restatementHadPostedInvoice } from './discount
  *
  * WHEN IT CANNOT BE RECOVERED. Every branch that cannot establish the figure reports UNRECOVERABLE,
  * and the caller refuses and surfaces — which is what that path already does for the other cases
- * where the remaining balance is ambiguous (prior refunds, no discount account configured).
+ * where the remaining balance is ambiguous (prior refunds, no discount account configured). A
+ * refusal describes a FAILURE and not the rows it happened over, so every answer — refusals
+ * included — also carries `documentSet`, the fingerprint of the rows it was derived from
+ * (r12 finding 1; see the block above `PostedOrderDiscountClient`).
  *
  * WHAT THE CALLER DOES WITH A RECOVERED FIGURE THAT DISAGREES. It refuses too, and that is a
  * deliberate limit on this function rather than a failure of it. Recovering the posted figure is
@@ -167,7 +170,18 @@ type MirroredDocument = {
   currency: string
   externalSystem: string | null
   externalId: string | null
+  /** Read for the document-set fingerprint only (r12 finding 1); it decides no amount. */
+  createdAt: unknown
   linesJson: unknown
+}
+
+/** A SALES_INVOICE_UPDATE that has not settled — the rows the first refusal below is about. */
+type UnsettledInvoiceUpdate = {
+  type: string
+  status: string
+  externalSystem: string | null
+  externalId: string | null
+  createdAt: unknown
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -296,6 +310,96 @@ function readDocumentTaxBasis(payload: Record<string, unknown>): PostedDocumentT
   return 'UNKNOWN'
 }
 
+/**
+ * THE DOCUMENT SET THIS ANSWER WAS DERIVED OVER, AS A VALUE (o3d-y14 r12 finding 1).
+ *
+ * THE DEFECT IT CLOSES. r11 finding 1 made the o3d-y14 re-validation compare the invoice-side
+ * position as a VALUE — including, for a refusal, the refusal's own words — so that a document
+ * voided, re-posted or joined by a second one between the correction and the print withdraws the
+ * printed remedy. r11 removed one source of non-determinism from those words (the disagreement
+ * refusal's amounts were sorted) so that they could be compared at all. This is the other half: an
+ * `UNRECOVERABLE` refusal describes a FAILURE, and a failure is not a description of the rows it
+ * happened over. Two entirely different document sets produce identical refusal text —
+ *
+ *   • `2 SALES_INVOICE_UPDATE event(s) … never reached POSTED` says only how many updates are
+ *     unsettled. It is reached BEFORE the posted documents are looked at at all, so the whole posted
+ *     set can be replaced underneath it and every field of the compared position is unchanged.
+ *   • `a SALES_INVOICE was posted for this order but the mirrored event does not carry a document
+ *     payload` names a TYPE and a reason, never a document. The same sentence covers INV-778 today
+ *     and INV-900 (voided, re-raised, still unparseable) tomorrow.
+ *   • only the several-documents-DISAGREE refusal carries `documentCount`/`externalIds`, and that is
+ *     deliberate — the callers read those as "the derivation established WHICH documents this is
+ *     about", and populating them elsewhere would make an unreadable-payload refusal render as a
+ *     DISAGREEMENT, which is a different and false statement.
+ *
+ * So the fingerprint is a SEPARATE field from the prose, carried on EVERY variant including the
+ * successful one, and read by nothing but the comparison and the withdrawal message.
+ *
+ * WHAT IT COVERS, and why exactly this set. It is the rows this derivation consulted, one entry each:
+ *
+ *   every POSTED sales-invoice event — its type, which connector and external id name it, when it
+ *   was mirrored, its own currency, and WHAT THIS DERIVATION READ OUT OF IT (the replayed posted
+ *   amount and tax basis, or the reason it could not be read). The read outcome is in there because
+ *   the set can move without any row appearing or vanishing: with three documents where the first is
+ *   unreadable, the refusal names the first and nothing else is examined at all — so a second
+ *   document going from readable to unreadable, or its amount changing under a re-mirror, is invisible
+ *   in every other field. Every document is therefore READ, not just the ones before the first
+ *   failure;
+ *
+ *   every UNSETTLED SALES_INVOICE_UPDATE — its identity and its status. That refusal's own words are
+ *   a COUNT, so one update settling to VOID while another arrives leaves the sentence, the posted set
+ *   and the count all identical while an update is now in flight against the document an operator is
+ *   being sent to read.
+ *
+ * WHAT IT DELIBERATELY IS NOT.
+ *
+ *   NOT A DIGEST. A withdrawal has to be able to SAY what moved (see
+ *   `describeWcCouponDocumentPosition`), and an operator told only that "something changed" learns to
+ *   re-run rather than to look. Every entry is a sentence.
+ *
+ *   NOT THE `AccountingEvent` PRIMARY KEY. A surrogate id means nothing to the operator who reads the
+ *   withdrawal, and the reference this whole module is built on is the (connector, external id) pair.
+ *   `createdAt` carries the row-identity part of the job and is readable.
+ *
+ *   NOT DE-DUPLICATED, unlike the id sets the position compares elsewhere. Two documents that are
+ *   identical in every field are TWO documents holding the discount twice, and collapsing them would
+ *   hide exactly the duplication r8 finding 2 exists for.
+ *
+ *   SORTED, for the reason r11 sorted the refusal's amounts: neither Prisma nor PostgreSQL promises a
+ *   stable row order, and a comparison that refused on row order would withdraw remedies at random —
+ *   which teaches an operator to ignore the withdrawal that matters.
+ *
+ * THE RESIDUAL, stated rather than rounded away. Two POSTED documents that record NO external id
+ * (o3d-9kek), were mirrored at the same instant and read identically are indistinguishable here, so
+ * swapping one for the other is not detected. The unique constraint makes that impossible for any
+ * document that DID record an id, and adding or removing one still moves the entry count. Likewise
+ * the failure the refusal NAMES is the first in the presentational order, and two documents tied on
+ * both `businessDate` and `createdAt` could swap which one that is between reads — which the
+ * fingerprint neither causes nor fixes, and which fails SAFE: it presents as a withdrawal, never as
+ * a remedy that should have been withdrawn and was not.
+ */
+function fingerprintInstant(value: unknown): string {
+  if (value instanceof Date) return value.toISOString()
+  if (typeof value === 'string' || typeof value === 'number') {
+    const parsed = new Date(value)
+    return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toISOString()
+  }
+  return 'no recorded time'
+}
+
+/** The identity half of a fingerprint entry, shared by posted documents and unsettled updates. */
+function describeMirroredRow(row: {
+  type: string
+  externalSystem: string | null
+  externalId: string | null
+  createdAt: unknown
+}): string {
+  return (
+    `${row.type} ${row.externalSystem ?? 'NO-SYSTEM'}/${row.externalId ?? 'NO-EXTERNAL-ID'} ` +
+    `mirrored ${fingerprintInstant(row.createdAt)}`
+  )
+}
+
 export type PostedOrderDiscountClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingSyncLog'>
 
 /** The client surface the mirrored-document read alone needs. */
@@ -350,9 +454,16 @@ export type PostedInvoiceOrderDiscount =
        * MIXED only where several documents disagree about it.
        */
       taxBasis: PostedInvoiceTaxBasis
+      /**
+       * THE ROWS THIS ANSWER WAS DERIVED OVER, sorted (o3d-y14 r12 finding 1). See the fingerprint
+       * block above `PostedOrderDiscountClient`. Carried on the SUCCESS variant too: two POSTED
+       * documents that both record no external id agree on an amount, a count and an (empty) id
+       * list, so replacing one of them moves nothing else either.
+       */
+      documentSet: string[]
     }
   /** No POSTED mirrored sales-invoice event exists. NOT the same as "no document exists". */
-  | { ok: false; reason: 'NO_POSTED_EVENT' }
+  | { ok: false; reason: 'NO_POSTED_EVENT'; documentSet: string[] }
   /** A document exists (or may) and what it carries cannot be established. Never guess past this. */
   | {
       ok: false
@@ -382,6 +493,17 @@ export type PostedInvoiceOrderDiscount =
        * is "not established", never "there are none".
        */
       externalIds?: string[]
+      /**
+       * THE ROWS THIS REFUSAL WAS DERIVED OVER, sorted (o3d-y14 r12 finding 1).
+       *
+       * REQUIRED here, unlike the two fields above, and that difference is the finding. Those two
+       * are a CLAIM the derivation makes about a document set it established, so their absence has
+       * to keep meaning "not established" — a caller renders `describeDisagreeingDocuments` from
+       * them. This is not a claim and prescribes nothing: it is the evidence the answer was computed
+       * from, it exists on every branch, and its whole job is to make "the same refusal about a
+       * different set of rows" impossible to mistake for "nothing moved".
+       */
+      documentSet: string[]
     }
 
 export async function readPostedInvoiceOrderDiscount(
@@ -392,25 +514,24 @@ export async function readPostedInvoiceOrderDiscount(
   // exactly what a SUCCESSFUL update leaves behind (see the header), so it cannot be read as "the
   // update never happened" and the original invoice's event cannot be trusted to describe the
   // document as it now stands.
-  const unsettledUpdates = await client.accountingEvent.count({
+  //
+  // READ AS ROWS, not counted (r12 finding 1). The refusal below states a COUNT, so an update
+  // settling to VOID while another arrives leaves it word-for-word identical; the rows themselves go
+  // into the fingerprint, where that swap is visible.
+  const unsettledUpdates = (await client.accountingEvent.findMany({
     where: {
       sourceEntityType: 'SalesOrder',
       sourceEntityId: order.id,
       type: 'SALES_INVOICE_UPDATE',
       status: { notIn: [...SETTLED_INVOICE_UPDATE_EVENT_STATUSES] },
     },
-  })
-  if (unsettledUpdates > 0) {
-    return {
-      ok: false,
-      reason: 'UNRECOVERABLE',
-      detail:
-        `${unsettledUpdates} SALES_INVOICE_UPDATE event(s) for this order never reached POSTED — which ` +
-        'is the state an update that DID modify the ledger document is left in, because it cannot ' +
-        'record its own external id against the original invoice event',
-    }
-  }
+    orderBy: [{ createdAt: 'desc' }],
+    select: { type: true, status: true, externalSystem: true, externalId: true, createdAt: true },
+  })) as UnsettledInvoiceUpdate[]
 
+  // READ EVEN WHEN THE UPDATES ALREADY REFUSE (r12 finding 1). The refusal above is reached before
+  // the posted documents are consulted at all, so without this the whole posted set could be
+  // replaced underneath an identical sentence. It decides nothing on that branch; it is evidence.
   const documents = (await client.accountingEvent.findMany({
     where: {
       sourceEntityType: 'SalesOrder',
@@ -422,24 +543,69 @@ export async function readPostedInvoiceOrderDiscount(
     // message. It decides no amount: every posted document must AGREE below, so no ordering
     // guarantee is being relied on (and, per the header, none exists).
     orderBy: [{ businessDate: 'desc' }, { createdAt: 'desc' }],
-    select: { type: true, status: true, currency: true, externalSystem: true, externalId: true, linesJson: true },
+    select: {
+      type: true,
+      status: true,
+      currency: true,
+      externalSystem: true,
+      externalId: true,
+      createdAt: true,
+      linesJson: true,
+    },
   })) as MirroredDocument[]
-
-  if (documents.length === 0) return { ok: false, reason: 'NO_POSTED_EVENT' }
 
   const amounts: number[] = []
   const bases: PostedDocumentTaxBasis[] = []
+  const postedEntries: string[] = []
+  // The FIRST failure in the presentational order, which is the one the refusal has always named.
+  // Recorded rather than returned on, because r12 finding 1 needs every document READ: with the
+  // first one unreadable, a second going bad — or its amount moving under a re-mirror — used to be
+  // invisible in every field the re-validation compares.
+  let firstFailure: { type: string; detail: string } | null = null
   for (const document of documents) {
     const read = readPostedDocumentDiscount(document, order.currency)
+    postedEntries.push(
+      `POSTED ${describeMirroredRow(document)} ${document.currency} ` +
+        (read.ok
+          ? `carries ${read.amount} ${order.currency} (${read.taxBasis})`
+          : `UNREADABLE: ${read.detail}`),
+    )
     if (!read.ok) {
-      return {
-        ok: false,
-        reason: 'UNRECOVERABLE',
-        detail: `a ${document.type} was posted for this order but ${read.detail}`,
-      }
+      firstFailure ??= { type: document.type, detail: read.detail }
+      continue
     }
     amounts.push(read.amount)
     bases.push(read.taxBasis)
+  }
+  // SORTED across both kinds of row, so the same rows read twice fingerprint identically whatever
+  // order either query returns them in. NOT de-duplicated: two identical documents are two
+  // documents.
+  const documentSet = [
+    ...postedEntries,
+    ...unsettledUpdates.map((update) => `UNSETTLED ${describeMirroredRow(update)} status ${update.status}`),
+  ].sort()
+
+  if (unsettledUpdates.length > 0) {
+    return {
+      ok: false,
+      reason: 'UNRECOVERABLE',
+      detail:
+        `${unsettledUpdates.length} SALES_INVOICE_UPDATE event(s) for this order never reached POSTED — ` +
+        'which is the state an update that DID modify the ledger document is left in, because it ' +
+        'cannot record its own external id against the original invoice event',
+      documentSet,
+    }
+  }
+
+  if (documents.length === 0) return { ok: false, reason: 'NO_POSTED_EVENT', documentSet }
+
+  if (firstFailure) {
+    return {
+      ok: false,
+      reason: 'UNRECOVERABLE',
+      detail: `a ${firstFailure.type} was posted for this order but ${firstFailure.detail}`,
+      documentSet,
+    }
   }
   // SORTED, so the refusal below reads the same on every re-read of the same rows. The netting and
   // the revalidation compare these refusals as VALUES (r11 finding 1), and a message whose numbers
@@ -467,6 +633,7 @@ export async function readPostedInvoiceOrderDiscount(
         'says which one a credit note now reverses',
       documentCount: documents.length,
       externalIds,
+      documentSet,
     }
   }
   const [newest] = documents
@@ -485,6 +652,7 @@ export async function readPostedInvoiceOrderDiscount(
     // Newest first, in the same order the documents were read. r10 finding 2.
     externalIds,
     taxBasis: distinctBases.length === 1 ? distinctBases[0] : 'MIXED',
+    documentSet,
   }
 }
 
