@@ -37,6 +37,29 @@
  * not-guarded. That subsumes the delegation hatch: a real facade is credited
  * because its delegate was read and found guarded, not because of its shape.
  *
+ * ---------------------------------------------------------------------------
+ * o3d-512h round 4 — THE SAME MECHANISM, APPLIED TO WHAT IT HAD NOT REACHED.
+ *
+ * Codex round 4 found three more instances of "credited without being verified",
+ * and all three are answered by extending resolution rather than by patching the
+ * shape that got past it:
+ *
+ *   * a resolved guard was credited from ANYWHERE in the body, including a branch
+ *     that may not run and a `try` whose `catch` swallows the refusal. Round 3's
+ *     own report named this and left it. Position is now verified the same way
+ *     identity is — see collectExecutedCalls — and the one conditional position
+ *     that IS sound (an unforgeable `Symbol()` sentinel) is verified by resolving
+ *     the sentinel, not by recognising the idiom;
+ *   * the secret-read rule still entered on a NAME match, so an aliased import of
+ *     a real reader never reached the resolver at all. The resolver is now the
+ *     entry condition — see readsSettingSecret;
+ *   * the model-surface pin was described as if it constrained SELF-SCOPING. It
+ *     does not and cannot: which tables an endpoint touches is a static fact, and
+ *     whether a row belongs to the caller is a runtime one. The claim is
+ *     corrected where it is made, and the property it overclaimed is proved where
+ *     it is decidable — by execution, in
+ *     tests/security/authentication-only-self-scoping.test.ts.
+ *
  * Not named *.test.ts on purpose — `npm run test:unit` globs tests/**\/*.test.ts.
  */
 import { readdirSync, readFileSync } from 'node:fs'
@@ -116,8 +139,12 @@ export const LOCAL_GUARD_DECLARATIONS: Record<string, { kind: GuardKind; reason:
   'app/actions/supplier-portal.ts:requireSupplier': {
     kind: 'authorization',
     reason:
-      'reads the session and returns null unless role === SUPPLIER and a supplierId is bound; '
-      + 'every caller null-checks it, and the row-level control is assertSupplierOwnsResource on top',
+      'round 4: now refuses through the SHARED lib/auth/session-state.ts:sessionAccessDenial '
+      + '(revoked/deactivated/force-logged-out/version-bumped sessions, and second-factor-pending '
+      + 'ones) before checking role === SUPPLIER and a bound supplierId. Until round 4 it checked '
+      + 'only role+supplierId — the shadowing-requireAuth defect, in the guard round 3 kept. '
+      + 'Every caller null-checks it, every query is scoped to ctx.supplierId, and the row-level '
+      + 'control is assertSupplierOwnsResource on top',
   },
   'app/actions/passkey.ts:getVerifiedSession': {
     kind: 'authentication',
@@ -219,10 +246,351 @@ function collectCalls(body: ts.ConciseBody): ts.CallExpression[] {
   return calls
 }
 
+// ---------------------------------------------------------------------------
+// Round 4, Codex finding 2 — DOES THE GUARD ACTUALLY RUN?
+// ---------------------------------------------------------------------------
+
 /**
- * The guard kinds a body PROVABLY establishes: every call whose callee resolves
- * to a pinned guard declaration, or to a function that reaches one within
- * MAX_GUARD_DEPTH wrappers.
+ * The calls that PROVABLY execute whenever the body executes, and whose refusal
+ * PROVABLY reaches the caller.
+ *
+ * Round 3 fixed WHICH declaration a call resolves to and left WHERE the call
+ * sits unexamined — its own report said so: "the guard walk credits a resolved
+ * call anywhere in the body, including inside a branch that may not run". That
+ * is the same defect as the one it fixed, one level along: a rule crediting
+ * something it has not verified. `if (process.env.SKIP) { await requireAdmin() }`
+ * resolves perfectly and gates nothing.
+ *
+ * So this is the same answer, applied to position instead of identity: a call is
+ * credited only from a position where execution is not in question. Everything
+ * else is NOT VERIFIED, and not-verified is not-guarded — the direction that
+ * turns the build red rather than quiet.
+ *
+ * Not credited, and why:
+ *   * `if` / `switch` branches, ternary arms, the right side of `&&`, `||`, `??`,
+ *     optional calls (`g?.()`) — may not run;
+ *   * loop bodies — may run zero times;
+ *   * function and arrow bodies — deferred to a caller that may never come, and
+ *     `[…].map(() => requireAdmin())` never awaits it anyway;
+ *   * statements after a `return`/`throw` — unreachable, and TypeScript does not
+ *     make unreachable code an error;
+ *   * a `try` block whose `catch` can FALL THROUGH, or whose `finally` returns.
+ *     `try { await requireAdmin() } catch {}` swallows the refusal and carries
+ *     straight on into the body, which is worse than no guard because it reads
+ *     like one;
+ *   * a call whose result nothing waits for — see resultIsWaitedFor.
+ *
+ * Still credited, because they do gate:
+ *   * the condition of an `if`/`switch` (it is evaluated to decide the branch);
+ *   * a `try` block whose `catch` cannot fall through — `try { await requireAdmin() }
+ *     catch { return [] }` is app/actions/users.ts:getUsers, a real refusal
+ *     written as a catch, and a rule that flagged it would be answered with an
+ *     allowlist entry rather than a fix;
+ *   * a `try` with no `catch` at all, and a `finally` block.
+ */
+function catchCannotFallThrough(clause: ts.CatchClause): boolean {
+  return blockCompletesAbruptly(clause.block)
+}
+
+/** True when control cannot reach the end of this block: every path returns or throws. */
+function blockCompletesAbruptly(block: ts.Block): boolean {
+  const statements = block.statements
+  if (statements.length === 0) return false
+  return statementCompletesAbruptly(statements[statements.length - 1])
+}
+
+function statementCompletesAbruptly(st: ts.Statement): boolean {
+  if (ts.isReturnStatement(st) || ts.isThrowStatement(st)) return true
+  if (ts.isBreakStatement(st) || ts.isContinueStatement(st)) return true
+  if (ts.isBlock(st)) return blockCompletesAbruptly(st)
+  if (ts.isIfStatement(st)) {
+    // Both arms must exist and both must be abrupt, or control falls through.
+    return !!st.elseStatement
+      && statementCompletesAbruptly(st.thenStatement)
+      && statementCompletesAbruptly(st.elseStatement)
+  }
+  if (ts.isTryStatement(st)) {
+    if (st.finallyBlock && blockCompletesAbruptly(st.finallyBlock)) return true
+    if (!blockCompletesAbruptly(st.tryBlock)) return false
+    return !st.catchClause || blockCompletesAbruptly(st.catchClause.block)
+  }
+  return false
+}
+
+/**
+ * Is this call's result WAITED FOR before the body carries on?
+ *
+ * An async guard that is called and not awaited has started a refusal the
+ * endpoint does not wait for: execution continues into the read while the
+ * permission check is still pending, and the rejection surfaces later as an
+ * unhandled rejection rather than as a denial. `requirePermission('x')` on its
+ * own line therefore gates nothing, and crediting it is the same mistake as
+ * crediting a branch that does not run.
+ *
+ * Credited: `await g()`, `return g()` (the caller awaits it), a concise arrow
+ * body `async () => g()`, and the same through parentheses / `as` casts.
+ * Anything else — a bare expression statement, a value stashed in a variable, an
+ * argument to another call — is not verified here.
+ */
+function resultIsWaitedFor(call: ts.CallExpression): boolean {
+  let node: ts.Node = call
+  let parent: ts.Node | undefined = call.parent
+  while (parent) {
+    if (ts.isParenthesizedExpression(parent) || ts.isAsExpression(parent) || ts.isNonNullExpression(parent)) {
+      node = parent
+      parent = parent.parent
+      continue
+    }
+    if (ts.isAwaitExpression(parent)) return true
+    if (ts.isReturnStatement(parent)) return true
+    // `async () => requirePermission('sync')` — the concise body IS the result.
+    if (ts.isArrowFunction(parent) && parent.body === node) return true
+    return false
+  }
+  return false
+}
+
+const isFunctionLikeNode = (n: ts.Node): boolean =>
+  ts.isArrowFunction(n)
+  || ts.isFunctionExpression(n)
+  || ts.isFunctionDeclaration(n)
+  || ts.isMethodDeclaration(n)
+  || ts.isClassDeclaration(n)
+  || ts.isClassExpression(n)
+  || ts.isGetAccessorDeclaration(n)
+  || ts.isSetAccessorDeclaration(n)
+
+/**
+ * THE UNFORGEABLE-SENTINEL BRANCH (round 4).
+ *
+ * Eight endpoints in this tree put their guard behind a condition on purpose:
+ *
+ *   if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+ *     await requirePermission('sales.process')
+ *   }
+ *
+ * That is a deliberate, documented control (o3d-43oz, o3d-e1yb): the sentinel is
+ * a module-level `Symbol()`, and a Server Action's arguments arrive deserialized
+ * from the wire, where a symbol cannot be represented. A network caller can
+ * therefore never make the comparison match, so the branch that runs the guard
+ * is the branch EVERY remote caller takes. The predecessor of that code was a
+ * `skipPermissionCheck?: boolean`, which a client could simply send — and the
+ * difference between the two is the whole point.
+ *
+ * The rule verifies exactly that difference, by resolution and nothing else: the
+ * sentinel operand must resolve, through the module graph, to a `const`
+ * initialized with a call to `Symbol`. A boolean flag, a string constant, or a
+ * name that merely reads like a capability token resolves to no such thing and
+ * earns no credit, so the o3d-43oz shape stays a violation.
+ *
+ * Polarity is checked, not assumed: credit goes to the branch taken when the
+ * sentinel did NOT match — the `!==` arm, `!(x === S)`, or `!a && !b` over two
+ * such tests, including through a local `const` that holds the comparison. The
+ * matching arm is an internal caller that has already proved itself by holding
+ * a value the network cannot express, and it is never credited as a guard.
+ */
+function isSymbolSentinel(
+  file: string,
+  expr: ts.Expression,
+  graph: ModuleGraph | undefined,
+): boolean {
+  if (!graph) return false
+  const decl = ts.isIdentifier(expr)
+    ? graph.resolve(file, expr.text)
+    : ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.expression) && ts.isIdentifier(expr.name)
+      ? graph.resolveMember(file, expr.expression.text, expr.name.text)
+      : null
+  if (!decl || !ts.isVariableDeclaration(decl.node)) return false
+  const init = decl.node.initializer
+  return !!init
+    && ts.isCallExpression(init)
+    && ts.isIdentifier(init.expression)
+    && init.expression.text === 'Symbol'
+}
+
+type SentinelPolarity = 'miss' | 'match' | null
+
+const flipPolarity = (p: SentinelPolarity): SentinelPolarity =>
+  p === 'miss' ? 'match' : p === 'match' ? 'miss' : null
+
+function sentinelPolarity(
+  file: string,
+  expr: ts.Expression,
+  graph: ModuleGraph | undefined,
+  localConsts: Map<string, ts.Expression>,
+  depth = 0,
+): SentinelPolarity {
+  if (depth > 4) return null
+  const recur = (e: ts.Expression) => sentinelPolarity(file, e, graph, localConsts, depth + 1)
+
+  if (ts.isParenthesizedExpression(expr)) return recur(expr.expression)
+  if (ts.isPrefixUnaryExpression(expr) && expr.operator === ts.SyntaxKind.ExclamationToken) {
+    return flipPolarity(recur(expr.operand))
+  }
+  // `const isInternal = options?.internalBypassToken === INTERNAL_ACTION_BYPASS`
+  // then `if (!isInternal)`: the test is one statement away, not one node.
+  if (ts.isIdentifier(expr)) {
+    const bound = localConsts.get(expr.text)
+    return bound ? recur(bound) : null
+  }
+  if (!ts.isBinaryExpression(expr)) return null
+
+  switch (expr.operatorToken.kind) {
+    case ts.SyntaxKind.ExclamationEqualsEqualsToken:
+    case ts.SyntaxKind.ExclamationEqualsToken:
+      return isSymbolSentinel(file, expr.left, graph) || isSymbolSentinel(file, expr.right, graph)
+        ? 'miss'
+        : null
+    case ts.SyntaxKind.EqualsEqualsEqualsToken:
+    case ts.SyntaxKind.EqualsEqualsToken:
+      return isSymbolSentinel(file, expr.left, graph) || isSymbolSentinel(file, expr.right, graph)
+        ? 'match'
+        : null
+    case ts.SyntaxKind.AmpersandAmpersandToken: {
+      // `!bypassPermission && !authOnly` — true only when NEITHER sentinel matched.
+      const left = recur(expr.left)
+      const right = recur(expr.right)
+      if (left === 'miss' && right === 'miss') return 'miss'
+      if (left === 'match' && right === 'match') return 'match'
+      return null
+    }
+    case ts.SyntaxKind.BarBarToken: {
+      // `x === S1 || x === S2` is a match test; the OR of two misses says only
+      // that ONE of them missed, which proves nothing, so it earns nothing.
+      const left = recur(expr.left)
+      const right = recur(expr.right)
+      return left === 'match' && right === 'match' ? 'match' : null
+    }
+    default:
+      return null
+  }
+}
+
+export function collectExecutedCalls(
+  file: string,
+  body: ts.ConciseBody,
+  graph?: ModuleGraph,
+): ts.CallExpression[] {
+  const calls: ts.CallExpression[] = []
+  /** `const` bindings seen so far on the executed path, for sentinel polarity. */
+  const localConsts = new Map<string, ts.Expression>()
+
+  const expression = (node: ts.Node | undefined): void => {
+    if (!node) return
+
+    if (isFunctionLikeNode(node)) return // deferred: may never be invoked
+
+    if (ts.isCallExpression(node)) {
+      // `g?.()` is skipped when g is nullish, so the call is conditional — but
+      // the callee expression is still evaluated.
+      if (!node.questionDotToken && resultIsWaitedFor(node)) calls.push(node)
+      expression(node.expression)
+      for (const arg of node.arguments) expression(arg)
+      return
+    }
+
+    if (ts.isConditionalExpression(node)) {
+      expression(node.condition) // arms are conditional by definition
+      return
+    }
+
+    if (ts.isBinaryExpression(node)) {
+      const op = node.operatorToken.kind
+      if (
+        op === ts.SyntaxKind.AmpersandAmpersandToken
+        || op === ts.SyntaxKind.BarBarToken
+        || op === ts.SyntaxKind.QuestionQuestionToken
+      ) {
+        expression(node.left) // the right operand may be short-circuited away
+        return
+      }
+      expression(node.left)
+      expression(node.right)
+      return
+    }
+
+    if (
+      (ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node))
+      && node.questionDotToken
+    ) {
+      expression(node.expression) // the rest of an optional chain may be skipped
+      return
+    }
+
+    ts.forEachChild(node, expression)
+  }
+
+  const statements = (list: readonly ts.Statement[]): void => {
+    for (const st of list) {
+      statement(st)
+      if (statementCompletesAbruptly(st)) return // anything after this is dead code
+    }
+  }
+
+  const statement = (st: ts.Statement): void => {
+    if (ts.isBlock(st)) return statements(st.statements)
+    if (ts.isLabeledStatement(st)) return statement(st.statement)
+
+    if (ts.isIfStatement(st)) {
+      expression(st.expression)
+      // The one conditional position that IS verified — see isSymbolSentinel.
+      const polarity = sentinelPolarity(file, st.expression, graph, localConsts)
+      if (polarity === 'miss') statement(st.thenStatement)
+      else if (polarity === 'match' && st.elseStatement) statement(st.elseStatement)
+      return
+    }
+    if (ts.isSwitchStatement(st)) return expression(st.expression)
+
+    if (ts.isTryStatement(st)) {
+      // A `finally` that returns discards an exception in flight, so it swallows
+      // the refusal exactly as a fall-through catch does.
+      const finallySwallows = !!st.finallyBlock && blockCompletesAbruptly(st.finallyBlock)
+      if (!finallySwallows && (!st.catchClause || catchCannotFallThrough(st.catchClause))) {
+        statements(st.tryBlock.statements)
+      }
+      if (st.finallyBlock) statements(st.finallyBlock.statements)
+      return
+    }
+
+    // Loops: the body may run zero times, and the guard would be inside it.
+    if (
+      ts.isForStatement(st) || ts.isForInStatement(st) || ts.isForOfStatement(st)
+      || ts.isWhileStatement(st) || ts.isDoStatement(st)
+    ) return
+
+    if (ts.isVariableStatement(st)) {
+      const isConst = (st.declarationList.flags & ts.NodeFlags.Const) !== 0
+      for (const decl of st.declarationList.declarations) {
+        expression(decl.initializer)
+        // Only `const`: a `let` holding the sentinel test can be reassigned
+        // between the test and the branch, so it proves nothing about the branch.
+        if (isConst && ts.isIdentifier(decl.name) && decl.initializer) {
+          localConsts.set(decl.name.text, decl.initializer)
+        }
+      }
+      return
+    }
+
+    if (ts.isExpressionStatement(st)) return expression(st.expression)
+    if (ts.isReturnStatement(st) || ts.isThrowStatement(st)) return expression(st.expression)
+
+    // Declarations, `debugger`, empty statements: nothing that can be a guard.
+  }
+
+  if (ts.isBlock(body)) statements(body.statements)
+  else expression(body) // a concise arrow body IS the expression, and always runs
+
+  return calls
+}
+
+/**
+ * The guard kinds a body PROVABLY establishes: every call that PROVABLY EXECUTES
+ * (collectExecutedCalls) and whose callee RESOLVES to a pinned guard declaration,
+ * or to a function that reaches one within MAX_GUARD_DEPTH wrappers.
+ *
+ * Both halves are verification. Round 3 added the second; round 4 added the
+ * first, because a guard that resolves perfectly and sits in a branch nothing
+ * takes is credit given for work not done.
  *
  * Without a graph nothing resolves, so nothing is credited. That is the correct
  * failure direction for a rule whose job is to have no false negatives, and it
@@ -239,7 +607,7 @@ export function guardKindsOfBody(
   if (!body || !graph || depth > MAX_GUARD_DEPTH) return kinds
   const v = verifierFor(graph)
 
-  for (const call of collectCalls(body)) {
+  for (const call of collectExecutedCalls(file, body, graph)) {
     const root = calleeRootName(call.expression)
     if (root !== null && DATA_CLIENT_ROOTS.has(root)) continue
 
@@ -382,10 +750,84 @@ const SETTINGS_STORE_FILE = 'lib/settings-store.ts'
  * authentication gate, and a rule that flagged those would be answered with an
  * allowlist instead of a fix.
  *
- * Round 3: the reader is matched by RESOLUTION when a graph is available, so a
- * local helper called `getSettingValue` that reads nothing does not trip it and,
- * more importantly, an aliased import of the real one does.
+ * Round 3 claimed the reader was "matched by RESOLUTION … so an aliased import of
+ * the real one does [trip it]". Codex round 4, finding 3: it did not. Resolution
+ * was only ever reached for an identifier whose TEXT was already one of the
+ * reader names, so the name match was still the entry condition and
+ * `import { getSettingValue as readSetting }` was invisible — the exact evasion
+ * the resolver was built to close, left open in the one rule that never adopted
+ * it. The resolver is now the entry condition, in both directions:
+ *
+ *   * every call target and every identifier in the body is RESOLVED, and a
+ *     binding landing on lib/settings-store.ts's decrypting readers counts as a
+ *     read whatever it is called locally (`readSetting`, `store.getSettingValue`);
+ *   * an identifier that MATCHES a reader name but resolves elsewhere — the local
+ *     helper of the same name — does not count, as before.
+ *
+ * SCOPE, stated rather than implied: this rule looks at the endpoint's OWN body.
+ * It is not transitive, and that is a deliberate limit, not an oversight. The
+ * readers are key-blind — `getSettingValue('public_app_url')` decrypts nothing —
+ * so following every resolvable callee would flag ordinary configuration reads
+ * (app/actions/passkey.ts reaches getSettingValue through getPublicAppUrl) and be
+ * answered with allowlist entries, which is how a rule stops meaning anything.
+ * A helper that wraps a reader and is called from an authentication-only
+ * endpoint is therefore NOT caught here; what covers that case is the pinned
+ * Prisma surface below, which IS transitive and names `setting` when it is
+ * reached.
  */
+/** True when this declaration IS one of the decrypting settings-store readers. */
+function isSecretReaderDeclaration(decl: Declaration | null): boolean {
+  return !!decl && decl.file === SETTINGS_STORE_FILE && SETTINGS_SECRET_READERS.has(decl.name)
+}
+
+/**
+ * Does this body read a stored setting value? Resolved, not name-matched.
+ *
+ * Fail-closed in two places, deliberately:
+ *   * with NO graph, a bare name match counts — the rule must not go quiet
+ *     because resolution was unavailable;
+ *   * with a graph, an identifier that matches a reader name but resolves to
+ *     NOTHING counts too, so a module the graph does not cover is treated as a
+ *     read rather than waved through.
+ */
+export function readsSettingSecret(
+  file: string,
+  body: ts.ConciseBody | undefined,
+  graph?: ModuleGraph,
+): boolean {
+  if (!body) return false
+  let found = false
+
+  const visit = (n: ts.Node) => {
+    if (found) return
+
+    // `store.getSettingValue(...)`, `readSetting(...)` — the call target is what
+    // the resolver is best at, so ask it first.
+    if (ts.isCallExpression(n) && graph && isSecretReaderDeclaration(graph.resolveCallTarget(file, n.expression))) {
+      found = true
+      return
+    }
+
+    if (ts.isIdentifier(n)) {
+      if (!graph) {
+        if (SETTINGS_SECRET_READERS.has(n.text)) { found = true; return }
+      } else {
+        // Every identifier, not only the ones already spelled like a reader:
+        // that name test was the aliasing hole (round 4, finding 3).
+        const decl = graph.resolve(file, n.text)
+        if (isSecretReaderDeclaration(decl)) { found = true; return }
+        if (!decl && SETTINGS_SECRET_READERS.has(n.text)) { found = true; return }
+      }
+    }
+
+    ts.forEachChild(n, visit)
+  }
+
+  if (ts.isBlock(body)) ts.forEachChild(body, visit)
+  else visit(body)
+  return found
+}
+
 export function scanSecretReadingActions(
   file: string,
   source: string,
@@ -399,28 +841,7 @@ export function scanSecretReadingActions(
   for (const action of exportedServerActions(sf)) {
     if (!action.body) continue
 
-    let readsSecret = false
-    const visit = (n: ts.Node) => {
-      if (readsSecret) return
-      if (ts.isIdentifier(n) && SETTINGS_SECRET_READERS.has(n.text)) {
-        if (!graph) {
-          readsSecret = true
-        } else {
-          const decl = graph.resolve(file, n.text)
-          // Unresolvable is treated as a read: this rule must not go quiet on a
-          // module the graph does not cover.
-          if (!decl || (decl.file === SETTINGS_STORE_FILE && SETTINGS_SECRET_READERS.has(decl.name))) {
-            readsSecret = true
-          }
-        }
-        if (readsSecret) return
-      }
-      ts.forEachChild(n, visit)
-    }
-    if (ts.isBlock(action.body)) ts.forEachChild(action.body, visit)
-    else visit(action.body)
-
-    if (!readsSecret) continue
+    if (!readsSettingSecret(file, action.body, graph)) continue
     const kinds = guardKindsOfBody(file, action.body, graph)
     if (!kinds.has('authorization') && !isAllowlisted(allowlist, file, action.name)) {
       violations.push(`${file}:${action.name}`)
@@ -590,6 +1011,23 @@ export function scanAuthenticationOnlyActions(
  * Unresolvable callees are simply not followed — the pin under-reports rather
  * than inventing reach, and the endpoints it covers are the handful whose bodies
  * a reviewer can check by eye.
+ *
+ * WHAT IT CANNOT DO — Codex round 4, finding 4, stated plainly rather than
+ * papered over. This pins WHICH models an endpoint reaches. It does not pin, and
+ * cannot pin, that a read is SCOPED TO THE CALLER. `db.user.findUnique` appears
+ * identically whether the argument is `{ where: { id: session.user.id } }` or
+ * `{ where: { id } }` from the request, and deciding which one a `where` object
+ * assembled two modules away amounts to is a runtime question about a value, not
+ * a static question about a call. Anything this file pinned in the name of
+ * self-scoping would be a proxy for the property rather than the property. So
+ * the property is proved where it is decidable — by RUNNING each
+ * authentication-only endpoint as an external principal and inspecting the
+ * `where` clauses it actually issued:
+ * tests/security/authentication-only-self-scoping.test.ts.
+ *
+ * ALL calls are followed here, not only the ones collectExecutedCalls credits: a
+ * conditional read is still a read, and a REACH pin must over-report where the
+ * guard walk must under-credit.
  */
 export function reachedPrismaModels(
   file: string,

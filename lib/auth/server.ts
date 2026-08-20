@@ -15,7 +15,7 @@ import {
   PermissionDeniedError,
   type AuthSession,
 } from '@/lib/auth/session-gates'
-import { loginPathForSessionInvalidReason } from '@/lib/auth/session-state'
+import { loginPathForSessionInvalidReason, sessionAccessDenial } from '@/lib/auth/session-state'
 import { isAuthorizationDenial } from '@/lib/auth/session-gates'
 
 export type { Permission }
@@ -38,18 +38,16 @@ export {
 export async function requireAuth(): Promise<AuthSession> {
   const session = await auth()
 
-  if (!session?.user) {
-    redirect('/login')
+  // The three checks themselves live in lib/auth/session-state.ts, shared with
+  // requireApiAuthSession and with the supplier portal's requireSupplier — see
+  // the note on sessionAccessDenial for why they are no longer open-coded here.
+  // This function owns only the REFUSAL: a redirect.
+  const denial = sessionAccessDenial(session?.user)
+  if (denial?.reason === 'no-session') redirect('/login')
+  if (denial?.reason === 'session-invalid') {
+    redirect(loginPathForSessionInvalidReason(denial.sessionInvalidReason))
   }
-
-  if (session.user.sessionInvalidReason) {
-    redirect(loginPathForSessionInvalidReason(session.user.sessionInvalidReason))
-  }
-
-  // If 2FA is enabled but not verified in this session, send to TOTP challenge
-  if (session.user.totpEnabled && !session.user.totpVerified) {
-    redirect('/2fa')
-  }
+  if (denial?.reason === 'second-factor-pending') redirect('/2fa')
 
   return session as AuthSession
 }
@@ -179,11 +177,18 @@ export async function requireFreshPermission(
 
 /**
  * Returns the current session or null — does not redirect.
+ *
+ * Round 4: this used to check `sessionInvalidReason` and stop there, so a
+ * password-only session that had not cleared the TOTP challenge came back as a
+ * session. app/actions/passkey.ts:getVerifiedSession compensated with its own
+ * second-factor check — correctly, and it keeps it — but the compensation was
+ * the caller's, which is precisely the arrangement that left requireSupplier
+ * with nothing. The predicate is shared now, so "usable session" means the same
+ * thing here as at every other gate.
  */
 export async function getSession(): Promise<AuthSession | null> {
   const session = await auth()
-  if (!session?.user) return null
-  if (session.user.sessionInvalidReason) return null
+  if (sessionAccessDenial(session?.user)) return null
   return session as AuthSession
 }
 

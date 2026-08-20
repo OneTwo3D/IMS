@@ -280,6 +280,28 @@ const AUTHENTICATION_ONLY_ACTIONS: string[] = [
  *
  * `activityLog` appears on the mutations because logActivity writes one; that is
  * a write of the caller's own action, not a read of anyone's data.
+ *
+ * WHAT THIS PIN DOES NOT DO — Codex round 4, finding 4.
+ *
+ * Round 3 presented this as covering the supplier-isolation class. It does not.
+ * It pins WHICH models an endpoint reaches; the inventory's whole justification
+ * is that each endpoint is SCOPED TO THE CALLER, and scope is not a property of
+ * the model list. `db.user.findUnique` looks identical whether the filter is the
+ * session's own id or an id from the request, so the escalation the inventory
+ * exists to prevent — an endpoint every signed-in principal may call starting to
+ * return somebody else's row — can happen without this pin moving a character.
+ * Anything pinned here in the name of self-scoping would be a proxy for the
+ * property, and a proxy accepted as the property is the defect this whole branch
+ * has been unwinding.
+ *
+ * So it is not pinned here. It is EXECUTED, in
+ * tests/security/authentication-only-self-scoping.test.ts: every endpoint on the
+ * list below is called as an external SUPPLIER principal, with foreign ids where
+ * it takes one, and every query it issues is inspected for the caller's own id.
+ * That file also asserts its coverage is exactly this inventory, so a new
+ * authentication-only endpoint cannot arrive with the self-scoping claim merely
+ * assumed. The two pins answer different questions and neither substitutes for
+ * the other: this one is static reach, that one is observed scope.
  */
 const AUTHENTICATION_ONLY_PRISMA_SURFACE: Record<string, string[]> = {
   'passkey.ts:deletePasskey': ['$transaction', 'activityLog', 'passkey', 'user'],

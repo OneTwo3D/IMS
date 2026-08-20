@@ -37,6 +37,10 @@ import { createRecordingDb, type QueryContext } from './recording-db'
 type Role = 'ADMIN' | 'MANAGER' | 'WAREHOUSE' | 'FINANCE' | 'READONLY' | 'SUPPLIER'
 let currentRole: Role = 'SUPPLIER'
 let currentSupplierId: string | null = 'supplier-A'
+/** Round 4: the session-state fields requireSupplier did not look at. */
+let currentSessionInvalidReason: string | null = null
+let currentTotpEnabled = false
+let currentTotpVerified = false
 
 mock.module('@/lib/auth', {
   namedExports: {
@@ -47,10 +51,22 @@ mock.module('@/lib/auth', {
         name: 'U',
         role: currentRole,
         supplierId: currentRole === 'SUPPLIER' ? currentSupplierId : null,
+        sessionInvalidReason: currentSessionInvalidReason,
+        totpEnabled: currentTotpEnabled,
+        totpVerified: currentTotpVerified,
       },
     }),
   },
 })
+
+/** Back to a plain, valid, fully-authenticated supplier-A session. */
+function resetSession() {
+  currentRole = 'SUPPLIER'
+  currentSupplierId = 'supplier-A'
+  currentSessionInvalidReason = null
+  currentTotpEnabled = false
+  currentTotpVerified = false
+}
 
 /** Captured `where` clauses, so "scoped to the caller's own rows" is checkable. */
 const queries: QueryContext[] = []
@@ -319,4 +335,144 @@ test('an INTERNAL role gets nothing from the supplier portal either — it is no
   const { getSupplierRfqs } = await import('@/app/actions/supplier-portal')
   assert.deepEqual(await getSupplierRfqs(), [])
   recorder.assertNoReads('ADMIN calling the supplier portal')
+})
+
+// ---------------------------------------------------------------------------
+// 3. THE SESSION ITSELF — Codex round 4, finding 1
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 3 audited this surface and got the right answer to the wrong question.
+ * It asked whether a SUPPLIER's reads are scoped to its own rows (they are, and
+ * the tests above prove it) and never asked whether the session arriving at that
+ * scope was still a session we would issue. `requireSupplier` read
+ * `session.user.role` and `session.user.supplierId` and nothing else — no
+ * `sessionInvalidReason`, no second-factor check — which is character-for-character
+ * the defect round 3 deleted from allocation.ts, surviving in the guard round 3
+ * kept and pinned as a LOCAL_GUARD_DECLARATION.
+ *
+ * Each case below is a session an administrator has already acted to stop.
+ * Authentication is not an answer to an authorization question, and a REVOKED
+ * authentication is not an answer to anything at all.
+ *
+ * Every case asserts the same three things: WHO the principal is (a SUPPLIER
+ * with supplier-A bound, holding every supplier_portal permission — so what
+ * refuses it is demonstrably not the permission table), WHAT it gets back (the
+ * empty refusal, never a row), and — through the proved recorder — that no query
+ * was issued at all.
+ */
+
+const SUPPLIER_PORTAL_READS: Array<[string, (m: Record<string, (...a: never[]) => Promise<unknown>>) => Promise<unknown>, unknown]> = [
+  ['getSupplierRfqs', (m) => m.getSupplierRfqs(), []],
+  ['getSupplierOrders', (m) => m.getSupplierOrders(), []],
+  ['getSupplierProducts', (m) => m.getSupplierProducts(), []],
+  ['getSupplierRfqDetail', (m) => m.getSupplierRfqDetail(...(['po-1'] as never[])), null],
+]
+
+const REVOKED_SESSIONS: Array<[string, () => void]> = [
+  // The administrator deactivated the supplier's user. The jwt callback stamps
+  // 'inactive-user' on the very next request; nothing here read it.
+  ['a DEACTIVATED account (inactive-user)', () => { currentSessionInvalidReason = 'inactive-user' }],
+  // "Sign out all sessions", a password change, or a role change: sessionVersion
+  // is bumped and every older token mismatches.
+  ['a REVOKED session (session-version-mismatch)', () => { currentSessionInvalidReason = 'session-version-mismatch' }],
+  // Forced logout at a point in time.
+  ['a FORCE-LOGGED-OUT session', () => { currentSessionInvalidReason = 'force-logout' }],
+  // The user row is gone.
+  ['a session whose user no longer exists', () => { currentSessionInvalidReason = 'missing-user' }],
+  // Password accepted, second factor never presented — requireAuth sends this to
+  // /2fa, and the portal used to serve it.
+  ['a 2FA-PENDING session', () => { currentTotpEnabled = true; currentTotpVerified = false }],
+]
+
+for (const [label, poison] of REVOKED_SESSIONS) {
+  for (const [name, call, empty] of SUPPLIER_PORTAL_READS) {
+    test(`supplier-portal ${name} refuses ${label}, reading nothing`, async () => {
+      resetSession()
+      poison()
+      recorder.reset()
+
+      const { hasPermission } = await import('@/lib/permissions')
+      assert.equal(
+        hasPermission('SUPPLIER', 'supplier_portal.rfq'),
+        true,
+        'the principal still HOLDS the portal permission — a permission is not what refuses it here',
+      )
+
+      const mod = await import('@/app/actions/supplier-portal')
+      const result = await call(mod as unknown as Record<string, (...a: never[]) => Promise<unknown>>)
+
+      assert.deepEqual(result, empty, `${name} must hand a revoked session the empty refusal, not data`)
+      recorder.assertNoReads(`${label} calling supplier-portal ${name}`)
+      resetSession()
+    })
+  }
+}
+
+test('a REASSIGNED supplier login cannot keep reading its previous company', async () => {
+  // The token still says supplier-A because role/supplierId are minted at login
+  // and never refreshed. What makes that safe is app/actions/users.ts bumping
+  // sessionVersion on a supplier change, which surfaces here as
+  // 'session-version-mismatch' — and which requireSupplier ignored, so the stale
+  // supplierId in the token stayed live for up to the 30-day session maxAge.
+  resetSession()
+  currentSupplierId = 'supplier-A'
+  currentSessionInvalidReason = 'session-version-mismatch'
+  recorder.reset()
+
+  const { getSupplierRfqs, submitSupplierQuote } = await import('@/app/actions/supplier-portal')
+  assert.deepEqual(await getSupplierRfqs(), [], 'the old supplier scope must not be readable')
+
+  const quote = await submitSupplierQuote('po-1', {
+    supplierRef: 'X', expectedDelivery: '', shippingCost: 0, shippingMethod: '',
+    lines: [{ lineId: 'l1', unitPrice: 1, qty: 1 }],
+  })
+  assert.equal((quote as { success: boolean }).success, false, 'nor writable')
+
+  recorder.assertNoReads('a reassigned supplier session')
+  resetSession()
+})
+
+test('the mutating supplier endpoints refuse a revoked session too, without writing', async () => {
+  // A read-only fix would have been half a fix: submitSupplierQuote writes prices
+  // onto a purchase order and submitProductEdit files a change request.
+  resetSession()
+  currentSessionInvalidReason = 'force-logout'
+  recorder.reset()
+
+  const { submitSupplierQuote, submitProductEdit } = await import('@/app/actions/supplier-portal')
+
+  const quote = await submitSupplierQuote('po-1', {
+    supplierRef: 'REF', expectedDelivery: '', shippingCost: 0, shippingMethod: '',
+    lines: [{ lineId: 'l1', unitPrice: 2, qty: 3 }],
+  })
+  assert.equal((quote as { success: boolean }).success, false)
+
+  const edit = await submitProductEdit('p-1', { name: 'New name' })
+  assert.equal((edit as { success: boolean }).success, false)
+
+  recorder.assertNoReads('a force-logged-out supplier mutating the portal')
+  resetSession()
+})
+
+test('a VALID supplier session still works — the session gate is not a blanket refusal', async () => {
+  // Too tight is also a defect. This is the same assertion as the scoped-read
+  // test above, re-run with the new fields present and benign, so a fix that
+  // simply refused everything would fail here.
+  resetSession()
+  currentTotpEnabled = true
+  currentTotpVerified = true // 2FA enabled AND cleared: a normal hardened login
+  recorder.reset()
+  queries.length = 0
+
+  const { getSupplierRfqs } = await import('@/app/actions/supplier-portal')
+  await getSupplierRfqs()
+
+  const listQuery = queries.find((q) => q.model === 'purchaseOrder' && q.op === 'findMany')
+  assert.ok(listQuery, 'a fully authenticated supplier must still read its own RFQ list')
+  assert.equal(
+    (listQuery.args[0] as { where?: { supplierId?: string } })?.where?.supplierId,
+    'supplier-A',
+  )
+  resetSession()
 })

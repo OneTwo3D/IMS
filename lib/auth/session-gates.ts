@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import type { Permission } from '@/lib/permissions'
 import {
   evaluateFreshAuth,
+  sessionAccessDenial,
   type FreshAuthDecision,
   type FreshAuthOptions,
   type SessionInvalidReason,
@@ -154,11 +155,18 @@ export function requireApiAuthSession(session: unknown): AuthSession | NextRespo
   if (!isAuthSession(session)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
-  if (session.user.sessionInvalidReason) {
-    return NextResponse.json({ error: 'Session expired' }, { status: 401 })
-  }
-  if (session.user.totpEnabled && !session.user.totpVerified) {
-    return NextResponse.json({ error: 'Two-factor verification required' }, { status: 401 })
+  // Same decision as requireAuth and as the supplier portal's requireSupplier —
+  // see sessionAccessDenial. Only the refusal differs: a JSON 401.
+  const denial = sessionAccessDenial(session.user)
+  if (denial) {
+    switch (denial.reason) {
+      case 'no-session':
+        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+      case 'session-invalid':
+        return NextResponse.json({ error: 'Session expired' }, { status: 401 })
+      case 'second-factor-pending':
+        return NextResponse.json({ error: 'Two-factor verification required' }, { status: 401 })
+    }
   }
   return session
 }

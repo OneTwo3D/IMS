@@ -593,3 +593,388 @@ export async function notAnEndpoint() {
 `
   assert.deepEqual(scanAuthenticationOnlyActions(F, src, {}, createSourceGraph({ [F]: src })), [])
 })
+
+// ---------------------------------------------------------------------------
+// Round 4, finding 2 — DOES THE GUARD ACTUALLY RUN?
+//
+// Round 3 verified WHICH declaration a call resolves to and left WHERE the call
+// sits unchecked; its own report said so. A resolved guard in a branch nothing
+// takes is credit for work not done, so position is verified the same way
+// identity is.
+// ---------------------------------------------------------------------------
+
+const BYPASS = { 'lib/bypass.ts': "export const INTERNAL_BYPASS = Symbol('internal-bypass')\nexport const OTHER_BYPASS = Symbol('other-bypass')\n" }
+const BYPASS_IMPORT = "import { INTERNAL_BYPASS, OTHER_BYPASS } from '@/lib/bypass'\n"
+
+test('a guard inside an `if` branch is NOT credited — it may not run', () => {
+  assert.deepEqual(
+    scan(`export async function a(flag: boolean) {
+      if (flag) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard in an `else` branch is NOT credited either', () => {
+  assert.deepEqual(
+    scan(`export async function a(flag: boolean) {
+      if (flag) { void 0 } else { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard whose refusal a `catch` SWALLOWS is not a guard', () => {
+  // Worse than no guard: it reads like one, and execution carries straight on
+  // into the body with the denial discarded.
+  assert.deepEqual(
+    scan(`export async function a() {
+      try { await requirePermission('sync') } catch {}
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard whose `catch` cannot fall through IS credited — the getUsers shape', () => {
+  // app/actions/users.ts:getUsers is exactly this, and it is a real refusal
+  // written as a catch. A rule that flagged it would be answered with an
+  // allowlist entry instead of a fix.
+  assert.deepEqual(
+    scan(`export async function a() {
+      try { await requirePermission('sync') } catch { return [] }
+      return db.thing.findMany()
+    }`),
+    [],
+  )
+})
+
+test('a guard in a try whose catch RETHROWS is credited', () => {
+  assert.deepEqual(
+    scan(`export async function a() {
+      try { await requirePermission('sync') } catch (e) { throw e }
+      return db.thing.findMany()
+    }`),
+    [],
+  )
+})
+
+test('a guard in a try with NO catch is credited', () => {
+  assert.deepEqual(
+    scan(`export async function a() {
+      try { await requirePermission('sync') } finally { void 0 }
+      return db.thing.findMany()
+    }`),
+    [],
+  )
+})
+
+test('a guard inside a LOOP body is not credited — the loop may run zero times', () => {
+  assert.deepEqual(
+    scan(`export async function a(ids: string[]) {
+      for (const id of ids) { await requirePermission('sync'); void id }
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard after a `return` is not credited — unreachable code is not a gate', () => {
+  assert.deepEqual(
+    scan(`export async function a() {
+      return db.thing.findMany()
+      await requirePermission('sync')
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard in a TERNARY arm is not credited', () => {
+  assert.deepEqual(
+    scan(`export async function a(flag: boolean) {
+      const gate = flag ? await requirePermission('sync') : null
+      void gate
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard on the SHORT-CIRCUITED side of && is not credited', () => {
+  assert.deepEqual(
+    scan(`export async function a(flag: boolean) {
+      const gate = flag && await requirePermission('sync')
+      void gate
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard inside a CALLBACK is not credited — it is deferred, and nothing awaits it', () => {
+  assert.deepEqual(
+    scan(`export async function a() {
+      const runners = [1].map(async () => requirePermission('sync'))
+      void runners
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('an OPTIONAL call on a real guard is not credited — it is skipped when the callee is nullish', () => {
+  // The callee resolves to lib/auth/server.ts:requirePermission, so identity is
+  // not the question here; `?.()` means the call may not happen at all.
+  assert.deepEqual(
+    scan(`export async function a() {
+      await requirePermission?.('sync')
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard evaluated in the CONDITION of an `if` IS credited — it runs to decide the branch', () => {
+  assert.deepEqual(
+    scan(`export async function a(flag: boolean) {
+      if ((await requirePermission('sync')) && flag) { return [] }
+      return db.thing.findMany()
+    }`),
+    [],
+  )
+})
+
+test('an unconditional guard is still credited — the ordinary shape does not regress', () => {
+  assert.deepEqual(
+    scan(`export async function a() {
+      await requirePermission('sync')
+      return db.thing.findMany()
+    }`),
+    [],
+  )
+})
+
+// --- the one conditional position that IS verified -------------------------
+
+test('a guard behind an UNFORGEABLE Symbol sentinel is credited', () => {
+  // A Server Action's arguments arrive deserialized from the wire, and a symbol
+  // cannot be represented there — so no network caller can make this comparison
+  // match, and the guarded arm is the only arm they can take. (o3d-43oz)
+  assert.deepEqual(
+    scan(`${BYPASS_IMPORT}export async function a(options?: { t?: symbol }) {
+      if (options?.t !== INTERNAL_BYPASS) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, BYPASS),
+    [],
+  )
+})
+
+test('the same shape with a BOOLEAN flag is flagged — this is the o3d-43oz defect', () => {
+  // `skipPermissionCheck?: boolean` is what the symbol replaced: a client could
+  // simply send it. The rule tells them apart by RESOLVING the sentinel to a
+  // `Symbol()` const, not by recognising the idiom.
+  assert.deepEqual(
+    scan(`export async function a(options?: { skipPermissionCheck?: boolean }) {
+      if (!options?.skipPermissionCheck) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a sentinel that is a STRING const, not a Symbol, earns nothing', () => {
+  assert.deepEqual(
+    scan(`import { STRING_BYPASS } from '@/lib/strbypass'
+    export async function a(options?: { t?: string }) {
+      if (options?.t !== STRING_BYPASS) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, { 'lib/strbypass.ts': "export const STRING_BYPASS = 'internal-bypass'\n" }),
+    [`${F}:a`],
+  )
+})
+
+test('a sentinel test held in a local `const`, negated, is credited — the createRefund shape', () => {
+  assert.deepEqual(
+    scan(`${BYPASS_IMPORT}export async function a(options?: { t?: symbol }) {
+      const isInternal = options?.t === INTERNAL_BYPASS
+      if (!isInternal) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, BYPASS),
+    [],
+  )
+})
+
+test('two sentinel tests combined with `!a && !b` are credited — the applySalesOrderStatusTransition shape', () => {
+  assert.deepEqual(
+    scan(`${BYPASS_IMPORT}export async function a(options?: { t?: symbol }) {
+      const bypassPermission = options?.t === INTERNAL_BYPASS
+      const authOnly = options?.t === OTHER_BYPASS
+      if (!bypassPermission && !authOnly) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, BYPASS),
+    [],
+  )
+})
+
+test('the same test held in a `let` earns nothing — it can be reassigned before the branch', () => {
+  assert.deepEqual(
+    scan(`${BYPASS_IMPORT}export async function a(options?: { t?: symbol }) {
+      let isInternal = options?.t === INTERNAL_BYPASS
+      isInternal = true
+      if (!isInternal) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, BYPASS),
+    [`${F}:a`],
+  )
+})
+
+test('POLARITY is checked: the MATCHING arm of a sentinel test is not a guard', () => {
+  // Here the guard runs only for the internal caller that already proved itself,
+  // and the network caller — the one the guard exists for — skips it entirely.
+  assert.deepEqual(
+    scan(`${BYPASS_IMPORT}export async function a(options?: { t?: symbol }) {
+      if (options?.t === INTERNAL_BYPASS) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, BYPASS),
+    [`${F}:a`],
+  )
+})
+
+test('the position rule reaches the SECRET-READ rule too', () => {
+  assert.deepEqual(
+    scanSecrets(`export async function a(flag: boolean) {
+      await requireAuth()
+      if (flag) { await requirePermission('settings') }
+      return getSettingValue('email_smtp_pass')
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a conditional requireAuth does not put an endpoint in the authentication-only inventory', () => {
+  // It is unguarded, which is the coverage rule's violation — not an
+  // authentication-only endpoint to be inventoried and accepted.
+  assert.deepEqual(
+    scanAuthOnly(`export async function a(flag: boolean) {
+      if (flag) { await requireAuth() }
+      return db.thing.findMany()
+    }`),
+    [],
+  )
+  assert.deepEqual(
+    scan(`export async function a(flag: boolean) {
+      if (flag) { await requireAuth() }
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Round 4, finding 3 — ALIASED SECRET READERS
+//
+// The resolver was built so that renaming could not defeat a name match. The
+// secret-read rule never adopted it: resolution was only reached for identifiers
+// already spelled like a reader, so the name test was still the entry condition.
+// ---------------------------------------------------------------------------
+
+const SETTINGS_ALIAS = "import { getSettingValue as readSetting } from '@/lib/settings-store'\n"
+
+test('an ALIASED import of a secret reader behind requireAuth IS flagged', () => {
+  assert.deepEqual(
+    scanSecrets(`${SETTINGS_ALIAS}export async function a() {
+      await requireAuth()
+      return readSetting('email_smtp_pass')
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('the same aliased read behind an AUTHORIZATION guard is not flagged', () => {
+  assert.deepEqual(
+    scanSecrets(`${SETTINGS_ALIAS}export async function a() {
+      await requirePermission('settings')
+      return readSetting('email_smtp_pass')
+    }`),
+    [],
+  )
+})
+
+test('a secret reader reached through a NAMESPACE import is flagged', () => {
+  assert.deepEqual(
+    scanSecrets(`import * as store from '@/lib/settings-store'
+    export async function a() {
+      await requireAuth()
+      return store.getSettingValue('email_smtp_pass')
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('an aliased reader passed around as a VALUE is flagged too', () => {
+  assert.deepEqual(
+    scanSecrets(`${SETTINGS_ALIAS}export async function a() {
+      await requireAuth()
+      const reader = readSetting
+      return reader('email_smtp_pass')
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('an import ALIASED TO a reader name that resolves elsewhere is NOT flagged', () => {
+  // The other direction of the same question: the local name looks exactly like
+  // a reader, and resolution says it is not one.
+  assert.deepEqual(
+    scanSecrets(`import { unrelated as getSettingValue } from '@/lib/other'
+    export async function a() {
+      await requireAuth()
+      return getSettingValue('email_smtp_pass')
+    }`, { 'lib/other.ts': 'export async function unrelated(k: string) { return k }\n' }),
+    [],
+  )
+})
+
+test('a guard whose promise NOTHING AWAITS is not credited', () => {
+  // The refusal is started and not waited for: execution continues into the read
+  // while the check is still pending, and the rejection surfaces later as an
+  // unhandled rejection instead of a denial.
+  assert.deepEqual(
+    scan(`export async function a() {
+      requirePermission('sync')
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard stashed in a variable and never awaited is not credited', () => {
+  assert.deepEqual(
+    scan(`export async function a() {
+      const pending = requirePermission('sync')
+      void pending
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('`return guard()` IS credited — the caller awaits it', () => {
+  assert.deepEqual(
+    scan(`export async function a() {
+      return requirePermission('sync')
+    }`),
+    [],
+  )
+})
+
+test('a guard in a try whose FINALLY returns is not credited — finally swallows the refusal', () => {
+  assert.deepEqual(
+    scan(`export async function a() {
+      try { await requirePermission('sync') } finally { return db.thing.findMany() }
+    }`),
+    [`${F}:a`],
+  )
+})
