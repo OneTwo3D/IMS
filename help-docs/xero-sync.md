@@ -700,6 +700,20 @@ When enabled, the IMS polls Xero every 15 minutes for:
 - **Paid purchase bills** (all POs — detects when a bill is paid via bank feed)
 - **Reversed payments** on either (payment removed or invoice voided — clears `paidAt`)
 
+**A part payment is not a reversal.** Xero moves an invoice back to *AUTHORISED* whenever it is no
+longer *fully* paid — which includes a bill that carries a real **part** payment, the ordinary cause
+being an IMS bill total lower than Xero's (a line or freight added in Xero after IMS posted it). The
+poll therefore reads what the ledger actually **holds** (`AmountPaid`), not just the status: `paidAt`
+is cleared only when nothing is paid against the document any more, or the invoice was voided.
+
+When the document is no longer fully paid but the ledger still holds a payment — or Xero's answer did
+not say how much is paid — the reversal is **withheld** and a WARNING is logged against the order or
+purchase order instead (*"…is AUTHORISED in Xero (not fully paid), but the ledger still holds a
+payment of …"*). Nothing is cleared and, on the sales side, no chargeback credit note is raised. This
+matters most on bills: clearing `paidAt` re-arms **Mark Paid** in the UI, and pressing it registers a
+**second** supplier payment on top of the part payment. Settle the balance in Xero, or correct the
+bill total in IMS.
+
 All four checks are answered by a **single** request that asks Xero only for invoices changed since
 the last successful poll, using the `If-Modified-Since` header. The poll advances its cursor only
 when it succeeds, and deliberately re-reads the last couple of minutes each time, so a payment can

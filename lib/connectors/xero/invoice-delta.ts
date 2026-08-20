@@ -18,6 +18,20 @@ export type XeroInvoice = {
    * fails closed rather than guessing.
    */
   UpdatedDateUTC?: string
+  /**
+   * What the ledger HOLDS against this invoice, gross. Xero returns both on every invoice in the
+   * Invoices collection, and they are the difference between a payment that was REMOVED and one that
+   * merely did not cover the whole bill — a distinction Status alone cannot make, because AUTHORISED
+   * means "approved and not fully paid" and says nothing about what has been paid (o3d-clxw).
+   *
+   * Optional only because the fixtures predate them. A reversal verdict that needs them and does not
+   * have them is WITHHELD rather than guessed — see partitionPaymentReversals.
+   *
+   * AmountCredited is deliberately not read: an allocated credit note is not a payment, and `paidAt`
+   * records a payment.
+   */
+  AmountPaid?: number | string
+  AmountDue?: number | string
 }
 
 export type XeroInvoicesResponse = {
@@ -805,4 +819,111 @@ export function idsWhere(
   return new Set(
     invoices.filter((i) => i.Type === type && statuses.includes(i.Status)).map((i) => i.InvoiceID),
   )
+}
+
+// ---------------------------------------------------------------------------
+// WHAT COUNTS AS A PAYMENT REVERSAL (o3d-clxw)
+// ---------------------------------------------------------------------------
+//
+// `idsWhere(changed, type, ['AUTHORISED', 'VOIDED'])` was the reversal set for both passes, and
+// AUTHORISED is not "unpaid". It is Xero's status for an approved invoice that is NOT FULLY paid,
+// which includes one carrying a real PART payment — Xero only moves an invoice to PAID when the
+// outstanding amount reaches zero.
+//
+// So a payment that landed as a part payment read as a payment REMOVAL. On the bill side that
+// cleared `paidAt`, logged "no longer present in Xero", and re-armed Mark Paid over a supplier
+// payment that had genuinely been made: the operator, seeing IMS say unpaid and the log say the
+// payment is gone, presses it again and the supplier is paid a second time (markBillPaid sends no
+// idempotency key and BILL_PAYMENT sits outside every live-row dedupe, so nothing downstream
+// refuses it). On the sales side the same reading additionally raises an automatic chargeback
+// credit note, unwinding revenue against a payment that is still in the ledger.
+//
+// The ordinary cause is not exotic: the IMS bill total is below the Xero total because the bill was
+// edited in Xero after IMS posted it, so the full-total payment IMS sends leaves a balance.
+//
+// A REVERSAL IS A FALL TO ZERO PAID, NOT A STATUS THAT IS MERELY NOT-PAID. The delta payload
+// already carries the number that says so, and this is where it is read.
+
+/**
+ * Money the ledger reports, or null when the payload does not state it.
+ *
+ * Xero serialises invoice amounts as JSON numbers, but a string is accepted rather than coerced
+ * blindly: `Number('')` is 0, and a zero conjured out of an empty field is exactly the "no payment
+ * is present" answer that clears paidAt and re-arms a second supplier payment.
+ */
+export function parseLedgerAmount(value: unknown): number | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (trimmed === '') return null
+    const parsed = Number(trimmed)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  return null
+}
+
+/**
+ * Below this, the ledger holds no payment. Xero rounds money to 2dp, so half a penny is well inside
+ * the gap between "nothing" and "the smallest payment that can exist".
+ */
+export const PAYMENT_PRESENT_EPSILON = 0.005
+
+export type PaymentReversalReading = {
+  /**
+   * Invoices whose payment is provably GONE: the ledger holds nothing against them, or the invoice
+   * itself is VOIDED. Only these may clear `paidAt`.
+   */
+  reversed: Set<string>
+  /**
+   * No longer PAID, but the ledger STILL HOLDS A PAYMENT — a part payment, or a bill edited upward
+   * after being paid. Not a reversal, and the IMS document must stay paid: clearing it re-arms the
+   * UI over money that has already moved.
+   */
+  partPaid: XeroInvoice[]
+  /**
+   * No longer PAID, and the payload does not say what the ledger holds. UNKNOWN IS NOT A REVERSAL:
+   * the cost of withholding is a document IMS still shows as paid, which a human can correct; the
+   * cost of guessing the other way is a second payment to a supplier, which nobody can.
+   */
+  unverifiable: XeroInvoice[]
+}
+
+/**
+ * Split one delta slice into the three answers the reversal passes may act on.
+ *
+ * VOIDED is a reversal unconditionally: Xero requires every payment to be removed before an invoice
+ * can be voided, the document IMS marked paid no longer exists, and a fresh payment against a voided
+ * invoice is refused by Xero anyway — so re-arming there cannot move money twice.
+ */
+export function partitionPaymentReversals(
+  invoices: XeroInvoice[],
+  type: 'ACCREC' | 'ACCPAY',
+): PaymentReversalReading {
+  const reversed = new Set<string>()
+  const partPaid: XeroInvoice[] = []
+  const unverifiable: XeroInvoice[] = []
+
+  for (const invoice of invoices) {
+    if (invoice.Type !== type) continue
+    if (invoice.Status === 'VOIDED') {
+      reversed.add(invoice.InvoiceID)
+      continue
+    }
+    if (invoice.Status !== 'AUTHORISED') continue
+
+    const amountPaid = parseLedgerAmount(invoice.AmountPaid)
+    if (amountPaid === null) {
+      unverifiable.push(invoice)
+      continue
+    }
+    // ABS, not `> 0`: a negative AmountPaid is not a number this code understands, and "the ledger
+    // holds something we cannot explain" is not permission to declare the payment gone.
+    if (Math.abs(amountPaid) > PAYMENT_PRESENT_EPSILON) {
+      partPaid.push(invoice)
+      continue
+    }
+    reversed.add(invoice.InvoiceID)
+  }
+
+  return { reversed, partPaid, unverifiable }
 }

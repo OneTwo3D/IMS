@@ -5,6 +5,9 @@ import {
   drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
   idsWhere,
+  parseLedgerAmount,
+  partitionPaymentReversals,
+  PAYMENT_PRESENT_EPSILON,
   MAX_CHUNKS_PER_POLL,
   MAX_PAGES,
   PAGE_SIZE,
@@ -463,4 +466,97 @@ test('one poll never drains more than MAX_CHUNKS_PER_POLL chunks', async () => {
 
   assert.equal(res.ok && res.complete, false, 'an unfinished drain must say so')
   assert.ok(chunks <= MAX_CHUNKS_PER_POLL, `drained ${chunks} chunks in one poll`)
+})
+
+// ---------------------------------------------------------------------------
+// A reversal is a fall to ZERO paid, not a status that is merely not-PAID (o3d-clxw)
+// ---------------------------------------------------------------------------
+
+function ledgerInv(id: string, type: 'ACCREC' | 'ACCPAY', status: string, amounts: Partial<XeroInvoice> = {}): XeroInvoice {
+  return { InvoiceID: id, Type: type, Status: status, ...amounts }
+}
+
+test('an AUTHORISED bill still carrying a payment is a PART payment, not a reversal', () => {
+  // The whole of o3d-clxw: read as a reversal, this clears paidAt, re-arms Mark Paid and pays the
+  // supplier a second time on top of the part payment.
+  const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 400, AmountDue: 100 })], 'ACCPAY')
+
+  assert.equal(reading.reversed.has('b1'), false, 'a bill the ledger has been paid against must not be called reversed')
+  assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), ['b1'])
+  assert.deepEqual(reading.unverifiable, [])
+})
+
+test('an AUTHORISED invoice with nothing paid against it IS a reversal', () => {
+  const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500 })], 'ACCPAY')
+
+  assert.deepEqual([...reading.reversed], ['b1'])
+  assert.deepEqual(reading.partPaid, [])
+})
+
+test('VOIDED is a reversal whatever the amounts say', () => {
+  // Xero requires payments to be removed before a void, and refuses a payment against a voided
+  // invoice — so re-arming a voided document cannot move money twice.
+  const reading = partitionPaymentReversals([
+    ledgerInv('v1', 'ACCPAY', 'VOIDED'),
+    ledgerInv('v2', 'ACCREC', 'VOIDED', { AmountPaid: 250 }),
+  ], 'ACCPAY')
+
+  assert.deepEqual([...reading.reversed], ['v1'])
+  assert.deepEqual(partitionPaymentReversals([ledgerInv('v2', 'ACCREC', 'VOIDED', { AmountPaid: 250 })], 'ACCREC').reversed.has('v2'), true)
+})
+
+test('an AmountPaid the payload does not state is UNVERIFIABLE, never a reversal', () => {
+  const reading = partitionPaymentReversals([
+    ledgerInv('b1', 'ACCPAY', 'AUTHORISED'),
+    ledgerInv('b2', 'ACCPAY', 'AUTHORISED', { AmountPaid: '' }),
+    ledgerInv('b3', 'ACCPAY', 'AUTHORISED', { AmountPaid: 'not a number' }),
+    ledgerInv('b4', 'ACCPAY', 'AUTHORISED', { AmountPaid: null as unknown as number }),
+  ], 'ACCPAY')
+
+  assert.equal(reading.reversed.size, 0, 'unknown must not read as "nothing is paid" — that is the answer that pays twice')
+  assert.deepEqual(reading.unverifiable.map((i) => i.InvoiceID), ['b1', 'b2', 'b3', 'b4'])
+})
+
+test('a numeric string AmountPaid is read, not discarded', () => {
+  const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: '12.50' })], 'ACCPAY')
+  assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), ['b1'])
+})
+
+test('rounding dust is not a payment, but a penny is', () => {
+  const dust = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: PAYMENT_PRESENT_EPSILON / 2 })], 'ACCPAY')
+  assert.deepEqual([...dust.reversed], ['b1'])
+
+  const penny = partitionPaymentReversals([ledgerInv('b2', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0.01 })], 'ACCPAY')
+  assert.deepEqual(penny.partPaid.map((i) => i.InvoiceID), ['b2'])
+})
+
+test('a negative AmountPaid is not read as "nothing is paid"', () => {
+  const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: -50 })], 'ACCPAY')
+  assert.equal(reading.reversed.has('b1'), false, 'a figure this code does not understand is not permission to declare the payment gone')
+  assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), ['b1'])
+})
+
+test('PAID and DRAFT rows are not reversal candidates at all, and types do not cross', () => {
+  const rows = [
+    ledgerInv('b-paid', 'ACCPAY', 'PAID', { AmountPaid: 500, AmountDue: 0 }),
+    ledgerInv('b-draft', 'ACCPAY', 'DRAFT', { AmountPaid: 0 }),
+    ledgerInv('s-auth', 'ACCREC', 'AUTHORISED', { AmountPaid: 0 }),
+  ]
+  const bills = partitionPaymentReversals(rows, 'ACCPAY')
+  assert.equal(bills.reversed.size, 0)
+  assert.equal(bills.partPaid.length, 0)
+  assert.equal(bills.unverifiable.length, 0)
+  assert.deepEqual([...partitionPaymentReversals(rows, 'ACCREC').reversed], ['s-auth'])
+})
+
+test('parseLedgerAmount refuses to turn an empty field into zero', () => {
+  assert.equal(parseLedgerAmount(''), null)
+  assert.equal(parseLedgerAmount('   '), null)
+  assert.equal(parseLedgerAmount(undefined), null)
+  assert.equal(parseLedgerAmount(null), null)
+  assert.equal(parseLedgerAmount(Number.NaN), null)
+  assert.equal(parseLedgerAmount({}), null)
+  assert.equal(parseLedgerAmount(0), 0)
+  assert.equal(parseLedgerAmount('0'), 0)
+  assert.equal(parseLedgerAmount(' 42.5 '), 42.5)
 })
