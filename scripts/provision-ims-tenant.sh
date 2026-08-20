@@ -40,6 +40,51 @@ append_env_line() {
   printf '%s=%q\n' "$key" "$value" >> "$file"
 }
 
+# Percent-encode a value for the userinfo section of a URL.
+#
+# o3d-tsc0 settles which of the two ways a Redis password can reach the rate
+# limiter is canonical: REDIS_URL carries it, and REDIS_PASSWORD is a
+# compatibility line for hosts whose URL predates that rule. Reasons, in order
+# of weight: the URL is what the client connects with, so it needs no
+# application wiring and reaches any future Redis consumer for free; it is the
+# only form that can express a Redis 6 ACL username (`AUTH <user> <pass>`),
+# which a bare password cannot; the rate limiter's memoisation key is derived
+# from REDIS_URL, so a rotation carried in the URL invalidates the cached
+# backend and one carried only in REDIS_PASSWORD need not; and inline
+# credentials already WIN over any env fallback, so choosing the URL is the
+# option that requires no change on either side and makes merge order
+# irrelevant. Getting that wrong is not a Redis outage — the auth rate-limit
+# buckets fail CLOSED, so the symptom is that nobody can sign in.
+#
+# LC_ALL=C makes bash walk the string BYTE by byte, so a multi-byte password is
+# encoded as the bytes the server will receive rather than as codepoints. Same
+# encoder as scripts/install.sh (o3d-g42a/o3d-xnwu); the two scripts share no
+# shell library, and a percent-encoder that only agrees with itself is exactly
+# the defect that made this a two-sided problem.
+urlencode() {
+  local LC_ALL=C string="$1" out="" i c
+  for (( i = 0; i < ${#string}; i++ )); do
+    c="${string:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) out+="$(printf '%%%02X' "'$c")" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
+# The summary at the end of this script is printed to a terminal and captured in
+# provisioning logs, and REDIS_URL now carries a credential (o3d-tsc0). Print the
+# shape, never the secret. Pure bash parameter expansion — no external process
+# gets the password on its argv either.
+redact_url_credentials() {
+  local url="$1"
+  case "$url" in
+    *"://"*"@"*) printf '%s://***@%s' "${url%%://*}" "${url#*@}" ;;
+    *) printf '%s' "$url" ;;
+  esac
+}
+
 ssh_proxmox() {
   ssh -o BatchMode=yes "${PROXMOX_SSH_USER}@${PROXMOX_HOST}" "$@"
 }
@@ -280,17 +325,33 @@ REDIS_HOST="${REDIS_HOST:-}"
 REDIS_PORT="${REDIS_PORT:-6379}"
 REDIS_DB="${REDIS_DB:-0}"
 REDIS_KEY_PREFIX="${REDIS_KEY_PREFIX:-${TENANT_SLUG}}"
+# Read before the URL is built, because the URL is where it has to end up
+# (o3d-tsc0). Previously this line came AFTER the block below, so the URL could
+# not have carried it even if the block had tried.
+REDIS_PASSWORD="${REDIS_PASSWORD:-}"
+REDIS_USERINFO=""
+if [[ -n "${REDIS_PASSWORD}" ]]; then
+  REDIS_USERINFO=":$(urlencode "${REDIS_PASSWORD}")@"
+fi
 if [[ -z "${REDIS_URL:-}" ]]; then
   if [[ "${REDIS_MODE}" == "external" ]]; then
     require_env REDIS_HOST
-    REDIS_URL="redis://${REDIS_HOST}:${REDIS_PORT}/${REDIS_DB}"
+    REDIS_URL="redis://${REDIS_USERINFO}${REDIS_HOST}:${REDIS_PORT}/${REDIS_DB}"
   elif [[ "${REDIS_MODE}" == "local" ]]; then
-    REDIS_URL="redis://localhost:${REDIS_PORT}/${REDIS_DB}"
+    REDIS_URL="redis://${REDIS_USERINFO}localhost:${REDIS_PORT}/${REDIS_DB}"
   else
     REDIS_URL=""
   fi
+elif [[ -n "${REDIS_PASSWORD}" && "${REDIS_URL}" != *"@"* ]]; then
+  # A URL the caller supplied themselves is left exactly as given — rewriting an
+  # operator's connection string is how you end up authenticating with something
+  # nobody typed. Say what will happen instead, in the words of the symptom:
+  # the login rate limiter fails CLOSED on its auth buckets, so a Redis that
+  # answers NOAUTH does not look like a Redis problem, it looks like nobody can
+  # sign in.
+  warn "REDIS_URL was supplied without credentials but REDIS_PASSWORD is set — the application connects with REDIS_URL, so put the password there (redis://:PASSWORD@host:port/db) or Redis will answer NOAUTH and sign-in will fail closed."
 fi
-REDIS_PASSWORD="${REDIS_PASSWORD:-}"
+REDIS_URL_DISPLAY="$(redact_url_credentials "${REDIS_URL}")"
 CLOUDFLARE_PROXIED="${CLOUDFLARE_PROXIED:-false}"
 OLS_HTTP_LISTENER="${OLS_HTTP_LISTENER:-Default}"
 OLS_HTTPS_LISTENER="${OLS_HTTPS_LISTENER:-SSL}"
@@ -754,7 +815,7 @@ Notification sent: ${NOTIFICATION_EMAIL}
 Repo branch:       ${GIT_BRANCH}
 Postgres mode:     ${POSTGRES_MODE} (${DB_HOST}:${DB_PORT}/${DB_NAME})
 Redis mode:        ${REDIS_MODE}
-Redis URL:         ${REDIS_URL:-disabled}
+Redis URL:         ${REDIS_URL_DISPLAY:-disabled}
 Redis prefix:      ${REDIS_KEY_PREFIX}
 SSH enabled:       ${INSTALL_SSHD}
 
