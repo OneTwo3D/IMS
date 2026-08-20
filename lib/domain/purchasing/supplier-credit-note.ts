@@ -114,6 +114,20 @@ export function resolveSupplierCreditNoteTaxType(params: {
  * credit note. The single line reverses the freight bill on the same account it
  * debited (transit/clearing) and mirrors its tax type, so the credit nets the
  * capitalised freight AND reverses the VAT correctly (audit-oy5p).
+ *
+ * THE DOCUMENT NUMBER MUST BE UNIQUE PER CREDIT NOTE — o3d-tfri. It used to fall back to
+ * `params.reference` before `SCN-<id>`, and `reference` is set to the PURCHASE ORDER's reference
+ * by `recordSupplierCreditNote` whenever the operator leaves the number blank (the field is
+ * optional free text). Several credit notes against one PO is a supported flow, so two
+ * blank-numbered ones produced the SAME `CreditNoteNumber` — and Xero's `POST /CreditNotes` is
+ * create-or-update on that number, so the second silently replaced the first in the ledger. Now
+ * the fallback is `SCN-<creditNoteId>`, unique by construction because the id is this row's
+ * primary key. The PO reference is not lost: it still travels as the credit note's `reference`,
+ * which posts to Xero's `Reference` field, so the PO linkage is as visible as it ever was.
+ *
+ * Both halves of the fix matter and neither replaces the other: this one stops the collision
+ * being generated, and `pushPurchaseCreditNote`'s PUT stops a collision from ANY source (a
+ * supplier who reuses their own number, an operator who types one twice) being absorbed silently.
  */
 export function buildSupplierCreditNoteSyncPayload(params: {
   creditNoteId: string
@@ -140,7 +154,7 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   lineAmountsIncludeTax?: boolean
 }): Record<string, unknown> {
   return {
-    creditNoteNumber: params.creditNoteNumber ?? params.reference ?? `SCN-${params.creditNoteId}`,
+    creditNoteNumber: params.creditNoteNumber ?? `SCN-${params.creditNoteId}`,
     contactName: params.supplierName,
     date: params.date,
     currency: params.currency,

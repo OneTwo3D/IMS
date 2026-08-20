@@ -178,13 +178,39 @@ test('sync payload posts EXCLUSIVE for reverse-charge (net amount), INCLUSIVE ot
   assert.equal(buildSupplierCreditNoteSyncPayload({ ...base, lineAmountsIncludeTax: false }).lineAmountsIncludeTax, false)
 })
 
-test('sync payload falls back to reference then a synthetic number, and a default line description', () => {
-  const noNumber = buildSupplierCreditNoteSyncPayload({
-    creditNoteId: 'scn-2', creditNoteNumber: null, reference: 'PO-ABC', reason: null,
+test('a BLANK credit-note number never becomes the PO reference — two on one PO would collide (o3d-tfri)', () => {
+  // `recordSupplierCreditNote` sets `reference` to the PO's reference whenever the operator leaves
+  // the number blank, and several credit notes per PO is a supported flow. The number used to fall
+  // back to that reference, so two blank-numbered credits on PO-ABC both posted as
+  // `CreditNoteNumber: 'PO-ABC'` — and Xero's create-or-update on that number meant the second
+  // REPLACED the first in the ledger. Each now gets its own row-id-derived number.
+  const common = {
+    reference: 'PO-ABC', reason: null, creditNoteNumber: null,
+    supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10,
+    transitAccount: 'T', taxType: 'NONE', date: '2026-06-13',
+  }
+  const first = buildSupplierCreditNoteSyncPayload({ ...common, creditNoteId: 'scn-2' })
+  const second = buildSupplierCreditNoteSyncPayload({ ...common, creditNoteId: 'scn-9' })
+
+  assert.equal(first.creditNoteNumber, 'SCN-scn-2')
+  assert.equal(second.creditNoteNumber, 'SCN-scn-9')
+  assert.notEqual(
+    first.creditNoteNumber,
+    second.creditNoteNumber,
+    'two blank-numbered credit notes on ONE purchase order must not share a CreditNoteNumber',
+  )
+  // The PO linkage is not lost — it just stops being the document number.
+  assert.equal(first.reference, 'PO-ABC')
+  assert.equal(second.reference, 'PO-ABC')
+  assert.equal((first.lines as Array<Record<string, unknown>>)[0].description, 'Supplier credit note')
+})
+
+test('an operator-supplied number is still used verbatim, and a bare credit note still gets one', () => {
+  const numbered = buildSupplierCreditNoteSyncPayload({
+    creditNoteId: 'scn-4', creditNoteNumber: 'SUPPLIER-CN-77', reference: 'PO-ABC', reason: null,
     supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: 'T', taxType: 'NONE', date: '2026-06-13',
   })
-  assert.equal(noNumber.creditNoteNumber, 'PO-ABC')
-  assert.equal((noNumber.lines as Array<Record<string, unknown>>)[0].description, 'Supplier credit note')
+  assert.equal(numbered.creditNoteNumber, 'SUPPLIER-CN-77')
 
   const noRef = buildSupplierCreditNoteSyncPayload({
     creditNoteId: 'scn-3', creditNoteNumber: null, reference: null, reason: null,

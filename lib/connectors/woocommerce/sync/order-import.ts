@@ -109,7 +109,6 @@ export type WcForeignTotalsLine = {
   unitPriceForeign: DecimalInput
   discountAmount: DecimalInput
   taxForeign: DecimalInput
-  taxRateValue: DecimalInput
 }
 
 /**
@@ -117,18 +116,25 @@ export type WcForeignTotalsLine = {
  * and grand total — computed entirely in Decimal so the AR-control / FX-revaluation
  * amounts don't accumulate float drift across many lines (scjz.62). Callers convert
  * to base currency at the single /fxRate boundary (divideRoundedNumber).
+ *
+ * o3d-cyn: THERE IS NO VAT TO EXTRACT HERE, on either WooCommerce price convention.
+ * `unitPriceForeign` comes from `line_items[].subtotal / quantity` and `discountAmount`
+ * from `subtotal - total`, and WC REST reports BOTH ex-tax whatever `prices_include_tax`
+ * says — the tax lives in `subtotal_tax` / `total_tax`, which is where `taxForeign` comes
+ * from. This used to divide by (1 + rate) for a tax-inclusive store, netting an amount
+ * that was already net: an order of net 100 + 20 VAT = 120 gross stored a subtotal of
+ * 83.33, so `subtotal + shipping + tax` no longer reconciled to `totalForeign` (the order
+ * total straight off Woo). Dropping the branch makes the identity hold on both
+ * conventions. Same reasoning as `isWooCommerceOrder()` in lib/sales-currency.ts, which
+ * already exempts WC orders from every gross-price derivation for this reason.
  */
 export function computeWcOrderForeignTotals(input: {
   lines: WcForeignTotalsLine[]
   shippingTaxForeign: Array<string | number | null | undefined>
   orderTotal: string | number | null | undefined
-  pricesIncludeVat: boolean
 }): { subtotalForeign: Decimal; taxForeign: Decimal; totalForeign: Decimal } {
   const subtotalForeign = input.lines.reduce((sum, line) => {
-    const gross = toDecimal(line.qty).mul(toDecimal(line.unitPriceForeign)).sub(toDecimal(line.discountAmount))
-    const net = input.pricesIncludeVat
-      ? gross.div(toDecimal(1).add(toDecimal(line.taxRateValue)))
-      : gross
+    const net = toDecimal(line.qty).mul(toDecimal(line.unitPriceForeign)).sub(toDecimal(line.discountAmount))
     return addMoney(sum, net)
   }, toDecimal(0))
   const shippingTaxForeign = input.shippingTaxForeign.reduce<Decimal>(
@@ -174,21 +180,78 @@ export function pendingFxQueueWhere(externalOrderId?: string): Prisma.ShoppingSy
  * back to the NET line sum (+shipping −discount, no tax), so a taxed invoice is under-settled by its VAT
  * and never reaches PAID (o3d-c0n). Non-taxed orders are unaffected because net == gross.
  *
- * Returns undefined (→ leaves the net fallback in place) when:
- *  • the order isn't paid (no payment is registered anyway), or
- *  • prices are tax-INCLUSIVE — those orders have a separate pre-existing invoice-construction bug that
- *    builds the invoice at the NET total (WC REST line amounts are always net but are sent to Xero
- *    flagged tax-inclusive), so a gross payment would EXCEED the invoice and Xero would reject it. Kept
- *    on the (net-but-consistent) fallback until that construction is fixed (o3d-cyn) rather than
- *    regressing them; the invoice is correctly built at gross only for tax-exclusive orders.
+ * BOTH WooCommerce price conventions, since o3d-cyn. This used to return undefined for a tax-INCLUSIVE
+ * store, because the invoice was CONSTRUCTED at the net total there — WC REST line amounts are always
+ * ex-tax, and the importer sent them flagged tax-inclusive, so Xero read net 100 as gross and the whole
+ * invoice landed at 100 for an order that grossed 120. A gross payment would have exceeded that invoice
+ * and Xero would have rejected it, so inclusive orders were left on the (wrong-but-consistent) net
+ * fallback. The construction now sends every component ex-tax with `lineAmountsIncludeTax: false` on
+ * both conventions, so the invoice totals to `wcOrder.total` either way and the gate has nothing left to
+ * protect: an inclusive order settles to PAID like an exclusive one.
+ *
+ * Returns undefined (→ leaves the net fallback in place) only when the order isn't paid, or carries no
+ * usable total — no payment is registered in either case.
  */
 export function resolveWcInvoicePaymentAmount(
-  wcOrder: Pick<WcFullOrder, 'date_paid_gmt' | 'total' | 'prices_include_tax'>,
+  wcOrder: Pick<WcFullOrder, 'date_paid_gmt' | 'total'>,
 ): number | undefined {
-  if (wcOrder.prices_include_tax) return undefined
   if (!wcOrder.date_paid_gmt || !wcOrder.total) return undefined
   const gross = Number(wcOrder.total)
   return Number.isFinite(gross) && gross > 0 ? gross : undefined
+}
+
+/**
+ * o3d-cyn: the TAX CONVENTION the WooCommerce → accounting document is built in, plus the two
+ * money legs that are not line items (shipping and the residual order-level discount).
+ *
+ * ONE CONVENTION FOR BOTH WOOCOMMERCE PRICE MODES, and it is the EXCLUSIVE one, because every
+ * amount the importer has is already ex-tax:
+ *
+ *  • line items  — `unitAmount` is `line_items[].subtotal / quantity`, `discountAmount` is
+ *    `subtotal - total`. WC REST reports both ex-tax whatever `prices_include_tax` says.
+ *  • coupons     — `coupon_lines[].discount` is ex-tax too (`discount_tax` is separate), which is
+ *    why Woo's allocation of a coupon into the lines is basis-consistent (o3d-y14).
+ *  • shipping    — `shipping_lines[].total` is ex-tax; the tax is `total_tax`.
+ *
+ * WHAT THIS REPLACES. The document used to be flagged `Inclusive` whenever the STORE displayed
+ * prices inclusive of tax, while still carrying those ex-tax amounts — so Xero read a net 100 line
+ * as a gross one and extracted the VAT back out of it, posting the invoice at 100 for an order that
+ * grossed 120. Shipping was singled out and multiplied by (1 + rate) to compensate, which made the
+ * document internally inconsistent as well as wrong: net-treated-as-gross lines beside a genuinely
+ * grossed shipping line. Both halves go; nothing is grossed up and nothing is flagged inclusive.
+ *
+ * Worked, at 20% VAT, on a tax-INCLUSIVE store — net 100 of goods, a net 10 coupon, net 10 shipping,
+ * `wcOrder.total` 120.00:
+ *   before → lines 100 − 10 = 90 read as GROSS, shipping 10 × 1.2 = 12 read as GROSS, invoice 102.00
+ *   after  → lines 100 − 10 = 90 net, shipping 10 net, Xero adds 20% → 100 × 1.2 = 120.00 = the order
+ * The same numbers on a tax-EXCLUSIVE store were already handled this way and are unchanged.
+ *
+ * Xero derives the tax from each line's `taxType` rather than from Woo's `total_tax`. The two agree
+ * to the penny in the ordinary case; where they do not, the invoice total can differ from
+ * `wcOrder.total` by rounding, and the gross payment (`resolveWcInvoicePaymentAmount`) is then
+ * refused BY XERO with an amount-exceeds-outstanding error on the INVOICE_PAYMENT follow-up — a
+ * visible, retryable sync row naming the invoice, not a wrong figure in the ledger. That exposure is
+ * identical to the one the tax-exclusive path has always carried.
+ */
+export function resolveWcAccountingAmountConvention(input: {
+  /**
+   * The STORE's price-display convention (`wcOrder.prices_include_tax`). Taken and deliberately
+   * NOT read: reading it here is precisely what the defect was, and the parameter stays so that a
+   * caller cannot reach this decision without the flag in hand and so that the tests can pin the
+   * inclusive answer to `Exclusive`. It describes how Woo shows prices to a shopper, never what
+   * the REST payload's amounts mean.
+   */
+  pricesIncludeVat: boolean
+  shippingForeign: DecimalInput
+  orderLevelDiscountForeign?: DecimalInput
+}): { lineAmountsIncludeTax: false; shippingAmount: number | undefined; discountAmount: number | undefined } {
+  const shipping = toDecimal(input.shippingForeign)
+  const discount = toDecimal(input.orderLevelDiscountForeign ?? 0)
+  return {
+    lineAmountsIncludeTax: false,
+    shippingAmount: shipping.gt(0) ? roundDecimalNumber(shipping, 4) : undefined,
+    discountAmount: discount.gt(0) ? roundDecimalNumber(discount, 2) : undefined,
+  }
 }
 
 export function buildPendingFxOrderPayload(
@@ -1262,16 +1325,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // many tax/line rows. Stored as Decimal @db.Decimal(18,4); base conversions happen
     // at the single /fxRate boundary below.
     const { subtotalForeign, taxForeign, totalForeign } = computeWcOrderForeignTotals({
-      lines: mappedLines.map((l, idx) => ({
+      lines: mappedLines.map((l) => ({
         qty: l.qty,
         unitPriceForeign: l.unitPriceForeign,
         discountAmount: l.discountAmount,
         taxForeign: l.taxForeign,
-        taxRateValue: lineTaxResolved[idx].taxRateValue,
       })),
       shippingTaxForeign: wcOrder.shipping_lines.map((line) => line.total_tax),
       orderTotal: wcOrder.total,
-      pricesIncludeVat,
     })
 
     // GBP conversions
@@ -1280,14 +1341,17 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const taxBase = divideRoundedNumber(taxForeign, fxRate, 4)
     const totalBase = divideRoundedNumber(totalForeign, fxRate, 4)
 
-    // Line data for Prisma
+    // Line data for Prisma.
+    //
+    // o3d-cyn: the line amount is NET on both WC price conventions — `unitPriceForeign` is
+    // `line_items[].subtotal / quantity` and `discountAmount` is `subtotal - total`, both of which
+    // WC REST reports ex-tax whatever `prices_include_tax` says (the tax is in `total_tax`, carried
+    // separately as `taxForeign`). Dividing by (1 + rate) for an inclusive store netted an already-net
+    // amount: a net-100 line at 20% was stored as 83.33 and the order's own lines no longer summed to
+    // its subtotal.
     const lineData = mappedLines.map((l, idx) => {
       const resolved = lineTaxResolved[idx]
-      const rate = resolved.taxRateValue
-      const grossForeign = toDecimal(l.qty).mul(l.unitPriceForeign).sub(l.discountAmount)
-      const netForeign = pricesIncludeVat
-        ? grossForeign.div(toDecimal(1).add(rate))
-        : grossForeign
+      const netForeign = toDecimal(l.qty).mul(l.unitPriceForeign).sub(l.discountAmount)
       const unitPriceBase = divideRoundedNumber(l.unitPriceForeign, fxRate, 6)
       const totalLineForeign = roundDecimalNumber(netForeign, 4)
       const totalLineGbp = divideRoundedNumber(totalLineForeign, fxRate, 4)
@@ -1536,13 +1600,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     try {
       const { queueAccountingSync, getAccountingSettings } = await import('@/lib/accounting')
       const settings = await getAccountingSettings()
-      // WC stores shipping_total already NET; line prices may be gross when
-      // the WC store is configured with prices_include_tax. Send everything
-      // to Xero as tax-inclusive when WC was inclusive so gross line prices
-      // are interpreted correctly — shipping is converted to gross first to
-      // stay consistent with the LineAmountTypes flag.
-      const vatMultiplier = toDecimal(1).add(taxRateValue || 0)
-      const shippingSendForeign = pricesIncludeVat ? toDecimal(shippingForeign).mul(vatMultiplier) : toDecimal(shippingForeign)
+      // o3d-cyn: EVERY component of this document is tax-EXCLUSIVE, on both WC price conventions,
+      // and it is sent that way — see `resolveWcAccountingAmountConvention`.
+      const { lineAmountsIncludeTax, shippingAmount, discountAmount: orderLevelDiscountAmount } =
+        resolveWcAccountingAmountConvention({ pricesIncludeVat, shippingForeign, orderLevelDiscountForeign })
       // WooCommerce discounts are imported exactly as stored on the order so the accounting
       // connector sees the original order-currency amounts without a base-currency round-trip.
       // Coupons ride on the per-line discountAmount below (that is where Woo puts them); the
@@ -1576,7 +1637,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             }),
             discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,
           })),
-          shippingAmount: shippingSendForeign.gt(0) ? roundDecimalNumber(shippingSendForeign, 4) : undefined,
+          shippingAmount,
           shippingDescription: 'Shipping',
           shippingAccountCode: settings.shippingAccount || undefined,
           // audit-H1b: shipping & discount stay on the base tax type (NOT swapped),
@@ -1586,10 +1647,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           // Only the residual — the coupon itself is already on the lines above as a per-line
           // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
           // discount line. Sending both deducted it twice (o3d-y14).
-          discountAmount: orderLevelDiscountForeign > 0 ? roundDecimalNumber(orderLevelDiscountForeign, 2) : undefined,
+          discountAmount: orderLevelDiscountAmount,
           discountAccountCode: settings.discountAccount || undefined,
           discountTaxType: accountingTaxType ?? undefined,
-          lineAmountsIncludeTax: pricesIncludeVat,
+          lineAmountsIncludeTax,
           _postingMode: 'submitted',
           _registerPayment: !!wcOrder.date_paid_gmt,
           _paymentMethod: wcOrder.payment_method || undefined,

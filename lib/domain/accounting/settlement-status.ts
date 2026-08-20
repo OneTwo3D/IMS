@@ -392,23 +392,33 @@ export function aggregatePaymentSyncRows(rows: PaymentSyncRow[]): PaymentSyncRow
 
 /**
  * The total the LEDGER's copy of a sales invoice was actually built at, which is what a payment against
- * it has to match — not necessarily the order total IMS shows.
+ * it has to match.
  *
- * They differ in ONE case: a tax-inclusive order IMPORTED FROM A SHOP. WC REST line amounts are always
- * net, and order-import sends them flagged tax-inclusive, so Xero reads the net figure as the gross one
- * and the invoice posts at the NET total. That is o3d-cyn, an invoice-construction defect with its own
- * issue. A payment that matches the invoice IMS really posted is not a SETTLEMENT discrepancy, and
- * reporting it as one would send an operator to the payment when the invoice is what is wrong — the same
- * reasoning as the documentPosted branch above: name the fault people can act on.
+ * IT IS NOW THE ORDER TOTAL IN EVERY CASE — o3d-cyn landed, and this is the collapse that issue's own
+ * note promised. Both invoice-construction paths post at the order's gross total:
  *
- * A tax-inclusive order raised IN IMS is NOT affected: queueSalesInvoiceSync sends the GROSS unit prices
- * (and grosses shipping up) before flagging them inclusive, so that invoice posts at the order total.
- * Keying on pricesIncludeVat ALONE understated it — and since a hand-recorded receipt is for the gross
- * the customer paid, the over-pay guard then refused every ordinary VAT receipt it exists to allow
- * (Codex, PR #582 round 1).
+ *  • raised IN IMS — `queueSalesInvoiceForOrder` sends the GROSS unit prices (and grosses shipping up)
+ *    before flagging them inclusive, so the invoice totals to the order. This was always true, and
+ *    keying on `pricesIncludeVat` ALONE understated it: since a hand-recorded receipt is for the gross
+ *    the customer paid, the over-pay guard then refused every ordinary VAT receipt it exists to allow
+ *    (Codex, PR #582 round 1).
+ *  • IMPORTED from WooCommerce — the importer now sends every component EX-TAX with
+ *    `lineAmountsIncludeTax: false` on both price conventions, and Xero adds the tax, so this too
+ *    totals to the order. Previously it sent Woo's ex-tax amounts flagged tax-INCLUSIVE, Xero read the
+ *    net figure as the gross one, and an imported tax-inclusive invoice posted at the NET total — which
+ *    is what the subtraction here existed to model.
  *
- * When o3d-cyn lands, imported tax-inclusive invoices post at gross too and this collapses to
- * `totalForeign`.
+ * THE RESIDUAL, and it is a real one: invoices IMPORTED AND POSTED BEFORE o3d-cyn are still sitting in
+ * the ledger at their net total. A gross receipt against one of those now passes this guard and is
+ * refused by XERO instead (amount exceeds the outstanding amount), which surfaces as a failed
+ * INVOICE_PAYMENT sync row naming the invoice. That is a visible refusal with a remedy — correct the
+ * invoice in Xero, or re-post it, then retry the payment row — rather than the alternative, which would
+ * be refusing the ordinary receipt on every correctly-built invoice from here on.
+ *
+ * The two inputs below are kept and deliberately NOT read. They are what the answer used to depend on,
+ * and they are the seam a per-order marker would attach to if the historical invoices are ever
+ * distinguished properly (the posted SALES_INVOICE payload's own `lineAmountsIncludeTax` is the exact
+ * signal); reading either of them again would re-introduce the defect this collapse removes.
  */
 export function ledgerSalesInvoiceTotalForeign(input: {
   totalForeign: number
@@ -417,7 +427,5 @@ export function ledgerSalesInvoiceTotalForeign(input: {
   /** Did this order arrive from a shop connector (WooCommerce), rather than being raised in IMS? */
   importedFromShop: boolean
 }): number {
-  return input.pricesIncludeVat && input.importedFromShop
-    ? input.totalForeign - input.taxForeign
-    : input.totalForeign
+  return input.totalForeign
 }

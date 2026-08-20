@@ -19,6 +19,30 @@ export const XERO_SALES_CREDIT_NOTE_TYPE = 'ACCRECCREDIT'
 
 /**
  * Create a sales credit note (ACCRECCREDIT) in Xero.
+ *
+ * POST, AND DELIBERATELY SO — o3d-tfri. `POST /CreditNotes` is create-or-update on
+ * `CreditNoteNumber`, the same upsert-on-a-natural-key that made `pushPurchaseBill` unsafe
+ * (o3d-6l3) and that `pushPurchaseCreditNote` below has just been converted away from. This one
+ * keeps it, because THE PREMISE THAT MAKES THE UPSERT DANGEROUS IS ABSENT HERE, and it is worth
+ * being explicit about which premise:
+ *
+ *   A sales credit note's number is MINTED BY US and is unique by construction.
+ *   `nextCreditNoteNumber` (lib/domain/sales/refund-service.ts) takes a
+ *   `pg_advisory_xact_lock` on a per-year counter key and increments a stored counter, so two
+ *   refunds cannot be handed the same number even concurrently. There is therefore no such thing
+ *   as two DIFFERENT sales credit notes arriving at one `CreditNoteNumber` — only the SAME
+ *   credit note posting again.
+ *
+ * And for that case the upsert is the property we want. Xero's idempotency key expires after six
+ * minutes, so a QUEUED retry is not protected by it; what stops a duplicate is the local
+ * `externalTransactionId`, which is exactly what is missing when the response to the first post
+ * was lost. Re-posting then REPLACES the credit note's own document with identical content and
+ * returns its id, and the ledger converges. `PUT` would instead refuse the retry — Xero requires
+ * ACCRECCREDIT numbers to be unique — leaving a credit note in the ledger that IMS has no id for
+ * and an operator to reconcile by hand.
+ *
+ * That is the opposite of the supplier case below, where the number is NOT unique by construction
+ * and the colliding documents are genuinely different ones. Do not convert this by analogy.
  */
 export async function pushCreditNote(
   data: CreditNoteData,
@@ -123,6 +147,26 @@ export function buildXeroPurchaseCreditNote(
  * audit-g5u2: create a SUPPLIER (purchase) credit note (ACCPAYCREDIT) in Xero —
  * e.g. crediting a duplicate freight bill. Resolves the SUPPLIER contact (vs the
  * customer contact the sales credit note uses).
+ *
+ * PUT, NOT POST — o3d-tfri, and for the same reason `pushPurchaseBill` is a PUT (o3d-6l3).
+ *
+ * `POST /CreditNotes` is create-or-update on `CreditNoteNumber`: hand it a number Xero already
+ * holds for this contact and it silently REPLACES that credit note and returns its id. On the
+ * PURCHASE side that number is not ours and is not unique. It is the supplier's own reference
+ * when they gave one, and when the operator leaves the field blank —
+ * which the UI allows, because it is optional free text — `buildSupplierCreditNoteSyncPayload`
+ * falls back to a per-credit-note `SCN-<id>`. Several credit notes against ONE purchase order is
+ * an explicitly supported flow (the over-credit guard caps the total, not the count), so before
+ * both halves of o3d-tfri two blank-numbered credits on one PO carried the PO reference and the
+ * second overwrote the first: payables understated by every credit but the last, no error on
+ * either side, and IMS only finding out when the unique index on
+ * `SupplierCreditNote.accountingCreditNoteId` (o3d-9kek) refused the second back-reference —
+ * long after the ledger damage was done.
+ *
+ * `PUT` is create-only, so a duplicate number is REFUSED at the API instead of destroying a
+ * payable quietly. ACCPAYCREDIT numbers are not required to be unique in Xero, so two genuinely
+ * distinct credits with distinct `SCN-` numbers both post as distinct documents, which is what
+ * they are.
  */
 export async function pushPurchaseCreditNote(
   data: CreditNoteData,
@@ -142,7 +186,7 @@ export async function pushPurchaseCreditNote(
     }
   }
   const creditNote = buildXeroPurchaseCreditNote(data, status, contactResult.contactId)
-  const res = await xeroPost<XeroCreditNoteResponse>('CreditNotes', creditNote, opts)
+  const res = await xeroPut<XeroCreditNoteResponse>('CreditNotes', creditNote, opts)
   if (!res.ok || !res.data?.CreditNotes?.length) {
     return { success: false, error: res.error ?? 'Failed to create purchase credit note' }
   }

@@ -3172,8 +3172,9 @@ async function registerInvoicePaymentWithLedger(params: {
         totalForeign: Number(so.totalForeign),
         taxForeign: Number(so.taxForeign),
         pricesIncludeVat: so.pricesIncludeVat,
-        // Only an IMPORTED tax-inclusive invoice posts at NET (o3d-cyn). An order raised in IMS posts at
-        // gross, and measuring its gross receipt against a net total refused every ordinary VAT receipt.
+        // Both still passed, and both now deliberately unread — see ledgerSalesInvoiceTotalForeign:
+        // since o3d-cyn an imported tax-inclusive invoice posts at gross like every other, so the
+        // ledger total is the order total whatever these say.
         importedFromShop: so.shoppingLinks.length > 0,
       }),
     })

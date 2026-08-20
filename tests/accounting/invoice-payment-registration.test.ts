@@ -128,11 +128,16 @@ test('this receipt does not count against itself when the decision is re-run', (
   assert.equal(d.register, true)
 })
 
-test('an imported tax-inclusive invoice is measured against what the ledger holds, not the gross total', () => {
-  // The caller passes ledgerTotal from ledgerSalesInvoiceTotalForeign: an IMPORTED tax-inclusive invoice
-  // posts at NET (o3d-cyn), so a gross receipt against it would EXCEED the invoice and Xero would reject
-  // it. Refusing here turns a rejected sync into a warning that names the number. An order raised in IMS
-  // posts at gross and is unaffected.
+test('a receipt bigger than what the ledger holds is refused here, not left for Xero to reject', () => {
+  // The caller passes ledgerTotal from ledgerSalesInvoiceTotalForeign. A receipt that EXCEEDS the
+  // invoice would be rejected by Xero, and refusing here turns that rejected sync into a warning that
+  // names the number instead.
+  //
+  // The case this used to model — an IMPORTED tax-inclusive invoice posted at its NET total — is gone
+  // since o3d-cyn: both construction paths now post at the order's gross, so ledgerTotal is the order
+  // total and an ordinary VAT receipt matches it. What is left for this guard is every OTHER way a
+  // receipt can exceed the document (a credited or part-refunded invoice, a mistyped amount), plus the
+  // invoices imported and posted before that fix.
   const d = decideInvoicePaymentRegistration({ ...base, paymentAmount: 120, ledgerTotal: 100 })
   assert.equal(d.register === false && d.refusal, 'WOULD_OVERPAY')
 })
