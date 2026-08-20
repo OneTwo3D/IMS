@@ -8,7 +8,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
 import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
-import { lockMintsoftDispatchSettings } from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
+import { lockMintsoftCourierServiceMap, lockMintsoftDispatchSettings } from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
 import {
   configChangeMetadata,
   describeConfigChange,
@@ -855,16 +855,26 @@ export async function saveMintsoftCourierServiceMap(rawJson: unknown): Promise<{
   // q66in.7.2: this save logged NOTHING. A courier map is the highest-consequence routing config in
   // the connector — a wrong or missing entry puts real parcels on the wrong service, or drops the
   // order onto the default courier id — and there was no record that anyone had ever touched it.
-  // The before image is read immediately ahead of the write; the entries themselves are recorded as
-  // KEY NAMES ONLY (added / removed / changed), not as two dumped maps.
-  const previousMap = parseRoutingMap((await getMintsoftSettings()).mintsoft_courier_service_map)
+  // The entries themselves are recorded as KEY NAMES ONLY (added / removed / changed), not as two
+  // dumped maps.
+  //
+  // q66in.7.2 r4 / Codex r3 #3: THE BEFORE-IMAGE IS READ INSIDE THE WRITE TRANSACTION, behind a row
+  // lock on the very row the upsert replaces. Round 1 added the audit but kept the read where it had
+  // always been — an unlocked `getMintsoftSettings()` out here — which is the exact staleness the
+  // dispatch save was restructured to remove, left standing on the other writer. Two saves reading
+  // map A, one committing B, the other committing A back and logging "no change": the B→A move
+  // reroutes live parcels onto different courier services and is recorded nowhere. See
+  // lockMintsoftCourierServiceMap for why reading inside the transaction is not enough on its own.
   const nextMap = parseRoutingMap(json)
-  const routing = diffRoutingMap(previousMap, nextMap)
-
-  await db.setting.upsert({
-    where: { key: 'mintsoft_courier_service_map' },
-    create: { key: 'mintsoft_courier_service_map', value: serializeSettingValue('mintsoft_courier_service_map', json) },
-    update: { value: serializeSettingValue('mintsoft_courier_service_map', json) },
+  const { previousMap, routing } = await db.$transaction(async (tx) => {
+    const before = parseRoutingMap(await lockMintsoftCourierServiceMap(tx))
+    const value = serializeSettingValue('mintsoft_courier_service_map', json)
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_courier_service_map' },
+      create: { key: 'mintsoft_courier_service_map', value },
+      update: { value },
+    })
+    return { previousMap: before, routing: diffRoutingMap(before, nextMap) }
   })
 
   await logActivity({

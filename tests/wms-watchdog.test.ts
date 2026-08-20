@@ -60,6 +60,7 @@ test('o3d-hl8l r3: the overdue-ASN alert names the Re-check remedy, not a callba
     warehouseCode: 'CAM',
     breach,
     creditNote,
+    sourceType: 'PURCHASE_ORDER',
   })
 
   assert.match(message, /^ASN ASN-77 \(CAM\) is past its ETA \(2026-07-10\) with no booked-in callback\./)
@@ -67,6 +68,51 @@ test('o3d-hl8l r3: the overdue-ASN alert names the Re-check remedy, not a callba
   assert.match(message, /purchase order → ASNs/, 'and where to find it')
   assert.match(message, /books in only what is still outstanding/, 'and that pressing it is safe')
   assert.doesNotMatch(message, /Chase the shipment/, 'the old text named no remedy at all')
+})
+
+test('o3d-hl8l r4: a STOCK-TRANSFER ASN is sent to the screen that can actually act on it', () => {
+  // Codex r3 #1. The remedy was one fixed sentence naming "purchase order → ASNs", and this
+  // processor serves stock-transfer ASNs too — for which that screen does not exist. An operator
+  // following the alert was sent somewhere with nothing to press, which reads as though the remedy
+  // had been tried and failed rather than as a wrong signpost.
+  const { breach, creditNote } = watchdog.describeAsnOverdueBreach(
+    { eta: days(2), lastCallbackAt: null, createdAt: days(10) },
+    [],
+    NOW,
+  )
+  const message = watchdog.buildAsnOverdueAlertMessage({
+    externalAsnId: 'ASN-T1',
+    warehouseCode: 'CAM',
+    breach,
+    creditNote,
+    sourceType: 'STOCK_TRANSFER',
+  })
+
+  assert.match(message, /"Re-check"/, 'the remedy is still named')
+  assert.match(message, /stock transfer → WMS ASN/, 'and it points at the transfer screen')
+  assert.doesNotMatch(
+    message,
+    /purchase order/,
+    'naming the purchase-order screen for a transfer ASN sends the reader somewhere that cannot act on it',
+  )
+})
+
+test('o3d-hl8l r4: the notification link follows the ASN kind, not a blanket /sync', () => {
+  assert.equal(
+    watchdog.describeAsnRecheckRemedy('PURCHASE_ORDER').actionUrl,
+    '/purchase-orders',
+  )
+  assert.equal(
+    watchdog.describeAsnRecheckRemedy('STOCK_TRANSFER').actionUrl,
+    '/stock-control/transfers',
+    'the alert must link to the table that carries THIS ASN\'s Re-check control',
+  )
+  // The line-level source types resolve the same way, so a row carrying one is not silently
+  // routed to the purchase-order default.
+  assert.equal(
+    watchdog.describeAsnRecheckRemedy('STOCK_TRANSFER_LINE').actionUrl,
+    '/stock-control/transfers',
+  )
 })
 
 test('o3d-hl8l r3: the remedy is appended after the alignment-credit blast radius, not instead of it', () => {
@@ -80,6 +126,7 @@ test('o3d-hl8l r3: the remedy is appended after the alignment-credit blast radiu
     warehouseCode: 'EAR2',
     breach,
     creditNote,
+    sourceType: 'PURCHASE_ORDER',
   })
 
   assert.match(message, /no further booked-in callback for 8 days/)

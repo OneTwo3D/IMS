@@ -9,6 +9,7 @@ import {
   SPLIT_PROBE_BUDGET_PER_SWEEP,
   isUnresolvedDriftSystemic,
   saveMintsoftDeltaCursors,
+  readMintsoftDeltaCursors,
 } from '../lib/domain/wms/dispatch-sweep.ts'
 import { mintsoftDeltaScopeToken } from '../lib/connectors/mintsoft/settings/schema.ts'
 import type { WmsDispatchSweepDeps, WmsDispatchCandidate } from '../lib/domain/wms/dispatch-sweep.ts'
@@ -2118,4 +2119,119 @@ test('q66in.7.2 r3: a deps pair with no scope sends NO token rather than inventi
 
   assert.equal(saved.length, 1)
   assert.ok(!('scope' in saved[0]), 'an absent token is how "do not check" is expressed')
+})
+
+// ---------------------------------------------------------------------------------------------
+// q66in.7.2 r4 (Codex r3 finding 2) — THE CAS IS ONLY AS GOOD AS THE PAIR IT COMPARES.
+//
+// Round 3's guard refuses a cursor write when the scope moved during the pass, and it works — but
+// it decides from a token the run captured at start, and the production wiring assembled that token
+// and those cursors with TWO SEPARATE UNLOCKED READS. A scope change committing between them hands
+// the run an OLD-scope watermark carrying a NEW-scope token; the CAS then compares new against new,
+// passes, and writes the old watermark straight back over the reset. The guard is defeated by
+// exactly the interleaving it was built for, because the evidence it judges was gathered across the
+// window rather than inside it.
+//
+// The double below fires the competing scope change at the LAST LEGAL MOMENT — after the read
+// transaction has touched the settings table and before it holds the lock. Once FOR UPDATE returns,
+// Postgres would make the other writer wait, which is the whole point of taking it.
+// ---------------------------------------------------------------------------------------------
+
+function cursorReadTx(initial: { watermark: string | null; scope: typeof OLD_SCOPE }) {
+  const state = {
+    rows: new Map<string, string>(
+      initial.watermark ? [['mintsoft_order_delta_since', initial.watermark]] : [],
+    ),
+    scope: initial.scope,
+  }
+  const trace: string[] = []
+  // Fires ONCE, at the last moment before the lock is held: the scope moves to NEW and the cursor
+  // rows are deleted, which is precisely what saveMintsoftOrderDispatchSettings does.
+  let pendingScopeChange = true
+  const commitScopeChange = () => {
+    if (!pendingScopeChange) return
+    pendingScopeChange = false
+    state.scope = NEW_SCOPE
+    state.rows.delete('mintsoft_order_delta_since')
+    state.rows.delete('mintsoft_order_reconcile_at')
+    trace.push('competing-scope-change')
+  }
+  return {
+    trace,
+    state,
+    commitScopeChange,
+    tx: {
+      setting: {
+        async findMany({ where }: { where: { key: { in: string[] } } }) {
+          trace.push('cursor-findMany')
+          // Honour the `where`. A double that returns every row it holds regardless cannot observe
+          // a deletion scoped to two keys, and would pass whether or not the reset happened.
+          return where.key.in
+            .filter((key) => state.rows.has(key))
+            .map((key) => ({ key, value: state.rows.get(key) ?? null }))
+        },
+      },
+      async $executeRaw(_query: TemplateStringsArray, ..._values: unknown[]) {
+        trace.push('materialise')
+        commitScopeChange()
+        return 0
+      },
+      async $queryRaw<T>(_query: TemplateStringsArray, ..._values: unknown[]) {
+        trace.push('locked-read')
+        return [] as unknown as T
+      },
+    },
+  }
+}
+
+/** Stands in for lockMintsoftDispatchSettings: takes the row lock, then resolves the scope. */
+function lockScopeVia(h: ReturnType<typeof cursorReadTx>) {
+  return async (tx: Parameters<typeof readMintsoftDeltaCursors>[0]) => {
+    await tx.$executeRaw`materialise`
+    await tx.$queryRaw`FOR UPDATE`
+    return h.state.scope
+  }
+}
+
+test('q66in.7.2 r4: the cursors and the scope token they belong to are read as ONE consistent pair', async () => {
+  const h = cursorReadTx({ watermark: '2026-07-15T11:00:00Z', scope: OLD_SCOPE })
+
+  const state = await readMintsoftDeltaCursors(h.tx, lockScopeVia(h))
+
+  // The competing change landed before the lock, so this read must see BOTH halves of it.
+  assert.equal(
+    state.scope,
+    mintsoftDeltaScopeToken(NEW_SCOPE),
+    'the scope change committed before the lock was held, so the token is the new scope',
+  )
+  assert.equal(
+    state.watermark,
+    null,
+    'and the watermark MUST be the cleared one — an old-scope watermark carrying a new-scope token '
+      + 'is the pair that makes the save-time CAS wave the stale advance through',
+  )
+})
+
+test('q66in.7.2 r4: the scope is resolved under the lock BEFORE the cursor rows are read', async () => {
+  const h = cursorReadTx({ watermark: '2026-07-15T11:00:00Z', scope: OLD_SCOPE })
+
+  await readMintsoftDeltaCursors(h.tx, lockScopeVia(h))
+
+  assert.deepEqual(
+    h.trace,
+    ['materialise', 'competing-scope-change', 'locked-read', 'cursor-findMany'],
+    'lock first, then read: reading the cursors before taking the lock reopens the window whatever '
+      + 'transaction the read happens to be inside',
+  )
+})
+
+test('q66in.7.2 r4: with no competing writer the cursors come back paired with their own scope', async () => {
+  const h = cursorReadTx({ watermark: '2026-07-15T11:00:00Z', scope: OLD_SCOPE })
+  h.commitScopeChange = () => {}
+
+  const state = await readMintsoftDeltaCursors(h.tx, async () => h.state.scope)
+
+  assert.equal(state.watermark, '2026-07-15T11:00:00Z')
+  assert.equal(state.scope, mintsoftDeltaScopeToken(OLD_SCOPE))
+  assert.equal(state.lastReconcile, null, 'an absent cursor row is null, not an empty string')
 })

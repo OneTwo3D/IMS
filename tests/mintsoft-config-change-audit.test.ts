@@ -214,6 +214,63 @@ test('a REJECTED courier map is not written and not audited', async () => {
   assert.deepEqual(logs, [], 'and a rejected save must not leave an audit entry claiming a change')
 })
 
+test('q66in.7.2 r4: the COURIER-MAP before-image is read under a lock inside the write transaction', async () => {
+  // Codex r3 #3. Round 1 gave this save an audit entry and left its before-image where it had always
+  // been: an unlocked read outside any transaction. That is the identical defect the dispatch save
+  // was restructured to remove, still standing on the other writer — and this one is the routing
+  // table itself. Two saves in flight: this one reads map A, another commits B, this one commits A
+  // back. Taken outside the lock the entry says "no change" while the transition it actually caused
+  // (B -> A) reroutes live parcels onto different courier services and is recorded nowhere.
+  const { saveMintsoftCourierServiceMap } = await loadActions()
+  reset()
+  settingRows.set('mintsoft_courier_service_map', JSON.stringify({ 'Next Day': 12 }))
+  concurrentWrite = new Map([['mintsoft_courier_service_map', JSON.stringify({ 'Next Day': 55 })]])
+
+  const result = await saveMintsoftCourierServiceMap(JSON.stringify({ 'Next Day': 12 }))
+  assert.equal(result.success, true)
+
+  const entry = logs.find((log) => log.action === 'mintsoft_courier_map_updated')
+  if (!entry) throw new Error('no courier-map audit entry was written')
+  assert.deepEqual(
+    entry.metadata?.before,
+    { 'Next Day': 55 },
+    'the entry must name the map it actually replaced, not one a concurrent save had already moved on from',
+  )
+  assert.deepEqual(entry.metadata?.after, { 'Next Day': 12 })
+  assert.deepEqual(
+    entry.metadata?.changed,
+    ['Next Day'],
+    'and it must report the real 55 -> 12 reroute, not the "no change" a stale before-image produces',
+  )
+
+  // No unlocked read of the settings table happened on this path at all.
+  assert.equal(
+    trace.some((step) => step.startsWith('unlocked-')),
+    false,
+    `an unlocked settings read is the defect itself; trace was ${trace.join(' -> ')}`,
+  )
+})
+
+test('q66in.7.2 r4: the courier-map lock is taken on the row the upsert replaces, before it writes', async () => {
+  const { saveMintsoftCourierServiceMap } = await loadActions()
+  reset()
+  settingRows.set('mintsoft_courier_service_map', JSON.stringify({ Standard: 3 }))
+
+  await saveMintsoftCourierServiceMap(JSON.stringify({ Standard: 4 }))
+
+  assert.deepEqual(
+    lockedKeys,
+    ['mintsoft_courier_service_map'],
+    'exactly the key this save overwrites — and only it, so the map save and the dispatch save '
+      + 'hold disjoint rows and cannot deadlock against each other',
+  )
+  assert.deepEqual(
+    trace,
+    ['materialise', 'locked-read', 'upsert:mintsoft_courier_service_map'],
+    'lock, then read, then write — in one transaction',
+  )
+})
+
 test('saving the order dispatch settings audits the delta-scope move and the cursor reset', async () => {
   const { saveMintsoftOrderDispatchSettings } = await loadActions()
   reset()

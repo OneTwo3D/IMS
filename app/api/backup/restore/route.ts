@@ -616,23 +616,56 @@ export type RestoreLockContext = {
  * `enqueueMintsoftBookedInRecheckForAsn` ("Re-check" on the purchase order's ASN table), which
  * reconstructs the trigger and re-reads the quantities from the warehouse.
  *
- * And the detection is slower and more conditional than "the watchdog alerts" implies. Stated in
- * full, so the next reader does not have to take it on trust:
+ * ROUND 4, FINDING 1 — AND THE FOURTH CONSECUTIVE ROUND IN WHICH THIS PARAGRAPH OVERSTATED THE
+ * RECOVERY. Round 3 listed three bounds and called them a bound. Every one of them was conditional,
+ * and on a DEFAULT INSTALLATION none of them held: the sender may not retry (its behaviour, not
+ * ours); the "Re-check" control existed on the purchase-order ASN table ONLY, while stock-transfer
+ * ASNs go through the same callback processor and the same fence; and the watchdog that was named
+ * as the backstop was registered `defaultEnabled: false`, so it did not run. Their intersection —
+ * a transfer ASN, a sender that gives up, a watchdog nobody enabled — was an ASN left IN_TRANSIT
+ * with its destination stock never applied, and NOTHING anywhere that would ever say so.
+ *
+ * WHAT ACTUALLY RECOVERS IT NOW, in the order it happens:
  *   • AT REFUSAL — the process log, and nothing else. `recordMaintenanceRefusal` in the webhook
  *     route emits a line naming the route and the remedy. It writes NO database row, deliberately:
  *     a row written into this window is being replayed over, and the fence runs before signature
  *     verification, so persisting would mean writing rows from unauthenticated callers.
  *   • THE 503 carries `Retry-After: 300`, so a sender that retries at all has a defined schedule
  *     rather than whatever its own backoff decides.
- *   • THE ALERT — the WMS watchdog, and only after ETA + 24h, or 7 days for an ASN with no ETA
- *     recorded, or 7 days of renewed silence for one that had already had a partial callback. It
- *     also requires a WMS connector to be enabled and at least one active ADMIN to notify, and it
- *     fires ONCE per ASN (deduped by `sloAlertedAt`, cleared only by a fresh callback or a close).
- *     Its message names the Re-check remedy.
+ *   • AUTOMATICALLY, WITHIN MINUTES OF THE WINDOW CLOSING — `disableMaintenanceMode` stamps
+ * wms-connector-boundary-ok: o3d-hl8l: the recovery is hosted on the Mintsoft sweeper; naming the job that carries it IS the correction.
+ *     `wms_booked_in_recheck_due_since` whenever a real window ends, and the Mintsoft webhook
+ *     sweeper (`defaultEnabled: true`, every five minutes, itself fenced so it cannot run during the
+ *     window) drains that stamp by re-checking EVERY open ASN — purchase-order and stock-transfer
+ *     alike, because the candidates come from `wms_asn_maps` rather than from whichever screens have
+ *     a button. See lib/domain/wms/post-maintenance-recheck.ts for why re-checking indiscriminately
+ *     is the only available targeting (the refusal is unrecordable, so there is no set of "the ones
+ *     that were refused") and why it is safe (a re-check reconstructs the TRIGGER; an ASN with
+ *     nothing outstanding books nothing in). The stamp is kept, not cleared, if any candidate threw
+ *     or the page truncated, so the next tick finishes the job.
+ *   • BY HAND, at any time — "Re-check" on the ASN, now present on BOTH the purchase-order and the
+ *     stock-transfer ASN tables (one shared component, so they cannot diverge again).
+ *   • THE ALERT — the WMS watchdog, NOW `defaultEnabled: true`, and only after ETA + 24h, or 7 days
+ *     for an ASN with no ETA recorded, or 7 days of renewed silence for one that had already had a
+ *     partial callback. It requires a WMS connector to be enabled and at least one active ADMIN to
+ *     notify, and it fires ONCE per ASN (deduped by `sloAlertedAt`, cleared only by a fresh callback
+ *     or a close). Its message names the Re-check remedy AND links to the screen that carries it for
+ *     that ASN's kind — it previously said "purchase order → ASNs" for a transfer ASN, sending the
+ *     reader to a page that could not act on it.
  *
- * So: a refused callback is recorded immediately in the log, retried by any sender that honours a
- * 503, alerted on a scale of days if neither happened, and recoverable by one operator action. It
- * is NOT recovered automatically, and this note does not claim it is.
+ * So: a refused callback is recorded in the log, retried by any sender that honours a 503,
+ * automatically re-checked within about five minutes of the window closing, recoverable by one
+ * operator action on either kind of ASN, and alerted on a scale of days if it is still open for some
+ * other reason.
+ *
+ * THE ONE PATH THAT IS STILL NOT AUTOMATIC, stated rather than left to be discovered: the stamp is
+ * written by `disableMaintenanceMode`, and the unconfirmed-backend branch below deliberately never
+ * calls it — the flag stays on and an operator clears it in the `settings` table by hand (there is
+ * no UI; `hasOperatorControl` is false). A window ended THAT way leaves no stamp, so its refused
+ * callbacks fall back to the watchdog and the manual Re-check. That is the same branch that already
+ * requires an operator to quiesce the application and verify a database backend is gone, so it is
+ * not a path anybody walks unattended — but it is not covered by the automatic re-check, and the
+ * operator message below is where that would have to be said if it ever needs to be.
  *
  * So ONE inbound webhook entry point and one OAuth callback still write to the database throughout
  * a held restore, and the operator message below names them.

@@ -34,8 +34,25 @@ import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
  * warehouse, so it is the action this alert is asking for. This alert is the only push that a
  * refused callback ever produces, so it is the only place the remedy can be said.
  */
-const ASN_OVERDUE_REMEDY = ' If no callback is coming, use "Re-check" on this ASN (purchase order → ASNs):'
-  + ' it re-reads the receipt from the WMS and books in only what is still outstanding.'
+/**
+ * o3d-hl8l r4 (Codex r3 finding 1): the remedy has to name a control the reader can actually REACH.
+ *
+ * The single sentence above said "purchase order → ASNs" for every breach, and this processor serves
+ * stock-transfer ASNs too — for which that screen does not exist, and (until this round) neither did
+ * any Re-check control. An operator following the alert for a transfer ASN was sent to a page that
+ * has nothing to do with it, which is worse than saying nothing: it reads as though the remedy had
+ * been tried and failed. The remedy and the notification's `actionUrl` are now both derived from the
+ * ASN's own `sourceType`, so they cannot drift apart from which screens carry the button.
+ */
+export function describeAsnRecheckRemedy(sourceType: string): { remedy: string; actionUrl: string } {
+  const transfer = sourceType.startsWith('STOCK_TRANSFER')
+  const where = transfer ? 'stock transfer → WMS ASN' : 'purchase order → ASNs'
+  return {
+    remedy: ` If no callback is coming, use "Re-check" on this ASN (${where}):`
+      + ' it re-reads the receipt from the WMS and books in only what is still outstanding.',
+    actionUrl: transfer ? '/stock-control/transfers' : '/purchase-orders',
+  }
+}
 
 /** Grace after the ETA before an open ASN counts as overdue. */
 export const ASN_OVERDUE_GRACE_MS = 24 * 60 * 60 * 1000
@@ -109,6 +126,7 @@ async function notifyActiveAdmins(
   tx: Pick<typeof db, 'user' | 'notification'>,
   title: string,
   message: string,
+  actionUrl = '/sync',
 ): Promise<void> {
   const admins = await tx.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
   if (admins.length === 0) throw new NoActiveAdminsError('no active ADMIN users to notify')
@@ -118,7 +136,7 @@ async function notifyActiveAdmins(
       type: 'warning',
       title,
       message,
-      actionUrl: '/sync',
+      actionUrl,
     })),
   })
 }
@@ -154,8 +172,10 @@ export function buildAsnOverdueAlertMessage(input: {
   warehouseCode: string
   breach: string
   creditNote: string
+  sourceType: string
 }): string {
-  return `ASN ${input.externalAsnId} (${input.warehouseCode}) ${input.breach}.${input.creditNote}${ASN_OVERDUE_REMEDY}`
+  const { remedy } = describeAsnRecheckRemedy(input.sourceType)
+  return `ASN ${input.externalAsnId} (${input.warehouseCode}) ${input.breach}.${input.creditNote}${remedy}`
 }
 
 export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
@@ -206,6 +226,7 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
     select: {
       id: true,
       externalAsnId: true,
+      sourceType: true,
       eta: true,
       lastCallbackAt: true,
       createdAt: true,
@@ -242,7 +263,11 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
             warehouseCode: asn.warehouse.code,
             breach,
             creditNote,
+            sourceType: asn.sourceType,
           }),
+          // The alert links to the screen that carries THIS ASN's Re-check control, not a blanket
+          // /sync that has none.
+          describeAsnRecheckRemedy(asn.sourceType).actionUrl,
         )
         return true
       })
@@ -270,6 +295,7 @@ export async function runWmsWatchdog(): Promise<WmsWatchdogResult> {
       metadata: {
         asnMapId: asn.id,
         externalAsnId: asn.externalAsnId,
+        sourceType: asn.sourceType,
         connector: connectorId,
         eta: asn.eta?.toISOString() ?? null,
         lastCallbackAt: asn.lastCallbackAt?.toISOString() ?? null,

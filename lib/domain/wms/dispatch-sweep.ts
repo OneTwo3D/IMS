@@ -4,7 +4,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { getMintsoftSettings, mintsoftDeltaScopeToken, type MintsoftDeltaScope } from '@/lib/connectors/mintsoft/settings/schema'
+import { mintsoftDeltaScopeToken, type MintsoftDeltaScope } from '@/lib/connectors/mintsoft/settings/schema'
 import {
   lockMintsoftDispatchSettings,
   type MintsoftDispatchSettingsLockTx,
@@ -1674,6 +1674,60 @@ export type MintsoftDeltaCursorTx = MintsoftDispatchSettingsLockTx & {
   }
 }
 
+/**
+ * The read side needs `findMany` and the write side needs `upsert`; kept as separate structural
+ * types so neither's doubles have to grow a delegate that path never calls.
+ */
+export type MintsoftDeltaCursorReadTx = MintsoftDispatchSettingsLockTx & {
+  setting: {
+    findMany(args: {
+      where: { key: { in: string[] } }
+      select: { key: true; value: true }
+    }): Promise<Array<{ key: string; value: string | null }>>
+  }
+}
+
+/** The two Setting keys the inbound-delta cursors live in, in the order both sides touch them. */
+export const MINTSOFT_DELTA_CURSOR_KEYS = ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] as const
+
+/**
+ * q66in.7.2 r4 (Codex r3 finding 2) — READ THE CURSORS AND THE SCOPE THEY BELONG TO ATOMICALLY.
+ *
+ * Round 3's compare-and-swap is only as good as the pairing it compares. The token it checks against
+ * is supposed to be "the scope these cursors were read under", and the production wiring did not
+ * produce that: it issued a `findMany` for the two cursor rows and THEN a separate, unlocked
+ * `getMintsoftSettings()` for the scope. A scope change committing between those two reads hands the
+ * run an OLD-scope watermark paired with a NEW-scope token — and the CAS at save time then compares
+ * new against new, passes, and writes the old-scope watermark straight back over the reset. The
+ * guard was defeated by the very interleaving it was built for, because the evidence it decides from
+ * was assembled across the window rather than inside it.
+ *
+ * Both rows are read in ONE transaction holding the SAME five-row dispatch lock the save takes, so
+ * the pair is provably consistent: whichever transaction takes the lock first runs to completion,
+ * and the other sees the result. A run that reads before the change gets (old cursors, old token)
+ * and is refused at save time; one that reads after gets (cleared cursors, new token) and correctly
+ * restarts from the lookback window.
+ *
+ * LOCK ORDER is the same on every path that touches these rows — the five dispatch keys, then the
+ * two cursor keys — so the read, the save and the settings write cannot cycle.
+ */
+export async function readMintsoftDeltaCursors(
+  tx: MintsoftDeltaCursorReadTx,
+  lockScope: (tx: MintsoftDeltaCursorReadTx) => Promise<MintsoftDeltaScope>,
+): Promise<{ watermark: string | null; lastReconcile: string | null; scope: string }> {
+  const scope = mintsoftDeltaScopeToken(await lockScope(tx))
+  const rows = await tx.setting.findMany({
+    where: { key: { in: [...MINTSOFT_DELTA_CURSOR_KEYS] } },
+    select: { key: true, value: true },
+  })
+  const map = new Map(rows.map((row) => [row.key, row.value]))
+  return {
+    watermark: map.get('mintsoft_order_delta_since') || null,
+    lastReconcile: map.get('mintsoft_order_reconcile_at') || null,
+    scope,
+  }
+}
+
 export type MintsoftDeltaCursorWriteResult =
   | { written: true }
   | { written: false; reason: 'scope_changed' }
@@ -1861,19 +1915,11 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       ? {
           fetchDelta: (sinceIso: string) => connector.fetchOrderDelta!(sinceIso),
           async getDeltaState() {
-            const rows = await db.setting.findMany({
-              where: { key: { in: ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] } },
-              select: { key: true, value: true },
-            })
-            const map = new Map(rows.map((row) => [row.key, row.value]))
-            // The scope these cursors belong to, resolved exactly as the SAVE resolves it
-            // (env override, then stored value, then default) so the two are comparable.
-            const scope = await getMintsoftSettings()
-            return {
-              watermark: map.get('mintsoft_order_delta_since') || null,
-              lastReconcile: map.get('mintsoft_order_reconcile_at') || null,
-              scope: mintsoftDeltaScopeToken(scope),
-            }
+            // The cursors AND the scope they belong to, read in one transaction under the same
+            // five-row lock the save takes (q66in.7.2 r4). Two separate unlocked reads could pair
+            // an old-scope watermark with a new-scope token, which is exactly what makes the CAS
+            // at save time wave the stale advance through — see readMintsoftDeltaCursors.
+            return db.$transaction((tx) => readMintsoftDeltaCursors(tx, lockMintsoftDispatchSettings))
           },
           async saveDeltaState(state: { watermark?: string; lastReconcile?: string; scope?: string | null }) {
             await db.$transaction((tx) => saveMintsoftDeltaCursors(tx, state, lockMintsoftDispatchSettings))
