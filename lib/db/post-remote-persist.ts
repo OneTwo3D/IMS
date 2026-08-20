@@ -167,6 +167,15 @@ export function isConnectionAcquisitionTimeout(error: unknown): boolean {
   })
 }
 
+/**
+ * The reason a persist is refused OUTRIGHT rather than attempted (round 4, finding 2).
+ *
+ * Not a database failure at all: the claim this worker holds no longer covers the write, so another
+ * worker may already own the row.
+ */
+export const LAPSED_CLAIM_REASON =
+  'the claim on this row no longer covers a persist, so another worker may already own it'
+
 /** Thrown when the record of a completed remote write could not be persisted at all. */
 export class UnrecordedRemoteWriteError extends Error {
   readonly attempts: number
@@ -175,9 +184,17 @@ export class UnrecordedRemoteWriteError extends Error {
 
   constructor(what: string, attempts: number, elapsedMs: number, deadlineMs: number, cause: unknown) {
     super(
-      `A completed remote write (${what}) could NOT be recorded locally: no database transaction could `
-        + `be started after ${attempts} attempt(s) over ${elapsedMs}ms (deadline ${deadlineMs}ms, set by `
-        + `how much of this worker's claim was left). The remote system holds the document; this system `
+      (attempts === 0
+        ? `A completed remote write (${what}) was NOT recorded locally and was NOT ATTEMPTED: the `
+          + `deadline derived from this worker's claim was 0 (deadline ${deadlineMs}ms, set by how much `
+          + `of this worker's claim was left), so the claim had already lapsed — or had only the safety `
+          + `margin left — by the time the record was reached. The ordinary persist updates the row by `
+          + `id with no claim fence, so running it here could trample a row another worker has already `
+          + `taken and is posting under. `
+        : `A completed remote write (${what}) could NOT be recorded locally: no database transaction `
+          + `could be started after ${attempts} attempt(s) over ${elapsedMs}ms (deadline ${deadlineMs}ms, `
+          + `set by how much of this worker's claim was left). `)
+        + `The remote system holds the document; this system `
         + `does not know its id. Check the connector before re-driving this row. `
         + `Cause: ${messagesOf(cause)[0] ?? String(cause)}`,
       { cause },
@@ -229,6 +246,28 @@ export async function persistAfterRemoteWrite<T>(
 
   const startedAt = now()
   const deadlineMs = postRemotePersistDeadlineMs(options.claim, startedAt, options.maxDeadlineMs)
+
+  // ZERO MEANS ZERO ATTEMPTS, NOT ONE (round 4, finding 2).
+  //
+  // Round 3 made the deadline arithmetic — `Math.max(0, ...)` — and wrote down what 0 means: "the
+  // claim has already lapsed, another worker may already be on this row, so re-driving is no longer
+  // provably safe and the give-up path runs immediately". The loop below did not implement that. It
+  // attempts FIRST and only compares elapsed against the deadline in the CATCH, so a deadline of 0
+  // bought exactly one execution of the persist — the one execution the clamp existed to prevent.
+  //
+  // That single attempt is not harmless, because the persist it runs is not claim-fenced: the Xero
+  // one is `accountingSyncLog.update({ where: { id } })`, which will happily flip a row that another
+  // worker has re-claimed and is at that moment posting under, to SYNCED with THIS worker's external
+  // id. Two documents in the ledger, one id recorded, and the row says it is finished.
+  //
+  // The give-up path is strictly better here and always was: its terminal write is a single statement
+  // fenced on `processingStartedAt`, so it records the id when the claim is genuinely still ours and
+  // does nothing at all when it is not — and it says which of the two happened. So a lapsed claim goes
+  // straight there, with the id, having touched nothing.
+  if (deadlineMs <= 0) {
+    throw new UnrecordedRemoteWriteError(what, 0, 0, deadlineMs, new Error(LAPSED_CLAIM_REASON))
+  }
+
   let attempts = 0
   for (;;) {
     attempts += 1

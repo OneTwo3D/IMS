@@ -1114,7 +1114,18 @@ safe.** What does the work instead:
   protection: when the database connection pool is exhausted it is re-driven rather than abandoned,
   for as long as this worker's 15-minute claim on the row allows (minus a minute held back for the
   give-up path, so it can never still be running when another worker may reclaim the row and post the
-  document a second time).
+  document a second time). When the claim has already lapsed by the time the record is reached, the
+  ordinary write is **not attempted at all** — it updates the row by id with no claim check, so under
+  a lost claim it could flip a row another worker is posting under. The give-up path below is used
+  instead, because its write *is* claim-checked.
+- **The claim is re-taken at the moment the document is sent.** Posting is not the first thing the
+  worker does after claiming a row: it reads the connection's granted permissions, looks the customer
+  or supplier up in Xero, resolves item codes — and any of those can sit out a Xero rate limit for
+  minutes. So immediately before the document is sent, IMS re-takes its own claim on the row. If it is
+  still ours, the fifteen minutes restart from there, giving the post and the record that follows it
+  the whole window. If another worker has taken it, **nothing is sent** and the row is left to
+  whoever holds it, with a warning in the activity log (`xero_sync_claim_lost_before_post`). Not
+  sending is the cheapest possible outcome for a lost claim.
 - **If the re-drive still cannot record it**, the id is written to the service log as a single line
   beginning `[UNRECORDED-REMOTE-WRITE]`, containing the external id, the sync log id and the
   reference — because at that moment that id exists nowhere else. IMS then makes one more attempt

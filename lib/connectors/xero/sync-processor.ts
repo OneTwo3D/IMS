@@ -9,6 +9,7 @@ import { db, POST_REMOTE_PERSIST_TX_OPTIONS } from '@/lib/db'
 import { XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import {
   persistAfterRemoteWrite,
+  postRemotePersistDeadlineMs,
   reportUnrecordedRemoteWrite,
   UnrecordedRemoteWriteError,
 } from '@/lib/db/post-remote-persist'
@@ -1306,6 +1307,60 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
  * Returns true when the row was recorded normally. On false the caller must NOT touch the database for
  * this row: the pool is exhausted, and everything worth saying has already been said by the reporter.
  */
+/**
+ * RE-TAKE THE CLAIM AT THE INSTANT THE REMOTE WRITE BEGINS (o3d-xl63 round 4, finding 1).
+ *
+ * Round 3 anchored the persist's deadline to the row's claim, which stops the persist outliving this
+ * worker's exclusivity. It says nothing about the OTHER end: the claim can be gone before the post
+ * even starts.
+ *
+ * The claim is taken, and then `processEntry` runs — and `processEntry` is not a POST. It reads the
+ * granted scopes, resolves (or creates) the Xero contact, looks items up, and every one of those calls
+ * goes through the same rate-limited client: `api.ts` records the worst case between the first HTTP
+ * call and the last as three 90-second Retry-After sleeps plus three 60-second minute-limit waits.
+ * Several such calls in front of the document post, and fifteen minutes of claim is spent BEFORE
+ * anything is posted. Meanwhile the next sweep tick measures staleness, finds this row past the
+ * cutoff, re-claims it and posts the document. Then this worker's post lands too: two documents in the
+ * ledger, and the persist that follows — deadline 0 — cannot even record which one we made.
+ *
+ * A check would only tell us we had lost. Re-taking tells us AND fixes the runway: the update is
+ * fenced on the exact `processingStartedAt` this worker wrote, so
+ *
+ *  • one row matched  -> the claim was still ours, and it now runs from HERE, giving the post and the
+ *                        persist that follows it the full claim rather than whatever was left;
+ *  • no row matched   -> someone else owns it. NOTHING IS POSTED. That is the whole point: the cheapest
+ *                        possible outcome for a lost claim is to have sent nothing.
+ *
+ * The renewed timestamp becomes the claim anchor for everything downstream — the cancelled-order
+ * guards inside `processEntry`, the persist deadline, and the claim-fenced terminal write on the
+ * give-up path — so all of them fence on the claim this worker actually holds.
+ */
+// Exported for tests/accounting/xero-claim-before-remote-write.test.ts: "we did not post" is the
+// outcome under test, and it is only observable at this seam.
+export async function renewClaimForRemoteWrite(entryId: string, heldFrom: Date): Promise<Date | null> {
+  const renewedAt = new Date()
+  const renewed = await db.accountingSyncLog.updateMany({
+    where: {
+      id: entryId,
+      connector: XERO_CONNECTOR,
+      status: 'PROCESSING',
+      processingStartedAt: heldFrom,
+    },
+    data: { processingStartedAt: renewedAt },
+  })
+  return renewed.count === 1 ? renewedAt : null
+}
+
+/**
+ * What to say when a claim was lost before anything was sent. Nothing is wrong with the row — it is
+ * being worked on by somebody else — so this is a re-drive, not a failure.
+ */
+function lostClaimMessage(entryId: string): string {
+  return `Xero sync log ${entryId} was not posted: this worker's claim on it had been taken by another `
+    + `worker before the remote write began, so posting would have created a second document. The row `
+    + `belongs to whoever holds it now.`
+}
+
 // Exported for tests/accounting/xero-unrecorded-remote-write.test.ts: the give-up path is the one
 // that runs when the database is unreachable, so it has to be drivable without one.
 export type PostedDocumentPersistOutcome =
@@ -1638,7 +1693,31 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, held)
+      // o3d-xl63 r4 #1: re-take the claim at the instant the remote write begins, and post NOTHING if
+      // it is gone. Everything downstream fences on the timestamp this returns, not on the one taken
+      // before the deferral checks above.
+      const postClaimedAt = await renewClaimForRemoteWrite(entry.id, claimedAt)
+      if (!postClaimedAt) {
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_sync_claim_lost_before_post',
+          tag: 'sync',
+          level: 'WARNING',
+          description: lostClaimMessage(entry.id),
+          metadata: { syncLogId: entry.id, type: entry.type, claimedAt: claimedAt.toISOString() },
+          resolveUser: false,
+        })
+        result.skipped++
+        continue
+      }
+
+            // THE RENEWED CLAIM IS THE ONE EVERYTHING DOWNSTREAM FENCES ON. `held` above was built from the
+      // instant taken before the deferral checks; the row now carries `postClaimedAt`, so a fence
+      // built from the older holder would match NOTHING — and these fences fail closed, so the
+      // symptom would be silence rather than an error. Wrapped rather than passed raw because
+      // o3d-550x's contract (merged as #639) is that a claim is a HOLDER asked for its instant at the
+      // point of use, and a bare `Date` is a compile error.
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimHeldFrom(postClaimedAt))
 
       if (syncResult.skipped) {
         // processEntry already terminalised this row (e.g. its order was cancelled — o3d-5rs). Nothing
@@ -1654,7 +1733,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           entry,
           payload,
           externalId: syncResult.externalId,
-          claimedAt,
+          // The RENEWED claim (r4 #1): the persist's deadline, and the claim-fenced terminal write on
+          // the give-up path, must both fence on the claim this worker actually holds.
+          claimedAt: postClaimedAt,
           // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
           // made is recorded and orders the document against other writers.
           externalRevisionAt: syncResult.externalRevisionAt ?? null,
@@ -2068,7 +2149,32 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, held)
+      // o3d-xl63 r4 #1: as in the direct path — re-take the claim at the instant the remote write
+      // begins. The outbox job is handed back for retry rather than failed: nothing was sent, and by
+      // the time it is re-claimed the row is either SYNCED (skipped at the top) or free again.
+      const postClaimedAt = await renewClaimForRemoteWrite(entry.id, claimedAt)
+      if (!postClaimedAt) {
+        await markXeroOutboxRetry(job, lostClaimMessage(entry.id))
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_sync_claim_lost_before_post',
+          tag: 'sync',
+          level: 'WARNING',
+          description: lostClaimMessage(entry.id),
+          metadata: { syncLogId: entry.id, type: entry.type, outboxJobId: job.id, claimedAt: claimedAt.toISOString() },
+          resolveUser: false,
+        })
+        result.skipped++
+        continue
+      }
+
+            // THE RENEWED CLAIM IS THE ONE EVERYTHING DOWNSTREAM FENCES ON. `held` above was built from the
+      // instant taken before the deferral checks; the row now carries `postClaimedAt`, so a fence
+      // built from the older holder would match NOTHING — and these fences fail closed, so the
+      // symptom would be silence rather than an error. Wrapped rather than passed raw because
+      // o3d-550x's contract (merged as #639) is that a claim is a HOLDER asked for its instant at the
+      // point of use, and a bare `Date` is a compile error.
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimHeldFrom(postClaimedAt))
 
       if (syncResult.skipped) {
         // processEntry already terminalised this row (e.g. its order was cancelled — o3d-5rs). Complete
@@ -2084,7 +2190,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           entry,
           payload,
           externalId: syncResult.externalId,
-          claimedAt,
+          // The RENEWED claim (r4 #1): the persist's deadline, and the claim-fenced terminal write on
+          // the give-up path, must both fence on the claim this worker actually holds.
+          claimedAt: postClaimedAt,
           // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
           // made is recorded and orders the document against other writers.
           externalRevisionAt: syncResult.externalRevisionAt ?? null,

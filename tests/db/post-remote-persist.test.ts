@@ -408,3 +408,62 @@ test('both Xero post-remote persists are routed through the anchored helper, not
   assert.match(helper.slice(0, 3_000), /POST_REMOTE_PERSIST_TX_OPTIONS/,
     'and the transaction waits on the POOL bound rather than Prisma\'s shorter default maxWait')
 })
+
+test('r4 #2: a deadline of 0 means ZERO attempts — the persist does not run once "for luck"', async () => {
+  const staleAfterMs = 15 * 60 * 1000
+  const heldFrom = 1_000_000_000_000
+  let ran = 0
+
+  // Three ways to arrive at a 0 deadline, and none of them may execute the persist:
+  //  - the claim has lapsed outright;
+  //  - it has only the safety margin left, which is reserved for the give-up path;
+  //  - the claim is unreadable, so nothing about its life can be asserted.
+  const zeroDeadlineNows = [
+    heldFrom + staleAfterMs + 1,
+    heldFrom + staleAfterMs - CLAIM_SAFETY_MARGIN_MS,
+    heldFrom,
+  ]
+  const claims = [
+    { heldFrom, staleAfterMs },
+    { heldFrom, staleAfterMs },
+    { heldFrom: Number.NaN, staleAfterMs },
+  ]
+
+  for (const [index, now] of zeroDeadlineNows.entries()) {
+    const failure = await persistAfterRemoteWrite('xero sync log lapsed-1 (INVOICE_PAYMENT)', async () => {
+      ran += 1
+      return 'persisted'
+    }, {
+      claim: claims[index],
+      now: () => now,
+      sleep: async () => { throw new Error('must not sleep') },
+      onRetry: () => { throw new Error('must not retry') },
+    }).then((value) => value, (error: unknown) => error)
+
+    assert.ok(failure instanceof UnrecordedRemoteWriteError,
+      `case ${index}: a lapsed claim must refuse, not quietly succeed by running an unfenced write`)
+    assert.equal(failure.attempts, 0)
+    assert.equal(failure.deadlineMs, 0)
+    assert.match(failure.message, /was NOT ATTEMPTED/)
+    assert.match(failure.message, /trample a row another worker has already taken/)
+    assert.match(failure.message, /deadline 0ms/, 'and still says the deadline came from the claim')
+  }
+
+  assert.equal(ran, 0,
+    'the persist updates the row BY ID with no claim fence — one execution under a lost claim flips a row '
+      + 'another worker is posting under to SYNCED with THIS worker\'s external id')
+})
+
+test('r4 #2 control: a live claim still runs the persist, exactly once, and returns its value', async () => {
+  const staleAfterMs = 15 * 60 * 1000
+  const heldFrom = 1_000_000_000_000
+  let ran = 0
+
+  const value = await persistAfterRemoteWrite('xero sync log live-1 (SALES_INVOICE)', async () => {
+    ran += 1
+    return 'persisted'
+  }, { claim: { heldFrom, staleAfterMs }, now: () => heldFrom + 60_000 })
+
+  assert.equal(value, 'persisted')
+  assert.equal(ran, 1, 'the refusal is for a lapsed claim only — a live one must be unaffected')
+})

@@ -1,0 +1,252 @@
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import test, { mock } from 'node:test'
+
+/**
+ * o3d-xl63 ROUND 4 — A CLAIM THAT IS GONE BEFORE THE POST BEGINS.
+ *
+ * Round 3 anchored the PERSIST's deadline to the row's claim, so the record of a completed post can
+ * never still be running when another worker may reclaim the row. It said nothing about the other end
+ * of the same window: the claim can be gone before the post ever starts.
+ *
+ * `processEntry` is not a POST. It reads the granted scopes, resolves or creates the Xero contact,
+ * looks items up — and every one of those goes through the rate-limited client, whose own header puts
+ * the worst case between the first HTTP call and the last at three 90-second Retry-After sleeps plus
+ * three 60-second minute-limit waits. Put a few of those in front of the document post and the
+ * fifteen-minute claim is spent before anything is sent. The next sweep tick then finds the row past
+ * the stale cutoff, re-claims it, and posts the document — and this worker posts it too.
+ *
+ * The fix re-TAKES the claim at the instant the remote write begins, fenced on the exact
+ * `processingStartedAt` this worker wrote. Matched: the runway restarts from here. Not matched:
+ * nothing is posted at all, which is the cheapest possible outcome for a lost claim.
+ */
+
+type UpdateManyArgs = { where: Record<string, unknown>; data: Record<string, unknown> }
+
+const state = {
+  updateMany: [] as UpdateManyArgs[],
+  /** Counts returned by successive updateMany calls: [claim, re-take, ...]. */
+  updateManyCounts: [] as number[],
+  updateManyCount: 1,
+  transactionAttempts: 0,
+  pending: [] as Array<Record<string, unknown>>,
+  pendingServed: false,
+  posted: [] as string[],
+  activity: [] as Array<{ action?: string; description?: string }>,
+}
+
+/**
+ * A permissive database double: the sweep touches far more than this test cares about, and the only
+ * calls that carry meaning here are the two `accountingSyncLog.updateMany`s — the claim and the
+ * re-take — and whether any transaction ran at all.
+ */
+function makeDbDouble(): Record<string, unknown> {
+  const model = new Proxy({}, {
+    get: (_target, method: string) => async (args: UpdateManyArgs) => {
+      switch (method) {
+        case 'updateMany': {
+          state.updateMany.push(args)
+          const next = state.updateManyCounts.shift()
+          return { count: next ?? state.updateManyCount }
+        }
+        case 'count': return 0
+        case 'findMany': {
+          if (state.pendingServed) return []
+          state.pendingServed = true
+          return state.pending
+        }
+        // The sales order the invoice belongs to: readable and not cancelled, so the
+        // cancelled-order guard lets the post through and the claim guard is the only thing
+        // that can stop it.
+        case 'findUnique': return { id: 'so-1', customerId: 'cust-1', status: 'PROCESSING' }
+        case 'findFirst': return null
+        default: return {}
+      }
+    },
+  })
+  const db: Record<string, unknown> = new Proxy({}, {
+    get: (_target, key: string) => {
+      if (key === '$transaction') {
+        return async (arg: unknown) => {
+          state.transactionAttempts += 1
+          return typeof arg === 'function' ? (arg as (tx: unknown) => unknown)(db) : []
+        }
+      }
+      if (key === 'then') return undefined
+      return model
+    },
+  })
+  return db
+}
+
+mock.module('@/lib/db', {
+  namedExports: {
+    db: makeDbDouble(),
+    POST_REMOTE_PERSIST_TX_OPTIONS: { maxWait: 11_000, timeout: 15_000 },
+  },
+})
+mock.module('@/lib/activity-log', {
+  namedExports: {
+    logActivity: async (entry: { action?: string; description?: string }) => { state.activity.push(entry) },
+    logActivityPersisted: async (entry: { action?: string; description?: string }) => { state.activity.push(entry); return true },
+  },
+})
+mock.module('@/lib/connectors/xero/auth', {
+  namedExports: { getGrantedScopes: async () => null },
+})
+mock.module('@/lib/connectors/xero/invoices', {
+  namedExports: {
+    pushSalesInvoice: async (data: { invoiceNumber: string }) => {
+      state.posted.push(data.invoiceNumber)
+      return { success: true, invoiceId: 'XERO-INV-1', invoiceNumber: data.invoiceNumber }
+    },
+    updateSalesInvoice: async () => ({ success: true, invoiceId: 'XERO-INV-1' }),
+  },
+})
+
+const processor = () => import('@/lib/connectors/xero/sync-processor')
+
+function reset(): void {
+  state.updateMany = []
+  state.updateManyCounts = []
+  state.updateManyCount = 1
+  state.transactionAttempts = 0
+  state.pending = []
+  state.pendingServed = false
+  state.posted = []
+  state.activity = []
+}
+
+function pendingSalesInvoice(): Record<string, unknown> {
+  return {
+    id: 'log-1',
+    connector: 'xero',
+    type: 'SALES_INVOICE',
+    status: 'PENDING',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    externalTransactionId: null,
+    retryCount: 0,
+    errorMessage: null,
+    processingStartedAt: null,
+    payload: { invoiceNumber: 'INV-1', contactName: 'A Customer', date: '2026-08-20', currency: 'GBP', lines: [] },
+  }
+}
+
+test('the claim is RE-TAKEN at the instant the remote write begins, fenced on this worker\'s own timestamp', async () => {
+  reset()
+  const { renewClaimForRemoteWrite } = await processor()
+  const heldFrom = new Date('2026-08-20T10:00:00.000Z')
+
+  const renewed = await renewClaimForRemoteWrite('log-1', heldFrom)
+
+  assert.ok(renewed instanceof Date)
+  assert.ok(renewed.getTime() > heldFrom.getTime(),
+    'the runway restarts HERE, so the post and the persist that follows get the whole claim, not the remainder')
+  assert.equal(state.updateMany.length, 1)
+  const [{ where, data }] = state.updateMany
+  assert.equal(where.id, 'log-1')
+  assert.equal(where.connector, 'xero')
+  assert.equal(where.status, 'PROCESSING')
+  assert.deepEqual(where.processingStartedAt, heldFrom,
+    'fenced on the EXACT claim this worker wrote — anything looser would re-take a claim someone else holds')
+  assert.deepEqual(data.processingStartedAt, renewed)
+})
+
+test('a claim taken by another worker returns null, and nothing else is written', async () => {
+  reset()
+  state.updateManyCount = 0
+  const { renewClaimForRemoteWrite } = await processor()
+
+  const renewed = await renewClaimForRemoteWrite('log-1', new Date('2026-08-20T10:00:00.000Z'))
+
+  assert.equal(renewed, null, 'null is what stops the post — a check that only logged would still send the document')
+  assert.equal(state.transactionAttempts, 0)
+})
+
+test('r4 #2: a persist reached on a LAPSED claim runs no transaction at all, and still records the id', async () => {
+  reset()
+  const { persistPostedXeroDocument } = await processor()
+  const staleAfterMs = 15 * 60 * 1000
+
+  const recorded = await persistPostedXeroDocument({
+    entry: { id: 'log-77', type: 'INVOICE_PAYMENT', referenceType: 'SalesInvoice', referenceId: 'inv-77' },
+    payload: {},
+    externalId: 'PAY-77',
+    // Claimed a full stale-window ago: there is nothing left of it.
+    claimedAt: new Date(Date.now() - staleAfterMs - 1_000),
+  })
+
+  assert.equal(recorded, false, 'the caller is told the row was not recorded normally')
+  assert.equal(state.transactionAttempts, 0,
+    'the ordinary persist updates the row BY ID with no claim fence — under a lapsed claim it must not run at all')
+
+  // What DOES run is the give-up path's single statement, which is claim-fenced and therefore safe.
+  assert.equal(state.updateMany.length, 1)
+  const [{ where, data }] = state.updateMany
+  assert.equal(where.id, 'log-77')
+  assert.ok(where.processingStartedAt, 'the terminal write is fenced on the claim; the persist it replaced was not')
+  assert.equal(data.externalTransactionId, 'PAY-77', 'and the id of the document Xero holds is still recovered')
+})
+
+test('both sweep paths re-take the claim before posting and anchor the persist to the RENEWED claim', () => {
+  // Structural, in the style of the round-3 test one file over: the guard's whole value is that it sits
+  // between the claim and the post, and nothing about a passing behavioural test would notice it being
+  // moved or dropped.
+  const source = readFileSync(new URL('../../lib/connectors/xero/sync-processor.ts', import.meta.url), 'utf8')
+  const lines = source.split('\n')
+  const postSites = lines.flatMap((line, index) => (line.includes('await processEntry(entry.id,') ? [index] : []))
+  assert.equal(postSites.length, 2, 'the direct path and the outbox path — if this changed, so did the fix')
+
+  for (const index of postSites) {
+    const before = lines.slice(Math.max(0, index - 22), index).join('\n')
+    assert.match(before, /renewClaimForRemoteWrite\(entry\.id, claimedAt\)/,
+      `the remote write at line ${index + 1} must re-take the claim first`)
+    assert.match(before, /if \(!postClaimedAt\)/,
+      `and must post NOTHING when the claim is gone (line ${index + 1})`)
+    assert.match(lines[index], /payload, postClaimedAt\)/,
+      `and everything downstream must fence on the RENEWED claim, not the one taken before the deferral checks`)
+  }
+
+  const persistSites = lines.flatMap((line, index) => (line.includes('await persistPostedXeroDocument({') ? [index] : []))
+  assert.equal(persistSites.length, 2)
+  for (const index of persistSites) {
+    assert.match(lines.slice(index, index + 9).join('\n'), /claimedAt: postClaimedAt,/,
+      `the persist at line ${index + 1} must be anchored to the renewed claim`)
+  }
+})
+
+test('the sweep POSTS NOTHING when the claim was taken between claiming and posting', async () => {
+  reset()
+  process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'false'
+  state.pending = [pendingSalesInvoice()]
+  // The claim succeeds; the re-take at the instant of the post finds the row already gone — which is
+  // what a sweep tick that spent its claim on Retry-After sleeps inside processEntry comes back to.
+  state.updateManyCounts = [1, 0]
+
+  const { processPendingXeroSync } = await processor()
+  const result = await processPendingXeroSync()
+
+  assert.deepEqual(state.posted, [],
+    'the document must NOT be sent: another worker holds this row and is posting it, so this would be the second one')
+  assert.equal(result.skipped, 1)
+  assert.equal(result.succeeded, 0)
+  assert.equal(state.transactionAttempts, 0, 'and nothing was persisted for a post that never happened')
+  const warning = state.activity.find((a) => a.action === 'xero_sync_claim_lost_before_post')
+  assert.ok(warning, 'the lost claim is recorded, not swallowed')
+  assert.match(warning.description ?? '', /posting would have created a second document/)
+})
+
+test('control: with the claim still held, the sweep posts exactly once', async () => {
+  reset()
+  process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'false'
+  state.pending = [pendingSalesInvoice()]
+  state.updateManyCounts = [1, 1]
+
+  const { processPendingXeroSync } = await processor()
+  const result = await processPendingXeroSync()
+
+  assert.deepEqual(state.posted, ['INV-1'], 'the ordinary path must be untouched by the guard')
+  assert.equal(result.skipped, 0)
+  assert.equal(state.activity.some((a) => a.action === 'xero_sync_claim_lost_before_post'), false)
+})
