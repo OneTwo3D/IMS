@@ -27,8 +27,10 @@ import {
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
 import {
   buildCompactedFollowUpLossActivity,
-  isCompactedFollowUpEvidence,
+  compactedRowLostFollowUps,
+  describeLostFollowUps,
 } from '@/lib/domain/accounting/compacted-followup-loss'
+import { XERO_FOLLOW_UP_PAYLOAD_DEBT } from './followup-payload-debt'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -96,7 +98,25 @@ async function announceCompactedFollowUpLoss(entry: {
   externalTransactionId: string | null
   backReferenceEvidenceCompactedAt: Date | null
 }): Promise<void> {
-  if (!isCompactedFollowUpEvidence(entry)) return
+  // NARROWED FROM THE STAMP TO THE ACTUAL LOSS (o3d-bqw7, o3d-kemx).
+  //
+  // r3/r4 asked only "is this a tombstone?", and then told the operator its follow-ups could no
+  // longer be enqueued. Those are two different facts. A sales CREDIT_NOTE has no branch in
+  // `enqueueFollowUps` at all, so compaction took nothing from it — and it is a back-reference type,
+  // so retention compacts it, so EVERY compacted sales credit note produced this warning.
+  //
+  // That was defensible while the warning was only noise. It stopped being defensible when r4 made
+  // the warning gate the RELEASE: the throw below withholds the release, the row returns to PENDING
+  // still owing its (nonexistent) follow-ups, and the retry meets the same unwritable activity log
+  // next pass. An already-posted document then re-drives for ever on the strength of a warning about
+  // work that never existed. Narrowing the question removes the false warnings, and the stranding
+  // goes with them.
+  //
+  // The direction is unchanged where the answer is genuinely unknown: `PAYLOAD_BUILT` means the TYPE
+  // can owe payload-built work, not that this row did, so a compacted sales invoice is still warned
+  // about even though most of them registered no payment. Over-reporting inside a type is noise;
+  // under-reporting loses a payment in silence.
+  if (!compactedRowLostFollowUps(entry, XERO_FOLLOW_UP_PAYLOAD_DEBT)) return
   // logActivityPersisted, NOT logActivity: the release below is conditional on having warned, and
   // logActivity swallows its own write failures and resolves regardless — which is the same
   // "reported success, did nothing" shape as the empty enqueue this exists to catch.
@@ -105,6 +125,7 @@ async function announceCompactedFollowUpLoss(entry: {
     activityActionPrefix: XERO_CONNECTOR,
     row: entry,
     phase: 'processor-short-circuit',
+    lostWork: describeLostFollowUps(entry.type, XERO_FOLLOW_UP_PAYLOAD_DEBT),
   }))
   if (persisted) return
   throw new CompactedFollowUpLossUnrecorded(
@@ -1754,6 +1775,12 @@ export async function repairXeroBackReferences(limit = DEFAULT_BACK_REFERENCE_SW
     logActivity: logActivityPersisted,
     enqueueFollowUps: (entryId, type, referenceType, referenceId, payload, syncResult) =>
       enqueueFollowUps(entryId, type, referenceType, referenceId, payload as SyncPayload, syncResult),
+    // The other half of the same contract, and required for the same reason (o3d-bqw7): the sweep
+    // cannot ask `enqueueFollowUps` what it WOULD have built from a payload that no longer exists —
+    // handed `{}` it enqueues nothing and returns normally — so the connector states it. Supplying
+    // the enqueue without the table would leave the sweep guessing on the connector's behalf, which
+    // is what the over-broad stamp was.
+    followUpPayloadDebt: XERO_FOLLOW_UP_PAYLOAD_DEBT,
   }, { limit })
 }
 

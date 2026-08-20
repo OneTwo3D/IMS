@@ -1074,20 +1074,42 @@ A compacted row is **still a repair candidate**, and the split is by what each p
 rather than by the row as a whole. Everything the id write reads — the reference and the external
 id — survives compaction, so the sweep can still link the order or bill, including one whose
 ambiguity only cleared *after* the retention cutoff. What cannot survive is the follow-up work built
-from the payload (PDF, payment registration, bill attachment); whenever the sweep settles one of
-these rows with follow-ups still outstanding — whether it repaired the link on that pass or the link
-was already there — it logs `*_backreference_followups_discarded` naming the document, so you can
-check for a missing PDF or payment and re-drive it by hand. The row is only closed once that warning
-has been written, so the loss is never absorbed silently. A compacted row also still counts as a claim when the
+from the payload; whenever the sweep settles one of these rows with follow-ups still outstanding —
+whether it repaired the link on that pass or the link was already there — it logs
+`*_backreference_followups_discarded` naming the document and **the specific work that was lost**, so
+you can check for it and re-drive it by hand. The row is only closed once that warning has been
+written, so the loss is never absorbed silently. A compacted row also still counts as a claim when the
 sweep decides whether a purchase order's bill is ambiguous.
+
+**Only rows that actually owed payload-built work are warned about.** Which follow-ups a row owes
+depends on its type, and for several types the answer is *none*:
+
+| Compacted row | What compaction destroyed | Warned about? |
+| --- | --- | --- |
+| Sales invoice | the customer payment registration, if that sale asked for one. Its invoice PDF is rebuilt from the external id and reference, so that part is still queued | yes |
+| Supplier bill | the supplier-invoice attachment, if the bill carried a file | yes |
+| Supplier credit note | the allocation against the bill it offsets | yes |
+| **Sales credit note** | **nothing — this type queues no follow-up work at all** | **no** |
+
+Before this distinction existed, a sales credit note produced the warning too. That was not just
+noise: because the row is only settled once the warning is on record, a credit note that had already
+posted to Xero could be held open indefinitely — re-driven on every sweep and every retry — purely
+because the activity log was failing to accept a warning about work that never existed.
+
+Where the answer genuinely depends on the destroyed payload — whether *this* sale registered a
+payment, whether *this* bill carried a PDF — the warning is still raised. A false alarm is cheap;
+staying quiet about a missing payment is not.
 
 **Retrying a compacted row by hand reports the same loss.** If you press *Retry* (or *Retry all*) on
 the Accounting Sync page and the row already carries an external id, IMS does **not** re-send the
-document — it settles the row against the id that is already there. On a compacted row that means
-the follow-ups built from the payload cannot be rebuilt either, so the retry writes the same
+document — it settles the row against the id that is already there. On a compacted row that owed
+payload-built work, that work cannot be rebuilt either, so the retry writes the same
 `xero_backreference_followups_discarded` WARNING naming the document, and the row is settled only
 once that warning has been written. A retry that turns such a row green is therefore never silent
 about what it could not do: check the activity log after a bulk retry over old failures.
+
+A compacted row that owed **no** payload-built work (a sales credit note) settles on retry like any
+other already-posted row, with no warning and nothing withheld.
 
 The follow-ups that **do** survive compaction are still queued in that situation. A sales invoice
 tombstone, for example, keeps everything the invoice-PDF job needs, so the retry enqueues it even

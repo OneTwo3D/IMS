@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { XERO_FOLLOW_UP_PAYLOAD_DEBT } from '@/lib/connectors/xero/followup-payload-debt'
 import { BACK_REFERENCE_PAIRS, syncTypeWritesBackReference } from '@/lib/domain/accounting/back-reference'
 import {
   BACK_REFERENCE_AMBIGUITY_RECHECK_INTERVAL_MS,
@@ -117,7 +118,17 @@ type Store = {
   orders: OrderRow[]
   /** Optional so the existing stores need no edit; defaulted in makeHarness. */
   creditNotes?: CreditNoteRow[]
+  /**
+   * SALES credit notes (o3d-bqw7). Type CREDIT_NOTE is the row the narrowed compaction question is
+   * actually about — a back-reference type retention compacts, with no branch in either connector's
+   * `enqueueFollowUps` — and it could not be driven through this sweep at all while
+   * `salesOrderRefund` was a hard-wired null, which is why the false warning on it went unnoticed
+   * through four review rounds. Optional and defaulted, so no existing store changes.
+   */
+  refunds?: RefundRow[]
 }
+
+type RefundRow = { id: string; accountingCreditNoteId: string | null }
 
 /**
  * purchase_invoices.accounting_invoice_id is UNIQUE (o3d-9kek r2 finding 1), and the fix depends
@@ -186,6 +197,7 @@ type Harness = {
 
 function makeHarness(store: Store): Harness {
   store.creditNotes ??= []
+  store.refunds ??= []
   const activities: BackReferenceSweepActivity[] = []
   const followUps: Harness['followUps'] = []
   const calls = { candidateQueries: 0, syncRowsRead: 0, probes: 0, billUpdates: 0, transactions: 0, rawStatements: [] as Array<{ sql: string; values: unknown[] }> }
@@ -268,8 +280,18 @@ function makeHarness(store: Store): Harness {
       },
     },
     salesOrderRefund: {
-      async findUnique() { return null },
-      async update() { throw new Error('unexpected salesOrderRefund.update') },
+      async findUnique(args: { where: { id: string } }) {
+        calls.probes++
+        if (failProbeFor.has(args.where.id)) throw new Error('probe blew up')
+        const refund = store.refunds!.find((candidate) => candidate.id === args.where.id)
+        return refund ? { accountingCreditNoteId: refund.accountingCreditNoteId } : null
+      },
+      async update(args: { where: { id: string }; data: Record<string, unknown> }) {
+        const refund = store.refunds!.find((candidate) => candidate.id === args.where.id)
+        if (!refund) throw new Error(`fake db: no sales order refund ${args.where.id}`)
+        Object.assign(refund, args.data)
+        return refund
+      },
     },
     purchaseInvoice: {
       async findUnique(args: { where: { id: string } }) {
@@ -369,6 +391,10 @@ function sweepDeps(harness: Harness, now?: () => Date, overrides: { cursorStore?
       if (harness.failFollowUpsFor.has(entryId)) throw new Error('follow-up enqueue failed')
       harness.followUps.push({ entryId, referenceType, referenceId })
     },
+    // THE REAL XERO TABLE, not a stub (o3d-bqw7). A hand-written one here would make every
+    // "is this row warned about?" assertion below a statement about the test's own opinion of
+    // SALES_INVOICE and CREDIT_NOTE, which is exactly the fact under test.
+    followUpPayloadDebt: XERO_FOLLOW_UP_PAYLOAD_DEBT,
   } as Parameters<typeof repairAccountingBackReferences>[0]
 }
 
@@ -1363,6 +1389,124 @@ test('[o3d-9kek r4 f3] a TOMBSTONE with an unresolved PO ambiguity is still defe
   assert.equal(harness.store.bills[0].accountingInvoiceId, null, 'refusing to guess survives compaction')
   assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null, 'DEFERRED, not retired')
   assert.ok(harness.store.syncRows[0].backReferenceAmbiguousLoggedAt)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-bqw7 / o3d-kemx — THE STAMP IS BROADER THAN THE LOSS.
+//
+// Everything above branches on "was this row compacted?" and then tells the operator its follow-ups
+// are gone. A SALES credit note (type CREDIT_NOTE) is compacted by retention like any other
+// back-reference type and has NO branch in `enqueueFollowUps`, so it never owed a follow-up to lose.
+// It was warned about anyway, never flipped out of FAILED, and — because the warning gates
+// settlement — left eligible for ever whenever the activity log was failing.
+//
+// The question is now asked of the connector's per-type table instead of the stamp.
+// ---------------------------------------------------------------------------
+
+function salesCreditNoteRow(index: number, overrides: Partial<SyncRow> = {}): SyncRow {
+  return {
+    id: `log-scn-${String(index).padStart(4, '0')}`,
+    connector: 'xero',
+    type: 'CREDIT_NOTE',
+    referenceType: 'SalesOrderRefund',
+    referenceId: `refund-${index}`,
+    externalTransactionId: `XSCN-${index}`,
+    status: 'FAILED',
+    payload: {},
+    createdAt: at(index),
+    backReferenceCheckedAt: null,
+    backReferenceAmbiguousLoggedAt: null,
+    backReferenceEvidenceCompactedAt: at(500),
+    backReferenceFollowUpsPendingAt: null,
+    ...overrides,
+  }
+}
+
+test('[o3d-bqw7] a TOMBSTONED sales credit note is repaired and SETTLED, with no discard warning', async () => {
+  const harness = makeHarness({
+    syncRows: [salesCreditNoteRow(1)],
+    bills: [],
+    orders: [],
+    refunds: [{ id: 'refund-1', accountingCreditNoteId: null }],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.repaired, 1, 'the id write never depended on the payload')
+  assert.equal(harness.store.refunds![0].accountingCreditNoteId, 'XSCN-1')
+  assert.equal(run.followUpsDiscarded, 0, 'CREDIT_NOTE has no branch in enqueueFollowUps — nothing was discarded')
+  assert.equal(
+    harness.activities.find((entry) => entry.action === 'xero_backreference_followups_discarded'),
+    undefined,
+    'so the operator is not sent to look for a PDF, payment or attachment this type never owed',
+  )
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'settled')
+  assert.equal(
+    harness.store.syncRows[0].status,
+    'SYNCED',
+    'and FLIPPED, unlike a real tombstone: there are no abandoned follow-ups for SYNCED to erase the trace of',
+  )
+})
+
+test('[o3d-kemx] and it settles even while the activity log is failing — a phantom loss cannot strand it', async () => {
+  // THE STRANDING, sweep side. The warning gates the stamp, so under the stamp-wide question this
+  // row came back on every single run, was warned about again, failed to persist again, and was
+  // never settled — an already-posted credit note held open by an activity log, over work that never
+  // existed. `failActivityFor` is deliberately still armed: the fix is that the write is never
+  // ATTEMPTED, not that it now succeeds.
+  const harness = makeHarness({
+    syncRows: [salesCreditNoteRow(1)],
+    bills: [],
+    orders: [],
+    refunds: [{ id: 'refund-1', accountingCreditNoteId: null }],
+  })
+  harness.failActivityFor.add('xero_backreference_followups_discarded')
+
+  const firstRun = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(firstRun.repaired, 1)
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'stamped on the FIRST pass')
+
+  const secondRun = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(secondRun.scanned, 0, 'and it has left the candidate set for good, rather than re-driving for ever')
+})
+
+test('[o3d-bqw7] a compacted row whose follow-ups are rebuilt from COLUMNS is enqueued, not reported discarded', async () => {
+  // INVOICE_PDF is the type whose follow-ups (INVOICE_EMAIL, WC_INVOICE_NOTE) are built from the
+  // SALES ORDER ROW rather than the payload, so compaction costs it nothing.
+  //
+  // THE ROW BELOW IS SYNTHETIC AND SAYS SO: today retention cannot produce it, because its
+  // compaction predicate requires an external id and a type in BACK_REFERENCE_SWEEP_TYPES, and
+  // INVOICE_PDF has neither. It is constructed to pin the COLUMN_BUILT entry in the connector's
+  // table to a behaviour — enqueue, do not warn — so that a future widening of that predicate
+  // cannot silently re-introduce the discard on a row that loses nothing.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, {
+      id: 'log-pdf-1',
+      type: 'INVOICE_PDF',
+      referenceType: 'SalesOrder',
+      externalTransactionId: null,
+      status: 'SYNCED',
+      payload: {},
+      backReferenceEvidenceCompactedAt: at(500),
+      backReferenceFollowUpsPendingAt: at(400),
+    })],
+    bills: [],
+    orders: [],
+  })
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(run.followUpsDiscarded, 0)
+  assert.deepEqual(
+    harness.followUps.map((entry) => entry.entryId),
+    ['log-pdf-1'],
+    'the enqueue is CALLED — its nested INVOICE_EMAIL / WC_INVOICE_NOTE read the order row, not the payload',
+  )
+  assert.ok(harness.activities.some((entry) => entry.action === 'xero_backreference_followups_recovered'))
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt)
+  assert.equal(harness.store.syncRows[0].backReferenceFollowUpsPendingAt, null)
 })
 
 test('[o3d-9kek r3 f4] the Setting-backed cursor store round-trips, and treats junk as "no cursor"', async () => {

@@ -652,6 +652,136 @@ test('[o3d-nepa r4] the OUTBOX loop releases the surviving follow-ups on an unwr
 })
 
 // ---------------------------------------------------------------------------
+// o3d-bqw7 / o3d-kemx — THE STAMP IS BROADER THAN THE LOSS, AND SINCE r4 THAT COSTS MONEY.
+//
+// r3/r4 announced the discard whenever `backReferenceEvidenceCompactedAt` was set. That column says
+// "the payload was thrown away". The warning says "its outstanding follow-ups can no longer be
+// enqueued". They are different facts, and the gap between them is not academic: a sales CREDIT_NOTE
+// has NO branch in `enqueueFollowUps`, and it IS a back-reference type, so retention compacts it —
+// every compacted sales credit note produced a warning about work that never existed.
+//
+// While the warning was only noise that was arguable. r4 made it gate the RELEASE, so an
+// unwritable warning returns the row to PENDING still owing its follow-ups. A FALSE warning
+// therefore holds an ALREADY-POSTED credit note at PENDING and re-drives it on every pass, for as
+// long as the activity log keeps failing — o3d-kemx. Narrowing the question removes the warning and
+// the stranding together.
+// ---------------------------------------------------------------------------
+
+/**
+ * A tombstone whose type owes NOTHING. CREDIT_NOTE is the case that actually occurs: retention's
+ * compaction predicate selects it (it is one of the four BACK_REFERENCE_SWEEP_TYPES), and neither
+ * connector's enqueue has a branch for it.
+ */
+function compactedCreditNoteRow(): SyncRow {
+  return {
+    ...blankRow(),
+    type: 'CREDIT_NOTE',
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    externalTransactionId: 'XCN-1',
+    status: 'PENDING',
+    payload: {},
+    backReferenceEvidenceCompactedAt: new Date('2026-01-05T00:00:00Z'),
+  }
+}
+
+test('[o3d-bqw7] a compacted sales CREDIT_NOTE is NOT warned about — its type owes no payload-built follow-up', async () => {
+  reset()
+  state.syncRows = [compactedCreditNoteRow()]
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(
+    discardWarning(),
+    undefined,
+    'nothing was discarded: `enqueueFollowUps` has no CREDIT_NOTE branch, so the compacted payload took nothing with it',
+  )
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'and the obligation is discharged normally')
+  assert.equal(subject().status, 'SYNCED')
+})
+
+test('[o3d-kemx] a compacted row that lost nothing SETTLES even when the discard warning cannot be written', async () => {
+  // THE STRANDING. Under the stamp this run warned, could not persist the warning, threw, and left an
+  // already-posted credit note at PENDING with its obligation intact — every pass, indefinitely,
+  // over work that never existed. The narrowed question never reaches the activity log at all, so
+  // the log's health stops being able to hold the row.
+  reset()
+  state.syncRows = [compactedCreditNoteRow()]
+  state.unpersistableActivityActions.add(DISCARD_ACTION)
+
+  const result = await runDirect()
+
+  assert.equal(result.failed, 0, 'a row that lost nothing cannot be failed by an unwritable warning about the loss')
+  assert.equal(result.succeeded, 1)
+  assert.equal(subject().status, 'SYNCED', 'settled, not returned to PENDING for another pass')
+  assert.equal(subject().retryCount, 0)
+  assert.equal(
+    subject().backReferenceFollowUpsPendingAt,
+    null,
+    'the obligation is released — it was never gating anything real',
+  )
+})
+
+test('[o3d-kemx] the OUTBOX loop settles it too, rather than re-driving the job for ever', async () => {
+  // Both short-circuit sites carry the same gate, and the outbox loop is the one production runs.
+  reset()
+  state.syncRows = [compactedCreditNoteRow()]
+  state.unpersistableActivityActions.add(DISCARD_ACTION)
+
+  const result = await runViaOutbox()
+
+  assert.equal(result.failed, 0)
+  assert.equal(subjectOutboxJob()?.status, 'SUCCEEDED', 'the job completes instead of being retried on a phantom loss')
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null)
+})
+
+test('[o3d-bqw7] a row that DID lose payload-built work is still gated — the safe direction is unchanged', async () => {
+  // The control. Narrowing must not become "stop refusing to settle": a PURCHASE_INVOICE tombstone
+  // may have owed a supplier-invoice attachment, only the destroyed payload knew, and that row still
+  // keeps its obligation until someone has been told.
+  reset()
+  state.syncRows = [compactedRow()]
+  state.unpersistableActivityActions.add(DISCARD_ACTION)
+
+  const result = await runDirect()
+
+  assert.equal(result.failed, 1)
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date)
+  assert.equal(subject().status, 'PENDING')
+})
+
+test('[o3d-bqw7] the warning names what THIS type lost, not a list of everything any type could lose', async () => {
+  // The operator-facing half of the over-report. "invoice PDF, payment registration or bill
+  // attachment" was wrong on every row it appeared on — a bill never had a PDF or a payment to lose,
+  // and a sales invoice's PDF is rebuilt from surviving columns and was enqueued moments earlier by
+  // r4's own fix. Sending someone to look for it is the same false alarm one level down.
+  reset()
+  state.syncRows = [compactedRow()]
+
+  await runDirect()
+
+  const billWarning = discardWarning()
+  assert.ok(billWarning)
+  assert.match(String(billWarning.description), /supplier-invoice attachment/)
+  assert.doesNotMatch(String(billWarning.description), /payment registration/, 'a bill owes no customer payment')
+
+  reset()
+  state.syncRows = [compactedSalesInvoiceRow()]
+
+  await runDirect()
+
+  const invoiceWarning = discardWarning()
+  assert.ok(invoiceWarning)
+  assert.match(String(invoiceWarning.description), /customer payment registration/)
+  assert.match(
+    String(invoiceWarning.description),
+    /invoice PDF is rebuilt from columns compaction keeps, and has been enqueued/,
+    'and it says so, because the PDF really was enqueued a moment earlier',
+  )
+})
+
+// ---------------------------------------------------------------------------
 // THE FRESH-POST BRANCH — sync-processor.ts:1071-1074, the exact lines the finding cited.
 //
 // The tests above drive the already-posted branch, which is the same shape but not the same code.

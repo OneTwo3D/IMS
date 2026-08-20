@@ -15,7 +15,10 @@ import {
 } from './back-reference'
 import {
   buildCompactedFollowUpLossActivity,
+  compactedRowLostFollowUps,
+  describeLostFollowUps,
   type CompactedFollowUpLossPhase,
+  type FollowUpPayloadDebtTable,
 } from '@/lib/domain/accounting/compacted-followup-loss'
 
 // ---------------------------------------------------------------------------
@@ -453,6 +456,21 @@ export type BackReferenceSweepDeps = {
     payload: Record<string, unknown>,
     syncResult: { externalId?: string; invoiceNumber?: string },
   ) => Promise<void>
+  /**
+   * WHAT EACH SYNC TYPE'S FOLLOW-UPS ARE BUILT FROM, per connector (o3d-bqw7, o3d-kemx).
+   *
+   * Required, and paired with `enqueueFollowUps` above, because the sweep cannot derive it: handed a
+   * tombstone's `{}` the enqueue takes no branch, enqueues nothing and returns NORMALLY, so calling
+   * it proves nothing about what was lost. Without this table the sweep can only ask "was the row
+   * compacted?", which is a broader fact than "did it lose a follow-up" and is what made a sales
+   * CREDIT_NOTE — a type with no follow-up branch at all — warned about and, since the warning gates
+   * settlement, deferred for as long as the activity log kept failing.
+   *
+   * It is a DEP rather than a shared constant because the connectors genuinely differ: Xero routes
+   * PURCHASE_CREDIT_NOTE to an allocation follow-up and QuickBooks has no such branch. A shared table
+   * would be right for one of them and wrong for the other, silently.
+   */
+  followUpPayloadDebt: FollowUpPayloadDebtTable
   now?: () => Date
 }
 
@@ -825,6 +843,22 @@ export async function repairAccountingBackReferences(
    * unlike an ambiguity, this discard cannot be undone by a later run, so stamping past a failed
    * write would destroy the work and the notice in one step.
    */
+  /**
+   * DID COMPACTION ACTUALLY TAKE ANYTHING FROM THIS ROW? (o3d-bqw7, o3d-kemx.)
+   *
+   * Every branch below used to read `backReferenceEvidenceCompactedAt !== null` directly and treat
+   * "the payload was thrown away" as "the follow-ups are gone". They are not the same fact: a sales
+   * CREDIT_NOTE is compacted by retention like any other back-reference type and has no follow-up
+   * branch in either connector's enqueue, so it lost nothing and was announced anyway — and since
+   * the announcement gates settlement, a failing activity log deferred it indefinitely.
+   *
+   * Asked ONCE, here, and read by name everywhere the old expression appeared, so the warning, the
+   * obligation claim, the enqueue and the SYNCED transition can never disagree about which of the
+   * two facts they meant.
+   */
+  const lostFollowUpsToCompaction = (row: BackReferenceSweepRow): boolean =>
+    compactedRowLostFollowUps(row, deps.followUpPayloadDebt)
+
   const reportDiscardedFollowUps = async (
     row: BackReferenceSweepRow,
     phase: Extract<CompactedFollowUpLossPhase, 'repaired' | 'already-applied'>,
@@ -838,6 +872,9 @@ export async function repairAccountingBackReferences(
       activityActionPrefix: prefix,
       row,
       phase,
+      // Names what THIS type lost, from the connector's own table. The generic wording it replaces
+      // claimed a PDF, a payment and an attachment on every row, which was wrong on all of them.
+      lostWork: describeLostFollowUps(row.type, deps.followUpPayloadDebt),
     }))
     if (!persisted) {
       console.error(`${prefix}: back-reference follow-up discard warning was not persisted; leaving row eligible`, row.id)
@@ -941,10 +978,15 @@ export async function repairAccountingBackReferences(
   const settleOutstandingFollowUpsOnly = async (row: BackReferenceSweepRow): Promise<boolean> => {
     if (row.backReferenceFollowUpsPendingAt === null) return true
     result.checked++
-    // A compacted payload cannot rebuild anything, and enqueueing from `{}` would report success
-    // while doing nothing — the silent version of the loss. Same terminal policy as the linked
-    // case: warn, and settle only if the warning landed.
-    if (row.backReferenceEvidenceCompactedAt !== null) return reportDiscardedFollowUps(row, 'already-applied')
+    // A compacted payload cannot rebuild THE FOLLOW-UPS THAT WERE BUILT FROM IT, and enqueueing from
+    // `{}` would report success while doing nothing — the silent version of the loss. Same terminal
+    // policy as the linked case: warn, and settle only if the warning landed.
+    //
+    // Narrowed to rows that actually owe payload-built work (o3d-bqw7). A tombstone whose type
+    // enqueues nothing, or enqueues only follow-ups rebuilt from surviving columns, falls through to
+    // the enqueue below exactly as an intact row does — which is the correct outcome twice over: it
+    // is not warned about, and the work it CAN still do is done rather than reported as discarded.
+    if (lostFollowUpsToCompaction(row)) return reportDiscardedFollowUps(row, 'already-applied')
     try {
       await deps.enqueueFollowUps(
         row.id,
@@ -1096,11 +1138,19 @@ export async function repairAccountingBackReferences(
           }
         }
 
-        // A TOMBSTONE (r4 finding 3): retention cleared the payload, so the ID write below is still
-        // exactly as possible as it ever was, and the FOLLOW-UPS are gone for good. Everything from
+        // A TOMBSTONE THAT ACTUALLY LOST SOMETHING (r4 finding 3, narrowed by o3d-bqw7): retention
+        // cleared the payload, so the ID write below is still exactly as possible as it ever was,
+        // and the follow-ups THIS TYPE BUILDS FROM THE PAYLOAD are gone for good. Everything from
         // here on branches on that distinction rather than on the row as a whole, which is the
         // difference between discarding unrecoverable work and retiring recoverable work.
-        const evidenceOnly = row.backReferenceEvidenceCompactedAt !== null
+        //
+        // A compacted row whose type owes no payload-built follow-up — a sales CREDIT_NOTE, which
+        // retention compacts like every other back-reference type and which neither connector's
+        // enqueue has a branch for — is FALSE here, and is then handled exactly like an intact row:
+        // it claims its obligation, runs the (no-op) enqueue, and settles, including the FAILED →
+        // SYNCED transition. Under the stamp it was warned about, never flipped out of FAILED, and
+        // held unsettled for as long as the activity log failed. Nothing about it was ever lost.
+        const lostFollowUps = lostFollowUpsToCompaction(row)
 
         /**
          * DOES THIS ROW STILL OWE ITS FOLLOW-UPS? (Codex r9 finding 1.)
@@ -1119,15 +1169,16 @@ export async function repairAccountingBackReferences(
          *     the next pass saw a linked SYNCED row, judged it reconciled and stamped it. The
          *     follow-ups were retired by a failure that was never a verdict.
          *
-         * A tombstone is excluded from the follow-ups-only PASS because its follow-ups cannot be
-         * rebuilt at all: running it on `{}` would enqueue nothing and then report the row
-         * reconciled, which is the silent version of the same loss. It is NOT excluded from the
-         * question — a tombstone that owes follow-ups still gets the terminal warning below.
+         * A tombstone THAT LOST PAYLOAD-BUILT WORK is excluded from the follow-ups-only PASS because
+         * those follow-ups cannot be rebuilt at all: running it on `{}` would enqueue nothing and
+         * then report the row reconciled, which is the silent version of the same loss. It is NOT
+         * excluded from the question — such a row still gets the terminal warning below. A tombstone
+         * that lost nothing (o3d-bqw7) is not excluded from either: it takes the ordinary pass.
          */
         const owesFollowUps = row.status === 'FAILED' || row.backReferenceFollowUpsPendingAt !== null
-        const followUpsOnly = !missing && owesFollowUps && !evidenceOnly
+        const followUpsOnly = !missing && owesFollowUps && !lostFollowUps
         if (!missing && !followUpsOnly) {
-          if (evidenceOnly && owesFollowUps) {
+          if (lostFollowUps && owesFollowUps) {
             // Linked, but its follow-ups never ran — and the payload that would let them run is
             // gone. This is the terminal case, and it is settled ONLY once someone has been told,
             // for the same reason an ambiguity is: the discard is irreversible, so stamping it after
@@ -1148,12 +1199,13 @@ export async function repairAccountingBackReferences(
         result.checked++
 
         // THE OBLIGATION IS RECORDED BEFORE THE REPAIR IS ATTEMPTED (Codex r9 finding 1), and only
-        // when the follow-ups are actually rebuildable — a tombstone's are not, and marking a
-        // discard as "pending" would promise a retry that can never happen. If it cannot be
+        // when the follow-ups are actually rebuildable — the payload-built ones a tombstone lost are
+        // not, and marking a discard as "pending" would promise a retry that can never happen. A
+        // tombstone that lost nothing has nothing to promise ABOUT, so it claims like any other row. If it cannot be
         // persisted, nothing else is done to the row: the link is still missing, so the next sweep
         // repeats this pass from the top rather than linking a document whose outstanding work
         // nothing records.
-        if (!evidenceOnly && !(await claimFollowUpObligation(row))) {
+        if (!lostFollowUps && !(await claimFollowUpObligation(row))) {
           result.failed++
           continue
         }
@@ -1193,14 +1245,15 @@ export async function repairAccountingBackReferences(
           // The follow-ups (PDF, payment, attachment) never ran on the original failed pass —
           // enqueue them now. The connector's own idempotency makes this safe to repeat.
           //
-          // Unless this is a tombstone, in which case they CANNOT be rebuilt (r4 finding 3): the
-          // payload they are constructed from was cleared at the retention cutoff. Calling
+          // Unless this is a tombstone that owed payload-built work, in which case THAT work cannot
+          // be rebuilt (r4 finding 3, narrowed by o3d-bqw7): the payload it is constructed from was
+          // cleared at the retention cutoff. Calling
           // enqueueFollowUps with `{}` would not fail — it would enqueue nothing and return
           // normally, and the row would then be stamped reconciled with the payment or PDF silently
           // missing. The terminal policy is stated instead of simulated: warn, naming what was
           // discarded, and settle only if the warning landed.
           let followUpsEnqueued = true
-          if (evidenceOnly) {
+          if (lostFollowUps) {
             if (!(await reportDiscardedFollowUps(row, 'repaired'))) followUpsEnqueued = false
           } else {
             try {
@@ -1232,9 +1285,11 @@ export async function repairAccountingBackReferences(
           // exactly this failure survived into r9 finding 1 for the non-FAILED half of the
           // population. `markChecked` clears the marker on the way out.
           //
-          // A tombstone is stamped CHECKED but never flipped to SYNCED: its id write succeeded, so
-          // there is nothing left for any future sweep to do, but its follow-ups were discarded
-          // rather than done and calling that SYNCED would erase the only trace of it (r4 finding 3).
+          // A tombstone THAT LOST WORK is stamped CHECKED but never flipped to SYNCED: its id write
+          // succeeded, so there is nothing left for any future sweep to do, but its follow-ups were
+          // discarded rather than done and calling that SYNCED would erase the only trace of it
+          // (r4 finding 3). A tombstone that lost nothing has no trace to erase, so it flips like
+          // any other repaired FAILED row (o3d-bqw7).
           //
           // AND ONLY IF THE SALE ENDED UP IN A REPORTING PERIOD (o3d-r5pj). The repair refuses to
           // invent `invoicedAt`, so a row whose posted date could not be recovered can leave the
@@ -1250,7 +1305,7 @@ export async function repairAccountingBackReferences(
           // terminal policy as the discarded follow-ups, because the remedy (a human reading the
           // date off the ledger) is not something this sweep can observe.
           if (followUpsEnqueued && await businessDateSettled(row, businessDate)) {
-            await markChecked(row.id, row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined)
+            await markChecked(row.id, row.status === 'FAILED' && !lostFollowUps ? { status: 'SYNCED', errorMessage: null } : undefined)
           }
 
           if (followUpsOnly) {
