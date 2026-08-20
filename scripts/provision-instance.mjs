@@ -35,6 +35,27 @@ async function upsertSetting(db, key, value) {
   )
 }
 
+/**
+ * Write a setting ONLY if it does not exist yet (o3d-ecbj).
+ *
+ * A seed is not an override. `upsertSetting` above overwrites, which is correct for a
+ * first-run bootstrap but wrong for anything an operator can edit afterwards: re-running
+ * the installer against an existing instance would silently undo their change. Insert-only
+ * means the environment supplies the value once and the Settings UI owns it from then on.
+ */
+export async function seedSetting(db, key, value) {
+  if (!value) return false
+  const result = await db.query(
+    `
+      insert into settings (key, value, "updatedAt")
+      values ($1, $2, now())
+      on conflict (key) do nothing
+    `,
+    [key, value],
+  )
+  return result.rowCount > 0
+}
+
 async function provisionDefaultAdmin(db, options) {
   const passwordHash = await bcrypt.hash(options.password, 12)
   const existing = await db.query(
@@ -139,6 +160,33 @@ async function main() {
   try {
     if (publicAppUrl) {
       await upsertSetting(db, 'public_app_url', publicAppUrl)
+    }
+
+    // Install-time SEED only, never a runtime override (o3d-ecbj; see the note in
+    // lib/settings-store.ts). scripts/install.sh PROMPTS for these two and writes them into
+    // every .env, so treating them as overrides pinned an installation to the credentials
+    // typed at install time — and only half of the connector honoured them, so an operator
+    // who rotated the key in Settings had orders importing under one credential while stock
+    // pushed under the other.
+    //
+    // The secret is seeded in PLAINTEXT: this script has no access to the app's
+    // settings-encryption key. `wc_consumer_secret` is a SENSITIVE_SETTING_KEY, so the
+    // settings store re-writes it as ciphertext on the first read once SETTINGS_ENCRYPTION_KEY
+    // is present (migrateEncryptedSettingValue), and decryption tolerates a plaintext row
+    // until then. Do not switch this to upsertSetting: that would re-plaintext a rotated,
+    // encrypted secret on every installer re-run.
+    for (const [key, envName] of [
+      ['wc_consumer_key', 'WC_CONSUMER_KEY'],
+      ['wc_consumer_secret', 'WC_CONSUMER_SECRET'],
+    ]) {
+      const value = getEnv(envName)
+      if (!value) continue
+      const seeded = await seedSetting(db, key, value)
+      console.log(
+        seeded
+          ? `[INFO] WooCommerce ${key} seeded from ${envName}.`
+          : `[INFO] WooCommerce ${key} already set in Settings; ${envName} left unapplied.`,
+      )
     }
 
     if (smtp.host && smtp.fromEmail) {

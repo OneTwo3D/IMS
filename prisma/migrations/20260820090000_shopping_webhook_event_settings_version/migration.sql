@@ -1,0 +1,18 @@
+-- o3d-wgl6: a WooCommerce webhook RETRIED after a credential rebind still carries the previous
+-- store's payload.
+--
+-- o3d-mlc7 fenced the product import against a rebind by snapshotting the credentials and
+-- `wc_settings_version` together before any remote read and re-checking the version inside the
+-- write transaction. That fence cannot see this case. A delivery from store A sits in the
+-- shopping_webhook_events inbox; the operator rebinds to store B; the inbox retries. The payload
+-- is store-A data, but every version the import observes is a consistent store-B, so the fence
+-- sees nothing wrong and writes store-A ids under store-B credentials.
+--
+-- The version has to be recorded AT RECEIPT, which is what this column is for. It cannot live in
+-- payloadJson: idempotency is the sha256 of the exact signed body, and stamping anything into the
+-- payload would break redelivery dedupe.
+--
+-- NULLABLE on purpose. Rows accepted before this column existed carry no stamp, and a connector
+-- with no settings-version concept never writes one; both keep today's behaviour instead of being
+-- refused wholesale, which would dead-letter an entire existing backlog on deploy.
+ALTER TABLE "shopping_webhook_events" ADD COLUMN "settingsVersion" TEXT;

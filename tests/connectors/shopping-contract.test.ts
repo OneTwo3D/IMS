@@ -62,6 +62,7 @@ function makeFakeRepo(store: FakeStore, connector: ShoppingWebhookEventConnector
         externalEventId: input.externalEventId ?? null,
         topic: input.topic,
         payloadHash: input.payloadHash,
+        settingsVersion: input.settingsVersion ?? null,
         payloadJson: input.payload,
         status: WC_WEBHOOK_EVENT_STATUS.pending,
         attempts: 0,
@@ -222,7 +223,7 @@ test('process core dead-letters an unsupported resource without retry (fi70j)', 
   // A row with a resource the core does not handle (orders/products/refunds only).
   store.rows.set('evt-x', {
     id: 'evt-x', connector: 'shopify', resource: 'customers', externalEventId: null, topic: null,
-    payloadHash: 'h', payloadJson: {}, status: WC_WEBHOOK_EVENT_STATUS.pending, attempts: 0,
+    payloadHash: 'h', payloadJson: {}, settingsVersion: null, status: WC_WEBHOOK_EVENT_STATUS.pending, attempts: 0,
     nextAttemptAt: null, processedAt: null, lastError: null, receivedAt: NOW, updatedAt: NOW,
   })
   let dispatched = false

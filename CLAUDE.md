@@ -490,8 +490,8 @@ Copy `.env.example` to `.env` and configure. Uses **NextAuth.js v5** variable na
 | Variable | Required | Description | Example |
 |----------|----------|-------------|---------|
 | `WC_STORE_URL` | No | WooCommerce store base URL (no trailing slash) | `https://yourstore.com` |
-| `WC_CONSUMER_KEY` | No | WC REST API consumer key | From WC admin → Settings → Advanced → REST API |
-| `WC_CONSUMER_SECRET` | No | WC REST API consumer secret | From WC admin → Settings → Advanced → REST API |
+| `WC_CONSUMER_KEY` | No | WC REST API consumer key. **Install-time seed only** — seeded into the `wc_consumer_key` setting once, then owned by Settings → Sync → WooCommerce | From WC admin → Settings → Advanced → REST API |
+| `WC_CONSUMER_SECRET` | No | WC REST API consumer secret. **Install-time seed only** — seeded into the `wc_consumer_secret` setting once, then owned by Settings → Sync → WooCommerce. Editing it in `.env` after install changes nothing (o3d-ecbj) | From WC admin → Settings → Advanced → REST API |
 | `WC_WEBHOOK_SECRET` | No | WC webhook signing key | Any random string (set same in WC webhooks config) |
 | `WC_SYNC_STATUSES` | No | Order statuses to sync (comma-separated) | `processing` (default: on-hold, completed) |
 | `WC_USE_WEBHOOKS` | No | Use webhooks or polling? | `true` (false = polling via cron) |

@@ -89,6 +89,7 @@ function wcWebhookEvent(overrides: Partial<{
     topic: overrides.topic ?? 'order.created',
     payloadHash: 'hash',
     payloadJson: overrides.payloadJson ?? { id: 123 },
+    settingsVersion: null,
     status: WC_WEBHOOK_EVENT_STATUS.pending,
     attempts: 0,
     nextAttemptAt: null,
@@ -108,6 +109,9 @@ function makeWcWebhookDependencies(overrides: Partial<WcWebhookDependencies> = {
       return true
     },
     async recordWebhookReceipt() {},
+    async getCurrentWcSettingsVersion() {
+      return '0'
+    },
     async getWebhookProcessingGate() {
       return { enabled: true }
     },

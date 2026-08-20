@@ -36,7 +36,6 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import { wcFetch, wcPost } from '../api'
@@ -44,7 +43,7 @@ import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
 } from '../sync-lock'
-import { validateWooCommerceBaseUrl } from '../url-safety'
+import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows } from '../credentials'
 import type { ConnectorCredentials } from '../../types'
 import {
   shouldForceWooZeroStock,
@@ -131,18 +130,14 @@ async function snapshotSyncContext(): Promise<{
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
     const rows = await tx.setting.findMany({
       where: {
-        key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret', WC_SETTINGS_VERSION_KEY] },
+        key: { in: [...WC_CREDENTIAL_SETTING_KEYS, WC_SETTINGS_VERSION_KEY] },
       },
     })
-    const map = new Map(rows.map((r) => [r.key, r.value]))
-    const url = map.get('wc_url')
-    const key = map.get('wc_consumer_key')
-    const secret = map.get('wc_consumer_secret')
-    const syncVersion = map.get(WC_SETTINGS_VERSION_KEY) ?? '0'
-    const validatedUrl = url ? validateWooCommerceBaseUrl(url) : null
-    const creds: ConnectorCredentials | null = validatedUrl?.ok && key && secret
-      ? { url: validatedUrl.normalizedUrl, key, secret: decryptSettingValue('wc_consumer_secret', secret) }
-      : null
+    const syncVersion = rows.find((row) => row.key === WC_SETTINGS_VERSION_KEY)?.value ?? '0'
+    // o3d-ecbj: built by THE credential resolver, not by a second local copy of the same
+    // three lines. The read stays here (it must happen inside this locked transaction);
+    // only the interpretation is shared with getWcCredentials.
+    const creds: ConnectorCredentials | null = resolveWcCredentialsFromRows(rows)
     return { creds, syncVersion }
   })
 }

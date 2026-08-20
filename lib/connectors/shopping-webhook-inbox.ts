@@ -31,6 +31,13 @@ export type ShoppingWebhookEventRow = {
   topic: string | null
   payloadHash: string
   payloadJson: unknown
+  /**
+   * The connector settings version current when the delivery was ACCEPTED (o3d-wgl6).
+   * NULL for rows accepted before the column existed, and for connectors with no version
+   * concept — both mean "unknown", and are treated as pre-existing behaviour, not as a
+   * mismatch.
+   */
+  settingsVersion: string | null
   status: string
   attempts: number
   nextAttemptAt: Date | null
@@ -48,6 +55,12 @@ export type PersistShoppingWebhookEventInput = {
   externalEventId?: string | null
   rawBody: string
   payload: unknown
+  /**
+   * The connector's settings version AS OF RECEIPT (o3d-wgl6). Supplied by the connector's
+   * webhook handler, because only it knows which setting carries the version. Omitted or
+   * null means "not known", which is the pre-o3d-wgl6 behaviour.
+   */
+  settingsVersion?: string | null
 }
 
 export type PersistWcWebhookEventInput = PersistShoppingWebhookEventInput
@@ -98,6 +111,7 @@ const eventSelect = {
   topic: true,
   payloadHash: true,
   payloadJson: true,
+  settingsVersion: true,
   status: true,
   attempts: true,
   nextAttemptAt: true,
@@ -173,6 +187,7 @@ export function createShoppingWebhookEventRepository(
           topic: input.topic,
           payloadHash: input.payloadHash,
           payloadJson: input.payload as Prisma.InputJsonValue,
+          settingsVersion: input.settingsVersion ?? null,
           status: WC_WEBHOOK_EVENT_STATUS.pending,
           attempts: 0,
           nextAttemptAt: null,
@@ -239,6 +254,7 @@ export function createShoppingWebhookEventRepository(
           "topic",
           "payloadHash",
           "payloadJson",
+          "settingsVersion",
           "status",
           "attempts",
           "nextAttemptAt",

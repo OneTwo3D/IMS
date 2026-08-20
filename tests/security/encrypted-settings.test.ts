@@ -13,6 +13,7 @@ import {
   deserializeSettingValue,
   getActiveSettingEnvOverrides,
   getEnvFallback,
+  getSettingEnvFallbackKey,
   migrateEncryptedSettingValue,
   migrateEncryptedSettingRows,
   serializeSettingValue,
@@ -198,16 +199,50 @@ test('settings-store bulk migration summarizes migrated, skipped, and raced rows
 })
 
 test('settings-store env fallbacks take precedence and expose active overrides', () => {
-  const previous = process.env.WC_CONSUMER_SECRET
+  const previous = process.env.WC_WEBHOOK_SECRET
   try {
-    process.env.WC_CONSUMER_SECRET = 'env-secret'
+    process.env.WC_WEBHOOK_SECRET = 'env-secret'
 
-    assert.equal(getEnvFallback('wc_consumer_secret'), 'env-secret')
-    assert.deepEqual(getActiveSettingEnvOverrides(['wc_consumer_secret', 'wc_url']), {
-      wc_consumer_secret: 'WC_CONSUMER_SECRET',
+    assert.equal(getEnvFallback('wc_webhook_secret'), 'env-secret')
+    assert.deepEqual(getActiveSettingEnvOverrides(['wc_webhook_secret', 'wc_url']), {
+      wc_webhook_secret: 'WC_WEBHOOK_SECRET',
     })
   } finally {
-    if (previous == null) delete process.env.WC_CONSUMER_SECRET
-    else process.env.WC_CONSUMER_SECRET = previous
+    if (previous == null) delete process.env.WC_WEBHOOK_SECRET
+    else process.env.WC_WEBHOOK_SECRET = previous
+  }
+})
+
+/**
+ * o3d-ecbj. The WooCommerce API credentials must have NO environment fallback.
+ *
+ * getSettingValue/getSettingValues prefer the environment, but the advisory-lock snapshots
+ * in sync/stock-sync.ts and sync/product-sync.ts read the settings ROWS inside their own
+ * transaction and cannot consult it — so an entry here is only ever half applied, and the
+ * connector talks to WooCommerce under two different credentials. WC_CONSUMER_KEY /
+ * WC_CONSUMER_SECRET are install-time seeds (scripts/provision-instance.mjs) instead.
+ *
+ * This fails if someone puts either fallback back.
+ */
+test('the WooCommerce API credentials have no environment override, so both sync paths read the same row', () => {
+  const previousKey = process.env.WC_CONSUMER_KEY
+  const previousSecret = process.env.WC_CONSUMER_SECRET
+  try {
+    process.env.WC_CONSUMER_KEY = 'ck_from_env'
+    process.env.WC_CONSUMER_SECRET = 'cs_from_env'
+
+    assert.equal(getSettingEnvFallbackKey('wc_consumer_key'), null)
+    assert.equal(getSettingEnvFallbackKey('wc_consumer_secret'), null)
+    assert.equal(getEnvFallback('wc_consumer_key'), null)
+    assert.equal(getEnvFallback('wc_consumer_secret'), null)
+    assert.deepEqual(
+      getActiveSettingEnvOverrides(['wc_url', 'wc_consumer_key', 'wc_consumer_secret']),
+      {},
+    )
+  } finally {
+    if (previousKey == null) delete process.env.WC_CONSUMER_KEY
+    else process.env.WC_CONSUMER_KEY = previousKey
+    if (previousSecret == null) delete process.env.WC_CONSUMER_SECRET
+    else process.env.WC_CONSUMER_SECRET = previousSecret
   }
 })

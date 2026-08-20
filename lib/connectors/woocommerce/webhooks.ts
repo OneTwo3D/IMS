@@ -15,6 +15,7 @@ import {
   shouldSuppressWcWebhookEcho,
 } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
+import { WC_SETTINGS_VERSION_KEY } from '@/lib/connectors/woocommerce/sync-lock'
 import {
   createShoppingWebhookEventRepository,
   persistWcWebhookEvent,
@@ -41,8 +42,10 @@ export type WcWebhookDependencies = {
   }>
   persistWebhookEvent: typeof persistWcWebhookEvent
   webhookEventRepository: ShoppingWebhookEventRepository
+  /** o3d-wgl6: `wc_settings_version` as of RIGHT NOW, stamped onto the accepted delivery. */
+  getCurrentWcSettingsVersion: () => Promise<string | null>
   handleOrderWebhook: (payload: unknown, topic: string | null) => Promise<Response>
-  handleProductWebhook: (payload: unknown) => Promise<Response>
+  handleProductWebhook: (payload: unknown, settingsVersion: string | null) => Promise<Response>
   handleRefundWebhook: (payload: unknown) => Promise<Response>
 }
 
@@ -369,7 +372,7 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   return NextResponse.json({ ok: false, failures }, { status: 500 })
 }
 
-async function handleProductWebhook(payload: unknown) {
+async function handleProductWebhook(payload: unknown, receivedAtSettingsVersion: string | null) {
   const productPayload = payload as Partial<WcFullProduct> & { stock_quantity?: number | null }
   const canSyncProduct =
     typeof productPayload.id === 'number'
@@ -386,14 +389,57 @@ async function handleProductWebhook(payload: unknown) {
   // product forever. Proper permanent/transient classification belongs with the product-write atomicity
   // fix (o3d-uh2).
   let productSyncError: string | null = null
+  /** o3d-wgl6: set when the delivery describes the PREVIOUS store binding. */
+  let staleStoreBinding = false
 
   if (canSyncProduct) {
-    const result = await syncWcProductToIms(productPayload as WcFullProduct)
+    // o3d-wgl6: the version this delivery was RECEIVED under, passed on every attempt including
+    // retries. Without it the o3d-mlc7 fence is blind here — a retry after a rebind observes a
+    // perfectly consistent NEW store while holding OLD-store data, so the import writes store-A
+    // ids under store-B credentials with nothing to object to. A null stamp is a pre-migration
+    // row and keeps the old behaviour (`undefined` = no fence).
+    const result = await syncWcProductToIms(
+      productPayload as WcFullProduct,
+      receivedAtSettingsVersion ?? undefined,
+    )
     if (result.success) {
       await db.setting.upsert({
         where: { key: 'last_wc_product_sync_at' },
         create: { key: 'last_wc_product_sync_at', value: new Date().toISOString() },
         update: { value: new Date().toISOString() },
+      })
+    } else if (result.staleSettingsVersion) {
+      staleStoreBinding = true
+      // o3d-wgl6: this delivery describes the store this installation was bound to BEFORE the
+      // rebind. It is ACKNOWLEDGED rather than retried, and the reasoning is the opposite of the
+      // one that keeps WcSettingsVersionChangedError transient for the sweeps.
+      //
+      // A sweep holding this error re-FETCHES the product on its next run and succeeds against the
+      // new store, so retrying is the fix. A webhook delivery cannot: the payload was captured at
+      // receipt and is frozen, `wc_settings_version` only ever increments, so every one of the ~24
+      // retries would re-read the same store-A body against a store-B binding, reach the identical
+      // refusal, and dead-letter. Nothing is lost by acknowledging — a product that exists in the
+      // NEW store is re-imported by the reconcile sweep against the new credentials, which is
+      // exactly what the fence's own note says happens.
+      //
+      // Logged at ERROR because this is also how a WRONG rebind announces itself: a burst of these
+      // means deliveries are still arriving from a store the operator thinks they have left.
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_product_webhook_stale_store',
+        tag: 'sync',
+        level: 'ERROR',
+        description: `WooCommerce product webhook for ${productPayload.sku} was received under the previous store binding `
+          + '(the WooCommerce credentials were rebound, or the product-id cache was reset, after this delivery '
+          + 'arrived); nothing was imported, and the delivery is acknowledged rather than retried against a store '
+          + 'it does not describe. The reconcile sync re-imports this product from the current store.',
+        metadata: {
+          externalId: productPayload.id,
+          sku: productPayload.sku,
+          error: result.error ?? 'WooCommerce settings changed after this webhook was received',
+          receivedAtSettingsVersion,
+          staleSettingsVersion: true,
+        },
       })
     } else if (result.permanent) {
       // A deterministic conflict, of one of two kinds:
@@ -474,6 +520,14 @@ async function handleProductWebhook(payload: unknown) {
     return NextResponse.json({ ok: false, error: productSyncError }, { status: 500 })
   }
 
+  // o3d-wgl6: and the stock correction below is skipped for the same reason the import was
+  // refused. `stock_quantity` in this payload is store-A's figure; pushing it (force:true, which
+  // bypasses the dedupe and reopens completed stock rows) would write the previous store's
+  // quantity into the current one — the very cross-store write the fence exists to prevent.
+  if (staleStoreBinding) {
+    return NextResponse.json({ ok: true, staleStoreBinding: true })
+  }
+
   if (typeof productPayload.id === 'number' && Object.prototype.hasOwnProperty.call(productPayload, 'stock_quantity')) {
     const product = await db.product.findFirst({
       where: { externalProductId: BigInt(productPayload.id) },
@@ -522,6 +576,23 @@ async function handleRefundWebhook(payload: unknown) {
   return NextResponse.json({ ok: true })
 }
 
+/**
+ * o3d-wgl6: the settings version to stamp on a delivery as it is accepted.
+ *
+ * Read WITHOUT the advisory lock on purpose. This is a receipt timestamp, not a fence: it
+ * records which binding the delivery arrived under so a LATER retry can tell it apart from the
+ * current one. A rebind committing concurrently with this read can only make the stamp one
+ * version stale, which the import then refuses — the fail-safe direction. Taking the lock here
+ * would put an exclusive-lock wait on the inbound webhook path for no additional guarantee.
+ *
+ * A missing row means no rebind has ever happened, which the snapshots also read as '0'; using
+ * the same default keeps a first delivery on a fresh install from looking stale.
+ */
+async function getCurrentWcSettingsVersion(): Promise<string | null> {
+  const row = await db.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY } })
+  return row?.value ?? '0'
+}
+
 async function getWebhookProcessingGate() {
   if (!(await isIntegrationPluginEnabled('woocommerce'))) {
     return { enabled: false as const, reason: 'woocommerce_plugin_disabled' as const }
@@ -538,6 +609,12 @@ export async function processWcWebhookPayload(
     resource: ShoppingWebhookResource
     topic: string | null
     payload: unknown
+    /**
+     * `wc_settings_version` as it stood when this delivery was ACCEPTED (o3d-wgl6). Undefined
+     * when a caller has no stamp to offer (a legacy row, or a test); that is treated as
+     * "unknown" and leaves the pre-o3d-wgl6 behaviour in place.
+     */
+    settingsVersion?: string | null
   },
   dependencies: Pick<WcWebhookDependencies, 'handleOrderWebhook' | 'handleProductWebhook' | 'handleRefundWebhook'> = defaultDependencies,
 ) {
@@ -545,7 +622,7 @@ export async function processWcWebhookPayload(
     case 'orders':
       return dependencies.handleOrderWebhook(input.payload, input.topic)
     case 'products':
-      return dependencies.handleProductWebhook(input.payload)
+      return dependencies.handleProductWebhook(input.payload, input.settingsVersion ?? null)
     case 'refunds':
       return dependencies.handleRefundWebhook(input.payload)
   }
@@ -558,6 +635,7 @@ const defaultDependencies: WcWebhookDependencies = {
   getWebhookProcessingGate,
   persistWebhookEvent: persistWcWebhookEvent,
   webhookEventRepository: createShoppingWebhookEventRepository({ connector: 'woocommerce' }),
+  getCurrentWcSettingsVersion,
   handleOrderWebhook,
   handleProductWebhook,
   handleRefundWebhook,
@@ -601,6 +679,11 @@ export async function handleWcWebhook(
   const parsed = parseWebhookJson<unknown>(body)
   if (!parsed.ok) return parsed.response
 
+  // o3d-wgl6: stamped at RECEIPT, which is the only moment the binding this payload describes is
+  // knowable. A retry after a rebind sees a wholly consistent new store and cannot otherwise tell
+  // that the body in hand belongs to the old one.
+  const settingsVersion = await dependencies.getCurrentWcSettingsVersion()
+
   const result: PersistWcWebhookEventResult = await dependencies.persistWebhookEvent(
     dependencies.webhookEventRepository,
     {
@@ -609,6 +692,7 @@ export async function handleWcWebhook(
       externalEventId,
       rawBody: body,
       payload: parsed.value,
+      settingsVersion,
     },
   )
 

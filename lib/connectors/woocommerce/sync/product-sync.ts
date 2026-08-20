@@ -5,7 +5,6 @@
 import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { getSettingValue } from '@/lib/settings-store'
 import { wcFetch, wcPut } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
@@ -23,7 +22,7 @@ import {
   WcProductWriteRaceError,
   WcSettingsVersionChangedError,
 } from './product-sync-errors'
-import { validateWooCommerceBaseUrl } from '../url-safety'
+import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows } from '../credentials'
 import type { ConnectorCredentials } from '../../types'
 import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
@@ -607,18 +606,14 @@ async function snapshotProductSyncContext(): Promise<{
     await tx.$executeRaw`SELECT pg_advisory_xact_lock_shared(${WC_SYNC_ADVISORY_LOCK_KEY})`
     const rows = await tx.setting.findMany({
       where: {
-        key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret', WC_SETTINGS_VERSION_KEY] },
+        key: { in: [...WC_CREDENTIAL_SETTING_KEYS, WC_SETTINGS_VERSION_KEY] },
       },
     })
-    const map = new Map(rows.map((row) => [row.key, row.value]))
-    const url = map.get('wc_url')
-    const key = map.get('wc_consumer_key')
-    const secret = map.get('wc_consumer_secret')
-    const syncVersion = map.get(WC_SETTINGS_VERSION_KEY) ?? '0'
-    const validatedUrl = url ? validateWooCommerceBaseUrl(url) : null
-    const creds: ConnectorCredentials | null = validatedUrl?.ok && key && secret
-      ? { url: validatedUrl.normalizedUrl, key, secret: decryptSettingValue('wc_consumer_secret', secret) }
-      : null
+    const syncVersion = rows.find((row) => row.key === WC_SETTINGS_VERSION_KEY)?.value ?? '0'
+    // o3d-ecbj: built by THE credential resolver, shared with getWcCredentials and the
+    // stock-sync snapshot, so an import and a stock push can never run under different
+    // credentials again.
+    const creds: ConnectorCredentials | null = resolveWcCredentialsFromRows(rows)
     return { creds, syncVersion }
   })
 }
@@ -768,7 +763,7 @@ export async function syncWcProductToIms(
    * under; a mismatch means the payload is stale and none of it may be written.
    */
   observedVersion?: string,
-): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
+): Promise<{ success: boolean; error?: string; permanent?: boolean; staleSettingsVersion?: boolean }> {
   try {
     const sku = asTrimmedString(wcProduct.sku)
     if (!sku) return { success: true } // skip products without SKU
@@ -1338,6 +1333,12 @@ export async function syncWcProductToIms(
     return { success: true }
   } catch (e) {
     const permanent = isPermanentProductSyncConflict(e)
+    // o3d-wgl6: reported as a distinct FACT, not folded into `permanent`. Whether a rebind makes
+    // this payload unretryable depends on the CALLER, and only the caller knows: a sweep re-FETCHES
+    // the product on its next run, so for it the version move is transient and the retry is the
+    // fix (see WcSettingsVersionChangedError's own note). A webhook delivery holds a FROZEN
+    // payload that can never be re-fetched, so for it the same condition is terminal.
+    const staleSettingsVersion = e instanceof WcSettingsVersionChangedError
     await db.shoppingSyncLog.create({
       data: {
         direction: 'FROM_CONNECTOR',
@@ -1350,7 +1351,7 @@ export async function syncWcProductToIms(
         syncedAt: new Date(),
       },
     })
-    return { success: false, error: String(e), permanent }
+    return { success: false, error: String(e), permanent, staleSettingsVersion }
   }
 }
 

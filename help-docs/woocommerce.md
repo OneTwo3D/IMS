@@ -31,6 +31,8 @@ Official guide: <https://woocommerce.com/document/woocommerce-rest-api/>
 
 > **Note:** The consumer secret is masked after saving. To change it, enter the full new value — the system detects and ignores the masked placeholder.
 >
+> **Settings own the credentials.** `WC_STORE_URL`, `WC_CONSUMER_KEY` and `WC_CONSUMER_SECRET` in `.env` are used **once**, at install time, to seed these fields. After that the connection form is the only place that changes them, and editing the `.env` values has no effect. Rotate the key here, not in the file.
+>
 > **Base currency check:** the WooCommerce store currency must match the IMS base currency before credentials or sync settings can be enabled. Order currencies may still vary per transaction; the IMS converts them into its own base currency for reporting and valuation.
 
 ### Connection Test Gate
@@ -47,6 +49,15 @@ The connection test gate prevents sync from running with stale or wrong credenti
 5. If you later change the URL, key, or secret, the fingerprint comparison detects the change and reverts the status to `stale`. You must re-test.
 
 This means a credential rotation can't silently leave sync running with old (or broken) credentials.
+
+### What happens to in-flight work when you rebind
+
+Changing the URL, key or secret is a **rebind**. It clears every cached WooCommerce product id (the next sync re-matches products by SKU) and moves the connector to a new settings version. Work that was already in flight under the old binding is then refused rather than applied:
+
+- A product import or stock push that started before the rebind abandons its writes instead of writing the old store's ids over the freshly cleared cache.
+- A **webhook delivery that arrived before the rebind** is refused when it is retried afterwards, and is acknowledged rather than retried again — its payload describes the previous store, and no number of retries can make it describe the new one. These appear in the activity log as *"received under the previous store binding"* at ERROR level. The reconcile sync re-imports the affected products from the store you are now connected to, so nothing needs to be replayed by hand.
+
+A burst of those log entries after a rebind is normal for a few minutes (the old store's queued deliveries draining). A burst that keeps going means the old store is still sending webhooks — remove the webhook in that store's WooCommerce admin.
 
 ## Order Sync
 
@@ -68,7 +79,7 @@ With the initial import complete, new and updated WooCommerce orders are importe
 **Configuration options:**
 
 - **Enable/disable** order sync with the toggle
-- **Status filter** — choose which WooCommerce statuses trigger an import (e.g. `processing`, `on-hold`, `completed`)
+- **Status filter** — choose which WooCommerce statuses trigger an import (e.g. `processing`, `on-hold`, `completed`). At least one status must be ticked: an empty selection is rejected when you save, because it is not a filter WooCommerce can be asked for. To stop importing orders altogether, turn **Enable order sync** off instead.
 - **Sync interval** — how often the system polls WooCommerce for changes (default: 5 minutes). This field is disabled when webhooks are active.
 
 **What happens when an order is imported:**

@@ -1204,6 +1204,8 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
     SMTP_FROM_NAME="${SMTP_FROM_NAME}" \
     SMTP_FROM_EMAIL="${SMTP_FROM_EMAIL}" \
     SMTP_REPLY_TO="${SMTP_REPLY_TO}" \
+    WC_CONSUMER_KEY="${WC_CONSUMER_KEY}" \
+    WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}" \
     node "${BOOTSTRAP_SCRIPT}"
   success "Bootstrap configuration complete."
 fi

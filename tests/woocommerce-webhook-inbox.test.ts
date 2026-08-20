@@ -28,6 +28,7 @@ function makeRow(overrides: Partial<WcWebhookEventRow> = {}): WcWebhookEventRow 
     topic: 'product.updated',
     payloadHash: hashWcWebhookPayload('{"id":1}'),
     payloadJson: { id: 1 },
+    settingsVersion: null,
     status: WC_WEBHOOK_EVENT_STATUS.pending,
     attempts: 0,
     nextAttemptAt: null,
