@@ -96,19 +96,77 @@ export function queryConstraint(ctx: QueryContext): unknown {
 }
 
 /**
- * Does the query's CONSTRAINT carry `needle`?
+ * Predicate positions inside a constraint that do NOT restrict the returned rows
+ * to the ones carrying `needle` (o3d-512h round 6, Codex finding 4).
+ *
+ * Round 5 narrowed the search from the whole argument object to the constraint
+ * and then matched by SUBSTRING inside it — so the constraint was read as text,
+ * and every one of these satisfied "the caller's id is in the where":
+ *
+ *   where: { NOT: { userId: 'u1' } }          // everyone EXCEPT the caller
+ *   where: { id: { not: 'u1' } }              // the same, spelled as a filter
+ *   where: { userId: { notIn: ['u1'] } }      // and again
+ *   where: { passkeys: { none: { userId: 'u1' } } }   // rows with none of theirs
+ *   where: { OR: [{ userId: 'u1' }, { public: true }] }  // or anybody's
+ *
+ * The first four are not a weaker form of scoping — they are its COMPLEMENT, and
+ * the predicate reported them as proof. `OR` was named as a stated limit rather
+ * than a defect, but a stated limit that the test then counts as evidence is
+ * still evidence that is not there: a disjunct constrains no row on its own.
+ *
+ * `every` joins them: `{ items: { every: { ownerId: 'u1' } } }` is vacuously true
+ * for a row with no items, so it reaches rows related to nobody.
+ */
+const NON_SCOPING_KEYS = new Set(['NOT', 'not', 'notIn', 'none', 'isNot', 'every', 'OR'])
+
+/**
+ * Is `needle` carried by a position that constrains EVERY row this query reaches?
+ *
+ * Structure, not text. The walk descends through objects and arrays — `AND`
+ * lists, nested relation filters, composed keys — and refuses to descend into the
+ * positions above. Two further rules, both in the fail-closed direction:
+ *
+ *   * only a STRING VALUE can carry the needle. An id appearing as a KEY
+ *     (`where: { u1: true }`) scopes nothing, and the round-5 predicate counted
+ *     it — the same defect its own `select: { [CALLER_ID]: true }` case was
+ *     written to refuse, one level in;
+ *   * `in: [...]` counts only as a singleton. `{ id: { in: ['u1', 'u2'] } }`
+ *     reaches a row that is not the caller's, so it is not scoping to the caller.
+ */
+function constraintCarries(node: unknown, needle: string): boolean {
+  if (typeof node === 'string') return node.includes(needle)
+  if (Array.isArray(node)) return node.some((el) => constraintCarries(el, needle))
+  if (node === null || typeof node !== 'object') return false
+  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
+    if (NON_SCOPING_KEYS.has(key)) continue
+    if (key === 'in') {
+      if (Array.isArray(value) && value.length === 1 && constraintCarries(value[0], needle)) return true
+      continue
+    }
+    if (constraintCarries(value, needle)) return true
+  }
+  return false
+}
+
+/**
+ * Does the query's CONSTRAINT carry `needle` in a position that scopes rows?
  *
  * Only the constraint is searched — never `select`, `include`, `orderBy`, or a
- * `data` payload on an operation that also has a `where`.
+ * `data` payload on an operation that also has a `where` — and within it, only
+ * the positions that restrict every row the query reaches (constraintCarries).
+ *
+ * WHAT IS STILL NOT PROVED, said rather than implied: that the constraint is
+ * SUFFICIENT. `where: { userId: 'u1', id }` and `where: { userId: 'u1' }` are
+ * indistinguishable here, and a field merely NAMED like an owner is taken at its
+ * word — the needle's presence in a conjunctive position is a lower bound on
+ * scoping, not a proof of ownership. What changed in round 6 is that it is now a
+ * lower bound on the right thing: a predicate that excludes the caller, or that
+ * only optionally includes them, no longer counts as including them.
  */
 export function constraintMentions(ctx: QueryContext, needle: string): boolean {
   const constraint = queryConstraint(ctx)
   if (constraint === undefined) return false
-  try {
-    return JSON.stringify(constraint)?.includes(needle) ?? false
-  } catch {
-    return false
-  }
+  return constraintCarries(constraint, needle)
 }
 
 /**

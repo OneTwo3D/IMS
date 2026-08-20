@@ -376,6 +376,58 @@ test('bindsAtModuleScope sees a binding `resolve` cannot — an unfollowable imp
   assert.equal(g.bindsAtModuleScope('lib/missing.ts', 'Symbol'), true)
 })
 
+test('bindsAtModuleScope sees a DESTRUCTURED binding — round 6, finding 1', () => {
+  // `locals` records a variable declaration only when its name is a plain
+  // identifier, so `const { Symbol } = …` bound the name at module scope and was
+  // in neither map bindsAtModuleScope used to consult. hasLexicalShadow stops AT
+  // the source file, so nothing else looked either: the name was reported
+  // untouched, and the sentinel behind it certified as the built-in.
+  const g = createSourceGraph({
+    'lib/obj.ts': "const { Symbol } = { Symbol: (s: string) => s }\nexport const S = Symbol('x')\n",
+    'lib/arr.ts': "const [Symbol] = [(s: string) => s]\nexport const S = Symbol('x')\n",
+    'lib/nested.ts': "const { compat: { Symbol } } = { compat: { Symbol: (s: string) => s } }\nexport const S = Symbol('x')\n",
+    'lib/renamed.ts': "const { make: Symbol } = { make: (s: string) => s }\nexport const S = Symbol('x')\n",
+    'lib/exported.ts': "export const { Symbol } = { Symbol: (s: string) => s }\nexport const S = Symbol('x')\n",
+    'lib/clean.ts': "export const S = Symbol('x')\n",
+  })
+  for (const file of ['lib/obj.ts', 'lib/arr.ts', 'lib/nested.ts', 'lib/renamed.ts', 'lib/exported.ts']) {
+    assert.equal(g.resolve(file, 'Symbol'), null, `${file}: still unresolvable — that is the trap`)
+    assert.equal(g.bindsAtModuleScope(file, 'Symbol'), true, `${file}: the name IS taken`)
+  }
+  assert.equal(g.bindsAtModuleScope('lib/clean.ts', 'Symbol'), false)
+})
+
+test('bindsAtModuleScope sees the other non-identifier binding forms too', () => {
+  const g = createSourceGraph({
+    'lib/enum.ts': 'enum Symbol { a }\nexport const S = Symbol\n',
+    'lib/ns.ts': "namespace Symbol { export const x = 1 }\nexport const S = Symbol.x\n",
+    'lib/eq.ts': "import Symbol = require('symbol-compat')\nexport const S = Symbol\n",
+    'lib/fn.ts': "function Symbol(s: string) { return s }\nexport const S = Symbol('x')\n",
+  })
+  for (const file of ['lib/enum.ts', 'lib/ns.ts', 'lib/eq.ts', 'lib/fn.ts']) {
+    assert.equal(g.bindsAtModuleScope(file, 'Symbol'), true, file)
+  }
+})
+
+test('resolveExportedName follows what the OUTSIDE WORLD gets — round 6, finding 2', () => {
+  // `resolve` answers what a name means inside a module. An endpoint is what the
+  // module PUBLISHES, and `export { x }` / `export { x as y }` / `export { x }
+  // from '…'` publish something `resolve` never had to look at.
+  const g = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'lib/work.ts': 'export async function work() {}\n',
+    'app/actions/e.ts': `import { work } from '@/lib/work'
+async function local() {}
+export { local, local as alias, work }
+export { work as fromThere } from '@/lib/work'`,
+  })
+  assert.deepEqual(pick(g.resolveExportedName('app/actions/e.ts', 'local')), { file: 'app/actions/e.ts', name: 'local' })
+  assert.deepEqual(pick(g.resolveExportedName('app/actions/e.ts', 'alias')), { file: 'app/actions/e.ts', name: 'local' })
+  assert.deepEqual(pick(g.resolveExportedName('app/actions/e.ts', 'work')), { file: 'lib/work.ts', name: 'work' })
+  assert.deepEqual(pick(g.resolveExportedName('app/actions/e.ts', 'fromThere')), { file: 'lib/work.ts', name: 'work' })
+  assert.equal(g.resolveExportedName('app/actions/e.ts', 'neverDeclared'), null)
+})
+
 test('hasLexicalShadow is exported and answers about a position, not a file', () => {
   const g = createSourceGraph({
     'lib/auth/server.ts': AUTH,

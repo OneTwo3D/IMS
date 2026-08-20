@@ -370,3 +370,77 @@ test('a query with NO constraint is unscoped — findMany() reads the table', ()
 test('an operation the predicate does not know is unscoped, not waved through', () => {
   assert.equal(constraintMentions(q('someNewPrismaOp', { where: { id: CALLER_ID } }), CALLER_ID), false)
 })
+
+// ---------------------------------------------------------------------------
+// Round 6, Codex finding 4 — the constraint was read as TEXT
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 5 narrowed WHICH region is searched and then searched it with
+ * `JSON.stringify(...).includes(needle)`. Naming the right region and then
+ * matching a substring inside it is the same defect one level in: the predicates
+ * below all contain the caller's id and every one of them reaches rows that are
+ * not the caller's — four of them reach precisely the rows that are NOT.
+ */
+test('a NEGATED predicate does not scope — it is the complement of scoping', () => {
+  for (const args of [
+    { where: { NOT: { userId: CALLER_ID } } },
+    { where: { id: { not: CALLER_ID } } },
+    { where: { userId: { notIn: [CALLER_ID] } } },
+    { where: { AND: [{ role: 'ADMIN' }, { NOT: { userId: CALLER_ID } }] } },
+  ]) {
+    assert.equal(
+      constraintMentions(q('findMany', args), CALLER_ID),
+      false,
+      `${JSON.stringify(args)} reaches every row EXCEPT the caller's`,
+    )
+  }
+})
+
+test('a relation filter that is not a positive existential does not scope', () => {
+  // `none` is "rows with none of the caller's"; `every` is vacuously true for a
+  // row with no related rows at all, so it reaches rows related to nobody.
+  assert.equal(constraintMentions(q('findMany', { where: { passkeys: { none: { userId: CALLER_ID } } } }), CALLER_ID), false)
+  assert.equal(constraintMentions(q('findMany', { where: { items: { every: { ownerId: CALLER_ID } } } }), CALLER_ID), false)
+  assert.equal(constraintMentions(q('findMany', { where: { owner: { isNot: { id: CALLER_ID } } } }), CALLER_ID), false)
+  // …and the positive forms still do.
+  assert.equal(constraintMentions(q('findMany', { where: { items: { some: { ownerId: CALLER_ID } } } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('findMany', { where: { owner: { is: { id: CALLER_ID } } } }), CALLER_ID), true)
+})
+
+test('an OR arm does not scope — a disjunct constrains no row on its own', () => {
+  // Round 5 called this a stated limit rather than a defect. A limit that the
+  // test then counts as evidence is still evidence that is not there.
+  assert.equal(
+    constraintMentions(q('findMany', { where: { OR: [{ userId: CALLER_ID }, { isPublic: true }] } }), CALLER_ID),
+    false,
+  )
+  assert.equal(
+    constraintMentions(q('findMany', { where: { AND: [{ userId: CALLER_ID }, { OR: [{ a: 1 }, { b: 2 }] }] } }), CALLER_ID),
+    true,
+    'an AND arm alongside an OR is still a constraint on every row',
+  )
+})
+
+test('the id as a KEY is not the id as a constraint', () => {
+  assert.equal(constraintMentions(q('findMany', { where: { [CALLER_ID]: true } }), CALLER_ID), false)
+  assert.equal(constraintMentions(q('create', { data: { [CALLER_ID]: true } }), CALLER_ID), false)
+})
+
+test('`in` scopes only as a singleton — a list reaches rows that are not the caller\'s', () => {
+  assert.equal(constraintMentions(q('findMany', { where: { userId: { in: [CALLER_ID] } } }), CALLER_ID), true)
+  assert.equal(
+    constraintMentions(q('findMany', { where: { userId: { in: [CALLER_ID, 'someone-else'] } } }), CALLER_ID),
+    false,
+  )
+})
+
+test('the ordinary scoped shapes are unchanged — the predicate did not just get quieter', () => {
+  // A predicate that has been tightened until it says no to everything proves
+  // nothing either. These are the shapes the nine endpoints actually issue.
+  assert.equal(constraintMentions(q('findUnique', { where: { id: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('deleteMany', { where: { id: 'pk', userId: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('update', { where: { id: CALLER_ID }, data: { name: 'x' } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('upsert', { where: { key: `passkey_challenge:reg:${CALLER_ID}` }, create: {}, update: {} }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('create', { data: { userId: CALLER_ID } }), CALLER_ID), true)
+})

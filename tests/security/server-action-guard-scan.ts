@@ -85,6 +85,33 @@
  * the query's CONSTRAINT, so an id in `data` or `select` counted as scoping. Its
  * answer lives in ./recording-db.ts:queryConstraint.
  *
+ * ---------------------------------------------------------------------------
+ * o3d-512h round 6 — ONE MISSED INPUT, AND TWO EXEMPTIONS WIDER THAN THEIR REASON.
+ *
+ * Codex round 6 raised four, and the first is different in kind from every
+ * finding of the five rounds before it:
+ *
+ *   * A NAMED EXPORT DECLARATION was invisible to every scanner here.
+ *     `export { wipeEverything }` publishes exactly the endpoint
+ *     `export async function wipeEverything` does, and it carries no export
+ *     MODIFIER — which is the only thing exportedServerActions looked at. Not the
+ *     coverage rule, not the inventory, not the secret-read rule, not the Prisma
+ *     surface pin: none of them were ever handed the node. Every other finding in
+ *     this branch has been a property judged too generously, and a rule that
+ *     judges wrongly can at least be argued with. A rule that never sees the
+ *     endpoint reports it green forever. Fixed at the input, by resolution, at
+ *     exportedServerActions.
+ *   * The write-laundering exemption (round 5) let ANY callee that reaches a
+ *     guard carry a write past a later check. Narrowed to PINNED guard
+ *     declarations, which is what it was for — see guardKindsOfBody.
+ *   * `isBuiltinGlobal` asked `bindsAtModuleScope`, which asked two maps that
+ *     index only identifier declarations. `const { Symbol } = compat` took the
+ *     name without appearing in either, and the sentinel behind it was certified
+ *     as the built-in. Fixed in module-graph.ts:moduleBindings.
+ *   * The self-scoping predicate matched the constraint by SUBSTRING, so
+ *     `where: { NOT: { userId } }` — the complement of scoping — counted as
+ *     scoping. Answered in ./recording-db.ts:constraintCarries.
+ *
  * Not named *.test.ts on purpose — `npm run test:unit` globs tests/**\/*.test.ts.
  */
 import { readdirSync, readFileSync } from 'node:fs'
@@ -750,6 +777,10 @@ function declarationWrites(decl: Declaration, v: Verifier, depth: number): boole
       if (root !== null && DATA_CLIENT_ROOTS.has(root)) continue
       const target = v.graph.resolveCallTarget(decl.file, call.expression)
       if (!target) continue
+      // A pinned guard's own writes are the audited control's (round 6): if they
+      // counted here, every helper that calls a guard would inherit them and the
+      // narrowed exemption in guardKindsOfBody would be worth nothing.
+      if (guardKindOfDeclaration(target) !== null) continue
       if (declarationWrites(target, v, depth + 1)) {
         v.writeMemo.set(key, true)
         return true
@@ -811,7 +842,29 @@ export function guardKindsOfBody(
 
   let firstWrite = firstDataMutationPosition(body)
   for (const entry of resolved) {
-    if (!entry.target || entry.kinds.size > 0) continue
+    if (!entry.target) continue
+    // ROUND 6, Codex finding 3 — WHOSE WRITE IS EXEMPT?
+    //
+    // Round 5 exempted any callee that reaches a guard (`entry.kinds.size > 0`),
+    // to protect a denial that records itself. That exemption is far wider than
+    // the thing it protects: ANY helper that calls a guard and then writes was
+    // exempt, so
+    //
+    //   await authAndWipe(id)             // requireAuth(), then db.thing.delete
+    //   await requirePermission('sales.delete')
+    //
+    // laundered the write past the authorization check — the row was gone under
+    // authentication alone, and the endpoint was credited with both kinds. That
+    // is the same laundering round 5 closed for UNGUARDED helpers, left open for
+    // guarded ones by the very clause meant to keep the rule honest.
+    //
+    // So the exemption is narrowed to what it was for: a PINNED guard
+    // declaration, whose body is on the reviewed list in this file and whose
+    // writes (a session touch, a denial log) are part of the audited control.
+    // A helper that merely CALLS a guard is ordinary code, and its writes are
+    // writes. Its own guard is still credited — the position it sets is its own
+    // call site, and a call at exactly `firstWrite` is not "after" it.
+    if (guardKindOfDeclaration(entry.target) !== null) continue
     if (entry.call.getStart() >= firstWrite) continue
     if (declarationWrites(entry.target, v, depth + 1)) firstWrite = entry.call.getStart()
   }
@@ -853,9 +906,54 @@ const isAsyncNode = (n: ts.Node): boolean =>
 
 /** One exported, async, callable endpoint in a `'use server'` module. */
 export type ExportedServerAction = {
+  /** The name the endpoint is published under — `export { a as b }` publishes `b`. */
   name: string
   /** Block body, or an arrow's concise expression body. */
   body: ts.ConciseBody | undefined
+  /**
+   * The module the body is DECLARED in, when that is not the scanned file
+   * (`export { handler } from './elsewhere'`). Resolution inside the body must be
+   * done against this file, not against the module that re-publishes it.
+   */
+  file?: string
+  /**
+   * The export exists and its body could NOT be reached. An endpoint whose body
+   * nothing has read is not an endpoint anything can vouch for, so callers treat
+   * this as a violation rather than skipping it.
+   */
+  unresolved?: boolean
+}
+
+/** Every locally declared callable in a module, exported or not, by name. */
+type LocalCallable = { body: ts.ConciseBody | undefined; isAsync: boolean }
+
+function localCallables(sf: ts.SourceFile): Map<string, LocalCallable> {
+  const out = new Map<string, LocalCallable>()
+  ts.forEachChild(sf, (node) => {
+    if (ts.isFunctionDeclaration(node) && node.name) {
+      out.set(node.name.text, { body: node.body, isAsync: isAsyncNode(node) })
+      return
+    }
+    if (ts.isVariableStatement(node)) {
+      for (const decl of node.declarationList.declarations) {
+        if (!ts.isIdentifier(decl.name) || !decl.initializer) continue
+        const init = decl.initializer
+        if (!ts.isArrowFunction(init) && !ts.isFunctionExpression(init)) continue
+        out.set(decl.name.text, { body: init.body, isAsync: isAsyncNode(init) })
+      }
+    }
+  })
+  return out
+}
+
+/** Is the declaration this resolved to an `async` callable? */
+function declarationIsAsync(node: ts.Node): boolean {
+  if (ts.isFunctionDeclaration(node) || ts.isMethodDeclaration(node)) return isAsyncNode(node)
+  if (ts.isVariableDeclaration(node) && node.initializer) {
+    const init = node.initializer
+    if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) return isAsyncNode(init)
+  }
+  return false
 }
 
 /**
@@ -871,9 +969,53 @@ export type ExportedServerAction = {
  *
  * `export default async function …` is deliberately NOT collected: a default
  * export is not a callable Server Action name in Next.js's action protocol.
+ *
+ * ---------------------------------------------------------------------------
+ * o3d-512h round 6, Codex finding 2 — THE ENDPOINT NO SCANNER COULD SEE.
+ *
+ * Everything above keys off the `export` MODIFIER, and a named export
+ * declaration carries no modifier:
+ *
+ *   async function wipeEverything(id: string) { await db.thing.deleteMany(…) }
+ *   export { wipeEverything }                     // or: export { wipeEverything as wipe }
+ *
+ * That publishes exactly the same HTTP endpoint as `export async function`, and
+ * NOTHING saw it — not the coverage rule, not the authentication-only inventory,
+ * not the secret-read rule, not the Prisma-surface pin. Every other finding in
+ * six rounds has been a property judged too generously; this one is an input
+ * never presented, which is worse: a scanner that judges wrongly can be argued
+ * with, and a scanner that cannot see the endpoint reports it green forever.
+ *
+ * Resolution answers it, as it has answered everything else here:
+ *   * `export { local }` / `export { local as published }` — the local
+ *     declaration is right there, so the body is taken from it and published
+ *     under the exported name;
+ *   * `export { imported }` and `export { x } from './m'` — the name is resolved
+ *     through the graph to its declaring module, and the body is scanned in THAT
+ *     module (`file`), because that is where its identifiers resolve;
+ *   * anything the graph cannot follow, and every `export * from '…'`, is
+ *     reported as `unresolved`. A star re-export publishes a set of endpoints
+ *     nobody has enumerated; treating that as "no endpoints" is precisely the
+ *     assumption this round exists to refuse, so it fails closed. (A module
+ *     wildcard in the allowlist still suppresses it — a `file:*` exemption is a
+ *     statement about every export of the file, which is what a star re-export
+ *     is.)
+ *
+ * A resolved export that is NOT async is not collected, exactly as a non-async
+ * `export function` is not: Next's action protocol only publishes async
+ * functions. NOTE, and it is a real one: the tree contains
+ * `app/actions/categories.ts: export { buildProductCategoryPathDisplay }`, a
+ * re-export of a SYNCHRONOUS helper from a `'use server'` module. Whether Next
+ * rejects that at build time is a `next build` question this scanner cannot
+ * settle, and it is flagged rather than silently classified.
  */
-export function exportedServerActions(sf: ts.SourceFile): ExportedServerAction[] {
+export function exportedServerActions(
+  sf: ts.SourceFile,
+  file?: string,
+  graph?: ModuleGraph,
+): ExportedServerAction[] {
   const actions: ExportedServerAction[] = []
+  let callables: Map<string, LocalCallable> | undefined
 
   ts.forEachChild(sf, (node) => {
     if (
@@ -897,6 +1039,46 @@ export function exportedServerActions(sf: ts.SourceFile): ExportedServerAction[]
         if (!isAsyncNode(init)) continue
         actions.push({ name: decl.name.text, body: init.body })
       }
+      return
+    }
+
+    // `export { … }` / `export { … } from '…'` / `export * from '…'` (round 6).
+    if (ts.isExportDeclaration(node)) {
+      if (node.isTypeOnly) return
+
+      if (!node.exportClause) {
+        // `export * from '…'`: an unknown set of published endpoints.
+        if (node.moduleSpecifier) actions.push({ name: '*', body: undefined, unresolved: true })
+        return
+      }
+      // `export * as ns from '…'` publishes an OBJECT, not a callable action name.
+      if (ts.isNamespaceExport(node.exportClause)) return
+
+      for (const el of node.exportClause.elements) {
+        if (el.isTypeOnly) continue
+        const published = el.name.text
+        const local = (el.propertyName ?? el.name).text
+
+        if (!node.moduleSpecifier) {
+          callables ??= localCallables(sf)
+          const own = callables.get(local)
+          if (own) {
+            // A sync local is not a Server Action, same as `export function foo()`.
+            if (own.isAsync && own.body) actions.push({ name: published, body: own.body })
+            continue
+          }
+        }
+
+        // Imported, or re-exported from another module: only resolution can say.
+        const decl = file && graph ? graph.resolveExportedName(file, published) : null
+        if (!decl) {
+          actions.push({ name: published, body: undefined, unresolved: true })
+          continue
+        }
+        const body = declarationBody(decl)
+        if (!body || !declarationIsAsync(decl.node)) continue
+        actions.push({ name: published, body, file: decl.file })
+      }
     }
   })
 
@@ -914,9 +1096,15 @@ export function scanSource(
   const violations: string[] = []
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
 
-  for (const action of exportedServerActions(sf)) {
+  for (const action of exportedServerActions(sf, file, graph)) {
+    // An export whose body nothing could read is NOT VERIFIED, and this file has
+    // treated not-verified as not-guarded since round 3.
+    if (action.unresolved) {
+      if (!isAllowlisted(allowlist, file, action.name)) violations.push(`${file}:${action.name}`)
+      continue
+    }
     if (!action.body) continue
-    const kinds = guardKindsOfBody(file, action.body, graph)
+    const kinds = guardKindsOfBody(action.file ?? file, action.body, graph)
     if (kinds.size === 0 && !isAllowlisted(allowlist, file, action.name)) {
       violations.push(`${file}:${action.name}`)
     }
@@ -1038,11 +1226,14 @@ export function scanSecretReadingActions(
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
   const violations: string[] = []
 
-  for (const action of exportedServerActions(sf)) {
+  for (const action of exportedServerActions(sf, file, graph)) {
+    // An unresolved export is already a coverage violation (scanSource); nothing
+    // is known about what it reads, so it is not double-reported here.
     if (!action.body) continue
 
-    if (!readsSettingSecret(file, action.body, graph)) continue
-    const kinds = guardKindsOfBody(file, action.body, graph)
+    const bodyFile = action.file ?? file
+    if (!readsSettingSecret(bodyFile, action.body, graph)) continue
+    const kinds = guardKindsOfBody(bodyFile, action.body, graph)
     if (!kinds.has('authorization') && !isAllowlisted(allowlist, file, action.name)) {
       violations.push(`${file}:${action.name}`)
     }
@@ -1099,6 +1290,7 @@ function rekey(graph: ModuleGraph, shortKey: string, realKey: string): ModuleGra
     source: (f) => graph.source(map(f)),
     sourceFile: (f) => graph.sourceFile(map(f)),
     bindsAtModuleScope: (f, n) => graph.bindsAtModuleScope(map(f), n),
+    resolveExportedName: (f, n) => graph.resolveExportedName(map(f), n),
     resolve: (f, n, at) => graph.resolve(map(f), n, at),
     resolveMember: (f, ns, m, at) => graph.resolveMember(map(f), ns, m, at),
     resolveCallTarget: (f, c) => graph.resolveCallTarget(map(f), c),
@@ -1179,9 +1371,11 @@ export function scanAuthenticationOnlyActions(
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
   const found: string[] = []
 
-  for (const action of exportedServerActions(sf)) {
+  for (const action of exportedServerActions(sf, file, graph)) {
+    // Unresolved: not an authentication-only endpoint — it is an UNGUARDED one,
+    // which is scanSource's violation, not this inventory's entry.
     if (!action.body) continue
-    const kinds = guardKindsOfBody(file, action.body, graph)
+    const kinds = guardKindsOfBody(action.file ?? file, action.body, graph)
     if (kinds.has('authentication') && !kinds.has('authorization')) {
       found.push(`${file}:${action.name}`)
     }
@@ -1282,9 +1476,11 @@ export function prismaSurfaceOf(
       continue
     }
     const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
-    const action = exportedServerActions(sf).find((a) => a.name === name)
+    const action = exportedServerActions(sf, file, graph).find((a) => a.name === name)
     out[key] = action
-      ? reachedPrismaModels(file, action.body, graph)
+      ? (action.unresolved
+        ? ['<export body not resolvable>']
+        : reachedPrismaModels(action.file ?? file, action.body, graph))
       : ['<export not found>']
   }
   return out

@@ -75,8 +75,21 @@ export type ModuleGraph = {
    * because an import the graph cannot follow (`import { Symbol } from 'x'`)
    * resolves to null exactly as an untouched global does. Returns true when the
    * file cannot be read: a module nobody looked at cannot vouch for a global.
+   *
+   * EVERY module-scope binding form counts, not the ones a resolver happens to
+   * index — see `moduleBindings` (o3d-512h round 6, Codex finding 1).
    */
   bindsAtModuleScope(file: string, name: string): boolean
+  /**
+   * The declaration the EXPORT `name` of `file` refers to — through
+   * `export { x as name }`, `export { name } from '…'`, a local declaration, or
+   * an `export *` chain. Null when it cannot be followed.
+   *
+   * `resolve` answers "what does this identifier mean INSIDE the module"; this
+   * answers "what does the outside world get when it asks for this export", and
+   * a `'use server'` module's exports are its HTTP endpoints.
+   */
+  resolveExportedName(file: string, name: string): Declaration | null
   /**
    * The declaration a call target refers to: `f()`, `ns.f()`, `mod.f()`.
    * Returns null for anything whose target is a value the graph cannot follow
@@ -274,6 +287,30 @@ type FileInfo = {
   imports: Map<string, ImportBinding>
   /** top-level declarations by name */
   locals: Map<string, ts.Node>
+  /**
+   * EVERY name bound at module scope, by any form — including the ones `locals`
+   * and `imports` cannot represent.
+   *
+   * o3d-512h round 6, Codex finding 1. `bindsAtModuleScope` used to ask those two
+   * maps, and `locals` records a variable declaration only when its name is a
+   * plain identifier (`if (!ts.isIdentifier(decl.name)) continue`). So
+   *
+   *   const { Symbol } = require('./compat')       // or: = compat, or = { Symbol: String }
+   *   const INTERNAL_ACTION_BYPASS = Symbol('internal')
+   *
+   * bound the name at module scope and was invisible to the very question
+   * `bindsAtModuleScope` exists to answer: the destructured binding was not in
+   * `locals`, was not in `imports`, and `hasLexicalShadow` stops AT the source
+   * file, so nothing looked at it. The sentinel was then certified as the
+   * built-in `Symbol` and every guard behind it credited — while a client can
+   * send whatever that destructured callable returns.
+   *
+   * This set is deliberately a superset of what resolves: `const { x } = y` binds
+   * `x` even though the graph has no declaration site for it, and "bound" is the
+   * whole question. Type-only declarations (interfaces, type aliases) are left
+   * out — they do not bind a value, so they cannot take a global away.
+   */
+  moduleBindings: Set<string>
   /** names this module exports from its own declarations */
   exportedNames: Set<string>
   /** exported name -> `export { x as y }` / `export { x } from '…'` */
@@ -293,7 +330,27 @@ function buildFileInfo(file: string, source: string): FileInfo {
     exportedNames: new Set(),
     exportAliases: new Map(),
     starExports: [],
+    moduleBindings: new Set(),
   }
+
+  // Pass one: what this module BINDS at its top level, by every form. Kept
+  // separate from the resolution pass below, which indexes only the forms it can
+  // resolve — and it was that gap between "bound" and "indexed" that let a
+  // destructured `Symbol` pass for the built-in (round 6, finding 1).
+  ts.forEachChild(sf, (node) => {
+    if (ts.isImportDeclaration(node)) {
+      const clause = node.importClause
+      if (!clause) return
+      if (clause.name) info.moduleBindings.add(clause.name.text)
+      const bindings = clause.namedBindings
+      if (bindings && ts.isNamespaceImport(bindings)) info.moduleBindings.add(bindings.name.text)
+      else if (bindings && ts.isNamedImports(bindings)) {
+        for (const el of bindings.elements) info.moduleBindings.add(el.name.text)
+      }
+      return
+    }
+    addStatementBindings(node as ts.Statement, info.moduleBindings)
+  })
 
   const isExported = (n: ts.Node): boolean =>
     !!(ts.canHaveModifiers(n) && ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword))
@@ -451,7 +508,11 @@ function createGraph(
     bindsAtModuleScope(file, name) {
       const fi = info(file)
       if (!fi) return true // unreadable module: cannot vouch for anything
-      return fi.locals.has(name) || fi.imports.has(name)
+      return fi.moduleBindings.has(name)
+    },
+
+    resolveExportedName(file, name) {
+      return resolveExport(file, name, new Set())
     },
 
     resolve(file, name, at) {

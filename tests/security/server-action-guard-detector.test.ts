@@ -1211,29 +1211,117 @@ test('a READING helper before the guard is not a write — the limit holds in bo
   )
 })
 
-test('a guard that RECORDS its own refusal does not disqualify the guards after it', () => {
+test('a PINNED guard that records its own refusal does not disqualify the guards after it', () => {
   // A denial that writes an activity row is still a denial. If the write question
   // were asked first, this endpoint would lose the AUTHORIZATION check that comes
-  // after the logging one and be reported as reading a secret behind
-  // authentication alone — a violation manufactured by the checker.
-  const GUARD_LOG = {
-    'lib/authlog.ts':
+  // after it and be reported as reading a secret behind authentication alone — a
+  // violation manufactured by the checker.
+  //
+  // ROUND 6: the exemption is for the PINNED guard itself, so the fixture puts
+  // the write where the claim is — inside lib/auth/server.ts:requireAuth, a
+  // declaration on BASE_GUARD_DECLARATIONS. Round 5 wrote this case with a
+  // wrapper instead, and that is what made the exemption wide enough to launder
+  // through (the test below).
+  const LOGGING_AUTH_SERVER = {
+    'lib/auth/server.ts':
+      "export async function requireAuth() { await db.activityLog.create({ data: { action: 'denied' } }) }\n"
+      + 'export async function getSession() {}\n'
+      + 'export async function requireFreshAuth() {}\n'
+      + 'export async function requireRole(...roles: string[]) { void roles }\n'
+      + 'export async function requirePermission(p: string) { void p }\n'
+      + 'export async function requireInternalUser() {}\n',
+  }
+  assert.deepEqual(
+    scanSecrets(`export async function a() {
+      await requireAuth()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, LOGGING_AUTH_SERVER),
+    [],
+  )
+})
+
+test('a WRAPPER around a writing pinned guard does not inherit its write', () => {
+  // The other half of the narrowed exemption, and it has to exist or the rule is
+  // inconsistent one call deep: if a pinned guard's denial log counted as a write
+  // when reached THROUGH a wrapper, every guard wrapper in the tree would start
+  // disqualifying the checks after it the day a guard began recording refusals.
+  const LOGGING_AUTH_SERVER = {
+    'lib/auth/server.ts':
+      "export async function requireAuth() { await db.activityLog.create({ data: { action: 'denied' } }) }\n"
+      + 'export async function getSession() {}\n'
+      + 'export async function requireFreshAuth() {}\n'
+      + 'export async function requireRole(...roles: string[]) { void roles }\n'
+      + 'export async function requirePermission(p: string) { void p }\n'
+      + 'export async function requireInternalUser() {}\n',
+    'lib/wrap.ts':
       "import { requireAuth } from '@/lib/auth/server'\n"
-      + 'export async function authAndLog() {\n'
+      + 'export async function wrapAuth() { await requireAuth() }\n',
+  }
+  assert.deepEqual(
+    scanSecrets(`import { wrapAuth } from '@/lib/wrap'
+    export async function a() {
+      await wrapAuth()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, LOGGING_AUTH_SERVER),
+    [],
+  )
+  // …and the wrapper's OWN write is still a write.
+  assert.deepEqual(
+    scanSecrets(`import { wrapAndWrite } from '@/lib/wrap2'
+    export async function a() {
+      await wrapAndWrite()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, {
+      ...LOGGING_AUTH_SERVER,
+      'lib/wrap2.ts':
+        "import { requireAuth } from '@/lib/auth/server'\n"
+        + "export async function wrapAndWrite() { await requireAuth(); await db.thing.deleteMany({ where: {} }) }\n",
+    }),
+    [`${F}:a`],
+  )
+})
+
+test('a GUARDED HELPER that writes still launders the write past a later guard — round 6, finding 3', () => {
+  // The hole round 5 left: `entry.kinds.size > 0` exempted ANY callee that
+  // reaches a guard, so a helper that authenticates and then writes carried the
+  // write past the authorization check that follows it. The row is changed under
+  // authentication alone and the endpoint is credited with both kinds.
+  const AUTH_AND_WIPE = {
+    'lib/authwipe.ts':
+      "import { requireAuth } from '@/lib/auth/server'\n"
+      + 'export async function authAndWipe(id: string) {\n'
       + '  await requireAuth()\n'
-      + "  await db.activityLog.create({ data: { action: 'seen' } })\n"
+      + '  await db.thing.deleteMany({ where: { id } })\n'
       + '}\n',
   }
   assert.deepEqual(
-    scanSecrets(`import { authAndLog } from '@/lib/authlog'
-    export async function a() {
-      await authAndLog()
+    scan(`import { authAndWipe } from '@/lib/authwipe'
+    export async function a(id: string) {
+      await authAndWipe(id)
+      await requirePermission('sales.delete')
+      return { ok: true }
+    }`, {}, AUTH_AND_WIPE),
+    [],
+    'the helper is itself a resolved authentication gate at its own call site, so the endpoint '
+    + 'is not UNGUARDED',
+  )
+  // …but the authorization check after the write earns nothing, which is what
+  // the secret-read rule (authorization or nothing) makes visible.
+  assert.deepEqual(
+    scanSecrets(`import { authAndWipe } from '@/lib/authwipe'
+    export async function a(id: string) {
+      await authAndWipe(id)
       await requirePermission('settings.read')
       return getSettingValue('smtp_password')
-    }`, GUARD_LOG),
-    [],
+    }`, AUTH_AND_WIPE),
+    [`${F}:a`],
   )
-  // …and the write it performs is still a write when it is NOT a guard.
+})
+
+test('a write is still a write when the helper performing it is NOT a guard', () => {
   assert.deepEqual(
     scanSecrets(`import { justLog } from '@/lib/justlog'
     export async function a() {
@@ -1258,5 +1346,207 @@ test('an UNRESOLVABLE callee before the guard is not treated as a write', () => 
       return { ok: true }
     }`),
     [],
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-512h round 6 — the checker must SEE the endpoint, and must not credit a
+// name it merely failed to find bound
+// ---------------------------------------------------------------------------
+
+test('a sentinel built from a DESTRUCTURED module-scope Symbol earns nothing — round 6, finding 1', () => {
+  // Round 5 verified the global as a global by asking `bindsAtModuleScope`,
+  // because an unfollowable import resolves to null exactly as an untouched
+  // global does. It asked two maps that only index identifier declarations, so a
+  // destructured binding took the name without appearing in either — and the
+  // value the sentinel then holds is a string a client can send.
+  const fake = {
+    'lib/destructsym.ts':
+      'const { Symbol } = { Symbol: (s: string) => s }\n'
+      + "export const FAKE_BYPASS = Symbol('internal-bypass')\n",
+  }
+  assert.deepEqual(
+    scan(`import { FAKE_BYPASS } from '@/lib/destructsym'
+    export async function a(options?: { t?: unknown }) {
+      if (options?.t !== FAKE_BYPASS) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, fake),
+    [`${F}:a`],
+  )
+})
+
+test('an ARRAY-destructured Symbol earns nothing either', () => {
+  const fake = {
+    'lib/arrsym.ts':
+      'const [Symbol] = [(s: string) => s]\n'
+      + "export const FAKE_BYPASS = Symbol('internal-bypass')\n",
+  }
+  assert.deepEqual(
+    scan(`import { FAKE_BYPASS } from '@/lib/arrsym'
+    export async function a(options?: { t?: unknown }) {
+      if (options?.t !== FAKE_BYPASS) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, fake),
+    [`${F}:a`],
+  )
+})
+
+// --- the endpoint no scanner could see (finding 2) --------------------------
+
+test('an UNGUARDED `export { … }` endpoint is flagged — round 6, finding 2', () => {
+  // No export modifier anywhere, so every rule in this file walked past it while
+  // Next published it as an HTTP endpoint.
+  assert.deepEqual(
+    scan(`async function wipeEverything(id: string) {
+      return db.thing.deleteMany({ where: { id } })
+    }
+    export { wipeEverything }`),
+    [`${F}:wipeEverything`],
+  )
+})
+
+test('a RENAMED named export is flagged under the name it is PUBLISHED as', () => {
+  // `export { a as b }` publishes `b`; an allowlist or an inventory keyed on `a`
+  // would name something the wire cannot call.
+  assert.deepEqual(
+    scan(`async function wipeEverything(id: string) {
+      return db.thing.deleteMany({ where: { id } })
+    }
+    export { wipeEverything as wipe }`),
+    [`${F}:wipe`],
+  )
+})
+
+test('a GUARDED named export is not flagged', () => {
+  assert.deepEqual(
+    scan(`async function wipeEverything(id: string) {
+      await requirePermission('sales.delete')
+      return db.thing.deleteMany({ where: { id } })
+    }
+    export { wipeEverything }`),
+    [],
+  )
+})
+
+test('a named export of an UNGUARDED arrow is flagged too', () => {
+  assert.deepEqual(
+    scan(`const readAll = async () => db.thing.findMany()
+    export { readAll }`),
+    [`${F}:readAll`],
+  )
+})
+
+test('a named RE-EXPORT is judged in the module that DECLARES it', () => {
+  // The body's identifiers resolve in its own module, not in the one that
+  // republishes it — so the guard must be looked for there.
+  const UNGUARDED = { 'lib/handlers.ts': 'export async function handler(id: string) { return db.thing.deleteMany({ where: { id } }) }' }
+  assert.deepEqual(
+    scan("export { handler } from '@/lib/handlers'", {}, UNGUARDED),
+    [`${F}:handler`],
+  )
+
+  const GUARDED = {
+    'lib/handlers.ts':
+      "import { requirePermission } from '@/lib/auth/server'\n"
+      + "export async function handler(id: string) {\n"
+      + "  await requirePermission('sales.delete')\n"
+      + '  return db.thing.deleteMany({ where: { id } })\n'
+      + '}\n',
+  }
+  assert.deepEqual(scan("export { handler } from '@/lib/handlers'", {}, GUARDED), [])
+})
+
+test('a re-export the graph CANNOT follow is flagged — not verified is not guarded', () => {
+  assert.deepEqual(
+    scan("export { handler } from 'some-package'"),
+    [`${F}:handler`],
+  )
+})
+
+test('`export * from` is flagged — it publishes a set nobody enumerated', () => {
+  assert.deepEqual(
+    scan("export * from '@/lib/handlers'", {}, {
+      'lib/handlers.ts': 'export async function handler() { return db.thing.findMany() }',
+    }),
+    [`${F}:*`],
+  )
+})
+
+test('a SYNC named export is not treated as a server action', () => {
+  // Same rule as `export function foo()` without `async`: Next's action protocol
+  // publishes async functions. Whether Next REJECTS a sync export from a
+  // 'use server' module is a `next build` question, not this scanner's.
+  assert.deepEqual(
+    scan(`function joinPath(parts: string[]) { return parts.join(' > ') }
+    export { joinPath }`),
+    [],
+  )
+  assert.deepEqual(
+    scan("export { joinPath } from '@/lib/pure'", {}, {
+      'lib/pure.ts': "export function joinPath(parts: string[]) { return parts.join(' > ') }",
+    }),
+    [],
+  )
+})
+
+test('a named export that is NOT callable at all is not an endpoint', () => {
+  assert.deepEqual(
+    scan(`const LIMIT = 50
+    export { LIMIT }`),
+    [],
+  )
+})
+
+test('a type-only export is not an endpoint', () => {
+  assert.deepEqual(
+    scan(`type Thing = { id: string }
+    export type { Thing }`),
+    [],
+  )
+  assert.deepEqual(
+    scan(`type Thing = { id: string }
+    async function go() { return db.thing.findMany() }
+    export { type Thing, go }`),
+    [`${F}:go`],
+  )
+})
+
+test('a named export is NOT flagged when the allowlist names it', () => {
+  assert.deepEqual(
+    scan(`async function wipe(id: string) { return db.thing.deleteMany({ where: { id } }) }
+    export { wipe }`, { [`${F}:wipe`]: 'reviewed' }),
+    [],
+  )
+})
+
+test('the SECRET-READ rule sees a named export too', () => {
+  assert.deepEqual(
+    scanSecrets(`async function readIt() {
+      await requireAuth()
+      return getSettingValue('smtp_password')
+    }
+    export { readIt }`),
+    [`${F}:readIt`],
+  )
+})
+
+test('the AUTHENTICATION-ONLY inventory sees a named export too', () => {
+  assert.deepEqual(
+    scanAuthOnly(`async function mine() {
+      await requireAuth()
+      return db.thing.findMany()
+    }
+    export { mine }`),
+    [`${F}:mine`],
+  )
+})
+
+test('a named export of a non-exported local does not double-report', () => {
+  // The local is unguarded and NOT exported by modifier; it becomes an endpoint
+  // exactly once, under its published name.
+  assert.deepEqual(
+    scan(`async function go() { return db.thing.findMany() }
+    export { go }`),
+    [`${F}:go`],
   )
 })
