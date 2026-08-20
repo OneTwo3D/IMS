@@ -26,6 +26,8 @@ import {
   resetMirroredAccountingEventsToPending,
 } from '@/lib/domain/accounting/accounting-event-mirror'
 import { scheduleXeroAccountingOutbox } from '@/lib/connectors/xero/outbox'
+import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
+import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -236,6 +238,13 @@ async function createPendingSyncLog(
     currency: string
   },
 ): Promise<void> {
+  // o3d-19gy: the connection this batch was composed against. A daily-batch journal carries no external
+  // document id, but every account code and tax type in it was resolved from the chart of accounts of
+  // ONE organisation, so posting it into another is wrong for exactly the same reason.
+  const payload = stampAccountingPayloadConnection(
+    params.payload,
+    await activeAccountingIdProvenance(XERO_CONNECTOR),
+  )
   const log = await tx.accountingSyncLog.create({
     data: {
       connector: XERO_CONNECTOR,
@@ -243,7 +252,7 @@ async function createPendingSyncLog(
       status: 'PENDING',
       referenceType: 'DailyBatch',
       referenceId: params.referenceId,
-      payload: params.payload as never,
+      payload: payload as never,
     },
   })
   await scheduleXeroAccountingOutbox(tx, {

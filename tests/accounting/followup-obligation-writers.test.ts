@@ -221,6 +221,10 @@ const outboxClient = {
 
 const db = {
   accountingSyncLog: syncLogClient,
+  // o3d-19gy: the processor asks which accounting connection is live before it posts anything, and
+  // stamps the same answer onto every follow-up payload it queues. A double with no token row is a
+  // DISCONNECTED instance, which is a different scenario from the one these tests are about.
+  accountingToken: { async findUnique() { return { tenantId: 'tenant-A' } } },
   purchaseInvoice: billClient,
   salesOrder: { async findUnique() { return null }, async update() { return {} } },
   salesOrderRefund: { async findUnique() { return null }, async update() { return {} } },

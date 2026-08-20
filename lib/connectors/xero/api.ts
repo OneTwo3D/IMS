@@ -52,6 +52,24 @@ export type XeroResponse<T = unknown> = {
   status: number
   data?: T
   error?: string
+  /**
+   * The Xero organisation this request was actually ADDRESSED TO — the tenantId that went out in the
+   * `Xero-Tenant-Id` header, resolved BEFORE the request was made (o3d-gfh, o3d-s36z).
+   *
+   * WHY THE RESPONSE CARRIES IT. Everything that caches an id Xero issued used to answer "which
+   * organisation issued this?" by asking the database AFTER the call returned
+   * (`activeAccountingIdProvenance`). That is a resample, not a record: a disconnect and reconnect to a
+   * different organisation landing during the in-flight call — and rate-limit retries widen that window
+   * to tens of seconds — stamps the NEW organisation onto an id the OLD one issued, and the exact-match
+   * guard then trusts the false provenance for good. o3d-s36z's own list of what a next attempt must do
+   * differently leads with "issuer identity must be established BEFORE the remote call can corrupt
+   * anything, not observed during it"; this is that, and it costs nothing because the auth was already
+   * resolved to build the request.
+   *
+   * `undefined` ONLY when no request was made (not connected / blocked token). A caller that treats
+   * undefined as "the current tenant" has reintroduced the resample.
+   */
+  tenantId?: string
 }
 
 function sleep(ms: number) {
@@ -300,7 +318,7 @@ async function xeroFetchWithAuth<T = unknown>(
 
   const res = await performRequest(auth, init, url)
   if (res.status === 429) {
-    return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited') }
+    return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited'), tenantId: auth.tenantId }
   }
 
   if (!res.ok) {
@@ -334,11 +352,11 @@ async function xeroFetchWithAuth<T = unknown>(
     } catch {
       errorMessage += ': ' + (rawBody.slice(0, 1000) || 'Unknown error (empty response body)')
     }
-    return { ok: false, status: res.status, error: errorMessage }
+    return { ok: false, status: res.status, error: errorMessage, tenantId: auth.tenantId }
   }
 
   const data = await res.json() as T
-  return { ok: true, status: res.status, data }
+  return { ok: true, status: res.status, data, tenantId: auth.tenantId }
 }
 
 /**

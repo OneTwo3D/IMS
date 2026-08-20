@@ -637,7 +637,35 @@ beforeEach(() => {
   // XERO_TENANT_ID is READ as of o3d-9tbz. It has to be cleared here like the others, or a value left
   // in the developer's own environment silently narrows the allow-list for every test in this file.
   delete process.env.XERO_TENANT_ID
+  // o3d-iaqy. Every test in this file that predates that issue is about an instance with a legitimate
+  // reason to run with whatever tenant control it has — including none — so the default here is the one
+  // environment for which "no tenant control" is a permitted state: production. The non-production
+  // instance, which is the whole subject of o3d-iaqy, is asked for explicitly by the tests that mean it
+  // (see `nonProductionInstance()`), so a test that does not say so cannot silently be exercising it.
+  setNodeEnv('production')
+  delete process.env.E2E_TEST_MODE
 })
+
+/** `process.env.NODE_ENV` is typed readonly; this is the repo's usual way round it (see tests/cron/*). */
+function setNodeEnv(value: string) {
+  ;(process.env as Record<string, string | undefined>).NODE_ENV = value
+}
+
+/**
+ * This instance says it is not production (o3d-iaqy) — the state the e2e rig was in for o3d-t74p.
+ *
+ * Two spellings, because the two signals are not interchangeable: the full-chain rig serves a PRODUCTION
+ * build and so reports NODE_ENV=production, and E2E_TEST_MODE=1 is the only thing that distinguishes it.
+ */
+function nonProductionInstance(via: 'node-env' | 'e2e-flag' = 'node-env') {
+  if (via === 'e2e-flag') {
+    setNodeEnv('production')
+    process.env.E2E_TEST_MODE = '1'
+    return
+  }
+  setNodeEnv('development')
+  delete process.env.E2E_TEST_MODE
+}
 
 /** A fresh database: no token row, no pin. The exact state the e2e rig connected in. */
 function freshDatabase() {
@@ -2517,4 +2545,105 @@ test('a refresh carries its generation forward, so the NEXT refresh still matche
   tokenRow!.expiresAt = new Date(Date.now() - 1000)
   assert.equal((await getAccessToken())?.accessToken, 'access-1', 'and again')
   assert.equal(activity.filter((e) => e.action === 'xero_refresh_discarded').length, 0)
+})
+
+
+// --- o3d-iaqy, end to end: a non-production instance with nothing configured ----------------------
+//
+// o3d-9tbz enforced the allow-list at BOTH points o3d-iaqy asked for — the callback and every use of
+// the stored token — but left the third requirement open: "fail CLOSED when the config is absent on a
+// non-production instance. A missing allowlist must not read as 'anything is allowed' — that is
+// precisely the state that produced o3d-t74p." These are that state, driven through the real callback
+// and the real getAccessToken.
+
+test('o3d-iaqy: the e2e rig connecting to the LIVE organisation is refused, and NOTHING is stored', async () => {
+  // The incident, with the rig's own environment: a production build (NODE_ENV=production), the e2e
+  // flag set, nothing else. Under o3d-9tbz alone this single-organisation consent succeeded — the case
+  // deliberately left working — and bound the rig to the live ledger.
+  nonProductionInstance('e2e-flag')
+  freshDatabase()
+  connectionsBody = [LIVE]
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /not marked as production and has no Xero tenant control set/)
+  assert.equal(tokenRow, null, 'no token row was written')
+  assert.equal(settings.xero_expected_tenant_id, undefined, 'no tenant was pinned')
+  assert.equal(organisationCalls, 0, 'and not one read was made against the organisation')
+  assert.ok(activity.some((entry) => entry.action === 'xero_connect_refused'), 'the refusal is recorded')
+})
+
+test('o3d-iaqy: an unguarded dev instance is refused the same way', async () => {
+  nonProductionInstance('node-env')
+  freshDatabase()
+  connectionsBody = [DEMO]
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /not marked as production and has no Xero tenant control set/)
+  assert.equal(tokenRow, null)
+})
+
+test('o3d-iaqy: a LIVE token restored onto a dev box stops syncing, with no callback in sight', async () => {
+  // The route the callback check cannot see at all: a production dump on a laptop. The token is already
+  // in the database, already pinned, and agrees with itself perfectly.
+  nonProductionInstance('node-env')
+  pinnedTo(LIVE)
+  const { getAccessToken, getStoredTenantBlockReason } = await loadAuth()
+
+  assert.equal(await getAccessToken(), null, 'no token is handed out')
+  assert.match(await getStoredTenantBlockReason() ?? '', /not marked as production and has no Xero tenant control set/)
+  assert.equal(notifications.length, 1, 'and the operator is told once, not once per sync tick')
+})
+
+test('o3d-iaqy: naming the ledger is enough — the configured rig connects and syncs as before', async () => {
+  // The remedy, performed. Everything o3d-9tbz decided still decides.
+  nonProductionInstance('e2e-flag')
+  process.env.XERO_ALLOWED_TENANT_IDS = DEMO.tenantId
+  freshDatabase()
+  connectionsBody = [LIVE, DEMO]
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, true)
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId, 'and it is Demo, not the organisation listed first')
+  assert.equal(settings.xero_expected_tenant_id, DEMO.tenantId)
+})
+
+test('o3d-iaqy: XERO_REQUIRE_DEMO_ORG alone satisfies it — the rotation-proof answer', async () => {
+  // The rig's real problem is that Demo's tenantId is re-issued every ~28 days, so an id list has to be
+  // re-edited every cycle and a control that is annoying enough gets switched off. This one needs no
+  // editing, and it is an identity anchor, so it clears the o3d-iaqy refusal too.
+  nonProductionInstance('e2e-flag')
+  process.env.XERO_REQUIRE_DEMO_ORG = 'true'
+  freshDatabase()
+  connectionsBody = [DEMO]
+  organisationBody = { Organisations: [{ BaseCurrency: 'GBP', Name: 'Demo Company (UK)', IsDemoCompany: true }] }
+  const { exchangeCodeForTokens } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+
+  assert.equal(result.success, true)
+  assert.equal(tokenRow?.tenantId, DEMO.tenantId)
+})
+
+test('o3d-iaqy: PRODUCTION with nothing configured is completely unaffected', async () => {
+  // The case that outranks the fix. Production legitimately runs with no allow-list — it is the
+  // organisation every other instance is being kept away from — so nothing about it may change.
+  freshDatabase()
+  connectionsBody = [LIVE]
+  const { exchangeCodeForTokens, getAccessToken } = await loadAuth()
+
+  const result = await exchangeCodeForTokens('code-1', 'https://ims.example/api/accounting/callback')
+  assert.equal(result.success, true)
+  assert.equal(tokenRow?.tenantId, LIVE.tenantId)
+
+  const auth = await getAccessToken()
+  assert.equal(auth?.tenantId, LIVE.tenantId)
+  assert.equal(notifications.length, 0)
 })

@@ -17,6 +17,24 @@
 import { db } from '@/lib/db'
 
 /**
+ * The provenance string for an id a KNOWN connection issued (o3d-gfh).
+ *
+ * The same `"<connector>:<tenantId>"` shape `activeAccountingIdProvenance` produces, built from a tenant
+ * the caller already holds instead of from another read of the token row. It exists so that the tenant
+ * an id was ISSUED BY can be stamped rather than the tenant that happens to be connected once the call
+ * has returned: those are the same value except in exactly the case provenance exists to catch, and the
+ * resample silently prefers the wrong one. Callers get the issuing tenant from `XeroResponse.tenantId`,
+ * which is the id that went out in the request's own `Xero-Tenant-Id` header.
+ *
+ * Returns null for a blank/absent tenant, so "no request was made" cannot be stamped as a provenance —
+ * a null column re-resolves on the next read, which is the safe direction.
+ */
+export function accountingIdProvenanceFor(connector: string, tenantId: string | null | undefined): string | null {
+  const tenant = (tenantId ?? '').trim()
+  return tenant ? `${connector}:${tenant}` : null
+}
+
+/**
  * The provenance string for a connector's currently-connected tenant/realm, or `null` when that connector
  * has no token (so nothing can legitimately match — a stored id is treated as stale).
  */

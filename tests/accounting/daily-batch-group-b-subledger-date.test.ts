@@ -116,6 +116,9 @@ mock.module('@/lib/db', {
       salesOrder: { findMany: async () => [] },
       shipment: { findMany: async () => [] },
       accountingSyncLog: { count: async () => 0 },
+      // o3d-19gy: each queued payload records the connection it was composed against, so the double
+      // needs one — see daily-sync.ts createPendingSyncLog.
+      accountingToken: { findUnique: async () => ({ tenantId: 'tenant-A' }) },
       $transaction: async (fn: (client: unknown) => Promise<unknown>) => fn(tx),
     },
   },

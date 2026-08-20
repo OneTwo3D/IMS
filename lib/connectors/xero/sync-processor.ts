@@ -13,6 +13,10 @@ import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } fr
 import { pushManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
+import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
+import {
+  accountingPayloadConnectionRefusal, stampAccountingPayloadConnection,
+} from '@/lib/connectors/accounting-connection-provenance'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -359,6 +363,13 @@ async function enqueueFollowUpSyncLog(
   /** Bounds the re-plan below, so a pathological race cannot recurse forever. */
   attempt = 0,
 ): Promise<void> {
+  // o3d-19gy: stamped HERE, before anything reads or plans against it, so `plan.payload` carries the
+  // connection whether it is used to create a row or to revive a FAILED one — a follow-up payload is
+  // rebuilt from a document that was just posted, and it carries that post's external id, so it is
+  // exactly the shape this guard exists for. Re-stamping on a revival is deliberate: the revived row
+  // will post NOW, against the connection resolved now, and the pinned Idempotency-Key that makes the
+  // revival safe is a separate field this does not touch.
+  payload = stampAccountingPayloadConnection(payload, await activeAccountingIdProvenance(XERO_CONNECTOR))
   // Fast-path check; the partial unique index (audit-42co) is the atomic backstop
   // for the check-then-create race between concurrent sync runs.
   const liveRowExists = await hasExistingSyncLog(type, referenceType, referenceId)
@@ -1376,6 +1387,24 @@ async function processEntry(
   claimedAt: Date,
 ): Promise<EntryResult> {
   const postingMode = payload._postingMode
+
+  // o3d-19gy / o3d-s36z: does this payload still belong to the ledger we are about to post it to?
+  //
+  // FIRST, before the scope check and before any handler runs, because everything below either sends
+  // something or reads something on the assumption that the connection is the one that composed this
+  // row. It is asked here rather than in each of the thirty case arms for the reason the scope guard is:
+  // a check the next arm has to remember to repeat is one the next arm will forget.
+  //
+  // Fails as an ordinary entry failure — the message goes onto the row's errorMessage and onto /sync —
+  // rather than throwing, so a queue holding one previous-tenant row does not stop the rows behind it.
+  const connectionRefusal = accountingPayloadConnectionRefusal({
+    payload,
+    activeProvenance: await activeAccountingIdProvenance(XERO_CONNECTOR),
+    type,
+    referenceType,
+    referenceId,
+  })
+  if (connectionRefusal) return { success: false, error: connectionRefusal }
 
   // A MISSING SCOPE IS A CONFIGURATION FAULT, NOT AN API ERROR (o3d-g2i). Adding a scope to the
   // authorization URL only affects future consents, so a connection made before it keeps 401ing

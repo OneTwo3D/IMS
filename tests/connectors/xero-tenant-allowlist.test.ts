@@ -8,6 +8,7 @@ import {
   parseXeroReleaseWitness, serializeXeroReleaseWitness,
   storedXeroConnectionRefusal, xeroDemoOrgVerdict, xeroMissingPinRefusal, xeroPinAbsenceVerdict,
   xeroPinEstablishmentStatements, xeroTenantBindingRaceMessage, xeroTenantVerdict,
+  xeroUnguardedInstanceRefusal,
   XERO_PIN_RELEASE_WITNESS_SETTING_KEY, XERO_TENANT_PIN_SETTING_KEY,
   type XeroConnectionSummary, type XeroPinSqlStatement, type XeroReleaseWitness, type XeroStoredBinding,
 } from '@/lib/connectors/xero/tenant-guard'
@@ -122,9 +123,9 @@ const LIVE: XeroConnectionSummary = { tenantId: 'e7fb4378-live-org', tenantName:
 const DEMO: XeroConnectionSummary = { tenantId: '5c949ed5-demo-org', tenantName: 'Demo Company (UK)' }
 const THIRD: XeroConnectionSummary = { tenantId: '9aa10000-third-org', tenantName: 'Bookkeeper Sandbox' }
 
-const NO_ALLOW_LIST = readXeroTenantAllowList({})
-const DEMO_BY_ID = readXeroTenantAllowList({ XERO_ALLOWED_TENANT_IDS: DEMO.tenantId })
-const DEMO_BY_NAME = readXeroTenantAllowList({ XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' })
+const NO_ALLOW_LIST = readXeroTenantAllowList({ NODE_ENV: 'production' })
+const DEMO_BY_ID = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_IDS: DEMO.tenantId })
+const DEMO_BY_NAME = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' })
 
 
 // --- the bug itself ----------------------------------------------------------
@@ -207,7 +208,7 @@ test('the allow-list picks its organisation out of several, with no pin at all',
 })
 
 test('an allow-list by NAME works the same way, case- and whitespace-insensitively', () => {
-  const allowList = readXeroTenantAllowList({ XERO_ALLOWED_TENANT_NAMES: '  demo   company (uk) ' })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_NAMES: '  demo   company (uk) ' })
   const choice = selectXeroTenant({ connections: [LIVE, DEMO], expectedTenantId: null, allowList })
   assert.equal(choice.ok === true && choice.connection.tenantId, DEMO.tenantId)
 })
@@ -235,7 +236,7 @@ test('the allow-list overrides a DATABASE pin — a restored dump cannot smuggle
 })
 
 test('an allow-list matching SEVERAL of the offered organisations is still ambiguous', () => {
-  const allowList = readXeroTenantAllowList({ XERO_ALLOWED_TENANT_IDS: `${DEMO.tenantId}, ${THIRD.tenantId}` })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_IDS: `${DEMO.tenantId}, ${THIRD.tenantId}` })
   const choice = selectXeroTenant({ connections: [LIVE, DEMO, THIRD], expectedTenantId: null, allowList })
   assert.equal(choice.ok === false && choice.reason, 'ambiguous')
   const error = choice.ok === false ? choice.error : ''
@@ -253,7 +254,7 @@ test('the allow-list narrowing several organisations down to ONE is enough to pr
 // --- reading the env ---------------------------------------------------------
 
 test('an unset allow-list allows everything — it is opt-in, production may not set it', () => {
-  const allowList = readXeroTenantAllowList({})
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production' })
   assert.equal(allowList.configured, false)
   assert.equal(isXeroTenantAllowed(LIVE, allowList), true)
   assert.equal(isXeroTenantAllowed(DEMO, allowList), true)
@@ -261,13 +262,13 @@ test('an unset allow-list allows everything — it is opt-in, production may not
 
 test('a BLANK allow-list is unset, not "allow nothing"', () => {
   // .env.example ships the keys. A blank line in a config file must not disable every Xero connection.
-  const allowList = readXeroTenantAllowList({ XERO_ALLOWED_TENANT_IDS: '   ', XERO_ALLOWED_TENANT_NAMES: ' , ,' })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_IDS: '   ', XERO_ALLOWED_TENANT_NAMES: ' , ,' })
   assert.equal(allowList.configured, false)
   assert.equal(isXeroTenantAllowed(LIVE, allowList), true)
 })
 
 test('ids are matched case-insensitively and tolerate spaces around the commas', () => {
-  const allowList = readXeroTenantAllowList({ XERO_ALLOWED_TENANT_IDS: ` ${DEMO.tenantId.toUpperCase()} , ` })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_IDS: ` ${DEMO.tenantId.toUpperCase()} , ` })
   assert.deepEqual(allowList.rawIds, [DEMO.tenantId.toUpperCase()])
   assert.equal(isXeroTenantAllowed(DEMO, allowList), true)
   assert.equal(isXeroTenantAllowed(LIVE, allowList), false)
@@ -277,6 +278,7 @@ test('ids and names INTERSECT — a name cannot admit an organisation the id lis
   // This was a union, and the union was the bug (r2 finding 1): a name is not an identity, so letting one
   // ADD an organisation meant an org renamed to an allow-listed name walked past the id list.
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_IDS: THIRD.tenantId,
     XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
   })
@@ -287,6 +289,7 @@ test('ids and names INTERSECT — a name cannot admit an organisation the id lis
 
 test('a name NARROWS an id list, and both together admit the organisation they agree on', () => {
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_IDS: `${DEMO.tenantId},${THIRD.tenantId}`,
     XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
   })
@@ -298,6 +301,7 @@ test('an organisation RENAMED to an allow-listed name is still refused by the id
   // A Xero organisation name is mutable and operator-controlled. Under the old union this passed.
   const renamedLive = { tenantId: LIVE.tenantId, tenantName: 'Demo Company (UK)' }
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
     XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
   })
@@ -306,7 +310,7 @@ test('an organisation RENAMED to an allow-listed name is still refused by the id
 })
 
 test('a nameless organisation is not admitted by an empty name entry', () => {
-  const allowList = readXeroTenantAllowList({ XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' })
   assert.equal(isXeroTenantAllowed({ tenantId: 'x', tenantName: null }, allowList), false)
   assert.equal(isXeroTenantAllowed({ tenantId: 'x' }, allowList), false)
 })
@@ -350,7 +354,7 @@ test('the stored-token refusal names the org, the allow-list, and both ways out'
 // strictly worse than an absent setting, because the name buys confidence the code never honoured. It
 // is now a deprecated single-tenant spelling of XERO_ALLOWED_TENANT_IDS, enforced on the same paths.
 
-const LEGACY_DEMO = readXeroTenantAllowList({ XERO_TENANT_ID: DEMO.tenantId })
+const LEGACY_DEMO = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_TENANT_ID: DEMO.tenantId })
 
 test('XERO_TENANT_ID set ALONE is a configured allow-list, not an ignored decoration', () => {
   // The whole finding in one assertion: this used to be `configured: false` and admit every org.
@@ -374,7 +378,7 @@ test('XERO_TENANT_ID alone overrides a DATABASE pin, exactly as the modern key d
 })
 
 test('a BLANK XERO_TENANT_ID is unset — .env.example and install.sh both ship it empty', () => {
-  const allowList = readXeroTenantAllowList({ XERO_TENANT_ID: '   ' })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_TENANT_ID: '   ' })
   assert.equal(allowList.configured, false)
   assert.equal(allowList.legacyTenantId, null)
   assert.equal(allowList.conflict, null)
@@ -382,7 +386,7 @@ test('a BLANK XERO_TENANT_ID is unset — .env.example and install.sh both ship 
 })
 
 test('XERO_TENANT_ID is matched case-insensitively, like every other id here', () => {
-  const allowList = readXeroTenantAllowList({ XERO_TENANT_ID: ` ${DEMO.tenantId.toUpperCase()} ` })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_TENANT_ID: ` ${DEMO.tenantId.toUpperCase()} ` })
   assert.equal(allowList.configured, true)
   assert.equal(isXeroTenantAllowed(DEMO, allowList), true)
   // Without the refusal half this passes vacuously: an unread variable leaves the list unconfigured,
@@ -397,6 +401,7 @@ test('XERO_TENANT_ID disagreeing with XERO_ALLOWED_TENANT_IDS refuses BOTH orgs,
   // Preferring either value silently discards an instruction the operator gave on purpose, on a money
   // path. A union would WIDEN what `XERO_TENANT_ID=<one org>` was written to restrict.
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_TENANT_ID: DEMO.tenantId,
     XERO_ALLOWED_TENANT_IDS: LIVE.tenantId,
   })
@@ -407,6 +412,7 @@ test('XERO_TENANT_ID disagreeing with XERO_ALLOWED_TENANT_IDS refuses BOTH orgs,
 
 test('the conflict refusal quotes both settings and gives a one-line fix', () => {
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_TENANT_ID: DEMO.tenantId,
     XERO_ALLOWED_TENANT_IDS: LIVE.tenantId,
   })
@@ -424,7 +430,7 @@ test('the conflict refusal quotes both settings and gives a one-line fix', () =>
 test('a conflict is refused BEFORE the connection list — even a single-org consent is not waved through', () => {
   // Ordinary first-time setup is the one case allowed to proceed on its own, but not while the server's
   // own configuration contradicts itself: we would have no basis for saying this org is the right one.
-  const allowList = readXeroTenantAllowList({ XERO_TENANT_ID: DEMO.tenantId, XERO_ALLOWED_TENANT_IDS: LIVE.tenantId })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_TENANT_ID: DEMO.tenantId, XERO_ALLOWED_TENANT_IDS: LIVE.tenantId })
   const choice = selectXeroTenant({ connections: [DEMO], expectedTenantId: null, allowList })
   assert.equal(choice.ok, false)
   assert.equal(choice.ok === false && choice.reason, 'config-conflict')
@@ -433,6 +439,7 @@ test('a conflict is refused BEFORE the connection list — even a single-org con
 test('the two keys set to the SAME single organisation is not a conflict', () => {
   // Belt and braces during a migration off the deprecated name must not be an outage.
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_TENANT_ID: DEMO.tenantId,
     XERO_ALLOWED_TENANT_IDS: ` ${DEMO.tenantId.toUpperCase()} `,
   })
@@ -444,7 +451,7 @@ test('the two keys set to the SAME single organisation is not a conflict', () =>
 test('the stored-token refusal under a conflict does NOT give the allow-list remedy', () => {
   // "add its tenantId to XERO_ALLOWED_TENANT_IDS" leaves the contradiction in place and the sync still
   // halted — a remedy whose faithful execution changes nothing.
-  const allowList = readXeroTenantAllowList({ XERO_TENANT_ID: DEMO.tenantId, XERO_ALLOWED_TENANT_IDS: LIVE.tenantId })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_TENANT_ID: DEMO.tenantId, XERO_ALLOWED_TENANT_IDS: LIVE.tenantId })
   const message = storedTenantRefusalMessage(LIVE, allowList)
   assert.match(message, /contradict each other/)
   assert.match(message, /delete that line/)
@@ -519,6 +526,7 @@ test('an ambiguous name alongside an id list is told to DELETE the name line', (
   // Telling this operator to "set XERO_ALLOWED_TENANT_IDS=..." would put a second id key beside the one
   // they already have — the conflict refusal. The id already identifies the org; the name is the surplus.
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
     XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
   })
@@ -556,11 +564,11 @@ test('a name-only configuration is flagged as having no identity anchor', () => 
   assert.equal(DEMO_BY_NAME.nameOnlyGuard, true)
   assert.equal(DEMO_BY_ID.nameOnlyGuard, false, 'an id is an identity')
   assert.equal(
-    readXeroTenantAllowList({ XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)', XERO_BLOCKED_TENANT_IDS: LIVE.tenantId }).nameOnlyGuard,
+    readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)', XERO_BLOCKED_TENANT_IDS: LIVE.tenantId }).nameOnlyGuard,
     false,
     'and so is a deny-listed id',
   )
-  assert.equal(readXeroTenantAllowList({}).nameOnlyGuard, false, 'no guard at all is not a name-only guard')
+  assert.equal(readXeroTenantAllowList({ NODE_ENV: 'production' }).nameOnlyGuard, false, 'no guard at all is not a name-only guard')
 })
 
 test('the name-only warning names the remedy that survives a rotating tenantId', () => {
@@ -579,7 +587,7 @@ test('the name-only warning names the remedy that survives a rotating tenantId',
 // organisation's id is the stable one. Blocking it is identity-strength, needs no maintenance, and
 // covers the connect path and the stored-token path alike.
 
-const BLOCK_LIVE = readXeroTenantAllowList({ XERO_BLOCKED_TENANT_IDS: LIVE.tenantId })
+const BLOCK_LIVE = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_BLOCKED_TENANT_IDS: LIVE.tenantId })
 
 test('the deny-list refuses the live org and lets the demo org through, with no pin and no allow-list', () => {
   // The incident's exact state — fresh database, live org first — closed by an id, not by a name.
@@ -615,6 +623,7 @@ test('blocking the live org disambiguates a name that a rename made shared', () 
   // Order is load-bearing: the deny-list runs before the name check, so removing the live org is what
   // leaves exactly one "Demo Company (UK)" on the consent.
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
     XERO_BLOCKED_TENANT_IDS: LIVE.tenantId,
   })
@@ -652,6 +661,7 @@ test('a STORED token for a blocked organisation is refused, which is the restore
 
 test('allowing and blocking the same organisation is a conflict, not a silent deny-wins', () => {
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
     XERO_BLOCKED_TENANT_IDS: `${LIVE.tenantId},${DEMO.tenantId.toUpperCase()}`,
   })
@@ -665,13 +675,13 @@ test('allowing and blocking the same organisation is a conflict, not a silent de
 })
 
 test('the same clash through the DEPRECATED key names XERO_TENANT_ID, the line they can find', () => {
-  const allowList = readXeroTenantAllowList({ XERO_TENANT_ID: DEMO.tenantId, XERO_BLOCKED_TENANT_IDS: DEMO.tenantId })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_TENANT_ID: DEMO.tenantId, XERO_BLOCKED_TENANT_IDS: DEMO.tenantId })
   assert.match(allowList.conflict ?? '', /XERO_TENANT_ID/)
   assert.doesNotMatch(allowList.conflict ?? '', /XERO_ALLOWED_TENANT_IDS/, 'not a key that is not in their .env')
 })
 
 test('a blank deny-list is unset, not "block nothing in a way that changes something"', () => {
-  const allowList = readXeroTenantAllowList({ XERO_BLOCKED_TENANT_IDS: ' , ' })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_BLOCKED_TENANT_IDS: ' , ' })
   assert.equal(allowList.configured, false)
   assert.equal(isXeroTenantAllowed(LIVE, allowList), true)
 })
@@ -683,6 +693,7 @@ test('XERO_TENANT_ID and that same organisation NAME are one instruction, not a 
   // These two spellings name a single organisation. Refusing them was the r2 finding-2 bug: the conflict
   // refusal has to fire on genuine disagreement, not on two ways of saying the same thing.
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_TENANT_ID: DEMO.tenantId,
     XERO_ALLOWED_TENANT_NAMES: 'demo company (uk)',
   })
@@ -695,6 +706,7 @@ test('XERO_TENANT_ID and that same organisation NAME are one instruction, not a 
 
 test('XERO_ALLOWED_TENANT_IDS and that same organisation NAME are likewise not a conflict', () => {
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
     XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
   })
@@ -707,6 +719,7 @@ test('an id and a name selecting DIFFERENT organisations on one consent IS a dis
   // Equivalence is decided against the organisations, so disagreement has to be too: each key picks a
   // real organisation out of this consent, and they are not the same one.
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
     XERO_ALLOWED_TENANT_NAMES: 'OneTwo3D Ltd',
   })
@@ -723,7 +736,7 @@ test('an id and a name selecting DIFFERENT organisations on one consent IS a dis
 })
 
 test('the same disagreement through the deprecated key quotes XERO_TENANT_ID', () => {
-  const allowList = readXeroTenantAllowList({ XERO_TENANT_ID: DEMO.tenantId, XERO_ALLOWED_TENANT_NAMES: 'OneTwo3D Ltd' })
+  const allowList = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_TENANT_ID: DEMO.tenantId, XERO_ALLOWED_TENANT_NAMES: 'OneTwo3D Ltd' })
   const choice = selectXeroTenant({ connections: [LIVE, DEMO], expectedTenantId: null, allowList })
   assert.match(choice.ok === false ? choice.error : '', new RegExp(`XERO_TENANT_ID=${DEMO.tenantId} selects`))
 })
@@ -731,6 +744,7 @@ test('the same disagreement through the deprecated key quotes XERO_TENANT_ID', (
 test('a name that matches NOTHING offered is none-allowed, not a contradiction', () => {
   // Only one side selected anything, so there is no disagreement to report — just nothing permitted.
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
     XERO_ALLOWED_TENANT_NAMES: 'A Company That Is Not On This Consent',
   })
@@ -745,10 +759,10 @@ test('a name that matches NOTHING offered is none-allowed, not a contradiction',
 // rotating Demo tenantId, and it refuses exactly ONE organisation. It never constrained the rig TO a
 // demo organisation — and `XERO_ALLOWED_TENANT_NAMES` cannot, because a name is not an identity.
 
-const DEMO_REQUIRED = readXeroTenantAllowList({ XERO_REQUIRE_DEMO_ORG: 'true' })
+const DEMO_REQUIRED = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_REQUIRE_DEMO_ORG: 'true' })
 
 test('a deny-list on the live org does NOT stop a third organisation — the gap being closed', () => {
-  const blockLive = readXeroTenantAllowList({ XERO_BLOCKED_TENANT_IDS: LIVE.tenantId })
+  const blockLive = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_BLOCKED_TENANT_IDS: LIVE.tenantId })
   const choice = selectXeroTenant({ connections: [THIRD], expectedTenantId: null, allowList: blockLive })
   assert.equal(choice.ok, true, 'a bookkeeper sandbox is neither blocked nor allow-listed')
   assert.equal(choice.ok === true && choice.connection.tenantId, THIRD.tenantId)
@@ -756,6 +770,7 @@ test('a deny-list on the live org does NOT stop a third organisation — the gap
 
 test('a name alongside the deny-list does not close it either — the org can be renamed', () => {
   const guarded = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_BLOCKED_TENANT_IDS: LIVE.tenantId,
     XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
   })
@@ -782,15 +797,15 @@ test('the requirement needs no maintenance when the Demo company is re-created',
 
 test('yes/no spellings are read, and anything else is a refusal rather than a silent "off"', () => {
   for (const on of ['true', 'TRUE', '1', 'yes', 'on', ' true ']) {
-    assert.equal(readXeroTenantAllowList({ XERO_REQUIRE_DEMO_ORG: on }).requireDemoOrg, true, on)
+    assert.equal(readXeroTenantAllowList({ NODE_ENV: 'production', XERO_REQUIRE_DEMO_ORG: on }).requireDemoOrg, true, on)
   }
   for (const off of ['false', '0', 'no', 'off', '', '   ', undefined]) {
-    const list = readXeroTenantAllowList({ XERO_REQUIRE_DEMO_ORG: off })
+    const list = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_REQUIRE_DEMO_ORG: off })
     assert.equal(list.requireDemoOrg, false, String(off))
     assert.equal(list.conflict, null, String(off))
   }
   // The XERO_TENANT_ID mistake in a new place: a line that reads like a guard, and no guard.
-  const malformed = readXeroTenantAllowList({ XERO_REQUIRE_DEMO_ORG: 'Demo Company (UK)' })
+  const malformed = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_REQUIRE_DEMO_ORG: 'Demo Company (UK)' })
   assert.equal(malformed.requireDemoOrg, false)
   assert.match(malformed.conflict ?? '', /is not a yes\/no value/)
   assert.match(malformed.conflict ?? '', /XERO_REQUIRE_DEMO_ORG=true/, 'and says the value that works')
@@ -803,9 +818,10 @@ test('yes/no spellings are read, and anything else is a refusal rather than a si
 test('the requirement counts as configured, and as an ANCHOR that clears the name-only warning', () => {
   assert.equal(DEMO_REQUIRED.configured, true)
   assert.equal(DEMO_REQUIRED.nameOnlyGuard, false)
-  const nameOnly = readXeroTenantAllowList({ XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' })
+  const nameOnly = readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' })
   assert.equal(nameOnly.nameOnlyGuard, true)
   const anchored = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
     XERO_REQUIRE_DEMO_ORG: 'true',
   })
@@ -813,7 +829,7 @@ test('the requirement counts as configured, and as an ANCHOR that clears the nam
 })
 
 test('the name-only warning offers the maintenance-free anchor first, and says what a deny-list misses', () => {
-  const warning = nameOnlyGuardWarning(readXeroTenantAllowList({ XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' }))
+  const warning = nameOnlyGuardWarning(readXeroTenantAllowList({ NODE_ENV: 'production', XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)' }))
   assert.match(warning, /XERO_REQUIRE_DEMO_ORG=true/)
   assert.match(warning, /any third organisation would still pass/)
 })
@@ -849,6 +865,7 @@ test('the stored check applies the allow-list FIRST, so the message names the bi
   // one that works, so it must not be shadowed by the demo requirement. The pin AGREES with the token
   // throughout, which is the ordinary connected state and the one these verdicts are about.
   const allowList = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
     XERO_REQUIRE_DEMO_ORG: 'true',
   })
@@ -915,6 +932,7 @@ test('the split binding is reported BEFORE the allow-list, whose remedy it would
 
 test('a self-contradictory .env is still reported first — no other remedy can take effect', () => {
   const conflicted = readXeroTenantAllowList({
+    NODE_ENV: 'production',
     XERO_TENANT_ID: LIVE.tenantId,
     XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
   })
@@ -1528,4 +1546,164 @@ test('the migration repairs the instances already in that state, and ONLY those'
     'the row\'s own values are still exactly what must never be copied into its receipt')
   assert.doesNotMatch(backfill, /= NOW\(\)|pinReleasedAt" = '/i,
     'nothing is written into a receipt by a migration — the only value it may set is NULL')
+})
+
+
+// --- o3d-iaqy: a non-production instance may not connect to whatever it is offered ----------------
+//
+// o3d-9tbz made the allow-list real and enforced it at the callback AND on every use of the stored
+// token, which is two of the three things o3d-iaqy asked for. The third was never done: an
+// UNCONFIGURED allow-list still allows everything ("it is opt-in, and production may legitimately not
+// set it" — isXeroTenantAllowed). That is the precise state the e2e rig was in when it invoiced into
+// the live ledger, so on an instance that is not production it must not be a permitted state.
+//
+// The doubles below are environments, because that is the whole subject: the guard's input is what the
+// instance says about ITSELF, and o3d-t74p's rig said nothing.
+
+const UNGUARDED_DEV = readXeroTenantAllowList({ NODE_ENV: 'development' })
+const UNGUARDED_E2E_RIG = readXeroTenantAllowList({ NODE_ENV: 'production', E2E_TEST_MODE: '1' })
+
+test('o3d-iaqy: a non-production instance with NO tenant control at all is unguarded', () => {
+  assert.equal(UNGUARDED_DEV.instanceIsNonProduction, true)
+  assert.equal(UNGUARDED_DEV.unguardedInstance, true)
+  assert.equal(UNGUARDED_DEV.configured, false,
+    'and `configured` still reads false — the two questions are different, which is why the old one '
+    + 'could answer "nothing is configured" and mean "everything is allowed"')
+})
+
+test('o3d-iaqy: the e2e rig is caught by E2E_TEST_MODE, which is the only signal that can catch it', () => {
+  // The rig serves a PRODUCTION build, so NODE_ENV is 'production' there and always was. A guard that
+  // read NODE_ENV alone would have passed the exact instance that caused o3d-t74p.
+  assert.equal(UNGUARDED_E2E_RIG.instanceIsNonProduction, true)
+  assert.equal(UNGUARDED_E2E_RIG.unguardedInstance, true)
+})
+
+test('o3d-iaqy: production with nothing configured is untouched', () => {
+  const production = readXeroTenantAllowList({ NODE_ENV: 'production' })
+  assert.equal(production.instanceIsNonProduction, false)
+  assert.equal(production.unguardedInstance, false,
+    'production IS the organisation everything else is being kept away from — requiring it to allow-list '
+    + 'itself would be a refusal aimed at the one instance that is where it should be')
+})
+
+test('o3d-iaqy: an ABSENT NODE_ENV is non-production — a missing signal is not a declaration', () => {
+  assert.equal(readXeroTenantAllowList({}).instanceIsNonProduction, true)
+  assert.equal(readXeroTenantAllowList({ NODE_ENV: '  ' }).instanceIsNonProduction, true)
+  assert.equal(readXeroTenantAllowList({ NODE_ENV: ' production ' }).instanceIsNonProduction, false,
+    'and the declaration survives the whitespace an .env line routinely carries')
+})
+
+test('o3d-iaqy: any one IDENTITY control clears it — an allowed id, a blocked id, or the demo requirement', () => {
+  const cases: Array<[string, Record<string, string>]> = [
+    ['an allowed id', { XERO_ALLOWED_TENANT_IDS: DEMO.tenantId }],
+    ['the deprecated single-id spelling', { XERO_TENANT_ID: DEMO.tenantId }],
+    // A deny-list does not constrain this instance TO anything (r3), but o3d-iaqy's sentence is
+    // "nothing stops it connecting to the LIVE organisation" — and blocking the live id is exactly
+    // that sentence, in the one spelling that survives Demo's ~28-day tenantId rotation.
+    ['blocking the live org', { XERO_BLOCKED_TENANT_IDS: LIVE.tenantId }],
+    ['the demo requirement', { XERO_REQUIRE_DEMO_ORG: 'true' }],
+  ]
+  for (const [label, env] of cases) {
+    const allowList = readXeroTenantAllowList({ NODE_ENV: 'development', ...env })
+    assert.equal(allowList.unguardedInstance, false, label)
+  }
+})
+
+test('o3d-iaqy: a NAME does NOT clear it — a rename is not an identity', () => {
+  const nameOnly = readXeroTenantAllowList({
+    NODE_ENV: 'development',
+    XERO_ALLOWED_TENANT_NAMES: 'Demo Company (UK)',
+  })
+  assert.equal(nameOnly.configured, true, 'something IS configured…')
+  assert.equal(nameOnly.unguardedInstance, true, '…and it is still not an identity control')
+  assert.match(xeroUnguardedInstanceRefusal(nameOnly), /XERO_ALLOWED_TENANT_NAMES=Demo Company \(UK\) is set, and it does NOT count/,
+    'and the refusal says so, because an operator who has set one believes they are protected')
+})
+
+test('o3d-iaqy: the CONNECT path refuses before naming a single organisation', () => {
+  // Even a single-organisation consent — the case o3d-9tbz deliberately left working — because the
+  // question is not "which of these" but "may this instance be choosing at all".
+  const choice = selectXeroTenant({
+    connections: [LIVE],
+    expectedTenantId: null,
+    allowList: UNGUARDED_E2E_RIG,
+  })
+  assert.equal(choice.ok, false)
+  assert.equal(choice.ok === false && choice.reason, 'unguarded-instance')
+  assert.match(choice.ok === false ? choice.error : '', /not marked as production and has no Xero tenant control set/)
+  assert.doesNotMatch(choice.ok === false ? choice.error : '', new RegExp(LIVE.tenantId),
+    'and it does not echo the organisation back: a rig that should not have been consenting is not '
+    + 'handed the id of the ledger it was about to be pointed at')
+})
+
+test('o3d-iaqy: a DATABASE pin does not rescue it — a pin is learned, not configured', () => {
+  // The self-writing latch this replaces: pinTenantId stamped whatever organisation you just connected
+  // to, so the e2e rig's pin read LIVE for eleven days and agreed with itself the whole time.
+  const choice = selectXeroTenant({
+    connections: [LIVE, DEMO],
+    expectedTenantId: LIVE.tenantId,
+    allowList: UNGUARDED_DEV,
+  })
+  assert.equal(choice.ok, false)
+  assert.equal(choice.ok === false && choice.reason, 'unguarded-instance')
+})
+
+test('o3d-iaqy: the STORED token is refused too — the callback ran once, the damage took eleven days', () => {
+  // And this is the arm that catches a production dump restored onto a dev box: it arrives with a live
+  // token already in the database and no callback ever runs.
+  const refusal = storedXeroConnectionRefusal(LIVE, UNGUARDED_DEV, LIVE.tenantId, BOUND, null)
+  assert.notEqual(refusal, null)
+  assert.match(refusal ?? '', /not marked as production and has no Xero tenant control set/)
+  assert.match(refusal ?? '', /553 objects/, 'named, because the remedy has to be worth performing')
+})
+
+test('o3d-iaqy: the remedy is to NAME a ledger, never to switch the guard off', () => {
+  const refusal = xeroUnguardedInstanceRefusal(UNGUARDED_DEV)
+  assert.match(refusal, /XERO_ALLOWED_TENANT_IDS=/)
+  assert.match(refusal, /XERO_REQUIRE_DEMO_ORG=true/)
+  assert.match(refusal, /XERO_BLOCKED_TENANT_IDS=/)
+  assert.match(refusal, /NODE_ENV=production/, 'and the one legitimate "this is not a test instance" answer')
+  assert.doesNotMatch(refusal, /SKIP|DISABLE|_OFF|ignore this/i,
+    'no boolean escape hatch: a guard whose documented way out is a switch is off on every instance '
+    + 'that ever hit it')
+})
+
+test('o3d-iaqy: a CONFIGURED non-production instance behaves exactly as before', () => {
+  // The no-regression guard. Everything o3d-9tbz decided still decides; this issue only closes the
+  // "nothing configured" hole underneath it.
+  const rig = readXeroTenantAllowList({
+    NODE_ENV: 'production',
+    E2E_TEST_MODE: '1',
+    XERO_ALLOWED_TENANT_IDS: DEMO.tenantId,
+  })
+  assert.equal(rig.unguardedInstance, false)
+  const choice = selectXeroTenant({ connections: [LIVE, DEMO], expectedTenantId: null, allowList: rig })
+  assert.equal(choice.ok, true)
+  assert.equal(choice.ok === true && choice.connection.tenantId, DEMO.tenantId)
+  assert.equal(storedXeroConnectionRefusal(DEMO, rig, DEMO.tenantId, BOUND, null), null)
+  // …and the allow-list still refuses the live org for the reason it always did, not for this one.
+  const blocked = selectXeroTenant({ connections: [LIVE], expectedTenantId: null, allowList: rig })
+  assert.equal(blocked.ok === false && blocked.reason, 'none-allowed')
+})
+
+test('o3d-iaqy: a CONFLICTING configuration is still reported as a conflict, not as unguarded', () => {
+  // Ordering. A conflict has a remedy that this refusal's remedy would send an operator straight past:
+  // "set XERO_ALLOWED_TENANT_IDS" is unperformable while XERO_TENANT_ID contradicts it.
+  const conflicted = readXeroTenantAllowList({
+    NODE_ENV: 'development',
+    XERO_TENANT_ID: DEMO.tenantId,
+    XERO_ALLOWED_TENANT_IDS: LIVE.tenantId,
+  })
+  assert.equal(conflicted.unguardedInstance, false, 'ids ARE set — this instance is not unguarded, it is contradictory')
+  const choice = selectXeroTenant({ connections: [DEMO], expectedTenantId: null, allowList: conflicted })
+  assert.equal(choice.ok === false && choice.reason, 'config-conflict')
+})
+
+test('o3d-iaqy: the per-organisation filter chain is deliberately NOT changed', () => {
+  // xeroTenantVerdict answers "does this org survive the configured filters" and every one of its
+  // answers names the key that removed the org. This issue removes no org in particular — it removes
+  // the entitlement to be choosing — so folding it in would make a pure predicate over (org, list)
+  // depend on the process environment, and make `whyRefused` describe a filter that never ran.
+  assert.equal(xeroTenantVerdict(LIVE, UNGUARDED_DEV), 'allowed')
+  assert.equal(isXeroTenantAllowed(LIVE, UNGUARDED_DEV), true)
 })
