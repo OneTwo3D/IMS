@@ -17,6 +17,7 @@ import {
 } from '@/lib/connectors/mintsoft/webhook-events'
 import { createMintsoftWebhookEventRepository } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 
 const MAX_WEBHOOK_BODY_BYTES = 256 * 1024
 
@@ -32,6 +33,8 @@ type MintsoftReceiptWebhookPayload = {
 }
 
 export type MintsoftBookedInWebhookRouteDependencies = {
+  /** o3d-hl8l: the maintenance-mode fence. Injectable so the 503 path is unit-testable. */
+  getMaintenanceModeResponse: (kind: 'cron' | 'webhook') => Promise<NextResponse | null>
   getMintsoftApiConfiguration: typeof getMintsoftApiConfiguration
   isIntegrationPluginEnabled: (plugin: 'mintsoft') => Promise<boolean>
   isUniqueConstraintError: (error: unknown) => boolean
@@ -98,6 +101,7 @@ async function readWebhookBody(request: Request, maxBytes: number): Promise<stri
 }
 
 const defaultMintsoftBookedInWebhookDependencies: MintsoftBookedInWebhookRouteDependencies = {
+  getMaintenanceModeResponse,
   getMintsoftApiConfiguration,
   isIntegrationPluginEnabled,
   isUniqueConstraintError(error) {
@@ -112,6 +116,33 @@ export async function handleMintsoftBookedInWebhook(
   request: Request,
   dependencies: MintsoftBookedInWebhookRouteDependencies = defaultMintsoftBookedInWebhookDependencies,
 ) {
+  // o3d-hl8l: MAINTENANCE-MODE FENCE. First statement, before the body is even read, so nothing
+  // on this path can write while the flag is on — matching lib/connectors/woocommerce/webhooks.ts,
+  // which is the only other inbound entry point that consults it.
+  //
+  // WHY REFUSE (503) RATHER THAN PERSIST-AND-DEFER (the o3d-56b shape used for the disabled
+  // WooCommerce processing gate). The o3d-osl8 note recorded the choice as open, because a fenced
+  // WooCommerce delivery is retried by WooCommerce and a dropped ASN callback may not be. Deciding
+  // it needs one more fact: the ONLY caller that enables this flag is the backup RESTORE endpoint,
+  // and the case it stays on for is a restore whose backend could not be confirmed dead. A row
+  // written into that window is being replayed over — persisting would not save the event, it would
+  // return `202 accepted` for a row the restore then destroys. A 503 makes no such promise and is
+  // the standard retry signal, so a sender that retries at all is not lost.
+  //
+  // WHAT IS THEREFORE ACCEPTED, stated rather than implied: if the sender does NOT retry, the
+  // booked-in TRIGGER is dropped. It is not silent, and it is recoverable, because the webhook
+  // carries only an ASN id — the authoritative booked-in quantities are re-fetched from the WMS by
+  // fetchMintsoftBookedInAsn when the event is processed. The wms-watchdog cron alerts on an open
+  // ASN past its ETA with no booked-in callback, and the ASN dialog replays the callback for a
+  // named ASN. What is genuinely lost is the automatic path: nothing but this route creates a
+  // receipt-event row, so recovery is operator-initiated rather than self-healing.
+  //
+  // Deliberately BEFORE signature verification, so a maintenance window cannot be probed for a
+  // valid secret and a 256KB body is not read to be thrown away. That does disclose the flag's
+  // state to an unauthenticated caller — the same trade the WooCommerce fence already makes.
+  const maintenance = await dependencies.getMaintenanceModeResponse('webhook')
+  if (maintenance) return maintenance
+
   let rawBody: string
   try {
     rawBody = await readWebhookBody(request, MAX_WEBHOOK_BODY_BYTES)

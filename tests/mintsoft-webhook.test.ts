@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import test from 'node:test'
+import { NextResponse } from 'next/server'
 import {
   handleMintsoftBookedInWebhook,
   type MintsoftBookedInWebhookRouteDependencies,
@@ -70,8 +71,12 @@ function buildSignedWebhookRequest(payload: Record<string, unknown>, timestamp =
 function buildWebhookRouteDependencies(
   repository: MintsoftWebhookEventRepository,
   logs: unknown[] = [],
+  maintenance: (() => NextResponse | null) | null = null,
 ): MintsoftBookedInWebhookRouteDependencies {
   return {
+    async getMaintenanceModeResponse() {
+      return maintenance ? maintenance() : null
+    },
     async getMintsoftApiConfiguration() {
       return {
         baseUrl: '',
@@ -586,4 +591,97 @@ test('isMintsoftWebhookTimestampFresh rejects stale signed timestamps', () => {
     isMintsoftWebhookTimestampFresh(new Date('2026-04-22T09:30:00.000Z'), now),
     false,
   )
+})
+
+
+// ---------------------------------------------------------------------------
+// o3d-hl8l: THE MAINTENANCE-MODE FENCE.
+//
+// The restore endpoint leaves maintenance mode ON when a restore backend cannot be confirmed dead,
+// and this route used to persist a receipt event straight through that window. It is now fenced —
+// as the FIRST statement, before the body is read and before the signature is verified, so nothing
+// on the persist path can run.
+// ---------------------------------------------------------------------------
+
+function maintenanceResponse(): NextResponse {
+  return NextResponse.json(
+    { skipped: true, reason: 'maintenance_mode', detail: 'Database restore in progress.' },
+    { status: 503 },
+  )
+}
+
+test('the booked-in webhook refuses with 503 maintenance_mode and persists NOTHING while maintenance mode is on', async () => {
+  const created: PersistMintsoftWebhookEventInput[] = []
+  const logs: unknown[] = []
+  const repository: MintsoftWebhookEventRepository = {
+    async findEvent() { return null },
+    async createEvent(input) {
+      created.push(input)
+      return { id: 'evt-row' }
+    },
+    async updatePendingEvent() { return true },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    buildSignedWebhookRequest({ eventId: 'evt-maint', asnId: 'asn-maint' }),
+    buildWebhookRouteDependencies(repository, logs, maintenanceResponse),
+  )
+
+  // The SPECIFIC refusal, not merely "not a 202": a 503 is the standard retry signal, and the
+  // reason names maintenance mode so an operator reading the sender's delivery log knows why.
+  assert.equal(response.status, 503)
+  assert.deepEqual(await response.json(), {
+    skipped: true,
+    reason: 'maintenance_mode',
+    detail: 'Database restore in progress.',
+  })
+
+  // The whole point: no row, and no activity row either. Both are writes into a database that may
+  // still be being replayed over.
+  assert.deepEqual(created, [], 'no receipt event may be persisted during maintenance mode')
+  assert.deepEqual(logs, [], 'and no activity row either')
+})
+
+test('the booked-in webhook fence runs BEFORE signature verification, so an unsigned delivery is refused as maintenance rather than unauthorized', async () => {
+  const repository: MintsoftWebhookEventRepository = {
+    async findEvent() { return null },
+    async createEvent() { return { id: 'x' } },
+    async updatePendingEvent() { return true },
+  }
+  const request = new Request('https://ims.example.com/api/webhooks/mintsoft/asn-booked-in', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ eventId: 'evt-unsigned' }),
+  })
+
+  const response = await handleMintsoftBookedInWebhook(
+    request,
+    buildWebhookRouteDependencies(repository, [], maintenanceResponse),
+  )
+
+  // 503 (fenced), NOT 401 (rejected signature) — the ordering is the assertion. If the fence moved
+  // below the signature check, this delivery would be a 401 and the fence would be reading the
+  // webhook secret out of the database mid-restore to decide it.
+  assert.equal(response.status, 503)
+  assert.equal((await response.json()).reason, 'maintenance_mode')
+})
+
+test('with maintenance mode OFF the booked-in webhook still persists and returns 202', async () => {
+  const created: PersistMintsoftWebhookEventInput[] = []
+  const repository: MintsoftWebhookEventRepository = {
+    async findEvent() { return null },
+    async createEvent(input) {
+      created.push(input)
+      return { id: 'evt-row' }
+    },
+    async updatePendingEvent() { return true },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    buildSignedWebhookRequest({ eventId: 'evt-open', asnId: 'asn-open' }),
+    buildWebhookRouteDependencies(repository, []),
+  )
+
+  assert.equal(response.status, 202)
+  assert.deepEqual(created.map((input) => input.externalEventId), ['evt-open'])
 })

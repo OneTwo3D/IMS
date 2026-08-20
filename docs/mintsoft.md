@@ -114,6 +114,14 @@ The signed payload is:
 ${timestamp}.${rawBody}
 ```
 
+### Maintenance-mode fence (o3d-hl8l)
+
+The booked-in webhook route consults maintenance mode as its **first** statement — before the body is read and before the signature is verified — and returns `503 {"skipped":true,"reason":"maintenance_mode"}` while the flag is on. Nothing is persisted and no activity row is written.
+
+The flag is set only by the database **restore** endpoint, and it stays on when a restore backend cannot be confirmed dead. A row written into that window is being replayed over, so persisting the event would return `202 accepted` for something the restore then destroys; a `503` promises nothing and is the standard retry signal.
+
+**If the sender does not retry, the booked-in trigger is dropped.** That is recoverable, because the webhook carries only an ASN id — the authoritative booked-in quantities are re-fetched from Mintsoft when the event is processed — and it is detected: the `wms-watchdog` cron alerts on an open ASN past its ETA with no booked-in callback, and the ASN dialog replays the callback for a named ASN. Recovery is operator-initiated, not automatic: nothing but this route creates a receipt-event row.
+
 The `timestamp` string must be the exact header value IMS uses for freshness validation. Prefer ISO-8601 timestamp strings. Numeric timestamp headers are accepted, but the signature prefix must match the exact header value; for example, `1776852000.0` and `1776852000` are different signature prefixes. Body-only signatures and payload-only timestamps are rejected.
 
 ### Migration Runbook
@@ -189,6 +197,24 @@ Beyond credentials, these connector settings drive dispatch and status. All are 
 | `mintsoft_courier_service_map` | JSON map of IMS shipping-service name → Mintsoft `CourierServiceId`, e.g. `{ "Royal Mail Tracked 24": 12 }` | _(blank)_ |
 
 The courier id map is strict: values must resolve to positive integers (numeric strings like `"12"` are accepted; decimals, negatives, and trailing junk are rejected).
+
+### Configuration-change audit (q66in.7.2)
+
+Connection, binding, courier-map and order-dispatch saves all write an activity entry carrying a **before/after diff**, not just the new values. Only fields that actually moved appear, so an unchanged save is silent.
+
+| Action | Entry |
+|---|---|
+| Connection save | `mintsoft_connection_updated` — base URL, label, lookup connector, active, auth mode, and **which secret slots were rotated**. Secret values never appear; presence is recorded as booleans and `scrubWmsMutationPayload` masks credential-shaped keys as defence in depth |
+| Binding save | `mintsoft_binding_updated` / `mintsoft_binding_created` — every operator-settable binding field, including the stock-sync mode, thresholds, recipients and align-down reason |
+| Courier map save | `mintsoft_courier_map_updated` — added / changed / **removed** service names, plus both maps. A removal is logged at `WARNING`: a dropped entry silently falls back to the default courier id |
+| Order dispatch save | `mintsoft_order_dispatch_settings_updated` — logged at `WARNING` when the ClientId/ChannelId/WarehouseId delta scope changes, because that also **discards the delta cursors** |
+
+### Retention (q66in.7.4)
+
+Two System Settings → Data Retention windows cover the WMS tables:
+
+- **WMS Inbound Events** (default 3 months) — **compacts** resolved (`PROCESSED`) rows in `wms_inbound_receipt_events` and `wms_webhook_events`: the `payload` (and the receipt table's `reviewDetails` dry-run image) is cleared, the row itself is kept because `(connector, externalEventId)` is the idempotency key that stops a redelivered callback booking stock twice. `DEAD`, `REQUIRES_REVIEW`, `PENDING`, `PENDING_RETRY` and `FAILED_RETRY` rows are **never** touched — a dead letter is replayable evidence, not an old row.
+- **WMS Sync Runs** (default 12 months) — deletes **finished** `wms_sync_jobs` rows, which cascades their per-SKU `wms_sync_logs` lines. Unfinished (`PENDING`/`RUNNING`) runs are kept, and so is every stock-sync run for a warehouse whose binding is in `ALIGN_TO_WMS` but not yet confirmed, because those runs are the unmet precondition of an outstanding operator confirmation. The 12-month default matches the 365-day mutation-audit window the runs are correlated with.
 
 ## Operational Notes
 

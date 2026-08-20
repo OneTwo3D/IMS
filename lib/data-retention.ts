@@ -1,3 +1,4 @@
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
@@ -7,6 +8,11 @@ import {
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
+import {
+  compactableInboundEventWhere,
+  inboundEventCompactionData,
+  receiptEventCompactionData,
+} from '@/lib/domain/wms/inbound-event-retention'
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -15,6 +21,8 @@ const RETENTION_KEYS = [
   'retention_stock_movements_months',
   'retention_sync_logs_months',
   'retention_webhook_events_months',
+  'retention_wms_events_months',
+  'retention_wms_sync_jobs_months',
 ] as const
 
 const DEFAULTS: Record<string, number> = {
@@ -29,6 +37,18 @@ const DEFAULTS: Record<string, number> = {
   // Only PROCESSED rows are compacted; DEAD_LETTER (failed, unresolved) and PENDING/FAILED (undelivered)
   // are left fully intact for investigation/replay.
   retention_webhook_events_months: 3,
+  // q66in.7.4: COMPACT resolved rows in the two inbound WMS event tables (wms_inbound_receipt_events,
+  // wms_webhook_events) after N months. Same 3-month default and the same compact-don't-delete rule
+  // as the shopping inbox above: the row is an idempotency tombstone, so only its payload expires,
+  // and only once the event has RESOLVED. See lib/domain/wms/inbound-event-retention.ts.
+  retention_wms_events_months: 3,
+  // q66in.7.4: DELETE finished WMS sync jobs after N months — which cascades their wms_sync_logs
+  // lines (the FK is ON DELETE CASCADE), the table the issue named as growing unbounded. Twelve
+  // months, deliberately: WmsMutationEvent — the audit-grade mutation timeline — keeps a full year
+  // and correlates to a run through its free-string `jobId`, so a shorter window here would leave
+  // the timeline pointing at runs that no longer exist. Tune this DOWN only together with
+  // WMS_MUTATION_EVENT_RETENTION_DAYS.
+  retention_wms_sync_jobs_months: 12,
 }
 
 async function getRetentionSettings(): Promise<Record<string, number>> {
@@ -58,6 +78,10 @@ function monthsAgo(months: number): Date {
  */
 export async function purgeExpiredData(): Promise<{
   syncLogsDeleted: number
+  /** Resolved inbound WMS event rows whose payload was cleared, keeping the idempotency tombstone (q66in.7.4). */
+  wmsInboundEventsCompacted: number
+  /** Finished WMS sync jobs deleted; their wms_sync_logs lines go with them by FK cascade (q66in.7.4). */
+  wmsSyncJobsDeleted: number
   /** Expired-but-unresolved accounting sync rows reduced to an attribution-only tombstone (o3d-9kek). */
   backReferenceEvidenceCompacted: number
   stockMovementsDeleted: number
@@ -68,6 +92,8 @@ export async function purgeExpiredData(): Promise<{
 }> {
   const settings = await getRetentionSettings()
   let syncLogsDeleted = 0
+  let wmsInboundEventsCompacted = 0
+  let wmsSyncJobsDeleted = 0
   let backReferenceEvidenceCompacted = 0
   let stockMovementsDeleted = 0
   let webhookEventsCompacted = 0
@@ -256,6 +282,63 @@ export async function purgeExpiredData(): Promise<{
     webhookEventsCompacted = count
   }
 
+  // Inbound WMS event tables — COMPACT resolved rows (q66in.7.4). Both tables were previously
+  // untouched by every retention pass, so a payload (delivery addresses, contact names, line detail)
+  // and a full dry-run review image lived forever. The predicate — resolved only, never a
+  // dead-letter or a review that is still waiting — lives in lib/domain/wms/inbound-event-retention.ts
+  // next to the reasoning for it.
+  const wmsEventMonths = settings.retention_wms_events_months
+  if (wmsEventMonths > 0) {
+    const cutoff = monthsAgo(wmsEventMonths)
+    const [receipts, webhooks] = await Promise.all([
+      db.wmsInboundReceiptEvent.updateMany({
+        where: compactableInboundEventWhere(cutoff),
+        data: receiptEventCompactionData(Prisma.JsonNull),
+      }),
+      db.wmsWebhookEvent.updateMany({
+        where: compactableInboundEventWhere(cutoff),
+        data: inboundEventCompactionData(),
+      }),
+    ])
+    wmsInboundEventsCompacted = receipts.count + webhooks.count
+  }
+
+  // WMS sync jobs — hard delete FINISHED runs, which cascades their per-SKU wms_sync_logs lines
+  // (q66in.7.4). Deleting the parent is what bounds the child: a stock sync writes one log line per
+  // checked SKU per run, so the lines are the volume and the job is the only handle on them.
+  //
+  // WHAT THIS REFUSES TO DELETE, and why age alone is not a licence:
+  //   • A job that has not FINISHED (PENDING/RUNNING, or any row with a null finishedAt). An
+  //     unfinished run is either in flight or stuck; either way its lines are live state, and an old
+  //     timestamp on a stuck job is a REASON to keep it, not to remove it.
+  //   • Every STOCK_SYNC job for a warehouse whose binding is in ALIGN_TO_WMS but has never been
+  //     confirmed. The confirm-alignment action refuses to arm live downward corrections unless a
+  //     completed dry run exists for that warehouse, so those jobs ARE the unmet precondition of an
+  //     outstanding operator decision. Deleting them silently revokes a confirmation the operator
+  //     was one click away from making. The exclusion is by warehouse rather than by
+  //     `summary.dryRun`, which over-retains a little and needs no JSON-path predicate inside a NOT.
+  const wmsJobMonths = settings.retention_wms_sync_jobs_months
+  if (wmsJobMonths > 0) {
+    const cutoff = monthsAgo(wmsJobMonths)
+    const pendingAlignmentBindings = await db.externalWmsBinding.findMany({
+      where: { stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmedAt: null },
+      select: { warehouseId: true },
+    })
+    const protectedWarehouseIds = [...new Set(pendingAlignmentBindings.map((row) => row.warehouseId))]
+
+    const { count } = await db.wmsSyncJob.deleteMany({
+      where: {
+        startedAt: { lt: cutoff },
+        finishedAt: { not: null },
+        status: { in: ['SUCCEEDED', 'FAILED', 'PARTIAL'] },
+        ...(protectedWarehouseIds.length > 0
+          ? { NOT: { AND: [{ type: 'STOCK_SYNC' as const }, { warehouseId: { in: protectedWarehouseIds } }] } }
+          : {}),
+      },
+    })
+    wmsSyncJobsDeleted = count
+  }
+
   // Stock movements — hard delete (exclude historical import types)
   const movementMonths = settings.retention_stock_movements_months
   if (movementMonths > 0) {
@@ -338,6 +421,8 @@ export async function purgeExpiredData(): Promise<{
   if (backReferenceEvidenceCompacted > 0) parts.push(`${backReferenceEvidenceCompacted} unresolved back-reference sync logs compacted`)
   if (stockMovementsDeleted > 0) parts.push(`${stockMovementsDeleted} stock movements deleted`)
   if (webhookEventsCompacted > 0) parts.push(`${webhookEventsCompacted} webhook events compacted`)
+  if (wmsInboundEventsCompacted > 0) parts.push(`${wmsInboundEventsCompacted} WMS inbound events compacted`)
+  if (wmsSyncJobsDeleted > 0) parts.push(`${wmsSyncJobsDeleted} WMS sync jobs deleted (with their log lines)`)
   if (salesOrdersArchived > 0) parts.push(`${salesOrdersArchived} sales orders archived`)
   if (purchaseOrdersArchived > 0) parts.push(`${purchaseOrdersArchived} purchase orders archived`)
   if (customersArchived > 0) parts.push(`${customersArchived} customers archived`)
@@ -348,10 +433,10 @@ export async function purgeExpiredData(): Promise<{
       action: 'cleanup',
       tag: 'system',
       description: `Data retention cleanup: ${parts.join(', ')}`,
-      metadata: { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
+      metadata: { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, wmsInboundEventsCompacted, wmsSyncJobsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
       resolveUser: false,
     })
   }
 
-  return { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
+  return { syncLogsDeleted, backReferenceEvidenceCompacted, stockMovementsDeleted, webhookEventsCompacted, wmsInboundEventsCompacted, wmsSyncJobsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived }
 }
