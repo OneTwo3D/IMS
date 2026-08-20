@@ -23,6 +23,14 @@ export const DB_POOL_MAX = 20
  * own bound still fires first on the paths that have one, so their behaviour and error text are
  * unchanged. It is the paths with NO bound of their own — the batch `$transaction([...])` form among
  * them, which takes no `maxWait` — that this is here for.
+ *
+ * IT IS A BOUND ON A *PRE-FLIGHT* WAIT, and that is the whole of its scope. A pool is one queue, so
+ * this single option also covers the acquisition a connector worker makes AFTER a remote system has
+ * accepted a write, purely to record what it did — where failing fast destroys the only local
+ * evidence that the write happened and invites a duplicate on the next attempt (o3d-xl63 r2 #2).
+ * Those callers do NOT get a second pool or a second bound; they wrap their persist in
+ * `persistAfterRemoteWrite` (lib/db/post-remote-persist.ts), which re-drives across this timeout
+ * because a caller that never got a connection provably ran nothing.
  */
 export const DB_POOL_ACQUISITION_TIMEOUT_MS = 10_000
 

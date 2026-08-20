@@ -20,7 +20,12 @@ const XERO_CONNECTOR = 'xero'
  * reason, so "0 means nothing left this process" is one rule across the module rather than two.
  */
 const XERO_NOT_SENT_STATUS = 0
-const XERO_MAX_RETRIES = 3
+
+/**
+ * In-request 429 retries. Exported because it is half of the only retry Xero's six-minute
+ * Idempotency-Key window actually covers — see lib/domain/accounting/idempotency-retention.ts.
+ */
+export const XERO_MAX_RETRIES = 3
 const XERO_MINUTE_LIMIT = 55 // Xero's is 60/min, rolling
 
 /**
@@ -46,7 +51,7 @@ const XERO_DAY_LIMIT = 950
  * the caller defer the work (the outbox already re-queues with backoff), because a job that
  * returns is one an operator can see (o3d-2it).
  */
-const XERO_MAX_RETRY_AFTER_MS = 90_000
+export const XERO_MAX_RETRY_AFTER_MS = 90_000
 
 const minuteBuckets = new Map<string, number[]>()
 const dayBuckets = new Map<string, number[]>()

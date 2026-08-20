@@ -7,6 +7,7 @@ import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { persistAfterRemoteWrite } from '@/lib/db/post-remote-persist'
 import { logActivity, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
@@ -924,6 +925,13 @@ async function enqueueFollowUpSyncLog(
   // derived from the entry id, so creating a replacement row would post the retry under a
   // key Xero has never seen — and if the failed attempt had actually committed, a SECOND
   // payment lands on the invoice.
+  //
+  // KEEPING THE KEY IS NECESSARY, NOT SUFFICIENT (o3d-wahn r2 #1). Xero forgets an
+  // Idempotency-Key after SIX MINUTES, and a follow-up is re-enqueued long after that, so a
+  // pinned token is by then a string Xero no longer recognises either. What actually stops
+  // the second payment is the plan's REFUSAL on an ambiguous token history below, plus the
+  // pinned request body — see lib/domain/accounting/idempotency-retention.ts for what is and
+  // is not protected once the window has closed.
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
@@ -1449,7 +1457,20 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         // document rather than refusing when a newer claim owns the row.
         // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it made
         // is recorded and orders the document against other writers.
-        const record = await recordPostedDocumentDurably(entry, syncResult.externalId ?? null, payload, syncResult.externalRevisionAt ?? null)
+        //
+        // POST-REMOTE PERSIST, NOT A PRE-FLIGHT ONE (o3d-xl63 r2 #2), and the two fit together rather
+        // than competing. o3d-550x owns WHAT is written and on what precondition — the evidence write
+        // is not fenced on the claim, and it refuses to overwrite a DIFFERENT document. This wrapper
+        // owns whether the attempt gets a connection at all: the pool's 10s acquisition bound is
+        // right for work that has not started and wrong for the record of a document Xero already
+        // holds, so the whole persist is RE-DRIVEN across an exhausted pool instead of being denied
+        // by it. Only a connection-acquisition timeout is re-driven; every other error — including
+        // the unwritten-evidence throw o3d-550x raises when it cannot file the conflict — is
+        // rethrown untouched, so the escalation path above it is unchanged.
+        const record = await persistAfterRemoteWrite(
+          `xero sync log ${entry.id} (${entry.type})`,
+          () => recordPostedDocumentDurably(entry, syncResult.externalId ?? null, payload, syncResult.externalRevisionAt ?? null),
+        )
         if (!record.recorded) {
           // See above: the evidence is already durable, or this line was never reached.
           result.failed++
@@ -1869,7 +1890,13 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         // rather than refusing when a newer claim owns the row.
         // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it made
         // is recorded and orders the document against other writers.
-        const record = await recordPostedDocumentDurably(entry, syncResult.externalId ?? null, payload, syncResult.externalRevisionAt ?? null)
+        //
+        // Same post-remote persist as the direct path (o3d-xl63 r2 #2), and this is the one MOST rows
+        // take: denying it a connection loses the external id of a document Xero already holds.
+        const record = await persistAfterRemoteWrite(
+          `xero sync log ${entry.id} (${entry.type})`,
+          () => recordPostedDocumentDurably(entry, syncResult.externalId ?? null, payload, syncResult.externalRevisionAt ?? null),
+        )
         if (!record.recorded) {
           // See above: permanent only because the evidence is already durable, and see above for why
           // no batch answer is kept for it.

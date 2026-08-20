@@ -1082,6 +1082,35 @@ refusing everything older than six minutes would refuse every retry there is.
 QuickBooks' `RequestId` dedupe window has not been established, so no equivalent claim is made for
 that connector and no caution is shown at its retry controls.
 
+#### The same is true of the AUTOMATIC retries
+
+The six minutes are not a fact about operators, and the automatic retry path does not clear them
+either:
+
+| Retry | When it happens | Inside the 6-minute window? |
+| --- | --- | --- |
+| In-request `429` retry (inside one API call) | up to 3 waits of at most 90s | **Yes** — but a `429` was refused before Xero processed it, so there is nothing to deduplicate |
+| First queued retry of a failed row | 5-minute backoff floor, then the next 5-minute `accounting-sync` tick | At or past the line |
+| Second and later retries | 10, 20, 40 minutes (capped at 60) | **No** |
+
+So an automatic retry gets no more duplicate protection from the key than a manual one, and the
+cases where it matters most — a request that reached Xero but whose response was lost — are never
+retried inside the window at all. **Nothing about "the key is deterministic" makes a queued retry
+safe.** What does the work instead:
+
+- **Sales invoices** are safe by Xero's own semantics, not by the key: `POST /Invoices` is
+  update-or-create on `InvoiceNumber`, and IMS sends the order number, so a re-post replaces the
+  invoice it already created rather than adding a second one.
+- **Everything else** — purchase bills, payments, credit-note allocations, manual journals — relies
+  on the **local record**: once the external id is written on the sync log, the next attempt
+  short-circuits and posts nothing. That write is treated as unlosable (it is retried across
+  database connection-pool exhaustion rather than abandoned) precisely because it is the protection.
+- **If that record is lost anyway** (the post landed, the process died before recording it), nothing
+  prevents a duplicate — IMS does not query Xero before re-posting a payment. It is then *detected*,
+  not prevented, by the settlement status on the order/PO (`over-settled`, `awaiting ledger`), the
+  payment poll and the daily payment reconcile sweep, and the accounting reconciliation report's
+  `duplicate_external_reference` finding. All of those need a person to unwind the duplicate in Xero.
+
 ### Tax Rate Sync (Multi-Component Profiles)
 
 When an IMS VAT rate has one or more active components (e.g. Canada `GST 5% + PST 7%`), saving the

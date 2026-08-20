@@ -4,6 +4,8 @@
 
 Replays always re-attempt the **original** work: payloads and idempotency keys are preserved, and every transition is a compare-and-set (a concurrent sweep or second click matches zero rows instead of double-applying). All replay actions require the `sync` permission; the high-risk ones (outbox, receipt events, refunds) additionally require fresh (step-up) authentication.
 
+**Preserving the key is not the same as being protected by it.** The compare-and-set stops *IMS* double-applying; whether the *remote system* deduplicates the re-post is the remote system's rule, and for Xero the key survives only 6 minutes — far less than any row spends in this inbox. Before replaying an accounting outbox row, check the ledger for the document: see [Retrying is not protected by idempotency](xero-sync.md#retrying-is-not-protected-by-idempotency--check-xero-first).
+
 ## Sections
 
 | Section | Source of truth | What it means | Replay |

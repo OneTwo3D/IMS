@@ -334,7 +334,50 @@ function orderLabel(order: SourceOrderRow): string {
   return order.orderNumber ?? order.externalOrderNumber ?? order.id
 }
 
-function hasAccountingEvent(
+/**
+ * The DISTINCT daily-batch journals a bare `<group>-<date>` key would match once the digest is
+ * stripped off the events (o3d-ecow round 2, finding 3).
+ *
+ * The bridge takes the DIGEST off, and the digest is the only thing that tells two journals of the
+ * same group and date apart. So on a day that was SPLIT — `A1-D-aaaa` and `A1-D-bbbb` — the bare key
+ * matches both, and one of them satisfies the existence check the other should have failed:
+ *
+ *   forward  a legacy row whose journal (bbbb) was never mirrored is vouched for by aaaa's event, so
+ *            a missing journal is not reported;
+ *   reverse  a duplicate or orphaned event (bbbb) is vouched for by the source rows of aaaa, so the
+ *            extra journal is not reported either.
+ *
+ * That is the same trap `dailyBatchLiveRefs` (daily-batch-reference.ts) refuses for the recreate
+ * sweep, arriving here through the other door. It cannot be fixed by matching harder: a legacy row
+ * carries no reference at all, so nothing in it can pick between the candidates. What it CAN do is
+ * stop claiming to have decided — callers turn an ambiguous bridge into an explicit finding naming
+ * every candidate, instead of a silent pass.
+ */
+function bridgedDailyBatchCandidates(
+  accountingEvents: AccountingEventRow[],
+  params: { type: string; sourceEntityType: string; sourceEntityId: string },
+): string[] {
+  const bareKey = sourceKey(params.type, params.sourceEntityType, params.sourceEntityId)
+  const candidates = new Set<string>()
+  for (const event of accountingEvents) {
+    const stripped = stripDailyBatchDigest(event.sourceEntityId)
+    if (sourceKey(event.type, event.sourceEntityType, stripped) === bareKey) candidates.add(event.sourceEntityId)
+  }
+  return [...candidates]
+}
+
+/** True when a bare key names more than one journal, so it can prove nothing about any of them. */
+function bridgeIsAmbiguous(
+  accountingEvents: AccountingEventRow[],
+  params: { type: string; sourceEntityType: string; sourceEntityId: string },
+): boolean {
+  return bridgedDailyBatchCandidates(accountingEvents, params).length > 1
+}
+
+/** 'ambiguous' = a same-day split means the bridged match names several journals — see above. */
+type EventExistence = 'found' | 'missing' | 'ambiguous'
+
+function accountingEventExistence(
   accountingEvents: AccountingEventRow[],
   params: {
     type: string
@@ -344,17 +387,36 @@ function hasAccountingEvent(
     /** o3d-ecow: match a digest-suffixed event id against this bare key. Legacy derived keys only. */
     digestBridged?: boolean
   },
-): boolean {
+): EventExistence {
   const bridge = Boolean(params.digestBridged) && DAILY_BATCH_EVENT_TYPES.has(params.type)
   const idOf = (event: AccountingEventRow): string => (
     bridge ? stripDailyBatchDigest(event.sourceEntityId) : event.sourceEntityId
   )
   const exactKey = eventKey(params)
-  if (params.externalSystem) {
-    return accountingEvents.some((event) => eventKey({ ...event, sourceEntityId: idOf(event) }) === exactKey)
-  }
-  const anyConnectorKey = sourceKey(params.type, params.sourceEntityType, params.sourceEntityId)
-  return accountingEvents.some((event) => sourceKey(event.type, event.sourceEntityType, idOf(event)) === anyConnectorKey)
+  const found = params.externalSystem
+    ? accountingEvents.some((event) => eventKey({ ...event, sourceEntityId: idOf(event) }) === exactKey)
+    : accountingEvents.some((event) => (
+      sourceKey(event.type, event.sourceEntityType, idOf(event))
+        === sourceKey(params.type, params.sourceEntityType, params.sourceEntityId)
+    ))
+  if (!found) return 'missing'
+  // Only a BRIDGED match can be ambiguous: an exact key is the literal id its journal was created
+  // under, so it names one journal by construction.
+  if (bridge && bridgeIsAmbiguous(accountingEvents, params)) return 'ambiguous'
+  return 'found'
+}
+
+function hasAccountingEvent(
+  accountingEvents: AccountingEventRow[],
+  params: {
+    type: string
+    sourceEntityType: string
+    sourceEntityId: string
+    externalSystem?: string | null
+    digestBridged?: boolean
+  },
+): boolean {
+  return accountingEventExistence(accountingEvents, params) !== 'missing'
 }
 
 function hasRefundCreditNoteEvidence(rows: AccountingReconciliationRows, refund: SourceRefundRow): boolean {
@@ -426,9 +488,47 @@ function normalizeFindingStatus(value: unknown): AccountingReconciliationFinding
     : null
 }
 
+/** The code an ambiguous same-day split bridge reports under, in both directions. */
+export const DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS = 'daily_batch_split_bridge_ambiguous'
+
+/**
+ * Report — ONCE per bare key — that a legacy digest bridge could not decide anything, because the
+ * `<group>-<date>` it is reduced to names several journals.
+ *
+ * Deduped rather than emitted per row: a split day can carry thousands of staged orders, and a
+ * finding per order would say the same unresolvable thing thousands of times and crowd out the rest
+ * of the report (findings are capped per run). One finding naming every candidate journal is the
+ * whole content.
+ */
+function addSplitBridgeAmbiguityFinding(
+  findings: AccountingReconciliationFinding[],
+  reported: Set<string>,
+  accountingEvents: AccountingEventRow[],
+  params: { type: string; sourceEntityType: string; sourceEntityId: string },
+): void {
+  const key = sourceKey(params.type, params.sourceEntityType, params.sourceEntityId)
+  if (reported.has(key)) return
+  reported.add(key)
+  const candidates = bridgedDailyBatchCandidates(accountingEvents, params)
+  findings.push({
+    severity: 'warning',
+    code: DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS,
+    message:
+      `${candidates.length} daily batch journals share the legacy key ${params.sourceEntityId}, so whether `
+      + 'each one was posted and mirrored cannot be established from rows that carry no batch reference',
+    details: {
+      type: params.type,
+      sourceEntityType: params.sourceEntityType,
+      sourceEntityId: params.sourceEntityId,
+      candidateSourceEntityIds: candidates,
+    },
+  })
+}
+
 function addExpectedSourceEventFinding(
   findings: AccountingReconciliationFinding[],
   rows: AccountingReconciliationRows,
+  reportedAmbiguousBridges: Set<string>,
   params: {
     code: string
     type: string
@@ -442,7 +542,15 @@ function addExpectedSourceEventFinding(
     details: Record<string, unknown>
   },
 ): void {
-  if (hasAccountingEvent(rows.accountingEvents, params)) return
+  const existence = accountingEventExistence(rows.accountingEvents, params)
+  if (existence === 'found') return
+  if (existence === 'ambiguous') {
+    // A journal DOES exist for this group and date — but the bare key matches several, so this row's
+    // own journal may be any of them, including one that is missing. Neither "no event" nor "event
+    // found" is true, and the round-1 bridge asserted the second (Codex r2 #3).
+    addSplitBridgeAmbiguityFinding(findings, reportedAmbiguousBridges, rows.accountingEvents, params)
+    return
+  }
   findings.push({
     severity: 'warning',
     code: params.code,
@@ -499,6 +607,8 @@ export function evaluateAccountingReconciliationRows(
   // `sourceKeys` because only the derived keys may be matched that loosely — a persisted ref is
   // exact, and stripping a digest off an event to satisfy one would vouch for a different journal.
   const digestBridgedSourceKeys = new Set<string>()
+  // Bare keys already reported as an unresolvable same-day split, so the report says it once.
+  const reportedAmbiguousBridges = new Set<string>()
   const refundIds = new Set(rows.refunds.map((refund) => refund.id))
   const refundsByOrderId = new Map<string, SourceRefundRow[]>()
   for (const refund of rows.refunds) {
@@ -520,7 +630,7 @@ export function evaluateAccountingReconciliationRows(
       const key = sourceKey('DAILY_BATCH_REVENUE_DEFERRAL', 'DailyBatch', sourceEntityId)
       sourceKeys.add(key)
       if (digestBridged) digestBridgedSourceKeys.add(key)
-      addExpectedSourceEventFinding(findings, rows, {
+      addExpectedSourceEventFinding(findings, rows, reportedAmbiguousBridges, {
         code: 'source_order_revenue_deferral_without_event',
         type: 'DAILY_BATCH_REVENUE_DEFERRAL',
         sourceEntityType: 'DailyBatch',
@@ -538,7 +648,7 @@ export function evaluateAccountingReconciliationRows(
       const key = sourceKey('DAILY_BATCH_INVENTORY_ALLOC', 'DailyBatch', sourceEntityId)
       sourceKeys.add(key)
       if (digestBridged) digestBridgedSourceKeys.add(key)
-      addExpectedSourceEventFinding(findings, rows, {
+      addExpectedSourceEventFinding(findings, rows, reportedAmbiguousBridges, {
         code: 'source_order_inventory_allocation_without_event',
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
         sourceEntityType: 'DailyBatch',
@@ -624,7 +734,7 @@ export function evaluateAccountingReconciliationRows(
     const key = sourceKey('DAILY_BATCH_GROUP_B', 'DailyBatch', sourceEntityId)
     sourceKeys.add(key)
     if (digestBridged) digestBridgedSourceKeys.add(key)
-    addExpectedSourceEventFinding(findings, rows, {
+    addExpectedSourceEventFinding(findings, rows, reportedAmbiguousBridges, {
       code: 'source_shipment_without_event',
       type: 'DAILY_BATCH_GROUP_B',
       sourceEntityType: 'DailyBatch',
@@ -647,7 +757,7 @@ export function evaluateAccountingReconciliationRows(
 
     for (const type of expectedRefundTypes) {
       sourceKeys.add(sourceKey(type, 'SalesOrderRefund', refund.id))
-      addExpectedSourceEventFinding(findings, rows, {
+      addExpectedSourceEventFinding(findings, rows, reportedAmbiguousBridges, {
         code: 'source_refund_without_event',
         type,
         sourceEntityType: 'SalesOrderRefund',
@@ -710,7 +820,22 @@ export function evaluateAccountingReconciliationRows(
       ? sourceKey(event.type, event.sourceEntityType, stripDailyBatchDigest(event.sourceEntityId))
       : null
     const isKnownRefund = event.sourceEntityType === 'SalesOrderRefund' && refundIds.has(event.sourceEntityId)
-    if (!sourceKeys.has(key) && !(bridgedKey !== null && digestBridgedSourceKeys.has(bridgedKey)) && !isKnownRefund) {
+    // ...but a bare key that names SEVERAL journals vouches for none of them (r2 #3). Rescuing this
+    // event on it would let a surviving split's source rows account for a duplicate or orphaned one,
+    // so an ambiguous bridge reports what it cannot decide instead of quietly deciding it.
+    const bareParams = {
+      type: event.type,
+      sourceEntityType: event.sourceEntityType,
+      sourceEntityId: stripDailyBatchDigest(event.sourceEntityId),
+    }
+    const bridgeOffered = bridgedKey !== null && digestBridgedSourceKeys.has(bridgedKey)
+    const bridgeAmbiguous = bridgeOffered && bridgeIsAmbiguous(rows.accountingEvents, bareParams)
+    const bridgeRescues = bridgeOffered && !bridgeAmbiguous
+    if (bridgeAmbiguous && !sourceKeys.has(key)) {
+      addSplitBridgeAmbiguityFinding(findings, reportedAmbiguousBridges, rows.accountingEvents, bareParams)
+      continue
+    }
+    if (!sourceKeys.has(key) && !bridgeRescues && !isKnownRefund) {
       findings.push({
         severity: 'warning',
         code: 'event_without_source',

@@ -18,6 +18,14 @@
  * SECOND payment lands against the same invoice. Per-entry idempotency is real; it just
  * does not survive regenerating the entry.
  *
+ * HOW LONG "REAL" LASTS (o3d-wahn r2 #1). Xero stores an Idempotency-Key for SIX MINUTES from
+ * the first call; a re-enqueue happens minutes-to-days later, so by the time the pinned token
+ * goes out the remote system has forgotten it and treats it as a new request. Pinning is still
+ * the right thing — it costs nothing, it is correct inside the window, and rotating a token is
+ * strictly worse — but it is NOT what makes a re-post safe. That is the `refuse` branch below:
+ * where several tokens could each have committed, this module stops and asks for a human. Read
+ * lib/domain/accounting/idempotency-retention.ts before adding any claim of remote dedupe here.
+ *
  * THE FIX. Stop deriving the token from anything that can change, and WRITE IT DOWN.
  *
  *  1. A new follow-up is stamped with a `_followUpIdempotencyKey` derived from its LOGICAL
