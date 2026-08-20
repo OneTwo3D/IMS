@@ -1110,6 +1110,36 @@ function invoicePaymentReferenceKey(entry: Pick<InvoicePaymentOrderingEntry, 're
   return `${entry.referenceType}\u0000${entry.referenceId}`
 }
 
+/**
+ * A TOTAL order over the live INVOICE_PAYMENT rows of one reference (Codex round 3 #2).
+ *
+ * `createdAt` ALONE IS NOT AN ORDER. `default(now())` is transaction-clock, so two rows inserted in
+ * the same transaction — or in two transactions that committed inside the same clock tick — carry the
+ * IDENTICAL timestamp. Under a strict `<` comparison neither of them is "after" the other, so NEITHER
+ * is deferred, and both run.
+ *
+ * That is not a cosmetic tie. The whole reason the post-time capacity guard may treat PENDING and
+ * PROCESSING siblings as consuming no capacity is that this function lets exactly ONE live entry per
+ * order be undeferred at a time — the later ones re-run the arithmetic against the earlier one's
+ * SYNCED row when their turn comes. Two same-timestamp receipts defeat that serialisation, both read
+ * a table in which neither has posted yet, and both post: the order is settled twice.
+ *
+ * So the order is made total by falling back to the row id, which is unique by construction. The
+ * TIE-BREAK VALUE DOES NOT MATTER — only that every runner computing this set independently picks the
+ * SAME winner. `id` is stable and identical in every process, where `createdAt` is not discriminating.
+ * (`[{ createdAt: 'asc' }, { id: 'asc' }]` is the same tie-break the tree already uses for stable
+ * pagination, e.g. pending-shipment-reconciliation.ts and outbox-admin.ts.)
+ */
+export function invoicePaymentLogPrecedes(
+  a: { id: string; createdAt: Date },
+  b: { id: string; createdAt: Date },
+): boolean {
+  const at = a.createdAt.getTime()
+  const bt = b.createdAt.getTime()
+  if (at !== bt) return at < bt
+  return a.id < b.id
+}
+
 export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
   client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
   entries: InvoicePaymentOrderingEntry[],
@@ -1131,13 +1161,18 @@ export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
       OR: referenceFilters,
     },
     select: { id: true, referenceType: true, referenceId: true, createdAt: true },
-    orderBy: { createdAt: 'asc' },
+    // Tie-broken by id so the database's own ordering agrees with invoicePaymentLogPrecedes below.
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   })
 
+  // The minimum is taken with the SAME comparator the blocking test uses rather than trusting the
+  // query's order: two functions that disagree about which row is earliest would elect a winner that
+  // then does not block anybody, which is the tie bug again in a different place.
   const earliestLiveByReference = new Map<string, { id: string; createdAt: Date }>()
   for (const log of liveLogs) {
     const key = invoicePaymentReferenceKey(log)
-    if (!earliestLiveByReference.has(key)) {
+    const incumbent = earliestLiveByReference.get(key)
+    if (!incumbent || invoicePaymentLogPrecedes(log, incumbent)) {
       earliestLiveByReference.set(key, log)
     }
   }
@@ -1145,7 +1180,9 @@ export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
   const blocked = new Set<string>()
   for (const entry of paymentEntries) {
     const earliest = earliestLiveByReference.get(invoicePaymentReferenceKey(entry))
-    if (earliest && earliest.id !== entry.id && earliest.createdAt < entry.createdAt) {
+    // Under a TOTAL order `precedes` is already false for the winner itself; the explicit id check
+    // stays so the intent survives a future change to the comparator.
+    if (earliest && earliest.id !== entry.id && invoicePaymentLogPrecedes(earliest, entry)) {
       blocked.add(entry.id)
     }
   }
@@ -3665,7 +3702,12 @@ async function processClaimedEntry(
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: referenceId,
-          action: 'invoice_payment_refused_over_settlement',
+          // The two refusals need an operator to do DIFFERENT things — reconcile an over-settlement,
+          // versus find out whether a failed attempt actually posted — so they are not filed under one
+          // action name that would make the second read as the first.
+          action: capacity.refusal === 'AMBIGUOUS_FAILED_REGISTRATION'
+            ? 'invoice_payment_refused_unknown_ledger_state'
+            : 'invoice_payment_refused_over_settlement',
           tag: 'accounting',
           level: 'ERROR',
           description: capacity.message,
@@ -3676,6 +3718,7 @@ async function processClaimedEntry(
             refusal: capacity.refusal,
             alreadyPosted: capacity.alreadyPosted,
             ledgerTotal: capacity.ledgerTotal,
+            ambiguousSyncLogIds: capacity.ambiguousIds,
             retired,
           },
         }).catch(() => { /* logging must never turn a safe refusal into a failure */ })

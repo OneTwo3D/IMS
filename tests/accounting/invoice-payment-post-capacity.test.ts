@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import {
   decideInvoicePaymentPost,
   guardInvoicePaymentCapacity,
+  type PostedInvoicePaymentRegistration,
   retireOverSettlingInvoicePayment,
 } from '@/lib/domain/accounting/invoice-payment-capacity'
 
@@ -26,6 +27,18 @@ import {
 
 const ENTRY = 'entry-under-test'
 
+/**
+ * `bodyCouldHavePosted: true` is the DEFAULT on purpose. It is what a row whose stored body is
+ * complete — or unreadable — reports, i.e. the ordinary case, and the only case that is safe to
+ * assume when nothing is known. A test that wants the provably-never-sent row has to say so.
+ */
+function reg(
+  row: Omit<PostedInvoicePaymentRegistration, 'bodyCouldHavePosted'>
+    & Partial<Pick<PostedInvoicePaymentRegistration, 'bodyCouldHavePosted'>>,
+): PostedInvoicePaymentRegistration {
+  return { bodyCouldHavePosted: true, ...row }
+}
+
 function decide(overrides: Partial<Parameters<typeof decideInvoicePaymentPost>[0]> = {}) {
   return decideInvoicePaymentPost({
     entryId: ENTRY,
@@ -39,7 +52,7 @@ function decide(overrides: Partial<Parameters<typeof decideInvoicePaymentPost>[0
 
 test('a payment that would take the invoice past its total is refused with WOULD_OVERPAY', () => {
   const verdict = decide({
-    registrations: [{ id: 'other', status: 'SYNCED', amount: 60, accountingInvoiceId: 'INV-1' }],
+    registrations: [reg({ id: 'other', status: 'SYNCED', amount: 60, accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(verdict.post, false)
   assert.equal(verdict.post === false && verdict.refusal, 'WOULD_OVERPAY')
@@ -51,7 +64,7 @@ test('a payment that exactly settles what is left still posts', () => {
   // The guard must not become a one-payment-per-invoice rule: a deposit and a balance are two payments.
   const verdict = decide({
     amount: 40,
-    registrations: [{ id: 'other', status: 'SYNCED', amount: 60, accountingInvoiceId: 'INV-1' }],
+    registrations: [reg({ id: 'other', status: 'SYNCED', amount: 60, accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(verdict.post, true)
 })
@@ -60,7 +73,7 @@ test('the entry s OWN row never counts against it', () => {
   // The row being posted is itself PROCESSING/SYNCED in the table it reads; counting it would make
   // every payment refuse itself, and a retry of a SYNCED-but-unfinished entry refuse its own success.
   const verdict = decide({
-    registrations: [{ id: ENTRY, status: 'SYNCED', amount: 100, accountingInvoiceId: 'INV-1' }],
+    registrations: [reg({ id: ENTRY, status: 'SYNCED', amount: 100, accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(verdict.post, true)
 })
@@ -72,17 +85,91 @@ test('a PENDING sibling does not consume capacity', () => {
   const verdict = decide({
     amount: 60,
     registrations: [
-      { id: 'sibling', status: 'PENDING', amount: 40, accountingInvoiceId: 'INV-1' },
-      { id: 'claimed', status: 'PROCESSING', amount: 40, accountingInvoiceId: 'INV-1' },
+      reg({ id: 'sibling', status: 'PENDING', amount: 40, accountingInvoiceId: 'INV-1' }),
+      reg({ id: 'claimed', status: 'PROCESSING', amount: 40, accountingInvoiceId: 'INV-1' }),
     ],
   })
   assert.equal(verdict.post, true)
 })
 
-test('a FAILED registration frees the capacity rather than stranding every later receipt', () => {
+// ---------------------------------------------------------------------------
+// ROUND 3 #3: A FAILED MONEY ROW IS NOT PROOF THAT NOTHING POSTED.
+//
+// Round 2 filed FAILED alongside CANCELLED as "did not post", so its capacity was free. That is a
+// GUESS about remote state, and it is the guess this session established is wrong: the processor
+// posts before it persists the result, so a lost response, a timeout or a crash after Xero created
+// the Payment all land FAILED, and errorMessage carries no provenance to tell them apart.
+//
+// The pinned idempotency token does not cover this. It re-drives the SAME follow-up onto the same
+// remote request; a receipt recorded again after a failure is a DIFFERENT row for a DIFFERENT local
+// Payment, so nothing dedupes it and this sum is the only thing between it and a second payment.
+// ---------------------------------------------------------------------------
+
+test('a FAILED registration whose body could have been sent refuses with AMBIGUOUS_FAILED_REGISTRATION', () => {
   const verdict = decide({
     amount: 100,
-    registrations: [{ id: 'other', status: 'FAILED', amount: 100, accountingInvoiceId: 'INV-1' }],
+    registrations: [reg({ id: 'other', status: 'FAILED', amount: 100, accountingInvoiceId: 'INV-1' })],
+  })
+  assert.equal(verdict.post, false)
+  assert.equal(verdict.post === false && verdict.refusal, 'AMBIGUOUS_FAILED_REGISTRATION')
+  // NOT a number: there is no "already posted" figure, because whether it posted is the unknown.
+  assert.equal(verdict.post === false && verdict.alreadyPosted, null)
+  assert.deepEqual(verdict.post === false && verdict.ambiguousIds, ['other'])
+})
+
+test('the ambiguous refusal fires even when the arithmetic would have fitted comfortably', () => {
+  // The point is not that the money does not fit. It is that IMS does not know how much of the
+  // invoice the ledger holds, so there is no sum to do — a refusal that only fired on a tight
+  // invoice would be an over-settlement check wearing a different name.
+  const verdict = decide({
+    amount: 1,
+    ledgerTotal: 1000,
+    registrations: [reg({ id: 'other', status: 'FAILED', amount: 1, accountingInvoiceId: 'INV-1' })],
+  })
+  assert.equal(verdict.post, false)
+  assert.equal(verdict.post === false && verdict.refusal, 'AMBIGUOUS_FAILED_REGISTRATION')
+})
+
+test('a FAILED registration whose stored body was INCOMPLETE frees the capacity — that one is proof', () => {
+  // The single sound "nothing was sent" signal: both connectors reject a body missing a required
+  // field before they build a request, so such an attempt provably never reached the ledger. Without
+  // this exception the refusal would be unconditional and every later receipt on the invoice would
+  // be stranded behind a request that could never have succeeded.
+  const verdict = decide({
+    amount: 100,
+    registrations: [
+      reg({ id: 'other', status: 'FAILED', amount: 100, accountingInvoiceId: 'INV-1', bodyCouldHavePosted: false }),
+    ],
+  })
+  assert.equal(verdict.post, true)
+})
+
+test('a FAILED registration against a DIFFERENT document does not make this invoice ambiguous', () => {
+  // o3d-hbgo, applied to the ambiguity: an attempt on the invoice this order no longer has cannot
+  // have settled the one it does have. Scoping the ambiguity the same way the arithmetic is scoped
+  // keeps a re-invoiced order from being blocked for ever by its predecessor's failure.
+  const verdict = decide({
+    amount: 100,
+    registrations: [reg({ id: 'other', status: 'FAILED', amount: 100, accountingInvoiceId: 'INV-0' })],
+  })
+  assert.equal(verdict.post, true)
+})
+
+test('a CANCELLED registration still frees the capacity — CANCELLED is only ever asserted pre-call', () => {
+  const verdict = decide({
+    amount: 100,
+    registrations: [reg({ id: 'other', status: 'CANCELLED', amount: 100, accountingInvoiceId: 'INV-1' })],
+  })
+  assert.equal(verdict.post, true)
+})
+
+test('this entry s OWN earlier FAILED state never blocks its own retry', () => {
+  // A reused FAILED row is flipped back to PENDING and re-posts under its PINNED token, so the ledger
+  // returns the original payment. Treating the row as ambiguous evidence against itself would refuse
+  // every retry the idempotency work exists to make safe.
+  const verdict = decide({
+    amount: 100,
+    registrations: [reg({ id: ENTRY, status: 'FAILED', amount: 100, accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(verdict.post, true)
 })
@@ -92,7 +179,7 @@ test('a posted registration against a DIFFERENT document consumes none of this i
   // order no longer has, and counting it would strand every payment on the replacement, for ever.
   const verdict = decide({
     amount: 100,
-    registrations: [{ id: 'other', status: 'SYNCED', amount: 100, accountingInvoiceId: 'INV-0' }],
+    registrations: [reg({ id: 'other', status: 'SYNCED', amount: 100, accountingInvoiceId: 'INV-0' })],
   })
   assert.equal(verdict.post, true)
 })
@@ -100,7 +187,7 @@ test('a posted registration against a DIFFERENT document consumes none of this i
 test('a posted registration naming NO document still counts — unknown reads as possibly this one', () => {
   const verdict = decide({
     amount: 100,
-    registrations: [{ id: 'other', status: 'SYNCED', amount: 100, accountingInvoiceId: null }],
+    registrations: [reg({ id: 'other', status: 'SYNCED', amount: 100, accountingInvoiceId: null })],
   })
   assert.equal(verdict.post, false)
   assert.equal(verdict.post === false && verdict.refusal, 'WOULD_OVERPAY')
@@ -110,7 +197,7 @@ test('an unreadable amount on a posted registration fails CLOSED with LEDGER_AMO
   // Treating it as zero would let this payment through on the assumption the ledger holds nothing,
   // which is precisely what is not known.
   const verdict = decide({
-    registrations: [{ id: 'other', status: 'SYNCED', amount: null, accountingInvoiceId: 'INV-1' }],
+    registrations: [reg({ id: 'other', status: 'SYNCED', amount: null, accountingInvoiceId: 'INV-1' })],
   })
   assert.equal(verdict.post, false)
   assert.equal(verdict.post === false && verdict.refusal, 'LEDGER_AMOUNT_UNKNOWN')
@@ -182,6 +269,53 @@ test('the IMPORTED-ORDER enqueue path is measured too, even though it never took
     result.post === false && result.kind === 'refused' ? result.message : '',
     /would over-settle it/,
   )
+})
+
+test('a FAILED sibling row read from the database refuses, and the message tells the operator what to check', async () => {
+  // END TO END for round 3 #3: receipt A timed out after Xero created the payment and landed FAILED
+  // with a COMPLETE body. Receipt B is the operator recording it again. Round 2 read A as free
+  // capacity and posted B — a second GBP 100 against a GBP 100 invoice, unrecoverable from IMS.
+  const { client } = mockClient({
+    order: { totalForeign: 100, taxForeign: 0, pricesIncludeVat: false, imported: false },
+    logs: [
+      { id: ENTRY, status: 'PROCESSING', payload: { amount: 100, accountingInvoiceId: 'INV-1', bankAccountId: 'bank-1' } },
+      { id: 'receipt-a', status: 'FAILED', payload: { amount: 100, accountingInvoiceId: 'INV-1', bankAccountId: 'bank-1' } },
+    ],
+  })
+
+  const result = await guardInvoicePaymentCapacity(client as never, GUARD_PARAMS)
+
+  assert.equal(result.post, false)
+  assert.equal(result.post === false && result.kind, 'refused')
+  assert.equal(
+    result.post === false && result.kind === 'refused' && result.refusal,
+    'AMBIGUOUS_FAILED_REGISTRATION',
+  )
+  assert.deepEqual(
+    result.post === false && result.kind === 'refused' ? result.ambiguousIds : [],
+    ['receipt-a'],
+  )
+  const message = result.post === false ? result.message : ''
+  assert.match(message, /receipt-a/, 'the message must name the entry the operator has to look at')
+  assert.match(message, /NOT proof that nothing reached the ledger/)
+  assert.match(message, /Nothing was sent\./)
+  assert.match(message, /Open this invoice in the ledger/)
+})
+
+test('a FAILED sibling whose stored body the connector would have rejected pre-call does not block the post', async () => {
+  // Same shape, but receipt A's payload has no bankAccountId — the Xero INVOICE_PAYMENT case rejects
+  // that before building a request, so it provably never reached the ledger and holds no capacity.
+  const { client } = mockClient({
+    order: { totalForeign: 100, taxForeign: 0, pricesIncludeVat: false, imported: false },
+    logs: [
+      { id: ENTRY, status: 'PROCESSING', payload: { amount: 100, accountingInvoiceId: 'INV-1', bankAccountId: 'bank-1' } },
+      { id: 'receipt-a', status: 'FAILED', payload: { amount: 100, accountingInvoiceId: 'INV-1' } },
+    ],
+  })
+
+  const result = await guardInvoicePaymentCapacity(client as never, GUARD_PARAMS)
+
+  assert.equal(result.post, true)
 })
 
 test('an imported tax-inclusive invoice is measured NET of VAT, so a gross receipt is refused', async () => {

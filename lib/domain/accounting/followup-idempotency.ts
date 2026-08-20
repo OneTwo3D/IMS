@@ -269,7 +269,7 @@ function bodyCouldHaveReachedTheLedger(type: string, stored: FollowUpPayload | n
 
 /**
  * PROOF that a stored attempt never reached the ledger — the opposite question, and deliberately
- * NOT the negation of the one above (o3d-qsbs).
+ * NOT the negation of `bodyCouldHaveReachedTheLedger` (o3d-qsbs).
  *
  * The two differ on exactly the cases where "no information" must not be read as "no call". A
  * `null` payload is unreadable, and an EMPTY one is indistinguishable from a payload retention
@@ -289,6 +289,32 @@ function bodyProvesNoCallLeft(type: string, stored: FollowUpPayload | null): boo
   if (stored === null) return false
   if (Object.keys(stored).length === 0) return false
   return !required.every(({ field, kind }) => fieldIsPresent(stored[field], kind))
+}
+
+/**
+ * DID THIS STORED ATTEMPT MAYBE REACH THE LEDGER? The one answer in this tree, over a raw payload.
+ *
+ * Exported so the POST-TIME capacity guards — `invoice-payment-capacity.ts` on the sales side and
+ * `payment-reversal.ts` on the supplier side — decide what a FAILED money row means using THIS
+ * definition rather than a second copy of it. There is exactly one sound "nothing was sent" signal in
+ * the system, and two guards deriving it differently would disagree about whether a document still has
+ * capacity, which for money is the whole question.
+ *
+ * IT IS BUILT ON `bodyProvesNoCallLeft`, NOT ON `bodyCouldHaveReachedTheLedger` (o3d-m5qk). Both
+ * branches that arrived at this merge had a version of the question and they answer differently on one
+ * input: an EMPTY `{}` body. `bodyCouldHaveReachedTheLedger` reads it as "could not have been sent",
+ * because it is missing every required field; `bodyProvesNoCallLeft` refuses to read it that way,
+ * because retention compacts a payload to `{}` and a compacted body says nothing whatever about what
+ * left the process. For choosing which body to PIN the first reading is right and harmless — an empty
+ * body genuinely cannot be re-sent. For deciding whether an invoice still has CAPACITY it is a claim
+ * that a payment provably never posted, made on evidence retention destroyed, and it ends in a second
+ * payment. So this reader takes the stricter one: unproven means it counts against capacity.
+ *
+ * Returns TRUE for an unreadable, absent or compacted payload: not knowing what was sent is not
+ * evidence that nothing was.
+ */
+export function storedBodyMayHaveReachedTheLedger(type: string, payload: unknown): boolean {
+  return !bodyProvesNoCallLeft(type, asPayload(payload))
 }
 
 /** Fields whose value defines the remote request, so a divergence is worth reporting. */

@@ -96,8 +96,108 @@ test('out-of-order INVOICE_PAYMENT entries are blocked by older live logs in one
       OR: [{ referenceType: 'SalesOrder', referenceId: 'order-1' }],
     },
     select: { id: true, referenceType: true, referenceId: true, createdAt: true },
-    orderBy: { createdAt: 'asc' },
+    orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   })
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 3 #2: THE ORDER HAS TO BE TOTAL.
+//
+// `createdAt` is a transaction clock. Two INVOICE_PAYMENT rows inserted in one transaction, or in two
+// that committed inside the same tick, carry the IDENTICAL timestamp — and under a strict `<` neither
+// is "after" the other, so NEITHER was deferred and both ran.
+//
+// That is not cosmetic. The post-time capacity guard is allowed to treat PENDING/PROCESSING siblings
+// as consuming no capacity ONLY because this function lets exactly one live entry per order be
+// undeferred at a time; the later ones re-run the arithmetic against the earlier one's SYNCED row.
+// Two same-timestamp receipts defeat that, both read a table in which neither has posted, and both
+// post — the invoice is settled twice.
+// ---------------------------------------------------------------------------
+
+function orderingClient(rows: Array<{ id: string; createdAt: Date }>) {
+  return {
+    accountingSyncLog: {
+      findMany: async () => rows.map((row) => ({
+        ...row,
+        referenceType: 'SalesOrder',
+        referenceId: 'order-1',
+      })),
+    },
+  }
+}
+
+function orderingEntries(rows: Array<{ id: string; createdAt: Date }>) {
+  return rows.map((row) => ({
+    id: row.id,
+    type: 'INVOICE_PAYMENT' as const,
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+  createdAt: row.createdAt,
+  }))
+}
+
+test('two INVOICE_PAYMENT rows sharing a timestamp still serialise — exactly one is left undeferred', async () => {
+  const t = new Date('2026-01-01T09:00:00.000Z')
+  const rows = [{ id: 'payment-a', createdAt: t }, { id: 'payment-b', createdAt: new Date(t) }]
+
+  const blocked = await findInvoicePaymentsBlockedByEarlierLiveLogs(
+    orderingClient(rows) as never,
+    orderingEntries(rows),
+  )
+
+  // Before the tie-break this set was EMPTY: both entries ran, and both posted.
+  assert.deepEqual([...blocked], ['payment-b'], 'the id tie-break must elect payment-a and defer payment-b')
+})
+
+test('three same-timestamp receipts leave exactly one runnable, not three', async () => {
+  const t = new Date('2026-01-01T09:00:00.000Z')
+  const rows = [
+    { id: 'payment-c', createdAt: new Date(t) },
+    { id: 'payment-a', createdAt: new Date(t) },
+    { id: 'payment-b', createdAt: new Date(t) },
+  ]
+
+  const blocked = await findInvoicePaymentsBlockedByEarlierLiveLogs(
+    orderingClient(rows) as never,
+    orderingEntries(rows),
+  )
+
+  assert.deepEqual([...blocked].sort(), ['payment-b', 'payment-c'])
+})
+
+test('the winner is elected by the comparator, not by the order the rows arrive in', async () => {
+  // Two independent runners each compute this set from their own snapshot. If the election depended on
+  // the query's row order rather than a total comparator, they could elect DIFFERENT winners and each
+  // let its own entry through — the same double post, reached from two processes instead of one.
+  const t = new Date('2026-01-01T09:00:00.000Z')
+  const forwards = [{ id: 'payment-a', createdAt: new Date(t) }, { id: 'payment-b', createdAt: new Date(t) }]
+  const backwards = [...forwards].reverse()
+
+  const first = await findInvoicePaymentsBlockedByEarlierLiveLogs(
+    orderingClient(forwards) as never,
+    orderingEntries(forwards),
+  )
+  const second = await findInvoicePaymentsBlockedByEarlierLiveLogs(
+    orderingClient(backwards) as never,
+    orderingEntries(backwards),
+  )
+
+  assert.deepEqual([...first], ['payment-b'])
+  assert.deepEqual([...second], ['payment-b'])
+})
+
+test('a strictly earlier row still wins regardless of how the ids sort', async () => {
+  // Guards against the tie-break being promoted into the primary key: `createdAt` decides whenever it
+  // discriminates, and only a tie falls through to the id.
+  const early = { id: 'zzz-earlier', createdAt: new Date('2026-01-01T09:00:00.000Z') }
+  const late = { id: 'aaa-later', createdAt: new Date('2026-01-01T10:00:00.000Z') }
+
+  const blocked = await findInvoicePaymentsBlockedByEarlierLiveLogs(
+    orderingClient([early, late]) as never,
+    orderingEntries([early, late]),
+  )
+
+  assert.deepEqual([...blocked], ['aaa-later'])
 })
 
 test('audit-H5: SALES_INVOICE_UPDATE is deferred while its SALES_INVOICE CREATE is still live', async () => {

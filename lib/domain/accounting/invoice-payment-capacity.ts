@@ -38,11 +38,41 @@
  *                      serialises INVOICE_PAYMENT entries per reference: only the earliest live entry
  *                      for an order is ever un-deferred, so no sibling can be posting alongside us. The
  *                      later one re-runs this guard against our SYNCED row when its turn comes.
- *   FAILED/CANCELLED   did not post, or was deliberately abandoned. Counting FAILED would strand every
- *                      subsequent receipt behind a permanently failed one. The residual — a FAILED row
- *                      that did commit remotely before failing (o3d-ju8t) — is handled by the pinned
- *                      remote idempotency token (o3d-h2wx), which makes its retry return the ORIGINAL
- *                      payment instead of creating a second, not by this arithmetic.
+ *   CANCELLED          provably pre-call. Every writer of this status in the tree asserts it only where
+ *                      "nothing was sent" is TRUE (o3d-sref; retireOverSettlingInvoicePayment runs
+ *                      BEFORE the remote call). It frees the capacity again.
+ *   FAILED             NEITHER. See below — this is the round 3 correction.
+ *
+ * A FAILED MONEY ROW IS NOT EVIDENCE THAT NOTHING POSTED (Codex round 3 #3).
+ *
+ * Round 2 put FAILED in the same bucket as CANCELLED, reasoning that counting it would strand every
+ * later receipt behind a permanently failed one, and that the residual was covered by the pinned
+ * remote idempotency token (o3d-h2wx). Both halves are wrong for THIS guard:
+ *
+ *  - The token pins a RETRY OF THE SAME follow-up back onto the original request, so the ledger hands
+ *    back the payment it already made. It says nothing about a DIFFERENT receipt on the same invoice,
+ *    which is exactly what this arithmetic is here to measure. A £100 receipt that timed out after
+ *    Xero created the payment lands FAILED; the operator records the receipt again; the replacement is
+ *    a different row for a different Payment row, so the token does not dedupe it, and the only thing
+ *    standing between it and a second £100 on a £100 invoice is this sum.
+ *  - "FAILED did not post" is a GUESS about remote state. o3d-ju8t settled the opposite reading, the
+ *    follow-up planner is built on it, and errorMessage carries no provenance (both connectors
+ *    overwrite `HTTP nnn` with the remote system's own text), so nothing in the row can tell a
+ *    rejection apart from a lost response.
+ *
+ * So a FAILED row makes remaining capacity UNKNOWABLE, and unknowable must not read as either "free"
+ * or "spent" — it must refuse, and say what a human has to do. The ONE exception is not a guess but a
+ * proof: a stored body missing a field the connector rejects before building a request CANNOT have
+ * reached the ledger. That test already exists, reviewed, in followup-idempotency.ts, and is imported
+ * rather than re-derived — two guards with two definitions of "nothing was sent" would disagree about
+ * whether an invoice has capacity, which is the whole question.
+ *
+ * THE COST, STATED. An unresolved FAILED registration now blocks later receipts on the same invoice
+ * instead of silently letting them through. That is the direction this file already chose for
+ * LEDGER_AMOUNT_UNKNOWN, and the refusal names the row and tells the operator how to clear it:
+ * look the invoice up in the ledger, and either register the balance by hand or resolve the failed
+ * entry. Round 2's stranding worry is real but it is a WORKFLOW cost; a duplicate supplier payment is
+ * an irreversible one.
  *
  * FAIL CLOSED. An unreadable order, an unreadable amount on a posted row, or a reference this guard
  * cannot measure at all does NOT post. A transient read outage must never become permission to move
@@ -62,11 +92,19 @@
 
 import type { Prisma } from '@/app/generated/prisma/client'
 
+import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
 import { CAPACITY_EPSILON } from '@/lib/domain/accounting/invoice-payment-registration'
 import { ledgerSalesInvoiceTotalForeign } from '@/lib/domain/accounting/settlement-status'
 
 /** The only status that asserts the remote call happened. */
 export const POSTED_INVOICE_PAYMENT_STATUSES = ['SYNCED'] as const
+
+/**
+ * Statuses that assert NOTHING about whether the remote call happened. The processor posts BEFORE it
+ * persists the result, so a row can be marked FAILED by a lost response, a timeout, or a crash after
+ * Xero created the Payment — indistinguishable from a rejection.
+ */
+export const AMBIGUOUS_INVOICE_PAYMENT_STATUSES = ['FAILED'] as const
 
 export type PostedInvoicePaymentRegistration = {
   id: string
@@ -75,17 +113,37 @@ export type PostedInvoicePaymentRegistration = {
   amount: number | null
   /** The ledger document it settled. Null on rows queued before the payload recorded it. */
   accountingInvoiceId: string | null
+  /**
+   * Whether this row's attempt MAY have reached the ledger (`storedBodyMayHaveReachedTheLedger`).
+   * Only consulted for the ambiguous statuses, and `false` is the one sound proof that an attempt
+   * never reached it: a body that is present, readable, and missing a field the connector rejects
+   * before it builds a request. Unknown, unreadable and RETENTION-COMPACTED bodies are all `true` —
+   * not knowing what was sent is not evidence that nothing was (o3d-m5qk).
+   */
+  bodyCouldHavePosted: boolean
 }
 
 export type InvoicePaymentPostRefusal =
   /** A posted registration exists whose amount cannot be read, so remaining capacity is unknowable. */
   | 'LEDGER_AMOUNT_UNKNOWN'
+  /**
+   * A FAILED registration against this same document may or may not have posted, so how much of the
+   * invoice the ledger already holds cannot be determined at all (Codex round 3 #3).
+   */
+  | 'AMBIGUOUS_FAILED_REGISTRATION'
   /** This payment does not fit in what is left of the invoice after what the ledger already holds. */
   | 'WOULD_OVERPAY'
 
 export type InvoicePaymentPostVerdict =
   | { post: true; alreadyPosted: number; ledgerTotal: number }
-  | { post: false; refusal: InvoicePaymentPostRefusal; alreadyPosted: number | null; ledgerTotal: number }
+  | {
+      post: false
+      refusal: InvoicePaymentPostRefusal
+      alreadyPosted: number | null
+      ledgerTotal: number
+      /** The rows whose remote outcome is unknown. Empty unless the refusal is the ambiguous one. */
+      ambiguousIds: string[]
+    }
 
 /**
  * Pure capacity arithmetic for one about-to-post registration. Kept separate from the reads so the rule
@@ -100,30 +158,69 @@ export function decideInvoicePaymentPost(input: {
   /** Every INVOICE_PAYMENT sync row for this order on this connector, including this entry's own. */
   registrations: PostedInvoicePaymentRegistration[]
 }): InvoicePaymentPostVerdict {
-  const posted = input.registrations.filter(
+  const againstThisInvoice = input.registrations.filter(
     (row) =>
       row.id !== input.entryId
-      && (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
       // o3d-hbgo: a row that settled a DIFFERENT ledger document paid an invoice this order no longer
       // has (deleted and re-posted). It consumes none of the CURRENT invoice's capacity. A row that
       // names NO document stays counted: for money, unknown reads as "possibly this one".
       && (row.accountingInvoiceId == null || row.accountingInvoiceId === input.accountingInvoiceId),
   )
 
+  // UNKNOWN BEFORE ARITHMETIC (Codex round 3 #3). A FAILED row that could have been sent leaves the
+  // ledger's balance on this invoice undetermined, so there is no sum to compute — not a sum that
+  // happens to come out favourable. Checked first because it is the stronger fact: a row whose
+  // outcome is unknown makes an unreadable amount on some OTHER row beside the point.
+  const ambiguous = againstThisInvoice.filter(
+    (row) =>
+      (AMBIGUOUS_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status)
+      && row.bodyCouldHavePosted,
+  )
+  if (ambiguous.length > 0) {
+    return {
+      post: false,
+      refusal: 'AMBIGUOUS_FAILED_REGISTRATION',
+      alreadyPosted: null,
+      ledgerTotal: input.ledgerTotal,
+      ambiguousIds: ambiguous.map((row) => row.id),
+    }
+  }
+
+  const posted = againstThisInvoice.filter(
+    (row) => (POSTED_INVOICE_PAYMENT_STATUSES as readonly string[]).includes(row.status),
+  )
+
   if (posted.some((row) => typeof row.amount !== 'number')) {
-    return { post: false, refusal: 'LEDGER_AMOUNT_UNKNOWN', alreadyPosted: null, ledgerTotal: input.ledgerTotal }
+    return {
+      post: false,
+      refusal: 'LEDGER_AMOUNT_UNKNOWN',
+      alreadyPosted: null,
+      ledgerTotal: input.ledgerTotal,
+      ambiguousIds: [],
+    }
   }
 
   const alreadyPosted = posted.reduce((sum, row) => sum + (row.amount as number), 0)
   if (input.amount > input.ledgerTotal - alreadyPosted + CAPACITY_EPSILON) {
-    return { post: false, refusal: 'WOULD_OVERPAY', alreadyPosted, ledgerTotal: input.ledgerTotal }
+    return {
+      post: false,
+      refusal: 'WOULD_OVERPAY',
+      alreadyPosted,
+      ledgerTotal: input.ledgerTotal,
+      ambiguousIds: [],
+    }
   }
   return { post: true, alreadyPosted, ledgerTotal: input.ledgerTotal }
 }
 
 export type InvoicePaymentPostGuardResult =
   | { post: true }
-  /** Measured, and it does not fit. Terminal: nothing was sent and nothing should be. */
+  /**
+   * Refused on what the rows say. Terminal: nothing was sent for THIS entry and nothing should be.
+   * Covers both "measured, and it does not fit" and "cannot be measured because an earlier row's
+   * remote outcome is unknown" — the second is terminal for the same reason as the first, since
+   * retrying cannot resolve it and a FAILED retry would only add another ambiguous row.
+   */
   | {
       post: false
       kind: 'refused'
@@ -131,6 +228,7 @@ export type InvoicePaymentPostGuardResult =
       message: string
       alreadyPosted: number | null
       ledgerTotal: number
+      ambiguousIds: string[]
     }
   /** Could not be measured. Retryable, and NOT posted — fail closed. */
   | { post: false; kind: 'unmeasurable'; message: string }
@@ -250,20 +348,40 @@ export async function guardInvoicePaymentCapacity(
       status: row.status,
       amount: payloadNumber(row.payload, 'amount'),
       accountingInvoiceId: payloadString(row.payload, 'accountingInvoiceId'),
+      bodyCouldHavePosted: storedBodyMayHaveReachedTheLedger('INVOICE_PAYMENT', row.payload),
     })),
   })
   if (verdict.post) return { post: true }
 
-  const message = verdict.refusal === 'LEDGER_AMOUNT_UNKNOWN'
-    ? `Refused to register a payment of ${params.amount.toFixed(2)} against invoice `
-      + `${params.accountingInvoiceId}: a payment already posted for this invoice does not record its `
-      + `amount, so IMS cannot tell how much of the invoice is still outstanding. Nothing was sent — `
-      + `reconcile the invoice in the ledger and register the payment there by hand.`
-    : `Refused to register a payment of ${params.amount.toFixed(2)} against invoice `
-      + `${params.accountingInvoiceId}: the ledger's copy of this invoice is for `
-      + `${verdict.ledgerTotal.toFixed(2)} with ${(verdict.alreadyPosted ?? 0).toFixed(2)} already `
-      + `registered against it, so this payment would over-settle it. Nothing was sent — reconcile the `
-      + `invoice in the ledger and register the balance there by hand if it is genuinely owed.`
+  // Every refusal message ends with what a HUMAN must do, because each of these is a state the code
+  // has decided it cannot resolve — and an operator who is only told "refused" will re-record the
+  // receipt, which is the one action that can turn an ambiguity into a duplicate payment.
+  const message = ((): string => {
+    const head = `Refused to register a payment of ${params.amount.toFixed(2)} against invoice `
+      + `${params.accountingInvoiceId}: `
+    switch (verdict.refusal) {
+      case 'LEDGER_AMOUNT_UNKNOWN':
+        return head
+          + `a payment already posted for this invoice does not record its amount, so IMS cannot tell `
+          + `how much of the invoice is still outstanding. Nothing was sent — reconcile the invoice in `
+          + `the ledger and register the payment there by hand.`
+      case 'AMBIGUOUS_FAILED_REGISTRATION':
+        return head
+          + `an earlier registration against this same invoice FAILED `
+          + `(sync ${verdict.ambiguousIds.join(', ')}), and a failed registration is NOT proof that `
+          + `nothing reached the ledger — the payment may have been created and the response lost. IMS `
+          + `therefore cannot tell how much of this invoice is already settled, and will not guess with `
+          + `money. Nothing was sent. Open this invoice in the ledger: if the failed payment is not `
+          + `there, resolve that sync entry and record the receipt again; if it IS there, the invoice `
+          + `is already settled by it and no further payment should be registered.`
+      case 'WOULD_OVERPAY':
+        return head
+          + `the ledger's copy of this invoice is for ${verdict.ledgerTotal.toFixed(2)} with `
+          + `${(verdict.alreadyPosted ?? 0).toFixed(2)} already registered against it, so this payment `
+          + `would over-settle it. Nothing was sent — reconcile the invoice in the ledger and register `
+          + `the balance there by hand if it is genuinely owed.`
+    }
+  })()
 
   return {
     post: false,
@@ -272,6 +390,7 @@ export async function guardInvoicePaymentCapacity(
     message,
     alreadyPosted: verdict.alreadyPosted,
     ledgerTotal: verdict.ledgerTotal,
+    ambiguousIds: verdict.ambiguousIds,
   }
 }
 

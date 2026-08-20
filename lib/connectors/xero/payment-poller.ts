@@ -33,7 +33,10 @@ import { xeroGet } from './api'
 import { logActivity, logActivityPersisted } from '@/lib/activity-log'
 import { notify, notifyPersisted } from '@/lib/notifications'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { detectPaymentReversals } from '@/lib/domain/accounting/payment-reversal'
+import {
+  detectPaymentReversals,
+  retireBillPaymentRegistrationsReversedInLedger,
+} from '@/lib/domain/accounting/payment-reversal'
 import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
 import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
@@ -894,7 +897,26 @@ async function processDeltaChunk(
     })
     if (paidBills.length > 0) {
       for (const bill of detectPaymentReversals(paidBills, reversedBillIds)) {
-        await db.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
+        // THE ONE PLACE THAT CAN RETIRE A POSTED REGISTRATION (Codex round 3 #1).
+        //
+        // markBillPaid used to call a SYNCED BILL_PAYMENT row "stale" from its status alone, which is
+        // an inference about Xero made without reading Xero — and a slow worker that posted and then
+        // wrote SYNCED looked identical to a payment the ledger had thrown away. Here it is not an
+        // inference: this pass has just read the bill back and found it no longer PAID. Recording
+        // that against the row, in the SAME transaction that clears paidAt, is what lets markBillPaid
+        // refuse everything it cannot prove without stranding the ordinary reversal-then-re-pay flow.
+        //
+        // `windowStart` is the delta window this verdict was computed from, so a row that synced
+        // before it had certainly posted by the time Xero was asked. One synced later may have created
+        // a payment this read never saw and is deliberately left for a human.
+        const retiredRegistrations = await db.$transaction(async (tx) => {
+          await tx.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
+          return retireBillPaymentRegistrationsReversedInLedger(tx, {
+            connector: XERO_CONNECTOR,
+            invoiceId: bill.id,
+            ledgerObservedBefore: windowStart,
+          })
+        })
         result.billsReversed++
         await logActivity({
           entityType: 'PURCHASE_ORDER',
@@ -902,7 +924,10 @@ async function processDeltaChunk(
           action: 'bill_payment_reversal_detected',
           tag: 'sync',
           level: 'WARNING',
-          description: `Bill payment no longer present in Xero for PO ${bill.po.reference} (PO status: ${bill.po.status}) — cleared paidAt.`
+          description: `Bill payment no longer present in Xero for PO ${bill.po.reference} (PO status: ${bill.po.status}) — cleared paidAt`
+            + (retiredRegistrations > 0
+              ? ` and retired ${retiredRegistrations} posted payment registration(s), so the bill can be marked paid again.`
+              : `. No posted payment registration was retired — if marking this bill paid again is refused, the registration must be reconciled in Xero and cancelled by hand.`)
             + (billResidual.provenGone.has(bill.accountingInvoiceId ?? '')
               // Named, because this is the case an amount reading calls a part payment: the ledger is
               // still holding money against this bill — just not ours.
