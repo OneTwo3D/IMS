@@ -72,6 +72,26 @@ export function wcProductConflictSettingKey(mode: WcProductSyncMode): string {
 }
 
 /**
+ * The companion row holding WHEN each carried id's conflict was last observed
+ * (o3d-xbt round 4, finding 1).
+ *
+ * WHY A SECOND ROW RATHER THAN A RICHER VALUE. The id list is a bare JSON array
+ * of numbers and an older build parses it as one. Encoding the timestamps INTO
+ * that array — pairs, objects, a versioned envelope — makes every one of those
+ * builds read the list as EMPTY, which is precisely the silent abandonment this
+ * whole mechanism exists to prevent, and it would happen on a rollback, when
+ * somebody is already having a bad day. A sidecar degrades instead: an older
+ * build ignores it and behaves exactly as it did before, losing the staleness
+ * check and nothing else.
+ *
+ * Both rows are written in the SAME transaction under the SAME lock, so they
+ * cannot drift apart.
+ */
+export function wcProductConflictSeenAtSettingKey(mode: WcProductSyncMode): string {
+  return mode === 'poll' ? 'wc_product_sync_conflict_seen_at' : 'wc_product_reconcile_conflict_seen_at'
+}
+
+/**
  * The advisory-lock id that serializes one mode's read-modify-write of its
  * conflict list against another sweep's (o3d-xbt round 3, finding 1).
  *
@@ -146,25 +166,95 @@ export function capWcProductConflictIds(
 }
 
 /**
+ * Parse the sidecar: id -> epoch milliseconds at which that id's conflict was
+ * last OBSERVED.
+ *
+ * Tolerant in exactly the way the id list is, and for the same reason: a
+ * malformed row must degrade to "no timestamps", which reproduces the previous
+ * build's behaviour, rather than throw and take down the sweep.
+ *
+ * A MISSING ENTRY MEANS ZERO, AND ZERO IS THE RIGHT DEFAULT. An id carried by a
+ * build that predates this row was written before this build was deployed, so it
+ * genuinely predates every run that can be in flight now — any evidence a
+ * current run holds really is newer. The check therefore starts permissive and
+ * tightens the moment the list is first rewritten, which is the very next sweep.
+ */
+export function parseWcProductConflictSeenAt(raw: string | null | undefined): Map<number, number> {
+  const seenAt = new Map<number, number>()
+  if (!raw) return seenAt
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return seenAt
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return seenAt
+  for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) {
+    const id = Number(key)
+    const at = typeof value === 'number' ? value : Number(value)
+    if (Number.isInteger(id) && id > 0 && Number.isFinite(at) && at > 0) seenAt.set(id, at)
+  }
+  return seenAt
+}
+
+/**
+ * Serialise the sidecar, PRUNED to the ids actually carried — otherwise it is a
+ * map that only ever grows, which is the defect the store limit exists to stop
+ * one row away.
+ *
+ * Zero is not written: it is what a missing entry already means.
+ */
+export function serializeWcProductConflictSeenAt(seenAt: ReadonlyMap<number, number>, kept: readonly number[]): string {
+  const out: Record<string, number> = {}
+  for (const id of kept) {
+    const at = seenAt.get(id)
+    if (at !== undefined && at > 0) out[String(id)] = at
+  }
+  return JSON.stringify(out)
+}
+
+/**
  * The evidence a run gathered about one product, from the sweep's point of view.
  * Named rather than passed as four bare sets, because which set an id lands in
  * IS the decision this module exists to make.
  */
 export type WcProductConflictEvidence = {
+  /**
+   * When THIS run began, epoch ms.
+   *
+   * The cheap half of the staleness question. If the run started at or after the
+   * moment a carried conflict was recorded, then everything the run knows, it
+   * learned afterwards — there is no race to adjudicate and the per-id stamps
+   * cannot say otherwise. Without it, two runs a millisecond apart (a fast poll
+   * over a small catalogue) look concurrent to a millisecond clock and a
+   * genuinely resolved product would sit on the list for an extra run.
+   */
+  runStartedAt: number
   /** The list as it stands in the database RIGHT NOW — re-read under the lock. */
   stored: readonly number[]
+  /**
+   * When each stored id's conflict was last OBSERVED, epoch ms — re-read under
+   * the lock alongside `stored`. A missing entry means zero; see
+   * `parseWcProductConflictSeenAt` for why that default is the safe one.
+   */
+  storedSeenAt: ReadonlyMap<number, number>
   /** Every id this run actually tried to import, whatever the outcome. */
   attempted: ReadonlySet<number>
   /**
-   * Ids this run has POSITIVE evidence are no longer conflicted: they imported
-   * cleanly, or WooCommerce answered a by-id fetch without them (deleted, or no
-   * longer visible to these credentials).
+   * Ids this run has POSITIVE evidence are no longer conflicted, and WHEN that
+   * evidence was gathered: they imported cleanly, or WooCommerce answered a
+   * by-id fetch without them (deleted, or no longer visible to these
+   * credentials).
    *
    * Not reaching an id is not evidence. Neither is a transient failure on it.
+   * AND EVIDENCE OLDER THAN THE CONFLICT IT WOULD ANSWER IS NOT EVIDENCE EITHER
+   * — see the merge below.
    */
-  cleared: ReadonlySet<number>
+  cleared: ReadonlyMap<number, number>
   /** Ids that conflicted in THIS run, in the order they were observed. */
   observed: readonly number[]
+  /** When this run observed each of those conflicts, epoch ms. */
+  observedAt: ReadonlyMap<number, number>
 }
 
 export type WcProductConflictMerge = WcProductConflictCarry & {
@@ -174,6 +264,16 @@ export type WcProductConflictMerge = WcProductConflictCarry & {
    * carried, and the cursor is long past them.
    */
   droppedRecoverableByCursor: number[]
+  /** The sidecar to write beside `kept`: when each kept id was last observed. */
+  seenAt: Map<number, number>
+  /**
+   * Ids this run holds clearing evidence for that it REFUSED to act on, because
+   * a newer conflict for the same product is on the list. Reported, because a
+   * sweep silently declining to apply its own result is exactly the kind of
+   * thing that should be visible when someone is working out why a product is
+   * still on the list.
+   */
+  staleClears: number[]
 }
 
 /**
@@ -215,21 +315,91 @@ export function mergeWcProductConflictIds(evidence: WcProductConflictEvidence): 
   for (const id of evidence.observed) {
     if (Number.isInteger(id) && id > 0) observed.add(id)
   }
-  // An id that conflicted in this run is conflicted, whatever else the run
-  // thinks it saw. Nothing should produce both, and if something ever does, the
-  // safe reading is the one that keeps the product on the list.
-  const cleared = (id: number) => evidence.cleared.has(id) && !observed.has(id)
 
+  const staleClears: number[] = []
   const stored = evidence.stored.filter((id) => Number.isInteger(id) && id > 0)
   const storedSet = new Set(stored)
 
-  const untouched = stored.filter((id) => !evidence.attempted.has(id) && !cleared(id))
-  const reattempted = stored.filter((id) => evidence.attempted.has(id) && !cleared(id))
+  /**
+   * EVIDENCE HAS A TIME, AND A STALE SUCCESS IS NOT A REFUTATION (o3d-xbt round
+   * 4, finding 1).
+   *
+   * Round 3's rule — "an id leaves the list on evidence only" — is still the
+   * rule. What it lacked is that evidence is gathered at a MOMENT, and the merge
+   * happens at a different one. Sweep A imports product 7 cleanly and carries on
+   * with the rest of the catalogue for another twenty minutes. Sweep B starts
+   * later, re-imports product 7, and this time a GTIN collision refuses it: B
+   * takes the lock, writes [7], advances. A finally reaches the lock, re-reads
+   * [7] — and removes it, because A genuinely does hold clearing evidence for 7.
+   * A's evidence is real; it is just OLDER than the conflict it is being used to
+   * answer. The product is now on no list with the cursor past it, which is the
+   * exact loss the merge was built to prevent, arrived at from the other side.
+   *
+   * So a clear must be NEWER than the observation it overrides — and "newer" is
+   * asked of the RUN first and the individual piece of evidence second. A run
+   * that began at or after the observation cannot be holding anything older than
+   * it, whoever wrote it; that is the ordinary sequential case, and deciding it
+   * on per-id stamps alone would leave a genuinely resolved product on the list
+   * for an extra run every time two sweeps land in the same millisecond. Only
+   * when the run OVERLAPPED does the per-id stamp decide, and there it is
+   * strictly newer: on an equal stamp the conflict wins, because keeping a
+   * resolved product on the list costs one id in a by-id fetch and losing a
+   * conflicted one is permanent and silent.
+   *
+   * The stamps come from `Date.now()` in the sweep that gathered them. Two
+   * sweeps on one host share a clock; across hosts a skew of seconds could let a
+   * stale clear through, which is the same exposure the rest of the sweep's
+   * modified-after cursor already has, and far smaller than the minutes-to-hours
+   * window this closes.
+   */
+  // Classified ONCE per stored id, not per band: the two band filters below both
+  // ask the same question, and a predicate that also records a stale clear would
+  // otherwise report each one twice.
+  const cleared = new Set<number>()
+  for (const id of storedSet) {
+    // An id that conflicted in THIS run is conflicted, whatever else the run
+    // thinks it saw. Nothing should produce both, and if something ever does,
+    // the safe reading is the one that keeps the product on the list.
+    if (observed.has(id)) continue
+    const clearedAt = evidence.cleared.get(id)
+    if (clearedAt === undefined) continue
+    const seenAt = evidence.storedSeenAt.get(id) ?? 0
+    // Two ways to be newer, and they answer different questions. The first: this
+    // run began after the conflict was recorded, so nothing it saw can predate
+    // it — sequential runs, the ordinary case. The second: this run OVERLAPPED
+    // the one that recorded it, and the individual piece of evidence still lands
+    // after. Anything else is a stale success and must not erase a live conflict.
+    if (evidence.runStartedAt >= seenAt || clearedAt > seenAt) cleared.add(id)
+    else staleClears.push(id)
+  }
+
+  const untouched = stored.filter((id) => !evidence.attempted.has(id) && !cleared.has(id))
+  const reattempted = stored.filter((id) => evidence.attempted.has(id) && !cleared.has(id))
   const fresh = [...observed].filter((id) => !storedSet.has(id))
 
   const { kept, dropped } = capWcProductConflictIds([...untouched, ...reattempted, ...fresh])
   const freshSet = new Set(fresh)
-  return { kept, dropped, droppedRecoverableByCursor: dropped.filter((id) => freshSet.has(id)) }
+
+  // The stamp only ever moves FORWARD. A run that re-observes a conflict pushes
+  // it to its own observation time, so a clear held by a sweep that started
+  // earlier can no longer answer it; a run with nothing new to say leaves the
+  // stamp exactly where it was rather than resetting it to now, which would
+  // silently re-arm every older sweep's evidence.
+  const seenAt = new Map<number, number>()
+  for (const id of kept) {
+    const before = evidence.storedSeenAt.get(id) ?? 0
+    const now = observed.has(id) ? (evidence.observedAt.get(id) ?? 0) : 0
+    const at = Math.max(before, now)
+    if (at > 0) seenAt.set(id, at)
+  }
+
+  return {
+    kept,
+    dropped,
+    droppedRecoverableByCursor: dropped.filter((id) => freshSet.has(id)),
+    seenAt,
+    staleClears,
+  }
 }
 
 /**

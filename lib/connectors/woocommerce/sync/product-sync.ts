@@ -15,8 +15,11 @@ import {
   WC_PRODUCT_CONFLICT_STORE_LIMIT,
   mergeWcProductConflictIds,
   parseWcProductConflictIds,
+  parseWcProductConflictSeenAt,
+  serializeWcProductConflictSeenAt,
   shouldAdvanceWcProductCursor,
   wcProductConflictLockId,
+  wcProductConflictSeenAtSettingKey,
   wcProductConflictSettingKey,
 } from './product-conflict-cursor'
 import { WC_PRODUCT_CONFLICT_LIST_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
@@ -1955,8 +1958,16 @@ export async function syncAllWcProducts(
   const onProgress = opts.onProgress
   const cursorKey = mode === 'poll' ? 'last_wc_product_sync_at' : 'last_wc_product_reconcile_at'
   const conflictKey = wcProductConflictSettingKey(mode)
+  const conflictSeenAtKey = wcProductConflictSeenAtSettingKey(mode)
   let totalProducts = 0
   let processedProducts = 0
+
+  /**
+   * Stamped before anything is fetched (o3d-xbt round 4). A run that began at or
+   * after the moment a carried conflict was recorded cannot be holding evidence
+   * older than it, whatever the per-id stamps say to a millisecond clock.
+   */
+  const runStartedAt = Date.now()
 
   // o3d-xbt: products whose LAST attempt hit a conflict a retry cannot clear.
   // Carried between runs and re-fetched by id below, which is what lets the
@@ -1965,13 +1976,24 @@ export async function syncAllWcProducts(
   const conflictIds = new Set<number>()
   const conflictSkus: string[] = []
   /**
-   * EVIDENCE that a product is no longer conflicted (o3d-xbt round 3). Only two
-   * things get an id in here: it imported cleanly, or WooCommerce answered a
-   * by-id fetch without it. Everything else — a transient failure, a fetch that
-   * errored, a run that simply did not reach it — says nothing, and an id we know
-   * nothing about stays on the list.
+   * WHEN this run observed each conflict (o3d-xbt round 4). Stamped at the
+   * moment of observation rather than at the merge, because a long sweep can be
+   * an hour between the two and the whole point of the stamp is to say which of
+   * two runs saw the product LAST.
    */
-  const clearedIds = new Set<number>()
+  const conflictObservedAt = new Map<number, number>()
+  /**
+   * EVIDENCE that a product is no longer conflicted (o3d-xbt round 3), and WHEN
+   * this run gathered it (round 4). Only two things get an id in here: it
+   * imported cleanly, or WooCommerce answered a by-id fetch without it.
+   * Everything else — a transient failure, a fetch that errored, a run that
+   * simply did not reach it — says nothing, and an id we know nothing about
+   * stays on the list.
+   *
+   * The time matters because a SUCCESSFUL sweep can be the stale one: a clean
+   * import from twenty minutes ago must not answer a conflict observed since.
+   */
+  const clearedAt = new Map<number, number>()
 
   const [lastSyncSetting, existingProduct, conflictSetting] = await Promise.all([
     db.setting.findUnique({ where: { key: cursorKey } }),
@@ -2017,7 +2039,7 @@ export async function syncAllWcProducts(
       // The first of the two pieces of evidence that take an id OFF the retry
       // list: it imported. (The second is WooCommerce answering a by-id fetch
       // without it, recorded in the retry pass below.)
-      clearedIds.add(product.id)
+      clearedAt.set(product.id, Date.now())
       return
     }
     const line = `SKU ${product.sku}: ${outcome.error}`
@@ -2025,6 +2047,7 @@ export async function syncAllWcProducts(
     if (outcome.permanent) {
       result.permanentErrors.push(line)
       conflictIds.add(product.id)
+      conflictObservedAt.set(product.id, Date.now())
       if (product.sku) conflictSkus.push(product.sku)
     }
   }
@@ -2145,9 +2168,12 @@ export async function syncAllWcProducts(
       // credentials). THAT is the evidence — the fetch succeeded and answered
       // without them — so they leave the list and it shrinks by itself instead of
       // accumulating dead ids forever.
+      // Stamped from the moment the STORE answered, not from the merge: that is
+      // when this evidence was actually true of WooCommerce.
+      const answeredAt = Date.now()
       const returnedIds = new Set((retryData as WcFullProduct[]).map((product) => product.id))
       for (const id of retryIds) {
-        if (!returnedIds.has(id)) clearedIds.add(id)
+        if (!returnedIds.has(id)) clearedAt.set(id, answeredAt)
       }
       for (const product of retryData as WcFullProduct[]) {
         if (!product.sku) {
@@ -2197,10 +2223,23 @@ export async function syncAllWcProducts(
   // (which is all of the other sweep's), drop only what this run can prove is
   // resolved, and rotate what we attempted to the back. Two overlapping sweeps
   // then compose instead of overwriting, in either order.
+  //
+  // EVIDENCE ALSO HAS A TIME (o3d-xbt round 4, finding 1). Merging fixed the
+  // sweep that carried NO evidence about another's id; it did not fix the one
+  // that carries evidence which is simply OLD. A slow sweep that imported
+  // product 7 cleanly an hour ago still holds that result when it finally
+  // reaches the lock, and a faster sweep may have observed a real conflict for 7
+  // in the meantime and written it. Removing it then loses the conflict with the
+  // cursor past the product — the same silent loss, reached from the other side.
+  // So every id carries WHEN its conflict was last observed, in a sidecar row
+  // written in this same transaction, and a clear only counts if this run began
+  // no earlier than that (sequential runs — no race to adjudicate) or the
+  // individual piece of evidence is strictly newer (overlapping runs).
   let conflictsPersisted = true
   let keptConflictIds: number[] = []
   let droppedConflictIds: number[] = []
   let droppedStrandedIds: number[] = []
+  let staleClearIds: number[] = []
 
   // Written on every run that has something to say, including the clean one that
   // clears the row: this is the live set of conflicted products, not a log of
@@ -2216,12 +2255,22 @@ export async function syncAllWcProducts(
         // the same list and the later write still wins outright — merging a
         // stale snapshot is no better than replacing with one.
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_CONFLICT_LIST_LOCK_NAMESPACE}::int4, ${wcProductConflictLockId(mode)}::int4)`
+        // Both rows re-read under the SAME lock, because the timestamps only
+        // mean anything against the list they describe. Reading the sidecar
+        // outside would reintroduce the stale snapshot one level down.
+        // Sequential, not Promise.all: an interactive transaction is one
+        // connection, and two queries in flight on it is not something to rely
+        // on for a read this load-bearing.
         const current = await tx.setting.findUnique({ where: { key: conflictKey } })
+        const currentSeenAt = await tx.setting.findUnique({ where: { key: conflictSeenAtKey } })
         const outcome = mergeWcProductConflictIds({
+          runStartedAt,
           stored: parseWcProductConflictIds(current?.value),
+          storedSeenAt: parseWcProductConflictSeenAt(currentSeenAt?.value),
           attempted: processedIds,
-          cleared: clearedIds,
+          cleared: clearedAt,
           observed: [...conflictIds],
+          observedAt: conflictObservedAt,
         })
         const value = JSON.stringify(outcome.kept)
         await tx.setting.upsert({
@@ -2229,11 +2278,20 @@ export async function syncAllWcProducts(
           create: { key: conflictKey, value },
           update: { value },
         })
+        // Written in the same transaction, so a reader can never see a list
+        // whose stamps belong to a different generation of it.
+        const seenAtValue = serializeWcProductConflictSeenAt(outcome.seenAt, outcome.kept)
+        await tx.setting.upsert({
+          where: { key: conflictSeenAtKey },
+          create: { key: conflictSeenAtKey, value: seenAtValue },
+          update: { value: seenAtValue },
+        })
         return outcome
       })
       keptConflictIds = merged.kept
       droppedConflictIds = merged.dropped
       droppedStrandedIds = merged.dropped.filter((id) => !merged.droppedRecoverableByCursor.includes(id))
+      staleClearIds = merged.staleClears
     } catch (error) {
       conflictsPersisted = false
       const reason = error instanceof Error ? error.message : String(error)
@@ -2257,6 +2315,27 @@ export async function syncAllWcProducts(
       })
       await reportProgress(`Failed to record conflicted WooCommerce products: ${reason}`)
     }
+  }
+
+  if (staleClearIds.length > 0) {
+    // o3d-xbt round 4, finding 1. THIS RUN IMPORTED THESE PRODUCTS CLEANLY AND
+    // DID NOT ACT ON IT, because a LATER run has since seen them conflict. That
+    // is the correct outcome and it is also a genuinely surprising one, so it is
+    // said out loud rather than left as a product that mysteriously will not
+    // leave the list.
+    //
+    // WARNING, not ERROR: nothing is lost and nothing needs doing. The next
+    // sweep re-attempts these by id and clears them for real if they now import.
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_product_sync_stale_clear_ignored', tag: 'sync', level: 'WARNING',
+      description:
+        `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${staleClearIds.length} product(s) imported cleanly in`
+        + ' this run but stayed on the conflict list, because a LATER run has since observed a conflict for them.'
+        + ' This run\'s evidence is older than that conflict, so acting on it would have erased a live conflict with the'
+        + ' sync cursor already past the product. They are re-attempted by id on the next run.',
+      metadata: { mode, staleClearedExternalProductIds: staleClearIds.slice(0, 50) },
+      resolveUser: false,
+    })
   }
 
   if (droppedConflictIds.length > 0) {

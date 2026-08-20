@@ -347,6 +347,7 @@ There is no separate worker process. Background tasks are handled via HTTP endpo
 | WooCommerce reconcile | `GET /api/cron/wc-reconcile` | Daily | Backup reconciliation for WooCommerce orders/products plus stock catch-up and queued retry draining |
 | Mintsoft webhook sweeper | `GET /api/cron/mintsoft-webhook-sweeper` | Every 5 minutes | Drain persisted Mintsoft ASN booked-in webhook events and apply stock/PO effects asynchronously |
 | Delivery status | `GET /api/cron/delivery-status` | Every 15 min | Poll delivery tracking providers for shipment status updates |
+| WC refusal bell retry | `GET /api/cron/wc-refusal-bell-retry` | Every 15 min | Re-send the admin notification for a refused WooCommerce completion whose first notification write failed — the only driver, since the refusal itself is acknowledged and never redelivered |
 | WC withdrawal sweep | `GET /api/cron/wc-withdrawal-sweep` | Every 15 min | Re-check orders refused as EU withdrawals against the live storefront status, by order ID — the only route that does not depend on another event arriving |
 | Auto-archive EOL | `GET /api/cron/auto-archive-eol` | Daily | Move EOL products with zero on-hand and zero incoming to ARCHIVED |
 

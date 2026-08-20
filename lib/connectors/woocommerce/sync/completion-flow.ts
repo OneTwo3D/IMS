@@ -32,16 +32,6 @@ const POST_DISPATCH_FOR_WDRAW: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLE
 export type WcCompletionResult = { success: boolean; error?: string; permanent?: boolean }
 
 /**
- * Park a refusal where an operator is already looking (/sync/exceptions).
- *
- * ONE open row per order: a refusal that recurs (the daily reconcile, another
- * store edit) must not turn one unfulfillable order into a growing pile of
- * identical rows, which is the same dedupe rule the product structure conflicts
- * follow. Deleting and re-creating rather than updating deliberately re-stamps
- * `createdAt`, so the timestamp reads as "last refused", which is what an
- * operator triaging the list needs.
- */
-/**
  * Was the admin bell for this refusal actually delivered?
  *
  * o3d-xnwu round 3, Codex finding 4. `notify` SWALLOWS its errors — that is its
@@ -59,6 +49,134 @@ export type WcCompletionResult = { success: boolean; error?: string; permanent?:
 function wasAdminBellDelivered(payload: unknown): boolean {
   if (!payload || typeof payload !== 'object') return false
   return (payload as { adminNotified?: unknown }).adminNotified === true
+}
+
+/** How many undelivered bells one sweep will attempt. */
+export const WC_REFUSAL_BELL_RETRY_LIMIT = 50
+
+type WcRefusalBellRow = {
+  id: string
+  entityId: string | null
+  externalId: string | null
+  errorMessage: string | null
+  payload: unknown
+}
+
+function refusalPayload(payload: unknown): Record<string, unknown> {
+  return payload && typeof payload === 'object' && !Array.isArray(payload)
+    ? { ...(payload as Record<string, unknown>) }
+    : {}
+}
+
+/**
+ * Ring the admins about ONE open refusal, and record on the row whether they
+ * were actually told.
+ *
+ * The single place the bell is rung, so the first attempt at the moment of
+ * refusal and the sweep's later re-attempt cannot drift into saying different
+ * things about the same order, or into counting delivery differently.
+ */
+async function ringWcCompletionRefusalBell(row: WcRefusalBellRow): Promise<{ delivered: number; admins: number }> {
+  const payload = refusalPayload(row.payload)
+  const orderNumber = typeof payload.wcOrderNumber === 'string' && payload.wcOrderNumber
+    ? payload.wcOrderNumber
+    : (row.externalId ?? row.entityId ?? 'unknown')
+
+  const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+  // allSettled, not all: one admin's failed insert must not discard the others'
+  // successes, and a rejection here must not throw out of a function whose
+  // caller reads a throw as "the exception row could not be filed".
+  const results = await Promise.allSettled(admins.map((admin) => notify({
+    userId: admin.id,
+    type: 'error',
+    title: 'WooCommerce order completed but not fulfilled',
+    message:
+      `WooCommerce marked order ${orderNumber} as completed, but IMS refused to record the dispatch: `
+      + `${row.errorMessage ?? 'External fulfillment update failed'}. No shipment exists and no stock has moved.`
+      + ' It needs attention in the sync exception inbox.',
+    actionUrl: '/sync/exceptions',
+  })))
+
+  const delivered = results.filter((result) => result.status === 'fulfilled' && result.value === true).length
+  // An empty admin list is a FAILED bell, not a satisfied one: `Promise.all([])`
+  // resolving is not the same as somebody having been told, and an install with
+  // no active admin is exactly where an unfulfilled order goes unnoticed.
+  if (delivered === admins.length && admins.length > 0) {
+    // FENCED on the refusal predicate as well as the id, because between the
+    // read and this write the row can have been replaced by a fresh refusal of
+    // the same order (delete-and-recreate, so a NEW id) or resolved and deleted
+    // outright. `updateMany` matching nothing is the correct outcome there, and
+    // `update` by id alone would either throw or stamp a row whose delivery
+    // state we never actually established.
+    await db.shoppingSyncLog.updateMany({
+      where: { id: row.id, ...buildExternalFulfillmentRefusalWhere(row.entityId ?? undefined) },
+      data: { payload: JSON.parse(JSON.stringify({ ...payload, adminNotified: true })) },
+    // The bell WAS rung; failing to write that down must not undo it. The cost
+    // of losing this write is one duplicate bell next time, which is the right
+    // direction to err.
+    }).catch(() => {})
+  }
+
+  return { delivered, admins: admins.length }
+}
+
+/**
+ * RETRY THE BELLS NOBODY EVER HEARD (o3d-xnwu round 4, finding 2).
+ *
+ * Round 3 stopped a failed bell being recorded as delivered, and re-rang it on
+ * the NEXT refusal of the same order. That is a retry with no driver of its own:
+ * the trigger for it is another webhook or another poll deciding to refuse the
+ * same order again — and the commonest refusal, an order that cannot be
+ * fulfilled from stock, is acknowledged precisely so it is NOT re-delivered. So
+ * the one case where nobody was told is also the case least likely to happen a
+ * second time. An outage in the notification write during the only refusal an
+ * order ever gets left it silently unannounced for ever, exactly as before, and
+ * the only surviving trace was an activity row among thousands.
+ *
+ * This sweep is the driver. It is deliberately NOT gated on the WooCommerce sync
+ * or plugin switches: it calls no external system and imports nothing, it reads
+ * local rows and writes local notifications, and an operator pausing the sync is
+ * not an operator saying they no longer want to hear about the orders it already
+ * refused.
+ */
+export async function retryUnnotifiedWcCompletionRefusalBells(
+  opts: { limit?: number } = {},
+): Promise<{ scanned: number; delivered: number; stillUndelivered: number; adminCount: number }> {
+  const rows = await db.shoppingSyncLog.findMany({
+    where: {
+      ...buildExternalFulfillmentRefusalWhere(),
+      // An EXPLICIT `false`, not "anything that is not true".
+      //
+      // A JSON path predicate over an ABSENT key is SQL NULL, so `NOT (... =
+      // true)` is NULL and the row is filtered out — the negated form would
+      // silently match nothing but the rows it was written to exclude. Every row
+      // this module files carries the key, because it is written on creation,
+      // true or false.
+      //
+      // Rows filed BEFORE this branch have no key and are therefore not swept.
+      // That is deliberate: they were belled once under the old code, and
+      // re-ringing every historical refusal on deploy is a notification storm
+      // that would teach an operator to ignore precisely this bell. A fresh
+      // refusal of such an order re-files the row WITH the key.
+      payload: { path: ['adminNotified'], equals: false },
+    },
+    orderBy: { createdAt: 'asc' },
+    take: opts.limit ?? WC_REFUSAL_BELL_RETRY_LIMIT,
+    select: { id: true, entityId: true, externalId: true, errorMessage: true, payload: true },
+  })
+
+  let delivered = 0
+  let adminCount = 0
+  for (const row of rows) {
+    const outcome = await ringWcCompletionRefusalBell(row)
+    adminCount = outcome.admins
+    if (outcome.delivered === outcome.admins && outcome.admins > 0) delivered++
+  }
+
+  // No per-row activity row on a retry. The first failure already wrote one, and
+  // one ERROR per unnotified order every fifteen minutes is how a real signal
+  // gets filtered into a mail rule. The cron run itself carries the state.
+  return { scanned: rows.length, delivered, stillUndelivered: rows.length - delivered, adminCount }
 }
 
 /**
@@ -115,44 +233,20 @@ async function recordWcCompletionRefusal(orderId: string, wcOrder: WcFullOrder, 
   // order, which READONLY/SUPPLIER users must not be shown.
   if (alreadyBelled) return
 
-  const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
-  // allSettled, not all: one admin's failed insert must not discard the others'
-  // successes, and a rejection here must not throw out of a function whose
-  // caller reads a throw as "the exception row could not be filed".
-  const results = await Promise.allSettled(admins.map((admin) => notify({
-    userId: admin.id,
-    type: 'error',
-    title: 'WooCommerce order completed but not fulfilled',
-    message:
-      `WooCommerce marked order ${wcOrder.number ?? wcOrder.id} as completed, but IMS refused to record the dispatch: `
-      + `${error}. No shipment exists and no stock has moved. It needs attention in the sync exception inbox.`,
-    actionUrl: '/sync/exceptions',
-  })))
+  const { delivered, admins } = await ringWcCompletionRefusalBell({
+    id: created.id,
+    entityId: orderId,
+    externalId: String(wcOrder.id),
+    errorMessage: error,
+    payload: created.payload,
+  })
+  if (delivered === admins && admins > 0) return
 
-  const delivered = results.filter((row) => row.status === 'fulfilled' && row.value === true).length
-  // An empty admin list is a FAILED bell, not a satisfied one: `Promise.all([])`
-  // resolving is not the same as somebody having been told, and an install with
-  // no active admin is exactly where an unfulfilled order goes unnoticed.
-  if (delivered === admins.length && admins.length > 0) {
-    await db.shoppingSyncLog.update({
-      where: { id: created.id },
-      data: {
-        payload: JSON.parse(JSON.stringify({
-          wcStatus: wcOrder.status,
-          wcOrderNumber: wcOrder.number ?? null,
-          adminNotified: true,
-        })),
-      },
-    // The bell WAS rung; failing to write that down must not undo it or fail the
-    // filing. The cost of losing this write is one duplicate bell next time,
-    // which is the right direction to err.
-    }).catch(() => {})
-    return
-  }
-
-  // Reported, and retried. The row stays marked unnotified, so the next refusal
-  // of this order rings again — and an operator is told now rather than finding
-  // out from a customer.
+  // Reported once, at the moment it fails. The RETRY is not this row's job any
+  // more: `retryUnnotifiedWcCompletionRefusalBells` sweeps the unnotified rows on
+  // its own schedule (o3d-xnwu round 4, finding 2), so the bell no longer waits
+  // for the same order to be refused a second time — which, for the acknowledged
+  // stock refusal that produces most of these, may never happen at all.
   await logActivity({
     entityType: 'SALES_ORDER',
     entityId: orderId,
@@ -161,13 +255,13 @@ async function recordWcCompletionRefusal(orderId: string, wcOrder: WcFullOrder, 
     level: 'ERROR',
     description:
       `Filed the exception row for a refused WooCommerce completion of order ${orderId}, but could not tell the admins:`
-      + ` ${delivered} of ${admins.length} notification(s) were written`
-      + `${admins.length === 0 ? ' — there is no active ADMIN user to notify' : ''}.`
-      + ' The refusal is on /sync/exceptions and the bell will be retried the next time this order is refused.'
+      + ` ${delivered} of ${admins} notification(s) were written`
+      + `${admins === 0 ? ' — there is no active ADMIN user to notify' : ''}.`
+      + ' The refusal is on /sync/exceptions and the bell is retried by the wc-refusal-bell-retry job until it lands.'
       + ` The refusal itself was: ${error}`,
     metadata: {
       externalOrderId: wcOrder.id,
-      adminCount: admins.length,
+      adminCount: admins,
       notificationsDelivered: delivered,
     },
     resolveUser: false,

@@ -63,9 +63,22 @@ mock.module('@/lib/activity-log', {
   },
 })
 
+/**
+ * Fires ONCE, on the first `notify` of a run — the only point at which a
+ * concurrent change can land between the sweep's read of a row and its write
+ * back to it. Setting the row up before calling the sweep would model a run that
+ * STARTED late, which is a different thing entirely.
+ */
+let onFirstNotify: (() => void) | null = null
+
 mock.module('@/lib/notifications', {
   namedExports: {
     notify: async (params: { userId?: string | null }) => {
+      if (onFirstNotify) {
+        const hook = onFirstNotify
+        onFirstNotify = null
+        hook()
+      }
       if (params.userId && notifyFailsFor.has(params.userId)) return false
       notifications.push(params)
       return true
@@ -82,8 +95,35 @@ mock.module('@/lib/fulfillment/external-fulfillment', {
   },
 })
 
+/**
+ * The `where` a Prisma JSON path predicate expresses, honoured rather than
+ * ignored (o3d-xnwu round 4).
+ *
+ * A double that answered `findMany` from the whole table would make the sweep's
+ * selectivity unfalsifiable: it would "find" the already-belled rows too and
+ * ring them again, and the test would pass against code with no predicate at
+ * all. `{ path: ['adminNotified'], equals: false }` therefore means what
+ * Postgres means by it — including that an ABSENT key is not `false`, which is
+ * the whole reason production writes the key on creation.
+ */
+function matchesJsonPath(value: unknown, filter: { path: string[]; equals: unknown }): boolean {
+  let cursor: unknown = value
+  for (const segment of filter.path) {
+    if (!cursor || typeof cursor !== 'object') return false
+    cursor = (cursor as Record<string, unknown>)[segment]
+  }
+  // An absent key is SQL NULL, which equals nothing at all — not even null.
+  if (cursor === undefined) return false
+  return cursor === filter.equals
+}
+
 function matches(row: SyncLogRow, where: Record<string, unknown>): boolean {
-  return Object.entries(where).every(([key, value]) => row[key] === value)
+  return Object.entries(where).every(([key, value]) => {
+    if (value !== null && typeof value === 'object' && 'path' in (value as Record<string, unknown>)) {
+      return matchesJsonPath(row[key], value as { path: string[]; equals: unknown })
+    }
+    return row[key] === value
+  })
 }
 
 mock.module('@/lib/db', {
@@ -119,6 +159,26 @@ mock.module('@/lib/db', {
           Object.assign(row, data)
           return row
         },
+        findMany: async ({ where, take, orderBy }: {
+          where: Record<string, unknown>
+          take?: number
+          orderBy?: { createdAt?: 'asc' | 'desc' }
+        }) => {
+          const found = syncLogs.filter((row) => matches(row, where))
+          if (orderBy?.createdAt === 'asc') {
+            found.sort((a, b) => Number(a.createdAt as Date) - Number(b.createdAt as Date))
+          }
+          return take === undefined ? found : found.slice(0, take)
+        },
+        updateMany: async ({ where, data }: { where: Record<string, unknown>; data: SyncLogRow }) => {
+          // Honours the FULL where clause, id and refusal predicate alike. A
+          // double that matched on id alone could not observe the fence at all,
+          // and the fence is the point: between the read and this write the row
+          // can have been replaced by a fresh refusal (new id) or resolved.
+          const hit = syncLogs.filter((row) => matches(row, where))
+          for (const row of hit) Object.assign(row, data)
+          return { count: hit.length }
+        },
         deleteMany: async ({ where }: { where: Record<string, unknown> }) => {
           const kept = syncLogs.filter((row) => !matches(row, where))
           const removed = syncLogs.length - kept.length
@@ -151,6 +211,7 @@ function reset() {
   notifications.length = 0
   syncLogWriteError = null
   notifyFailsFor = new Set()
+  onFirstNotify = null
   adminUsers = [{ id: 'admin-1' }, { id: 'admin-2' }]
   fulfillmentResult = { success: true }
   lockedOrder = { id: 'so-1', withdrawalApprovedAt: null, status: 'PROCESSING' }
@@ -448,4 +509,195 @@ test('an install with NO active admin is a failed bell, not a satisfied one (o3d
   assert.ok(unnotified, 'an unfulfilled order with nobody to tell is exactly where this goes unnoticed')
   assert.match(String(unnotified.description), /no active ADMIN user to notify/)
   assert.equal(belled(), false, 'so when an admin does exist, the next refusal tells them')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu round 4, finding 2 — A FAILED BELL NEEDS A DRIVER OF ITS OWN.
+//
+// Round 3 stopped a failed bell being recorded as delivered and re-rang it on
+// the NEXT refusal of the same order. That is a retry with no driver: the
+// trigger is another refusal, and the commonest refusal — an order that cannot
+// be fulfilled from stock — is classified PERMANENT precisely so the webhook is
+// acknowledged and NOT redelivered. The one case where nobody was told is
+// therefore the case least likely to recur.
+// ---------------------------------------------------------------------------
+
+async function runBellRetry() {
+  const { retryUnnotifiedWcCompletionRefusalBells } = await import('@/lib/connectors/woocommerce/sync/completion-flow')
+  return retryUnnotifiedWcCompletionRefusalBells()
+}
+
+/** Refuse the order once, with the bell failing, and leave the row parked. */
+async function refuseWithFailedBell() {
+  fulfillmentResult = {
+    success: false,
+    reason: 'insufficient-stock',
+    error: 'External fulfillment requires physical stock — order has 3 unit(s) on backorder',
+  }
+  notifyFailsFor = new Set(['admin-1', 'admin-2'])
+  await runCompletion()
+  assert.equal(notifications.length, 0, 'precondition: nobody was told')
+  assert.equal(belled(), false, 'precondition: and the row says so')
+}
+
+test('an undelivered bell is rung WITHOUT the order being refused again (o3d-xnwu r4, finding 2)', async () => {
+  reset()
+  await refuseWithFailedBell()
+
+  // No second refusal. Nothing happens to the order at all — only time passes
+  // and the sweep runs.
+  notifyFailsFor = new Set()
+  const sweep = await runBellRetry()
+
+  assert.equal(sweep.scanned, 1, 'the sweep must FIND the unnotified row on its own — nothing refused this order again')
+  assert.equal(sweep.delivered, 1, 'and ring it')
+  assert.equal(sweep.stillUndelivered, 0)
+  assert.deepEqual(
+    notifications.map((row) => row.userId),
+    ['admin-1', 'admin-2'],
+    'both admins are told, individually — the message names a customer order, so it is never a broadcast',
+  )
+  assert.equal(
+    notifications[0].message?.includes('order has 3 unit(s) on backorder'),
+    true,
+    'and it carries the refusal itself, not a generic "something failed"',
+  )
+  assert.equal(notifications[0].actionUrl, '/sync/exceptions')
+  assert.equal(belled(), true, 'the row records the delivery, so the next sweep leaves it alone')
+})
+
+test('a delivered bell is NOT rung again by the sweep', async () => {
+  reset()
+  fulfillmentResult = {
+    success: false,
+    reason: 'insufficient-stock',
+    error: 'External fulfillment requires physical stock — order has 3 unit(s) on backorder',
+  }
+  await runCompletion()
+  assert.equal(belled(), true, 'precondition: this one landed')
+  notifications.length = 0
+
+  const sweep = await runBellRetry()
+
+  assert.equal(sweep.scanned, 0, 'the sweep selects on the recorded delivery, not on the row existing')
+  assert.deepEqual(notifications, [], 'a bell per sweep would train an operator to ignore exactly this bell')
+})
+
+test('a bell that fails AGAIN in the sweep stays unnotified and is reported', async () => {
+  reset()
+  await refuseWithFailedBell()
+
+  const sweep = await runBellRetry()
+
+  assert.equal(sweep.delivered, 0, 'notify refused again, so nobody was told')
+  assert.equal(sweep.stillUndelivered, 1, 'the caller can make the run visibly red instead of a silent 200')
+  assert.equal(belled(), false, 'and the row stays unnotified, so the next sweep tries again')
+})
+
+test('a PARTIAL delivery in the sweep is not counted as done', async () => {
+  reset()
+  await refuseWithFailedBell()
+
+  // One admin's row writes, the other's does not. One duplicate bell beats an
+  // admin never told.
+  notifyFailsFor = new Set(['admin-2'])
+  const sweep = await runBellRetry()
+
+  assert.equal(sweep.delivered, 0, 'one of two admins is not "the admins were told"')
+  assert.equal(sweep.stillUndelivered, 1)
+  assert.equal(belled(), false, 'marking this delivered would silence admin-2 for ever')
+})
+
+test('an install with NO active admin is still an undelivered bell, and says so', async () => {
+  reset()
+  await refuseWithFailedBell()
+
+  adminUsers = []
+  const sweep = await runBellRetry()
+
+  assert.equal(sweep.adminCount, 0, 'precondition: no active ADMIN user')
+  assert.equal(sweep.stillUndelivered, 1, 'an empty list resolving is not somebody having been told')
+  assert.equal(belled(), false)
+})
+
+test('the sweep does not stamp a refusal that was RESOLVED while it was ringing', async () => {
+  reset()
+  await refuseWithFailedBell()
+  const rowId = openRefusals()[0].id as string
+
+  // The operator clears the exception from /sync/exceptions while the sweep is
+  // mid-ring — the replay action sets the row SYNCED. Writing delivery onto it
+  // now records something about a row that has left the inbox, from a read taken
+  // before it did. The write is fenced on the refusal predicate, not the id
+  // alone, so it matches nothing.
+  notifyFailsFor = new Set()
+  onFirstNotify = () => {
+    syncLogs.find((row) => row.id === rowId)!.status = 'SYNCED'
+  }
+
+  await runBellRetry()
+
+  const row = syncLogs.find((candidate) => candidate.id === rowId)!
+  assert.equal(row.status, 'SYNCED', 'precondition: the resolve landed mid-ring')
+  assert.equal(
+    (row.payload as { adminNotified?: unknown }).adminNotified,
+    false,
+    'the sweep read this row as an OPEN refusal; by the write it was not one, so it writes nothing',
+  )
+})
+
+test('a legacy row with no delivery key is not swept, and is not silently resolved either', async () => {
+  reset()
+  // Filed before this branch: no `adminNotified` key at all. An absent key is
+  // SQL NULL, so the predicate does not match it — deliberately. Re-ringing
+  // every historical refusal on deploy is a notification storm; a fresh refusal
+  // of the same order re-files the row WITH the key.
+  syncLogs.push({
+    id: 'legacy-1',
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    status: 'QUARANTINED',
+    entityType: 'SalesOrderFulfillment',
+    entityId: 'so-legacy',
+    externalId: '9999',
+    errorMessage: 'External fulfillment requires physical stock',
+    payload: { wcStatus: 'completed', wcOrderNumber: '9999' },
+    createdAt: new Date(),
+  })
+
+  const sweep = await runBellRetry()
+
+  assert.equal(sweep.scanned, 0)
+  assert.deepEqual(notifications, [])
+  assert.equal(
+    (syncLogs.find((row) => row.id === 'legacy-1')!.payload as { adminNotified?: unknown }).adminNotified,
+    undefined,
+    'and the sweep did not quietly mark it delivered on the way past',
+  )
+})
+
+test('the retry is SCHEDULED, not merely reachable', async () => {
+  // A sweep nothing calls is not a driver. Route-auth registration authorizes
+  // requests; it does not create them.
+  const { readFileSync } = await import('node:fs')
+  const jobs = readFileSync('lib/cron-jobs/woocommerce.ts', 'utf8')
+  assert.ok(jobs.includes("slug: 'wc-refusal-bell-retry'"), 'the driver must be in the cron registry')
+  assert.ok(/wc-refusal-bell-retry[\s\S]{0,900}defaultSchedule: '\*\/15 \* \* \* \*'/.test(jobs))
+  assert.ok(
+    /wc-refusal-bell-retry[\s\S]{0,900}defaultEnabled: true/.test(jobs),
+    'a recovery that itself depends on somebody finding and enabling a switch is not a recovery',
+  )
+  const policy = readFileSync('lib/security/route-auth-policy.ts', 'utf8')
+  assert.ok(policy.includes("'/api/cron/wc-refusal-bell-retry'"), 'an unregistered cron route fails the boundary guard')
+  const route = readFileSync('app/api/cron/wc-refusal-bell-retry/route.ts', 'utf8')
+  assert.ok(route.includes('retryUnnotifiedWcCompletionRefusalBells'), 'and the route must actually run the sweep')
+  assert.ok(
+    route.includes('sweep.stillUndelivered > 0'),
+    'a silent 200 over an order nobody has been told about is the defect, one level up',
+  )
+  assert.equal(
+    /wc_sync_enabled/.test(route),
+    false,
+    'not gated on the sync switch: it calls nothing external, and pausing sync is not asking to stop hearing about refusals already made',
+  )
 })

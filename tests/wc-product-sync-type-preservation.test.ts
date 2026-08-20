@@ -3246,3 +3246,117 @@ test('o3d-y89x r5: a blocker the DECISION saw and the itemisation missed still r
   assert.notEqual(result.permanent, true, 'a blocker that clears itself must stay retryable')
   assert.equal(findProductBySku('PARENT-SKU')?.type, 'SIMPLE', 'the transform is not committed')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-xbt round 4, finding 1 — A STALE SUCCESSFUL SWEEP MUST NOT ERASE A NEWER
+// CONFLICT.
+//
+// Round 3's merge fixed the sweep that carries NO evidence about another's id.
+// It did not fix the sweep whose evidence is real but OLD, and a SUCCESS is
+// evidence: "I imported this cleanly" is exactly what takes an id off the list.
+// Sweep A imports product 4242 cleanly and spends another twenty minutes on the
+// rest of the catalogue. Sweep B starts later, re-imports 4242, hits a conflict,
+// takes the lock and writes it. A finally reaches the lock and removes it — on
+// evidence, precisely as round 3 requires — and the live conflict is gone with
+// the cursor already past the product.
+//
+// Modelled at the lock for the same reason round 3's merge tests are: that is
+// the interleaving `pg_advisory_xact_lock` permits, because it serializes rather
+// than excludes.
+// ---------------------------------------------------------------------------
+
+test('a stale clean import does NOT erase a conflict a later sweep recorded (o3d-xbt r4, finding 1)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // Carried from an earlier run, and the cursor is long past it: this list is the
+  // only record the product exists. Our by-id re-attempt imports it CLEANLY.
+  state.settings.set('wc_product_reconcile_conflict_ids', '[4242]')
+  productsById = { '4242': simpleProduct({ id: 4242, sku: 'CLEARED-SKU' }) as unknown as Row }
+
+  // The other sweep, finishing between our import and our lock, records a REAL
+  // conflict for the same product — stamped after our clean import.
+  onConflictListLock = () => {
+    state.settings.set('wc_product_reconcile_conflict_ids', '[4242]')
+    state.settings.set('wc_product_reconcile_conflict_seen_at', JSON.stringify({ 4242: Date.now() + 60_000 }))
+  }
+
+  await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(onConflictListLock, null, 'the sweep really did take the lock — the hook fired')
+  assert.deepEqual(
+    JSON.parse(state.settings.get('wc_product_reconcile_conflict_ids')!),
+    [4242],
+    'our import succeeded BEFORE that conflict, so it cannot answer it — dropping 4242 loses it for good, cursor already past',
+  )
+  const stale = state.activity.find((row) => row.action === 'wc_product_sync_stale_clear_ignored')
+  assert.ok(stale, 'and a sweep that declines to act on its own successful import says so')
+  assert.deepEqual((stale!.metadata as Row).staleClearedExternalProductIds, [4242])
+})
+
+test('a conflict recorded BEFORE this run started is still cleared by a clean import', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // The mirror: the rule is a comparison, not "a carried id can never be
+  // cleared". Without this the list would only ever grow. (The per-id arm — an
+  // OVERLAPPING run whose individual evidence still lands later — is pinned in
+  // tests/wc-product-conflict-cursor.test.ts, where the two runs' clocks can be
+  // stated exactly rather than raced.)
+  state.settings.set('wc_product_reconcile_conflict_ids', '[4242]')
+  productsById = { '4242': simpleProduct({ id: 4242, sku: 'CLEARED-SKU' }) as unknown as Row }
+  onConflictListLock = () => {
+    state.settings.set('wc_product_reconcile_conflict_ids', '[4242]')
+    state.settings.set('wc_product_reconcile_conflict_seen_at', JSON.stringify({ 4242: Date.now() - 60_000 }))
+  }
+
+  await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(state.settings.get('wc_product_reconcile_conflict_ids'), '[]', 'ours is the latest thing anyone knows')
+  assert.equal(
+    state.activity.some((row) => row.action === 'wc_product_sync_stale_clear_ignored'),
+    false,
+    'nothing was declined, so nothing is reported',
+  )
+})
+
+test('the stamps are written in the SAME transaction as the list they describe', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  state.products.push(imsRow({ id: 'ims-kit', sku: 'PARENT-SKU', name: 'A kit', type: 'KIT' }))
+  productPages = { '1': [variableProduct() as unknown as Row] }
+
+  await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(state.settings.get('wc_product_reconcile_conflict_ids'), '[77]')
+  const rawStamps = state.settings.get('wc_product_reconcile_conflict_seen_at')
+  assert.ok(
+    rawStamps !== undefined,
+    'the sidecar row must be written beside the list — an absent one silently degrades every later run to "no timestamps", which is the round-3 behaviour this fixes',
+  )
+  const stamps = JSON.parse(rawStamps!) as Record<string, number>
+  assert.deepEqual(Object.keys(stamps), ['77'], 'every carried id is stamped, and only the carried ones')
+  assert.ok(stamps['77'] > 0, 'with the moment the conflict was OBSERVED, not a placeholder')
+  // A list whose stamps could be read from an older generation of it would be
+  // worse than no stamps at all: it would authorise stale clears rather than
+  // merely fail to block them.
+  assert.equal(
+    settingUpsertError,
+    null,
+    'sanity: this run wrote both rows through the same upsert path the transaction uses',
+  )
+})
+
+test('a list written by a build with NO stamp row still clears normally', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // The migration and the rollback case in one: ids carried by an older build
+  // were written before this one was deployed, so they really do predate every
+  // run that can be in flight, and behaviour is exactly round 3's until the row
+  // is first rewritten.
+  state.settings.set('wc_product_reconcile_conflict_ids', '[4242]')
+  productsById = { '4242': simpleProduct({ id: 4242, sku: 'CLEARED-SKU' }) as unknown as Row }
+
+  await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(state.settings.get('wc_product_reconcile_conflict_ids'), '[]')
+  assert.equal(state.settings.get('wc_product_reconcile_conflict_seen_at'), '{}')
+})
