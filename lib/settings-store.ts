@@ -20,11 +20,6 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
   shopify_invoice_pdf_secret: 'SHOPIFY_INVOICE_PDF_SECRET',
   shopify_webhook_secret: 'SHOPIFY_WEBHOOK_SECRET',
   wc_invoice_pdf_secret: 'WC_INVOICE_PDF_SECRET',
-  // o3d-esha: scripts/install.sh prompts for WC_STORE_URL alongside the three
-  // secrets below, but wc_url had no entry here, so an env-configured
-  // WooCommerce landed its credentials with no store to point them at and
-  // reported itself unconfigured. The env path is only complete with all four.
-  wc_url: 'WC_STORE_URL',
   wc_webhook_secret: 'WC_WEBHOOK_SECRET',
 }
 
@@ -55,6 +50,32 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
 // clobber the operator's value), exactly like WC_STORE_URL and the SMTP_* variables. After
 // that the Settings UI is the single source of truth, and
 // lib/connectors/woocommerce/credentials.ts is the single resolver both paths build from.
+//
+// `wc_url` is deliberately NOT in the map above, and WC_STORE_URL is deliberately
+// not an override (o3d-esha, reconsidered).
+//
+// An earlier pass added it, reasoning that install.sh prompts for WC_STORE_URL
+// alongside the three WooCommerce secrets and that the env path is only complete
+// with all four. That is the same argument this sweep REJECTED for
+// WC_SYNC_STATUSES — the installer writes the line into every install, so wiring
+// it pins every existing installation to whatever was typed at install time and
+// makes the Settings field inert — and it applies here with more force, not less:
+//
+//   - getSettingValue prefers the environment, so an install set up years ago
+//     against one store and since repointed in Settings -> Sync -> Connection
+//     would silently revert to the old store the moment it upgraded. Orders would
+//     be imported from, and stock pushed to, a store the operator had abandoned.
+//   - the override would only be half-applied. getWcCredentials (the order
+//     import, FX push and partial-shipment paths) resolves wc_url through
+//     getSettingValues and would follow the environment, while
+//     product-sync.ts / stock-sync.ts / lib/shopping.ts read the settings ROW
+//     directly inside their advisory-lock snapshots and would follow the
+//     database. One installation, two stores, no error anywhere.
+//
+// WC_STORE_URL still has a job: scripts/provision-instance.mjs SEEDS the wc_url
+// setting from it at install time (insert-only, so a re-run cannot clobber the
+// operator's value), exactly like the SMTP_* variables. After that the Settings
+// UI is the single source of truth.
 
 export const SENSITIVE_SETTING_KEYS = new Set([
   'backup_s3_secret_key',

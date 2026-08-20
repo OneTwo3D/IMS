@@ -1355,9 +1355,12 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     test.setTimeout(600_000)
 
     // The counterpart to OC-13 (which proved the WEBHOOK path imports an on-hold order as a non-processing SO).
-    // The reconcile/poll path instead honours wc_sync_order_statuses at the WooCommerce FETCH (status=
-    // processing,completed in reconcile mode), so an on-hold order is never returned and never imported. Create
-    // an on-hold order, never nudge WP-Cron (no webhook delivers), run the reconcile, and assert NO SO exists.
+    // That difference is the DESIGNED split, not a bug: wc_sync_order_statuses governs the routes that FETCH
+    // orders — this reconcile sweep, the poll and the initial import — because each turns the selection into a
+    // WooCommerce `?status=` query (status=processing,completed in reconcile mode), while a webhook is a push
+    // the store makes about an order that already exists. See lib/connectors/woocommerce/order-status-filter.ts;
+    // the Sync page states the exemption next to the checkboxes. Create an on-hold order, never nudge WP-Cron
+    // (no webhook delivers), run the reconcile, and assert NO SO exists.
     const sku = taggedSku(runId, 'OC20')
     const unitPrice = '19.00'
 

@@ -34,6 +34,13 @@ import {
 import { getSettingValue } from '@/lib/settings-store'
 import { notify } from '@/lib/notifications'
 import { parsePositiveIntegerEnv } from '@/lib/env'
+import {
+  parseWcSyncOrderStatuses,
+  resolveWcPullStatuses,
+  WC_NO_STATUSES_SELECTED_MESSAGE,
+  WC_SYNC_ORDER_STATUSES_SETTING_KEY,
+  type WcOrderPullRoute,
+} from '../order-status-filter'
 
 // ---------------------------------------------------------------------------
 // Import a single WC order into IMS
@@ -2276,6 +2283,24 @@ export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ at
 // Sync all new/updated WC orders
 // ---------------------------------------------------------------------------
 
+/**
+ * `resolveWcPullStatuses` with the settings read for you — the single entry
+ * point every pull route uses, so the initial import and the sweeps cannot
+ * drift apart again (see lib/connectors/woocommerce/order-status-filter.ts).
+ *
+ * Returns `[]` when the operator has selected no statuses. Callers must treat
+ * that as "import nothing": passing an empty list to WooCommerce as `status=`
+ * asks for EVERY status.
+ */
+export async function getWcPullStatuses(route: WcOrderPullRoute): Promise<string[]> {
+  const { getWithdrawalStatuses } = await import('./withdrawal')
+  const [setting, withdrawal] = await Promise.all([
+    db.setting.findUnique({ where: { key: WC_SYNC_ORDER_STATUSES_SETTING_KEY } }),
+    getWithdrawalStatuses(),
+  ])
+  return resolveWcPullStatuses(route, parseWcSyncOrderStatuses(setting?.value), withdrawal)
+}
+
 export async function syncNewWcOrders(
   opts: { mode?: 'poll' | 'reconcile' | 'manual_reconcile' } = {},
 ): Promise<SyncResult> {
@@ -2289,28 +2314,23 @@ export async function syncNewWcOrders(
     return { synced: 0, skipped: 0, errors: ['Initial order import has not been completed yet. Run the initial import first.'] }
   }
 
-  // Read settings
-  const [statusesSetting, lastSyncSetting, existingOrder] = await Promise.all([
-    db.setting.findUnique({ where: { key: 'wc_sync_order_statuses' } }),
+  // Read settings. The status list — the operator's `wc_sync_order_statuses`
+  // selection, plus `completed` on the reconcile sweeps and the withdrawal
+  // statuses in every live mode — is resolved by the shared filter module so
+  // the initial import cannot drift away from it (see order-status-filter.ts).
+  const { getWithdrawalStatuses } = await import('./withdrawal')
+  const [lastSyncSetting, existingOrder, statuses, wdraw] = await Promise.all([
     db.setting.findUnique({ where: { key: cursorKey } }),
     db.salesOrder.findFirst({ select: { id: true } }),
+    getWcPullStatuses(mode),
+    getWithdrawalStatuses(),
   ])
 
-  let statuses: string[]
-  try { statuses = statusesSetting?.value ? JSON.parse(statusesSetting.value) : ['processing'] }
-  catch { statuses = ['processing'] }
-  if (mode !== 'poll' && !statuses.includes('completed')) {
-    statuses = [...statuses, 'completed']
-  }
-  // o3d-e1yb [wdraw]: ALWAYS include the withdrawal statuses, in every mode.
-  // This is the only backstop for a withdrawal whose webhook never arrived,
-  // and a withdrawal that is never seen means an order the customer asked to
-  // stop carries on to the warehouse. They are deliberately not left to the
-  // operator-configured `wc_sync_order_statuses`.
-  const { getWithdrawalStatuses } = await import('./withdrawal')
-  const wdraw = await getWithdrawalStatuses()
-  for (const s of [wdraw.submitted, wdraw.approved]) {
-    if (s && !statuses.includes(s)) statuses = [...statuses, s]
+  // No statuses selected is a real instruction, not an unset setting: fetch
+  // nothing. Passing an empty list through to `status=` would ask WooCommerce
+  // for EVERY status, which is the opposite of what was configured.
+  if (statuses.length === 0) {
+    return { synced: 0, skipped: 0, errors: [WC_NO_STATUSES_SELECTED_MESSAGE] }
   }
 
   // After a transaction reset or on a fresh install, there is nothing local to

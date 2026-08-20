@@ -73,6 +73,22 @@ function parseRedisValue(buffer: Buffer, offset = 0): ParsedRedisValue | null {
   throw new Error(`Unsupported Redis response type "${type}"`)
 }
 
+/**
+ * Both options below are wired from environment variables the installer already
+ * writes into every `.env`, which is the same shape as the WC_STORE_URL override
+ * that was rejected (see lib/settings-store.ts) — so it is worth saying why
+ * these two survive that argument and it did not.
+ *
+ * The rejected failure mode is an environment value silently OVERRIDING a
+ * setting an operator has since changed in the UI. That needs a stored setting
+ * to shadow and a UI that accepts the change and appears to work. Neither
+ * REDIS_PASSWORD nor REDIS_KEY_PREFIX has either: there is no setting, no form
+ * field, and no other way to configure them, so wiring them makes the only
+ * control that exists start working rather than overruling a competing one.
+ * Their failure mode is also loud, not silent — a wrong password fails AUTH and
+ * `checkRateLimit` records a `rate_limit_backend_error` WARNING, where a wrong
+ * store URL would quietly import orders from somebody else's shop.
+ */
 export type RedisRateLimitOptions = {
   /**
    * o3d-esha: scripts/install.sh:445 writes `requirepass` into redis.conf but

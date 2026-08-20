@@ -1174,8 +1174,8 @@ run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" SEED_TEST_ADMIN="fa
   npm run db:seed --prefix "${APP_DIR}"
 success "Database seed applied."
 
-if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}" || -n "${APP_DOMAIN}" ]]; then
-  header "Bootstrapping default admin"
+if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}" || -n "${APP_DOMAIN}" || -n "${WC_STORE_URL}" ]]; then
+  header "Bootstrapping default admin and seeded settings"
   BOOTSTRAP_SCRIPT="${APP_DIR}/scripts/provision-instance.mjs"
   [[ -f "${BOOTSTRAP_SCRIPT}" ]] || BOOTSTRAP_SCRIPT="/root/provision-instance.mjs"
 
@@ -1195,6 +1195,7 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
     SMTP_FROM_NAME="${SMTP_FROM_NAME}" \
     SMTP_FROM_EMAIL="${SMTP_FROM_EMAIL}" \
     SMTP_REPLY_TO="${SMTP_REPLY_TO}" \
+    WC_STORE_URL="${WC_STORE_URL}" \
     WC_CONSUMER_KEY="${WC_CONSUMER_KEY}" \
     WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}" \
     node "${BOOTSTRAP_SCRIPT}"

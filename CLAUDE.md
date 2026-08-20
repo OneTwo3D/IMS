@@ -494,16 +494,35 @@ Copy `.env.example` to `.env` and configure. Uses **NextAuth.js v5** variable na
 
 | Variable | Required | Description | Example |
 |----------|----------|-------------|---------|
-| `WC_STORE_URL` | No | WooCommerce store base URL (no trailing slash) | `https://yourstore.com` |
+| `WC_STORE_URL` | No | WooCommerce store base URL (no trailing slash). **Install-time seed only** — `scripts/provision-instance.mjs` writes it into the `wc_url` setting on a fresh install (insert-only); it never overrides what Settings → Sync → WooCommerce holds | `https://yourstore.com` |
 | `WC_CONSUMER_KEY` | No | WC REST API consumer key. **Install-time seed only** — seeded into the `wc_consumer_key` setting once, then owned by Settings → Sync → WooCommerce | From WC admin → Settings → Advanced → REST API |
 | `WC_CONSUMER_SECRET` | No | WC REST API consumer secret. **Install-time seed only** — seeded into the `wc_consumer_secret` setting once, then owned by Settings → Sync → WooCommerce. Editing it in `.env` after install changes nothing (o3d-ecbj) | From WC admin → Settings → Advanced → REST API |
 | `WC_WEBHOOK_SECRET` | No | WC webhook signing key | Any random string (set same in WC webhooks config) |
+
+> `WC_STORE_URL` is an **install-time seed only**. `scripts/provision-instance.mjs` writes it into
+> the `wc_url` setting on a fresh install, insert-only, and it is deliberately **not** in
+> `SETTING_ENV_FALLBACKS`: the installer writes the line into every `.env`, so an override would
+> repoint an installation that had since been moved to a different store back to the old one on its
+> next upgrade — and only half of the code reads `wc_url` through the settings store, so the two
+> halves would target different stores (o3d-esha). `WC_CONSUMER_KEY` / `WC_CONSUMER_SECRET` /
+> `WC_WEBHOOK_SECRET` / `WC_INVOICE_PDF_SECRET` **are** runtime overrides; the Connection tab shows
+> an "overridden by" banner while one is set.
 
 > Which order statuses import, webhooks vs polling, and the poll interval are **not** environment
 > variables. They are application settings edited in Settings -> Sync -> WooCommerce and stored in
 > the `settings` table (`wc_sync_order_statuses`, `wc_sync_interval_minutes`); the importer reads
 > them from the database. `WC_SYNC_STATUSES`, `WC_USE_WEBHOOKS` and `WC_POLL_INTERVAL_MINUTES` were
 > documented here and read by nothing (o3d-tj6v) - setting them silently changed nothing.
+
+> `wc_sync_order_statuses` governs every route that **fetches** orders from WooCommerce - the
+> initial "Import Active Orders" backfill, the polling sweep and the reconcile sweeps - because each
+> turns the selection into a `?status=` query. The rules live in one place,
+> `lib/connectors/woocommerce/order-status-filter.ts`, shared by the importer and the Sync page.
+> It does **not** apply to the order **webhook**: WooCommerce pushes that event, so there is no
+> query to scope, and dropping it would leave IMS disagreeing with the store about which orders
+> exist. The status still governs what an imported order does, via `shopping_status_mappings`. The
+> Sync page states this next to the checkboxes; keep the UI copy and
+> `lib/connectors/woocommerce/webhooks.ts` in step.
 
 ### Xero Integration (OAuth 2.0)
 

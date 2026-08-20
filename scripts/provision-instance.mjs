@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+import path from 'node:path'
+import { pathToFileURL } from 'node:url'
+
 import bcrypt from 'bcryptjs'
 import nodemailer from 'nodemailer'
 import pg from 'pg'
@@ -36,7 +39,7 @@ async function upsertSetting(db, key, value) {
 }
 
 /**
- * Write a setting ONLY if it does not exist yet (o3d-ecbj).
+ * Write a setting ONLY if it does not exist yet (o3d-ecbj, o3d-esha).
  *
  * A seed is not an override. `upsertSetting` above overwrites, which is correct for a
  * first-run bootstrap but wrong for anything an operator can edit afterwards: re-running
@@ -54,6 +57,24 @@ export async function seedSetting(db, key, value) {
     [key, value],
   )
   return result.rowCount > 0
+}
+
+/**
+ * The WooCommerce store URL as the app stores it: origin + path, no trailing
+ * slash (wcFetch appends `/wp-json/wc/v3/...`). Returns '' for anything that is
+ * not an http(s) URL, so a mistyped installer answer is skipped rather than
+ * seeded into a connector that would then fail every call.
+ */
+export function normaliseStoreUrl(raw) {
+  if (!raw) return ''
+  let parsed
+  try {
+    parsed = new URL(raw)
+  } catch {
+    return ''
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return ''
+  return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '')
 }
 
 async function provisionDefaultAdmin(db, options) {
@@ -154,6 +175,12 @@ async function main() {
     replyTo: getEnv('SMTP_REPLY_TO'),
   }
 
+  // Install-time SEED only, never an override: WC_STORE_URL is written into
+  // every .env by scripts/install.sh, so treating it as a runtime override would
+  // repoint an upgraded installation at whatever store it was first installed
+  // against (o3d-esha; see lib/settings-store.ts).
+  const wcStoreUrl = normaliseStoreUrl(getEnv('WC_STORE_URL'))
+
   const db = new Client({ connectionString: databaseUrl })
   await db.connect()
 
@@ -189,14 +216,23 @@ async function main() {
       )
     }
 
-    // The STORE URL is deliberately not seeded from here (o3d-ecbj). `wc_url` never had an
-    // environment fallback — it has always had to be entered in Settings — so nothing on this
-    // branch regressed it, and the seed for it belongs to the change that owns WC_STORE_URL
-    // (o3d-esha). Two independent seeds for the same setting, with two independent ideas of
-    // how to normalise a URL, is the drift this issue was about in the first place.
-    //
-    // What IS new is that the credentials can now be present while the URL is not, which reads
-    // to an operator as a configured connector that silently cannot reach anything. So say so.
+    // AND THE STORE URL, seeded HERE and only here (o3d-esha). o3d-ecbj deliberately left this
+    // out and said so: `wc_url` had no environment fallback then, and the seed belonged to the
+    // change that owns WC_STORE_URL. This is that change, so the seed lands here — one seed, one
+    // normalisation (`normaliseStoreUrl` above). Two independent seeds for the same setting, with
+    // two independent ideas of how to normalise a URL, is the drift both issues were about.
+    if (wcStoreUrl) {
+      const seeded = await seedSetting(db, 'wc_url', wcStoreUrl)
+      console.log(
+        seeded
+          ? `[INFO] WooCommerce store URL seeded from WC_STORE_URL: ${wcStoreUrl}.`
+          : '[INFO] WooCommerce store URL already set in Settings; WC_STORE_URL left unapplied.',
+      )
+    }
+
+    // The credentials can still be present while the URL is not — a mistyped WC_STORE_URL is
+    // skipped by `normaliseStoreUrl` rather than seeded — which reads to an operator as a
+    // configured connector that silently cannot reach anything. So say so.
     const wcRows = await db.query(
       `select key from settings where key in ('wc_url', 'wc_consumer_key', 'wc_consumer_secret')`,
     )
@@ -255,7 +291,12 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error('[ERROR]', error instanceof Error ? error.message : String(error))
-  process.exit(1)
-})
+// Only provision when run as a script. Exporting the helpers above lets the
+// seed rules be unit-tested without a database; without this guard the import
+// alone would try to connect to one.
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    console.error('[ERROR]', error instanceof Error ? error.message : String(error))
+    process.exit(1)
+  })
+}

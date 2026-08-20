@@ -622,15 +622,15 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
     key: maskSettingSecret('wc_consumer_key', key, 7),
     secret: maskSettingSecret('wc_consumer_secret', secret, 7),
     secretMasked: !!secret,
-    // Deliberately computed rather than hardcoded: WC_CONSUMER_KEY / WC_CONSUMER_SECRET are
-    // install-time SEEDS, not overrides (o3d-ecbj), so they are normally empty here — but if either
-    // is ever put back into SETTING_ENV_FALLBACKS, the Connection banner starts telling the operator
-    // again instead of quietly lying about which credential is in force.
+    // Deliberately computed rather than hardcoded to `{}`: WC_CONSUMER_KEY / WC_CONSUMER_SECRET are
+    // install-time SEEDS, not overrides (o3d-ecbj), so this is normally empty — but if either is ever
+    // put back into SETTING_ENV_FALLBACKS, the Connection banner starts telling the operator again
+    // instead of quietly lying about which credential is in force.
     //
-    // `wc_url` IS in that map (o3d-esha): the installer prompts for WC_STORE_URL, so an env-configured
-    // store really can be overriding the setting, and a banner that omitted it would report the store
-    // the operator typed into Settings while the importer talked to another one.
-    envOverrides: getActiveSettingEnvOverrides(['wc_url', 'wc_consumer_key', 'wc_consumer_secret']),
+    // wc_url is absent for the SAME reason and by the same decision, reached separately (o3d-tj6v r2):
+    // WC_STORE_URL seeds the setting at install time and never overrides it, so there is no override
+    // to warn about. Round 1 of this branch briefly wired it up and round 2 took it back out.
+    envOverrides: getActiveSettingEnvOverrides(['wc_consumer_key', 'wc_consumer_secret']),
     connectionTest,
   }
 }

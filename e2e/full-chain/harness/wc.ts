@@ -89,8 +89,10 @@ export async function createWcProduct(
  * Create an order in Woo.
  *
  * status defaults to 'processing' deliberately: wc_sync_order_statuses is
- * ["processing"], so an order in any other status is SILENTLY not imported. That
- * silence is a real trap — it presents as a webhook failure.
+ * ["processing"], so an order in any other status is SILENTLY not FETCHED by the
+ * initial import or the poll/reconcile sweeps. That silence is a real trap. A
+ * webhook still delivers such an order (see awaitWebhookDelivery below), which is
+ * why OC-13 can create an on-hold order and OC-20 cannot reconcile one.
  */
 export async function createWcOrder(
   c: WcCreds,
@@ -229,8 +231,13 @@ export async function nudgeWpCron(c: WcCreds): Promise<void> {
  * Fails with a diagnosis rather than a bare timeout, because "the order never arrived"
  * has several very different causes and the useful one is rarely the first guess:
  *   - the Action Scheduler stalled (stage's does — the runbook warns about it);
- *   - the order is in a status wc_sync_order_statuses does not import;
+ *   - the initial import has not been completed, so handleOrderWebhook ACKs and drops
+ *     every order webhook (wc_initial_import_completed);
  *   - the order parked in the pending-FX quarantine (order-import.ts) and is NOT lost.
+ *
+ * NOT a cause: the wc_sync_order_statuses filter. It governs the routes that FETCH
+ * orders (the initial import and the poll/reconcile sweeps), not this push path — a
+ * webhook imports the order whatever its status.
  */
 export async function awaitWebhookDelivery(
   wcOrderId: number,

@@ -7,7 +7,7 @@
     "QUICKBOOKS_CLIENT_ID": "A real instance of the o3d-esha defect, deliberately left open: QuickBooks is deprioritised (connector priority 2026-08) and the real control is the quickbooks_client_id setting written by the OAuth flow. Wire it up or delete the documentation when QuickBooks work resumes.",
     "QUICKBOOKS_CLIENT_SECRET": "A real instance of the o3d-esha defect, deliberately left open: QuickBooks is deprioritised (connector priority 2026-08) and the real control is the quickbooks_client_secret setting. Wire it up or delete the documentation when QuickBooks work resumes.",
     "QUICKBOOKS_COMPANY_ID": "A real instance of the o3d-esha defect, deliberately left open: QuickBooks is deprioritised (connector priority 2026-08) and the realm id is written to the quickbooks_company_id setting by the OAuth callback. Wire it up or delete the documentation when QuickBooks work resumes.",
-    "SHOPIFY_STORE_DOMAIN": "A real instance of the o3d-esha defect, deliberately left open: Shopify is deprioritised (connector priority 2026-08). Exactly the WC_STORE_URL shape - the three Shopify secrets have SETTING_ENV_FALLBACKS entries and the store domain does not, so an env-only Shopify config can never become configured."
+    "SHOPIFY_STORE_DOMAIN": "A real instance of the o3d-esha defect, deliberately left open: Shopify is deprioritised (connector priority 2026-08). Same shape as WC_STORE_URL - the three Shopify secrets have SETTING_ENV_FALLBACKS entries and the store domain does not. Resolve it the way WC_STORE_URL was: SEED the setting once at install time in scripts/provision-instance.mjs rather than adding an env override, which would repoint an upgraded install at a stale store."
   },
   "undocumentedReads": {}
 }

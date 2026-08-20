@@ -125,6 +125,9 @@ the client sends.
 ### WooCommerce (Optional)
 - Store URL, consumer key, consumer secret, webhook secret
 - Can be configured later in Settings
+- The store URL is a **seed**: the installer writes it into the `wc_url` setting once, and
+  **Settings > Sync > Connection** owns it from then on. The three secrets are **overrides** —
+  while they are set in `.env` they win over anything saved in the UI
 
 ### Xero (Optional)
 - Client ID and client secret
@@ -289,6 +292,7 @@ For WooCommerce specifically:
 
 - real-time order/product intake should come from webhooks
 - `/api/cron/wc-reconcile` is the daily backup reconcile path for orders/products and also runs the stock catch-up plus queued retry drain
+- the **Import order statuses** selection (Settings > Sync > WooCommerce) governs every route that *fetches* orders — the one-off active-order import and the poll/reconcile sweeps — because each turns the selection into a WooCommerce `?status=` query. It does **not** apply to the order webhook, which is a push about an order that already exists in the store; an imported order's status still decides what it does, through the status mappings. The Sync page states this next to the checkboxes
 
 For Mintsoft specifically:
 
@@ -454,7 +458,7 @@ Key variables in the `.env` file:
 | `REDIS_URL` | Redis connection URL, and the canonical place a Redis credential lives: `redis://:PASSWORD@host:port/db` (percent-encode the password). It is what the client connects with, and it is the only form that can express a Redis 6 ACL username. `scripts/install.sh` writes it this way for BOTH a locally provisioned Redis and one you already run, and leaves `REDIS_PASSWORD` empty when it does |
 | `REDIS_PASSWORD` | Compatibility fallback, used only when `REDIS_URL` carries no credential of its own — for hosts whose URL predates the rule above. Set one or the other, not both: two different values are a configuration error and are refused rather than resolved by precedence. A Redis that answers `NOAUTH` does not look like a Redis fault, because the login rate-limit buckets fail closed — it looks like nobody can sign in |
 | `REDIS_KEY_PREFIX` | Optional Redis namespace prefix for tenant- or instance-scoped keys |
-| `WC_STORE_URL` | WooCommerce store URL. Never read at runtime — the live value is the `wc_url` setting |
+| `WC_STORE_URL` | WooCommerce store URL. Install-time seed only: `scripts/provision-instance.mjs` writes it into the `wc_url` setting on a fresh install (insert-only) and it never overrides the value saved in **Settings > Sync > Connection** |
 | `WC_CONSUMER_KEY` | WooCommerce API consumer key. Install-time seed only — the live value is the `wc_consumer_key` setting |
 | `WC_CONSUMER_SECRET` | WooCommerce API consumer secret. Install-time seed only — the live value is the `wc_consumer_secret` setting |
 | `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks and WooCommerce helper-plugin FX pushes |
@@ -524,7 +528,8 @@ Environment variables for connector secrets take precedence over database settin
 
 `WC_CONSUMER_KEY` and `WC_CONSUMER_SECRET` are **not** in that group. They are install-time **seeds**: `scripts/provision-instance.mjs` writes them into the settings table only if no value is there yet, and Settings → Sync → WooCommerce → Connection owns them from then on. Editing them in `.env` after installation changes nothing — rotate the credential in the UI. (Environment precedence was removed because it was only half applied: the order import followed the environment while the stock and product syncs followed the database, so a stale `.env` secret made one installation talk to WooCommerce under two different credentials.)
 
-`WC_STORE_URL` has never been read at runtime at all. The live store URL is always the `wc_url` setting, entered in Settings → Sync → WooCommerce → Connection. If the credentials are stored but no store URL is, the installer says so and the connector cannot reach the store until the URL is entered.
+`WC_STORE_URL` is never read at runtime either. The live store URL is always the `wc_url` setting, entered in Settings → Sync → WooCommerce → Connection; `WC_STORE_URL` seeds that row once on a fresh install and nothing reads it afterwards. If the credentials are stored but no store URL is, the installer says so and the connector cannot reach the store until the URL is entered.
+`WC_STORE_URL` is not one of them either, and for the same reason with more force: the installer writes it into every `.env`, so making it an override would repoint an installation that had since been moved to a different store back to the old one on its next upgrade — and only part of the code resolves `wc_url` through the settings store, so order import and stock push would end up targeting different shops. It seeds the setting once at install time instead (`scripts/provision-instance.mjs`, insert-only).
 
 To rotate from the legacy global key to the settings key, first deploy with both the old key as `ENCRYPTION_KEY` and the new key as `SETTINGS_ENCRYPTION_KEY`, then run `npm run cli -- migrate-encrypted-settings` or save each connector settings page so sensitive values are rewritten as `enc:setting:v1:` with the new key. After confirming no `enc:v1` values remain in the `settings` table, remove the legacy `ENCRYPTION_KEY`.
 

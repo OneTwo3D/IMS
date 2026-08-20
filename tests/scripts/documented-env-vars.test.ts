@@ -191,6 +191,102 @@ test('read detection ignores mentions that appear only in comments', () => {
   assert.ok(keys.has('DATABASE_URL'))
 })
 
+// ---------------------------------------------------------------------------
+// ...but generous must stop short of "merely NAMED counts as read", or the
+// guard passes on exactly the defect it exists to catch.
+// ---------------------------------------------------------------------------
+
+test('a TRAILING comment mention is not a read', () => {
+  // The o3d-esha sweep left comments like this in the files the guard scans, so
+  // re-documenting any of these variables would have passed the check on the
+  // strength of the note explaining that nothing reads them.
+  const code = [
+    'const port = 587 // SMTP_PORT is an install-time seed, not a runtime input',
+    'const level = 3 /* LOG_LEVEL is read by nothing */',
+    'const mode = process.env.FILE_SCAN_MODE',
+  ].join('\n')
+
+  const keys = extractReadKeys(code)
+
+  assert.equal(keys.has('SMTP_PORT'), false)
+  assert.equal(keys.has('LOG_LEVEL'), false)
+  assert.ok(keys.has('FILE_SCAN_MODE'))
+})
+
+test('stripping a trailing comment does not mangle a URL inside a string', () => {
+  // This is why trailing comments used to be left alone: a line-based strip cuts
+  // `https://` in half, and mangling a line can only DELETE a real read — which
+  // is a false positive, the failure mode this guard cannot afford.
+  const code = [
+    "const base = 'https://store.example/wp-json' // WC_STORE_URL is a seed",
+    "const key = parseEnvList('TRUSTED_PROXY_IPS')",
+  ].join('\n')
+
+  const keys = extractReadKeys(code)
+
+  assert.ok(keys.has('TRUSTED_PROXY_IPS'), 'the read after the URL line survives')
+  assert.equal(keys.has('WC_STORE_URL'), false)
+})
+
+test('a name buried in a longer string is not a read; a string that IS the name is', () => {
+  const code = [
+    "throw new Error('UPLOAD_MAX_SIZE_MB was documented and read by nothing')",
+    "const ips = parseEnvList('TRUSTED_PROXY_IPS')",
+    "const MODE_ENV = 'MINTSOFT_AUTH_MODE'",
+  ].join('\n')
+
+  const keys = extractReadKeys(code)
+
+  // No read can arrive with the name glued into a sentence: every indirect read
+  // in this codebase passes the exact name and nothing else.
+  assert.equal(keys.has('UPLOAD_MAX_SIZE_MB'), false)
+  assert.ok(keys.has('TRUSTED_PROXY_IPS'))
+  assert.ok(keys.has('MINTSOFT_AUTH_MODE'))
+})
+
+test('a regex containing a backtick does not swallow the reads that follow it', () => {
+  // Every guard added here has to answer for its own false positives. A quote
+  // inside a regex literal is ordinary code, but to a scanner that does not know
+  // it is in a regex it opens a literal — and a BACKTICK opens one that does not
+  // end at the newline, so it blanks everything up to the next backtick in the
+  // file and deletes every read in between.
+  const code = [
+    "const plain = value.replace(/`/g, '')",
+    'const url = process.env.DATABASE_URL',
+    "const dir = process.env['BACKUP_DIR']",
+    'const label = `store: ${plain}`',
+  ].join('\n')
+
+  const keys = extractReadKeys(code)
+
+  assert.ok(keys.has('DATABASE_URL'))
+  assert.ok(keys.has('BACKUP_DIR'))
+})
+
+test('an apostrophe in JSX text does not blank the reads after it', () => {
+  // The scanner cannot know a quote opened a string until it finds the closing
+  // one. An apostrophe in prose never gets a partner, so the blanking has to be
+  // undone rather than left in place — otherwise the rest of the line is gone.
+  const code = "const el = <p>Don't forget to set DATABASE_URL and BACKUP_DIR</p>"
+
+  const keys = extractReadKeys(code)
+
+  assert.ok(keys.has('DATABASE_URL'))
+  assert.ok(keys.has('BACKUP_DIR'))
+})
+
+test('a template literal with a substitution is scanned as code, not swallowed', () => {
+  const code = [
+    'const sql = `select value from settings where key = ${KEY_COLUMN}`',
+    'const secret = process.env.CRON_SECRET',
+  ].join('\n')
+
+  const keys = extractReadKeys(code)
+
+  assert.ok(keys.has('KEY_COLUMN'), 'the substitution is code')
+  assert.ok(keys.has('CRON_SECRET'), 'the line after the template still reads')
+})
+
 test('the inverse report sees SETTING_ENV_FALLBACKS entries, which literal matching cannot', () => {
   const settingsStore = `
     export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {

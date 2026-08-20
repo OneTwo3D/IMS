@@ -1,10 +1,17 @@
 /**
- * WooCommerce active order import — background job.
+ * WooCommerce order backfill — background job.
  *
- * Imports active orders (processing/pending/on-hold) as SalesOrders via importWcOrder.
- * Historical demand data import is handled separately by the forecast module.
+ * Imports the orders the operator selected under Settings -> Sync -> WooCommerce
+ * -> "Import order statuses" as SalesOrders via importWcOrder. Historical demand
+ * data import is handled separately by the forecast module.
  *
- * Skips failed, cancelled, and refunded orders entirely.
+ * The status list used to be hardcoded here as `processing,pending,on-hold`
+ * while the same setting governed every other pull route (o3d-tj6v follow-up).
+ * That made the checkboxes a lie on the ONE import that runs on every new
+ * installation: unticking `on-hold` still backfilled on-hold orders, and the
+ * only place that said otherwise was the sentence on this card. The list now
+ * comes from `getWcPullStatuses('initial')` like every other pull route, and the
+ * Sync page prints the resolved list before the button is pressed.
  */
 
 import { after } from 'next/server'
@@ -12,7 +19,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { notify } from '@/lib/notifications'
 import { wcFetch } from '../api'
-import { importWcOrder } from './order-import'
+import { getWcPullStatuses, importWcOrder } from './order-import'
+import { WC_NO_STATUSES_SELECTED_MESSAGE } from '../order-status-filter'
 import type { WcFullOrder } from './types'
 
 // ---------------------------------------------------------------------------
@@ -112,7 +120,35 @@ export async function startInitialImport(): Promise<void> {
 
 async function runInitialImport(progress: InitialImportProgress) {
   try {
-    progress.message = 'Importing active orders\u2026'
+    const statuses = await getWcPullStatuses('initial')
+
+    // No statuses selected is an instruction, not an unset setting. Marking the
+    // import COMPLETE here would unlock live order sync on a configuration that
+    // imports nothing, so surface it as an error the Sync page offers a retry
+    // for \u2014 the operator ticks a status and presses the button again.
+    if (statuses.length === 0) {
+      progress.status = 'error'
+      progress.message = WC_NO_STATUSES_SELECTED_MESSAGE
+      progress.errors.push(WC_NO_STATUSES_SELECTED_MESSAGE)
+      await saveProgress(progress)
+      await logActivity({
+        entityType: 'IMPORT',
+        tag: 'import',
+        action: 'failed',
+        level: 'WARNING',
+        description: `Active WC order import did not run: ${WC_NO_STATUSES_SELECTED_MESSAGE}`,
+        resolveUser: false,
+      })
+      notify({
+        type: 'error',
+        title: 'Active Order Import Failed',
+        message: WC_NO_STATUSES_SELECTED_MESSAGE,
+        actionUrl: '/sync',
+      })
+      return
+    }
+
+    progress.message = `Importing orders (${statuses.join(', ')})\u2026`
     await saveProgress(progress)
 
     // Deduplication: pre-load existing WooCommerce order links.
@@ -127,14 +163,14 @@ async function runInitialImport(progress: InitialImportProgress) {
 
     while (page <= totalPages) {
       progress.currentPage = page
-      progress.message = `Fetching active orders\u2026 page ${page}${totalPages > 1 ? ` / ${totalPages}` : ''}`
+      progress.message = `Fetching orders (${statuses.join(', ')})\u2026 page ${page}${totalPages > 1 ? ` / ${totalPages}` : ''}`
       await saveProgress(progress)
 
       let result: Awaited<ReturnType<typeof wcFetch>> | null = null
       for (let attempt = 1; attempt <= 3; attempt++) {
         try {
           result = await wcFetch('/orders', {
-            status: 'processing,pending,on-hold',
+            status: statuses.join(','),
             per_page: '100',
             page: String(page),
             orderby: 'date',

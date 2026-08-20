@@ -38,6 +38,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getSettingValues } from '@/lib/settings-store'
 import { INTERNAL_STATUS_TRANSITION_AUTH_ONLY } from '@/lib/sales/status-transition-bypass'
+import { normaliseWcOrderStatus } from '../order-status-filter'
 import type { WcFullOrder } from './types'
 
 /** Settings keys, so a store that renames the plugin's statuses can follow. */
@@ -74,13 +75,12 @@ export type TransitionResult = { success: boolean; error?: string; permanent?: b
  *  lifecycle against real dispatch evidence. */
 const POST_DISPATCH: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
-export function normaliseStatus(status: unknown): string {
-  const s = String(status ?? '').trim().toLowerCase()
-  // WooCommerce reports `processing`, but a setting may be entered as
-  // `wc-processing`. NB startsWith + slice, never lstrip-style character
-  // stripping, which would turn "withdrawn" into "ithdrawn".
-  return s.startsWith('wc-') ? s.slice(3) : s
-}
+/**
+ * Re-exported from the shared filter module so the withdrawal statuses and the
+ * operator's `wc_sync_order_statuses` selection can never be normalised by two
+ * different rules and then compared to each other.
+ */
+export const normaliseStatus = normaliseWcOrderStatus
 
 export async function getWithdrawalStatuses(): Promise<{ submitted: string; approved: string }> {
   const map = await getSettingValues([WDRAW_SUBMITTED_STATUS_KEY, WDRAW_APPROVED_STATUS_KEY])

@@ -21,7 +21,7 @@
 // always to stop DOCUMENTING the variable (or, as with XERO_TOKEN_PATH, to stop the installer
 // WRITING it).
 export const RETIRED_ENV_VARS: Readonly<Record<string, string>> = {
-  WC_SYNC_STATUSES: 'The order status filter is the wc_sync_order_statuses setting, edited in Settings -> Sync -> WooCommerce.',
+  WC_SYNC_STATUSES: 'The order status filter is the wc_sync_order_statuses setting, edited in Settings -> Sync -> WooCommerce. It governs the routes that FETCH orders (the initial import and the poll/reconcile sweeps), not the order webhook, which imports whatever the store pushes.',
   WC_USE_WEBHOOKS: 'There is no webhooks-or-polling switch: webhook events are accepted whenever a WooCommerce webhook secret is configured, and the wc-reconcile cron polls regardless.',
   WC_POLL_INTERVAL_MINUTES: 'The polling cadence is the wc-reconcile cron schedule, edited in Settings -> Cron.',
   XERO_CLIENT_ID: 'The Xero OAuth client id is the xero_client_id setting, entered in Settings -> Integrations -> Xero.',

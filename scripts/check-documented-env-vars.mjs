@@ -21,13 +21,20 @@
  *     (ALL_CAPS with at least one underscore), which excludes `POST`, `GET`,
  *     `SQL` and friends from HTTP/verb tables.
  *
- *   - READ is deliberately generous: any mention of the exact name in a
- *     TypeScript/JS source file outside comments. Reads in this codebase hide
- *     behind `process.env.X`, `env.X`, `env[SOME_CONST]` where the constant
- *     holds the name, `parseEnvList('X')`, and the SETTING_ENV_FALLBACKS map.
- *     Enumerating those patterns would miss one and fail a variable that is
- *     genuinely read. Being generous biases the guard toward missing a defect
- *     rather than inventing one.
+ *   - READ is deliberately generous: any mention of the exact name in the CODE
+ *     of a TypeScript/JS source file. Reads in this codebase hide behind
+ *     `process.env.X`, `env.X`, `env[SOME_CONST]` where the constant holds the
+ *     name, `parseEnvList('X')`, and the SETTING_ENV_FALLBACKS map. Enumerating
+ *     those patterns would miss one and fail a variable that is genuinely read.
+ *     Being generous biases the guard toward missing a defect rather than
+ *     inventing one.
+ *
+ *     Generous stops at "merely NAMED": a comment (including a trailing one) and
+ *     a name buried in a longer string are mentions, not reads, and counting
+ *     them would pass the guard on exactly the defect it exists for — the
+ *     o3d-esha sweep left `// LOG_LEVEL is read by nothing` comments in the very
+ *     files this scans. A string that is EXACTLY the name still counts, because
+ *     that is how every indirect read passes it. See `extractReadKeys`.
  *
  * The suppression list is scripts/documented-env-var-allowlist.json, which
  * requires a reason string per entry so that a suppression is a decision
@@ -171,21 +178,245 @@ export function extractDocumentedKeys(kind, text) {
 }
 
 /**
- * Strip block comments and whole-line `//` comments. Trailing `//` comments are
- * left alone deliberately: stripping them would have to cope with `https://`
- * inside string literals, and mangling a line can only ever DELETE a real read,
- * which turns into a false positive.
+ * Keywords after which a `/` opens a REGULAR EXPRESSION rather than being a
+ * division operator (`return /x/.test(s)`). Everything else that ends in an
+ * identifier character — a variable, a property, a closing bracket — means
+ * division. Getting this wrong only matters for regexes containing an unpaired
+ * quote (`.replace(/'/g, '')`), which would otherwise open a phantom string.
  */
-export function stripCodeComments(text) {
-  return text
-    .replace(/\/\*[\s\S]*?\*\//g, ' ')
-    .replace(/^[ \t]*\/\/.*$/gm, ' ')
+const REGEX_PRECEDING_KEYWORDS = new Set([
+  'await', 'case', 'delete', 'do', 'else', 'in', 'instanceof', 'new', 'of',
+  'return', 'throw', 'typeof', 'void', 'yield',
+])
+
+/**
+ * Single pass over a source file, classifying every character as code, comment,
+ * string or regex.
+ *
+ * A hand-rolled scanner rather than regex surgery because the two are not
+ * equivalent here. The previous matcher stripped block comments and whole-line
+ * `//` comments and deliberately LEFT trailing `//` comments alone, because a
+ * naive line strip mangles `https://` inside a string literal — and mangling a
+ * line can only DELETE a real read, which becomes a false positive. A scanner
+ * that knows it is inside a string when it meets `//` has no such trade-off:
+ * it removes every comment, including trailing ones, and never touches a URL.
+ *
+ * Returns three views of the file:
+ *   - `codeWithComments` — comments blanked, string and regex bodies intact.
+ *     `process.env.X` / `process.env['X']` matching needs the literals.
+ *   - `codeOutsideLiterals` — comments AND literal bodies blanked. What is left
+ *     is identifiers, properties and object keys: things the file names because
+ *     it USES them.
+ *   - `stringLiterals` — the complete content of every string / no-substitution
+ *     template literal, so a literal can be judged as a whole.
+ *
+ * Blanking preserves length and newlines so offsets and line numbers survive.
+ */
+export function scanCodeRegions(text) {
+  const withComments = text.split('')
+  const outsideLiterals = text.split('')
+  const stringLiterals = []
+
+  const blank = (index) => {
+    if (text[index] !== '\n') outsideLiterals[index] = ' '
+  }
+  const blankBoth = (index) => {
+    if (text[index] !== '\n') {
+      withComments[index] = ' '
+      outsideLiterals[index] = ' '
+    }
+  }
+
+  // Template literals nest: `a${ `b${ c }` }d`. The stack records, per open
+  // template, whether we are inside its `${ }` (code) or its static text.
+  const templateStack = []
+  let i = 0
+  let lastSignificant = ''
+  let lastWord = ''
+
+  const startsRegex = () => {
+    if (lastSignificant === '') return true
+    if (/[)\]}]/.test(lastSignificant)) return false
+    if (/[A-Za-z0-9_$]/.test(lastSignificant)) return REGEX_PRECEDING_KEYWORDS.has(lastWord)
+    // Quotes end a literal, so `/` after one is division.
+    return !/['"`]/.test(lastSignificant)
+  }
+
+  const noteSignificant = (char) => {
+    lastSignificant = char
+    if (/[A-Za-z0-9_$]/.test(char)) lastWord += char
+    else lastWord = ''
+  }
+
+  /**
+   * Put back what a mis-read literal blanked.
+   *
+   * Blanking is speculative: we do not know a quote was really a string until we
+   * find its partner. Rewinding `i` without restoring the characters would leave
+   * the rest of the line blank in `codeOutsideLiterals` and DELETE every read on
+   * it — the false positive this guard cannot afford. A stray apostrophe in JSX
+   * text ("Don't set DATABASE_URL") is the everyday case.
+   */
+  const restore = (from, to) => {
+    for (let index = from; index < to && index < text.length; index += 1) {
+      outsideLiterals[index] = text[index]
+    }
+  }
+
+  while (i < text.length) {
+    const char = text[i]
+    const next = text[i + 1]
+
+    if (char === '/' && next === '/') {
+      while (i < text.length && text[i] !== '\n') blankBoth(i++)
+      continue
+    }
+
+    if (char === '/' && next === '*') {
+      blankBoth(i++)
+      blankBoth(i++)
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) blankBoth(i++)
+      if (i < text.length) { blankBoth(i++); blankBoth(i++) }
+      lastSignificant = ''
+      lastWord = ''
+      continue
+    }
+
+    if (char === '/' && startsRegex()) {
+      const start = i
+      i++
+      let inClass = false
+      let terminated = false
+      while (i < text.length) {
+        const c = text[i]
+        if (c === '\\') { blank(i); blank(i + 1); i += 2; continue }
+        if (c === '\n') break
+        if (c === '[') inClass = true
+        else if (c === ']') inClass = false
+        else if (c === '/' && !inClass) { i++; terminated = true; break }
+        blank(i)
+        i++
+      }
+      // A regex literal never spans a line, so an unterminated one means the
+      // heuristic misfired on a division. Undo it.
+      if (!terminated) { restore(start, i); i = start + 1 }
+      noteSignificant(terminated ? ')' : '/')
+      continue
+    }
+
+    if (char === '\'' || char === '"') {
+      const quote = char
+      const start = i
+      i++
+      let content = ''
+      let terminated = false
+      while (i < text.length) {
+        const c = text[i]
+        if (c === '\\') { blank(i); blank(i + 1); content += text[i + 1] ?? ''; i += 2; continue }
+        if (c === quote) { i++; terminated = true; break }
+        // An unterminated quote (a stray apostrophe the regex heuristic let
+        // through) must not swallow the rest of the file: stop at the newline.
+        if (c === '\n') break
+        blank(i)
+        content += c
+        i++
+      }
+      if (terminated) stringLiterals.push(content)
+      else { restore(start, i); i = start + 1 }
+      noteSignificant(quote)
+      continue
+    }
+
+    if (char === '`') {
+      const start = i
+      i++
+      let content = ''
+      let substituted = false
+      let terminated = false
+      while (i < text.length) {
+        const c = text[i]
+        if (c === '\\') { blank(i); blank(i + 1); content += text[i + 1] ?? ''; i += 2; continue }
+        if (c === '`') { i++; terminated = true; break }
+        if (c === '$' && text[i + 1] === '{') {
+          // Leave the substitution as code and resume the template afterwards.
+          substituted = true
+          templateStack.push(start)
+          i += 2
+          break
+        }
+        blank(i)
+        content += c
+        i++
+      }
+      if (terminated && !substituted) stringLiterals.push(content)
+      if (!terminated && !substituted) { restore(start, i); i = start + 1 }
+      if (!substituted) noteSignificant('`')
+      else { lastSignificant = '{'; lastWord = '' }
+      continue
+    }
+
+    if (char === '}' && templateStack.length > 0) {
+      // Back into the static half of the innermost template literal.
+      templateStack.pop()
+      i++
+      while (i < text.length) {
+        const c = text[i]
+        if (c === '\\') { blank(i); blank(i + 1); i += 2; continue }
+        if (c === '`') { i++; break }
+        if (c === '$' && text[i + 1] === '{') { templateStack.push(i); i += 2; break }
+        blank(i)
+        i++
+      }
+      noteSignificant('`')
+      continue
+    }
+
+    if (!/\s/.test(char)) noteSignificant(char)
+    i++
+  }
+
+  return {
+    codeWithComments: withComments.join(''),
+    codeOutsideLiterals: outsideLiterals.join(''),
+    stringLiterals,
+  }
 }
 
+/**
+ * Comments removed, literals preserved. Kept as the name the literal-access
+ * matchers below use; `scanCodeRegions` is what actually does the work.
+ */
+export function stripCodeComments(text) {
+  return scanCodeRegions(text).codeWithComments
+}
+
+/**
+ * READ is deliberately generous — see the file header — but "generous" has to
+ * stop short of "a variable that is merely NAMED counts as read", or the guard
+ * passes on exactly the defect it exists for. Two mentions are not reads:
+ *
+ *   - a comment, including a trailing one. `// LOG_LEVEL is read by nothing` is
+ *     the opposite of a read, and the o3d-esha sweep left such comments behind
+ *     in the very files the guard scans.
+ *   - a name buried in a longer string: an error message, a doc string, a
+ *     migration's SQL. `'WC_SYNC_STATUSES was documented and read by nothing'`
+ *     names the variable; it does not consult it.
+ *
+ * A string that is EXACTLY the variable name still counts, because that is how
+ * every indirect read in this codebase passes it: `parseEnvList('X')`,
+ * `process.env['X']`, `const X_ENV = 'X'; env[X_ENV]`, and the
+ * SETTING_ENV_FALLBACKS values. No read can arrive with the name glued into a
+ * sentence, so requiring the whole literal to match costs nothing and closes
+ * the "merely named" hole.
+ */
 export function extractReadKeys(text) {
   const keys = new Set()
-  for (const [, token] of stripCodeComments(text).matchAll(/\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b/g)) {
+  const { codeOutsideLiterals, stringLiterals } = scanCodeRegions(text)
+  for (const [, token] of codeOutsideLiterals.matchAll(/\b([A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+)\b/g)) {
     keys.add(token)
+  }
+  for (const literal of stringLiterals) {
+    if (ENV_VAR_NAME_RE.test(literal)) keys.add(literal)
   }
   return keys
 }

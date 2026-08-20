@@ -241,6 +241,20 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
 
   const wcOrder = payload as WcFullOrder
 
+  // `wc_sync_order_statuses` is NOT consulted here, and that is a decision
+  // rather than an omission (o3d-tj6v follow-up). It governs every route that
+  // PULLS orders — the initial import and the poll/reconcile sweeps, all of
+  // which turn the selection into a WooCommerce `?status=` query — but a
+  // webhook is a PUSH: the store is telling IMS about an order that exists.
+  // Refusing the event would leave IMS silently disagreeing with the store, and
+  // an order that later moved into an admitted status would arrive with no
+  // `order.created` behind it. The status still decides what the order DOES:
+  // shopping_status_mappings gives an unpaid `on-hold` order the ON_HOLD
+  // lifecycle, which allocates no stock and raises no invoice.
+  //
+  // Because that is genuinely surprising to an operator who has just unticked a
+  // status, the exemption is stated next to the checkboxes on the Sync page —
+  // see app/(dashboard)/sync/sync-client.tsx. Keep the two in step.
   const failures: string[] = []
   // Failures a stable business rule caused. Re-delivering the identical payload re-hits the identical
   // rule, so these are acknowledged rather than retried into the dead-letter queue (o3d-bx9).

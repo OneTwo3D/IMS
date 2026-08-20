@@ -252,21 +252,36 @@ test('the WooCommerce API credentials have no environment override, so both sync
   }
 })
 
-// o3d-esha item 3: WC_CONSUMER_KEY / WC_CONSUMER_SECRET / WC_WEBHOOK_SECRET /
-// WC_INVOICE_PDF_SECRET were env-backed but wc_url was not, so a WooCommerce
-// configured entirely by environment landed its credentials with no store to
-// point them at and reported itself unconfigured.
-test('settings-store backs the WooCommerce store URL with WC_STORE_URL', () => {
+// o3d-esha item 3, reconsidered. An earlier pass made WC_STORE_URL a runtime
+// override for wc_url, on the grounds that install.sh prompts for it alongside
+// the three WooCommerce secrets. That is the same argument this sweep REJECTED
+// for WC_SYNC_STATUSES — the installer writes the line into every .env, so
+// wiring it pins every existing installation — and it bites harder here:
+//
+//   - getSettingValue prefers the environment, so an install repointed at a new
+//     store in Settings would silently revert to the store it was first
+//     installed against the moment it upgraded;
+//   - the override would only be HALF applied. getWcCredentials (order import,
+//     FX push, partial shipment) resolves wc_url through getSettingValues and
+//     would follow the environment, while product-sync.ts / stock-sync.ts /
+//     lib/shopping.ts read the settings ROW directly inside their advisory-lock
+//     snapshots and would follow the database. One install, two stores.
+//
+// WC_STORE_URL now seeds the setting once at install time
+// (scripts/provision-instance.mjs, insert-only) and never overrides it.
+test('settings-store does NOT let WC_STORE_URL override the saved WooCommerce store URL', () => {
   const previousUrl = process.env.WC_STORE_URL
   const previousKey = process.env.WC_CONSUMER_KEY
   try {
-    process.env.WC_STORE_URL = 'https://env-store.example'
-    delete process.env.WC_CONSUMER_KEY
+    process.env.WC_STORE_URL = 'https://stale-store-from-an-old-install.example'
+    process.env.WC_CONSUMER_KEY = 'env-key'
 
-    assert.equal(getSettingEnvFallbackKey('wc_url'), 'WC_STORE_URL')
-    assert.equal(getEnvFallback('wc_url'), 'https://env-store.example')
+    assert.equal(getSettingEnvFallbackKey('wc_url'), null)
+    assert.equal(getEnvFallback('wc_url'), null)
+    // The credentials ARE overrides and still report themselves as such, so the
+    // Connection tab's "overridden by" banner keeps working for them.
     assert.deepEqual(getActiveSettingEnvOverrides(['wc_url', 'wc_consumer_key']), {
-      wc_url: 'WC_STORE_URL',
+      wc_consumer_key: 'WC_CONSUMER_KEY',
     })
   } finally {
     if (previousUrl == null) delete process.env.WC_STORE_URL
