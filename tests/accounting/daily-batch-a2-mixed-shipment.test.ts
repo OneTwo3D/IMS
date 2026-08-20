@@ -287,3 +287,155 @@ test('Xero live Group A2 REFUSES the batch when a dispatched line it must accoun
     'the refusal names the allocation, the order and the quantity it could not account for',
   )
 })
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r8 (Codex round 8) — TWO ROUTES TO THE SAME DOUBLE POST, BOTH ON THE JOURNAL AMOUNT.
+//
+// r7 fixed the QUANTITY: `accountedAllocationQty` says how many dispatched units no entry on the
+// row accounts for, and the pass posts only those. It then chose the ENTRIES for that quantity by
+// re-deriving them from every dispatched line at the scope, as though none had ever been taken —
+// so a later pass was handed the FIRST shipment's already-posted entries again. And the record it
+// all rests on was destroyed outright whenever a rewrite moved the row to another warehouse.
+//
+// Both are the same defect: a posted amount treated as a quantity to re-derive rather than a fact
+// already recorded. The two tests below are the two routes, each asserted on what A2 posts.
+// ---------------------------------------------------------------------------------------------
+
+/** What an earlier pass recorded: all 6 units of the first dispatch, at the £10 layer it consumed. */
+const RECORDED_FIRST_DISPATCH = [{
+  costLayerId: 'layer-dispatch-1',
+  qty: '6.000000',
+  unitCostBase: '10.000000',
+  shipmentLineId: 'ship-line-1',
+  source: 'shipment',
+}]
+
+function shipmentOf(id: string, lineId: string, qty: number, layerId: string, unitCostBase: string): ShipmentRow {
+  return {
+    id,
+    status: 'SHIPPED',
+    warehouseId: 'wh-1',
+    lines: [{
+      id: lineId,
+      lineId: 'line-1',
+      productId: 'prod-1',
+      qty,
+      costLayerSnapshot: [{ costLayerId: layerId, qty: `${qty}.000000`, unitCostBase, shipmentLineId: lineId, source: 'shipment' }],
+    }],
+  }
+}
+
+test('Xero live Group A2 values a SECOND dispatch at its own layers, never at the first one it already posted (o3d-0i5y r8)', async () => {
+  resetRun()
+  // 10 allocated. 6 dispatched at £10 and RECORDED by an earlier pass, which posted that £60.
+  // A residual of 4 has since dispatched at £2. Nothing is left on the shelf: 4 units are
+  // unrecorded, and the entries for them are S2's — S1's are spent.
+  a2Order = {
+    id: 'order-1',
+    orderNumber: 'SO-1',
+    externalOrderNumber: null,
+    status: 'SHIPPED',
+    allocations: [{
+      id: 'alloc-1',
+      lineId: 'line-1',
+      productId: 'prod-1',
+      warehouseId: 'wh-1',
+      qty: 10,
+      costLayerSnapshot: RECORDED_FIRST_DISPATCH,
+    }],
+    shipments: [
+      shipmentOf('ship-1', 'ship-line-1', 6, 'layer-dispatch-1', '10.000000'),
+      shipmentOf('ship-2', 'ship-line-2', 4, 'layer-dispatch-2', '2.000000'),
+    ],
+  }
+  shelfLayers = []
+
+  const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+  const result = await runDailyBatchSync()
+
+  assert.deepEqual(result.errors, [], 'the run must complete, not be asserted on after failing')
+  assert.equal(result.groupA2, 1)
+
+  const journal = a2Journal()
+  assert.ok(journal, 'A2 posted a reclassification journal')
+  // 4 units at S2's own £2 = £8. Together with the £60 the first pass posted, Allocated Inventory
+  // holds £68 — exactly what the two dispatches cost. r7 took the 4 units off the FRONT of the
+  // pool, which is still S1 at £10, and posted £40: £40 of S1's cost entered the ledger twice and
+  // S2's £8 never entered it at all.
+  assert.deepEqual(
+    journal.payload.lines,
+    [
+      { accountCode: '631', description: 'Daily inventory allocation — 1 order(s)', debit: 8 },
+      { accountCode: '630', description: 'Daily inventory allocation — 1 order(s)', credit: 8 },
+    ],
+    'A2 debits Allocated Inventory £8 — the second dispatch at its own cost',
+  )
+  assert.equal(orderUpdates[0]?.data.allocationBatchAmount, 8, 'and the order records the same £8')
+
+  const written = allocationUpdates[0].costLayerSnapshot as Array<Record<string, string>>
+  assert.deepEqual(
+    written.map((entry) => [entry.costLayerId, String(entry.qty), String(entry.shipmentLineId)]),
+    [
+      ['layer-dispatch-1', '6.000000', 'ship-line-1'],
+      ['layer-dispatch-2', '4.000000', 'ship-line-2'],
+    ],
+    'and the row records each dispatch once, against the line that dispatched it',
+  )
+})
+
+test('Xero live Group A2 owes only the residual on a row whose record MOVED warehouse with it (o3d-0i5y r8)', async () => {
+  resetRun()
+  // THE ROW IS NOT A LITERAL — it is whatever the allocation rewrite decides this scope will hold.
+  // 10 units A2 already posted at £5 sat at wh-2; the rewrite moves the whole claim to wh-1 and
+  // raises it to 14. Building the fixture through the planner is what makes this test see the
+  // allocator's decision: strip the carry-over and the row arrives blank, exactly as it did before.
+  const { planAccountedRecordCarryOver } = await import('@/lib/domain/sales/allocation-service')
+  const { allocationScopeKey } = await import('@/lib/domain/inventory/reservation-residual')
+  const { Prisma } = await import('@/app/generated/prisma/client')
+  const destination = { lineId: 'line-1', productId: 'prod-1', warehouseId: 'wh-1' }
+  const carriedRecord = planAccountedRecordCarryOver(
+    [{
+      lineId: 'line-1',
+      productId: 'prod-1',
+      warehouseId: 'wh-2',
+      costLayerSnapshot: [{ costLayerId: 'layer-w2', qty: '10.000000', unitCostBase: '5.000000' }],
+    }],
+    [{ ...destination, qty: new Prisma.Decimal(14) }],
+  ).get(allocationScopeKey(destination))?.write ?? null
+
+  a2Order = {
+    id: 'order-1',
+    orderNumber: 'SO-1',
+    externalOrderNumber: null,
+    status: 'ALLOCATED',
+    allocations: [{
+      id: 'alloc-1',
+      lineId: 'line-1',
+      productId: 'prod-1',
+      warehouseId: 'wh-1',
+      qty: 14,
+      costLayerSnapshot: carriedRecord,
+    }],
+    shipments: [],
+  }
+  shelfLayers = [{ id: 'layer-w1', remainingQty: 14, unitCostBase: 5 }]
+
+  const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+  const result = await runDailyBatchSync()
+
+  assert.deepEqual(result.errors, [])
+  const journal = a2Journal()
+  assert.ok(journal, 'A2 posted a reclassification journal')
+  // 4 unaccounted units at £5. Before the carry-over the rewrite deleted the record with the row,
+  // so this pass saw all 14 units unaccounted and posted £70 — £50 of it for units already sitting
+  // in Allocated Inventory from the first posting, which nothing reverses.
+  assert.deepEqual(
+    journal.payload.lines,
+    [
+      { accountCode: '631', description: 'Daily inventory allocation — 1 order(s)', debit: 20 },
+      { accountCode: '630', description: 'Daily inventory allocation — 1 order(s)', credit: 20 },
+    ],
+    'A2 debits Allocated Inventory £20 — the 4 new units only',
+  )
+  assert.equal(orderUpdates[0]?.data.allocationBatchAmount, 20)
+})

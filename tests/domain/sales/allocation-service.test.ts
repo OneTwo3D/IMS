@@ -27,6 +27,12 @@ import {
   type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
 import { toDecimal } from '@/lib/domain/math/decimal'
+import { Prisma } from '@/app/generated/prisma/client'
+import {
+  parseCostLayerSnapshot,
+  sumCostLayerSnapshot,
+  sumCostLayerSnapshotQty,
+} from '@/lib/cost-layer-snapshots'
 import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 
 type ProductRow = {
@@ -372,7 +378,13 @@ function createClient(state: MemoryState): AllocationServiceClient {
             || (allocation.fulfillmentGraphVersion ?? 0) !== where.fulfillmentGraphVersion.not
           ))
         for (const row of rows) {
-          if ('costLayerSnapshot' in data) row.costLayerSnapshot = null
+          // o3d-0i5y r8: the WRITTEN VALUE is honoured, not hardcoded to null. Forcing null asserted
+          // a destructive rewrite as a REQUIREMENT — whatever the allocator wrote, the row came back
+          // empty — so a test could observe Group A2's posted record being destroyed but never being
+          // CARRIED onto the row that inherits its units, which is the fix.
+          if ('costLayerSnapshot' in data) {
+            row.costLayerSnapshot = data.costLayerSnapshot === Prisma.DbNull ? null : data.costLayerSnapshot
+          }
           if (data.fulfillmentGraphVersion !== undefined) row.fulfillmentGraphVersion = data.fulfillmentGraphVersion
           if (data.qty !== undefined) row.qty = persistAllocationQty(decimalLikeToNumber(data.qty))
         }
@@ -2079,6 +2091,163 @@ test('an allocation change DOES clear the A2 stamp when A2 recorded a debit of e
   assert.equal(
     activityLogWrites.filter((entry) => (entry as { action: string }).action === 'allocation_accounting_stage_retained').length,
     0,
+  )
+})
+
+/**
+ * o3d-0i5y r8 — THE POSTED RECORD FOLLOWS THE UNITS, NOT THE ROW.
+ *
+ * `costLayerSnapshot` on an allocation row is the record that Group A2 has already debited
+ * Allocated Inventory for those units. The rewrite used to destroy it in the ordinary course of
+ * business: move a residual to another warehouse and the old scope's row is deleted, the new one
+ * created blank, and A2 — which decides what it owes by reading the record — pins and posts every
+ * unit a second time. Nothing reverses the first posting.
+ *
+ * 10 units posted at £5 = £50 in Allocated Inventory. The stock moves to warehouse-1 and 4 more
+ * units are allocated there. The money half of this is asserted on the real Group A2 writer in
+ * tests/accounting/daily-batch-a2-mixed-shipment.test.ts, on the row shape these two tests prove
+ * the allocator now writes.
+ */
+function movedState(lineQty: number): ReturnType<typeof baseState> {
+  const product = { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false }
+  return baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      // A2 has run: these rows are POSTED, which is exactly what the stamp means.
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: 50,
+      lines: [{ id: 'line-1', productId: 'product-1', qty: lineQty, sku: 'SKU-1', description: 'Product 1', product }],
+    },
+    warehouses: [
+      { id: 'warehouse-1', code: 'MAIN', name: 'Main', active: true, availableForSale: true, isDefault: true, syncToStore: false },
+      { id: 'warehouse-2', code: 'SEC', name: 'Second', active: true, availableForSale: true, isDefault: false, syncToStore: false },
+    ],
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: lineQty, reservedQty: 0 },
+      { productId: 'product-1', warehouseId: 'warehouse-2', quantity: 10, reservedQty: 10 },
+    ],
+    allocations: [{
+      id: 'alloc-w2',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-2',
+      qty: 10,
+      costLayerSnapshot: [{ costLayerId: 'layer-w2', qty: '10.000000', unitCostBase: '5.000000' }],
+    }],
+  })
+}
+
+test('o3d-0i5y r8: a warehouse MOVE carries the posted A2 record onto the row that inherits the units', async () => {
+  // 10 posted at warehouse-2, 14 now wanted and warehouse-1 (the default) can cover all of them.
+  const state = movedState(14)
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(
+    rows.map((row) => `${row.warehouseId}:${Number(row.qty)}`),
+    ['warehouse-1:14'],
+    'the whole claim moved to warehouse-1',
+  )
+  const record = parseCostLayerSnapshot(rows[0].costLayerSnapshot)
+  assert.equal(
+    sumCostLayerSnapshotQty(record).toString(),
+    '10',
+    'the 10 units A2 already posted are still recorded — on the row that now holds them',
+  )
+  assert.equal(
+    sumCostLayerSnapshot(record).toString(),
+    '50',
+    'at the £50 that is actually in Allocated Inventory, so A2 owes the 4 new units and nothing else',
+  )
+  assert.equal(
+    state.order.inventoryAllocatedDate,
+    null,
+    'and the order does go back to A2, because 4 units genuinely are unaccounted',
+  )
+})
+
+test('o3d-0i5y r8: a move with nothing new to account keeps the A2 stamp — the order is not handed back to post again', async () => {
+  // The same move without the residual. Every unit is already accounted, so there is nothing for a
+  // second A2 pass to do and the order must not be selected for one.
+  const state = movedState(10)
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(
+    rows.map((row) => `${row.warehouseId}:${Number(row.qty)}`),
+    ['warehouse-1:10'],
+  )
+  assert.equal(
+    sumCostLayerSnapshot(parseCostLayerSnapshot(rows[0].costLayerSnapshot)).toString(),
+    '50',
+    'the record moved with the units',
+  )
+  assert.deepEqual(
+    state.order.inventoryAllocatedDate,
+    new Date('2026-01-01T00:00:00Z'),
+    'the stamp stands: a move is not new quantity, and clearing it is what invited the second posting',
+  )
+  assert.equal(state.order.allocationBatchAmount, 50, 'and so does the amount A2 recorded posting')
+})
+
+test('o3d-0i5y r8: a record moving onto a scope that SURVIVES is added to the record already there', async () => {
+  // The in-place half of the carry: warehouse-1 already holds 2 posted units of its own and takes
+  // warehouse-2's 10 as well. Adding them is the point — writing only the arrivals would drop the
+  // £10 the surviving row was already evidence for, and A2 would post those 2 units again.
+  const product = { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false }
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: 60,
+      lines: [{ id: 'line-1', productId: 'product-1', qty: 12, sku: 'SKU-1', description: 'Product 1', product }],
+    },
+    warehouses: [
+      { id: 'warehouse-1', code: 'MAIN', name: 'Main', active: true, availableForSale: true, isDefault: true, syncToStore: false },
+      { id: 'warehouse-2', code: 'SEC', name: 'Second', active: true, availableForSale: true, isDefault: false, syncToStore: false },
+    ],
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 12, reservedQty: 2 },
+      { productId: 'product-1', warehouseId: 'warehouse-2', quantity: 10, reservedQty: 10 },
+    ],
+    allocations: [
+      {
+        id: 'alloc-w1',
+        orderId: 'order-1',
+        lineId: 'line-1',
+        productId: 'product-1',
+        warehouseId: 'warehouse-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-w1', qty: '2.000000', unitCostBase: '5.000000' }],
+      },
+      {
+        id: 'alloc-w2',
+        orderId: 'order-1',
+        lineId: 'line-1',
+        productId: 'product-1',
+        warehouseId: 'warehouse-2',
+        qty: 10,
+        costLayerSnapshot: [{ costLayerId: 'layer-w2', qty: '10.000000', unitCostBase: '5.000000' }],
+      },
+    ],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(rows.map((row) => `${row.id}:${row.warehouseId}:${Number(row.qty)}`), ['alloc-w1:warehouse-1:12'])
+  const record = parseCostLayerSnapshot(rows[0].costLayerSnapshot)
+  assert.equal(sumCostLayerSnapshotQty(record).toString(), '12', 'both records are on the row, not just the arriving one')
+  assert.equal(sumCostLayerSnapshot(record).toString(), '60', 'the whole £60 already in Allocated Inventory')
+  assert.deepEqual(
+    state.order.inventoryAllocatedDate,
+    new Date('2026-01-01T00:00:00Z'),
+    'and with all 12 units accounted there is nothing to hand back to A2',
   )
 })
 

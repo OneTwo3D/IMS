@@ -46,7 +46,16 @@ import {
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { accountedAllocationQty, parseCostLayerSnapshot, type CostLayerSnapshotEntry } from '@/lib/cost-layer-snapshots'
+import {
+  accountedAllocationQty,
+  parseCostLayerSnapshot,
+  reduceSnapshotByQty,
+  serializeCostLayerSnapshot,
+  sumCostLayerSnapshotQty,
+  takeFromSnapshotEntries,
+  type CostLayerSnapshotEntry,
+  type SerializedCostLayerSnapshotEntry,
+} from '@/lib/cost-layer-snapshots'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -485,6 +494,102 @@ export async function journaledAllocationFloors(
   return floors
 }
 
+/** What one (line, warehouse, product) scope will hold as its A2 record after a rewrite. */
+export type AccountedRecordPlanEntry = {
+  /** The complete record — the entries Group A2 has already posted against these units. */
+  entries: CostLayerSnapshotEntry[]
+  /**
+   * The value to WRITE onto the row, when a record moved onto this scope from one the rewrite is
+   * dropping. `null` when the row already holds its record and must simply be left alone.
+   */
+  write: SerializedCostLayerSnapshotEntry[] | null
+}
+
+/** Keyed by {@link allocationScopeKey} of the row in the NEXT set. */
+export type AccountedRecordPlan = Map<string, AccountedRecordPlanEntry>
+
+/**
+ * WHERE EACH POSTED RECORD LIVES AFTER THIS REWRITE (o3d-0i5y r8).
+ *
+ * An allocation row's `costLayerSnapshot` is not decoration and not a cache: it is the record that
+ * Group A2 has already debited Allocated Inventory for those units. Group A2 decides what it owes by
+ * reading it, so anything that DESTROYS it re-presents posted units as unaccounted, and the next
+ * pass posts them a second time. Nothing reverses the first posting.
+ *
+ * The rewrite destroyed it in the ordinary course of business. Move a residual from warehouse-1 to
+ * warehouse-2 — a stock transfer, a warehouse going out of stock, the 15-minute re-allocation sweep
+ * finding a better source — and the (line, w1, product) scope is not in the new set, so its row is
+ * deleted and a brand-new (line, w2, product) row is created with no record at all. A2 then sees a
+ * row with an empty record and its full quantity outstanding, and pins and posts every unit again:
+ *
+ *   10 units allocated at w1, pinned and posted by A2 at £5 = £50 in Allocated Inventory.
+ *   the stock moves to w2. The w1 row is deleted, the w2 row created blank.
+ *   the next A2 pass posts another £50 for the SAME 10 units. Allocated Inventory now holds £100.
+ *
+ * So the record follows the units instead of following the row. A scope the new set keeps holds its
+ * own record untouched; a scope it drops hands its record to the new scopes of the same (line,
+ * product), oldest warehouse first, filling each to its quantity and giving any remainder to the
+ * last — a shrunk row legitimately records more than it holds, exactly as
+ * {@link unaccountedAllocationQty}'s floor already allows. A record whose (line, product) has no row
+ * left at all is not carried: those units are off the order (a deallocation, a cancellation, a full
+ * refund), nothing will re-allocate them, and A2 will never look at them again.
+ *
+ * This is the same rule as {@link resetAllocationAccountingIfStaged}'s: what has been posted is a
+ * recorded FACT. A reset means "come back to A2 for whatever is NEW", never "forget what was posted".
+ */
+export function planAccountedRecordCarryOver(
+  existing: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; costLayerSnapshot?: Prisma.JsonValue | null }>,
+  next: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>,
+): AccountedRecordPlan {
+  const nextKeys = new Set(next.map((row) => allocationScopeKey(row)))
+  const plan: AccountedRecordPlan = new Map()
+  const strandedByLineProduct = new Map<string, CostLayerSnapshotEntry[]>()
+
+  for (const row of existing) {
+    const entries = parseCostLayerSnapshot(row.costLayerSnapshot ?? null)
+    if (entries.length === 0) continue
+    const key = allocationScopeKey(row)
+    if (nextKeys.has(key)) {
+      plan.set(key, { entries, write: null })
+      continue
+    }
+    const lineProduct = `${row.lineId}|${row.productId}`
+    strandedByLineProduct.set(lineProduct, [...(strandedByLineProduct.get(lineProduct) ?? []), ...entries])
+  }
+
+  for (const [lineProduct, stranded] of strandedByLineProduct) {
+    const destinations = next
+      .filter((row) => `${row.lineId}|${row.productId}` === lineProduct)
+      .slice()
+      .sort((a, b) => (a.warehouseId === b.warehouseId ? 0 : a.warehouseId < b.warehouseId ? -1 : 1))
+    // The units are off the order entirely. Nothing will re-allocate them and A2 will never be
+    // asked about them again, so there is no double post to prevent by carrying the record.
+    if (destinations.length === 0) continue
+
+    let pool = stranded
+    for (let index = 0; index < destinations.length; index += 1) {
+      if (pool.length === 0) break
+      const destination = destinations[index]
+      const key = allocationScopeKey(destination)
+      const held = plan.get(key)?.entries ?? []
+      const isLast = index === destinations.length - 1
+      // The last destination takes whatever is left, so a record is never dropped for want of
+      // headroom — dropping it is the double post this function exists to prevent.
+      const headroom = isLast
+        ? sumCostLayerSnapshotQty(pool)
+        : toDecimal(destination.qty).sub(sumCostLayerSnapshotQty(held))
+      if (headroom.lte(0)) continue
+      const { taken } = takeFromSnapshotEntries(pool, headroom.toNumber())
+      if (taken.length === 0) continue
+      pool = reduceSnapshotByQty(pool, sumCostLayerSnapshotQty(taken))
+      const entries = [...held, ...taken]
+      plan.set(key, { entries, write: serializeCostLayerSnapshot(entries) })
+    }
+  }
+
+  return plan
+}
+
 /**
  * Does the declared allocation set leave quantity that Group A2 has never reclassified? (o3d-0i5y r5)
  *
@@ -522,6 +627,13 @@ async function declaresUnaccountedAllocationQty(
   tx: Prisma.TransactionClient,
   orderId: string,
   nextAllocations: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>,
+  /**
+   * o3d-0i5y r8: where each posted record will LIVE once the caller has written its set. Read the
+   * records off the persisted rows instead and a warehouse move reads as "10 units nothing has
+   * reclassified" at the destination scope, because the record is still filed under the scope the
+   * rewrite is about to drop — which hands A2 an order to post a second time.
+   */
+  records?: AccountedRecordPlan,
 ): Promise<boolean> {
   const nextByKey = new Map<string, Prisma.Decimal>()
   for (const row of nextAllocations) {
@@ -531,10 +643,12 @@ async function declaresUnaccountedAllocationQty(
   if (nextByKey.size === 0) return false
 
   const [persisted, shippedLines] = await Promise.all([
-    tx.orderAllocation.findMany({
-      where: { orderId },
-      select: { lineId: true, productId: true, warehouseId: true, costLayerSnapshot: true },
-    }),
+    records
+      ? Promise.resolve([])
+      : tx.orderAllocation.findMany({
+        where: { orderId },
+        select: { lineId: true, productId: true, warehouseId: true, costLayerSnapshot: true },
+      }),
     tx.shipmentLine.findMany({
       where: { shipment: { orderId, status: 'SHIPPED' } },
       select: { lineId: true, productId: true, qty: true, shipment: { select: { warehouseId: true } } },
@@ -542,6 +656,7 @@ async function declaresUnaccountedAllocationQty(
   ])
 
   const pinnedByKey = new Map<string, CostLayerSnapshotEntry[]>()
+  for (const [key, record] of records ?? []) pinnedByKey.set(key, record.entries)
   for (const row of persisted) {
     const key = allocationScopeKey(row)
     pinnedByKey.set(key, [
@@ -629,6 +744,13 @@ export async function resetAllocationAccountingIfStaged(
      * omitting it keeps the old blanket refusal.
      */
     nextAllocations?: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>
+    /**
+     * o3d-0i5y r8: where the caller is about to leave each POSTED RECORD, from
+     * {@link planAccountedRecordCarryOver}. Only meaningful alongside `nextAllocations`, and only
+     * needed when the set moves a scope — without it a moved record is looked for under the scope
+     * being dropped and the destination reads as never reclassified.
+     */
+    accountedRecords?: AccountedRecordPlan
   } = {},
 ): Promise<void> {
   const so = await tx.salesOrder.findUnique({
@@ -643,25 +765,41 @@ export async function resetAllocationAccountingIfStaged(
   })
   if (!so?.inventoryAllocatedDate) return
 
+  const unstage = () => tx.salesOrder.update({
+    where: { id: orderId },
+    data: {
+      // o3d-0qoo: stamp and batch ref move together, as everywhere else that un-stages.
+      inventoryAllocatedDate: null,
+      inventoryAllocatedBatchRef: null,
+      allocationBatchAmount: null,
+    },
+  })
+
   const journaledShipment = await tx.shipment.findFirst({
     where: { orderId, shipmentJournalDate: { not: null } },
     select: { id: true },
   })
   if (journaledShipment) {
     await assertJournalSafeAllocationChange(tx, orderId, options.nextAllocations)
-    // Permitted. The snapshots stay — they are the posted evidence — but the ORDER goes back to A2
-    // when, and only when, this change leaves quantity nothing has reclassified. See the block
-    // comment above and {@link declaresUnaccountedAllocationQty}.
-    if (await declaresUnaccountedAllocationQty(tx, orderId, options.nextAllocations ?? [])) {
-      await tx.salesOrder.update({
-        where: { id: orderId },
-        data: {
-          // o3d-0qoo: stamp and batch ref move together, as everywhere else that un-stages.
-          inventoryAllocatedDate: null,
-          inventoryAllocatedBatchRef: null,
-          allocationBatchAmount: null,
-        },
-      })
+  }
+
+  // o3d-0i5y r8 — ONE RULE FOR EVERY DECLARED SET, JOURNALED OR NOT.
+  //
+  // r4 gave the journaled order this treatment (keep the record, un-stage only for what is new) and
+  // left the unjournaled one on the blanket reset below, on the reading that an unposted order has
+  // no evidence worth keeping. It does: `inventoryAllocatedDate` is set precisely because GROUP A2
+  // has already posted DR Allocated / CR Inventory for these rows, and Group B's journal is a later,
+  // independent event. So the blanket reset was throwing away A2's posted evidence on every
+  // ordinary allocation change — the extra unit arriving, the warehouse moving — and the next A2
+  // pass, finding empty records, posted the whole order a second time. Nothing reverses the first.
+  //
+  // The record therefore stays wherever the caller's own plan puts it, and the stamp is cleared
+  // exactly when the declared set leaves quantity nothing has reclassified. A caller that declares
+  // NOTHING still gets the blanket reset: it cannot say what the order will be left holding, so
+  // "come back and re-derive everything" is the only answer available to it.
+  if (options.nextAllocations) {
+    if (await declaresUnaccountedAllocationQty(tx, orderId, options.nextAllocations, options.accountedRecords)) {
+      await unstage()
     }
     return
   }
@@ -2320,7 +2458,17 @@ export async function allocateSalesOrder(
       // o3d-4kfh r7 (Codex finding 3): the STAMP is selected too, so the unchanged branch below can
       // tell "identical rows, current recipe" from "identical rows, stale recipe" — which are the
       // same set of numbers and completely different states of the order.
-      select: { lineId: true, productId: true, warehouseId: true, qty: true, fulfillmentGraphVersion: true },
+      // o3d-0i5y r8: and the RECORD, because a rewrite that moves a scope has to carry it. Selecting
+      // the quantities without it is what let the allocator delete Group A2's posted evidence and
+      // hand the same units back to be posted again — see `planAccountedRecordCarryOver`.
+      select: {
+        lineId: true,
+        productId: true,
+        warehouseId: true,
+        qty: true,
+        fulfillmentGraphVersion: true,
+        costLayerSnapshot: true,
+      },
     })
 
     // o3d-i5it: when the computed set is identical to the persisted one, write NOTHING.
@@ -2389,7 +2537,15 @@ export async function allocateSalesOrder(
       // still covers what was posted. `persistedAllocations` re-adds every committed shipment line
       // — journaled ones included — so the residual rebuild satisfies it by construction, which is
       // what makes the r1–r3 remedy reachable from a part-despatched, part-posted order.
-      await resetAllocationAccountingIfStaged(tx, orderId, { nextAllocations: persistedAllocations })
+      // o3d-0i5y r8: computed BEFORE the first write, from the rows as they still stand, and used
+      // twice — by the reset to decide whether anything is genuinely unaccounted, and by the
+      // rewrite below to put each record on the row that inherits its units.
+      const accountedRecords = planAccountedRecordCarryOver(existingAllocs, persistedAllocations)
+
+      await resetAllocationAccountingIfStaged(tx, orderId, {
+        nextAllocations: persistedAllocations,
+        accountedRecords,
+      })
 
       // o3d-4kfh: release the RESIDUAL of the persisted rows, not their retained quantity.
       //
@@ -2441,6 +2597,11 @@ export async function allocateSalesOrder(
         // o3d-4kfh r6: the graph version THIS run expanded, from the same statement as the
         // components. Commitment and dispatch refuse when the product has moved past it.
         const fulfillmentGraphVersion = graphVersionByLine.get(alloc.lineId) ?? 0
+        // o3d-0i5y r8: a record that arrived here from a scope this rewrite is dropping — a
+        // warehouse move — is WRITTEN onto the row that now holds those units. `write` is null for a
+        // row that already carries its own record, which is then left exactly as it is: re-writing
+        // it would serialize a value nothing asked to change.
+        const carriedRecord = accountedRecords.get(allocationScopeKey(alloc))?.write
         if (existingByScopeKey.has(allocationScopeKey(alloc))) {
           await tx.orderAllocation.updateMany({
             where: {
@@ -2449,7 +2610,11 @@ export async function allocateSalesOrder(
               productId: alloc.productId,
               warehouseId: alloc.warehouseId,
             },
-            data: { qty: alloc.qty, fulfillmentGraphVersion },
+            data: {
+              qty: alloc.qty,
+              fulfillmentGraphVersion,
+              ...(carriedRecord ? { costLayerSnapshot: carriedRecord as Prisma.InputJsonValue } : {}),
+            },
           })
           continue
         }
@@ -2461,6 +2626,7 @@ export async function allocateSalesOrder(
             warehouseId: alloc.warehouseId,
             qty: alloc.qty,
             fulfillmentGraphVersion,
+            ...(carriedRecord ? { costLayerSnapshot: carriedRecord as Prisma.InputJsonValue } : {}),
           },
         })
       }

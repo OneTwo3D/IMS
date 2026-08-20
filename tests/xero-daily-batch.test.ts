@@ -271,7 +271,10 @@ function applyA2Pass(
   shipmentLines: ReturnType<typeof shipmentLineWithSnapshot>[],
 ): ReturnType<typeof allocationRow> {
   const recordQty = plan.shipmentAccountedByAllocation.get(row.id)
-  const recorded = recordQty ? takeShipmentAccountedEntries(shipmentLines, recordQty, row.id) : []
+  // o3d-0i5y r8: the row's own record is passed in, exactly as `runDailyBatchSync` passes it, so the
+  // take can never re-offer an entry an earlier pass already valued.
+  const alreadyRecorded = parseCostLayerSnapshot(row.costLayerSnapshot)
+  const recorded = recordQty ? takeShipmentAccountedEntries(alreadyRecorded, shipmentLines, recordQty, row.id) : []
   const outstanding = plan.outstandingByAllocation.get(row.id)
   const pinned: CostLayerSnapshotEntry[] = outstanding
     ? [{ costLayerId: 'layer-on-the-shelf', qty: outstanding.toString(), unitCostBase: 5 }]
@@ -279,7 +282,7 @@ function applyA2Pass(
   return {
     ...row,
     costLayerSnapshot: [
-      ...parseCostLayerSnapshot(row.costLayerSnapshot),
+      ...alreadyRecorded,
       ...recorded,
       ...pinned,
     ] as never,
@@ -349,7 +352,7 @@ test('o3d-0i5y r6: a genuine residual added AFTER the record is still owed, and 
   // The counter-guard: r5 exists to get residual quantity into the ledger, and r6 must not buy its
   // idempotence by stranding it again. 3 more units allocated after the pass -> exactly 3 owed.
   const line = shipmentLineWithSnapshot({ qty: 6 })
-  const recorded = takeShipmentAccountedEntries([line], toDecimal(6), 'alloc-1')
+  const recorded = takeShipmentAccountedEntries([], [line], toDecimal(6), 'alloc-1')
   const plan = planA2Reclassification({
     allocations: [allocationRow({
       qty: 13,
@@ -371,7 +374,7 @@ test('o3d-0i5y r6: the record carries the layers the dispatch consumed, and neve
     shipmentLineWithSnapshot({ id: 'shipment-line-2', qty: 3, layerId: 'layer-b' }),
   ]
 
-  const taken = takeShipmentAccountedEntries(lines, toDecimal(6), 'alloc-1')
+  const taken = takeShipmentAccountedEntries([], lines, toDecimal(6), 'alloc-1')
 
   assert.equal(sumCostLayerSnapshotQty(taken).toString(), '6')
   assert.deepEqual(
@@ -386,6 +389,7 @@ test('o3d-0i5y r6: the record carries the layers the dispatch consumed, and neve
   // A legacy line with no snapshot cannot be recorded. Recording less is the safe direction: the row
   // keeps looking under-accounted rather than over-accounted, which is r5's behaviour, not worse.
   const partial = takeShipmentAccountedEntries(
+    [],
     [...lines, { id: 'shipment-line-3', costLayerSnapshot: null }],
     toDecimal(9),
     'alloc-1',

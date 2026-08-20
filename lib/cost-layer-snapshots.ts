@@ -246,3 +246,68 @@ export function takeFromSnapshotEntries(
 
   return { taken, remainingQty: remainingQty.toNumber() }
 }
+
+/**
+ * The dispatched entries a pass may still value: `candidates` LESS the ones the row's own record
+ * already accounts for (o3d-0i5y r8).
+ *
+ * WHAT HAS BEEN POSTED IS A RECORDED FACT, NOT A QUANTITY RE-DERIVED EACH PASS. r6 and r7 got the
+ * QUANTITY right — {@link accountedAllocationQty} answers how many dispatched units no entry on the
+ * row accounts for — and then chose the ENTRIES for that quantity by re-deriving them: taking FIFO
+ * from every dispatched line at the scope, as though none of them had ever been taken from. They
+ * had. The units a pass records are taken out of exactly this pool and written onto the row, so on
+ * the next pass the front of the pool is entries that are already in the ledger:
+ *
+ *   pass 1  6 units dispatched from shipment line S1 at £10. Nothing is pinned, so all 6 are
+ *           unrecorded; A2 takes 6 × £10 from S1, records them, and posts £60.
+ *   pass 2  a residual of 4 has since dispatched from S2 at £2. `accountedAllocationQty` says 4
+ *           units are unrecorded — correct. The take then walks the pool from the front and hands
+ *           back 4 MORE units of S1 at £10, so A2 posts £40 for units that cost £8, re-presenting
+ *           £40 of S1's already-posted cost as new. The row ends up claiming 10 units of a layer
+ *           the dispatch only consumed 6 of, which Group B and the refund reversal then relieve
+ *           against.
+ *
+ * Netting the pool by the record makes that impossible rather than unlikely: an entry can be valued
+ * ONCE, because the record of having valued it is subtracted before anything is taken. Only
+ * `source: 'shipment'` entries net the pool — an allocation-source pin describes units on the shelf
+ * that overlap the dispatch rather than coming out of it, which is the overlap `accountedAllocationQty`
+ * resolves with `max` and must not be double-charged here.
+ *
+ * Matched on (shipmentLineId, costLayerId) so a line partly recorded by an earlier pass offers only
+ * its remainder; a record that carries no `shipmentLineId` nets by layer alone, which is the most a
+ * pre-r6 entry can say about itself.
+ */
+export function unrecordedShipmentEntries(
+  recorded: CostLayerSnapshotEntry[],
+  candidates: CostLayerSnapshotEntry[],
+): CostLayerSnapshotEntry[] {
+  const byShipmentLine = new Map<string, Decimal>()
+  const byLayerOnly = new Map<string, Decimal>()
+  for (const entry of recorded) {
+    if (entry.source !== 'shipment') continue
+    const pool = entry.shipmentLineId ? byShipmentLine : byLayerOnly
+    const key = entry.shipmentLineId ? `${entry.shipmentLineId}|${entry.costLayerId}` : entry.costLayerId
+    pool.set(key, (pool.get(key) ?? toDecimal(0)).add(toDecimal(entry.qty)))
+  }
+
+  const consume = (pool: Map<string, Decimal>, key: string, qty: Decimal): Decimal => {
+    const available = pool.get(key)
+    if (!available || available.lte(0)) return qty
+    const take = available.lt(qty) ? available : qty
+    pool.set(key, available.sub(take))
+    return qty.sub(take)
+  }
+
+  const remaining: CostLayerSnapshotEntry[] = []
+  for (const entry of candidates) {
+    let qty = toDecimal(entry.qty)
+    if (entry.shipmentLineId) {
+      qty = consume(byShipmentLine, `${entry.shipmentLineId}|${entry.costLayerId}`, qty)
+    }
+    if (qty.gt(0)) qty = consume(byLayerOnly, entry.costLayerId, qty)
+    if (qty.gt('0.0000001')) {
+      remaining.push({ ...entry, qty: roundQuantity(qty, 6).toFixed(6) })
+    }
+  }
+  return remaining
+}

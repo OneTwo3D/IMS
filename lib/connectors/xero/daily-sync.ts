@@ -37,6 +37,7 @@ import {
   sumCostLayerSnapshotQty,
   takeFromSnapshotEntries,
   unaccountedAllocationQty,
+  unrecordedShipmentEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -289,18 +290,27 @@ export function planA2Reclassification<TLine extends { lineId: string; productId
  *
  * They are decorated with `source: 'shipment'`, which is the marker {@link accountedAllocationQty}
  * reads to know these units are DISJOINT from the allocated pin rather than overlapping it.
+ *
+ * o3d-0i5y r8: AND THE POOL IS NETTED BY THE ROW'S OWN RECORD FIRST. Taking from every dispatched
+ * line at the scope, as r6/r7 did, re-offers the entries an earlier pass already recorded and
+ * posted — so a second shipment's units were valued at the FIRST shipment's layers, posting its
+ * cost a second time. `recorded` is that row's existing snapshot, and
+ * {@link unrecordedShipmentEntries} subtracts it before anything is taken, which makes valuing an
+ * entry twice impossible rather than merely unlikely. See the worked example there.
  */
 export function takeShipmentAccountedEntries(
+  recorded: CostLayerSnapshotEntry[],
   lines: Array<{ id: string; costLayerSnapshot: Prisma.JsonValue | null }>,
   qty: Decimal,
   allocationId: string,
 ): CostLayerSnapshotEntry[] {
-  const available = lines.flatMap((line) => (
+  const dispatched = lines.flatMap((line) => (
     parseCostLayerSnapshot(line.costLayerSnapshot).map((entry) => ({
       ...entry,
       shipmentLineId: entry.shipmentLineId ?? line.id,
     }))
   ))
+  const available = unrecordedShipmentEntries(recorded, dispatched)
   return takeFromSnapshotEntries(available, qty.toNumber(), {
     orderAllocationId: allocationId,
     source: 'shipment',
@@ -1041,12 +1051,17 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             const outstanding = plan.outstandingByAllocation.get(alloc.id)
             const shipmentAccounted = plan.shipmentAccountedByAllocation.get(alloc.id)
             if (!outstanding && !shipmentAccounted) continue
+            // o3d-0i5y r8: the row's RECORD — what earlier passes already accounted and posted. It
+            // is both the base the new entries are appended to and the pool the shipment take is
+            // netted by, so a dispatched entry this row has already valued can never be valued again.
+            const alreadyRecorded = parseCostLayerSnapshot(alloc.costLayerSnapshot)
             // o3d-0i5y r6: units this pass is accounting from the SHIPMENT snapshots, written onto the
             // row so a later pass reads them as evidence instead of inferring them from an overlap.
             // They add NO value here — the shipment value is posted once, above, and only while the
             // shipment is unjournaled — this is a record of quantity already in the ledger.
             const recorded = shipmentAccounted
               ? takeShipmentAccountedEntries(
+                  alreadyRecorded,
                   order.shipments
                     .filter((shipment) => shipment.warehouseId === alloc.warehouseId)
                     .flatMap((shipment) => shipment.lines.filter((line) => (
@@ -1088,7 +1103,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             // and the refund reversal run for each shipment line consumes exactly those units and
             // leaves the unshipped pin standing.
             allocationSnapshots.set(alloc.id, [
-              ...parseCostLayerSnapshot(alloc.costLayerSnapshot),
+              ...alreadyRecorded,
               ...recorded,
               ...consumed,
             ])
