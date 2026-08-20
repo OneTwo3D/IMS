@@ -159,3 +159,32 @@ test('the bulk "Retry All" stays unfenced: it is not a judgement about any one a
   // and getting back to FAILED needs a claim, which mints a new revision. So the bulk form needs no bump.
   assert.equal(store.get('log-1')?.attemptRevision, 4)
 })
+
+// o3d-e2mz r6 (MEDIUM, FILED as o3d-psvi rather than fixed): a fence-loss row held at CANCELLED
+// because the sale could not be read has NO operator path back. Pinned here so the filed issue rests
+// on observed behaviour, and so whoever implements the release affordance sees both entry points.
+test('o3d-e2mz r6: a CANCELLED unreadable-sale row is refused by BOTH retry entry points (o3d-psvi)', async () => {
+  const UNREADABLE_ROW = {
+    id: 'log-1',
+    status: 'CANCELLED',
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    retryCount: 0,
+    externalTransactionId: 'XERO-INV-1',
+    errorMessage: 'Posted to Xero as XERO-INV-1 ... while the sale could not be read.',
+  }
+  reset([syncLogRow({ ...UNREADABLE_ROW, attemptRevision: 4 })])
+
+  // Per-row, quoting exactly the attempt the sync log shows.
+  const perRow = await (await loadRetry())('log-1', 4)
+  assert.equal(perRow.success, false)
+  assert.match(perRow.error ?? '', /is now CANCELLED/, 'the fence refuses it on status, not on the attempt')
+  assert.equal(store.get('log-1')?.status, 'CANCELLED')
+
+  // And the bulk sweep, which is FAILED-only, does not reach it either.
+  const bulk = await (await loadRetry())()
+  assert.deepEqual(bulk, { success: true, reset: 0 }, 'Retry All re-queues FAILED rows only')
+  assert.equal(store.get('log-1')?.status, 'CANCELLED')
+  assert.equal(store.get('log-1')?.externalTransactionId, 'XERO-INV-1', 'and the document it names is untouched')
+})
