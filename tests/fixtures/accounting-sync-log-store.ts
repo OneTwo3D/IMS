@@ -95,6 +95,35 @@ export function matchesWhere(row: SyncLogRow, where: Record<string, unknown> | u
   return true
 }
 
+/**
+ * Apply an update `data` the way Prisma does — including the atomic number operations, so a fence that
+ * advances a revision with `{ increment: 1 }` really moves the row. Assigning the operation object
+ * verbatim (the naive stub) would leave `attemptRevision` holding `{ increment: 1 }`, and every
+ * subsequent CAS on a number would then fail for the wrong reason.
+ */
+function applyData(row: SyncLogRow, data: Record<string, unknown>): void {
+  for (const [key, value] of Object.entries(data)) {
+    if (value && typeof value === 'object' && !(value instanceof Date) && !Array.isArray(value)) {
+      const spec = value as Record<string, unknown>
+      const current = (row as unknown as Record<string, unknown>)[key]
+      if ('increment' in spec) {
+        ;(row as unknown as Record<string, unknown>)[key] = (current as number) + (spec.increment as number)
+        continue
+      }
+      if ('decrement' in spec) {
+        ;(row as unknown as Record<string, unknown>)[key] = (current as number) - (spec.decrement as number)
+        continue
+      }
+      if ('set' in spec) {
+        ;(row as unknown as Record<string, unknown>)[key] = spec.set
+        continue
+      }
+      throw new Error(`accounting-sync-log-store: unsupported update operation on ${key}`)
+    }
+    ;(row as unknown as Record<string, unknown>)[key] = value
+  }
+}
+
 export type SyncLogStore = {
   rows: SyncLogRow[]
   /** Every `where` an updateMany was attempted with, in order — so a missing fence is visible. */
@@ -133,7 +162,7 @@ export function createSyncLogStore(initial: SyncLogRow[] = []): SyncLogStore {
       let count = 0
       for (const row of rows) {
         if (!matchesWhere(row, where)) continue
-        Object.assign(row, data)
+        applyData(row, data)
         count += 1
       }
       return { count }
@@ -141,7 +170,7 @@ export function createSyncLogStore(initial: SyncLogRow[] = []): SyncLogStore {
     update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
       const row = rows.find((candidate) => candidate.id === where.id)
       if (!row) throw new Error(`accounting-sync-log-store: no row ${where.id}`)
-      Object.assign(row, data)
+      applyData(row, data)
       return { ...row }
     },
     create: async ({ data }: { data: Record<string, unknown> }) => {

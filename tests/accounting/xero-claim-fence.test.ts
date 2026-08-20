@@ -434,7 +434,7 @@ test('o3d-550x: a displaced owner cannot RETIRE a row a live worker now holds', 
     externalTransactionId: null,
   })
 
-  const retired = await retireSalesInvoiceForCancelledOrder(tx, 'log-1', 'order-1', claimHeldFrom(T_DISPLACED_CLAIM))
+  const retired = await retireSalesInvoiceForCancelledOrder(tx, ATTEMPT, 'order-1', claimHeldFrom(T_DISPLACED_CLAIM))
 
   assert.equal(retired, false)
   assert.equal(state!.status, 'PROCESSING', 'a retraction by a worker that lost the row must do nothing')
@@ -447,7 +447,7 @@ test('o3d-550x: the claim holder DOES retire, and only while the row names no do
     processingStartedAt: T_REPLACEMENT_CLAIM,
     externalTransactionId: null,
   })
-  assert.equal(await retireSalesInvoiceForCancelledOrder(holder.tx, 'log-1', 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), true)
+  assert.equal(await retireSalesInvoiceForCancelledOrder(holder.tx, ATTEMPT, 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), true)
   assert.equal(holder.state!.status, 'CANCELLED')
 
   // The arm that is this call site's own, not part of the shared fence: a row that already posted must
@@ -458,7 +458,7 @@ test('o3d-550x: the claim holder DOES retire, and only while the row names no do
     processingStartedAt: T_REPLACEMENT_CLAIM,
     externalTransactionId: 'INV-XERO-1',
   })
-  assert.equal(await retireSalesInvoiceForCancelledOrder(posted.tx, 'log-1', 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), false)
+  assert.equal(await retireSalesInvoiceForCancelledOrder(posted.tx, ATTEMPT, 'order-1', claimHeldFrom(T_REPLACEMENT_CLAIM)), false)
   assert.equal(posted.state!.status, 'PROCESSING')
 })
 

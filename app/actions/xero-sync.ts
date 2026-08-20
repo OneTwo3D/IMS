@@ -13,6 +13,7 @@ import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/con
 import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, maskSettingSecret, serializeSettingValue } from '@/lib/settings-store'
+import { applyFencedAttemptDecision } from '@/lib/domain/accounting/sync-log-attempt'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
 import { isMaskedSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
@@ -546,14 +547,94 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
   }
 }
 
-export async function retryFailedXeroSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
+/**
+ * Reset failed Xero sync rows so the processor picks them up again.
+ *
+ * PER-ROW (entryId given) is an operator decision about ONE attempt — the FAILED row they were looking
+ * at — so o3d-e2mz fences it on that attempt. Without the fence the CAS was `(id, status: 'FAILED')`,
+ * and status is not an identity: the row this reset lands on can be a LATER failure than the one the
+ * operator judged (the earlier one having been retried and failed again in between), or a failure of an
+ * attempt that posted a document the operator never saw. `expectedAttemptRevision` is what the sync log
+ * showed them; the reset lands only while that is still current, and bumps it as it lands.
+ *
+ * A per-row request that names no attempt is REFUSED rather than run unfenced — that is the same rule
+ * applyFencedAttemptDecision applies to revision 0, for the same reason: a decision that cannot be tied
+ * to an attempt cannot be shown to be about the row it will hit.
+ *
+ * BULK ("Retry All", no entryId) is deliberately NOT fenced, and does not need to be: it is not a
+ * judgement about any particular attempt, only "re-queue whatever is failed now", and every row it
+ * touches goes FAILED -> PENDING, a status change a later fenced decision already detects
+ * (STATUS_MOVED). Getting back to FAILED requires a claim, which mints a new revision, so a stale
+ * decision cannot survive the round trip either.
+ */
+export async function retryFailedXeroSync(
+  entryId?: string,
+  expectedAttemptRevision?: number,
+): Promise<{ success: boolean; reset: number; error?: string }> {
   try {
     await requireSyncPermission()
-    const where = entryId
-      ? { id: entryId, connector: 'xero', status: 'FAILED' as const }
-      : { connector: 'xero', status: 'FAILED' as const }
+
+    if (entryId) {
+      if (expectedAttemptRevision === undefined) {
+        return {
+          success: false,
+          reset: 0,
+          error: `Retrying Xero sync row ${entryId} needs the attempt it was requested about, and none was `
+            + 'supplied, so it was NOT retried. Reload the sync log and retry from what it shows.',
+        }
+      }
+      // The fence CAS cannot also carry `connector`, and a connector never changes, so check it here.
+      // Without it an id belonging to another connector would be re-queued as if it were Xero's.
+      const row = await db.accountingSyncLog.findUnique({
+        where: { id: entryId },
+        select: { connector: true },
+      })
+      if (!row) {
+        return { success: false, reset: 0, error: `Accounting sync row ${entryId} no longer exists, so it was NOT retried.` }
+      }
+      if (row.connector !== 'xero') {
+        return {
+          success: false,
+          reset: 0,
+          error: `Accounting sync row ${entryId} belongs to the ${row.connector} connector, not Xero, so it was NOT retried.`,
+        }
+      }
+
+      const outcome = await applyFencedAttemptDecision(db, {
+        id: entryId,
+        expectedAttemptRevision,
+        expectedStatus: 'FAILED',
+        data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
+      })
+      if (!outcome.ok) {
+        // A row that predates the fence (or belongs to a connector that stamps none) can never be
+        // retried per-row. Say where the operator can still go, or the refusal reads as a dead end.
+        const message = outcome.reason === 'UNFENCED_ATTEMPT'
+          ? `${outcome.message} "Retry All" is deliberately unfenced and still re-queues it.`
+          : outcome.message
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_retry_failed_refused',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Refused a Xero sync retry for ${entryId}: ${message}`,
+          metadata: { syncLogId: entryId, reason: outcome.reason, expectedAttemptRevision },
+        })
+        return { success: false, reset: 0, error: message }
+      }
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'xero_retry_failed',
+        tag: 'sync',
+        description: `Reset 1 failed Xero sync entry for retry (attempt ${expectedAttemptRevision})`,
+        metadata: { syncLogId: entryId, expectedAttemptRevision, attemptRevision: outcome.attemptRevision },
+      })
+      revalidatePath('/sync')
+      return { success: true, reset: 1 }
+    }
+
     const result = await db.accountingSyncLog.updateMany({
-      where,
+      where: { connector: 'xero', status: 'FAILED' as const },
       data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
     })
     await logActivity({

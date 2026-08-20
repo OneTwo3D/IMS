@@ -1,6 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
+import { UNCLAIMED_ATTEMPT_REVISION, nextAttemptRevision, type AttemptRef } from './sync-log-attempt'
 
 /** SALES_INVOICE sync types that recognise revenue for a sales order. */
 const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const
@@ -127,28 +128,47 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
   const staleProcessingCutoff = new Date(now.getTime() - STALE_PROCESSING_MS)
   const reason = 'Cancelled: sales order cancelled before the invoice posted (no revenue to recognise).'
 
-  const result = await tx.accountingSyncLog.updateMany({
-    where: {
-      referenceId: orderId,
-      type: { in: [...SALES_INVOICE_SYNC_TYPES] },
-      // Only retire rows that never reached the ledger. A row that posted and then reverted to
-      // PENDING/FAILED on a follow-up failure keeps its externalTransactionId; cancelling it would
-      // falsely record that a real Xero receivable never posted and hide it from recovery.
-      externalTransactionId: null,
-      OR: [
-        { status: 'PENDING' },
-        // FAILED rows stay eligible for the "Retry All" actions, so a cancelled order's failed invoice
-        // would otherwise still post on a retry — retire it too.
-        { status: 'FAILED' },
-        { status: 'PROCESSING', processingStartedAt: null },
-        { status: 'PROCESSING', processingStartedAt: { lt: staleProcessingCutoff } },
-      ],
-    },
-    // CANCELLED (not FAILED) so reconciliation/backfill sweeps and error dashboards ignore it. A freshly
-    // claimed PROCESSING row (recent processingStartedAt) is intentionally NOT matched — it is left to
-    // finish; SYNCED rows are already posted and out of scope for retirement (a cancel-after-post needs
-    // an explicit reversal, tracked separately).
-    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
+  const retirable = {
+    referenceId: orderId,
+    type: { in: [...SALES_INVOICE_SYNC_TYPES] },
+    // Only retire rows that never reached the ledger. A row that posted and then reverted to
+    // PENDING/FAILED on a follow-up failure keeps its externalTransactionId; cancelling it would
+    // falsely record that a real Xero receivable never posted and hide it from recovery.
+    externalTransactionId: null,
+    OR: [
+      { status: 'PENDING' as const },
+      // FAILED rows stay eligible for the "Retry All" actions, so a cancelled order's failed invoice
+      // would otherwise still post on a retry — retire it too.
+      { status: 'FAILED' as const },
+      { status: 'PROCESSING' as const, processingStartedAt: null },
+      { status: 'PROCESSING' as const, processingStartedAt: { lt: staleProcessingCutoff } },
+    ],
+  }
+  // CANCELLED (not FAILED) so reconciliation/backfill sweeps and error dashboards ignore it. A freshly
+  // claimed PROCESSING row (recent processingStartedAt) is intentionally NOT matched — it is left to
+  // finish; SYNCED rows are already posted and out of scope for retirement (a cancel-after-post needs
+  // an explicit reversal, tracked separately).
+  const retirement = { status: 'CANCELLED' as const, errorMessage: reason, processingStartedAt: null }
+
+  // o3d-e2mz: A WRITER THAT RETIRES A ROW MUST ADVANCE THE FENCE. This sweep retires stale-PROCESSING
+  // rows, and "stale" is a guess about a worker that may still be alive holding that attempt. Leaving
+  // the revision where it is means that worker's own writeback still CASes successfully and silently
+  // reverses the cancellation — the collision the fence exists to make detectable, happening inside the
+  // fence. Bumping it means the worker's writeback finds nothing and reports it, and a worker that had
+  // already posted escalates with the external id instead of quietly re-opening a cancelled sale.
+  //
+  // Two statements, because revision 0 must STAY 0. Zero means "nothing that stamps an attempt has ever
+  // claimed this row", and every decision naming a revision is refused on such a row. Bumping an
+  // unfenced row to 1 would forge an attempt that never existed and let a later decision believe it was
+  // fenced. An unfenced row is retired on its remaining guards alone (status, and no external id) —
+  // exactly what it got before the fence existed, no better and no worse.
+  const fencedRetirement = await tx.accountingSyncLog.updateMany({
+    where: { ...retirable, attemptRevision: { not: UNCLAIMED_ATTEMPT_REVISION } },
+    data: { ...retirement, attemptRevision: { increment: 1 } },
+  })
+  const unfencedRetirement = await tx.accountingSyncLog.updateMany({
+    where: { ...retirable, attemptRevision: UNCLAIMED_ATTEMPT_REVISION },
+    data: retirement,
   })
 
   // Terminalise the mirrored events too, or a dangling PENDING mirror reads as work still owed.
@@ -159,7 +179,7 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
     reason,
   })
 
-  return result.count
+  return fencedRetirement.count + unfencedRetirement.count
 }
 
 /**
@@ -168,28 +188,61 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
  * sweep cannot — an invoice enqueued (Woo import) or a claimed attempt re-queued (rate-limit/defer/fail)
  * AFTER the order was cancelled and its then-pending rows swept. Sets this row to CANCELLED and voids the
  * order's not-yet-posted mirrored events (idempotent — a no-op if the sweep already ran).
+ *
+ * o3d-e2mz: fenced on the ATTEMPT the caller holds, and it ADVANCES that attempt as it lands.
+ *
+ * The claim timestamp this used to key on is gone. `processingStartedAt` says WHEN a claim was taken,
+ * never WHICH — two claims landing in the same millisecond carry the same token — so the row had two
+ * competing claim identities, and a retirement that moved neither of them left a hole inside the fence:
+ * a worker still holding the attempt kept a writeback CAS that silently reversed the retirement.
+ * `attemptRevision` is the identity, and bumping it is what makes that worker find out.
+ *
+ * What is left in the `where` besides the attempt are the facts the retirement protects, not fence
+ * bookkeeping: still PROCESSING (this is a claimed row, not a queued one), and naming no document
+ * (retiring a posted row would hide a real receivable). If the CAS matches nothing — the attempt moved,
+ * the row already posted, or it is no longer claimed — leave the row and the mirror untouched.
+ *
+ * A caller at UNCLAIMED_ATTEMPT_REVISION is a connector whose processor stamps no attempt (QuickBooks).
+ * It is retired on those remaining guards alone and STAYS at revision 0: no forged attempt, and no later
+ * decision can believe such a row was ever fenced.
  */
 export async function retireSalesInvoiceForCancelledOrder(
   client: Prisma.TransactionClient,
-  syncLogId: string,
+  attempt: AttemptRef,
   orderId: string,
   held: HeldClaim,
 ): Promise<boolean> {
   const reason = 'Cancelled: order cancelled before this invoice posted (no revenue to recognise).'
-  // Claim-fenced compare-and-swap: retire the row ONLY if it is still the exact PROCESSING claim THIS
-  // worker holds AND has no external id. A stale reclaim refreshes processingStartedAt, so keying on it
-  // stops an old worker cancelling a row a newer worker now owns; requiring externalTransactionId: null
-  // stops cancelling a row that already posted (which would hide a real Xero receivable). If the CAS
-  // matches nothing, leave the row and the mirror untouched.
+  const fenced = attempt.attemptRevision !== UNCLAIMED_ATTEMPT_REVISION
+  // BOTH claim identities in the predicate, and the retirement ADVANCES the one that is an identity.
   //
-  // THE OWNERSHIP HALF IS COMPOSED FROM heldClaimWhere, NOT SPELT OUT AGAIN (Codex r1, medium 1). The
-  // inline copy happened to match, which is the dangerous case: a change to what "I still hold this
-  // claim" means would silently apply to the connector's releases and not to this retirement, and this
-  // one is a RETRACTION — a displaced worker terminalising a row a live worker owns. The extra
-  // `externalTransactionId: null` arm stays this call site's own, because it guards a different fact.
+  // THE OWNERSHIP HALF IS COMPOSED FROM heldClaimWhere, NOT SPELT OUT AGAIN (o3d-550x, Codex r1
+  // medium 1): a change to what "I still hold this claim" means must apply to this RETRACTION as
+  // well as to the connector's releases. It is also the only fence a connector that stamps no
+  // attempt revision has — QuickBooks retires at revision 0 — so removing it would weaken the very
+  // caller this branch leaves unfenced.
+  //
+  // THE ATTEMPT HALF IS WHAT CLOSES THE HOLE o3d-e2mz FOUND (Codex r1). `processingStartedAt` says
+  // WHEN a claim was taken, never WHICH — two claims landing in the same millisecond carry the same
+  // token — and a retirement that advanced NEITHER identity left a worker still holding the attempt
+  // with a writeback CAS that silently reversed the retirement. Bumping the revision is what makes
+  // that worker find out. A caller at UNCLAIMED_ATTEMPT_REVISION is left AT 0 rather than bumped:
+  // forging an attempt that never existed would let a later decision believe the row was fenced.
+  //
+  // The `externalTransactionId: null` arm stays this call site's own, because it guards a different
+  // fact: retiring a posted row would hide a real receivable.
   const retired = await client.accountingSyncLog.updateMany({
-    where: { ...heldClaimWhere(syncLogId, held), externalTransactionId: null },
-    data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
+    where: {
+      ...heldClaimWhere(attempt.id, held),
+      attemptRevision: attempt.attemptRevision,
+      externalTransactionId: null,
+    },
+    data: {
+      status: 'CANCELLED',
+      errorMessage: reason,
+      processingStartedAt: null,
+      ...(fenced ? { attemptRevision: nextAttemptRevision(attempt.attemptRevision) } : {}),
+    },
   })
   if (retired.count === 0) return false
   await voidMirroredAccountingEventsForOrder(client, {

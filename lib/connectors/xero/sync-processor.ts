@@ -2221,7 +2221,9 @@ async function reportPostOnMovedAttempt(
       + `${externalId ?? 'a document whose id Xero did not return'} on attempt ${attempt.attemptRevision}, but sync `
       + `row ${attempt.id} had already moved to attempt ${current?.attemptRevision ?? 'a deleted row'} `
       + `(${current?.status ?? 'gone'}). Anything decided about attempt ${attempt.attemptRevision} was decided `
-      + 'without this outcome. The document is in the ledger: reverse or credit-note it there if it should not exist.',
+      + 'without this outcome. The document id IS recorded on the sync row — this runs only after the '
+      + 'record landed — so the order cannot be deleted while the document exists. The document is in '
+      + 'the ledger: reverse or credit-note it there if it should not exist.',
     metadata: {
       syncLogId: attempt.id,
       claimedAttemptRevision: attempt.attemptRevision,
@@ -2386,7 +2388,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease, attempt)
 
       // BEFORE `skipped` and before `success` (r5 #1): this row stopped without sending anything, so
       // it must not be failed, must not spend a retry, and must not be persisted.
@@ -2884,7 +2886,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
 
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease, attempt)
 
       if (syncResult.notPosted) {
         // The lock may itself be what was lost, in which case handing the job back cannot work — say
@@ -3118,7 +3120,7 @@ type EntryResult = {
  * timeout or a read error returns a retryable failure rather than permission to post.
  */
 export async function guardCancelledSalesOrderInvoice(
-  entryId: string,
+  attempt: AttemptRef,
   referenceType: string,
   referenceId: string,
   held: HeldClaim,
@@ -3137,10 +3139,11 @@ export async function guardCancelledSalesOrderInvoice(
       })
       if (!so) return { kind: 'missing' as const }
       if (so.status === 'CANCELLED') {
-        // Claim-fenced: only retire if this exact claim still owns the row (retire returns false
-        // otherwise). Either way nothing was posted, so skip — a lost fence means another worker
-        // owns/posted it.
-        await retireSalesInvoiceForCancelledOrder(tx, entryId, referenceId, held)
+        // Claim-fenced AND attempt-fenced (o3d-550x + o3d-e2mz): only retire if this exact claim
+        // still owns the row and THIS attempt is still the current one, and advance the attempt as
+        // it retires so nothing else can write back onto it (retire returns false otherwise).
+        // Either way nothing was posted, so skip — a lost fence means another attempt owns/posted it.
+        await retireSalesInvoiceForCancelledOrder(tx, attempt, referenceId, held)
         return { kind: 'cancelled' as const }
       }
       return { kind: 'live' as const, customerId: so.customerId ?? undefined }
@@ -3878,10 +3881,12 @@ async function processEntry(
   // The LEASE, not a claim timestamp (o3d-xl63 r5 #1). Every remote mutation below fences on it, and
   // the caller reads `lease.heldFrom()` afterwards to anchor the persist to the claim actually held.
   lease: RemoteWriteLease,
+  /** o3d-e2mz: the attempt this claim minted — the cancelled-order retirement below fences on it. */
+  attempt: AttemptRef,
 ): Promise<EntryResult> {
   return withAccountingPostingIntent(
     { connector: XERO_CONNECTOR, payload, type, referenceType, referenceId },
-    () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, lease),
+    () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, lease, attempt),
   )
 }
 
@@ -3897,6 +3902,7 @@ async function processClaimedEntry(
   // to re-take the claim immediately before it sends. `RemoteWriteLease` satisfies `HeldClaim`
   // structurally, so everything downstream that only wants the holder still takes it unchanged.
   lease: RemoteWriteLease,
+  attempt: AttemptRef,
 ): Promise<EntryResult> {
   const postingMode = payload._postingMode
 
@@ -3935,7 +3941,7 @@ async function processClaimedEntry(
       // attached — see lib/domain/accounting/document-tax-reconciliation.ts.
       const reconciled = refuseUnreconciledDocument(payload)
       if (!reconciled.post) return { success: false, error: reconciled.reason }
-      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, lease)
+      const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
       // o3d-k26m.5: the number must be ours to post under. Refusing is recoverable; overwriting a
@@ -3985,7 +3991,7 @@ async function processClaimedEntry(
       }
       // Same cancelled-order backstop as the create: don't modify an external receivable for an order
       // that has since been cancelled (retire the update instead), and fail closed on an unreadable order.
-      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, lease)
+      const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice-update', payload)

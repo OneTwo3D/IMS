@@ -130,7 +130,56 @@ test('a settled row whose document DID post gets the external id recorded, loudl
   assert.equal(row?.status, 'SYNCED', 'the delete guard must see a posted document, not a cancelled row')
   assert.equal(row?.attemptRevision, 6, 'recording the correction must itself move the attempt on')
   assert.match(row?.errorMessage ?? '', /Posted to Xero as XERO-1 on attempt 4/)
-  assert.ok(activity.some((entry) => entry.action === 'xero_sync_post_fenced_out' && entry.level === 'ERROR'))
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.level, 'ERROR')
+  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
+  assert.match(escalation?.description ?? '', /now recorded on the sync row/)
+})
+
+test('a SECOND fence loss does not discard the id of a document that is known to have posted', async () => {
+  // o3d-e2mz Finding 2. Round 1 fenced the recording write on the revision it had just read, so a row
+  // that moved AGAIN between that read and that write refused it — the mechanism built to protect the
+  // evidence destroying the only durable record of the document, in exactly the case it exists for.
+  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
+  interleave = () => {
+    Object.assign(store.get('log-1')!, {
+      status: 'CANCELLED',
+      attemptRevision: 5,
+      externalTransactionId: null,
+      errorMessage: 'Operator verified: never posted',
+    })
+    // ...and the row moves a SECOND time, between the escalation's read and the recording write.
+    interleave = () => {
+      Object.assign(store.get('log-1')!, { attemptRevision: 9, errorMessage: 'Reset by an operator' })
+    }
+  }
+
+  await (await loadProcessor())()
+
+  const row = store.get('log-1')
+  assert.equal(row?.externalTransactionId, 'XERO-1', 'the id of a document known to exist must not depend on winning a race')
+  assert.equal(row?.status, 'SYNCED')
+  assert.equal(row?.attemptRevision, 10, 'recording the evidence still advances the fence, it just never depends on it')
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
+})
+
+test('a document whose row has vanished is reported as the log being the only record of it', async () => {
+  // The one case where the id genuinely cannot be recorded anywhere durable. The operator must be told
+  // that plainly rather than reading an escalation that implies something downstream will catch it.
+  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
+  interleave = () => {
+    Object.assign(store.get('log-1')!, { status: 'CANCELLED', attemptRevision: 5, externalTransactionId: null })
+    interleave = () => { store.rows.length = 0 }
+  }
+
+  await (await loadProcessor())()
+
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.level, 'ERROR')
+  assert.equal(escalation?.metadata?.evidence, 'ROW_MISSING')
+  assert.match(escalation?.description ?? '', /ONLY record/)
+  assert.match(escalation?.description ?? '', /XERO-1/)
 })
 
 test('a settled row that already names a document is left exactly as the decision left it', async () => {
@@ -148,7 +197,11 @@ test('a settled row that already names a document is left exactly as the decisio
 
   assert.equal(store.get('log-1')?.externalTransactionId, 'XERO-OPERATOR-VERIFIED', 'a recorded document id must never be renamed')
   assert.equal(store.get('log-1')?.attemptRevision, 5)
-  assert.ok(activity.some((entry) => entry.action === 'xero_sync_post_fenced_out'))
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'ALREADY_NAMED')
+  // The id we posted exists only in this entry, and the operator is told to check BOTH.
+  assert.match(escalation?.description ?? '', /DIFFERENT document/)
+  assert.match(escalation?.description ?? '', /XERO-1/)
 })
 
 test('a stale PROCESSING claim is reclaimed onto a new attempt, so the old holder cannot write', async () => {

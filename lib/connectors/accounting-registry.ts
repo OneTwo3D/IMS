@@ -107,7 +107,13 @@ export type AccountingConnector = AccountingConnectorDef & {
   ): Promise<MissingTaxRateGenerateResult>
   getSyncLogs(limit?: number): Promise<AccountingSyncLogRow[]>
   triggerSync(): Promise<{ success: boolean; result?: unknown; error?: string }>
-  retryFailedSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }>
+  /**
+   * o3d-e2mz: `expectedAttemptRevision` is the attempt the operator was looking at when they asked for
+   * this ONE row to be retried. A connector whose processor stamps attempt revisions fences the retry on
+   * it and refuses a request that names none; a connector that stamps none ignores it. Omitted for the
+   * bulk ("Retry All") form, which is not a decision about any particular attempt.
+   */
+  retryFailedSync(entryId?: string, expectedAttemptRevision?: number): Promise<{ success: boolean; reset: number; error?: string }>
   getSyncReadiness(): Promise<AccountingSyncReadiness>
 }
 
@@ -213,6 +219,9 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         return triggerQuickBooksSync()
       },
       async retryFailedSync(entryId) {
+        // o3d-e2mz: this connector's processor stamps no attempt revision, so there is no attempt to
+        // fence a per-row retry on and the parameter is deliberately ignored. Out of scope by owner
+        // instruction; the retry stays exactly as unfenced as it was.
         const { retryFailedQuickBooksSync } = await import('@/app/actions/quickbooks-sync')
         return retryFailedQuickBooksSync(entryId)
       },
@@ -321,9 +330,9 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
       const { triggerXeroSync } = await import('@/app/actions/xero-sync')
       return triggerXeroSync()
     },
-    async retryFailedSync(entryId) {
+    async retryFailedSync(entryId, expectedAttemptRevision) {
       const { retryFailedXeroSync } = await import('@/app/actions/xero-sync')
-      return retryFailedXeroSync(entryId)
+      return retryFailedXeroSync(entryId, expectedAttemptRevision)
     },
     async getSyncReadiness() {
       const { getXeroSyncReadiness } = await import('@/app/actions/xero-sync')

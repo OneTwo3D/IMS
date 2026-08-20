@@ -27,6 +27,8 @@ export type AccountingBatchHistoryEntry = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /** o3d-e2mz: the attempt this row is on, for the panel's per-row retry. Absent for connectors that stamp none. */
+  attemptRevision?: number
   lines: Array<{ accountCode: string; description: string; debit: number; credit: number }>
 }
 
@@ -52,6 +54,7 @@ function mapHistoryEntry(
     externalTransactionId: entry.externalTransactionId,
     errorMessage: entry.errorMessage,
     retryCount: entry.retryCount,
+    attemptRevision: entry.attemptRevision,
     lines: entry.lines,
   }
 }
