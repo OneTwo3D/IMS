@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
@@ -12,6 +14,7 @@ import {
   scanSource,
   scanTreeForInlineServerActions,
   scanUseServerOutsideActions,
+  useServerModulesOutsideScanRoots,
 } from './server-action-guard-scan'
 
 // Regression guard for onetwo3d-ims-mgq1: every exported async function in a
@@ -485,3 +488,99 @@ function splitEntry(entry: string): [string, string] {
   const sep = entry.lastIndexOf(':')
   return [entry.slice(0, sep), entry.slice(sep + 1)]
 }
+
+// ---------------------------------------------------------------------------
+// Round 8, Codex finding 1 — THE FILE NOBODY OWNED, AND THE ROOTS NOBODY CHECKED
+// ---------------------------------------------------------------------------
+
+/**
+ * Two filters described the same boundary in different words, and a file fell
+ * between them. `scanActionsDir` took `.ts`; `scanUseServerOutsideActions` took
+ * `.ts` and `.tsx` and then skipped anything sitting directly in app/actions
+ * because "it is covered by scanActionsDir". So `app/actions/wipe.tsx` — a
+ * `'use server'` module in the directory this whole file is named after,
+ * publishing an unguarded `deleteMany` — was covered by NEITHER, and every rule
+ * here returned green on it.
+ *
+ * Round 7 argued that a scanner which cannot see an endpoint reports it green
+ * forever and then answered it for directives behind comments and for inline
+ * actions. This is the same sentence about the INPUT WALK, which is the one place
+ * that argument had not been applied.
+ *
+ * Built on disk rather than in a fixture graph on purpose: the defect was in the
+ * directory walkers, and a walker can only be tested against directories.
+ */
+test('a `use server` module in app/actions is scanned WHATEVER its extension', () => {
+  const tmp = mkdtempSync(path.join(os.tmpdir(), 'o3d-512h-'))
+  try {
+    mkdirSync(path.join(tmp, 'app', 'actions'), { recursive: true })
+    mkdirSync(path.join(tmp, 'lib', 'auth'), { recursive: true })
+    writeFileSync(
+      path.join(tmp, 'lib/auth/server.ts'),
+      'export async function requirePermission(p: string) { void p }\n',
+    )
+    const unguarded = `'use server'
+import { db } from '@/lib/db'
+export async function wipeEverything(id: string) {
+  await db.purchaseOrder.deleteMany({ where: { id } })
+}
+`
+    for (const name of ['wipe.tsx', 'wipe.mts', 'wipe.js', 'wipe.jsx']) {
+      writeFileSync(path.join(tmp, 'app', 'actions', name), unguarded)
+    }
+    // A test file next to them must still be ignored, or the rule has just
+    // started scanning its own fixtures.
+    writeFileSync(path.join(tmp, 'app', 'actions', 'wipe.test.tsx'), unguarded)
+
+    const found = [
+      ...scanActionsDir(path.join(tmp, 'app', 'actions'), {}, scanSource, undefined, 'app/actions'),
+      ...scanUseServerOutsideActions(tmp, ['app', 'lib'], {}, scanSource, undefined),
+    ].sort()
+
+    assert.deepEqual(
+      found,
+      ['wipe.js:wipeEverything', 'wipe.jsx:wipeEverything', 'wipe.mts:wipeEverything', 'wipe.tsx:wipeEverything'],
+      'a `use server` module in app/actions must be scanned whatever it is named — and a .test file must not be',
+    )
+  } finally {
+    rmSync(tmp, { recursive: true, force: true })
+  }
+})
+
+/**
+ * SCAN_ROOTS is a three-name array at the top of this file, and until round 8
+ * nothing asserted it covered anything. A `'use server'` module under `types/`,
+ * `scripts/`, `proxy.ts` at the repo root, or a directory created next week is
+ * compiled and published by Next exactly like one under `app/` — while every rule
+ * here walks somewhere else.
+ *
+ * The fix is not a longer root list, which decays the same way. It is that the
+ * residue is enumerated and pinned: anything mentioning `use server` outside the
+ * roots must appear below with a reason, and a new one fails this test with its
+ * own path in the message. Unrecognised fails; it does not pass.
+ */
+const USE_SERVER_OUTSIDE_SCAN_ROOTS: Record<string, string> = {
+  'scripts/check-server-action-auth-bypass.mjs':
+    'a CHECKER, not an endpoint: it greps the tree for the directive. Ships nothing to Next.',
+}
+
+test('no `use server` module hides outside the scanned roots', () => {
+  const outside = useServerModulesOutsideScanRoots(ROOT, SCAN_ROOTS).filter(
+    (f) => !f.startsWith('tests/') && !f.startsWith('e2e/'),
+  )
+
+  assert.deepEqual(
+    outside,
+    Object.keys(USE_SERVER_OUTSIDE_SCAN_ROOTS).sort(),
+    'A module outside app/ lib/ components/ mentions `use server`. The directive creates the '
+    + 'endpoint, not the directory — so either bring the directory into SCAN_ROOTS (and let every '
+    + 'rule in this file judge it), or list it above with a reason it publishes nothing. '
+    + '"There is nothing there today" is the argument this file exists to stop anyone from making.',
+  )
+})
+
+test('every outside-the-roots exemption states a reason', () => {
+  for (const [file, reason] of Object.entries(USE_SERVER_OUTSIDE_SCAN_ROOTS)) {
+    assert.ok(reason.trim().length > 0, `${file} needs a stated reason`)
+  }
+})

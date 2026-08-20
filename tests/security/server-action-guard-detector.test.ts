@@ -1978,3 +1978,164 @@ test('the guard itself still keeps its OWN credit — its write is at its own ca
     [],
   )
 })
+
+// ---------------------------------------------------------------------------
+// Round 8, Codex finding 2 — THE OTHER ENUMERATOR
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 7 made `exportedServerActions` exhaustive and then asked
+ * `ModuleGraph.exportedNamesOf` — round 3's shape list — which names a star
+ * re-export publishes. So every form round 7 had just made visible went invisible
+ * again the moment it arrived through a star, and a star target is the one module
+ * the compiler's "only async functions may be exported from a `use server` file"
+ * rule does not apply to, because it carries no directive of its own.
+ *
+ * Before the fix, the assertion below was `[]`: not "three exports we judged
+ * leniently" but ZERO exports, for a `'use server'` module that publishes three
+ * names.
+ */
+test('a star re-export publishes DESTRUCTURED and enum exports — and they are not invisible', () => {
+  const HANDLERS = `
+export const { wipeAll, purgeAll } = makeHandlers()
+export enum Mode { A }
+function makeHandlers(): any { return {} }
+`
+  assert.deepEqual(
+    scan("export * from './handlers'", {}, { 'app/actions/handlers.ts': HANDLERS }),
+    [`${F}:Mode`, `${F}:purgeAll`, `${F}:wipeAll`],
+    'a name published through `export *` that no declaration site can be read for is NOT VERIFIED, '
+    + 'which is a violation — it must not be dropped from the export set entirely',
+  )
+})
+
+test('a star re-export of a namespace and an `import x =` is enumerated too', () => {
+  assert.deepEqual(
+    scan("export * from './handlers'", {}, {
+      'app/actions/handlers.ts':
+        'export namespace Ops { export const x = 1 }\n'
+        + "import type * as T from './handlers'\n"
+        + 'export type Alias = T.Ops\n',
+    }),
+    [`${F}:Ops`],
+    'a type-only export publishes no endpoint; a namespace binds a value and does',
+  )
+})
+
+test('a star re-export of a real async endpoint is still judged on its GUARD, not dropped', () => {
+  // The predicate did not just get louder: a guarded endpoint arriving through a
+  // star is still clean, and an unguarded one is still a violation.
+  assert.deepEqual(
+    scan("export * from './handlers'", {}, {
+      'app/actions/handlers.ts':
+        "import { requirePermission } from '@/lib/auth/server'\n"
+        + "export async function ok() { await requirePermission('sync'); return db.thing.findMany() }\n"
+        + 'export async function bad() { return db.thing.findMany() }\n',
+    }),
+    [`${F}:bad`],
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Round 8, Codex finding 3 — A WRITE THAT MIGHT HAPPEN IS A WRITE
+// ---------------------------------------------------------------------------
+
+/**
+ * The write position was read off `collectExecutedCalls`, the set of calls that
+ * PROVABLY execute. That set exists to UNDER-credit guards; using it to find
+ * writes inverts its polarity, so a helper call in a branch could carry a
+ * deletion past every check that followed it.
+ *
+ * The inline spelling of the same thing has been a violation since round 5,
+ * because `firstDataMutationPosition` counts every mutation in the body, branch
+ * or not. Both spellings are pinned here so the two halves cannot drift apart
+ * again — a rule that flags a write and clears the same write moved one call away
+ * is a rule answered by extracting a function.
+ */
+test('a write inside a BRANCH launders nothing — the later guard loses its credit', () => {
+  const WIPE = 'export async function wipeHelper(id: string) { await db.purchaseOrder.deleteMany({ where: { id } }) }'
+  assert.deepEqual(
+    scan(`import { wipeHelper } from '@/lib/wipe'
+export async function doIt(id: string, force: boolean) {
+  if (force) { await wipeHelper(id) }
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, { 'lib/wipe.ts': WIPE }),
+    [`${F}:doIt`],
+    'the rows are gone before requirePermission runs on the branch that takes the write',
+  )
+})
+
+test('the same write spelled INLINE in the branch is a violation too — the halves agree', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string, force: boolean) {
+  if (force) { await db.purchaseOrder.deleteMany({ where: { id } }) }
+  await requirePermission('purchasing.manage')
+  return true
+}`),
+    [`${F}:doIt`],
+  )
+})
+
+test('a loop body and a `try` are branches for this purpose as well', () => {
+  const WIPE = 'export async function wipeHelper(id: string) { await db.purchaseOrder.deleteMany({ where: { id } }) }'
+  for (const shape of [
+    'for (const x of ids) { await wipeHelper(x) }',
+    'try { await wipeHelper(id) } catch { /* ignored */ }',
+    'ids.length > 0 ? await wipeHelper(id) : null',
+  ]) {
+    assert.deepEqual(
+      scan(`import { wipeHelper } from '@/lib/wipe'
+export async function doIt(id: string, ids: string[]) {
+  ${shape}
+  await requirePermission('purchasing.manage')
+  return true
+}`, {}, { 'lib/wipe.ts': WIPE }),
+      [`${F}:doIt`],
+      `a conditional helper write (${shape}) must set the write position`,
+    )
+  }
+})
+
+test('a guard BEFORE the conditional write keeps its credit — the rule did not just get louder', () => {
+  const WIPE = 'export async function wipeHelper(id: string) { await db.purchaseOrder.deleteMany({ where: { id } }) }'
+  assert.deepEqual(
+    scan(`import { wipeHelper } from '@/lib/wipe'
+export async function doIt(id: string, force: boolean) {
+  await requirePermission('purchasing.manage')
+  if (force) { await wipeHelper(id) }
+  return true
+}`, {}, { 'lib/wipe.ts': WIPE }),
+    [],
+  )
+})
+
+/**
+ * The write position is a SOURCE OFFSET, and a guard call starts before its own
+ * arguments do — while the arguments EXECUTE first. So a write parked inside the
+ * guard's argument list sits at a later offset than the guard that is supposed to
+ * gate it, and the guard kept full credit for rows that were already gone when it
+ * ran. Same class as the branch case above: a guard credited over a write it did
+ * not govern, this time by the one place `getStart()` and execution order are
+ * guaranteed to disagree.
+ */
+test('a write inside the GUARD\'S OWN ARGUMENTS is not something that guard gated', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string) {
+  await requirePermission(await db.purchaseOrder.deleteMany({ where: { id } }) ? 'a' : 'b')
+  return true
+}`),
+    [`${F}:doIt`],
+    'the deleteMany is evaluated to build the argument, so it runs BEFORE requirePermission',
+  )
+})
+
+test('…and a guard whose arguments write nothing is untouched', () => {
+  assert.deepEqual(
+    scan(`export async function doIt(id: string) {
+  await requirePermission(id.length > 0 ? 'purchasing.manage' : 'purchasing.read')
+  return db.purchaseOrder.findMany()
+}`),
+    [],
+  )
+})

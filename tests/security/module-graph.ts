@@ -352,7 +352,32 @@ type FileInfo = {
   defaultExport?: ts.Node
 }
 
-const SOURCE_EXTENSIONS = ['', '.ts', '.tsx', '/index.ts', '/index.tsx']
+/**
+ * Every extension a module in this tree can be written in.
+ *
+ * o3d-512h round 8, Codex finding 1. A `'use server'` module is a module, not a
+ * `.ts` file, and the scanners' input surface was pinned to the two extensions
+ * the tree happens to use. What the DIRECTIVE creates is an endpoint; what the
+ * extension decides is only whether anything here reads the file.
+ */
+export const MODULE_FILE_EXTENSIONS = ['.ts', '.tsx', '.mts', '.cts', '.js', '.jsx', '.mjs', '.cjs'] as const
+
+/** Is this filename a module the scanners must read? Test files excluded. */
+export function isModuleFileName(name: string): boolean {
+  if (/\.(test|spec)\.[cm]?[jt]sx?$/.test(name)) return false
+  return /\.[cm]?[jt]sx?$/.test(name)
+}
+
+/** The script kind TypeScript must parse a source as — JSX is not optional. */
+export function probeFileName(file: string): string {
+  return /\.(tsx|jsx)$/.test(file) ? 'directive-probe.tsx' : 'directive-probe.ts'
+}
+
+const SOURCE_EXTENSIONS = [
+  '',
+  ...MODULE_FILE_EXTENSIONS,
+  ...MODULE_FILE_EXTENSIONS.map((e) => `/index${e}`),
+]
 
 function buildFileInfo(file: string, source: string): FileInfo {
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
@@ -460,9 +485,56 @@ function buildFileInfo(file: string, source: string): FileInfo {
       for (const decl of node.declarationList.declarations) {
         if (!ts.isIdentifier(decl.name)) continue
         info.locals.set(decl.name.text, decl)
-        if (isExported(node)) info.exportedNames.add(decl.name.text)
       }
     }
+  })
+
+  // ---------------------------------------------------------------------------
+  // o3d-512h round 8, Codex finding 2 — THE OTHER ENUMERATOR.
+  //
+  // Round 7 made server-action-guard-scan.ts:exportedServerActions EXHAUSTIVE:
+  // every top-level export of a `'use server'` module produces an entry, and
+  // anything not established to be an async function is NOT VERIFIED rather than
+  // dropped. It then routed `export * from '…'` through THIS function, which was
+  // still round 3's shape list — function declarations, class declarations, and
+  // variable declarators with an IDENTIFIER name. So every form round 7 had just
+  // made visible went invisible again the moment it arrived through a star:
+  //
+  //   // app/actions/star.ts
+  //   'use server'
+  //   export * from './handlers'
+  //
+  //   // app/actions/handlers.ts   (NOT a 'use server' module — no compiler check)
+  //   export const { wipeAll, purgeAll } = makeHandlers()
+  //   export enum Mode { … }
+  //
+  // `exportedServerActions` reported ZERO exports for star.ts, so the coverage
+  // rule, the secret-read rule and the authentication-only inventory all had
+  // nothing to judge — the round-6 failure mode ("a scanner that cannot see an
+  // endpoint reports it green forever") reproduced one indirection along. And a
+  // star target is the one place the compiler's "only async functions may be
+  // exported from a `use server` file" check does NOT apply, because the target
+  // module carries no directive of its own.
+  //
+  // Two enumerators of the same set will drift again, so this one stops being a
+  // shape list: the published name set is taken from `addStatementBindings`, the
+  // same binder `moduleBindings` uses, which walks EVERY declaration form —
+  // destructuring and array patterns, enums, namespaces, `import x = …`. A name
+  // published without a declaration `locals` can index resolves to null, which
+  // callers already treat as NOT VERIFIED; that is the fail-closed direction, and
+  // it is the direction a name nobody could read belongs in.
+  ts.forEachChild(sf, (node) => {
+    if (!ts.canHaveModifiers(node)) return
+    const mods = ts.getModifiers(node)
+    if (!mods?.some((m) => m.kind === ts.SyntaxKind.ExportKeyword)) return
+    // `export declare …` binds nothing at runtime, so it publishes no endpoint.
+    if (mods.some((m) => m.kind === ts.SyntaxKind.DeclareKeyword)) return
+    if (mods.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)) {
+      info.exportedNames.add('default')
+      return
+    }
+    if (ts.isInterfaceDeclaration(node) || ts.isTypeAliasDeclaration(node)) return
+    addStatementBindings(node as ts.Statement, info.exportedNames)
   })
 
   return info
@@ -736,7 +808,13 @@ export function createSourceGraph(sources: Record<string, string>): ModuleGraph 
 
 const SKIP_DIRS = new Set(['node_modules', '.next', 'generated', '.git'])
 
-/** Every .ts/.tsx under `roots`, keyed by repo-relative POSIX path. */
+/**
+ * Every module file under `roots`, keyed by repo-relative POSIX path.
+ *
+ * Round 8: every extension a module can be written in, not the two the tree
+ * happens to use — a guard that resolves through `.ts` and stops at `.mts` is a
+ * guard whose coverage is decided by a filename.
+ */
 export function listSourceFiles(root: string, roots: string[]): string[] {
   const out: string[] = []
   const walk = (dir: string) => {
@@ -753,7 +831,7 @@ export function listSourceFiles(root: string, roots: string[]): string[] {
         walk(full)
         continue
       }
-      if (!/\.tsx?$/.test(entry.name)) continue
+      if (!isModuleFileName(entry.name)) continue
       out.push(path.relative(root, full).split(path.sep).join('/'))
     }
   }

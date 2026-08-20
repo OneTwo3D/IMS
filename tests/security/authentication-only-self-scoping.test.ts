@@ -543,3 +543,82 @@ test('the shapes the nine endpoints issue are all still credited — round 7 did
   )
   assert.equal(constraintMentions(q('create', { data: { userId: CALLER_ID } }), CALLER_ID), true)
 })
+
+// ---------------------------------------------------------------------------
+// Round 8, Codex finding 4 — THE LEAF, AND THE LIST'S OWN SHAPE
+// ---------------------------------------------------------------------------
+
+/**
+ * Rounds 6 and 7 tightened the ROUTE to the leaf and never looked at the leaf.
+ * Every version of this predicate has ended in `node.includes(needle)`, so with a
+ * caller id of `u1` every row whose value merely CONTAINS it — `u10`, `u1x`,
+ * `u1-victim` — was proof that the query was scoped to the caller. The structural
+ * work was being done on top of a text match.
+ */
+test('a value that merely CONTAINS the caller id does not scope to the caller', () => {
+  for (const foreign of ['u1x', 'u10', 'u1-victim', 'xu1', 'au1b']) {
+    assert.equal(
+      constraintMentions(q('findMany', { where: { id: foreign } }), CALLER_ID),
+      false,
+      `${foreign} is a DIFFERENT row's id that happens to contain ${CALLER_ID}`,
+    )
+  }
+})
+
+test('…and the whole-segment forms the tree really issues still scope', () => {
+  // A bare `===` would have been the easy fix and it is the wrong one: the
+  // one-time-token rows are keyed by a COMPOSED string, and refusing those would
+  // have made this predicate say no to the shapes it exists to approve.
+  assert.equal(constraintMentions(q('findUnique', { where: { id: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(
+    constraintMentions(q('upsert', { where: { key: `passkey_challenge:reg:${CALLER_ID}` }, create: {}, update: {} }), CALLER_ID),
+    true,
+  )
+  assert.equal(
+    constraintMentions(q('findFirst', { where: { key: `${CALLER_ID}:reg` } }), CALLER_ID),
+    true,
+  )
+})
+
+/**
+ * `notIn` and `notStartsWith` are the same word with a different tail. Round 7
+ * refused the first by membership in a list and credited the second, because the
+ * list was a list of the negations someone had thought of. Negation is now a
+ * property of the KEY, tested by prefix.
+ */
+test('a negation nobody listed is still a negation', () => {
+  for (const key of ['notStartsWith', 'notEndsWith', 'notContains', 'notIn', 'not']) {
+    assert.equal(
+      constraintMentions(q('findMany', { where: { userId: { [key]: CALLER_ID } } }), CALLER_ID),
+      false,
+      `{ userId: { ${key}: '${CALLER_ID}' } } reaches rows that are NOT the caller's`,
+    )
+  }
+})
+
+/**
+ * The direction the walk defaults in. Round 7 refused the keys it recognised as
+ * non-scoping and credited everything else; a filter object mixing a known
+ * operator with an unknown key was credited on the strength of the unknown one.
+ */
+test('an unrecognised operator SHAPE earns nothing rather than being walked through', () => {
+  assert.equal(
+    constraintMentions(q('findMany', { where: { userId: { gte: 'a', someFutureOp: CALLER_ID } } }), CALLER_ID),
+    false,
+    'part operator, part unknown is a shape this predicate does not recognise',
+  )
+  assert.equal(
+    constraintMentions(q('findMany', { where: { name: { contains: 'x', mode: 'insensitive' } } }), CALLER_ID),
+    false,
+  )
+})
+
+test('the positive vocabulary is unchanged — the predicate did not just get quieter (round 8)', () => {
+  assert.equal(constraintMentions(q('findMany', { where: { userId: { equals: CALLER_ID } } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('findMany', { where: { items: { some: { ownerId: CALLER_ID } } } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('findMany', { where: { owner: { is: { id: CALLER_ID } } } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('findMany', { where: { owner: { id: CALLER_ID } } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('findMany', { where: { tags: { has: CALLER_ID } } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('findMany', { where: { userId: { in: [CALLER_ID] } } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('deleteMany', { where: { AND: [{ id: 'pk' }, { userId: CALLER_ID }] } }), CALLER_ID), true)
+})

@@ -161,6 +161,8 @@ import {
   createRepoGraph,
   declarationBody,
   hasLexicalShadow,
+  isModuleFileName,
+  probeFileName,
   type Declaration,
   type ModuleGraph,
 } from './module-graph'
@@ -314,10 +316,14 @@ export function isDelegatingFacadeBody(body: ts.ConciseBody | undefined): boolea
  * common spelling, and the substring test keeps the cost of the fallback off the
  * ~800 files in the tree that never mention it.
  */
-export function isUseServer(source: string): boolean {
+export function isUseServer(source: string, file = 'directive-probe.ts'): boolean {
   if (/^\s*['"]use server['"]/.test(source)) return true
   if (!source.includes('use server')) return false
-  const sf = ts.createSourceFile('directive-probe.ts', source, ts.ScriptTarget.Latest, true)
+  // ROUND 8: the probe must be parsed with the source's own SCRIPT KIND. TypeScript
+  // takes that from the file name, and a `.tsx` module parsed as `.ts` reads `<T>`
+  // as a type assertion — a different grammar, a different statement list, and a
+  // directive prologue answered from a misparse.
+  const sf = ts.createSourceFile(probeFileName(file), source, ts.ScriptTarget.Latest, true)
   return hasUseServerPrologue(sf.statements)
 }
 
@@ -343,6 +349,17 @@ type Verifier = {
   writeMemo: Map<string, boolean>
   /** declaration -> the Prisma models it mutates transitively (round 7). */
   modelMemo: Map<string, Set<string>>
+  /**
+   * Declarations whose mutated-model set could NOT be established completely
+   * (round 8), keyed `file:name` exactly as `modelMemo` is.
+   *
+   * The inverse store, and per-graph for the same reason the memo is: a key in
+   * `modelMemo` has an answer, a key here has one nobody may build an exemption
+   * on. Two graphs in one process resolve `lib/auth/server.ts:requireAuth` to
+   * different declarations, so a global set would carry a fixture's verdict into
+   * the live tree.
+   */
+  incompleteModels: Set<string>
   active: Set<string>
 }
 
@@ -351,7 +368,14 @@ const verifiers = new WeakMap<ModuleGraph, Verifier>()
 function verifierFor(graph: ModuleGraph): Verifier {
   let v = verifiers.get(graph)
   if (!v) {
-    v = { graph, memo: new Map(), writeMemo: new Map(), modelMemo: new Map(), active: new Set() }
+    v = {
+      graph,
+      memo: new Map(),
+      writeMemo: new Map(),
+      modelMemo: new Map(),
+      incompleteModels: new Set(),
+      active: new Set(),
+    }
     verifiers.set(graph, v)
   }
   return v
@@ -849,18 +873,50 @@ export const AUDITED_CONTROL_WRITE_MODELS: Record<string, string> = {
  * Every Prisma model this declaration mutates, itself or through anything the
  * graph can follow — INCLUDING through other pinned guards, because a guard that
  * calls a guard that wipes rows has laundered the wipe just the same.
+ *
+ * ROUND 8: no depth parameter. This walk used to inherit MAX_GUARD_DEPTH, which
+ * is a budget for how far a GUARD may hide behind wrappers and says nothing about
+ * how far a WRITE may — and a walk that stops early returns the empty set, which
+ * is indistinguishable from "writes nothing" to the caller that grants the
+ * exemption. There is a cycle guard and a memo, so following every resolvable
+ * callee costs one visit per reachable declaration. Where the walk genuinely
+ * cannot finish it says so, in `v.incompleteModels`.
  */
-function mutatedModelsOfDeclaration(decl: Declaration, v: Verifier, depth: number): Set<string> {
+function mutatedModelsOfDeclaration(decl: Declaration, v: Verifier): Set<string> {
   const key = `${decl.file}:${decl.name}`
   const cached = v.modelMemo.get(key)
   if (cached) return cached
   const models = new Set<string>()
-  if (depth > MAX_GUARD_DEPTH) return models
-  if (v.active.has(`models:${key}`)) return models // recursion: claim nothing
+  // ROUND 8, Codex finding 3 — AN ANSWER THAT WAS NEVER ESTABLISHED.
+  //
+  // Round 7 asked "does this guard write outside the audited surface" and read
+  // the answer off an EMPTY model set. Every way this walk could fail to find a
+  // write produced that same empty set: a body it could not read, a recursion
+  // cut, and — the one that mattered — a depth cut at MAX_GUARD_DEPTH, which is a
+  // budget for how far a GUARD may hide behind wrappers and has nothing to do
+  // with how far a WRITE may. "I found nothing" was returned as "there is
+  // nothing", to a caller whose next move was to grant an exemption.
+  //
+  // So the walk reports its own completeness, and it no longer stops at a depth.
+  // There is a cycle guard and a memo, so following every resolvable callee costs
+  // one visit per reachable declaration; the depth limit bought nothing here
+  // except the silence above. What remains incomplete — a cycle, an unreadable
+  // body — is reported as incomplete, and the exemption requires completeness.
+  if (v.active.has(`models:${key}`)) {
+    // A cycle: this frame cannot contribute, and the answer it is part of is not
+    // established. Not cached — the outer frame's result is the one to keep.
+    v.incompleteModels.add(key)
+    return models
+  }
   v.active.add(`models:${key}`)
+  let complete = true
   try {
     const body = declarationBody(decl)
-    if (!body) return models
+    if (!body) {
+      // A declaration with no body the graph can read writes an unknown set.
+      v.incompleteModels.add(key)
+      return models
+    }
     const visit = (n: ts.Node) => {
       if (ts.isCallExpression(n)) {
         const model = mutatedModelOfCall(n)
@@ -875,10 +931,18 @@ function mutatedModelsOfDeclaration(decl: Declaration, v: Verifier, depth: numbe
       const root = calleeRootName(call.expression)
       if (root !== null && DATA_CLIENT_ROOTS.has(root)) continue
       const target = v.graph.resolveCallTarget(decl.file, call.expression)
+      // An unresolvable callee is the LIMIT this walk shares with
+      // declarationWrites, and it is stated in both places rather than only one:
+      // neither can see a write behind a value the graph cannot follow. Making it
+      // incomplete here would make every pinned guard non-exempt on the strength
+      // of a `headers()` call, which is not what the exemption is about.
       if (!target) continue
-      for (const m of mutatedModelsOfDeclaration(target, v, depth + 1)) models.add(m)
+      const inner = mutatedModelsOfDeclaration(target, v)
+      for (const m of inner) models.add(m)
+      if (v.incompleteModels.has(`${target.file}:${target.name}`)) complete = false
     }
-    v.modelMemo.set(key, models)
+    if (complete) v.modelMemo.set(key, models)
+    else v.incompleteModels.add(key)
     return models
   } finally {
     v.active.delete(`models:${key}`)
@@ -890,9 +954,17 @@ function mutatedModelsOfDeclaration(decl: Declaration, v: Verifier, depth: numbe
  *
  * True means the exemption does not apply: the guard is carrying a business write
  * and is treated as an ordinary writing helper at its call site.
+ *
+ * ROUND 8: true ALSO means "this could not be established". The exemption is a
+ * claim that a guard's writes are all part of the control, and a claim nobody
+ * checked is not a weaker version of a claim that was checked — it is the same
+ * "credited without being verified" this whole branch has been unwinding, sitting
+ * in the one rule whose job is to hand out credit.
  */
-function guardWritesBusinessData(decl: Declaration, v: Verifier, depth: number): boolean {
-  for (const model of mutatedModelsOfDeclaration(decl, v, depth)) {
+function guardWritesBusinessData(decl: Declaration, v: Verifier): boolean {
+  const models = mutatedModelsOfDeclaration(decl, v)
+  if (v.incompleteModels.has(`${decl.file}:${decl.name}`)) return true
+  for (const model of models) {
     if (!Object.prototype.hasOwnProperty.call(AUDITED_CONTROL_WRITE_MODELS, model)) return true
   }
   return false
@@ -910,7 +982,7 @@ export function guardWriteSurface(graph: ModuleGraph): Record<string, string[]> 
       out[`${file}:${name}`] = ['<declaration not found>']
       return
     }
-    const models = [...mutatedModelsOfDeclaration(decl, v, 0)].sort()
+    const models = [...mutatedModelsOfDeclaration(decl, v)].sort()
     if (models.length > 0) out[`${file}:${name}`] = models
   }
   for (const [file, names] of Object.entries(BASE_GUARD_DECLARATIONS)) {
@@ -941,17 +1013,22 @@ export function guardWriteSurface(graph: ModuleGraph): Record<string, string[]> 
  * would be answered by moving the guard above the closure, not by an allowlist.
  */
 export function firstDataMutationPosition(body: ts.ConciseBody | undefined): number {
-  if (!body) return Infinity
   let first = Infinity
+  for (const at of dataMutationPositions(body)) first = Math.min(first, at)
+  return first
+}
+
+/** Every source offset in this body at which a write happens. */
+function dataMutationPositions(body: ts.ConciseBody | undefined): number[] {
+  if (!body) return []
+  const at: number[] = []
   const visit = (n: ts.Node) => {
-    if (ts.isCallExpression(n) && isDataMutationCall(n)) {
-      first = Math.min(first, n.getStart())
-    }
+    if (ts.isCallExpression(n) && isDataMutationCall(n)) at.push(n.getStart())
     ts.forEachChild(n, visit)
   }
   if (ts.isBlock(body)) ts.forEachChild(body, visit)
   else visit(body)
-  return first
+  return at
 }
 
 /**
@@ -998,7 +1075,7 @@ function declarationWrites(decl: Declaration, v: Verifier, depth: number): boole
       // wrapper exactly as an ordinary helper does, so the wrapper must inherit
       // that write — or the rule is inconsistent one call deep in the direction
       // that hides the laundering.
-      if (guardKindOfDeclaration(target) !== null && !guardWritesBusinessData(target, v, depth + 1)) continue
+      if (guardKindOfDeclaration(target) !== null && !guardWritesBusinessData(target, v)) continue
       if (declarationWrites(target, v, depth + 1)) {
         v.writeMemo.set(key, true)
         return true
@@ -1058,9 +1135,37 @@ export function guardKindsOfBody(
     return { call, target, kinds }
   })
 
-  let firstWrite = firstDataMutationPosition(body)
-  for (const entry of resolved) {
-    if (!entry.target) continue
+  // ROUND 8, Codex finding 3 — WHICH CALLS CAN CARRY A WRITE.
+  //
+  // The write position used to be read off `resolved`, which is
+  // collectExecutedCalls — the calls that PROVABLY EXECUTE. That set exists to
+  // UNDER-credit guards, and using it to find writes inverts its polarity: a
+  // helper whose write may or may not happen is excluded, so
+  //
+  //   if (force) { await wipeHelper(id) }        // db.purchaseOrder.deleteMany
+  //   await requirePermission('purchasing.manage')
+  //
+  // left `firstWrite` at Infinity and the permission check kept full credit, on
+  // rows that were already gone when it ran. The inline spelling of exactly that
+  // — `if (force) { await db.purchaseOrder.deleteMany(…) }` — has been a violation
+  // since round 5, because firstDataMutationPosition deliberately over-reports
+  // every mutation in the body, branch or not. A rule that flags the write and
+  // clears the same write moved one call away is a rule answered by extracting a
+  // function.
+  //
+  // So the write question is asked of EVERY call in the body, and the two halves
+  // now err in the same direction: guards are credited only from a position where
+  // execution is not in question, and writes are counted wherever they might
+  // happen at all.
+  const writeAt = dataMutationPositions(body)
+  let firstWrite = writeAt.reduce((a, b) => Math.min(a, b), Infinity)
+  for (const call of collectCalls(body)) {
+    if (call.getStart() >= firstWrite) continue
+    const root = calleeRootName(call.expression)
+    if (root !== null && DATA_CLIENT_ROOTS.has(root)) continue
+    const target = graph.resolveCallTarget(file, call.expression)
+    if (!target) continue
+    const entry = { call, target }
     // ROUND 6, Codex finding 3 — WHOSE WRITE IS EXEMPT?
     //
     // Round 5 exempted any callee that reaches a guard (`entry.kinds.size > 0`),
@@ -1095,15 +1200,34 @@ export function guardKindsOfBody(
     // write position like any other helper.
     if (
       guardKindOfDeclaration(entry.target) !== null
-      && !guardWritesBusinessData(entry.target, v, depth + 1)
+      && !guardWritesBusinessData(entry.target, v)
     ) continue
-    if (entry.call.getStart() >= firstWrite) continue
-    if (declarationWrites(entry.target, v, depth + 1)) firstWrite = entry.call.getStart()
+    if (declarationWrites(entry.target, v, depth + 1)) {
+      writeAt.push(entry.call.getStart())
+      firstWrite = Math.min(firstWrite, entry.call.getStart())
+    }
   }
 
   for (const entry of resolved) {
     // A guard that runs after the row is already written gated nothing (round 5).
     if (entry.call.getStart() > firstWrite) continue
+    // ROUND 8 — THE ONE PLACE OFFSET AND EXECUTION ORDER MUST DISAGREE.
+    //
+    // `firstWrite` is a source offset, and a call starts before its own arguments
+    // do while the arguments EVALUATE first. So a write parked inside a guard's
+    // argument list sits at a LATER offset than the guard it defeats:
+    //
+    //   await requirePermission(await db.purchaseOrder.deleteMany({ where: { id } }) ? 'a' : 'b')
+    //
+    // The rows are gone before requirePermission is entered, and every offset
+    // comparison in this function said the guard came first. A write inside a
+    // guard's own source range is therefore never something that guard gated —
+    // which leaves the case the write-exemption depends on untouched, because a
+    // write in a guard's BODY is recorded at the guard's own call offset, not
+    // strictly inside it.
+    const from = entry.call.getStart()
+    const to = entry.call.getEnd()
+    if (writeAt.some((at) => at > from && at < to)) continue
     for (const kind of entry.kinds) kinds.add(kind)
   }
 
@@ -1513,7 +1637,7 @@ export function scanSource(
   allowlist: Record<string, string> = {},
   graph?: ModuleGraph,
 ): string[] {
-  if (!isUseServer(source)) return []
+  if (!isUseServer(source, file)) return []
   const violations: string[] = []
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
 
@@ -1647,7 +1771,7 @@ export function scanSecretReadingActions(
   allowlist: Record<string, string> = {},
   graph?: ModuleGraph,
 ): string[] {
-  if (!isUseServer(source)) return []
+  if (!isUseServer(source, file)) return []
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
   const violations: string[] = []
 
@@ -1689,7 +1813,16 @@ export function scanActionsDir(
 ): string[] {
   const violations: string[] = []
   for (const entry of readdirSync(dir)) {
-    if (!entry.endsWith('.ts') || entry.endsWith('.test.ts')) continue
+    // ROUND 8, Codex finding 1 — THE FILE NOBODY OWNED.
+    //
+    // This walker took `.ts`; scanUseServerOutsideActions took `.ts` and `.tsx`
+    // and then skipped anything sitting directly in app/actions because "it is
+    // covered by scanActionsDir". `app/actions/wipe.tsx` was therefore covered by
+    // NEITHER — a `'use server'` module in the directory this whole file is
+    // named after, publishing an unguarded `deleteMany`, and every rule here
+    // returned green. Two filters describing the same boundary in different
+    // words is how a file falls between them, so both now ask one predicate.
+    if (!isModuleFileName(entry)) continue
     const full = path.join(dir, entry)
     const source = readFileSync(full, 'utf8')
     // The graph is keyed by repo-relative path; the allowlist and the reported
@@ -1760,12 +1893,13 @@ export function scanUseServerOutsideActions(
         walk(full)
         continue
       }
-      if (!entry.name.endsWith('.ts') && !entry.name.endsWith('.tsx')) continue
-      if (entry.name.endsWith('.test.ts') || entry.name.endsWith('.test.tsx')) continue
-      if (path.dirname(full) === actionsDir) continue // covered by scanActionsDir
+      if (!isModuleFileName(entry.name)) continue
+      // Covered by scanActionsDir — which, since round 8, takes exactly the same
+      // set of files this predicate does. The two used to disagree.
+      if (path.dirname(full) === actionsDir) continue
       const source = readFileSync(full, 'utf8')
-      if (!isUseServer(source)) continue
       const rel = path.relative(root, full).split(path.sep).join('/')
+      if (!isUseServer(source, rel)) continue
       violations.push(...scanner(rel, source, allowlist, graph))
     }
   }
@@ -1796,7 +1930,7 @@ export function scanUseServerOutsideActions(
  * class this whole file exists for.
  *
  * And NOTHING here could see one. Every rule in this file starts with
- * `if (!isUseServer(source)) return []`, which asks about the module's directive
+ * `if (!isUseServer(source, file)) return []`, which asks about the module's directive
  * prologue; both directory walkers skip a file that fails it. So the entire
  * inline form — the form Next's own documentation reaches for first — was outside
  * the scanners' input, in a file whose header comment argues that a rule which
@@ -1893,8 +2027,7 @@ export function scanTreeForInlineServerActions(
         walk(full)
         continue
       }
-      if (!entry.name.endsWith('.ts') && !entry.name.endsWith('.tsx')) continue
-      if (/\.test\.tsx?$/.test(entry.name)) continue
+      if (!isModuleFileName(entry.name)) continue
       const source = readFileSync(full, 'utf8')
       if (!source.includes('use server')) continue // keeps the parse off ~800 files
       const rel = path.relative(root, full).split(path.sep).join('/')
@@ -1904,6 +2037,68 @@ export function scanTreeForInlineServerActions(
 
   for (const r of scanRoots) walk(path.join(root, r))
   return violations
+}
+
+// ---------------------------------------------------------------------------
+// Round 8, Codex finding 1 — WHAT THE ROOTS DO NOT COVER
+// ---------------------------------------------------------------------------
+
+/**
+ * Every module in the repo that MENTIONS `use server` and sits outside the roots
+ * the scanners walk.
+ *
+ * Round 7 answered "a scanner that cannot see an endpoint reports it green
+ * forever" for a directive behind a comment and for the inline form. It did not
+ * answer it for a file in a directory nobody listed. `SCAN_ROOTS` is a three-name
+ * array in the coverage test, asserted nowhere, and a `'use server'` module under
+ * `types/`, `scripts/`, a new top-level directory, or `proxy.ts` at the repo root
+ * is compiled and published by Next exactly like one under `app/` — while every
+ * rule in this file is walking somewhere else.
+ *
+ * The answer is not a wider root list, which decays the same way. It is that the
+ * roots must be shown to COVER the tree: this returns the residue, the coverage
+ * test pins it against a stated exemption list, and a `'use server'` module
+ * appearing anywhere new fails the build with its own path in the message.
+ *
+ * Deliberately a mention test, not a directive test: `isUseServer` would let a
+ * file that only nearly qualifies (a directive inside a nested block, a spelling
+ * this file does not parse) drop out of the residue too. What is claimed here is
+ * only "nothing here talks about server actions unreviewed", which is the weaker
+ * claim a coverage check can actually make good on.
+ */
+export function useServerModulesOutsideScanRoots(root: string, scanRoots: string[]): string[] {
+  const rootsAbs = scanRoots.map((r) => path.join(root, r))
+  const found: string[] = []
+
+  const walk = (dir: string) => {
+    let entries: Array<{ name: string; isDirectory(): boolean }>
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name)
+      if (entry.isDirectory()) {
+        if (SKIP_DIRS.has(entry.name)) continue
+        if (rootsAbs.includes(full)) continue // walked by the scanners
+        walk(full)
+        continue
+      }
+      if (!isModuleFileName(entry.name)) continue
+      let source: string
+      try {
+        source = readFileSync(full, 'utf8')
+      } catch {
+        continue
+      }
+      if (!source.includes('use server')) continue
+      found.push(path.relative(root, full).split(path.sep).join('/'))
+    }
+  }
+
+  walk(root)
+  return found.sort()
 }
 
 /**
@@ -1925,7 +2120,7 @@ export function scanAuthenticationOnlyActions(
   graph?: ModuleGraph,
 ): string[] {
   void _allowlist
-  if (!isUseServer(source)) return []
+  if (!isUseServer(source, file)) return []
   const sf = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true)
   const found: string[] = []
 

@@ -140,72 +140,192 @@ export function queryConstraint(ctx: QueryContext): unknown {
  * `hasNone` joins the negatives; `hasSome` joins `in` as disjunctive membership,
  * and `in` was already singleton-only.
  */
-const NON_SCOPING_KEYS = new Set([
-  // Negation, exclusion, absence.
-  'NOT', 'not', 'notIn', 'none', 'isNot', 'hasNone',
+/**
+ * o3d-512h round 8, Codex finding 4 — THE WALK CREDITED WHAT IT DID NOT RECOGNISE.
+ *
+ * Rounds 6 and 7 answered this question by growing a list of keys to REFUSE, and
+ * the answer was right about every key on it. The list is the defect. A walk that
+ * refuses the predicates someone thought of and credits everything else has its
+ * default in the wrong direction, and two whole classes were still walking
+ * through it at the end of round 7:
+ *
+ *   where: { id: 'u1-victim' }                    // the caller's id as a PREFIX
+ *   where: { userId: { notStartsWith: 'u1' } }    // a negation nobody listed
+ *
+ * The first is not an operator question at all — it is the leaf. Every round of
+ * this predicate has ended with `node.includes(needle)`, so a value that merely
+ * CONTAINS the caller's id was proof of scoping: with a caller id of `u1`, rows
+ * belonging to `u10`, `u1x` and `u1-victim` all "scoped to the caller". The
+ * structural rounds were tightening the route to a leaf that never checked
+ * anything. The second is the list's own shape: `notIn`, `not`, `none`, `hasNone`
+ * and `isNot` are refused by name, and `notStartsWith` — same family, same
+ * meaning, not on the list — was credited as scoping.
+ *
+ * So the walk is inverted. It now knows two POSITIONS and moves between them:
+ *
+ *   * FILTER position — a `where`, a `data`, or a nested relation `where`. Its
+ *     keys are FIELD NAMES, plus the three logical operators. `AND` is followed,
+ *     `OR` and `NOT` are refused, a field's value is descended into.
+ *   * OPERATOR position — the object value of a field, e.g. `{ equals: … }`,
+ *     `{ some: … }`. Its keys are Prisma OPERATORS, and only the operators on
+ *     SCOPING_OPERATORS are followed. Every other KNOWN operator is refused, and
+ *     an object that MIXES known operators with unknown keys is an unrecognised
+ *     shape and is refused whole — which is the case the old walk would have
+ *     credited on the strength of the unknown key alone.
+ *
+ * and the leaf is a WHOLE-SEGMENT match rather than a substring: the needle must
+ * occupy a complete run of identifier characters. `passkey_challenge:reg:u1` still
+ * scopes — that is the real one-time-token shape and the reason a bare `===` will
+ * not do — while `u1-victim`, `u10` and `xu1` no longer do.
+ *
+ * WHAT IS STILL OPEN, named rather than left to be found: a field's object value
+ * whose keys are ALL unknown to this file is read as the to-one relation shorthand
+ * (`owner: { id: 'u1' }`) and descended into as a filter. A Prisma operator added
+ * after this list was written, appearing alone, lands there. Two things narrow it:
+ * a key spelled like a negation is refused wherever it appears, by prefix and not
+ * by membership (`isNegationKey`), and the leaf must still carry the caller's id
+ * as a whole segment. What is left is a positively-spelled future operator that
+ * does not mean equality — and that one is a diff to this file, not a silent pass,
+ * the day the operator vocabulary below stops matching Prisma's.
+ */
+
+/** Operators that restrict every row the query reaches to ones carrying the needle. */
+const SCOPING_OPERATORS = new Set([
+  'equals',     // the explicit spelling of the scalar equality a bare value means
+  'is',         // to-one relation: the related row must match
+  'some',       // to-many relation: at least one related row must match
+  'has',        // scalar list contains the value
+  'in',         // ONLY as a singleton — enforced at the call site, not here
+])
+
+/**
+ * Operators that do NOT, with the reason each is on this side.
+ *
+ * Kept explicit rather than "everything not above" because the difference between
+ * the two sets is the whole judgement, and a reviewer must be able to read it.
+ */
+const NON_SCOPING_OPERATORS = new Set([
+  // Negation, exclusion, absence — the complement of scoping.
+  'not', 'notIn', 'none', 'isNot', 'hasNone', 'isEmpty', 'isSet',
   // Vacuously true for a row with no related rows at all.
   'every',
-  // Disjunction: an arm constrains no row on its own.
-  'OR', 'hasSome',
+  // Disjunctive membership: an arm constrains no row on its own.
+  'hasSome',
   // Partial match: satisfied by rows that merely CONTAIN the id.
   'contains', 'startsWith', 'endsWith', 'search',
   // Range: satisfied by every row on one side of the id.
   'gt', 'gte', 'lt', 'lte',
+  // Under-credited on purpose: `hasEvery: ['u1', 'x']` does scope, and refusing it
+  // costs a red build on good code rather than a green one on bad.
+  'hasEvery',
+  // Modifiers, not predicates.
+  'mode',
 ])
 
+/** Everything this file recognises as an operator. Keys outside it are field names. */
+const KNOWN_OPERATORS = new Set([...SCOPING_OPERATORS, ...NON_SCOPING_OPERATORS])
+
 /**
- * Keys whose ARRAY value is a conjunction — every arm applies to every row, so one
- * arm carrying the needle constrains all of them.
- *
- * Everywhere else an array is a list of ALTERNATIVES or a list of ROWS, and one
- * element carrying the needle says nothing about the others. `createMany({ data:
- * [{ userId: 'u1' }, { userId: 'victim' }] })` was the round-6 predicate's answer
- * to "is every row scoped to the caller": yes, on the strength of the first one.
+ * Logical operators, which live in FILTER position rather than operator position.
+ * `AND` is the only one that constrains every row through a single arm.
  */
-const CONJUNCTIVE_LIST_KEYS = new Set(['AND'])
+const LOGICAL_KEYS = new Set(['AND', 'OR', 'NOT'])
+
+/**
+ * A key spelled like a negation, by PREFIX rather than by membership.
+ *
+ * `notIn` and `notStartsWith` are the same word with a different tail, and the
+ * round-7 list had one of them. This costs a field genuinely named `notes` its
+ * credit, which is a red build on good code — the direction to be wrong in.
+ */
+function isNegationKey(key: string): boolean {
+  return /^not/i.test(key) || key === 'NOT' || key === 'none' || key === 'hasNone' || key === 'isNot'
+}
+
+/** Does this string carry `needle` as a WHOLE segment, not as a substring? */
+function stringCarries(value: string, needle: string): boolean {
+  if (needle.length === 0) return false
+  const isSegmentChar = (c: string) => /[A-Za-z0-9_-]/.test(c)
+  let from = 0
+  for (;;) {
+    const at = value.indexOf(needle, from)
+    if (at === -1) return false
+    const before = at === 0 ? '' : value[at - 1]
+    const afterAt = at + needle.length
+    const after = afterAt >= value.length ? '' : value[afterAt]
+    if (!isSegmentChar(before) && !isSegmentChar(after)) return true
+    from = at + 1
+  }
+}
 
 /**
  * Is `needle` carried by a position that constrains EVERY row this query reaches?
  *
- * Structure, not text. The walk descends through objects and arrays — `AND`
- * lists, nested relation filters, composed keys — and refuses to descend into the
- * positions above. Two further rules, both in the fail-closed direction:
- *
- *   * only a STRING VALUE can carry the needle. An id appearing as a KEY
- *     (`where: { u1: true }`) scopes nothing, and the round-5 predicate counted
- *     it — the same defect its own `select: { [CALLER_ID]: true }` case was
- *     written to refuse, one level in;
- *   * `in: [...]` counts only as a singleton. `{ id: { in: ['u1', 'u2'] } }`
- *     reaches a row that is not the caller's, so it is not scoping to the caller.
- *
- * Round 7 adds the third, and it is the one the words "EVERY row" were always
- * about: an ARRAY is credited only where the array is a conjunction. Under `AND`,
- * one arm carrying the needle constrains every row the query reaches. Anywhere
- * else — a `createMany` row list, a scalar-list filter — the elements are separate
- * subjects, so EVERY element must carry it or the ones that do not are unscoped.
- * That under-credits `hasEvery: ['u1', 'x']`, which does scope; the direction is
- * deliberate and it is the one that turns the test red.
+ * `position` says which vocabulary the object's KEYS are drawn from — see the
+ * note above. `arrayMode` says whether one element of an array is enough: under
+ * `AND` every arm applies to every row, so one arm carrying the needle constrains
+ * all of them; everywhere else an array is a list of ALTERNATIVES or a list of
+ * ROWS, and one element carrying the needle says nothing about the others.
+ * `createMany({ data: [{ userId: 'u1' }, { userId: 'victim' }] })` was the
+ * round-6 predicate's answer to "is every row scoped to the caller": yes, on the
+ * strength of the first one.
  */
 function constraintCarries(
   node: unknown,
   needle: string,
+  position: 'filter' | 'operator' = 'filter',
   arrayMode: 'all' | 'any' = 'all',
 ): boolean {
-  if (typeof node === 'string') return node.includes(needle)
+  if (typeof node === 'string') return stringCarries(node, needle)
   if (Array.isArray(node)) {
     if (node.length === 0) return false
     return arrayMode === 'any'
-      ? node.some((el) => constraintCarries(el, needle))
-      : node.every((el) => constraintCarries(el, needle))
+      ? node.some((el) => constraintCarries(el, needle, position))
+      : node.every((el) => constraintCarries(el, needle, position))
   }
   if (node === null || typeof node !== 'object') return false
-  for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
-    if (NON_SCOPING_KEYS.has(key)) continue
-    if (key === 'in') {
-      if (Array.isArray(value) && value.length === 1 && constraintCarries(value[0], needle)) return true
+
+  const entries = Object.entries(node as Record<string, unknown>)
+  if (entries.length === 0) return false
+
+  if (position === 'operator') {
+    const known = entries.filter(([key]) => KNOWN_OPERATORS.has(key) || LOGICAL_KEYS.has(key))
+    // No operator at all: the to-one relation shorthand, `owner: { id: 'u1' }`.
+    // This is the residual named in the note above.
+    if (known.length === 0) return constraintCarries(node, needle, 'filter', arrayMode)
+    // A shape that is part operator and part something else is a shape this file
+    // does not recognise, and an unrecognised shape earns nothing.
+    if (known.length !== entries.length) return false
+  }
+
+  for (const [key, value] of entries) {
+    if (isNegationKey(key)) continue
+
+    if (position === 'filter') {
+      if (key === 'OR') continue // a disjunct constrains no row on its own
+      if (key === 'AND') {
+        if (constraintCarries(value, needle, 'filter', 'any')) return true
+        continue
+      }
+      // A FIELD name. A scalar value is equality; an object value is the field's
+      // filter, which is operator position.
+      if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+        if (constraintCarries(value, needle, 'operator')) return true
+        continue
+      }
+      if (constraintCarries(value, needle, 'filter')) return true
       continue
     }
-    if (constraintCarries(value, needle, CONJUNCTIVE_LIST_KEYS.has(key) ? 'any' : 'all')) return true
+
+    // Operator position: only the operators that scope are followed.
+    if (!SCOPING_OPERATORS.has(key)) continue
+    if (key === 'in') {
+      // A list reaches rows that are not the caller's, so only a singleton scopes.
+      if (Array.isArray(value) && value.length === 1 && constraintCarries(value[0], needle, 'filter')) return true
+      continue
+    }
+    // `is`/`some` take a nested where; `equals`/`has` take a value or a composite.
+    if (constraintCarries(value, needle, 'filter')) return true
   }
   return false
 }
