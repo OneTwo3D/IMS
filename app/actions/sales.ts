@@ -9,7 +9,7 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
-import { freshAuthFailureResult, requireAuth, requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireFreshPermission, requireInternalUser, requirePermission } from '@/lib/auth/server'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 import { xeroGet } from '@/lib/connectors/xero/api'
 import {
@@ -703,7 +703,7 @@ export async function getSalesOrders(
   limit = 200,
   opts?: { includeCompleted?: boolean }
 ): Promise<SoRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const where: Prisma.SalesOrderWhereInput = { archived: { not: true } }
   if (!opts?.includeCompleted) {
     where.status = { notIn: ['COMPLETED', 'DELIVERED'] }
@@ -753,7 +753,7 @@ function claimedReceivedForeign(so: {
 }
 
 export async function getSalesOrder(id: string): Promise<SoDetail | null> {
-  await requireAuth()
+  await requireInternalUser()
   const so = await db.salesOrder.findUnique({
     where: { id },
     select: {

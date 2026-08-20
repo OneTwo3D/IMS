@@ -29,21 +29,79 @@ import {
 export type { XeroSettings } from '@/lib/connectors/xero/settings'
 
 /**
- * `sync` is the entitlement for every guarded export in this file, and ADMIN and MANAGER both
- * hold it.
+ * TWO GATES IN THIS FILE, AND THEY ANSWER TWO DIFFERENT QUESTIONS (o3d-512h round 3 + o3d-m3gy).
  *
- * These helpers used to be named `requireAdmin`, which SHADOWED `requireAdmin` from
- * @/lib/auth/server (that one is requireRole('ADMIN')). The name misled two separate review
- * passes into reporting that MANAGER crashes on the Integrations page - the reader sees
- * `requireAdmin()` and reasonably concludes ADMIN-only. They are renamed rather than merely
- * commented, because a comment did not stop it happening the second time. The gate agreement
- * across the whole page is asserted, not assumed, in tests/accounting/dashboard-read-gates.test.ts.
+ * WHAT ROUND 3 FIXED. The dispatcher note in app/actions/accounting-sync.ts justifies gating each
+ * dispatcher on the LOOSEST of its two branches' gates by saying "the stricter branch keeps enforcing
+ * its own on top", and names that stricter branch as the Xero one: "The Xero delegates use
+ * requireRole('ADMIN')". They did not. This module's local helper was `requirePermission('sync')`
+ * verbatim — identical to the dispatcher's own gate and to QuickBooks' — so a MANAGER passed the
+ * dispatcher and then passed the delegate too, and the "reach change per principal" table's claim
+ * that MANAGER "is still refused by the Xero delegate" was false for every export in this file. Round
+ * 3 fixed that by making the code true rather than the sentence smaller.
+ *
+ * WHAT THE MERGE FOUND, AND WHY THE FIX IS NOW SCOPED (o3d-m3gy). Round 3 applied the ADMIN role to
+ * EVERY export here, and stated the consequence as "MANAGER loses this tenant's Xero connection,
+ * settings, sync logs and readiness — it keeps the whole QuickBooks branch". On current
+ * `development` that second half is FALSE, and it is false for a reason that landed after round 3:
+ * app/(dashboard)/sync/page.tsx now treats a denial from ANY of its reads as FATAL (o3d-osl8), on the
+ * deliberate principle that a partial page is a dishonest answer to a denial. Seven of the page's
+ * reads route through this module, so an ADMIN-only read surface does not narrow MANAGER's reach —
+ * it replaces the whole /sync page with the generic error boundary, QuickBooks half included, and
+ * gives an operator "Go to Login" / "Try Again" for a refusal no retry can clear. That is
+ * tests/accounting/dashboard-read-gates.test.ts, and it is measuring a real user-visible outcome
+ * rather than restating a policy.
+ *
+ * So the strictness goes where the claim actually lives. The dispatcher note's own words are
+ * "saveXeroSettings → requireRole('ADMIN'), which still applies on its own path" and round 3's is
+ * "connector OAuth credentials are ADMIN business" — both about the CREDENTIAL surface, not about
+ * reading the connector's state:
+ *
+ *   requireSyncPermission        'sync'. The connector's STATE: settings (secret masked), connection
+ *                                status, connection-test state, account list, tax rates, sync logs,
+ *                                readiness, and running a sync. This is what the Integrations page
+ *                                renders, and MANAGER holds 'sync'.
+ *   requireXeroCredentialAdmin   'sync' AND the ADMIN role. Anything that WRITES the OAuth
+ *                                credentials or exercises them to establish a connection. This is the
+ *                                stricter frame the dispatcher note names, and it really does exist
+ *                                now: tests/security/accounting-dispatcher-authorization.test.ts
+ *                                asserts MANAGER through the dispatcher and refused by the delegate,
+ *                                on a WRITE dispatcher.
+ *
+ * These are not two answers to one question — that is the defect this merge exists to remove. They
+ * are the answers to "may this principal SEE the connector?" and "may it CHANGE the credentials?",
+ * and conflating them is what made the note false in the first place.
+ *
+ * ON THE NAME. `development` had renamed the local `requireAdmin` to `requireSyncPermission`, because
+ * `requireAdmin` SHADOWED `requireAdmin` from @/lib/auth/server and misled two separate review passes
+ * into reporting that MANAGER crashes on the Integrations page — the reader saw `requireAdmin()` and
+ * reasonably concluded ADMIN-only. That name is kept for the 'sync' gate, and the ADMIN one is named
+ * for what it guards rather than for a role, so neither name can mislead the next reader the same way.
  */
 async function requireSyncPermission() {
   return requirePermission('sync')
 }
 
-async function requireFreshAdmin() {
+/**
+ * The credential surface: 'sync' first, so a principal without it gets the NAMED permission denial
+ * the refusal tests assert on (WAREHOUSE / READONLY / FINANCE / SUPPLIER), then the ADMIN role check,
+ * which is the stricter claim and is what refuses MANAGER — MANAGER does hold 'sync'.
+ */
+async function requireXeroCredentialAdmin() {
+  await requirePermission('sync')
+  return requireRole('ADMIN')
+}
+
+/**
+ * The credential surface, with a step-up re-auth on top. Every caller of this writes or revokes the
+ * connection itself.
+ *
+ * Order matters: refuse on the STABLE facts (permission, then role) before asking for a step-up
+ * re-auth. Prompting a MANAGER to re-authenticate for something no amount of re-authentication will
+ * grant is a worse answer than "no".
+ */
+async function requireFreshXeroCredentialAdmin() {
+  await requireXeroCredentialAdmin()
   return requireFreshPermission('sync')
 }
 
@@ -81,9 +139,9 @@ async function buildXeroConnectionFingerprint(): Promise<string> {
 
 export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireSyncPermission()
+    await requireXeroCredentialAdmin()
     if (shouldFreshGateSecretWrite(data, 'xero_client_secret')) {
-      await requireFreshAdmin()
+      await requireFreshXeroCredentialAdmin()
     }
 
     // Only run the readiness gate when the user is *transitioning* sync from
@@ -159,7 +217,7 @@ export async function getXeroConnectionTestState(): Promise<IntegrationConnectio
 }
 
 export async function testXeroConnection(): Promise<{ success: boolean; error?: string; message?: string }> {
-  await requireSyncPermission()
+  await requireXeroCredentialAdmin()
 
   const fingerprint = await buildXeroConnectionFingerprint()
   const [imsBaseCurrency, orgRes] = await Promise.all([
@@ -191,7 +249,7 @@ export async function saveXeroConnectionSettings(
   clientSecret: string,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
   try {
-    await requireFreshAdmin()
+    await requireFreshXeroCredentialAdmin()
 
     const nextClientId = clientId.trim()
     const nextClientSecretInput = clientSecret.trim()
@@ -279,7 +337,7 @@ export async function connectXero(
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
     void origin
-    const session = await requireFreshAdmin()
+    const session = await requireFreshXeroCredentialAdmin()
 
     // Save credentials (never overwrite secret with masked value)
     const ops = [
@@ -317,7 +375,7 @@ export async function connectXero(
 
 export async function disconnectXero(): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireFreshAdmin()
+    await requireFreshXeroCredentialAdmin()
     await disconnect()
 
     await logActivity({

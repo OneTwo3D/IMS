@@ -1,9 +1,8 @@
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync } from 'node:fs'
-import path from 'node:path'
-import test, { mock } from 'node:test'
+import test, { before, mock } from 'node:test'
 
-import ts from 'typescript'
+import { createRepoGraph } from './module-graph'
+import { createRecordingDb } from './recording-db'
 
 /**
  * o3d-512h — action-level control on the generic settings read.
@@ -16,6 +15,17 @@ import ts from 'typescript'
  * This is the case that shows a page gate is not a substitute for an action
  * gate: the settings pages are now permission-gated, and this endpoint was
  * still reachable without going near them.
+ *
+ * ROUND 3 — the refusals are now PROVED to have read nothing.
+ *
+ * Codex round 3, finding 6: this file asserted a refusal against a `db` stub
+ * whose every method answered `null`/`[]`. Nothing established that the stub was
+ * even wired to the module under test, so "no data was read" was credited rather
+ * than observed — the same vacuity class as the guards this branch has been
+ * fixing, sitting in the tests written to prove the fix. The recorder in
+ * ./recording-db.ts refuses to certify an empty touch list until `prove()` has
+ * demonstrated, in this process and through this module graph, that it CAN see a
+ * read.
  */
 
 type Role = 'ADMIN' | 'MANAGER' | 'WAREHOUSE' | 'READONLY' | 'SUPPLIER'
@@ -33,15 +43,14 @@ mock.module('@/lib/auth', {
 // A static import is hoisted, so it would evaluate settings-store — and with it
 // its own '@/lib/db' import — before mock.module registers, and the tests would
 // open a real Postgres connection.
-mock.module('@/lib/db', {
-  namedExports: {
-    db: {
-      setting: {
-        findUnique: async () => null,
-        findMany: async () => [],
-      },
-    },
-  },
+const recorder = createRecordingDb(null)
+mock.module('@/lib/db', { namedExports: { db: recorder.db } })
+
+before(async () => {
+  // The positive control that makes every assertNoReads below mean something.
+  currentRole = 'ADMIN'
+  const { getSetting } = await import('@/app/actions/settings')
+  await recorder.prove(() => getSetting('email_smtp_pass'))
 })
 
 test('SENSITIVE_SETTING_KEYS still contains the credentials this test is about', async () => {
@@ -53,9 +62,10 @@ test('SENSITIVE_SETTING_KEYS still contains the credentials this test is about',
   }
 })
 
-for (const role of ['WAREHOUSE', 'READONLY', 'SUPPLIER'] as const) {
-  test(`getSetting refuses a ${role} session reading the decrypted SMTP password, naming the settings permission`, async () => {
+for (const role of ['WAREHOUSE', 'READONLY'] as const) {
+  test(`getSetting refuses a ${role} session reading the decrypted SMTP password, naming the settings permission, without reading it`, async () => {
     currentRole = role
+    recorder.reset()
     const { getSetting } = await import('@/app/actions/settings')
     await assert.rejects(
       () => getSetting('email_smtp_pass'),
@@ -65,35 +75,82 @@ for (const role of ['WAREHOUSE', 'READONLY', 'SUPPLIER'] as const) {
         return true
       },
     )
+    recorder.assertNoReads(`${role} reading email_smtp_pass`)
   })
 }
+
+/**
+ * o3d-512h round 3 — the SUPPLIER refusal is a different refusal now, and that is
+ * the point.
+ *
+ * A supplier is an EXTERNAL principal. It is refused one frame earlier than an
+ * internal role without 'settings', by requireInternalUser, so it never reaches
+ * the settings gate at all — and it is refused for EVERY key, not only the
+ * sensitive ones. Asserting the permission name is what distinguishes the two
+ * refusals; a test that only asserted "it threw" could not tell whether the
+ * supplier boundary exists.
+ */
+test('getSetting refuses a SUPPLIER session at the INTERNAL-PRINCIPAL boundary, before the settings gate', async () => {
+  currentRole = 'SUPPLIER'
+  recorder.reset()
+  const { getSetting } = await import('@/app/actions/settings')
+  await assert.rejects(
+    () => getSetting('email_smtp_pass'),
+    (error: unknown) => {
+      assert.equal((error as { permission?: string }).permission, 'internal')
+      assert.match(String((error as Error).message), /Forbidden: missing permission internal/)
+      return true
+    },
+  )
+  recorder.assertNoReads('SUPPLIER reading email_smtp_pass')
+})
+
+test('getSetting refuses a SUPPLIER session even for a NON-sensitive key', async () => {
+  // The settings gate is scoped to secrets, deliberately. The internal-principal
+  // gate is not: an external party has no business reading the tenant's numbering
+  // prefixes or FX schedule either.
+  currentRole = 'SUPPLIER'
+  recorder.reset()
+  const { getSetting } = await import('@/app/actions/settings')
+  await assert.rejects(
+    () => getSetting('financial_year_start'),
+    (error: unknown) => (error as { permission?: string }).permission === 'internal',
+  )
+  recorder.assertNoReads('SUPPLIER reading financial_year_start')
+})
 
 test('getSetting refuses a WAREHOUSE session for every sensitive key, not just the sampled ones', async () => {
   currentRole = 'WAREHOUSE'
   const { SENSITIVE_SETTING_KEYS } = await import('@/lib/settings-store')
   const { getSetting } = await import('@/app/actions/settings')
   for (const key of SENSITIVE_SETTING_KEYS) {
+    recorder.reset()
     await assert.rejects(
       () => getSetting(key),
       (error: unknown) => (error as { permission?: string }).permission === 'settings',
       `sensitive key ${key} must not be readable by WAREHOUSE`,
     )
+    recorder.assertNoReads(`WAREHOUSE reading ${key}`)
   }
 })
 
 test('getSetting still serves a NON-sensitive key to a WAREHOUSE session', async () => {
-  // The gate must be scoped to secrets. Ordinary settings (timezone, FX
-  // schedule, retention windows) are read by pages every role can see, so
-  // over-gating here would be an outage, not a fix.
+  // The settings gate must be scoped to secrets. Ordinary settings (timezone, FX
+  // schedule, retention windows) are read by pages every internal role can see,
+  // so over-gating here would be an outage, not a fix.
   currentRole = 'WAREHOUSE'
+  recorder.reset()
   const { getSetting } = await import('@/app/actions/settings')
   assert.equal(await getSetting('financial_year_start'), null)
+  recorder.assertCalls(['setting.findUnique'], 'WAREHOUSE reading a non-sensitive key')
 })
 
 test('getSetting serves a sensitive key to ADMIN', async () => {
   currentRole = 'ADMIN'
+  recorder.reset()
   const { getSetting } = await import('@/app/actions/settings')
   assert.equal(await getSetting('email_smtp_pass'), null)
+  recorder.assertCalls(['setting.findUnique'], 'ADMIN reading a sensitive key')
 })
 
 // ---------------------------------------------------------------------------
@@ -150,9 +207,10 @@ test('maskSettingSecret masks a covered key exactly as maskSecret did', async ()
   assert.equal(maskSettingSecret('wc_consumer_key', '', 7), '')
 })
 
-for (const role of ['MANAGER', 'WAREHOUSE', 'READONLY', 'SUPPLIER'] as const) {
+for (const role of ['MANAGER', 'WAREHOUSE', 'READONLY'] as const) {
   test(`getSetting refuses a ${role} session reading wc_consumer_key, naming the settings permission`, async () => {
     currentRole = role as typeof currentRole
+    recorder.reset()
     const { getSetting } = await import('@/app/actions/settings')
     await assert.rejects(
       () => getSetting('wc_consumer_key'),
@@ -162,13 +220,16 @@ for (const role of ['MANAGER', 'WAREHOUSE', 'READONLY', 'SUPPLIER'] as const) {
         return true
       },
     )
+    recorder.assertNoReads(`${role} reading wc_consumer_key`)
   })
 }
 
 test('getSetting still serves wc_consumer_key to ADMIN', async () => {
   currentRole = 'ADMIN'
+  recorder.reset()
   const { getSetting } = await import('@/app/actions/settings')
   assert.equal(await getSetting('wc_consumer_key'), null)
+  recorder.assertCalls(['setting.findUnique'])
 })
 
 // ---------------------------------------------------------------------------
@@ -177,11 +238,22 @@ test('getSetting still serves wc_consumer_key to ADMIN', async () => {
 // the "this is a credential" statement somewhere the gate cannot hear it — which
 // is precisely how wc_consumer_key drifted for as long as it did.
 //
-// The list below is therefore not another hand-written inventory of secrets. It
-// is a pin on the far narrower question "who is allowed to mask without
-// declaring", and every entry is a file that exists today with a stated reason.
-// A NEW importer turns this red, and the fix is one line: call maskSettingSecret
-// instead, which cannot be called for a key outside SENSITIVE_SETTING_KEYS.
+// ROUND 3, Codex finding 5 — THE PIN NOW RESOLVES INSTEAD OF PATTERN-MATCHING.
+//
+// The previous implementation walked the tree looking for ONE import shape: a
+// named import from a specifier ending 'security/secret-mask' whose imported name
+// was literally `maskSecret`. Every other legal way to reach the same function
+// walked straight past it:
+//
+//     import { maskSecret as hide } from '@/lib/security/secret-mask'   // aliased
+//     import * as mask from '@/lib/security/secret-mask'                // namespace
+//     import { maskSecret } from '@/lib/security'                       // re-export barrel
+//
+// The first was half-handled (the imported NAME was read, not the alias), the
+// other two were not handled at all — and the barrel is the one a refactor
+// produces by accident. The pin now asks ./module-graph.ts which files reference
+// lib/security/secret-mask.ts:maskSecret, which is a question about the symbol
+// rather than about the syntax, and module-graph.test.ts pins all four shapes.
 // ---------------------------------------------------------------------------
 
 const RAW_MASK_SECRET_IMPORTERS: Record<string, string> = {
@@ -199,53 +271,13 @@ const RAW_MASK_SECRET_IMPORTERS: Record<string, string> = {
   'app/actions/quickbooks-sync.ts': 'OUT OF SCOPE (QuickBooks) — masks quickbooks_client_secret, in the set today, but not via the gate',
 }
 
-function filesImportingRawMaskSecret(root: string, roots: string[]): string[] {
-  const found: string[] = []
-
-  const walk = (dir: string) => {
-    let entries: ReturnType<typeof readdirSync>
-    try {
-      entries = readdirSync(dir, { withFileTypes: true }) as never
-    } catch {
-      return
-    }
-    for (const entry of entries as unknown as Array<{ name: string; isDirectory(): boolean }>) {
-      const full = path.join(dir, entry.name)
-      if (entry.isDirectory()) {
-        if (entry.name === 'node_modules' || entry.name === '.next') continue
-        walk(full)
-        continue
-      }
-      if (!/\.tsx?$/.test(entry.name) || /\.test\.tsx?$/.test(entry.name)) continue
-
-      const source = readFileSync(full, 'utf8')
-      // Cheap reject before paying for a parse.
-      if (!source.includes('secret-mask')) continue
-
-      const sf = ts.createSourceFile(full, source, ts.ScriptTarget.Latest, true)
-      let imports = false
-      ts.forEachChild(sf, (node) => {
-        if (!ts.isImportDeclaration(node)) return
-        if (!ts.isStringLiteral(node.moduleSpecifier)) return
-        if (!node.moduleSpecifier.text.endsWith('security/secret-mask')) return
-        const bindings = node.importClause?.namedBindings
-        if (!bindings || !ts.isNamedImports(bindings)) return
-        // The imported NAME, not the local alias — an alias would rename the
-        // problem, not remove it.
-        if (bindings.elements.some((el) => (el.propertyName ?? el.name).text === 'maskSecret')) {
-          imports = true
-        }
-      })
-      if (imports) found.push(path.relative(root, full).split(path.sep).join('/'))
-    }
-  }
-
-  for (const r of roots) walk(path.join(root, r))
-  return found.sort()
+function filesReferencingRawMaskSecret(): string[] {
+  const graph = createRepoGraph(process.cwd(), ['app', 'lib', 'components'])
+  return graph.referrers('lib/security/secret-mask.ts', 'maskSecret')
 }
 
-test('nothing imports raw maskSecret except the pinned, justified call sites', () => {
-  const importers = filesImportingRawMaskSecret(process.cwd(), ['app', 'lib', 'components'])
+test('nothing references raw maskSecret except the pinned, justified call sites', () => {
+  const importers = filesReferencingRawMaskSecret()
 
   assert.deepEqual(
     importers,
@@ -262,10 +294,10 @@ test('nothing imports raw maskSecret except the pinned, justified call sites', (
   }
 })
 
-test('the in-scope maskers were converted — wc-sync, xero-sync and mintsoft-sync no longer import raw maskSecret', () => {
+test('the in-scope maskers were converted — wc-sync, xero-sync and mintsoft-sync no longer reach raw maskSecret', () => {
   // The direction of travel, pinned. These three are the connectors in scope for
   // this branch, and all three now declare the key they mask.
-  const importers = new Set(filesImportingRawMaskSecret(process.cwd(), ['app', 'lib', 'components']))
+  const importers = new Set(filesReferencingRawMaskSecret())
   for (const file of [
     'app/actions/wc-sync.ts',
     'app/actions/xero-sync.ts',

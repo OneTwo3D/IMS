@@ -106,6 +106,34 @@ export async function requirePermission(permission: Permission): Promise<AuthSes
 }
 
 /**
+ * Requires an INTERNAL principal (o3d-512h round 3).
+ *
+ * `requireAuth` answers "is someone signed in". It cannot answer "is this one of
+ * ours", and SUPPLIER — a third party we issue a login to so it can quote its own
+ * RFQs — is signed in. Every `'use server'` export gated on requireAuth alone was
+ * therefore a supplier-reachable endpoint: app/actions/purchase-orders.ts:
+ * getPurchaseOrder handed a supplier session any purchase order by id, including
+ * other suppliers' prices, and getPurchaseOrders enumerated the lot.
+ *
+ * This is the boundary those reads needed. It is deliberately NOT a per-endpoint
+ * permission: picking one of those for each of ~70 endpoints would have been ~70
+ * guesses, several of which would lock out an internal role that legitimately
+ * reads the data (WAREHOUSE holds no 'analytics', FINANCE no 'stock_control').
+ * `internal` is held by every internal role and by no supplier, so it removes the
+ * external principal and costs no internal role anything — the narrowest change
+ * that actually closes the hole. Tightening individual endpoints further is a
+ * separate, per-endpoint argument.
+ *
+ * On the supplier's own surface this helper is the WRONG control and is
+ * deliberately absent: there, holding 'supplier_portal.*' is not sufficient
+ * either, because every supplier holds it. Those actions must scope to the
+ * session's own supplierId (see lib/security/supplier-portal-boundary.ts).
+ */
+export async function requireInternalUser(): Promise<AuthSession> {
+  return requirePermission('internal')
+}
+
+/**
  * Page-boundary authorization (o3d-512h).
  *
  * A page is the entrance a principal reaches by typing the URL, so it needs a

@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabled, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
@@ -538,7 +538,20 @@ function mapLine(l: {
 // ---------------------------------------------------------------------------
 
 export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
-  await requireAuth()
+  // o3d-512h round 3 — SUPPLIER ISOLATION. `requireAuth` only asks whether someone
+  // is signed in, and SUPPLIER sessions are signed in: this export enumerated EVERY
+  // supplier's purchase orders — references, currencies, totals and supplier names —
+  // to any supplier who POSTed to it. `getPurchaseOrder` below was the sharper half:
+  // an id is all it took to read another supplier's line prices.
+  //
+  // 'purchasing' is the gate the rest of this surface already uses, and every
+  // internal role holds it (ADMIN, MANAGER, WAREHOUSE, FINANCE, READONLY), so it
+  // removes the external principal and nobody else. A supplier's own orders are
+  // served by app/actions/supplier-portal.ts, where the control is a supplierId
+  // scope on the query rather than a permission — because every supplier holds the
+  // supplier-portal permissions, so holding one proves nothing about whose rows
+  // these are.
+  await requirePermission('purchasing')
   const pos = await db.purchaseOrder.findMany({
     where: { archived: { not: true } },
     select: PO_SELECT,
@@ -592,7 +605,9 @@ async function latestBillPaymentSyncRows(
 }
 
 export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
-  await requireAuth()
+  // o3d-512h round 3 — see getPurchaseOrders: an unscoped read by id was the
+  // cross-supplier leak. SUPPLIER holds no 'purchasing'.
+  await requirePermission('purchasing')
   const po = await db.purchaseOrder.findUnique({
     where: { id },
     select: {
@@ -2168,13 +2183,27 @@ export async function receivePurchaseOrder(
 }
 
 export async function cancelPurchaseOrder(id: string): Promise<CancelPurchaseOrderResult> {
+  // o3d-512h round 3 — this endpoint carries its own gate now.
+  //
+  // It used to be credited as a "delegating facade": a one-line `return
+  // cancelPurchaseOrderAction(id)`, which the old detector accepted on SHAPE, having
+  // never looked at the delegate. Resolution looks. The delegate takes its guard as
+  // an INJECTED DEPENDENCY (`deps.requirePermission`, defaulted to the real one), so
+  // "the delegate is guarded" is true of the default binding and of nothing else —
+  // precisely the kind of claim an allowlist reason cannot keep. The permission is
+  // the delegate's own, so this changes no principal's reach; it moves the boundary
+  // to the endpoint, where the endpoint is.
+  await requirePermission('purchasing.create')
   return cancelPurchaseOrderAction(id)
 }
 
 export async function getSupplierLastPrices(
   supplierId: string,
 ): Promise<Record<string, { lastUnitCost: number; currency: string; supplierSku: string | null }>> {
-  await requireAuth()
+  // see getPurchaseOrders
+  // o3d-512h round 3: last agreed unit costs per supplier — a competitor's prices
+  // to any other supplier under requireAuth.
+  await requirePermission('purchasing')
   const rows = await db.supplierProduct.findMany({
     where: { supplierId },
     select: { productId: true, lastUnitCost: true, currency: true, supplierSku: true },
@@ -4117,7 +4146,9 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
 
 /** Get linked freight POs for a primary PO, with their cost lines */
 export async function getLinkedFreightPos(primaryPoId: string) {
-  await requireAuth()
+  // see getPurchaseOrders
+  // o3d-512h round 3: freight POs and their suppliers; supplier-reachable under requireAuth.
+  await requirePermission('purchasing')
   const links = await db.landedCostLink.findMany({
     where: { primaryPoId },
     select: {
@@ -4173,7 +4204,9 @@ export async function getLinkedFreightPos(primaryPoId: string) {
 
 /** Get all GOODS-type POs for linking (for the freight PO form) */
 export async function getGoodsPosForLinking(): Promise<{ id: string; reference: string; supplierName: string; totalForeign: number; currency: string }[]> {
-  await requireAuth()
+  // see getPurchaseOrders
+  // o3d-512h round 3: every open goods PO with its supplier name and total.
+  await requirePermission('purchasing')
   const pos = await db.purchaseOrder.findMany({
     where: { type: 'GOODS', status: { notIn: ['DRAFT', 'CANCELLED'] } },
     select: {

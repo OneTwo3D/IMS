@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
 import { DEFAULT_BASE_CURRENCY, getFallbackCurrencyMeta, isBaseCurrencyLocked } from '@/lib/base-currency'
@@ -42,7 +42,7 @@ export type OrganisationData = {
 }
 
 export async function getOrganisation(): Promise<OrganisationData> {
-  await requireAuth()
+  await requireInternalUser()
   const org = await db.organisation.findFirst()
   return {
     name: org?.name ?? '',
@@ -66,7 +66,7 @@ export async function getOrganisation(): Promise<OrganisationData> {
 }
 
 export async function getBaseCurrencySettings(): Promise<{ locked: boolean }> {
-  await requireAuth()
+  await requireInternalUser()
   return { locked: await isBaseCurrencyLocked() }
 }
 
@@ -205,7 +205,7 @@ export async function getNumberingFormats(
   // session, so requireAuth would redirect (NEXT_REDIRECT). The numbering formats are
   // non-sensitive settings; bypass the session check for trusted internal callers.
   if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
-    await requireAuth()
+    await requireInternalUser()
   }
 
   const connectorKeys = SHOPPING_CONNECTORS.flatMap((c) => [
@@ -465,7 +465,7 @@ export type BrandingColours = {
 }
 
 export async function getBrandingColours(): Promise<BrandingColours> {
-  await requireAuth()
+  await requireInternalUser()
   const [p, a] = await Promise.all([
     db.setting.findUnique({ where: { key: 'brand_primary_color' } }),
     db.setting.findUnique({ where: { key: 'brand_accent_color' } }),
@@ -507,7 +507,7 @@ export type DocumentTemplateData = {
 const TEMPLATE_TYPES = ['sales_order', 'purchase_order', 'invoice', 'packing_slip', 'credit_note', 'rfq', 'manufacturing_order']
 
 export async function getDocumentTemplates(): Promise<DocumentTemplateData[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.documentTemplate.findMany({ orderBy: { type: 'asc' } })
   const map = new Map(rows.map((r) => [r.type, r]))
 

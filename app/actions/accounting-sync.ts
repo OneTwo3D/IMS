@@ -12,7 +12,7 @@ import {
   type PluginSelectionLockTx,
 } from '@/lib/integration-plugin-selection-lock'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
-import { freshAuthFailureResult, requireAuth, requirePermission, requireRole } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireInternalUser, requirePermission, requireRole } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import {
   summarizeCrossConnectorOrphans,
@@ -117,7 +117,7 @@ const LIVE_ACCOUNTING_SYNC_STATUSES = ['PENDING', 'PROCESSING'] as const
  * own connector's rows), so switching connectors strands them silently.
  */
 export async function getCrossConnectorOrphanSummary(): Promise<ConnectorOrphanSummary> {
-  await requireAuth()
+  await requireInternalUser()
   const activeConnector = await getActiveConnector()
   const groups = await db.accountingSyncLog.groupBy({
     by: ['connector'],
@@ -145,7 +145,7 @@ export type FailedAccountingSyncSummary = {
  * are NOT FAILED, so they are correctly excluded — these are real failures.
  */
 export async function getFailedAccountingSyncSummary(): Promise<FailedAccountingSyncSummary> {
-  await requireAuth()
+  await requireInternalUser()
   const connector = await getActiveConnector()
   if (!connector) return { connector: null, failedCount: 0 }
   const failedCount = await db.accountingSyncLog.count({
@@ -410,7 +410,7 @@ async function cancelOrphanedRowsUnderLock(
 
 export async function getAccountingIntegrationConnector() {
   // o3d-1fel: not a facade — resolves plugin state (a DB-backed read) itself.
-  await requireAuth()
+  await requireInternalUser()
   const connector = await getActiveConnector()
   if (!connector) return null
   return {
@@ -440,8 +440,16 @@ export async function getAccountingIntegrationConnector() {
 //
 // WHICH gate, and why not the delegate's own: a dispatcher serves BOTH branches,
 // and the two branches do not gate alike. The Xero delegates use
-// requireRole('ADMIN'); quickbooks-sync.ts declares a module-local `requireAdmin`
-// that is literally `requirePermission('sync')`, which also admits MANAGER. So
+// requireRole('ADMIN') — o3d-512h round 3: they DID NOT when this paragraph was
+// first written. xero-sync.ts's module-local `requireAdmin` was
+// `requirePermission('sync')`, the same gate as the dispatcher and as QuickBooks,
+// so "the stricter branch keeps enforcing its own" was false and MANAGER passed
+// straight through. The sentence was not softened to match; xero-sync.ts:
+// requireAdmin now enforces 'sync' AND the ADMIN role, and
+// tests/security/accounting-dispatcher-authorization.test.ts asserts the
+// difference between the two frames. quickbooks-sync.ts declares a module-local
+// `requireAdmin` that is literally `requirePermission('sync')`, which also admits
+// MANAGER. So
 // there is no single "the delegate's gate" to copy, and copying Xero's stricter
 // one would lock MANAGER out of the QuickBooks branch that legitimately admits
 // it. Each dispatcher therefore takes the LOOSEST gate any branch's delegate
@@ -455,9 +463,10 @@ export async function getAccountingIntegrationConnector() {
 //     delegates agree on that permission (settings.ts:{autoLink,previewMissing,
 //     generateMissing}{Xero,QuickBooks}TaxRates).
 //
-// Reach change per principal: ADMIN unchanged. MANAGER unchanged — it passed the
-// unguarded dispatcher before and is still refused by the Xero delegate / still
-// admitted by the QuickBooks one; on the tax-rate dispatchers it was already
+// Reach change per principal: ADMIN unchanged. MANAGER passed the unguarded
+// dispatcher before, and is now refused by the Xero delegate (round 3 — this is
+// the part that was claimed but not implemented) / still admitted by the
+// QuickBooks one; on the tax-rate dispatchers it was already
 // refused by both delegates and is now refused one frame earlier. FINANCE keeps
 // balance snapshots and loses the rest. WAREHOUSE, READONLY and SUPPLIER lose the
 // early-return answer and the plugin-state read that produced it — which is the
@@ -667,7 +676,7 @@ export async function getRejectedAccountingDocumentUpdateWarnings(
   references: AccountingDocumentUpdateReference[],
   limit = 10,
 ): Promise<RejectedAccountingDocumentUpdateWarning[]> {
-  await requireAuth()
+  await requireInternalUser()
   return collectRejectedAccountingDocumentUpdateWarnings(db, references, limit)
 }
 

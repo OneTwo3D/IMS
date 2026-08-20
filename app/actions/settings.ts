@@ -5,7 +5,7 @@ import { unstable_rethrow } from 'next/navigation'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import {
   INTEGRATION_PLUGIN_SETTING_KEYS,
   type IntegrationPluginId,
@@ -50,7 +50,7 @@ export type AdjustmentReason = {
 }
 
 export async function getAdjustmentReasons(activeOnly = false): Promise<AdjustmentReason[]> {
-  await requireAuth()
+  await requireInternalUser()
   return db.adjustmentReason.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
@@ -203,7 +203,7 @@ function normaliseTaxCategory(input: unknown): TaxCategoryValue {
 }
 
 export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.taxRate.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
@@ -857,7 +857,7 @@ export async function getAccountCodes(): Promise<AccountCodeOption[]> {
 // ---------------------------------------------------------------------------
 
 export async function getSetting(key: string): Promise<string | null> {
-  await requireAuth()
+  await requireInternalUser()
   // o3d-512h: getSetting takes an arbitrary key and getSettingValue DECRYPTS the
   // sensitive ones (lib/settings-store.ts:deserializeSettingValue), so with only
   // requireAuth this 'use server' export handed any authenticated principal —
@@ -876,7 +876,17 @@ export async function getSetting(key: string): Promise<string | null> {
 export type UserOption = { id: string; name: string; email: string }
 
 export async function getUsers(): Promise<UserOption[]> {
-  await requireAuth()
+  // o3d-512h round 3 — this was the entry in the authentication-only inventory that
+  // was already unsafe when the inventory was written. It returns the ACTIVE STAFF
+  // DIRECTORY (id, display name, work email) for the sales-page assignee filter, and
+  // under requireAuth it returned it to SUPPLIER — an external company — as a
+  // ready-made phishing list against the buyer's own colleagues. The sibling that
+  // serves the same table, users.ts:getUsers, gates on 'settings.users'.
+  //
+  // Internal-principal, not 'settings.users': the legitimate caller is the sales page,
+  // which every internal role reaches. Pinning the reached model (below, in the
+  // inventory) is what stops the next edit from widening WHAT it returns.
+  await requireInternalUser()
   const rows = await db.user.findMany({
     where: { active: true },
     select: { id: true, name: true, email: true },
@@ -1134,7 +1144,7 @@ export type PurchaseUnitRow = {
 }
 
 export async function getPurchaseUnits(activeOnly = true): Promise<PurchaseUnitRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.purchaseUnit.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: { name: 'asc' },
@@ -1184,7 +1194,7 @@ export async function createPurchaseUnit(input: {
 
 /** Returns unique stock unit names from all purchase units, plus "pcs" */
 export async function getStockUnitOptions(): Promise<string[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.purchaseUnit.findMany({
     where: { active: true },
     select: { stockUnitName: true },
@@ -1273,7 +1283,7 @@ const warehouseFields = {
 } as const
 
 export async function getWarehousesForSettings(): Promise<WarehouseRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   return db.warehouse.findMany({
     orderBy: [{ isDefault: 'desc' }, { code: 'asc' }],
     select: warehouseFields,

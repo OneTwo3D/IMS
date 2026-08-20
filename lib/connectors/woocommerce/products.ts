@@ -1,6 +1,6 @@
 'use server'
 
-import { requireAuth } from '@/lib/auth/server'
+import { requireInternalUser } from '@/lib/auth/server'
 
 import { getWcProductExternalLink } from './links'
 
@@ -14,14 +14,17 @@ import { getWcProductExternalLink } from './links'
  * distinguishes "not configured" from "no product found for SKU X") and an
  * outbound-request amplifier using the tenant's own WooCommerce credentials.
  *
- * requireAuth matches the equivalent guarded action, app/actions/shopping.ts:
- * fetchShoppingProductLink, which additionally rate-limits per user; callers
- * that need a lookup should prefer that one.
+ * o3d-512h round 3: requireAuth was still not enough. It admits SUPPLIER — an
+ * external principal — so a supplier session could probe the storefront's SKU
+ * space and spend the tenant's WooCommerce rate budget doing it. requireInternalUser
+ * removes the external principal; the equivalent guarded action,
+ * app/actions/shopping.ts:fetchShoppingProductLink, additionally rate-limits per
+ * user, and callers that need a lookup should still prefer that one.
  */
 export async function fetchWcProductUrl(
   sku: string,
 ): Promise<{ permalink: string | null; error?: string }> {
-  await requireAuth()
+  await requireInternalUser()
   const result = await getWcProductExternalLink(sku)
   return { permalink: result.link?.url ?? null, error: result.error }
 }

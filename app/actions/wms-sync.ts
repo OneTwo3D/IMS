@@ -1,5 +1,6 @@
 'use server'
 
+import { requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/types'
 import type { MintsoftDashboardData } from '@/app/actions/mintsoft-sync'
@@ -31,6 +32,11 @@ async function resolveEnabledWmsConnectorId(): Promise<WmsConnectorId | null> {
 export async function getWmsSyncDashboardData(
   activeConnectorId?: WmsConnectorId | null,
 ): Promise<WmsSyncDashboardData | null> {
+  // o3d-512h round 3 — `return null` when no WMS connector is enabled is still an
+  // answer about the tenant's configuration, and resolveEnabledWmsConnectorId reads
+  // plugin state to produce it. Delegate: mintsoft-sync.ts:getMintsoftDashboardData
+  // → requireMintsoftReadAccess() → requirePermission('sync').
+  await requirePermission('sync')
   const connectorId = activeConnectorId !== undefined
     ? activeConnectorId
     : await resolveEnabledWmsConnectorId()

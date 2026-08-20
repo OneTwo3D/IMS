@@ -49,8 +49,8 @@
     "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui",
     "refunds:basis:backfill": "tsx scripts/backfill-refund-basis.ts",
     "check:server-action-auth-bypass": "node scripts/check-server-action-auth-bypass.mjs",
-    "check:server-action-guard-coverage": "tsx --test --experimental-test-module-mocks tests/security/server-action-guard-coverage.test.ts tests/security/server-action-guard-detector.test.ts",
-    "check:server-action-authorization": "tsx --test --experimental-test-module-mocks tests/security/accounting-dispatcher-authorization.test.ts tests/security/accounting-read-authorization.test.ts tests/security/company-email-settings-authorization.test.ts tests/security/setting-secret-read-authorization.test.ts tests/security/settings-page-authorization.test.ts tests/security/server-action-auth.test.ts",
+    "check:server-action-guard-coverage": "tsx --test --experimental-test-module-mocks tests/security/server-action-guard-coverage.test.ts tests/security/server-action-guard-detector.test.ts tests/security/module-graph.test.ts",
+    "check:server-action-authorization": "tsx --test --experimental-test-module-mocks tests/security/accounting-dispatcher-authorization.test.ts tests/security/accounting-read-authorization.test.ts tests/security/company-email-settings-authorization.test.ts tests/security/setting-secret-read-authorization.test.ts tests/security/settings-page-authorization.test.ts tests/security/recording-db.test.ts tests/security/supplier-isolation.test.ts tests/security/supplier-portal-boundary.test.ts tests/security/server-action-auth.test.ts",
     "check:server-action-guards": "npm run check:server-action-auth-bypass && npm run check:server-action-guard-coverage && npm run check:server-action-authorization"
   },
   "dependencies": {

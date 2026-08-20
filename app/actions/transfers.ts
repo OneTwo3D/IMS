@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
@@ -196,7 +196,7 @@ const TRANSFER_SELECT = {
 // ---------------------------------------------------------------------------
 
 export async function getTransfers(limit = 200): Promise<TransferRow[]> {
-  await requireAuth()
+  await requireInternalUser()
   const rows = await db.stockTransfer.findMany({
     orderBy: { createdAt: 'desc' },
     take: limit,

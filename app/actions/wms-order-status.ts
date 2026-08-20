@@ -1,7 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
-import { requireAuth } from '@/lib/auth/server'
+import { requireInternalUser } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/registry'
@@ -22,7 +22,7 @@ export type WmsOrderStatusView = Omit<WmsOrderStatus, 'dispatched'> & { connecto
  * WMS/API failure resolves to null so the sales view never breaks.
  */
 export async function getWmsOrderStatusForSalesOrder(salesOrderId: string): Promise<WmsOrderStatusView | null> {
-  await requireAuth()
+  await requireInternalUser()
 
   const state = await getIntegrationPluginState()
   const connectorId = WMS_CONNECTOR_IDS.find((id) => state[id])

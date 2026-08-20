@@ -179,6 +179,7 @@ mock.module('@/lib/auth/server', {
   namedExports: {
     requirePermission: async () => ({ user: { id: 'user-test', role: 'ADMIN' } }),
     requireAuth: async () => ({ user: { id: 'user-test', role: 'ADMIN' } }),
+    requireInternalUser: async () => ({ user: { id: 'user-test', role: 'ADMIN' } }),
   },
 })
 mock.module('@/lib/shopping', {

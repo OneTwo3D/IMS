@@ -7,10 +7,16 @@
 #     'use server' module must enforce a guard, delegate to something that does,
 #     or be allowlisted with a stated reason (o3d-1fel); plus the fixtures that
 #     pin the DETECTOR itself, because a rule whose own tests run somewhere else
-#     can be quietly weakened until it reports nothing (o3d-512h).
+#     can be quietly weakened until it reports nothing (o3d-512h); plus the
+#     fixtures for the module RESOLVER those rules are now built on, since a
+#     resolver that silently stops resolving turns every rule above green at once
+#     (o3d-512h round 3).
 #   * check:server-action-authorization   — the executable proofs that the gates
 #     actually refuse the principals they claim to: which role, which named
-#     permission, and that no read ran on the refused path (o3d-512h).
+#     permission, and that no read ran on the refused path (o3d-512h). Includes
+#     the supplier-isolation proofs: an EXTERNAL principal must be refused by the
+#     internal surface, and scoped to its own rows on its own surface — two
+#     different controls that are not substitutes for each other.
 #
 # Both were reachable only via `npm run check:all`, which NO workflow invoked;
 # the coverage test additionally ran inside `npm run test:unit`, but that lives

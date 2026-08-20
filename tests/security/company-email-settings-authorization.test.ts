@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
-import test, { mock } from 'node:test'
+import test, { before, mock } from 'node:test'
+
+import { createRecordingDb } from './recording-db'
 
 /**
  * o3d-512h round 2, finding 1 — app/actions/company.ts:getEmailSettings.
@@ -20,6 +22,12 @@ import test, { mock } from 'node:test'
  * session source, so what is asserted is the actual RBAC decision: which
  * principal is refused, which permission the refusal names, and that no read
  * ran on the refused path.
+ *
+ * Round 3 (Codex finding 6): "no read ran" is now PROVED rather than credited.
+ * The recorder in ./recording-db.ts refuses to certify an empty touch list until
+ * it has demonstrated, in this process and through this module graph, that it can
+ * see a read at all — an empty array from an unwired mock is indistinguishable
+ * from a real refusal, and that is the vacuity this branch exists to remove.
  */
 
 type Role = 'ADMIN' | 'MANAGER' | 'WAREHOUSE' | 'FINANCE' | 'READONLY' | 'SUPPLIER'
@@ -33,28 +41,19 @@ mock.module('@/lib/auth', {
   },
 })
 
-// Records every Prisma model touched, so "nothing was read" is provable rather
-// than assumed — a guard that throws AFTER the query still leaked the row.
-const dbTouches: string[] = []
-const dbProxy = new Proxy({}, {
-  get(_t, model: string) {
-    return new Proxy({}, {
-      get(_t2, op: string) {
-        return (...args: unknown[]) => {
-          dbTouches.push(`${model}.${op}`)
-          void args
-          return Promise.resolve([])
-        }
-      },
-    })
-  },
+const recorder = createRecordingDb([])
+mock.module('@/lib/db', { namedExports: { db: recorder.db } })
+
+before(async () => {
+  currentRole = 'ADMIN'
+  const { getEmailSettings } = await import('@/app/actions/company')
+  await recorder.prove(() => getEmailSettings())
 })
-mock.module('@/lib/db', { namedExports: { db: dbProxy } })
 
 for (const role of ['MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER'] as const) {
   test(`getEmailSettings refuses a ${role} session, naming settings.company, without reading the SMTP settings`, async () => {
     currentRole = role
-    dbTouches.length = 0
+    recorder.reset()
     const { getEmailSettings } = await import('@/app/actions/company')
 
     await assert.rejects(
@@ -67,11 +66,7 @@ for (const role of ['MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER'] a
       },
     )
 
-    assert.deepEqual(
-      dbTouches,
-      [],
-      `refused call must not query the settings table, but touched: ${dbTouches.join(', ')}`,
-    )
+    recorder.assertNoReads(`${role} calling getEmailSettings`)
   })
 }
 
@@ -81,11 +76,11 @@ test('getEmailSettings still serves an ADMIN session — the only role that legi
   // without costing any role reach it had. Without this case the refusal tests
   // above would also pass on a permanently broken action.
   currentRole = 'ADMIN'
-  dbTouches.length = 0
+  recorder.reset()
   const { getEmailSettings } = await import('@/app/actions/company')
 
   const settings = await getEmailSettings()
   assert.equal(settings.smtp_host, '')
   assert.equal(settings.smtp_pass, '')
-  assert.deepEqual(dbTouches, ['setting.findMany'])
+  recorder.assertCalls(['setting.findMany'], 'ADMIN calling getEmailSettings')
 })

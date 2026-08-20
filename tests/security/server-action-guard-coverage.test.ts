@@ -3,9 +3,12 @@ import path from 'node:path'
 import test from 'node:test'
 
 import {
+  createRepoGraph,
+  prismaSurfaceOf,
   scanActionsDir,
   scanAuthenticationOnlyActions,
   scanSecretReadingActions,
+  scanSource,
   scanUseServerOutsideActions,
 } from './server-action-guard-scan'
 
@@ -17,9 +20,19 @@ import {
 //
 // The detection rules live in ./server-action-guard-scan.ts and are themselves
 // tested in ./server-action-guard-detector.test.ts (o3d-hic9). This file owns
-// only the policy: the allowlist, and the tree it is applied to.
+// only the policy: the allowlist, the inventory, and the tree they are applied to.
+//
+// o3d-512h round 3: every rule below is handed a resolving MODULE GRAPH
+// (./module-graph.ts). "Delegates to a guarded action" is now something the rule
+// checked rather than something the allowlist asserted, which is why six entries
+// could be deleted outright this round rather than reworded again.
 
-const ACTIONS_DIR = path.join(process.cwd(), 'app', 'actions')
+const ROOT = process.cwd()
+const SCAN_ROOTS = ['app', 'lib', 'components']
+const ACTIONS_DIR = path.join(ROOT, 'app', 'actions')
+const ACTIONS_KEY_PREFIX = 'app/actions'
+
+const graph = createRepoGraph(ROOT, SCAN_ROOTS)
 
 // Identifiers that establish an auth/authorization boundary.
 const GUARD_IDENTIFIERS = new Set([
@@ -33,8 +46,7 @@ const GUARD_IDENTIFIERS = new Set([
 
 // Exports intentionally without a direct guard. Each entry needs a reason.
 const ALLOWLIST: Record<string, string> = {
-  // Pre-auth by design (authentication / account recovery entry points).
-  'auth.ts:*': 'authentication entry points run before a session exists',
+  // Pre-auth by design (account recovery / login ceremonies).
   'password-reset.ts:*': 'password reset is pre-auth; rate-limited + anti-enumeration',
   'passkey.ts:getPasskeyAuthenticationOptions': 'pre-auth passkey login ceremony',
   'passkey.ts:verifyPasskeyAuthentication': 'pre-auth passkey login ceremony (one-time token bound)',
@@ -43,42 +55,36 @@ const ALLOWLIST: Record<string, string> = {
   // Public, static (non-sensitive) connector catalogue.
   'company.ts:getShoppingConnectors': 'returns static connector id/label/available metadata only',
 
-  // Connector-facade modules: thin routers that resolve the active connector and
-  // delegate to a guarded connector action. A deeper pass to give each facade
-  // getter its own guard is tracked in onetwo3d-ims-mgq1. Core business-logic
-  // modules are NOT allowlisted.
+  // o3d-512h round 3 — SIX ENTRIES DELETED, none of them by rewording.
   //
-  // o3d-512h: 'accounting-batch.ts:*' USED to sit here on that reason. It was the
-  // accounting-sync defect verbatim — when neither connector is active,
-  // getAccountingBatchPreview / getAccountingBatchHistory /
-  // refreshAccountingBatchPreview answer from their own module, after a
-  // plugin-state read, with no delegate anywhere on that path. Both branches'
-  // delegates gate on requirePermission('sync'), so all three now carry that gate
-  // themselves and the entry is deleted rather than reworded.
-
-  // o3d-1fel / o3d-512h: accounting-sync.ts and xero-sync.ts previously carried a
-  // `*` wildcard justified as "connector facade". That was false for several
-  // exports — xero-sync.ts:getAccountingAccounts read the chart of accounts
-  // straight from Prisma with no guard at all, and the wildcard hid it.
+  //   * 'auth.ts:*' matched nothing: app/actions/auth.ts does not exist and has
+  //     not for some time. A stale entry is a standing invitation to create a file
+  //     with that name and inherit a blanket exemption nobody reviewed — so the
+  //     "no dead entries" test below now fails the build on one.
+  //   * 'shopping-sync.ts:getShoppingSyncLogsForConnector' claimed "dispatcher →
+  //     guarded shopify/wc sync-log actions; no unguarded arm". True, as it
+  //     happens — and now VERIFIED, by resolution, so the claim does not need to
+  //     be taken on trust or re-checked by hand each round.
+  //   * 'quickbooks-daily-batch.ts:*' said "verified: both getters gate on
+  //     requirePermission(sync) and refresh delegates to one". Also true, also now
+  //     machine-checked, so the exemption suppresses nothing and is gone. That the
+  //     rule below FOUND it is the point: three of these six were only visible
+  //     once something checked whether each entry was still about live code.
+  //   * 'wms-sync.ts:*', 'wms-asn.ts:*' and 'wms-onboarding.ts:*' each carried a
+  //     reason that admitted, in as many words, that the no-connector arm returns
+  //     UNGUARDED. That is the accounting-sync defect in Mintsoft's dispatchers,
+  //     and an allowlist entry describing a hole is not a reason, it is a bug
+  //     report filed against yourself. All six endpoints now carry their own
+  //     delegate's gate — 'sync' for the three reads, 'purchasing.receive' and
+  //     'stock_control.transfer' for the two ASN creates, which do NOT share a
+  //     permission and would have been wrong to gate alike.
   //
-  // The per-export accounting-sync.ts entries that replaced the wildcard are gone
-  // too. Each named the delegate whose guard it "inherits", but a dispatcher that
-  // returns on `if (!connector) …` never reaches that delegate, so the
-  // justification was false on exactly the path an unauthorized caller takes —
-  // and on the QuickBooks branch several connector methods answer from a constant
-  // rather than any guarded action at all. Every dispatcher now carries the
-  // delegate's own guard, so neither this file nor a reader has to reason about
-  // which branch runs. NO accounting-sync.ts entry belongs here again: an
-  // allowlist reason is a claim about code, and this one could not be kept true.
+  // Nothing about accounting-sync.ts or accounting-batch.ts belongs here again
+  // either: every dispatcher carries its delegate's gate (see the note at the top
+  // of app/actions/accounting-sync.ts).
 
-  // Two-branch dispatcher with no unguarded arm: every return goes through a
-  // guarded action (shopping-sync.ts:getShopifySyncLogs → requireShoppingAdmin,
-  // shopping-sync.ts:getShoppingSyncLogs → wc-sync.ts:getWcSyncLogs →
-  // requirePermission('sync')). Re-verified for o3d-512h.
-  'shopping-sync.ts:getShoppingSyncLogsForConnector': 'dispatcher → guarded shopify/wc sync-log actions; no unguarded arm',
-
-  // o3d-512h — REASONS NARROWED. An allowlist reason is a claim about code, and
-  // these three claimed more than the code does. What is actually true is stated
+  // o3d-512h — REASON NARROWED. An allowlist reason is a claim about code, and
+  // this one claimed more than the code does. What is actually true is stated
   // here; what is NOT verified is stated as not verified, because "connector
   // facade → guarded X actions" reads as a coverage guarantee and was being taken
   // as one.
@@ -92,32 +98,57 @@ const ALLOWLIST: Record<string, string> = {
   // but this entry no longer asserts they are guarded.
   'quickbooks-sync.ts:*':
     'OUT OF SCOPE (QuickBooks, owner instruction) — NOT verified as guarded: six exports carry no guard; reachable via accounting-sync.ts only behind its dispatcher gate',
-  'quickbooks-daily-batch.ts:*':
-    'OUT OF SCOPE (QuickBooks, owner instruction) — verified: both getters gate on requirePermission(sync) and refresh delegates to one',
-
-  // wms-*.ts route to MINTSOFT only; there is no ShipHero branch in any of them,
-  // so the old reason named a connector these files do not mention. Each also has
-  // a no-connector arm that answers from its own module without a delegate — the
-  // accounting-sync defect class again, in Mintsoft's dispatchers. Their delegates
-  // do NOT share one gate (requireMintsoftReadAccess for the reads,
-  // 'purchasing.receive' / 'stock_control.transfer' for the two ASN creates), so
-  // guarding them is a per-dispatcher job, filed rather than guessed at here.
-  'wms-sync.ts:*':
-    'dispatcher → mintsoft-sync.ts:getMintsoftDashboardData (requireMintsoftReadAccess); NO ShipHero branch exists; the no-connector arm returns null unguarded — follow-up',
-  'wms-asn.ts:*':
-    'dispatcher → guarded mintsoft ASN actions (requireMintsoftReadAccess / purchasing.receive / stock_control.transfer); NO ShipHero branch exists; the no-connector arm returns unguarded — follow-up',
-  'wms-onboarding.ts:*':
-    'dispatcher → mintsoft-sync.ts:getMintsoftOnboardingConnectionData (requireMintsoftReadAccess); NO ShipHero branch exists; the no-connector arm returns unguarded — follow-up',
 }
 
 test('every exported server action enforces an auth guard or is allowlisted', () => {
-  const violations = scanActionsDir(ACTIONS_DIR, ALLOWLIST)
+  const violations = scanActionsDir(ACTIONS_DIR, ALLOWLIST, scanSource, graph, ACTIONS_KEY_PREFIX)
 
   assert.deepEqual(
     violations,
     [],
     `Unguarded exported server action(s) found — add a guard or allowlist with a reason:\n${violations.join('\n')}`,
   )
+})
+
+/**
+ * o3d-512h round 3 — an allowlist entry is a claim about code that exists.
+ *
+ * 'auth.ts:*' sat in the list above naming a file that had been gone for
+ * releases. Nothing failed, because a suppression that suppresses nothing is
+ * invisible — and the day someone adds app/actions/auth.ts, every export in it is
+ * exempt on a reason written for different code. The same goes for a per-export
+ * entry whose export was renamed.
+ *
+ * So the allowlist is checked against the tree: every entry must currently
+ * suppress something. This is the same rule the branch applies to prose — a
+ * justification that cannot be shown to be about live code does not get to stand.
+ */
+test('every allowlist entry actually suppresses a live violation — no dead exemptions', () => {
+  const unsuppressed = new Set(scanActionsDir(ACTIONS_DIR, {}, scanSource, graph, ACTIONS_KEY_PREFIX))
+  const dead: string[] = []
+
+  for (const entry of Object.keys(ALLOWLIST)) {
+    const [file, name] = splitEntry(entry)
+    const covers = name === '*'
+      ? [...unsuppressed].some((v) => v.startsWith(`${file}:`))
+      : unsuppressed.has(entry)
+    if (!covers) dead.push(entry)
+  }
+
+  assert.deepEqual(
+    dead,
+    [],
+    'Allowlist entries that suppress nothing. Either the export gained a real guard '
+    + '(delete the entry — that is the good direction), or the file/export was renamed '
+    + 'or removed and the exemption is now a trap set for whoever recreates the name:\n'
+    + dead.join('\n'),
+  )
+})
+
+test('every allowlist entry states a reason', () => {
+  for (const [entry, reason] of Object.entries(ALLOWLIST)) {
+    assert.ok(reason.trim().length > 0, `${entry} needs a stated reason`)
+  }
 })
 
 /**
@@ -130,9 +161,11 @@ const OUTSIDE_ACTIONS_ALLOWLIST: Record<string, string> = {}
 
 test('every `use server` export OUTSIDE app/actions enforces an auth guard or is allowlisted', () => {
   const violations = scanUseServerOutsideActions(
-    process.cwd(),
-    ['app', 'lib', 'components'],
+    ROOT,
+    SCAN_ROOTS,
     OUTSIDE_ACTIONS_ALLOWLIST,
+    scanSource,
+    graph,
   )
 
   assert.deepEqual(
@@ -155,8 +188,8 @@ test('every `use server` export OUTSIDE app/actions enforces an auth guard or is
  *
  * This third rule is what makes a repeat cost a red build rather than another
  * review round: an endpoint that reaches the settings-store readers (which
- * decrypt SENSITIVE_SETTING_KEYS) must hold an authorization guard, not just
- * requireAuth.
+ * decrypt SENSITIVE_SETTING_KEYS) must hold an authorization guard, not just an
+ * authentication one.
  *
  * The allowlists are empty and should stay that way — an endpoint reading a
  * credential under authentication only is the defect, not a shape to excuse.
@@ -164,7 +197,13 @@ test('every `use server` export OUTSIDE app/actions enforces an auth guard or is
 const SECRET_READ_ALLOWLIST: Record<string, string> = {}
 
 test('every server action reading a stored secret holds an authorization guard, not just requireAuth', () => {
-  const violations = scanActionsDir(ACTIONS_DIR, SECRET_READ_ALLOWLIST, scanSecretReadingActions)
+  const violations = scanActionsDir(
+    ACTIONS_DIR,
+    SECRET_READ_ALLOWLIST,
+    scanSecretReadingActions,
+    graph,
+    ACTIONS_KEY_PREFIX,
+  )
 
   assert.deepEqual(
     violations,
@@ -175,10 +214,11 @@ test('every server action reading a stored secret holds an authorization guard, 
 
 test('the same secret-read rule applies OUTSIDE app/actions', () => {
   const violations = scanUseServerOutsideActions(
-    process.cwd(),
-    ['app', 'lib', 'components'],
+    ROOT,
+    SCAN_ROOTS,
     SECRET_READ_ALLOWLIST,
     scanSecretReadingActions,
+    graph,
   )
 
   assert.deepEqual(
@@ -189,132 +229,118 @@ test('the same secret-read rule applies OUTSIDE app/actions', () => {
 })
 
 /**
- * o3d-512h — the AUTHENTICATION-ONLY inventory, and the answer to "what stops a
- * third instance of the getEmailSettings class".
+ * o3d-512h — the AUTHENTICATION-ONLY inventory.
  *
- * The first sweep of this branch walked past company.ts:getEmailSettings because
- * every rule above asks only "is there a guard at all" — and there was one,
- * `requireAuth`, while the action returned the decrypted SMTP configuration to
- * every signed-in role. The secret-read rule catches the mechanical half of that
- * (an endpoint that reaches the decrypting settings readers). It could never have
- * caught the other half: settings.ts:getAccountCodes and
- * purchase-orders.ts:getBillPaymentAccounts reach the stored chart of accounts
- * through a helper two modules away, so nothing in their own source looks like a
- * privileged read. No single-file rule was going to see those; what found them
- * was a human asking "what does this return, and who else guards the same rows".
+ * ROUND 3 CHANGED WHAT THIS MEANS. It used to be a 78-line list of business
+ * reads, defended as "requireAuth is the right answer for most of these". It was
+ * not: `requireAuth` answers "is someone signed in", and SUPPLIER — an external
+ * company we issue a login to — is signed in. Every entry on that list was a
+ * supplier-reachable endpoint, and purchase-orders.ts:getPurchaseOrder was
+ * handing a supplier any other supplier's order by id.
  *
- * So this is not a cleverer rule — it is a list that makes the question get
- * ASKED. `requireAuth` is the right answer for most of these (a warehouse
- * operative must read products and stock), which is exactly why it cannot be a
- * violation. Pinning the set means ADDING an endpoint to it, or moving one out of
- * it, turns the build red, and the author has to say in the diff why
- * authentication alone is sufficient for what that endpoint returns. A sweep
- * somebody has to remember to redo becomes a decision the next author cannot
- * skip.
+ * Those 70-odd endpoints now hold `requireInternalUser`, which is an
+ * authorization gate, so they are simply not on this list any more. What is left
+ * is the set for which authentication genuinely IS the whole answer: endpoints
+ * that are SELF-SCOPED by session.user.id — your own profile, your own passkeys.
+ * A supplier reaching those reaches only its own row, which is the property that
+ * makes the gate sufficient.
  *
- * Removing an entry is the good direction (it gained a real authorization gate).
- * Adding one is the direction that needs the argument.
+ * Adding an entry therefore means asserting that new claim, in the diff:
+ * this endpoint is self-scoped to the caller, and an external principal reading
+ * it reads nothing but its own.
  */
 const AUTHENTICATION_ONLY_ACTIONS: string[] = [
-  'accounting-sync.ts:getAccountingIntegrationConnector',
-  'accounting-sync.ts:getCrossConnectorOrphanSummary',
-  'accounting-sync.ts:getFailedAccountingSyncSummary',
-  'accounting-sync.ts:getRejectedAccountingDocumentUpdateWarnings',
-  'allocation.ts:getOrderAllocations',
-  'allocation.ts:getOrderFulfillmentRequirements',
-  'allocation.ts:getOrderShipments',
-  'categories.ts:listCategoryTree',
-  'company.ts:getBaseCurrencySettings',
-  'company.ts:getBrandingColours',
-  'company.ts:getDocumentTemplates',
-  'company.ts:getNumberingFormats',
-  'company.ts:getOrganisation',
-  'currencies.ts:getCurrencies',
-  'currencies.ts:getCurrencyRateMap',
-  'currencies.ts:getFxHealth',
-  'currencies.ts:getFxPushLog',
-  'currencies.ts:getLatestFxRates',
-  'customers.ts:getCustomer',
-  'customers.ts:getCustomerDetail',
-  'customers.ts:getCustomers',
-  'manufacturing.ts:getBomProducts',
-  'manufacturing.ts:getComponentStock',
-  'manufacturing.ts:getDisassemblyStock',
-  'manufacturing.ts:getLastManufacturer',
-  'manufacturing.ts:getManufacturingOrder',
-  'manufacturing.ts:getManufacturingOrders',
-  'manufacturing.ts:getMaxAssembly',
-  'manufacturing.ts:getSuppliers',
-  'manufacturing.ts:getWarehouses',
   'passkey.ts:deletePasskey',
   'passkey.ts:getPasskeyRegistrationOptions',
   'passkey.ts:listPasskeys',
   'passkey.ts:renamePasskey',
   'passkey.ts:verifyPasskeyRegistration',
-  'products.ts:getAllocationDetails',
-  'products.ts:getIncomingDetails',
-  'products.ts:getKitStock',
-  'products.ts:getProduct',
-  'products.ts:getProductComponents',
-  'products.ts:getProductOptions',
-  'products.ts:getProductSuppliers',
-  'products.ts:getVariableProducts',
-  'products.ts:listProductCategories',
-  'products.ts:listProductSupplierOptions',
-  'products.ts:listProducts',
   'profile.ts:changePassword',
   'profile.ts:getProfileData',
   'profile.ts:updatePictureUrl',
-  'purchase-orders.ts:getGoodsPosForLinking',
-  'purchase-orders.ts:getLinkedFreightPos',
-  'purchase-orders.ts:getPurchaseOrder',
-  'purchase-orders.ts:getPurchaseOrders',
-  'purchase-orders.ts:getSupplierLastPrices',
-  'sales.ts:getSalesOrder',
-  'sales.ts:getSalesOrders',
-  'settings.ts:getAdjustmentReasons',
-  'settings.ts:getPurchaseUnits',
-  'settings.ts:getStockUnitOptions',
-  'settings.ts:getTaxRates',
-  'settings.ts:getUsers',
-  'settings.ts:getWarehousesForSettings',
-  'shopping.ts:fetchShoppingProductLink',
-  'stock.ts:getActiveAdjustmentReasons',
-  'stock.ts:getAdjustmentHistory',
-  'stock.ts:getAvgCogsMap',
-  'stock.ts:getProductStockFlow',
-  'stock.ts:getScopedStockLevelMap',
-  'stock.ts:getWarehouses',
-  'suppliers.ts:getSupplier',
-  'suppliers.ts:getSuppliers',
-  'transfers.ts:getTransfers',
-  'wms-order-push.ts:getWmsOrderPushStateForSalesOrder',
-  'wms-order-status.ts:getWmsOrderStatusForSalesOrder',
+  'profile.ts:updateProfile',
 ]
 
-const AUTHENTICATION_ONLY_OUTSIDE_ACTIONS: string[] = [
-  'lib/connectors/woocommerce/products.ts:fetchWcProductUrl',
-]
+/**
+ * o3d-512h round 3, Codex finding 3 — WHAT each of those endpoints reaches.
+ *
+ * The inventory pinned WHICH endpoints are authentication-only and said nothing
+ * about what they return, so an endpoint could start serving privileged rows
+ * without ever leaving the list — which is the exact question the inventory
+ * exists to force. Worse, it could not have caught the class it was written for:
+ * settings.ts:getAccountCodes and purchase-orders.ts:getBillPaymentAccounts
+ * reached the stored chart of accounts through a helper two modules away, and
+ * nothing in their own source looked like an accounting read.
+ *
+ * The module graph resolves through those helpers, so the pin can be about the
+ * DATA SURFACE: the Prisma models each endpoint reaches, transitively, through
+ * every callee that resolves. A self-scoped profile read that starts touching
+ * `supplier`, `purchaseOrder` or `setting` turns the build red on the line that
+ * names the model, whatever its gate still says.
+ *
+ * `activityLog` appears on the mutations because logActivity writes one; that is
+ * a write of the caller's own action, not a read of anyone's data.
+ */
+const AUTHENTICATION_ONLY_PRISMA_SURFACE: Record<string, string[]> = {
+  'passkey.ts:deletePasskey': ['$transaction', 'activityLog', 'passkey', 'user'],
+  'passkey.ts:getPasskeyRegistrationOptions': ['oneTimeToken', 'setting', 'user'],
+  'passkey.ts:listPasskeys': ['passkey'],
+  'passkey.ts:renamePasskey': ['activityLog', 'passkey'],
+  'passkey.ts:verifyPasskeyRegistration': ['$transaction', 'activityLog', 'oneTimeToken', 'passkey', 'setting', 'user'],
+  'profile.ts:changePassword': ['activityLog', 'user'],
+  'profile.ts:getProfileData': ['user'],
+  'profile.ts:updatePictureUrl': ['activityLog', 'user'],
+  'profile.ts:updateProfile': ['activityLog', 'user'],
+}
+
+const AUTHENTICATION_ONLY_OUTSIDE_ACTIONS: string[] = []
 
 test('the set of server actions gated on AUTHENTICATION ONLY is exactly the pinned inventory', () => {
-  const found = scanActionsDir(ACTIONS_DIR, {}, scanAuthenticationOnlyActions).sort()
+  const found = scanActionsDir(
+    ACTIONS_DIR,
+    {},
+    scanAuthenticationOnlyActions,
+    graph,
+    ACTIONS_KEY_PREFIX,
+  ).sort()
 
   assert.deepEqual(
     found,
     [...AUTHENTICATION_ONLY_ACTIONS].sort(),
     'An endpoint moved into or out of authentication-only gating. If you ADDED one, say in the '
-    + 'diff why every signed-in role — including SUPPLIER and READONLY — may read what it returns, '
-    + 'and check no sibling endpoint already guards the same rows. If you REMOVED one by giving it '
-    + 'a real authorization gate, just delete the line.',
+    + 'diff why an EXTERNAL principal — a SUPPLIER session — may call it, which for an '
+    + 'authentication-only endpoint means showing it is scoped to that caller\'s own row. '
+    + 'If you REMOVED one by giving it a real authorization gate, just delete the line.',
+  )
+})
+
+test('the pinned inventory also pins WHAT each endpoint reaches, not only its gate', () => {
+  const surface = prismaSurfaceOf(
+    AUTHENTICATION_ONLY_ACTIONS.map((entry) => {
+      const [file, name] = splitEntry(entry)
+      return { key: entry, file: `${ACTIONS_KEY_PREFIX}/${file}`, name }
+    }),
+    graph,
+  )
+
+  assert.deepEqual(
+    surface,
+    AUTHENTICATION_ONLY_PRISMA_SURFACE,
+    'The DATA SURFACE of an authentication-only endpoint changed. The gate did not have to '
+    + 'move for this to be a privilege escalation: an endpoint every signed-in principal may '
+    + 'call, including SUPPLIER, now reaches a different set of tables. Justify the new model '
+    + 'in the diff — or give the endpoint an authorization gate, which removes it from the '
+    + 'inventory and from this pin.',
   )
 })
 
 test('the authentication-only inventory covers `use server` modules OUTSIDE app/actions too', () => {
   const found = scanUseServerOutsideActions(
-    process.cwd(),
-    ['app', 'lib', 'components'],
+    ROOT,
+    SCAN_ROOTS,
     {},
     scanAuthenticationOnlyActions,
+    graph,
   ).sort()
 
   assert.deepEqual(
@@ -325,14 +351,23 @@ test('the authentication-only inventory covers `use server` modules OUTSIDE app/
 })
 
 test('the pinned inventory names no endpoint this branch gave an authorization gate', () => {
-  // The four this round moved off requireAuth. If any reappears above, a later
-  // edit put it back on authentication only — which is the regression, not a
-  // stale list to refresh.
+  // The ones this branch moved off requireAuth, across all three rounds. If any
+  // reappears above, a later edit put it back on authentication only — which is
+  // the regression, not a stale list to refresh.
   const regated = [
     'company.ts:getEmailSettings',
     'settings.ts:getAccountCodes',
-    'purchase-orders.ts:getBillPaymentAccounts',
     'settings.ts:getSetting',
+    'settings.ts:getUsers',
+    'purchase-orders.ts:getBillPaymentAccounts',
+    'purchase-orders.ts:getPurchaseOrder',
+    'purchase-orders.ts:getPurchaseOrders',
+    'purchase-orders.ts:getSupplierLastPrices',
+    'purchase-orders.ts:getGoodsPosForLinking',
+    'purchase-orders.ts:getLinkedFreightPos',
+    'allocation.ts:getOrderAllocations',
+    'allocation.ts:getOrderShipments',
+    'allocation.ts:getOrderFulfillmentRequirements',
   ]
   for (const name of regated) {
     assert.ok(
@@ -341,3 +376,8 @@ test('the pinned inventory names no endpoint this branch gave an authorization g
     )
   }
 })
+
+function splitEntry(entry: string): [string, string] {
+  const sep = entry.lastIndexOf(':')
+  return [entry.slice(0, sep), entry.slice(sep + 1)]
+}

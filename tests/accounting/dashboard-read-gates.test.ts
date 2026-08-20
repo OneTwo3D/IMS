@@ -256,7 +256,18 @@ test('the Xero connection-test state really is reached through the adapter, and 
   const denial = await denialFor(() => getAccountingConnectionTestState())
 
   assert.equal(denial, null, 'MANAGER is not refused')
-  assert.deepEqual(state.demanded, ['sync'], 'and the delegation asked for `sync` — the page\'s own permission')
+  // SUPERSEDED SHAPE (o3d-m3gy): this was `deepEqual(state.demanded, ['sync'])`, written when the
+  // dispatcher carried NO guard of its own and the delegate was the only frame that asked. o3d-512h
+  // round 2 gave every dispatcher its own gate, because a dispatcher that answers `if (!connector)
+  // return …` never reaches the delegate whose guard the allowlist said it inherited — so on exactly
+  // the path an unauthorized caller takes there was no guard at all. Two frames now ask, and both
+  // legitimately ask for the same thing. The property this pins is unchanged and is about WHAT is
+  // demanded, not how many times: nothing beyond the page's own permission.
+  assert.deepEqual(
+    [...new Set(state.demanded)], ['sync'],
+    'the delegation asked for `sync` and nothing more — the page\'s own permission',
+  )
+  assert.equal(state.demanded.length, 2, 'and it asked at BOTH frames: the dispatcher and the delegate')
   assert.ok(state.reachedDatabase, 'it got past the gate to the query, so the gate really ran and really passed')
 
   // Still a gate, not an absence of one.
