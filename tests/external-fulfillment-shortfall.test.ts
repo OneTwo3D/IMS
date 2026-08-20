@@ -71,7 +71,25 @@ mock.module('@/lib/db', {
             .map((row) => ({ ...row }))
         },
       },
-      salesOrderRefundLine: { findMany: async () => state.refundLines.map((row) => ({ ...row })) },
+      /**
+       * Refuses a fixture that does not state what its refund says about the goods. A row
+       * missing `refund` would silently read as "no evidence the goods left" and make the
+       * restock/chargeback tests below vacuous — the double must not answer a question the
+       * fixture never posed.
+       */
+      salesOrderRefundLine: {
+        findMany: async ({ select }: { select?: Row } = {}) => {
+          if (!select?.refund) {
+            throw new Error('salesOrderRefundLine.findMany double: production stopped selecting `refund`')
+          }
+          return state.refundLines.map((row) => {
+            if (!row.refund) {
+              throw new Error(`refund line fixture must state its refund: ${JSON.stringify(row)}`)
+            }
+            return { ...row }
+          })
+        },
+      },
       orderAllocation: { count: async () => state.allocationCount },
       shipment: {
         count: async () => state.shipments.length,
@@ -120,6 +138,13 @@ mock.module('@/lib/products/kit-fulfillment', {
     expandFulfillmentRequirementsDecimal: realExpandFulfillmentRequirementsDecimal,
   },
 })
+
+/** A refund that cancelled goods which never moved: nothing to receive back, no chargeback. */
+const CANCELLED_BEFORE_DISPATCH = { returnWarehouseId: null, chargeback: false }
+/** A refund that RESTOCKED goods — they can only come back if they went out. */
+const RETURNED_TO_STOCK = { returnWarehouseId: 'wh-returns', chargeback: false }
+/** A chargeback: scjz.70 suppresses restock precisely because the customer KEEPS the goods. */
+const KEPT_BY_CUSTOMER = { returnWarehouseId: null, chargeback: true }
 
 function reset() {
   state.order = { id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: 'WC-1', status: 'ALLOCATED', refundStatus: 'NONE' }
@@ -203,7 +228,7 @@ test('refunded units are netted out of demand, so a part-refunded order is not p
   reset()
   state.order.refundStatus = 'PARTIAL'
   state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
-  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 6 }]
+  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: CANCELLED_BEFORE_DISPATCH }]
   state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 4 }]
 
   const result = await apply()
@@ -235,7 +260,7 @@ test('a FULL refund that really returned the goods nets to zero and proceeds', a
   state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
   // Quantity-bearing refund lines are what actually cancel goods, and the per-leaf
   // subtraction already handles them. No short-circuit is needed to reach zero demand.
-  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 10 }]
+  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 10, refund: CANCELLED_BEFORE_DISPATCH }]
   state.shipmentLines = []
 
   const result = await apply()
@@ -298,4 +323,65 @@ test('a PACKED progress report is not judged on full coverage — only the SHIPP
 
   assert.deepEqual(result, { success: true })
   assert.deepEqual(state.transitions, [['shp-1', 'PACKED']])
+})
+
+
+test('a RESTOCKING partial refund does not excuse an uncovered dispatch', async () => {
+  reset()
+  // Order 10; IMS only ever allocated 6, so shipment A covers 6 and dispatched. The customer
+  // returned those 6 and the refund restocked them — an INBOUND movement for units that only
+  // exist because they went out. The 3PL now reports the remaining 4 dispatched with nothing
+  // allocated to put on shipment B.
+  //
+  // Netting the restocked 6 out of demand gives 4 against coverage 6 and waves this through,
+  // booking four units of movement for a dispatch of ten while the return has already added
+  // six back. A restock is evidence the goods LEFT, not evidence they were never wanted.
+  state.order.refundStatus = 'PARTIAL'
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  state.shipments = [{ id: 'shp-1', status: 'SHIPPED' }, { id: 'shp-2', status: 'PACKED' }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 6 }]
+  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: RETURNED_TO_STOCK }]
+
+  const result = await apply()
+
+  // The specific reason, not a bare failure: the restocked/kept units must still show as
+  // uncovered demand, in the quantity the shipment lines fall short by.
+  assert.match(result.error ?? '', /WIDGET \(4 of 10 uncovered\)/)
+  assert.equal(result.success, false)
+  assert.equal(state.transitions.length, 0)
+})
+
+test('a CHARGEBACK refund does not excuse an uncovered dispatch either', async () => {
+  reset()
+  // A chargeback states the same fact the other way round: no restock and no COGS reversal
+  // because the customer keeps the goods. They left the warehouse, so they still have to be
+  // covered by shipment lines.
+  state.order.refundStatus = 'PARTIAL'
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 3 }]
+  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 7, refund: KEPT_BY_CUSTOMER }]
+
+  const result = await apply()
+
+  // The specific reason, not a bare failure: the restocked/kept units must still show as
+  // uncovered demand, in the quantity the shipment lines fall short by.
+  assert.match(result.error ?? '', /WIDGET \(7 of 10 uncovered\)/)
+  assert.equal(result.success, false)
+  assert.equal(state.transitions.length, 0)
+})
+
+test('a restocking refund on a FULLY covered dispatch still proceeds', async () => {
+  reset()
+  // The complement, and the reason this is a netting rule rather than a blanket refusal: the
+  // shipment lines cover all ten, the return is accounted for separately, and refusing here
+  // would strand a perfectly ordinary return.
+  state.order.refundStatus = 'PARTIAL'
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 10 }]
+  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 6, refund: RETURNED_TO_STOCK }]
+
+  const result = await apply()
+
+  assert.deepEqual(result, { success: true })
+  assert.deepEqual(state.transitions, [['shp-1', 'SHIPPED']])
 })

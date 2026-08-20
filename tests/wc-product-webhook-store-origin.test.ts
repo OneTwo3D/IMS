@@ -184,13 +184,27 @@ test('a delivery ALREADY IN FLIGHT when the rebind lands is recorded as the OLD 
   assert.equal(persisted[0].originAttestation, 'store:store-a.example.com')
 })
 
-test('with no source header, the signed body is asked instead', async () => {
+test('the signed body is asked FIRST, and outranks a contradictory source header', async () => {
   reset()
-  // `permalink` is inside the HMAC-signed body, so it is the stronger of the two statements —
-  // it is the fallback only because it is not present on every resource.
+  // `permalink` and `_links.self` are inside the HMAC-signed body; `X-WC-Webhook-Source` is
+  // not. Round 2 read the header first, so an unsigned header that disagreed with the signed
+  // body decided the attestation. It cannot now: the header is only consulted when the body
+  // has said nothing at all.
   const body = JSON.stringify({ ...PRODUCT_PAYLOAD, permalink: `${STORE_A}/product/widget/` })
 
-  const persisted = await receive(body)
+  const persisted = await receive(body, { 'x-wc-webhook-source': `${STORE_B}/` })
+
+  assert.equal(persisted[0].originAttestation, 'store-under:store-a.example.com/product/widget')
+})
+
+test('a signed self-link gives the site root exactly, header or no header', async () => {
+  reset()
+  const body = JSON.stringify({
+    ...PRODUCT_PAYLOAD,
+    _links: { self: [{ href: `${STORE_A}/wp-json/wc/v3/products/4242` }] },
+  })
+
+  const persisted = await receive(body, { 'x-wc-webhook-source': `${STORE_B}/` })
 
   assert.equal(persisted[0].originAttestation, 'store:store-a.example.com')
 })
@@ -273,8 +287,8 @@ test('a delivery from the previous store imports nothing, pushes no stock, and i
   assert.ok(logged, 'the refusal must be visible in the activity log')
   assert.equal(logged.level, 'ERROR')
   assert.equal((logged.metadata as Row).verdict, 'foreign-store')
-  assert.equal((logged.metadata as Row).deliveryHost, 'store-a.example.com')
-  assert.equal((logged.metadata as Row).boundHost, 'store-b.example.com')
+  assert.equal((logged.metadata as Row).deliveryStore, 'store-a.example.com')
+  assert.equal((logged.metadata as Row).boundStore, 'store-b.example.com')
 })
 
 test('a same-store credential rotation does NOT suppress the import or the stock correction', async () => {
@@ -338,6 +352,55 @@ test('a modern row that found no store is refused too, and is told apart from a 
   assert.equal(response.status, 200)
   assert.deepEqual(state.syncCalls, [])
   assert.equal((refusal()?.metadata as Row).originAttestation, 'unproven:not-stated')
+})
+
+test('a DEPLOY-WINDOW row — inserted by the previous build, on the column default — is refused and named', async () => {
+  reset()
+  // The column's DEFAULT exists so the still-running previous build can keep inserting while
+  // the migration is live. What it must not do is let such a row read as examined: it names no
+  // store, so it is refused like any other unproven row, and the marker says which writer left
+  // it that way rather than blaming a pre-migration backfill.
+  const response = await dispatchProduct('unproven:legacy-writer')
+
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { ok: true, foreignStore: true, verdict: 'unproven' })
+  assert.deepEqual(state.syncCalls, [])
+  assert.deepEqual(state.stockSyncCalls, [])
+  assert.equal((refusal()?.metadata as Row).originAttestation, 'unproven:legacy-writer')
+})
+
+test('a SIBLING store in another subdirectory of the same host is a foreign store', async () => {
+  reset()
+  // Path-based multisite: `shop.example.com/store-a` and `shop.example.com/store-b` are
+  // different stores with different products and different keys. Hostname-only identity
+  // attested them the same, so a delivery from the one we left imported into the one we are
+  // bound to now.
+  state.settings.set('wc_url', 'https://shop.example.com/store-b')
+  // Encoded through the real attestation path, so an identity that drops the subdirectory
+  // collapses the two subsites here exactly as it would in production.
+  const { attestWebhookOrigin } = await import('@/lib/connectors/webhook-origin')
+
+  const response = await dispatchProduct(attestWebhookOrigin('https://shop.example.com/store-a/'))
+
+  assert.deepEqual(state.syncCalls, [], 'nothing may be imported from the sibling subsite')
+  assert.deepEqual(state.stockSyncCalls, [], 'and no stock may be forced from its figures')
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { ok: true, foreignStore: true, verdict: 'foreign-store' })
+  assert.equal((refusal()?.metadata as Row).deliveryStore, 'shop.example.com/store-a')
+  assert.equal((refusal()?.metadata as Row).boundStore, 'shop.example.com/store-b')
+})
+
+test('a subdirectory store still accepts its OWN deliveries, including a resource-URL statement', async () => {
+  reset()
+  state.settings.set('wc_url', 'https://shop.example.com/store-b')
+
+  const { attestWebhookOriginUnder } = await import('@/lib/connectors/webhook-origin')
+  const response = await dispatchProduct(attestWebhookOriginUnder('https://shop.example.com/store-b/product/widget/'))
+
+  assert.equal(response.status, 200)
+  assert.deepEqual(await response.json(), { ok: true })
+  assert.equal(state.syncCalls.length, 1)
+  assert.equal(refusal(), undefined)
 })
 
 test('an unreadable OWN binding lets the delivery through rather than discarding it', async () => {

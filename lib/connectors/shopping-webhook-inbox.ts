@@ -34,9 +34,10 @@ export type ShoppingWebhookEventRow = {
   payloadJson: unknown
   /**
    * Which STORE sent this delivery, as the delivery itself stated it at receipt (o3d-wgl6):
-   * `store:<host>`, or one of the `unproven:*` markers in lib/connectors/webhook-origin.ts.
-   * Never null and never blank — a row that could not name a store says so explicitly, and
-   * says which era failed to name it.
+   * `store:<host>[/<path>]` / `store-under:<host>/<path>`, or one of the `unproven:*` markers
+   * in lib/connectors/webhook-origin.ts. Never null and never blank — a row that could not
+   * name a store says so explicitly, and says which era failed to name it, including the
+   * column DEFAULT that catches an INSERT from the build running during a deploy.
    */
   originAttestation: string
   status: string

@@ -411,8 +411,8 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
       tag: 'sync',
       level: 'ERROR',
       description: origin.verdict === 'foreign-store'
-        ? `WooCommerce product webhook for ${productPayload.sku} was sent by ${origin.deliveryHost}, which is not the `
-          + `store this installation is bound to (${origin.boundHost}). Nothing was imported and no stock was `
+        ? `WooCommerce product webhook for ${productPayload.sku} was sent by ${origin.deliveryStore}, which is not the `
+          + `store this installation is bound to (${origin.boundStore}). Nothing was imported and no stock was `
           + 'corrected; the delivery is acknowledged rather than retried against a store it does not describe. '
           + 'The reconcile sync re-imports this product from the current store.'
         : `WooCommerce product webhook for ${productPayload.sku} did not say which store sent it `
@@ -424,8 +424,9 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
         sku: productPayload.sku,
         verdict: origin.verdict,
         originAttestation: origin.attestation,
-        deliveryHost: origin.deliveryHost,
-        boundHost: origin.boundHost,
+        deliveryStore: origin.deliveryStore,
+        boundStore: origin.boundStore,
+        originScope: origin.scope,
       },
     })
     return NextResponse.json({ ok: true, foreignStore: true, verdict: origin.verdict })

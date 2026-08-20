@@ -188,17 +188,57 @@ const EXTERNAL_FULFILLMENT_QTY_EPSILON = new Prisma.Decimal('0.000001')
  * as zero demand skipped the coverage check on precisely the orders that DID dispatch, which
  * is the under-booking this function exists to catch.
  *
- * A refund that genuinely cancels goods still nets to zero, one leaf at a time, through the
- * per-line subtraction below: that is what quantity-bearing refund lines are for. A refund
- * that returned no quantities leaves demand standing, and the shipment lines have to cover it
- * or the dispatch is refused. Nothing loops on that refusal — this gate runs once, on an
- * inbound dispatch, not on a rotating selector.
+ * A refund that genuinely cancels goods — one whose line quantities describe goods that never
+ * moved — still nets to zero, one leaf at a time, through the per-line subtraction below: that
+ * is what quantity-bearing refund lines are for. A refund that returned no quantities leaves
+ * demand standing, and so does one whose own record says the goods already left (a restock, a
+ * chargeback — see `refundEvidencesGoodsLeft`, which is the same retrospective reasoning
+ * applied to partial refunds). Either way the shipment lines have to cover the demand or the
+ * dispatch is refused. Nothing loops on that refusal — this gate runs once, on an inbound
+ * dispatch, not on a rotating selector.
  *
  * WHICH LINES COUNT. Only stock-tracked lines with a product. A description-only line has no
  * product to ship (the same exclusion `validateActiveShipmentTotalsWithinOrder` makes), and
  * NON_INVENTORY / VARIABLE lines can never receive shipment coverage at all — including
  * either would refuse every external dispatch, forever, on any order carrying one.
  */
+/**
+ * Does this refund itself say the goods have already left the warehouse? (o3d-okbd round 3)
+ *
+ * Round 2 stopped a FULL refund short-circuiting the coverage check, on the ground that a
+ * refund is a monetary event and cannot un-ship goods, and that a refund which genuinely
+ * cancels goods nets to zero one leaf at a time through the per-line subtraction. The second
+ * half of that was only true for refunds that cancel goods which never moved. It was not
+ * carried to the PARTIAL, quantity-bearing refunds that RETURN goods, and those are the same
+ * retrospective question the full case was:
+ *
+ *   Order 10. IMS only ever allocated 6, so shipment A covers 6 and dispatches. The customer
+ *   sends those 6 back and the refund restocks them. The 3PL then reports the remaining 4
+ *   dispatched, and IMS builds shipment B with nothing allocated to put on it. Netting the
+ *   refund gives demand 10 - 6 = 4 against coverage 6, no shortfall, and the order is promoted
+ *   SHIPPED having booked four units of stock movement it never made.
+ *
+ * A restock is POSITIVE evidence in the other direction. Goods can only be received back if
+ * they went out: `buildRefundFallbackReturnRows` refuses to restock a line with no SHIPPED
+ * shipment behind it, and the return books an INBOUND movement for those units. Netting them
+ * out of demand lets the matching OUTBOUND be skipped, so stock rises by the returned quantity
+ * with nothing to account for it — the mirror image of the under-booking this check exists to
+ * catch, and it lands on the same orders.
+ *
+ * A chargeback is the same fact stated the other way round: scjz.70 suppresses restock and
+ * COGS reversal precisely because the customer KEEPS the goods. They left too.
+ *
+ * What still nets, and must: a quantity-bearing refund with neither mark. That is the ordinary
+ * cancellation of a line that never shipped — no return warehouse because there is nothing to
+ * receive back — and it is what round 2's "nets to zero, one leaf at a time" was describing.
+ */
+function refundEvidencesGoodsLeft(
+  refund: { returnWarehouseId: string | null; chargeback: boolean } | null,
+): boolean {
+  if (!refund) return false
+  return refund.returnWarehouseId !== null || refund.chargeback
+}
+
 export async function findExternalFulfillmentShortfall(
   orderId: string,
 ): Promise<ExternalFulfillmentShortfall[]> {
@@ -224,7 +264,15 @@ export async function findExternalFulfillmentShortfall(
     }),
     db.salesOrderRefundLine.findMany({
       where: { refund: { orderId } },
-      select: { salesOrderLineId: true, productId: true, qty: true },
+      select: {
+        salesOrderLineId: true,
+        productId: true,
+        qty: true,
+        // What the refund itself says about where the goods are (o3d-okbd round 3). Set by the
+        // refund writer at creation, never by a caller, so this is a lookup rather than a
+        // reconstruction — the same reason `totalsBasis` is persisted.
+        refund: { select: { returnWarehouseId: true, chargeback: true } },
+      },
     }),
   ])
 
@@ -257,6 +305,8 @@ export async function findExternalFulfillmentShortfall(
     // leaf. Netting it against an arbitrary line would understate demand and hide a real
     // shortfall, so it nets nothing.
     if (!refundLine.salesOrderLineId || !refundLine.productId) continue
+    // ...and neither does a refund the goods have already left the warehouse for.
+    if (refundEvidencesGoodsLeft(refundLine.refund)) continue
     for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(refundLine.productId, toDecimal(refundLine.qty), graph)) {
       const leafKey = key(refundLine.salesOrderLineId, componentId)
       const current = demandByLeaf.get(leafKey)
