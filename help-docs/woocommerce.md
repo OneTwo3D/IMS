@@ -124,6 +124,13 @@ There is nothing to do unless an order *stays* here. If one does, the order is n
 check that WooCommerce actually generated the invoice document for it, and that order sync is
 running. You can always queue the sales invoice from the sales order by hand once the number shows.
 
+One case is called out separately, because the release can be a no-op through no fault of the order:
+if the accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to
+**off**, queueing the released invoice does nothing at all. IMS checks that the accounting sync row
+really exists before it closes the hold, so the order stays held and logs
+`sales_invoice_release_not_queued` naming the likely cause. Switch the connector or the Sales
+Invoices setting back on and the next order sync releases it.
+
 #### If WooCommerce changes an order's invoice number
 
 IMS follows the storefront **until something has committed to the number** — that is, until an

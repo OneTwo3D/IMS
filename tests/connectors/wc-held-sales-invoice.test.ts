@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFileSync } from 'node:fs'
 
 import { decideStoredInvoiceNumberUpdate } from '@/lib/connectors/woocommerce/sync/invoice-number'
 import {
@@ -8,6 +9,7 @@ import {
   heldSalesInvoiceQueueWhere,
   isHeldSalesInvoicePayload,
   MISSING_INVOICE_NUMBER_QUEUE_REASON,
+  releasedSalesInvoiceQueueWhere,
 } from '@/lib/connectors/woocommerce/sync/held-sales-invoice'
 
 // ---------------------------------------------------------------------------
@@ -108,6 +110,48 @@ test('held rows are PENDING and reason-scoped, so the FX queue and FAILED dashbo
   // Without the reason filter this selector would also match the pending-FX queue's rows and
   // release orders that are waiting for an exchange rate, not a number.
   assert.notEqual(MISSING_INVOICE_NUMBER_QUEUE_REASON, 'missing_fx_rate')
+})
+
+// ---------------------------------------------------------------------------
+// Codex round 3 (HIGH): the enqueue can do nothing, quietly.
+//
+// `queueAccountingSync` returns void and returns EARLY — without throwing — when no accounting
+// connector is active, when the connector's sync is switched off, when SALES_INVOICE posting is
+// off, or when the sales order was deleted underneath it. Round 2 marked the hold SYNCED with
+// "the sales invoice was queued" regardless, so the invoice was never posted and the one row that
+// knew the order was waiting had just been closed.
+// ---------------------------------------------------------------------------
+
+test('the release looks for the sync row under the very key it enqueued', () => {
+  const where = releasedSalesInvoiceQueueWhere({
+    salesOrderId: 'so-1',
+    idempotencyKey: 'wc-held-sales-invoice:so-1:164981',
+  })
+  assert.equal(where.type, 'SALES_INVOICE')
+  assert.equal(where.referenceType, 'SalesOrder')
+  assert.equal(where.referenceId, 'so-1')
+  assert.deepEqual(where.payload, {
+    path: ['_idempotencyKey'],
+    equals: 'wc-held-sales-invoice:so-1:164981',
+  })
+})
+
+test('the confirmation asks the SAME question the enqueue dedupes on, so the two cannot disagree', () => {
+  // Widen this set and a FAILED row reads as work in flight, closing the hold on an invoice
+  // nothing will retry. Narrow it and every poll enqueues a duplicate. It is not a free choice:
+  // it is queueXeroSync's own predicate, and this pins them together.
+  const where = releasedSalesInvoiceQueueWhere({ salesOrderId: 'so-1', idempotencyKey: 'k' })
+  assert.deepEqual(where.status, { in: ['PENDING', 'PROCESSING', 'SYNCED'] })
+  const queueSource = readFileSync('lib/connectors/xero/queue.ts', 'utf8')
+  assert.ok(
+    queueSource.includes("status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },"),
+    'queueXeroSync must still dedupe on exactly these statuses',
+  )
+  const accountingSource = readFileSync('lib/accounting.ts', 'utf8')
+  assert.ok(
+    accountingSource.includes("status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },"),
+    'and so must the transactional enqueue',
+  )
 })
 
 // ---------------------------------------------------------------------------

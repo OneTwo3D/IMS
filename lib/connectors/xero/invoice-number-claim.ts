@@ -15,13 +15,57 @@
  * "nothing" into permission to post. Xero says "nobody holds it" with `{"Invoices":[]}` and
  * nothing else, so anything else is refused into the fail-closed branch.
  *
+ * ------------------------------------------------------------------------------------------------
+ * THE ANSWER MUST BE COMPLETE, NOT MERELY NON-EMPTY (Codex round 3)
+ * ------------------------------------------------------------------------------------------------
+ * An "unclaimed" verdict is what authorises the post, so a lookup that can MISS a holder makes the
+ * whole fence unsound — the one wrong answer that ends in an overwrite rather than a refusal.
+ *
+ * AND IT IS THE PROPERTY THE FENCE RESTS ON AFTER CUTOVER. Xeroom is being removed, not run
+ * alongside, so the documents this protects are not a concurrent writer's — they are the ~14,415
+ * documents xeroom ALREADY posted, standing in the ledger under exactly the numbers IMS now derives
+ * from `_wcpdf_invoice_number`. They are always present when the question is asked. A false
+ * "unclaimed" on one of them is IMS silently replacing a real historical invoice, with no second
+ * system left to notice.
+ *
+ * Round 2 sent this request UNPAGED and read the array it got back. That array is one PAGE. Xero's
+ * page cap is verified live in invoice-delta.ts: an unpaged response SILENTLY STOPS AT 100
+ * (see PAGE_SIZE there — the same defect cost the payment poller invoices in #494). A holder past
+ * that cut is invisible, and invisible reads as unclaimed.
+ *
+ * Reaching the cap on an exact-number filter needs an unusual ledger — Xero enforces uniqueness on
+ * ACCREC numbers, so the extra documents would be voided predecessors under a reused number and
+ * ACCPAY bills that happen to carry it — but "unusual" is not "impossible", the historical
+ * population is large and was written by a system whose numbering IMS does not control, and the
+ * cost of being wrong here is an unrecoverable write. So the page is treated as evidence only when
+ * it PROVES it is the whole result set:
+ *
+ *   - the request is explicitly paged (`page=1&pageSize=100`) rather than relying on a default;
+ *   - a page shorter than `pageSize` IS the complete set — nothing follows a short page;
+ *   - a FULL page, or a `pagination` block that admits to more than one page, is a LOOKUP FAILURE.
+ *     It fails closed to LEDGER_LOOKUP_UNAVAILABLE, which refuses and retries, rather than
+ *     reporting the fraction it happened to see.
+ *
+ * Deliberately NOT a multi-page walk. Offset paging over a live result set is not a snapshot — a
+ * concurrent edit shifts rows between requests and can slide a row into a page already read (the
+ * o3d-8f9 analysis in invoice-delta.ts), which would reintroduce exactly the missed holder this
+ * closes. One page, or no answer. It also keeps the fence at ONE call per create, which is what
+ * the daily-budget argument for the fence was costed on.
+ *
+ * EVERY HOLDER IS RETURNED, not the first one found. Which document a POST would replace is a
+ * question about the whole set (a live document plus voided predecessors is a different answer
+ * from two live documents), and picking `find()`'s first match answered it by accident of
+ * ordering — Xero pages oldest-first, so that was systematically the OLDEST holder.
+ *
  * ACCREC ONLY. Purchase bills (ACCPAY) share the endpoint and their numbers are the SUPPLIER's,
  * explicitly non-unique, and posted create-only via PUT (see bills.ts). A bill that happens to
  * carry the same number as a sales invoice is not a claim on the sales-invoice sequence and must
- * not block a receivable.
+ * not block a receivable. They are still COUNTED against the page cap above, because they occupy
+ * rows that could push a real holder out of the page.
  */
 
 import { xeroGet } from './api'
+import { PAGE_SIZE } from './invoice-delta'
 import type { InvoiceNumberLookup, LedgerInvoiceClaim } from '@/lib/domain/accounting/invoice-number-ownership'
 
 type XeroInvoiceNumberLookupResponse = {
@@ -33,6 +77,8 @@ type XeroInvoiceNumberLookupResponse = {
     Total?: unknown
     Contact?: { Name?: unknown }
   }>
+  /** Xero returns this alongside a paged request. Used only to fail closed, never to widen. */
+  pagination?: { pageCount?: unknown; itemCount?: unknown }
 }
 
 type LookupDeps = {
@@ -61,7 +107,9 @@ export async function lookupXeroInvoiceNumberClaim(
 
   let res: { ok: boolean; status: number; data?: XeroInvoiceNumberLookupResponse; error?: string }
   try {
-    res = await deps.get<XeroInvoiceNumberLookupResponse>(`Invoices?InvoiceNumbers=${encodeURIComponent(wanted)}`)
+    res = await deps.get<XeroInvoiceNumberLookupResponse>(
+      `Invoices?InvoiceNumbers=${encodeURIComponent(wanted)}&page=1&pageSize=${PAGE_SIZE}`,
+    )
   } catch (error) {
     // A throw here is a lookup failure like any other. Letting it propagate would abort the entry
     // with a stack trace instead of the fail-closed refusal the caller knows how to describe.
@@ -75,32 +123,49 @@ export async function lookupXeroInvoiceNumberClaim(
     return { ok: false, error: 'the invoice-number lookup returned no Invoices array' }
   }
 
-  const match = res.data.Invoices.find((inv) => {
+  const rows = res.data.Invoices
+  if (rows.length >= PAGE_SIZE) {
+    return {
+      ok: false,
+      error:
+        `the invoice-number lookup filled its page (${rows.length} documents at pageSize ${PAGE_SIZE}) for `
+        + `${wanted}, so it cannot show that it saw every document holding that number`,
+    }
+  }
+  const pageCount = res.data.pagination?.pageCount
+  if (typeof pageCount === 'number' && pageCount > 1) {
+    return {
+      ok: false,
+      error: `the invoice-number lookup for ${wanted} spans ${pageCount} pages, so one page is not the whole answer`,
+    }
+  }
+
+  const claims: LedgerInvoiceClaim[] = []
+  for (const inv of rows) {
     const number = asString(inv?.InvoiceNumber)
-    if (!number || number.toLowerCase() !== wanted.toLowerCase()) return false
+    if (!number || number.toLowerCase() !== wanted.toLowerCase()) continue
     const type = asString(inv?.Type)
     // Absent Type is treated as a match: the endpoint returns it, so a missing one is a shape we
     // do not understand, and on this fence an unknown document counts as a claim.
-    return type === undefined || type.toUpperCase() === 'ACCREC'
-  })
+    if (type !== undefined && type.toUpperCase() !== 'ACCREC') continue
 
-  if (!match) return { ok: true, claim: null }
+    const invoiceId = asString(inv?.InvoiceID)
+    if (!invoiceId) {
+      // Something holds the number and the ledger did not say what. That is the least safe possible
+      // state to guess in.
+      return { ok: false, error: `a document holds invoice number ${wanted} but the lookup returned no InvoiceID` }
+    }
 
-  const invoiceId = asString(match.InvoiceID)
-  if (!invoiceId) {
-    // Something holds the number and the ledger did not say what. That is the least safe possible
-    // state to guess in.
-    return { ok: false, error: `a document holds invoice number ${wanted} but the lookup returned no InvoiceID` }
+    const claim: LedgerInvoiceClaim = {
+      invoiceId,
+      invoiceNumber: number,
+      status: asString(inv?.Status) ?? 'UNKNOWN',
+    }
+    const contactName = asString(inv?.Contact?.Name)
+    if (contactName) claim.contactName = contactName
+    if (typeof inv?.Total === 'number' && Number.isFinite(inv.Total)) claim.total = inv.Total
+    claims.push(claim)
   }
 
-  const claim: LedgerInvoiceClaim = {
-    invoiceId,
-    invoiceNumber: asString(match.InvoiceNumber) ?? wanted,
-    status: asString(match.Status) ?? 'UNKNOWN',
-  }
-  const contactName = asString(match.Contact?.Name)
-  if (contactName) claim.contactName = contactName
-  if (typeof match.Total === 'number' && Number.isFinite(match.Total)) claim.total = match.Total
-
-  return { ok: true, claim }
+  return { ok: true, claims }
 }

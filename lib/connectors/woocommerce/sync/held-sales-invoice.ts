@@ -71,6 +71,33 @@ export function heldSalesInvoiceQueueWhere(params?: { salesOrderId?: string; ext
   }
 }
 
+/**
+ * The accounting sync row the release must actually SEE before it may call the invoice released
+ * (o3d-k26m.6, Codex round 3).
+ *
+ * `queueAccountingSync` returns void and returns early — silently — when no accounting connector is
+ * active, when the connector's sync is off, when this type's posting mode is off, or when the sales
+ * order was deleted under it. Treating "it did not throw" as "it queued" marked the hold SYNCED for
+ * an invoice that will never post, which is the very defect the hold exists to prevent.
+ *
+ * THE STATUS SET IS NOT A CHOICE. It is exactly the set `queueAccountingSync`/`queueXeroSync`
+ * dedupe their idempotency key against, so "no row matches this" means "the next release would
+ * create one". Widen it and a FAILED row would be read as work in flight, closing the hold on an
+ * invoice nothing will retry; narrow it and every poll would enqueue a duplicate.
+ */
+export function releasedSalesInvoiceQueueWhere(params: {
+  salesOrderId: string
+  idempotencyKey: string
+}): Prisma.AccountingSyncLogWhereInput {
+  return {
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: params.salesOrderId,
+    status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+    payload: { path: ['_idempotencyKey'], equals: params.idempotencyKey },
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
 }

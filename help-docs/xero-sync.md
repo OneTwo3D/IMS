@@ -693,12 +693,14 @@ the sync row and in the activity log as `sales_invoice_number_not_ours`:
 
 | What the check found | What IMS does | What you do |
 |---|---|---|
-| Nobody holds the number | Posts, after recording that it claimed the number | — |
+| Nobody holds the number | Posts, after recording on the sync row which number it is about to post under | — |
 | The document this order is linked to holds it | Posts (this is a re-post of our own invoice) | — |
 | **Another document holds it, and IMS does not own that document** | Refuses | This is the cutover case: xeroom almost certainly already invoiced this order. If the existing Xero invoice is the right one, leave it and cancel the IMS sync row. If this order genuinely has no Xero document, link the correct one to the order (or void the wrong one in Xero) and re-queue |
 | The order is linked to one document but a *different* one holds the number | Refuses | Either the link or the number is wrong. Establish which document belongs to this order before anything is posted |
 | A **voided or deleted** document holds it | Refuses | Xero will not accept a modification of a voided document. Resolve it in Xero, then re-queue |
+| **More than one live document** holds it | Refuses | Which one an update-or-create would replace cannot be established from outside Xero — not even when one of them is yours. Void or renumber all but one, then re-queue |
 | **Xero could not be asked** (disconnected, rate-limited, network) | Refuses, and retries by itself | Nothing — the row re-runs once the connection is healthy. If it persists, fix the connection |
+| **Xero's answer could not be shown to be complete** (a full page of documents came back) | Refuses, and retries by itself | Nothing automatic. If it persists, look for the pile of documents sharing that number in Xero — the check will not guess past a result it cannot see the end of |
 
 The refusals other than the last are verdicts about what is in Xero, not transient errors. The row
 still retries a handful of times before it settles as FAILED with the reason on it — and those
@@ -707,17 +709,35 @@ to the order (or voided the wrong one), the next retry sees the number as ours a
 runs out of retries first, re-queue the invoice from the sales order. Either way, **a refused post
 is recoverable and an overwritten live invoice is not.**
 
-Two limits worth knowing. The check costs one extra Xero API call per sales-invoice create, which
-counts against the 1,000-call rolling daily limit. And it cannot see a document that appears in the
-fraction of a second between the check and the post — it protects against the standing population of
-documents another system has *already* posted, which is the cutover risk, not against a simultaneous
-write.
+**What this protects, and what it cannot do.** The documents at risk are not a rival system's
+future posts — xeroom is *removed* at cutover, not run alongside. They are the **~14,415 invoices
+xeroom already posted**, which stay in Xero under exactly the numbers IMS now takes from
+`_wcpdf_invoice_number`. They are always there when the check asks, so the check sees them — and
+after cutover there is no second system left to notice if it ever failed to. That is why the check
+refuses whenever it cannot show that it read Xero's answer in full.
 
-> **Cutover note.** While the xeroom WordPress plugin is still live it posts the *same* numbers to
-> the *same* Xero organisation. The check above is what stops an IMS post from overwriting one of
-> those invoices, but it is a backstop, not a plan: expect a refusal for every order xeroom has
-> already invoiced. Switch xeroom off for the orders IMS will handle before enabling Sales Invoices
-> against the live organisation.
+What it cannot do is see a document that appears between the check and the post. With xeroom gone,
+the only things that can land there are a second IMS worker (which needs two queued invoices
+carrying the same number) or somebody typing an invoice into Xero by hand. IMS deliberately does
+**not** treat "I was about to post under this number" as proof that the document now holding it is
+mine: that reasoning would only ever be used when the number *is* held, which after cutover means
+the check missed one of the historical documents — so it would repeat an overwrite instead of
+reporting it. See o3d-k26m.8.
+
+One consequence worth knowing in advance: if a post reaches Xero and the *response* is lost, the
+order's invoice is not re-posted automatically any more. The next attempt sees the number held by a
+document IMS cannot recognise and refuses. Open the invoice in Xero, confirm it is the one for this
+order, link it to the order, and the next retry updates it instead of replacing it.
+
+And the check costs one extra Xero API call per sales-invoice create, which counts against the
+1,000-call rolling daily limit.
+
+> **Cutover note.** Xeroom posts the *same* numbers to the *same* Xero organisation, and it is being
+> removed rather than run alongside IMS — so the check above is not there to referee two live
+> systems. It is there for what xeroom leaves behind: every order it has already invoiced keeps a
+> real document under the number IMS would post. Expect a refusal for each of those if it is
+> re-imported, backfilled or re-queued, and treat a refusal as the system working. Switch xeroom off
+> for the orders IMS will handle before enabling Sales Invoices against the live organisation.
 
 ## Multi-Currency FX Rates
 

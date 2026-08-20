@@ -1505,22 +1505,25 @@ async function guardSalesInvoiceNumberOwnership(
     }
   }
 
-  let ownClaimInvoiceNumber: string | null = null
+  // Message material for a refusal, never a licence to post (o3d-k26m.5, Codex round 3). A read
+  // failure here still refuses: it is the same unhealthy-database signal that would stop the
+  // POST's own outcome from being recorded.
+  let attemptedInvoiceNumber: string | null = null
   try {
     const entry = await db.accountingSyncLog.findUnique({
       where: { id: entryId },
-      select: { invoiceNumberClaim: true },
+      select: { attemptedInvoiceNumber: true },
     })
-    ownClaimInvoiceNumber = entry?.invoiceNumberClaim ?? null
+    attemptedInvoiceNumber = entry?.attemptedInvoiceNumber ?? null
   } catch (error) {
     return {
       post: false,
-      result: { success: false, error: `Could not read the invoice-number claim on sync row ${entryId}: ${String(error)}` },
+      result: { success: false, error: `Could not read the invoice-number attempt on sync row ${entryId}: ${String(error)}` },
     }
   }
 
   const lookup = await lookupXeroInvoiceNumberClaim(invoiceNumber ?? '')
-  const decision = decideInvoiceNumberPost({ invoiceNumber, lookup, ownedInvoiceId, ownClaimInvoiceNumber, orderLabel })
+  const decision = decideInvoiceNumberPost({ invoiceNumber, lookup, ownedInvoiceId, attemptedInvoiceNumber, orderLabel })
 
   if (!decision.post) {
     await logActivity({
@@ -1542,21 +1545,21 @@ async function guardSalesInvoiceNumberOwnership(
     return { post: false, result: { success: false, error: decision.reason } }
   }
 
-  if (decision.recordClaim && invoiceNumber) {
-    // BEFORE the post, never after: the claim's entire meaning is that it was durable at the
-    // moment the request left. Written on the row we are processing, so a retry of THIS entry can
-    // recognise its own document if the response is lost. A failure to write it is a failure to
-    // post — an unclaimed post whose claim was not recorded is precisely the crash-after-post case
-    // the fence can no longer heal.
+  if (decision.recordAttempt && invoiceNumber) {
+    // BEFORE the post, never after — and a failure to write it REFUSES the post. Not because the
+    // record licenses anything (it does not: see invoice-number-ownership.ts), but because a
+    // create whose local record cannot be written is a create whose OUTCOME cannot be written
+    // either. A database that will not take this row will not take the InvoiceID the response
+    // carries, and that is exactly the lost-response state the fence can no longer heal.
     try {
       await db.accountingSyncLog.update({
         where: { id: entryId },
-        data: { invoiceNumberClaim: invoiceNumber, invoiceNumberClaimedAt: new Date() },
+        data: { attemptedInvoiceNumber: invoiceNumber, attemptedInvoiceNumberAt: new Date() },
       })
     } catch (error) {
       return {
         post: false,
-        result: { success: false, error: `Could not record the invoice-number claim for ${invoiceNumber} on sync row ${entryId} before posting: ${String(error)}` },
+        result: { success: false, error: `Could not record the invoice-number attempt for ${invoiceNumber} on sync row ${entryId} before posting: ${String(error)}` },
       }
     }
   }

@@ -23,23 +23,24 @@ import {
 const OURS = 'xero-invoice-id-ours'
 const THEIRS = 'xero-invoice-id-theirs'
 
-function claimOn(invoiceId: string, overrides: Partial<LedgerInvoiceClaim> = {}): InvoiceNumberLookup {
+function claim(invoiceId: string, overrides: Partial<LedgerInvoiceClaim> = {}): LedgerInvoiceClaim {
   return {
-    ok: true,
-    claim: {
-      invoiceId,
-      invoiceNumber: '164981',
-      status: 'AUTHORISED',
-      contactName: 'A Customer',
-      total: 120.5,
-      ...overrides,
-    },
+    invoiceId,
+    invoiceNumber: '164981',
+    status: 'AUTHORISED',
+    contactName: 'A Customer',
+    total: 120.5,
+    ...overrides,
   }
 }
 
-const UNCLAIMED: InvoiceNumberLookup = { ok: true, claim: null }
+function heldBy(...claims: LedgerInvoiceClaim[]): InvoiceNumberLookup {
+  return { ok: true, claims }
+}
 
-test('a number nobody holds is posted, and the claim is recorded first', () => {
+const UNCLAIMED: InvoiceNumberLookup = { ok: true, claims: [] }
+
+test('a number nobody holds is posted, and the attempt is recorded first', () => {
   const decision = decideInvoiceNumberPost({
     invoiceNumber: '164981',
     lookup: UNCLAIMED,
@@ -48,29 +49,29 @@ test('a number nobody holds is posted, and the claim is recorded first', () => {
   })
   assert.equal(decision.post, true)
   assert.equal(decision.post && decision.basis, 'unclaimed')
-  // The claim is what makes a lost response recoverable. Posting without recording it re-opens
-  // the crash-after-post hole the fence would otherwise create.
-  assert.equal(decision.post && decision.recordClaim, true)
+  // Written before the request leaves. It licenses nothing (see below) — it is the local record
+  // without which the post's own outcome could not be recorded either.
+  assert.equal(decision.post && decision.recordAttempt, true)
 })
 
 test('the number held by the document this order is linked to is our own — post', () => {
   const decision = decideInvoiceNumberPost({
     invoiceNumber: '164981',
-    lookup: claimOn(OURS),
+    lookup: heldBy(claim(OURS)),
     ownedInvoiceId: OURS,
     orderLabel: 'order WC-164981',
   })
   assert.equal(decision.post, true)
   assert.equal(decision.post && decision.basis, 'own-document')
   assert.equal(decision.post && decision.claimedInvoiceId, OURS)
-  // Nothing to claim: the authoritative link already exists.
-  assert.equal(decision.post && decision.recordClaim, false)
+  // Nothing to record: the authoritative link already exists.
+  assert.equal(decision.post && decision.recordAttempt, false)
 })
 
 test('a number held by a document IMS does not own is REFUSED, naming the number and the overwrite', () => {
   const decision = decideInvoiceNumberPost({
     invoiceNumber: '164981',
-    lookup: claimOn(THEIRS),
+    lookup: heldBy(claim(THEIRS)),
     ownedInvoiceId: null,
     orderLabel: 'order WC-164981',
   })
@@ -89,7 +90,7 @@ test('a number held by a document IMS does not own is REFUSED, naming the number
 test('a number held by a DIFFERENT document than the one this order is linked to is refused', () => {
   const decision = decideInvoiceNumberPost({
     invoiceNumber: '164981',
-    lookup: claimOn(THEIRS),
+    lookup: heldBy(claim(THEIRS)),
     ownedInvoiceId: OURS,
     orderLabel: 'order WC-164981',
   })
@@ -104,7 +105,7 @@ test('a VOIDED document still holds its number, and the create is refused with t
   for (const status of ['VOIDED', 'DELETED', 'voided']) {
     const decision = decideInvoiceNumberPost({
       invoiceNumber: '164981',
-      lookup: claimOn(THEIRS, { status }),
+      lookup: heldBy(claim(THEIRS, { status })),
       ownedInvoiceId: null,
       orderLabel: 'order WC-164981',
     })
@@ -149,59 +150,145 @@ test('an empty invoice number is refused rather than fenced against nothing', ()
 })
 
 // ---------------------------------------------------------------------------
-// The lost-response case. Without this the fence turns a self-healing retry into a permanent
-// refusal: today the retry simply re-POSTs and the upsert lands back on the same document.
+// Codex round 3, CRITICAL: a pre-request record does not identify the holder.
+//
+// Round 2 posted on this inference: "nobody held this number when this row set out to post it;
+// somebody holds it now; therefore the holder is ours." The record is a fact about the LOOKUP's
+// moment and cannot identify a holder — and the licence is only ever reached when the number IS
+// held. Once xeroom is removed the only documents that can hold one of these numbers are the
+// ~14,415 it already posted, so "held now, unclaimed then" means THE LOOKUP MISSED ONE: the licence
+// would fire exactly where the fence has already failed, repeat the overwrite, and remove the
+// refusal that would have exposed it. It was the only wrong answer in the fence that ended in an
+// overwrite instead of a refusal.
 // ---------------------------------------------------------------------------
 
-test('this row claimed the number before it posted, so the document now holding it is ours', () => {
+test('a previous attempt by THIS row does not license posting over whoever holds the number now', () => {
   const decision = decideInvoiceNumberPost({
     invoiceNumber: '164981',
-    lookup: claimOn(THEIRS),
+    lookup: heldBy(claim(THEIRS)),
     ownedInvoiceId: null,
-    ownClaimInvoiceNumber: '164981',
-    orderLabel: 'order WC-164981',
-  })
-  assert.equal(decision.post, true)
-  assert.equal(decision.post && decision.basis, 'own-claim')
-  assert.equal(decision.post && decision.claimedInvoiceId, THEIRS)
-  assert.equal(decision.post && decision.recordClaim, false)
-})
-
-test('a claim on a DIFFERENT number licenses nothing', () => {
-  const decision = decideInvoiceNumberPost({
-    invoiceNumber: '164981',
-    lookup: claimOn(THEIRS),
-    ownedInvoiceId: null,
-    // The payload's number moved after the claim was taken. The claim says nothing about 164981.
-    ownClaimInvoiceNumber: '164980',
+    attemptedInvoiceNumber: '164981',
     orderLabel: 'order WC-164981',
   })
   assert.equal(decision.post, false)
   assert.equal(decision.post === false && decision.code, 'NUMBER_HELD_BY_FOREIGN_DOCUMENT')
+  assert.equal(decision.post === false && decision.retryable, false)
 })
 
-test('a claim cannot override the order’s own recorded document id', () => {
+test('the attempt is named in the refusal, as a lead to check and explicitly not as proof', () => {
   const decision = decideInvoiceNumberPost({
     invoiceNumber: '164981',
-    lookup: claimOn(THEIRS),
-    // The order IS linked to a document, and it is not the one holding the number. The recorded
-    // id is stronger evidence than a claim and must win.
+    lookup: heldBy(claim(THEIRS)),
+    ownedInvoiceId: null,
+    attemptedInvoiceNumber: '164981',
+    orderLabel: 'order WC-164981',
+  })
+  const reason = decision.post === false ? decision.reason : ''
+  assert.match(reason, /already set out to post under this number once before/)
+  assert.match(reason, /a lost response looks exactly like this/)
+  // The operator must not read the lead as a verdict.
+  assert.match(reason, /NOT proof/)
+  assert.match(reason, /link it to this order and the next retry will UPDATE it/)
+})
+
+test('an attempt on a DIFFERENT number is not even mentioned', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    lookup: heldBy(claim(THEIRS)),
+    ownedInvoiceId: null,
+    // The payload's number moved after the attempt was recorded. It says nothing about 164981.
+    attemptedInvoiceNumber: '164980',
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post === false && decision.code, 'NUMBER_HELD_BY_FOREIGN_DOCUMENT')
+  assert.doesNotMatch(decision.post === false ? decision.reason : '', /already set out to post/)
+})
+
+test('an attempt cannot override the order’s own recorded document id', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    lookup: heldBy(claim(THEIRS)),
+    // The order IS linked to a document, and it is not the one holding the number.
     ownedInvoiceId: OURS,
-    ownClaimInvoiceNumber: '164981',
+    attemptedInvoiceNumber: '164981',
     orderLabel: 'order WC-164981',
   })
   assert.equal(decision.post, false)
   assert.equal(decision.post === false && decision.code, 'NUMBER_HELD_BY_ANOTHER_IMS_DOCUMENT')
 })
 
-test('a claim does not license posting onto a VOIDED document', () => {
+test('an attempt does not license posting onto a VOIDED document', () => {
   const decision = decideInvoiceNumberPost({
     invoiceNumber: '164981',
-    lookup: claimOn(THEIRS, { status: 'VOIDED' }),
+    lookup: heldBy(claim(THEIRS, { status: 'VOIDED' })),
     ownedInvoiceId: null,
-    ownClaimInvoiceNumber: '164981',
+    attemptedInvoiceNumber: '164981',
     orderLabel: 'order WC-164981',
   })
   assert.equal(decision.post, false)
   assert.equal(decision.post === false && decision.code, 'NUMBER_HELD_BY_VOIDED_DOCUMENT')
+})
+
+// ---------------------------------------------------------------------------
+// Codex round 3: the lookup answers with the WHOLE set of holders, so the decision has to be one
+// about a set. Round 2 took `find()`'s first match — and Xero pages oldest-first, so "first" was
+// systematically the OLDEST document holding the number.
+// ---------------------------------------------------------------------------
+
+test('a live holder is not masked by a voided predecessor that comes back ahead of it', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    // Oldest first, exactly as Xero returns them: the voided predecessor, then the live document.
+    lookup: heldBy(claim('xero-invoice-id-old', { status: 'VOIDED' }), claim(OURS)),
+    ownedInvoiceId: OURS,
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post, true)
+  assert.equal(decision.post && decision.basis, 'own-document')
+  assert.equal(decision.post && decision.claimedInvoiceId, OURS)
+})
+
+test('a voided predecessor alongside a FOREIGN live holder still refuses, and both are named', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    lookup: heldBy(claim('xero-invoice-id-old', { status: 'DELETED' }), claim(THEIRS)),
+    ownedInvoiceId: null,
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post === false && decision.code, 'NUMBER_HELD_BY_FOREIGN_DOCUMENT')
+  const reason = decision.post === false ? decision.reason : ''
+  assert.match(reason, /xero-invoice-id-theirs/)
+  assert.match(reason, /1 voided\/deleted document also holds that number/)
+  assert.match(reason, /xero-invoice-id-old/)
+})
+
+test('two LIVE documents holding the number is refused: which one an upsert replaces is unknowable', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    lookup: heldBy(claim(OURS), claim(THEIRS)),
+    // Even owning one of them is not enough — the create addresses the NUMBER, not the id.
+    ownedInvoiceId: OURS,
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post, false)
+  assert.equal(decision.post === false && decision.code, 'NUMBER_HELD_BY_MULTIPLE_DOCUMENTS')
+  assert.equal(decision.post === false && decision.retryable, false)
+  const reason = decision.post === false ? decision.reason : ''
+  assert.match(reason, /2 live documents/)
+  assert.match(reason, /xero-invoice-id-ours/)
+  assert.match(reason, /xero-invoice-id-theirs/)
+  assert.match(reason, /including when one of them is ours/)
+})
+
+test('several voided holders and no live one is a voided refusal that names the extras', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    lookup: heldBy(claim('xero-invoice-id-old', { status: 'VOIDED' }), claim(THEIRS, { status: 'DELETED' })),
+    ownedInvoiceId: null,
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post === false && decision.code, 'NUMBER_HELD_BY_VOIDED_DOCUMENT')
+  const reason = decision.post === false ? decision.reason : ''
+  assert.match(reason, /a VOIDED document \(invoice xero-invoice-id-old/)
+  assert.match(reason, /1 voided\/deleted document also holds that number \(invoice xero-invoice-id-theirs/)
 })

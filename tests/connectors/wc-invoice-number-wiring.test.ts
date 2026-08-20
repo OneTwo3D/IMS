@@ -154,12 +154,38 @@ test('the release enqueues BEFORE it marks the row, so a crash cannot strand the
   const mark = body.indexOf("status: 'SYNCED',")
   assert.ok(enqueue > 0 && mark > enqueue, 'the queue row must be marked SYNCED only AFTER the enqueue succeeds')
   assert.ok(
-    body.includes('idempotencyKey: `wc-held-sales-invoice:${orderId}:${invoiceNumber}`'),
+    body.includes('const idempotencyKey = `wc-held-sales-invoice:${orderId}:${invoiceNumber}`'),
     'the enqueue must be deduplicable, so a repeated release adds nothing',
   )
   assert.ok(
     body.includes('buildReleasedSalesInvoicePayload(held, invoiceNumber)'),
     'the release must post the parked payload plus the number, not a rebuilt one',
+  )
+})
+
+test('the release CONFIRMS the sync row exists before it calls the invoice released', () => {
+  // Codex round 3, HIGH: queueAccountingSync returns void and returns EARLY, without throwing,
+  // when no connector is active, when the connector's sync is off, when SALES_INVOICE posting is
+  // off, or when the order was deleted. Round 2's catch could not see any of them, so the hold was
+  // marked SYNCED with "the sales invoice was queued" for an invoice that will never post — and
+  // the one row that knew the order was waiting had just been closed.
+  const src = source(ORDER_IMPORT)
+  const start = src.indexOf('async function releaseHeldWcSalesInvoice(')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const confirm = body.indexOf('releasedSalesInvoiceQueueWhere({ salesOrderId: orderId, idempotencyKey })')
+  const mark = body.indexOf("status: 'SYNCED',")
+  assert.ok(confirm > 0, 'the release must ask the database whether the sync row is really there')
+  assert.ok(confirm < mark, 'the confirmation must happen BEFORE the hold is marked released')
+  const unqueued = body.indexOf('if (!queued) {')
+  assert.ok(unqueued > 0, 'a missing sync row must be handled explicitly')
+  assert.ok(unqueued < mark, 'an unqueued invoice must return before the hold is closed')
+  assert.ok(
+    body.includes("action: 'sales_invoice_release_not_queued'"),
+    'a silent no-op must become a WARNING naming the order and the number',
+  )
+  assert.ok(
+    body.includes('accounting connector is disconnected, its sync is switched off'),
+    'the warning must name the ordinary causes, or the operator has nowhere to start',
   )
 })
 
@@ -257,24 +283,44 @@ test('the UPDATE is not fenced — it addresses a document by an id we recorded 
   )
 })
 
-test('the claim is written BEFORE the post, and a failure to write it blocks the post', () => {
+function ownershipFenceBody(): string {
   const src = source(XERO_PROCESSOR)
   const start = src.indexOf('async function guardSalesInvoiceNumberOwnership(')
   assert.ok(start > 0, 'the fence must exist')
-  const body = src.slice(start, src.indexOf('\nasync function processEntry(', start))
-  const write = body.indexOf('data: { invoiceNumberClaim: invoiceNumber, invoiceNumberClaimedAt: new Date() },')
+  return src.slice(start, src.indexOf('\nasync function processEntry(', start))
+}
+
+test('the attempt is written BEFORE the post, and a failure to write it blocks the post', () => {
+  const body = ownershipFenceBody()
+  const guard = body.indexOf('if (decision.recordAttempt && invoiceNumber) {')
+  const write = body.indexOf('data: { attemptedInvoiceNumber: invoiceNumber, attemptedInvoiceNumberAt: new Date() },')
   const allow = body.lastIndexOf('return { post: true }')
-  assert.ok(write > 0, 'an unclaimed number must be claimed on the row before it is posted')
-  assert.ok(write < allow, 'the claim must be durable before the caller is allowed to post')
-  // A claim that was not recorded leaves the crash-after-post state unrecoverable, which is the
-  // one thing the fence must not create.
+  assert.ok(guard > 0, 'the write must be reached whenever the decision asks for it')
+  assert.ok(guard < write, 'and it must be the thing that reaches the write')
+  assert.ok(write > 0, 'the number about to be posted must be recorded on the row first')
+  assert.ok(write < allow, 'the record must be durable before the caller is allowed to post')
+  // Not because the record licenses anything — because a create whose local record cannot be
+  // written is a create whose OUTCOME cannot be written either.
   assert.ok(
-    body.includes('Could not record the invoice-number claim for ${invoiceNumber} on sync row ${entryId} before posting'),
-    'failing to record the claim must refuse the post, not proceed without it',
+    body.includes('Could not record the invoice-number attempt for ${invoiceNumber} on sync row ${entryId} before posting'),
+    'failing to record the attempt must refuse the post, not proceed without it',
   )
   // Fails closed on an unreadable order, matching guardCancelledSalesOrderInvoice.
   assert.ok(
     body.includes('Sales order ${referenceId} not found before posting an invoice'),
     'a missing order must refuse, never read as "unowned"',
   )
+})
+
+test('the recorded attempt reaches the decision as MESSAGE material and nothing else', () => {
+  // Codex round 3, CRITICAL: round 2 passed this as `ownClaimInvoiceNumber` and the rule posted on
+  // it — "nobody held the number when this row set out, somebody holds it now, therefore ours".
+  // The name and the parameter are both gone; what remains may only be quoted back to an operator.
+  const body = ownershipFenceBody()
+  assert.ok(
+    body.includes('decideInvoiceNumberPost({ invoiceNumber, lookup, ownedInvoiceId, attemptedInvoiceNumber, orderLabel })'),
+    'the fence must pass the recorded attempt under its honest name',
+  )
+  assert.ok(!body.includes('ownClaimInvoiceNumber'), 'no parameter may claim the attempt proves ownership')
+  assert.ok(!body.includes('invoiceNumberClaim'), 'the claim column and its inference are retired')
 })

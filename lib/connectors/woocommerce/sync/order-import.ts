@@ -17,6 +17,7 @@ import {
   buildReleasedSalesInvoicePayload,
   heldSalesInvoiceQueueWhere,
   isHeldSalesInvoicePayload,
+  releasedSalesInvoiceQueueWhere,
 } from './held-sales-invoice'
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
@@ -600,6 +601,21 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
  * row already there and adds nothing. The other order would be worse in the way that matters: a
  * crash after marking the row SYNCED but before enqueueing strands the invoice permanently, which
  * is the exact defect being fixed.
+ *
+ * AND THE ENQUEUE IS VERIFIED, NOT ASSUMED (Codex round 3). `queueAccountingSync` returns void and
+ * RETURNS EARLY, silently, in several ordinary states: no accounting connector is active, the
+ * connector's sync is switched off, this sync type's posting mode is `off`, or the sales order was
+ * hard-deleted between the import and the enqueue (o3d-hrak). None of them throws, so the catch
+ * below never sees them — and round 2 then marked the row SYNCED with "the sales invoice was
+ * queued", which was false. The held invoice would never post and the one row that knew it was
+ * waiting had just been closed, which is the exact defect this module exists to end, reintroduced
+ * one line later.
+ *
+ * So the release ASKS THE DATABASE whether the sync row is really there, under the same key and
+ * the same status set the enqueue itself dedupes on — the answer comes from the same place the
+ * work has to come from, rather than from a return value the callee does not give. If it is not
+ * there the held row stays PENDING and says so, so the next redelivery or poll retries it once the
+ * connector is switched on.
  */
 async function releaseHeldWcSalesInvoice(
   orderId: string,
@@ -646,6 +662,7 @@ async function releaseHeldWcSalesInvoice(
   }
 
   const held = row.payload
+  const idempotencyKey = `wc-held-sales-invoice:${orderId}:${invoiceNumber}`
   try {
     const { queueAccountingSync } = await import('@/lib/accounting')
     await queueAccountingSync({
@@ -653,7 +670,7 @@ async function releaseHeldWcSalesInvoice(
       referenceType: 'SalesOrder',
       referenceId: orderId,
       payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
-      idempotencyKey: `wc-held-sales-invoice:${orderId}:${invoiceNumber}`,
+      idempotencyKey,
     })
   } catch (error) {
     // Left PENDING on purpose — the next redelivery or poll retries it.
@@ -672,6 +689,40 @@ async function releaseHeldWcSalesInvoice(
         invoiceNumber,
         errorName: error instanceof Error ? error.name : typeof error,
       },
+      resolveUser: false,
+    }).catch(() => {})
+    return
+  }
+
+  // The enqueue can no-op silently — see the note above. A row that is not there was not queued,
+  // and marking the hold "released" would strand the invoice with nothing left saying so.
+  let queued: { id: string } | null = null
+  try {
+    queued = await db.accountingSyncLog.findFirst({
+      // Deliberately the enqueue's OWN dedupe predicate — see releasedSalesInvoiceQueueWhere.
+      where: releasedSalesInvoiceQueueWhere({ salesOrderId: orderId, idempotencyKey }),
+      select: { id: true },
+    })
+  } catch (error) {
+    console.error(`[wc-import] could not confirm the released sales invoice for ${orderId} was queued:`, error)
+    return
+  }
+  if (!queued) {
+    // Left PENDING on purpose, exactly as the throwing case is: the next redelivery or poll tries
+    // again, and the deterministic key means a later success adds one row, not two.
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'sales_invoice_release_not_queued',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `WooCommerce order ${wcOrder.number} has its invoice number (${invoiceNumber}), but queueing the held `
+        + 'sales invoice produced no accounting sync row, so NOTHING will post. The usual cause is that the '
+        + 'accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to off; the '
+        + 'other is that the sales order was deleted. The order stays queued for release and retries on the next '
+        + 'order sync.',
+      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), invoiceNumber, idempotencyKey },
       resolveUser: false,
     }).catch(() => {})
     return
