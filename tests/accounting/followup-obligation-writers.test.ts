@@ -108,7 +108,7 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>): 
  * instant the write happened. Ordering is the whole property under test — "the marker ends up set"
  * is true of a marker written afterwards too, and that is the version this finding rejected.
  */
-type Journal = Array<{ op: string; markerAtThisPoint: Date | null; data?: Record<string, unknown> }>
+type Journal = Array<{ op: string; markerAtThisPoint: Date | null; data?: Record<string, unknown>; where?: Record<string, unknown> }>
 
 const state = {
   syncRows: [] as SyncRow[],
@@ -133,8 +133,8 @@ function marker(): Date | null {
   return state.syncRows[0]?.backReferenceFollowUpsPendingAt ?? null
 }
 
-function record(op: string, data?: Record<string, unknown>) {
-  state.journal.push({ op, markerAtThisPoint: marker(), data })
+function record(op: string, data?: Record<string, unknown>, where?: Record<string, unknown>) {
+  state.journal.push({ op, markerAtThisPoint: marker(), data, where })
 }
 
 const syncLogClient = {
@@ -179,7 +179,9 @@ const syncLogClient = {
   async updateMany(args: { where: Record<string, unknown>; data: Record<string, unknown> }) {
     const matched = state.syncRows.filter((row) => matches(row, args.where))
     for (const row of matched) Object.assign(row, args.data)
-    record('syncLog.updateMany', args.data)
+    // The WHERE is journalled too (o3d-xl63 r5 #2): the fresh-post SYNCED write is claim-FENCED now,
+    // and a journal that recorded only `data` could not tell a fenced write from an unfenced one.
+    record('syncLog.updateMany', args.data, args.where)
     return { count: matched.length }
   },
 }
@@ -702,6 +704,9 @@ test('[o3d-9kek r10 f1] a FRESHLY POSTED Xero row claims the obligation in the w
   // this file is about is unchanged: the obligation is claimed in the SAME write.
   const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
   assert.ok(synced, 'the row must be marked SYNCED')
+  assert.equal(synced.where?.status, 'PROCESSING',
+    'and fenced on the claim: an update keyed on the row id alone would settle a row another worker had taken')
+  assert.ok(synced.where?.processingStartedAt instanceof Date)
   assert.equal(synced.data?.externalTransactionId, 'XBILL-1', 'this is the write that records the id')
   assert.ok(
     synced.data?.backReferenceFollowUpsPendingAt instanceof Date,
@@ -723,6 +728,15 @@ test('[o3d-9kek r10 f1] the same holds on the OUTBOX fresh-post branch', async (
   // o3d-550x: the SYNCED transition is an updateMany now — its where carries the "do not overwrite a
   // DIFFERENT document" precondition, which Prisma's unique-where update cannot express. The property
   // this file is about is unchanged: the obligation is claimed in the SAME write.
+  //
+  // o3d-xl63 r5 #2 ASSERTED `synced.where.status === 'PROCESSING'` here — that the settling write is
+  // also fenced on this worker's claim. That assertion is SUPERSEDED by #639 and is deliberately not
+  // restated: o3d-550x considered claim-fencing this exact write and rejected it in as many words,
+  // because a displaced worker that DID post must still be able to record its document id or the
+  // document exists in Xero with nothing in IMS naming it. The window r5 #2 was closing is closed
+  // instead by the precondition above — the row must not already name a DIFFERENT document — which
+  // refuses the same overwrite without discarding the evidence. See the note on the r5 #2 test in
+  // tests/accounting/xero-remote-write-lease.test.ts.
   const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
   assert.equal(synced?.data?.externalTransactionId, 'XBILL-1')
   assert.ok(synced?.data?.backReferenceFollowUpsPendingAt instanceof Date)

@@ -162,7 +162,15 @@ export async function waitForBudget(
    */
   budgetMs: number = Number.POSITIVE_INFINITY,
 ): Promise<{ ok: true } | { ok: false; reason: 'day' | 'budget'; waitMs: number }> {
-  let sleptMs = 0
+  /**
+   * AN ABSOLUTE DEADLINE, NOT A RUNNING TOTAL OF INTENDED SLEEPS (o3d-xl63 r5 #3).
+   *
+   * The previous shape accumulated `sleptMs += minuteWait` — the sleep it ASKED for, not the one it
+   * got. `setTimeout` is a floor, not a promise: an event loop busy with another tenant's response
+   * wakes this one late, and every millisecond of that overrun was invisible to the budget. Reading
+   * the real clock each time round makes an overslept timer cost what it actually cost.
+   */
+  const deadlineAt = Number.isFinite(budgetMs) ? Date.now() + budgetMs : Number.POSITIVE_INFINITY
   while (true) {
     const now = Date.now()
     const minute = (minuteBuckets.get(tenantId) ?? []).filter((ts) => ts >= now - 60_000)
@@ -177,9 +185,16 @@ export async function waitForBudget(
 
     const minuteWait = minute.length >= XERO_MINUTE_LIMIT ? 60_000 - (now - minute[0]) : 0
     if (minuteWait <= 0) return { ok: true }
-    if (sleptMs + minuteWait > budgetMs) return { ok: false, reason: 'budget', waitMs: minuteWait }
+    /**
+     * REFUSED AT EQUALITY, because equality is already outside (o3d-xl63 r5 #3).
+     *
+     * `>` let a sleep land the next attempt on the deadline exactly. Six minutes is not the last
+     * instant the key is good for — `isWithinXeroIdempotencyWindow` is `age < RETENTION`, so an
+     * attempt sent AT six minutes is one the retention predicate itself calls expired. A budget whose
+     * boundary case is the one the rest of the codebase treats as unprotected is not a bound.
+     */
+    if (now + minuteWait >= deadlineAt) return { ok: false, reason: 'budget', waitMs: minuteWait }
     await sleep(minuteWait)
-    sleptMs += minuteWait
   }
 }
 
@@ -287,6 +302,25 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
       `(${Math.round(elapsedMs / 1000)}s already spent on this call). Not waiting — the work must be ` +
       `deferred, where the local record of the external id is what prevents a duplicate.`,
   } as Response)
+  /**
+   * THE ATTEMPT THAT WAS ABOUT TO GO OUT AT OR PAST THE LINE (o3d-xl63 r5 #3).
+   *
+   * Distinct from the refusal above, and it has to be: that one is decided BEFORE a wait, from the
+   * wait's intended length. This one is decided AFTER every await, from the clock — the case where the
+   * waits were each individually affordable and the elapsed total still reached the deadline, whether
+   * by an exact-boundary sleep or by a timer that woke late. Its own message, so a test can tell which
+   * of the two refused and an operator can tell which bound was hit.
+   */
+  const budgetSpentResponse = (elapsedMs: number) => ({
+    ok: false,
+    status: 429,
+    text: async () =>
+      `Rate limited; the ${XERO_IN_REQUEST_RETRY_BUDGET_MS / 1000}s Xero remembers an Idempotency-Key ` +
+      `for was ALREADY SPENT (${Math.round(elapsedMs / 1000)}s) at the moment this attempt was about to ` +
+      `be sent, so it was not sent. At or past that line Xero treats the key as a new request, which is ` +
+      `exactly how a retry becomes a second document. The work must be deferred, where the local record ` +
+      `of the external id is what prevents a duplicate.`,
+  } as Response)
 
   // THE ONE PLACE the queued row's connection is authorised, and the last statement before anything
   // leaves this process (o3d-gfh, Codex r1 finding 3).
@@ -345,6 +379,26 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
       return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => egressRefusal } as Response
     }
 
+    /**
+     * RE-READ THE CLOCK BEFORE THE REQUEST GOES OUT, NOT BEFORE THE WAIT (o3d-xl63 r5 #3).
+     *
+     * `waitForBudget` decides from the wait it is ABOUT to take; between that decision and this line
+     * lies the wait itself, and at the bottom of the loop a Retry-After sleep. Both can overrun, and
+     * an exact-boundary wait lands here precisely ON the deadline. Deciding again HERE — from
+     * `Date.now()`, immediately before `noteRequest` records an attempt and `connectorFetch` sends
+     * one — is the only check that sees what actually elapsed. Strict: at the line the key is already
+     * expired as far as `isWithinXeroIdempotencyWindow` is concerned.
+     *
+     * AFTER the egress refusal above, and that order is the one that satisfies BOTH rules. This read
+     * is SYNCHRONOUS, so placing it second leaves the egress check's "nothing between here and
+     * `connectorFetch` awaits" true, while placing it first would put that check's `await` between
+     * this clock reading and the send — the very gap this re-read exists to eliminate.
+     */
+    const remainingAtSend = budgetRemainingMs()
+    if (remainingAtSend <= 0) {
+      return budgetSpentResponse(XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingAtSend)
+    }
+
     noteRequest(auth.tenantId)
     firstCallAt ??= Date.now()
 
@@ -366,7 +420,9 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     // what the tests drive. It exists so that raising either constant cannot silently reintroduce the
     // overrun; the test pins that relationship so the day it stops holding, this becomes live.
     const remaining = budgetRemainingMs()
-    if (lastRateLimitMs > remaining && attempt !== XERO_MAX_RETRIES) {
+    // `>=`, not `>` (r5 #3): a sleep exactly as long as what is left lands the next attempt ON the
+    // deadline, which the retention predicate already calls expired.
+    if (lastRateLimitMs >= remaining && attempt !== XERO_MAX_RETRIES) {
       return outOfBudgetResponse(lastRateLimitMs, XERO_IN_REQUEST_RETRY_BUDGET_MS - remaining)
     }
     if (lastRateLimitMs > XERO_MAX_RETRY_AFTER_MS || attempt === XERO_MAX_RETRIES) {

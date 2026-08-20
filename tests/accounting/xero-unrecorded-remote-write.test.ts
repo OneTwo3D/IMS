@@ -151,3 +151,113 @@ test('r3 #3: a claim lost while the pool was down is reported, not silently over
   assert.match(last.reason, /another worker owns it/,
     'the guarded write matched nothing, and that outcome is distinguishable from having recorded the id')
 })
+
+/**
+ * o3d-xl63 ROUND 5, FINDING 2 — THE SAME ORDERING, FOR THE OTHER WAY A RECORD CAN BE LOST.
+ *
+ * Above, the record cannot be written because the pool has no connections. Here the database is
+ * perfectly healthy and the record is refused anyway: the persist is claim-fenced now, and the claim
+ * was taken between the deadline being derived and the write being made. The document is in Xero
+ * either way, and the id exists nowhere but this process's memory either way — so the round-3
+ * ordering has to hold on this path too: fd 2 FIRST, unconditionally, before anything that could
+ * itself fail or block.
+ *
+ * This one is worse than the pool case and the evidence says so. There, the row keeps this worker's
+ * claim and the next run finishes it. Here the row belongs to a second worker which is free to post
+ * the document again, and nothing this process can write will stop it.
+ */
+function runLostClaimScenario(): { stdout: string; stderr: string } {
+  const code = `
+    const { writeSync } = await import('node:fs')
+    const { mock } = await import('node:test')
+    mock.module('@/lib/db', {
+      namedExports: {
+        db: {
+          // Healthy: the transaction starts and the callback runs. What refuses is the WHERE clause.
+          $transaction: async (fn) => fn({
+            accountingSyncLog: {
+              updateMany: async (args) => {
+                writeSync(2, 'FENCE-WRITE ' + JSON.stringify(args.where) + '\\n')
+                return { count: 0 }
+              },
+            },
+            accountingEvent: { updateMany: async () => { writeSync(2, 'MIRRORED-EVENT\\n'); return { count: 1 } } },
+            accountingEventLog: { create: async () => { writeSync(2, 'MIRRORED-EVENT\\n'); return {} } },
+          }),
+          accountingSyncLog: { updateMany: async () => { writeSync(2, 'FALLBACK-WRITE\\n'); return { count: 1 } } },
+        },
+        POST_REMOTE_PERSIST_TX_OPTIONS: { maxWait: 11000, timeout: 15000 },
+      },
+    })
+    mock.module('@/lib/activity-log', {
+      namedExports: {
+        logActivity: async (entry) => { writeSync(2, 'ACTIVITY-WRITE ' + JSON.stringify(entry) + '\\n') },
+        logActivityPersisted: async (entry) => { writeSync(2, 'ACTIVITY-WRITE ' + JSON.stringify(entry) + '\\n'); return true },
+      },
+    })
+    const ns = await import('@/lib/connectors/xero/sync-processor')
+    const mod = ns.persistPostedXeroDocument ? ns : ns.default
+    const recorded = await mod.persistPostedXeroDocument({
+      entry: { id: 'log-88', type: 'INVOICE_PAYMENT', referenceType: 'SalesInvoice', referenceId: 'inv-88' },
+      payload: {},
+      externalId: 'PAY-88',
+      // A HEALTHY claim: minutes left on it. The arithmetic has no complaint — which is the point.
+      // Only the WHERE clause can discover that the row has changed hands.
+      claimedAt: new Date(Date.now() - 1000),
+    })
+    console.log(JSON.stringify({ recorded }))
+    process.exit(0)
+  `
+  const child = spawnSync(process.execPath, ['--import', 'tsx', '--experimental-test-module-mocks', '-e', code], {
+    cwd: REPO_ROOT,
+    encoding: 'utf8',
+    stdio: ['ignore', 'pipe', 'pipe'],
+    env: { ...process.env, NODE_NO_WARNINGS: '1' },
+  })
+  assert.equal(child.status, 0, `a lost claim must not crash the sweep. stderr:\n${child.stderr}`)
+  return { stdout: child.stdout, stderr: child.stderr }
+}
+
+test('r5 #2: a claim lost mid-persist reports the id to fd 2 BEFORE the database, and records nothing over the new owner', () => {
+  const { stdout, stderr } = runLostClaimScenario()
+
+  assert.deepEqual(JSON.parse(stdout.trim()), { recorded: false },
+    'the caller is told the row was not recorded, so it does not go on to report success')
+
+  // The write was ATTEMPTED and it was FENCED — without both, this proves nothing.
+  const fenceLine = stderr.split('\n').find((line) => line.startsWith('FENCE-WRITE'))
+  assert.ok(fenceLine, 'the persist must have attempted its write')
+  const fenceWhere = JSON.parse(fenceLine!.slice('FENCE-WRITE '.length))
+  assert.equal(fenceWhere.id, 'log-88')
+  assert.equal(fenceWhere.status, 'PROCESSING')
+  assert.ok(fenceWhere.processingStartedAt,
+    "the claim is IN the WHERE — an update keyed on the row id alone could not have refused, and would "
+      + "have flipped the new owner's row to SYNCED carrying this worker's id")
+
+  assert.equal(stderr.includes('MIRRORED-EVENT'), false,
+    'the fence throws before the mirrored event, so the transaction rolls back whole rather than leaving '
+      + 'an event that says POSTED beside a row that does not')
+  assert.equal(stderr.includes('FALLBACK-WRITE'), false,
+    'and no recovery write is attempted: every write here is fenced on a claim that is gone, so it could '
+      + 'only match nothing — or, unfenced, trample the worker that now owns the row')
+
+  const evidenceAt = stderr.indexOf('[UNRECORDED-REMOTE-WRITE]')
+  const activityAt = stderr.indexOf('ACTIVITY-WRITE')
+  assert.ok(evidenceAt >= 0, `the id must reach fd 2. Got:\n${stderr}`)
+  assert.ok(activityAt >= 0, 'and an activity row must follow, or the evidence is grep-only')
+  assert.ok(evidenceAt < activityAt,
+    'fd 2 FIRST (r3 #3): the durable record is attempted only after the line that needs nothing but this '
+      + 'process still holding the id')
+
+  const evidence = JSON.parse(stderr.slice(evidenceAt + '[UNRECORDED-REMOTE-WRITE]'.length).split('\n')[0])
+  assert.equal(evidence.externalId, 'PAY-88', 'the id itself, not a pointer to a row that does not have it')
+  assert.equal(evidence.recorded, false)
+  assert.match(evidence.reason, /claim was lost between deriving the deadline and writing/,
+    'and the reason distinguishes this from the pool-exhaustion give-up, which is a different remedy')
+
+  const activity = JSON.parse(stderr.slice(activityAt + 'ACTIVITY-WRITE '.length).split('\n')[0])
+  assert.equal(activity.action, 'xero_sync_claim_lost_during_persist')
+  assert.equal(activity.level, 'ERROR', 'a document in Xero that no row names is not a warning')
+  assert.equal(activity.metadata.externalId, 'PAY-88')
+  assert.match(activity.description, /CHECK XERO/)
+})

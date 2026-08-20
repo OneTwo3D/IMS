@@ -189,31 +189,94 @@ test('r4 #2: a persist reached on a LAPSED claim runs no transaction at all, and
   assert.equal(data.externalTransactionId, 'PAY-77', 'and the id of the document Xero holds is still recovered')
 })
 
-test('both sweep paths re-take the claim before posting and anchor the persist to the RENEWED claim', () => {
+test('both sweep paths open the lease before posting and anchor the persist to the claim it currently holds', () => {
   // Structural, in the style of the round-3 test one file over: the guard's whole value is that it sits
   // between the claim and the post, and nothing about a passing behavioural test would notice it being
   // moved or dropped.
+  //
+  // r5 #1 restates round 4's property against the lease that replaced the bare re-take: the re-take now
+  // happens INSIDE `openRemoteWriteLease`, and the persist anchors to `lease.heldFrom()` — the claim as
+  // it stands after the last fence — rather than to a timestamp captured before processEntry ran.
   const source = readFileSync(new URL('../../lib/connectors/xero/sync-processor.ts', import.meta.url), 'utf8')
   const lines = source.split('\n')
   const postSites = lines.flatMap((line, index) => (line.includes('await processEntry(entry.id,') ? [index] : []))
   assert.equal(postSites.length, 2, 'the direct path and the outbox path — if this changed, so did the fix')
 
   for (const index of postSites) {
-    const before = lines.slice(Math.max(0, index - 22), index).join('\n')
-    assert.match(before, /renewClaimForRemoteWrite\(entry\.id, claimedAt\)/,
-      `the remote write at line ${index + 1} must re-take the claim first`)
-    assert.match(before, /if \(!postClaimedAt\)/,
-      `and must post NOTHING when the claim is gone (line ${index + 1})`)
-    assert.match(lines[index], /payload, postClaimedAt\)/,
-      `and everything downstream must fence on the RENEWED claim, not the one taken before the deferral checks`)
+    const before = lines.slice(Math.max(0, index - 26), index).join('\n')
+    assert.match(before, /openRemoteWriteLease\(entry\.id, claimedAt/,
+      `the remote write at line ${index + 1} must open the lease (which re-takes the claim) first`)
+    assert.match(before, /if \(!lease\)/,
+      `and must post NOTHING when the claim is already gone (line ${index + 1})`)
+    assert.match(lines[index], /payload, lease\)/,
+      `and everything downstream must fence on the lease, not on the claim taken before the deferral checks`)
   }
 
   const persistSites = lines.flatMap((line, index) => (line.includes('await persistPostedXeroDocument({') ? [index] : []))
   assert.equal(persistSites.length, 2)
   for (const index of persistSites) {
-    assert.match(lines.slice(index, index + 9).join('\n'), /claimedAt: postClaimedAt,/,
-      `the persist at line ${index + 1} must be anchored to the renewed claim`)
+    assert.match(lines.slice(index, index + 9).join('\n'), /claimedAt: lease\.heldFrom\(\),/,
+      `the persist at line ${index + 1} must be anchored to the claim the lease currently holds`)
   }
+
+  // And the outbox path must pass its job in, or the queue-side lock is never renewed.
+  const outboxLease = lines.findIndex((line) => line.includes('openRemoteWriteLease(entry.id, claimedAt, job)'))
+  assert.ok(outboxLease > 0,
+    'the outbox path must hand its job to the lease so every fence renews the OUTBOX lock as well as the row claim')
+})
+
+test('r5 #1: EVERY remote mutation in processEntry is fenced immediately before it, and the fence is the last statement', () => {
+  // Round 4 fenced once, in front of the whole entry, and said so in its own commit message: "time
+  // burnt inside the processor between the re-take and each individual push call is still unfenced".
+  // This is the test for the part that was left. It is structural because that is the only way to
+  // catch the failure that matters — a NEW case added to the switch with no fence in front of it,
+  // which no behavioural test of the existing cases would ever notice.
+  const source = readFileSync(new URL('../../lib/connectors/xero/sync-processor.ts', import.meta.url), 'utf8')
+  const body = source.slice(source.indexOf('async function processEntry('), source.indexOf('async function updateBackReference('))
+  const lines = body.split('\n')
+
+  // Every call in processEntry that MUTATES something outside this database.
+  const mutations = [
+    'await pushSalesInvoice(',
+    'await updateSalesInvoice(',
+    'await pushPurchaseBill(',
+    'await updatePurchaseBill(',
+    'await xeroUploadAttachment(',
+    'await sendAccountingInvoiceEmailInternal(',
+    'await pushInvoiceNoteToWc(',
+    'return pushCreditNote(',
+    'return pushPurchaseCreditNote(',
+    'await allocatePurchaseCreditNote(',
+    'return pushManualJournal(',
+    'await putXeroTaxRate(',
+  ]
+  // The two `xeroPost('Payments'` sites are matched separately: the same text appears twice.
+  const paymentSites = lines.flatMap((line, index) => (line.includes("xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments'") ? [index] : []))
+  assert.equal(paymentSites.length, 2, 'INVOICE_PAYMENT and BILL_PAYMENT — a payment has no natural key Xero dedupes on')
+
+  const sites = [...paymentSites]
+  for (const needle of mutations) {
+    const found = lines.flatMap((line, index) => (line.includes(needle) ? [index] : []))
+    assert.equal(found.length, 1, `expected exactly one call site for ${needle} — the list above has drifted from the code`)
+    sites.push(found[0])
+  }
+
+  for (const index of sites) {
+    // IMMEDIATELY before: the fence's value is that nothing awaitable happens between proving the
+    // claim and using it. One line of leeway, for the comment the fence carries.
+    const preceding = lines.slice(Math.max(0, index - 2), index)
+    assert.ok(
+      preceding.some((line) => line.includes('if (!fence.ok) return fence.result')),
+      `the remote mutation at processEntry line ${index + 1} (${lines[index].trim().slice(0, 60)}) is NOT fenced `
+        + `immediately before it — a claim proven earlier in the entry has had every preparation call since to lapse`,
+    )
+  }
+
+  assert.equal(
+    lines.filter((line) => line.includes('await lease.fenceBeforeRemoteWrite(')).length,
+    sites.length,
+    'every fence must belong to a mutation and every mutation to a fence — a spare one is a renewal protecting nothing',
+  )
 })
 
 test('the sweep POSTS NOTHING when the claim was taken between claiming and posting', async () => {

@@ -8,6 +8,8 @@ import { createHash } from 'crypto'
 import { db, POST_REMOTE_PERSIST_TX_OPTIONS } from '@/lib/db'
 import { XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import {
+  LostClaimDuringPersistError,
+  LOST_CLAIM_DURING_PERSIST_REASON,
   persistAfterRemoteWrite,
   postRemotePersistDeadlineMs,
   reportUnrecordedRemoteWrite,
@@ -1355,10 +1357,133 @@ export async function renewClaimForRemoteWrite(entryId: string, heldFrom: Date):
  * What to say when a claim was lost before anything was sent. Nothing is wrong with the row — it is
  * being worked on by somebody else — so this is a re-drive, not a failure.
  */
-function lostClaimMessage(entryId: string): string {
+function lostClaimMessage(entryId: string, operation?: string): string {
   return `Xero sync log ${entryId} was not posted: this worker's claim on it had been taken by another `
-    + `worker before the remote write began, so posting would have created a second document. The row `
-    + `belongs to whoever holds it now.`
+    + `worker before the remote write${operation ? ` (${operation})` : ''} began, so posting would have `
+    + `created a second document. The row belongs to whoever holds it now.`
+}
+
+/**
+ * ONE ABSOLUTE LEASE OVER THE WHOLE ENTRY, AND A FENCE AT EVERY REMOTE MUTATION (o3d-xl63 r5 #1).
+ *
+ * Round 4 re-took the claim at the instant the remote write began and flagged, in its own commit
+ * message, what that did NOT close: `processEntry` is not one call. Preparing an invoice loops over
+ * every distinct item; a credit-note allocation does two reads and then a write; several types read
+ * the chart of accounts first. Every one of those goes through the same rate-limited client, whose
+ * in-request budget is six minutes PER CALL. The re-take happened once, in front of all of it — so
+ * with enough sequential preparation calls the claim it took could be gone again by the time the
+ * document itself was sent, which is the very state the re-take existed to prevent.
+ *
+ * Two bounds, and they answer different questions:
+ *
+ *  • THE FENCE answers "is this row still mine, right now?" It re-takes the claim immediately before
+ *    each remote mutation — not once per entry — so the exclusivity is proven at the instant it is
+ *    relied on rather than minutes earlier. Renewing rather than merely checking also means a long
+ *    but legitimate entry stops LOOKING stale to the next sweep tick, which is what invited the
+ *    second worker in.
+ *
+ *  • THE ABSOLUTE DEADLINE answers "has this entry had long enough?" It is fixed when the lease opens
+ *    and NEVER moves, however many times the claim is renewed. Without it the renewals are a
+ *    perpetual motion machine: a row wedged behind a rate limit could hold its claim for ever and
+ *    never post. Preparation calls are inside it, which is the whole point — round 4's window began
+ *    at the post; this one begins where the work does.
+ *
+ * A refusal from either is the SAME outcome, and it is the good one: nothing has been sent, so there
+ * is nothing to be duplicated, no id to lose, and no persist to fence. The row is handed back.
+ */
+export const XERO_ENTRY_LEASE_MS = CLAIM_STALE_MS
+
+export type RemoteWriteFence = { ok: true } | { ok: false; result: EntryResult }
+
+export type RemoteWriteLease = {
+  entryId: string
+  /** The claim this worker holds RIGHT NOW. Moves forward on every successful fence. */
+  heldFrom: () => Date
+  /** Wall-clock instant past which no further remote mutation may BEGIN. Never moves. */
+  deadlineAt: number
+  /** Re-take the claim immediately before a remote mutation, or refuse to make it. */
+  fenceBeforeRemoteWrite: (operation: string) => Promise<RemoteWriteFence>
+}
+
+/**
+ * Renew this worker's lock on the outbox job, fenced on the exact `lockedAt` it holds.
+ *
+ * The sync-row claim is not the only thing that can lapse under a long entry: the outbox job carries
+ * its own `staleLockMs` (the same fifteen minutes), and a job whose lock has gone stale is handed to
+ * another worker by `claimIntegrationOutboxWork` exactly as the row is. Fencing one and not the other
+ * would leave the second worker free to re-post from the queue side.
+ *
+ * On success `job.lockedAt` is advanced IN PLACE, because every `markXeroOutbox*` helper fences on
+ * it — a renewal that did not update the caller's copy would make the job impossible to complete.
+ */
+async function renewOutboxLockForRemoteWrite(job: IntegrationOutboxRow): Promise<boolean> {
+  if (!job.lockedAt) return false
+  const renewedAt = new Date()
+  const renewed = await db.integrationOutbox.updateMany({
+    where: {
+      id: job.id,
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      lockedBy: XERO_ACCOUNTING_WORKER_ID,
+      lockedAt: job.lockedAt,
+    },
+    data: { lockedAt: renewedAt },
+  })
+  if (renewed.count !== 1) return false
+  job.lockedAt = renewedAt
+  return true
+}
+
+/**
+ * Open a lease for one entry: re-take the claim now, and fix the absolute deadline from this moment.
+ *
+ * Returns null when the claim is already gone, which is round 4's outcome unchanged — nothing is
+ * sent and the row belongs to whoever holds it.
+ */
+export async function openRemoteWriteLease(
+  entryId: string,
+  claimedAt: Date,
+  outboxJob?: IntegrationOutboxRow,
+  now: () => number = () => Date.now(),
+): Promise<RemoteWriteLease | null> {
+  const renewed = await renewClaimForRemoteWrite(entryId, claimedAt)
+  if (!renewed) return null
+
+  let heldFrom = renewed
+  const deadlineAt = now() + XERO_ENTRY_LEASE_MS
+
+  return {
+    entryId,
+    heldFrom: () => heldFrom,
+    deadlineAt,
+    async fenceBeforeRemoteWrite(operation: string): Promise<RemoteWriteFence> {
+      // The deadline is checked BEFORE the renewal, so an entry that has run out of lease does not
+      // extend its own claim on the way to refusing. Nothing is sent either way.
+      if (now() >= deadlineAt) {
+        const message = `Xero sync log ${entryId} was not posted: this entry has held its lease for the `
+          + `full ${Math.round(XERO_ENTRY_LEASE_MS / 60_000)} minutes it is allowed — preparation calls `
+          + `included — and the remote write (${operation}) was not started. Nothing was sent, so the row `
+          + `is handed back intact and the next run gets a fresh lease.`
+        return { ok: false, result: { success: false, error: message, notPosted: { reason: 'lease-expired', operation, message } } }
+      }
+
+      // Outbox lock first: if it is gone the sync-row claim is left exactly as it was, so the two
+      // never disagree about who holds this work.
+      if (outboxJob && !(await renewOutboxLockForRemoteWrite(outboxJob))) {
+        const message = `Xero sync log ${entryId} was not posted: this worker's lock on outbox job `
+          + `${outboxJob.id} had been taken before the remote write (${operation}) began, so the queue `
+          + `may already be posting it. Nothing was sent.`
+        return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
+      }
+
+      const again = await renewClaimForRemoteWrite(entryId, heldFrom)
+      if (!again) {
+        const message = lostClaimMessage(entryId, operation)
+        return { ok: false, result: { success: false, error: message, notPosted: { reason: 'claim-lost', operation, message } } }
+      }
+      heldFrom = again
+      return { ok: true }
+    },
+  }
 }
 
 // Exported for tests/accounting/xero-unrecorded-remote-write.test.ts: the give-up path is the one
@@ -1431,6 +1556,82 @@ export async function persistPostedXeroDocument(input: {
     if (!(error instanceof UnrecordedRemoteWriteError)) throw error
     await reportUnrecordedXeroWrite({ entry, externalId, claimedAt, error })
     return { persisted: false, reason: 'pool-exhausted' }
+  }
+}
+
+/**
+ * The claim was lost between deriving the persist's deadline and making its write (o3d-xl63 r5 #2).
+ *
+ * There is no recovery write to attempt, and that is not a gap — it is the finding. Every write this
+ * module makes to a sync row is fenced on this worker's claim, and the claim is gone; a fenced write
+ * would match nothing, and an UNFENCED one is exactly the trample the fence was added to prevent.
+ * What is left is evidence, and the id is the whole of it.
+ *
+ * fd 2 FIRST and unconditionally, before anything touches the database — the round-3 ordering, kept
+ * for the same reason: it is the only channel with no precondition beyond this process still holding
+ * the id. The activity row follows, because a log line nobody greps is not an alert; here, unlike the
+ * pool-exhaustion case, the database is not the thing that failed, so it is very likely reachable.
+ */
+async function reportLostClaimAfterXeroWrite(input: {
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+  externalId: string | null
+  claimedAt: Date
+  error: LostClaimDuringPersistError
+}): Promise<void> {
+  const { entry, externalId, claimedAt, error } = input
+
+  reportUnrecordedRemoteWrite({
+    what: error.what,
+    externalId,
+    detail: {
+      connector: XERO_CONNECTOR,
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      claimedAt: claimedAt.toISOString(),
+    },
+    attempts: 1,
+    elapsedMs: 0,
+    recorded: false,
+    reason: LOST_CLAIM_DURING_PERSIST_REASON,
+  })
+
+  const description = externalId
+    ? `Xero accepted this document (${externalId}) but the record of it could NOT be written: this `
+      + `worker's claim on sync log ${entry.id} was taken by another worker before the write landed. `
+      + `The row now belongs to that worker, which may post the document a SECOND time. CHECK XERO for `
+      + `${externalId} and for a duplicate of it before doing anything to this row.`
+    : `Xero accepted a document for sync log ${entry.id} but returned no id, AND this worker's claim `
+      + `was taken before the attempt could be recorded. There is nothing that would stop a re-post. `
+      + `CHECK XERO before re-queueing this row.`
+
+  try {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_sync_claim_lost_during_persist',
+      tag: 'sync',
+      level: 'ERROR',
+      description,
+      metadata: {
+        syncLogId: entry.id,
+        type: entry.type,
+        externalId,
+        claimedAt: claimedAt.toISOString(),
+        reason: LOST_CLAIM_DURING_PERSIST_REASON,
+      },
+      resolveUser: false,
+    })
+  } catch (activityError) {
+    reportUnrecordedRemoteWrite({
+      what: error.what,
+      externalId,
+      attempts: 1,
+      elapsedMs: 0,
+      recorded: false,
+      reason: `the activity row for the lost claim could not be written either, so THIS LINE IS THE `
+        + `ONLY RECORD of ${externalId ?? 'an unidentified document'} in Xero: ${String(activityError)}`,
+    })
   }
 }
 
@@ -1693,11 +1894,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
 
-      // o3d-xl63 r4 #1: re-take the claim at the instant the remote write begins, and post NOTHING if
-      // it is gone. Everything downstream fences on the timestamp this returns, not on the one taken
-      // before the deferral checks above.
-      const postClaimedAt = await renewClaimForRemoteWrite(entry.id, claimedAt)
-      if (!postClaimedAt) {
+      // o3d-xl63 r4 #1 / r5 #1: open the lease. Opening it re-takes the claim at the instant the work
+      // begins and posts NOTHING if it is gone; from here on every remote mutation inside processEntry
+      // fences on it again, and the absolute deadline it fixes covers the preparation calls too.
+      const lease = await openRemoteWriteLease(entry.id, claimedAt)
+      if (!lease) {
         await logActivity({
           entityType: 'SYSTEM',
           action: 'xero_sync_claim_lost_before_post',
@@ -1711,13 +1912,30 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
 
-            // THE RENEWED CLAIM IS THE ONE EVERYTHING DOWNSTREAM FENCES ON. `held` above was built from the
-      // instant taken before the deferral checks; the row now carries `postClaimedAt`, so a fence
-      // built from the older holder would match NOTHING — and these fences fail closed, so the
-      // symptom would be silence rather than an error. Wrapped rather than passed raw because
-      // o3d-550x's contract (merged as #639) is that a claim is a HOLDER asked for its instant at the
-      // point of use, and a bare `Date` is a compile error.
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimHeldFrom(postClaimedAt))
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease)
+
+      // BEFORE `skipped` and before `success` (r5 #1): this row stopped without sending anything, so
+      // it must not be failed, must not spend a retry, and must not be persisted.
+      if (syncResult.notPosted) {
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: syncResult.notPosted.reason === 'lease-expired'
+            ? 'xero_sync_lease_expired_before_post'
+            : 'xero_sync_claim_lost_before_post',
+          tag: 'sync',
+          level: 'WARNING',
+          description: syncResult.notPosted.message,
+          metadata: {
+            syncLogId: entry.id,
+            type: entry.type,
+            operation: syncResult.notPosted.operation,
+            reason: syncResult.notPosted.reason,
+          },
+          resolveUser: false,
+        })
+        result.skipped++
+        continue
+      }
 
       if (syncResult.skipped) {
         // processEntry already terminalised this row (e.g. its order was cancelled — o3d-5rs). Nothing
@@ -1733,9 +1951,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           entry,
           payload,
           externalId: syncResult.externalId,
-          // The RENEWED claim (r4 #1): the persist's deadline, and the claim-fenced terminal write on
-          // the give-up path, must both fence on the claim this worker actually holds.
-          claimedAt: postClaimedAt,
+          // The claim as it stands after the LAST fence (r4 #1, r5 #1): the persist's deadline, its own
+          // fence, and the claim-fenced terminal write on the give-up path must all use the claim this
+          // worker actually holds — which the fence before the document post moved forward.
+          claimedAt: lease.heldFrom(),
           // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
           // made is recorded and orders the document against other writers.
           externalRevisionAt: syncResult.externalRevisionAt ?? null,
@@ -2149,11 +2368,13 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
 
-      // o3d-xl63 r4 #1: as in the direct path — re-take the claim at the instant the remote write
-      // begins. The outbox job is handed back for retry rather than failed: nothing was sent, and by
-      // the time it is re-claimed the row is either SYNCED (skipped at the top) or free again.
-      const postClaimedAt = await renewClaimForRemoteWrite(entry.id, claimedAt)
-      if (!postClaimedAt) {
+      // o3d-xl63 r4 #1 / r5 #1: as in the direct path — open the lease, which re-takes the claim at the
+      // instant the work begins. The job is passed in, so every fence renews the OUTBOX lock as well:
+      // the queue side has its own fifteen-minute staleness and would otherwise hand this job to a
+      // second worker while the first is still legitimately working. Handed back for retry rather than
+      // failed, because nothing was sent.
+      const lease = await openRemoteWriteLease(entry.id, claimedAt, job)
+      if (!lease) {
         await markXeroOutboxRetry(job, lostClaimMessage(entry.id))
         await logActivity({
           entityType: 'SYSTEM',
@@ -2168,13 +2389,40 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
 
-            // THE RENEWED CLAIM IS THE ONE EVERYTHING DOWNSTREAM FENCES ON. `held` above was built from the
-      // instant taken before the deferral checks; the row now carries `postClaimedAt`, so a fence
-      // built from the older holder would match NOTHING — and these fences fail closed, so the
-      // symptom would be silence rather than an error. Wrapped rather than passed raw because
-      // o3d-550x's contract (merged as #639) is that a claim is a HOLDER asked for its instant at the
-      // point of use, and a bare `Date` is a compile error.
-      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, claimHeldFrom(postClaimedAt))
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, lease)
+
+      if (syncResult.notPosted) {
+        // The lock may itself be what was lost, in which case handing the job back cannot work — say
+        // so rather than letting the fence's own throw escape into the generic failure handler and
+        // spend a retry on a row that was never posted.
+        try {
+          await markXeroOutboxRetry(job, syncResult.notPosted.message)
+        } catch (releaseError) {
+          console.error(
+            `[xero-sync] outbox job ${job.id} could not be handed back after a lost claim `
+              + `(${syncResult.notPosted.reason}): ${String(releaseError)}`,
+          )
+        }
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: syncResult.notPosted.reason === 'lease-expired'
+            ? 'xero_sync_lease_expired_before_post'
+            : 'xero_sync_claim_lost_before_post',
+          tag: 'sync',
+          level: 'WARNING',
+          description: syncResult.notPosted.message,
+          metadata: {
+            syncLogId: entry.id,
+            type: entry.type,
+            outboxJobId: job.id,
+            operation: syncResult.notPosted.operation,
+            reason: syncResult.notPosted.reason,
+          },
+          resolveUser: false,
+        })
+        result.skipped++
+        continue
+      }
 
       if (syncResult.skipped) {
         // processEntry already terminalised this row (e.g. its order was cancelled — o3d-5rs). Complete
@@ -2190,9 +2438,8 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           entry,
           payload,
           externalId: syncResult.externalId,
-          // The RENEWED claim (r4 #1): the persist's deadline, and the claim-fenced terminal write on
-          // the give-up path, must both fence on the claim this worker actually holds.
-          claimedAt: postClaimedAt,
+          // The claim as it stands after the LAST fence (r4 #1, r5 #1) — see the direct path.
+          claimedAt: lease.heldFrom(),
           // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
           // made is recorded and orders the document against other writers.
           externalRevisionAt: syncResult.externalRevisionAt ?? null,
@@ -2339,6 +2586,12 @@ type EntryResult = {
   externalRevisionAt?: Date | null
   error?: string
   skipped?: boolean
+  /**
+   * Set when the entry stopped BEFORE sending anything (o3d-xl63 r5 #1). Distinct from a failure:
+   * a failure may have reached Xero, this provably did not, so the row is handed back rather than
+   * having its retry count spent. Callers must test this before `skipped` and before `success`.
+   */
+  notPosted?: { reason: 'claim-lost' | 'lease-expired'; operation: string; message: string }
 }
 
 /**
@@ -3076,11 +3329,13 @@ async function processEntry(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-  held: HeldClaim,
+  // The LEASE, not a claim timestamp (o3d-xl63 r5 #1). Every remote mutation below fences on it, and
+  // the caller reads `lease.heldFrom()` afterwards to anchor the persist to the claim actually held.
+  lease: RemoteWriteLease,
 ): Promise<EntryResult> {
   return withAccountingPostingIntent(
     { connector: XERO_CONNECTOR, payload, type, referenceType, referenceId },
-    () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, held),
+    () => processClaimedEntry(entryId, type, referenceType, referenceId, payload, lease),
   )
 }
 
@@ -3090,12 +3345,12 @@ async function processClaimedEntry(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
-  // o3d-550x: the HELD CLAIM, not a snapshot instant. Development split this function out of
-  // `processEntry` (o3d-19gy / o3d-s36z posting intent) while this branch was replacing the carried
-  // `claimedAt: Date` with a holder read at the point of use — the two changes merged textually and
-  // the parameter kept the old name and type. A bare `Date` is a compile error at every fence below,
-  // which is exactly what `HeldClaim` exists to force.
-  held: HeldClaim,
+  // THE LEASE (o3d-xl63 r5 #1). Development split this function out of `processEntry` for the
+  // posting-intent wrapper (o3d-19gy / o3d-s36z) and gave it a `HeldClaim`; this branch needs more
+  // than the holder here, because every remote mutation below calls `lease.fenceBeforeRemoteWrite`
+  // to re-take the claim immediately before it sends. `RemoteWriteLease` satisfies `HeldClaim`
+  // structurally, so everything downstream that only wants the holder still takes it unchanged.
+  lease: RemoteWriteLease,
 ): Promise<EntryResult> {
   const postingMode = payload._postingMode
 
@@ -3129,7 +3384,7 @@ async function processClaimedEntry(
 
   switch (type) {
     case 'SALES_INVOICE': {
-      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, held)
+      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
       // o3d-k26m.5: the number must be ours to post under. Refusing is recoverable; overwriting a
@@ -3138,6 +3393,9 @@ async function processClaimedEntry(
       const numberFence = await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, held)
       if (!numberFence.post) return numberFence.result
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
+      // r5 #1: the claim is re-taken HERE, after the scope read and the cancelled-order guard, not once at the top of the entry.
+      const fence = await lease.fenceBeforeRemoteWrite('sales-invoice')
+      if (!fence.ok) return fence.result
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
         contactName: payload.contactName as string,
@@ -3170,10 +3428,12 @@ async function processClaimedEntry(
       }
       // Same cancelled-order backstop as the create: don't modify an external receivable for an order
       // that has since been cancelled (retire the update instead), and fail closed on an unreadable order.
-      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, held)
+      const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, lease)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice-update', payload)
+      const fence = await lease.fenceBeforeRemoteWrite('sales-invoice-update')
+      if (!fence.ok) return fence.result
       const invoiceResult = await updateSalesInvoice(accountingInvoiceId, {
         invoiceNumber: payload.invoiceNumber as string,
         contactName: payload.contactName as string,
@@ -3204,6 +3464,8 @@ async function processClaimedEntry(
           }).catch(() => null)
         : null
       const billIdempotencyKey = buildXeroIdempotencyKey(entryId, 'bill', payload)
+      const fence = await lease.fenceBeforeRemoteWrite('purchase-bill')
+      if (!fence.ok) return fence.result
       const billResult = await pushPurchaseBill({
         invoiceNumber: payload.invoiceNumber as string | undefined,
         contactName: payload.contactName as string,
@@ -3229,6 +3491,8 @@ async function processClaimedEntry(
           }).catch(() => null)
         : null
       const billIdempotencyKey = buildXeroIdempotencyKey(entryId, 'bill-update', payload)
+      const fence = await lease.fenceBeforeRemoteWrite('purchase-bill-update')
+      if (!fence.ok) return fence.result
       const billResult = await updatePurchaseBill(accountingInvoiceId, {
         invoiceNumber: payload.invoiceNumber as string | undefined,
         contactName: payload.contactName as string,
@@ -3258,6 +3522,9 @@ async function processClaimedEntry(
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
       }
       try {
+        // A payment has no natural key Xero deduplicates on, so the local record is the ONLY thing between a second worker and a second payment. Prove the claim here.
+        const fence = await lease.fenceBeforeRemoteWrite('invoice-payment')
+        if (!fence.ok) return fence.result
         const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
           Invoice: { InvoiceID: accountingInvoiceId },
           Account: { AccountID: account.externalAccountId },
@@ -3292,6 +3559,9 @@ async function processClaimedEntry(
         }
         const pdfBuffer = await readFile(pdfPath)
         const filename = relPath.split('/').pop() ?? 'supplier-invoice.pdf'
+        // The PDF read above can be slow on a cold disk; fence after it, immediately before the upload.
+        const fence = await lease.fenceBeforeRemoteWrite('bill-attachment')
+        if (!fence.ok) return fence.result
         const uploadRes = await xeroUploadAttachment('Invoices', accountingInvoiceId, filename, pdfBuffer, 'application/pdf')
         if (!uploadRes.ok) {
           return { success: false, error: uploadRes.error ?? 'Failed to attach supplier invoice PDF' }
@@ -3308,6 +3578,10 @@ async function processClaimedEntry(
       if (!accountingInvoiceId || !orderId) {
         return { success: false, error: 'Missing accountingInvoiceId or referenceId for INVOICE_PDF' }
       }
+      // NO FENCE, deliberately (o3d-xl63 r5 #1). This branch makes no remote mutation: it GETs the
+      // PDF Xero already holds and writes the file path locally. Two workers doing it concurrently
+      // produce the same path from the same document — there is no second document to create, so a
+      // fence here would renew a claim to protect nothing.
       try {
         const { downloadXeroInvoicePdf, saveInvoicePdf } = await import('./invoice-pdf')
         const pdfBuffer = await downloadXeroInvoicePdf(accountingInvoiceId)
@@ -3327,6 +3601,9 @@ async function processClaimedEntry(
       const orderId = payload.referenceId as string | undefined
       if (!orderId) return { success: false, error: 'Missing referenceId for INVOICE_EMAIL' }
       const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
+      // Not a Xero call, but an external side effect all the same: a second worker here means the customer receives the invoice twice.
+      const fence = await lease.fenceBeforeRemoteWrite('invoice-email')
+      if (!fence.ok) return fence.result
       const emailResult = await sendAccountingInvoiceEmailInternal(orderId)
       return emailResult.success ? { success: true } : { success: false, error: emailResult.error ?? 'Failed to email invoice' }
     }
@@ -3335,6 +3612,8 @@ async function processClaimedEntry(
       const orderId = payload.referenceId as string | undefined
       if (!orderId) return { success: false, error: 'Missing referenceId for WC_INVOICE_NOTE' }
       const { pushInvoiceNoteToWc } = await import('@/lib/connectors/woocommerce/sync/invoice-note')
+      const fence = await lease.fenceBeforeRemoteWrite('wc-invoice-note')
+      if (!fence.ok) return fence.result
       const wcResult = await pushInvoiceNoteToWc(orderId)
       return wcResult.success ? { success: true } : { success: false, error: wcResult.error ?? 'Failed to notify WooCommerce about invoice' }
     }
@@ -3358,6 +3637,8 @@ async function processClaimedEntry(
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
       }
       try {
+        const fence = await lease.fenceBeforeRemoteWrite('bill-payment')
+        if (!fence.ok) return fence.result
         const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
           Invoice: { InvoiceID: accountingInvoiceId },
           Account: { AccountID: account.externalAccountId },
@@ -3382,6 +3663,8 @@ async function processClaimedEntry(
             select: { order: { select: { customerId: true } } },
           }).catch(() => null))?.order.customerId ?? undefined
         : undefined
+      const fence = await lease.fenceBeforeRemoteWrite('credit-note')
+      if (!fence.ok) return fence.result
       return pushCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
         contactName: payload.contactName as string,
@@ -3399,6 +3682,8 @@ async function processClaimedEntry(
       // audit-g5u2: supplier credit note (ACCPAYCREDIT) — e.g. crediting a
       // duplicate freight bill. The payload carries the supplier contact + the
       // expense-account lines (built by recordSupplierFreightCreditNote, g5u2.3).
+      const fence = await lease.fenceBeforeRemoteWrite('purchase-credit-note')
+      if (!fence.ok) return fence.result
       return pushPurchaseCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
         contactName: payload.contactName as string,
@@ -3424,6 +3709,9 @@ async function processClaimedEntry(
       if (!creditNoteId || !accountingInvoiceId || amount == null) {
         return { success: false, error: 'Missing creditNoteId, accountingInvoiceId, or amount for PURCHASE_CREDIT_NOTE_ALLOCATION' }
       }
+      // Two reads and a write inside this one call (the shape the review named); the fence is the last thing before it.
+      const fence = await lease.fenceBeforeRemoteWrite('purchase-credit-note-allocation')
+      if (!fence.ok) return fence.result
       const result = await allocatePurchaseCreditNote(
         { creditNoteId, invoiceId: accountingInvoiceId, amount, date: allocationDate },
         { idempotencyKey: buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), 'purchase-credit-note-allocation') },
@@ -3455,6 +3743,8 @@ async function processClaimedEntry(
         : type.startsWith('DAILY_BATCH_')
         ? `${type}:${referenceId}`
         : entryId
+      const fence = await lease.fenceBeforeRemoteWrite('manual-journal')
+      if (!fence.ok) return fence.result
       return pushManualJournal({
         date: payload.date as string,
         reference: payload.reference as string,
@@ -3471,6 +3761,8 @@ async function processClaimedEntry(
         return { success: false, error: 'TAX_RATE_SYNC payload missing name or components' }
       }
       const idempotencyKey = buildXeroIdempotencyKey(entryId, 'tax-rate', payload)
+      const fence = await lease.fenceBeforeRemoteWrite('tax-rate')
+      if (!fence.ok) return fence.result
       const result = await putXeroTaxRate({
         name,
         reportTaxType: payload.reportTaxType as string | null | undefined,

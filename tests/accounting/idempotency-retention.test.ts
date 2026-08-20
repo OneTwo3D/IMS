@@ -138,9 +138,13 @@ test('o3d-wahn r3 #4: the in-request retry loop is MEASURED, and it stays inside
 
   // THE BOUND, measured from the first HTTP call — which is where Xero starts the key's clock.
   const spanMs = attemptsAt[attemptsAt.length - 1] - attemptsAt[0]
+  // STRICT (o3d-xl63 r5 #3). `<=` accepted the boundary, and the boundary is not inside the window:
+  // `isWithinXeroIdempotencyWindow` is `age < RETENTION`, so an attempt sent at exactly six minutes is
+  // one this repository's own predicate calls expired. An assertion that admits the failing case is
+  // not a bound.
   assert.ok(
-    spanMs <= XERO_IN_REQUEST_RETRY_BUDGET_MS,
-    `the last in-request attempt went out ${spanMs}ms after the first, past the `
+    spanMs < XERO_IN_REQUEST_RETRY_BUDGET_MS,
+    `the last in-request attempt went out ${spanMs}ms after the first, at or past the `
       + `${XERO_IN_REQUEST_RETRY_BUDGET_MS}ms Xero remembers the Idempotency-Key for`,
   )
   assert.deepEqual(
@@ -294,4 +298,96 @@ test('o3d-wahn: the operator documentation records the same window as the code',
     'and links the page it came from')
   assert.match(doc, /manual retry is therefore a new request/i,
     'and states the consequence for the control the operator actually presses')
+})
+
+
+/**
+ * o3d-xl63 ROUND 5, FINDING 3 — THE BUDGET WAS NOT STRICT, AT EITHER END.
+ *
+ * `waitForBudget` refused a wait only when it was strictly LONGER than what was left, so a wait
+ * exactly as long as the remainder was taken — landing the next attempt ON six minutes. And having
+ * taken it, `performRequest` never looked at the clock again before sending: it decided from the wait
+ * it INTENDED, not the time that actually passed, so a timer that woke late sent the attempt later
+ * still with nothing to notice.
+ *
+ * Both cases send a request Xero treats as NEW — `isWithinXeroIdempotencyWindow` is `age < RETENTION`
+ * — which is exactly how an in-request retry stops being a retry and becomes a second document.
+ */
+
+test('r5 #3: a wait exactly as long as what is left is REFUSED, because the boundary is already outside', async (t) => {
+  currentTenantId = 'tenant-exact-boundary'
+  const { xeroGet, waitForBudget } = await import('@/lib/connectors/xero/api')
+
+  connectorFetchHandler = async () => new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  t.after(() => mock.timers.reset())
+
+  // Fill the minute bucket with real calls, so the 60s wait under test is one the real limiter wants
+  // to take rather than a state asserted into existence.
+  for (let i = 0; i < 55; i++) await xeroGet('Organisation')
+
+  type BudgetOutcome = Awaited<ReturnType<typeof waitForBudget>>
+  const outcomes: BudgetOutcome[] = []
+  // EXACTLY the wait it wants: 60,000ms of budget against a 60,000ms minute-limit wait.
+  void waitForBudget(currentTenantId, 60_000).then((result) => { outcomes.push(result) })
+  await settle()
+
+  assert.equal(outcomes.length, 1,
+    'it answered WITHOUT sleeping — taking this wait would put the next attempt on the deadline, where '
+      + 'the key is already gone')
+  const outcome = outcomes[0]
+  assert.equal(outcome.ok, false)
+  assert.equal(outcome.ok === false && outcome.reason, 'budget',
+    'and it is the budget that refused it, not the day limit')
+  assert.equal(outcome.ok === false && outcome.waitMs, 60_000)
+
+  // Not vacuous: one millisecond more of budget and the same state really does sleep.
+  const allowed: BudgetOutcome[] = []
+  void waitForBudget(currentTenantId, 60_001).then((result) => { allowed.push(result) })
+  await settle()
+  assert.equal(allowed.length, 0, 'with the wait strictly inside the budget it is asleep, not refusing')
+  await runClock(() => allowed.length > 0, 1_000, 120)
+  assert.equal(allowed[0]?.ok, true)
+})
+
+test('r5 #3: an OVERSLEPT timer cannot smuggle an attempt out past the window', async (t) => {
+  currentTenantId = 'tenant-overslept'
+  const { xeroGet, XERO_IN_REQUEST_RETRY_BUDGET_MS } = await import('@/lib/connectors/xero/api')
+
+  const attemptsAt: number[] = []
+  connectorFetchHandler = async () => {
+    attemptsAt.push(Date.now())
+    return new Response('rate limited', { status: 429, headers: { 'Retry-After': '90' } })
+  }
+
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  t.after(() => mock.timers.reset())
+
+  let done = false
+  const call = xeroGet('Invoices').then((result) => { done = true; return result })
+  // 200 SECONDS PER STEP against 90-second Retry-After sleeps: every sleep wakes 110s late, which is
+  // what a saturated event loop does and what `sleptMs += minuteWait` could not see. Two of these
+  // overshoot the six-minute window even though no individual sleep was ever unaffordable.
+  await runClock(() => done, 200_000, 40)
+
+  assert.equal(done, true, 'the call finished rather than blocking for ever')
+  const response = await call
+  assert.equal(response.ok, false)
+
+  const spanMs = attemptsAt[attemptsAt.length - 1] - attemptsAt[0]
+  assert.ok(
+    spanMs < XERO_IN_REQUEST_RETRY_BUDGET_MS,
+    `an attempt went out ${spanMs}ms after the first — at or past the ${XERO_IN_REQUEST_RETRY_BUDGET_MS}ms `
+      + `Xero remembers the Idempotency-Key for, so Xero would have treated it as a NEW request. The `
+      + `attempts landed at ${JSON.stringify(attemptsAt.map((at) => at - attemptsAt[0]))}`,
+  )
+  assert.deepEqual(attemptsAt.map((at) => at - attemptsAt[0]), [0, 200_000],
+    'the third attempt would have gone out at 400,000ms — 40s past the window — so it was not sent at all')
+
+  // And it says WHICH bound refused it, so an operator is not left guessing between this and the
+  // "the next wait would not fit" refusal decided before a sleep.
+  assert.match(response.error ?? '', /ALREADY SPENT/,
+    'the refusal names the at-send check, not the before-the-wait one')
+  assert.match(response.error ?? '', /work must be deferred/)
 })

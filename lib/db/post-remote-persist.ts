@@ -176,6 +176,49 @@ export function isConnectionAcquisitionTimeout(error: unknown): boolean {
 export const LAPSED_CLAIM_REASON =
   'the claim on this row no longer covers a persist, so another worker may already own it'
 
+/**
+ * THE PERSIST ITSELF MUST BE FENCED, NOT MERELY SCHEDULED INSIDE A LIVE CLAIM (o3d-xl63 r5 #2).
+ *
+ * Round 4 stopped a LAPSED claim from attempting the persist at all, which closes the case the
+ * arithmetic can see: deadline 0, so do not start. It cannot close the case the arithmetic cannot
+ * see. A deadline is computed once, from a claim believed held; the claim can be taken by another
+ * worker at any instant AFTER that computation — a clock skew, a sweep tick landing between the
+ * check and the write, a pause between the two.
+ *
+ * And what runs then is `update({ where: { id } })`: an unconditional write, keyed on the row id and
+ * nothing else. It flips a row another worker has re-claimed and is at that moment posting under to
+ * SYNCED, carrying THIS worker's external id. Two documents in the ledger; the row names one of them
+ * and reads finished. The give-up path never had this defect — its recovery write is
+ * `updateMany({ where: { ..., processingStartedAt: claimedAt } })` and does nothing when the claim is
+ * gone. The ordinary path is now fenced the same way, so the fence is a property of the write rather
+ * than of the moment it was scheduled.
+ *
+ * A fence that matches no row is NOT an error to swallow and NOT a failure to retry. The remote write
+ * happened; the id exists; only the right to record it on this row is gone. That is precisely what
+ * the terminal reporter exists to say, so this error carries the id there instead of being logged as
+ * a generic persistence fault.
+ */
+/** The reason, as a constant, so callers and tests assert on the cause rather than on prose. */
+export const LOST_CLAIM_DURING_PERSIST_REASON =
+  'the claim-fenced persist matched no row: the claim was lost between deriving the deadline and writing'
+
+export class LostClaimDuringPersistError extends Error {
+  readonly what: string
+
+  constructor(what: string) {
+    super(
+      `A completed remote write (${what}) could NOT be recorded locally: the claim-fenced persist `
+        + `matched no row, so this worker's claim was taken between the deadline being derived and the `
+        + `write being made. Another worker now owns the row and may post the document a SECOND time. `
+        + `Recording it here would have overwritten that worker's claim with this worker's id.`,
+      { cause: new Error(LOST_CLAIM_DURING_PERSIST_REASON) },
+    )
+    this.name = 'LostClaimDuringPersistError'
+    this.what = what
+  }
+}
+
+
 /** Thrown when the record of a completed remote write could not be persisted at all. */
 export class UnrecordedRemoteWriteError extends Error {
   readonly attempts: number

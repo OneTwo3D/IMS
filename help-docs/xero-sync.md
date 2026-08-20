@@ -1089,7 +1089,7 @@ either:
 
 | Retry | When it happens | Inside the 6-minute window? |
 | --- | --- | --- |
-| In-request `429` retry (inside one API call) | up to 3 waits of at most 90s, **plus** up to 60s of minute-rate-limit waiting before each attempt | **Yes, and now enforced** — the loop refuses any wait that would put the next attempt past six minutes and hands the work back to the queue instead. (A `429` was refused before Xero processed it, so there was nothing to deduplicate either way.) |
+| In-request `429` retry (inside one API call) | up to 3 waits of at most 90s, **plus** up to 60s of minute-rate-limit waiting before each attempt | **Yes, and enforced strictly** — the loop refuses any wait that would put the next attempt **at or past** six minutes, and re-reads the clock immediately before each attempt is actually sent so that an over-running timer is refused too. Past the line the work is handed back to the queue instead. (A `429` was refused before Xero processed it, so there was nothing to deduplicate either way.) |
 | First queued retry of a failed row | 5-minute backoff floor + tail jitter, then the next 5-minute `accounting-sync` tick | **Undetermined** — the floor alone (5 min) is inside the window; jitter, the tick, and however long the failed call itself took push it out. You cannot tell which happened |
 | Second and later retries | 10, 20, 40 minutes (capped at 60) | **No** |
 
@@ -1100,10 +1100,14 @@ when its floor is in fact inside it. Both are corrected above: the first is now 
 enforces, the second is honestly undetermined. **A protection you cannot tell is present is not one
 you may rely on** — which is why the local record below, not the key, is what the design depends on.
 
-So an automatic retry gets no more duplicate protection from the key than a manual one, and the
-cases where it matters most — a request that reached Xero but whose response was lost — are never
-retried inside the window at all. **Nothing about "the key is deterministic" makes a queued retry
-safe.** What does the work instead:
+So an automatic retry gets no more duplicate protection from the key than a manual one. Be exact
+about which retry, because the row above already is: the **first** queued retry may land on either
+side of the six minutes and you cannot tell which from outside, and the **second and later** retries
+are outside it unconditionally. An earlier version of this paragraph said such retries were "never
+retried inside the window at all", which contradicted the table two lines above it and overstated the
+case in the one direction that matters — it made a retry sound safely outside the window when its
+position is exactly what is unknown. **Nothing about "the key is deterministic" makes a queued retry
+safe**, whichever side of the line it lands on. What does the work instead:
 
 - **Sales invoices** are safe by Xero's own semantics, not by the key: `POST /Invoices` is
   update-or-create on `InvoiceNumber`, and IMS sends the order number, so a re-post replaces the
@@ -1118,14 +1122,34 @@ safe.** What does the work instead:
   ordinary write is **not attempted at all** — it updates the row by id with no claim check, so under
   a lost claim it could flip a row another worker is posting under. The give-up path below is used
   instead, because its write *is* claim-checked.
-- **The claim is re-taken at the moment the document is sent.** Posting is not the first thing the
-  worker does after claiming a row: it reads the connection's granted permissions, looks the customer
-  or supplier up in Xero, resolves item codes — and any of those can sit out a Xero rate limit for
-  minutes. So immediately before the document is sent, IMS re-takes its own claim on the row. If it is
-  still ours, the fifteen minutes restart from there, giving the post and the record that follows it
-  the whole window. If another worker has taken it, **nothing is sent** and the row is left to
-  whoever holds it, with a warning in the activity log (`xero_sync_claim_lost_before_post`). Not
-  sending is the cheapest possible outcome for a lost claim.
+- **The claim is re-taken at the moment the document is sent — every time, not once.** Posting is not
+  the first thing the worker does after claiming a row: it reads the connection's granted permissions,
+  looks the customer or supplier up in Xero, resolves item codes — and any of those can sit out a Xero
+  rate limit for minutes. Nor is a sync entry a single call: preparing an invoice loops over every
+  distinct item, and a credit-note allocation performs two reads before its write. So IMS re-takes its
+  own claim on the row immediately before **each** remote mutation, not once per entry. If it is still
+  ours, the fifteen minutes restart from there, giving that write and the record that follows it the
+  whole window. If another worker has taken it, **nothing is sent** and the row is left to whoever
+  holds it, with a warning in the activity log (`xero_sync_claim_lost_before_post`). Not sending is
+  the cheapest possible outcome for a lost claim. On the queued path the **outbox job's own lock is
+  renewed by the same fence**, because the queue has its own fifteen-minute staleness and would
+  otherwise hand the job to a second worker while the first is still legitimately working.
+- **One entry gets one lease, and renewals do not extend it.** The fence above stops another worker
+  taking the row; on its own it would also let one entry hold the row for ever, renewing every time it
+  crawled forward behind a rate limit. So the lease has an absolute deadline, fixed when the entry
+  starts — preparation calls included — and unmoved by any renewal. Past it no further remote write is
+  **started**: nothing has been sent, so the row is handed back untouched (it does not spend a retry)
+  and the next run gets a fresh lease, logged as `xero_sync_lease_expired_before_post`.
+- **The record of the post is claim-checked in the database, not just scheduled inside a live claim.**
+  The write that marks the row `SYNCED` and stores the external id carries this worker's claim in its
+  `WHERE`, so it lands on the row this worker still owns or lands nowhere at all. It used to be keyed
+  on the row id alone, which meant that if the claim was taken in the gap between checking it and
+  writing — a gap no amount of pre-checking can close — the write would flip a row another worker was
+  posting under to `SYNCED`, carrying this worker's id: two documents in Xero, one recorded, and the
+  row reading finished. When that fence now matches no row, the transaction is rolled back and the
+  event is reported as `xero_sync_claim_lost_during_persist` (activity log, `ERROR`) as well as on the
+  `[UNRECORDED-REMOTE-WRITE]` service-log line — **this is the case where a duplicate is most likely
+  and IMS cannot prevent it**, so check Xero for the id named in the message.
 - **If the re-drive still cannot record it**, the id is written to the service log as a single line
   beginning `[UNRECORDED-REMOTE-WRITE]`, containing the external id, the sync log id and the
   reference — because at that moment that id exists nowhere else. IMS then makes one more attempt
