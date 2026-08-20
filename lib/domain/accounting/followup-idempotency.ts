@@ -338,11 +338,10 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // a scope REFUSE for ever, so a genuinely new payment against a replacement invoice was blocked
   // by history that could not have touched it. `carried` is added unconditionally: it is a token
   // this very call has already committed to posting under, not a historical attempt.
-  const candidateTokens = new Set(
-    couldHaveCommitted
-      .filter((row) => !bodyProvesNoCallLeft(input.type, asPayload(row.payload)))
-      .map((row) => row.effectiveToken),
+  const mayHaveCommitted = couldHaveCommitted.filter(
+    (row) => !bodyProvesNoCallLeft(input.type, asPayload(row.payload)),
   )
+  const candidateTokens = new Set(mayHaveCommitted.map((row) => row.effectiveToken))
   if (carried) candidateTokens.add(carried)
   if (candidateTokens.size > 1 && moneyMoving) {
     return {
@@ -358,7 +357,23 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // it FIRST is the request that stands — pinning a newer row's materially different body
   // (amount, bank account, date) would record a settlement the ledger never made (Codex r6).
   // failedRows arrive newest-first, so the oldest match is the last one.
-  const pinnedTokenValue = carried ?? couldHaveCommitted[0]?.effectiveToken
+  //
+  // AND THE TOKEN IS CHOSEN FROM THE SAME SET THE REFUSAL COUNTS (o3d-qsbs, Codex r10 #1). The two
+  // predicates are deliberately not negations of each other, and the consequence for TOKEN SELECTION
+  // was missed: `couldHaveCommitted[0]` is the NEWEST surviving row whether or not it could ever
+  // have sent anything. So a newer row that PROVABLY never posted — a legacy body missing
+  // `accountingInvoiceId`, or a body missing `bankAccountId` — displaced the token of an older row
+  // that MAY have committed. Nothing refused, because the unsendable row's token is (correctly) not
+  // a candidate for having committed; the retry then went out under a token the ledger has never
+  // seen while a payment posted under the OTHER token may already stand. That is the duplicate
+  // payment this module exists to prevent, reintroduced one branch below the fix for it.
+  //
+  // So: prefer the newest attempt that may have committed. Falling back to `couldHaveCommitted[0]`
+  // only when NONE of them may have — every surviving token was then proven never to leave the
+  // process, so any of them reproduces a remote key the ledger has never seen and pinning the
+  // newest keeps the row-id reuse (and the `{}`-compacted case, which is never proof, in the
+  // may-have-committed set where it belongs).
+  const pinnedTokenValue = carried ?? mayHaveCommitted[0]?.effectiveToken ?? couldHaveCommitted[0]?.effectiveToken
   const sameToken = couldHaveCommitted.filter((row) => row.effectiveToken === pinnedTokenValue)
   // ...but only among bodies that could actually have reached the ledger. An incomplete body
   // is rejected pre-call by both connectors, so it provably never posted and pinning it

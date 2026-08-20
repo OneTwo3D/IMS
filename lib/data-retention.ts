@@ -5,6 +5,7 @@ import {
   UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
   backReferenceEvidenceTombstone,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/postable-sync-statuses'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 
 const RETENTION_KEYS = [
@@ -107,12 +108,32 @@ export async function purgeExpiredData(): Promise<{
       // may exist in the ledger, since no externalTransactionId was ever written. Deleting it by age
       // makes the order hard-deletable again.
       //
-      // An earlier revision of this branch exempted PROCESSING rows from deletion. That was
-      // REVERTED: it retains the full row — payload included, holding customer names, emails and
-      // financial lines — indefinitely, which contradicts the retention period the settings UI
-      // promises, and every connector switch would strand more. Doing it properly needs a compacted
-      // tombstone carrying only what the guard reads, which is tracked in o3d-nepa rather than
-      // bolted on here.
+      // o3d-nepa, THE ACTUAL P1: age alone never expires accounting work that CAN STILL BE POSTED.
+      // A PENDING, PROCESSING or FAILED row is not a log of something that happened — it is an
+      // UNFINISHED JOB carrying the payload a worker will post from, and both processors read the
+      // row and its payload BEFORE they conditionally claim it, so a worker can be holding the
+      // payload in memory while retention removes the row underneath it. The remote call still
+      // happens and nothing is left to record that it did. The hard-delete guard counts the same
+      // statuses (o3d-sref; o3d-ju8t: FAILED does NOT prove nothing was posted), so a deleted row
+      // reads as zero and the order becomes hard-deletable with a document standing in the ledger.
+      //
+      // An earlier revision of this branch exempted PROCESSING rows from deletion and was REVERTED,
+      // on the grounds that retaining the full row — payload included, holding customer names,
+      // emails and financial lines — contradicts the retention period the settings UI promises.
+      // That objection is answered by fixing the PROMISE rather than the data, because there is no
+      // version of this that keeps both: a compacted payload cannot be posted, so retaining
+      // unfinished work WHOLE is the only shape that works. What is retained is bounded by the
+      // OUTSTANDING WORK BACKLOG — visible and actionable on the failed-sync dashboard — not by
+      // history: every row leaves this exemption the moment it reaches SYNCED or CANCELLED and is
+      // then expired by age normally. components/settings/data-retention.tsx says so.
+      //
+      // THE STATUS LIST IS THE SHARED CONSTANT, NOT A LOCAL COPY. It is the same file PR #618
+      // (o3d-y14, branch o3d-y14-backfill-safety) introduces, byte for byte, so the two land as an
+      // identical add and #618's `applyWcCouponCorrection` — which counts these statuses under the
+      // sales-order lock and declines to correct an order that has any — reads the same set this
+      // delete refuses to touch. That function does not exist on this branch yet, which is why the
+      // constant's doc comment names a call site you will not find here; the drift it prevents is
+      // the whole reason neither side spells the statuses out.
       //
       // o3d-9kek: what this does NOT delete is UNRESOLVED BACK-REFERENCE EVIDENCE — a posted row
       // whose repair sweep has not reached a verdict on it. Deleting one of those does not just
@@ -140,9 +161,29 @@ export async function purgeExpiredData(): Promise<{
       // externalTransactionId AND one of the four DOCUMENT types, and the harm here comes from
       // FOLLOW-UP types whose row matters whatever their status. See remote-money-evidence.ts for
       // the three readers and for why this is not compaction (yet).
+      //
+      // THREE CLAUSES, THREE DIFFERENT QUESTIONS, AND NONE SUBSUMES ANOTHER:
+      //
+      //   status ∉ POSTABLE  — "can a document still be posted FROM this row?" PENDING carries no
+      //                        externalTransactionId at all, so the back-reference predicate never
+      //                        sees it; without this clause a PENDING SALES_INVOICE is still
+      //                        deleted by age with its payload.
+      //   type ∉ MONEY       — "is this row's bare existence the only thing suppressing a second
+      //                        remote call?" That is about FINISHED work — SYNCED and CANCELLED
+      //                        rows, which the status clause deliberately releases.
+      //   NOT UNRESOLVED_…   — "is this row the only evidence that a document was posted without
+      //                        being linked?" SYNCED/FAILED carrying an external id.
+      //
+      // Where the first and third overlap (FAILED with an external id) the row is retained by both
+      // and then COMPACTED below, which blanks the payload. That is safe rather than contradictory:
+      // an external id means the document already posted and both processors short-circuit to the
+      // follow-ups instead of re-posting when `externalTransactionId` is set, so no blanked payload
+      // is ever sent, and what the delete guard needs is only that the ROW SURVIVES — it counts
+      // rows, it does not read them.
       db.accountingSyncLog.deleteMany({
         where: {
           createdAt: { lt: cutoff },
+          status: { notIn: [...POSTABLE_ACCOUNTING_SYNC_STATUSES] },
           type: { notIn: [...REMOTE_MONEY_EVIDENCE_TYPES] },
           NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
         },
@@ -156,11 +197,20 @@ export async function purgeExpiredData(): Promise<{
     // doing the delete first means a crash between them leaves rows un-compacted (repeated next run)
     // rather than un-deleted.
     //
-    // They are no longer exact COMPLEMENTS, because o3d-nepa holds the money-evidence types back from
-    // the delete without adding them here: those rows are in NEITHER pass, deliberately. Compaction
-    // writes `payload: {}`, and a money row with a blank body is the worst of both worlds — the
-    // follow-up planner can neither prove from it that nothing was sent nor re-send it, which is
-    // exactly the shape that made money retries permanently unusable in o3d-nepa's parked attempt.
+    // They are no longer exact COMPLEMENTS, because o3d-nepa holds two further sets back from the
+    // delete without adding either of them here — both are in NEITHER pass, deliberately:
+    //
+    //   • the MONEY-EVIDENCE types. Compaction writes `payload: {}`, and a money row with a blank
+    //     body is the worst of both worlds — the follow-up planner can neither prove from it that
+    //     nothing was sent nor re-send it, which is exactly the shape that made money retries
+    //     permanently unusable in o3d-nepa's parked attempt (round 1 finding 2).
+    //   • POSTABLE rows with no external id (PENDING, PROCESSING, and FAILED that never posted).
+    //     These are unfinished JOBS, and the payload is the request a worker will build from, so
+    //     blanking it would destroy the work while leaving the row claiming it is still owed.
+    //
+    // A POSTABLE row that DOES carry an external id (FAILED, already posted) is in both the delete's
+    // exemption and this pass, and is compacted: its document exists, both processors short-circuit
+    // to the follow-ups rather than re-posting, so the payload is not what makes it postable.
     //
     // `backReferenceEvidenceCompactedAt: null` PERMANENTLY excludes already-compacted rows from THIS
     // PASS, so each daily run rewrites only the newly-eligible slice instead of the whole tombstone

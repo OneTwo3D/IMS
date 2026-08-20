@@ -785,3 +785,66 @@ test('[o3d-qsbs] a compacted body is still never PINNED as the request', () => {
   assert.equal(plan.action === 'reuse' ? plan.bodyDisposition : undefined, 'fresh')
   assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 200)
 })
+
+test('[o3d-qsbs] an UNSENDABLE row never displaces the token of one that may have committed', () => {
+  // Codex r10 #1. The split between "could this be sent" and "is there proof nothing left" is
+  // right, but token selection did not follow it through: `couldHaveCommitted[0]` is simply the
+  // NEWEST surviving row. Here the newest is a legacy body missing `accountingInvoiceId` and
+  // `bankAccountId`, so both connectors reject it before any HTTP call — it provably never posted,
+  // and its token was correctly excluded from the ambiguity count, so nothing refuses. The OLDER
+  // row is a complete body that may well have committed under `tok-sent`.
+  //
+  // Pinning the unsendable row's token sends the retry under a key the ledger has never seen while
+  // a payment under `tok-sent` may already stand: two payments against one invoice.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-unsendable', payload: { amount: 200 }, effectiveToken: 'tok-never-left' },
+      {
+        id: 'log-sendable',
+        payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+        effectiveToken: 'tok-sent',
+      },
+    ],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(
+    plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined,
+    'tok-sent',
+    'the retry must go out under the token of the attempt that may have committed, not the one that provably never left',
+  )
+  assert.equal(plan.action === 'reuse' ? plan.syncLogId : undefined, 'log-sendable')
+  // ...and because that attempt may have committed, its BODY is pinned too: a recomputed amount
+  // under a token the ledger already saw records a settlement that never happened.
+  assert.equal(plan.action === 'reuse' ? plan.bodyDisposition : undefined, 'pinned')
+  assert.equal(plan.action === 'reuse' ? plan.tokenDisposition : undefined, 'pinned')
+})
+
+test('[o3d-qsbs] the may-have-committed token wins even when the unsendable row is the only complete-looking one', () => {
+  // The same hazard where the unsendable row carries the anchor. `couldHaveCommittedThis` still
+  // matches both (the older row names the same invoice; the newer one names nothing, which reads as
+  // "possibly this one"), and the newer one is missing `bankAccountId` so it provably never posted.
+  const plan = planFollowUpEnqueue({
+    ...ORDER,
+    payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 200 },
+    liveRowExists: false,
+    failedRows: [
+      { id: 'log-unsendable', payload: { accountingInvoiceId: 'inv-9', amount: 200 }, effectiveToken: 'tok-never-left' },
+      {
+        id: 'log-sendable',
+        payload: { accountingInvoiceId: 'inv-9', bankAccountId: 'bank-1', amount: 175 },
+        effectiveToken: 'tok-sent',
+      },
+    ],
+  })
+
+  assert.equal(plan.action, 'reuse')
+  assert.equal(plan.action === 'reuse' ? plan.payload[FOLLOW_UP_IDEMPOTENCY_KEY] : undefined, 'tok-sent')
+  // The pinned body is the one that may have posted — 175, not the recomputed 200.
+  assert.equal(plan.action === 'reuse' ? plan.payload.amount : undefined, 175)
+  assert.equal(plan.action === 'reuse' ? plan.bodyDisposition : undefined, 'pinned')
+})
+

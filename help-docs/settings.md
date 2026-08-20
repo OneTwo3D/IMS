@@ -272,7 +272,8 @@ This means an admin viewing the activity log can see who did what but not see se
   - Saves are applied as one all-or-nothing change and are serialised against anything that acts on which connector is active (notably cancelling stranded accounting sync rows), so no other part of the system can observe a half-switched selection.
 - **Scheduler** — configure the public app URL used for external callbacks and manage scheduled jobs
 - **Activity log retention** — set how many days to keep log entries, configurable per log level
-- **Data retention** — configure archival/deletion windows for operational records. Two kinds of
+- **Data retention** — configure archival/deletion windows for operational records. Accounting sync entries that are still **pending, in progress or failed** are exempt from the age-based deletion: they are unfinished work rather than history, their payload is what a retry posts, and deleting one while a worker is holding it would land a document in the accounting system that nothing in IMS records. They expire normally once they settle (synced or cancelled), so the way to clear them is to resolve them on the Accounting Sync page.
+- Two kinds of
   record are compacted rather than deleted at the end of their window, because deleting them would
   break something that cannot be reconstructed: shopping webhook events (the row is the idempotency
   record) and accounting sync rows whose back-reference is still unresolved (the row is the only
@@ -289,7 +290,9 @@ This means an admin viewing the activity log can see who did what but not see se
   deliberately no repair sweep at all — a QuickBooks document id is a per-company integer, so a sweep
   could not tell a previously connected company's id from the current one's — and an unresolved row
   is compacted on the same schedule but only ever links by hand. See *Back-Reference Repair* in the
-  accounting sync guide.
+  accounting sync guide. A row can fall under both rules at once (a failed sync that already has an
+  accounting document id): it is kept for the retry AND has its content cleared on schedule, which is
+  safe because a document that already posted is never re-sent — only its follow-ups are re-driven.
   One further set of accounting sync rows is **never deleted by age at all**: registered invoice
   payments, applied supplier-credit-note allocations and sent bill payments (`INVOICE_PAYMENT`,
   `PURCHASE_CREDIT_NOTE_ALLOCATION`, `BILL_PAYMENT`). For those, the row's existence *is* the record

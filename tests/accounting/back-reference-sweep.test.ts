@@ -171,6 +171,13 @@ type Harness = {
    */
   failPendingMarkerFor: Set<string>
   /**
+   * Sales orders whose POST-REPAIR INVOICE-DATE READ fails (o3d-r5pj, Codex r10 #3). Separate from
+   * failProbeFor because the two reads happen at different points and must fail differently: a
+   * failed probe abandons the repair, a failed invoice-date read must leave an ALREADY REPAIRED row
+   * unsettled rather than settling it on an answer nobody got.
+   */
+  failInvoiceDateReadFor: Set<string>
+  /**
    * A concurrent writer, fired the instant the PO attribution has read the bills — i.e.
    * inside the resolve→apply window. Set by the finding-3 test.
    */
@@ -186,8 +193,10 @@ function makeHarness(store: Store): Harness {
   const failProbeFor = new Set<string>()
   const failActivityFor = new Set<string>()
   const failPendingMarkerFor = new Set<string>()
+  const failInvoiceDateReadFor = new Set<string>()
   const harness = {
-    store, activities, followUps, calls, failFollowUpsFor, failProbeFor, failActivityFor, failPendingMarkerFor, raceAfterBillRead: null,
+    store, activities, followUps, calls, failFollowUpsFor, failProbeFor, failActivityFor, failPendingMarkerFor,
+    failInvoiceDateReadFor, raceAfterBillRead: null,
   } as Harness
 
   const client = {
@@ -219,10 +228,20 @@ function makeHarness(store: Store): Harness {
       },
     },
     salesOrder: {
-      async findUnique(args: { where: { id: string } }) {
+      // SELECT-AWARE ON PURPOSE (o3d-r5pj, Codex r10 #3). The sweep now asks this table TWO
+      // different questions — "is the back-reference still missing?" and "does the sale actually
+      // have an invoice date?" — and a double that answered both with the same object would let
+      // production read a column it never selected, or read the wrong one, and still pass. The
+      // invoice-date read is not a probe and is not failed by failProbeFor: it happens after the
+      // repair, so counting it would silently change every probe-count assertion in this file.
+      async findUnique(args: { where: { id: string }; select?: Record<string, unknown> }) {
+        const order = store.orders.find((candidate) => candidate.id === args.where.id)
+        if (args.select?.invoicedAt) {
+          if (failInvoiceDateReadFor.has(args.where.id)) throw new Error('invoice-date read blew up')
+          return order ? { invoicedAt: order.invoicedAt ?? null } : null
+        }
         calls.probes++
         if (failProbeFor.has(args.where.id)) throw new Error('probe blew up')
-        const order = store.orders.find((candidate) => candidate.id === args.where.id)
         return order ? { accountingInvoiceId: order.accountingInvoiceId } : null
       },
       async update(args: { where: { id: string }; data: Record<string, unknown> }) {
@@ -1765,9 +1784,76 @@ test('[o3d-r5pj] an invoice date the order already has is left alone, never blan
     orders: [{ id: 'so-1', accountingInvoiceId: null, invoicedAt: alreadyInvoicedAt }],
   })
 
-  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
 
   assert.deepEqual(harness.store.orders[0].invoicedAt, alreadyInvoicedAt)
+  // ...AND THE OPERATOR IS NOT TOLD OTHERWISE (Codex r10 #3). An unrecoverable payload date is a
+  // fact about this sync row. Reporting it as "this sale is in NO reporting period" is a different
+  // and false claim about an order that is correctly dated, and it sends a human to fix something
+  // that is not broken — which is how the warning that DOES matter stops being read.
+  assert.equal(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_invoice_date_unrecoverable'),
+    false,
+    'a dated sale must not be reported as having no invoice date',
+  )
+  assert.equal(run.repaired, 1)
+  assert.ok(harness.store.syncRows[0].backReferenceCheckedAt, 'and it settles, with nothing outstanding')
+})
+
+test('[o3d-r5pj] the warning is spent only on a sale that genuinely has no date', async () => {
+  // The pair to the test above, run through the SAME unrecoverable payload, so the two differ in
+  // exactly one thing: what the order itself holds. The claim in the description is checked
+  // against the order, not merely against the row.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', payload: { invoiceNumber: 'INV-1' } })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null, invoicedAt: null }],
+  })
+
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  const warned = harness.activities.find((entry) => entry.action === 'xero_backreference_invoice_date_unrecoverable')
+  assert.ok(warned)
+  assert.match(warned.description, /the order has no invoice date of its own/,
+    'the warning must say the order was checked, because that is what makes the claim true')
+})
+
+test('[o3d-r5pj] a failed invoice-date read leaves the row UNSETTLED rather than settling on no answer', async () => {
+  // The read decides whether a sale is silently outside every VAT period. Swallowing its failure
+  // and settling would stamp the row — and a stamped row is never looked at again.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', payload: { invoiceNumber: 'INV-1' } })],
+    bills: [],
+    orders: [{ id: 'so-1', accountingInvoiceId: null, invoicedAt: null }],
+  })
+  harness.failInvoiceDateReadFor.add('so-1')
+
+  const run = await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(harness.store.syncRows[0].backReferenceCheckedAt, null)
+  assert.equal(run.failed, 1)
+  assert.equal(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_invoice_date_unrecoverable'),
+    false,
+    'and no claim is made about a period nobody could establish',
+  )
+})
+
+test('[o3d-r5pj] a repair whose sales order no longer exists makes no reporting-period claim', async () => {
+  // A deleted order has no period to be missing from. Warning here would name a document that is
+  // not there and ask a human to date it.
+  const harness = makeHarness({
+    syncRows: [salesInvoiceRow(1, { status: 'FAILED', payload: { invoiceNumber: 'INV-1' } })],
+    bills: [],
+    orders: [],
+  })
+
+  await repairAccountingBackReferences(sweepDeps(harness), { limit: 10 })
+
+  assert.equal(
+    harness.activities.some((entry) => entry.action === 'xero_backreference_invoice_date_unrecoverable'),
+    false,
+  )
 })
 
 test('[o3d-wf86] the sweep\'s conflict warning says which kind of link is in the way', async () => {

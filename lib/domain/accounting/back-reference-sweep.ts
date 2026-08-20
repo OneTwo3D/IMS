@@ -395,6 +395,17 @@ export type BackReferenceSweepClient = BackReferenceDeps & {
     findMany(args: BackReferenceCandidateQuery): Promise<BackReferenceSweepRow[]>
     update(args: { where: { id: string }; data: Record<string, unknown> }): Promise<unknown>
   }
+  /**
+   * The sweep asks the SalesOrder one question `BackReferenceDeps` does not (o3d-r5pj, Codex r10 #3):
+   * what invoice date does it ACTUALLY have?
+   *
+   * An intersection rather than a widened select, so each read keeps its own return type — the
+   * repair probe still gets `{ accountingInvoiceId }` and this one gets `{ invoicedAt }`, and a
+   * double cannot satisfy one by answering the other.
+   */
+  salesOrder: BackReferenceDeps['salesOrder'] & {
+    findUnique(args: { where: { id: string }; select: { invoicedAt: true } }): Promise<{ invoicedAt: Date | null } | null>
+  }
 }
 
 export type BackReferenceSweepActivity = {
@@ -847,8 +858,19 @@ export async function repairAccountingBackReferences(
    *
    * Only the SALES_INVOICE / SalesOrder pair writes `invoicedAt` at all, so every other pair
    * settles unconditionally. For that one, a recovered business date means the repair reproduced
-   * the original write and there is nothing to report; a missing one means the sale now carries an
-   * accounting invoice id and NO invoice date.
+   * the original write and there is nothing to report.
+   *
+   * A MISSING ONE IS A FACT ABOUT THIS ROW, NOT ABOUT THE ORDER (Codex r10 #3). An earlier revision
+   * warned on `businessDate === null` alone and told the operator the sale is "in NO reporting
+   * period". That is a different and often false claim: `recoverPostedBusinessDate` reads the
+   * PAYLOAD's own `date` field, and its absence — a compacted tombstone, a legacy body, a connector
+   * that never stored one — says nothing about `SalesOrder.invoicedAt`, which is also written by
+   * `app/actions/sales.ts` when a local invoice number is issued and can be set by an operator at
+   * any time. The repair passes NULL precisely so it LEAVES that column alone; reporting a date the
+   * order still has as missing sends a human to correct something that is already correct, and
+   * teaches them to ignore the warning that matters.
+   *
+   * So the order is ASKED. Only a sale that genuinely has no invoice date is warned about.
    *
    * That is deliberately not treated as an acceptable end state. The old behaviour — `new Date()`
    * — put the sale in the WRONG period; writing nothing puts it in NO period. Both are wrong, and
@@ -866,15 +888,28 @@ export async function repairAccountingBackReferences(
   const businessDateSettled = async (row: BackReferenceSweepRow, businessDate: Date | null): Promise<boolean> => {
     if (row.type !== 'SALES_INVOICE' || row.referenceType !== 'SalesOrder') return true
     if (businessDate !== null) return true
+    // Read AFTER the repair, so it reflects whatever the repair did (it deliberately did nothing to
+    // this column) plus anything else that ever set it. A throw propagates to the per-row handler,
+    // which counts a failure and leaves the row unstamped — the repair is not settled on a read
+    // that did not answer.
+    const order = await deps.db.salesOrder.findUnique({ where: { id: row.referenceId }, select: { invoicedAt: true } })
+    if (order === null) {
+      // The sale is gone. There is no reporting period to be missing from and no document to name,
+      // so there is nothing to announce — but say so once, because a repaired back-reference
+      // pointing at a deleted order is worth a line in the log.
+      console.warn(`${prefix}: invoice-date check skipped; sales order no longer exists`, row.referenceId)
+      return true
+    }
+    if (order.invoicedAt !== null) return true
     const persisted = await deps.logActivity({
       entityType: 'SYSTEM',
       action: `${prefix}_backreference_invoice_date_unrecoverable`,
       tag: 'sync',
       level: 'WARNING',
       description: `Linked ${connectorLabel} invoice ${row.externalTransactionId} to sales order ${row.referenceId}, but this sync row `
-        + 'no longer records the date the invoice was posted with, so NO invoice date was written. A repair must not invent one: '
-        + 'stamping the time the repair ran would move the sale into whichever VAT period this sweep happened to run in. Until the '
-        + 'invoice date is set from the document in the ledger, this sale is in NO reporting period.',
+        + 'no longer records the date the invoice was posted with, and the order has no invoice date of its own — both were checked. '
+        + 'A repair must not invent one: stamping the time the repair ran would move the sale into whichever VAT period this sweep '
+        + 'happened to run in. Until the invoice date is set from the document in the ledger, this sale is in NO reporting period.',
       metadata: {
         syncLogId: row.id,
         type: row.type,
@@ -1209,14 +1244,19 @@ export async function repairAccountingBackReferences(
           // there is nothing left for any future sweep to do, but its follow-ups were discarded
           // rather than done and calling that SYNCED would erase the only trace of it (r4 finding 3).
           //
-          // AND ONLY IF THE SALE ENDED UP IN A REPORTING PERIOD (o3d-r5pj). The repair now refuses
-          // to invent `invoicedAt`, so a row whose posted date could not be recovered leaves the
+          // AND ONLY IF THE SALE ENDED UP IN A REPORTING PERIOD (o3d-r5pj). The repair refuses to
+          // invent `invoicedAt`, so a row whose posted date could not be recovered can leave the
           // sale with no invoice date at all — out of EVERY VAT and currency period rather than in
-          // the wrong one. Stamping that is the worse half of the original defect: the row would
-          // become non-repairable at the same moment it became invisible to reporting, and nothing
-          // downstream ever asks why an order has an accounting invoice id and no date. So it is
-          // warned about and DEFERRED — never a verdict, because a human setting the date makes the
-          // row settle by itself on the next lap.
+          // the wrong one. Stamping that silently is the worse half of the original defect: the row
+          // would become non-repairable at the same moment it became invisible to reporting, and
+          // nothing downstream ever asks why an order has an accounting invoice id and no date.
+          //
+          // `businessDateSettled` therefore ASKS THE ORDER (Codex r10 #3) rather than inferring
+          // from the payload: an unrecoverable payload date is common and harmless when the order
+          // already carries a date, and the warning is spent only on the case that is actually
+          // wrong. When it does warn, it settles once the warning is CONFIRMED PERSISTED — the same
+          // terminal policy as the discarded follow-ups, because the remedy (a human reading the
+          // date off the ledger) is not something this sweep can observe.
           if (followUpsEnqueued && await businessDateSettled(row, businessDate)) {
             await markChecked(row.id, row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined)
           }
