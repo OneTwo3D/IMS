@@ -9,6 +9,7 @@ import type { ConnectorOrphanSummary } from '@/lib/domain/accounting/connector-o
 import type { StrandedSyncRowsResult } from '@/lib/domain/accounting/stranded-sync-rows'
 import { resolveConnectorOrphanBannerState } from '@/lib/domain/accounting/stranded-sync-visibility'
 import { observeServerRender } from '@/lib/domain/accounting/server-render-marker'
+import { SettleSyncRowControl } from './settle-sync-row-control'
 
 const CONNECTOR_LABELS: Record<string, string> = { xero: 'Xero', quickbooks: 'QuickBooks' }
 
@@ -64,9 +65,12 @@ export function ConnectorOrphanBanner({
    * the specific criticism. Listing them with connector / type / reference / status / age / last
    * error is what makes them actionable at all.
    *
-   * Read-only: there is no per-row control here, because there is no per-row remedy anywhere
-   * yet (o3d-e2mz). Null for a role without the `sync` permission — the page does not fetch it —
-   * and also null when the fetch FAILED, which `strandedLoadFailed` distinguishes.
+   * Each row now also carries a per-row REMEDY (o3d-osl8 item 2): the settlement control, which
+   * records an operator's verified outcome for the attempt shown. Rows that cannot take one — a
+   * DAILY_BATCH type, a PENDING row, or a row at attempt revision 0 — say so in place of the
+   * control rather than silently omitting it. Null for a role without the `sync` permission (the
+   * page does not fetch it) and also null when the fetch FAILED, which `strandedLoadFailed`
+   * distinguishes.
    *
    * Carries `hasMore` / `total` because the list is truncated to the oldest N and nothing here
    * can clear the rows at the front of it.
@@ -285,7 +289,8 @@ export function ConnectorOrphanBanner({
                       <th className="pr-3 font-medium">Reference</th>
                       <th className="pr-3 font-medium">Status</th>
                       <th className="pr-3 font-medium">Age</th>
-                      <th className="font-medium">Last error</th>
+                      <th className="pr-3 font-medium">Last error</th>
+                      <th className="font-medium">Settle</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -304,9 +309,32 @@ export function ConnectorOrphanBanner({
                             <div className="opacity-70">posted as {row.externalTransactionId}</div>
                           )}
                         </td>
-                        <td className="pr-3 py-0.5">{row.status}</td>
+                        <td className="pr-3 py-0.5">
+                          {row.status}
+                          {/* The attempt the settlement control will name. Shown because the operator is
+                              being asked to make a decision ABOUT it, and a refusal that says "this row
+                              has moved on to attempt 4" is unreadable if attempt 3 was never on screen. */}
+                          <div className="opacity-70">attempt {row.attemptRevision}</div>
+                        </td>
                         <td className="pr-3 py-0.5 whitespace-nowrap">{row.ageDays}d</td>
-                        <td className="py-0.5 max-w-[24rem] break-words opacity-80">{row.errorMessage ?? '—'}</td>
+                        <td className="pr-3 py-0.5 max-w-[24rem] break-words opacity-80">{row.errorMessage ?? '—'}</td>
+                        <td className="py-0.5 whitespace-nowrap">
+                          {/* o3d-osl8 item 2. The row's OWN remedy, next to the row — an aggregate
+                              count with a bulk Cancel was the specific criticism, and a bulk cancel
+                              cannot carry an assertion about one document anyway. */}
+                          <SettleSyncRowControl
+                            syncLogId={row.id}
+                            status={row.status}
+                            attemptRevision={row.attemptRevision}
+                            type={row.type}
+                            referenceType={row.referenceType}
+                            referenceId={row.referenceId}
+                            settleable={row.settleable}
+                            notSettleableReason={row.notSettleableReason}
+                            caveat={row.settlementCaveat}
+                            onSettled={() => router.refresh()}
+                          />
+                        </td>
                       </tr>
                     ))}
                   </tbody>

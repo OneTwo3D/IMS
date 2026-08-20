@@ -13,10 +13,10 @@ import {
 // ---------------------------------------------------------------------------
 // o3d-osl8 item 1 — the stranded-row LOADER.
 //
-// Read-only. This module lists unresolved accounting sync rows on a connector that is no longer
-// active; it does not settle, cancel or retry any of them. A per-row remedy for a PROCESSING row
-// needs an immutable claim generation the connectors' writeback compare-and-sets on (o3d-e2mz),
-// and does not exist yet.
+// Read-only. This module LISTS unresolved accounting sync rows on a connector that is no longer
+// active; it never mutates one. The per-row remedy is a separate action — settleAccountingSyncRow in
+// app/actions/accounting-settlement.ts (o3d-nf9i / o3d-osl8 item 2) — and each row here now carries
+// whether that control applies to it, plus the attempt revision a settlement would have to name.
 //
 // NOTE: StrandedSyncRow / StrandedSyncRowsResult are deliberately NOT re-exported from here. This module is 'use server',
 // and Turbopack registers every export of such a module in the server-actions manifest —
@@ -84,6 +84,9 @@ export async function getStrandedAccountingSyncRows(limit = 50): Promise<Strande
       externalTransactionId: true,
       errorMessage: true,
       createdAt: true,
+      // o3d-e2mz: the attempt a settlement of this row would have to name. Selected here rather than
+      // defaulted in the mapper so a row that has never been fence-claimed reports its real 0.
+      attemptRevision: true,
     },
   })
   const page = pageStrandedSyncRows(sourceRows, take, new Date())

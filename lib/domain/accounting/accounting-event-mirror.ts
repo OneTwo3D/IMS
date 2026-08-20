@@ -156,6 +156,31 @@ export function isMirrorableAccountingSyncType(type: string): type is MirroredAc
   return MIRRORED_TYPES.has(type)
 }
 
+/**
+ * EVERY idempotency key `updateMirroredAccountingEventStatus` would try for these params, in the
+ * order it tries them: the primary key (which prefers the payload's `_idempotencyKey`, then the
+ * sync-log id) and the legacy, syncLogId-less key it falls back to when the primary matches no
+ * event. Empty for a non-mirrorable type — nothing is mirrored, so nothing can be touched.
+ *
+ * Exported because mirror identity is LOGICAL: two attempts at the same document share a key, so a
+ * caller that is about to terminalise a mirror needs to know whether the event it is about to write
+ * actually belongs to the row it is settling (o3d-nf9i / findMirrorOwnershipConflict). Both key
+ * forms count: the payload branch is shared by construction, and the legacy
+ * `<connector>:<type>:<ref>:<date>` form is shared by every attempt on the same day.
+ */
+export function mirroredAccountingEventIdempotencyKeys(params: {
+  syncLogId?: string
+  connector: string
+  type: string
+  referenceType: string
+  referenceId: string
+  payload: unknown
+}): string[] {
+  const primary = buildMirroredAccountingEventIdempotencyKey(params)
+  const legacy = buildMirroredAccountingEventIdempotencyKey({ ...params, syncLogId: undefined })
+  return [...new Set([primary, legacy].filter((key): key is string => typeof key === 'string' && key.length > 0))]
+}
+
 function isMirrorableJournalAccountingSyncType(type: string): type is MirroredJournalAccountingSyncType {
   return MIRRORED_JOURNAL_TYPES.has(type)
 }
@@ -887,6 +912,40 @@ export async function resolveDocumentRevisionExternalIdClaim(
   }
 }
 
+/**
+ * What a mirror write actually did. o3d-nf9i round 2 finding 4: the caller used to record
+ * `mirrorUpdate: 'applied'` in its audit BEFORE calling this, while this function returned silently
+ * when no event matched either key — so an audit row could assert a mirror update that never
+ * happened. A missing mirror is a SUPPORTED state (the queue paths swallow mirror failures and keep
+ * the sync row), so "not found" is not an error, it is a fact the caller has to be able to record.
+ */
+export type MirroredEventUpdateOutcome =
+  /** The mirrored event was found and written. */
+  | 'updated'
+  /** Neither the primary nor the legacy key matched an event — nothing is mirrored for this row. */
+  | 'not_found'
+  /** The event exists but the caller's guard did not hold, so it was deliberately left alone. */
+  | 'refused'
+
+/**
+ * A compare-and-swap on the mirrored event itself, for callers whose write must not clobber a
+ * DIFFERENT attempt's record of the same logical document.
+ *
+ * Mirror identity is logical, not per-row: buildMirroredAccountingEventIdempotencyKey prefers the
+ * payload's `_idempotencyKey`, and the legacy fallback key is shared by every attempt on the same
+ * day — so one AccountingEvent can be the mirror of several AccountingSyncLog rows. Reading the
+ * siblings first tells a caller who else might own it, but that read is not a lock: a sibling can
+ * post between the read and the write. Guarding the write itself makes both interleavings safe —
+ * the late poster overwrites a VOID with its POSTED, and the late VOID is refused against an
+ * already-POSTED event — without any caller having to serialise on the mirror key.
+ */
+export type MirroredEventWriteGuard = {
+  /** Write only while the event is in one of these statuses. */
+  statusIn: readonly AccountingEventStatus[]
+  /** Write only while the event names no external document (post evidence must never be erased). */
+  requireExternalIdNull?: boolean
+}
+
 export async function updateMirroredAccountingEventStatus(
   client: AccountingEventMirrorTransactionClient,
   params: {
@@ -907,20 +966,25 @@ export async function updateMirroredAccountingEventStatus(
      */
     externalRevisionAt?: Date | null
     message?: string | null
+    /**
+     * Optional. Absent = the historical unconditional write, which is what the connectors' own
+     * success/failure writeback wants: it owns the attempt it is reporting on. Present = the write
+     * lands only while the guard holds, and `'refused'` is returned instead of overwriting.
+     */
+    guard?: MirroredEventWriteGuard
   },
-): Promise<void> {
+): Promise<MirroredEventUpdateOutcome> {
   const idempotencyKey = buildMirroredAccountingEventIdempotencyKey(params)
-  if (!idempotencyKey) return
+  if (!idempotencyKey) return 'not_found'
 
-  async function applyStatus(
-    key: string,
+  const guard = params.guard
+
+  function statusWriteData(
     // o3d-cvj9 r2: the STALE path records the same transition without claiming the document id,
     // because a newer revision already holds it. Both overrides are set together and only there.
     override?: { status: AccountingEventStatus; claimExternalId: false },
   ) {
-    return client.accountingEvent.update({
-      where: { idempotencyKey: key },
-      data: {
+    return {
         status: override?.status ?? params.status,
         ...(params.externalId !== undefined && override?.claimExternalId !== false
           ? { externalId: params.externalId }
@@ -951,12 +1015,44 @@ export async function updateMirroredAccountingEventStatus(
                 : {}),
             }
           : {}),
-      },
+    }
+  }
+
+  async function applyStatus(
+    key: string,
+    override?: { status: AccountingEventStatus; claimExternalId: false },
+  ) {
+    return client.accountingEvent.update({
+      where: { idempotencyKey: key },
+      data: statusWriteData(override),
       select: { id: true },
     })
   }
 
-  async function updateByIdempotencyKey(key: string) {
+  async function updateByIdempotencyKey(key: string): Promise<{ id: string } | 'not_found' | 'refused'> {
+    // o3d-nf9i: the CAS. `updateMany` rather than `update` because the where has to carry more than
+    // the unique key, and because a guard that does not hold must be a zero-row no-op, not a throw.
+    //
+    // The guarded path deliberately does NOT enter the revision-claim machinery below. That
+    // machinery exists to order two CONNECTOR WRITES against each other on the external system's own
+    // revision stamps; a guarded caller is an operator ASSERTION that made no write and carries no
+    // stamp, so it has nothing to order with and must never supersede a row that does. A collision
+    // on the external reference therefore stays fatal here and rolls the caller's transaction back —
+    // fail-closed, which is what a money-path assertion has to do.
+    if (guard) {
+      const written = await client.accountingEvent.updateMany({
+        where: {
+          idempotencyKey: key,
+          status: { in: [...guard.statusIn] },
+          ...(guard.requireExternalIdNull ? { externalId: null } : {}),
+        },
+        data: statusWriteData(),
+      })
+      // Read purely to explain the outcome. The CAS above, not this read, decided it.
+      const event = await client.accountingEvent.findUnique({ where: { idempotencyKey: key }, select: { id: true } })
+      if (written.count > 0) return event ?? 'not_found'
+      return event ? 'refused' : 'not_found'
+    }
     try {
       // o3d-cvj9: the SAVEPOINT is what makes the catch below usable at all. `client` is the
       // CALLER's interactive transaction (the same one that just marked the sync log SYNCED);
@@ -966,7 +1062,7 @@ export async function updateMirroredAccountingEventStatus(
       // with "current transaction is aborted, commands ignored until end of transaction block".
       return await withSavepoint(client, () => applyStatus(key))
     } catch (error) {
-      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') return null
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') return 'not_found'
       // Classified from the statement that RAISED it, not inferred from where we are: the only
       // other unique constraint on accounting_events is idempotencyKey, which this statement does
       // not write.
@@ -1113,8 +1209,10 @@ export async function updateMirroredAccountingEventStatus(
     }
   }
 
-  let event = await updateByIdempotencyKey(idempotencyKey)
-  if (!event && params.syncLogId) {
+  let outcome = await updateByIdempotencyKey(idempotencyKey)
+  // o3d-nf9i: only a genuine MISS falls through to the legacy key. A refusal means the primary event
+  // exists and the guard declined it; trying a second key would be looking for a way to write anyway.
+  if (outcome === 'not_found' && params.syncLogId) {
     const legacyIdempotencyKey = buildMirroredAccountingEventIdempotencyKey({
       connector: params.connector,
       type: params.type,
@@ -1123,11 +1221,12 @@ export async function updateMirroredAccountingEventStatus(
       payload: params.payload,
     })
     if (legacyIdempotencyKey && legacyIdempotencyKey !== idempotencyKey) {
-      event = await updateByIdempotencyKey(legacyIdempotencyKey)
+      outcome = await updateByIdempotencyKey(legacyIdempotencyKey)
     }
   }
 
-  if (!event) return
+  if (outcome === 'not_found' || outcome === 'refused') return outcome
+  const event = outcome
 
   await client.accountingEventLog.create({
     data: buildAccountingEventLog({
@@ -1144,6 +1243,7 @@ export async function updateMirroredAccountingEventStatus(
       },
     }) as never,
   })
+  return 'updated'
 }
 
 export async function resetMirroredAccountingEventsToPending(

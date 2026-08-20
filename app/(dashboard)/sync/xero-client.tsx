@@ -43,6 +43,8 @@ import {
 import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
+import { describeSyncRowSettleability } from '@/lib/domain/accounting/sync-row-settlement'
+import { SettleSyncRowControl } from './settle-sync-row-control'
 
 type AccountingAccount = { id: string; externalAccountId: string; code: string | null; name: string; type: string }
 
@@ -1030,6 +1032,16 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                   <TableBody>
                     {pagedLogs.map(log => {
                       const badge = STATUS_BADGE[log.status] ?? { variant: 'outline' as const, label: log.status }
+                      // Computed ONCE per row, from the same shared helper the stranded-row list uses.
+                      const settlement = describeSyncRowSettleability({
+                        status: log.status,
+                        type: log.type,
+                        attemptRevision: log.attemptRevision,
+                      })
+                      // Only the two statuses a settlement could ever apply to get a control (or a
+                      // reason). Rendering "not settleable" against every SYNCED row would be noise
+                      // that buries the rows an operator actually has to act on.
+                      const settlementApplies = log.status === 'FAILED' || log.status === 'PROCESSING'
                       return (
                         <TableRow key={log.id}>
                           <TableCell className="font-mono text-xs">{log.type.replace(/_/g, ' ')}</TableCell>
@@ -1044,18 +1056,45 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                             {log.errorMessage ?? '—'}
                           </TableCell>
                           <TableCell>
-                            {log.status === 'FAILED' && (
-                              <Button
-                                variant="ghost"
-                                size="sm"
-                                className="h-7 w-7 p-0"
-                                title="Retry this entry"
-                                onClick={() => handleRetryOne(log.id)}
-                                disabled={retryingId === log.id}
-                              >
-                                {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
-                              </Button>
-                            )}
+                            <div className="flex items-center gap-0.5">
+                              {log.status === 'FAILED' && (
+                                <Button
+                                  variant="ghost"
+                                  size="sm"
+                                  className="h-7 w-7 p-0"
+                                  title="Retry this entry"
+                                  onClick={() => handleRetryOne(log.id)}
+                                  disabled={retryingId === log.id}
+                                >
+                                  {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+                                </Button>
+                              )}
+                              {/*
+                                o3d-nf9i — the settlement control, beside Retry rather than instead of it.
+                                The two are opposites and the operator has to be able to choose: Retry
+                                re-attempts work the system already decided to do, and o3d-0m56 REFUSES it
+                                when several rows for one reference posted under different idempotency
+                                tokens. Until now that refusal was a dead end — "resolve these rows
+                                manually" with no manual path in the app. This is that path.
+                                Rendered only where a settlement could actually land: the helper returns
+                                `settleable: false` for PENDING/terminal rows, DAILY_BATCH types and rows
+                                at attempt revision 0, and the component then shows the reason instead.
+                              */}
+                              {settlementApplies && (
+                                <SettleSyncRowControl
+                                  syncLogId={log.id}
+                                  status={log.status}
+                                  attemptRevision={log.attemptRevision ?? 0}
+                                  type={log.type}
+                                  referenceType={log.referenceType}
+                                  referenceId={log.referenceId}
+                                  settleable={settlement.settleable}
+                                  notSettleableReason={settlement.notSettleableReason}
+                                  caveat={settlement.settlementCaveat}
+                                  onSettled={() => router.refresh()}
+                                />
+                              )}
+                            </div>
                           </TableCell>
                         </TableRow>
                       )

@@ -76,6 +76,7 @@ function dbRow(over: Record<string, unknown> = {}) {
     externalTransactionId: null,
     errorMessage: 'HTTP 500 from QuickBooks',
     createdAt: new Date(Date.now() - 3 * 86_400_000),
+    attemptRevision: 0,
     ...over,
   }
 }
@@ -103,6 +104,33 @@ test('the stranded loader requires the `sync` permission, and reads NOTHING with
   state.permissions = new Set(['sync'])
   assert.deepEqual(await getStrandedAccountingSyncRows(50), { rows: [], hasMore: false, total: 0 })
   assert.equal(state.queries.length, 1)
+})
+
+test('the loader SELECTS the attempt revision — a settlement cannot name an attempt it was never given', async () => {
+  // o3d-e2mz. The per-row settlement control passes the attempt it was shown straight back as the
+  // fence. If the loader does not read the column, every row reaches the UI at 0 and every
+  // settlement is refused as UNFENCED_ATTEMPT — indistinguishable, from the operator's side, from
+  // the feature not existing.
+  const getStrandedAccountingSyncRows = await loadLoader()
+  await getStrandedAccountingSyncRows()
+  assert.equal(state.queries[0].select.attemptRevision, true)
+})
+
+test('a stranded row reaches the UI with its settlement affordance and the reason when it has none', async () => {
+  const getStrandedAccountingSyncRows = await loadLoader()
+  state.rows = [
+    dbRow({ id: 'log-unfenced', status: 'FAILED', attemptRevision: 0 }),
+    dbRow({ id: 'log-settleable', status: 'PROCESSING', attemptRevision: 4 }),
+  ]
+  const result = await getStrandedAccountingSyncRows()
+
+  // Every QuickBooks row is permanently here: that processor stamps no attempt revision.
+  assert.equal(result.rows[0].settleable, false)
+  assert.match(result.rows[0].notSettleableReason ?? '', /carries no attempt revision/)
+  // A claimed-forever PROCESSING row on a retired connector — the o3d-osl8 case — now has a remedy.
+  assert.equal(result.rows[1].settleable, true)
+  assert.equal(result.rows[1].attemptRevision, 4)
+  assert.match(result.rows[1].settlementCaveat ?? '', /may never have returned/)
 })
 
 test('the query is scoped AWAY from the active connector, oldest first', async () => {

@@ -1345,11 +1345,67 @@ The sync log at **Integrations → Xero** shows queued transactions for the **cu
 
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
 
+### Settling a row IMS cannot resolve for itself
+
+A **Failed** row does **not** prove that nothing reached Xero. The remote call is made *before* the
+result is written back, so a row can end up Failed with a real document sitting in the ledger. That
+is why a Failed row keeps its sales order from being deleted, and it is also why some Failed rows
+must never be retried: when several rows for one reference posted under different idempotency
+tokens, IMS refuses the retry outright, because a manual retry is far too late for Xero to
+deduplicate it.
+
+Rows in that position — and **Processing** rows whose connector was switched off while a worker held
+them — now carry a **Settle** control (the gavel icon) beside Retry, both in the sync log and in the
+stranded-rows banner. It records what *you* found in Xero:
+
+- **It DID post** — you supply the Xero document id. The row becomes **Synced** and records that id.
+- **It did NOT post** — the row becomes **Cancelled** and no id is written, which is what lets the
+  order be deleted again and what releases a blocked follow-up (a part-payment, say, where one of two
+  genuine payments failed).
+
+Read what this is, because it is not a repair. IMS cannot check either statement; the control records
+**your assertion**, logged against your account with the time, and it appears in the Activity log as a
+warning rather than an ordinary note. Look the document up in Xero before using it.
+
+**The decision applies to one attempt, and says so.** The dialog names the attempt it is about, and
+the assertion is refused — with nothing written — if the row has moved on since the page was
+rendered: "this row has moved on to attempt 5; the decision was made about attempt 3". Reload and
+judge what the sync log then shows. This is what stops a conclusion about one failure landing on a
+later, still-unresolved one.
+
+**Evidence outranks the assertion, in both directions.** Settling a row as "did not post" is refused
+outright if the row already names a Xero document. And if a claim you settled as "did not post" turns
+out to have posted after all, the connector records that document's id on the row anyway and raises
+an error naming it — so the order stays undeletable and you are told, rather than the assertion being
+quietly believed.
+
+**What cannot be settled, and why the control says so instead of disappearing:**
+
+- **Pending** rows — nothing was sent, so there is nothing to assert. The ordinary sweeps retire them.
+- **Synced** and **Cancelled** rows — the outcome is already recorded and must not be rewritten.
+- **Daily batch** rows — a batch row covers every order staged into it, so cancelling one could let an
+  order be deleted while a recreate is still building a journal containing its value. Reverse the
+  journal in Xero and let the batch sweep re-derive it.
+- Rows showing **attempt 0** — no fence-aware worker has ever claimed them, so a decision cannot be
+  tied to an attempt. This is permanent for QuickBooks rows, whose processor stamps no attempt.
+
+Settling needs the **sync** permission and a recently re-verified session; you will be asked to
+confirm your identity if your session is older than that.
+
 ### Rows stranded on a connector you switched away from
 
 Because the sync log is scoped to the active connector, unresolved rows left behind on a connector that has since been turned off appear in **no** sync log. They are listed instead in the amber banner at the top of **Integrations**, which shows each row's connector, type, reference, status, age in days, and last error — plus the external transaction ID if the row already posted something before it stalled.
 
-These rows still block their sales order from being deleted. To clear one, either re-enable the connector it was queued for (Pending rows then resume on the next cron run), or look the document up in that accounting system using the reference and external ID shown. Pending and Processing rows queued for an inactive connector can also be bulk-cancelled from the same banner; cancelling discards the queued row and does not stop the document syncing to the active connector later.
+Each row also shows the **attempt** it is on, and carries the same per-row **Settle** control described
+above — which is the point of the list: an aggregate count is not something anyone can act on.
+
+These rows still block their sales order from being deleted. To clear one you have three routes:
+re-enable the connector it was queued for (Pending rows then resume on the next cron run); look the
+document up in that accounting system using the reference and external ID shown and then **Settle**
+the row with what you found; or, for Pending and Processing rows only, bulk-cancel them from the same
+banner. Bulk-cancelling discards the queued row and does not stop the document syncing to the active
+connector later. Settling is the route to use when the connector can never be re-enabled — the usual
+reason a connector is retired is that its credentials or tenant are gone.
 
 **If a cancel reports an error, read which kind it is.** There are two, and they mean different things:
 
@@ -1358,7 +1414,7 @@ These rows still block their sales order from being deleted. To clear one, eithe
 
 Cancelling cannot be caught out by a connector switch happening at the same moment. The plugin selection is locked for the duration of the cancel, so a switch either lands entirely before it or entirely after it; if one somehow does land in between, the whole cancel is rolled back and reported rather than half-applied.
 
-**The list shows the oldest 50 rows only.** When there are more, it says so explicitly — "Showing the oldest 50 of 137 stranded row(s) — 87 more are not listed here." The hidden rows stay hidden until the listed ones are resolved: there is no per-row control here, and Failed rows in particular are not cleared by anything on this page, so a long-standing backlog at the front of the list will keep newer rows out of view. Resolve the oldest ones (re-enable their connector, or cancel the Pending/Processing ones) and the next set appears on reload. When the list is complete it says "Showing all N stranded row(s)" instead, so a count on this banner is never ambiguous about what it excludes.
+**The list shows the oldest 50 rows only.** When there are more, it says so explicitly — "Showing the oldest 50 of 137 stranded row(s) — 87 more are not listed here." The hidden rows stay hidden until the listed ones are resolved. Most can now be cleared from this page with **Settle**, but not all of them: a daily-batch row, a row at attempt 0, and a Pending row no sweep reaches are not clearable from here at all, so a run of those at the front of the list will still keep newer rows out of view. Resolve the oldest ones (settle them, re-enable their connector, or cancel the Pending/Processing ones) and the next set appears on reload. When the list is complete it says "Showing all N stranded row(s)" instead, so a count on this banner is never ambiguous about what it excludes.
 
 If the list itself cannot be loaded, the banner says so in red — "The list of stranded sync rows could not be loaded" — rather than showing nothing. An empty banner section always means there is nothing stranded; it never means the lookup failed.
 

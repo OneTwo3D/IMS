@@ -49,6 +49,16 @@ export type AccountingSyncLogRow = {
   externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
+  /**
+   * o3d-e2mz: which attempt this row is currently on, for connectors whose processor stamps one.
+   * A per-row operator decision must carry it back so the decision can be fenced to the attempt it
+   * was made about (lib/domain/accounting/sync-log-attempt.ts).
+   *
+   * OPTIONAL on purpose: a connector that does not stamp an attempt revision reports none, rather
+   * than reporting a 0 that reads like a real attempt. Absent and 0 both mean "cannot be fenced",
+   * and applyFencedAttemptDecision refuses both — the caller never has to tell them apart.
+   */
+  attemptRevision?: number
   syncedAt: string | null
   createdAt: string
 }
