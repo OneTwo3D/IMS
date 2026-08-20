@@ -443,3 +443,166 @@ test('install.sh makes the SERVER confirm the two encodings agree before it fini
   )
   assert.match(script, /die "Redis rejected the password this script just wrote/)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu round 3 — THE ENCODERS ONLY ENCODE WHAT THEY ARE GIVEN
+//
+// Both encodings are byte-exact and they agree with each other, which is what
+// round 2 established. Neither is upstream of `prompt`, and `prompt` changed the
+// answer before either of them ran: `read` under the script-wide IFS=$'\n\t'
+// strips leading and trailing TABS, and the assignment went through `eval`, which
+// re-parsed the DEFAULT as shell source. Everything downstream then agreed
+// perfectly about the wrong secret — config matches URL, the live AUTH probe
+// passes, and the password in the operator's password manager is rejected.
+//
+// The typed answer is fed to the SHIPPED prompt on stdin and read back with
+// `od`, so what is being compared is bytes in against bytes out.
+// ---------------------------------------------------------------------------
+
+/**
+ * The keystrokes an operator makes, on the prompt's stdin: the typed text and the
+ * single newline Enter produces, and nothing else.
+ *
+ * Written as raw bytes to a file the harness reads from, rather than piped in or
+ * echoed: `read` cannot tell a regular file from a pipe, and an `echo`/heredoc
+ * would put the answer through one more round of shell processing — which is the
+ * very thing under test.
+ */
+async function typedOnStdin(typed: string): Promise<string> {
+  const dir = await mkdtemp(path.join(tmpdir(), 'ims-prompt-input-'))
+  const file = path.join(dir, 'keystrokes')
+  await writeFile(file, Buffer.from(`${typed}\n`, 'utf8'))
+  return file
+}
+
+/** Run the shipped `prompt` against those keystrokes, and return the bytes it stored. */
+async function promptStores(script: string, typed: string, defaultValue = ''): Promise<Buffer> {
+  const harness = `
+    set -euo pipefail
+    IFS=$'\\n\\t'
+    BOLD=''; RESET=''
+    NON_INTERACTIVE=false
+    ${sliceBlock(script, 'prompt() {', '}')}
+    exec < ${shq(await typedOnStdin(typed))}
+    prompt REDIS_PASSWORD "Redis password" ${shq(defaultValue)} "secret"
+    printf '%s' "$REDIS_PASSWORD" | od -An -v -tx1 | tr -d ' \\n'
+  `
+  const { stdout } = await execFileAsync('bash', ['-c', harness])
+  return Buffer.from(stdout.trim(), 'hex')
+}
+
+test('the password the operator TYPES is the password that gets stored (o3d-xnwu r3, finding 3)', async () => {
+  const script = await readScript('install.sh')
+
+  for (const [password, why] of HOSTILE_PASSWORDS) {
+    const stored = await promptStores(script, password)
+    assert.equal(
+      stored.toString('binary'),
+      Buffer.from(password, 'utf8').toString('binary'),
+      `prompt changed the password before either encoder saw it (${why})`,
+    )
+  }
+
+  // The one the round-2 suite already named as hostile to redis.conf, and which
+  // never reached redis.conf at all: IFS=$'\n\t' makes a tab a field separator,
+  // so `read` trimmed it off the front of the answer.
+  assert.equal(
+    (await promptStores(script, '\ttabbed')).toString('utf8'),
+    '\ttabbed',
+    'a leading tab was stripped by read, so both encoders encoded "tabbed" and the server rejected the real password',
+  )
+  assert.equal((await promptStores(script, 'trailing\t')).toString('utf8'), 'trailing\t')
+  assert.equal((await promptStores(script, 'in\tside')).toString('utf8'), 'in\tside')
+})
+
+test('an empty answer takes the default, and the default is not re-parsed as shell (o3d-xnwu r3)', async () => {
+  const script = await readScript('install.sh')
+
+  assert.equal((await promptStores(script, '', 'fallback')).toString('utf8'), 'fallback')
+
+  // Defaults are not all constants: NOTIFICATION_EMAIL defaults to the admin
+  // email the operator typed a moment earlier, and the GitHub owner/name default
+  // to halves of the repo URL they typed. Under eval, pressing Enter ran them.
+  const marker = '/tmp/ims-install-prompt-eval-marker'
+  await execFileAsync('bash', ['-c', `rm -f ${marker}`])
+  const stored = await promptStores(script, '', `x"; touch ${marker}; :"y`)
+  assert.equal(
+    stored.toString('utf8'),
+    `x"; touch ${marker}; :"y`,
+    'the default must be stored as text, not executed as source',
+  )
+  const { stdout } = await execFileAsync('bash', ['-c', `test -e ${marker} && echo RAN || echo clean`])
+  assert.equal(stdout.trim(), 'clean', 'the default was executed by the shell')
+})
+
+test('a y/n answer is stored, not executed (o3d-xnwu r3)', async () => {
+  // The sharper end of the same defect: prompt_yn interpolated the ANSWER into
+  // the eval program, so `y"; <anything>; "` at any y/n prompt ran it.
+  const script = await readScript('install.sh')
+  const marker = '/tmp/ims-install-promptyn-eval-marker'
+  await execFileAsync('bash', ['-c', `rm -f ${marker}`])
+
+  const harness = `
+    set -euo pipefail
+    IFS=$'\\n\\t'
+    BOLD=''; RESET=''
+    NON_INTERACTIVE=false
+    ${sliceBlock(script, 'prompt_yn() {', '}')}
+    exec < ${shq(await typedOnStdin(`Y"; touch ${marker}; "`))}
+    prompt_yn INSTALL_REDIS "Install Redis?" "y"
+    printf 'ANSWER=%s\\n' "$INSTALL_REDIS"
+  `
+  const { stdout } = await execFileAsync('bash', ['-c', harness])
+
+  assert.match(stdout, /ANSWER=y"; touch .*; "/, 'the answer is stored verbatim, lower-cased')
+  const { stdout: check } = await execFileAsync('bash', ['-c', `test -e ${marker} && echo RAN || echo clean`])
+  assert.equal(check.trim(), 'clean', 'a y/n prompt executed what was typed at it')
+})
+
+test('the answer survives prompt AND both encoders, end to end (o3d-xnwu r3)', async () => {
+  // The two halves joined up: what the operator types goes through the shipped
+  // prompt, and the result of THAT is what the two encoders encode. Round 2
+  // proved the encoders agree; this proves they agree about the right bytes.
+  const script = await readScript('install.sh')
+  const urlencode = sliceBlock(script, 'urlencode() {', '}')
+  const confQuote = sliceBlock(script, 'redis_conf_quote() {', '}')
+  const urlBuild = sliceBlock(script, '  if [[ -n "${REDIS_PASSWORD}" ]]; then', '  fi')
+  const confBlock = sliceBlock(script, '    if [[ -n "${REDIS_PASSWORD}" ]]; then', '    fi')
+
+  for (const password of ['\ttabbed', 'hunter 2', 'a"b', 'pässwörd']) {
+    const dir = await mkdtemp(path.join(tmpdir(), 'ims-redis-e2e-'))
+    const conf = path.join(dir, 'redis.conf')
+    await writeFile(conf, 'port 6379\n# requirepass foobared\n')
+
+    const harness = `
+      set -euo pipefail
+      IFS=$'\\n\\t'
+      BOLD=''; RESET=''
+      NON_INTERACTIVE=false
+      ${sliceBlock(script, 'prompt() {', '}')}
+      exec < ${shq(await typedOnStdin(password))}
+      ${urlencode}
+      ${confQuote}
+      REDIS_HOST=localhost
+      REDIS_PORT=6379
+      REDIS_CONF=${shq(conf)}
+      prompt REDIS_PASSWORD "Redis password" "" "secret"
+${urlBuild}
+${confBlock}
+      printf '%s' "$REDIS_URL"
+    `
+    // `prompt` echoes a newline after a secret read (it stands in for the one the
+    // terminal does not show), so the URL is not the whole of stdout.
+    const { stdout } = await execFileAsync('bash', ['-c', harness])
+
+    const fromUrl = passwordFromRedisUrl(stdout.trim())
+    const fromConf = requirepassFromConf(await readFile(conf))
+    assert.ok(fromUrl && fromConf, `no usable credential for ${JSON.stringify(password)}`)
+    assert.equal(
+      fromConf.toString('binary'),
+      Buffer.from(password, 'utf8').toString('binary'),
+      `redis.conf must hold the password the operator TYPED, not what prompt made of it (${JSON.stringify(password)})`,
+    )
+    assert.equal(fromUrl.toString('binary'), fromConf.toString('binary'), 'and the URL must carry the same secret')
+  }
+})

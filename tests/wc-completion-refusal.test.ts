@@ -36,6 +36,21 @@ const notifications: Array<{ userId?: string | null; title?: string; message?: s
 /** Set to make the exception-row write fail, so the acknowledge decision can be tested. */
 let syncLogWriteError: string | null = null
 
+/**
+ * Which admin ids `notify` REFUSES to write a row for (o3d-xnwu round 3).
+ *
+ * `notify` swallows its own errors and reports nothing, which is the whole
+ * defect: the caller could not tell a delivered bell from a lost one. The double
+ * therefore returns the same boolean the real one now returns, per admin, so a
+ * partial failure is expressible — `Promise.all` would have hidden it behind one
+ * rejection, and a double that always resolved would make "the bell was
+ * delivered" unfalsifiable.
+ */
+let notifyFailsFor: Set<string> = new Set()
+/** Active ADMIN users. An install can genuinely have none. */
+let adminUsers: Array<{ id: string }> = [{ id: 'admin-1' }, { id: 'admin-2' }]
+let nextSyncLogId = 1
+
 let lockedOrder: { id: string; withdrawalApprovedAt: Date | null; status: string } | null = {
   id: 'so-1',
   withdrawalApprovedAt: null,
@@ -50,7 +65,11 @@ mock.module('@/lib/activity-log', {
 
 mock.module('@/lib/notifications', {
   namedExports: {
-    notify: async (params: { userId?: string | null }) => { notifications.push(params) },
+    notify: async (params: { userId?: string | null }) => {
+      if (params.userId && notifyFailsFor.has(params.userId)) return false
+      notifications.push(params)
+      return true
+    },
   },
 })
 
@@ -80,12 +99,25 @@ mock.module('@/lib/db', {
           salesOrder: { findUnique: async () => lockedOrder },
         })
       },
-      user: { findMany: async () => [{ id: 'admin-1' }, { id: 'admin-2' }] },
+      user: { findMany: async () => adminUsers },
       shoppingSyncLog: {
         create: async ({ data }: { data: SyncLogRow }) => {
           if (syncLogWriteError) throw new Error(syncLogWriteError)
-          syncLogs.push({ ...data, createdAt: new Date() })
-          return data
+          // A REAL id, because the delivery mark is written back by id. A double
+          // that returned the bare `data` would leave production updating
+          // `where: { id: undefined }`, which the double would then have to
+          // guess at — and the guess is what would be under test.
+          const row = { ...data, id: `syncLog-${nextSyncLogId++}`, createdAt: new Date() }
+          syncLogs.push(row)
+          return row
+        },
+        findFirst: async ({ where }: { where: Record<string, unknown> }) =>
+          syncLogs.find((row) => matches(row, where)) ?? null,
+        update: async ({ where, data }: { where: { id: string }; data: SyncLogRow }) => {
+          const row = syncLogs.find((candidate) => candidate.id === where.id)
+          if (!row) throw new Error(`no shopping_sync_logs row ${where.id}`)
+          Object.assign(row, data)
+          return row
         },
         deleteMany: async ({ where }: { where: Record<string, unknown> }) => {
           const kept = syncLogs.filter((row) => !matches(row, where))
@@ -118,8 +150,16 @@ function reset() {
   fulfillmentCalls.length = 0
   notifications.length = 0
   syncLogWriteError = null
+  notifyFailsFor = new Set()
+  adminUsers = [{ id: 'admin-1' }, { id: 'admin-2' }]
   fulfillmentResult = { success: true }
   lockedOrder = { id: 'so-1', withdrawalApprovedAt: null, status: 'PROCESSING' }
+}
+
+/** What the open refusal row says about whether an admin was actually told. */
+function belled(): unknown {
+  const row = openRefusals()[0]
+  return (row?.payload as { adminNotified?: unknown } | undefined)?.adminNotified
 }
 
 function openRefusals() {
@@ -297,4 +337,115 @@ test('an approved withdrawal still refuses the completion, and reports it as res
     activityLog.some((entry) => entry.action === 'wc_completion_refused_withdrawn' && entry.level === 'WARNING'),
     'it keeps its own loud record',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu round 3, Codex finding 4 — a failed bell is not a delivered bell.
+//
+// `notify` swallows its errors by design, and the dedupe keyed on the ROW
+// EXISTING. So the first refusal wrote the row, lost the notification, and every
+// later refusal of that order took the "they have already been told" branch. The
+// admin bell was never retried and its failure was never reported anywhere: a
+// notification silently treated as delivered, for ever.
+//
+// Same shape as the rule one layer up (a refusal that cannot be FILED is not
+// reported as permanent, so the delivery retries) applied to the bell: what was
+// not delivered is not recorded as delivered.
+// ---------------------------------------------------------------------------
+
+test('a failed admin bell is REPORTED, not silently treated as delivered (o3d-xnwu r3)', async () => {
+  reset()
+  notifyFailsFor = new Set(['admin-1', 'admin-2'])
+  fulfillmentResult = { success: false, reason: 'insufficient-stock', error: 'no stock: 3 unit(s) on backorder' }
+
+  const result = await runCompletion()
+
+  assert.deepEqual(notifications, [], 'nobody was told')
+  const unnotified = activityLog.find((entry) => entry.action === 'wc_completion_refusal_unnotified')
+  assert.ok(unnotified, `the lost bell must be reported, saw: ${JSON.stringify(activityLog.map((e) => e.action))}`)
+  assert.equal(unnotified.level, 'ERROR')
+  assert.equal(unnotified.entityId, 'so-1')
+  assert.match(String(unnotified.description), /0 of 2 notification\(s\) were written/)
+  assert.match(String(unnotified.description), /no stock: 3 unit\(s\) on backorder/, 'including the refusal it was about')
+
+  assert.equal(openRefusals().length, 1, 'the durable row still stands — the inbox is the record, the bell is the alert')
+  assert.equal(belled(), false, 'and the row says the bell has NOT landed')
+  assert.equal(
+    result.permanent,
+    true,
+    'the refusal WAS filed where an operator can see it, so the delivery is still acknowledged — '
+    + 'the lost bell is retried on its own terms, not by replaying the webhook into a dead letter',
+  )
+})
+
+test('a bell that failed is RETRIED on the next refusal of the same order (o3d-xnwu r3)', async () => {
+  reset()
+  notifyFailsFor = new Set(['admin-1', 'admin-2'])
+  fulfillmentResult = { success: false, reason: 'insufficient-stock', error: 'no stock: 3 unit(s) on backorder' }
+  await runCompletion()
+  assert.equal(notifications.length, 0, 'the first bell is lost')
+
+  // The reconcile comes round again, or the store re-fires the webhook. Under the
+  // old dedupe this branch was unreachable for ever, because the row existed.
+  notifyFailsFor = new Set()
+  await runCompletion()
+
+  assert.deepEqual(notifications.map((row) => row.userId), ['admin-1', 'admin-2'], 'they are told this time')
+  assert.equal(belled(), true)
+  assert.equal(openRefusals().length, 1, 'and it is still one row, not one per attempt')
+})
+
+test('a bell that LANDED is still rung only once (o3d-xnwu r3)', async () => {
+  reset()
+  fulfillmentResult = { success: false, reason: 'insufficient-stock', error: 'no stock: 3 unit(s) on backorder' }
+  await runCompletion()
+  assert.equal(notifications.length, 2)
+  assert.equal(belled(), true, 'delivery is recorded ON the row, so it survives the row being re-stamped')
+
+  await runCompletion()
+  await runCompletion()
+
+  assert.equal(
+    notifications.length,
+    2,
+    'the retry is keyed on delivery, not on the attempt — a bell per redelivery would train admins to ignore it',
+  )
+})
+
+test('a PARTIAL delivery is retried rather than counted as done (o3d-xnwu r3)', async () => {
+  reset()
+  notifyFailsFor = new Set(['admin-2'])
+  fulfillmentResult = { success: false, reason: 'insufficient-stock', error: 'no stock: 3 unit(s) on backorder' }
+
+  await runCompletion()
+
+  assert.deepEqual(notifications.map((row) => row.userId), ['admin-1'], 'one landed, one did not')
+  assert.match(
+    String(activityLog.find((entry) => entry.action === 'wc_completion_refusal_unnotified')?.description),
+    /1 of 2 notification\(s\) were written/,
+    'Promise.all would have collapsed this to one rejection and lost the admin who WAS reached',
+  )
+  assert.equal(belled(), false)
+
+  notifyFailsFor = new Set()
+  await runCompletion()
+  assert.deepEqual(
+    notifications.map((row) => row.userId),
+    ['admin-1', 'admin-1', 'admin-2'],
+    'admin-1 gets a second copy, deliberately: one duplicate bell is a far better failure than an admin never told',
+  )
+})
+
+test('an install with NO active admin is a failed bell, not a satisfied one (o3d-xnwu r3)', async () => {
+  reset()
+  adminUsers = []
+  fulfillmentResult = { success: false, reason: 'insufficient-stock', error: 'no stock: 3 unit(s) on backorder' }
+
+  await runCompletion()
+
+  // Promise.all([]) resolves, which is not the same as somebody having been told.
+  const unnotified = activityLog.find((entry) => entry.action === 'wc_completion_refusal_unnotified')
+  assert.ok(unnotified, 'an unfulfilled order with nobody to tell is exactly where this goes unnoticed')
+  assert.match(String(unnotified.description), /no active ADMIN user to notify/)
+  assert.equal(belled(), false, 'so when an admin does exist, the next refusal tells them')
 })

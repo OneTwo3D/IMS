@@ -12,11 +12,14 @@ import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-m
 import { isPermanentProductSyncConflict } from './product-sync-errors'
 import {
   WC_PRODUCT_CONFLICT_RETRY_LIMIT,
-  capWcProductConflictIds,
+  WC_PRODUCT_CONFLICT_STORE_LIMIT,
+  mergeWcProductConflictIds,
   parseWcProductConflictIds,
   shouldAdvanceWcProductCursor,
+  wcProductConflictLockId,
   wcProductConflictSettingKey,
 } from './product-conflict-cursor'
+import { WC_PRODUCT_CONFLICT_LIST_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   WC_SETTINGS_VERSION_KEY,
@@ -1961,6 +1964,14 @@ export async function syncAllWcProducts(
   const processedIds = new Set<number>()
   const conflictIds = new Set<number>()
   const conflictSkus: string[] = []
+  /**
+   * EVIDENCE that a product is no longer conflicted (o3d-xbt round 3). Only two
+   * things get an id in here: it imported cleanly, or WooCommerce answered a
+   * by-id fetch without it. Everything else — a transient failure, a fetch that
+   * errored, a run that simply did not reach it — says nothing, and an id we know
+   * nothing about stays on the list.
+   */
+  const clearedIds = new Set<number>()
 
   const [lastSyncSetting, existingProduct, conflictSetting] = await Promise.all([
     db.setting.findUnique({ where: { key: cursorKey } }),
@@ -2003,6 +2014,10 @@ export async function syncAllWcProducts(
     processedIds.add(product.id)
     if (outcome.success) {
       result.synced++
+      // The first of the two pieces of evidence that take an id OFF the retry
+      // list: it imported. (The second is WooCommerce answering a by-id fetch
+      // without it, recorded in the retry pass below.)
+      clearedIds.add(product.id)
       return
     }
     const line = `SKU ${product.sku}: ${outcome.error}`
@@ -2093,12 +2108,16 @@ export async function syncAllWcProducts(
   // cleanly, or WooCommerce answered a by-id fetch without it (deleted, or no
   // longer visible to these credentials). Not reaching it is not evidence.
   //
-  // The slice below can never truncate, and that is a property of two constants
-  // agreeing rather than a coincidence: parseWcProductConflictIds reads at most
-  // WC_PRODUCT_CONFLICT_RETRY_LIMIT ids, so everything carried is attempted. It
-  // is stated here — and pinned in tests/wc-product-conflict-cursor.test.ts —
-  // because if the read cap ever grew past the retry cap, the overflow would be
-  // dropped by this line with nothing said, which is the defect one paragraph up.
+  // o3d-xbt round 3, Codex finding 2 — THE SLICE IS A WINDOW, NOT A CAP.
+  //
+  // The store now holds up to WC_PRODUCT_CONFLICT_STORE_LIMIT ids and this line
+  // takes the first WC_PRODUCT_CONFLICT_RETRY_LIMIT of them, so the re-attempt
+  // stays exactly one WooCommerce request however long the backlog is. What
+  // makes that safe — and what makes it a rotation rather than a truncation — is
+  // that the ids NOT in the window are not dropped: the merge that writes the
+  // list back keeps every id it has no evidence about, and puts the ones this run
+  // attempted at the BACK. The list arrives at the next run rotated, so its
+  // window is the ids this one could not reach.
   const retryIds = carriedConflictIds.filter((id) => !processedIds.has(id)).slice(0, WC_PRODUCT_CONFLICT_RETRY_LIMIT)
   if (retryIds.length > 0) {
     await reportProgress(`Re-attempting ${retryIds.length} previously conflicted product(s)...`)
@@ -2116,16 +2135,28 @@ export async function syncAllWcProducts(
       result.errors.push(`Re-attempt of conflicted products failed: ${retryError}`)
       // …and the ids survive it. A failed fetch says nothing about whether these
       // products still conflict, and dropping them here abandoned every one of
-      // them permanently (o3d-xbt round 2, finding 1).
-      for (const id of retryIds) conflictIds.add(id)
+      // them permanently (o3d-xbt round 2, finding 1). They survive by the merge
+      // finding no evidence about them, not by being re-asserted as conflicts:
+      // re-adding them would make a transport failure look like a fresh
+      // observation and rotate them to the back of a queue they never left.
       await reportProgress(`Failed to re-fetch conflicted WooCommerce products: ${retryError}`)
     } else {
       // Ids WooCommerce did not return are deleted (or no longer visible to these
-      // credentials). They fall out of the set by not being re-added, so the list
-      // shrinks by itself instead of accumulating dead ids forever.
+      // credentials). THAT is the evidence — the fetch succeeded and answered
+      // without them — so they leave the list and it shrinks by itself instead of
+      // accumulating dead ids forever.
+      const returnedIds = new Set((retryData as WcFullProduct[]).map((product) => product.id))
+      for (const id of retryIds) {
+        if (!returnedIds.has(id)) clearedIds.add(id)
+      }
       for (const product of retryData as WcFullProduct[]) {
         if (!product.sku) {
+          // Returned, but unimportable: a product whose SKU was removed in
+          // WooCommerce is skipped by the ordinary pass too. That is not evidence
+          // the conflict is resolved, so it stays carried — marked attempted only,
+          // which rotates it to the back of the queue instead of clearing it.
           result.skipped++
+          processedIds.add(product.id)
           continue
         }
         const r = await syncWcProductToIms(product, retryVersion)
@@ -2151,21 +2182,58 @@ export async function syncAllWcProducts(
   // past products whose ids were never recorded: nothing re-fetches them, nothing
   // knows they exist, and the sweep reports a clean run. Persisting the safety
   // net before stepping off the ledge is the whole of the fix.
-  const { kept: keptConflictIds, dropped: droppedConflictIds } = capWcProductConflictIds(conflictIds)
-
-  // Written on every run, including the clean one that clears it: this row is the
-  // live set of conflicted products, not a log of past ones.
-  // (Skipped only when there is nothing to say and nothing to clear, so a store
-  // that never conflicts does not grow a settings row it will never read.)
+  //
+  // ORDER IS NOT ENOUGH ON ITS OWN (o3d-xbt round 3, finding 1). It sequences
+  // OUR two writes; it says nothing about ANOTHER sweep's. The cron reconcile and
+  // the manual reconcile share this row and this cursor, and the poll can lap
+  // itself when the catalogue takes longer than the cron interval. Sweep A
+  // finishes, writes its list, advances the cursor; sweep B then writes a list it
+  // computed from a snapshot taken before A committed, and every id A had just
+  // recorded is gone — with the cursor already past those products. Both runs
+  // report success.
+  //
+  // So the list is not REPLACED, it is MERGED, under a lock held across the read
+  // and the write: re-read the row, keep every id we have no evidence about
+  // (which is all of the other sweep's), drop only what this run can prove is
+  // resolved, and rotate what we attempted to the back. Two overlapping sweeps
+  // then compose instead of overwriting, in either order.
   let conflictsPersisted = true
+  let keptConflictIds: number[] = []
+  let droppedConflictIds: number[] = []
+  let droppedStrandedIds: number[] = []
+
+  // Written on every run that has something to say, including the clean one that
+  // clears the row: this is the live set of conflicted products, not a log of
+  // past ones. (Skipped when this run conflicted on nothing AND there was no row
+  // to clear, so a store that never conflicts does not grow a settings row it
+  // will never read — and a sweep with nothing to contribute leaves a concurrent
+  // sweep's row entirely alone.)
   if (conflictIds.size > 0 || conflictSetting) {
-    const serializedConflicts = JSON.stringify(keptConflictIds)
     try {
-      await db.setting.upsert({
-        where: { key: conflictKey },
-        create: { key: conflictKey, value: serializedConflicts },
-        update: { value: serializedConflicts },
+      const merged = await db.$transaction(async (tx) => {
+        // Held to commit, so the read below and the write after it are one step
+        // as far as any other sweep is concerned. Without it, both sweeps read
+        // the same list and the later write still wins outright — merging a
+        // stale snapshot is no better than replacing with one.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_CONFLICT_LIST_LOCK_NAMESPACE}::int4, ${wcProductConflictLockId(mode)}::int4)`
+        const current = await tx.setting.findUnique({ where: { key: conflictKey } })
+        const outcome = mergeWcProductConflictIds({
+          stored: parseWcProductConflictIds(current?.value),
+          attempted: processedIds,
+          cleared: clearedIds,
+          observed: [...conflictIds],
+        })
+        const value = JSON.stringify(outcome.kept)
+        await tx.setting.upsert({
+          where: { key: conflictKey },
+          create: { key: conflictKey, value },
+          update: { value },
+        })
+        return outcome
       })
+      keptConflictIds = merged.kept
+      droppedConflictIds = merged.dropped
+      droppedStrandedIds = merged.dropped.filter((id) => !merged.droppedRecoverableByCursor.includes(id))
     } catch (error) {
       conflictsPersisted = false
       const reason = error instanceof Error ? error.message : String(error)
@@ -2184,7 +2252,7 @@ export async function syncAllWcProducts(
           `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: the list of ${conflictIds.size} conflicted product(s)`
           + ` could not be written to ${conflictKey} (${reason}). The sync cursor has been HELD so the same products are`
           + ' fetched again next run — nothing is abandoned, but this run did less than it appears to have done.',
-        metadata: { mode, conflictedExternalProductIds: keptConflictIds, error: reason },
+        metadata: { mode, conflictedExternalProductIds: [...conflictIds], error: reason },
         resolveUser: false,
       })
       await reportProgress(`Failed to record conflicted WooCommerce products: ${reason}`)
@@ -2192,41 +2260,63 @@ export async function syncAllWcProducts(
   }
 
   if (droppedConflictIds.length > 0) {
-    // o3d-xbt round 2, finding 2. The cap is deliberate — the retry pass must stay
-    // one extra request — but a truncation nobody is told about reads as full
-    // coverage. Named ids, not a count: an operator who has to go and look at
-    // these needs to know which.
+    // o3d-xbt round 3, Codex finding 2. The store rotates, so reaching this at
+    // all means MORE THAN WC_PRODUCT_CONFLICT_STORE_LIMIT products are
+    // conflicted at once — not a long backlog (a backlog is carried and walked a
+    // window at a time), but a catalogue that disagrees with IMS wholesale.
+    //
+    // What round 2 got wrong was the classification. It called the overflow
+    // PERMANENT so the cursor could still advance, and then told the operator to
+    // "resolve the carried conflicts to make room" — an instruction that could
+    // not work: the dropped ids were no longer on any list, and the cursor had
+    // stepped past them, so making room re-attempted nothing. An instruction
+    // that cannot work is worse than none.
+    //
+    // It is reported as TRANSIENT instead, which HOLDS the cursor. That is the
+    // same rule the rest of this branch follows — a refusal that cannot be filed
+    // is not reported as permanent — and here it is also the only thing that
+    // makes the remedy true: with the cursor held, next run's modified-after
+    // window still covers these products, so they are re-fetched, and as soon as
+    // resolving the carried conflicts frees slots they are carried. The cost is
+    // the one o3d-xbt exists to avoid — a full catalogue sweep every cycle — and
+    // it is the right trade at this scale: it is bounded by the operator fixing
+    // a store that has a thousand conflicted products in it, and the alternative
+    // is discarding valid work silently.
+    const dropped = `${droppedConflictIds.length} conflicted product(s) exceeded the ${WC_PRODUCT_CONFLICT_STORE_LIMIT}-id conflict list`
+      + ` and could not be carried: ${droppedConflictIds.slice(0, 20).join(', ')}`
+      + `${droppedConflictIds.length > 20 ? `, +${droppedConflictIds.length - 20} more` : ''}`
+    // `errors` only, never `permanentErrors`: that difference IS the held cursor.
+    // Pushed BEFORE the activity row, so the row's claim that the cursor is held
+    // is already true when it is written — the same order as the conflict list
+    // and the cursor above, for the same reason.
+    result.errors.push(`${dropped} — the sync cursor has been held so they are re-fetched next run`)
     await logActivity({
-      entityType: 'SYNC', action: 'wc_product_sync_conflicts_truncated', tag: 'sync', level: 'WARNING',
+      entityType: 'SYNC', action: 'wc_product_sync_conflicts_truncated', tag: 'sync', level: 'ERROR',
       description:
-        `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${conflictIds.size} product(s) conflicted but only`
-        + ` ${keptConflictIds.length} can be carried to the next run (one WooCommerce page). ${droppedConflictIds.length}`
-        + ` id(s) were DROPPED and will NOT be re-attempted: ${droppedConflictIds.slice(0, 50).join(', ')}`
+        `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${conflictIds.size} product(s) conflicted and only`
+        + ` ${keptConflictIds.length} fit the carry list. ${droppedConflictIds.length} id(s) could NOT be carried:`
+        + ` ${droppedConflictIds.slice(0, 50).join(', ')}`
         + `${droppedConflictIds.length > 50 ? `, +${droppedConflictIds.length - 50} more` : ''}.`
-        + ' The cursor has moved past them, so they will only be seen again if they change in WooCommerce or the cursor'
-        + ' is reset. Resolve the carried conflicts to make room, or reset the cursor to re-import from scratch.',
+        + ' The sync cursor has been HELD rather than advanced, so next run re-fetches them the ordinary way and'
+        + ' nothing is abandoned — but until the carried conflicts are resolved this sweep re-imports the whole'
+        + ' catalogue every cycle. Resolve the conflicts under Sync → Exceptions to free slots.'
+        + (droppedStrandedIds.length > 0
+          ? ` WARNING: ${droppedStrandedIds.length} of them (${droppedStrandedIds.slice(0, 50).join(', ')}) were carried`
+            + ' from an earlier run, so the held cursor does NOT cover them and they will only be seen again if they'
+            + ' change in WooCommerce or the cursor is reset.'
+          : ''),
       metadata: {
         mode,
         droppedExternalProductIds: droppedConflictIds.slice(0, 200),
         droppedCount: droppedConflictIds.length,
+        droppedStrandedExternalProductIds: droppedStrandedIds.slice(0, 200),
         carriedCount: keptConflictIds.length,
+        storeLimit: WC_PRODUCT_CONFLICT_STORE_LIMIT,
         retryLimit: WC_PRODUCT_CONFLICT_RETRY_LIMIT,
+        cursorHeld: true,
       },
       resolveUser: false,
     })
-    result.errors.push(
-      `${droppedConflictIds.length} conflicted product(s) exceeded the ${WC_PRODUCT_CONFLICT_RETRY_LIMIT}-id retry list`
-      + ` and were dropped: ${droppedConflictIds.slice(0, 20).join(', ')}`
-      + `${droppedConflictIds.length > 20 ? `, +${droppedConflictIds.length - 20} more` : ''}`,
-    )
-    // Permanent as well: a full retry list is not a transport hiccup, and holding
-    // the cursor on it would re-import the whole catalogue every cycle — the very
-    // defect o3d-xbt exists to fix.
-    result.permanentErrors.push(
-      `${droppedConflictIds.length} conflicted product(s) exceeded the ${WC_PRODUCT_CONFLICT_RETRY_LIMIT}-id retry list`
-      + ` and were dropped: ${droppedConflictIds.slice(0, 20).join(', ')}`
-      + `${droppedConflictIds.length > 20 ? `, +${droppedConflictIds.length - 20} more` : ''}`,
-    )
   }
 
   if (conflictsPersisted && shouldAdvanceWcProductCursor(result)) {
@@ -2246,7 +2336,9 @@ export async function syncAllWcProducts(
       description:
         `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${conflictIds.size} product(s) cannot be imported until an operator resolves a conflict`
         + `${conflictSkus.length > 0 ? ` — ${conflictSkus.slice(0, 20).join(', ')}${conflictSkus.length > 20 ? `, +${conflictSkus.length - 20} more` : ''}` : ''}.`
-        + ' Retrying cannot clear these on its own; they are re-attempted by id on every run until resolved.'
+        + ` Retrying cannot clear these on its own; they are re-attempted by id until resolved — up to`
+        + ` ${WC_PRODUCT_CONFLICT_RETRY_LIMIT} per run, rotating, so a longer list is walked a window at a time rather`
+        + ' than costing more requests.'
         + ' A structure conflict also carries a row under Sync → Exceptions; a mapping conflict (a GTIN or a WooCommerce id'
         + ' already held by a different IMS product) is recorded in the WooCommerce sync log as PERMANENT_CONFLICT.',
       metadata: { mode, conflictedExternalProductIds: [...conflictIds], skus: conflictSkus.slice(0, 50) },

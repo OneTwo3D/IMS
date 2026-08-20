@@ -142,20 +142,47 @@ NON_INTERACTIVE=false
 
 # ---------------------------------------------------------------------------
 # Helper: prompt with default
+#
+# WHAT THE OPERATOR TYPED IS WHAT MUST BE STORED (o3d-xnwu round 3, finding 3).
+#
+# Both Redis encoders — `urlencode` for REDIS_URL and `redis_conf_quote` for
+# requirepass — are byte-exact, and they are still only as good as the bytes
+# handed to them. This function is upstream of both, and it changed them twice
+# before either encoder ran:
+#
+#   1. `read` with the script-wide IFS=$'\n\t' STRIPS leading and trailing tabs
+#      from the answer, because a tab is IFS whitespace. A password typed with
+#      one becomes a different password, silently, and every later check agrees
+#      with itself about the wrong secret: the config and the URL match, the AUTH
+#      probe passes, and the operator's password manager holds something the
+#      server will reject. `IFS=` for the duration of the read is the fix; a
+#      password is a byte string, not a field to be split.
+#
+#   2. `eval "$varname=\"\${input:-$default}\""` re-parsed the DEFAULT as shell
+#      source. Defaults are not all constants — NOTIFICATION_EMAIL defaults to
+#      the admin email the operator typed a moment earlier, and the GitHub
+#      owner/name default to halves of the repo URL they typed — so pressing
+#      Enter could execute what an earlier answer contained. `printf -v` assigns
+#      without a second round of parsing at all.
+#
+# The value is read back with `${!varname:-}` rather than through eval for the
+# same reason.
 # ---------------------------------------------------------------------------
 prompt() {
   local varname="$1" question="$2" default="$3" secret="${4:-}"
+  local current="${!varname:-}"
   if $NON_INTERACTIVE; then
-    eval "$varname=\"\${$varname:-$default}\""
+    printf -v "$varname" '%s' "${current:-$default}"
     return
   fi
+  local input=""
   if [[ "$secret" == "secret" ]]; then
-    read -r -s -p "$(echo -e "${BOLD}${question}${RESET} [${default}]: ")" input
+    IFS= read -r -s -p "$(echo -e "${BOLD}${question}${RESET} [${default}]: ")" input
     echo ""
   else
-    read -r -p "$(echo -e "${BOLD}${question}${RESET} [${default}]: ")" input
+    IFS= read -r -p "$(echo -e "${BOLD}${question}${RESET} [${default}]: ")" input
   fi
-  eval "$varname=\"\${input:-$default}\""
+  printf -v "$varname" '%s' "${input:-$default}"
 }
 
 # Percent-encode a value for use inside a URL's userinfo section. LC_ALL=C makes
@@ -213,16 +240,21 @@ redis_conf_quote() {
   printf '%s"' "$out"
 }
 
+# Same rule, and the sharper end of it: this one interpolated the ANSWER into the
+# eval program (`eval "$varname=\"${input,,}\""` — expanded by the outer shell,
+# not by eval), so a y/n prompt answered with `y"; <anything>; "` ran it.
 prompt_yn() {
   local varname="$1" question="$2" default="${3:-y}"
+  local current="${!varname:-}"
   if $NON_INTERACTIVE; then
-    eval "$varname=\"\${$varname:-$default}\""
+    printf -v "$varname" '%s' "${current:-$default}"
     return
   fi
   local options="[Y/n]"; [[ "$default" == "n" ]] && options="[y/N]"
-  read -r -p "$(echo -e "${BOLD}${question}${RESET} ${options}: ")" input
+  local input=""
+  IFS= read -r -p "$(echo -e "${BOLD}${question}${RESET} ${options}: ")" input
   input="${input:-$default}"
-  eval "$varname=\"${input,,}\""
+  printf -v "$varname" '%s' "${input,,}"
 }
 
 # ---------------------------------------------------------------------------

@@ -63,7 +63,12 @@ After installation, sign in and set the organisation base currency in **Settings
 - **Redis port** (local install) or **Redis URL** (default: `redis://localhost:6379`)
 - **Redis password** — leave blank if not required. For a Redis installed by this script the
   password is written into `redis.conf` as `requirepass` *and* into the generated `REDIS_URL`,
-  percent-encoded, because the URL is what the application connects with
+  percent-encoded, because the URL is what the application connects with. Both are byte-exact
+  encodings of what you type — spaces, tabs, quotes, backslashes and non-ASCII characters are
+  all safe, and the installer proves it by running `AUTH` against the server it just restarted
+  and refusing to finish if the server disagrees. (A mismatch here does not look like a Redis
+  problem: the login rate limiter fails **closed** on its auth buckets, so the symptom is that
+  nobody can sign in.)
 - **Redis key prefix** — optional namespace for Redis-backed features
 - **Share rate-limit counters through Redis?** — writes `RATE_LIMIT_BACKEND` (`redis` or
   `memory`) into `.env`. Defaults to `redis` when Redis is installed here, `memory` otherwise.

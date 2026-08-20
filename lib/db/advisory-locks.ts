@@ -170,8 +170,34 @@ export const REFUND_RELEASE_WARNING_LOCK_NAMESPACE = 411_220_867
 export const BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE = 411_220_868
 
 
+/**
+ * Per-MODE serialization of the WooCommerce product sweep's conflict-list
+ * read-modify-write (o3d-xbt round 3).
+ *
+ * The list of conflicted WooCommerce product ids is the ONLY record that those
+ * products need re-fetching once the modified-after cursor has moved past them.
+ * Two sweeps overlap in practice — the cron reconcile against the manual one,
+ * which share the row, and the poll against itself when a catalogue takes longer
+ * than the cron interval — and a plain read-modify-write loses the other sweep's
+ * ids entirely: it writes a list computed from a snapshot taken before the other
+ * run committed, and the cursor is already past everything it dropped.
+ *
+ * Held for the read AND the write, so the merge in
+ * `mergeWcProductConflictIds` sees a list nobody else is midway through
+ * replacing. Keyed on the mode (poll = 1, reconcile/manual_reconcile = 2)
+ * because the two modes write different rows; making them queue behind each
+ * other would be contention with no safety gain.
+ *
+ * Deliberately NOT `WC_SYNC_ADVISORY_LOCK_KEY`: that one fences credential
+ * rebinds against in-flight writes and is taken (shared) for the whole of every
+ * product-write transaction, up to a minute at a time. This one is held for two
+ * statements at the very end of a sweep and must not wait behind that.
+ */
+export const WC_PRODUCT_CONFLICT_LIST_LOCK_NAMESPACE = 918_273_647
+
 export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
+  WC_PRODUCT_CONFLICT_LIST_LOCK_NAMESPACE,
   DISPATCH_SWEEP_LOCK_NAMESPACE,
   REFUND_RELEASE_WARNING_LOCK_NAMESPACE,
   BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE,
