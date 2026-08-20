@@ -311,11 +311,22 @@ function createClient(state: MemoryState): AllocationServiceClient {
       count: async ({ where }: { where: { orderId: string } }) => allocations
         .filter((allocation) => allocation.orderId === where.orderId)
         .length,
-      deleteMany: async ({ where }: { where: { orderId: string } }) => {
+      // o3d-0i5y r4: the SCOPE predicate is honoured. The allocator no longer wipes the order and
+      // rebuilds it — it deletes only the (line, warehouse, product) scopes the new set dropped —
+      // so a double that ignored those keys would report a targeted delete as having destroyed
+      // every row on the order, and the identity-preservation assertions would be vacuous.
+      deleteMany: async ({ where }: {
+        where: { orderId: string; lineId?: string; productId?: string; warehouseId?: string }
+      }) => {
         writeCounts.allocationDeletes += 1
         const before = allocations.length
         for (let index = allocations.length - 1; index >= 0; index -= 1) {
-          if (allocations[index].orderId === where.orderId) allocations.splice(index, 1)
+          const row = allocations[index]
+          if (row.orderId !== where.orderId) continue
+          if (where.lineId != null && row.lineId !== where.lineId) continue
+          if (where.productId != null && row.productId !== where.productId) continue
+          if (where.warehouseId != null && row.warehouseId !== where.warehouseId) continue
+          allocations.splice(index, 1)
         }
         return { count: before - allocations.length }
       },
@@ -334,14 +345,28 @@ function createClient(state: MemoryState): AllocationServiceClient {
       // `lineId` and a `fulfillmentGraphVersion: { not }` predicate. Both are honoured — a double
       // that ignored them would report a re-stamp scoped to one stale line as having touched every
       // row on the order, so a test could not tell a targeted repair from a blanket rewrite.
+      //
+      // o3d-0i5y r4: it is ALSO the allocator's in-place quantity write now, so it honours the full
+      // (line, warehouse, product) scope and coerces `qty` to the column's 4dp exactly as `create`
+      // does. A double that took the qty verbatim would let a test observe a precision Postgres
+      // would have rounded away, and one that ignored productId/warehouseId would silently apply
+      // one scope's new quantity to every row on the order.
       updateMany: async ({ where, data }: {
-        where: { orderId: string; lineId?: string; fulfillmentGraphVersion?: { not?: number } }
-        data: { costLayerSnapshot?: unknown; fulfillmentGraphVersion?: number }
+        where: {
+          orderId: string
+          lineId?: string
+          productId?: string
+          warehouseId?: string
+          fulfillmentGraphVersion?: { not?: number }
+        }
+        data: { costLayerSnapshot?: unknown; fulfillmentGraphVersion?: number; qty?: number | { toNumber(): number } }
       } = { where: { orderId: '' }, data: {} }) => {
         writeCounts.allocationUpdateManys += 1
         const rows = allocations
           .filter((allocation) => allocation.orderId === where.orderId)
           .filter((allocation) => where.lineId == null || allocation.lineId === where.lineId)
+          .filter((allocation) => where.productId == null || allocation.productId === where.productId)
+          .filter((allocation) => where.warehouseId == null || allocation.warehouseId === where.warehouseId)
           .filter((allocation) => (
             where.fulfillmentGraphVersion?.not == null
             || (allocation.fulfillmentGraphVersion ?? 0) !== where.fulfillmentGraphVersion.not
@@ -349,6 +374,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
         for (const row of rows) {
           if ('costLayerSnapshot' in data) row.costLayerSnapshot = null
           if (data.fulfillmentGraphVersion !== undefined) row.fulfillmentGraphVersion = data.fulfillmentGraphVersion
+          if (data.qty !== undefined) row.qty = persistAllocationQty(decimalLikeToNumber(data.qty))
         }
         return { count: rows.length }
       },
@@ -461,17 +487,32 @@ function createClient(state: MemoryState): AllocationServiceClient {
       // two DIFFERENT questions of this table and they must not be conflated: demand netting uses
       // every non-PENDING shipment, while the reservation residual uses only SHIPPED — the single
       // status at which reservedQty is actually decremented (o3d-4kfh).
+      //
+      // o3d-0i5y r4 adds a THIRD question to the same table: which lines belong to a shipment Group
+      // B has already POSTED (`shipmentJournalDate: { not: null }`, no status predicate at all).
+      // That is the floor the journal-safe permit is checked against, so a double that answered it
+      // with the unfiltered set would let a test pass with the floor computed from shipments no
+      // journal ever touched.
       findMany: async ({ where }: {
-        where: { shipment: { orderId: string; status: string | { not: string } } }
+        where: {
+          shipment: {
+            orderId: string
+            status?: string | { not: string }
+            shipmentJournalDate?: { not: null }
+          }
+        }
       }) => {
         const statusFilter = where.shipment.status
         return shipmentLines.flatMap((line) => {
           const shipment = shipments.find((row) => row.id === line.shipmentId)
           if (!shipment || shipment.orderId !== where.shipment.orderId) return []
           const status = shipment.status ?? 'PENDING'
-          const matches = typeof statusFilter === 'string'
-            ? status === statusFilter
-            : status !== statusFilter.not
+          if (where.shipment.shipmentJournalDate?.not === null && shipment.shipmentJournalDate == null) return []
+          const matches = statusFilter == null
+            ? true
+            : typeof statusFilter === 'string'
+              ? status === statusFilter
+              : status !== statusFilter.not
           if (!matches) return []
           return [{
             lineId: line.lineId,
@@ -1102,22 +1143,131 @@ test('onReconciledInTx does NOT run on the refused path — the backstop stays p
   assert.equal(calls, 0, 'a refuse must not resolve the backstop')
 })
 
-test('allocateSalesOrder blocks allocation edits after shipment accounting is journaled', async () => {
+// ---------------------------------------------------------------------------
+// o3d-0i5y r4 — A JOURNALED PARTIAL SHIPMENT MUST NOT TAKE THE REMEDY AWAY.
+//
+// r1 stops promoting a short order, r3 makes "re-allocate, create the residual shipments, dispatch
+// them" reachable from PICKING/PACKING. But the FIRST step of that remedy is a re-allocation, and
+// the re-allocation went through `resetAllocationAccountingIfStaged`, which refused outright once
+// Group B had posted the despatched part. So the orders r3 was rescuing — part despatched, part
+// posted — were stranded again.
+//
+// The refusal is now the invariant it stood in for: no row a journal posted against may be dropped
+// or shrunk below the posted quantity. These two tests are the permit and the refusal.
+// ---------------------------------------------------------------------------
+
+test('o3d-0i5y r4: a JOURNALED short order can still be RE-ALLOCATED for its residual', async () => {
+  // The exact shape r1 leaves behind, one daily batch later. 3 ordered, 2 allocated and despatched,
+  // Group B has posted that shipment, and stock for the last unit has since arrived. Before this,
+  // the re-allocation the operator is told to perform threw before writing anything.
   const state = baseState({
     order: {
       ...baseState().order,
+      status: 'PICKING',
       inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
     },
-    shipments: [{ id: 'shipment-1', orderId: 'order-1', shipmentJournalDate: new Date('2026-01-02T00:00:00Z') }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 3, reservedQty: 0 }],
+    allocations: [{
+      id: 'alloc-posted',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCost: 4 }],
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      warehouseId: 'warehouse-1',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00Z'),
+    }],
+    shipmentLines: [{ shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.success, true)
+  // The whole claim: 1 outstanding + the 2 already posted, per the o3d-4kfh contract. That is what
+  // `confirmSalesOrderShipments` subtracts the committed 2 from to raise the residual shipment.
+  const own = (state.allocations ?? []).find((row) => row.orderId === 'order-1')
+  assert.equal(Number(own?.qty), 3)
+  // AND the evidence Group B posted through is untouched: same row, same id, same pinned layers.
+  // A delete+recreate would leave the numbers identical and break both.
+  assert.equal(own?.id, 'alloc-posted', 'the allocation identity the shipment snapshot references survives')
+  assert.deepEqual(
+    own?.costLayerSnapshot,
+    [{ costLayerId: 'layer-1', qty: 2, unitCost: 4 }],
+    'and so does the cost snapshot the refund reversal relieves against',
+  )
+  assert.equal(
+    state.order.inventoryAllocatedDate?.toISOString(),
+    '2026-01-01T00:00:00.000Z',
+    'the A2 stamp is KEPT — re-staging a journaled order re-posts its reclassification and wipes the snapshots',
+  )
+  // Only the residual unit is newly reserved; the despatched 2 gave their reservation back already.
+  assert.equal(state.stockLevels[0].reservedQty, 1)
+})
+
+test('o3d-0i5y r4: an allocation that would SHRINK a posted row is still refused, and says which row', async () => {
+  // The case the original blanket refusal genuinely existed for. Declared directly against the
+  // guard, because `allocateSalesOrder` cannot produce it — `persistedAllocations` re-adds every
+  // committed shipment line — and a refusal that only exists inside a caller that can never reach
+  // it is not a guard.
+  const { tx, salesOrderUpdates, allocationUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
   })
 
   await assert.rejects(
-    () => allocateSalesOrder(createClient(state), { orderId: 'order-1' }),
-    /Cannot modify allocations after shipments have been posted to accounting/,
+    () => resetAllocationAccountingIfStaged(
+      tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+      'order-1',
+      {
+        nextAllocations: [{
+          lineId: 'line-1',
+          productId: 'product-1',
+          warehouseId: 'warehouse-1',
+          qty: toDecimal('1'),
+        }],
+      },
+    ),
+    (error: Error) => {
+      assert.match(error.message, /Cannot reduce an allocation below the quantity already posted/)
+      assert.match(error.message, /product-1 @ warehouse-1 on line line-1/, 'names the row')
+      assert.match(error.message, /posted 2, allocation would keep 1/, 'and the size of the shortfall')
+      assert.match(error.message, /Process a refund or return/, 'and a remedy the operator can actually perform')
+      return true
+    },
   )
-  assert.deepEqual(state.allocations, [])
-  assert.equal(state.stockLevels[0].reservedQty, 0)
-  assert.equal(state.order.status, 'PROCESSING')
+  assert.deepEqual(salesOrderUpdates, [], 'and it refuses BEFORE touching the A2 stamp')
+  assert.deepEqual(allocationUpdates, [], 'or the cost snapshots')
+})
+
+test('o3d-0i5y r4: a caller that declares NO set is still refused — and is told which button does declare one', async () => {
+  // updateAllocation / addAllocation / the cancellation and teardown releases all call the guard
+  // without a set. They cannot be permitted, because there is nothing to check them against; what
+  // changes is that the refusal now names a remedy that exists, instead of "contact finance".
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+  })
+
+  await assert.rejects(
+    () => resetAllocationAccountingIfStaged(
+      tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+      'order-1',
+    ),
+    (error: Error) => {
+      assert.match(error.message, /Cannot modify allocations one row at a time/)
+      assert.match(error.message, /Use Re-Allocate on the order instead/)
+      return true
+    },
+  )
+  assert.deepEqual(salesOrderUpdates, [])
 })
 
 test('assertReservationReleaseDelta verifies exact per-scope reservation release', () => {
@@ -1762,6 +1912,7 @@ test('a genuine allocation change still resets accounting state (o3d-i5it), keep
     },
     stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 2 }],
     allocations: [{
+      id: 'alloc-a',
       orderId: 'order-1',
       lineId: 'line-1',
       productId: 'product-1',
@@ -1784,8 +1935,55 @@ test('a genuine allocation change still resets accounting state (o3d-i5it), keep
     'and the retention is recorded where an operator can see it',
   )
   assert.ok(result.syncProductIds.includes('product-1'), 'and still pushes the storefront update')
-  assert.ok(writeCounts.allocationDeletes > 0, 'and the destructive cycle DID run for a real change')
-  assert.ok(writeCounts.allocationCreates > 0)
+  // o3d-0i5y r4: the cycle is no longer DESTRUCTIVE. The quantity moved on the row that was
+  // already there, so the row keeps the id a dispatched shipment line's cost snapshot references
+  // (`orderAllocationId`) — a delete+recreate would leave these same numbers behind a new id, and
+  // the next refund would relieve nothing and over-reverse.
+  assert.equal(state.allocations?.[0].id, 'alloc-a', 'and the row was updated in place, not replaced')
+  assert.equal(writeCounts.allocationDeletes, 0, 'nothing was deleted — the scope is still wanted')
+  assert.equal(writeCounts.allocationCreates, 0, 'and nothing re-created')
+  assert.ok(writeCounts.allocationUpdateManys > 0, 'the change was written, as an in-place update')
+})
+
+test('o3d-0i5y r4: a scope the new set DROPS is deleted, and only that scope', async () => {
+  // The other half of the reconcile-by-key rewrite. Warehouse-2 loses its stock, so the whole claim
+  // moves to warehouse-1: the w2 row must go, and the w1 row must survive with its identity.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      lines: [{
+        id: 'line-1',
+        productId: 'product-1',
+        qty: 3,
+        sku: 'SKU-1',
+        description: 'Product 1',
+        product: { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false },
+      }],
+    },
+    warehouses: [
+      { id: 'warehouse-1', code: 'MAIN', name: 'Main', active: true, availableForSale: true, isDefault: true, syncToStore: false },
+      { id: 'warehouse-2', code: 'SEC', name: 'Second', active: true, availableForSale: true, isDefault: false, syncToStore: false },
+    ],
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 2 },
+      { productId: 'product-1', warehouseId: 'warehouse-2', quantity: 1, reservedQty: 1 },
+    ],
+    allocations: [
+      { id: 'alloc-w1', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 },
+      { id: 'alloc-w2', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-2', qty: 1 },
+    ],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const remaining = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(
+    remaining.map((row) => `${row.id}:${row.warehouseId}:${Number(row.qty)}`),
+    ['alloc-w1:warehouse-1:3'],
+    'the surviving scope kept its identity, the dropped one really was removed',
+  )
+  assert.equal(state.stockLevels[1].reservedQty, 0, 'and warehouse-2 got its reservation back')
 })
 
 test('an allocation change does NOT clear the A2 stamp on a CANCELLED journal either (o3d-o97 r5)', async () => {
@@ -2160,6 +2358,13 @@ function createResetTx(options: {
   allocationBatchAmount?: number | null
   allocationBatchSyncLogId?: string | null
   a2JournalStatus?: string | null
+  /**
+   * o3d-0i5y r4: the lines the journaled shipment posted, at allocation-row grain. These ARE the
+   * floors the journal-safe permit is checked against — a double that returned none would make
+   * every permit assertion vacuous, because an empty floor set is trivially satisfied by any
+   * proposed allocation, including one that drops every row.
+   */
+  journaledShipmentLines?: Array<{ lineId: string; productId: string; warehouseId: string; qty: number }>
 }) {
   const salesOrderUpdates: Array<Record<string, unknown>> = []
   const allocationUpdates: Array<Record<string, unknown>> = []
@@ -2191,6 +2396,14 @@ function createResetTx(options: {
         activityLogs.push(data)
         return data
       },
+    },
+    shipmentLine: {
+      findMany: async () => (options.journaledShipmentLines ?? []).map((line) => ({
+        lineId: line.lineId,
+        productId: line.productId,
+        qty: line.qty,
+        shipment: { warehouseId: line.warehouseId },
+      })),
     },
     orderAllocation: {
       updateMany: async ({ data }: { data: Record<string, unknown> }) => {

@@ -24,8 +24,10 @@ import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inv
 import {
   RESERVATION_RELEASING_SHIPMENT_STATUS,
   UNCOMMITTED_SHIPMENT_STATUS,
+  allocationScopeKey,
   residualAllocationRows,
   residualAllocationRowsForOrder,
+  type AllocationScope,
 } from '@/lib/domain/inventory/reservation-residual'
 import {
   EMPTY_PENDING_SHIPMENT_RECONCILIATION,
@@ -376,6 +378,113 @@ export async function lockStockLevels(
 }
 
 /**
+ * The journal-safe check: would this proposed allocation set destroy evidence a Group B journal
+ * has already posted against? (o3d-0i5y r4)
+ *
+ * Two ways to fail, and the message names which row and by how much, because "allocation change
+ * refused" with no coordinates is not something an operator can act on:
+ *
+ *   - the caller DECLARED NOTHING. It cannot be permitted, because nothing it says can be checked.
+ *     The remedy is stated outright: re-allocate the order, which does declare its set.
+ *   - the declared set drops a posted row, or covers less of it than the journal posted. That
+ *     really is the destructive case the original refusal existed for, and there is no way to
+ *     write it safely — the remedy is a refund/return, which reverses through the very rows this
+ *     refuses to disturb.
+ *
+ * Compared with the allocation epsilon, not exactly: `persistedAllocations` is canonicalised to
+ * `numeric(12,4)` and a fractional-KIT component can round half an ulp below the raw shipped
+ * quantity it covers. Refusing the whole recovery over 0.00005 of a component would be the same
+ * over-refusal in miniature.
+ */
+async function assertJournalSafeAllocationChange(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  nextAllocations: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }> | undefined,
+): Promise<void> {
+  if (!nextAllocations) {
+    throw new Error(
+      'Cannot modify allocations one row at a time after shipments have been posted to accounting. '
+      + 'Use Re-Allocate on the order instead — a re-allocation keeps every posted shipment\'s '
+      + 'quantity on the row it was picked from, so it is allowed here. If the order has to lose '
+      + 'allocated quantity that has already shipped, process a refund or return: that reverses '
+      + 'through these rows instead of deleting them.',
+    )
+  }
+
+  const floors = await journaledAllocationFloors(tx, orderId)
+  if (floors.size === 0) return
+
+  const nextByKey = new Map<string, Prisma.Decimal>()
+  for (const row of nextAllocations) {
+    const key = allocationScopeKey(row)
+    nextByKey.set(key, (nextByKey.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)))
+  }
+
+  const shortfalls: string[] = []
+  for (const [key, floor] of floors) {
+    const proposed = nextByKey.get(key) ?? new Prisma.Decimal(0)
+    if (proposed.gte(floor.qty.sub(ALLOCATION_EPSILON_DECIMAL))) continue
+    shortfalls.push(
+      `${floor.productId} @ ${floor.warehouseId} on line ${floor.lineId} `
+      + `(posted ${floor.qty.toString()}, allocation would keep ${proposed.toString()})`,
+    )
+  }
+  if (shortfalls.length === 0) return
+
+  throw new Error(
+    'Cannot reduce an allocation below the quantity already posted to accounting: '
+    + `${shortfalls.join('; ')}. `
+    + 'The shipment journal and the refund cost reversal both resolve their cost basis through '
+    + 'these rows, so shrinking one reverses cost for units that have already left. Process a '
+    + 'refund or return for the quantity that is coming back instead.',
+  )
+}
+
+/**
+ * The quantity each allocation row has already had POSTED against it by a Group B shipment
+ * journal, at (lineId, warehouseId, productId) grain — the same grain `OrderAllocation` is unique
+ * on, and the grain `residualAllocationRows` nets at.
+ *
+ * o3d-0i5y r4 — THIS IS THE FACT THE JOURNALED REFUSAL WAS STANDING IN FOR. Once Group B has
+ * posted a shipment, two things on the allocation row it was picked from become evidence for a
+ * ledger entry that already exists: the row's `id` (a shipment line's `costLayerSnapshot` carries
+ * it as `orderAllocationId`, and `refund-service` relieves the allocation basis through exactly
+ * that reference) and the row's own `costLayerSnapshot`. Destroy either and the refund reversal
+ * silently reverses cost for units that already shipped, because a dangling `orderAllocationId`
+ * relieves nothing.
+ *
+ * What must NOT happen is that a row is deleted, or shrunk below what a journal posted against it.
+ * That is narrower than "no allocation change at all", and the difference is the whole of this
+ * issue — see {@link resetAllocationAccountingIfStaged}.
+ */
+export async function journaledAllocationFloors(
+  client: Pick<Prisma.TransactionClient, 'shipmentLine'>,
+  orderId: string,
+): Promise<Map<string, AllocationScope & { qty: Prisma.Decimal }>> {
+  const lines = await client.shipmentLine.findMany({
+    where: { shipment: { orderId, shipmentJournalDate: { not: null } } },
+    select: {
+      lineId: true,
+      productId: true,
+      qty: true,
+      shipment: { select: { warehouseId: true } },
+    },
+  })
+  const floors = new Map<string, AllocationScope & { qty: Prisma.Decimal }>()
+  for (const line of lines) {
+    const scope: AllocationScope = {
+      lineId: line.lineId,
+      productId: line.productId,
+      warehouseId: line.shipment.warehouseId,
+    }
+    const key = allocationScopeKey(scope)
+    const running = floors.get(key)?.qty ?? new Prisma.Decimal(0)
+    floors.set(key, { ...scope, qty: running.add(toDecimal(line.qty)) })
+  }
+  return floors
+}
+
+/**
  * If the daily batch A2 has already staged this order's allocations for
  * accounting (inventoryAllocatedDate is set), any subsequent allocation
  * edit would orphan the FIFO snapshots that Group B and refund reversals
@@ -388,10 +497,49 @@ export async function lockStockLevels(
  *
  * Safe to call unconditionally; no-ops when inventoryAllocatedDate is null.
  * Must run inside the same transaction as the allocation mutation.
+ *
+ * ---------------------------------------------------------------------------
+ * o3d-0i5y r4 — A JOURNALED PARTIAL SHIPMENT NO LONGER REFUSES THE RESIDUAL REBUILD.
+ *
+ * This guard used to refuse EVERY allocation change once any shipment on the order carried a
+ * `shipmentJournalDate`. That took the r1–r3 remedy away from the exact orders r3 existed to
+ * rescue: an order held short at PICKING/PACKING whose despatched part has since been posted by
+ * Group B. The advice — re-allocate, create the residual shipments, dispatch them — begins with a
+ * re-allocation, `allocateSalesOrder` rewrites the rows whenever the computed set differs, and
+ * that rewrite came through here. So the order was stranded again, and a refusal with no remedy
+ * the operator can perform is the defect r1 set out to avoid.
+ *
+ * The refusal is replaced by the invariant it was a proxy for: **no row a journal posted against
+ * may be dropped or reduced below the posted quantity** ({@link journaledAllocationFloors}). A
+ * caller that can show its proposed set honours those floors is allowed through — and by the
+ * o3d-4kfh whole-claim contract the residual rebuild always can, because `persistedAllocations`
+ * re-adds every committed shipment line, journaled ones included.
+ *
+ * The permit is CALLER-DECLARED, in the same sense as r2's completion authority: `nextAllocations`
+ * is the caller stating what it is about to write, and this function checks it against the
+ * database's own record of what was posted. A caller that declares nothing — `updateAllocation`,
+ * `addAllocation`, the cancellation and teardown releases — is refused exactly as before, because
+ * none of them can show what the order will be left holding.
+ *
+ * A permitted change also SKIPS THE UN-STAGE. That is not laziness, it is the only correct answer
+ * here: A2 derives a shipped order's allocated value from its SHIPMENT snapshots and writes an
+ * EMPTY `costLayerSnapshot` to every allocation row (see Group A2 in `xero/daily-sync.ts`), so
+ * clearing the stamp on a journaled order would re-post the same inventory reclassification while
+ * re-snapshotting nothing. Keeping the stamp keeps the posted evidence — and the row's snapshot —
+ * exactly where Group B and the refund reversal expect to find it.
+ * ---------------------------------------------------------------------------
  */
 export async function resetAllocationAccountingIfStaged(
   tx: Prisma.TransactionClient,
   orderId: string,
+  options: {
+    /**
+     * The complete set of allocation rows the caller is about to leave on this order, already
+     * canonicalised to the persisted scale. Supplying it is what unlocks the journal-safe path;
+     * omitting it keeps the old blanket refusal.
+     */
+    nextAllocations?: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>
+  } = {},
 ): Promise<void> {
   const so = await tx.salesOrder.findUnique({
     where: { id: orderId },
@@ -410,10 +558,9 @@ export async function resetAllocationAccountingIfStaged(
     select: { id: true },
   })
   if (journaledShipment) {
-    throw new Error(
-      'Cannot modify allocations after shipments have been posted to accounting. ' +
-      'Process a refund instead, or contact finance to reverse the journal entries first.',
-    )
+    await assertJournalSafeAllocationChange(tx, orderId, options.nextAllocations)
+    // Permitted — and deliberately no un-stage and no snapshot clear. See the block comment above.
+    return
   }
 
   // o3d-o97 r4 — THE UN-STAGE IS NO LONGER A DELETION OF EVIDENCE.
@@ -2133,7 +2280,13 @@ export async function allocateSalesOrder(
     if (!unchanged) {
       // Reached only for a real modification, so the accounting reset — and its posted-shipment
       // guard — applies to an actual allocation change rather than to a no-op re-run.
-      await resetAllocationAccountingIfStaged(tx, orderId)
+      //
+      // o3d-0i5y r4: THE SET IS DECLARED, so a journaled order can be re-allocated. The guard no
+      // longer refuses every change on an order Group B has posted; it checks that this exact set
+      // still covers what was posted. `persistedAllocations` re-adds every committed shipment line
+      // — journaled ones included — so the residual rebuild satisfies it by construction, which is
+      // what makes the r1–r3 remedy reachable from a part-despatched, part-posted order.
+      await resetAllocationAccountingIfStaged(tx, orderId, { nextAllocations: persistedAllocations })
 
       // o3d-4kfh: release the RESIDUAL of the persisted rows, not their retained quantity.
       //
@@ -2149,9 +2302,54 @@ export async function allocateSalesOrder(
         residualAllocationRows(existingAllocs, dispatchedAllocationLines),
         'release',
       )
-      await tx.orderAllocation.deleteMany({ where: { orderId } })
+      // o3d-0i5y r4 — THE REWRITE KEEPS THE ROWS IT IS KEEPING.
+      //
+      // This was `deleteMany({ orderId })` followed by a `create` per row. Every row therefore got
+      // a NEW `id` even when its (line, warehouse, product) and quantity were untouched, and that
+      // id is not decoration: a dispatched shipment line's `costLayerSnapshot` carries it as
+      // `orderAllocationId`, and `refund-service` uses that reference to relieve the allocation
+      // cost basis by the quantity that already shipped. A dangling reference relieves nothing, so
+      // the next refund reverses allocation cost for units it had already reversed through the
+      // shipment — over-reversal, silently, on any partly-dispatched order that gets re-allocated.
+      // The blanket journaled refusal hid half of this and never covered the SHIPPED-but-unjournaled
+      // half at all.
+      //
+      // So the rewrite is reconciled by key instead: rows the new set no longer contains are
+      // deleted, rows it still contains are UPDATED in place (id and `costLayerSnapshot` intact),
+      // and only genuinely new scopes are created. The old behaviour is the limiting case of this
+      // one — when every key changes, every row is deleted and every row created — so there is
+      // still ONE rule, not a journaled path and an ordinary path that can drift apart.
+      const existingByScopeKey = new Map(existingAllocs.map((row) => [allocationScopeKey(row), row]))
+      const nextByScopeKey = new Map(persistedAllocations.map((row) => [allocationScopeKey(row), row]))
+
+      for (const existing of existingAllocs) {
+        if (nextByScopeKey.has(allocationScopeKey(existing))) continue
+        await tx.orderAllocation.deleteMany({
+          where: {
+            orderId,
+            lineId: existing.lineId,
+            productId: existing.productId,
+            warehouseId: existing.warehouseId,
+          },
+        })
+      }
 
       for (const alloc of persistedAllocations) {
+        // o3d-4kfh r6: the graph version THIS run expanded, from the same statement as the
+        // components. Commitment and dispatch refuse when the product has moved past it.
+        const fulfillmentGraphVersion = graphVersionByLine.get(alloc.lineId) ?? 0
+        if (existingByScopeKey.has(allocationScopeKey(alloc))) {
+          await tx.orderAllocation.updateMany({
+            where: {
+              orderId,
+              lineId: alloc.lineId,
+              productId: alloc.productId,
+              warehouseId: alloc.warehouseId,
+            },
+            data: { qty: alloc.qty, fulfillmentGraphVersion },
+          })
+          continue
+        }
         await tx.orderAllocation.create({
           data: {
             orderId,
@@ -2159,9 +2357,7 @@ export async function allocateSalesOrder(
             productId: alloc.productId,
             warehouseId: alloc.warehouseId,
             qty: alloc.qty,
-            // o3d-4kfh r6: the graph version THIS run expanded, from the same statement as the
-            // components. Commitment and dispatch refuse when the product has moved past it.
-            fulfillmentGraphVersion: graphVersionByLine.get(alloc.lineId) ?? 0,
+            fulfillmentGraphVersion,
           },
         })
       }
