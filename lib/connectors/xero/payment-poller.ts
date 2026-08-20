@@ -45,6 +45,7 @@ import {
   idsWhere,
   parseLedgerAmount,
   partitionPaymentReversals,
+  zeroPaidIsProvenReversal,
   type PaymentReversalReading,
   type RegisteredPaymentRow,
   type RegisteredPaymentVerdict,
@@ -125,11 +126,14 @@ async function notifyReversalAdmins(
 // follows. The alternative is checkpointing past a money disagreement nobody was told about, which is
 // the defect itself.
 
-type WithheldAmountReason = 'part-payment' | 'amount-not-stated'
-
-function withheldReason(invoice: XeroInvoice): WithheldAmountReason {
-  return parseLedgerAmount(invoice.AmountPaid) === null ? 'amount-not-stated' : 'part-payment'
-}
+/**
+ * WHY a reversal was withheld. Three causes, one outcome — `paidAt` left set and a human told.
+ *
+ * `zero-paid-unproven` is round 3's: the LEDGER's answer was a clean zero and would have been acted
+ * on, and it is IMS's OWN registration rows that withheld it, because one of them may have put a
+ * payment into the ledger that this read did not see.
+ */
+type WithheldAmountReason = 'part-payment' | 'amount-not-stated' | 'zero-paid-unproven'
 
 function ledgerAmountText(value: unknown): string {
   const parsed = parseLedgerAmount(value)
@@ -143,11 +147,17 @@ function ledgerAmountText(value: unknown): string {
  * registered, or why IMS could not tell — which is the difference between "settle the balance" and
  * "our payment has been deleted and nobody noticed".
  */
-function registrationText(verdict: RegisteredPaymentVerdict): string {
+function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmountReason): string {
   switch (verdict.verdict) {
     case 'STILL_HELD':
-      return ` The payment IMS registered (${verdict.paymentIds.join(', ')}) is still among the payments the `
-        + `ledger lists on this invoice, so this is a genuine PART payment and not a removal of ours.`
+      return reason === 'zero-paid-unproven'
+        // A ledger that lists our payment while stating nothing is paid is contradicting itself, and
+        // "a part payment" is not an available reading of a zero.
+        ? ` The ledger LISTS the payment IMS registered (${verdict.paymentIds.join(', ')}) on this `
+          + `invoice while also stating that nothing has been paid against it. IMS cannot settle that `
+          + `contradiction from one read, and an unsettled contradiction is not proof of a removal.`
+        : ` The payment IMS registered (${verdict.paymentIds.join(', ')}) is still among the payments the `
+          + `ledger lists on this invoice, so this is a genuine PART payment and not a removal of ours.`
     case 'NOTHING_REGISTERED':
       return ` IMS holds no payment registration for this document, so it cannot say whether the payment `
         + `the ledger is holding is the one IMS recorded.`
@@ -221,29 +231,57 @@ async function signalWithheldReversal(
 // to a reversal. Every other answer stays withheld exactly as round 1 left it, with the reason now
 // naming whose payment is in question.
 
-type ResidualDoc<T> = { doc: T; invoice: XeroInvoice; verdict: RegisteredPaymentVerdict }
+type ResidualDoc<T> = {
+  doc: T
+  invoice: XeroInvoice
+  verdict: RegisteredPaymentVerdict
+  reason: WithheldAmountReason
+}
 
 type ResidualReading<T> = {
-  /** Invoice id -> the document whose OWN registered payment is provably gone. Promoted to a reversal. */
+  /**
+   * Invoice id -> the document whose OWN registered payment is provably gone WHILE THE LEDGER STILL
+   * HOLDS MONEY against the invoice. Promoted to a reversal, with the revenue unwind suppressed:
+   * somebody else's payment is sitting there.
+   */
   provenGone: Map<string, { doc: T; invoice: XeroInvoice; paymentIds: string[] }>
-  /** Still withheld, with the reason the registration reading gives. */
+  /**
+   * Invoice ids the LEDGER read as zero-paid AND whose registrations this read can account for
+   * (o3d-clxw round 3). An ordinary reversal in every respect — the ledger holds nothing, so a sales
+   * chargeback is correct here and is NOT suppressed.
+   *
+   * Empty is the fail-closed answer: if the registration read throws, nothing is admitted, an error
+   * is pushed, and the chunk is not checkpointed.
+   */
+  zeroPaidReversed: Set<string>
+  /** Still withheld, with the reason the readings give between them. */
   withheld: ResidualDoc<T>[]
 }
 
 function emptyResidual<T>(): ResidualReading<T> {
-  return { provenGone: new Map(), withheld: [] }
+  return { provenGone: new Map(), zeroPaidReversed: new Set(), withheld: [] }
 }
 
 /**
  * Ask, for each document IMS holds as paid whose invoice regressed, whether the payment IMS
- * registered against it is still in the ledger.
+ * registered against it is still in the ledger — and route the answer by WHAT THE LEDGER SAID.
+ *
+ * Two populations arrive here and they need opposite defaults, which is the whole of round 3:
+ *
+ *   the ledger holds money (partPaid / unverifiable)   withheld by default. Only a PROVED absence of
+ *                                                      our own payment (GONE) promotes it.
+ *   the ledger holds nothing (zeroPaid)                a reversal by default — EXCEPT that a zero is
+ *                                                      also what an unposted payment of ours looks
+ *                                                      like, so a registration this read cannot speak
+ *                                                      for withholds it. See zeroPaidIsProvenReversal.
  *
  * `ledgerObservedBefore` is the instant Xero was asked; see classifyRegisteredPayment for why a
  * registration that finished after it cannot be decided by this read.
  */
 async function readResidualVerdicts<T extends { id: string; accountingInvoiceId: string | null }>(
   docs: T[],
-  withheldInvoices: Map<string, XeroInvoice>,
+  candidateInvoices: Map<string, XeroInvoice>,
+  zeroPaidInvoiceIds: ReadonlySet<string>,
   registrationType: 'BILL_PAYMENT' | 'INVOICE_PAYMENT',
   referenceType: 'PurchaseInvoice' | 'SalesOrder',
   ledgerObservedBefore: Date,
@@ -273,14 +311,36 @@ async function readResidualVerdicts<T extends { id: string; accountingInvoiceId:
   }
 
   for (const doc of docs) {
-    const invoice = doc.accountingInvoiceId ? withheldInvoices.get(doc.accountingInvoiceId) : undefined
+    const invoice = doc.accountingInvoiceId ? candidateInvoices.get(doc.accountingInvoiceId) : undefined
     if (!invoice) continue
     const verdict = classifyRegisteredPayment(invoice, byDocument.get(doc.id) ?? [], ledgerObservedBefore)
+
+    if (zeroPaidInvoiceIds.has(invoice.InvoiceID)) {
+      if (zeroPaidIsProvenReversal(verdict)) {
+        out.zeroPaidReversed.add(invoice.InvoiceID)
+      } else {
+        out.withheld.push({ doc, invoice, verdict, reason: 'zero-paid-unproven' })
+      }
+      continue
+    }
+
+    const reason: WithheldAmountReason =
+      parseLedgerAmount(invoice.AmountPaid) === null ? 'amount-not-stated' : 'part-payment'
     if (verdict.verdict === 'GONE') {
       out.provenGone.set(invoice.InvoiceID, { doc, invoice, paymentIds: verdict.paymentIds })
     } else {
-      out.withheld.push({ doc, invoice, verdict })
+      out.withheld.push({ doc, invoice, verdict, reason })
     }
+  }
+
+  // AN INVOICE WITH ANY WITHHELD DOCUMENT IS NEVER REVERSED. Both promoted sets are keyed by INVOICE
+  // id while the verdicts are per DOCUMENT, and the reversal passes select on the invoice id — so two
+  // IMS documents sharing one `accountingInvoiceId` could otherwise have the admitted one's id clear
+  // `paidAt` on the withheld one as well. The intersection is the safe reading of a disagreement.
+  for (const { doc } of out.withheld) {
+    if (doc.accountingInvoiceId == null) continue
+    out.zeroPaidReversed.delete(doc.accountingInvoiceId)
+    out.provenGone.delete(doc.accountingInvoiceId)
   }
   return out
 }
@@ -300,22 +360,36 @@ type WithheldOrderDoc = {
   status: string
 }
 
-async function signalWithheldBillReversals(residual: ResidualReading<WithheldBillDoc>, result: PollResult): Promise<void> {
-  for (const { doc: bill, invoice, verdict } of residual.withheld) {
-    const reason = withheldReason(invoice)
-    result.billReversalsWithheld++
-    const description = (reason === 'part-payment'
-      ? `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the ledger `
+function billWithheldDescription(bill: WithheldBillDoc, invoice: XeroInvoice, reason: WithheldAmountReason): string {
+  switch (reason) {
+    case 'part-payment':
+      return `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the ledger `
         + `still holds a payment of ${ledgerAmountText(invoice.AmountPaid)} against it with `
         + `${ledgerAmountText(invoice.AmountDue)} still due. That is a PART payment, NOT a reversal, so `
         + `paidAt was left set: clearing it would re-arm Mark Paid over a supplier payment that has `
         + `already been made, and pressing it again would pay the supplier twice. Settle the balance in `
         + `Xero, or correct the bill total in IMS.`
-      : `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the invoice `
+    case 'amount-not-stated':
+      return `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the invoice `
         + `payload did not state how much has been paid, so IMS cannot tell a part payment from a `
         + `removed one. paidAt was left set rather than guessed — clearing it would re-arm Mark Paid and `
-        + `risk a second supplier payment. Check the bill in Xero and reconcile it by hand.`)
-      + registrationText(verdict)
+        + `risk a second supplier payment. Check the bill in Xero and reconcile it by hand.`
+    case 'zero-paid-unproven':
+      return `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero with NOTHING paid against it, `
+        + `which normally means the payment was removed. paidAt was LEFT SET anyway: IMS holds a payment `
+        + `registration for this bill that this Xero read cannot speak for, so the zero may be a payment `
+        + `of OURS that has not reached the ledger yet rather than one taken away. Clearing paidAt would `
+        + `re-arm Mark Paid over a payment that may be in flight, and pressing it would pay the supplier `
+        + `a second time — Xero's idempotency key expires after six minutes, so nothing downstream would `
+        + `refuse it. IMS will decide this by itself once a read covers those registrations; if it never `
+        + `does, reconcile the bill in Xero and cancel the sync entry named below by hand.`
+  }
+}
+
+async function signalWithheldBillReversals(residual: ResidualReading<WithheldBillDoc>, result: PollResult): Promise<void> {
+  for (const { doc: bill, invoice, verdict, reason } of residual.withheld) {
+    result.billReversalsWithheld++
+    const description = billWithheldDescription(bill, invoice, reason) + registrationText(verdict, reason)
 
     await signalWithheldReversal({
       label: `PO ${bill.po.reference}`,
@@ -345,23 +419,37 @@ async function signalWithheldBillReversals(residual: ResidualReading<WithheldBil
   }
 }
 
-async function signalWithheldSalesReversals(residual: ResidualReading<WithheldOrderDoc>, result: PollResult): Promise<void> {
-  for (const { doc: order, invoice, verdict } of residual.withheld) {
-    const reason = withheldReason(invoice)
-    const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
-    result.salesReversalsWithheld++
-    const description = (reason === 'part-payment'
-      ? `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the ledger still `
+function salesWithheldDescription(ref: string, invoice: XeroInvoice, reason: WithheldAmountReason): string {
+  switch (reason) {
+    case 'part-payment':
+      return `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the ledger still `
         + `holds a payment of ${ledgerAmountText(invoice.AmountPaid)} against it with `
         + `${ledgerAmountText(invoice.AmountDue)} still due. That is a PART payment, NOT a reversal, so `
         + `paidAt was left set and NO chargeback credit note was raised — unwinding revenue against a `
         + `payment the ledger is still holding would be wrong. Settle the balance in Xero, or correct `
         + `the order total in IMS.`
-      : `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the invoice payload `
+    case 'amount-not-stated':
+      return `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the invoice payload `
         + `did not state how much has been paid, so IMS cannot tell a part payment from a removed one. `
         + `paidAt was left set and NO chargeback credit note was raised. Check the invoice in Xero and `
-        + `reconcile it by hand.`)
-      + registrationText(verdict)
+        + `reconcile it by hand.`
+    case 'zero-paid-unproven':
+      // The sales side of the same race: an INVOICE_PAYMENT registered and not yet posted reads as a
+      // zero, and a chargeback raised there reverses recognised revenue against a payment about to land.
+      return `Invoice for order ${ref} is ${invoice.Status} in Xero with NOTHING paid against it, which `
+        + `normally means the payment was removed. paidAt was LEFT SET and NO chargeback credit note was `
+        + `raised: IMS holds a payment registration for this order that this Xero read cannot speak for, `
+        + `so the zero may be a payment of OURS that has not reached the ledger yet. Unwinding revenue `
+        + `against a payment that is about to land would be a wrong credit note. IMS will decide this by `
+        + `itself once a read covers those registrations.`
+  }
+}
+
+async function signalWithheldSalesReversals(residual: ResidualReading<WithheldOrderDoc>, result: PollResult): Promise<void> {
+  for (const { doc: order, invoice, verdict, reason } of residual.withheld) {
+    const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
+    result.salesReversalsWithheld++
+    const description = salesWithheldDescription(ref, invoice, reason) + registrationText(verdict, reason)
 
     await signalWithheldReversal({
       label: `order ${ref}`,
@@ -431,8 +519,12 @@ async function processDeltaChunk(
   // not fully paid", which a bill carrying a real PART payment satisfies — reading it as a removal
   // cleared paidAt over money that had already left the bank. partitionPaymentReversals asks the
   // payload what the ledger HOLDS, and withholds the verdict when it cannot tell.
+  //
+  // AND ITS `zeroPaid` BUCKET IS NOT A VERDICT EITHER (round 3). Only `voided` clears paidAt on the
+  // strength of the ledger alone; a zero has to be put to the registration reading below, because a
+  // payment IMS posted seconds ago reads exactly like one that was taken away.
   const salesReversal = partitionPaymentReversals(changed, 'ACCREC')
-  const voidedSalesIds = idsWhere(changed, 'ACCREC', ['VOIDED'])
+  const voidedSalesIds = salesReversal.voided
   const paidBillIds = idsWhere(changed, 'ACCPAY', ['PAID'])
   const billReversal = partitionPaymentReversals(changed, 'ACCPAY')
   const invoiceById = new Map(changed.map((i) => [i.InvoiceID, i]))
@@ -443,42 +535,54 @@ async function processDeltaChunk(
   // A read that throws leaves the reading empty, which is round 1's behaviour exactly — every withheld
   // document stays withheld — and pushes an error, so the chunk is not checkpointed and the question is
   // asked again next poll rather than silently answered "no".
-  const billWithheldInvoices = new Map(
-    [...billReversal.partPaid, ...billReversal.unverifiable].map((i) => [i.InvoiceID, i]),
+  const billZeroPaidIds = new Set(billReversal.zeroPaid.map((i) => i.InvoiceID))
+  const billCandidateInvoices = new Map(
+    [...billReversal.zeroPaid, ...billReversal.partPaid, ...billReversal.unverifiable].map((i) => [i.InvoiceID, i]),
   )
   let billResidual = emptyResidual<WithheldBillDoc>()
   try {
-    const withheldBills = billWithheldInvoices.size === 0 ? [] : await db.purchaseInvoice.findMany({
-      where: { accountingInvoiceId: { in: [...billWithheldInvoices.keys()] }, paidAt: { not: null } },
+    const candidateBills = billCandidateInvoices.size === 0 ? [] : await db.purchaseInvoice.findMany({
+      where: { accountingInvoiceId: { in: [...billCandidateInvoices.keys()] }, paidAt: { not: null } },
       select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true } } },
     })
     billResidual = await readResidualVerdicts(
-      withheldBills, billWithheldInvoices, 'BILL_PAYMENT', 'PurchaseInvoice', ledgerObservedBefore,
+      candidateBills, billCandidateInvoices, billZeroPaidIds, 'BILL_PAYMENT', 'PurchaseInvoice', ledgerObservedBefore,
     )
   } catch (e) {
     result.errors.push(`Bills registered-payment reading error: ${String(e)}`)
   }
 
-  const salesWithheldInvoices = new Map(
-    [...salesReversal.partPaid, ...salesReversal.unverifiable].map((i) => [i.InvoiceID, i]),
+  const salesZeroPaidIds = new Set(salesReversal.zeroPaid.map((i) => i.InvoiceID))
+  const salesCandidateInvoices = new Map(
+    [...salesReversal.zeroPaid, ...salesReversal.partPaid, ...salesReversal.unverifiable].map((i) => [i.InvoiceID, i]),
   )
   let salesResidual = emptyResidual<WithheldOrderDoc>()
   try {
-    const withheldOrders = salesWithheldInvoices.size === 0 ? [] : await db.salesOrder.findMany({
-      where: { accountingInvoiceId: { in: [...salesWithheldInvoices.keys()] }, paidAt: { not: null } },
+    const candidateOrders = salesCandidateInvoices.size === 0 ? [] : await db.salesOrder.findMany({
+      where: { accountingInvoiceId: { in: [...salesCandidateInvoices.keys()] }, paidAt: { not: null } },
       select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true },
     })
     salesResidual = await readResidualVerdicts(
-      withheldOrders, salesWithheldInvoices, 'INVOICE_PAYMENT', 'SalesOrder', ledgerObservedBefore,
+      candidateOrders, salesCandidateInvoices, salesZeroPaidIds, 'INVOICE_PAYMENT', 'SalesOrder', ledgerObservedBefore,
     )
   } catch (e) {
     result.errors.push(`Sales registered-payment reading error: ${String(e)}`)
   }
 
-  // A document whose OWN registered payment is proved absent from the ledger's list IS reversed, even
-  // though a residual payment somebody else applied is still sitting there.
-  const reversedSalesIds = new Set([...salesReversal.reversed, ...salesResidual.provenGone.keys()])
-  const reversedBillIds = new Set([...billReversal.reversed, ...billResidual.provenGone.keys()])
+  // THREE WAYS INTO THE REVERSAL PASSES, AND ONLY ONE OF THEM NEEDS NO EVIDENCE FROM IMS:
+  //
+  //   voided             the ledger settles it alone — Xero refuses a payment against a voided invoice.
+  //   zeroPaidReversed   the ledger read zero AND no registration of ours is unaccounted for.
+  //   provenGone         the ledger still holds money, but our own payment id is absent from its list.
+  //
+  // A zero-paid invoice with an in-flight registration is in NONE of them, which is the round 3 fix:
+  // it is withheld and reported instead of clearing paidAt over a payment that may be about to land.
+  const reversedSalesIds = new Set([
+    ...salesReversal.voided, ...salesResidual.zeroPaidReversed, ...salesResidual.provenGone.keys(),
+  ])
+  const reversedBillIds = new Set([
+    ...billReversal.voided, ...billResidual.zeroPaidReversed, ...billResidual.provenGone.keys(),
+  ])
 
   // --- Sales invoices (manual orders only — no shopping connector link) ---
   try {

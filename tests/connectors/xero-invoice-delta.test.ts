@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   classifyRegisteredPayment,
+  zeroPaidIsProvenReversal,
   drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
   idsWhere,
@@ -483,15 +484,21 @@ test('an AUTHORISED bill still carrying a payment is a PART payment, not a rever
   // supplier a second time on top of the part payment.
   const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 400, AmountDue: 100 })], 'ACCPAY')
 
-  assert.equal(reading.reversed.has('b1'), false, 'a bill the ledger has been paid against must not be called reversed')
+  assert.equal(reading.voided.has('b1'), false, 'a bill the ledger has been paid against must not be called reversed')
+  assert.deepEqual(reading.zeroPaid, [])
   assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), ['b1'])
   assert.deepEqual(reading.unverifiable, [])
 })
 
-test('an AUTHORISED invoice with nothing paid against it IS a reversal', () => {
+test('an AUTHORISED invoice with nothing paid against it is a QUESTION, not a verdict (o3d-clxw r3)', () => {
+  // Round 1 put this straight into the reversal set. A zero is also what a payment IMS registered
+  // moments ago looks like before the worker posts it, so the LEDGER cannot settle it alone: it goes
+  // to zeroPaid, and only the registration reading may promote it.
   const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, AmountDue: 500 })], 'ACCPAY')
 
-  assert.deepEqual([...reading.reversed], ['b1'])
+  assert.deepEqual(reading.zeroPaid.map((i) => i.InvoiceID), ['b1'])
+  assert.deepEqual([...reading.voided], [],
+    'only VOIDED may clear paidAt on the strength of the ledger alone')
   assert.deepEqual(reading.partPaid, [])
 })
 
@@ -503,8 +510,8 @@ test('VOIDED is a reversal whatever the amounts say', () => {
     ledgerInv('v2', 'ACCREC', 'VOIDED', { AmountPaid: 250 }),
   ], 'ACCPAY')
 
-  assert.deepEqual([...reading.reversed], ['v1'])
-  assert.deepEqual(partitionPaymentReversals([ledgerInv('v2', 'ACCREC', 'VOIDED', { AmountPaid: 250 })], 'ACCREC').reversed.has('v2'), true)
+  assert.deepEqual([...reading.voided], ['v1'])
+  assert.deepEqual(partitionPaymentReversals([ledgerInv('v2', 'ACCREC', 'VOIDED', { AmountPaid: 250 })], 'ACCREC').voided.has('v2'), true)
 })
 
 test('an AmountPaid the payload does not state is UNVERIFIABLE, never a reversal', () => {
@@ -515,7 +522,8 @@ test('an AmountPaid the payload does not state is UNVERIFIABLE, never a reversal
     ledgerInv('b4', 'ACCPAY', 'AUTHORISED', { AmountPaid: null as unknown as number }),
   ], 'ACCPAY')
 
-  assert.equal(reading.reversed.size, 0, 'unknown must not read as "nothing is paid" — that is the answer that pays twice')
+  assert.equal(reading.voided.size, 0, 'unknown must not read as "nothing is paid" — that is the answer that pays twice')
+  assert.deepEqual(reading.zeroPaid, [], 'an unstated amount is not a zero')
   assert.deepEqual(reading.unverifiable.map((i) => i.InvoiceID), ['b1', 'b2', 'b3', 'b4'])
 })
 
@@ -526,7 +534,7 @@ test('a numeric string AmountPaid is read, not discarded', () => {
 
 test('rounding dust is not a payment, but a penny is', () => {
   const dust = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: PAYMENT_PRESENT_EPSILON / 2 })], 'ACCPAY')
-  assert.deepEqual([...dust.reversed], ['b1'])
+  assert.deepEqual(dust.zeroPaid.map((i) => i.InvoiceID), ['b1'])
 
   const penny = partitionPaymentReversals([ledgerInv('b2', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0.01 })], 'ACCPAY')
   assert.deepEqual(penny.partPaid.map((i) => i.InvoiceID), ['b2'])
@@ -534,7 +542,8 @@ test('rounding dust is not a payment, but a penny is', () => {
 
 test('a negative AmountPaid is not read as "nothing is paid"', () => {
   const reading = partitionPaymentReversals([ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: -50 })], 'ACCPAY')
-  assert.equal(reading.reversed.has('b1'), false, 'a figure this code does not understand is not permission to declare the payment gone')
+  assert.equal(reading.voided.has('b1'), false, 'a figure this code does not understand is not permission to declare the payment gone')
+  assert.deepEqual(reading.zeroPaid, [])
   assert.deepEqual(reading.partPaid.map((i) => i.InvoiceID), ['b1'])
 })
 
@@ -545,10 +554,11 @@ test('PAID and DRAFT rows are not reversal candidates at all, and types do not c
     ledgerInv('s-auth', 'ACCREC', 'AUTHORISED', { AmountPaid: 0 }),
   ]
   const bills = partitionPaymentReversals(rows, 'ACCPAY')
-  assert.equal(bills.reversed.size, 0)
+  assert.equal(bills.voided.size, 0)
+  assert.equal(bills.zeroPaid.length, 0)
   assert.equal(bills.partPaid.length, 0)
   assert.equal(bills.unverifiable.length, 0)
-  assert.deepEqual([...partitionPaymentReversals(rows, 'ACCREC').reversed], ['s-auth'])
+  assert.deepEqual(partitionPaymentReversals(rows, 'ACCREC').zeroPaid.map((i) => i.InvoiceID), ['s-auth'])
 })
 
 test('parseLedgerAmount refuses to turn an empty field into zero', () => {
@@ -651,4 +661,46 @@ test('a payload that does not list its payments cannot prove ours is absent', ()
   assert.deepEqual(
     classifyRegisteredPayment(ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 20 }), [postedRegistration()], READ_AT),
     { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' })
+})
+
+// ---------------------------------------------------------------------------
+// A ZERO IS NOT A REVERSAL ON ITS OWN (o3d-clxw round 3)
+//
+// Round 1's reversal verdict was "AUTHORISED and nothing paid". A payment IMS registered and has not
+// posted yet reads EXACTLY like that — so the poller could clear paidAt, re-arm Mark Paid, and invite
+// a second supplier payment over its own in-flight one. The ledger cannot tell the two apart, because
+// the distinguishing fact is in IMS's registration rows, not in Xero.
+// ---------------------------------------------------------------------------
+
+test('a zero-paid document with a registration this read cannot speak for is NOT a proven reversal', () => {
+  assert.equal(
+    zeroPaidIsProvenReversal({ verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] }), false,
+    'the payment may be on the wire right now — clearing paidAt here is what pays the supplier twice')
+})
+
+test('a zero-paid document whose own payment the ledger still lists is not a proven reversal either', () => {
+  // The ledger contradicting itself (lists our payment, states nothing paid) is not proof of anything.
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'STILL_HELD', paymentIds: ['PAY-1'] }), false)
+})
+
+test('a zero-paid document IMS can fully account for IS a reversal', () => {
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'GONE', paymentIds: ['PAY-1'] }), true)
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'NOTHING_REGISTERED' }), true,
+    'no registration of ours can be in flight, so the zero is the whole story')
+  assert.equal(zeroPaidIsProvenReversal({ verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }), true,
+    'an aggregate of zero needs no list: a ledger holding no money is not holding ours')
+})
+
+test('a registration that synced at the very instant of the read is undecided, matching o3d-batch-payidx', () => {
+  // The sibling retires registrations on `OR: [{ syncedAt: null }, { syncedAt: { gte:
+  // ledgerObservedBefore } }]` = undecidable. A `<=` here would call the tie decided while the sibling
+  // called it undecided — two components disagreeing about one supplier payment.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 0, Payments: [] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ syncedAt: READ_AT })], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] })
+  // One millisecond earlier is decidable, so the fence is strict rather than simply broken.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ syncedAt: new Date(READ_AT.getTime() - 1) })], READ_AT),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] })
 })

@@ -884,10 +884,21 @@ export const PAYMENT_PRESENT_EPSILON = 0.005
 
 export type PaymentReversalReading = {
   /**
-   * Invoices whose payment is provably GONE: the ledger holds nothing against them, or the invoice
-   * itself is VOIDED. Only these may clear `paidAt`.
+   * VOIDED invoices, and ONLY those. An unconditional reversal that needs no further evidence: Xero
+   * requires every payment to be removed before an invoice can be voided and refuses a payment
+   * against a voided one, so re-arming a voided document cannot move money twice.
    */
-  reversed: Set<string>
+  voided: Set<string>
+  /**
+   * AUTHORISED with a STATED zero paid. The ledger says it holds nothing — which is what a removed
+   * payment looks like, AND ALSO WHAT A PAYMENT IMS POSTED SECONDS AGO LOOKS LIKE (o3d-clxw round 3).
+   *
+   * So this is NOT a reversal on its own. It is a reversal only once the registration reading says
+   * IMS holds no payment of its own that this read cannot speak for — see zeroPaidIsProvenReversal.
+   * The two readings are separate because they answer different questions: this one is about the
+   * LEDGER, and it cannot see a payment that has not reached the ledger yet.
+   */
+  zeroPaid: XeroInvoice[]
   /**
    * No longer PAID, but the ledger STILL HOLDS A PAYMENT — a part payment, or a bill edited upward
    * after being paid. Not a reversal, and the IMS document must stay paid: clearing it re-arms the
@@ -903,24 +914,32 @@ export type PaymentReversalReading = {
 }
 
 /**
- * Split one delta slice into the three answers the reversal passes may act on.
+ * Split one delta slice into the four answers the reversal passes may act on.
  *
- * VOIDED is a reversal unconditionally: Xero requires every payment to be removed before an invoice
- * can be voided, the document IMS marked paid no longer exists, and a fresh payment against a voided
- * invoice is refused by Xero anyway — so re-arming there cannot move money twice.
+ * THE ZERO IS NOT SELF-EVIDENT (o3d-clxw round 3). Round 1 replaced "AUTHORISED means unpaid" with
+ * "AUTHORISED and nothing paid means the payment was removed", and put that straight into the
+ * reversal set. But an AUTHORISED bill reading zero paid is also the ordinary shape of a bill IMS
+ * marked paid MOMENTS AGO: Mark Paid sets paidAt locally and queues a BILL_PAYMENT registration, and
+ * until the worker posts it the ledger holds nothing. A poll landing in that gap read its own
+ * in-flight payment as a reversal, cleared paidAt, and re-armed the button over a payment that was
+ * about to land — the branch's own thesis turned on it.
+ *
+ * `voided` is therefore the only bucket this function can settle by itself. The zero is handed on as
+ * a QUESTION, to be answered against the registrations IMS holds and the instant the ledger was read.
  */
 export function partitionPaymentReversals(
   invoices: XeroInvoice[],
   type: 'ACCREC' | 'ACCPAY',
 ): PaymentReversalReading {
-  const reversed = new Set<string>()
+  const voided = new Set<string>()
+  const zeroPaid: XeroInvoice[] = []
   const partPaid: XeroInvoice[] = []
   const unverifiable: XeroInvoice[] = []
 
   for (const invoice of invoices) {
     if (invoice.Type !== type) continue
     if (invoice.Status === 'VOIDED') {
-      reversed.add(invoice.InvoiceID)
+      voided.add(invoice.InvoiceID)
       continue
     }
     if (invoice.Status !== 'AUTHORISED') continue
@@ -936,10 +955,10 @@ export function partitionPaymentReversals(
       partPaid.push(invoice)
       continue
     }
-    reversed.add(invoice.InvoiceID)
+    zeroPaid.push(invoice)
   }
 
-  return { reversed, partPaid, unverifiable }
+  return { voided, zeroPaid, partPaid, unverifiable }
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,7 +1068,11 @@ export function classifyRegisteredPayment(
       && typeof row.externalTransactionId === 'string'
       && row.externalTransactionId.trim() !== ''
       && row.syncedAt != null
-      && row.syncedAt.getTime() <= ledgerObservedBefore.getTime()
+      // STRICTLY before, matching the sibling's `OR: [{ syncedAt: null }, { syncedAt: { gte:
+      // ledgerObservedBefore } }]` undecidable predicate EXACTLY. At the tie the two would otherwise
+      // give opposite answers about the same row, and the safe side of a tie about a supplier payment
+      // is "this read cannot speak for it".
+      && row.syncedAt.getTime() < ledgerObservedBefore.getTime()
     ) {
       posted.push(row.externalTransactionId.trim())
       continue
@@ -1072,4 +1095,58 @@ export function classifyRegisteredPayment(
   // and clearing paidAt there re-arms Mark Paid for the WHOLE total on top of the surviving payment.
   if (stillHeld.length > 0) return { verdict: 'STILL_HELD', paymentIds: stillHeld }
   return { verdict: 'GONE', paymentIds: posted }
+}
+
+/**
+ * MAY A ZERO-PAID DOCUMENT CLEAR `paidAt`? (o3d-clxw round 3)
+ *
+ * The ledger saying it holds nothing is one of two very different facts, and it looks identical
+ * either way:
+ *
+ *   the payment was REMOVED         — a genuine reversal, and `paidAt` must be cleared.
+ *   the payment HAS NOT LANDED YET  — IMS marked the bill paid and the worker has not posted the
+ *                                     registration. Clearing `paidAt` re-arms Mark Paid over a
+ *                                     payment that is on its way, and the operator presses it. Xero's
+ *                                     idempotency key expires after six minutes, BILL_PAYMENT sits
+ *                                     outside every live-row dedupe, and markBillPaid sends no key at
+ *                                     all — so nothing downstream refuses the second payment.
+ *
+ * The ledger CANNOT distinguish them, because the distinguishing fact is not in the ledger: it is in
+ * IMS's own registration rows and the instant the ledger was read. So the amount reading proposes and
+ * this decides.
+ *
+ * Verdict by verdict, and every one of them fails towards withholding:
+ *
+ *   GONE                        our registered payment was posted before the read and is absent from
+ *                               a list we could read fully. Removed. REVERSAL.
+ *   NOTHING_REGISTERED          IMS never told the ledger about a payment here (or every registration
+ *                               is CANCELLED, which asserts nothing was sent), so there is no payment
+ *                               of ours to be in flight and the zero is the whole story. REVERSAL.
+ *                               `paidAt` came from the forward pass or the reconcile, and the ledger
+ *                               has since been emptied.
+ *   LEDGER_DID_NOT_LIST_PAYMENTS  the payload withheld `Payments[]`, but it STATED a zero total. An
+ *                               aggregate of zero needs no list: if the ledger holds no money at all,
+ *                               it is not holding ours either, whatever its id. REVERSAL.
+ *   REGISTRATION_UNDECIDED      THE DEFECT THIS FUNCTION EXISTS FOR. A PENDING, PROCESSING or FAILED
+ *                               registration, or one that synced after the read, may have created a
+ *                               payment this snapshot never saw. WITHHELD.
+ *   STILL_HELD                  the ledger lists our payment on an invoice it says is unpaid. That is
+ *                               a contradiction IMS cannot settle from one read — Xero can list a
+ *                               payment that has since been deleted — and an unsettled contradiction
+ *                               is not proof. WITHHELD.
+ *
+ * Note what the withheld answers cost, because it is the asymmetry the whole module turns on: a
+ * document IMS keeps showing as paid, loudly warned about on every poll that sees it, which a human
+ * can correct in a minute. The other direction costs a second supplier payment, which nobody can.
+ */
+export function zeroPaidIsProvenReversal(verdict: RegisteredPaymentVerdict): boolean {
+  switch (verdict.verdict) {
+    case 'GONE':
+    case 'NOTHING_REGISTERED':
+    case 'LEDGER_DID_NOT_LIST_PAYMENTS':
+      return true
+    case 'REGISTRATION_UNDECIDED':
+    case 'STILL_HELD':
+      return false
+  }
 }

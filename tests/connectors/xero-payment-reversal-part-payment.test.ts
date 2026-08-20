@@ -534,3 +534,215 @@ test('a withheld verdict that WAS recorded checkpoints normally', async () => {
     'a recorded disagreement must not stall the poller — the cursor is held only when nothing was written')
   assert.equal(state.notifications.filter((n) => n.title === 'Bill payment reversal withheld').length, 1)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-clxw ROUND 3 — AND AN IN-FLIGHT PAYMENT READS AS A ZERO
+//
+// This branch exists because a PART-paid bill read as a reversal. Round 1 replaced that with "the
+// ledger holds nothing" — and a payment IMS posted moments ago, or is posting right now, also reads
+// as nothing held. Mark Paid sets paidAt at once and queues a BILL_PAYMENT registration; until the
+// worker posts it the ledger is empty. A poll landing in that gap cleared paidAt, re-armed the
+// button over IMS's OWN payment, and the operator pressed it: markBillPaid sends no idempotency key,
+// BILL_PAYMENT is outside every live-row dedupe, and Xero's own key expires after six minutes, so
+// nothing anywhere refuses the second supplier payment.
+// ---------------------------------------------------------------------------
+
+test('a zero-paid bill whose payment is STILL ON THE WIRE is not reversed: Mark Paid stays disarmed (o3d-clxw r3)', async () => {
+  reset()
+  // Nothing paid in the ledger, and IMS is holding a PROCESSING registration — the request may be
+  // in Xero's hands this instant.
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({ status: 'PROCESSING', externalTransactionId: null, syncedAt: null })]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [],
+    'the zero is our own unposted payment, not a removal — clearing paidAt re-arms Mark Paid and pays the supplier twice')
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
+
+  const withheld = state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')
+  assert.ok(withheld, 'a withheld money verdict must leave a durable record')
+  assert.equal(withheld.metadata?.reason, 'zero-paid-unproven')
+  assert.equal(withheld.metadata?.registrationVerdict, 'REGISTRATION_UNDECIDED')
+  assert.equal(withheld.metadata?.amountPaid, 0)
+  assert.match(withheld.description ?? '', /NOTHING paid against it/)
+  assert.match(withheld.description ?? '', /may be in flight/)
+  assert.match(withheld.description ?? '', /idempotency key expires after six minutes/)
+  assert.match(withheld.description ?? '', /log_1/)
+
+  assert.equal(state.activity.some((a) => a.action === 'bill_payment_reversal_detected'), false,
+    'nothing was reversed, so nothing may be logged as "no longer present in Xero"')
+  assert.equal(state.notifications.filter((n) => n.title === 'Bill payment reversal withheld').length, 1)
+})
+
+test('a zero-paid bill whose registration SYNCED after the Xero read is not reversed either', async () => {
+  reset()
+  // The exact Mark Paid race: paidAt set locally, the worker posts a few seconds later, and this read
+  // was taken in between. Its emptiness says nothing about a payment created after it.
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({ syncedAt: new Date(Date.now() + 60_000) })]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
+  assert.equal(state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')?.metadata?.registrationVerdict,
+    'REGISTRATION_UNDECIDED')
+})
+
+test('a zero-paid bill whose payment attempt FAILED is not reversed: a failure is not proof nothing posted', async () => {
+  reset()
+  // The processor posts BEFORE it persists the outcome, so a lost response is written down exactly
+  // like a rejection. Re-arming here queues a replacement under a fresh entry id and therefore a
+  // fresh Idempotency-Key, on top of a payment that may already exist.
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({ status: 'FAILED', externalTransactionId: null, syncedAt: null })]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.equal(result.billReversalsWithheld, 1)
+  const withheld = state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')
+  assert.equal(withheld?.metadata?.reason, 'zero-paid-unproven')
+  assert.match(withheld?.description ?? '', /cancel the sync entry named below by hand/)
+})
+
+test('a zero-paid bill whose registration POSTED before the read IS reversed: our payment really is gone', async () => {
+  reset()
+  // The counter-guard. The registration finished before Xero was asked and the ledger holds nothing,
+  // so the payment IMS made has been removed and Mark Paid must be re-armed.
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_1'])
+  assert.equal(result.billsReversed, 1)
+  assert.equal(result.billReversalsWithheld, 0)
+  assert.ok(state.activity.some((a) => a.action === 'bill_payment_reversal_detected'))
+})
+
+test('a zero-paid bill whose only registration is CANCELLED IS reversed: nothing of ours can be in flight', async () => {
+  reset()
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({ status: 'CANCELLED', externalTransactionId: null, syncedAt: null })]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_1'],
+    'CANCELLED is only ever asserted where nothing was sent — and it is the operator remedy for a stuck FAILED row')
+  assert.equal(result.billsReversed, 1)
+})
+
+test('a zero-paid bill whose payload omits Payments[] IS reversed: a stated zero needs no list', async () => {
+  reset()
+  // LEDGER_DID_NOT_LIST_PAYMENTS blocks a RESIDUAL-paid invoice, where the list is the only way to
+  // tell whose payment is there. Against a stated zero there is no money to attribute.
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500 })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_1'])
+  assert.equal(result.billsReversed, 1)
+})
+
+test('a zero-paid SALES invoice with a payment in flight raises NO chargeback and keeps paidAt', async () => {
+  reset()
+  // The sales half of the same race: a credit note raised here unwinds recognised revenue against a
+  // payment that is about to land.
+  state.invoices = [{ InvoiceID: 'XS1', Type: 'ACCREC', Status: 'AUTHORISED', AmountPaid: 0, AmountDue: 100, Payments: [] }]
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [salesRegistration({ status: 'PROCESSING', externalTransactionId: null, syncedAt: null })]
+
+  const result = await poll()
+
+  assert.deepEqual(state.chargebacks, [], 'no credit note against a payment that has not landed yet')
+  assert.deepEqual(clearedPaidAt(state.salesOrderUpdates), [])
+  assert.equal(result.salesReversed, 0)
+  assert.equal(result.salesReversalsWithheld, 1)
+  const withheld = state.activity.find((a) => a.action === 'payment_reversal_withheld')
+  assert.equal(withheld?.metadata?.reason, 'zero-paid-unproven')
+  assert.match(withheld?.description ?? '', /NOTHING paid against it/)
+  assert.match(withheld?.description ?? '', /wrong credit note/)
+  assert.equal(state.notifications.some((n) => n.title === 'Payment reversal detected'), false)
+})
+
+test('a withheld zero-paid verdict that left no record holds the poll cursor', async () => {
+  reset()
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({ status: 'PROCESSING', externalTransactionId: null, syncedAt: null })]
+  state.activityWriteFails = true
+
+  const result = await poll()
+
+  assert.deepEqual(state.settingUpserts, [],
+    'checkpointing past an unsignalled disagreement loses it for good — the delta only returns an invoice when it CHANGES')
+  assert.equal(result.errors.length, 1)
+  assert.match(result.errors[0], /left no durable signal/)
+})
+
+test('a zero-paid bill IMS does not hold as paid is neither reversed nor reported', async () => {
+  reset()
+  // An ordinary unpaid bill sitting at AUTHORISED with nothing paid is the commonest row in the
+  // window. It must not become a withheld "disagreement" now that zero-paid rows reach the reading.
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [{ ...paidBillRow(), paidAt: null }]
+  state.syncLogs = [billRegistration({ status: 'PROCESSING', externalTransactionId: null, syncedAt: null })]
+
+  const result = await poll()
+
+  assert.equal(result.billReversalsWithheld, 0)
+  assert.equal(result.billsReversed, 0)
+  assert.equal(state.activity.some((a) => a.action === 'bill_payment_reversal_withheld'), false)
+})
+
+test('two bills on one Xero invoice: an in-flight payment on either holds BOTH', async () => {
+  reset()
+  // The promoted sets are keyed by INVOICE id while the verdicts are per DOCUMENT, and the reversal
+  // pass selects on the invoice id. Admitting the clean bill would carry the withheld one's paidAt
+  // away with it — a second supplier payment on the bill nobody could decide.
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [] })]
+  state.purchaseInvoices = [
+    paidBillRow(),
+    { ...paidBillRow(), id: 'pi_2', poId: 'po_2', po: { reference: 'PO-0002', status: 'RECEIVED' } },
+  ]
+  state.syncLogs = [billRegistration({ id: 'log_2', referenceId: 'pi_2', status: 'PROCESSING', externalTransactionId: null, syncedAt: null })]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [],
+    'one undecidable document makes the whole invoice undecidable — pi_1 must not be reversed on pi_2 behalf')
+  assert.equal(result.billsReversed, 0)
+})
+
+test('a ledger that lists our payment while stating nothing is paid withholds rather than guesses', async () => {
+  reset()
+  // Reachable: Xero can carry a payment in Payments[] that has since been deleted, so the aggregate
+  // falls to zero while the id is still listed. IMS cannot settle that from one read, and an
+  // unsettled contradiction is not proof of a removal.
+  state.invoices = [bill({ AmountPaid: 0, AmountDue: 500, Payments: [{ PaymentID: 'pay-ours' }] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
+  const withheld = state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')
+  assert.equal(withheld?.metadata?.reason, 'zero-paid-unproven')
+  assert.equal(withheld?.metadata?.registrationVerdict, 'STILL_HELD')
+  assert.match(withheld?.description ?? '', /while also stating that nothing has been paid/)
+  assert.doesNotMatch(withheld?.description ?? '', /genuine PART payment/,
+    'a zero has no reading as a part payment')
+})

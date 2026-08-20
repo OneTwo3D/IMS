@@ -704,7 +704,11 @@ When enabled, the IMS polls Xero every 15 minutes for:
 longer *fully* paid — which includes a bill that carries a real **part** payment, the ordinary cause
 being an IMS bill total lower than Xero's (a line or freight added in Xero after IMS posted it). The
 poll therefore reads what the ledger actually **holds** (`AmountPaid`), not just the status: `paidAt`
-is cleared only when nothing is paid against the document any more, or the invoice was voided.
+is cleared only when nothing is paid against the document any more *and* the IMS has no payment
+registration of its own that this Xero read cannot speak for (see below), or the invoice was voided.
+A **voided** invoice is the one unconditional reversal — Xero requires every payment to be removed
+before a void and refuses a payment against a voided invoice, so re-arming there cannot move money
+twice.
 
 When the document is no longer fully paid but the ledger still holds a payment — or Xero's answer did
 not say how much is paid — the reversal is **withheld** and a WARNING is logged against the order or
@@ -732,6 +736,28 @@ Paid** setting the flag and the payment actually posting, where "not listed yet"
 On the sales side a reversal established this way clears `paidAt` but raises **no** chargeback credit
 note: a chargeback unwinds the whole recognised revenue, and the invoice still carries a payment. The
 alert says so — unwind revenue by hand if that is what the removal means.
+
+**And a ledger holding *nothing* is not proof either.** "Nothing paid against this bill" is what a
+removed payment looks like — and it is equally what a payment the IMS registered *seconds ago* looks
+like, because **Mark Paid** sets `paidAt` at once and the worker posts the payment to Xero afterwards.
+A poll landing in that gap used to clear `paidAt`, re-arm **Mark Paid** over the IMS's own in-flight
+payment, and invite a second supplier payment: nothing downstream would refuse it, since Xero's
+idempotency key expires after six minutes.
+
+So a zero-paid document is put to the *same* registration question as a part-paid one before anything
+is cleared. It is treated as reversed only when the IMS can account for every payment registration it
+holds against the document — the registration posted before Xero was asked (so the empty ledger covers
+it), or there is no registration at all, or every one of them is cancelled. If any registration is
+still queued, on the wire, **failed**, or finished after this Xero read was taken, the reversal is
+**withheld** exactly as a part payment would be, and the warning names the sync entry in question.
+A *failed* attempt counts as unresolved deliberately: the connector posts before it records the
+outcome, so a lost response is written down identically to a rejection.
+
+Such a bill decides itself: a registration that really did post modified the invoice in Xero, so the
+invoice reappears in a later delta and the verdict completes on its own. One that genuinely never
+posted will not, and the bill stays marked paid with the warning repeating — reconcile it in Xero and
+**cancel** the named sync entry, which takes it out of the question without destroying the evidence
+that an attempt was made.
 
 **A withheld verdict is now an alert, not just a log line.** Withholding writes nothing to the
 database, so the warning is its only record — and the poll then moves its cursor past the invoice,
