@@ -275,6 +275,35 @@ test('an apostrophe in JSX text does not blank the reads after it', () => {
   assert.ok(keys.has('BACKUP_DIR'))
 })
 
+test('a NESTED JSX CLOSING TAG is not a regex, so the reads between two tags survive', () => {
+  // The scanner's THIRD self-inflicted hazard, after the backtick-in-a-regex and the apostrophe in
+  // JSX text above. `startsRegex` was asked at the `/` of `</span>` and saw `<` before it — not a
+  // bracket, not an identifier, not a quote — so it answered "regex". A regex reading terminates at
+  // the next `/` on the line, which is the NEXT closing tag, and blanks everything in between.
+  //
+  // The result is a MISSED READ, and a missed read is this guard failing a variable that is
+  // genuinely used — the direction the whole single-pass scanner exists to rule out.
+  const code = [
+    'export function Panel() {',
+    '  return (',
+    '    <div>',
+    '      <span>{DATABASE_URL}</span> <span>{BACKUP_DIR}</span>',
+    '      <p>Set <code>{CRON_SECRET}</code> then {REDIS_URL} here</p>',
+    '    </div>',
+    '  )',
+    '}',
+  ].join('\n')
+
+  const keys = extractReadKeys(code)
+
+  // The FIRST name on each line was never at risk — the phantom regex opened after it. These two
+  // are the ones the misclassification deleted, which is why they are asserted by name.
+  assert.ok(keys.has('BACKUP_DIR'), 'the read between two closing tags on one line')
+  assert.ok(keys.has('REDIS_URL'), 'and the read after a nested closing tag')
+  assert.ok(keys.has('DATABASE_URL'))
+  assert.ok(keys.has('CRON_SECRET'))
+})
+
 test('a template literal with a substitution is scanned as code, not swallowed', () => {
   const code = [
     'const sql = `select value from settings where key = ${KEY_COLUMN}`',

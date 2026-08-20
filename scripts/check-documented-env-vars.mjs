@@ -236,6 +236,21 @@ export function scanCodeRegions(text) {
 
   const startsRegex = () => {
     if (lastSignificant === '') return true
+    // A JSX CLOSING TAG. `startsRegex` is only ever asked at a `/`, so a `<` here means `</` — and
+    // in .tsx that is `</div>`, never a regex. Read as one it terminates at the NEXT closing tag on
+    // the line and blanks everything between them, so
+    //     <span>{FIRST}</span> <span>{SECOND}</span>
+    // loses SECOND from codeOutsideLiterals entirely. THAT IS A MISSED READ, which this guard turns
+    // into a FALSE POSITIVE against a variable that is genuinely used — the one failure mode the
+    // whole scanner exists to avoid (see the header on why the old matcher deliberately left
+    // trailing comments alone).
+    //
+    // The trade is safe in this direction and only this direction. Calling a real regex "division"
+    // costs nothing but a phantom string if it contains an unpaired quote, and that already
+    // self-heals: an unterminated string stops at the newline and `restore` puts the line back.
+    // Calling real code "a regex" deletes it with no way back. `a < /x/.test(b)` is the only thing
+    // given up, and it does not occur.
+    if (lastSignificant === '<') return false
     if (/[)\]}]/.test(lastSignificant)) return false
     if (/[A-Za-z0-9_$]/.test(lastSignificant)) return REGEX_PRECEDING_KEYWORDS.has(lastWord)
     // Quotes end a literal, so `/` after one is division.

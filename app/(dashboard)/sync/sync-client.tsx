@@ -1101,22 +1101,23 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   ))}
                 </div>
                 <p className="text-xs text-muted-foreground">
-                  Applies to every import that <strong>fetches</strong> orders from WooCommerce: Import
-                  Active Orders above, the polling sweep, and the backup reconciliation. Reconciliation
-                  also fetches <code>completed</code> so a finished order is never stranded, and customer
-                  withdrawal statuses are always fetched.
+                  Decides which orders IMS <strong>takes on</strong>. It applies to every import that
+                  fetches orders from WooCommerce — Import Active Orders above, the polling sweep and the
+                  backup reconciliation — and to orders pushed by the order webhook, which are imported
+                  only if they arrive in a selected status. Reconciliation also fetches{' '}
+                  <code>completed</code> so a finished order is never stranded, and customer withdrawal
+                  statuses are always included.
                 </p>
-                <p className="text-xs text-amber-600">
-                  It does <strong>not</strong> apply to the order webhook. When WooCommerce pushes an
-                  order it is imported whatever its status — refusing it would leave IMS disagreeing with
-                  the store about which orders exist. The status still decides what the order does: see
-                  the Status Mapping tab, where (for example) <code>on-hold</code> maps to a lifecycle
-                  that allocates no stock and raises no invoice.
+                <p className="text-xs text-muted-foreground">
+                  An order in an unselected status is skipped, not lost: if it later moves into a
+                  selected status it is imported then. Once IMS has an order it keeps following it
+                  whatever status it moves to afterwards — this setting never stops updates to an order
+                  you already have.
                 </p>
                 {noOrderStatusesSelected && (
                   <p className="text-xs text-destructive">
-                    No statuses selected — the fetching imports above will import nothing. Orders pushed
-                    by webhook still arrive.
+                    No statuses selected — nothing will be imported, by fetch or by webhook. Tick at
+                    least one status and save.
                   </p>
                 )}
               </div>

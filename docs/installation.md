@@ -292,7 +292,7 @@ For WooCommerce specifically:
 
 - real-time order/product intake should come from webhooks
 - `/api/cron/wc-reconcile` is the daily backup reconcile path for orders/products and also runs the stock catch-up plus queued retry drain
-- the **Import order statuses** selection (Settings > Sync > WooCommerce) governs every route that *fetches* orders — the one-off active-order import and the poll/reconcile sweeps — because each turns the selection into a WooCommerce `?status=` query. It does **not** apply to the order webhook, which is a push about an order that already exists in the store; an imported order's status still decides what it does, through the status mappings. The Sync page states this next to the checkboxes
+- the **Import order statuses** selection (Settings > Sync > WooCommerce) decides which orders IMS takes on. It governs every route that *fetches* orders — the one-off active-order import and the poll/reconcile sweeps, each of which turns the selection into a WooCommerce `?status=` query — and the order webhook, where it is applied as an **admission** rule: a pushed order IMS has never seen is imported only if it arrives in a selected status, and one that later moves into a selected status is imported by that update. An order IMS already holds is never gated, so it keeps following the store whatever status it moves to afterwards. Reconciliation additionally fetches `completed` so a finished order is never stranded, and the customer-withdrawal statuses are always included. An empty selection imports nothing, on every route. The Sync page states all of this next to the checkboxes
 
 For Mintsoft specifically:
 

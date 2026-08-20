@@ -601,18 +601,34 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
     await addStockAdjustment(page, sku, 10, WAREHOUSE_CODE)
 
     const product = await createWcProduct(creds, runId, { label: 'OC13', price: unitPrice })
-    // 'on-hold' + set_paid:false is an unpaid order. createWcOrder defaults to a paid 'processing' order,
-    // so both must be set explicitly.
-    const order = await createWcOrder(creds, runId, {
-      lines: [{ productId: product.id, quantity: qty }],
-      status: 'on-hold',
-      setPaid: false,
-    })
-    expect(order.status).toBe('on-hold')
 
-    // It still imports (a real order awaiting payment), so the webhook DOES create a SO link.
-    const imported = await awaitWebhookDelivery(order.id, { creds })
-    expect(imported.salesOrderId).toBeTruthy()
+    // o3d-tj6v r3: `on-hold` HAS TO BE SELECTED for this test's premise to hold. The order-status
+    // selection is now an ADMISSION boundary that the webhook honours too, so an on-hold order IMS
+    // has never seen is no longer imported just because the store pushed it — which is the whole
+    // point of the change, and it used to be this test's free ride. The subject under test is the
+    // ACCOUNTING gate (an imported unpaid order must not raise an invoice), not the status filter,
+    // so the filter is widened for the duration and restored in `finally`. Restoring matters: OC-20
+    // asserts the reconcile sweep does NOT import an on-hold order, which needs the default back.
+    const priorStatuses = await readSetting('wc_sync_order_statuses')
+    await setSetting('wc_sync_order_statuses', JSON.stringify(['processing', 'on-hold']))
+    let order: Awaited<ReturnType<typeof createWcOrder>>
+    let imported: Awaited<ReturnType<typeof awaitWebhookDelivery>>
+    try {
+      // 'on-hold' + set_paid:false is an unpaid order. createWcOrder defaults to a paid 'processing'
+      // order, so both must be set explicitly.
+      order = await createWcOrder(creds, runId, {
+        lines: [{ productId: product.id, quantity: qty }],
+        status: 'on-hold',
+        setPaid: false,
+      })
+      expect(order.status).toBe('on-hold')
+
+      // It still imports (a real order awaiting payment), so the webhook DOES create a SO link.
+      imported = await awaitWebhookDelivery(order.id, { creds })
+      expect(imported.salesOrderId).toBeTruthy()
+    } finally {
+      await setSetting('wc_sync_order_statuses', priorStatuses ?? JSON.stringify(['processing']))
+    }
 
     // BARRIER before any negative assertion. awaitWebhookDelivery returns as soon as the SO LINK is visible,
     // but importWcOrder creates that link and only THEN reaches the invoice queue/skip decision — so an
@@ -1354,13 +1370,13 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
   test('OC-20: the reconcile sweep does NOT import an order whose status is not configured for sync', async ({ page }) => {
     test.setTimeout(600_000)
 
-    // The counterpart to OC-13 (which proved the WEBHOOK path imports an on-hold order as a non-processing SO).
-    // That difference is the DESIGNED split, not a bug: wc_sync_order_statuses governs the routes that FETCH
-    // orders — this reconcile sweep, the poll and the initial import — because each turns the selection into a
-    // WooCommerce `?status=` query (status=processing,completed in reconcile mode), while a webhook is a push
-    // the store makes about an order that already exists. See lib/connectors/woocommerce/order-status-filter.ts;
-    // the Sync page states the exemption next to the checkboxes. Create an on-hold order, never nudge WP-Cron
-    // (no webhook delivers), run the reconcile, and assert NO SO exists.
+    // wc_sync_order_statuses decides which orders IMS TAKES ON, on every route: this reconcile sweep and the
+    // poll turn the selection into a WooCommerce `?status=` query (status=processing,completed in reconcile
+    // mode), and since o3d-tj6v r3 the webhook honours the same selection as an ADMISSION rule. So an on-hold
+    // order is not imported by EITHER route while `on-hold` is unticked — see
+    // lib/connectors/woocommerce/order-status-filter.ts. OC-13 covers the same status with `on-hold` explicitly
+    // added to the selection, which is why the two do not contradict each other. Create an on-hold order,
+    // never nudge WP-Cron (no webhook delivers), run the reconcile, and assert NO SO exists.
     const sku = taggedSku(runId, 'OC20')
     const unitPrice = '19.00'
 

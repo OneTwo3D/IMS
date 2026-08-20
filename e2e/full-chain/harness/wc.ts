@@ -89,10 +89,10 @@ export async function createWcProduct(
  * Create an order in Woo.
  *
  * status defaults to 'processing' deliberately: wc_sync_order_statuses is
- * ["processing"], so an order in any other status is SILENTLY not FETCHED by the
- * initial import or the poll/reconcile sweeps. That silence is a real trap. A
- * webhook still delivers such an order (see awaitWebhookDelivery below), which is
- * why OC-13 can create an on-hold order and OC-20 cannot reconcile one.
+ * ["processing"], so an order in any other status is SILENTLY not imported — not
+ * FETCHED by the initial import or the poll/reconcile sweeps, and since o3d-tj6v r3
+ * not ADMITTED from a webhook push either. That silence is a real trap. A test that
+ * needs another status must add it to the selection for the duration, as OC-13 does.
  */
 export async function createWcOrder(
   c: WcCreds,
@@ -235,9 +235,11 @@ export async function nudgeWpCron(c: WcCreds): Promise<void> {
  *     every order webhook (wc_initial_import_completed);
  *   - the order parked in the pending-FX quarantine (order-import.ts) and is NOT lost.
  *
- * NOT a cause: the wc_sync_order_statuses filter. It governs the routes that FETCH
- * orders (the initial import and the poll/reconcile sweeps), not this push path — a
- * webhook imports the order whatever its status.
+ *   - the order's WooCommerce status is not in wc_sync_order_statuses. Since o3d-tj6v r3
+ *     that selection is an ADMISSION boundary the webhook honours too, so an order IMS
+ *     has never seen in an unselected status is ACKed and dropped, and an activity row
+ *     `wc_order_webhook_status_not_admitted` says so (throttled to one an hour). An
+ *     order IMS ALREADY holds is never gated, so this only bites first arrivals.
  */
 export async function awaitWebhookDelivery(
   wcOrderId: number,

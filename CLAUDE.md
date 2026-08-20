@@ -514,15 +514,20 @@ Copy `.env.example` to `.env` and configure. Uses **NextAuth.js v5** variable na
 > them from the database. `WC_SYNC_STATUSES`, `WC_USE_WEBHOOKS` and `WC_POLL_INTERVAL_MINUTES` were
 > documented here and read by nothing (o3d-tj6v) - setting them silently changed nothing.
 
-> `wc_sync_order_statuses` governs every route that **fetches** orders from WooCommerce - the
-> initial "Import Active Orders" backfill, the polling sweep and the reconcile sweeps - because each
-> turns the selection into a `?status=` query. The rules live in one place,
-> `lib/connectors/woocommerce/order-status-filter.ts`, shared by the importer and the Sync page.
-> It does **not** apply to the order **webhook**: WooCommerce pushes that event, so there is no
-> query to scope, and dropping it would leave IMS disagreeing with the store about which orders
-> exist. The status still governs what an imported order does, via `shopping_status_mappings`. The
-> Sync page states this next to the checkboxes; keep the UI copy and
-> `lib/connectors/woocommerce/webhooks.ts` in step.
+> `wc_sync_order_statuses` decides which orders IMS **takes on**. It governs every route that
+> **fetches** orders from WooCommerce - the initial "Import Active Orders" backfill, the polling
+> sweep and the reconcile sweeps - because each turns the selection into a `?status=` query. The
+> rules live in one place, `lib/connectors/woocommerce/order-status-filter.ts`, shared by the
+> importer and the Sync page.
+> It governs the order **webhook** too, as an **admission** rule rather than a fetch filter
+> (`isWcOrderAdmittedByStatus`): a pushed order IMS has never seen is created only if its current
+> status is selected, and one that later moves into a selected status is created by THAT update from
+> its own full payload. An order IMS already holds is never gated - it keeps following the store
+> whatever status it moves to afterwards, which is what stops IMS disagreeing with the store about an
+> order it owns. Withdrawal statuses are always admitted; an empty selection admits nothing. Refused
+> deliveries are ACKed (never retried) and logged as `wc_order_webhook_status_not_admitted`, at most
+> hourly. The status still governs what an imported order does, via `shopping_status_mappings`. Keep
+> the Sync page copy, `docs/installation.md` and `lib/connectors/woocommerce/webhooks.ts` in step.
 
 ### Xero Integration (OAuth 2.0)
 

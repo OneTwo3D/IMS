@@ -4,6 +4,7 @@ import path from 'node:path'
 import test from 'node:test'
 
 import {
+  isWcOrderAdmittedByStatus,
   parseWcSyncOrderStatuses,
   resolveWcPullStatuses,
   WC_DEFAULT_SYNC_ORDER_STATUSES,
@@ -119,20 +120,74 @@ test('a store with no withdrawal statuses configured gets no blank entries', () 
 const REPO_ROOT = path.resolve(import.meta.dirname ?? path.dirname(new URL(import.meta.url).pathname), '..')
 const SYNC_CLIENT = path.join(REPO_ROOT, 'app/(dashboard)/sync/sync-client.tsx')
 
-test('the Sync page tells the operator that the webhook ignores the status filter', () => {
-  // Deciding a webhook should not honour the filter is a legitimate answer only
-  // if the UI says so — an operator reading "Import order statuses" will not
-  // expect a webhook to bypass it, and a control that silently does less than
-  // it claims is worse than an absent one. Keep this in step with the comment
-  // in lib/connectors/woocommerce/webhooks.ts.
+test('the Sync page says the selection governs the webhook too, and what it does NOT gate', () => {
+  // o3d-tj6v r3 REPLACES THE ASSERTION THAT USED TO LIVE HERE. It pinned the UI stating that the
+  // webhook ignores the filter — true copy for a control that was advertised and unenforced, and
+  // saying so out loud was never the same as honouring it. Now the selection reaches the webhook, so
+  // the page must say that instead, together with the two limits that make it safe to believe:
+  // an unselected order is skipped rather than lost, and an order IMS already has is never gated.
+  // Keep in step with lib/connectors/woocommerce/webhooks.ts and docs/installation.md.
   const source = readFileSync(SYNC_CLIENT, 'utf8')
   const filterSection = source.slice(source.indexOf('Import order statuses'))
 
-  assert.match(filterSection, /does <strong>not<\/strong> apply to the order\s+webhook/)
-  assert.match(filterSection, /whatever its status/)
-  // ...and which routes it DOES govern, so the statement is complete.
+  assert.match(filterSection, /orders pushed by the order webhook, which are imported\s+only if they arrive in a selected status/)
+  assert.match(filterSection, /if it later moves into a\s+selected status it is imported then/)
+  assert.match(filterSection, /never stops updates to an order\s+you already have/)
+  // ...and which fetch routes it governs, so the statement is still complete.
   assert.match(filterSection, /polling sweep/)
-  assert.match(filterSection, /reconciliation/)
+  assert.match(filterSection, /backup reconciliation/)
+  // The old exemption copy must be gone, not merely contradicted further down the page.
+  assert.doesNotMatch(filterSection, /does <strong>not<\/strong> apply to the order/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-tj6v r3 — the webhook admission boundary
+// ---------------------------------------------------------------------------
+
+test('an admitted status lets an unseen pushed order in', () => {
+  assert.equal(isWcOrderAdmittedByStatus('processing', ['processing', 'on-hold'], WDRAW), true)
+})
+
+test('a status the operator EXCLUDED does not let an unseen pushed order in', () => {
+  // The whole point. Round 2 imported this order and told the operator so in the UI; the checkbox
+  // said "Import order statuses" and pending orders imported anyway.
+  assert.equal(isWcOrderAdmittedByStatus('pending', ['processing'], WDRAW), false)
+})
+
+test('admission normalises both sides, so a wc- prefix on either does not open or close the boundary', () => {
+  assert.equal(isWcOrderAdmittedByStatus('wc-processing', ['processing'], WDRAW), true)
+  assert.equal(isWcOrderAdmittedByStatus('processing', ['wc-processing'], WDRAW), true)
+  assert.equal(isWcOrderAdmittedByStatus('WC-Processing', ['processing'], WDRAW), true)
+})
+
+test('withdrawal statuses are admitted whatever the selection', () => {
+  // Same rule resolveWcPullStatuses applies to every live sweep (o3d-e1yb): a withdrawal that is
+  // never seen means an order the customer asked to stop carries on to the warehouse.
+  assert.equal(isWcOrderAdmittedByStatus(WDRAW.submitted, ['processing'], WDRAW), true)
+  assert.equal(isWcOrderAdmittedByStatus(WDRAW.approved, ['processing'], WDRAW), true)
+})
+
+test('an EMPTY selection admits nothing at all, withdrawals included', () => {
+  // Exactly what resolveWcPullStatuses does with an empty list — it short-circuits BEFORE the
+  // withdrawal statuses are added. "Import nothing" has to mean the same thing on every route.
+  assert.equal(isWcOrderAdmittedByStatus('processing', [], WDRAW), false)
+  assert.equal(isWcOrderAdmittedByStatus(WDRAW.submitted, [], WDRAW), false)
+  assert.deepEqual(resolveWcPullStatuses('poll', [], WDRAW), [])
+})
+
+test('a payload with no usable status is not admitted', () => {
+  // Otherwise a malformed push is the one way past the boundary.
+  for (const status of [null, undefined, '', '   ', 'wc-']) {
+    assert.equal(isWcOrderAdmittedByStatus(status, ['processing'], WDRAW), false, `status ${JSON.stringify(status)}`)
+  }
+})
+
+test('a store with no withdrawal statuses configured cannot be opened up by a blank one', () => {
+  // getWithdrawalStatuses can yield '' for an unconfigured store. A blank must not match a blank
+  // payload status, and normaliseWcOrderStatus('') is '' on both sides — hence the explicit
+  // empty-status refusal above rather than relying on the comparison.
+  assert.equal(isWcOrderAdmittedByStatus('', ['processing'], { submitted: '', approved: '' }), false)
+  assert.equal(isWcOrderAdmittedByStatus('anything', ['processing'], { submitted: '', approved: '' }), false)
 })
 
 test('the Sync page describes the initial import by the selected statuses, not a hardcoded list', () => {
