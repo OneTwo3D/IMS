@@ -96,6 +96,17 @@ With the initial import complete, new and updated WooCommerce orders are importe
 - The customer is matched by WooCommerce customer ID or email, or created if new
 - Multi-currency orders are converted to the IMS base currency using the FX rate from `frankfurter.dev` (ECB) at import time. The same rate is stamped on the order's `fxRateToBase` field and forwarded to Xero as `CurrencyRate` on the resulting invoice — so the WooCommerce store, IMS, and Xero all see the same base-currency total for the order. See `docs/xero-sync.md` § Multi-Currency FX Rates.
 - Tax rates are resolved using the tax rate mappings you configure (see Tax Rates below)
+- **Shipping is taxed at its own rate, not the goods' rate.** A store that charges zero-rated postage
+  beside standard-rated goods (or the reverse) would otherwise post an accounting invoice that does
+  not total to the WooCommerce order — and the payment IMS registers for the order total would only
+  part-settle it, leaving a balance in the ledger while IMS showed the order settled. The shipping
+  line now takes the tax rate that reproduces the tax WooCommerce actually charged on shipping
+- **A paid order registers no payment when the document will not total to the order.** Before
+  registering the gross payment, IMS checks the tax the accounting document will produce against the
+  tax WooCommerce charged, per line and for shipping. When they disagree — usually a shipping or line
+  tax rate WooCommerce applied that has no mapping in IMS — the payment is withheld and a WARNING is
+  logged naming the components and both figures. The order then shows a settlement discrepancy
+  ("no payment was ever queued") instead of a green *Settled* over a balance nobody is watching
 - The order number uses your configured WooCommerce prefix (e.g. `WC-1234`, set in Settings > Company > Document Numbering)
 - **The accounting invoice number comes from WooCommerce, not from IMS.** IMS reads `_wcpdf_invoice_number` — the number WooCommerce PDF Invoices & Packing Slips assigned and printed on the customer's PDF — and uses it *verbatim* as both the IMS invoice number and the `InvoiceNumber` on the Xero invoice. No prefix is added, so the Xero document, the customer's PDF and the WooCommerce order all carry the same number. The **Invoice Prefix** field for WooCommerce under Settings > Company > Document Numbering no longer affects it
 - Stock is auto-allocated from warehouses marked **Sync to Store**

@@ -1387,12 +1387,23 @@ releasing it is an explicit, confirmed operator action (see *Releasing a stale e
 The repair sweep reports a refusal it hits as `xero_backreference_id_conflict` and re-reports it once
 a day until it is resolved, rather than retrying silently.
 
-The likeliest causes are a connector reconnected to a different company that has reissued an id (see
-below), and the ledger merging two of our documents because they were posted under the same document
-number. Supplier credit notes are the live case of the second: if two credit notes are raised against
-one purchase order and the **credit-note number is left blank on both**, they post under the purchase
-order's own reference and Xero treats the second as an edit of the first. Give each supplier credit
-note its own number.
+The likeliest cause is a connector reconnected to a different company that has reissued an id (see
+below). The other — the ledger merging two of our documents because they were posted under the same
+document number — used to have a live case in supplier credit notes: two credits raised against one
+purchase order with the number left blank on both posted under the purchase order's own reference,
+and Xero treated the second as an edit of the first.
+
+That is fixed at the source. **A supplier credit note now posts under a document number IMS mints
+from the credit note's own record (`SCN-…`)**, whatever you type in the number field, so two credits
+can never claim one number. What you type is still sent — it travels as the credit note's *Reference*
+in Xero, which is also where the purchase order reference goes when you leave the field blank.
+
+That is what lets the supplier credit note use the same posting verb as the sales credit note. The
+alternative — a create-only post, which refuses a duplicate number — protects against a collision
+that can no longer happen, and in exchange **creates a second credit note** whenever the response to
+the first post is lost in transit, understating payables by the duplicate. Posting under a number that
+is unique to the record means a retry replaces that record's own document and the two systems
+converge.
 
 ### Releasing a stale external id
 

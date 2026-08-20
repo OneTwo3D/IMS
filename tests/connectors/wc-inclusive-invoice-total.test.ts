@@ -217,7 +217,7 @@ test('an inclusive order stores subtotal + shipping + tax == the order total', a
 test('a paid tax-INCLUSIVE order now settles for its gross total (o3d-c0n gate removed)', async () => {
   const { resolveWcInvoicePaymentAmount } = await orderImport()
   assert.equal(
-    resolveWcInvoicePaymentAmount({ date_paid_gmt: '2026-08-20T10:00:00', total: '132.00' }),
+    resolveWcInvoicePaymentAmount({ date_paid_gmt: '2026-08-20T10:00:00', total: '132.00' }, { totalsToTheOrder: true }),
     132,
     'the invoice is now built at 132.00 too, so the gross payment no longer exceeds it',
   )
@@ -225,13 +225,13 @@ test('a paid tax-INCLUSIVE order now settles for its gross total (o3d-c0n gate r
 
 test('an UNPAID order still registers no payment, on either convention', async () => {
   const { resolveWcInvoicePaymentAmount } = await orderImport()
-  assert.equal(resolveWcInvoicePaymentAmount({ date_paid_gmt: null, total: '132.00' }), undefined)
+  assert.equal(resolveWcInvoicePaymentAmount({ date_paid_gmt: null, total: '132.00' }, { totalsToTheOrder: true }), undefined)
 })
 
 test('a zero / missing / non-numeric total still registers no payment', async () => {
   const { resolveWcInvoicePaymentAmount } = await orderImport()
   const paid = { date_paid_gmt: '2026-08-20T10:00:00' }
-  assert.equal(resolveWcInvoicePaymentAmount({ ...paid, total: '0' }), undefined)
-  assert.equal(resolveWcInvoicePaymentAmount({ ...paid, total: '' }), undefined)
-  assert.equal(resolveWcInvoicePaymentAmount({ ...paid, total: 'n/a' }), undefined)
+  assert.equal(resolveWcInvoicePaymentAmount({ ...paid, total: '0' }, { totalsToTheOrder: true }), undefined)
+  assert.equal(resolveWcInvoicePaymentAmount({ ...paid, total: '' }, { totalsToTheOrder: true }), undefined)
+  assert.equal(resolveWcInvoicePaymentAmount({ ...paid, total: 'n/a' }, { totalsToTheOrder: true }), undefined)
 })

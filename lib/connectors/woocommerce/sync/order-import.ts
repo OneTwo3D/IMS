@@ -189,12 +189,25 @@ export function pendingFxQueueWhere(externalOrderId?: string): Prisma.ShoppingSy
  * both conventions, so the invoice totals to `wcOrder.total` either way and the gate has nothing left to
  * protect: an inclusive order settles to PAID like an exclusive one.
  *
- * Returns undefined (→ leaves the net fallback in place) only when the order isn't paid, or carries no
- * usable total — no payment is registered in either case.
+ * Returns undefined (→ registers no payment) when the order isn't paid, when it carries no usable
+ * total, and — o3d-cyn round 2 — WHEN THE DOCUMENT WILL NOT TOTAL TO THAT ORDER.
+ *
+ * That last one is the whole point of the second argument. The gross is the right payment only for a
+ * document built at the gross; send it against a document Xero will total differently and Xero either
+ * refuses it or, worse, accepts it as a PART payment and leaves a balance nobody is looking at — while
+ * IMS compares the amount it sent against the order total, finds them equal, and reports SETTLED. The
+ * caller establishes whether the document reconciles (see `reconcileWcDocumentTax`), and an order that
+ * does not reconcile registers NOTHING: settlement then reads NOT_SENT, which is a discrepancy an
+ * operator is shown.
+ *
+ * The argument is REQUIRED and has no default on purpose. A default would make the guard opt-in, and
+ * the callers who forget it are exactly the ones whose documents are wrong.
  */
 export function resolveWcInvoicePaymentAmount(
   wcOrder: Pick<WcFullOrder, 'date_paid_gmt' | 'total'>,
+  document: { totalsToTheOrder: boolean },
 ): number | undefined {
+  if (!document.totalsToTheOrder) return undefined
   if (!wcOrder.date_paid_gmt || !wcOrder.total) return undefined
   const gross = Number(wcOrder.total)
   return Number.isFinite(gross) && gross > 0 ? gross : undefined
@@ -252,6 +265,192 @@ export function resolveWcAccountingAmountConvention(input: {
     shippingAmount: shipping.gt(0) ? roundDecimalNumber(shipping, 4) : undefined,
     discountAmount: discount.gt(0) ? roundDecimalNumber(discount, 2) : undefined,
   }
+}
+
+// ---------------------------------------------------------------------------
+// SHIPPING NEED NOT CARRY THE GOODS' TAX RATE (o3d-cyn round 2)
+// ---------------------------------------------------------------------------
+//
+// The document sends shipping on `accountingTaxType` — the ORDER DEFAULT, derived from the goods.
+// A store that charges a different rate on delivery (zero-rated postage beside standard-rated goods,
+// or the reverse) therefore posts a shipping line Xero taxes at the WRONG rate, and the invoice no
+// longer totals to `wcOrder.total`:
+//
+//   goods net 100 @ 20% = 20 VAT, shipping net 10 @ 0% = 0 VAT, wcOrder.total = 130.00
+//   sent on the goods' rate, Xero computes 20% on the shipping too → invoice 132.00
+//
+// AND NOTHING SAID SO. The gross payment registered is `wcOrder.total` = 130.00, which Xero accepts
+// as a PART payment against its 132.00 invoice; the invoice stays AUTHORISED with 2.00 outstanding
+// for ever. IMS meanwhile compares the 130.00 it sent against the 130.00 order total —
+// `ledgerSalesInvoiceTotalForeign` returns the order total, correctly, because that is what a
+// correctly-built document totals to — and prints SETTLED. The one figure neither system compares
+// against is the one the ledger actually holds.
+//
+// Two changes, and they are layers rather than alternatives:
+//
+//  1. RESOLVE THE SHIPPING RATE FROM THE SHIPPING LINE'S OWN TAX, so the ordinary mixed-rate order
+//     posts a document that does total to the order and settles.
+//  2. CHECK THE DOCUMENT AGAINST WOO'S OWN PER-COMPONENT TAX BEFORE CLAIMING THE PAYMENT SETTLES
+//     IT. When the tax the document will produce disagrees with the tax Woo reports, no payment is
+//     registered at all: the settlement verdict is then NOT_SENT, which is a discrepancy an operator
+//     is shown, rather than SETTLED, which is a lie nobody is shown.
+
+/** A tax rate as `resolveWcTaxRateById` reports it, reduced to what these decisions depend on. */
+export type WcResolvedRateForDocument = {
+  accountingTaxType: string | null
+  taxRateValue: number
+  source?: 'mapped' | 'default'
+}
+
+export type WcShippingTaxResolution = {
+  /** The accounting tax type to send on the shipping line. */
+  taxType: string | null
+  /** The rate that tax type will apply, as a fraction. */
+  rateValue: number
+  /** False when no rate we hold reproduces the tax Woo actually charged on shipping. */
+  resolved: boolean
+  /** Named when unresolved, for the operator-facing warning. */
+  reason?: string
+}
+
+/**
+ * A penny either way. Both systems round money to 2dp, so a rate is judged by whether it REPRODUCES
+ * the tax Woo charged, not by comparing rate fractions — `1.67 / 8.33` is not `0.20` and never will
+ * be, while `8.33 × 0.20` rounds to `1.67` exactly as Woo's own arithmetic did.
+ */
+const COMPONENT_TAX_TOLERANCE = 0.011
+
+function reproducesTax(netForeign: Decimal, rateValue: number, reportedTax: Decimal): boolean {
+  return Math.abs(Number(netForeign.mul(toDecimal(rateValue)).sub(reportedTax))) <= COMPONENT_TAX_TOLERANCE
+}
+
+/**
+ * Which tax type the SHIPPING line should carry.
+ *
+ * The answer is chosen by arithmetic, not by trust: a candidate rate is accepted only if applying it
+ * to the shipping net reproduces the tax WooCommerce actually charged on shipping. That makes the
+ * choice self-verifying, and it is why a rate id Woo names but IMS has not mapped cannot quietly
+ * substitute the goods rate.
+ *
+ * Order of preference:
+ *  1. a MAPPED rate the shipping line itself names, which reproduces Woo's shipping tax;
+ *  2. the ORDER DEFAULT, if it reproduces Woo's shipping tax — this is the ordinary single-rate
+ *     order, and it is what was always sent, so nothing about that case moves;
+ *  3. nothing. The order default is still sent (there is no better guess, and omitting shipping
+ *     would understate the invoice), but `resolved` is false and the caller must not then claim the
+ *     document settles for the order total.
+ */
+export function resolveWcShippingTaxRate(input: {
+  shippingLines: Array<{
+    total_tax?: string | number | null
+    taxes?: Array<{ id: number; total?: string | number | null }> | null
+  }>
+  shippingNetForeign: DecimalInput
+  /** Every WooCommerce rate id already resolved for this order. */
+  rateById: ReadonlyMap<number, WcResolvedRateForDocument>
+  orderDefault: WcResolvedRateForDocument
+}): WcShippingTaxResolution {
+  const net = toDecimal(input.shippingNetForeign)
+  // No shipping line is put on the document at all below zero, so no tax type is used and there is
+  // nothing here that can be wrong.
+  if (!net.gt(0)) {
+    return { taxType: input.orderDefault.accountingTaxType, rateValue: 0, resolved: true }
+  }
+
+  const reportedTax = input.shippingLines.reduce<Decimal>(
+    (sum, line) => addMoney(sum, toDecimal(line.total_tax ?? 0)),
+    toDecimal(0),
+  )
+
+  const named = new Map<number, WcResolvedRateForDocument>()
+  for (const line of input.shippingLines) {
+    for (const tax of line.taxes ?? []) {
+      const rate = input.rateById.get(tax.id)
+      // `source: 'default'` means Woo named a rate id IMS has no mapping for, so its tax type is a
+      // substitution rather than a translation — exactly what the per-line path refuses to trust.
+      if (rate && rate.source === 'mapped') named.set(tax.id, rate)
+    }
+  }
+  const matching = [...named.values()].filter((rate) => reproducesTax(net, rate.taxRateValue, reportedTax))
+  const distinctTypes = new Set(matching.map((rate) => rate.accountingTaxType))
+  if (distinctTypes.size === 1) {
+    const chosen = matching[0]
+    return { taxType: chosen.accountingTaxType, rateValue: chosen.taxRateValue, resolved: true }
+  }
+  if (distinctTypes.size > 1) {
+    return {
+      taxType: input.orderDefault.accountingTaxType,
+      rateValue: input.orderDefault.taxRateValue,
+      resolved: false,
+      reason:
+        `WooCommerce charged ${reportedTax.toFixed(2)} of tax on ${net.toFixed(2)} of shipping and IMS holds `
+        + `${distinctTypes.size} different accounting tax types that would produce it, so the shipping line `
+        + `cannot be given one.`,
+    }
+  }
+  if (reproducesTax(net, input.orderDefault.taxRateValue, reportedTax)) {
+    return {
+      taxType: input.orderDefault.accountingTaxType,
+      rateValue: input.orderDefault.taxRateValue,
+      resolved: true,
+    }
+  }
+  return {
+    taxType: input.orderDefault.accountingTaxType,
+    rateValue: input.orderDefault.taxRateValue,
+    resolved: false,
+    reason:
+      `WooCommerce charged ${reportedTax.toFixed(2)} of tax on ${net.toFixed(2)} of shipping, which is neither `
+      + `the order's default rate of ${(input.orderDefault.taxRateValue * 100).toFixed(2)}% nor any WooCommerce `
+      + `shipping rate mapped in IMS.`,
+  }
+}
+
+/** One component of the document whose tax WooCommerce also reports, so the two can be compared. */
+export type WcDocumentTaxComponent = {
+  label: string
+  /** The NET amount the document carries, in order currency. */
+  netForeign: DecimalInput
+  /** The rate the accounting tax type sent for it will apply, as a fraction. */
+  rateValue: number
+  /** The tax WooCommerce itself charged on this component. */
+  reportedTaxForeign: DecimalInput
+}
+
+export type WcDocumentTaxReconciliation = {
+  reconciles: boolean
+  /** Every component whose modelled tax disagrees with Woo's, worst first. */
+  disagreements: Array<{ label: string; modelledTax: number; reportedTax: number; difference: number }>
+}
+
+/**
+ * Will the document produce the tax WooCommerce charged?
+ *
+ * PER COMPONENT, against Woo's own figure for that component, rather than against a single order
+ * total — because a total can agree while two components are wrong in opposite directions, and
+ * because naming the component is what makes the resulting warning actionable.
+ *
+ * The ORDER-LEVEL RESIDUAL DISCOUNT is deliberately NOT a component here. It is coupon money Woo did
+ * not allocate to any line (o3d-y14), so Woo reports no tax figure for it and there is nothing to
+ * compare against; inventing one would make this check assert its own guess. Its exposure is
+ * unchanged by this function and is the same one o3d-y14 records.
+ */
+export function reconcileWcDocumentTax(components: WcDocumentTaxComponent[]): WcDocumentTaxReconciliation {
+  const disagreements = components
+    .map((component) => {
+      const net = toDecimal(component.netForeign)
+      const reported = toDecimal(component.reportedTaxForeign)
+      const modelled = net.mul(toDecimal(component.rateValue))
+      return {
+        label: component.label,
+        modelledTax: roundDecimalNumber(modelled, 2),
+        reportedTax: roundDecimalNumber(reported, 2),
+        difference: roundDecimalNumber(modelled.sub(reported), 2),
+      }
+    })
+    .filter((d) => Math.abs(d.difference) > COMPONENT_TAX_TOLERANCE)
+    .sort((a, b) => Math.abs(b.difference) - Math.abs(a.difference))
+  return { reconciles: disagreements.length === 0, disagreements }
 }
 
 export function buildPendingFxOrderPayload(
@@ -1148,6 +1347,11 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const distinctWcRateIds = Array.from(new Set([
       ...mappedLines.map((l) => l.externalTaxRateId).filter((x): x is number => typeof x === 'number'),
       ...wcOrder.tax_lines.map((line) => line.rate_id).filter((x): x is number => typeof x === 'number'),
+      // o3d-cyn r2: the SHIPPING line's own rate ids. They normally also appear in `tax_lines`, but
+      // the shipping tax type is now resolved from them directly, and a rate this map does not hold
+      // cannot be resolved at all.
+      ...wcOrder.shipping_lines.flatMap((line) => (line.taxes ?? []).map((tax) => tax.id))
+        .filter((x): x is number => typeof x === 'number'),
     ]))
     const wcResolvedById = new Map<
       number,
@@ -1334,6 +1538,36 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       shippingTaxForeign: wcOrder.shipping_lines.map((line) => line.total_tax),
       orderTotal: wcOrder.total,
     })
+
+    // o3d-cyn r2: shipping need not carry the goods' rate, and a document that will not produce
+    // Woo's own tax must not be claimed as settled by a payment for the order total.
+    const shippingTax = resolveWcShippingTaxRate({
+      shippingLines: wcOrder.shipping_lines,
+      shippingNetForeign: shippingForeign,
+      rateById: wcResolvedById,
+      orderDefault: { accountingTaxType, taxRateValue },
+    })
+    const documentTaxReconciliation = reconcileWcDocumentTax([
+      ...mappedLines.map((l, idx) => ({
+        label: l.sku || l.description || `line ${idx + 1}`,
+        netForeign: toDecimal(l.qty).mul(toDecimal(l.unitPriceForeign)).sub(toDecimal(l.discountAmount)),
+        // A reverse-charge sales line carries NO tax on the invoice — the notional VAT nets to zero,
+        // which is why Woo reports none on it either. Modelling it at the mapped rate would invent a
+        // disagreement on every RC order.
+        rateValue: lineTaxResolved[idx]?.reverseCharge ? 0 : (lineTaxResolved[idx]?.taxRateValue ?? 0),
+        reportedTaxForeign: l.taxForeign,
+      })),
+      {
+        label: 'Shipping',
+        netForeign: shippingForeign,
+        rateValue: shippingTax.rateValue,
+        reportedTaxForeign: wcOrder.shipping_lines.reduce<Decimal>(
+          (sum, line) => addMoney(sum, toDecimal(line.total_tax ?? 0)),
+          toDecimal(0),
+        ),
+      },
+    ])
+    const documentTotalsToTheOrder = shippingTax.resolved && documentTaxReconciliation.reconciles
 
     // GBP conversions
     const subtotalBase = divideRoundedNumber(subtotalForeign, fxRate, 4)
@@ -1604,6 +1838,37 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       // and it is sent that way — see `resolveWcAccountingAmountConvention`.
       const { lineAmountsIncludeTax, shippingAmount, discountAmount: orderLevelDiscountAmount } =
         resolveWcAccountingAmountConvention({ pricesIncludeVat, shippingForeign, orderLevelDiscountForeign })
+      // o3d-cyn r2: say it out loud when the document will not total to the order. This is the
+      // difference between a wrong number nobody sees and an unsettled invoice somebody can fix — the
+      // payment is withheld below, so the settlement verdict becomes NOT_SENT rather than SETTLED.
+      if (!documentTotalsToTheOrder && wcOrder.date_paid_gmt) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'wc_invoice_tax_does_not_reconcile',
+          tag: 'accounting',
+          level: 'WARNING',
+          description:
+            `WooCommerce order ${wcOrder.number} is paid, but the tax the accounting document will produce `
+            + `does not match the tax WooCommerce charged, so the invoice will not total to the order's `
+            + `${wcOrder.total}. NO payment was registered against it — registering one would settle a `
+            + `figure the ledger does not hold. `
+            + (shippingTax.resolved ? '' : `${shippingTax.reason} `)
+            + documentTaxReconciliation.disagreements
+              .map((d) => `${d.label}: document ${d.modelledTax.toFixed(2)} vs WooCommerce ${d.reportedTax.toFixed(2)}`)
+              .join('; '),
+          metadata: {
+            connector: 'woocommerce',
+            externalOrderId: String(wcOrder.id),
+            externalOrderNumber: wcOrder.number,
+            orderTotal: wcOrder.total,
+            shippingTaxResolved: shippingTax.resolved,
+            shippingTaxType: shippingTax.taxType,
+            shippingTaxRate: shippingTax.rateValue,
+            disagreements: documentTaxReconciliation.disagreements,
+          },
+        })
+      }
       // WooCommerce discounts are imported exactly as stored on the order so the accounting
       // connector sees the original order-currency amounts without a base-currency round-trip.
       // Coupons ride on the per-line discountAmount below (that is where Woo puts them); the
@@ -1640,10 +1905,15 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           shippingAmount,
           shippingDescription: 'Shipping',
           shippingAccountCode: settings.shippingAccount || undefined,
-          // audit-H1b: shipping & discount stay on the base tax type (NOT swapped),
-          // matching the native invoice push + credit-note builder (the H1 rule —
-          // only goods lines carry the reverse charge).
-          shippingTaxType: accountingTaxType ?? undefined,
+          // audit-H1b: shipping & discount stay off the REVERSE-CHARGE swap (NOT swapped), matching
+          // the native invoice push + credit-note builder (the H1 rule — only goods lines carry the
+          // reverse charge).
+          //
+          // o3d-cyn r2: but the RATE is shipping's own, not the goods'. `resolveWcShippingTaxRate`
+          // picks the tax type that reproduces the tax Woo actually charged on shipping, falling back
+          // to the order default when that is the one that does — so a single-rate order is unchanged
+          // and a zero-rated-postage order stops being taxed at the goods' rate.
+          shippingTaxType: shippingTax.taxType ?? accountingTaxType ?? undefined,
           // Only the residual — the coupon itself is already on the lines above as a per-line
           // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
           // discount line. Sending both deducted it twice (o3d-y14).
@@ -1652,10 +1922,15 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           discountTaxType: accountingTaxType ?? undefined,
           lineAmountsIncludeTax,
           _postingMode: 'submitted',
-          _registerPayment: !!wcOrder.date_paid_gmt,
           _paymentMethod: wcOrder.payment_method || undefined,
           _paymentDate: wcOrder.date_paid_gmt || undefined,
-          _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder),
+          // NOT `!!wcOrder.date_paid_gmt` alone (o3d-cyn r2): registering the net fallback against a
+          // document that will not total to the order is the same wrong settlement one figure down.
+          // Carried onto the HELD payload too (development's invoice-number branch below): a document
+          // that does not total to the order must not register a payment whether it is queued now or
+          // released later.
+          _registerPayment: !!wcOrder.date_paid_gmt && documentTotalsToTheOrder,
+          _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder, { totalsToTheOrder: documentTotalsToTheOrder }),
       }
 
       if (invoiceNumberResolution.ok) {

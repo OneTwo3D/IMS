@@ -115,19 +115,29 @@ export function resolveSupplierCreditNoteTaxType(params: {
  * debited (transit/clearing) and mirrors its tax type, so the credit nets the
  * capitalised freight AND reverses the VAT correctly (audit-oy5p).
  *
- * THE DOCUMENT NUMBER MUST BE UNIQUE PER CREDIT NOTE — o3d-tfri. It used to fall back to
- * `params.reference` before `SCN-<id>`, and `reference` is set to the PURCHASE ORDER's reference
- * by `recordSupplierCreditNote` whenever the operator leaves the number blank (the field is
- * optional free text). Several credit notes against one PO is a supported flow, so two
- * blank-numbered ones produced the SAME `CreditNoteNumber` — and Xero's `POST /CreditNotes` is
- * create-or-update on that number, so the second silently replaced the first in the ledger. Now
- * the fallback is `SCN-<creditNoteId>`, unique by construction because the id is this row's
- * primary key. The PO reference is not lost: it still travels as the credit note's `reference`,
- * which posts to Xero's `Reference` field, so the PO linkage is as visible as it ever was.
+ * THE DOCUMENT NUMBER IS ALWAYS `SCN-<creditNoteId>` — o3d-tfri, both rounds.
  *
- * Both halves of the fix matter and neither replaces the other: this one stops the collision
- * being generated, and `pushPurchaseCreditNote`'s PUT stops a collision from ANY source (a
- * supplier who reuses their own number, an operator who types one twice) being absorbed silently.
+ * ROUND 1: it used to fall back to `params.reference`, which `recordSupplierCreditNote` sets to the
+ * PURCHASE ORDER's reference whenever the operator leaves the number blank (the field is optional
+ * free text). Several credit notes against one PO is a supported flow, so two blank-numbered ones
+ * produced the SAME `CreditNoteNumber` — and Xero's `POST /CreditNotes` is create-or-update on that
+ * number, so the second silently replaced the first in the ledger.
+ *
+ * ROUND 2: THE FALLBACK IS NOW THE ONLY PATH. Deriving the number from this row's primary key ONLY
+ * when the operator left the field blank left the collision fully alive in the other branch — a
+ * supplier who reuses their own credit-note reference, or an operator who types one twice, still
+ * produced two documents claiming one number. It also left the number outside our control, which is
+ * what forced `pushPurchaseCreditNote` onto a create-only verb, and a create-only verb DUPLICATES the
+ * credit note when a response is lost (see that function for the full argument). Minting the number
+ * from the primary key unconditionally makes it unique BY CONSTRUCTION, exactly as
+ * `nextCreditNoteNumber`'s advisory-locked counter does on the sales side — which is the premise
+ * that lets the poster go back to the upserting verb and converge on a retry.
+ *
+ * NOTHING IS LOST. `params.creditNoteNumber` is kept and deliberately NOT read — it is the seam a
+ * future "show the supplier's own number in the ledger" would attach to, and reading it again is
+ * exactly the defect — and the value itself already reaches Xero: `recordSupplierCreditNote` stores
+ * the operator's number as the row's `reference` when they give one (falling back to the PO
+ * reference), and `reference` posts to Xero's `Reference` field.
  */
 export function buildSupplierCreditNoteSyncPayload(params: {
   creditNoteId: string
@@ -154,7 +164,7 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   lineAmountsIncludeTax?: boolean
 }): Record<string, unknown> {
   return {
-    creditNoteNumber: params.creditNoteNumber ?? `SCN-${params.creditNoteId}`,
+    creditNoteNumber: `SCN-${params.creditNoteId}`,
     contactName: params.supplierName,
     date: params.date,
     currency: params.currency,

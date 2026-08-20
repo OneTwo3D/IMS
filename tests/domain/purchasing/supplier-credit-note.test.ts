@@ -95,7 +95,7 @@ test('sync payload reverses on the transit account with the supplier contact', (
   assert.equal(payload.supplierId, 'sup-1')
   assert.equal(payload.currency, 'EUR')
   assert.equal(payload.currencyRateToBase, 0.85)
-  assert.equal(payload.creditNoteNumber, 'CN-77')
+  assert.equal(payload.creditNoteNumber, 'SCN-scn-1', 'the LEDGER document number is minted from the row id, never from free text')
   const lines = payload.lines as Array<Record<string, unknown>>
   assert.equal(lines.length, 1)
   assert.equal(lines[0].accountCode, '1250')
@@ -205,12 +205,25 @@ test('a BLANK credit-note number never becomes the PO reference — two on one P
   assert.equal((first.lines as Array<Record<string, unknown>>)[0].description, 'Supplier credit note')
 })
 
-test('an operator-supplied number is still used verbatim, and a bare credit note still gets one', () => {
+test('an operator-supplied number never becomes the LEDGER document number — it travels as the reference (o3d-tfri r2)', () => {
+  // Production shape: recordSupplierCreditNote stores `reference = creditNoteNumber || po.reference`,
+  // so an operator-typed number arrives here in BOTH fields. Only one of them may reach Xero's
+  // CreditNoteNumber, because a number nothing makes unique is what forced the create-only verb —
+  // and a create-only verb duplicates the credit note after a lost response.
   const numbered = buildSupplierCreditNoteSyncPayload({
-    creditNoteId: 'scn-4', creditNoteNumber: 'SUPPLIER-CN-77', reference: 'PO-ABC', reason: null,
+    creditNoteId: 'scn-4', creditNoteNumber: 'SUPPLIER-CN-77', reference: 'SUPPLIER-CN-77', reason: null,
     supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: 'T', taxType: 'NONE', date: '2026-06-13',
   })
-  assert.equal(numbered.creditNoteNumber, 'SUPPLIER-CN-77')
+  assert.equal(numbered.creditNoteNumber, 'SCN-scn-4', 'unique by construction, from this row\'s primary key')
+  assert.equal(numbered.reference, 'SUPPLIER-CN-77', 'and the supplier\'s own number still reaches the ledger')
+
+  // Two credit notes on ONE purchase order whose supplier reused their own reference: distinct
+  // documents in the ledger, which is what they are.
+  const twin = buildSupplierCreditNoteSyncPayload({
+    creditNoteId: 'scn-5', creditNoteNumber: 'SUPPLIER-CN-77', reference: 'SUPPLIER-CN-77', reason: null,
+    supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: 'T', taxType: 'NONE', date: '2026-06-13',
+  })
+  assert.notEqual(twin.creditNoteNumber, numbered.creditNoteNumber)
 
   const noRef = buildSupplierCreditNoteSyncPayload({
     creditNoteId: 'scn-3', creditNoteNumber: null, reference: null, reason: null,
