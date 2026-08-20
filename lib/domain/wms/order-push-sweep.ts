@@ -396,6 +396,11 @@ export interface WmsOrderPushPort {
    *  could not be read, which is NOT the same as "not withdrawn". Optional; absent = no live
    *  recheck, and the IMS markers remain the only trigger. */
   readLiveWithdrawal?(orderId: string): Promise<{ withdrawn: boolean; approved: boolean } | null>
+  /** o3d-rbyg: does a STANDING withdrawal tombstone exist for this order? The durable half of the
+   *  fence — a local read that an outage cannot change the answer of. It says only that a
+   *  withdrawal stands, never what to do about it. Optional; absent = the tombstone is not
+   *  consulted. */
+  readWithdrawalTombstone?(orderId: string): Promise<{ standing: boolean } | null>
   updateLinkByOrder?(orderId: string, data: LinkWrite): Promise<void>
   updateLink(id: string, data: LinkWrite): Promise<void>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
@@ -812,6 +817,34 @@ export async function runWmsOrderPushSweepCore(
           }
         }
 
+        // o3d-rbyg: and the DURABLE half. The live read above is the half that an outage takes
+        // away — exactly when a fence is most needed — and the tombstone is what the screen and the
+        // live read WRITE so the order stays fenced without it. Consulting only the two readable
+        // signals meant an order with a standing tombstone was promoted to SYNCED the moment
+        // WooCommerce was unreachable, and SYNCED is what the dispatch passes act on.
+        //
+        // It is checked even when the live read came back CLEAN, for the same reason
+        // verifyWithdrawalFenceForPush refuses a standing row without asking anyone: a tombstone is
+        // retired only after the storefront has reported the request rejected across a whole
+        // quiescence window, re-verified by the by-ID sweep. One ad-hoc read is not that evidence.
+        //
+        // HOLD, never cancel. A tombstone says "this order needs checking", never WHAT to do — the
+        // rule the withdrawal module states in as many words — so the reversible action is the only
+        // one it can authorise. If the customer's request was in fact approved, the markers, the
+        // live read or the ordinary cancel pass supply that verdict and the cancel follows.
+        let tombstoned = false
+        if (!heldNow) {
+          try {
+            tombstoned = Boolean((await port.readWithdrawalTombstone?.(link.orderId))?.standing)
+          } catch (e) {
+            console.error(`[wms-order-push] verify-pass withdrawal tombstone read failed for ${link.orderId}: ${scrubWmsError(e, 'read failed')}`)
+          }
+          if (tombstoned) {
+            heldNow = true
+            heldApproved = false
+          }
+        }
+
         if (heldNow) {
           const approved = heldApproved
           let pulled = false
@@ -821,6 +854,11 @@ export async function runWmsOrderPushSweepCore(
           } catch (e) {
             console.error(`[wms-order-push] verified-then-withdrawn cancel failed for ${link.orderId}: ${scrubWmsError(e, 'cancel failed')}`)
           }
+          // Which evidence fenced it, so the timeline shows whether a human still has to establish
+          // what the customer actually asked for.
+          const evidence = tombstoned
+            ? ' (on a standing withdrawal tombstone — held, not cancelled, until the request itself is established)'
+            : ''
           await port.updateLink(link.id, pulled
             ? { state: approved ? 'CANCELLED' : 'HELD', cancelledAt: new Date(), lastError: null, reconcileCheckedAt: null }
             : { state: 'SYNCED', lastError: 'Verified ours, but the customer has withdrawn this order and it could not be cancelled — cancel it in the WMS by hand' })
@@ -829,8 +867,8 @@ export async function runWmsOrderPushSweepCore(
             action: approved ? 'order_cancel' : 'order_hold', outcome: pulled ? 'SUCCEEDED' : 'FAILED',
             entityType: 'SALES_ORDER', entityId: link.orderId, externalId: link.externalOrderId,
             summary: pulled
-              ? 'Ownership verified for an order the customer had withdrawn in the meantime; cancelled at the WMS'
-              : 'Ownership verified for an order the customer had withdrawn, but it could NOT be cancelled — cancel it in the WMS by hand',
+              ? `Ownership verified for an order the customer had withdrawn in the meantime; ${approved ? 'cancelled' : 'held'} at the WMS${evidence}`
+              : `Ownership verified for an order the customer had withdrawn, but it could NOT be pulled back — handle it in the WMS by hand${evidence}`,
             error: pulled ? undefined : 'verified-then-withdrawn, remote cancel failed',
           })
           continue
@@ -1281,6 +1319,10 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     async readLiveWithdrawal(orderId) {
       const { readLiveWithdrawalForOrder } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
       return readLiveWithdrawalForOrder(orderId)
+    },
+    async readWithdrawalTombstone(orderId) {
+      const { readStandingWithdrawalTombstone } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+      return readStandingWithdrawalTombstone(orderId)
     },
     async readWithdrawalState(orderId) {
       return db.salesOrder.findUnique({

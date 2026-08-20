@@ -105,6 +105,60 @@ test('aging: an UNPROVEN basis is uncomputable too (o3d-lvk)', () => {
   const result = netOfRefunds(TAXABLE_ORDER, [{ totalsBasis: null, totalBase: '100.00' }])
   assert.equal(result.basis, 'UNKNOWN')
   assert.equal(result.netTotal, null)
+  assert.equal(result.refundsTotal, 100, 'the credit still exists, and how much of it there is was never in doubt')
+})
+
+/**
+ * o3d-lvk round 2 proposed the opposite of the two assertions below: that a mixed or unproven set
+ * should report `refundsTotal: null` too, with the money split into a `byBasis` triple, on the
+ * grounds that 60 gross + 60 net is not 120 of any unit.
+ *
+ * o3d-iigc (PR #633) had already settled this the other way on `development`, and its rule stands:
+ * a figure that cannot be stated on a consistent basis PUBLISHES NOTHING — which `netTotal` above
+ * does — WHILE STILL SHOWING THE CREDIT TOTAL, because how much credit exists is not in doubt. Only
+ * the *comparison* with the sale is unavailable, and withholding the credit total too would hide a
+ * real, known, wholly unambiguous sum of money from the operator looking for it.
+ *
+ * The two tests below are round 2's, rewritten to that rule. What they were really pinning — that
+ * a unanimous set is unaffected, and that dust is still value — is untouched by the disagreement,
+ * so it is kept rather than lost with the design it arrived in.
+ */
+test('aging: a unanimous set is unaffected — the null is scoped to sets with no single basis (o3d-lvk)', () => {
+  // This is what stops the rule degrading every ordinary refunded order to "unknown".
+  const net = netOfRefunds(TAXABLE_ORDER, [
+    { totalsBasis: 'NET', totalBase: '40.00' },
+    { totalsBasis: 'NET', totalBase: '35.00' },
+  ])
+  assert.equal(net.basis, 'NET')
+  assert.equal(net.refundsTotal, 75)
+  assert.equal(net.netTotal, 25, 'the EX-VAT total (120 - 20) less 75')
+
+  const gross = netOfRefunds(TAXABLE_ORDER, [{ totalsBasis: 'GROSS', totalBase: '12.00' }])
+  assert.equal(gross.basis, 'GROSS')
+  assert.equal(gross.refundsTotal, 12)
+  assert.equal(gross.netTotal, 108, 'the VAT-inclusive total less 12')
+})
+
+test('aging: a zero row vetoes nothing, but sub-penny dust still unknowns the NET figure (o3d-lvk)', () => {
+  // refundSetBasis skips exactly-zero rows — zero is the same amount on either basis, so it carries
+  // no basis information. Its sub-penny sibling is not zero, and must not be treated as though it
+  // were: an epsilon here would let unstamped dust accumulate into a material amount while the set
+  // still reported a clean basis.
+  const zero = netOfRefunds(TAXABLE_ORDER, [
+    { totalsBasis: 'NET', totalBase: '100.00' },
+    { totalsBasis: null, totalBase: '0' },
+  ])
+  assert.equal(zero.basis, 'NET')
+  assert.equal(zero.refundsTotal, 100, 'a zero row carries no basis information and vetoes nothing')
+  assert.equal(zero.netTotal, 0, 'and the net-of-credits figure is still computable')
+
+  const dust = netOfRefunds(TAXABLE_ORDER, [
+    { totalsBasis: 'NET', totalBase: '100.00' },
+    { totalsBasis: null, totalBase: '0.004' },
+  ])
+  assert.equal(dust.basis, 'UNKNOWN', 'four tenths of a penny on an unproven basis is still value')
+  assert.equal(dust.netTotal, null, 'so the figure that mixes bases is withheld')
+  assert.equal(dust.refundsTotal, 100, 'while the credit itself is reported, rounded once at the end')
 })
 
 test('aging: an order with no refunds is untouched by any of this (o3d-lvk)', () => {

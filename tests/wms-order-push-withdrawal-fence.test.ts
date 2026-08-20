@@ -64,6 +64,8 @@ type Seed = {
   screenLiveWithdrawals?: (orderIds: string[]) => Promise<ReadonlySet<string>>
   readLiveWithdrawal?: (orderId: string) => Promise<{ withdrawn: boolean; approved: boolean } | null>
   readWithdrawalState?: (orderId: string) => Promise<{ withdrawalHoldAt: Date | null; withdrawalApprovedAt: Date | null } | null>
+  /** o3d-rbyg: the DURABLE half — a local row an outage cannot change the answer of. */
+  readWithdrawalTombstone?: (orderId: string) => Promise<{ standing: boolean } | null>
   verifyWithdrawalFence?: (orderId: string) => Promise<boolean>
 }
 
@@ -75,6 +77,7 @@ function makePort(seed: Seed) {
   const claims: string[] = []
   const screened: string[][] = []
   const liveReads: string[] = []
+  const tombstoneReads: string[] = []
 
   const port: WmsOrderPushPort = {
     activeBindings: async () => BINDINGS,
@@ -99,7 +102,10 @@ function makePort(seed: Seed) {
   if (seed.readLiveWithdrawal) {
     port.readLiveWithdrawal = async (orderId) => { liveReads.push(orderId); return seed.readLiveWithdrawal!(orderId) }
   }
-  return { port, upserts, updates, updatesByOrder, events, claims, screened, liveReads }
+  if (seed.readWithdrawalTombstone) {
+    port.readWithdrawalTombstone = async (orderId) => { tombstoneReads.push(orderId); return seed.readWithdrawalTombstone!(orderId) }
+  }
+  return { port, upserts, updates, updatesByOrder, events, claims, screened, liveReads, tombstoneReads }
 }
 
 const okPush = async (): Promise<WmsOrderPushResult> => ({ externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' })
@@ -301,4 +307,107 @@ test('verify: an IMS marker alone still cancels, with no storefront read needed 
   assert.equal(r.held, 1, 'the marker alone is still enough')
   assert.equal(r.verified, 0)
   assert.deepEqual(liveReads, [], 'and the storefront is not read when the markers already answer')
+})
+
+
+// --- 3b. the verify pass and the DURABLE tombstone -------------------------------------------
+
+test('verify: a STANDING tombstone fences the promotion when the storefront cannot be read (o3d-rbyg)', async () => {
+  // The outage case, which is the whole reason the tombstone is written. The live read returns null
+  // and the markers are clean, so before this the link was promoted to SYNCED — and SYNCED is what
+  // the dispatch passes act on.
+  let cancelled = 0
+  const { port, updates, tombstoneReads } = makePort({
+    verifiable: [verifyLink()],
+    readWithdrawalState: async () => ({ withdrawalHoldAt: null, withdrawalApprovedAt: null }),
+    readLiveWithdrawal: async () => null,
+    readWithdrawalTombstone: async () => ({ standing: true }),
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({
+      verifyPushedOrder: async () => 'ours',
+      cancelOrder: async () => { cancelled += 1; return { cancelled: true, status: 'CANCELLED' } },
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+
+  assert.deepEqual(tombstoneReads, ['so-1'], 'the durable row was consulted')
+  assert.equal(r.verified, 0, 'the link was NOT promoted to SYNCED')
+  assert.equal(cancelled, 1, 'the warehouse order was pulled back')
+  assert.equal(r.held, 1, 'and parked HELD — the reversible action')
+  assert.equal(r.cancelled, 0, 'a tombstone says the order needs checking, never that it must be cancelled')
+  assert.equal(updates[0]?.data.state, 'HELD')
+})
+
+test('verify: a standing tombstone outranks a CLEAN live read (o3d-rbyg)', async () => {
+  // A tombstone is retired only after the storefront has reported the request rejected for a whole
+  // quiescence window. One ad-hoc read that happens to come back clean is not that evidence — this
+  // is the same refusal verifyWithdrawalFenceForPush makes for a non-retired row.
+  const { port, updates } = makePort({
+    verifiable: [verifyLink()],
+    readLiveWithdrawal: async () => ({ withdrawn: false, approved: false }),
+    readWithdrawalTombstone: async () => ({ standing: true }),
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ verifyPushedOrder: async () => 'ours' }), 'mintsoft', port, { now: NOW },
+  )
+
+  assert.equal(r.verified, 0)
+  assert.equal(r.held, 1)
+  assert.equal(updates[0]?.data.state, 'HELD')
+})
+
+test('verify: a RETIRED tombstone does not fence, and the link is promoted (o3d-rbyg)', async () => {
+  // The bound on the rule. Retirement is reached only through the quiescence protocol, so a retired
+  // row is spent — otherwise one withdrawal would fence the order forever.
+  const { port, updates } = makePort({
+    verifiable: [verifyLink()],
+    readLiveWithdrawal: async () => ({ withdrawn: false, approved: false }),
+    readWithdrawalTombstone: async () => ({ standing: false }),
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ verifyPushedOrder: async () => 'ours' }), 'mintsoft', port, { now: NOW },
+  )
+
+  assert.equal(r.verified, 1)
+  assert.equal(updates[0]?.data.state, 'SYNCED')
+})
+
+test('verify: an APPROVED marker still CANCELS — the tombstone does not downgrade it to a hold (o3d-rbyg)', async () => {
+  // The tombstone supplies the reversible action only when nothing better says what the customer
+  // asked for. Where the markers DO say it, they decide.
+  const { port, updates, tombstoneReads } = makePort({
+    verifiable: [verifyLink()],
+    readWithdrawalState: async () => ({ withdrawalHoldAt: null, withdrawalApprovedAt: new Date('2026-08-19T00:00:00.000Z') }),
+    readWithdrawalTombstone: async () => ({ standing: true }),
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ verifyPushedOrder: async () => 'ours' }), 'mintsoft', port, { now: NOW },
+  )
+
+  assert.equal(r.cancelled, 1, 'an approved withdrawal is terminal')
+  assert.equal(r.held, 0)
+  assert.equal(updates[0]?.data.state, 'CANCELLED')
+  assert.deepEqual(tombstoneReads, [], 'and the tombstone is not read when the markers already answer')
+})
+
+test('verify: a tombstone read that THROWS does not cancel a proved-ours order (o3d-rbyg)', async () => {
+  // Same asymmetry as the live read: acting on no evidence here means pulling back a warehouse order
+  // we have just proved is ours. The failure is logged, and the markers remain the only trigger.
+  let cancelled = 0
+  const { port, updates } = makePort({
+    verifiable: [verifyLink()],
+    readWithdrawalTombstone: async () => { throw new Error('DB connection lost') },
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({
+      verifyPushedOrder: async () => 'ours',
+      cancelOrder: async () => { cancelled += 1; return { cancelled: true, status: 'CANCELLED' } },
+    }),
+    'mintsoft', port, { now: NOW },
+  )
+
+  assert.equal(cancelled, 0)
+  assert.equal(r.verified, 1)
+  assert.equal(updates[0]?.data.state, 'SYNCED')
 })

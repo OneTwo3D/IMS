@@ -923,6 +923,41 @@ export async function readLiveWithdrawalForOrder(
   return { withdrawn: true, approved: status === approved }
 }
 
+/**
+ * o3d-rbyg part 3: is there a STANDING withdrawal tombstone for this order?
+ *
+ * The durable half of the fence, read on its own. `screenLiveWithdrawalsForPush` and
+ * `readLiveWithdrawalForOrder` both WRITE this row precisely so the order stays fenced when nothing
+ * can be read at all — but a reader that only ever asks the storefront never benefits from it. This
+ * is the read side, and it touches no API: an outage cannot make it answer differently.
+ *
+ * A row that is RETIRED does not stand. Retirement is not an ad-hoc judgement — it is only reached
+ * after the storefront has reported the request rejected for a whole quiescence window, re-verified
+ * by the by-ID sweep — so a retired row is the one case where "there was a withdrawal here once" is
+ * genuinely spent. `verifyWithdrawalFenceForPush` takes its own live read past that point; this
+ * reader deliberately does not, because its callers already have one.
+ *
+ * It reports only WHETHER a tombstone stands, never what to do about it — the rule this file states
+ * at reconcileSuppressionAfterImport. The remembered `wcStatus` is a snapshot the WooCommerce inbox
+ * guarantees no ordering for, so deciding "cancel" from it is exactly the mistake that was removed
+ * there. A caller acting on a standing tombstone alone must therefore take the REVERSIBLE action.
+ */
+export async function readStandingWithdrawalTombstone(
+  salesOrderId: string,
+): Promise<{ standing: boolean }> {
+  const link = await db.shoppingOrderLink.findFirst({
+    where: { orderId: salesOrderId, connector: 'woocommerce' },
+    select: { externalOrderId: true },
+  })
+  if (!link) return { standing: false } // not a WooCommerce order: no withdrawal can exist
+
+  const row = await db.wcWithdrawalSuppression.findUnique({
+    where: { connector_externalOrderId: { connector: 'woocommerce', externalOrderId: link.externalOrderId } },
+    select: { retiredAt: true },
+  })
+  return { standing: Boolean(row && !row.retiredAt) }
+}
+
 /** The live order, or null when it cannot be read. */
 async function readLiveWcOrder(externalOrderId: string): Promise<WcFullOrder | null> {
   try {

@@ -113,6 +113,11 @@ export const POST_DISPATCH_STATUSES = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'CAN
  * nothing failed if one side gained a state the other did not. Both sides now
  * call this, so a change to eligibility is a change to both by construction.
  */
+/**
+ * o3d-rbyg: this is HALF the eligibility. The withdrawal fence is the other half, and it cannot
+ * live in this clause — see `screenWithdrawnOrders` in the core. A link parked by that fence sets
+ * `dispatchDeadLetteredAt`, which IS excluded here, so the exclusion is durable once it has fired.
+ */
 export function dispatchCandidateWhere(connectorId: string) {
   return {
     connector: connectorId,
@@ -354,12 +359,14 @@ export type WmsDispatchCounters = {
   dispatched: number
   pending: number
   errors: number
+  /** o3d-rbyg: links this pass refused to fulfil because a withdrawal stands against the order. */
+  withheld: number
 }
 
 export type WmsDispatchLog = {
   orderId: string
   externalOrderNumber: string
-  action: 'dispatched' | 'pending' | 'error'
+  action: 'dispatched' | 'pending' | 'error' | 'withheld'
   reason: string
 }
 
@@ -410,6 +417,39 @@ export type WmsDispatchSweepDeps = {
    * Optional so a connector or test that predates the quarantine keeps its
    * previous behaviour (streak never advances, nothing is ever quarantined).
    */
+  /**
+   * o3d-rbyg: which of these orders has a withdrawal standing against it?
+   *
+   * THE FIFTH FULFILMENT PATH. The withdrawal fence guards the four moments at which an order is
+   * PUSHED — the batch screen, the pre-claim fence, the post-create recheck and the verify pass's
+   * promotion. None of them ever looks at an order again once its link is SYNCED, and this sweep is
+   * what carries a SYNCED link the rest of the way: `applyDispatch` writes the IMS shipment SHIPPED,
+   * relieves the stock and sends the storefront's despatch email. So an order withdrawn AFTER it was
+   * pushed — with its webhook missed, which is the whole premise of the fence — was fulfilled in
+   * full by this pass with nothing having asked.
+   *
+   * A LOCAL read, deliberately: the IMS markers and the durable suppression tombstone, never the
+   * storefront. This runs against every active link on every tick, so a per-order API call is out of
+   * the question, and a batched storefront screen would make a WooCommerce outage able to interfere
+   * with dispatch reconciliation for the whole shop. The tombstone exists precisely so the fence
+   * survives without a live read.
+   *
+   * Optional so a connector or test that predates the fence keeps its previous behaviour.
+   */
+  screenWithdrawnOrders?(orderIds: string[]): Promise<ReadonlySet<string>>
+  /**
+   * Take a withdrawn link OUT of the sweep and put it in front of a human.
+   *
+   * Not merely skipped: a skip repeats every tick, fulfils nothing, alerts nobody and leaves the
+   * order's stock reserved forever. Parking sets the link's dead-letter stamp — the same durable
+   * exclusion `dispatchCandidateWhere` already honours — so the link stops being polled, appears in
+   * the sync exception inbox, and an operator decides between cancelling it at the WMS, releasing
+   * the hold, or replaying the link once the withdrawal is resolved.
+   *
+   * Reports whether the park actually committed: a park that did not reach disk must not let the
+   * pass claim it decided this link.
+   */
+  parkWithdrawn?(candidate: WmsDispatchCandidate, reason: string): Promise<{ parked: boolean }>
   recordUnresolvedRead?(candidate: WmsDispatchCandidate, reason: string): Promise<{ count: number }>
   quarantineUnresolved?(
     candidate: WmsDispatchCandidate,
@@ -827,8 +867,11 @@ export async function runWmsDispatchSweepCore(
   // the whole eligible set", which the truncation recovery below relies on.
   const batchSize = Math.max(1, options?.batchSize ?? DISPATCH_SWEEP_DEFAULT_BATCH_SIZE)
   const now = options?.now ?? new Date()
-  const counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
+  const counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0, withheld: 0 }
   const logs: WmsDispatchLog[] = []
+  // o3d-rbyg: orders this pass must not fulfil because a withdrawal stands against them. Filled by
+  // screenWithdrawn() below, once per candidate list, before anything is reconciled.
+  const withdrawnOrderIds = new Set<string>()
 
   // --- Inbound Order/List delta (o3d-bjc) ---------------------------------
   // Only engages when the connector supplies a bulk delta AND the flag is on.
@@ -983,6 +1026,37 @@ export async function runWmsDispatchSweepCore(
   ) => {
     counters.totalChecked += 1
 
+    // o3d-rbyg: the fifth fulfilment path, fenced BEFORE the status is even looked at.
+    //
+    // Ahead of reconcileOneOrder rather than beside applyDispatch, because a split order dispatches
+    // through a different function (reconcileSplitOrder → pushPartialShipment) and a fence that
+    // guarded only the whole-order call would leave every split order unfenced. Nothing downstream
+    // of here may run for a withdrawn order: not the dispatch, not the partial shipments, not the
+    // merge repoint.
+    if (withdrawnOrderIds.has(candidate.orderId)) {
+      const reason = 'A withdrawal request stands against this order, so its WMS dispatch was NOT applied '
+        + '— no shipment, no stock relief and no despatch email. Cancel it at the WMS, or resolve the '
+        + 'withdrawal and replay this link.'
+      let parked = false
+      try {
+        parked = (await deps.parkWithdrawn?.(candidate, reason))?.parked ?? false
+      } catch (parkError) {
+        console.error('[wms-dispatch-sweep] withdrawal park failed:', parkError)
+      }
+      // A park that did not commit leaves the link a candidate again next tick, so this pass has
+      // NOT decided it — hold the watermark rather than let the change age out of the window.
+      if (!parked) passClean = false
+      counters.withheld += 1
+      linksDecided += 1
+      logs.push({
+        orderId: candidate.orderId,
+        externalOrderNumber: candidate.externalOrderNumber,
+        action: 'withheld',
+        reason: parked ? reason : `${reason} (the link could not be parked — it will be refused again next sweep)`,
+      })
+      return
+    }
+
     let outcome: WmsDispatchOutcome
     try {
       outcome = await reconcileOneOrder(deps, candidate, preload, expectedExternalOrderId, requireResolution, mergeNumberUnique)
@@ -1065,6 +1139,30 @@ export async function runWmsDispatchSweepCore(
   ): boolean | undefined => {
     const count = counts?.get(orderNumber)
     return count === undefined ? undefined : count === 1
+  }
+
+  /**
+   * o3d-rbyg: screen a candidate list against the durable withdrawal evidence, once, in bulk.
+   *
+   * A FAILURE HERE IS NOT SILENT. This is a local read — an outage of it means the database is in
+   * trouble, not the storefront — so there is no honest "leave them as they were": the pass simply
+   * does not know. It proceeds (refusing every candidate would halt dispatch reconciliation shop-wide
+   * on one bad query, the same trade round 1 made for the storefront screen) but marks the pass
+   * DIRTY, so the watermark is held and nothing ages out unexamined.
+   */
+  const screenWithdrawn = async (list: WmsDispatchCandidate[]) => {
+    if (!deps.screenWithdrawnOrders || list.length === 0) return
+    try {
+      const fenced = await deps.screenWithdrawnOrders([...new Set(list.map((entry) => entry.orderId))])
+      for (const orderId of fenced) withdrawnOrderIds.add(orderId)
+    } catch (screenError) {
+      passClean = false
+      console.error(
+        '[wms-dispatch-sweep] withdrawal screen failed — the watermark is held, and this pass cannot '
+        + 'prove a withdrawn order was not fulfilled:',
+        screenError,
+      )
+    }
   }
 
   const processedLinkIds = new Set<string>()
@@ -1245,6 +1343,8 @@ export async function runWmsDispatchSweepCore(
       linksPerNumber = await deps.countLinksByOrderNumber([...mergedComponentNumbers])
     }
 
+    await screenWithdrawn(deltaCandidates)
+
     for (const candidate of deltaCandidates) {
       // Stable-id join is authoritative. A candidate without one is eligible
       // only through the split-only number lookup and is always force-fetched.
@@ -1375,6 +1475,8 @@ export async function runWmsDispatchSweepCore(
     const reconcileClaimants = deps.countLinksByOrderNumber
       ? await deps.countLinksByOrderNumber(candidates.map((entry) => entry.externalOrderNumber))
       : null
+    await screenWithdrawn(candidates)
+
     for (const candidate of candidates) {
       if (processedLinkIds.has(candidate.linkId)) continue // already handled from the delta
       await processOne(
@@ -2149,6 +2251,107 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         },
       })
     },
+    /**
+     * o3d-rbyg: the durable withdrawal evidence for a batch of orders, read LOCALLY.
+     *
+     * Two independent signals, either of which is enough:
+     *   - the IMS markers (`withdrawalHoldAt` / `withdrawalApprovedAt`) — what IMS was told;
+     *   - a STANDING WooCommerce suppression tombstone — what the storefront was observed to say,
+     *     written by the push sweep's screen and by the withdrawal ingress, and retired only after
+     *     the storefront has reported the request rejected across a whole quiescence window.
+     *
+     * The tombstone half is what makes this work when the webhook that sets the markers was the
+     * thing that went missing — which is the premise of the entire fence.
+     */
+    async screenWithdrawnOrders(orderIds) {
+      const withdrawn = new Set<string>()
+      const unique = [...new Set(orderIds.filter(Boolean))]
+      if (unique.length === 0) return withdrawn
+      const CHUNK = 200
+      for (let i = 0; i < unique.length; i += CHUNK) {
+        const chunk = unique.slice(i, i + CHUNK)
+        const marked = await db.salesOrder.findMany({
+          where: {
+            id: { in: chunk },
+            OR: [{ withdrawalHoldAt: { not: null } }, { withdrawalApprovedAt: { not: null } }],
+          },
+          select: { id: true },
+        })
+        for (const row of marked) withdrawn.add(row.id)
+
+        // The tombstone side. Joined through the storefront link because the suppression row is
+        // keyed by the WooCommerce order id, not by ours.
+        const links = await db.shoppingOrderLink.findMany({
+          where: { orderId: { in: chunk }, connector: 'woocommerce' },
+          select: { orderId: true, externalOrderId: true },
+        })
+        if (links.length === 0) continue
+        const standing = await db.wcWithdrawalSuppression.findMany({
+          where: {
+            connector: 'woocommerce',
+            externalOrderId: { in: [...new Set(links.map((link) => link.externalOrderId))] },
+            retiredAt: null,
+          },
+          select: { externalOrderId: true },
+        })
+        const standingIds = new Set(standing.map((row) => row.externalOrderId))
+        for (const link of links) if (standingIds.has(link.externalOrderId)) withdrawn.add(link.orderId)
+      }
+      return withdrawn
+    },
+    async parkWithdrawn(candidate, reason) {
+      // Compare-and-set on the stamp being absent, exactly as the dead-letter and quarantine paths
+      // do: an overlapping sweep must not park the same link twice and raise two alerts.
+      const updated = await db.wmsOrderPushLink.updateMany({
+        where: { id: candidate.linkId, dispatchDeadLetteredAt: null },
+        data: { dispatchDeadLetteredAt: new Date(), dispatchLastError: reason },
+      })
+      // Already parked by a concurrent run: the link IS out of the sweep, which is what the caller
+      // needs to know. Reporting false would make it hold the watermark for a link it can never see
+      // again — the same trap quarantineUnresolved documents.
+      if (updated.count === 0) {
+        const existing = await db.wmsOrderPushLink.findUnique({
+          where: { id: candidate.linkId },
+          select: { dispatchDeadLetteredAt: true },
+        })
+        return { parked: Boolean(existing?.dispatchDeadLetteredAt) }
+      }
+
+      // COMMITTED above. Everything below is audit and alerting; a failure here must not report the
+      // park as having failed.
+      try {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: candidate.orderId,
+          tag: 'sync',
+          action: 'wms_dispatch_withheld_withdrawn',
+          description: `Dispatch reconciliation refused for WMS order ${candidate.externalOrderNumber}: ${reason}`,
+          metadata: {
+            orderId: candidate.orderId,
+            externalOrderNumber: candidate.externalOrderNumber,
+            connector: connectorId,
+            withdrawalFence: true,
+          },
+          level: 'WARNING',
+          resolveUser: false,
+        })
+        // Individually, never a broadcast: a null userId would expose order details to
+        // READONLY/SUPPLIER users (same reasoning as the dead-letter and quarantine alerts).
+        const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+        await Promise.all(admins.map((admin) => notify({
+          userId: admin.id,
+          type: 'error',
+          title: 'Dispatch withheld — withdrawal standing',
+          message: `Order ${candidate.externalOrderNumber} is withdrawn (or has a withdrawal standing against it) `
+            + 'but the WMS reports it active. IMS did NOT mark it shipped or email the customer. '
+            + 'Cancel it at the WMS, or resolve the withdrawal and replay the link.',
+          actionUrl: '/sync/exceptions',
+        })))
+      } catch (alertError) {
+        console.error('[wms-dispatch-sweep] withdrawal park alerting failed:', alertError)
+      }
+      return { parked: true }
+    },
     async recordDispatchError(candidate, reason) {
       const link = await db.wmsOrderPushLink.update({
         where: { id: candidate.linkId },
@@ -2550,7 +2753,7 @@ async function runWmsDispatchSweepLocked(
   })
 
   // Hoisted so a failure during persistence still reports the work the core did.
-  let counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0 }
+  let counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0, withheld: 0 }
 
   try {
     const core = await runWmsDispatchSweepCore(deps, coreOptions)
@@ -2568,6 +2771,11 @@ async function runWmsDispatchSweepLocked(
         dispatched: 'corrected',
         pending: 'noop',
         error: 'error',
+        // o3d-rbyg: a refused fulfilment is an EXCEPTION, not a quiet no-op. It is logged as an
+        // error row so the job's own log shows it; the link's dead-letter stamp is what puts it in
+        // the exception inbox, and `resolveDispatchJobOutcome` reads counters, not these rows, so
+        // this does not silently fail the job.
+        withheld: 'error',
       }
       await db.wmsSyncLog.createMany({
         data: logs.map((log) => ({
@@ -2690,7 +2898,7 @@ async function runWmsDispatchSweepLocked(
       },
     })
 
-    if (counters.dispatched > 0 || effectiveErrors > 0) {
+    if (counters.dispatched > 0 || effectiveErrors > 0 || counters.withheld > 0) {
       await logActivity({
         entityType: 'SYSTEM',
         tag: 'sync',
@@ -2698,7 +2906,8 @@ async function runWmsDispatchSweepLocked(
         level: deltaError ? 'WARNING' : undefined,
         description: deltaError
           ? `WMS dispatch sync (${connectorId}) DEGRADED — inbound delta failed, ran per-order reconcile fallback: ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} order errors. Delta error: ${deltaError}`
-          : `WMS dispatch sync (${connectorId}): ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} errors.`,
+          : `WMS dispatch sync (${connectorId}): ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} errors`
+            + (counters.withheld > 0 ? `, ${counters.withheld} withheld (withdrawal standing).` : '.'),
         metadata: { jobId: job.id, connector: connectorId, deltaError: deltaError ?? undefined, ...counters },
         resolveUser: false,
       })
