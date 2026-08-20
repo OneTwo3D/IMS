@@ -356,7 +356,15 @@ test('an id in `where` — however deep — does scope it', () => {
   )
 })
 
-test('a create IS scoped by its `data` — it has no `where` to be scoped by', () => {
+test('a create is judged by its `data` — it has no `where` to be judged by', () => {
+  // WHAT THIS ASSERTS, exactly: the new row carries the caller's identity
+  // somewhere in it. NOT that the row is theirs. `data` cannot tell the field
+  // that OWNS the row from the field that records who made it, so
+  // `{ userId: victim, createdById: 'u1' }` would pass — that is a question about
+  // which column is the owner, which is schema knowledge this predicate does not
+  // have and will not guess at from a name. The limit is stated at
+  // `constraintMentions` and deliberately NOT pinned as a passing case here: a
+  // limit a test counts as evidence is evidence that is not there.
   assert.equal(constraintMentions(q('create', { data: { userId: CALLER_ID } }), CALLER_ID), true)
   assert.equal(constraintMentions(q('create', { data: { userId: 'someone-else' } }), CALLER_ID), false)
 })
@@ -442,5 +450,96 @@ test('the ordinary scoped shapes are unchanged — the predicate did not just ge
   assert.equal(constraintMentions(q('deleteMany', { where: { id: 'pk', userId: CALLER_ID } }), CALLER_ID), true)
   assert.equal(constraintMentions(q('update', { where: { id: CALLER_ID }, data: { name: 'x' } }), CALLER_ID), true)
   assert.equal(constraintMentions(q('upsert', { where: { key: `passkey_challenge:reg:${CALLER_ID}` }, create: {}, update: {} }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('create', { data: { userId: CALLER_ID } }), CALLER_ID), true)
+})
+
+// ---------------------------------------------------------------------------
+// Round 7, Codex finding 4 — THE PREDICATES THAT CARRY THE ID WITHOUT TESTING
+// EQUALITY WITH IT
+// ---------------------------------------------------------------------------
+
+/**
+ * Round 6 refused negation, exclusion, absence, the universal quantifier and
+ * disjunction. What it left was a family of filters that mention the caller's id
+ * and constrain rows that are not the caller's, because they do not compare
+ * against it: a partial match, a range bound, and disjunctive list membership.
+ * The walk refused the KEYS it had thought of and then fell through to a
+ * substring test on the value.
+ */
+test('a PARTIAL MATCH does not scope — `contains` is satisfied by rows that are not the caller', () => {
+  for (const args of [
+    { where: { name: { contains: CALLER_ID } } },
+    { where: { key: { startsWith: CALLER_ID } } },
+    { where: { key: { endsWith: CALLER_ID } } },
+    { where: { body: { search: CALLER_ID } } },
+  ]) {
+    assert.equal(
+      constraintMentions(q('findMany', args), CALLER_ID),
+      false,
+      `${JSON.stringify(args)} reaches every row whose value merely CONTAINS the caller's id`,
+    )
+  }
+})
+
+test('a RANGE BOUND does not scope — it reaches every row on one side of the id', () => {
+  for (const op of ['gt', 'gte', 'lt', 'lte']) {
+    assert.equal(
+      constraintMentions(q('findMany', { where: { id: { [op]: CALLER_ID } } }), CALLER_ID),
+      false,
+      `{ id: { ${op}: '${CALLER_ID}' } } orders the table around the caller; it does not select them`,
+    )
+  }
+})
+
+test('a scalar-list filter scopes only when it is not a disjunction', () => {
+  // `hasSome` is `in`, spelled for lists — and `in` has been singleton-only since
+  // round 6. `hasNone` is its negation.
+  assert.equal(constraintMentions(q('findMany', { where: { tags: { has: CALLER_ID } } }), CALLER_ID), true)
+  assert.equal(
+    constraintMentions(q('findMany', { where: { tags: { hasSome: [CALLER_ID, 'other'] } } }), CALLER_ID),
+    false,
+  )
+  assert.equal(constraintMentions(q('findMany', { where: { tags: { hasNone: [CALLER_ID] } } }), CALLER_ID), false)
+})
+
+test('a createMany scopes only when EVERY row it writes carries the caller', () => {
+  // The predicate's own words are "constrains EVERY row this query reaches", and
+  // an array of rows was credited on the strength of one of them. This is the
+  // case those words were about.
+  assert.equal(
+    constraintMentions(q('createMany', { data: [{ userId: CALLER_ID }, { userId: CALLER_ID }] }), CALLER_ID),
+    true,
+  )
+  assert.equal(
+    constraintMentions(q('createMany', { data: [{ userId: CALLER_ID }, { userId: 'victim' }] }), CALLER_ID),
+    false,
+    'the second row is attached to somebody else, and the query writes both',
+  )
+  assert.equal(constraintMentions(q('createMany', { data: [] }), CALLER_ID), false)
+})
+
+test('an AND list is still credited from ONE arm — a conjunction applies to every row', () => {
+  // The array rule must not become "every element", or every ordinary
+  // `AND: [{ id }, { userId }]` stops counting and the predicate has been
+  // tightened into silence.
+  assert.equal(
+    constraintMentions(q('findMany', { where: { AND: [{ tenant: 't' }, { userId: CALLER_ID }] } }), CALLER_ID),
+    true,
+  )
+  assert.equal(
+    constraintMentions(q('deleteMany', { where: { AND: [{ AND: [{ userId: CALLER_ID }] }] } }), CALLER_ID),
+    true,
+  )
+})
+
+test('the shapes the nine endpoints issue are all still credited — round 7 did not just get quieter', () => {
+  assert.equal(constraintMentions(q('findUnique', { where: { id: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('deleteMany', { where: { id: 'pk', userId: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('findMany', { where: { userId: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(
+    constraintMentions(q('upsert', { where: { key: `passkey_challenge:reg:${CALLER_ID}` }, create: {}, update: {} }), CALLER_ID),
+    true,
+    'a composed key still carries the id as a substring of a VALUE — that path is untouched',
+  )
   assert.equal(constraintMentions(q('create', { data: { userId: CALLER_ID } }), CALLER_ID), true)
 })

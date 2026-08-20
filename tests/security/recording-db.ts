@@ -117,7 +117,52 @@ export function queryConstraint(ctx: QueryContext): unknown {
  * `every` joins them: `{ items: { every: { ownerId: 'u1' } } }` is vacuously true
  * for a row with no items, so it reaches rows related to nobody.
  */
-const NON_SCOPING_KEYS = new Set(['NOT', 'not', 'notIn', 'none', 'isNot', 'every', 'OR'])
+/**
+ * o3d-512h round 7, Codex finding 4 — THE REST OF THEM.
+ *
+ * Round 6 refused negation, exclusion, absence, the universal quantifier and
+ * disjunction, and required a string VALUE. Every one of those was right, and the
+ * list was still a list of the cases someone had thought of. What survived is a
+ * whole family of predicates that carry the caller's id and constrain rows that
+ * are not the caller's — because they do not test EQUALITY with it:
+ *
+ *   where: { name: { contains: 'u1' } }        // every row whose name contains it
+ *   where: { key: { startsWith: 'u1' } }       // …begins with it
+ *   where: { id: { gt: 'u1' } }                // every row ordered after it
+ *   where: { tags: { hasSome: ['u1', 'x'] } }  // rows with EITHER — `in`, spelled for lists
+ *
+ * A partial match and a range bound are not weak scoping, they are a different
+ * relation: `contains` is satisfied by a row belonging to `u10`, and `gt` is
+ * satisfied by every row in the table above the caller. The round-6 predicate
+ * credited all four, because it looked at the KEY only to refuse the negatives and
+ * then fell through to a substring test on the value.
+ *
+ * `hasNone` joins the negatives; `hasSome` joins `in` as disjunctive membership,
+ * and `in` was already singleton-only.
+ */
+const NON_SCOPING_KEYS = new Set([
+  // Negation, exclusion, absence.
+  'NOT', 'not', 'notIn', 'none', 'isNot', 'hasNone',
+  // Vacuously true for a row with no related rows at all.
+  'every',
+  // Disjunction: an arm constrains no row on its own.
+  'OR', 'hasSome',
+  // Partial match: satisfied by rows that merely CONTAIN the id.
+  'contains', 'startsWith', 'endsWith', 'search',
+  // Range: satisfied by every row on one side of the id.
+  'gt', 'gte', 'lt', 'lte',
+])
+
+/**
+ * Keys whose ARRAY value is a conjunction — every arm applies to every row, so one
+ * arm carrying the needle constrains all of them.
+ *
+ * Everywhere else an array is a list of ALTERNATIVES or a list of ROWS, and one
+ * element carrying the needle says nothing about the others. `createMany({ data:
+ * [{ userId: 'u1' }, { userId: 'victim' }] })` was the round-6 predicate's answer
+ * to "is every row scoped to the caller": yes, on the strength of the first one.
+ */
+const CONJUNCTIVE_LIST_KEYS = new Set(['AND'])
 
 /**
  * Is `needle` carried by a position that constrains EVERY row this query reaches?
@@ -132,10 +177,27 @@ const NON_SCOPING_KEYS = new Set(['NOT', 'not', 'notIn', 'none', 'isNot', 'every
  *     written to refuse, one level in;
  *   * `in: [...]` counts only as a singleton. `{ id: { in: ['u1', 'u2'] } }`
  *     reaches a row that is not the caller's, so it is not scoping to the caller.
+ *
+ * Round 7 adds the third, and it is the one the words "EVERY row" were always
+ * about: an ARRAY is credited only where the array is a conjunction. Under `AND`,
+ * one arm carrying the needle constrains every row the query reaches. Anywhere
+ * else — a `createMany` row list, a scalar-list filter — the elements are separate
+ * subjects, so EVERY element must carry it or the ones that do not are unscoped.
+ * That under-credits `hasEvery: ['u1', 'x']`, which does scope; the direction is
+ * deliberate and it is the one that turns the test red.
  */
-function constraintCarries(node: unknown, needle: string): boolean {
+function constraintCarries(
+  node: unknown,
+  needle: string,
+  arrayMode: 'all' | 'any' = 'all',
+): boolean {
   if (typeof node === 'string') return node.includes(needle)
-  if (Array.isArray(node)) return node.some((el) => constraintCarries(el, needle))
+  if (Array.isArray(node)) {
+    if (node.length === 0) return false
+    return arrayMode === 'any'
+      ? node.some((el) => constraintCarries(el, needle))
+      : node.every((el) => constraintCarries(el, needle))
+  }
   if (node === null || typeof node !== 'object') return false
   for (const [key, value] of Object.entries(node as Record<string, unknown>)) {
     if (NON_SCOPING_KEYS.has(key)) continue
@@ -143,7 +205,7 @@ function constraintCarries(node: unknown, needle: string): boolean {
       if (Array.isArray(value) && value.length === 1 && constraintCarries(value[0], needle)) return true
       continue
     }
-    if (constraintCarries(value, needle)) return true
+    if (constraintCarries(value, needle, CONJUNCTIVE_LIST_KEYS.has(key) ? 'any' : 'all')) return true
   }
   return false
 }
@@ -161,7 +223,19 @@ function constraintCarries(node: unknown, needle: string): boolean {
  * word — the needle's presence in a conjunctive position is a lower bound on
  * scoping, not a proof of ownership. What changed in round 6 is that it is now a
  * lower bound on the right thing: a predicate that excludes the caller, or that
- * only optionally includes them, no longer counts as including them.
+ * only optionally includes them, no longer counts as including them. Round 7
+ * removed the predicates that carry the id without testing equality with it, and
+ * made "every row" mean every row of a list rather than one of them.
+ *
+ * THE SHARPEST REMAINING LIMIT, and it is worth naming on its own: on a `create`
+ * the constraint is `data`, and `data` cannot distinguish the field that OWNS the
+ * new row from the field that records who made it.
+ * `create({ data: { userId: victim, createdById: 'u1' } })` carries the caller's
+ * id in a conjunctive position and attaches the row to somebody else. Telling
+ * those apart is a question about which column is the owner, which is schema
+ * knowledge this predicate does not have and would only be guessing at from the
+ * name. So what a passing create asserts is exactly this: the new row carries the
+ * caller's identity somewhere. It is not asserted to be theirs.
  */
 export function constraintMentions(ctx: QueryContext, needle: string): boolean {
   const constraint = queryConstraint(ctx)

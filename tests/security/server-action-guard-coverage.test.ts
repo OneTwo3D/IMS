@@ -4,11 +4,13 @@ import test from 'node:test'
 
 import {
   createRepoGraph,
+  guardWriteSurface,
   prismaSurfaceOf,
   scanActionsDir,
   scanAuthenticationOnlyActions,
   scanSecretReadingActions,
   scanSource,
+  scanTreeForInlineServerActions,
   scanUseServerOutsideActions,
 } from './server-action-guard-scan'
 
@@ -98,6 +100,29 @@ const ALLOWLIST: Record<string, string> = {
   // but this entry no longer asserts they are guarded.
   'quickbooks-sync.ts:*':
     'OUT OF SCOPE (QuickBooks, owner instruction) — NOT verified as guarded: six exports carry no guard; reachable via accounting-sync.ts only behind its dispatcher gate',
+
+  // o3d-512h round 7, Codex finding 1 — THE ONE RESIDUAL IN THE TREE.
+  //
+  // The collector is now exhaustive: every name a 'use server' module publishes
+  // produces an entry, and anything not established to be an async function is
+  // NOT VERIFIED rather than dropped. This is the only export in 55 'use server'
+  // modules that lands there, and it needs an entry BY NAME — a `file:*` wildcard
+  // cannot clear an unverified export any more (isUnverifiedAllowlisted).
+  //
+  // WHAT IS VERIFIED: the name resolves through the graph to
+  // lib/products/categories.ts:buildProductCategoryPathDisplay, a SYNCHRONOUS,
+  // pure string function over its own arguments. It reads no database, no
+  // session and no setting, so there is no data for a guard to protect.
+  //
+  // WHAT IS NOT VERIFIED, and cannot be from here: whether Next's action protocol
+  // publishes it. `next build` compiles this tree (round 6), so the usual
+  // "a 'use server' module may only export async functions" build error does not
+  // fire on a sync RE-export, and this scanner deliberately does not decide a
+  // question only the compiler can answer. If it IS published, the endpoint hands
+  // an unauthenticated caller a formatted string built from the argument they
+  // sent.
+  'categories.ts:buildProductCategoryPathDisplay':
+    'sync re-export of a pure string helper (lib/products/categories.ts); touches no data, session or setting. NOT verified: whether Next publishes a sync re-export from a `use server` module — a next build question, flagged rather than assumed either way',
 }
 
 test('every exported server action enforces an auth guard or is allowlisted', () => {
@@ -172,6 +197,63 @@ test('every `use server` export OUTSIDE app/actions enforces an auth guard or is
     violations,
     [],
     `Unguarded exported server action(s) found outside app/actions:\n${violations.join('\n')}`,
+  )
+})
+
+/**
+ * o3d-512h round 7, Codex finding 1 — THE INLINE ACTION.
+ *
+ * The two rules above both begin by asking whether the FILE carries the
+ * directive. An inline server action lives in a file that does not:
+ *
+ *   async function save(form: FormData) { 'use server'; await db.thing.update(…) }
+ *
+ * declared inside a page component is a registered server reference with a public
+ * id, callable by anyone who ever loaded the page, with every declared parameter
+ * under their control. It was outside the scanners' INPUT entirely — not judged
+ * leniently, not seen.
+ *
+ * The tree has none today. That is the reason to add the rule now rather than the
+ * reason not to: the first one written must land red, not be discovered by the
+ * next review round.
+ */
+const INLINE_ACTION_ALLOWLIST: Record<string, string> = {}
+
+test('every INLINE `use server` function enforces an auth guard', () => {
+  const violations = scanTreeForInlineServerActions(ROOT, SCAN_ROOTS, INLINE_ACTION_ALLOWLIST, graph)
+
+  assert.deepEqual(
+    violations,
+    [],
+    'Inline `use server` function(s) with no verified guard. An inline action is a public HTTP '
+    + 'endpoint exactly as an exported one is — its id ships to the browser and its arguments come '
+    + 'off the wire. Gate it, or move it into app/actions where the rest of the rules apply:\n'
+    + violations.join('\n'),
+  )
+})
+
+/**
+ * o3d-512h round 7, Codex finding 3 — WHAT THE GUARDS THEMSELVES WRITE.
+ *
+ * The write-ordering rule exempts a pinned guard's own writes, because a denial
+ * that records itself is still a denial. Round 6 read that exemption off the
+ * DECLARATION, so a guard that also deleted rows carried the deletion past every
+ * later check. It is now a statement about MODELS
+ * (AUDITED_CONTROL_WRITE_MODELS) — and this pin makes even an exempt write
+ * visible, because today the honest answer is that no pinned guard writes
+ * anything at all.
+ *
+ * An empty object is the expected state. A guard acquiring a write shows up here
+ * as a diff to argue about, whether or not the exemption still covers it.
+ */
+test('no pinned guard mutates anything — the write exemption is currently vacuous', () => {
+  assert.deepEqual(
+    guardWriteSurface(graph),
+    {},
+    'A pinned auth guard now WRITES. If the write is part of the control (a denial audit row, a '
+    + 'session touch) it must be named in AUDITED_CONTROL_WRITE_MODELS with a reason; anything '
+    + 'else is a business write, and the guard will stop exempting it — every check placed after '
+    + 'that guard loses its credit. Either way this is a decision, not a refresh.',
   )
 })
 

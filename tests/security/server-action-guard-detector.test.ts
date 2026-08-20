@@ -7,6 +7,7 @@ import { createSourceGraph, type ModuleGraph } from './module-graph'
 import {
   isDelegatingFacadeBody,
   scanAuthenticationOnlyActions,
+  scanInlineServerActions,
   scanSecretReadingActions,
   scanSource,
 } from './server-action-guard-scan'
@@ -402,8 +403,124 @@ test('every declarator in one exported statement is its own endpoint', () => {
   )
 })
 
-test('a NON-async exported arrow is not treated as a server action', () => {
-  assert.deepEqual(scan(`export const notAnEndpoint = () => db.x.findMany()`), [])
+test('a NON-async exported arrow is NOT VERIFIED, not waved through — round 7, finding 1', () => {
+  // WITHDRAWN CLAIM. This test used to assert `[]`, on the reasoning that Next's
+  // action protocol publishes async functions only, so a sync export is not an
+  // endpoint. That is a claim about the compiler, made by a scanner that cannot
+  // run it — and round 6 established the compiler does NOT always reject one
+  // (app/actions/categories.ts re-exports a sync helper and `next build`
+  // compiles). "The build would have caught it" was doing the work here, and it
+  // does not hold, so the export is reported as not verified.
+  assert.deepEqual(scan(`export const notAnEndpoint = () => db.x.findMany()`), [`${F}:notAnEndpoint`])
+})
+
+test('an exported CONST that is not a function at all is reported, not dropped', () => {
+  // A `'use server'` module may only export async functions. A const that is not
+  // one is either a build error this scanner cannot check, or a published name
+  // no rule here can judge — and both are things to be told about, rather than
+  // the silence the shape-list collector produced.
+  assert.deepEqual(scan(`export const LIMIT = 50`), [`${F}:LIMIT`])
+})
+
+test('an exported class, enum and namespace are each reported', () => {
+  assert.deepEqual(scan(`export class Thing { async go() { return db.x.findMany() } }`), [`${F}:Thing`])
+  assert.deepEqual(scan(`export enum Mode { A }`), [`${F}:Mode`])
+})
+
+test('a WRAPPED action is reported — the collector saw an initializer it could not read', () => {
+  // `export const save = withAudit(async () => …)` publishes `save`. The
+  // collector cannot tell what `withAudit` returns, so it cannot claim the guard
+  // walk looked at the right body — and round 6's lesson is that the silent
+  // answer is the dangerous one.
+  assert.deepEqual(
+    scan(`import { withAudit } from '@/lib/wrap'
+    export const save = withAudit(async () => db.thing.deleteMany({ where: {} }))`, {}, {
+      'lib/wrap.ts': 'export function withAudit<T>(f: T) { return f }',
+    }),
+    [`${F}:save`],
+  )
+})
+
+test('a DESTRUCTURED export publishes every bound name, and every one is reported', () => {
+  assert.deepEqual(
+    scan(`import { actions } from '@/lib/actions'
+    export const { save, remove } = actions`, {}, {
+      'lib/actions.ts': 'export const actions = { save: async () => {}, remove: async () => {} }',
+    }),
+    [`${F}:save`, `${F}:remove`],
+  )
+})
+
+// ---------------------------------------------------------------------------
+// `export default` — round 7, Codex finding 2
+// ---------------------------------------------------------------------------
+
+test('an UNGUARDED default export is flagged — `default` is an export NAME', () => {
+  // WITHDRAWN CLAIM, four rounds old: "a default export is not a callable Server
+  // Action name in Next.js's action protocol". It was asserted and never
+  // established. `import action from './actions'` is how a form action is
+  // usually written; the module's default export is registered and addressable
+  // exactly as a named one is, and skipping it hid a whole publishing form from
+  // every rule in the file.
+  assert.deepEqual(
+    scan(`export default async function wipe(id: string) { return db.thing.deleteMany({ where: { id } }) }`),
+    [`${F}:default`],
+  )
+})
+
+test('a GUARDED default export is not flagged', () => {
+  assert.deepEqual(
+    scan(`export default async function wipe(id: string) {
+      await requirePermission('sales.delete')
+      return db.thing.deleteMany({ where: { id } })
+    }`),
+    [],
+  )
+})
+
+test('an anonymous default-exported arrow is an endpoint too', () => {
+  assert.deepEqual(
+    scan(`export default async () => db.thing.findMany()`),
+    [`${F}:default`],
+  )
+  assert.deepEqual(
+    scan(`export default async () => { await requireInternalUser(); return db.thing.findMany() }`),
+    [],
+  )
+})
+
+test('`export default someLocal` resolves to the local and is judged there', () => {
+  assert.deepEqual(
+    scan(`async function wipe() { return db.thing.deleteMany({ where: {} }) }
+    export default wipe`),
+    [`${F}:default`],
+  )
+  assert.deepEqual(
+    scan(`async function wipe() { await requirePermission('sales.delete'); return db.thing.deleteMany({ where: {} }) }
+    export default wipe`),
+    [],
+  )
+})
+
+test('a SYNC default export is reported, not silently dropped', () => {
+  assert.deepEqual(scan(`export default function label() { return 'x' }`), [`${F}:default`])
+})
+
+test('the SECRET-READ rule and the AUTH-ONLY inventory both see a default export', () => {
+  assert.deepEqual(
+    scanSecrets(`export default async function () {
+      await requireAuth()
+      return getSettingValue('smtp_password')
+    }`),
+    [`${F}:default`],
+  )
+  assert.deepEqual(
+    scanAuthOnly(`export default async function () {
+      await requireAuth()
+      return db.thing.findMany()
+    }`),
+    [`${F}:default`],
+  )
 })
 
 test('a non-exported async arrow is not flagged', () => {
@@ -1463,36 +1580,100 @@ test('a re-export the graph CANNOT follow is flagged — not verified is not gua
   )
 })
 
-test('`export * from` is flagged — it publishes a set nobody enumerated', () => {
+test('`export * from` is FOLLOWED, and each published endpoint judged — round 7, finding 5', () => {
+  // Round 6 reported `file:*` and offered a `file:*` allowlist entry as the cure,
+  // which exempts every export of the module for ever on a reason written before
+  // any of them existed. The graph can enumerate the target instead, so there is
+  // nothing left to exempt: the star's endpoints are reported BY NAME.
   assert.deepEqual(
     scan("export * from '@/lib/handlers'", {}, {
       'lib/handlers.ts': 'export async function handler() { return db.thing.findMany() }',
     }),
-    [`${F}:*`],
+    [`${F}:handler`],
+  )
+  // …and a guarded one earns its silence the ordinary way.
+  assert.deepEqual(
+    scan("export * from '@/lib/handlers'", {}, {
+      'lib/handlers.ts':
+        "import { requirePermission } from '@/lib/auth/server'\n"
+        + "export async function handler() { await requirePermission('sync'); return db.thing.findMany() }",
+    }),
+    [],
   )
 })
 
-test('a SYNC named export is not treated as a server action', () => {
-  // Same rule as `export function foo()` without `async`: Next's action protocol
-  // publishes async functions. Whether Next REJECTS a sync export from a
-  // 'use server' module is a `next build` question, not this scanner's.
+test('a star re-export chain is followed all the way through', () => {
+  assert.deepEqual(
+    scan("export * from '@/lib/mid'", {}, {
+      'lib/mid.ts': "export * from '@/lib/deep'",
+      'lib/deep.ts': 'export async function deepHandler() { return db.thing.findMany() }',
+    }),
+    [`${F}:deepHandler`],
+  )
+})
+
+test('a star into a module the graph CANNOT enumerate is flagged AND is not allowlistable', () => {
+  // The only case left, and the one with no name to write an entry against. It
+  // must not be clearable by a wildcard, or the documented cure for "nobody has
+  // enumerated what this publishes" is "exempt everything it publishes".
+  const body = "export * from 'some-uncovered-package'"
+  assert.deepEqual(scan(body), [`${F}:*`])
+  assert.deepEqual(
+    scan(body, { [`${F}:*`]: 'reviewed, honest' }),
+    [`${F}:*`],
+    'a module wildcard must NOT suppress an unenumerable star re-export',
+  )
+  assert.deepEqual(
+    scan(body, { [`${F}:*from`]: 'named the specifier instead' }),
+    [`${F}:*`],
+    'nor does any other spelling — there is no allowlist form for this one',
+  )
+})
+
+test('a SYNC named export is NOT VERIFIED — round 7, finding 1', () => {
+  // WITHDRAWN CLAIM. Round 6 asserted "Next's action protocol publishes async
+  // functions", so a sync export is not an endpoint, and then noted in the same
+  // breath that `next build` accepts app/actions/categories.ts's sync re-export.
+  // Those two statements cannot both stand: if the compiler accepts it, "it is
+  // not published" is a guess about the protocol, made where being wrong costs an
+  // ungated endpoint. It is reported, and the live one is allowlisted BY NAME
+  // with what is and is not verified about it stated there.
   assert.deepEqual(
     scan(`function joinPath(parts: string[]) { return parts.join(' > ') }
     export { joinPath }`),
-    [],
+    [`${F}:joinPath`],
   )
   assert.deepEqual(
     scan("export { joinPath } from '@/lib/pure'", {}, {
       'lib/pure.ts': "export function joinPath(parts: string[]) { return parts.join(' > ') }",
     }),
-    [],
+    [`${F}:joinPath`],
   )
 })
 
-test('a named export that is NOT callable at all is not an endpoint', () => {
+test('a named export that is NOT callable at all is reported too', () => {
   assert.deepEqual(
     scan(`const LIMIT = 50
     export { LIMIT }`),
+    [`${F}:LIMIT`],
+  )
+})
+
+test('an unverified export is cleared only by NAME, never by a module wildcard', () => {
+  // The other half of "no wildcard-shaped hatch". A `file:*` entry is a claim
+  // about exports somebody looked at; an unverified export is by definition one
+  // nobody could. It takes its own line.
+  const body = `const LIMIT = 50
+  export { LIMIT }`
+  assert.deepEqual(scan(body, { [`${F}:*`]: 'blanket' }), [`${F}:LIMIT`])
+  assert.deepEqual(scan(body, { [`${F}:LIMIT`]: 'a pure constant, reviewed' }), [])
+})
+
+test('a module wildcard still clears an ordinary UNGUARDED export', () => {
+  // The narrowing is about exports the scanner could not read, not about the
+  // ones it read and found unguarded — those keep the exemption they always had.
+  assert.deepEqual(
+    scan(`export async function go() { return db.thing.findMany() }`, { [`${F}:*`]: 'reviewed' }),
     [],
   )
 })
@@ -1548,5 +1729,252 @@ test('a named export of a non-exported local does not double-report', () => {
     scan(`async function go() { return db.thing.findMany() }
     export { go }`),
     [`${F}:go`],
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-512h round 7 — THE MODULE THE SCANNERS NEVER OPENED, AND THE ENDPOINT
+// THAT IS NOT AN EXPORT AT ALL (Codex finding 1)
+// ---------------------------------------------------------------------------
+
+/** A `'use server'` fixture whose directive is written some other legal way. */
+function scanRaw(source: string, extra: Record<string, string> = {}): string[] {
+  const graph = createSourceGraph({
+    'lib/auth/server.ts': AUTH_SERVER,
+    'lib/settings-store.ts': SETTINGS_STORE,
+    [F]: source,
+    ...extra,
+  })
+  return scanSource(F, source, {}, graph)
+}
+
+test('a directive behind a COMMENT still makes the module a server module', () => {
+  // `isUseServer` required the directive at character zero. A directive prologue
+  // does not have to be there — comments precede it — so this whole module was
+  // skipped at the door by every rule in the file, unread rather than misjudged.
+  assert.deepEqual(
+    scanRaw(`// eslint-disable-next-line something\n'use server'\nexport async function wipe() { return db.thing.deleteMany({ where: {} }) }\n`),
+    [`${F}:wipe`],
+  )
+})
+
+test('a directive behind a LICENCE BLOCK comment counts too', () => {
+  assert.deepEqual(
+    scanRaw(`/* Copyright 2026 */\n"use server"\nexport async function wipe() { return db.thing.deleteMany({ where: {} }) }\n`),
+    [`${F}:wipe`],
+  )
+})
+
+test("a directive after 'use strict' counts — a prologue may hold several", () => {
+  assert.deepEqual(
+    scanRaw(`'use strict'\n'use server'\nexport async function wipe() { return db.thing.deleteMany({ where: {} }) }\n`),
+    [`${F}:wipe`],
+  )
+})
+
+test('a `use server` string that is NOT in the prologue does not make a server module', () => {
+  // The rule has to stay narrow in this direction too, or every module mentioning
+  // the directive in prose becomes a set of endpoints.
+  assert.deepEqual(
+    scanRaw(`export async function wipe() { const note = 'use server'; void note; return db.thing.deleteMany({ where: {} }) }\n`),
+    [],
+  )
+  assert.deepEqual(
+    scanRaw(`// This file is NOT 'use server'.\nexport async function wipe() { return db.thing.deleteMany({ where: {} }) }\n`),
+    [],
+  )
+})
+
+test('an INLINE `use server` function is an endpoint — round 7, finding 1', () => {
+  // Not an export, in a file with no module directive: outside every scanner's
+  // input until now. Next registers it as a server reference, its id ships to the
+  // browser, and its parameters come off the wire.
+  const source = `export default function Page({ id }: { id: string }) {
+  async function save(form: FormData) {
+    'use server'
+    await db.thing.update({ where: { id }, data: { name: String(form.get('n')) } })
+  }
+  return save
+}
+`
+  const graph = createSourceGraph({ 'lib/auth/server.ts': AUTH_SERVER, 'app/page.tsx': source })
+  assert.deepEqual(scanInlineServerActions('app/page.tsx', source, {}, graph), ['app/page.tsx:save@2'])
+})
+
+test('a GUARDED inline action is not flagged — the same guard rule, unchanged', () => {
+  const source = `import { requirePermission } from '@/lib/auth/server'
+export default function Page({ id }: { id: string }) {
+  async function save() {
+    'use server'
+    await requirePermission('sales.edit')
+    await db.thing.update({ where: { id }, data: {} })
+  }
+  return save
+}
+`
+  const graph = createSourceGraph({ 'lib/auth/server.ts': AUTH_SERVER, 'app/page.tsx': source })
+  assert.deepEqual(scanInlineServerActions('app/page.tsx', source, {}, graph), [])
+})
+
+test('an inline action whose guard runs AFTER the write is flagged — ordering still applies', () => {
+  const source = `import { requirePermission } from '@/lib/auth/server'
+export default function Page() {
+  const save = async () => {
+    'use server'
+    await db.thing.deleteMany({ where: {} })
+    await requirePermission('sales.delete')
+  }
+  return save
+}
+`
+  const graph = createSourceGraph({ 'lib/auth/server.ts': AUTH_SERVER, 'app/page.tsx': source })
+  assert.deepEqual(scanInlineServerActions('app/page.tsx', source, {}, graph), ['app/page.tsx:save@3'])
+})
+
+test('an inline action is found in a `use server` module too, and in a nested arrow', () => {
+  const source = `'use server'
+export async function outer() {
+  await Promise.resolve()
+  return async () => {
+    'use server'
+    return db.thing.findMany()
+  }
+}
+`
+  const graph = createSourceGraph({ 'lib/auth/server.ts': AUTH_SERVER, [F]: source })
+  assert.deepEqual(scanInlineServerActions(F, source, {}, graph), [`${F}:<anonymous>@4`])
+})
+
+test('a function whose body merely MENTIONS the directive is not an inline action', () => {
+  const source = `export function helper() {
+  const doc = 'use server'
+  return doc
+}
+`
+  const graph = createSourceGraph({ 'app/page.tsx': source })
+  assert.deepEqual(scanInlineServerActions('app/page.tsx', source, {}, graph), [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-512h round 7, Codex finding 3 — A PINNED GUARD THAT WRITES BUSINESS DATA
+// ---------------------------------------------------------------------------
+
+/** lib/auth/server.ts with `requireAuth` doing something beyond refusing. */
+function authServerWhere(requireAuthBody: string): Record<string, string> {
+  return {
+    'lib/auth/server.ts':
+      `export async function requireAuth() { ${requireAuthBody} }\n`
+      + 'export async function getSession() {}\n'
+      + 'export async function requireFreshAuth() {}\n'
+      + 'export async function requireRole(...roles: string[]) { void roles }\n'
+      + 'export async function requirePermission(p: string) { void p }\n'
+      + 'export async function requireInternalUser() {}\n',
+  }
+}
+
+test('a pinned guard that WRITES BUSINESS DATA no longer launders it — round 7, finding 3', () => {
+  // Round 6 narrowed the exemption from "any callee reaching a guard" to "a
+  // PINNED guard declaration" and then exempted everything that declaration
+  // writes. Being on the guard list is an argument about what a function
+  // ESTABLISHES, not about what it changes: a guard that deletes rows still
+  // carries the deletion past every check after it.
+  assert.deepEqual(
+    scanSecrets(`export async function a() {
+      await requireAuth()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, authServerWhere("await db.salesOrder.deleteMany({ where: { draft: true } })")),
+    [`${F}:a`],
+    'the deleteMany happened under authentication alone; the authorization check after it earns nothing',
+  )
+})
+
+test('a pinned guard writing an AUDITED control model is still exempt — round 6 stays', () => {
+  assert.deepEqual(
+    scanSecrets(`export async function a() {
+      await requireAuth()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, authServerWhere("await db.activityLog.create({ data: { action: 'denied' } })")),
+    [],
+    'a denial that records itself is still a denial',
+  )
+})
+
+test('a WRAPPER around a guard that writes business data inherits the write', () => {
+  // The exemption has to be about the models one call deep too, or the rule is
+  // defeated by moving the call into a wrapper — the shape check round 3
+  // abolished, reintroduced through the exemption.
+  assert.deepEqual(
+    scanSecrets(`import { wrapAuth } from '@/lib/wrap'
+    export async function a() {
+      await wrapAuth()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, {
+      ...authServerWhere("await db.salesOrder.deleteMany({ where: { draft: true } })"),
+      'lib/wrap.ts': "import { requireAuth } from '@/lib/auth/server'\nexport async function wrapAuth() { await requireAuth() }\n",
+    }),
+    [`${F}:a`],
+  )
+  // …and the audited write still does not travel through the wrapper.
+  assert.deepEqual(
+    scanSecrets(`import { wrapAuth } from '@/lib/wrap'
+    export async function a() {
+      await wrapAuth()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, {
+      ...authServerWhere("await db.activityLog.create({ data: { action: 'denied' } })"),
+      'lib/wrap.ts': "import { requireAuth } from '@/lib/auth/server'\nexport async function wrapAuth() { await requireAuth() }\n",
+    }),
+    [],
+  )
+})
+
+test('a guard whose write is laundered through a HELPER of its own is not exempt either', () => {
+  assert.deepEqual(
+    scanSecrets(`export async function a() {
+      await requireAuth()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, {
+      ...authServerWhere("await wipe()"),
+      'lib/auth/server.ts':
+        "import { wipe } from '@/lib/wipe'\n"
+        + 'export async function requireAuth() { await wipe() }\n'
+        + 'export async function getSession() {}\n'
+        + 'export async function requireFreshAuth() {}\n'
+        + 'export async function requireRole(...roles: string[]) { void roles }\n'
+        + 'export async function requirePermission(p: string) { void p }\n'
+        + 'export async function requireInternalUser() {}\n',
+      'lib/wipe.ts': 'export async function wipe() { await db.salesOrder.deleteMany({ where: {} }) }',
+    }),
+    [`${F}:a`],
+  )
+})
+
+test('a raw write in a pinned guard is never audited — $executeRaw names no model', () => {
+  assert.deepEqual(
+    scanSecrets(`export async function a() {
+      await requireAuth()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, authServerWhere('await db.$executeRawUnsafe("delete from thing")')),
+    [`${F}:a`],
+  )
+})
+
+test('the guard itself still keeps its OWN credit — its write is at its own call site', () => {
+  // A business-writing guard is not disarmed, it just stops covering what comes
+  // after it. The coverage rule must still see the endpoint as guarded, or the
+  // narrowing would manufacture "unguarded" out of an endpoint that has a gate.
+  assert.deepEqual(
+    scan(`export async function a() {
+      await requireAuth()
+      await requirePermission('settings.read')
+      return db.thing.findMany()
+    }`, {}, authServerWhere("await db.salesOrder.deleteMany({ where: { draft: true } })")),
+    [],
   )
 })

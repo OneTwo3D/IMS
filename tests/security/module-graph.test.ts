@@ -447,3 +447,77 @@ export async function ok() { await requireAuth() }`,
   assert.equal(hasLexicalShadow(calls[0], 'requireAuth'), true)
   assert.equal(hasLexicalShadow(calls[1], 'requireAuth'), false)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-512h round 7 — ENUMERATING WHAT A MODULE PUBLISHES
+// ---------------------------------------------------------------------------
+
+/**
+ * `exportedNamesOf` exists so a star re-export can be FOLLOWED rather than
+ * excused with a `file:*` allowlist entry (Codex round 7, finding 5). The whole
+ * point is that it must be complete or say it is not — a set that quietly omits a
+ * name is a set of endpoints nobody judged, wearing the appearance of one that
+ * was.
+ */
+test('enumerates every value export, and no type export', () => {
+  const g = createSourceGraph({
+    'lib/m.ts': `export async function a() {}
+export const b = async () => {}
+export class C {}
+export type T = { x: string }
+export interface I { y: string }
+function d() {}
+export { d }
+export { d as e }
+type U = string
+export type { U }`,
+  })
+  assert.deepEqual(g.exportedNamesOf('lib/m.ts'), ['C', 'a', 'b', 'd', 'e'])
+})
+
+test('enumerates a re-export chain, and `default` when there is one', () => {
+  const g = createSourceGraph({
+    'lib/inner.ts': 'export async function inner() {}',
+    'lib/m.ts': "export { inner } from '@/lib/inner'\nexport default async function () {}",
+  })
+  assert.deepEqual(g.exportedNamesOf('lib/m.ts'), ['default', 'inner'])
+})
+
+test('follows `export *` into the graph and returns the union', () => {
+  const g = createSourceGraph({
+    'lib/deep.ts': 'export async function deep() {}\nexport default async function () {}',
+    'lib/mid.ts': "export * from '@/lib/deep'\nexport async function mid() {}",
+    'lib/m.ts': "export * from '@/lib/mid'\nexport async function own() {}",
+  })
+  // `export *` never re-exports a default, so `deep`'s default does not surface.
+  assert.deepEqual(g.exportedNamesOf('lib/m.ts'), ['deep', 'mid', 'own'])
+})
+
+test('returns NULL when a star points outside the graph — the set cannot be closed', () => {
+  const g = createSourceGraph({
+    'lib/m.ts': "export * from 'some-uncovered-package'\nexport async function own() {}",
+  })
+  assert.equal(g.exportedNamesOf('lib/m.ts'), null)
+  assert.equal(g.exportedNamesOf('lib/not-in-graph.ts'), null)
+})
+
+test('a star CYCLE does not hang, and still enumerates both modules', () => {
+  const g = createSourceGraph({
+    'lib/a.ts': "export * from '@/lib/b'\nexport async function fromA() {}",
+    'lib/b.ts': "export * from '@/lib/a'\nexport async function fromB() {}",
+  })
+  assert.deepEqual(g.exportedNamesOf('lib/a.ts'), ['fromA', 'fromB'])
+})
+
+test('resolves the `default` export name — to a function, an arrow, or a local', () => {
+  const g = createSourceGraph({
+    'lib/fn.ts': 'export default async function named() {}',
+    'lib/arrow.ts': 'export default async () => {}',
+    'lib/local.ts': 'async function work() {}\nexport default work',
+    'lib/none.ts': 'export async function notDefault() {}',
+  })
+  assert.ok(declarationBody(g.resolveExportedName('lib/fn.ts', 'default')))
+  assert.ok(declarationBody(g.resolveExportedName('lib/arrow.ts', 'default')))
+  assert.deepEqual(pick(g.resolveExportedName('lib/local.ts', 'default')), { file: 'lib/local.ts', name: 'work' })
+  assert.equal(g.resolveExportedName('lib/none.ts', 'default'), null)
+})

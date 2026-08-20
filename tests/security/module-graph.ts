@@ -91,6 +91,27 @@ export type ModuleGraph = {
    */
   resolveExportedName(file: string, name: string): Declaration | null
   /**
+   * EVERY value name this module publishes, or null when the set cannot be
+   * enumerated completely.
+   *
+   * o3d-512h round 7, Codex finding 5. Round 6 made an unfollowable
+   * `export * from '…'` a violation — fail-closed, and the only way to clear it
+   * was a `file:*` allowlist entry, which is a blanket exemption for every
+   * present and future export of the file. That is a wildcard-shaped escape
+   * hatch bolted onto a rule about not knowing what is published, and it is how
+   * a rule decays.
+   *
+   * So the star is FOLLOWED instead of excused: when the target module is in the
+   * graph, its exports are enumerated and each one is judged individually, and
+   * there is nothing left to exempt. Null — the genuinely unenumerable case,
+   * a star into a module nobody covers — is what stays a violation, and it is
+   * fixed by naming the exports, not by widening an allowlist.
+   *
+   * Type-only exports are left out: they bind no value, so they publish no
+   * endpoint. `export * as ns from '…'` publishes the namespace name itself.
+   */
+  exportedNamesOf(file: string): string[] | null
+  /**
    * The declaration a call target refers to: `f()`, `ns.f()`, `mod.f()`.
    * Returns null for anything whose target is a value the graph cannot follow
    * (`connector.getAccounts()`, `db.user.findMany()`).
@@ -112,6 +133,9 @@ export function declarationBody(decl: Declaration | null): ts.ConciseBody | unde
   const node = decl.node
   if (ts.isFunctionDeclaration(node)) return node.body
   if (ts.isMethodDeclaration(node)) return node.body
+  // `export default async function () {}` / `export default async () => {}` — the
+  // declaration IS the function, with no binding name in between (round 7).
+  if (ts.isFunctionExpression(node) || ts.isArrowFunction(node)) return node.body
   if (ts.isVariableDeclaration(node) && node.initializer) {
     const init = node.initializer
     if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) return init.body
@@ -317,6 +341,15 @@ type FileInfo = {
   exportAliases: Map<string, ExportBinding>
   /** `export * from '…'` specifiers */
   starExports: string[]
+  /**
+   * `export default …` — the declaration node, when there is one.
+   *
+   * o3d-512h round 7. `default` is an export NAME like any other: a `'use server'`
+   * module's default export is addressable over the action protocol exactly as a
+   * named one is. Not indexing it meant `resolveExportedName(file, 'default')`
+   * answered null, which every caller reads as NOT VERIFIED.
+   */
+  defaultExport?: ts.Node
 }
 
 const SOURCE_EXTENSIONS = ['', '.ts', '.tsx', '/index.ts', '/index.tsx']
@@ -373,6 +406,10 @@ function buildFileInfo(file: string, source: string): FileInfo {
     }
 
     if (ts.isExportDeclaration(node)) {
+      // A type-only export binds no value and publishes no endpoint. Indexing it
+      // as an export would put a type name into `exportedNamesOf`, which is the
+      // set the scanners treat as the module's HTTP surface.
+      if (node.isTypeOnly) return
       const spec = node.moduleSpecifier && ts.isStringLiteral(node.moduleSpecifier)
         ? node.moduleSpecifier.text
         : undefined
@@ -385,6 +422,7 @@ function buildFileInfo(file: string, source: string): FileInfo {
         return
       }
       for (const el of node.exportClause.elements) {
+        if (el.isTypeOnly) continue
         const original = (el.propertyName ?? el.name).text
         if (spec) info.exportAliases.set(el.name.text, { spec, imported: original })
         else info.exportAliases.set(el.name.text, { local: original })
@@ -392,13 +430,27 @@ function buildFileInfo(file: string, source: string): FileInfo {
       return
     }
 
-    if (ts.isFunctionDeclaration(node) && node.name) {
+    // `export default async function …` / `export default expr` — `default` is an
+    // export name, and a `'use server'` module publishes it (round 7).
+    if (ts.isExportAssignment(node)) {
+      if (!node.isExportEquals) info.defaultExport = node.expression
+      return
+    }
+
+    const isDefault = (n: ts.Node): boolean =>
+      !!(ts.canHaveModifiers(n) && ts.getModifiers(n)?.some((m) => m.kind === ts.SyntaxKind.DefaultKeyword))
+
+    if (ts.isFunctionDeclaration(node)) {
+      if (isDefault(node)) info.defaultExport = node
+      if (!node.name) return
       info.locals.set(node.name.text, node)
       if (isExported(node)) info.exportedNames.add(node.name.text)
       return
     }
 
-    if (ts.isClassDeclaration(node) && node.name) {
+    if (ts.isClassDeclaration(node)) {
+      if (isDefault(node)) info.defaultExport = node
+      if (!node.name) return
       info.locals.set(node.name.text, node)
       if (isExported(node)) info.exportedNames.add(node.name.text)
       return
@@ -455,6 +507,15 @@ function createGraph(
     const fi = info(file)
     if (!fi) return null
 
+    if (name === 'default' && !fi.exportAliases.has('default')) {
+      const node = fi.defaultExport
+      if (!node) return null
+      // `export default foo` names a local; `export default async function …`
+      // and `export default async () => {}` ARE the declaration.
+      if (ts.isIdentifier(node)) return resolveLocal(file, node.text, seen)
+      return { file, name: 'default', node }
+    }
+
     const alias = fi.exportAliases.get(name)
     if (alias) {
       if (alias.spec) {
@@ -480,6 +541,36 @@ function createGraph(
     }
 
     return null
+  }
+
+  /**
+   * Every value name `file` publishes, or null when the set cannot be closed.
+   *
+   * Null propagates: a module whose star re-export points outside the graph
+   * publishes an unknown set, and so does every module that stars THAT one. A
+   * cycle contributes nothing rather than looping — the names it could add are
+   * reached by the other arm of the cycle.
+   */
+  const exportedNames = (file: string, seen: Set<string>): string[] | null => {
+    if (seen.has(file)) return []
+    seen.add(file)
+    const fi = info(file)
+    if (!fi) return null // a module nobody can read publishes an unknown set
+
+    const names = new Set<string>(fi.exportedNames)
+    for (const name of fi.exportAliases.keys()) names.add(name)
+    if (fi.defaultExport || fi.exportAliases.has('default')) names.add('default')
+
+    for (const spec of fi.starExports) {
+      const target = options.resolveSpecifier(file, spec)
+      if (!target) return null
+      const inner = exportedNames(target, seen)
+      if (inner === null) return null
+      // `export *` re-exports every NAMED export of the target, never its default.
+      for (const name of inner) if (name !== 'default') names.add(name)
+    }
+
+    return [...names].sort()
   }
 
   const resolveLocal = (file: string, name: string, seen: Set<string>): Declaration | null => {
@@ -513,6 +604,10 @@ function createGraph(
 
     resolveExportedName(file, name) {
       return resolveExport(file, name, new Set())
+    },
+
+    exportedNamesOf(file) {
+      return exportedNames(file, new Set())
     },
 
     resolve(file, name, at) {
