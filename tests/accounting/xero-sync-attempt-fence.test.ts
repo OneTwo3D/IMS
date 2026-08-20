@@ -45,6 +45,9 @@ let salesOrders: Map<string, { status: string }> | null = null
  */
 const orderLockLog: string[] = []
 
+/** o3d-e2mz r7: how many of the next `$queryRaw` row-lock attempts must FAIL. */
+let queryRawFailures = 0
+
 const dbStub = {
   accountingSyncLog,
   salesOrder: {
@@ -57,6 +60,13 @@ const dbStub = {
   // lockSalesOrder issues `SELECT id FROM "sales_orders" WHERE id = $1 FOR UPDATE`.
   $queryRaw: async (query: { values?: unknown[] }) => {
     orderLockLog.push(`lock:${String(query?.values?.[0] ?? '')}`)
+    // o3d-e2mz r7: a failing LOCK is how the evidence write's transaction dies WITHOUT the sale being
+    // unreadable — a lock timeout, or a deadlock with the very cancellation the lock serialises
+    // against. r6 read every such failure as "the sale cannot be read".
+    if (queryRawFailures > 0) {
+      queryRawFailures -= 1
+      throw new Error('could not lock the sales order row')
+    }
     return []
   },
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
@@ -102,6 +112,7 @@ function reset(rows: Parameters<typeof createSyncLogStore>[0]) {
   interleave = null
   activity.length = 0
   orderLockLog.length = 0
+  queryRawFailures = 0
   salesOrders = new Map([['order-1', { status: 'PROCESSING' }]])
 }
 
@@ -745,4 +756,116 @@ test('o3d-e2mz r5: a SUBMITTED journal keeps the reversing-journal remedy', asyn
   const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
   assert.match(escalation?.description ?? '', /post a reversing journal there/)
   assert.doesNotMatch(escalation?.description ?? '', /DELETE the draft/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-e2mz r7 — A ROW THAT ALREADY NAMED ITS DOCUMENT WAS NEVER TAKEN OUT OF THE SWEEP'S SHAPE.
+//
+// r5 and r6 expressed "stop this cancelled sale's work" as the STATUS half of the RECORDING write, so
+// it inherited that write's precondition: `externalTransactionId: null`. Right for recording — that is
+// the fact recording protects — and wrong for retiring. A row that already names its document skips
+// the write entirely and keeps whatever status it has, and SYNCED/FAILED is exactly
+// repairXeroBackReferences' candidate shape: the sweep then writes the id onto the CANCELLED order and
+// enqueues its follow-ups — PDF, email, storefront note, PAYMENT.
+//
+// Every fixture in the r5/r6 blocks above nulls the external id in its interleave, so none of them
+// could see it — and r6's retry meets that row EVERY time, because the first pass is what recorded the
+// id. Retiring is now its own statement, with its own precondition, fired only by a PROVEN cancellation.
+// ---------------------------------------------------------------------------
+
+test('o3d-e2mz r7: a cancelled sale RETIRES a row that already names its document, instead of leaving it to the sweep', async () => {
+  // The row carries its external id already (the loop's "already posted, just record it" branch), and
+  // the concurrent writer settles it SYNCED without clearing that id — which is what a real writer
+  // does: nothing erases the evidence of a posted document.
+  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
+  salesOrders = new Map([['order-1', { status: 'CANCELLED' }]])
+  interleave = () => {
+    Object.assign(store.get('log-1')!, { status: 'SYNCED', attemptRevision: 9, syncedAt: new Date() })
+  }
+
+  await (await loadProcessor())()
+
+  const row = store.get('log-1')
+  assert.equal(row?.externalTransactionId, 'XERO-INV-1', 'the document that exists is still named on the row')
+  assert.equal(row?.status, 'CANCELLED', 'and the row is retired out of the sweep\'s shape')
+  assert.equal(row?.syncedAt, null, 'a cancelled sale has no successful sync to date-stamp')
+  assert.equal(
+    wouldBeSweptForRepair(row),
+    false,
+    'so repairXeroBackReferences never writes the id onto the cancelled order or enqueues its PAYMENT',
+  )
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'ALREADY_RECORDED', 'nothing was recorded — the id was already there')
+  assert.equal(escalation?.metadata?.retiredFromSweep, true, 'but something WAS done, and it is reported')
+  assert.match(escalation?.description ?? '', /ALSO RETIRED to CANCELLED/)
+})
+
+test('o3d-e2mz r7: a failed row LOCK re-takes the decision rather than declaring the sale unreadable', async () => {
+  // r6 sent every failure of that transaction to the read-free fallback, which can neither settle the
+  // row nor retire it. A lock that timed out — or lost a deadlock to the cancellation itself — says
+  // nothing about whether the sale is readable, and the second attempt proves it by reading it.
+  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
+  salesOrders = new Map([['order-1', { status: 'CANCELLED' }]])
+  queryRawFailures = 1
+  interleave = () => {
+    Object.assign(store.get('log-1')!, { status: 'SYNCED', attemptRevision: 9, syncedAt: new Date() })
+  }
+
+  await (await loadProcessor())()
+
+  assert.deepEqual(
+    orderLockLog,
+    ['lock:order-1', 'lock:order-1', 'read:order-1'],
+    'the lock is attempted, fails, and the whole decision is taken again in a fresh transaction',
+  )
+  const row = store.get('log-1')
+  assert.equal(row?.status, 'CANCELLED', 'so the cancelled sale is still seen, and the row still retired')
+  assert.equal(wouldBeSweptForRepair(row), false)
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.retiredFromSweep, true)
+})
+
+test('o3d-e2mz r7: a failed row LOCK on a LIVE sale still settles the row, instead of stranding it as CANCELLED', async () => {
+  // The same change from the other side: r6 answered a lock failure with the unreadable branch, which
+  // terminalises a LIVE sale's row as CANCELLED — a state no self-service action releases (o3d-psvi).
+  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
+  queryRawFailures = 1
+  interleave = () => {
+    Object.assign(store.get('log-1')!, {
+      status: 'CANCELLED',
+      attemptRevision: 9,
+      externalTransactionId: null,
+      errorMessage: 'Operator verified: never posted',
+    })
+  }
+
+  await (await loadProcessor())()
+
+  const row = store.get('log-1')
+  assert.equal(row?.status, 'SYNCED', 'the live sale IS the legitimate repair, and the second read proves it')
+  assert.equal(row?.externalTransactionId, 'XERO-INV-1')
+  assert.equal(wouldBeSweptForRepair(row), true, 'so the sweep may finish the live sale\'s work')
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
+  assert.equal(escalation?.metadata?.retiredFromSweep, false)
+})
+
+test('o3d-e2mz r7: an UNREADABLE sale does NOT retract a row that is already settled', async () => {
+  // The counter-guard, and the reason the retirement fires only on a PROVEN cancellation. Failing
+  // closed means refusing to RELEASE work; it is not permission to retract a release a successful read
+  // justified. A transient order-read outage must not demote every settled row it touches.
+  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
+  salesOrders = null
+  interleave = () => {
+    Object.assign(store.get('log-1')!, { status: 'SYNCED', attemptRevision: 9, syncedAt: new Date() })
+  }
+
+  await (await loadProcessor())()
+
+  const row = store.get('log-1')
+  assert.equal(row?.status, 'SYNCED', 'the settled row stands: this pass proved nothing about the sale')
+  assert.equal(row?.externalTransactionId, 'XERO-INV-1')
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'ALREADY_RECORDED')
+  assert.equal(escalation?.metadata?.retiredFromSweep, false, 'and the escalation does not claim a retirement')
 })
