@@ -9,6 +9,7 @@ import {
   type PostedInvoicePaymentRegistration,
   retireOverSettlingInvoicePayment,
 } from '@/lib/domain/accounting/invoice-payment-capacity'
+import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 
 /**
  * o3d-cjt8, round 2 #2. Rescoping accounting_sync_logs_followup_live_unique to
@@ -405,7 +406,10 @@ test('a refused entry is retired CLAIM-FENCED, so a reclaimed or already-posted 
 
   const retired = await retireOverSettlingInvoicePayment(client as never, {
     entryId: 'entry-1',
-    claimedAt,
+    // The CLAIM, not the instant (o3d-550x / o3d-xl63). A caller whose claim is renewed mid-entry
+    // hands in a holder that answers the CURRENT instant, so the fence follows the row rather than
+    // silently matching nothing.
+    claim: claimHeldFrom(claimedAt),
     reason: 'would over-settle',
   })
 
@@ -420,11 +424,34 @@ test('a refused entry is retired CLAIM-FENCED, so a reclaimed or already-posted 
   assert.equal((updates[0].data as { status: string }).status, 'CANCELLED')
 })
 
+test('a renewed claim releases the row it actually holds, not the one it was picked up on', async () => {
+  // The failure mode a bare `Date` hid: the remote-write lease moves `processingStartedAt` before every
+  // send, so a fence built from the instant captured at pickup matches NOTHING — the retirement never
+  // happens and the refusal is invisible. The holder is asked at the moment the statement is built.
+  const updates: Array<{ where?: unknown }> = []
+  const client = {
+    accountingSyncLog: {
+      updateMany: async (args: { where?: unknown }) => { updates.push(args); return { count: 1 } },
+    },
+  }
+  let held = new Date('2026-08-20T10:00:00.000Z')
+  const renewing = { heldFrom: () => held }
+  held = new Date('2026-08-20T10:07:00.000Z')
+
+  await retireOverSettlingInvoicePayment(client as never, {
+    entryId: 'entry-1',
+    claim: renewing,
+    reason: 'would over-settle',
+  })
+
+  assert.equal((updates[0].where as { processingStartedAt: Date }).processingStartedAt.toISOString(), held.toISOString())
+})
+
 test('losing the claim fence retires nothing', async () => {
   const client = { accountingSyncLog: { updateMany: async () => ({ count: 0 }) } }
   const retired = await retireOverSettlingInvoicePayment(client as never, {
     entryId: 'entry-1',
-    claimedAt: new Date(),
+    claim: claimHeldFrom(new Date()),
     reason: 'would over-settle',
   })
   assert.equal(retired, false)

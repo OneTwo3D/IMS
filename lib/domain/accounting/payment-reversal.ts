@@ -1,5 +1,8 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 
+import { databaseStampedCompletion, type LedgerReadFence } from '@/lib/connectors/xero/invoice-delta'
+import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
+
 // ---------------------------------------------------------------------------
 // Payment-reversal detection (audit-M-acct #3)
 //
@@ -74,10 +77,12 @@ export function detectPaymentReversals<T extends ReversalCandidate>(
  *             the whole event. This is the same line deletePayment and the o3d-sref orphan sweep draw.
  *   PROCESSING  may be on the wire RIGHT NOW.                       -> PAYMENT_IN_FLIGHT
  *   SYNCED      posted, and no ledger observation has retired it.   -> PAYMENT_ALREADY_POSTED
+ *   FAILED      attempted, outcome unknown (round 4 #5).            -> PAYMENT_MAY_HAVE_POSTED
  *
- * The two refusals are kept apart because they ask the operator for different things: waiting, versus
- * looking the bill up in Xero. Neither is a guess in either direction — IMS says it does not know, and
- * names the entry, which is the whole of the round-3 rule for unknowable remote state.
+ * The refusals are kept apart because they ask the operator for different things: waiting, versus
+ * looking the bill up in Xero, versus reconciling a failed attempt. None is a guess in either
+ * direction — IMS says it does not know, and names the entry, which is the whole of the round-3 rule
+ * for unknowable remote state.
  *
  * WHAT THIS COSTS, PLAINLY. A SYNCED registration that IS genuinely stale but whose retirement the
  * poller never made — a reversal detected by a connector whose poller does not do this, a poll cycle
@@ -88,10 +93,15 @@ export function detectPaymentReversals<T extends ReversalCandidate>(
  * the same reason: these are rows recording money that may already have moved, and picking a survivor
  * for the operator is a guess about which payment is real.
  *
- * FAILED and CANCELLED are still left exactly as they are. They are already outside the live
- * predicate, so they block nothing, and rewriting a FAILED row as CANCELLED would erase the fact that
- * the ledger rejected it — the evidence an operator needs, and which o3d-ju8t's "FAILED does not prove
- * nothing posted" reading depends on.
+ * FAILED and CANCELLED are never REWRITTEN. Rewriting a FAILED row as CANCELLED would erase the fact
+ * that an attempt was made — the evidence an operator needs, and which o3d-ju8t's "FAILED does not
+ * prove nothing posted" reading depends on.
+ *
+ * ROUND 4 SEPARATES "NOT REWRITTEN" FROM "HARMLESS", which round 3 ran together. Being outside the
+ * live predicate means a FAILED row blocks no unique-index SLOT; it does not mean it holds no PAYMENT.
+ * A FAILED row now REFUSES (PAYMENT_MAY_HAVE_POSTED) exactly as its sales-side counterpart does in
+ * `invoice-payment-capacity.ts`, and is still left byte-for-byte alone. CANCELLED remains harmless:
+ * every writer of that status in this tree asserts it only where "nothing was sent" is TRUE.
  */
 export const SUPERSEDABLE_BILL_PAYMENT_STATUSES = ['PENDING'] as const
 
@@ -106,6 +116,43 @@ export const IN_FLIGHT_BILL_PAYMENT_STATUSES = ['PROCESSING'] as const
  * created is a question only a ledger read can answer, and this module never takes one.
  */
 export const POSTED_BILL_PAYMENT_STATUSES = ['SYNCED'] as const
+
+/**
+ * THE STATE THAT ASSERTS NOTHING AT ALL (Codex round 4 #5).
+ *
+ * Round 3 established this for the SALES side and stopped there: `invoice-payment-capacity.ts` reads a
+ * FAILED INVOICE_PAYMENT as making the invoice's remaining capacity UNKNOWABLE, because the processor
+ * posts BEFORE it persists the result — a timeout, a lost response or a crash after the ledger created
+ * the payment is written down identically to a rejection, and `errorMessage` carries no provenance
+ * (both connectors overwrite `HTTP nnn` with the remote system's own text).
+ *
+ * NONE OF THAT REASONING IS ABOUT SALES. It is about how this system records the outcome of a money
+ * call, and BILL_PAYMENT is recorded by the same processor in the same order. Yet this planner let a
+ * FAILED row fall past every branch into `proceed: true` — not even counted, simply not mentioned —
+ * so a bill whose payment attempt failed after Xero created the Payment was free capacity, and Mark
+ * Paid queued a second supplier payment under a fresh entry id and therefore a fresh
+ * Idempotency-Key. The sales side refuses that; the supplier side, where the money leaves, did not.
+ *
+ * The one sound exception is not a guess but a proof: a stored body missing a field the connector
+ * rejects BEFORE building a request cannot have reached the ledger. That test is imported from
+ * `followup-idempotency.ts` rather than re-derived, for the reason the capacity guard already gives —
+ * two definitions of "nothing was sent" would disagree about whether a bill is settled, which is the
+ * whole question.
+ */
+export const AMBIGUOUS_BILL_PAYMENT_STATUSES = ['FAILED'] as const
+
+/**
+ * Whether a registration's attempt MAY have reached the ledger. Only ever consulted for the ambiguous
+ * statuses, and `false` is the one sound proof that it did not: a body that is present, readable, and
+ * missing a field the connector rejects before it builds a request.
+ *
+ * An unreadable, absent or RETENTION-COMPACTED payload answers TRUE: not knowing what was sent is not
+ * evidence that nothing was (o3d-m5qk — the compacted `{}` case is why this delegates to
+ * `storedBodyMayHaveReachedTheLedger` and not to a "could this body be sent?" test).
+ */
+export function billPaymentBodyCouldHavePosted(payload: unknown): boolean {
+  return storedBodyMayHaveReachedTheLedger('BILL_PAYMENT', payload)
+}
 
 export const BILL_PAYMENT_SUPERSEDED_REASON =
   'Superseded: the bill was marked unpaid (payment no longer present in the accounting connector) and ' +
@@ -130,33 +177,107 @@ export const BILL_PAYMENT_LEDGER_REVERSED_REASON =
  *  - `status: 'SYNCED'` — only a row that finished. A PENDING row is a re-payment somebody has already
  *    queued and a PROCESSING row may be posting this instant; neither is the payment the poller just
  *    failed to find, and cancelling either is round 1's defect over again.
- *  - `syncedAt < ledgerObservedBefore` — only a row that had already posted when the ledger snapshot
- *    this verdict came from was taken. A row that synced afterwards may have created a payment the
- *    snapshot never saw, so "not present" says nothing about it. A row with no syncedAt at all is
- *    excluded by the comparison, which is the safe direction: it falls through to markBillPaid's
- *    refusal and a human, rather than being retired on an unknown timestamp.
+ *  - `databaseStampedCompletion(row) < ledgerObservedBefore.databaseClock` — only a row that had
+ *    already posted when the ledger snapshot this verdict came from was taken. A row that synced
+ *    afterwards may have created a payment the snapshot never saw, so "not present" says nothing
+ *    about it. Such a row is REPORTED as undecided (round 4 #2) rather than filtered away, and the
+ *    whole verdict is withheld: see the note in the body for why abandoning it was worse than
+ *    refusing to decide.
  *  - `connector` — a reversal seen by one connector says nothing about another's rows.
  *
  * CANCELLED, not deleted, and the errorMessage says the row DID post: o3d-sref's rule is that
  * CANCELLED must never be asserted where "nothing was sent" would be false, and it is the reason
  * string that carries which of the two happened.
  */
+export type BillPaymentRetirementOutcome =
+  /** The observation covered every posted registration on this bill. `retired` may be 0: there were none. */
+  | { decided: true; retired: number }
+  /**
+   * At least one posted registration finished AFTER the ledger was read, so this observation cannot
+   * speak for it. NOTHING is retired and the caller must NOT clear paidAt — see the note below.
+   */
+  | { decided: false; undecided: string[] }
+
 export async function retireBillPaymentRegistrationsReversedInLedger(
   client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
-  params: { connector: string; invoiceId: string; ledgerObservedBefore: Date },
-): Promise<number> {
+  params: {
+    connector: string
+    invoiceId: string
+    /**
+     * The instant the ledger was asked, AS THE DATABASE MEASURED IT — never a host `Date`, which is
+     * why this is the branded `LedgerReadFence` and not a plain one (o3d-clxw round 4, #634). NULL
+     * means the database clock could not be read at all, and then this observation can be ordered
+     * against nothing: every registration is undecidable and the verdict is withheld.
+     */
+    ledgerObservedBefore: LedgerReadFence | null
+  },
+): Promise<BillPaymentRetirementOutcome> {
+  const scope = {
+    connector: params.connector,
+    type: 'BILL_PAYMENT' as const,
+    referenceType: 'PurchaseInvoice',
+    referenceId: params.invoiceId,
+    status: { in: [...POSTED_BILL_PAYMENT_STATUSES] },
+  }
+
+  // ASK WHAT THIS OBSERVATION CANNOT SPEAK FOR, BEFORE ACTING ON WHAT IT CAN (Codex round 4 #2).
+  //
+  // Round 3 expressed the fence as a filter — `syncedAt < ledgerObservedBefore` inside the update —
+  // so a row outside it was not merely skipped, it was INVISIBLE. The poller cleared paidAt anyway,
+  // the bill dropped out of `paidAt: { not: null }`, and with it out of the ONLY query that ever
+  // produces another reversal observation for that document. The row then refused every future Mark
+  // Paid, forever, with nothing anywhere recording why. A registration was retired or it was
+  // silently abandoned, and the two were indistinguishable from the outside.
+  //
+  // `syncedAt: null` is undecidable deliberately: a posted row with no timestamp cannot be placed
+  // relative to the read at all, which is the same answer, not a lesser one.
+  //
+  // ONE ANSWER TO "DID THIS REACH THE LEDGER", NOT TWO (o3d-m5qk). This used to be a Prisma predicate
+  // — `OR: [{ syncedAt: null }, { syncedAt: { gte: fence } }]` — reading `syncedAt` ALONE. The sibling
+  // o3d-clxw (#634) proved that column cannot answer the question by itself: an old build writes its
+  // own host's `new Date()` into it, and comparing that against a database fence is the cross-host
+  // comparison that clears paidAt over a payment still in flight and pays the supplier twice. Its
+  // answer is `databaseStampedCompletion`, which accepts a completion instant only while
+  // `syncedAtDatabaseClock` still equals `syncedAt` — an equality the trigger in migration
+  // 20260821090000 maintains by CLEARING the marker whenever a statement changes status / syncedAt /
+  // externalTransactionId / processingStartedAt without minting a new one. A legacy write therefore
+  // loses provenance because of WHAT IT TOUCHED, not because of the value it happened to write.
+  //
+  // The old predicate treated such a row as DECIDABLE where the merged branch withholds. That
+  // direction was safe under the round-8 proof gate but it was WEAKER, and two guards answering one
+  // money question differently is the defect this branch spent eight rounds removing elsewhere. So
+  // the rows are read and judged by the SAME function `classifyRegisteredPayment` uses. The decided
+  // set can only shrink, which is the direction the merge algebra requires: when the sibling admits a
+  // bill, every non-CANCELLED registration on it is SYNCED with an external id and a
+  // database-stamped completion strictly below the fence, so this set is NECESSARILY EMPTY.
+  const posted = await client.accountingSyncLog.findMany({
+    where: scope,
+    select: { id: true, syncedAt: true, syncedAtDatabaseClock: true },
+  })
+  const fence = params.ledgerObservedBefore
+  const undecidable = posted.filter((row) => {
+    // NULL FENCE = NOTHING IS DECIDED, exactly as classifyRegisteredPayment reads it.
+    if (fence == null) return true
+    const completedAt = databaseStampedCompletion(row)
+    // STRICTLY before, matching the sibling's comparison at the tie as well as away from it.
+    return completedAt == null || completedAt.getTime() >= fence.databaseClock.getTime()
+  })
+  if (undecidable.length > 0) {
+    // ALL OR NOTHING, per BILL. Retiring the decidable siblings and abandoning the rest would leave
+    // the bill in a state that reads as fully reconciled while one registration's payment may be
+    // sitting in the ledger unaccounted for. When a later observation arrives — one taken after every
+    // one of these rows finished — it decides them together.
+    return { decided: false, undecided: undecidable.map((row) => row.id) }
+  }
+
+  // By id, and STILL SCOPED: `scope` pins the status, so a row that changed underneath the read is
+  // not retired on the strength of a survey that no longer describes it. Re-expressing the fence as a
+  // second `syncedAt` predicate here would be the second answer this function just deleted.
   const retired = await client.accountingSyncLog.updateMany({
-    where: {
-      connector: params.connector,
-      type: 'BILL_PAYMENT',
-      referenceType: 'PurchaseInvoice',
-      referenceId: params.invoiceId,
-      status: { in: [...POSTED_BILL_PAYMENT_STATUSES] },
-      syncedAt: { lt: params.ledgerObservedBefore },
-    },
+    where: { ...scope, id: { in: posted.map((row) => row.id) } },
     data: { status: 'CANCELLED', errorMessage: BILL_PAYMENT_LEDGER_REVERSED_REASON },
   })
-  return retired.count
+  return { decided: true, retired: retired.count }
 }
 
 export type BillPaymentSupersessionRefusal =
@@ -164,26 +285,56 @@ export type BillPaymentSupersessionRefusal =
   | 'PAYMENT_IN_FLIGHT'
   /** A registration has POSTED and no ledger observation has retired it. */
   | 'PAYMENT_ALREADY_POSTED'
+  /**
+   * A registration FAILED, and a failed money call is not evidence that nothing reached the ledger
+   * (Codex round 4 #5). Whether this bill is already settled cannot be determined from here at all.
+   */
+  | 'PAYMENT_MAY_HAVE_POSTED'
   /** A registration changed status between the survey and the fenced write, so its outcome is open. */
   | 'PAYMENT_STATE_CHANGED'
 
+/** What the planner needs to know about one registration. */
+export type BillPaymentSupersessionRow = {
+  status: string
+  /**
+   * Only consulted for AMBIGUOUS_BILL_PAYMENT_STATUSES. `false` is the one sound proof that an attempt
+   * never reached the ledger; produced by `billPaymentBodyCouldHavePosted`, never hand-rolled.
+   */
+  bodyCouldHavePosted: boolean
+}
+
 export type BillPaymentSupersessionPlan<T> =
   /** Nothing may be retired and nothing may be queued. */
-  | { proceed: false; refusal: 'PAYMENT_IN_FLIGHT' | 'PAYMENT_ALREADY_POSTED'; blocking: T[] }
+  | {
+      proceed: false
+      refusal: 'PAYMENT_IN_FLIGHT' | 'PAYMENT_ALREADY_POSTED' | 'PAYMENT_MAY_HAVE_POSTED'
+      blocking: T[]
+    }
   | { proceed: true; supersede: T[] }
 
 /**
- * IN-FLIGHT IS REPORTED AHEAD OF POSTED when both are present, because it is the more urgent thing for
- * an operator to know and the only one that changes on its own. It makes no difference to the outcome:
- * either way nothing is retired and nothing is queued.
+ * ORDER OF REPORTING, and why it does not change the outcome. All three refusals do the identical
+ * thing — nothing retired, nothing queued — so the order is purely about what the operator is told
+ * first. IN-FLIGHT leads because it is the only one that resolves on its own (wait, then look).
+ * ALREADY-POSTED next: look in the ledger, the payment is probably there. MAY-HAVE-POSTED last
+ * because it is the most static and the most work to clear.
+ *
+ * A FAILED row whose stored body could NOT have been sent blocks nothing — that is a proof, not a
+ * guess, and it is the only exemption this planner grants.
  */
-export function planBillPaymentSupersession<T extends { status: string }>(
+export function planBillPaymentSupersession<T extends BillPaymentSupersessionRow>(
   rows: T[],
 ): BillPaymentSupersessionPlan<T> {
   const inFlight = rows.filter((row) => (IN_FLIGHT_BILL_PAYMENT_STATUSES as readonly string[]).includes(row.status))
   if (inFlight.length > 0) return { proceed: false, refusal: 'PAYMENT_IN_FLIGHT', blocking: inFlight }
   const posted = rows.filter((row) => (POSTED_BILL_PAYMENT_STATUSES as readonly string[]).includes(row.status))
   if (posted.length > 0) return { proceed: false, refusal: 'PAYMENT_ALREADY_POSTED', blocking: posted }
+  const ambiguous = rows.filter(
+    (row) =>
+      (AMBIGUOUS_BILL_PAYMENT_STATUSES as readonly string[]).includes(row.status)
+      && row.bodyCouldHavePosted,
+  )
+  if (ambiguous.length > 0) return { proceed: false, refusal: 'PAYMENT_MAY_HAVE_POSTED', blocking: ambiguous }
   return {
     proceed: true,
     supersede: rows.filter((row) => (SUPERSEDABLE_BILL_PAYMENT_STATUSES as readonly string[]).includes(row.status)),
@@ -209,6 +360,29 @@ export class BillPaymentSupersessionRollback extends Error {
   }
 }
 
+/**
+ * Thrown by the caller when the accounting queue DECLINES to write a BILL_PAYMENT row for a bill that
+ * the ledger already holds (Codex round 4 #4). Carries the ledger id because that — not the bill's IMS
+ * id — is what an operator looks the document up by when they go to settle it there.
+ *
+ * A separate class from `BillPaymentSupersessionRollback` because it is a different kind of event: not
+ * a refusal derived from the registrations, but a queue that would not accept the work. It rolls the
+ * transaction back for the same reason all the same.
+ */
+export class BillPaymentEnqueueDeclined extends Error {
+  constructor(readonly accountingInvoiceId: string) {
+    super(`The accounting queue declined a BILL_PAYMENT for ledger invoice ${accountingInvoiceId}`)
+    this.name = 'BillPaymentEnqueueDeclined'
+  }
+}
+
+export const BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE =
+  'This bill has already been posted to the accounting connector, but the connector would not accept '
+  + 'a payment for it — accounting sync, or bill-payment posting specifically, is switched off. '
+  + 'Marking the bill paid now would leave the ledger showing it outstanding with nothing queued to '
+  + 'correct that, so nothing was changed. Turn bill-payment posting back on and try again, or record '
+  + 'the payment in the ledger by hand.'
+
 /** What an operator has to do about each refusal, in the words they will see. */
 export function billPaymentRefusalMessage(refusal: BillPaymentSupersessionRefusal): string {
   switch (refusal) {
@@ -223,6 +397,13 @@ export function billPaymentRefusalMessage(refusal: BillPaymentSupersessionRefusa
         + 'the supplier twice, and that cannot be undone from IMS. Open the bill in the connector: if '
         + 'the payment is there, the bill is settled and nothing more is needed; if it is genuinely '
         + 'gone, cancel that sync entry and mark the bill paid again.'
+    case 'PAYMENT_MAY_HAVE_POSTED':
+      return 'A payment registration for this bill FAILED, and a failed registration is NOT proof '
+        + 'that nothing reached the accounting connector — the payment may have been created and the '
+        + 'response lost. IMS therefore cannot tell whether this bill is already settled, and will '
+        + 'not guess with a supplier payment. Nothing was changed. Open the bill in the connector: if '
+        + 'the failed payment is there, the bill is settled and nothing more is needed; if it is not, '
+        + 'cancel that sync entry and mark the bill paid again.'
     case 'PAYMENT_STATE_CHANGED':
       return 'A payment registration for this bill was picked up by the sync worker while this bill '
         + 'was being marked paid, so IMS cannot tell whether it reached the accounting connector. '
@@ -248,10 +429,18 @@ export async function markBillPaidSupersedingStaleRegistrations(
     paymentReference: string | null
   },
 ): Promise<BillPaymentSupersessionOutcome> {
-  const rows = await client.accountingSyncLog.findMany({
+  const surveyed = await client.accountingSyncLog.findMany({
     where: { type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: params.invoiceId },
-    select: { id: true, status: true },
+    // The payload is read for ONE purpose: to ask whether a FAILED row's stored body was complete
+    // enough for its connector to have sent it. That is the only exemption the planner grants, and
+    // it is answered by the shared definition, never by re-reading fields here.
+    select: { id: true, status: true, payload: true },
   })
+  const rows = surveyed.map((row) => ({
+    id: row.id,
+    status: row.status,
+    bodyCouldHavePosted: billPaymentBodyCouldHavePosted(row.payload),
+  }))
   const plan = planBillPaymentSupersession(rows)
   if (!plan.proceed) {
     return { outcome: 'refused', refusal: plan.refusal, blockingIds: plan.blocking.map((row) => row.id) }

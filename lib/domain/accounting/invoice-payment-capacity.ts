@@ -93,6 +93,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
+import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { CAPACITY_EPSILON } from '@/lib/domain/accounting/invoice-payment-registration'
 import { ledgerSalesInvoiceTotalForeign } from '@/lib/domain/accounting/settlement-status'
 
@@ -402,19 +403,28 @@ export async function guardInvoicePaymentCapacity(
  * call, so this row demonstrably never reached the ledger. That is exactly the distinction o3d-sref
  * drew — CANCELLED must only ever be asserted where "nothing was sent" is TRUE.
  *
- * Fenced on `status: 'PROCESSING'` + this worker's exact `processingStartedAt` + `externalTransactionId:
- * null`, so a stale reclaim by a newer worker is not clobbered and a row that already posted is never
- * rewritten as if it had not.
+ * Fenced on `heldClaimWhere` — `status: 'PROCESSING'` + the instant the caller's claim holds RIGHT NOW
+ * — plus `externalTransactionId: null`, so a stale reclaim by a newer worker is not clobbered and a
+ * row that already posted is never rewritten as if it had not.
+ *
+ * THE CLAIM, NOT A `Date` (o3d-550x / o3d-xl63, merged). This used to spell the ownership predicate out
+ * inline over a captured `claimedAt`, which is a SECOND DEFINITION of "who owns this row" and one that
+ * silently fails closed the moment the caller's claim is renewed: the remote-write lease moves
+ * `processingStartedAt` before every send, so a fence on the captured instant matches nothing, the
+ * retirement never happens, and the refusal is invisible. Taking `HeldClaim` makes that a compile error
+ * at the call site instead of a no-op at runtime, and the instant is read here, as the statement is
+ * built.
+ *
+ * NOT routed through `releaseClaimForRetry`: this is a TERMINAL transition with a precondition of its
+ * own (`externalTransactionId: null`), which that helper deliberately does not carry.
  */
 export async function retireOverSettlingInvoicePayment(
   client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
-  params: { entryId: string; claimedAt: Date; reason: string },
+  params: { entryId: string; claim: HeldClaim; reason: string },
 ): Promise<boolean> {
   const retired = await client.accountingSyncLog.updateMany({
     where: {
-      id: params.entryId,
-      status: 'PROCESSING',
-      processingStartedAt: params.claimedAt,
+      ...heldClaimWhere(params.entryId, params.claim),
       externalTransactionId: null,
     },
     data: { status: 'CANCELLED', errorMessage: params.reason, processingStartedAt: null },

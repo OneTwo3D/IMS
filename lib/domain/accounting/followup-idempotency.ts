@@ -233,6 +233,18 @@ const REQUIRED_BODY_FIELDS: Record<string, readonly { field: string; kind: 'id' 
     { field: 'bankAccountId', kind: 'id' },
     { field: 'amount', kind: 'amount' },
   ],
+  // The SUPPLIER side of the same guard, verified against both connectors rather than assumed from
+  // the sales one: xero/sync-processor.ts and quickbooks/sync-processor.ts each open their
+  // BILL_PAYMENT case with the identical
+  //   if (!accountingInvoiceId || !bankAccountId || amount == null)
+  // and return before building any request. Without this entry a FAILED BILL_PAYMENT row would be
+  // permanently unknowable even when its stored body could never have been sent, which is the one
+  // case that IS provable (o3d-a3wx round 4 #5).
+  BILL_PAYMENT: [
+    { field: 'accountingInvoiceId', kind: 'id' },
+    { field: 'bankAccountId', kind: 'id' },
+    { field: 'amount', kind: 'amount' },
+  ],
   PURCHASE_CREDIT_NOTE_ALLOCATION: [
     { field: 'creditNoteId', kind: 'id' },
     { field: 'accountingInvoiceId', kind: 'id' },

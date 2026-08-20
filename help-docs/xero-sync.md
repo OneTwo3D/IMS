@@ -1278,9 +1278,22 @@ Deleting a payment removes its queued registration if it has not posted yet; if 
 
 ### Supplier bills: marking one paid again
 
-The payment poller clears **Paid** on a bill whose payment has disappeared from Xero, so a bill can legitimately be marked paid a second time. Doing so retires the earlier registration (it no longer describes the ledger) and queues a fresh one.
+The payment poller clears **Paid** on a bill whose payment has disappeared from Xero, so a bill can legitimately be marked paid a second time. The poller is the only thing that retires the earlier registration, and it does so in the same write that clears **Paid** — because it has just read the bill back from Xero, which is the one moment "the ledger no longer holds this payment" is an *observation* rather than a guess. With the registration retired, **Mark as paid** queues a fresh one normally.
 
-**Except while the earlier registration is still being sent.** If its sync entry has been claimed by the sync worker, the request may already be on its way to Xero and nothing in the IMS can recall it — cancelling the entry would free the slot and let a *second* supplier payment post. In that case **Mark as paid** is refused outright: the bill stays unpaid, nothing is queued, and a warning in the activity log names the entry to wait for. Try again once that entry has finished (it will end up synced or failed); a claim that dies is released automatically after 15 minutes.
+**Mark as paid refuses whenever the IMS cannot prove what the ledger holds.** Each refusal leaves the bill unpaid, queues nothing, changes nothing, and writes a warning naming the sync entry involved:
+
+| What the IMS sees | Why it refuses | What to do |
+|---|---|---|
+| The registration is **being sent now** (claimed by the sync worker) | The request may already be on its way and nothing here can recall it | Wait for that entry to finish — it will end up synced or failed; a dead claim is released after 15 minutes — then check the bill in Xero |
+| The registration is **synced** and no poll has retired it | It posted, and no Xero read has since disproved it | Open the bill in Xero. If the payment is there, the bill is settled. If it is genuinely gone, cancel that sync entry and mark the bill paid again |
+| The registration **failed** | A failed money call is *not* proof that nothing reached Xero — the payment may have been created and the response lost | Open the bill in Xero. If the failed payment is there, the bill is settled. If it is not, cancel that sync entry and mark the bill paid again |
+| The registration **changed status** while the bill was being marked paid | A worker picked it up mid-operation, so its outcome is open | Check that entry, then try again |
+
+A failed registration whose stored request was missing a field Xero rejects before sending (no invoice id, no bank account, no amount) blocks nothing — that one *is* provable.
+
+**When the poller cannot decide, it leaves the bill marked Paid.** If a payment registration finished *after* the Xero read the reversal was computed from, that read cannot say whether the payment it created is gone. Clearing **Paid** then would re-arm the button over money that may have moved, so the poll withholds the whole verdict, logs a warning naming the undecidable entries, and counts it on the poll result. The IMS resolves this by itself on the next Xero read that covers those registrations. If it never does, the daily reconcile keeps reporting the bill as a *suspect advance* — settle it in Xero, or cancel the named sync entry by hand.
+
+**Marking a bill paid needs somewhere to send the payment.** If the bill has already been posted to Xero but bill-payment posting is switched off, **Mark as paid** is refused rather than recorded locally: marking it paid with nothing queued would leave Xero showing the full amount outstanding and nothing to correct it. A bill that was never posted to Xero is unaffected — there is no second system to keep in step.
 
 ## FIFO Cost Layers
 

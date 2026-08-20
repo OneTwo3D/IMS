@@ -28,7 +28,9 @@ import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, r
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import {
+  BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE,
   billPaymentRefusalMessage,
+  BillPaymentEnqueueDeclined,
   BillPaymentSupersessionRollback,
   markBillPaidSupersedingStaleRegistrations,
 } from '@/lib/domain/accounting/payment-reversal'
@@ -3520,22 +3522,45 @@ export async function markBillPaid(
         // audit-H5), BILL_PAYMENT needs no CREATE-ordering deferral — it is safe by construction,
         // exactly like INVOICE_PAYMENT.
         //
-        // `false` here means the connector or this sync type is switched off, which is not a fault.
-        const queued = invoice.accountingInvoiceId
-          ? await queueAccountingSyncTx(tx, {
-              type: 'BILL_PAYMENT',
-              referenceType: 'PurchaseInvoice',
-              referenceId: invoice.id,
-              payload: {
-                accountingInvoiceId: invoice.accountingInvoiceId,
-                bankAccountId: input.bankAccountId,
-                paymentDate: input.paymentDate,
-                amount: paymentAmount,
-                currency: invoice.po.currency,
-                reference: input.reference ?? undefined,
-              },
-            })
-          : false
+        // A FALSY RETURN IS A NON-EVENT, AND ROUND 3 COMMITTED ON IT ANYWAY (Codex round 4 #4).
+        //
+        // Moving the enqueue inside the transaction made the two writes share a fate only against a
+        // THROW. `queueAccountingSyncTx` does not throw when it declines: it RETURNS FALSE — no
+        // posting context (the connector or BILL_PAYMENT posting is switched off), or the suppression
+        // rule. Round 3 stored that in `queued`, never read it, and committed. The result is exactly
+        // the state the round-3 comment describes as "the quietest way the two systems can disagree":
+        // the bill marked PAID in IMS, nothing queued, no FAILED row, and the ledger showing the full
+        // amount outstanding for as long as anyone cares to look.
+        //
+        // THE DISTINCTION THAT MAKES THIS SAFE TO ENFORCE is the bill's own external id, not the
+        // connector's settings:
+        //
+        //   no accountingInvoiceId  this bill was never posted to a ledger. There is no second system
+        //                           to keep in step, so paid-in-IMS-only is COMPLETE, not partial.
+        //                           This is the escape valve for a tenant running without accounting
+        //                           sync, and it is untouched.
+        //   accountingInvoiceId set the ledger holds this bill. Marking it paid here while the ledger
+        //                           is not told is a divergence, whatever the reason the queue gave.
+        //
+        // So the declined enqueue is refused rather than absorbed, and the refusal names the cause an
+        // operator can act on.
+        let queued = false
+        if (invoice.accountingInvoiceId) {
+          queued = await queueAccountingSyncTx(tx, {
+            type: 'BILL_PAYMENT',
+            referenceType: 'PurchaseInvoice',
+            referenceId: invoice.id,
+            payload: {
+              accountingInvoiceId: invoice.accountingInvoiceId,
+              bankAccountId: input.bankAccountId,
+              paymentDate: input.paymentDate,
+              amount: paymentAmount,
+              currency: invoice.po.currency,
+              reference: input.reference ?? undefined,
+            },
+          })
+          if (!queued) throw new BillPaymentEnqueueDeclined(invoice.accountingInvoiceId)
+        }
         return { requestedIds: result.requestedIds, retiredCount: result.retiredCount, queued }
       }, STOCK_TX_OPTIONS)
     } catch (rollback) {
@@ -3563,19 +3588,29 @@ export async function markBillPaid(
         }).catch(() => { /* logging must never block the refusal */ })
         return { success: false, error }
       }
-      // The enqueue threw, so the whole transaction rolled back: the bill is NOT marked paid and no
-      // row was written. Both systems still agree, which is the point of moving the enqueue inside —
-      // but the operator must be told, because the action they took did not happen.
+      // The enqueue did not happen — it either threw, or DECLINED by returning false — so the whole
+      // transaction rolled back: the bill is NOT marked paid and no row was written. Both systems
+      // still agree, which is the point of moving the enqueue inside — but the operator must be told,
+      // because the action they took did not happen.
+      //
+      // The two are logged apart because they are different problems with different fixes: a throw is
+      // a fault to retry, a decline is a SETTING to change (round 4 #4). Telling an operator to
+      // "retry" a switched-off connector would send them round the same loop indefinitely.
+      const declined = rollback instanceof BillPaymentEnqueueDeclined
       await logActivity({
         entityType: 'PURCHASE_ORDER',
         entityId: invoice.poId,
-        action: 'bill_payment_not_queued',
+        action: declined ? 'bill_payment_enqueue_declined' : 'bill_payment_not_queued',
         tag: 'purchase',
         level: 'ERROR',
-        description:
-          `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the payment could not be ` +
-          `queued for the accounting connector, so the paid status was rolled back rather than left ` +
-          `standing with nothing queued. Retry, or record the payment in the ledger by hand.`,
+        description: declined
+          ? `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the accounting queue ` +
+            `declined a BILL_PAYMENT for a bill the ledger already holds (posting for this sync type ` +
+            `is switched off), so the paid status was rolled back rather than left standing with ` +
+            `nothing queued.`
+          : `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: the payment could not be ` +
+            `queued for the accounting connector, so the paid status was rolled back rather than left ` +
+            `standing with nothing queued. Retry, or record the payment in the ledger by hand.`,
         metadata: {
           invoiceId: invoice.id,
           reference: invoice.po.reference,
@@ -3586,9 +3621,10 @@ export async function markBillPaid(
       }).catch(() => { /* logging must never swallow the real error */ })
       return {
         success: false,
-        error:
-          'The payment could not be queued for the accounting connector, so the bill was not marked ' +
-          'paid. Nothing was changed — try again, or record the payment in the ledger by hand.',
+        error: declined
+          ? BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE
+          : 'The payment could not be queued for the accounting connector, so the bill was not marked ' +
+            'paid. Nothing was changed — try again, or record the payment in the ledger by hand.',
       }
     }
 

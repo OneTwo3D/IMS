@@ -575,6 +575,11 @@ type PollResult = {
    * did not state), so the reversal was WITHHELD and paidAt left alone (o3d-clxw). Counted separately
    * from `reversed` because they are the opposite outcome: nothing was reconciled, and a human has
    * something to look at.
+   *
+   * `billReversalsWithheld` is ALSO what an undecidable registration withholds under (o3d-a3wx round
+   * 4), on the same activity action `bill_payment_reversal_withheld`: "we would have cleared paidAt
+   * and did not" is one fact with several causes, and splitting it into per-cause counters would hide
+   * it. The cause is named in the activity description, not in a second number.
    */
   salesReversalsWithheld: number
   billReversalsWithheld: number
@@ -602,6 +607,31 @@ type PollResult = {
  *
  * Errors are pushed onto `result` rather than thrown: the caller reads that to decide whether this
  * chunk may be checkpointed.
+ */
+/**
+ * TWO TIMESTAMPS, NOT ONE (Codex round 4 #2).
+ *
+ * Round 3 handed `lastPollDate` to this function under the single name `windowStart` and used it for
+ * two unrelated jobs. It is correct for one of them and badly wrong for the other:
+ *
+ *   windowStart          the DELTA window. "Has a WooCommerce refund been recorded since the last
+ *                        poll?" is a question about the period this poll covers, and lastPollDate is
+ *                        exactly that period's start.
+ *   ledgerObservedBefore the instant XERO WAS ASKED. "Had this registration already posted when the
+ *                        ledger gave us this answer?" is a question about the READ, and the read
+ *                        happens at the END of the window, not the start. Fenced on lastPollDate,
+ *                        EVERY registration that posted during the preceding fifteen minutes counted
+ *                        as unreadable — and on a cold cursor the default window is TWENTY-FOUR
+ *                        HOURS, so a full day of registrations was undecidable for no reason.
+ *
+ * AND IT IS THE DATABASE'S CLOCK, NOT THIS HOST'S (o3d-clxw round 4, merged as #634). This branch
+ * originally passed `pollStartedAt` — a `new Date()` on whichever instance ran the poll — against a
+ * `syncedAt` written by `new Date()` on whichever instance ran the sync processor. Two free-running
+ * clocks, and one skew direction clears paidAt over a payment still in flight. `LedgerReadFence` is
+ * branded so only `databaseLedgerFence` can mint one, from a `SELECT clock_timestamp()` taken
+ * immediately BEFORE the ledger was asked; a plain `Date` no longer type-checks here, which is the
+ * point. NULL means the database clock could not be read, and then nothing this poll saw can be
+ * ordered against anything — every registration withholds.
  */
 async function processDeltaChunk(
   changed: XeroInvoice[],
@@ -906,17 +936,68 @@ async function processDeltaChunk(
         // that against the row, in the SAME transaction that clears paidAt, is what lets markBillPaid
         // refuse everything it cannot prove without stranding the ordinary reversal-then-re-pay flow.
         //
-        // `windowStart` is the delta window this verdict was computed from, so a row that synced
-        // before it had certainly posted by the time Xero was asked. One synced later may have created
-        // a payment this read never saw and is deliberately left for a human.
-        const retiredRegistrations = await db.$transaction(async (tx) => {
-          await tx.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
-          return retireBillPaymentRegistrationsReversedInLedger(tx, {
+        // `ledgerObservedBefore` is the instant Xero was asked (see processDeltaChunk), so a row that
+        // synced before it had certainly posted by the time Xero answered. One synced later may have
+        // created a payment this read never saw.
+        //
+        // AND IF THERE IS ONE, THE WHOLE VERDICT IS WITHHELD (Codex round 4 #2). Round 3 cleared
+        // paidAt regardless and simply left such a row alone. That looks conservative and is the
+        // opposite: clearing paidAt removes the bill from `paidAt: { not: null }`, which is the ONLY
+        // query that ever produces another reversal observation for it, so the row could never be
+        // decided again — permanently stranded, and permanently refusing Mark Paid, on the strength
+        // of an observation nobody recorded.
+        //
+        // Holding paidAt keeps the bill inside every set that will look at it again: this pass, on
+        // the next appearance of the invoice in the delta (by which time the row's syncedAt IS before
+        // the read and the retirement completes on its own), and the daily reconcile, where a bill
+        // IMS holds paid whose Xero invoice is not PAID is already reported as a suspect advance.
+        //
+        // It also happens to be the truthful answer more often than not: the undecidable case is a
+        // registration that finished DURING the read, and if it posted, the bill really is paid.
+        const outcome = await db.$transaction(async (tx) => {
+          const verdict = await retireBillPaymentRegistrationsReversedInLedger(tx, {
             connector: XERO_CONNECTOR,
             invoiceId: bill.id,
-            ledgerObservedBefore: windowStart,
+            ledgerObservedBefore,
           })
+          // The clear is written only on a decided verdict, and inside the same transaction as the
+          // retirement it is justified by — neither may commit without the other.
+          if (verdict.decided) {
+            await tx.purchaseInvoice.update({ where: { id: bill.id }, data: { paidAt: null } })
+          }
+          return verdict
         })
+
+        if (!outcome.decided) {
+          result.billReversalsWithheld++
+          await logActivity({
+            entityType: 'PURCHASE_ORDER',
+            entityId: bill.poId,
+            action: 'bill_payment_reversal_withheld',
+            tag: 'sync',
+            level: 'WARNING',
+            description:
+              `Bill payment appears to be no longer present in Xero for PO ${bill.po.reference} `
+              + `(PO status: ${bill.po.status}), but ${outcome.undecided.length} posted payment `
+              + `registration(s) finished AFTER this Xero read was taken, so the read cannot say `
+              + `whether the payment they created is gone. The bill is LEFT MARKED PAID rather than `
+              + `re-armed for payment — clearing it would invite a second supplier payment on top of `
+              + `one that may exist. IMS will decide this by itself on the next Xero read that covers `
+              + `those registrations; if it never does, open the bill in Xero and either settle it or `
+              + `cancel sync entr${outcome.undecided.length === 1 ? 'y' : 'ies'} `
+              + `${outcome.undecided.join(', ')} by hand.`,
+            metadata: {
+              invoiceId: bill.id,
+              reference: bill.po.reference,
+              undecidedSyncLogIds: outcome.undecided,
+              // Null when the database clock could not be read — the case where NOTHING is decidable.
+              ledgerObservedBefore: ledgerObservedBefore?.databaseClock.toISOString() ?? null,
+            },
+            resolveUser: false,
+          })
+          continue
+        }
+
         result.billsReversed++
         await logActivity({
           entityType: 'PURCHASE_ORDER',
@@ -925,9 +1006,9 @@ async function processDeltaChunk(
           tag: 'sync',
           level: 'WARNING',
           description: `Bill payment no longer present in Xero for PO ${bill.po.reference} (PO status: ${bill.po.status}) — cleared paidAt`
-            + (retiredRegistrations > 0
-              ? ` and retired ${retiredRegistrations} posted payment registration(s), so the bill can be marked paid again.`
-              : `. No posted payment registration was retired — if marking this bill paid again is refused, the registration must be reconciled in Xero and cancelled by hand.`)
+            + (outcome.retired > 0
+              ? ` and retired ${outcome.retired} posted payment registration(s), so the bill can be marked paid again.`
+              : `. There was no posted payment registration to retire — if marking this bill paid again is refused, the entry named by the refusal must be reconciled in Xero and cancelled by hand.`)
             + (billResidual.provenGone.has(bill.accountingInvoiceId ?? '')
               // Named, because this is the case an amount reading calls a part payment: the ledger is
               // still holding money against this bill — just not ours.
@@ -1464,7 +1545,8 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
         windowStart: lastPollDate,
         // The instant Xero WAS ASKED, not the start of the window it covers: "had this registration
         // already posted when the ledger gave us this answer?" is a question about the READ. Read
-        // from the database before the fetch, so every chunk is read after it.
+        // from the DATABASE before the fetch (never `pollStartedAt`, which is this host's clock), so
+        // every chunk is read after it and both ends of the comparison are one clock's readings.
         ledgerObservedBefore,
       })
       // A pass that errored may have left work undone inside this chunk, so the chunk is not
@@ -1529,6 +1611,8 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
     result.errors.push(`Withheld-reversal recheck error: ${String(e)}`)
   }
 
+  // `billReversalsWithheld` counts BOTH causes — a ledger amount that does not prove a reversal, and
+  // a registration this read cannot speak for (o3d-a3wx round 4) — so this one summand covers both.
   const withheld = result.salesReversalsWithheld + result.billReversalsWithheld
   if (result.salesPaid > 0 || result.billsPaid > 0 || result.salesReversed > 0 || result.billsReversed > 0
     || withheld > 0 || result.withheldRechecked > 0) {
@@ -1541,8 +1625,8 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
         `Payment poll: ${result.salesPaid} sales paid, ${result.billsPaid} bills paid, ` +
         `${result.salesReversed} sales reversed, ${result.billsReversed} bills reversed` +
         (withheld > 0
-          ? `, ${withheld} reversal(s) WITHHELD because the ledger still holds a payment (or did not say) — ` +
-            `see the per-document warnings`
+          ? `, ${withheld} reversal(s) WITHHELD because the ledger still holds a payment (or did not say), ` +
+            `or a registration this read cannot speak for — see the per-document warnings`
           : '') +
         (result.withheldRechecked > 0
           ? `, ${result.withheldRechecked} previously-withheld reversal(s) reconsidered ` +

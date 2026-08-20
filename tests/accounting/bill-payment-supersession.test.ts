@@ -4,6 +4,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
+  BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE,
   BILL_PAYMENT_LEDGER_REVERSED_REASON,
   BILL_PAYMENT_SUPERSEDED_REASON,
   billPaymentRefusalMessage,
@@ -11,6 +12,7 @@ import {
   planBillPaymentSupersession,
   retireBillPaymentRegistrationsReversedInLedger,
 } from '@/lib/domain/accounting/payment-reversal'
+import { databaseLedgerFence } from '@/lib/connectors/xero/invoice-delta'
 
 /**
  * o3d-a3wx. BILL_PAYMENT joined accounting_sync_logs_followup_live_unique. markBillPaid only wins the
@@ -31,11 +33,18 @@ import {
  * markBillPaid keeps only what it can prove locally: a PENDING row was never sent.
  */
 
-const PROCESSING_ROW = { id: 'log-inflight', status: 'PROCESSING' }
-const SYNCED_ROW = { id: 'log-posted', status: 'SYNCED' }
+/**
+ * `bodyCouldHavePosted` is what the planner consults for a FAILED row, and it is spelled out on every
+ * fixture rather than defaulted: the whole round-4 point is that a registration's remote outcome is a
+ * fact the planner must be TOLD, never one it may assume.
+ */
+const PROCESSING_ROW = { id: 'log-inflight', status: 'PROCESSING', bodyCouldHavePosted: true }
+const SYNCED_ROW = { id: 'log-posted', status: 'SYNCED', bodyCouldHavePosted: true }
+const PENDING_ROW = { id: 'log-1', status: 'PENDING', bodyCouldHavePosted: true }
+const FAILED_ROW = { id: 'log-failed', status: 'FAILED', bodyCouldHavePosted: true }
 
 test('a PENDING registration is superseded — nothing has been sent, so cancelling it IS the whole event', () => {
-  const plan = planBillPaymentSupersession([{ id: 'log-1', status: 'PENDING' }])
+  const plan = planBillPaymentSupersession([PENDING_ROW])
   assert.equal(plan.proceed, true)
   assert.deepEqual(plan.proceed && plan.supersede.map((r) => r.id), ['log-1'])
 })
@@ -69,18 +78,55 @@ test('in-flight is reported ahead of already-posted when both are present', () =
 test('one posted row blocks the whole plan, even alongside retirable ones', () => {
   // Retiring the PENDING sibling would free the slot just as effectively, so the refusal has to be
   // about the BILL, not about each row.
-  const plan = planBillPaymentSupersession([{ id: 'log-1', status: 'PENDING' }, SYNCED_ROW])
+  const plan = planBillPaymentSupersession([PENDING_ROW, SYNCED_ROW])
   assert.equal(plan.proceed, false)
   assert.equal(plan.proceed === false && plan.refusal, 'PAYMENT_ALREADY_POSTED')
 })
 
-test('FAILED and CANCELLED rows are left exactly as they are', () => {
-  // They are already outside the live predicate, so they block nothing — and rewriting a FAILED row as
-  // CANCELLED would erase the fact that the ledger rejected it, which is the evidence an operator needs
-  // and which the "FAILED does not prove nothing posted" reading (o3d-ju8t) depends on.
-  const plan = planBillPaymentSupersession([{ id: 'log-1', status: 'FAILED' }, { id: 'log-2', status: 'CANCELLED' }])
+test('a FAILED registration REFUSES as may-have-posted — the supplier side inherits the round-3 rule (round 4 #5)', () => {
+  // THE DEFECT THIS CLOSES. A FAILED row matched no branch of the planner at all and fell into
+  // `proceed: true` with an empty supersede list, so Mark Paid queued a replacement under a fresh
+  // entry id and therefore a fresh Idempotency-Key. But the processor posts BEFORE it records the
+  // outcome: a timeout, a lost response or a crash after Xero created the Payment is written down
+  // identically to a rejection, and errorMessage carries no provenance. invoice-payment-capacity.ts
+  // settled exactly this for the SALES side in round 3 (AMBIGUOUS_FAILED_REGISTRATION) and the
+  // supplier side — where the money actually leaves — was left guessing.
+  const plan = planBillPaymentSupersession([FAILED_ROW])
+  assert.equal(plan.proceed, false)
+  assert.equal(plan.proceed === false && plan.refusal, 'PAYMENT_MAY_HAVE_POSTED')
+  assert.deepEqual(plan.proceed === false && plan.blocking.map((r) => r.id), ['log-failed'])
+})
+
+test('a FAILED registration whose stored body could never have been sent blocks nothing', () => {
+  // The ONE exemption, and it is a proof rather than a guess: both connectors return from their
+  // BILL_PAYMENT case before building any request when accountingInvoiceId, bankAccountId or amount is
+  // missing. Without this the refusal would be unconditional and a bill could never be re-paid after a
+  // malformed enqueue.
+  const plan = planBillPaymentSupersession([{ ...FAILED_ROW, bodyCouldHavePosted: false }])
   assert.equal(plan.proceed, true)
   assert.deepEqual(plan.proceed && plan.supersede, [])
+})
+
+test('CANCELLED rows still block nothing, and a FAILED row is never rewritten', () => {
+  // CANCELLED is the one status every writer in this tree asserts only where "nothing was sent" is
+  // TRUE, so it frees the slot. FAILED now blocks — but the planner never returns it as superseded, so
+  // nothing rewrites it and the evidence that an attempt was made survives.
+  const plan = planBillPaymentSupersession([{ id: 'log-2', status: 'CANCELLED', bodyCouldHavePosted: true }])
+  assert.equal(plan.proceed, true)
+  assert.deepEqual(plan.proceed && plan.supersede, [])
+
+  const withFailed = planBillPaymentSupersession([FAILED_ROW])
+  assert.equal(withFailed.proceed, false)
+  assert.equal(withFailed.proceed === false && withFailed.refusal, 'PAYMENT_MAY_HAVE_POSTED')
+})
+
+test('in-flight and already-posted are both reported ahead of may-have-posted', () => {
+  // Same outcome — nothing retired, nothing queued — but the order decides which sentence the operator
+  // reads first, and a FAILED row is the one that will not change on its own.
+  const inFlightFirst = planBillPaymentSupersession([FAILED_ROW, PROCESSING_ROW])
+  assert.equal(inFlightFirst.proceed === false && inFlightFirst.refusal, 'PAYMENT_IN_FLIGHT')
+  const postedFirst = planBillPaymentSupersession([FAILED_ROW, SYNCED_ROW])
+  assert.equal(postedFirst.proceed === false && postedFirst.refusal, 'PAYMENT_ALREADY_POSTED')
 })
 
 test('every refusal tells the operator what to do, and the posted one says where to look', () => {
@@ -90,6 +136,13 @@ test('every refusal tells the operator what to do, and the posted one says where
   assert.match(billPaymentRefusalMessage('PAYMENT_ALREADY_POSTED'), /Open the bill in the connector/)
   assert.match(billPaymentRefusalMessage('PAYMENT_ALREADY_POSTED'), /cancel that sync entry/)
   assert.match(billPaymentRefusalMessage('PAYMENT_STATE_CHANGED'), /Nothing was changed/)
+  // The may-have-posted refusal has to say WHY a failure is not a clean slate, or the operator reads
+  // "it failed" as "nothing happened" and re-records the payment — the single action that turns the
+  // ambiguity into a second supplier payment.
+  assert.match(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /NOT proof/)
+  assert.match(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /response lost/)
+  assert.match(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /Open the bill in the connector/)
+  assert.match(billPaymentRefusalMessage('PAYMENT_MAY_HAVE_POSTED'), /cancel that sync entry/)
 })
 
 // ---------------------------------------------------------------------------
@@ -98,7 +151,7 @@ test('every refusal tells the operator what to do, and the posted one says where
 // the caller at all. These drive the real function against a recording transaction client.
 // ---------------------------------------------------------------------------
 
-type SyncRow = { id: string; status: string }
+type SyncRow = { id: string; status: string; payload?: unknown }
 
 function mockTx(rows: SyncRow[], options: { paidCount?: number; retiredCount?: number; afterRetire?: SyncRow[] } = {}) {
   const calls = {
@@ -248,29 +301,187 @@ test('losing the paidAt compare-and-swap reports already-paid and retires nothin
   assert.equal(calls.syncUpdateMany.length, 0, 'a bill we did not transition is not ours to retire rows for')
 })
 
+test('a FAILED registration read from the database refuses BEFORE the bill is written as paid (round 4 #5)', async () => {
+  // End to end through the real function, not just the planner: the survey has to READ the payload and
+  // put it through the shared body test, or the refusal never fires in production no matter what the
+  // pure rule says.
+  const { tx, calls } = mockTx([
+    {
+      id: 'log-failed',
+      status: 'FAILED',
+      payload: { accountingInvoiceId: 'xero-inv-1', bankAccountId: 'acct-1', amount: 120.5 },
+    },
+  ])
+
+  const result = await markBillPaidSupersedingStaleRegistrations(tx as never, PARAMS)
+
+  assert.equal(result.outcome, 'refused')
+  assert.equal(result.outcome === 'refused' && result.refusal, 'PAYMENT_MAY_HAVE_POSTED')
+  assert.deepEqual(result.outcome === 'refused' && result.blockingIds, ['log-failed'])
+  assert.equal(calls.invoiceUpdateMany.length, 0, 'the bill must NOT be written as paid')
+  assert.equal(calls.syncUpdateMany.length, 0, 'a failed registration must never be rewritten from here')
+})
+
+test('the survey reads the payload, so the FAILED exemption is decided by the shared body test', async () => {
+  // billPaymentBodyCouldHavePosted delegates to storedBodyCouldHaveReachedTheLedger. A survey that
+  // selected only id and status could not consult it at all, and the exemption would silently become
+  // "every FAILED row blocks" — a different rule that happens to be safe, and so would never be caught
+  // by a refusal test.
+  const { tx, calls } = mockTx([
+    { id: 'log-failed', status: 'FAILED', payload: { accountingInvoiceId: '', bankAccountId: '', amount: null } },
+  ])
+
+  const result = await markBillPaidSupersedingStaleRegistrations(tx as never, PARAMS)
+
+  assert.deepEqual(calls.syncFindMany[0].select, { id: true, status: true, payload: true })
+  assert.equal(result.outcome, 'paid', 'a body the connector would reject before sending blocks nothing')
+})
+
 // ---------------------------------------------------------------------------
 // THE OTHER HALF: retirement moves to the one component that reads the ledger.
 // ---------------------------------------------------------------------------
 
-test('a reversed bill retires only SYNCED rows that had already posted when the ledger was read', async () => {
+/**
+ * THE DOUBLE NOW RETURNS COMPLETION PROVENANCE, NOT JUST IDS (o3d-m5qk, merging o3d-clxw #634).
+ *
+ * The fence used to be a Prisma predicate over `syncedAt` alone, so a double only had to hand back
+ * the rows the query "selected". It is now `databaseStampedCompletion` applied in this process, which
+ * reads BOTH columns: `syncedAt` and the marker `syncedAtDatabaseClock` the database mints beside it.
+ * So the rows a test hands in have to carry both, and the interesting cases are the ones where they
+ * DISAGREE — that is an old build's host-clock write, and it is undecidable however early it looks.
+ */
+type RetirementRow = { id: string; syncedAt: Date | null; syncedAtDatabaseClock: Date | null }
+
+/** A row the database stamped: both columns carry the same instant, which is what the trigger keeps true. */
+function stamped(id: string, at: string): RetirementRow {
+  return { id, syncedAt: new Date(at), syncedAtDatabaseClock: new Date(at) }
+}
+
+function retirementClient(rows: RetirementRow[], retiredCount = 1) {
   const updates: Array<{ where?: Record<string, unknown>; data?: unknown }> = []
+  const finds: Array<{ where?: Record<string, unknown>; select?: unknown }> = []
   const client = {
     accountingSyncLog: {
+      findMany: async (args: { where?: Record<string, unknown>; select?: unknown }) => {
+        finds.push(args)
+        return rows
+      },
       updateMany: async (args: { where?: Record<string, unknown>; data?: unknown }) => {
         updates.push(args)
-        return { count: 1 }
+        return { count: retiredCount }
       },
     },
   }
-  const observedBefore = new Date('2026-08-20T09:45:00.000Z')
+  return { client, updates, finds }
+}
 
-  const retired = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+test('a posted registration that finished AFTER the ledger read is REPORTED, not filtered away (round 4 #2)', async () => {
+  // THE DEFECT THIS CLOSES. Round 3 expressed the fence as `syncedAt: { lt: observedBefore }` inside
+  // the update, so such a row was not skipped — it was INVISIBLE. The poller cleared paidAt anyway,
+  // the bill left `paidAt: { not: null }`, and with it left the ONLY query that ever produces another
+  // reversal observation for that document. The row then refused every future Mark Paid, for ever,
+  // with nothing recording why.
+  const observedBefore = databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z'))
+  const { client, updates, finds } = retirementClient([stamped('log-late', '2026-08-20T09:46:00.000Z')])
+
+  const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
     connector: 'xero',
     invoiceId: 'inv-1',
     ledgerObservedBefore: observedBefore,
   })
 
-  assert.equal(retired, 1)
+  assert.equal(outcome.decided, false)
+  assert.deepEqual(outcome.decided === false && outcome.undecided, ['log-late'])
+  assert.equal(updates.length, 0, 'nothing may be retired on a verdict this read cannot support')
+  // SUPERSEDED ASSERTION (o3d-m5qk). This used to be
+  //   assert.deepEqual(finds[0].where?.OR, [{ syncedAt: null }, { syncedAt: { gte: observedBefore } }])
+  // — the undecidable predicate expressed in SQL over `syncedAt` alone. That column cannot answer the
+  // question by itself (o3d-clxw #634: an old build writes its own host's clock into it), so the query
+  // now selects the scope and the verdict is reached in this process by `databaseStampedCompletion`,
+  // the SAME reader `classifyRegisteredPayment` uses. What is asserted instead is that the read asks
+  // for both columns, because a select that omitted the marker would make every row undecidable
+  // silently.
+  assert.equal(finds[0].where?.OR, undefined, 'the fence is no longer a SQL predicate')
+  assert.deepEqual(finds[0].select, { id: true, syncedAt: true, syncedAtDatabaseClock: true })
+})
+
+test('a completion time the database did not mint is UNDECIDABLE, however early it looks (o3d-clxw round 5)', async () => {
+  // The one case the two branches answered differently, and the reason this predicate moved onto the
+  // marker. `syncedAt` is well before the read, so the old `syncedAt`-alone fence called this row
+  // DECIDED and retired it. But the marker disagrees with it, which is what a row written by a build
+  // that does not know about the marker looks like — its `syncedAt` is that host's `new Date()`, and
+  // comparing a foreign host's clock against a database fence is exactly the cross-host comparison
+  // that clears paidAt over a payment still in flight and pays the supplier twice.
+  const observedBefore = databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z'))
+  const { client, updates } = retirementClient([
+    { id: 'log-legacy', syncedAt: new Date('2026-08-20T09:00:00.000Z'), syncedAtDatabaseClock: null },
+    {
+      id: 'log-rewritten',
+      syncedAt: new Date('2026-08-20T09:00:00.000Z'),
+      syncedAtDatabaseClock: new Date('2026-08-20T09:00:00.001Z'),
+    },
+  ])
+
+  const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+    connector: 'xero',
+    invoiceId: 'inv-1',
+    ledgerObservedBefore: observedBefore,
+  })
+
+  assert.equal(outcome.decided, false)
+  assert.deepEqual(outcome.decided === false && outcome.undecided, ['log-legacy', 'log-rewritten'])
+  assert.equal(updates.length, 0)
+})
+
+test('a NULL fence decides nothing at all, even for a row stamped long ago', async () => {
+  // The database clock could not be read, so this poll has no ordering whatever. Failing closed means
+  // every registration might have landed after the snapshot — the same reading classifyRegisteredPayment
+  // gives a null fence, so the two cannot disagree about a bill.
+  const { client, updates } = retirementClient([stamped('log-old', '2020-01-01T00:00:00.000Z')])
+
+  const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+    connector: 'xero',
+    invoiceId: 'inv-1',
+    ledgerObservedBefore: null,
+  })
+
+  assert.equal(outcome.decided, false)
+  assert.deepEqual(outcome.decided === false && outcome.undecided, ['log-old'])
+  assert.equal(updates.length, 0)
+})
+
+test('one undecidable registration withholds the whole bill, including its decidable siblings', async () => {
+  // Retiring the siblings and abandoning the rest would leave the bill reading as fully reconciled
+  // while one registration's payment may be sitting in the ledger unaccounted for. A later observation
+  // — one taken after every row finished — decides them together.
+  const { client, updates } = retirementClient([
+    stamped('log-early', '2026-08-20T09:00:00.000Z'),
+    stamped('log-late', '2026-08-20T09:46:00.000Z'),
+  ])
+
+  const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+    connector: 'xero',
+    invoiceId: 'inv-1',
+    ledgerObservedBefore: databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z')),
+  })
+
+  assert.equal(outcome.decided, false)
+  assert.deepEqual(outcome.decided === false && outcome.undecided, ['log-late'])
+  assert.equal(updates.length, 0)
+})
+
+test('a reversed bill retires only SYNCED rows that had already posted when the ledger was read', async () => {
+  const observedBefore = databaseLedgerFence(new Date('2026-08-20T09:45:00.000Z'))
+  const { client, updates } = retirementClient([stamped('log-posted', '2026-08-20T09:00:00.000Z')])
+
+  const outcome = await retireBillPaymentRegistrationsReversedInLedger(client as never, {
+    connector: 'xero',
+    invoiceId: 'inv-1',
+    ledgerObservedBefore: observedBefore,
+  })
+
+  assert.equal(outcome.decided, true)
+  assert.equal(outcome.decided === true && outcome.retired, 1)
   assert.deepEqual(updates[0].where, {
     connector: 'xero',
     type: 'BILL_PAYMENT',
@@ -279,11 +490,12 @@ test('a reversed bill retires only SYNCED rows that had already posted when the 
     // SYNCED only: a PENDING row is a re-payment someone has already queued and a PROCESSING row may
     // be posting this instant. Neither is the payment this ledger read failed to find.
     status: { in: ['SYNCED'] },
-    // And only a row that had already posted when the snapshot behind this verdict was taken. One
-    // that synced afterwards may have created a payment the read never saw, so "not present" says
-    // nothing about it — and a row with no syncedAt is excluded by the comparison, which is the safe
-    // direction: it falls through to markBillPaid's refusal and a human.
-    syncedAt: { lt: observedBefore },
+    // SUPERSEDED ASSERTION (o3d-m5qk): this used to be `syncedAt: { lt: observedBefore }`, a SECOND
+    // spelling of the fence inside the destructive write. The fence is now decided once, above, by
+    // `databaseStampedCompletion`, and the write names the exact rows that survived it — re-deriving
+    // it here would be the two-answers-to-one-money-question defect this merge removed. The status
+    // scope stays, so a row that changed underneath the read is still not retired.
+    id: { in: ['log-posted'] },
   })
   assert.equal((updates[0].data as { status: string }).status, 'CANCELLED')
   assert.equal((updates[0].data as { errorMessage: string }).errorMessage, BILL_PAYMENT_LEDGER_REVERSED_REASON)
@@ -316,6 +528,78 @@ test('the Xero poller clears paidAt and retires the registration in ONE transact
     block.indexOf('retireBillPaymentRegistrationsReversedInLedger(tx,') > txAt,
     'the retirement must run on the same transaction client',
   )
+})
+
+test('the poller withholds the paidAt clear when the read cannot decide a registration (round 4 #2)', () => {
+  // The retirement and the clear are two halves of one verdict. Clearing paidAt on an undecided
+  // verdict is what makes the stranding permanent: it removes the bill from the reversal pass's
+  // candidate query, so no later Xero read can ever revisit the registration. Holding it keeps the
+  // bill in that query AND in the daily reconcile's suspect-advance report.
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/payment-poller.ts'), 'utf8')
+  const blockStart = src.indexOf('--- Purchase bill payment reversals')
+  assert.ok(blockStart > 0, 'the bill reversal pass must exist')
+  const block = src.slice(blockStart, src.indexOf('export async function pollXeroPayments', blockStart))
+
+  const retireAt = block.indexOf('retireBillPaymentRegistrationsReversedInLedger(tx,')
+  const guardAt = block.indexOf('if (verdict.decided) {')
+  const clearAt = block.indexOf('tx.purchaseInvoice.update(')
+  assert.ok(retireAt > 0, 'the retirement must run inside the transaction')
+  assert.ok(guardAt > retireAt, 'the verdict must be consulted before anything is cleared')
+  assert.ok(clearAt > guardAt, 'the paidAt clear must sit INSIDE the decided branch')
+  // The withheld case must be reported and counted, not silently skipped — a disagreement between IMS
+  // and the ledger that nobody is told about is the same defect one layer up.
+  assert.ok(block.includes("action: 'bill_payment_reversal_withheld'"), 'a withheld reversal must be logged')
+  assert.ok(block.includes('result.billReversalsWithheld++'), 'a withheld reversal must be counted')
+  assert.ok(
+    block.includes('undecidedSyncLogIds: outcome.undecided'),
+    'the log must name the registrations the read could not decide',
+  )
+})
+
+test('the poller fences the retirement on when XERO WAS ASKED, not on the start of the delta window', () => {
+  // lastPollDate is the start of the period the delta covers; the read happens at its END. Fenced on
+  // the window start, every registration that posted during the preceding poll interval counted as
+  // unreadable — and on a cold cursor that interval is the 24h default.
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/payment-poller.ts'), 'utf8')
+  assert.ok(
+    src.includes('ledgerObservedBefore: pollStartedAt'),
+    'the observation instant handed to the chunk must be the pre-fetch stamp',
+  )
+  assert.ok(src.includes('windowStart: lastPollDate'), 'the WooCommerce refund window is still the delta window')
+  const blockStart = src.indexOf('--- Purchase bill payment reversals')
+  const block = src.slice(blockStart, src.indexOf('export async function pollXeroPayments', blockStart))
+  assert.ok(block.includes('ledgerObservedBefore,'), 'the retirement must be fenced on the read instant')
+  assert.equal(
+    block.indexOf('ledgerObservedBefore: windowStart'),
+    -1,
+    'the delta window start must no longer stand in for the moment Xero was asked',
+  )
+})
+
+test('markBillPaid rolls back when the accounting queue DECLINES the enqueue (round 4 #4)', () => {
+  // Round 3 moved the enqueue inside the transaction so the two writes share a fate — against a THROW.
+  // queueAccountingSyncTx does not throw when it declines, it returns FALSE, and round 3 stored that
+  // in `queued`, never read it, and committed: bill PAID in IMS, nothing queued, no FAILED row, ledger
+  // still showing the full amount outstanding.
+  const src = readFileSync(join(process.cwd(), 'app/actions/purchase-orders.ts'), 'utf8')
+  const start = src.indexOf('MARK PAID, RETIRE THE PRE-CALL REGISTRATIONS, AND QUEUE THE REPLACEMENT')
+  assert.ok(start > 0, 'the markBillPaid settlement block must exist')
+  const block = src.slice(start, src.indexOf("action: 'bill_paid'", start))
+
+  const queueAt = block.indexOf('queueAccountingSyncTx(tx,')
+  const throwAt = block.indexOf('if (!queued) throw new BillPaymentEnqueueDeclined(')
+  const txEndAt = block.indexOf('}, STOCK_TX_OPTIONS)')
+  assert.ok(queueAt > 0, 'the enqueue must still be inside the transaction')
+  assert.ok(throwAt > queueAt && throwAt < txEndAt, 'a falsy enqueue result must roll the transaction back')
+  // The escape valve stays open: a bill the ledger never received has nothing to keep in step with.
+  assert.ok(
+    block.includes('if (invoice.accountingInvoiceId) {'),
+    'the refusal must be scoped to bills the ledger actually holds',
+  )
+  // A decline is a SETTING to change, not a fault to retry, and the two must not share a message.
+  assert.ok(block.includes("action: declined ? 'bill_payment_enqueue_declined'"), 'a decline must be logged as its own event')
+  assert.match(BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE, /switched off/)
+  assert.match(BILL_PAYMENT_ENQUEUE_DECLINED_MESSAGE, /nothing was changed/i)
 })
 
 test('markBillPaid queues the replacement INSIDE the transaction that marks the bill paid (round 3 #4)', () => {

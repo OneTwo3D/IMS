@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
+
 import {
   buildXeroIdempotencyKey,
+  decideInvoicePaymentClaim,
   findInvoicePaymentsBlockedByEarlierLiveLogs,
   findInvoiceUpdatesBlockedByPendingCreate,
+  invoicePaymentDeferralMessage,
   isXeroAccountingOutboxEnabled,
 } from '@/lib/connectors/xero/sync-processor'
 
@@ -297,4 +302,189 @@ test('audit-H5: UPDATE is NOT deferred by a CREATE queued AFTER it (re-issued CR
     { id: 'update-l', type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'order-l', createdAt: tUpdate },
   ])
   assert.equal(blocked.size, 0)
+})
+
+// ---------------------------------------------------------------------------
+// AN ELECTION IS NOT AN EXCLUSION (Codex round 4 #3).
+//
+// The tests above establish that every runner computing the blocked set from THE SAME ROWS elects the
+// same winner. Round 3 then leaned on that as if it serialised the post. It does not: each runner
+// computes the set ONCE, before its claim loop, from its own snapshot, and a row that commits between
+// two snapshots is in one and not the other. "Am I the smallest?" can always be invalidated by a
+// smaller key arriving later, so no amount of agreement about ORDER produces exclusion.
+//
+// decideInvoicePaymentClaim adds the test that only ever looks BACKWARD — something else for this
+// reference is already claimed, therefore I may not be — which a later row cannot undo.
+// ---------------------------------------------------------------------------
+
+const T0 = new Date('2026-03-01T09:00:00.000Z')
+const T1 = new Date('2026-03-01T09:00:05.000Z')
+
+test('a sibling already PROCESSING blocks this entry even when this entry is the earliest (round 4 #3)', () => {
+  // THE DEFECT, in one assertion. By createdAt, `payment-early` is the winner and the round-3 rule
+  // would run it — while `payment-late` is on the wire RIGHT NOW for the same order. Both post, and
+  // the post-time capacity guard cannot see it: at the moment each read the table, neither had SYNCED.
+  const decision = decideInvoicePaymentClaim({
+    entryId: 'payment-early',
+    live: [
+      { id: 'payment-early', status: 'PENDING', createdAt: T0 },
+      { id: 'payment-late', status: 'PROCESSING', createdAt: T1 },
+    ],
+  })
+
+  assert.equal(decision.claim, false)
+  assert.equal(decision.claim === false && decision.reason, 'ANOTHER_ENTRY_IS_POSTING')
+  assert.equal(decision.claim === false && decision.blockedBy, 'payment-late')
+})
+
+test('two runners reading different rows cannot both claim, which the total order alone could not prevent', () => {
+  // The exact interleaving: runner A reads at t1 and sees only X, so X claims. A second receipt Y then
+  // commits with an EARLIER createdAt (a re-driven row keeping its original timestamp, or clock skew
+  // between app instances). Runner B reads at t2 and sees {X PROCESSING, Y PENDING}.
+  //
+  // Under "elect the minimum", B's minimum is Y — B elects ITSELF and posts alongside X. Under the
+  // backward-looking test, X's claim is a fact B cannot argue with.
+  const runnerA = decideInvoicePaymentClaim({
+    entryId: 'payment-x',
+    live: [{ id: 'payment-x', status: 'PENDING', createdAt: T1 }],
+  })
+  assert.equal(runnerA.claim, true, 'the first runner takes the slot')
+
+  const runnerB = decideInvoicePaymentClaim({
+    entryId: 'payment-y',
+    live: [
+      { id: 'payment-x', status: 'PROCESSING', createdAt: T1 },
+      { id: 'payment-y', status: 'PENDING', createdAt: T0 },
+    ],
+  })
+  assert.equal(runnerB.claim, false)
+  assert.equal(runnerB.claim === false && runnerB.reason, 'ANOTHER_ENTRY_IS_POSTING')
+  assert.equal(runnerB.claim === false && runnerB.blockedBy, 'payment-x')
+})
+
+test('an earlier PENDING sibling still defers this entry, and names it', () => {
+  // Ordering keeps its job: with nothing claimed, the earliest live entry goes first. The reason is
+  // reported separately from the exclusion because the two say different things to an operator
+  // reading the queue.
+  const decision = decideInvoicePaymentClaim({
+    entryId: 'payment-late',
+    live: [
+      { id: 'payment-early', status: 'PENDING', createdAt: T0 },
+      { id: 'payment-late', status: 'PENDING', createdAt: T1 },
+    ],
+  })
+
+  assert.equal(decision.claim, false)
+  assert.equal(decision.claim === false && decision.reason, 'AN_EARLIER_ENTRY_IS_WAITING')
+  assert.equal(decision.claim === false && decision.blockedBy, 'payment-early')
+})
+
+test('the earliest live entry claims when nothing else holds the slot', () => {
+  const decision = decideInvoicePaymentClaim({
+    entryId: 'payment-early',
+    live: [
+      { id: 'payment-early', status: 'PENDING', createdAt: T0 },
+      { id: 'payment-late', status: 'PENDING', createdAt: T1 },
+    ],
+  })
+  assert.equal(decision.claim, true)
+})
+
+test('an entry never blocks itself, so a stale claim can still be re-taken', () => {
+  // A stale reclaim reads its OWN row back as PROCESSING. Counting that as "another entry is posting"
+  // would make every stale row permanently unretryable.
+  const decision = decideInvoicePaymentClaim({
+    entryId: 'payment-x',
+    live: [{ id: 'payment-x', status: 'PROCESSING', createdAt: T0 }],
+  })
+  assert.equal(decision.claim, true)
+})
+
+test('a PROCESSING sibling blocks whether or not its claim has gone stale', () => {
+  // Staleness measures elapsed time; "dead" and "slow" do not differ by duration. The deferral costs a
+  // minute, and the stale row is itself re-claimable, so this terminates — it does not strand.
+  const decision = decideInvoicePaymentClaim({
+    entryId: 'payment-y',
+    live: [
+      { id: 'payment-stale', status: 'PROCESSING', createdAt: new Date('2020-01-01T00:00:00.000Z') },
+      { id: 'payment-y', status: 'PENDING', createdAt: T1 },
+    ],
+  })
+  assert.equal(decision.claim, false)
+  assert.equal(decision.claim === false && decision.reason, 'ANOTHER_ENTRY_IS_POSTING')
+})
+
+test('the blocking entry reported is stable under row order, not whichever the database returned first', () => {
+  const forwards = [
+    { id: 'payment-b', status: 'PROCESSING', createdAt: T1 },
+    { id: 'payment-a', status: 'PROCESSING', createdAt: T0 },
+    { id: 'payment-me', status: 'PENDING', createdAt: T1 },
+  ]
+  const backwards = [...forwards].reverse()
+  const first = decideInvoicePaymentClaim({ entryId: 'payment-me', live: forwards })
+  const second = decideInvoicePaymentClaim({ entryId: 'payment-me', live: backwards })
+  // Both rows are PROCESSING, so the answer must be the exclusion, not the ordering — and it must name
+  // the same one either way, or two operators reading the same queue are told different things.
+  assert.equal(first.claim === false && first.reason, 'ANOTHER_ENTRY_IS_POSTING')
+  assert.equal(second.claim === false && second.reason, 'ANOTHER_ENTRY_IS_POSTING')
+  assert.equal(first.claim === false && first.blockedBy, 'payment-a')
+  assert.equal(second.claim === false && second.blockedBy, 'payment-a')
+})
+
+test('the deferral message names the blocking entry and distinguishes waiting from in-flight', () => {
+  // The errorMessage is what an operator staring at a stuck queue reads. "Deferred" alone tells them
+  // nothing about whether to wait or to go and look.
+  assert.match(
+    invoicePaymentDeferralMessage({ reason: 'ANOTHER_ENTRY_IS_POSTING', blockedBy: 'log-9' }),
+    /log-9 for the same order is being sent now/,
+  )
+  assert.match(
+    invoicePaymentDeferralMessage({ reason: 'AN_EARLIER_ENTRY_IS_WAITING', blockedBy: 'log-9' }),
+    /until earlier invoice payment sync log log-9 posts/,
+  )
+})
+
+test('the claim and the exclusion test are taken together under the order row lock', () => {
+  // Structural, because the whole point is WHERE these two statements sit relative to each other. Read
+  // outside the lock, the decision is stale before it is used and the fix is cosmetic.
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
+  const start = src.indexOf('async function claimAccountingSyncLog(')
+  assert.ok(start > 0, 'the claim helper must exist')
+  const block = src.slice(start, src.indexOf('async function deferPaymentUntilEarlierLogsPost(', start))
+
+  const txAt = block.indexOf('db.$transaction(async (tx) => {')
+  const lockAt = block.indexOf('await lockSalesOrder(tx, entry.referenceId)')
+  const readAt = block.indexOf('tx.accountingSyncLog.findMany(')
+  const decideAt = block.indexOf('decideInvoicePaymentClaim({')
+  const writeAt = block.indexOf('tx.accountingSyncLog.updateMany(')
+  assert.ok(txAt > 0, 'the invoice-payment claim must open a transaction')
+  assert.ok(lockAt > txAt, 'the order row lock must be taken first')
+  assert.ok(readAt > lockAt, 'the live rows must be read UNDER the lock')
+  assert.ok(decideAt > readAt && writeAt > decideAt, 'the decision and the claim must follow, in that order')
+  // Only order-scoped invoice payments pay for the lock; nothing else is competing for a per-reference
+  // post slot, and putting an order lock in front of every journal push would be a new hazard.
+  assert.ok(
+    block.includes("entry.type !== 'INVOICE_PAYMENT' || entry.referenceType !== 'SalesOrder'"),
+    'the locked path must be scoped to order-scoped invoice payments',
+  )
+})
+
+test('both runners take the claim through the same helper — neither may claim raw', () => {
+  // The direct processor and the outbox worker are the two runners in the finding. A fix applied to
+  // one of them is not a fix.
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
+  const direct = src.slice(src.indexOf('async function processPendingXeroSyncDirect('), src.indexOf('async function processPendingXeroSyncViaOutbox('))
+  const outbox = src.slice(src.indexOf('async function processPendingXeroSyncViaOutbox('))
+  for (const [name, block] of [['direct', direct], ['outbox', outbox]] as const) {
+    assert.ok(
+      block.includes('await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)'),
+      `the ${name} runner must claim through the exclusion helper`,
+    )
+    assert.equal(
+      block.indexOf('where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff)'),
+      -1,
+      `the ${name} runner must not take a raw, unserialised claim`,
+    )
+    assert.ok(block.includes("claim.outcome === 'deferred'"), `the ${name} runner must handle a declined claim`)
+  }
 })
