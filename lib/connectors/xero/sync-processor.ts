@@ -1160,29 +1160,33 @@ export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
       status: { in: ['PENDING', 'PROCESSING'] },
       OR: referenceFilters,
     },
-    select: { id: true, referenceType: true, referenceId: true, createdAt: true },
+    // `status` is selected because this pre-filter now asks decideInvoicePaymentClaim the question
+    // rather than re-deriving a second, narrower rule of its own (round 5 #1).
+    select: { id: true, referenceType: true, referenceId: true, status: true, createdAt: true },
     // Tie-broken by id so the database's own ordering agrees with invoicePaymentLogPrecedes below.
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   })
 
-  // The minimum is taken with the SAME comparator the blocking test uses rather than trusting the
-  // query's order: two functions that disagree about which row is earliest would elect a winner that
-  // then does not block anybody, which is the tie bug again in a different place.
-  const earliestLiveByReference = new Map<string, { id: string; createdAt: Date }>()
+  // ONE RULE, ASKED TWICE (round 5 #1). Both runners consult this set AFTER taking the locked claim
+  // and defer the entry if it is a member — so a verdict here that the locked claim does not share is
+  // not a cheap pre-filter, it is a second, contradictory decider that hands the claim straight back.
+  //
+  // Round 4's local rule was "is any live row for this reference earlier than me?", which says YES for
+  // the stale PROCESSING holder that the claim had just admitted: claimed, then immediately deferred,
+  // every minute, for ever. That is the same deadlock as decideInvoicePaymentClaim's, reached through
+  // the pre-filter instead. Delegating removes the possibility of the two disagreeing at all.
+  const liveByReference = new Map<string, LiveInvoicePaymentEntry[]>()
   for (const log of liveLogs) {
     const key = invoicePaymentReferenceKey(log)
-    const incumbent = earliestLiveByReference.get(key)
-    if (!incumbent || invoicePaymentLogPrecedes(log, incumbent)) {
-      earliestLiveByReference.set(key, log)
-    }
+    const bucket = liveByReference.get(key)
+    if (bucket) bucket.push(log)
+    else liveByReference.set(key, [log])
   }
 
   const blocked = new Set<string>()
   for (const entry of paymentEntries) {
-    const earliest = earliestLiveByReference.get(invoicePaymentReferenceKey(entry))
-    // Under a TOTAL order `precedes` is already false for the winner itself; the explicit id check
-    // stays so the intent survives a future change to the comparator.
-    if (earliest && earliest.id !== entry.id && invoicePaymentLogPrecedes(earliest, entry)) {
+    const live = liveByReference.get(invoicePaymentReferenceKey(entry)) ?? []
+    if (!decideInvoicePaymentClaim({ entryId: entry.id, live }).claim) {
       blocked.add(entry.id)
     }
   }
@@ -1229,6 +1233,40 @@ export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
  * deferral, because a stale row is itself re-claimable and will be driven to SYNCED or FAILED by
  * whichever runner takes it — at which point this entry proceeds and the capacity guard judges it on
  * what that row ended up saying.
+ *
+ * AND THAT LAST SENTENCE WAS NOT TRUE AS ROUND 4 WROTE IT (Codex round 5 #1). The stale row is only
+ * re-claimable if the rules let it claim, and they did not:
+ *
+ *     S  PROCESSING, claimed fifteen minutes ago, createdAt 09:00:05
+ *     P  PENDING, createdAt 09:00:00
+ *
+ *   P asks to claim: S is PROCESSING, so ANOTHER_ENTRY_IS_POSTING — defer 60s.
+ *   S asks to re-claim: P is PENDING and precedes it, so AN_EARLIER_ENTRY_IS_WAITING — defer 60s.
+ *
+ * Each defers to the other, for ever, and the order's payment never posts. The exclusion rule and the
+ * ordering rule formed a cycle: exclusion points forward in status, ordering points backward in time,
+ * and with the two rows disagreeing on those two axes there is no member of the live set that either
+ * rule admits.
+ *
+ * THE CUT IS AT THE ORDERING RULE, NEVER AT THE EXCLUSION. Ordering exists to pick which UNCLAIMED
+ * entry goes next; a row that is ITSELF PROCESSING is not queueing for the slot, it already holds it.
+ * Applying a queue-position rule to the holder is what closed the cycle. So the holder skips the
+ * ordering test — and only that test: it still has to pass the exclusion, so it can never run
+ * alongside a different in-flight post. Nothing forward-looking is reintroduced.
+ *
+ * WHY THIS TERMINATES, as a property of the live set L for one reference rather than a hope:
+ *   • If some row of L is PROCESSING, it is the ONLY one (exclusion + the order row lock admit no
+ *     second claim), every other row is deferred by exclusion, and the holder is admitted by the
+ *     exemption above. Whoever takes it drives it to SYNCED/FAILED/CANCELLED and it leaves L.
+ *   • If no row of L is PROCESSING, the minimum under the total order has no PROCESSING sibling and
+ *     no earlier sibling, so it is admitted.
+ * L is therefore never fully blocked, and every admission ends with a row leaving L. |L| strictly
+ * decreases, which is the termination argument round 4 asserted and did not have.
+ *
+ * The exemption costs nothing in safety: `accountingSyncLogClaimWhere` is still the fence that decides
+ * whether a PROCESSING row may actually be re-taken, and it requires the claim to be older than the
+ * stale cutoff. A live worker's own row is admitted by this function and then refused by that where
+ * clause. This function decides QUEUE POSITION; the where clause decides WHO OWNS THE ROW.
  */
 export type LiveInvoicePaymentEntry = { id: string; status: string; createdAt: Date }
 
@@ -1249,6 +1287,7 @@ export function decideInvoicePaymentClaim(input: {
   live: LiveInvoicePaymentEntry[]
 }): InvoicePaymentClaimDecision {
   const others = input.live.filter((row) => row.id !== input.entryId)
+  const self = input.live.find((row) => row.id === input.entryId)
 
   // BACKWARD-LOOKING, and therefore the only test here that excludes. Ordered by the same total order
   // so the id reported is stable rather than whichever row the database happened to return first.
@@ -1257,7 +1296,15 @@ export function decideInvoicePaymentClaim(input: {
     .sort((a, b) => (invoicePaymentLogPrecedes(a, b) ? -1 : 1))[0]
   if (posting) return { claim: false, reason: 'ANOTHER_ENTRY_IS_POSTING', blockedBy: posting.id }
 
-  const self = input.live.find((row) => row.id === input.entryId)
+  // THE HOLDER OF THE SLOT IS NOT QUEUEING FOR IT (round 5 #1). Reached only when nothing ELSE is
+  // posting, so this row is the single live claim for the reference. Deferring it behind an earlier
+  // PENDING row — which is itself deferred by the exclusion above, because THIS row is the thing
+  // posting — is the deadlock: the two rules point in opposite directions and neither admits anybody.
+  // Ordering decides which unclaimed entry goes next; it has no opinion about the entry that already
+  // went. Whether this row may actually be RE-taken is `accountingSyncLogClaimWhere`'s question, and
+  // it still answers "only if the claim is stale".
+  if (self?.status === 'PROCESSING') return { claim: true }
+
   if (!self) return { claim: true }
   const earlier = others
     .filter((row) => invoicePaymentLogPrecedes(row, self))

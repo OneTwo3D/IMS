@@ -100,7 +100,7 @@ test('out-of-order INVOICE_PAYMENT entries are blocked by older live logs in one
       status: { in: ['PENDING', 'PROCESSING'] },
       OR: [{ referenceType: 'SalesOrder', referenceId: 'order-1' }],
     },
-    select: { id: true, referenceType: true, referenceId: true, createdAt: true },
+    select: { id: true, referenceType: true, referenceId: true, status: true, createdAt: true },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   })
 })
@@ -429,6 +429,79 @@ test('the blocking entry reported is stable under row order, not whichever the d
   assert.equal(second.claim === false && second.reason, 'ANOTHER_ENTRY_IS_POSTING')
   assert.equal(first.claim === false && first.blockedBy, 'payment-a')
   assert.equal(second.claim === false && second.blockedBy, 'payment-a')
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 5 #1: A STALE CLAIM AND AN EARLIER PENDING ROW DEFERRED TO EACH OTHER FOR EVER.
+//
+// Round 4 argued the exclusion terminates because "a stale row is itself re-claimable". It was not:
+// the exclusion pointed forward in status (something is PROCESSING, so I may not claim) and the
+// ordering pointed backward in time (something older is waiting, so I may not claim), and with the
+// stale claim being the NEWER row the two rules admitted nobody. Not a slow queue — a stopped one.
+//
+// The cut is at the ordering rule only. The holder of the slot is not queueing for the slot.
+// ---------------------------------------------------------------------------
+
+const T_STALE = new Date('2026-03-01T09:00:05.000Z')
+const T_EARLIER = new Date('2026-03-01T09:00:00.000Z')
+
+test('a stale PROCESSING holder is not deferred behind the earlier PENDING row that is deferred behind IT (round 5 #1)', () => {
+  // THE DEADLOCK, both halves in one test. Under round 4, BOTH of these were `claim: false`, so the
+  // order's payment never posted no matter how many times either runner came back.
+  const live = [
+    { id: 'payment-earlier', status: 'PENDING', createdAt: T_EARLIER },
+    { id: 'payment-stale', status: 'PROCESSING', createdAt: T_STALE },
+  ]
+
+  const holder = decideInvoicePaymentClaim({ entryId: 'payment-stale', live })
+  assert.equal(holder.claim, true, 'the row that already holds the slot must be admitted, or nothing ever moves')
+
+  // And the other half is UNCHANGED: the earlier row still refuses to post alongside an in-flight one.
+  // Termination must not be bought by letting both of them run.
+  const waiter = decideInvoicePaymentClaim({ entryId: 'payment-earlier', live })
+  assert.equal(waiter.claim, false)
+  assert.equal(waiter.claim === false && waiter.reason, 'ANOTHER_ENTRY_IS_POSTING')
+  assert.equal(waiter.claim === false && waiter.blockedBy, 'payment-stale')
+})
+
+test('the holder exemption does not let a holder post alongside a DIFFERENT in-flight entry', () => {
+  // The counter-guard. If the exemption had been written above the exclusion test — "I am PROCESSING,
+  // therefore I claim" — two PROCESSING rows would each admit themselves and both post. Exclusion
+  // still runs first, so a second in-flight entry refuses this one however stale its own claim is.
+  const decision = decideInvoicePaymentClaim({
+    entryId: 'payment-stale',
+    live: [
+      { id: 'payment-other', status: 'PROCESSING', createdAt: T_EARLIER },
+      { id: 'payment-stale', status: 'PROCESSING', createdAt: T_STALE },
+    ],
+  })
+  assert.equal(decision.claim, false)
+  assert.equal(decision.claim === false && decision.reason, 'ANOTHER_ENTRY_IS_POSTING')
+  assert.equal(decision.claim === false && decision.blockedBy, 'payment-other')
+})
+
+test('the run-snapshot pre-filter does not hand the holder its claim straight back (round 5 #1)', async () => {
+  // The second half of the deadlock, and the one that survives a fix confined to the decision helper:
+  // both runners take the locked claim and THEN consult this set, deferring the entry if it is a
+  // member. Round 4's local "is anything live earlier than me?" rule said yes for the stale holder, so
+  // the holder was claimed and immediately deferred on every pass.
+  const client = {
+    accountingSyncLog: {
+      findMany: async () => [
+        { id: 'payment-earlier', status: 'PENDING', referenceType: 'SalesOrder', referenceId: 'order-1', createdAt: T_EARLIER },
+        { id: 'payment-stale', status: 'PROCESSING', referenceType: 'SalesOrder', referenceId: 'order-1', createdAt: T_STALE },
+      ],
+    },
+  }
+
+  const blocked = await findInvoicePaymentsBlockedByEarlierLiveLogs(client as never, [
+    { id: 'payment-stale', type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'order-1', createdAt: T_STALE },
+    { id: 'payment-earlier', type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'order-1', createdAt: T_EARLIER },
+  ])
+
+  // Exactly the two verdicts decideInvoicePaymentClaim reaches — the pre-filter may not disagree with
+  // the decider that authorised the claim.
+  assert.deepEqual([...blocked], ['payment-earlier'])
 })
 
 test('the deferral message names the blocking entry and distinguishes waiting from in-flight', () => {
