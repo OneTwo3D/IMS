@@ -18,7 +18,7 @@ import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuIte
 import {
   updateSalesOrderStatus, createRefund, retryRefundAccounting, cloneSalesOrder, deleteSalesOrder,
   updateSalesOrderNotes, generateInvoiceNumber,
-  addPayment, deletePayment, releaseWithdrawalHold,
+  addPayment, deletePayment, reverseLedgerPayment, releaseWithdrawalHold,
   type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
 import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
@@ -39,6 +39,7 @@ import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
+import { useStepUpReauth, isFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
 import { hasPermission } from '@/lib/permissions'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
@@ -862,6 +863,14 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const [showPayment, setShowPayment] = useState<{ refundId?: string; creditNoteNumber?: string } | null>(null)
   const [visibleCols, setVisibleCols] = useState<Set<OptCol>>(new Set())
   const [error, setError] = useState('')
+  const { promptReauth, stepUpDialog } = useStepUpReauth()
+  /**
+   * o3d-1vuv: a refusal from deletePayment, shown NEXT TO the receipt it refused rather than in the
+   * page-level error line far above the payments block. A refusal whose remedy is a button is
+   * useless if the operator cannot see both at once — and until this change the result of
+   * deletePayment was DISCARDED entirely, so the refusal would not have appeared anywhere at all.
+   */
+  const [paymentRefusal, setPaymentRefusal] = useState<{ paymentId: string; message: string; code?: string } | null>(null)
   const [allocations, setAllocations] = useState<AllocationRow[]>(initialAllocations)
   const [shipments, setShipments] = useState<ShipmentRow[]>(initialShipments)
   const requirementsByLine = new Map(fulfillmentRequirements.map((row) => [row.lineId, row.requirements]))
@@ -1322,6 +1331,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       )}
 
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {/* o3d-1vuv: reverseLedgerPayment takes a FRESH session, so the step-up prompt has to be mounted. */}
+      {stepUpDialog}
 
       {/* Header info */}
       <div className="rounded-md border p-4 grid grid-cols-1 md:grid-cols-2 gap-x-8 gap-y-3 text-sm">
@@ -1627,18 +1638,65 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
             {so.payments.filter((p) => !p.refundId).length > 0 && (
               <div className="mt-2 space-y-1">
                 {so.payments.filter((p) => !p.refundId).map((p) => (
-                  <div key={p.id} className="flex items-center justify-between text-xs">
-                    <div className="flex items-center gap-2">
-                      <span className="text-muted-foreground">{formatDateTime(p.paidAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
-                      {p.method && <span className="text-muted-foreground">{p.method}</span>}
-                      {p.reference && <span className="font-mono text-muted-foreground">{p.reference}</span>}
+                  <div key={p.id} className="space-y-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <div className="flex items-center gap-2">
+                        <span className="text-muted-foreground">{formatDateTime(p.paidAt, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                        {p.method && <span className="text-muted-foreground">{p.method}</span>}
+                        {p.reference && <span className="font-mono text-muted-foreground">{p.reference}</span>}
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-mono font-medium">{money(p.amount)}</span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!confirm('Delete this payment?')) return
+                            setPaymentRefusal(null)
+                            startTransition(async () => {
+                              // o3d-1vuv: the result used to be DISCARDED, so a refusal — and before
+                              // this change, the "reverse this in the ledger by hand" warning — reached
+                              // nobody. It is now shown against the receipt it refused.
+                              const result = await deletePayment(p.id, so.id)
+                              if (result.success) { router.refresh(); return }
+                              setPaymentRefusal({ paymentId: p.id, message: result.error ?? 'Failed to delete the payment.', code: result.code })
+                            })
+                          }}
+                          className="text-muted-foreground hover:text-destructive"
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </div>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono font-medium">{money(p.amount)}</span>
-                      <button type="button" onClick={() => { if (confirm('Delete this payment?')) startTransition(async () => { await deletePayment(p.id, so.id); router.refresh() }) }} className="text-muted-foreground hover:text-destructive">
-                        <Trash2 className="h-3 w-3" />
-                      </button>
-                    </div>
+                    {paymentRefusal?.paymentId === p.id && (
+                      <div className="rounded border border-destructive/40 bg-destructive/5 p-2 space-y-2">
+                        <p className="text-xs text-destructive whitespace-pre-line">{paymentRefusal.message}</p>
+                        {paymentRefusal.code === 'ledger_holds_payment' && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="h-6 text-xs"
+                            disabled={isPending}
+                            onClick={() => startTransition(async () => {
+                              // IMS asks the accounting system whether the payment is really gone; it
+                              // does NOT take this click as a claim that it is. A refusal here names
+                              // what the ledger actually said.
+                              const run = () => reverseLedgerPayment(p.id, so.id)
+                              let result = await run()
+                              if (isFreshAuthFailure(result) && await promptReauth()) result = await run()
+                              if (isFreshAuthFailure(result)) {
+                                setPaymentRefusal({ paymentId: p.id, message: 'Sign in again to confirm a ledger reversal.' })
+                                return
+                              }
+                              if (result.success) { setPaymentRefusal(null); router.refresh(); return }
+                              setPaymentRefusal({ paymentId: p.id, message: result.error, code: result.code })
+                            })}
+                          >
+                            {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
+                            I have reversed it — check and delete
+                          </Button>
+                        )}
+                      </div>
+                    )}
                   </div>
                 ))}
               </div>
@@ -1695,7 +1753,22 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                       </div>
                       <div className="flex items-center gap-2">
                         <span className="font-mono">{money(p.amount)}</span>
-                        <button type="button" onClick={() => { if (confirm('Delete?')) startTransition(async () => { await deletePayment(p.id, so.id); router.refresh() }) }} className="text-muted-foreground hover:text-destructive"><Trash2 className="h-3 w-3" /></button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (!confirm('Delete?')) return
+                            setError('')
+                            startTransition(async () => {
+                              // A credit-note receipt settles a CREDIT NOTE, not this invoice, so it
+                              // has no INVOICE_PAYMENT registration and never hits the ledger-hold
+                              // refusal. It can still fail, and the failure used to be discarded.
+                              const result = await deletePayment(p.id, so.id)
+                              if (result.success) { router.refresh(); return }
+                              setError(result.error ?? 'Failed to delete the payment.')
+                            })
+                          }}
+                          className="text-muted-foreground hover:text-destructive"
+                        ><Trash2 className="h-3 w-3" /></button>
                       </div>
                     </div>
                   ))}

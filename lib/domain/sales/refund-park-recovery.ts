@@ -1,0 +1,437 @@
+/**
+ * o3d-54p — OPERATOR RECOVERY for a STALE CROSS-ORDER WooCommerce refund park.
+ *
+ * THE STUCK STATE THIS EXISTS FOR.
+ *
+ * o3d-ee9/o3d-7yf made the refund CREATE and the park CREATE serialise on one advisory lock
+ * (`hashtext('wc_refund:'||id)`) and, under it, fail CLOSED whenever the external refund id is
+ * already parked as an actionable WooCommerce refund for a DIFFERENT order. Failing closed is the
+ * right AUTOMATIC behaviour — silently resolving or moving a foreign park would destroy one order's
+ * durable refund evidence and mis-block the other. But it left no way out of a park that is
+ * genuinely stale (a bad historical order-link association, an order rebind, an import anomaly):
+ *
+ *   • createSalesOrderRefund for the TRUE owner throws on the foreign park, every time;
+ *   • syncWcRefund refuses the same way, every sweep;
+ *   • retryRefundSyncPark can only re-fetch the park's OWN recorded order — for a park sitting on
+ *     the wrong order that fetch cannot contain the refund, so the retry can never resolve it and
+ *     never reassign it;
+ *   • actionable parks are retention-exempt (lib/data-retention.ts) and block the order delete
+ *     guard (lib/domain/sales/order-delete-guard.ts) and the store-URL rebind (app/actions/wc-sync.ts).
+ *
+ * So the refund, its credit note and its restock are blocked indefinitely, and both orders are
+ * undeletable, with no operator act that can change any of it. That is the shape this session kept
+ * finding: a refusal with no reachable remedy.
+ *
+ * WHAT THE OPERATOR MAY NOW ASSERT, AND WHAT VERIFIES IT.
+ *
+ *   { outcome: 'REASSIGN', wcOrderId }  "this refund belongs to WooCommerce order N, not here"
+ *   { outcome: 'DISMISS',  reason? }    "WooCommerce no longer has this refund on this order"
+ *
+ * Unlike o3d-nf9i's accounting settlement — where the fact (did the ledger take it?) is genuinely
+ * uncomputable and the operator's word is the only source — WooCommerce IS the authority on which
+ * order a refund belongs to, and it can be asked. So this action does NOT take the operator's word
+ * for the ownership fact. It takes their word for WHICH ORDER TO CHECK, then checks it against
+ * FRESH source data and refuses when the answer contradicts them. That is the settled rule
+ * "verified evidence outranks an unverifiable assertion" applied where the evidence is reachable.
+ *
+ * The operator's assertion is still recorded with their name on it, because WHAT TO DO about a
+ * genuine anomaly (move it, or write it off) is theirs and not the system's — and this module
+ * prescribes nothing about which to choose.
+ *
+ * Pure functions only, exactly as connector-orphans.ts and sync-row-settlement.ts are, so the
+ * decision vocabulary is unit-testable without a database or a WooCommerce store.
+ */
+
+/**
+ * The park statuses an operator may recover.
+ *
+ * These are precisely the ACTIONABLE statuses — the set carried by the partial unique index
+ * `shopping_sync_logs_active_refund_park_uq`, by REFUND_PARK_WHERE in the exception inbox, by the
+ * order delete guard, and by the retention exemption. A park in any of them is blocking something;
+ * a park outside them is already resolved and is not this action's business.
+ *
+ * QUARANTINED is included deliberately. It is the o3d-iup "monetary-only refund on a non-uniformly
+ * taxed order" refusal — but the tax profile it was refused against is the profile of the order the
+ * park is sitting on, which is exactly what is in question here. A quarantine computed against the
+ * WRONG order carries no information about the right one.
+ */
+export const RECOVERABLE_REFUND_PARK_STATUSES = ['PENDING', 'FAILED', 'QUARANTINED'] as const
+
+export type RecoverableRefundParkStatus = (typeof RECOVERABLE_REFUND_PARK_STATUSES)[number]
+
+export function isRecoverableRefundParkStatus(status: string): status is RecoverableRefundParkStatus {
+  return (RECOVERABLE_REFUND_PARK_STATUSES as readonly string[]).includes(status)
+}
+
+/**
+ * The status a resolved park carries.
+ *
+ * SYNCED is not a claim that this refund posted — it is this table's established "an operator
+ * resolved it" terminal, and lib/data-retention.ts says so in as many words ("It must persist until
+ * an operator resolves it (which flips it to SYNCED, after which it expires normally)").
+ * resolveActionableParks and retryRefundSyncPark already write it for the same purpose.
+ *
+ * The DIFFERENCE between "the refund landed" and "the park was dismissed" is carried in
+ * errorMessage: a landing CLEARS it to null, a dismissal REPLACES it with the recovery note. So a
+ * SYNCED park with a non-null errorMessage beginning REFUND_PARK_RECOVERY_NOTE_PREFIX is a
+ * dismissal and reads as one, without a new enum value rippling through the partial unique index,
+ * the delete guard, the retention predicate and every dashboard that knows this enum.
+ */
+export const RESOLVED_REFUND_PARK_STATUS = 'SYNCED' as const
+
+/**
+ * The status a REASSIGNED park lands on.
+ *
+ * PENDING, not the status it had: the park's recorded failure was computed against the wrong order,
+ * so carrying it across would describe the new owner with the old order's arithmetic. PENDING is
+ * also the only actionable status the refund sweep's dedup does NOT skip (syncWcRefund treats a
+ * QUARANTINED park as handled), so the reassigned park is immediately retryable on its true owner —
+ * which is the whole point of moving it rather than deleting it.
+ */
+export const REASSIGNED_REFUND_PARK_STATUS = 'PENDING' as const
+
+/** Every recovery note starts with this, so a resolved park's provenance is greppable. */
+export const REFUND_PARK_RECOVERY_NOTE_PREFIX = 'Recovered by operator:'
+
+export type RefundParkRecoveryAssertion =
+  | { outcome: 'REASSIGN'; wcOrderId: number }
+  | { outcome: 'DISMISS'; reason?: string }
+
+export type RefundParkRecoveryOutcome = RefundParkRecoveryAssertion['outcome']
+
+export type RefundParkRecoveryRefusalCode =
+  /** The row is not (or is no longer) an actionable refund park. */
+  | 'park_not_actionable'
+  /** The row is gone, or moved off the order the operator was looking at, between view and write. */
+  | 'park_moved'
+  /** The operator named the order the park is ALREADY on. */
+  | 'asserted_order_is_parked_order'
+  /** WooCommerce could not be asked. Nothing was changed. */
+  | 'wc_lookup_failed'
+  /** WooCommerce lists this refund on the parked order after all — the park is not stale. */
+  | 'wc_confirms_current_owner'
+  /** WooCommerce does not list this refund on the order the operator named. */
+  | 'refund_not_in_asserted_order'
+  /** That WooCommerce order is not linked to any IMS order, so there is nothing to reassign to. */
+  | 'asserted_order_not_linked'
+  /** The parked order has no WooCommerce link, so a dismissal cannot be verified against WC. */
+  | 'parked_order_not_linked'
+  /** A SalesOrderRefund for this refund now exists on the parked order — this is not a stale park. */
+  | 'refund_already_landed'
+  /** A SalesOrderRefund for this refund exists on some OTHER order than the reassign target. */
+  | 'refund_landed_elsewhere'
+  /** The target order was deleted under us; a park must never be written onto a gone order. */
+  | 'target_order_missing'
+  /** The supplied arguments are not a recovery this action understands. */
+  | 'unrecognised_outcome'
+
+export type RefundParkRecoveryRefusal = { code: RefundParkRecoveryRefusalCode; message: string }
+
+/** The subset of the park row every decision below is made against. */
+export type RefundParkView = {
+  id: string
+  status: string
+  /** The IMS order the park currently sits on. Never null for a refund park (index predicate). */
+  entityId: string
+  /** The WooCommerce refund id, as stored (a string column). */
+  externalId: string
+}
+
+/**
+ * What WooCommerce said, just now, about one order's refunds.
+ *
+ * `refundIds` is the COMPLETE list WooCommerce returned for that order. An empty list is a real
+ * answer ("that order has no refunds"), which is why a failed fetch must be represented as a
+ * refusal and never as an empty evidence object — see refuseOnLookupFailure.
+ */
+export type WcOrderRefundEvidence = {
+  wcOrderId: number
+  refundIds: readonly number[]
+  fetchedAt: Date
+}
+
+export function wcOrderListsRefund(evidence: WcOrderRefundEvidence, externalRefundId: number): boolean {
+  return evidence.refundIds.includes(externalRefundId)
+}
+
+function trimmed(value: string | null | undefined): string {
+  return typeof value === 'string' ? value.trim() : ''
+}
+
+/**
+ * Whether the per-row recovery control applies at all, and the reason when it does not.
+ *
+ * ONE implementation, so the exception inbox and the server action cannot disagree about which rows
+ * get a control — a row offered a button it cannot use looks identical to one that works until it
+ * is clicked. This is a UI AFFORDANCE, not a permission and not a guarantee: whether a recovery
+ * lands is decided at write time, under the per-refund advisory lock, against the state then.
+ */
+export function describeRefundParkRecoverability(
+  row: { status: string; externalId: string | null; entityId: string | null },
+): { recoverable: boolean; notRecoverableReason: string | null } {
+  if (!isRecoverableRefundParkStatus(row.status)) {
+    return {
+      recoverable: false,
+      notRecoverableReason:
+        `This park is ${row.status}: it is already resolved, so there is nothing blocking the refund `
+        + 'and nothing to recover.',
+    }
+  }
+  if (!trimmed(row.externalId)) {
+    return {
+      recoverable: false,
+      notRecoverableReason:
+        'This row records no WooCommerce refund id, so there is no refund to look up in WooCommerce and '
+        + 'no ownership question to answer.',
+    }
+  }
+  if (!trimmed(row.entityId)) {
+    return {
+      recoverable: false,
+      notRecoverableReason:
+        'This row is not attached to an order, so it is not a refund park — it cannot be blocking one '
+        + "order's refund on behalf of another.",
+    }
+  }
+  return { recoverable: true, notRecoverableReason: null }
+}
+
+/**
+ * What the operator needs to know BEFORE asserting. Facts, not a recommendation — the choice
+ * between moving a refund and writing the park off is theirs.
+ */
+export function describeRefundParkRecoveryCaveat(outcome: RefundParkRecoveryOutcome): string {
+  if (outcome === 'REASSIGN') {
+    return 'IMS will ask WooCommerce which refunds that order actually has, right now, and refuse if this '
+      + 'refund is not one of them. If it is, the park moves to that order as PENDING and becomes '
+      + 'retryable there — the refund itself has still not been applied, and the credit note and restock '
+      + 'have still not posted.'
+  }
+  return 'IMS will ask WooCommerce which refunds THIS order actually has, right now, and refuse if this '
+    + 'refund is still one of them. Dismissing only removes a park WooCommerce contradicts — it does not '
+    + 'apply the refund anywhere. If the money did leave the business, the refund still has to reach its '
+    + 'true order, so reassign it instead wherever that order is known.'
+}
+
+// ---------------------------------------------------------------------------
+// Refusals
+// ---------------------------------------------------------------------------
+
+export function refuseOnLookupFailure(wcOrderId: number, error: string | undefined): RefundParkRecoveryRefusal {
+  return {
+    code: 'wc_lookup_failed',
+    message:
+      `WooCommerce could not be asked about order ${wcOrderId}, so nothing was changed and the park is `
+      + `exactly as it was${error ? ` (${error})` : ''}. This recovery is only ever made against a fresh `
+      + 'answer from WooCommerce — it will not fall back to the payload stored on the park, which is the '
+      + 'evidence that is in doubt.',
+  }
+}
+
+/**
+ * The verified refusals for a REASSIGN, in the order that produces the most useful message.
+ *
+ * `parkedOrderEvidence` may be null: a parked order with no WooCommerce link cannot be asked about,
+ * and that does not block a reassign — the assertion is about the TARGET order, and the target's own
+ * evidence is what establishes ownership.
+ */
+export function refuseReassign(input: {
+  park: RefundParkView
+  externalRefundId: number
+  /** Fresh evidence for the order the operator named. */
+  targetEvidence: WcOrderRefundEvidence
+  /** The IMS order that WooCommerce order maps to, or null when nothing links to it. */
+  targetOrderId: string | null
+  /** The order that already holds a SalesOrderRefund for this refund id, if any. */
+  landedOnOrderId: string | null
+}): RefundParkRecoveryRefusal | null {
+  const { park, externalRefundId, targetEvidence, targetOrderId, landedOnOrderId } = input
+
+  if (!wcOrderListsRefund(targetEvidence, externalRefundId)) {
+    return {
+      code: 'refund_not_in_asserted_order',
+      message:
+        `WooCommerce does not list refund ${externalRefundId} on order ${targetEvidence.wcOrderId}. `
+        + `That order has ${targetEvidence.refundIds.length === 0 ? 'no refunds at all' : `refunds ${targetEvidence.refundIds.join(', ')}`}. `
+        + 'Nothing was changed. Open the refund in WooCommerce and read its parent order number off the '
+        + 'refund itself before asserting one here.',
+    }
+  }
+  if (!targetOrderId) {
+    return {
+      code: 'asserted_order_not_linked',
+      message:
+        `WooCommerce order ${targetEvidence.wcOrderId} does have refund ${externalRefundId}, but no IMS `
+        + 'order is linked to it, so there is no order to move the park to. Import or re-link that order '
+        + 'first, then recover this park.',
+    }
+  }
+  if (targetOrderId === park.entityId) {
+    return {
+      code: 'asserted_order_is_parked_order',
+      message:
+        'That WooCommerce order is the one this park is already on, so WooCommerce agrees with the park '
+        + 'and there is nothing stale to recover. Use Retry to re-attempt the refund here.',
+    }
+  }
+  if (landedOnOrderId && landedOnOrderId === park.entityId) {
+    return {
+      code: 'refund_already_landed',
+      message:
+        `Refund ${externalRefundId} has already been applied to the order this park is on, so the park is `
+        + 'a leftover rather than a cross-order anomaly. Use Retry, which resolves a park whose refund has '
+        + 'landed.',
+    }
+  }
+  if (landedOnOrderId && landedOnOrderId !== targetOrderId) {
+    return {
+      code: 'refund_landed_elsewhere',
+      message:
+        `Refund ${externalRefundId} is already recorded against IMS order ${landedOnOrderId}, which is `
+        + 'neither this park\'s order nor the one you named. Nothing was changed: moving the park would '
+        + 'point a third order at a refund that is already accounted for somewhere else. Resolve that '
+        + 'contradiction before recovering this park.',
+    }
+  }
+  if (landedOnOrderId && landedOnOrderId === targetOrderId) {
+    return {
+      code: 'refund_landed_elsewhere',
+      message:
+        `Refund ${externalRefundId} has already been applied to IMS order ${targetOrderId} — the order you `
+        + 'named — so moving this park there would re-open work that is already done. Dismiss the park '
+        + 'instead: WooCommerce will confirm it does not belong on the order it is sitting on.',
+    }
+  }
+  return null
+}
+
+/** The verified refusals for a DISMISS. */
+export function refuseDismiss(input: {
+  park: RefundParkView
+  externalRefundId: number
+  /** Fresh evidence for the PARKED order — the only thing a dismissal is verified against. */
+  parkedEvidence: WcOrderRefundEvidence | null
+  landedOnOrderId: string | null
+}): RefundParkRecoveryRefusal | null {
+  const { park, externalRefundId, parkedEvidence, landedOnOrderId } = input
+
+  if (!parkedEvidence) {
+    return {
+      code: 'parked_order_not_linked',
+      message:
+        'This park\'s order has no WooCommerce link, so WooCommerce cannot be asked whether the refund '
+        + 'belongs to it and the dismissal cannot be verified. Nothing was changed. Reassign the park to '
+        + 'the WooCommerce order that really holds this refund instead.',
+    }
+  }
+  if (wcOrderListsRefund(parkedEvidence, externalRefundId)) {
+    return {
+      code: 'wc_confirms_current_owner',
+      message:
+        `WooCommerce still lists refund ${externalRefundId} on order ${parkedEvidence.wcOrderId}, which is `
+        + 'the order this park is on. The park is not stale — it is a refund that has not been applied '
+        + 'yet. Nothing was changed; use Retry.',
+    }
+  }
+  if (landedOnOrderId && landedOnOrderId === park.entityId) {
+    return {
+      code: 'refund_already_landed',
+      message:
+        `Refund ${externalRefundId} has already been applied to this park's own order, so this is a `
+        + 'leftover park rather than a false one. Use Retry, which resolves it against the refund that '
+        + 'landed.',
+    }
+  }
+  return null
+}
+
+// ---------------------------------------------------------------------------
+// What each outcome writes
+// ---------------------------------------------------------------------------
+
+/**
+ * The note written onto the park, and repeated in the audit.
+ *
+ * It states the VERIFIED fact and the operator's act separately, because they are separate things:
+ * WooCommerce supplied the ownership, the operator supplied the decision.
+ */
+export function refundParkRecoveryNote(
+  assertion: RefundParkRecoveryAssertion,
+  evidence: WcOrderRefundEvidence,
+  externalRefundId: number,
+): string {
+  if (assertion.outcome === 'REASSIGN') {
+    return `${REFUND_PARK_RECOVERY_NOTE_PREFIX} reassigned from a stale cross-order park. WooCommerce `
+      + `confirmed refund ${externalRefundId} on order ${evidence.wcOrderId} at `
+      + `${evidence.fetchedAt.toISOString()}. The refund has NOT been applied yet — retry it here.`
+  }
+  const reason = trimmed(assertion.reason)
+  return `${REFUND_PARK_RECOVERY_NOTE_PREFIX} dismissed as a stale cross-order park. WooCommerce order `
+    + `${evidence.wcOrderId} did NOT list refund ${externalRefundId} at ${evidence.fetchedAt.toISOString()}, `
+    + `so this park does not describe this order.${reason ? ` ${reason}` : ''}`
+}
+
+/**
+ * The patch for a REASSIGN.
+ *
+ * `payload` is DELIBERATELY ABSENT — not cleared. It holds the WooCommerce refund body the original
+ * delivery parked, which is the same refund whichever order it belongs to, and it is the only copy
+ * IMS has of what WooCommerce sent. Destroying it as a side effect of correcting the order link
+ * would throw away evidence about a refund whose money has already left the business.
+ *
+ * The row keeps its id, so the exception inbox shows one row that MOVED rather than one that
+ * vanished and another that appeared — and the partial unique index is untouched, because it is
+ * keyed on (connector, externalId), neither of which changes.
+ */
+export function buildRefundParkReassignData(targetOrderId: string, note: string, now: Date) {
+  return {
+    entityId: targetOrderId,
+    status: REASSIGNED_REFUND_PARK_STATUS,
+    errorMessage: note,
+    syncedAt: now,
+  }
+}
+
+/**
+ * The patch for a DISMISS.
+ *
+ * entityId is left alone: the park stays attached to the order it was wrongly recorded against, so
+ * the false association remains readable in the activity log and on the row itself. Only its
+ * ACTIONABILITY is removed — which is what unblocks the true owner's refund create, the two orders'
+ * deletes and the store rebind.
+ */
+export function buildRefundParkDismissData(note: string, now: Date) {
+  return {
+    status: RESOLVED_REFUND_PARK_STATUS,
+    errorMessage: note,
+    syncedAt: now,
+  }
+}
+
+/**
+ * Whether a resolved park was dismissed by an operator rather than resolved by a refund landing.
+ * Exported for readers (and tests) that must tell the two apart without re-deriving the convention.
+ */
+export function isDismissedRefundPark(row: { status: string; errorMessage: string | null }): boolean {
+  return row.status === RESOLVED_REFUND_PARK_STATUS
+    && trimmed(row.errorMessage).startsWith(REFUND_PARK_RECOVERY_NOTE_PREFIX)
+}
+
+/** Server actions take untrusted arguments; narrow to the domain union or reject. */
+export function normalizeRefundParkRecoveryAssertion(input: unknown): RefundParkRecoveryAssertion | null {
+  if (!input || typeof input !== 'object') return null
+  const candidate = input as { outcome?: unknown; wcOrderId?: unknown; reason?: unknown }
+  if (candidate.outcome === 'REASSIGN') {
+    // A non-integer would reach the WooCommerce URL as `NaN` and fetch a 404 that this action would
+    // then report as "WooCommerce could not be asked" — a refusal that names the wrong cause.
+    if (typeof candidate.wcOrderId !== 'number' || !Number.isSafeInteger(candidate.wcOrderId) || candidate.wcOrderId <= 0) {
+      return null
+    }
+    return { outcome: 'REASSIGN', wcOrderId: candidate.wcOrderId }
+  }
+  if (candidate.outcome === 'DISMISS') {
+    if (candidate.reason !== undefined && typeof candidate.reason !== 'string') return null
+    return { outcome: 'DISMISS', ...(candidate.reason ? { reason: candidate.reason } : {}) }
+  }
+  return null
+}

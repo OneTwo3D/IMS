@@ -9,7 +9,30 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { logActivity } from '@/lib/activity-log'
 import { entersFulfilment, reconcileAllocationBeforeFulfilment, recordShortfallUnderLock } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireAuth, requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
+import { xeroGet } from '@/lib/connectors/xero/api'
+import {
+  HOLD_MOVED_REFUSAL,
+  NO_LEDGER_HOLD_REFUSAL,
+  PAYMENT_REGISTRATION_TYPE,
+  REGISTRATION_IN_FLIGHT_REFUSAL,
+  RETIRABLE_REGISTRATION_STATUSES,
+  UNVERIFIABLE_IN_FLIGHT_REFUSAL,
+  VERIFIABLE_REVERSAL_CONNECTORS,
+  buildVerifiedReversalData,
+  describeLedgerHoldRefusal,
+  hasPostEvidence,
+  isReversedInLedger,
+  ledgerReversalNote,
+  refuseLedgerLookupFailure,
+  refuseLedgerStillHolds,
+  refuseUnverifiableConnector,
+  splitPaymentRegistrations,
+  type LedgerReversalRefusalCode,
+  type PaymentDeleteRefusalCode,
+  type PaymentRegistrationRow,
+} from '@/lib/domain/accounting/payment-ledger-hold'
 import {
   queueAccountingSync,
   queueAccountingSyncTx,
@@ -3515,7 +3538,117 @@ export async function addPayment(input: {
   }
 }
 
-export async function deletePayment(paymentId: string, orderId: string): Promise<{ success: boolean; error?: string }> {
+/**
+ * o3d-1vuv: a refusal raised from INSIDE a payment transaction.
+ *
+ * IT MUST THROW, NOT RETURN. Returning from a Prisma interactive transaction COMMITS it — so a
+ * refusal that `return`s after the retirement updateMany has already run would leave those
+ * registrations CANCELLED while telling the operator nothing was changed: some of a receipt's
+ * ledger registrations retired, the receipt itself still there, and no record of the half-write.
+ * Throwing is what makes "nothing was changed" true, and the two callers translate it back into
+ * their own typed refusal at the boundary.
+ */
+class PaymentTransactionRefusal extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message)
+    this.name = 'PaymentTransactionRefusal'
+  }
+}
+
+/**
+ * The INVOICE_PAYMENT registrations that NAME this receipt.
+ *
+ * o3d-1vuv: the query deliberately admits a row in ANY status that carries a document id, not just
+ * the live ones. The remote call is made BEFORE the result is written back (o3d-ju8t), so a FAILED
+ * registration can sit in front of a real payment in the ledger — and post evidence outranks status
+ * everywhere else in this codebase, so it must here too.
+ *
+ * Matching is by the payload's own paymentId and never by amount: an imported paid order carries a
+ * perfectly legitimate INVOICE_PAYMENT with no local Payment row behind it, and a row that names no
+ * payment is nobody's to retract (Codex, PR #582 round 2).
+ */
+async function readPaymentRegistrations(
+  client: Pick<typeof db, 'accountingSyncLog'>,
+  orderId: string,
+  paymentId: string,
+): Promise<PaymentRegistrationRow[]> {
+  const rows = await client.accountingSyncLog.findMany({
+    where: {
+      type: PAYMENT_REGISTRATION_TYPE,
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+      OR: [
+        { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
+        { externalTransactionId: { not: null } },
+      ],
+    },
+    select: { id: true, connector: true, status: true, externalTransactionId: true, payload: true },
+  })
+  return rows
+    .filter((row) => payloadPaymentId(row.payload) === paymentId)
+    .map(({ id, connector, status, externalTransactionId }) => ({ id, connector, status, externalTransactionId }))
+}
+
+/**
+ * Remove the Payment row and settle paidAt. ONE implementation, shared by the ordinary delete and by
+ * the verified ledger reversal, so the two cannot disagree about when an order stops being paid.
+ */
+async function removePaymentAndSettlePaidAt(
+  tx: Prisma.TransactionClient,
+  input: {
+    paymentId: string
+    orderId: string
+    refundId: string | null
+    currency: string
+    totalForeign: unknown
+    paidAt: Date | null
+  },
+): Promise<boolean> {
+  await tx.payment.delete({ where: { id: input.paymentId } })
+  if (input.refundId) return false
+  const remainingPayments = await tx.payment.findMany({
+    where: { orderId: input.orderId, refundId: null },
+    select: { amount: true, currency: true },
+  })
+  const totalPaid = remainingPayments.reduce((sum, p) => {
+    if (p.currency !== input.currency) return sum
+    return sum + Number(p.amount)
+  }, 0)
+  const stillFullyPaid = totalPaid >= Number(input.totalForeign) - 0.0001
+  // Only a genuine paid → not-paid transition is a mismatch. An order that was never fully paid
+  // (e.g. shipped on credit terms) isn't flagged just because a partial payment was removed.
+  const becameUnpaid = input.paidAt !== null && !stillFullyPaid
+  await tx.salesOrder.update({
+    where: { id: input.orderId },
+    data: { paidAt: stillFullyPaid ? undefined : null },
+  })
+  return becameUnpaid
+}
+
+export type DeletePaymentResult = { success: boolean; error?: string; code?: PaymentDeleteRefusalCode }
+
+/**
+ * Delete a locally-recorded receipt — and REFUSE while the accounting system still holds a payment
+ * for it (o3d-1vuv).
+ *
+ * WHAT CHANGED, AND WHY IT IS A REFUSAL RATHER THAN A LOUDER WARNING.
+ *
+ * This used to succeed whatever state the INVOICE_PAYMENT registration was in: it deleted the local
+ * Payment, cleared paidAt, and logged `payment_external_reversal_required` — a WARNING asking
+ * somebody to reverse the payment in the connector by hand. The ledger went on showing the invoice
+ * settled. PR #582 made that visible as LEDGER_UNMATCHED; visible is not resolved, and a wrong
+ * figure in a real ledger is worse than a refusal.
+ *
+ * THE REFUSAL HAS A REMEDY, which is the part that was missing: reverseLedgerPayment below, which
+ * confirms with the accounting system that the payment really is gone before removing anything here.
+ *
+ * THE CHECK MOVED INSIDE THE TRANSACTION, and that is not cosmetic. The registration read and the
+ * retirement used to happen AFTER the Payment was already deleted, so a worker claiming the queued
+ * row in that window left the receipt deleted and the payment posting — the previous code could only
+ * report that afterwards. Now the retirement is compare-and-swapped in the SAME transaction as the
+ * delete, so a claim in the window ABORTS the delete instead of stranding a posted payment.
+ */
+export async function deletePayment(paymentId: string, orderId: string): Promise<DeletePaymentResult> {
   try {
     await requirePermission('sales.refund')
     const txResult = await db.$transaction(async (tx) => {
@@ -3540,87 +3673,46 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       if (!payment || payment.orderId !== orderId) {
         return { error: 'Payment not found for this order' }
       }
-      await tx.payment.delete({ where: { id: paymentId } })
-      let becameUnpaid = false
+
+      // A refund payment settles a CREDIT NOTE, not this invoice, and is registered by a different
+      // path — so it has no INVOICE_PAYMENT registration to hold it back.
       if (!payment.refundId) {
-        const remainingPayments = await tx.payment.findMany({
-          where: { orderId, refundId: null },
-          select: { amount: true, currency: true },
-        })
-        const totalPaid = remainingPayments.reduce((sum, p) => {
-          if (p.currency !== so.currency) return sum
-          return sum + Number(p.amount)
-        }, 0)
-        const stillFullyPaid = totalPaid >= Number(so.totalForeign) - 0.0001
-        // Only a genuine paid → not-paid transition is a mismatch. An order that
-        // was never fully paid (e.g. shipped on credit terms) isn't flagged just
-        // because a partial payment was removed.
-        becameUnpaid = so.paidAt !== null && !stillFullyPaid
-        await tx.salesOrder.update({
-          where: { id: orderId },
-          data: { paidAt: stillFullyPaid ? undefined : null },
-        })
+        const registrations = await readPaymentRegistrations(tx, orderId, paymentId)
+        const { retirable, ledgerHold } = splitPaymentRegistrations(registrations)
+        if (ledgerHold.length > 0) {
+          const refusal = describeLedgerHoldRefusal(ledgerHold, getSalesOrderReference(so))
+          throw new PaymentTransactionRefusal(refusal.code, refusal.message)
+        }
+        if (retirable.length > 0) {
+          // CANCELLED rather than deleted, because that is the retirement the processor already
+          // understands — it re-reads the live status after claiming and treats CANCELLED as an
+          // intentional no-op — and it leaves the audit trail intact.
+          const retired = await tx.accountingSyncLog.updateMany({
+            where: { id: { in: retirable.map((row) => row.id) }, status: { in: [...RETIRABLE_REGISTRATION_STATUSES] } },
+            data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
+          })
+          // A row that did NOT transition was claimed by a worker between the read and this write, so
+          // it may be posting right now. Abort — the whole transaction rolls back and the receipt
+          // stays. This is the window the old post-transaction retirement could only report on.
+          if (retired.count !== retirable.length) {
+            // THROWN, so the rows that DID transition roll back with it. Returning here would commit
+            // a partial retirement under a message that says nothing was changed.
+            throw new PaymentTransactionRefusal(REGISTRATION_IN_FLIGHT_REFUSAL.code, REGISTRATION_IN_FLIGHT_REFUSAL.message)
+          }
+        }
       }
-      return { so, becameUnpaid, payment: { refundId: payment.refundId, amount: Number(payment.amount), currency: payment.currency } }
+
+      const becameUnpaid = await removePaymentAndSettlePaidAt(tx, {
+        paymentId,
+        orderId,
+        refundId: payment.refundId,
+        currency: so.currency,
+        totalForeign: so.totalForeign,
+        paidAt: so.paidAt,
+      })
+      return { so, becameUnpaid }
     }, STOCK_TX_OPTIONS)
     if ('error' in txResult) return { success: false, error: txResult.error }
-    if (!txResult.payment.refundId) {
-      const paymentLogs = await db.accountingSyncLog.findMany({
-        where: {
-          type: 'INVOICE_PAYMENT',
-          referenceType: 'SalesOrder',
-          referenceId: orderId,
-          status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-        },
-        select: { id: true, status: true, payload: true },
-      })
-      // ONLY the row that NAMES this payment. Matching by amount instead used to retract whichever
-      // registration happened to be for the same figure — and an imported paid order carries a perfectly
-      // legitimate INVOICE_PAYMENT with no local Payment row behind it, so recording and then deleting an
-      // equal receipt would delete the imported order's own registration, or raise a false "reverse this
-      // in the ledger" warning about a payment that had nothing to do with the deletion (Codex, PR #582
-      // round 2). A row that names no payment is nobody's to retract.
-      const matchingLogs = paymentLogs.filter((log) => payloadPaymentId(log.payload) === paymentId)
-      // RETIRE the queued registration, guarded on the status we read — do not delete it blind. A worker
-      // can claim the row between the read above and this write, and deleting it then erased the only
-      // record of a payment the worker went on to post: the ledger kept the money, IMS kept nothing, not
-      // even the warning below (Codex, PR #582 round 3).
-      //
-      // CANCELLED rather than deleted, because that is the retirement the processor already understands —
-      // it re-reads the live status after claiming and treats CANCELLED as an intentional no-op — and it
-      // leaves the audit trail intact. The verdict reads a CANCELLED row as holding nothing, so an order
-      // whose only receipt was deleted goes back to plainly unpaid.
-      const pendingIds = matchingLogs.filter((log) => log.status === 'PENDING').map((log) => log.id)
-      let claimedUnderUs: string[] = []
-      if (pendingIds.length > 0) {
-        await db.accountingSyncLog.updateMany({
-          where: { id: { in: pendingIds }, status: 'PENDING' },
-          data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
-        })
-        // Whichever ids did NOT transition were taken by a worker first, so they belong with the rows
-        // that need reversing in the ledger rather than being silently forgotten.
-        const survivors = await db.accountingSyncLog.findMany({
-          where: { id: { in: pendingIds }, status: { in: ['PROCESSING', 'SYNCED'] } },
-          select: { id: true },
-        })
-        claimedUnderUs = survivors.map((row) => row.id)
-      }
-      const externalLogs = [
-        ...matchingLogs.filter((log) => log.status === 'PROCESSING' || log.status === 'SYNCED'),
-        ...claimedUnderUs.map((id) => ({ id })),
-      ]
-      if (externalLogs.length > 0) {
-        await logActivity({
-          entityType: 'SALES_ORDER',
-          entityId: orderId,
-          action: 'payment_external_reversal_required',
-          tag: 'accounting',
-          level: 'WARNING',
-          description: `Deleted local payment for ${getSalesOrderReference(txResult.so)} after payment sync had already started; reverse the payment in the accounting connector if required.`,
-          metadata: { orderNumber: getSalesOrderReference(txResult.so), paymentId, accountingSyncLogIds: externalLogs.map((log) => log.id) },
-        })
-      }
-    }
     revalidatePath(`/sales/${orderId}`)
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -3647,6 +3739,10 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
     }
     return { success: true }
   } catch (e) {
+    // A refusal is a decision, not a fault: it must not be logged as an ERROR and must keep its code.
+    if (e instanceof PaymentTransactionRefusal) {
+      return { success: false, error: e.message, code: e.code as PaymentDeleteRefusalCode }
+    }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
@@ -3657,6 +3753,193 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       metadata: null,
     })
     return { success: false, error: String(e) }
+  }
+}
+
+export type ReverseLedgerPaymentResult =
+  | { success: true }
+  | { success: false; error: string; code: LedgerReversalRefusalCode }
+  | FreshAuthFailureResult
+
+/**
+ * o3d-1vuv — THE REVERSAL PATH the warning used to stand in for.
+ *
+ * WHAT THE OPERATOR DOES, AND WHAT THIS ASSERTS ON THEIR BEHALF: nothing. They reverse the payment
+ * in the accounting system — where the authority over that ledger lives, and where the reversal may
+ * need a date, an unallocation or a bank-rec decision IMS has no business making — and then ask IMS
+ * to let the local receipt go. IMS does NOT take their word for it. It ASKS XERO whether that
+ * payment is really gone, and refuses BY NAME when the answer is anything but DELETED.
+ *
+ * WHY VERIFICATION IS NOT OPTIONAL HERE, unlike the operator assertions elsewhere in this codebase.
+ * settlementStatus reads a PENDING/PROCESSING/SYNCED registration as "the ledger holds a payment"
+ * and CANCELLED as holding nothing. Retiring the row on an unchecked claim would turn a real
+ * LEDGER_UNMATCHED discrepancy into a plain, undiscrepant UNPAID — it would delete the ALARM rather
+ * than the cause, and a mistaken claim would then never be contradicted by anything. An assertion is
+ * only acceptable where the fact cannot be computed, and this one can: the row already carries the
+ * Xero PaymentID, and one GET settles it.
+ *
+ * WHAT IS DELIBERATELY NOT BUILT HERE. IMS does not perform the reversal itself (the issue's option
+ * 2). That is a WRITE to the ledger and belongs with the connector's own posting machinery in
+ * lib/connectors/xero/sync-processor.ts and lib/domain/accounting/payment-reversal.ts — both of
+ * which branch o3d-batch-payidx is rewriting — so building it here would collide with that work
+ * rather than complement it. This is the read-only half, which needs none of it and is complete on
+ * its own: the operator can always finish the job, and IMS never destroys local state on an
+ * unchecked claim.
+ */
+export async function reverseLedgerPayment(paymentId: string, orderId: string): Promise<ReverseLedgerPaymentResult> {
+  try {
+    // FRESH permission, unlike deletePayment's plain one. Deleting a receipt the ledger does not hold
+    // is an ordinary correction; retiring a registration for a document that DID post is a statement
+    // about a ledger, so it takes a session re-verified in the last 15 minutes.
+    const session = await requireFreshPermission('sales.refund')
+
+    const payment = await db.payment.findUnique({
+      where: { id: paymentId },
+      select: { orderId: true, refundId: true },
+    })
+    if (!payment || payment.orderId !== orderId) {
+      return { success: false, code: 'payment_missing', error: 'That receipt no longer exists on this order, so nothing was changed.' }
+    }
+    if (payment.refundId) {
+      return { success: false, code: NO_LEDGER_HOLD_REFUSAL.code, error: NO_LEDGER_HOLD_REFUSAL.message }
+    }
+
+    const registrations = await readPaymentRegistrations(db, orderId, paymentId)
+    const { retirable, ledgerHold } = splitPaymentRegistrations(registrations)
+    if (ledgerHold.length === 0) {
+      return { success: false, code: NO_LEDGER_HOLD_REFUSAL.code, error: NO_LEDGER_HOLD_REFUSAL.message }
+    }
+    const unsupported = ledgerHold.find((row) => !(VERIFIABLE_REVERSAL_CONNECTORS as readonly string[]).includes(row.connector))
+    if (unsupported) {
+      const refusal = refuseUnverifiableConnector(unsupported.connector)
+      return { success: false, code: refusal.code, error: refusal.message }
+    }
+    // A claimed registration with no document id yet: IMS asked the ledger to take this payment and
+    // has not learned what happened. There is nothing to look up, so there is nothing to confirm.
+    if (ledgerHold.some((row) => !hasPostEvidence(row))) {
+      return { success: false, code: UNVERIFIABLE_IN_FLIGHT_REFUSAL.code, error: UNVERIFIABLE_IN_FLIGHT_REFUSAL.message }
+    }
+
+    // ASK THE LEDGER. Outside any transaction — a network call inside one holds row locks for the
+    // duration of somebody else's outage.
+    for (const row of ledgerHold) {
+      const externalId = (row.externalTransactionId ?? '').trim()
+      const response = await xeroGet<{ Payments?: Array<{ PaymentID?: string; Status?: string }> }>(
+        `Payments/${encodeURIComponent(externalId)}`,
+      )
+      if (!response.ok) {
+        const refusal = refuseLedgerLookupFailure(externalId, response.error)
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+      const ledgerStatus = response.data?.Payments?.[0]?.Status
+      if (!isReversedInLedger(ledgerStatus)) {
+        const refusal = refuseLedgerStillHolds(externalId, ledgerStatus ?? 'unknown')
+        return { success: false, code: refusal.code, error: refusal.message }
+      }
+    }
+
+    const now = new Date()
+    const note = ledgerReversalNote(ledgerHold.map((row) => row.externalTransactionId ?? ''), now)
+
+    const outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      const so = await tx.salesOrder.findUnique({
+        where: { id: orderId },
+        select: { id: true, orderNumber: true, externalOrderNumber: true, currency: true, totalForeign: true, status: true, paidAt: true },
+      })
+      if (!so) throw new PaymentTransactionRefusal('payment_missing', 'Order not found')
+      const stillRecorded = await tx.payment.findUnique({ where: { id: paymentId }, select: { orderId: true } })
+      if (!stillRecorded || stillRecorded.orderId !== orderId) {
+        throw new PaymentTransactionRefusal('payment_missing', 'That receipt no longer exists on this order, so nothing was changed.')
+      }
+
+      // THE FENCE. Each row is compare-and-swapped on the EXACT status and document id that was
+      // checked against the ledger. A row that has since been retried, re-posted or resolved carries
+      // a different one, and a conclusion drawn about the payment that was there must not land on a
+      // payment that is there now.
+      for (const row of ledgerHold) {
+        const moved = await tx.accountingSyncLog.updateMany({
+          where: {
+            id: row.id,
+            // The domain type carries `status` as a plain string so the decision module stays free of
+            // generated Prisma enums; it can only ever hold a value read off this same column.
+            status: row.status as Prisma.AccountingSyncLogWhereInput['status'],
+            externalTransactionId: row.externalTransactionId,
+          },
+          data: buildVerifiedReversalData(note),
+        })
+        // THROWN, so any row retired earlier in this loop rolls back with it. A `return` would commit
+        // a partial retirement while reporting that nothing changed.
+        if (moved.count !== 1) throw new PaymentTransactionRefusal(HOLD_MOVED_REFUSAL.code, HOLD_MOVED_REFUSAL.message)
+      }
+      if (retirable.length > 0) {
+        const retired = await tx.accountingSyncLog.updateMany({
+          where: { id: { in: retirable.map((row) => row.id) }, status: { in: [...RETIRABLE_REGISTRATION_STATUSES] } },
+          data: { status: 'CANCELLED', errorMessage: 'Retired: the local payment it registered was deleted.' },
+        })
+        if (retired.count !== retirable.length) {
+          // A queued sibling registration was claimed while this was being recorded. Reported as
+          // hold_moved rather than as a delete refusal: from here the remedy is the same — reload and
+          // look again — and the rows already retired roll back with the throw.
+          throw new PaymentTransactionRefusal('hold_moved', REGISTRATION_IN_FLIGHT_REFUSAL.message)
+        }
+      }
+
+      const becameUnpaid = await removePaymentAndSettlePaidAt(tx, {
+        paymentId,
+        orderId,
+        refundId: null,
+        currency: so.currency,
+        totalForeign: so.totalForeign,
+        paidAt: so.paidAt,
+      })
+      return { so, becameUnpaid }
+    }, STOCK_TX_OPTIONS)
+
+    revalidatePath(`/sales/${orderId}`)
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'payment_ledger_reversal_confirmed',
+      tag: 'accounting',
+      // WARNING, not INFO: a payment that reached a real ledger has been undone, and the row that
+      // proved it is now CANCELLED. It belongs in the level-filtered accounting views.
+      level: 'WARNING',
+      description:
+        `Deleted the receipt on ${getSalesOrderReference(outcome.so)} after confirming with the accounting `
+        + `system that its payment was reversed there (${ledgerHold.map((row) => row.externalTransactionId).join(', ')})`,
+      metadata: {
+        orderNumber: getSalesOrderReference(outcome.so),
+        paymentId,
+        // Both ends: which rows were retired, and the document ids the ledger was asked about. The
+        // ids stay on the rows too — a CANCELLED row that still names a document is a complete
+        // account of a payment that existed and was undone.
+        accountingSyncLogIds: ledgerHold.map((row) => row.id),
+        externalTransactionIds: ledgerHold.map((row) => row.externalTransactionId),
+        priorStatuses: ledgerHold.map((row) => row.status),
+        verifiedAt: now.toISOString(),
+        userId: session.user.id,
+      },
+    })
+    if (isPaymentStatusMismatch(outcome.so.status, outcome.becameUnpaid)) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'payment_status_mismatch',
+        tag: 'sales',
+        level: 'WARNING',
+        description: `Order ${getSalesOrderReference(outcome.so)} is ${outcome.so.status} but is no longer fully paid after reversing a payment. Review whether the status should be reverted.`,
+        metadata: { orderNumber: getSalesOrderReference(outcome.so), status: outcome.so.status, paymentId },
+      })
+    }
+    return { success: true }
+  } catch (error) {
+    if (error instanceof PaymentTransactionRefusal) {
+      return { success: false, error: error.message, code: error.code as LedgerReversalRefusalCode }
+    }
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
   }
 }
 

@@ -36,6 +36,23 @@ import {
   buildDeadReceiptEventReplayWhere,
 } from '@/lib/domain/wms/exception-inbox'
 import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { wcFetch } from '@/lib/connectors/woocommerce/api'
+import {
+  RECOVERABLE_REFUND_PARK_STATUSES,
+  buildRefundParkDismissData,
+  buildRefundParkReassignData,
+  describeRefundParkRecoverability,
+  normalizeRefundParkRecoveryAssertion,
+  refundParkRecoveryNote,
+  refuseDismiss,
+  refuseOnLookupFailure,
+  refuseReassign,
+  type RefundParkRecoveryOutcome,
+  type RefundParkRecoveryRefusal,
+  type RefundParkRecoveryRefusalCode,
+  type RefundParkView,
+  type WcOrderRefundEvidence,
+} from '@/lib/domain/sales/refund-park-recovery'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
@@ -116,6 +133,14 @@ export type RefundSyncParkRow = {
   externalRefundId: string | null
   orderId: string | null
   orderNumber: string | null
+  /**
+   * o3d-54p: the WooCommerce order this park's IMS order is linked to, or null when it has no link.
+   * Shown because a cross-order park is only recognisable by comparing the refund against the order
+   * it claims to belong to — and because a park whose order has NO WooCommerce link cannot be
+   * dismissed (the dismissal is verified against that order's own refund list), so the control has
+   * to be able to say so before it is clicked rather than after.
+   */
+  wcOrderId: string | null
   errorMessage: string | null
   createdAt: string
 }
@@ -582,6 +607,15 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       })
     : []
   const refundOrderNumberById = new Map(refundOrders.map((order) => [order.id, order.orderNumber]))
+  // o3d-54p: which WooCommerce order each parked order is linked to. Read for the whole page in one
+  // query rather than per row.
+  const refundOrderLinks = refundOrderIds.length > 0
+    ? await db.shoppingOrderLink.findMany({
+        where: { connector: 'woocommerce', orderId: { in: refundOrderIds } },
+        select: { orderId: true, externalOrderId: true },
+      })
+    : []
+  const wcOrderIdByOrderId = new Map(refundOrderLinks.map((link) => [link.orderId, link.externalOrderId]))
 
   // The cohort's orders, for the operator to review before isolating (o3d-51du).
   // Read through the same eligibility predicate the isolate action writes
@@ -669,6 +703,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       externalRefundId: log.externalId,
       orderId: log.entityId,
       orderNumber: log.entityId ? refundOrderNumberById.get(log.entityId) ?? null : null,
+      wcOrderId: log.entityId ? wcOrderIdByOrderId.get(log.entityId) ?? null : null,
       errorMessage: log.errorMessage,
       createdAt: log.createdAt.toISOString(),
     })),
@@ -920,6 +955,311 @@ export async function retryRefundSyncPark(id: string): Promise<MutationResult & 
     })
     revalidatePath('/sync/exceptions')
     return { success: true, synced: Boolean(refundLanded) }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * o3d-54p — OPERATOR RECOVERY for a STALE CROSS-ORDER refund park.
+ *
+ * WHY RETRY IS NOT ENOUGH, AND WHY THIS IS A SEPARATE ACTION.
+ *
+ * retryRefundSyncPark re-fetches the refunds of THE PARK'S OWN RECORDED ORDER. For a park sitting on
+ * the wrong order that fetch cannot contain the refund, so the retry can never resolve it — and it
+ * deliberately refuses to resolve the park with a refund belonging to another order. Meanwhile
+ * createSalesOrderRefund and syncWcRefund both fail CLOSED on the foreign park (o3d-ee9/o3d-7yf), so
+ * the TRUE owner's refund, credit note and restock are blocked; the park is retention-exempt; and
+ * both orders are undeletable. Nothing an operator could do changed any of it.
+ *
+ * WHAT THIS ASSERTS, AND WHAT VERIFIES IT. WooCommerce is the authority on which order a refund
+ * belongs to, so this action does not take the operator's word for the ownership fact — it takes
+ * their word for WHICH ORDER TO ASK ABOUT, asks WooCommerce FRESH, and refuses when the answer
+ * contradicts them. The decision (move it, or write it off) stays theirs and is recorded with their
+ * name on it; the ownership is evidence, not an assertion. The decision vocabulary — every refusal
+ * and every patch — lives in lib/domain/sales/refund-park-recovery.ts as pure functions.
+ *
+ * THE AUDIT. logActivity is best-effort (it swallows its own errors), which is why the recovery note
+ * is written onto the PARK ROW ITSELF in the same transaction as the status change: the fact that a
+ * human recovered this park, and what WooCommerce said when they did, survives a logging failure.
+ * o3d-batch-settle adds logActivityInTransaction for exactly this problem; when that lands, this
+ * activity write should move inside the transaction rather than being duplicated here.
+ */
+export type RecoverRefundSyncParkInput = { observedOrderId: string } & (
+  | { outcome: 'REASSIGN'; wcOrderId: number }
+  | { outcome: 'DISMISS'; reason?: string }
+)
+
+export type RecoverRefundSyncParkResult =
+  | { success: true; outcome: RefundParkRecoveryOutcome; targetOrderId: string | null }
+  | { success: false; error: string; code: RefundParkRecoveryRefusalCode }
+  | FreshAuthFailureResult
+
+/**
+ * WooCommerce's default page size for /orders/{id}/refunds is 10, and syncRefundsForOrder never asks
+ * for more. Reading only the first page here would be far worse than a missing sync: a refund on
+ * page 2 would look ABSENT, and "absent from this order" is precisely what authorises a dismissal.
+ * So this pages exhaustively, and refuses rather than guessing when an order carries more refunds
+ * than the cap.
+ */
+const WC_REFUND_PAGE_SIZE = 100
+const WC_REFUND_MAX_PAGES = 10
+
+async function readWcOrderRefundIds(
+  wcOrderId: number,
+): Promise<{ evidence: WcOrderRefundEvidence } | { error: string }> {
+  const ids: number[] = []
+  let page = 1
+  let totalPages = 1
+  do {
+    const { data, totalPages: reported, error } = await wcFetch(
+      `/orders/${wcOrderId}/refunds`,
+      { per_page: String(WC_REFUND_PAGE_SIZE), page: String(page) },
+    )
+    if (error) return { error }
+    if (!Array.isArray(data)) return { error: 'WooCommerce returned an unexpected response for this order\'s refunds.' }
+    for (const entry of data) {
+      const candidate = (entry as { id?: unknown }).id
+      if (typeof candidate === 'number' && Number.isSafeInteger(candidate)) ids.push(candidate)
+    }
+    totalPages = Math.max(1, reported || 1)
+    if (totalPages > WC_REFUND_MAX_PAGES) {
+      return {
+        error: `that order reports ${totalPages} pages of refunds, more than this check will read`,
+      }
+    }
+    page += 1
+  } while (page <= totalPages)
+  return { evidence: { wcOrderId, refundIds: ids, fetchedAt: new Date() } }
+}
+
+export async function recoverRefundSyncPark(
+  id: string,
+  input: RecoverRefundSyncParkInput,
+): Promise<RecoverRefundSyncParkResult> {
+  try {
+    // Same guard as retryRefundSyncPark: `sync` is not held by READONLY or SUPPLIER, and a recovery
+    // that moves a refund between orders is at least as ledger-affecting as a retry, so it takes the
+    // FRESH variant too. A 'use server' export is a public HTTP endpoint; this is the only thing
+    // between an authenticated session and a write that reassigns refund evidence.
+    const session = await requireFreshPermission('sync')
+
+    const assertion = normalizeRefundParkRecoveryAssertion(input)
+    if (!assertion) {
+      return {
+        success: false,
+        code: 'unrecognised_outcome',
+        error: 'That recovery was not supplied correctly, so nothing was changed. Reload the exception '
+          + 'inbox and recover from what it shows.',
+      }
+    }
+    if (typeof input.observedOrderId !== 'string' || !input.observedOrderId) {
+      return {
+        success: false,
+        code: 'unrecognised_outcome',
+        error: 'The order this recovery was made about was not supplied, so nothing was changed. Reload '
+          + 'the exception inbox and recover from what it shows.',
+      }
+    }
+
+    const row = await db.shoppingSyncLog.findFirst({
+      where: { id, ...REFUND_PARK_WHERE },
+      select: { id: true, status: true, entityId: true, externalId: true },
+    })
+    const recoverability = describeRefundParkRecoverability(row ?? { status: 'SYNCED', entityId: null, externalId: null })
+    if (!row || !recoverability.recoverable) {
+      return {
+        success: false,
+        code: 'park_not_actionable',
+        error: row
+          ? recoverability.notRecoverableReason ?? 'This park cannot be recovered.'
+          : 'That refund park no longer exists or is already resolved, so nothing was changed. Reload the '
+            + 'exception inbox.',
+      }
+    }
+    // Non-null by describeRefundParkRecoverability, which refuses a park with no order or no refund id.
+    const parkedOrderId = row.entityId as string
+    const externalRefundId = Number(row.externalId)
+    if (!Number.isSafeInteger(externalRefundId) || externalRefundId <= 0) {
+      return {
+        success: false,
+        code: 'park_not_actionable',
+        error: `This park records "${row.externalId}" as its WooCommerce refund id, which is not a refund `
+          + 'id WooCommerce can be asked about. Nothing was changed.',
+      }
+    }
+    // The fence's first half, checked before WooCommerce is troubled: the operator judged a park
+    // sitting on a particular order, and a park that has since moved is a different question.
+    if (parkedOrderId !== input.observedOrderId) {
+      return {
+        success: false,
+        code: 'park_moved',
+        error: 'This park is no longer on the order it was shown against, so the recovery you asked for '
+          + 'was not made. Reload the exception inbox and look again.',
+      }
+    }
+
+    const park: RefundParkView = { id: row.id, status: row.status, entityId: parkedOrderId, externalId: row.externalId as string }
+
+    // The refund as IMS currently records it, wherever it landed. Read again INSIDE the transaction
+    // under the per-refund lock — this copy only lets a refusal be reported before WooCommerce is
+    // asked and before any lock is taken.
+    const landedBefore = await db.salesOrderRefund.findFirst({
+      where: { externalRefundId },
+      select: { orderId: true },
+    })
+
+    let refusal: RefundParkRecoveryRefusal | null = null
+    let evidence: WcOrderRefundEvidence
+    let targetOrderId: string | null = null
+
+    if (assertion.outcome === 'REASSIGN') {
+      const lookup = await readWcOrderRefundIds(assertion.wcOrderId)
+      if ('error' in lookup) {
+        const refused = refuseOnLookupFailure(assertion.wcOrderId, lookup.error)
+        return { success: false, error: refused.message, code: refused.code }
+      }
+      evidence = lookup.evidence
+      const targetLink = await db.shoppingOrderLink.findFirst({
+        where: { connector: 'woocommerce', externalOrderId: String(assertion.wcOrderId) },
+        select: { orderId: true },
+      })
+      targetOrderId = targetLink?.orderId ?? null
+      refusal = refuseReassign({
+        park,
+        externalRefundId,
+        targetEvidence: evidence,
+        targetOrderId,
+        landedOnOrderId: landedBefore?.orderId ?? null,
+      })
+    } else {
+      const parkedLink = await db.shoppingOrderLink.findFirst({
+        where: { orderId: parkedOrderId, connector: 'woocommerce' },
+        select: { externalOrderId: true },
+      })
+      const parkedWcOrderId = parkedLink ? Number(parkedLink.externalOrderId) : NaN
+      let parkedEvidence: WcOrderRefundEvidence | null = null
+      if (parkedLink && Number.isSafeInteger(parkedWcOrderId) && parkedWcOrderId > 0) {
+        const lookup = await readWcOrderRefundIds(parkedWcOrderId)
+        if ('error' in lookup) {
+          const refused = refuseOnLookupFailure(parkedWcOrderId, lookup.error)
+          return { success: false, error: refused.message, code: refused.code }
+        }
+        parkedEvidence = lookup.evidence
+      }
+      refusal = refuseDismiss({
+        park,
+        externalRefundId,
+        parkedEvidence,
+        landedOnOrderId: landedBefore?.orderId ?? null,
+      })
+      // refuseDismiss returns parked_order_not_linked when there is no evidence, so past it the
+      // evidence is present.
+      evidence = parkedEvidence as WcOrderRefundEvidence
+    }
+    if (refusal) return { success: false, error: refusal.message, code: refusal.code }
+
+    const now = new Date()
+    const note = refundParkRecoveryNote(assertion, evidence, externalRefundId)
+
+    const applied = await db.$transaction(async (tx) => {
+      // o3d-ee9's key, and its ordering: the per-refund advisory lock FIRST, then any order row lock,
+      // matching createSalesOrderRefund and upsertRefundPark so none of the three can deadlock. Held
+      // to commit, so a refund create for this id either happens entirely before this recovery (and
+      // is seen by the re-read below) or entirely after it (and sees the recovered park).
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${externalRefundId}`}))`
+
+      // Re-read under the lock. Between the WooCommerce fetch above and this transaction the refund
+      // may have landed — on this park's order (the park is then a leftover, not a foreign one) or on
+      // another. Both are refusals with their own remedy, not something to write through.
+      const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId }, select: { orderId: true } })
+      const lateRefusal = assertion.outcome === 'REASSIGN'
+        ? refuseReassign({ park, externalRefundId, targetEvidence: evidence, targetOrderId, landedOnOrderId: landed?.orderId ?? null })
+        : refuseDismiss({ park, externalRefundId, parkedEvidence: evidence, landedOnOrderId: landed?.orderId ?? null })
+      if (lateRefusal) return { ok: false as const, refusal: lateRefusal }
+
+      if (assertion.outcome === 'REASSIGN') {
+        // The same FOR UPDATE re-verify upsertRefundPark does before writing a park, and for the same
+        // reason: deleteSalesOrder takes this lock, so without it the target order could be deleted
+        // between the link lookup and this write, leaving an orphaned park on a gone order that
+        // retryRefundSyncPark could never resolve.
+        const rows = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "sales_orders" WHERE id = ${targetOrderId as string} FOR UPDATE`
+        if (rows.length === 0) {
+          return {
+            ok: false as const,
+            refusal: {
+              code: 'target_order_missing' as const,
+              message: 'The order you named was deleted while this recovery was being made, so nothing was '
+                + 'changed — a park must never be written onto an order that no longer exists.',
+            },
+          }
+        }
+      }
+
+      // The fence's second half, and the only write. Conditioned on the park still being on the order
+      // the operator judged AND still actionable, so a concurrent resolve, retry or re-park is not
+      // overwritten by a conclusion formed about the row as it was.
+      const updated = await tx.shoppingSyncLog.updateMany({
+        where: {
+          id: park.id,
+          connector: 'woocommerce',
+          direction: 'FROM_CONNECTOR',
+          entityType: 'SalesOrder',
+          externalId: park.externalId,
+          entityId: park.entityId,
+          status: { in: [...RECOVERABLE_REFUND_PARK_STATUSES] },
+        },
+        data: assertion.outcome === 'REASSIGN'
+          ? buildRefundParkReassignData(targetOrderId as string, note, now)
+          : buildRefundParkDismissData(note, now),
+      })
+      if (updated.count !== 1) {
+        return {
+          ok: false as const,
+          refusal: {
+            code: 'park_moved' as const,
+            message: 'This park changed while the recovery was being made — it was resolved, retried or '
+              + 'moved by something else — so nothing was changed. Reload the exception inbox and look again.',
+          },
+        }
+      }
+      return { ok: true as const }
+    })
+
+    if (!applied.ok) return { success: false, error: applied.refusal.message, code: applied.refusal.code }
+
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: parkedOrderId,
+      tag: 'sync',
+      action: 'wc_refund_park_recovered',
+      // WARNING, not INFO: a human correcting an order association on a refund whose money has
+      // already left the business, on evidence the system could not act on by itself.
+      level: 'WARNING',
+      description: assertion.outcome === 'REASSIGN'
+        ? `Reassigned parked WooCommerce refund ${externalRefundId} from order ${parkedOrderId} to order `
+          + `${targetOrderId} after WooCommerce confirmed it on WC order ${evidence.wcOrderId}`
+        : `Dismissed the parked WooCommerce refund ${externalRefundId} on order ${parkedOrderId} after `
+          + `WooCommerce order ${evidence.wcOrderId} did not list it`,
+      metadata: {
+        shoppingSyncLogId: park.id,
+        externalRefundId,
+        outcome: assertion.outcome,
+        parkedOrderId,
+        targetOrderId,
+        // What was asked, and what came back — so the recovery can be re-judged later against the
+        // evidence it was actually made on rather than against WooCommerce as it is by then.
+        wcOrderId: evidence.wcOrderId,
+        wcRefundIds: [...evidence.refundIds],
+        wcFetchedAt: evidence.fetchedAt.toISOString(),
+        priorStatus: park.status,
+        userId: session.user.id,
+      },
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true, outcome: assertion.outcome, targetOrderId }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure

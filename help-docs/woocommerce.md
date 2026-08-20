@@ -359,6 +359,33 @@ and how far it reached — until the rest arrive, that order shows a smaller ref
 does, and a 3PL despatch for it can be refused as uncovered. The next sweep re-reads the order from the
 first page, so it clears itself.
 
+### Parked refunds, and a refund parked against the wrong order
+
+A refund the system cannot apply safely is **parked** and appears in **Sync → Exceptions** under
+"WooCommerce refunds — parked". The refund, its credit note and its restock have not posted. **Retry**
+re-fetches that order's refunds fresh from WooCommerce and re-attempts it.
+
+A WooCommerce refund belongs to exactly one order, so a park recorded against the *wrong* order is an
+anomaly the system deliberately refuses to resolve by itself — it will not move one order's refund
+evidence onto another. Retry cannot fix it either: it re-fetches the order the park is sitting on,
+and that order does not have the refund. Meanwhile the refund's real order cannot have it applied,
+and neither order can be deleted.
+
+Use **"Wrong order"** on the parked row. It offers two things, and checks both with WooCommerce
+before changing anything:
+
+- **It belongs to another WooCommerce order** — give the WooCommerce order number. One Two Inventory
+  asks WooCommerce which refunds that order actually has, right now, and refuses if this refund is
+  not one of them. If it is, the park moves to that order and becomes retryable there. The refund
+  itself has still not been applied — retry it from its new order.
+- **WooCommerce no longer has it on this order** — for a refund that has since been deleted in
+  WooCommerce. One Two Inventory asks WooCommerce which refunds *this* order has and refuses if the
+  refund is still one of them. Dismissing only clears a park WooCommerce contradicts; it does not
+  apply the refund anywhere, so if money did leave the business, reassign it instead.
+
+Either way the WooCommerce answer it acted on — the order asked, the refunds returned, and the time —
+is recorded in the activity log alongside who did it.
+
 ## Invoice Notes and Customer PDF Downloads
 
 When an invoice is generated for a WooCommerce order, the system pushes invoice metadata to the WC order. The customer-facing invoice PDF download is then handled by the **OneTwoInventory Helper** WordPress plugin via a server-to-server handoff.

@@ -3,10 +3,11 @@
 import { Fragment, useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, CheckCircle2, Inbox, Loader2, RotateCcw } from 'lucide-react'
+import { ArrowLeft, CheckCircle2, Inbox, Loader2, RotateCcw, Split } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { Card } from '@/components/ui/card'
+import { Input } from '@/components/ui/input'
 import {
   Table,
   TableBody,
@@ -30,7 +31,9 @@ import {
   retryUnresolvedDriftCohort,
   repushMissingWmsOrder,
   retryRefundSyncPark,
+  recoverRefundSyncPark,
   type ExceptionInboxData,
+  type RefundSyncParkRow,
 } from '@/app/actions/sync-exceptions'
 
 type Props = {
@@ -59,6 +62,9 @@ export function ExceptionsClient({ data }: Props) {
   // already armed, against whatever cohort came back. Keying it to the exact set
   // means any change to that set disarms it by construction.
   const [confirmingIsolate, setConfirmingIsolate] = useState<string | null>(null)
+  // o3d-54p: which refund park (if any) has its recovery panel open. One at a time, and NEVER
+  // pre-armed: the panel opens with no outcome chosen, so a stray click cannot assert anything.
+  const [recoveringParkId, setRecoveringParkId] = useState<string | null>(null)
 
   async function withStepUp<T extends MaybeFreshAuthFailure>(run: () => Promise<T>): Promise<T> {
     const result = await run()
@@ -356,34 +362,73 @@ export function ExceptionsClient({ data }: Props) {
             </TableHeader>
             <TableBody>
               {data.refundSyncParks.map((row) => (
-                <TableRow key={row.id}>
-                  <TableCell>
-                    {row.orderId
-                      ? <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
-                      : '—'}
-                  </TableCell>
-                  <TableCell className="text-xs font-mono">{row.externalRefundId ?? '—'}</TableCell>
-                  <TableCell className="text-xs">{row.status}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.errorMessage ?? ''}>{row.errorMessage ?? '—'}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.createdAt)}</TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(async () => {
-                        const result = await retryRefundSyncPark(row.id)
-                        if ('success' in result && result.success && !result.synced) {
-                          return { success: false, error: 'Retried, but the refund still did not apply — the amount mismatch likely persists in WooCommerce.' }
-                        }
-                        return result
-                      }, 'Refund re-synced and applied.')}
-                    >
-                      <RotateCcw className="h-3 w-3 mr-1" />Retry
-                    </Button>
-                  </TableCell>
-                </TableRow>
+                <Fragment key={row.id}>
+                  <TableRow>
+                    <TableCell>
+                      {row.orderId
+                        ? <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
+                        : '—'}
+                      {row.wcOrderId ? <span className="ml-2 text-[11px] text-muted-foreground font-mono">WC #{row.wcOrderId}</span> : null}
+                    </TableCell>
+                    <TableCell className="text-xs font-mono">{row.externalRefundId ?? '—'}</TableCell>
+                    <TableCell className="text-xs">{row.status}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.errorMessage ?? ''}>{row.errorMessage ?? '—'}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.createdAt)}</TableCell>
+                    <TableCell className="text-right space-x-1 whitespace-nowrap">
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => runAction(async () => {
+                          const result = await retryRefundSyncPark(row.id)
+                          if ('success' in result && result.success && !result.synced) {
+                            return { success: false, error: 'Retried, but the refund still did not apply — the amount mismatch likely persists in WooCommerce.' }
+                          }
+                          return result
+                        }, 'Refund re-synced and applied.')}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Retry
+                      </Button>
+                      {/*
+                        o3d-54p. Retry is the right first move and stays the default; this is the way
+                        OUT of the park Retry can never resolve — one recorded against the WRONG
+                        order, where every retry re-fetches an order that does not have this refund
+                        and the true owner's refund create fails closed on the park forever.
+                      */}
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        disabled={isPending || !row.orderId || !row.externalRefundId}
+                        title="This park is on the wrong order — check WooCommerce and move or dismiss it"
+                        onClick={() => setRecoveringParkId(recoveringParkId === row.id ? null : row.id)}
+                      >
+                        <Split className="h-3 w-3 mr-1" />Wrong order
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                  {recoveringParkId === row.id ? (
+                    <TableRow>
+                      <TableCell colSpan={6} className="bg-muted/30">
+                        <RecoverRefundParkPanel
+                          row={row}
+                          busy={isPending}
+                          onCancel={() => setRecoveringParkId(null)}
+                          onSubmit={(assertion) => {
+                            setRecoveringParkId(null)
+                            runAction(
+                              () => recoverRefundSyncPark(row.id, { observedOrderId: row.orderId as string, ...assertion }),
+                              assertion.outcome === 'REASSIGN'
+                                ? 'WooCommerce confirmed the refund on that order; the park moved there and is retryable from its new order.'
+                                : 'WooCommerce did not list that refund on this order; the park is dismissed and no longer blocks it.',
+                            )
+                          }}
+                        />
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </Fragment>
               ))}
             </TableBody>
           </Table>
@@ -734,6 +779,128 @@ function SectionHeading({ title, detail, shown, total }: { title: string; detail
         {detail}
         {capped ? ` Showing the ${shown} most recent of ${total}.` : ''}
       </p>
+    </div>
+  )
+}
+
+
+/**
+ * o3d-54p — the operator's end of the cross-order refund-park recovery.
+ *
+ * DELIBERATELY MINIMAL, and deliberately NOT a recommendation. It offers exactly the two things an
+ * operator can be right about, and prescribes neither:
+ *
+ *   REASSIGN  "WooCommerce refund N belongs to WooCommerce order X, not this one."
+ *   DISMISS   "WooCommerce no longer has this refund on this order at all."
+ *
+ * NEITHER IS BELIEVED ON ITS OWN. The server asks WooCommerce, fresh, before it writes anything, and
+ * refuses with the specific contradiction when the answer disagrees — a reassign whose named order
+ * does not have the refund, or a dismissal of a park WooCommerce still confirms. So the wording here
+ * says what IMS will CHECK, not what it will assume, because an operator who thinks this button
+ * moves a refund on their say-so will use it where they should have used Retry.
+ *
+ * The panel opens with no outcome selected and the confirm button disabled. There is no default,
+ * because a default here is a recommendation about somebody else's money.
+ */
+function RecoverRefundParkPanel({
+  row,
+  busy,
+  onCancel,
+  onSubmit,
+}: {
+  row: RefundSyncParkRow
+  busy: boolean
+  onCancel: () => void
+  onSubmit: (assertion: { outcome: 'REASSIGN'; wcOrderId: number } | { outcome: 'DISMISS'; reason?: string }) => void
+}) {
+  const [outcome, setOutcome] = useState<'REASSIGN' | 'DISMISS' | null>(null)
+  const [wcOrderId, setWcOrderId] = useState('')
+  const [reason, setReason] = useState('')
+
+  const parsedWcOrderId = Number(wcOrderId.trim())
+  const wcOrderIdValid = wcOrderId.trim() !== '' && Number.isSafeInteger(parsedWcOrderId) && parsedWcOrderId > 0
+  const canSubmit = !busy && (outcome === 'DISMISS' || (outcome === 'REASSIGN' && wcOrderIdValid))
+
+  return (
+    <div className="space-y-3 py-2 text-xs">
+      <p className="text-muted-foreground max-w-3xl">
+        A WooCommerce refund belongs to exactly one order. While refund{' '}
+        <span className="font-mono">{row.externalRefundId}</span> is parked here, its real order cannot have
+        it applied — the refund, the credit note and the restock are all refused — and neither order can be
+        deleted. Open the refund in WooCommerce and read its parent order off the refund itself before
+        choosing.
+      </p>
+      <div className="flex flex-wrap gap-4">
+        <label className="flex items-center gap-2">
+          <input type="radio" name={`recover-${row.id}`} checked={outcome === 'REASSIGN'} onChange={() => setOutcome('REASSIGN')} />
+          <span>It belongs to another WooCommerce order</span>
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="radio" name={`recover-${row.id}`} checked={outcome === 'DISMISS'} onChange={() => setOutcome('DISMISS')} />
+          <span>WooCommerce no longer has it on this order</span>
+        </label>
+      </div>
+
+      {outcome === 'REASSIGN' ? (
+        <div className="space-y-1 max-w-sm">
+          <label className="block text-muted-foreground" htmlFor={`wc-order-${row.id}`}>
+            WooCommerce order number that holds this refund
+          </label>
+          <Input
+            id={`wc-order-${row.id}`}
+            inputMode="numeric"
+            value={wcOrderId}
+            onChange={(event) => setWcOrderId(event.target.value)}
+            placeholder={row.wcOrderId ? `not ${row.wcOrderId}` : 'e.g. 10432'}
+          />
+          <p className="text-muted-foreground">
+            IMS will ask WooCommerce which refunds that order actually has, right now, and refuse if this
+            refund is not one of them. If it is, the park moves there as PENDING and becomes retryable from
+            that order — the refund itself has still not been applied.
+          </p>
+        </div>
+      ) : null}
+
+      {outcome === 'DISMISS' ? (
+        <div className="space-y-1 max-w-lg">
+          <label className="block text-muted-foreground" htmlFor={`dismiss-reason-${row.id}`}>
+            What you found (optional, recorded on the park)
+          </label>
+          <Input
+            id={`dismiss-reason-${row.id}`}
+            value={reason}
+            onChange={(event) => setReason(event.target.value)}
+            placeholder="e.g. refund deleted in WooCommerce on 12 Aug"
+          />
+          <p className="text-muted-foreground">
+            IMS will ask WooCommerce which refunds THIS order actually has, right now, and refuse if this
+            refund is still one of them. Dismissing only removes a park WooCommerce contradicts — it does
+            not apply the refund anywhere, so if the money did leave the business, reassign it instead
+            wherever its real order is known.
+          </p>
+          {row.wcOrderId ? null : (
+            <p className="text-destructive">
+              This order has no WooCommerce link, so there is no order for IMS to ask about and a dismissal
+              cannot be verified. Reassign it to the order that really holds the refund instead.
+            </p>
+          )}
+        </div>
+      ) : null}
+
+      <div className="flex gap-2">
+        <Button
+          type="button"
+          size="sm"
+          disabled={!canSubmit}
+          onClick={() => {
+            if (outcome === 'REASSIGN' && wcOrderIdValid) onSubmit({ outcome: 'REASSIGN', wcOrderId: parsedWcOrderId })
+            else if (outcome === 'DISMISS') onSubmit(reason.trim() ? { outcome: 'DISMISS', reason: reason.trim() } : { outcome: 'DISMISS' })
+          }}
+        >
+          Check WooCommerce and recover
+        </Button>
+        <Button type="button" size="sm" variant="ghost" onClick={onCancel}>Cancel</Button>
+      </div>
     </div>
   )
 }

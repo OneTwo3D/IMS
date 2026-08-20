@@ -217,6 +217,29 @@ You can record payments against a sales order:
 
 Payment records help you track outstanding balances on each order.
 
+### Deleting a payment the accounting system already holds
+
+A payment recorded here is registered against the invoice in your accounting system. Once that
+registration has been sent, **deleting the receipt here is refused** — deleting it would leave the
+ledger showing the invoice settled while One Two Inventory shows it unpaid, which is the
+"PAID IN LEDGER ONLY" state that then has to be chased by hand.
+
+The refusal names the document id and gives you the way out:
+
+1. Reverse (delete) the payment in the accounting system, where you can choose the date and deal
+   with any bank reconciliation it touches.
+2. Come back to the order and use **"I have reversed it — check and delete"** on that receipt.
+
+One Two Inventory then **asks the accounting system whether that payment is really gone** before it
+removes anything. If the accounting system still reports the payment, the deletion is refused again
+and tells you the status it saw — your word alone is never enough to remove a local receipt while a
+real ledger still holds the money. The retired sync row keeps the document id, so the order's
+history still shows which payment existed and was undone.
+
+A receipt whose registration is still queued (nothing has been sent yet) deletes normally, and the
+queued registration is cancelled with it. A receipt against a **credit note** settles the credit
+note rather than the invoice, so this check does not apply to it.
+
 ## Invoice Generation
 
 Invoices can be generated either manually or automatically. The trigger for automatic invoice generation is configurable in **Settings > Sales Settings**. Options include:
