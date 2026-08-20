@@ -57,6 +57,8 @@ import {
 } from '@/lib/domain/sales/refund-park-recovery'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { createPrismaDispatchDeps, reconcileOneOrder } from '@/lib/domain/wms/dispatch-sweep'
+import { releaseWithdrawalHold } from '@/app/actions/sales'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
@@ -163,6 +165,10 @@ export type StuckDispatchRow = {
    * fix it in the WMS, then replay.
    */
   kind: 'dead-letter' | 'unresolved'
+  /** o3d-rbyg round 2: the order's lifecycle status — which remedy applies depends on it. */
+  orderStatus: string
+  /** o3d-rbyg round 2: a withdrawal stands against this order, so Replay is NOT the remedy. */
+  withdrawalStanding: boolean
 }
 
 export type ProductStructureConflictRow = {
@@ -329,7 +335,7 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
     dispatchUnresolvedCount: true,
     dispatchUnresolvedError: true,
     dispatchUnresolvedAt: true,
-    order: { select: { orderNumber: true } },
+    order: { select: { orderNumber: true, status: true } },
   } as const
 
   const [deadLettered, quarantined] = await Promise.all([
@@ -349,7 +355,17 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
     }),
   ])
 
-  return mergeStuckDispatchRows([...deadLettered, ...quarantined], SECTION_LIMIT)
+  const rows = mergeStuckDispatchRows([...deadLettered, ...quarantined], SECTION_LIMIT)
+
+  // o3d-rbyg round 2, Codex finding 3: say WHY, and only then can the page offer the right remedy.
+  //
+  // A link parked by the withdrawal fence looks exactly like a link parked by five failed
+  // reconciles, and the one action on offer — Replay — is the wrong one for it: the screen still
+  // sees the withdrawal, so a replay re-parks it, for ever. Screened through the SAME local
+  // evidence the sweep's fence reads, so the page cannot claim a reason the fence would not.
+  const { screenLocalWithdrawalEvidence } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+  const standing = await screenLocalWithdrawalEvidence(rows.map((row) => row.orderId))
+  return rows.map((row) => (standing.has(row.orderId) ? { ...row, withdrawalStanding: true } : row))
 }
 
 /**
@@ -1488,6 +1504,253 @@ export async function replayStuckDispatch(orderId: string): Promise<MutationResu
       action: 'wms_dispatch_replay',
       description: 'Re-queued a dead-lettered dispatch reconciliation via the exception inbox',
       metadata: { orderId, userId: session.user.id },
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * o3d-rbyg round 2, Codex finding 3: THE REMEDY FOR GOODS THAT HAVE ALREADY GONE.
+ *
+ * Round 1 flagged this against itself: a withdrawn order the warehouse has ALREADY despatched is
+ * refused by the dispatch fence and parked — goods gone, IMS showing it unshipped, stock still on
+ * the shelf in the sub-ledger — "until an operator acts". The inbox then offered exactly one
+ * action, Replay, which re-runs the same screen, hits the same standing withdrawal and re-parks the
+ * link. A refusal whose only offered remedy cannot work is a refusal with no remedy.
+ *
+ * This is that remedy. It is deliberately NOT a bypass flag on the fence:
+ *
+ *   - THE WMS MUST SAY THE GOODS WENT. The operator's claim is verified against the warehouse
+ *     before anything irreversible happens, exactly as the sweep verifies it. If the WMS does not
+ *     report the order despatched, this refuses and the link stays parked.
+ *   - THE HOLD IS RELEASED, NOT IGNORED. Recording a despatch against a live withdrawal hold is a
+ *     decision about the customer's request — the goods have left, so it is a RETURN now, not a
+ *     withheld shipment — so it goes through `releaseWithdrawalHold`, with its generation guard and
+ *     its audit row, rather than around it. A hold raised again after the page was rendered fails
+ *     that guard and this action stops.
+ *   - THE TOMBSTONE IS NOT TOUCHED. It is retired only by the quiescence protocol, never by an
+ *     ad-hoc decision. It does not need to be: once the order is SHIPPED it is outside
+ *     `dispatchCandidateWhere` altogether, so a standing tombstone fences nothing that can still
+ *     happen.
+ *   - THE FULFILMENT IS THE SWEEP'S OWN. `reconcileOneOrder` does the work — split parts, merge
+ *     repointing, tracking, the despatch email — so this action cannot drift from what a normal
+ *     dispatch does, and it takes the sweep's lock so it cannot run beside one.
+ *
+ * An APPROVED withdrawal is refused here on purpose: that order is CANCELLED, IMS will not record a
+ * shipment against a cancelled order (nor should it), and the parcel in flight is a return. That
+ * case gets `dismissWithdrawnDispatch` instead.
+ */
+export async function recordWithdrawnDespatch(orderId: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const connectorId = await getEnabledWmsConnectorId()
+    if (!connectorId) {
+      return { success: false, error: 'No WMS connector is enabled, so there is no warehouse to confirm the despatch against.' }
+    }
+
+    const outcome = await withDispatchSweepLockOrSkip(connectorId, async (): Promise<MutationResult> => {
+      // Everything below is re-read UNDER the lock: the page may have been open for a while, and
+      // the sweep itself may have resolved, replayed or re-parked this link since it rendered.
+      const link = await db.wmsOrderPushLink.findUnique({
+        where: { orderId },
+        select: {
+          id: true,
+          connector: true,
+          state: true,
+          externalOrderId: true,
+          externalOrderNumber: true,
+          dispatchDeadLetteredAt: true,
+          order: { select: { status: true, orderNumber: true, withdrawalHoldAt: true, withdrawalApprovedAt: true } },
+        },
+      })
+      if (!link || link.connector !== connectorId) {
+        return { success: false, error: 'This order has no link on the enabled WMS connector.' }
+      }
+      if (!link.dispatchDeadLetteredAt) {
+        return { success: false, error: 'This dispatch is no longer held back — the sweep has it again (already resolved).' }
+      }
+      if (link.state !== 'SYNCED' && link.state !== 'MERGED') {
+        return { success: false, error: `This link is ${link.state}, so it is not waiting on a dispatch. Resolve it from the order instead.` }
+      }
+      if (!link.externalOrderNumber) {
+        return { success: false, error: 'This link has no WMS order number, so its despatch cannot be confirmed.' }
+      }
+      if (link.order.withdrawalApprovedAt || link.order.status === 'CANCELLED') {
+        return {
+          success: false,
+          error: 'This order’s withdrawal was APPROVED and the order cancelled, so IMS cannot record a shipment '
+            + 'against it. The parcel that left is a return: book the goods back in when they arrive (or write the '
+            + 'stock off if they do not), then use Dismiss to clear this row.',
+        }
+      }
+
+      // This action exists for ONE situation, and it checks that the situation is real rather than
+      // trusting the button that was clicked: the page decides which control to show from the same
+      // local evidence, but a server action that took the client's word for it would be a general
+      // "dispatch this link anyway" — and that is not a decision anyone made here.
+      const { screenLocalWithdrawalEvidence } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+      const standing = await screenLocalWithdrawalEvidence([orderId])
+      if (!standing.has(orderId)) {
+        return {
+          success: false,
+          error: 'No withdrawal stands against this order any more, so there is nothing for this action to decide. '
+            + 'Replay it instead — the sweep will dispatch it normally.',
+        }
+      }
+
+      // Confirm with the warehouse BEFORE anything is released or applied. A split order's primary
+      // row can read undespatched while its parts have shipped, so a split is passed through to the
+      // per-part reconcile below, which is the only thing that can answer for it.
+      const connector = getWmsConnector(connectorId)
+      const deps = createPrismaDispatchDeps(connectorId, connector)
+      const status = await deps.fetchOrderStatus(link.externalOrderNumber)
+      if (!status) {
+        return { success: false, error: `The WMS did not return order ${link.externalOrderNumber}, so its despatch cannot be confirmed. Nothing was changed.` }
+      }
+      if (!status.dispatched && !status.isSplit) {
+        return {
+          success: false,
+          error: `The WMS reports ${link.externalOrderNumber} as "${status.status || 'unknown'}", not despatched — there is nothing to record. `
+            + 'Cancel it at the WMS while the withdrawal stands; this row clears itself once the order is cancelled.',
+        }
+      }
+
+      // The customer's request outlives the goods: released here as an explicit operator decision,
+      // audited, and only because the warehouse has just said the parcel is gone.
+      if (link.order.withdrawalHoldAt) {
+        const released = await releaseWithdrawalHold(
+          orderId,
+          'The warehouse had already despatched this order when the withdrawal was found. The hold is released so '
+          + 'the despatch can be recorded; the request is handled as a return.',
+        )
+        if (!released.success) {
+          return { success: false, error: released.error ?? 'The withdrawal hold could not be released, so nothing was recorded.' }
+        }
+      }
+
+      const candidate = {
+        linkId: link.id,
+        orderId,
+        externalOrderNumber: link.externalOrderNumber,
+        externalOrderId: link.externalOrderId,
+      }
+      const reconciled = await reconcileOneOrder(deps, candidate, status)
+      if (reconciled.action !== 'dispatched') {
+        // The hold, if there was one, has been released and is NOT silently re-applied: re-writing
+        // a customer's withdrawal marker from a failed repair would fabricate a request state
+        // nobody asked for, and the release is already on the order's timeline. The link stays
+        // parked, so nothing fulfils behind this failure.
+        return {
+          success: false,
+          error: `The despatch could not be recorded: ${reconciled.reason}. The link is still held back, and the `
+            + 'withdrawal hold (if there was one) has been released and logged on the order.',
+        }
+      }
+
+      // Only now is the park cleared — the order is SHIPPED, so the link has left the candidate set
+      // anyway and this is bookkeeping that stops the row lingering in the inbox.
+      await db.wmsOrderPushLink.updateMany({
+        where: { id: link.id, dispatchDeadLetteredAt: { not: null } },
+        data: { dispatchDeadLetteredAt: null, dispatchFailureCount: 0, dispatchLastError: null },
+      })
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        tag: 'sync',
+        action: 'wms_dispatch_withdrawn_despatch_recorded',
+        level: 'WARNING',
+        description: `Operator recorded the despatch of ${link.order.orderNumber ?? orderId} (WMS ${link.externalOrderNumber}) `
+          + 'after a withdrawal was found against it: the warehouse confirmed the goods had already gone, so the shipment, '
+          + 'the stock relief and the despatch notification were applied and the request becomes a return.',
+        metadata: { orderId, connector: connectorId, externalOrderNumber: link.externalOrderNumber, userId: session.user.id },
+        resolveUser: false,
+      })
+      revalidatePath('/sync/exceptions')
+      revalidatePath(`/sales/${orderId}`)
+      return { success: true }
+    })
+    if ('lockSkipped' in outcome) {
+      return { success: false, error: 'A dispatch sweep is running right now — try again in a moment.' }
+    }
+    return outcome
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * o3d-rbyg round 2: the other half of finding 3 — clear a withheld row whose order is TERMINAL.
+ *
+ * When the withdrawal was approved the order is CANCELLED, and a cancelled order is outside
+ * `dispatchCandidateWhere` entirely: clearing the park cannot let anything fulfil, because there is
+ * nothing left for the sweep to select. That is what makes this safe here and refused everywhere
+ * else — on a live order, clearing the park just hands the link back to a screen that will re-park
+ * it, which is the loop this whole finding is about.
+ *
+ * It resolves the INBOX ROW, not the goods. Whatever left the warehouse is a return, and the
+ * activity row says so, so nobody later reads a cleared exception as evidence the stock came back.
+ */
+export async function dismissWithdrawnDispatch(orderId: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const link = await db.wmsOrderPushLink.findUnique({
+      where: { orderId },
+      select: {
+        id: true,
+        externalOrderNumber: true,
+        dispatchDeadLetteredAt: true,
+        dispatchUnresolvedAt: true,
+        order: { select: { status: true, orderNumber: true } },
+      },
+    })
+    if (!link) return { success: false, error: 'This order has no WMS link.' }
+    if (!link.dispatchDeadLetteredAt && !link.dispatchUnresolvedAt) {
+      return { success: false, error: 'This dispatch is no longer held back (already resolved).' }
+    }
+    if (link.order.status !== 'CANCELLED') {
+      return {
+        success: false,
+        error: `Dismiss only applies to a CANCELLED order — this one is ${link.order.status}, so clearing the hold-back `
+          + 'would simply hand it to the same screen and it would be held back again. Record the despatch if the goods '
+          + 'have gone, or resolve the withdrawal on the order and replay.',
+      }
+    }
+
+    const cleared = await db.wmsOrderPushLink.updateMany({
+      where: {
+        id: link.id,
+        OR: [{ dispatchDeadLetteredAt: { not: null } }, { dispatchUnresolvedAt: { not: null } }],
+      },
+      data: {
+        dispatchDeadLetteredAt: null,
+        dispatchFailureCount: 0,
+        dispatchLastError: null,
+        dispatchUnresolvedAt: null,
+        dispatchUnresolvedCount: 0,
+        dispatchUnresolvedError: null,
+      },
+    })
+    if (cleared.count === 0) {
+      return { success: false, error: 'This dispatch is no longer held back (already resolved).' }
+    }
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      tag: 'sync',
+      action: 'wms_dispatch_withdrawn_dismissed',
+      level: 'WARNING',
+      description: `Operator dismissed the withheld dispatch for cancelled order ${link.order.orderNumber ?? orderId} `
+        + `(WMS ${link.externalOrderNumber ?? '—'}). The order stays CANCELLED and IMS records no shipment for it; `
+        + 'anything the warehouse despatched is handled as a return, and this clears only the exception row.',
+      metadata: { orderId, userId: session.user.id },
+      resolveUser: false,
     })
     revalidatePath('/sync/exceptions')
     return { success: true }

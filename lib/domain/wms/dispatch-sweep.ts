@@ -314,10 +314,16 @@ export function resolveDispatchJobOutcome(
   // job still reported SUCCEEDED with zero errors while the delta made no
   // forward progress, so a pinned watermark could repeat every sweep
   // indefinitely with nothing to alert on.
+  //
+  // o3d-rbyg round 2: withdrawalScreenFailures joins them. A screen the sweep cannot read now
+  // DEFERS every candidate in that list rather than shipping it, which is the safe answer — and a
+  // safe answer repeated every tick is a warehouse that has quietly stopped reconciling. It must
+  // be visible from the job, not only from a console line.
   degraded?: {
     unresolved?: number
     deltaWindowTruncated?: boolean
     deltaCoverageIncomplete?: boolean
+    withdrawalScreenFailures?: number
   },
 ): { status: 'SUCCEEDED' | 'PARTIAL'; effectiveErrors: number } {
   const effectiveErrors =
@@ -326,6 +332,7 @@ export function resolveDispatchJobOutcome(
     + (degraded?.unresolved ?? 0)
     + (degraded?.deltaWindowTruncated ? 1 : 0)
     + (degraded?.deltaCoverageIncomplete ? 1 : 0)
+    + (degraded?.withdrawalScreenFailures ?? 0)
   return { status: effectiveErrors > 0 ? 'PARTIAL' : 'SUCCEEDED', effectiveErrors }
 }
 
@@ -361,12 +368,18 @@ export type WmsDispatchCounters = {
   errors: number
   /** o3d-rbyg: links this pass refused to fulfil because a withdrawal stands against the order. */
   withheld: number
+  /**
+   * o3d-rbyg round 2: links this pass could not screen, so did not fulfil. Distinct from `withheld`
+   * — nothing is known against these orders and nothing durable was written; they are simply not
+   * dispatched on unread evidence, and the next sweep decides them.
+   */
+  deferred: number
 }
 
 export type WmsDispatchLog = {
   orderId: string
   externalOrderNumber: string
-  action: 'dispatched' | 'pending' | 'error' | 'withheld'
+  action: 'dispatched' | 'pending' | 'error' | 'withheld' | 'deferred'
   reason: string
 }
 
@@ -862,16 +875,22 @@ export async function runWmsDispatchSweepCore(
   deltaWindowTruncated: boolean
   /** True when the sweep pinned the watermark because it could not prove full coverage. */
   deltaCoverageIncomplete: boolean
+  /** o3d-rbyg round 2: candidate lists whose withdrawal screen could not be read (their links were deferred). */
+  withdrawalScreenFailures: number
 }> {
   // At least 1: a batchSize of 0 would poll nothing yet still look like "covered
   // the whole eligible set", which the truncation recovery below relies on.
   const batchSize = Math.max(1, options?.batchSize ?? DISPATCH_SWEEP_DEFAULT_BATCH_SIZE)
   const now = options?.now ?? new Date()
-  const counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0, withheld: 0 }
+  const counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0, withheld: 0, deferred: 0 }
   const logs: WmsDispatchLog[] = []
   // o3d-rbyg: orders this pass must not fulfil because a withdrawal stands against them. Filled by
   // screenWithdrawn() below, once per candidate list, before anything is reconciled.
   const withdrawnOrderIds = new Set<string>()
+  // o3d-rbyg round 2: orders whose screen FAILED. Not "clean" and not "withdrawn" — unknown, and an
+  // unknown must not be fulfilled irreversibly. Deferred by processOne, retried next tick.
+  const unscreenedOrderIds = new Set<string>()
+  let screenFailures = 0
 
   // --- Inbound Order/List delta (o3d-bjc) ---------------------------------
   // Only engages when the connector supplies a bulk delta AND the flag is on.
@@ -1017,14 +1036,53 @@ export async function runWmsDispatchSweepCore(
   // never count as another reconcile failure (Codex: recordDispatchError
   // throwing inside the catch would have recursed into itself) nor abort the
   // rest of the pass.
+  //
+  // Returns whether this pass DECIDED the link. A deferral (see below) returns false, so the caller
+  // does not mark it processed: the reconcile pass screens its own list moments later, and a link
+  // the delta could not screen must be allowed a second, working screen in the same tick rather than
+  // waiting a whole interval on the first bad query.
   const processOne = async (
     candidate: WmsDispatchCandidate,
     preload: WmsOrderStatus | null | undefined,
     expectedExternalOrderId?: string,
     requireResolution = false,
     mergeNumberUnique?: boolean,
-  ) => {
+  ): Promise<boolean> => {
     counters.totalChecked += 1
+
+    // o3d-rbyg round 2, Codex finding 2: this candidate was never screened, so DEFER it.
+    //
+    // Round 1 let an unscreened candidate through and merely held the watermark. That is the trade
+    // the PUSH screen makes, and it is right there: an unreadable storefront says nothing about the
+    // order, and refusing would idle the warehouse on somebody else's outage — while the act it
+    // guards (a create) is reversible by the hold and cancel passes.
+    //
+    // NEITHER HALF OF THAT HOLDS HERE. The screen is a read of our OWN database, so its failure is
+    // not an independent outage the fence should absorb — it is the sweep being partly blind (an
+    // unmigrated suppression table, a statement timeout on the join) while the rest of the pass
+    // works perfectly and ships. And what it guards is not reversible: applyDispatch marks the
+    // shipment SHIPPED, consumes FIFO stock and sends the customer a despatch email that cannot be
+    // unsent. Deferral costs one sweep interval on an order the WMS has already despatched; the
+    // failure it prevents cannot be undone at any price.
+    //
+    // A defer is NOT a park: nothing durable is written, the link stays a candidate, and the very
+    // next tick with a working screen dispatches it. The pass is dirty either way, so the watermark
+    // is held and the job reports PARTIAL rather than a silent success.
+    if (unscreenedOrderIds.has(candidate.orderId)) {
+      counters.deferred += 1
+      logs.push({
+        orderId: candidate.orderId,
+        externalOrderNumber: candidate.externalOrderNumber,
+        action: 'deferred',
+        reason: 'The withdrawal screen could not be read, so this pass could not prove no withdrawal stands '
+          + 'against this order. Dispatch was NOT applied — no shipment, no stock relief and no despatch '
+          + 'email — and the link is retried on the next sweep. Nothing durable was written.',
+      })
+      // Deliberately NOT counted in linksDecided: the pass decided nothing about this link, and
+      // that counter is the denominator the unresolved-drift ratio is judged against.
+      passClean = false
+      return false
+    }
 
     // o3d-rbyg: the fifth fulfilment path, fenced BEFORE the status is even looked at.
     //
@@ -1035,8 +1093,9 @@ export async function runWmsDispatchSweepCore(
     // merge repoint.
     if (withdrawnOrderIds.has(candidate.orderId)) {
       const reason = 'A withdrawal request stands against this order, so its WMS dispatch was NOT applied '
-        + '— no shipment, no stock relief and no despatch email. Cancel it at the WMS, or resolve the '
-        + 'withdrawal and replay this link.'
+        + '— no shipment, no stock relief and no despatch email. Cancel it at the WMS while the withdrawal '
+        + 'stands; if the warehouse has ALREADY despatched it, record the despatch from the sync exception '
+        + 'inbox (IMS confirms it with the WMS first). Once the withdrawal itself is resolved, replay this link.'
       let parked = false
       try {
         parked = (await deps.parkWithdrawn?.(candidate, reason))?.parked ?? false
@@ -1054,7 +1113,7 @@ export async function runWmsDispatchSweepCore(
         action: 'withheld',
         reason: parked ? reason : `${reason} (the link could not be parked — it will be refused again next sweep)`,
       })
-      return
+      return true
     }
 
     let outcome: WmsDispatchOutcome
@@ -1127,6 +1186,7 @@ export async function runWmsDispatchSweepCore(
       action: outcome.action,
       reason,
     })
+    return true
   }
 
   // "Is this order number claimed by exactly one link?" — `undefined` when we never
@@ -1144,22 +1204,32 @@ export async function runWmsDispatchSweepCore(
   /**
    * o3d-rbyg: screen a candidate list against the durable withdrawal evidence, once, in bulk.
    *
-   * A FAILURE HERE IS NOT SILENT. This is a local read — an outage of it means the database is in
-   * trouble, not the storefront — so there is no honest "leave them as they were": the pass simply
-   * does not know. It proceeds (refusing every candidate would halt dispatch reconciliation shop-wide
-   * on one bad query, the same trade round 1 made for the storefront screen) but marks the pass
-   * DIRTY, so the watermark is held and nothing ages out unexamined.
+   * A FAILURE HERE IS NOT SILENT AND IS NOT WAVED THROUGH (round 2, Codex finding 2). This is a
+   * read of our own database, so its failure is the sweep going partly blind rather than an outage
+   * somewhere else — and what the screen guards is irreversible. Every order in a list that could
+   * not be screened is DEFERRED by processOne: no dispatch, nothing durable written, the pass marked
+   * dirty so the watermark is held, and the whole list retried next tick.
+   *
+   * The failure is remembered PER ORDER rather than for the pass, so the second pass's own screen
+   * can clear it: the delta list and the reconcile list are screened separately, and one bad query
+   * against a 200-id chunk must not idle a candidate the other pass screened cleanly moments later.
    */
   const screenWithdrawn = async (list: WmsDispatchCandidate[]) => {
     if (!deps.screenWithdrawnOrders || list.length === 0) return
+    const orderIds = [...new Set(list.map((entry) => entry.orderId))]
     try {
-      const fenced = await deps.screenWithdrawnOrders([...new Set(list.map((entry) => entry.orderId))])
+      const fenced = await deps.screenWithdrawnOrders(orderIds)
       for (const orderId of fenced) withdrawnOrderIds.add(orderId)
+      // Screened cleanly: retract any earlier pass's failure for these same orders.
+      for (const orderId of orderIds) unscreenedOrderIds.delete(orderId)
     } catch (screenError) {
       passClean = false
+      screenFailures += 1
+      for (const orderId of orderIds) unscreenedOrderIds.add(orderId)
       console.error(
-        '[wms-dispatch-sweep] withdrawal screen failed — the watermark is held, and this pass cannot '
-        + 'prove a withdrawn order was not fulfilled:',
+        `[wms-dispatch-sweep] withdrawal screen failed for ${orderIds.length} candidate(s) — their dispatch `
+        + 'is DEFERRED (nothing shipped, nothing parked) and the watermark is held, because this pass '
+        + 'cannot prove no withdrawal stands against them:',
         screenError,
       )
     }
@@ -1431,7 +1501,7 @@ export async function runWmsDispatchSweepCore(
       // counting it here would mask exactly the slow path this metric exists to expose.
       if (preload && !preload.authoritativeReread) deltaPreloadServed += 1
       if (preload?.authoritativeReread) deltaAuthoritativeRereads += 1
-      await processOne(
+      const decidedByDelta = await processOne(
         effectiveCandidate,
         preload,
         idRow ? undefined : candidate.externalOrderId ?? undefined,
@@ -1440,7 +1510,7 @@ export async function runWmsDispatchSweepCore(
         true,
         claimantUniqueness(linksPerNumber, candidate.externalOrderNumber),
       )
-      processedLinkIds.add(candidate.linkId)
+      if (decidedByDelta) processedLinkIds.add(candidate.linkId)
     }
   }
 
@@ -1479,7 +1549,7 @@ export async function runWmsDispatchSweepCore(
 
     for (const candidate of candidates) {
       if (processedLinkIds.has(candidate.linkId)) continue // already handled from the delta
-      await processOne(
+      const decided = await processOne(
         candidate,
         undefined,
         undefined,
@@ -1490,7 +1560,7 @@ export async function runWmsDispatchSweepCore(
         deltaWindowTruncated,
         claimantUniqueness(reconcileClaimants, candidate.externalOrderNumber),
       )
-      processedLinkIds.add(candidate.linkId)
+      if (decided) processedLinkIds.add(candidate.linkId)
     }
   }
 
@@ -1743,6 +1813,11 @@ export async function runWmsDispatchSweepCore(
     // Likewise for coverage: the sweep pinned the watermark because it could not
     // prove it saw every changed order. Safe, but it must not look like success.
     deltaCoverageIncomplete: !deltaCoverageComplete,
+    // o3d-rbyg round 2: how many candidate lists could not be screened for withdrawals. Their
+    // orders were deferred rather than dispatched, which is safe — and, exactly like the two flags
+    // above, must not read as a clean sweep. A screen that fails every tick stops fulfilment
+    // silently otherwise.
+    withdrawalScreenFailures: screenFailures,
   }
 }
 
@@ -2252,52 +2327,17 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
       })
     },
     /**
-     * o3d-rbyg: the durable withdrawal evidence for a batch of orders, read LOCALLY.
+     * o3d-rbyg: the durable withdrawal evidence for a batch of orders, read LOCALLY — the IMS
+     * markers, or a standing WooCommerce suppression tombstone.
      *
-     * Two independent signals, either of which is enough:
-     *   - the IMS markers (`withdrawalHoldAt` / `withdrawalApprovedAt`) — what IMS was told;
-     *   - a STANDING WooCommerce suppression tombstone — what the storefront was observed to say,
-     *     written by the push sweep's screen and by the withdrawal ingress, and retired only after
-     *     the storefront has reported the request rejected across a whole quiescence window.
-     *
-     * The tombstone half is what makes this work when the webhook that sets the markers was the
-     * thing that went missing — which is the premise of the entire fence.
+     * Delegated to the withdrawal module rather than re-queried here (round 2): the exception inbox
+     * has to explain the very refusal this screen produces, and two copies of the query are how the
+     * fence and its explanation drift apart. Dynamically imported so the connector-agnostic sweep
+     * does not statically depend on a storefront connector.
      */
     async screenWithdrawnOrders(orderIds) {
-      const withdrawn = new Set<string>()
-      const unique = [...new Set(orderIds.filter(Boolean))]
-      if (unique.length === 0) return withdrawn
-      const CHUNK = 200
-      for (let i = 0; i < unique.length; i += CHUNK) {
-        const chunk = unique.slice(i, i + CHUNK)
-        const marked = await db.salesOrder.findMany({
-          where: {
-            id: { in: chunk },
-            OR: [{ withdrawalHoldAt: { not: null } }, { withdrawalApprovedAt: { not: null } }],
-          },
-          select: { id: true },
-        })
-        for (const row of marked) withdrawn.add(row.id)
-
-        // The tombstone side. Joined through the storefront link because the suppression row is
-        // keyed by the WooCommerce order id, not by ours.
-        const links = await db.shoppingOrderLink.findMany({
-          where: { orderId: { in: chunk }, connector: 'woocommerce' },
-          select: { orderId: true, externalOrderId: true },
-        })
-        if (links.length === 0) continue
-        const standing = await db.wcWithdrawalSuppression.findMany({
-          where: {
-            connector: 'woocommerce',
-            externalOrderId: { in: [...new Set(links.map((link) => link.externalOrderId))] },
-            retiredAt: null,
-          },
-          select: { externalOrderId: true },
-        })
-        const standingIds = new Set(standing.map((row) => row.externalOrderId))
-        for (const link of links) if (standingIds.has(link.externalOrderId)) withdrawn.add(link.orderId)
-      }
-      return withdrawn
+      const { screenLocalWithdrawalEvidence } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+      return screenLocalWithdrawalEvidence(orderIds)
     },
     async parkWithdrawn(candidate, reason) {
       // Compare-and-set on the stamp being absent, exactly as the dead-letter and quarantine paths
@@ -2344,7 +2384,8 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           title: 'Dispatch withheld — withdrawal standing',
           message: `Order ${candidate.externalOrderNumber} is withdrawn (or has a withdrawal standing against it) `
             + 'but the WMS reports it active. IMS did NOT mark it shipped or email the customer. '
-            + 'Cancel it at the WMS, or resolve the withdrawal and replay the link.',
+            + 'Cancel it at the WMS — or, if the goods have already gone, record the despatch from the '
+            + 'exception inbox so the stock and the sub-ledger match reality.',
           actionUrl: '/sync/exceptions',
         })))
       } catch (alertError) {
@@ -2753,7 +2794,7 @@ async function runWmsDispatchSweepLocked(
   })
 
   // Hoisted so a failure during persistence still reports the work the core did.
-  let counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0, withheld: 0 }
+  let counters: WmsDispatchCounters = { totalChecked: 0, dispatched: 0, pending: 0, errors: 0, withheld: 0, deferred: 0 }
 
   try {
     const core = await runWmsDispatchSweepCore(deps, coreOptions)
@@ -2761,7 +2802,7 @@ async function runWmsDispatchSweepLocked(
     const {
       logs, deltaError, unresolved, deltaWindowTruncated, deltaCoverageIncomplete,
       deltaPreloadServed, deltaAuthoritativeRereads, deltaRowCount,
-      unresolvedQuarantined, unresolvedSystemic,
+      unresolvedQuarantined, unresolvedSystemic, withdrawalScreenFailures,
     } = core
 
     if (logs.length > 0) {
@@ -2776,6 +2817,10 @@ async function runWmsDispatchSweepLocked(
         // the exception inbox, and `resolveDispatchJobOutcome` reads counters, not these rows, so
         // this does not silently fail the job.
         withheld: 'error',
+        // o3d-rbyg round 2: a DEFERRED link is not an error against the order — nothing is wrong
+        // with it and nothing was written. It is a noop row so the job's log still shows the pass
+        // saw it and chose not to act; the screen failure itself is the error row raised below.
+        deferred: 'noop',
       }
       await db.wmsSyncLog.createMany({
         data: logs.map((log) => ({
@@ -2803,6 +2848,25 @@ async function runWmsDispatchSweepLocked(
           action: 'error',
           reason: `Inbound Order/List delta fetch failed — fell back to the per-order reconcile this run: ${deltaError}`,
           payload: { deltaFailure: true, connector: connectorId } as Prisma.InputJsonValue,
+        },
+      })
+    }
+
+    // o3d-rbyg round 2: the same treatment for a screen that could not be read. The deferral is
+    // deliberate and safe, but a shop whose withdrawal screen has been failing for a day would
+    // otherwise see only SUCCEEDED jobs and a warehouse that had stopped despatching.
+    if (withdrawalScreenFailures > 0) {
+      await db.wmsSyncLog.create({
+        data: {
+          jobId: job.id,
+          sku: null,
+          productId: null,
+          action: 'error',
+          reason: `The withdrawal screen failed on ${withdrawalScreenFailures} candidate list(s) — `
+            + `${counters.deferred} link(s) were DEFERRED rather than dispatched, because this pass could not `
+            + 'prove no withdrawal stands against them. Nothing was shipped and nothing was parked; they are '
+            + 'retried next sweep.',
+          payload: { withdrawalScreenFailure: true, connector: connectorId, deferred: counters.deferred } as Prisma.InputJsonValue,
         },
       })
     }
@@ -2884,6 +2948,7 @@ async function runWmsDispatchSweepLocked(
       unresolved,
       deltaWindowTruncated,
       deltaCoverageIncomplete,
+      withdrawalScreenFailures,
     })
     await db.wmsSyncJob.update({
       where: { id: job.id },
@@ -2898,16 +2963,20 @@ async function runWmsDispatchSweepLocked(
       },
     })
 
-    if (counters.dispatched > 0 || effectiveErrors > 0 || counters.withheld > 0) {
+    if (counters.dispatched > 0 || effectiveErrors > 0 || counters.withheld > 0 || counters.deferred > 0) {
       await logActivity({
         entityType: 'SYSTEM',
         tag: 'sync',
         action: deltaError ? 'wms_dispatch_sync_degraded' : 'wms_dispatch_sync',
-        level: deltaError ? 'WARNING' : undefined,
+        // o3d-rbyg round 2: a pass that deferred links is degraded in the same way a delta failure
+        // is — fulfilment did not happen, and the reason was ours.
+        level: deltaError || counters.deferred > 0 ? 'WARNING' : undefined,
         description: deltaError
           ? `WMS dispatch sync (${connectorId}) DEGRADED — inbound delta failed, ran per-order reconcile fallback: ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} order errors. Delta error: ${deltaError}`
           : `WMS dispatch sync (${connectorId}): ${counters.totalChecked} checked, ${counters.dispatched} dispatched, ${counters.errors} errors`
-            + (counters.withheld > 0 ? `, ${counters.withheld} withheld (withdrawal standing).` : '.'),
+            + (counters.withheld > 0 ? `, ${counters.withheld} withheld (withdrawal standing)` : '')
+            + (counters.deferred > 0 ? `, ${counters.deferred} deferred (withdrawal screen unreadable)` : '')
+            + '.',
         metadata: { jobId: job.id, connector: connectorId, deltaError: deltaError ?? undefined, ...counters },
         resolveUser: false,
       })

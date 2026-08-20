@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { runWmsDispatchSweepCore, type WmsDispatchSweepDeps } from '../lib/domain/wms/dispatch-sweep.ts'
+import { resolveDispatchJobOutcome, runWmsDispatchSweepCore, type WmsDispatchSweepDeps } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsOrderStatus, WmsOrderPart } from '../lib/connectors/wms/types.ts'
 
 /**
@@ -157,14 +157,17 @@ test('dispatch: a park that COMMITS lets the watermark advance (o3d-rbyg)', asyn
   assert.ok(saved[0].watermark, 'a decided link does not pin the delta')
 })
 
-test('dispatch: a screen that THROWS holds the watermark rather than passing silently (o3d-rbyg)', async () => {
-  // The screen is a LOCAL read: its failure means the database is in trouble, not the storefront, so
-  // there is no honest "leave them as they were". Refusing every candidate would halt dispatch
-  // reconciliation shop-wide on one bad query, so the pass proceeds — but it must not then claim to
-  // have covered the window it could not screen.
+test('dispatch: a screen that THROWS defers the dispatch instead of shipping unscreened (o3d-rbyg r2)', async () => {
+  // ROUND 2, Codex finding 2. Round 1 let the pass proceed and merely held the watermark — the same
+  // trade the PUSH screen makes. It is not the same trade. This screen is a read of our OWN
+  // database, so its failure is the sweep going blind rather than somebody else's outage; and what
+  // it guards is irreversible — a shipment marked SHIPPED, FIFO stock consumed, and a despatch
+  // email the customer cannot be un-sent. Deferring costs one sweep interval.
   const applied: string[] = []
+  const parked: string[] = []
+  const errored: string[] = []
   const saved: Array<{ watermark?: string }> = []
-  const { counters } = await runWmsDispatchSweepCore(deps({
+  const { counters, logs } = await runWmsDispatchSweepCore(deps({
     listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
     listActiveByExternalOrderIds: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }],
     listReconcileCandidates: async () => [],
@@ -173,12 +176,84 @@ test('dispatch: a screen that THROWS holds the watermark rather than passing sil
     saveDeltaState: async (state) => { saved.push(state) },
     applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
     screenWithdrawnOrders: async () => { throw new Error('connection terminated') },
+    parkWithdrawn: async (candidate) => { parked.push(candidate.linkId); return { parked: true } },
+    recordDispatchError: async (candidate) => { errored.push(candidate.linkId); return { deadLettered: false } },
+  }))
+
+  assert.deepEqual(applied, [], 'nothing was shipped on evidence the pass could not read')
+  assert.equal(counters.deferred, 1, 'the link was DEFERRED, and the pass says so')
+  assert.equal(counters.dispatched, 0)
+  assert.equal(counters.withheld, 0, 'a deferral is not a refusal — nothing is known against this order')
+  assert.deepEqual(parked, [], 'and it is not a park: nothing durable was written')
+  assert.deepEqual(errored, [], 'nor an error against the link, which has done nothing wrong')
+  assert.equal(logs[0].action, 'deferred')
+  assert.match(logs[0].reason, /withdrawal screen could not be read/)
+  assert.match(logs[0].reason, /retried on the next sweep/)
+  assert.equal(saved[0]?.watermark, undefined, 'the watermark is held, so nothing ages out unscreened')
+})
+
+test('dispatch: a deferral is retracted by a later pass that screens the same order cleanly (o3d-rbyg r2)', async () => {
+  // The failure is remembered PER ORDER, not for the pass: the delta list and the reconcile list are
+  // screened separately, so one bad query against the delta batch must not idle a candidate the
+  // reconcile pass screens cleanly moments later, in the same tick.
+  const applied: string[] = []
+  let screens = 0
+  const { counters } = await runWmsDispatchSweepCore(deps({
+    listCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' }],
+    listActiveByExternalOrderIds: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }],
+    listReconcileCandidates: async () => [{ linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001', externalOrderId: 'M-1' }],
+    fetchDelta: async () => [status({})],
+    fetchOrderStatus: async () => status({}),
+    getDeltaState: async () => ({ watermark: null, lastReconcile: null }),
+    saveDeltaState: async () => {},
+    applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+    screenWithdrawnOrders: async () => {
+      screens += 1
+      if (screens === 1) throw new Error('statement timeout')
+      return new Set<string>()
+    },
     parkWithdrawn: async () => ({ parked: true }),
   }))
 
-  assert.deepEqual(applied, ['o1'], 'the pass does not halt — one bad query must not stop the warehouse')
-  assert.equal(counters.withheld, 0)
-  assert.equal(saved[0]?.watermark, undefined, 'but the watermark is held, so the pass cannot claim it screened')
+  assert.equal(screens, 2, 'the reconcile pass screened its own list rather than inheriting the delta failure')
+  assert.deepEqual(applied, ['o1'], 'and once screened cleanly, the SAME tick dispatches it')
+  assert.equal(counters.dispatched, 1)
+  assert.equal(counters.deferred, 1, 'the delta pass did defer it — the recovery is a second screen, not a silent pass-through')
+})
+
+test('dispatch: a deferral does not stop the rest of the batch, only the unscreened orders (o3d-rbyg r2)', async () => {
+  // Failing closed must not become a shop-wide halt by the back door. Only orders in the list that
+  // could not be screened are deferred; a list that screened cleanly dispatches as normal.
+  const applied: string[] = []
+  const { counters } = await runWmsDispatchSweepCore(deps({
+    listCandidates: async () => [
+      { linkId: 'l1', orderId: 'o1', externalOrderNumber: 'WC-1001' },
+      { linkId: 'l2', orderId: 'o2', externalOrderNumber: 'WC-1002' },
+    ],
+    fetchOrderStatus: async (number) => status({ externalOrderNumber: number }),
+    applyDispatch: async (orderId) => { applied.push(orderId); return { success: true } },
+    screenWithdrawnOrders: async (orderIds) => {
+      if (orderIds.includes('o1')) throw new Error('deadlock detected')
+      return new Set<string>()
+    },
+    parkWithdrawn: async () => ({ parked: true }),
+  }))
+
+  // Both orders are in ONE candidate list here, so both are deferred — the point being that the
+  // deferral is scoped to the list the screen actually failed on, and reports its size.
+  assert.deepEqual(applied, [])
+  assert.equal(counters.deferred, 2)
+  assert.equal(counters.totalChecked, 2, 'the pass still SAW them — a deferral is not an invisible skip')
+})
+
+test('dispatch: a failed screen makes the job PARTIAL rather than a clean success (o3d-rbyg r2)', () => {
+  // The deferral is safe. A deferral repeated every tick is a warehouse that has quietly stopped
+  // reconciling, and it must not be reported as SUCCEEDED with zero errors.
+  const clean = resolveDispatchJobOutcome(0, null, { withdrawalScreenFailures: 0 })
+  assert.equal(clean.status, 'SUCCEEDED')
+  const degraded = resolveDispatchJobOutcome(0, null, { withdrawalScreenFailures: 2 })
+  assert.equal(degraded.status, 'PARTIAL')
+  assert.equal(degraded.effectiveErrors, 2)
 })
 
 test('dispatch: a connector with no screen behaves exactly as before (o3d-rbyg)', async () => {

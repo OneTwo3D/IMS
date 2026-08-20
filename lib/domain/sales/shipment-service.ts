@@ -611,12 +611,34 @@ export async function transitionShipmentStatus(
       // mutually exclusive. It covers the manual shipment paths too.
       const withdrawn = await tx.salesOrder.findUnique({
         where: { id: shipment.orderId },
-        select: { withdrawalApprovedAt: true, status: true },
+        select: { withdrawalApprovedAt: true, withdrawalHoldAt: true, status: true },
       })
       if (withdrawn?.withdrawalApprovedAt) {
         throw new Error(
           'This order\u2019s EU withdrawal request was approved; its shipments cannot be dispatched.',
         )
+      }
+      // o3d-rbyg round 2, Codex finding 5: THE SIXTH FULFILMENT PATH \u2014 a SUBMITTED withdrawal.
+      //
+      // Only the APPROVED marker was checked here, so every manual dispatch (the shipment screen,
+      // the label-purchase flow, any repair that walks a shipment to SHIPPED) went straight through
+      // a hold that is still being decided. The WMS paths never hit it because a hold pulls the
+      // order back out of the warehouse \u2014 but the manual paths do not go through the warehouse at
+      // all, and this transaction is the only place that sees them.
+      //
+      // A submitted withdrawal means the customer has asked for the goods NOT to go, and the whole
+      // point of the hold is that they stay put until a person decides. That is exactly the same
+      // reason the approval is refused above; the difference is only that this one is reversible \u2014
+      // so it is REFUSED rather than thrown, and the refusal names the remedy: an operator releases
+      // the hold on the order (Sales -> the order -> Release withdrawal hold) and dispatches again.
+      // Read under the order lock, like the approval, so a hold committing between the caller's
+      // read and this dispatch is still honoured rather than raced past.
+      if (withdrawn?.withdrawalHoldAt) {
+        return {
+          success: false as const,
+          error: 'This order is under an EU right-of-withdrawal hold, so its shipments cannot be dispatched. '
+            + 'Release the withdrawal hold on the order once the request has been decided, then dispatch again.',
+        }
       }
       // o3d-4kfh r6 (Codex finding 4): NOT ON A CANCELLED ORDER. Read under the same order lock the
       // cancel takes, so a cancel committing between the caller's read and this dispatch is honoured.

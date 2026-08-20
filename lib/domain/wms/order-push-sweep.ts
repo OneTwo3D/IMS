@@ -785,6 +785,12 @@ export async function runWmsOrderPushSweepCore(
         verifyError = scrubWmsError(error, 'WMS push verification failed')
         console.error('[wms-order-push] verification failed', link.orderId, verifyError)
       }
+      // o3d-rbyg round 2: the withdrawal evidence is gathered BEFORE the promotion is decided,
+      // because one of these reads can WITHDRAW the verdict rather than merely qualify it (see the
+      // tombstone read below). Hoisted so the decision block below can still see what was found.
+      let heldNow = false
+      let heldApproved = false
+      let tombstoned = false
       if (verdict === 'ours') {
         // o3d-6x66: the id is now proved ours — which is precisely the moment a
         // raced-withdrawal create was left waiting for. Do NOT just promote and
@@ -794,8 +800,8 @@ export async function runWmsOrderPushSweepCore(
         // leaves a verified, active WMS order that neither pass picks up —
         // with the explicit warning erased. Re-read the markers first.
         const held = await port.readWithdrawalState?.(link.orderId)
-        let heldNow = Boolean(held && (held.withdrawalHoldAt || held.withdrawalApprovedAt))
-        let heldApproved = Boolean(held?.withdrawalApprovedAt)
+        heldNow = Boolean(held && (held.withdrawalHoldAt || held.withdrawalApprovedAt))
+        heldApproved = Boolean(held?.withdrawalApprovedAt)
 
         // o3d-rbyg: promotion to SYNCED is a fulfilment decision — a SYNCED link is what the
         // dispatch passes act on — and until now it consulted only the IMS markers. An order
@@ -832,19 +838,40 @@ export async function runWmsOrderPushSweepCore(
         // rule the withdrawal module states in as many words — so the reversible action is the only
         // one it can authorise. If the customer's request was in fact approved, the markers, the
         // live read or the ordinary cancel pass supply that verdict and the cancel follows.
-        let tombstoned = false
         if (!heldNow) {
           try {
             tombstoned = Boolean((await port.readWithdrawalTombstone?.(link.orderId))?.standing)
           } catch (e) {
-            console.error(`[wms-order-push] verify-pass withdrawal tombstone read failed for ${link.orderId}: ${scrubWmsError(e, 'read failed')}`)
+            // o3d-rbyg round 2, Codex finding 4: an UNREAD tombstone is not an absent one, and the
+            // decision it feeds is a promotion to SYNCED — which is precisely the state the dispatch
+            // sweep fulfils from. Swallowing the failure and promoting anyway meant one bad local
+            // read moved the link into the dispatch set with its durable fence never consulted.
+            //
+            // So the VERDICT is withdrawn, not the fence: the link stays PENDING_VERIFY and is
+            // retried on the next sweep by the ordinary unresolved ladder below — attempts stamped
+            // so it rotates, and escalated to the exception inbox at the bound rather than retrying
+            // in silence for ever. Nothing is cancelled and nothing is re-pushed, so holding here
+            // costs a sweep interval and risks nothing; promoting costs a customer's withdrawn
+            // order being shipped.
+            //
+            // Deliberately NOT the same trade as the live storefront read above. That one falls back
+            // to the markers because it is a REMOTE dependency whose outage says nothing about this
+            // order and would otherwise strand every verified link shop-wide. This is a local read
+            // of our own database, its failure is ours, and the safe side of it is standing still.
+            const message = scrubWmsError(e, 'read failed')
+            console.error(`[wms-order-push] verify-pass withdrawal tombstone read failed for ${link.orderId}: ${message}`)
+            verdict = 'unknown'
+            verifyError = `WMS order ${link.externalOrderId} is ours, but the durable withdrawal tombstone could not be read (${message})`
+              + ' — the link was NOT promoted to SYNCED, because a SYNCED link is what the dispatch sweep fulfils'
           }
           if (tombstoned) {
             heldNow = true
             heldApproved = false
           }
         }
+      }
 
+      if (verdict === 'ours') {
         if (heldNow) {
           const approved = heldApproved
           let pulled = false

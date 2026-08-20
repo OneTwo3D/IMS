@@ -395,7 +395,7 @@ test('verify: a tombstone read that THROWS does not cancel a proved-ours order (
   // Same asymmetry as the live read: acting on no evidence here means pulling back a warehouse order
   // we have just proved is ours. The failure is logged, and the markers remain the only trigger.
   let cancelled = 0
-  const { port, updates } = makePort({
+  const { port } = makePort({
     verifiable: [verifyLink()],
     readWithdrawalTombstone: async () => { throw new Error('DB connection lost') },
   })
@@ -407,7 +407,53 @@ test('verify: a tombstone read that THROWS does not cancel a proved-ours order (
     'mintsoft', port, { now: NOW },
   )
 
-  assert.equal(cancelled, 0)
-  assert.equal(r.verified, 1)
-  assert.equal(updates[0]?.data.state, 'SYNCED')
+  assert.equal(cancelled, 0, 'nothing is pulled back on an unread row')
+  assert.equal(r.cancelled, 0)
+  assert.equal(r.held, 0)
+})
+
+test('verify: a tombstone read that THROWS does not PROMOTE the link either (o3d-rbyg r2)', async () => {
+  // ROUND 2, Codex finding 4. The failure was swallowed and the link promoted to SYNCED anyway —
+  // and SYNCED is exactly the state the dispatch sweep fulfils from, so one unreadable local row
+  // moved an order into the dispatch set with its durable fence never consulted.
+  //
+  // Not promoting is cheap and reversible: the link stays PENDING_VERIFY, is re-read next sweep, and
+  // nothing is cancelled or re-pushed in the meantime. Promoting is not: the next dispatch tick can
+  // ship it, relieve the stock and email the customer.
+  const { port, updates } = makePort({
+    verifiable: [verifyLink()],
+    readWithdrawalTombstone: async () => { throw new Error('DB connection lost') },
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ verifyPushedOrder: async () => 'ours' }), 'mintsoft', port, { now: NOW },
+  )
+
+  assert.equal(r.verified, 0, 'the link was NOT promoted into the dispatch set')
+  assert.equal(r.verifyUnresolved, 1, 'it is counted as unresolved — the ordinary retry ladder, not a silent hold')
+  assert.equal(updates[0]?.data.state, undefined, 'and it stays PENDING_VERIFY rather than being moved anywhere')
+  assert.equal(updates[0]?.data.attempts, 1, 'the attempt is stamped so the batch rotates instead of re-selecting it forever')
+  assert.match(
+    String(updates[0]?.data.lastError),
+    /withdrawal tombstone could not be read/,
+    'and the reason names the unread evidence, not a generic verification failure',
+  )
+  assert.match(String(updates[0]?.data.lastError), /NOT promoted to SYNCED/)
+})
+
+test('verify: an unreadable tombstone ESCALATES at the attempt bound instead of retrying forever (o3d-rbyg r2)', async () => {
+  // The bound on the hold. A local row that stays unreadable would otherwise leave the order doing
+  // nothing, invisibly, for ever — the shape of permanent hold the quarantine exists to end. At the
+  // fifth attempt it becomes an operator's problem in the exception inbox, and is never re-pushed.
+  const { port, updates } = makePort({
+    verifiable: [verifyLink({ verifyAttempts: 4 })],
+    readWithdrawalTombstone: async () => { throw new Error('relation "wc_withdrawal_suppressions" does not exist') },
+  })
+  const r = await runWmsOrderPushSweepCore(
+    connector({ verifyPushedOrder: async () => 'ours' }), 'mintsoft', port, { now: NOW },
+  )
+
+  assert.equal(r.verified, 0)
+  assert.equal(r.verifyQuarantined, 1)
+  assert.equal(updates[0]?.data.state, 'DEAD_LETTER')
+  assert.match(String(updates[0]?.data.lastError), /NOT re-pushed/)
 })

@@ -3,7 +3,7 @@
 import { Fragment, useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { ArrowLeft, CheckCircle2, Inbox, Loader2, RotateCcw, Split } from 'lucide-react'
+import { ArrowLeft, CheckCircle2, Inbox, Loader2, PackageCheck, RotateCcw, Split, XCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { Card } from '@/components/ui/card'
@@ -21,7 +21,9 @@ import { useStepUpReauth, isFreshAuthFailure, type MaybeFreshAuthFailure } from 
 import { replayWmsOrderPush } from '@/app/actions/wms-order-push'
 import {
   clearPennyMismatchFlag,
+  dismissWithdrawnDispatch,
   endHeldMaintenanceWindow,
+  recordWithdrawnDespatch,
   runPostMaintenanceRecheckNow,
   replayDeadReceiptEvent,
   replayDeadWebhookEvent,
@@ -442,7 +444,14 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`Dispatch reconciliation — dead-lettered orders (${data.summary.stuckDispatches})`}
-            detail="The WMS despatched these orders but IMS could not reconcile them (typically no IMS stock to consume). After repeated failures the sweep stops retrying; fix the order's stock position, then replay."
+            detail={
+              'The WMS despatched these orders but IMS could not reconcile them (typically no IMS stock to consume). '
+              + 'After repeated failures the sweep stops retrying; fix the order\u2019s stock position, then replay. '
+              + 'Rows marked WITHDRAWAL STANDING are different: IMS refused to fulfil them because the customer asked to '
+              + 'withdraw the order, so a replay would only refuse them again. If the warehouse had already despatched, '
+              + 'record the despatch \u2014 IMS confirms it with the WMS first, then books the shipment, the stock and the '
+              + 'despatch notification, and the request becomes a return.'
+            }
             shown={data.stuckDispatches.length}
             total={data.summary.stuckDispatches}
           />
@@ -466,7 +475,14 @@ export function ExceptionsClient({ data }: Props) {
                   </TableCell>
                   <TableCell className="text-xs font-mono">{row.externalOrderNumber ?? '—'}</TableCell>
                   <TableCell className="text-xs">
-                    {row.kind === 'unresolved' ? (
+                    {row.withdrawalStanding ? (
+                      <span
+                        className="font-medium"
+                        title="A withdrawal stands against this order, so IMS refused to mark it shipped, relieve stock or email the customer. Replaying re-runs the same check and holds it back again."
+                      >
+                        Withdrawal standing
+                      </span>
+                    ) : row.kind === 'unresolved' ? (
                       <span title="The WMS answered, but its record could not be read as a dispatch state. Quarantined so it stops holding the inbound sync back.">
                         Unreadable record
                       </span>
@@ -478,15 +494,56 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.reason ?? ''}>{row.reason ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.deadLetteredAt ? formatDateTime(row.deadLetteredAt) : '—'}</TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(() => replayStuckDispatch(row.orderId), 'Dispatch reconciliation re-queued for the next sweep.')}
-                    >
-                      <RotateCcw className="h-3 w-3 mr-1" />Replay
-                    </Button>
+                    <div className="flex justify-end gap-2">
+                      {/*
+                        o3d-rbyg round 2: the remedy a withheld withdrawal actually needs. A CANCELLED
+                        order (an APPROVED withdrawal) cannot carry a shipment in IMS at all, so it is
+                        offered Dismiss instead — clearing the row without pretending the goods came back.
+                      */}
+                      {row.withdrawalStanding ? (
+                        row.orderStatus === 'CANCELLED' ? (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={isPending}
+                            title="The order is cancelled, so IMS records no shipment for it. This clears the exception row; anything already despatched is handled as a return."
+                            onClick={() => runAction(
+                              () => dismissWithdrawnDispatch(row.orderId),
+                              'Cleared. The order stays cancelled — handle anything already despatched as a return.',
+                            )}
+                          >
+                            <XCircle className="h-3 w-3 mr-1" />Dismiss
+                          </Button>
+                        ) : (
+                          <Button
+                            type="button"
+                            variant="outline"
+                            size="sm"
+                            disabled={isPending}
+                            title="Confirms with the WMS that the goods have gone, releases the withdrawal hold, then books the shipment, the stock relief and the despatch notification."
+                            onClick={() => runAction(
+                              () => recordWithdrawnDespatch(row.orderId),
+                              'Despatch recorded — the shipment, the stock relief and the despatch notification were applied.',
+                            )}
+                          >
+                            <PackageCheck className="h-3 w-3 mr-1" />Record despatch
+                          </Button>
+                        )
+                      ) : null}
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        title={row.withdrawalStanding
+                          ? 'Only once the withdrawal itself is resolved — otherwise the sweep refuses this order again.'
+                          : undefined}
+                        onClick={() => runAction(() => replayStuckDispatch(row.orderId), 'Dispatch reconciliation re-queued for the next sweep.')}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Replay
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}

@@ -837,8 +837,24 @@ const WC_WITHDRAWAL_SCREEN_CHUNK = 100
 export async function screenLiveWithdrawalsForPush(
   salesOrderIds: string[],
 ): Promise<ReadonlySet<string>> {
+  return (await screenLiveWithdrawals(salesOrderIds)).withdrawn
+}
+
+/**
+ * The same screen, reporting WHAT IT COULD NOT READ (o3d-rbyg round 2).
+ *
+ * `screenLiveWithdrawalsForPush` deliberately swallows an unreadable chunk, and for the push that
+ * is right — see above. But a caller that is SCANNING, rather than deciding one push, needs the
+ * difference: a rotating scan that treats an unread slice as a clean slice advances its cursor past
+ * orders nobody looked at, and will not come back to them for a whole rotation. That caller holds
+ * its cursor on `unreadableChunks > 0` instead.
+ */
+export async function screenLiveWithdrawals(
+  salesOrderIds: string[],
+): Promise<{ withdrawn: ReadonlySet<string>; unreadableChunks: number }> {
   const withdrawn = new Set<string>()
-  if (salesOrderIds.length === 0) return withdrawn
+  let unreadableChunks = 0
+  if (salesOrderIds.length === 0) return { withdrawn, unreadableChunks }
 
   const links = await db.shoppingOrderLink.findMany({
     where: { orderId: { in: salesOrderIds }, connector: 'woocommerce' },
@@ -846,7 +862,7 @@ export async function screenLiveWithdrawalsForPush(
   })
   // No WooCommerce orders in this batch — spend no API call at all. The push sweep is
   // connector-agnostic and most of its batches may have nothing to do with WooCommerce.
-  if (links.length === 0) return withdrawn
+  if (links.length === 0) return { withdrawn, unreadableChunks }
 
   const salesOrderIdsByExternal = new Map<string, string[]>()
   for (const link of links) {
@@ -870,6 +886,7 @@ export async function screenLiveWithdrawalsForPush(
       per_page: String(WC_WITHDRAWAL_SCREEN_CHUNK),
     })
     if (error || !Array.isArray(data)) {
+      unreadableChunks += 1
       console.error(
         `[wc-withdrawal-screen] could not screen ${chunk.length} order(s) against WooCommerce: `
         + `${error ?? 'unexpected (non-list) response'} — those orders keep the fence they already had`,
@@ -888,7 +905,197 @@ export async function screenLiveWithdrawalsForPush(
     }
   }
 
+  return { withdrawn, unreadableChunks }
+}
+
+/**
+ * o3d-rbyg: the durable withdrawal evidence for a batch of orders, read LOCALLY.
+ *
+ * Two independent signals, either of which is enough:
+ *   - the IMS markers (`withdrawalHoldAt` / `withdrawalApprovedAt`) — what IMS was told;
+ *   - a STANDING WooCommerce suppression tombstone — what the storefront was observed to say,
+ *     written by the push sweep's screen and by the withdrawal ingress, and retired only after the
+ *     storefront has reported the request rejected across a whole quiescence window.
+ *
+ * The tombstone half is what makes this work when the webhook that sets the markers was the thing
+ * that went missing — which is the premise of the entire fence.
+ *
+ * ONE definition, called by both the dispatch sweep's screen and the exception inbox (round 2). The
+ * inbox has to say WHY a link is parked, and a second hand-copied version of this query is exactly
+ * how the screen and the screen's own explanation drift apart.
+ */
+export async function screenLocalWithdrawalEvidence(
+  salesOrderIds: string[],
+): Promise<ReadonlySet<string>> {
+  const withdrawn = new Set<string>()
+  const unique = [...new Set(salesOrderIds.filter(Boolean))]
+  if (unique.length === 0) return withdrawn
+  const CHUNK = 200
+  for (let i = 0; i < unique.length; i += CHUNK) {
+    const chunk = unique.slice(i, i + CHUNK)
+    const marked = await db.salesOrder.findMany({
+      where: {
+        id: { in: chunk },
+        OR: [{ withdrawalHoldAt: { not: null } }, { withdrawalApprovedAt: { not: null } }],
+      },
+      select: { id: true },
+    })
+    for (const row of marked) withdrawn.add(row.id)
+
+    // The tombstone side. Joined through the storefront link because the suppression row is keyed
+    // by the WooCommerce order id, not by ours.
+    const links = await db.shoppingOrderLink.findMany({
+      where: { orderId: { in: chunk }, connector: 'woocommerce' },
+      select: { orderId: true, externalOrderId: true },
+    })
+    if (links.length === 0) continue
+    const standing = await db.wcWithdrawalSuppression.findMany({
+      where: {
+        connector: 'woocommerce',
+        externalOrderId: { in: [...new Set(links.map((link) => link.externalOrderId))] },
+        retiredAt: null,
+      },
+      select: { externalOrderId: true },
+    })
+    const standingIds = new Set(standing.map((row) => row.externalOrderId))
+    for (const link of links) if (standingIds.has(link.externalOrderId)) withdrawn.add(link.orderId)
+  }
   return withdrawn
+}
+
+/**
+ * o3d-rbyg round 2, Codex finding 1: MAKE A MISSED WITHDRAWAL LOCALLY KNOWN, BEFORE DISPATCH ACTS.
+ *
+ * The dispatch sweep's withdrawal screen is deliberately LOCAL — markers or a standing tombstone,
+ * never a storefront call — because it runs over every active link on every tick, and a batched
+ * remote screen there would let a WooCommerce outage interfere with dispatch reconciliation for the
+ * whole shop. That argument is sound, and it is exactly why a withdrawal IMS has never heard of is
+ * invisible to it: an order withdrawn AFTER it was pushed, with its webhook missed, carries no
+ * marker, and no tombstone either, because the push screen that writes tombstones only ever looks
+ * at orders it is ABOUT to push.
+ *
+ * So the storefront read moves OFF the dispatch tick rather than onto it. This pass rotates a
+ * bounded slice of the DISPATCH-ELIGIBLE set past WooCommerce on its own schedule, and turns what
+ * it finds into ordinary local evidence: the batch screen writes the durable tombstone, and the
+ * ordinary withdrawal machinery then applies the hold (or the confirmed approval), so the markers
+ * land, the order goes ON_HOLD, and the WMS hold pass pulls it back. Every fence that already
+ * exists — the dispatch screen, the push fence, the manual shipment guard — sees it from then on
+ * without any of them asking the storefront anything.
+ *
+ * IT CANNOT FAIL INTO THE DISPATCH PATH. It lives in the WooCommerce withdrawal cron, behind the
+ * same kill switches as the rest of the connector; if WooCommerce is down this pass reports it and
+ * makes no progress, and the dispatch sweep keeps reconciling on local evidence exactly as before.
+ *
+ * THE BOUND IS THE ROTATION, and it is not zero. With `limit` links per run and the job's interval
+ * T, every dispatch-eligible link is screened at least once per ceil(eligible / limit) runs — twice
+ * that in the worst case for a link created just behind the cursor. A withdrawal filed AND
+ * despatched by the warehouse inside that window is still fulfilled: that residue is the price of
+ * keeping WooCommerce out of the dispatch path, and it is stated here rather than left implied.
+ *
+ * The cursor is the link id, not a timestamp, and it is HELD when a chunk could not be read — an
+ * unread slice must not be skipped for a whole rotation on the strength of an outage.
+ */
+export const WDRAW_DISPATCH_RECON_CURSOR_KEY = 'wc_withdrawal_dispatch_recon_cursor'
+export const WDRAW_DISPATCH_RECON_LIMIT = 100
+
+export async function sweepDispatchEligibleWithdrawals(limit = WDRAW_DISPATCH_RECON_LIMIT): Promise<{
+  scanned: number
+  withdrawn: number
+  applied: number
+  retracted: number
+  unresolved: number
+  wrapped: boolean
+  skipped?: string
+}> {
+  const result = { scanned: 0, withdrawn: 0, applied: 0, retracted: 0, unresolved: 0, wrapped: false }
+  // One API call per run: the screen chunks at WC_WITHDRAWAL_SCREEN_CHUNK, so a slice larger than
+  // that buys nothing but a second round trip inside a job that is already rotating.
+  const take = Math.min(Math.max(limit, 1), WC_WITHDRAWAL_SCREEN_CHUNK)
+
+  // Dynamic, like the rest of this file's cross-module reads: the WMS side must not be pulled into
+  // every module that imports a withdrawal helper.
+  const [{ dispatchCandidateWhere }, { WMS_CONNECTOR_IDS }, { getIntegrationPluginState }] = await Promise.all([
+    import('@/lib/domain/wms/dispatch-sweep'),
+    import('@/lib/connectors/wms/types'),
+    import('@/lib/integration-plugins'),
+  ])
+  const pluginState = await getIntegrationPluginState()
+  const connectorId = WMS_CONNECTOR_IDS.find((id) => pluginState[id])
+  // No warehouse connector, no dispatch path to get ahead of.
+  if (!connectorId) return { ...result, skipped: 'no active WMS connector' }
+
+  // THE SWEEP'S OWN ELIGIBILITY, called rather than copied (the o3d-0gzr rule). Screening a set
+  // that had drifted from the set that dispatches is the same defect as screening nothing.
+  const where = dispatchCandidateWhere(connectorId)
+  const select = { id: true, orderId: true } as const
+  const cursorRow = await db.setting.findUnique({
+    where: { key: WDRAW_DISPATCH_RECON_CURSOR_KEY },
+    select: { value: true },
+  })
+  const cursor = cursorRow?.value ?? ''
+
+  let links = await db.wmsOrderPushLink.findMany({
+    where: { ...where, id: { gt: cursor } },
+    orderBy: { id: 'asc' },
+    take,
+    select,
+  })
+  if (links.length === 0 && cursor) {
+    // End of the rotation — start again from the front. Links whose id sorts BEHIND the cursor are
+    // the ones this wrap exists for; without it the tail of the set would be screened once and
+    // never again.
+    result.wrapped = true
+    links = await db.wmsOrderPushLink.findMany({ where, orderBy: { id: 'asc' }, take, select })
+  }
+  if (links.length === 0) {
+    if (cursor) await saveDispatchReconCursor('')
+    return result
+  }
+  result.scanned = links.length
+
+  const { withdrawn, unreadableChunks } = await screenLiveWithdrawals(links.map((link) => link.orderId))
+  result.withdrawn = withdrawn.size
+  result.unresolved += unreadableChunks
+
+  if (withdrawn.size > 0) {
+    const { submitted, approved } = await getWithdrawalStatuses()
+    const wcLinks = await db.shoppingOrderLink.findMany({
+      where: { orderId: { in: [...withdrawn] }, connector: 'woocommerce' },
+      select: { orderId: true, externalOrderId: true },
+    })
+    for (const wcLink of wcLinks) {
+      // Re-read by ID rather than acting on the batch snapshot. The module's standing rule is that
+      // a withdrawal decision is taken from the LIVE status, and this pass is no more entitled to
+      // an exception than the tombstone resolver is.
+      const live = await readLiveWcOrder(wcLink.externalOrderId)
+      if (!live) {
+        result.unresolved += 1
+        continue
+      }
+      const status = normaliseStatus(live.status)
+      if (status !== submitted && status !== approved) {
+        // Rejected between the screen and this read. The tombstone the screen wrote STANDS — only
+        // the quiescence protocol retires it — so nothing is done here and nothing is lost.
+        result.retracted += 1
+        continue
+      }
+      if (await applyWithdrawalToLinkedOrder(live)) result.applied += 1
+      else result.unresolved += 1
+    }
+  }
+
+  // A slice we could not read is a slice nobody has looked at: hold the cursor and screen it again
+  // next run, rather than rotating past it and coming back in an hour.
+  if (unreadableChunks === 0) await saveDispatchReconCursor(links[links.length - 1].id)
+  return result
+}
+
+async function saveDispatchReconCursor(value: string): Promise<void> {
+  await db.setting.upsert({
+    where: { key: WDRAW_DISPATCH_RECON_CURSOR_KEY },
+    create: { key: WDRAW_DISPATCH_RECON_CURSOR_KEY, value },
+    update: { value },
+  })
 }
 
 /**
