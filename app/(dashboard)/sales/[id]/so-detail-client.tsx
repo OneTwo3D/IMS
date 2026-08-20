@@ -475,13 +475,23 @@ function AllocationPanel({
           Stock Allocation
         </h2>
         <div className="flex items-center gap-1.5">
-          {['PROCESSING', 'ALLOCATED'].includes(status) && (
+          {/*
+            o3d-0i5y r3: PICKING and PACKING are here because they are where a SHORT order is LEFT.
+            Since r1 an order whose shipments all despatched while it still owed quantity is not
+            promoted to SHIPPED — it keeps the pre-shipment status it had — and the warning it raises
+            tells the operator to "allocate and ship the remainder". These two buttons ARE that
+            remedy, so gating them to PROCESSING/ALLOCATED made the instruction impossible to follow
+            from the very states the hold produces. The panel itself only renders when quantity is
+            genuinely outstanding (see showAllocations), so this does not offer re-allocation on an
+            order that is merely mid-pick and fully covered.
+          */}
+          {['PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(status) && (
             <Button variant="outline" size="sm" className="h-7 text-xs" onClick={handleReAllocate} disabled={isPending}>
               {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
               {allocations.length > 0 ? 'Re-Allocate' : 'Auto-Allocate'}
             </Button>
           )}
-          {allocations.length > 0 && status === 'ALLOCATED' && (
+          {allocations.length > 0 && ['ALLOCATED', 'PICKING', 'PACKING'].includes(status) && (
             <Button size="sm" className="h-7 text-xs" onClick={() => {
               startTransition(async () => {
                 const result = await confirmAllocations(orderId)
@@ -964,8 +974,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     return committed + refunded < l.qty
   })
 
-  // Show allocation panel when PROCESSING/ALLOCATED AND (no shipments OR unfulfilled lines remain)
-  const showAllocations = ['PROCESSING', 'ALLOCATED'].includes(so.status) && (!hasShipments || hasUnfulfilledLines)
+  // Show allocation panel when PROCESSING/ALLOCATED/PICKING/PACKING AND (no shipments OR unfulfilled
+  // lines remain).
+  //
+  // o3d-0i5y r3: PICKING/PACKING were added because they are the states a SHORT order is HELD in.
+  // The whole panel was hidden there, so an order that despatched everything raised against it while
+  // still owing quantity had no allocate button, no create-shipments button and no route forward at
+  // all — the r1 warning told the operator to ship the remainder from a screen that did not exist.
+  // `hasUnfulfilledLines` is what keeps this narrow: an order simply being picked, with every line
+  // covered by a committed shipment, shows nothing new.
+  const showAllocations = ['PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status) && (!hasShipments || hasUnfulfilledLines)
   // o3d-4kfh r6 (Codex finding 4): CANCELLED is in the list too, but ONLY so the operator can see
   // and discard shipments that are still sitting on a cancelled order. A cancelled order normally
   // has none — `cancelSalesOrderFulfillmentState` deletes them in the same transaction as the

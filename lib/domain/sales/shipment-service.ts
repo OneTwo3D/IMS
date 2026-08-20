@@ -7,6 +7,7 @@ import {
   validateSalesOrderStatusTransition,
   validateShipmentStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
+import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import {
   lockSalesOrder,
   lockStockLevels,
@@ -424,6 +425,34 @@ export async function findOrderShipmentShortfall(
   return shortfall.length > 0 ? shortfall : null
 }
 
+/**
+ * Order statuses that already stand AT OR BEYOND `ALLOCATED` in the fulfilment progression.
+ *
+ * The status write at the end of `confirmSalesOrderShipments` is a FLOOR — "shipments exist for this
+ * order, so it is at least allocated" — not a move. Applied to an order that is already further
+ * along it is a DEMOTION, and `SALES_ORDER_TRANSITIONS` rightly has no PICKING/PACKING -> ALLOCATED
+ * edge, so the guard threw and took the whole confirm down with it.
+ *
+ * o3d-0i5y r3 — THAT REFUSAL HAD NO REMEDY BEHIND IT. Since r1 an order that ships short is no
+ * longer promoted to SHIPPED; it is deliberately left in whatever pre-shipment status it already
+ * holds, and the operator is told to "allocate and ship the remainder". That advice worked from
+ * ALLOCATED and from nowhere else: from PICKING or PACKING the residual allocation could be built,
+ * but the confirm that turns it into shipments died on this line, so the order was stranded with no
+ * route forward and no way back (PICKING/PACKING cannot return to ALLOCATED either). A refusal
+ * without a remedy is the defect r1 set out to avoid, so the floor is now a floor.
+ *
+ * SHIPPED / COMPLETED / DELIVERED are deliberately NOT in the set. The r1 hold can never leave an
+ * order in one of them — the promotion it declines is the only thing that writes them here — so
+ * they are outside this fix, and they keep today's behaviour (the transition guard below refuses
+ * them). Confirming fresh shipments onto an order the business already calls shipped is a separate
+ * question with a separate blast radius; it is flagged, not smuggled in.
+ */
+const ORDER_STATUSES_AT_OR_BEYOND_ALLOCATED: ReadonlySet<string> = new Set<SalesOrderStatus>([
+  'ALLOCATED',
+  'PICKING',
+  'PACKING',
+])
+
 export async function confirmSalesOrderShipments(
   client: ShipmentServiceClient,
   orderId: string,
@@ -435,6 +464,18 @@ export async function confirmSalesOrderShipments(
       select: { orderNumber: true, externalOrderNumber: true, status: true },
     })
     if (!so) throw new Error('Order not found')
+
+    // Refused HERE, in words, and BEFORE the first write — not as a side effect of the status floor
+    // below failing its transition check. A cancelled sale must never grow new shipments: they would
+    // be picked, dispatched and their COGS recognised against an order that will not be invoiced,
+    // which is the same irreversible harm `SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES` refuses for
+    // the shipments already on it. Making the floor a floor (o3d-0i5y r3) removed the accidental cover this used to
+    // get from `CANCELLED -> ALLOCATED` being an illegal transition, so it is now stated outright.
+    if (so.status === 'CANCELLED') {
+      throw new Error(
+        'Cannot create shipments for a cancelled order. Discard the shipments still on it, or raise a new order if the goods are still to go out.',
+      )
+    }
 
     const allocs = await tx.orderAllocation.findMany({
       where: { orderId },
@@ -564,7 +605,10 @@ export async function confirmSalesOrderShipments(
       })
     }
 
-    if (so.status !== 'ALLOCATED') {
+    // A FLOOR, not a move — see ORDER_STATUSES_AT_OR_BEYOND_ALLOCATED. An order already at or past
+    // ALLOCATED keeps the status it has, so the residual shipments an order held short at PICKING or
+    // PACKING needs can actually be created; only an order BEHIND the floor is raised to it.
+    if (!ORDER_STATUSES_AT_OR_BEYOND_ALLOCATED.has(so.status)) {
       const transition = validateSalesOrderStatusTransition(so.status, 'ALLOCATED')
       if (!transition.success) throw new Error(transition.error)
       await tx.salesOrder.update({
