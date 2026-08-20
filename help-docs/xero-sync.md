@@ -1268,11 +1268,19 @@ If any of those does not hold, the receipt is still recorded in the IMS, nothing
 
 **Imported orders.** A paid WooCommerce order registers its payment automatically without creating a payment row in the IMS. That registration cannot be matched to any particular receipt, so while it is there the IMS will not register a hand-recorded one on the same order — recording "the" payment afterwards would pay the Xero invoice twice.
 
+**The fit check is applied again at the moment of posting**, not only when the receipt is recorded. Every payment bound for Xero — hand-recorded, re-registered after the invoice posts, or raised automatically by an imported order — is measured against the invoice one last time immediately before the call goes out, counting only payments that have actually posted. A payment that no longer fits is **not sent**: its sync entry is retired as cancelled and an error appears in the activity log naming the invoice, what is already registered against it, and the amount refused. Reconcile the invoice in Xero and register the balance there by hand if it is genuinely owed. If the order or its totals cannot be read at that moment, nothing is sent either and the entry retries — an unreadable order is never treated as permission to move money.
+
 **A receipt recorded before the invoice posts** is no longer lost. A payment cannot attach to a document Xero has never seen, so it is refused at the time with a warning — but the IMS now re-registers it by itself as soon as the invoice reaches Xero, re-running the same checks. Only receipts with no registration attempt of their own are picked up this way; one that already failed is left to the retry path, since a failed attempt may still have reached Xero.
 
 **A re-issued invoice** (deleted in Xero and posted again) starts with a clean slate: payments registered against the old invoice no longer count against the new one, and the payment for the replacement is queued rather than skipped as already-done.
 
 Deleting a payment removes its queued registration if it has not posted yet; if it already reached Xero, a warning asks you to reverse it there.
+
+### Supplier bills: marking one paid again
+
+The payment poller clears **Paid** on a bill whose payment has disappeared from Xero, so a bill can legitimately be marked paid a second time. Doing so retires the earlier registration (it no longer describes the ledger) and queues a fresh one.
+
+**Except while the earlier registration is still being sent.** If its sync entry has been claimed by the sync worker, the request may already be on its way to Xero and nothing in the IMS can recall it — cancelling the entry would free the slot and let a *second* supplier payment post. In that case **Mark as paid** is refused outright: the bill stays unpaid, nothing is queued, and a warning in the activity log names the entry to wait for. Try again once that entry has finished (it will end up synced or failed); a claim that dies is released automatically after 15 minutes.
 
 ## FIFO Cost Layers
 

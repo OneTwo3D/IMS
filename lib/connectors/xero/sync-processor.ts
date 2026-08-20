@@ -68,6 +68,10 @@ import {
   buildCompactedFollowUpLossActivity,
   isCompactedFollowUpEvidence,
 } from '@/lib/domain/accounting/compacted-followup-loss'
+import {
+  guardInvoicePaymentCapacity,
+  retireOverSettlingInvoicePayment,
+} from '@/lib/domain/accounting/invoice-payment-capacity'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -3631,6 +3635,53 @@ async function processClaimedEntry(
       const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
+      }
+      // OVER-SETTLEMENT IS REFUSED HERE, NOT AT THE ENQUEUE (o3d-cjt8 round 2).
+      //
+      // The under-lock capacity re-check in registerInvoicePaymentWithLedger only ever covered the
+      // enqueue paths someone remembered to list, and that list was already wrong: the imported-order
+      // follow-up (`_registerPayment`, enqueueSalesInvoiceFollowUps below) enqueues a payment with no
+      // order lock and no arithmetic at all. Rather than add the check to a third call site — the same
+      // assumption that has now failed once — it goes where nothing can route around it. Every
+      // INVOICE_PAYMENT, whatever enqueued it, must come through this case to reach Xero.
+      //
+      // Fails CLOSED on anything it cannot measure, and on a genuine refusal retires the row as
+      // CANCELLED — accurate, because this runs BEFORE the remote call, so nothing was sent.
+      const capacity = await guardInvoicePaymentCapacity(db, {
+        connector: XERO_CONNECTOR,
+        entryId,
+        referenceType,
+        referenceId,
+        accountingInvoiceId,
+        amount,
+      })
+      if (!capacity.post) {
+        if (capacity.kind === 'unmeasurable') return { success: false, error: capacity.message }
+        const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
+          entryId,
+          claimedAt,
+          reason: capacity.message,
+        }))
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: referenceId,
+          action: 'invoice_payment_refused_over_settlement',
+          tag: 'accounting',
+          level: 'ERROR',
+          description: capacity.message,
+          metadata: {
+            syncLogId: entryId,
+            accountingInvoiceId,
+            amount,
+            refusal: capacity.refusal,
+            alreadyPosted: capacity.alreadyPosted,
+            ledgerTotal: capacity.ledgerTotal,
+            retired,
+          },
+        }).catch(() => { /* logging must never turn a safe refusal into a failure */ })
+        // Nothing was sent and nothing should be retried: report it as handled, not as a failure that
+        // burns retries and ends FAILED (which would then read as "may have posted").
+        return { success: true, skipped: true }
       }
       const account = await db.accountingAccount.findFirst({
         where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },

@@ -27,7 +27,10 @@ import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purcha
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
-import { supersededBillPaymentRows } from '@/lib/domain/accounting/payment-reversal'
+import {
+  BillPaymentSupersessionRollback,
+  markBillPaidSupersedingStaleRegistrations,
+} from '@/lib/domain/accounting/payment-reversal'
 import {
   updatePurchaseOrderFxRateOnly,
   type PurchaseOrderFxRateOnlyUpdateDb,
@@ -3471,41 +3474,64 @@ export async function markBillPaid(
       STOCK_TX_OPTIONS,
     )
 
-    const paidUpdate = await db.purchaseInvoice.updateMany({
-      where: { id: invoiceId, paidAt: null },
-      data: {
-        paidAt: paymentDate,
-        paymentAccountId: input.bankAccountId,
-        paymentAccountName: account.name,
-        paymentReference: input.reference || null,
-      },
-    })
-    if (paidUpdate.count === 0) {
-      return { success: false, error: 'Bill is already marked as paid' }
-    }
-
-    // o3d-a3wx: winning that transition means IMS held this bill as UNSETTLED, so any live BILL_PAYMENT
-    // row describes a payment the ledger no longer has (the poller's reversal pass is what clears
-    // paidAt). Retire it before queueing the replacement. Without this, the newly widened
-    // accounting_sync_logs_followup_live_unique would let the stale row hold the slot and REFUSE the
-    // legitimate re-payment — the bill paid in IMS with nothing queued, and the constraint that exists
-    // to stop a double payment stranding a real one instead.
-    const supersededBillPayments = supersededBillPaymentRows(
-      await db.accountingSyncLog.findMany({
-        where: { type: 'BILL_PAYMENT', referenceType: 'PurchaseInvoice', referenceId: invoice.id },
-        select: { id: true, status: true },
-      }),
-    )
-    if (supersededBillPayments.length > 0) {
-      await db.accountingSyncLog.updateMany({
-        where: { id: { in: supersededBillPayments.map((row) => row.id) } },
-        data: {
-          status: 'CANCELLED',
-          errorMessage:
-            'Superseded: the bill was marked unpaid (payment no longer present in the accounting ' +
-            'connector) and has been paid again, so this registration no longer describes the ledger.',
+    // MARK PAID AND RETIRE THE STALE REGISTRATIONS TOGETHER, OR DO NEITHER (o3d-a3wx).
+    //
+    // Winning the `paidAt: null -> paid` transition means IMS held this bill as UNSETTLED, so a live
+    // BILL_PAYMENT row describes a payment the ledger no longer has (the poller's reversal pass is what
+    // clears paidAt). Retiring it frees the accounting_sync_logs_followup_live_unique slot the
+    // replacement needs — without that, the constraint meant to stop a DOUBLE payment would strand a
+    // real one.
+    //
+    // But a PROCESSING row is not stale evidence, it is a REQUEST THAT MAY BE ON THE WIRE. Cancelling
+    // its row frees the slot and does nothing at all to the call already on its way to the ledger, so
+    // the replacement posts a SECOND supplier payment (Codex, round 2 #1). Such a row is therefore a
+    // refusal, not a supersession: nothing is written, the paidAt transition is rolled back with it,
+    // and the operator is told to wait — a claim goes stale and is reclaimed, or the row lands
+    // SYNCED/FAILED, and either way one more attempt is cheap where a duplicate payment is not.
+    let settlement: { requestedIds: string[]; retiredCount: number }
+    try {
+      settlement = await db.$transaction(async (tx) => {
+        const result = await markBillPaidSupersedingStaleRegistrations(tx, {
+          invoiceId,
+          paidAt: paymentDate,
+          paymentAccountId: input.bankAccountId,
+          paymentAccountName: account.name,
+          paymentReference: input.reference || null,
+        })
+        // Anything but `paid` must undo the paidAt write as well, which only a rollback can do.
+        if (result.outcome !== 'paid') throw new BillPaymentSupersessionRollback(result)
+        return { requestedIds: result.requestedIds, retiredCount: result.retiredCount }
+      }, STOCK_TX_OPTIONS)
+    } catch (rollback) {
+      if (!(rollback instanceof BillPaymentSupersessionRollback)) throw rollback
+      if (rollback.result.outcome === 'already-paid') {
+        return { success: false, error: 'Bill is already marked as paid' }
+      }
+      const inFlightIds = rollback.result.outcome === 'payment-in-flight' ? rollback.result.inFlightIds : []
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: invoice.poId,
+        action: 'bill_payment_not_marked_paid',
+        tag: 'purchase',
+        level: 'WARNING',
+        description:
+          `Bill ${invoice.invoiceNumber ?? '(no number)'} was NOT marked paid: a previous payment ` +
+          `registration for it is still being sent to the accounting connector, and IMS cannot recall ` +
+          `a request already in flight. Marking it paid now would register the payment a second time.`,
+        metadata: {
+          invoiceId: invoice.id,
+          reference: invoice.po.reference,
+          inFlightSyncLogIds: inFlightIds,
+          refusal: 'PAYMENT_IN_FLIGHT',
         },
-      })
+      }).catch(() => { /* logging must never block the refusal */ })
+      return {
+        success: false,
+        error:
+          'A payment registration for this bill is still being sent to the accounting connector. ' +
+          'Marking it paid now could register the payment twice. Wait for that sync entry to finish ' +
+          '(it will end up synced or failed), then try again.',
+      }
     }
 
     revalidatePath('/purchase-orders')
@@ -3524,6 +3550,9 @@ export async function markBillPaid(
         bankAccountName: account.name,
         paymentDate: input.paymentDate,
         amountForeign: paymentAmount,
+        // Which stale registrations were retired to free the live-follow-up slot for this payment.
+        supersededSyncLogIds: settlement.requestedIds,
+        supersededSyncLogCount: settlement.retiredCount,
       },
     })
 

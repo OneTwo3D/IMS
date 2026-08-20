@@ -50,8 +50,13 @@ export type ExistingInvoicePaymentSync = {
   accountingInvoiceId?: string | null
 }
 
-/** Sub-penny slack, so an exact settlement is not refused by float noise. */
-const CAPACITY_EPSILON = 0.005
+/**
+ * Sub-penny slack, so an exact settlement is not refused by float noise. Exported because the
+ * POST-SITE capacity guard (invoice-payment-capacity.ts) must apply the identical tolerance: two
+ * guards on one arithmetic that round differently would refuse at the enqueue and allow at the post,
+ * or the reverse.
+ */
+export const CAPACITY_EPSILON = 0.005
 
 export function decideInvoicePaymentRegistration(input: {
   syncEnabled: boolean
