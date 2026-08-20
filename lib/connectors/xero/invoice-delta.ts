@@ -634,9 +634,134 @@ export type DeltaChunk = {
 /** `stop` leaves the cursor where the last successful chunk put it and ends the drain. */
 export type DeltaChunkHandler = (chunk: DeltaChunk) => Promise<'continue' | 'stop'>
 
+/**
+ * Everything a later poll needs to CONTINUE a drain instead of rediscovering it (o3d-pzu0).
+ *
+ * Without this, every poll that resumes a drain first repeats the unbounded whole-window walk —
+ * up to MAX_PAGES+1 = 21 requests — purely to learn again that the window is oversized, and then
+ * re-bisects the chunk width from scratch. At the 15-minute cron cadence a sustained backlog spends
+ * that toll 96 times a day against a shared allowance of well under 1,000 calls, so the quota can
+ * be exhausted by the rediscovery alone, at which point NOTHING drains.
+ *
+ * The window end is part of the state and is FIXED for the life of the drain. A resumed poll
+ * finishes the window it started, rather than stretching the end to `now` each time — a moving end
+ * is a target the drain can never reach while ingress continues, which is precisely the
+ * "running but never catching up" failure this issue is about.
+ *
+ * It is a HINT, never an authority. The cursor remains the only thing that decides what has been
+ * processed: the poller invalidates this state whenever it does not match the cursor it was saved
+ * beside, and the drain re-validates it again below. Anything suspect falls back to the 21-request
+ * rediscovery, which is slow but cannot lose a payment.
+ */
+export type DeltaDrainContinuation = {
+  /** Fixed exclusive end of the window being drained (ISO). */
+  windowEnd: string
+  /** Exclusive lower bound of the work NOT yet handed to the chunk handler (ISO). */
+  watermark: string
+  /** The last chunk width that fitted, so a resumed poll does not re-bisect from scratch. */
+  spanMs: number
+}
+
 export type DeltaDrainResult =
-  | { ok: true; chunks: number; complete: boolean; stopped: boolean }
-  | { ok: false; error: string; chunks: number }
+  | {
+      ok: true
+      chunks: number
+      complete: boolean
+      stopped: boolean
+      /** Requests this poll actually spent, so the quota burn stops being invisible (o3d-pzu0). */
+      requests: number
+      /** Non-null while work remains in this window; the caller persists it for the next poll. */
+      continuation: DeltaDrainContinuation | null
+    }
+  | { ok: false; error: string; chunks: number; requests: number; continuation: DeltaDrainContinuation | null }
+
+/**
+ * Cursor lag below which a poll is simply healthy, and no stall can be declared (o3d-pzu0).
+ *
+ * A poll that reads its whole window checkpoints at `pollStartedAt`, so its lag is ~0. A drain's
+ * lag is the age of the last checkpoint, which is minutes to hours. Thirty minutes is comfortably
+ * above two ordinary 15-minute poll intervals, so an ordinary schedule hiccup never reads as a
+ * backlog.
+ */
+export const LAG_ALERT_FLOOR_MS = 30 * 60_000
+
+/**
+ * How much lag a poll must actually REMOVE to count as progress.
+ *
+ * A drain that shaves seconds off an hours-long backlog is not converging; treating any decrease
+ * at all as progress would reset the stall counter forever and the escalation would never fire —
+ * which is today's behaviour, where a drain that runs every 15 minutes and never catches up looks
+ * exactly like a healthy one.
+ */
+export const MIN_LAG_PROGRESS_MS = 60_000
+
+/**
+ * Consecutive polls without real progress before the lag is escalated. Four polls is one hour at
+ * the 15-minute cron cadence: long enough that a single dense window is not an incident, short
+ * enough that a genuinely non-converging drain is reported the same morning it starts.
+ */
+export const LAG_STALL_POLLS = 4
+
+/**
+ * A saved continuation as it is PERSISTED — the drain's own state plus the bookkeeping that ties it
+ * to a cursor and to the drain's history across polls (o3d-pzu0).
+ */
+export type PersistedDrainState = DeltaDrainContinuation & {
+  /** The cursor value this state was saved against; any other value invalidates it. */
+  cursor: string | null
+  /** Polls this drain has now spanned — the escalation reports it. */
+  polls: number
+  /** When the drain began, so its total elapsed time can be reported. */
+  startedAt: string
+}
+
+/**
+ * May a saved drain state be resumed against the cursor as it reads NOW? (o3d-pzu0)
+ *
+ * The cursor is the only authority on what has been processed. This state is a hint about how to
+ * finish the remaining window cheaply, and a hint that disagrees with the authority is worthless:
+ * another writer, a hand edit or a restored backup can all move the cursor without touching this
+ * row, and resuming from a watermark that belongs to a different cursor would skip whatever sits
+ * between them.
+ *
+ * String equality, not date equality, and deliberately so — the question is "is this the same value
+ * I saved beside", so a reformatted or re-serialised cursor should invalidate rather than silently
+ * match. Discarding costs one expensive poll; a false match costs a payment.
+ */
+export function resumableDrainState(
+  saved: PersistedDrainState | null,
+  cursorValue: string | null,
+): PersistedDrainState | null {
+  if (!saved) return null
+  // A state saved against no cursor at all cannot be tied to anything; a null cursor now means the
+  // poll is running from the 24h default, which is not the window this state describes either.
+  if (saved.cursor === null || cursorValue === null) return null
+  return saved.cursor === cursorValue ? saved : null
+}
+
+/** What the previous poll recorded about cursor lag. */
+export type CursorLagState = { lagMs: number; at: string; stalledPolls: number }
+
+/**
+ * Decide whether cursor lag is CONVERGING, purely from the previous reading and this one.
+ *
+ * Pure so the escalation rule can be tested without a database, and so the rule lives next to the
+ * constants that define it rather than being spelled out inline in the poller.
+ */
+export function assessCursorLag(
+  previous: CursorLagState | null,
+  lagMs: number,
+): { stalledPolls: number; escalate: boolean } {
+  // Not behind: nothing to converge, and the counter must reset or one bad afternoon would keep
+  // the alarm armed for the rest of the tenant's life.
+  if (lagMs <= LAG_ALERT_FLOOR_MS) return { stalledPolls: 0, escalate: false }
+  // First reading above the floor: record it, but one sample proves nothing about a trend.
+  if (!previous || previous.lagMs <= LAG_ALERT_FLOOR_MS) return { stalledPolls: 1, escalate: false }
+  const removed = previous.lagMs - lagMs
+  if (removed >= MIN_LAG_PROGRESS_MS) return { stalledPolls: 0, escalate: false }
+  const stalledPolls = previous.stalledPolls + 1
+  return { stalledPolls, escalate: stalledPolls >= LAG_STALL_POLLS }
+}
 
 /**
  * Read `[since, windowEnd)` in bounded pieces, handing each to `onChunk` before reading the next.
@@ -690,6 +815,13 @@ export async function drainInvoicesModifiedSince(
    * tests whose fetcher makes exactly one call per invocation.
    */
   observeAttempts?: () => number,
+  /**
+   * o3d-pzu0: state saved by a previous poll of the SAME window. When it validates, the unbounded
+   * whole-window rediscovery walk is skipped entirely and this poll resumes chunking where the last
+   * one stopped. When it does not, it is ignored and the ordinary path runs — the fallback is
+   * always the expensive-but-correct one.
+   */
+  resume?: DeltaDrainContinuation | null,
 ): Promise<DeltaDrainResult> {
   // ONE budget for the whole poll — the unbounded probe, every chunk, every page, and every
   // saturated-second verification pass all count against it (o3d-8f9). Without this the nested
@@ -700,36 +832,65 @@ export async function drainInvoicesModifiedSince(
   // against the ceiling instead of hiding behind one invocation (o3d-8f9 r3).
   const counted = observeAttempts ? budgetedFetcher(get, budget, observeAttempts) : get
 
-  // The ordinary poll: one unbounded read of the whole window, exactly as before chunking existed.
-  const whole = await walkPages(since, undefined, counted, budget)
-  if (whole.status === 'error') return { ok: false, error: whole.error, chunks: 0 }
-  if (whole.status === 'ok') {
-    const decision = await onChunk({ invoices: whole.invoices, through: windowEnd })
-    return { ok: true, chunks: 1, complete: decision === 'continue', stopped: decision === 'stop' }
-  }
+  // o3d-pzu0: a validated continuation replaces the whole-window rediscovery walk. Validation is
+  // deliberately strict and silent-on-failure — an unusable hint costs 21 requests, a trusted bad
+  // one would move the cursor over unread invoices, and those are not comparable risks.
+  const resumed = readContinuation(resume, since, windowEnd)
 
-  // Oversized. Everything below reads bounded sub-windows only.
-  // The end is floored to the second because that is the resolution the upper bound can express;
-  // the sliver between it and windowEnd simply belongs to the next poll's window.
-  const end = secondFloor(windowEnd.getTime())
-  let watermark = since.getTime()
-  if (watermark >= end) {
-    return {
-      ok: false,
-      error:
-        `More than ${MAX_PAGES * PAGE_SIZE} invoices changed since ${since.toISOString()} and the ` +
-        `window ending ${windowEnd.toISOString()} is too short to subdivide. The cursor is held ` +
-        `(o3d-zdh).`,
-      chunks: 0,
+  let end: number
+  let watermark: number
+  let span: number
+
+  if (resumed) {
+    end = resumed.end
+    watermark = resumed.watermark
+    span = resumed.span
+  } else {
+    // The ordinary poll: one unbounded read of the whole window, exactly as before chunking existed.
+    const whole = await walkPages(since, undefined, counted, budget)
+    if (whole.status === 'error') return { ok: false, error: whole.error, chunks: 0, requests: budget.spent(), continuation: null }
+    if (whole.status === 'ok') {
+      const decision = await onChunk({ invoices: whole.invoices, through: windowEnd })
+      return {
+        ok: true, chunks: 1, complete: decision === 'continue', stopped: decision === 'stop',
+        requests: budget.spent(),
+        // The window was read WHOLE: there is nothing left to continue, and leaving a stale
+        // continuation behind would make the next poll resume a window that is already finished.
+        continuation: null,
+      }
     }
+
+    // Oversized. Everything below reads bounded sub-windows only.
+    // The end is floored to the second because that is the resolution the upper bound can express;
+    // the sliver between it and windowEnd simply belongs to the next poll's window.
+    end = secondFloor(windowEnd.getTime())
+    watermark = since.getTime()
+    if (watermark >= end) {
+      return {
+        ok: false,
+        error:
+          `More than ${MAX_PAGES * PAGE_SIZE} invoices changed since ${since.toISOString()} and the ` +
+          `window ending ${windowEnd.toISOString()} is too short to subdivide. The cursor is held ` +
+          `(o3d-zdh).`,
+        chunks: 0,
+        requests: budget.spent(),
+        continuation: null,
+      }
+    }
+    span = Math.max(MIN_CHUNK_MS, Math.floor((end - watermark) / 2))
   }
 
-  let span = Math.max(MIN_CHUNK_MS, Math.floor((end - watermark) / 2))
   let chunks = 0
   let probes = 0
+  /** Where this poll leaves the drain, for the next one to pick up. */
+  const carry = (): DeltaDrainContinuation => ({
+    windowEnd: new Date(end).toISOString(),
+    watermark: new Date(watermark).toISOString(),
+    spanMs: span,
+  })
 
   while (watermark < end) {
-    if (chunks >= MAX_CHUNKS_PER_POLL) return { ok: true, chunks, complete: false, stopped: false }
+    if (chunks >= MAX_CHUNKS_PER_POLL) return { ok: true, chunks, complete: false, stopped: false, requests: budget.spent(), continuation: carry() }
 
     const floor = new Date(watermark - CHUNK_FLOOR_BACKOFF_MS)
     // The narrowest chunk that still moves the cursor a whole second forward. Anything smaller is
@@ -747,6 +908,11 @@ export async function drainInvoicesModifiedSince(
         `checkpointed; the cursor is held there rather than skipping invoices nobody read. This ` +
         `needs an operator: look for a bulk edit in Xero at that timestamp (o3d-zdh).`,
       chunks,
+      requests: budget.spent(),
+      // Kept, not cleared. The window is still the right window and the watermark is still the
+      // right restart point — the next poll should re-attempt from here (and be told the same
+      // thing for 1 request instead of 21) rather than rediscover the overflow first.
+      continuation: carry(),
     })
 
     if (++probes > MAX_CHUNK_PROBES) {
@@ -757,6 +923,8 @@ export async function drainInvoicesModifiedSince(
           `${floor.toISOString()} to ${upper.toISOString()}). ${chunks} chunk(s) were processed and ` +
           `checkpointed; the cursor is held at ${new Date(watermark).toISOString()} (o3d-zdh).`,
         chunks,
+        requests: budget.spent(),
+        continuation: carry(),
       }
     }
 
@@ -767,7 +935,7 @@ export async function drainInvoicesModifiedSince(
     const narrower = Math.max(MIN_CHUNK_MS, Math.floor(width / 2))
 
     const fit = await fitsUnderCap(floor, upper, counted, budget)
-    if (fit.status === 'error') return { ok: false, error: fit.error, chunks }
+    if (fit.status === 'error') return { ok: false, error: fit.error, chunks, requests: budget.spent(), continuation: carry() }
     if (fit.status === 'overflow') {
       if (upperMs <= narrowest) return undividable()
       span = narrower
@@ -775,7 +943,7 @@ export async function drainInvoicesModifiedSince(
     }
 
     const walked = await walkPages(floor, upper, counted, budget)
-    if (walked.status === 'error') return { ok: false, error: walked.error, chunks }
+    if (walked.status === 'error') return { ok: false, error: walked.error, chunks, requests: budget.spent(), continuation: carry() }
     if (walked.status === 'overflow') {
       // The window grew between the sentinel probe and the walk. Narrow and re-ask rather than
       // trust a half-read chunk.
@@ -787,13 +955,49 @@ export async function drainInvoicesModifiedSince(
     const decision = await onChunk({ invoices: walked.invoices, through: upper })
     chunks++
     watermark = upperMs
-    if (decision === 'stop') return { ok: true, chunks, complete: false, stopped: true }
+    if (decision === 'stop') return { ok: true, chunks, complete: false, stopped: true, requests: budget.spent(), continuation: carry() }
     // Grow back after a success: one dense stretch must not pin every later chunk to a second, or a
     // day-long backlog would need 86,400 of them.
     span = Math.min(Math.max(end - watermark, MIN_CHUNK_MS), width * 2)
   }
 
-  return { ok: true, chunks, complete: true, stopped: false }
+  return { ok: true, chunks, complete: true, stopped: false, requests: budget.spent(), continuation: null }
+}
+
+/**
+ * Validate a saved continuation against the window this poll is actually looking at (o3d-pzu0).
+ *
+ * Returns the resumable numbers, or null to fall back to the whole-window walk. Every rejection is
+ * a correctness rejection, not a nicety:
+ *
+ *  - unreadable numbers: a NaN watermark would become a `new Date(NaN)` bound and the chunk request
+ *    would carry a nonsense `where` clause;
+ *  - a watermark BELOW the read floor: the cursor moved backward or the state belongs to an older
+ *    drain, and resuming there would start above ground the floor is meant to re-cover;
+ *  - a window end ABOVE this poll's: the state claims to be draining toward a future the caller has
+ *    not authorised, so its chunk bounds are not ones this poll may checkpoint;
+ *  - a watermark at or past the end: the drain it describes is already finished.
+ *
+ * The span is clamped rather than rejected — it is only the starting guess for the bisection, and
+ * the loop re-narrows on overflow anyway, so a silly value costs at most one probe.
+ */
+function readContinuation(
+  resume: DeltaDrainContinuation | null | undefined,
+  since: Date,
+  windowEnd: Date,
+): { end: number; watermark: number; span: number } | null {
+  if (!resume) return null
+  const parsedEnd = Date.parse(resume.windowEnd)
+  const watermark = Date.parse(resume.watermark)
+  if (!Number.isFinite(parsedEnd) || !Number.isFinite(watermark)) return null
+  const end = secondFloor(parsedEnd)
+  if (watermark < since.getTime()) return null
+  if (end > secondFloor(windowEnd.getTime())) return null
+  if (watermark >= end) return null
+  const span = Number.isFinite(resume.spanMs)
+    ? Math.min(Math.max(MIN_CHUNK_MS, Math.floor(resume.spanMs)), Math.max(MIN_CHUNK_MS, end - watermark))
+    : MIN_CHUNK_MS
+  return { end, watermark, span }
 }
 
 /** Invoice IDs of one type currently sitting at one of `statuses`. */

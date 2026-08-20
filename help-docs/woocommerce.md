@@ -150,6 +150,20 @@ The **Products** tab controls bidirectional product synchronisation.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 - Variation attributes are synced for the options panel
 
+**There is a supported size for a variable product: 1,000 variations.** A product's variations are
+read in full *before* anything is written, and then applied in a single transaction, so that a
+failure anywhere leaves the catalogue exactly as it was. That transaction has a budget, and 1,000
+variations is what fits inside it. A larger product is **refused before the first write**, with an
+exception-inbox row naming the count — importing part of a product and reporting success would leave
+the catalogue silently incomplete. The remedy is to split the product in WooCommerce; raising the
+limit means raising the write transaction's budget with it.
+
+Two related refusals come from the same place. If WooCommerce does not report a readable page count
+for a product's variations, the import stops rather than treating the first page as the whole set —
+that used to end the read silently and apply a truncated product as if it were complete. And if
+reading the variations takes longer than five minutes, the import gives up and retries later, so that
+a slow store cannot leave a webhook in flight long enough for a second worker to pick the same one up.
+
 ### What the connector will NOT change
 
 WooCommerce models two product shapes (`simple`, `variable`); IMS models six. A WooCommerce type is therefore an *absence* of information about everything else IMS knows, never an assertion that the product has none — so the import may set a product's type only when the existing IMS row is **SIMPLE**. On any other type the type write is dropped and everything else in the payload (name, price, images, dimensions, trade fields, category, WooCommerce mapping) still applies:

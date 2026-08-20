@@ -59,10 +59,24 @@ export type WmsPushDeadLetterRow = {
   orderId: string
   orderNumber: string | null
   connector: string
+  /** o3d-92fu: DEAD_LETTER or VALIDATION_FAILED — the remedies are different, so the row says which. */
+  state: string
   attempts: number
   lastError: string | null
   lastAttemptAt: string | null
 }
+
+/**
+ * o3d-92fu — push states that mean "this order will NOT reach the warehouse without a human".
+ *
+ * VALIDATION_FAILED belongs here even though it is not a failed remote call. It is the state
+ * the sweep parks an order in when its payload cannot be BUILT, and its whole purpose is to
+ * take the order out of the create queue so malformed orders stop starving valid ones — which
+ * means nothing retries it on its own except a payload rebuild that will keep failing until
+ * someone fixes the data. Left out of this inbox it would be a silent, permanent non-delivery,
+ * which is the same class of invisible drop the dead-letter section exists to prevent.
+ */
+export const BLOCKED_WMS_PUSH_STATES = ['DEAD_LETTER', 'VALIDATION_FAILED'] as const
 
 export type PennyMismatchRow = {
   orderId: string
@@ -405,7 +419,7 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
 async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
-    db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
+    db.wmsOrderPushLink.count({ where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.wmsWebhookEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
@@ -453,12 +467,13 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   const counts = await loadExceptionCounts()
   const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
     db.wmsOrderPushLink.findMany({
-      where: { state: 'DEAD_LETTER' },
+      where: { state: { in: [...BLOCKED_WMS_PUSH_STATES] } },
       orderBy: { lastAttemptAt: 'desc' },
       take: SECTION_LIMIT,
       select: {
         orderId: true,
         connector: true,
+        state: true,
         attempts: true,
         lastError: true,
         lastAttemptAt: true,
@@ -589,6 +604,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       orderId: link.orderId,
       orderNumber: link.order.orderNumber,
       connector: link.connector,
+      state: link.state,
       attempts: link.attempts,
       lastError: link.lastError,
       lastAttemptAt: link.lastAttemptAt?.toISOString() ?? null,

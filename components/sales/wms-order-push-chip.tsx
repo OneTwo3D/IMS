@@ -17,6 +17,9 @@ const STATE_TONE: Record<string, string> = {
   HELD: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200',
   CANCELLED: 'bg-muted text-muted-foreground',
   DEAD_LETTER: 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200',
+  // o3d-92fu: amber, not red — nothing failed at the warehouse; the order's own data is
+  // unusable and the remedy is here, not in the connector.
+  VALIDATION_FAILED: 'bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200',
 }
 
 const STATE_LABEL: Record<string, string> = {
@@ -26,6 +29,7 @@ const STATE_LABEL: Record<string, string> = {
   HELD: 'Held',
   CANCELLED: 'Cancelled',
   DEAD_LETTER: 'Push failed',
+  VALIDATION_FAILED: 'Payload invalid',
 }
 
 export function WmsOrderPushChip({ orderId, push }: { orderId: string; push: WmsOrderPushStateView }) {

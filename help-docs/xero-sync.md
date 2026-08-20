@@ -660,6 +660,23 @@ and saves its position after each one, up to four slices per run. The activity l
 *"processed N bounded chunk(s) of an oversized delta"* and the remainder is picked up by the next
 poll, so a backlog clears itself over the following runs with nothing skipped.
 
+A drain that spans several polls **remembers where it got to**, so the poll that continues it picks
+up from the last slice instead of re-reading the whole oversized window first just to rediscover that
+it is oversized. That rediscovery cost around 21 of the roughly 109 Xero requests a backlog poll
+spends, every 15 minutes, against an allowance shared with every other Xero sync in the system — so a
+long backlog could exhaust the day's calls on the rediscovery alone and stop draining entirely. The
+saved position is only ever used when it still matches the saved cursor; anything else is discarded
+and the poll simply pays the full cost, which is slow but cannot skip an invoice.
+
+**A backlog that never shrinks is now reported as an error.** A drain that runs every 15 minutes,
+saves its position each time and still falls further behind used to look identical to a healthy one —
+the same *"the remainder resumes on the next poll"* notice, forever. The poll now records how far
+behind its cursor is, and if four consecutive polls fail to remove even a minute of that lag it logs
+`xero_payment_poll_lag_not_converging` at ERROR, naming the current and previous lag, the requests
+spent and how much of the window is left. That means changes in Xero are arriving faster than a
+bounded drain can carry them, and payments will keep being detected late until the source of the
+backlog is dealt with.
+
 The one case it cannot split is more than 2,000 invoices carrying the **same second** of
 `UpdatedDateUTC`, because Xero's date filters only go down to whole seconds. Everything before that
 second is processed and saved; the poll then stops with an error naming the timestamp, so no invoice

@@ -45,6 +45,18 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
     select: { id: true, state: true, externalOrderId: true },
   })
   if (!link) return { success: false, error: 'No WMS push record for this order.' }
+  // o3d-92fu: a payload-invalid push has nothing to re-queue. Re-queueing would set
+  // PENDING_CREATE, the next sweep would fail to build the payload again and park it straight
+  // back — and in between the order would be undeletable again, because PENDING_CREATE blocks
+  // the hard-delete guard and VALIDATION_FAILED (at zero remote attempts) deliberately does
+  // not. The sweep's revalidation pass re-queues it automatically once the data is fixed.
+  if (link.state === 'VALIDATION_FAILED') {
+    return {
+      success: false,
+      error: 'This order could not be turned into a WMS payload at all (see the error on the push chip) — '
+        + 'nothing was sent, so there is nothing to replay. Fix the order data and the push sweep re-queues it by itself.',
+    }
+  }
   if (link.state !== 'DEAD_LETTER') return { success: false, error: 'Only dead-lettered pushes can be re-queued.' }
   // o3d-bjc.8: a dead letter that still carries an external id is not a failed
   // create — it is an order that EXISTS in the WMS and could not be verified as

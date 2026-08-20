@@ -7,9 +7,9 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { getSettingValue } from '@/lib/settings-store'
-import { wcFetch, wcPut } from '../api'
+import { wcFetch, wcPut, WC_PAGINATION_UNKNOWN } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
-import { isPermanentProductSyncConflict } from './product-sync-errors'
+import { isPermanentProductSyncConflict, WcVariationLimitExceededError } from './product-sync-errors'
 import {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   WC_SETTINGS_VERSION_KEY,
@@ -66,8 +66,8 @@ const MANUAL_PRODUCT_SYNC_STALE_MS = 30 * 60 * 1000
  * too tight for a product with several hundred variations, but the ceiling stays
  * low enough that a wedged transaction cannot hold its row locks indefinitely.
  */
-const PRODUCT_WRITE_TX_TIMEOUT_MS = 60_000
-const PRODUCT_WRITE_TX_MAX_WAIT_MS = 15_000
+export const PRODUCT_WRITE_TX_TIMEOUT_MS = 60_000
+export const PRODUCT_WRITE_TX_MAX_WAIT_MS = 15_000
 
 /**
  * A connector may never silently destroy IMS-owned structure (o3d-y89x, o3d-8s89, o3d-h2cz).
@@ -1363,6 +1363,52 @@ export async function syncWcProductToIms(
 // inside a lock-holding transaction or reintroduce page-by-page partial writes.
 // ---------------------------------------------------------------------------
 
+/** WooCommerce's variations page size. 100 is the maximum the REST API honours. */
+export const WC_VARIATION_PAGE_SIZE = 100
+
+/**
+ * The largest variable product this sync SUPPORTS (o3d-jcx).
+ *
+ * It is derived from PRODUCT_WRITE_TX_TIMEOUT_MS, not from what the fetch could hold. Inside that
+ * one transaction each variation costs an advisory-lock acquisition plus one to four sequential
+ * statements, so the count that fits the budget IS the count that may be fetched. Prefetching
+ * more would only guarantee a rollback after the parent lock had been held for most of a minute —
+ * which the pre-o3d-uh2 page-by-page code did not do, and is why this issue exists.
+ *
+ * Raising it means raising the transaction budget with it, and measuring; the error says so.
+ */
+export const MAX_WC_VARIATIONS_PER_PRODUCT = 1_000
+
+/** Page ceiling implied by the item ceiling, so an absurd `x-wp-totalpages` is refused up front. */
+export const MAX_WC_VARIATION_PAGES = Math.ceil(MAX_WC_VARIATIONS_PER_PRODUCT / WC_VARIATION_PAGE_SIZE)
+
+/**
+ * Wall-clock ceiling on the whole variations prefetch (o3d-jcx).
+ *
+ * The count limit alone does not bound TIME: ten pages at the 120-second per-request timeout is
+ * twenty minutes, which is longer than the webhook inbox's stale-processing window — so a slow
+ * store could have its item reclaimed by a second worker while the first was still fetching, and
+ * both would then contend on the same SKU advisory locks while each reclaim burned an attempt
+ * toward the dead-letter cap.
+ *
+ * Bounding the fetch is what removes that race, so the budget is not a nicety: see
+ * `tests/wc-product-sync-variation-limits.test.ts`, which asserts the whole worst case
+ * (budget + one in-flight request + the write transaction) stays inside the reclaim window.
+ * The check happens BETWEEN pages, so one in-flight request may overshoot it — that is the
+ * "+ WC_REQUEST_TIMEOUT_MS" term in the invariant.
+ */
+export const WC_VARIATION_FETCH_BUDGET_MS = 5 * 60_000
+
+/**
+ * How many SKUs go into one `WHERE sku IN (...)` (o3d-jcx).
+ *
+ * The lookup ran unchunked over every variation SKU, inside a transaction already holding the
+ * parent row lock and every per-SKU advisory lock. Chunking bounds the statement's parameter
+ * count and its planning cost; it does not weaken anything, because the locks are all held for
+ * the whole transaction either way and the reads are repeatable within it.
+ */
+export const WC_VARIATION_SKU_LOOKUP_CHUNK = 200
+
 /**
  * Fetch EVERY variations page for a WC parent, or throw.
  *
@@ -1370,21 +1416,51 @@ export async function syncWcProductToIms(
  * catalog exactly as it was. Propagating instead of swallowing is o3d-q1w: the
  * parent sync then records FAILED, writes no SYNCED log, and neither the webhook
  * nor the bulk cursor advances, so the reconcile re-attempts.
+ *
+ * BOUNDED, AND IT VALIDATES WHAT THE SERVER TOLD IT (o3d-jcx). The previous version trusted
+ * `x-wp-totalpages` and retained every page with no page, item, or time limit:
+ *
+ *  - an absurd or growing page count kept the loop running and the array growing;
+ *  - an UNREADABLE page count silently ended the walk after page one and returned that as the
+ *    complete variation set (`parseInt('')` is NaN, and `page <= NaN` is false), which is the
+ *    same class of silent truncation the rest of this connector refuses;
+ *  - nothing bounded the elapsed time, so a slow store could outlive the inbox claim on the very
+ *    item it was processing.
+ *
+ * Rows are keyed by variation id rather than appended. WooCommerce paginates a LIVE list, so an
+ * insert or delete between pages shifts the window and can serve the same variation twice; the
+ * old array kept both copies and left `applyVariations` to resolve them last-one-wins.
  */
 async function fetchAllWcVariations(
   wcParentId: number,
   creds: ConnectorCredentials | null,
+  now: () => number = Date.now,
 ): Promise<WcVariation[]> {
-  const all: WcVariation[] = []
+  const deadline = now() + WC_VARIATION_FETCH_BUDGET_MS
+  const byId = new Map<number, WcVariation>()
+  let duplicates = 0
+  let reportedItems = WC_PAGINATION_UNKNOWN
   let page = 1
   let totalPages = 1
 
   while (page <= totalPages) {
+    if (page > MAX_WC_VARIATION_PAGES) {
+      throw new WcVariationLimitExceededError({ wcParentId, limit: MAX_WC_VARIATION_PAGES, observed: page, unit: 'pages' })
+    }
+    if (page > 1 && now() >= deadline) {
+      // TRANSIENT on purpose: a slow store recovers, and the alternative — running past the
+      // inbox's stale-processing window — hands the same item to a second worker.
+      throw new Error(
+        `Fetching variations for WC product ${wcParentId} exceeded its ${WC_VARIATION_FETCH_BUDGET_MS}ms ` +
+        `budget after ${page - 1} page(s); refusing to keep a claimed webhook item in flight past the ` +
+        'inbox reclaim window. Nothing was written and it will be retried.',
+      )
+    }
     // PINNED credentials, not ambient (o3d-mlc7): resolving them per page let a rebind
     // mid-import pair store-A parent data with store-B variations in one transaction.
-    const { data, totalPages: tp, error } = await wcFetch(
+    const { data, totalPages: tp, totalItems, error } = await wcFetch(
       `/products/${wcParentId}/variations`,
-      { per_page: '100', page: String(page) },
+      { per_page: String(WC_VARIATION_PAGE_SIZE), page: String(page) },
       creds,
     )
     if (error) {
@@ -1392,13 +1468,71 @@ async function fetchAllWcVariations(
         `Failed to fetch variations for WC product ${wcParentId} (page ${page}/${totalPages}): ${error}`,
       )
     }
-
+    if (tp === WC_PAGINATION_UNKNOWN || !Number.isInteger(tp) || tp < 1) {
+      throw new Error(
+        `WooCommerce did not report a readable page count for the variations of product ${wcParentId} ` +
+        `(x-wp-totalpages read as ${tp}). Refusing to treat page ${page} as the complete set — a ` +
+        'truncated variation list applied as if whole is silent catalogue corruption.',
+      )
+    }
+    if (tp > MAX_WC_VARIATION_PAGES) {
+      // Fail on the FIRST page rather than spending the whole page budget discovering it.
+      throw new WcVariationLimitExceededError({ wcParentId, limit: MAX_WC_VARIATION_PAGES, observed: tp, unit: 'pages' })
+    }
+    if (!Array.isArray(data)) {
+      throw new Error(
+        `WooCommerce returned a non-list variations page for product ${wcParentId} (page ${page}); ` +
+        'refusing to import it.',
+      )
+    }
+    if (page === 1) reportedItems = totalItems
     totalPages = tp
-    all.push(...(data as WcVariation[]))
+
+    const batch = data as WcVariation[]
+    for (const variation of batch) {
+      if (byId.has(variation.id)) duplicates += 1
+      byId.set(variation.id, variation)
+    }
+    if (byId.size > MAX_WC_VARIATIONS_PER_PRODUCT) {
+      throw new WcVariationLimitExceededError({
+        wcParentId, limit: MAX_WC_VARIATIONS_PER_PRODUCT, observed: byId.size, unit: 'variations',
+      })
+    }
+    if (batch.length === 0) {
+      // An empty page below the reported total means the list shrank under the walk. Stop rather
+      // than spend the remaining page budget on a server that has nothing more to give.
+      if (page < totalPages) {
+        console.warn(
+          `[wc-product-sync] WC product ${wcParentId}: page ${page} of ${totalPages} came back empty; ` +
+          `ending the variations walk with ${byId.size} variation(s).`,
+        )
+      }
+      break
+    }
     page++
   }
 
-  return all
+  if (duplicates > 0) {
+    // Not fatal — deduping by id is exactly the right resolution — but it is evidence the list
+    // moved between requests, so it is said out loud rather than absorbed silently.
+    console.warn(
+      `[wc-product-sync] WC product ${wcParentId}: ${duplicates} variation(s) were served on more than ` +
+      'one page; the list changed while it was being read. Deduplicated by variation id.',
+    )
+  }
+  if (reportedItems > 0 && byId.size < reportedItems) {
+    // Deletions during the walk explain this legitimately, so it is not a refusal — but a shortfall
+    // nobody can see is how a partial import gets mistaken for a complete one. applyVariations only
+    // upserts (it never removes a variation that is absent from the payload), so the cost of a short
+    // read is "some variations not updated this run", which the reconcile re-attempts.
+    console.warn(
+      `[wc-product-sync] WC product ${wcParentId}: WooCommerce reported ${reportedItems} variation(s) ` +
+      `but the walk collected ${byId.size}. Variations deleted mid-walk explain this; a persistent ` +
+      'gap does not, and would mean some variations are never being updated.',
+    )
+  }
+
+  return [...byId.values()]
 }
 
 /**
@@ -1541,10 +1675,20 @@ async function applyVariations(
   // candidate set: `WHERE parentId IN (candidates) GROUP BY parentId` returns at most one row per
   // candidate, off the `parentId` index. r4 asked it per row and returned one row per child —
   // hundreds of rows for a high-variation catalogue, read only to compute a boolean per candidate.
-  const existingRows = await withConnectorChildFlags(
-    tx,
-    await tx.product.findMany({ where: { sku: { in: entries.map((entry) => entry.sku) } } }),
-  )
+  //
+  // CHUNKED (o3d-jcx). It ran unchunked over every variation SKU, so a large product built one
+  // enormous parameter list inside a transaction that already holds the parent row lock and every
+  // per-SKU advisory lock. Chunking bounds the statement without weakening anything: the locks are
+  // held for the whole transaction either way, so the reads are repeatable across the chunks.
+  // Deduped first — WooCommerce permits one SKU on several variations of a parent, and asking for
+  // the same SKU twice only makes the list longer.
+  const lookupSkus = [...new Set(entries.map((entry) => entry.sku))]
+  const loadSkuChunk = (skus: string[]) =>
+    tx.product.findMany({ where: { sku: { in: skus } } }).then((rows) => withConnectorChildFlags(tx, rows))
+  const existingRows: Awaited<ReturnType<typeof loadSkuChunk>> = []
+  for (let start = 0; start < lookupSkus.length; start += WC_VARIATION_SKU_LOOKUP_CHUNK) {
+    existingRows.push(...await loadSkuChunk(lookupSkus.slice(start, start + WC_VARIATION_SKU_LOOKUP_CHUNK)))
+  }
   const existingBySku = new Map(existingRows.map((row) => [row.sku, row]))
 
   // Every WC variation id this payload maps to each SKU (o3d-fsi). WC permits one SKU on

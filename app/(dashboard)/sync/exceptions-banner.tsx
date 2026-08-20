@@ -15,7 +15,7 @@ export function ExceptionsBanner({ summary }: { summary: ExceptionInboxSummary }
   if (summary.total === 0) return null
 
   const parts = [
-    summary.wmsPushDeadLetters > 0 ? `${summary.wmsPushDeadLetters} dead-lettered order push(es)` : null,
+    summary.wmsPushDeadLetters > 0 ? `${summary.wmsPushDeadLetters} blocked order push(es)` : null,
     summary.outboxFailures > 0 ? `${summary.outboxFailures} failed outbox row(s)` : null,
     summary.deadReceiptEvents > 0 ? `${summary.deadReceiptEvents} dead receipt event(s)` : null,
     summary.refundSyncParks > 0 ? `${summary.refundSyncParks} parked refund(s)` : null,

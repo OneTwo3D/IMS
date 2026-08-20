@@ -117,8 +117,8 @@ export function ExceptionsClient({ data }: Props) {
       {data.wmsPushDeadLetters.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
-            title={`WMS order pushes — dead-lettered (${data.summary.wmsPushDeadLetters})`}
-            detail="These orders never reached the warehouse (or a hold/cancel conflicted). They will not fulfil until replayed or resolved."
+            title={`WMS order pushes — blocked (${data.summary.wmsPushDeadLetters})`}
+            detail="These orders never reached the warehouse (or a hold/cancel conflicted). They will not fulfil until replayed or resolved. A payload-invalid row cannot be replayed — fix the order data and the sweep re-queues it by itself (o3d-92fu)."
             shown={data.wmsPushDeadLetters.length}
             total={data.summary.wmsPushDeadLetters}
           />
@@ -127,6 +127,7 @@ export function ExceptionsClient({ data }: Props) {
               <TableRow>
                 <TableHead>Order</TableHead>
                 <TableHead>Connector</TableHead>
+                <TableHead>Why</TableHead>
                 <TableHead>Attempts</TableHead>
                 <TableHead>Last error</TableHead>
                 <TableHead>Last attempt</TableHead>
@@ -140,19 +141,28 @@ export function ExceptionsClient({ data }: Props) {
                     <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
                   </TableCell>
                   <TableCell className="text-xs">{row.connector}</TableCell>
+                  <TableCell className="text-xs">{row.state === 'VALIDATION_FAILED' ? 'Payload invalid' : 'Push failed'}</TableCell>
                   <TableCell className="text-xs">{row.attempts}</TableCell>
                   <TableCell className="text-xs text-muted-foreground max-w-[320px] truncate" title={row.lastError ?? ''}>{row.lastError ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.lastAttemptAt ? formatDateTime(row.lastAttemptAt) : '—'}</TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      disabled={isPending}
-                      onClick={() => runAction(() => replayWmsOrderPush(row.orderId), `Re-queued the WMS push for ${row.orderNumber ?? row.orderId}.`)}
-                    >
-                      <RotateCcw className="h-3 w-3 mr-1" />Replay
-                    </Button>
+                    {/* o3d-92fu: a payload-invalid row has nothing to replay — no remote call was
+                        ever made, and the sweep's revalidation pass re-queues it for free as soon
+                        as the payload builds. Offering Replay here would be a button that always
+                        refuses. */}
+                    {row.state === 'VALIDATION_FAILED' ? (
+                      <span className="text-xs text-muted-foreground">Fix the order data</span>
+                    ) : (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => runAction(() => replayWmsOrderPush(row.orderId), `Re-queued the WMS push for ${row.orderNumber ?? row.orderId}.`)}
+                      >
+                        <RotateCcw className="h-3 w-3 mr-1" />Replay
+                      </Button>
+                    )}
                   </TableCell>
                 </TableRow>
               ))}

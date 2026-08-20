@@ -39,12 +39,47 @@ import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
 import {
   advanceCheckpoint,
+  assessCursorLag,
   CURSOR_OVERLAP_MS,
   drainInvoicesModifiedSince,
   idsWhere,
+  LAG_STALL_POLLS,
+  MAX_CHUNKS_PER_POLL,
+  MAX_PAGES,
+  PAGE_SIZE,
+  resumableDrainState,
+  type CursorLagState,
+  type PersistedDrainState,
   type XeroInvoice,
   type XeroInvoicesResponse,
 } from './invoice-delta'
+
+/** The poll cursor: the exclusive upper bound of everything already processed. */
+const CURSOR_KEY = 'xero_last_payment_poll'
+
+/**
+ * o3d-pzu0 — the in-progress drain, so a resumed poll CONTINUES it instead of rediscovering it.
+ *
+ * Saved beside the cursor value it was written against. The cursor stays the sole authority on what
+ * has been processed; this row is only a hint about how to get through the rest of the window
+ * cheaply, and it is thrown away the instant it disagrees with the cursor (another writer, a hand
+ * edit, a restored backup). Discarding costs one expensive poll; trusting a stale one would move
+ * the cursor over invoices nobody read.
+ */
+const DRAIN_STATE_KEY = 'xero_payment_poll_drain'
+
+/** o3d-pzu0 — the previous poll's cursor lag, so a drain that never catches up can be recognised. */
+const LAG_STATE_KEY = 'xero_payment_poll_lag'
+
+function readJsonSetting<T>(value: string | null | undefined): T | null {
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value)
+    return parsed && typeof parsed === 'object' ? (parsed as T) : null
+  } catch {
+    return null
+  }
+}
 
 // A detected payment reversal / chargeback needs a human to reconcile (dispute the
 // chargeback, revert fulfilment, chase re-payment). Broadcast a warning to active
@@ -70,7 +105,23 @@ async function notifyReversalAdmins(order: DetectedReversalOrder, wcHandled: boo
   )
 }
 
-type PollResult = { salesPaid: number; billsPaid: number; salesReversed: number; billsReversed: number; errors: string[]; skipped?: string }
+type PollResult = {
+  salesPaid: number
+  billsPaid: number
+  salesReversed: number
+  billsReversed: number
+  errors: string[]
+  skipped?: string
+  /**
+   * o3d-pzu0 — how many Xero requests this poll actually spent. Previously invisible, which made
+   * the quota question unanswerable: the drain's cost was a number nobody could read off a run.
+   */
+  xeroRequests?: number
+  /** o3d-pzu0 — how far behind `now` the cursor was left. ~0 on a healthy poll. */
+  cursorLagMs?: number
+  /** o3d-pzu0 — window still to drain, in ms. Absent when nothing is being drained. */
+  drainRemainingMs?: number
+}
 
 /**
  * The four passes, run over ONE slice of the delta.
@@ -316,14 +367,14 @@ export async function pollXeroPayments(): Promise<PollResult> {
 }
 
 async function pollXeroPaymentsLocked(): Promise<PollResult> {
-  const result = { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [] as string[] }
+  const result: PollResult = { salesPaid: 0, billsPaid: 0, salesReversed: 0, billsReversed: 0, errors: [] as string[] }
 
   // Read last poll timestamp. Parsed defensively: the cursor is a free-text Setting, and an
   // unparseable one (hand-edited, truncated) would otherwise reach toISOString() and throw
   // RangeError straight out of here — the cron route does not wrap this call, so that is a 500
   // rather than a recorded error. Falling back to the same 24h default as a missing cursor keeps a
   // corrupt value degrading instead of breaking.
-  const lastPollSetting = await db.setting.findUnique({ where: { key: 'xero_last_payment_poll' } })
+  const lastPollSetting = await db.setting.findUnique({ where: { key: CURSOR_KEY } })
   const defaultLastPoll = new Date(Date.now() - 24 * 60 * 60 * 1000)
   const parsedLastPoll = lastPollSetting?.value ? new Date(lastPollSetting.value) : defaultLastPoll
   const lastPollDate = Number.isFinite(parsedLastPoll.getTime()) ? parsedLastPoll : defaultLastPoll
@@ -363,6 +414,33 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
   // Clamping to a monotonic maximum keeps the overlap doing its job (the records ARE re-read and
   // re-processed, idempotently) while making the checkpoint one-way.
   let checkpoint = lastPollDate
+  // o3d-pzu0: the cursor VALUE as written, tracked so the drain state can be tied to it. String
+  // equality, not date equality — this is about "is this the same row I saved beside", and a
+  // reformatted or hand-edited value should invalidate the hint rather than silently match.
+  let cursorValue = lastPollSetting?.value ?? null
+
+  // o3d-pzu0 — resume an in-progress drain rather than rediscovering it.
+  //
+  // Every resumed poll used to repeat the unbounded whole-window walk first (up to MAX_PAGES+1 =
+  // 21 requests) purely to learn again that the window is oversized, and then re-bisect the chunk
+  // width from scratch. That is ~21 of the ~109 requests a maximal drain poll spends, paid 96
+  // times a day at the 15-minute cadence, against a tenant allowance the code itself puts at
+  // 1,000/day — so the rediscovery alone could exhaust the quota, and once it does nothing drains
+  // at all.
+  //
+  // The saved state is only honoured while it matches the cursor it was written against. That
+  // check is what keeps the cursor the single authority: a state row that disagrees is discarded,
+  // and the poll pays the full rediscovery rather than trusting it.
+  const drainStateRow = await db.setting.findUnique({ where: { key: DRAIN_STATE_KEY } })
+  const savedDrain = readJsonSetting<PersistedDrainState>(drainStateRow?.value)
+  const resumable = resumableDrainState(savedDrain, cursorValue)
+  if (savedDrain && !resumable) {
+    console.warn(
+      `[xero] discarding a saved drain state written against cursor ${JSON.stringify(savedDrain.cursor)}; ` +
+      `the cursor now reads ${JSON.stringify(cursorValue)}. This poll re-establishes the window from scratch.`,
+    )
+  }
+
   const drain = await drainInvoicesModifiedSince(
     since,
     pollStartedAt,
@@ -381,19 +459,112 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
       if (!advanced) return 'continue'
       checkpoint = advanced
 
+      const value = through.toISOString()
       await db.setting.upsert({
-        where: { key: 'xero_last_payment_poll' },
-        create: { key: 'xero_last_payment_poll', value: through.toISOString() },
-        update: { value: through.toISOString() },
+        where: { key: CURSOR_KEY },
+        create: { key: CURSOR_KEY, value },
+        update: { value },
       })
+      cursorValue = value
       return 'continue'
     },
     // Real HTTP attempts, not fetcher invocations: xeroGet retries a 429 internally, so one
     // invocation can be several tenant API calls (o3d-8f9 r3).
     xeroHttpAttemptCount,
+    resumable
+      ? { windowEnd: resumable.windowEnd, watermark: resumable.watermark, spanMs: resumable.spanMs }
+      : null,
   )
 
   if (!drain.ok) result.errors.push(`Xero invoice fetch failed: ${drain.error}`)
+
+  // o3d-pzu0: persist (or clear) the continuation — INCLUDING after an error. An error holds the
+  // cursor, which means the window and the watermark are both still correct; throwing the state
+  // away there would make the very next poll pay the 21-request rediscovery to be told the same
+  // thing it was just told for one request.
+  const drainRemainingMs = drain.continuation
+    ? Math.max(0, Date.parse(drain.continuation.windowEnd) - Date.parse(drain.continuation.watermark))
+    : undefined
+  if (drain.continuation) {
+    const value = JSON.stringify({
+      cursor: cursorValue,
+      ...drain.continuation,
+      polls: (resumable?.polls ?? 0) + 1,
+      startedAt: resumable?.startedAt ?? pollStartedAt.toISOString(),
+    } satisfies PersistedDrainState)
+    await db.setting.upsert({
+      where: { key: DRAIN_STATE_KEY },
+      create: { key: DRAIN_STATE_KEY, value },
+      update: { value },
+    })
+  } else if (drainStateRow) {
+    // The window is finished (or was read whole). A leftover row would make the next poll resume a
+    // drain that no longer exists.
+    await db.setting.deleteMany({ where: { key: DRAIN_STATE_KEY } })
+  }
+
+  // o3d-pzu0 — CURSOR LAG, and whether it is actually shrinking.
+  //
+  // A drain that runs every 15 minutes, checkpoints every chunk and never catches up is
+  // indistinguishable from a healthy one in every signal this poller emitted: it reports chunks
+  // processed and a WARNING that says "the remainder resumes on the next poll", forever. What was
+  // missing is the second derivative — whether the backlog is getting smaller.
+  const cursorLagMs = Math.max(0, pollStartedAt.getTime() - checkpoint.getTime())
+  const previousLag = readJsonSetting<CursorLagState>(
+    (await db.setting.findUnique({ where: { key: LAG_STATE_KEY } }))?.value,
+  )
+  const lagVerdict = assessCursorLag(previousLag, cursorLagMs)
+  const lagValue = JSON.stringify({
+    lagMs: cursorLagMs,
+    at: pollStartedAt.toISOString(),
+    stalledPolls: lagVerdict.stalledPolls,
+  } satisfies CursorLagState)
+  await db.setting.upsert({
+    where: { key: LAG_STATE_KEY },
+    create: { key: LAG_STATE_KEY, value: lagValue },
+    update: { value: lagValue },
+  })
+
+  result.xeroRequests = drain.requests
+  result.cursorLagMs = cursorLagMs
+  if (drainRemainingMs !== undefined) result.drainRemainingMs = drainRemainingMs
+
+  if (lagVerdict.escalate) {
+    const previousMinutes = previousLag ? Math.round(previousLag.lagMs / 60_000) : null
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_payment_poll_lag_not_converging',
+      tag: 'sync',
+      // ERROR, not WARNING. The draining WARNING below is the "this is working, give it time"
+      // signal; this one contradicts it, and an operator who has learned to ignore the first must
+      // not have to notice that the wording changed.
+      level: 'ERROR',
+      description:
+        `Xero payment detection is falling behind and NOT catching up: the cursor is ` +
+        `${Math.round(cursorLagMs / 60_000)} minutes behind` +
+        (previousMinutes === null ? '' : ` (was ${previousMinutes} at the previous poll)`) +
+        `, and ${lagVerdict.stalledPolls} consecutive polls have failed to remove a full minute of it. ` +
+        `This poll spent ${drain.requests} Xero request(s) and processed ${drain.chunks} chunk(s)` +
+        (drainRemainingMs === undefined
+          ? ''
+          : `, leaving ${Math.round(drainRemainingMs / 60_000)} minutes of the window still to drain`) +
+        `. Sustained ingress is at or above what a bounded drain can carry ` +
+        `(${MAX_CHUNKS_PER_POLL} chunks x ${MAX_PAGES * PAGE_SIZE} rows per run), so payments are ` +
+        `being detected late and will stay late until the backlog source is dealt with (o3d-pzu0).`,
+      metadata: {
+        cursorLagMs,
+        previousCursorLagMs: previousLag?.lagMs ?? null,
+        stalledPolls: lagVerdict.stalledPolls,
+        stallThreshold: LAG_STALL_POLLS,
+        xeroRequests: drain.requests,
+        chunks: drain.chunks,
+        drainRemainingMs: drainRemainingMs ?? null,
+        drainPolls: resumable ? resumable.polls + 1 : 1,
+        drainStartedAt: resumable?.startedAt ?? null,
+      },
+      resolveUser: false,
+    })
+  }
 
   if (result.errors.length > 0) {
     await logActivity({

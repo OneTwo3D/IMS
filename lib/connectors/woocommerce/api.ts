@@ -53,6 +53,29 @@ export async function getWcCredentials(): Promise<ConnectorCredentials | null> {
   return { url: validated.normalizedUrl, key, secret }
 }
 
+/**
+ * Per-request ceiling for every WooCommerce call (o3d-jcx: exported so the callers that page can
+ * reason about their aggregate worst case against the webhook inbox's stale-processing window,
+ * instead of the number being three copies of a literal nobody can see from outside).
+ */
+export const WC_REQUEST_TIMEOUT_MS = 120_000
+
+/**
+ * Value used for a pagination header WooCommerce did not send readably (o3d-jcx).
+ *
+ * Negative on purpose: it can never be mistaken for a real count, and a caller that compares it
+ * against a page number stops rather than looping, while a caller that validates it (see
+ * fetchAllWcVariations) can refuse instead of silently treating page 1 as the whole set.
+ */
+export const WC_PAGINATION_UNKNOWN = -1
+
+/** Exported for test: the NaN this replaced is the silent truncation itself (o3d-jcx). */
+export function readWcCountHeader(raw: string | null, whenAbsent: number): number {
+  if (raw === null) return whenAbsent
+  const parsed = Number.parseInt(raw.trim(), 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : WC_PAGINATION_UNKNOWN
+}
+
 export async function wcFetch(
   path: string,
   params: Record<string, string> = {},
@@ -75,7 +98,7 @@ export async function wcFetch(
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
   const res = await connectorFetch(url, {
     headers: { Authorization: `Basic ${auth}` },
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
   }, {
     connectorName: 'WooCommerce',
   })
@@ -90,8 +113,13 @@ export async function wcFetch(
     return { data: null, totalPages: 0, totalItems: 0, error: `WC API returned non-JSON response (${contentType}). The server may have timed out.` }
   }
 
-  const totalPages = parseInt(res.headers.get('x-wp-totalpages') ?? '1')
-  const totalItems = parseInt(res.headers.get('x-wp-total') ?? '0')
+  // o3d-jcx: `parseInt('')` is NaN, and `page <= NaN` is false — so a WooCommerce install that
+  // sent an EMPTY x-wp-totalpages ended every paging loop in this connector after page one and
+  // reported the truncated result as complete. NaN is now surfaced as a NEGATIVE sentinel so a
+  // caller that pages can tell "one page" from "the server did not say", rather than the two
+  // being indistinguishable. Callers that ignore it are no worse off than before.
+  const totalPages = readWcCountHeader(res.headers.get('x-wp-totalpages'), 1)
+  const totalItems = readWcCountHeader(res.headers.get('x-wp-total'), 0)
   const data = await res.json()
   return { data, totalPages, totalItems }
 }
@@ -115,7 +143,7 @@ export async function wcPost(
     method: 'POST',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
   }, {
     connectorName: 'WooCommerce',
   })
@@ -146,7 +174,7 @@ export async function wcPut(
     method: 'PUT',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120000),
+    signal: AbortSignal.timeout(WC_REQUEST_TIMEOUT_MS),
   }, {
     connectorName: 'WooCommerce',
   })

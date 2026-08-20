@@ -237,17 +237,44 @@ export async function findSalesOrderDeleteBlocker(
   // 1b. WMS push link. The link row is the push sweep's claim: it exists from immediately before
   // the remote create until the order is withdrawn, so ANY link means the WMS may hold
   // (or be about to be handed) this order.
+  //
+  // ONE EXCEPTION (o3d-92fu): a VALIDATION_FAILED link that has spent NO remote attempts. That
+  // disposition is written by the push sweep BEFORE it claims anything and BEFORE it calls the
+  // connector — it means buildPushInput threw on local data (a line with no SKU), so pushOrder
+  // was demonstrably never invoked and no remote side effect is possible. Without it, a purely
+  // local data error made an order permanently undeletable: the failure aged into DEAD_LETTER,
+  // which this guard blocks on and which the create pass will never retry.
+  //
+  // It could NOT be derived from the other columns, which is why the state exists. A
+  // DEAD_LETTER caused by repeated REMOTE failures also has externalOrderId = null and
+  // pushedAt = null, and those attempts DID make calls that may have partially succeeded —
+  // that is the whole reason this guard blocks on every link.
+  //
+  // The `attempts`/`pushedAt`/`externalOrderId` conditions are not belt-and-braces: a link can
+  // reach VALIDATION_FAILED having ALREADY failed remotely (it pushed, failed, and only later
+  // stopped building — an edited order, say). It keeps the state to stay out of the create
+  // queue, but its earlier calls are exactly as ambiguous as any other dead letter, so it must
+  // still refuse. attempts is only ever incremented on the remote-failure path.
   const pushLink = await tx.wmsOrderPushLink.findUnique({
     where: { orderId },
-    select: { state: true, externalOrderNumber: true, externalOrderId: true },
+    select: { state: true, externalOrderNumber: true, externalOrderId: true, attempts: true, pushedAt: true },
   })
-  if (pushLink) {
+  const provenPreCallValidationFailure =
+    pushLink?.state === 'VALIDATION_FAILED'
+    && pushLink.attempts === 0
+    && pushLink.pushedAt === null
+    && pushLink.externalOrderId === null
+  if (pushLink && !provenPreCallValidationFailure) {
     const ref = pushLink.externalOrderNumber ?? pushLink.externalOrderId
     blockers.push({
       code: 'wms_order_push_link',
-      message:
-        `Cannot delete an order that has been claimed for or sent to the warehouse management system ` +
-        `(push state ${pushLink.state}${ref ? `, WMS order ${ref}` : ''}). Cancel the order instead so the WMS order is withdrawn.`,
+      message: pushLink.state === 'VALIDATION_FAILED'
+        ? `Cannot delete an order that has been sent to the warehouse management system `
+          + `(${pushLink.attempts} push attempt(s) were made before its payload became invalid`
+          + `${ref ? `, WMS order ${ref}` : ''}). A failed push does not prove nothing was created — `
+          + 'cancel the order instead so the WMS order is withdrawn.'
+        : `Cannot delete an order that has been claimed for or sent to the warehouse management system `
+          + `(push state ${pushLink.state}${ref ? `, WMS order ${ref}` : ''}). Cancel the order instead so the WMS order is withdrawn.`,
     })
   }
 

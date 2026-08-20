@@ -2,14 +2,21 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  assessCursorLag,
   drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
   idsWhere,
+  LAG_ALERT_FLOOR_MS,
+  LAG_STALL_POLLS,
   MAX_CHUNKS_PER_POLL,
   MAX_PAGES,
+  MIN_LAG_PROGRESS_MS,
   PAGE_SIZE,
+  resumableDrainState,
   upperBoundWhere,
+  type DeltaDrainContinuation,
   type InvoiceFetcher,
+  type PersistedDrainState,
   type XeroInvoice,
 } from '@/lib/connectors/xero/invoice-delta'
 
@@ -463,4 +470,250 @@ test('one poll never drains more than MAX_CHUNKS_PER_POLL chunks', async () => {
 
   assert.equal(res.ok && res.complete, false, 'an unfinished drain must say so')
   assert.ok(chunks <= MAX_CHUNKS_PER_POLL, `drained ${chunks} chunks in one poll`)
+})
+
+
+// ---------------------------------------------------------------------------
+// o3d-pzu0: continue a drain instead of rediscovering it, and notice when a
+// drain is running without ever catching up.
+// ---------------------------------------------------------------------------
+
+/** 9,000 invoices over two hours — four-and-a-half caps' worth, so the window must chunk. */
+function oversizedBacklog(): { rows: Row[]; endMs: number } {
+  const rows = Array.from({ length: 9_000 }, (_, i) => row(`i-${i}`, T0 + i * 800))
+  return { rows, endMs: T0 + 9_000 * 800 + 60_000 }
+}
+
+const unbounded = (paths: string[]) => paths.filter((path) => !path.includes('where='))
+
+test('o3d-pzu0: an incomplete drain hands on its window end, watermark and chunk width', async () => {
+  const { rows, endMs } = oversizedBacklog()
+  const { get } = fakeTenant(rows)
+  let cursorMs = T0
+
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(endMs), get, async (c) => {
+    cursorMs = c.through.getTime()
+    return 'continue'
+  })
+
+  assert.equal(res.ok, true)
+  assert.equal(res.ok && res.complete, false, 'the backlog must not fit in one poll')
+  const carried = res.ok ? res.continuation : null
+  assert.ok(carried, 'an unfinished drain must say where to resume')
+  assert.equal(Date.parse(carried!.watermark), cursorMs, 'the watermark is the last checkpoint')
+  // The window end is FIXED at the value this drain started with, floored to the second Xero can
+  // express. A drain whose end follows `now` is a target it can never reach while ingress
+  // continues — which is the "running but never catching up" failure itself.
+  assert.equal(Date.parse(carried!.windowEnd), Math.floor(endMs / 1000) * 1000)
+  assert.ok(carried!.spanMs >= 1_000, 'a resumable chunk width must be at least one second')
+  assert.ok(res.ok && res.requests > 0, 'the request spend must be reported, not invisible')
+})
+
+test('o3d-pzu0: a resumed poll issues NO unbounded rediscovery request', async () => {
+  // The whole cost this issue is about: every resumed poll re-walked the oversized window from
+  // scratch (up to MAX_PAGES+1 = 21 requests) purely to learn again that it overflows.
+  const { rows, endMs } = oversizedBacklog()
+  const { get, paths } = fakeTenant(rows)
+  let cursorMs = T0
+
+  const first = await drainInvoicesModifiedSince(new Date(cursorMs), new Date(endMs), get, async (c) => {
+    cursorMs = c.through.getTime()
+    return 'continue'
+  })
+  assert.ok(first.ok && first.continuation)
+  assert.ok(unbounded(paths).length > 1, 'the FIRST poll pays the rediscovery walk')
+  const firstRequests = first.ok ? first.requests : 0
+
+  paths.length = 0
+  const second = await drainInvoicesModifiedSince(
+    new Date(cursorMs), new Date(endMs), get,
+    async (c) => { cursorMs = c.through.getTime(); return 'continue' },
+    undefined,
+    first.ok ? first.continuation : null,
+  )
+
+  assert.equal(second.ok, true)
+  assert.deepEqual(unbounded(paths), [], 'a resumed poll must not re-ask the whole-window question')
+  const saved = firstRequests - (second.ok ? second.requests : 0)
+  assert.ok(saved >= MAX_PAGES, `expected to save at least the ${MAX_PAGES}-page rediscovery walk, saved ${saved}`)
+})
+
+test('o3d-pzu0: resuming reads the SAME invoices as rediscovering would — nothing is skipped', async () => {
+  const { rows, endMs } = oversizedBacklog()
+
+  const withResume: string[] = []
+  {
+    const { get } = fakeTenant(rows)
+    let cursorMs = T0
+    let carry: DeltaDrainContinuation | null = null
+    for (let poll = 0; poll < 12; poll++) {
+      const res: Awaited<ReturnType<typeof drainInvoicesModifiedSince>> = await drainInvoicesModifiedSince(
+        new Date(cursorMs), new Date(endMs), get,
+        async (c) => { for (const i of c.invoices) withResume.push(i.InvoiceID); cursorMs = c.through.getTime(); return 'continue' },
+        undefined, carry,
+      )
+      assert.equal(res.ok, true, res.ok ? '' : `drain failed: ${res.error}`)
+      if (!res.ok) break
+      carry = res.continuation
+      if (res.complete) break
+    }
+    assert.equal(carry, null, 'a finished drain must clear its continuation')
+  }
+
+  const withoutResume = (await drainAcrossPolls(rows, { startMs: T0, endMs })).seen
+  assert.deepEqual(new Set(withResume), new Set(withoutResume))
+  assert.equal(new Set(withResume).size, rows.length)
+})
+
+test('o3d-pzu0: a resumed drain never checkpoints past the window end it was handed', async () => {
+  // The caller's windowEnd moves forward every poll (it is `now`). The drain must finish the
+  // window it started, not stretch to the new one — a checkpoint above the fixed end would claim
+  // ground the drain's own bisection never covered.
+  const { rows, endMs } = oversizedBacklog()
+  const { get } = fakeTenant(rows)
+  let cursorMs = T0
+  const first = await drainInvoicesModifiedSince(new Date(cursorMs), new Date(endMs), get, async (c) => {
+    cursorMs = c.through.getTime()
+    return 'continue'
+  })
+  assert.ok(first.ok && first.continuation)
+
+  const fixedEnd = Math.floor(endMs / 1000) * 1000
+  const throughs: number[] = []
+  await drainInvoicesModifiedSince(
+    new Date(cursorMs), new Date(endMs + 3_600_000), get,
+    async (c) => { throughs.push(c.through.getTime()); cursorMs = c.through.getTime(); return 'continue' },
+    undefined,
+    first.ok ? first.continuation : null,
+  )
+  assert.ok(throughs.length > 0)
+  for (const through of throughs) {
+    assert.ok(through <= fixedEnd, `checkpointed ${through} past the fixed window end ${fixedEnd}`)
+  }
+})
+
+test('o3d-pzu0: a normal-sized window leaves NO continuation behind', async () => {
+  const { get } = fakeTenant([row('a', T0 + 1_000)])
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(T0 + 900_000), get, async () => 'continue')
+  assert.equal(res.ok && res.complete, true)
+  // A leftover row would make the next poll resume a window that is already finished.
+  assert.equal(res.ok ? res.continuation : 'missing', null)
+})
+
+test('o3d-pzu0: a continuation that disagrees with the read floor is REFUSED, not trusted', async () => {
+  // Resuming above the floor would start the drain past ground the floor is meant to re-cover.
+  // Refusing costs the 21-request rediscovery; trusting would move the cursor over unread rows.
+  const { rows, endMs } = oversizedBacklog()
+  const { get, paths } = fakeTenant(rows)
+  const stale: DeltaDrainContinuation = {
+    windowEnd: new Date(endMs).toISOString(),
+    watermark: new Date(T0 - 60_000).toISOString(),
+    spanMs: 60_000,
+  }
+  await drainInvoicesModifiedSince(new Date(T0), new Date(endMs), get, async () => 'continue', undefined, stale)
+  assert.ok(unbounded(paths).length > 1, 'the refused continuation must fall back to the whole-window walk')
+})
+
+test('o3d-pzu0: a continuation claiming a window end beyond this poll is REFUSED', async () => {
+  const { rows, endMs } = oversizedBacklog()
+  const { get, paths } = fakeTenant(rows)
+  const overreaching: DeltaDrainContinuation = {
+    windowEnd: new Date(endMs + 3_600_000).toISOString(),
+    watermark: new Date(T0 + 60_000).toISOString(),
+    spanMs: 60_000,
+  }
+  await drainInvoicesModifiedSince(new Date(T0), new Date(endMs), get, async () => 'continue', undefined, overreaching)
+  assert.ok(unbounded(paths).length > 1, 'a state draining toward an unauthorised end must not be honoured')
+})
+
+test('o3d-pzu0: an unreadable continuation is REFUSED rather than turned into a NaN bound', async () => {
+  const { rows, endMs } = oversizedBacklog()
+  const { get, paths } = fakeTenant(rows)
+  const corrupt: DeltaDrainContinuation = { windowEnd: 'not a date', watermark: 'nor this', spanMs: Number.NaN }
+  await drainInvoicesModifiedSince(new Date(T0), new Date(endMs), get, async () => 'continue', undefined, corrupt)
+  assert.ok(unbounded(paths).length > 1)
+  for (const path of paths) assert.equal(path.includes('NaN'), false, `NaN reached a request path: ${path}`)
+})
+
+test('o3d-pzu0: an errored drain KEEPS its continuation, so the next poll does not re-pay rediscovery', async () => {
+  const { rows, endMs } = oversizedBacklog()
+  const base = fakeTenant(rows)
+  let calls = 0
+  const failing: InvoiceFetcher = async (path, opts) => {
+    calls++
+    // Fail once a couple of chunks are through, so there is real progress to carry.
+    if (calls > 30) return { ok: false, status: 503, error: 'Xero unavailable' }
+    return base.get(path, opts)
+  }
+  const res = await drainInvoicesModifiedSince(new Date(T0), new Date(endMs), failing, async () => 'continue')
+  assert.equal(res.ok, false)
+  // An error HOLDS the cursor, which means the window and the watermark are both still correct.
+  // Discarding here is what makes the next poll pay 21 requests to be told the same thing.
+  assert.ok(res.ok === false && res.continuation, 'a held cursor must still carry its restart point')
+  assert.ok(res.ok === false && res.requests > 0)
+})
+
+test('o3d-pzu0 assessCursorLag: lag under the floor is healthy and resets the counter', () => {
+  const verdict = assessCursorLag({ lagMs: 10 * 3_600_000, at: '2026-08-01T00:00:00.000Z', stalledPolls: 9 }, LAG_ALERT_FLOOR_MS)
+  assert.deepEqual(verdict, { stalledPolls: 0, escalate: false })
+})
+
+test('o3d-pzu0 assessCursorLag: one reading above the floor is not yet a trend', () => {
+  assert.deepEqual(assessCursorLag(null, LAG_ALERT_FLOOR_MS + 1), { stalledPolls: 1, escalate: false })
+})
+
+test('o3d-pzu0 assessCursorLag: removing a full minute of lag counts as progress and resets', () => {
+  const previous = { lagMs: 4 * 3_600_000, at: '2026-08-01T00:00:00.000Z', stalledPolls: 3 }
+  assert.deepEqual(
+    assessCursorLag(previous, previous.lagMs - MIN_LAG_PROGRESS_MS),
+    { stalledPolls: 0, escalate: false },
+  )
+})
+
+test('o3d-pzu0 assessCursorLag: a token decrease is NOT progress — that is how a stall hides', () => {
+  // Treating any decrease at all as progress would reset the counter forever, and a drain that
+  // shaves seconds off an hours-long backlog would keep looking healthy.
+  const previous = { lagMs: 4 * 3_600_000, at: '2026-08-01T00:00:00.000Z', stalledPolls: 1 }
+  assert.deepEqual(
+    assessCursorLag(previous, previous.lagMs - 1_000),
+    { stalledPolls: 2, escalate: false },
+  )
+})
+
+test('o3d-pzu0 assessCursorLag: escalates once the stall has held for LAG_STALL_POLLS polls', () => {
+  let state = { lagMs: 4 * 3_600_000, at: '2026-08-01T00:00:00.000Z', stalledPolls: 1 }
+  let escalations = 0
+  for (let poll = 2; poll <= LAG_STALL_POLLS; poll++) {
+    const verdict = assessCursorLag(state, state.lagMs + 60_000)
+    state = { lagMs: state.lagMs + 60_000, at: state.at, stalledPolls: verdict.stalledPolls }
+    assert.equal(verdict.stalledPolls, poll)
+    if (verdict.escalate) escalations++
+  }
+  assert.equal(escalations, 1, 'exactly the poll that reaches the threshold escalates')
+  assert.equal(state.stalledPolls, LAG_STALL_POLLS)
+})
+
+
+const savedState = (overrides: Partial<PersistedDrainState> = {}): PersistedDrainState => ({
+  cursor: '2026-08-01T00:00:00.000Z',
+  windowEnd: '2026-08-01T02:00:00.000Z',
+  watermark: '2026-08-01T00:30:00.000Z',
+  spanMs: 60_000,
+  polls: 2,
+  startedAt: '2026-07-31T23:00:00.000Z',
+  ...overrides,
+})
+
+test('o3d-pzu0: a drain state is resumable only against the exact cursor it was saved beside', () => {
+  const saved = savedState()
+  assert.equal(resumableDrainState(saved, '2026-08-01T00:00:00.000Z'), saved)
+  // Another writer, a hand edit or a restored backup moves the cursor without touching this row.
+  // Resuming from a watermark that belongs to a DIFFERENT cursor skips whatever sits between them.
+  assert.equal(resumableDrainState(saved, '2026-08-01T00:05:00.000Z'), null)
+  // Same instant, different serialisation: still refused. The question is "is this the same value
+  // I saved", and a re-serialised cursor is evidence something else wrote it.
+  assert.equal(resumableDrainState(saved, '2026-08-01T00:00:00Z'), null)
+  assert.equal(resumableDrainState(saved, null), null)
+  assert.equal(resumableDrainState(savedState({ cursor: null }), '2026-08-01T00:00:00.000Z'), null)
+  assert.equal(resumableDrainState(null, '2026-08-01T00:00:00.000Z'), null)
 })
