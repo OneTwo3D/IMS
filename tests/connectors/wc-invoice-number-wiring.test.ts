@@ -57,29 +57,109 @@ test('the order row records the same number the connector is sent', () => {
 
 test('no number means NO accounting post — the importer must not invent one', () => {
   const body = importWcOrderBody()
-  const guard = body.indexOf('if (!invoiceNumberResolution.ok) {')
-  const enqueue = body.indexOf('queueAccountingSync({')
-  assert.ok(guard > 0, 'the importer must refuse to queue when WooCommerce has not numbered the invoice')
-  assert.ok(guard < enqueue, 'the refusal must come BEFORE the enqueue, not after it')
-  const refusal = body.slice(guard, enqueue)
+  // The enqueue is reachable ONLY through the resolution's ok branch; the other branch parks the
+  // payload (o3d-k26m.6) instead of sending it.
+  const branch = body.indexOf('if (invoiceNumberResolution.ok) {')
+  const enqueue = body.indexOf('await queueAccountingSync({')
+  const hold = body.indexOf('await holdWcSalesInvoiceForMissingNumber({')
+  assert.ok(branch > 0, 'the importer must branch on whether WooCommerce numbered the invoice')
+  assert.ok(branch < enqueue, 'the enqueue must sit INSIDE the ok branch, not before it')
+  assert.ok(enqueue < hold, 'the else branch must be the hold, not a second enqueue')
   assert.ok(
-    refusal.includes("action: 'sales_invoice_number_unavailable'"),
+    body.includes("action: 'sales_invoice_number_unavailable'"),
     'the refusal must be visible as a WARNING an operator can act on',
   )
   assert.ok(
-    refusal.includes('return await finishWithoutAccounting(reason)'),
+    body.includes('return await finishWithoutAccounting(heldReason)'),
     'the refusal must return without queueing anything',
+  )
+  // The regression this replaces: `invoiceNumber: <anything we made up>`. There is exactly one
+  // expression that may reach the payload's invoice number on this path.
+  assert.ok(
+    body.includes('payload: { invoiceNumber: invoiceNumberResolution.invoiceNumber, ...accountingPayload }'),
+    'the only number the importer may post is the resolved one',
   )
 })
 
-test('a redelivery captures the number once WooCommerce assigns it, and never overwrites one', () => {
+test('the held payload is PARKED, not discarded, so the advertised recovery can complete', () => {
+  const body = importWcOrderBody()
+  // o3d-k26m.6: round 1 held the invoice back and dropped the payload. The warning told operators
+  // to re-import; the re-import captured the number and queued nothing, so the remedy produced no
+  // invoice. The payload the import WOULD have sent is now stored against the order.
+  assert.ok(
+    body.includes('const accountingPayload: Record<string, unknown> = {'),
+    'the payload must be built once, without a number, so held and posted paths cannot diverge',
+  )
+  const built = body.indexOf('const accountingPayload: Record<string, unknown> = {')
+  assert.ok(built < body.indexOf('await holdWcSalesInvoiceForMissingNumber({'), 'the hold must park the built payload')
+  assert.ok(
+    body.includes('metaKey: invoiceNumberResolution.metaKey,'),
+    'the parked row must say which meta key it is waiting for',
+  )
+})
+
+test('a redelivery captures the number, may correct it before anything posts, and releases the held invoice', () => {
   const src = source(ORDER_IMPORT)
   const start = src.indexOf('async function updateExistingWcOrderFromPayload(')
   const body = src.slice(start, src.indexOf('\n}\n', start))
   assert.ok(body.includes('resolveWcAccountingInvoiceNumber(wcOrder)'), 'the redelivery path must look for the number')
   assert.ok(
-    body.includes('where: { id: orderId, invoiceNumber: null },'),
-    'the backfill must be guarded on invoiceNumber: null so a posted document’s number is never rewritten',
+    body.includes('await applyResolvedWcInvoiceNumber(orderId, wcOrder, resolvedInvoiceNumber.invoiceNumber)'),
+    'the capture must go through the decision that knows when a number may still be corrected (o3d-k26m.7)',
+  )
+  // The regression (o3d-k26m.6): capturing the number and queueing nothing, leaving the order
+  // numbered, PROCESSING and permanently un-invoiced.
+  assert.ok(
+    body.includes('await releaseHeldWcSalesInvoice(orderId, wcOrder, usableInvoiceNumber)'),
+    'capturing the number must RELEASE the invoice that was held back for it',
+  )
+  assert.ok(
+    body.includes('if (so.accountingInvoiceId) return'),
+    'an order that already has a ledger document has nothing held, and must never be released into a second post',
+  )
+  // The blanket `invoiceNumber: null` guard is what froze a pre-post number; the decision replaces it.
+  assert.ok(
+    !body.includes('where: { id: orderId, invoiceNumber: null },'),
+    'the blanket null guard must be gone — it froze numbers captured before anything posted',
+  )
+})
+
+test('a refused capture writes nothing and releases nothing', () => {
+  // o3d-k26m.5, the "ALSO IN SCOPE" half: an EMPTY invoiceNumber is not evidence that nothing has
+  // posted — it is the state of every WooCommerce order invoiced before o3d-k26m.1, each of which
+  // has a live Xero document numbered `INWC-...`.
+  const src = source(ORDER_IMPORT)
+  const start = src.indexOf('async function applyResolvedWcInvoiceNumber(')
+  assert.ok(start > 0, 'the capture/correction wiring must exist')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const refusal = body.indexOf("if (decision.action === 'refuse-capture') {")
+  assert.ok(refusal > 0, 'a refused capture must be handled, not fall through to the write')
+  const tail = body.slice(refusal)
+  assert.ok(
+    tail.includes("action: 'sales_invoice_number_capture_refused'"),
+    'a refused capture must be visible as a WARNING naming both the order and the storefront number',
+  )
+  assert.ok(
+    tail.indexOf('return { usable: false }') < tail.indexOf('return { usable: true'),
+    'a refused capture must return unusable, so nothing is released under a number IMS did not record',
+  )
+})
+
+test('the release enqueues BEFORE it marks the row, so a crash cannot strand the invoice', () => {
+  const src = source(ORDER_IMPORT)
+  const start = src.indexOf('async function releaseHeldWcSalesInvoice(')
+  assert.ok(start > 0, 'the release must exist')
+  const body = src.slice(start, src.indexOf('\n}\n', start))
+  const enqueue = body.indexOf('await queueAccountingSync({')
+  const mark = body.indexOf("status: 'SYNCED',")
+  assert.ok(enqueue > 0 && mark > enqueue, 'the queue row must be marked SYNCED only AFTER the enqueue succeeds')
+  assert.ok(
+    body.includes('idempotencyKey: `wc-held-sales-invoice:${orderId}:${invoiceNumber}`'),
+    'the enqueue must be deduplicable, so a repeated release adds nothing',
+  )
+  assert.ok(
+    body.includes('buildReleasedSalesInvoicePayload(held, invoiceNumber)'),
+    'the release must post the parked payload plus the number, not a rebuilt one',
   )
 })
 
@@ -131,5 +211,70 @@ test('generateInvoiceNumber refuses to mint over a storefront-supplied number', 
   assert.ok(
     body.indexOf('externallySupplied: true as const') < body.indexOf('nextDocumentNumber(tx, {'),
     'the check must precede the mint',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-k26m.5 — the fence, at the seam where the irreversible write happens.
+//
+// The rule is unit-tested in tests/accounting/invoice-number-ownership.test.ts and the lookup in
+// tests/connectors/xero-invoice-number-claim.test.ts. What neither can see is whether the
+// sales-invoice create actually CONSULTS them, which is one line in the middle of a switch — and
+// Xero is live, so it cannot be exercised end to end here.
+// ---------------------------------------------------------------------------
+
+const XERO_PROCESSOR = 'lib/connectors/xero/sync-processor.ts'
+
+function salesInvoiceCase(): string {
+  const src = source(XERO_PROCESSOR)
+  const start = src.indexOf("    case 'SALES_INVOICE': {")
+  assert.ok(start > 0, 'the SALES_INVOICE case must exist')
+  const end = src.indexOf("    case 'SALES_INVOICE_UPDATE': {", start)
+  assert.ok(end > start, 'the SALES_INVOICE case must be delimited')
+  return src.slice(start, end)
+}
+
+test('the sales-invoice CREATE asks who owns the number before it sends anything', () => {
+  const body = salesInvoiceCase()
+  const fence = body.indexOf('await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload)')
+  const push = body.indexOf('await pushSalesInvoice({')
+  assert.ok(fence > 0, 'the create must consult the ownership fence')
+  assert.ok(fence < push, 'the fence must run BEFORE the post, not after it')
+  assert.ok(
+    body.includes('if (!numberFence.post) return numberFence.result'),
+    'a refusal must return without posting',
+  )
+})
+
+test('the UPDATE is not fenced — it addresses a document by an id we recorded ourselves', () => {
+  const src = source(XERO_PROCESSOR)
+  const start = src.indexOf("    case 'SALES_INVOICE_UPDATE': {")
+  const body = src.slice(start, src.indexOf("    case 'PURCHASE_INVOICE': {", start))
+  assert.ok(body.includes('await updateSalesInvoice(accountingInvoiceId, {'), 'the update posts to an id')
+  assert.ok(
+    !body.includes('guardSalesInvoiceNumberOwnership('),
+    'fencing the update would spend a call re-proving ownership the id already establishes',
+  )
+})
+
+test('the claim is written BEFORE the post, and a failure to write it blocks the post', () => {
+  const src = source(XERO_PROCESSOR)
+  const start = src.indexOf('async function guardSalesInvoiceNumberOwnership(')
+  assert.ok(start > 0, 'the fence must exist')
+  const body = src.slice(start, src.indexOf('\nasync function processEntry(', start))
+  const write = body.indexOf('data: { invoiceNumberClaim: invoiceNumber, invoiceNumberClaimedAt: new Date() },')
+  const allow = body.lastIndexOf('return { post: true }')
+  assert.ok(write > 0, 'an unclaimed number must be claimed on the row before it is posted')
+  assert.ok(write < allow, 'the claim must be durable before the caller is allowed to post')
+  // A claim that was not recorded leaves the crash-after-post state unrecoverable, which is the
+  // one thing the fence must not create.
+  assert.ok(
+    body.includes('Could not record the invoice-number claim for ${invoiceNumber} on sync row ${entryId} before posting'),
+    'failing to record the claim must refuse the post, not proceed without it',
+  )
+  // Fails closed on an unreadable order, matching guardCancelledSalesOrderInvoice.
+  assert.ok(
+    body.includes('Sales order ${referenceId} not found before posting an invoice'),
+    'a missing order must refuse, never read as "unowned"',
   )
 })

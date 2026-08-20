@@ -113,10 +113,35 @@ number*, so a document posted under a stand-in number cannot be renumbered later
 under the real number would create a **second invoice** rather than replacing the first. Holding the
 order back is recoverable; a wrongly numbered document in a live ledger is not.
 
-To clear one: make sure WooCommerce has generated the invoice for that order, then let the order
-resync (a webhook redelivery or the next poll). IMS records the number the moment it appears. The
-accounting invoice itself is not queued automatically by the resync — queue it from the sales order
-once the number is showing.
+**It clears itself.** The invoice IMS would have posted is kept against the order, waiting for the
+number. As soon as WooCommerce assigns one and the order resyncs — a webhook redelivery, or the next
+order poll, which picks the order up precisely because writing that meta touches it — IMS records
+the number and queues the accounting invoice automatically, using the payload it built at import
+time (so the invoice date, tax treatment and payment registration are exactly what they would have
+been). The activity log shows `sales_invoice_number_captured`.
+
+There is nothing to do unless an order *stays* here. If one does, the order is not being resynced:
+check that WooCommerce actually generated the invoice document for it, and that order sync is
+running. You can always queue the sales invoice from the sales order by hand once the number shows.
+
+#### If WooCommerce changes an order's invoice number
+
+IMS follows the storefront **until something has committed to the number** — that is, until an
+accounting document exists for the order, or a sales-invoice sync has been queued for it. Before
+that point a changed `_wcpdf_invoice_number` simply replaces the stored one (logged as
+`sales_invoice_number_corrected`).
+
+After that point the number is frozen and IMS keeps what it has, logging
+`sales_invoice_number_correction_refused` with both numbers. Renumbering then is not a correction:
+the accounting create is update-or-create on the number, so posting the new one would add a *second*
+document rather than renumber the first. The order's invoice in the accounting system and the
+customer's PDF have genuinely diverged, and somebody has to decide which is right.
+
+The same applies to orders that have **no** number recorded but already carry an accounting
+document — every WooCommerce order invoiced before this change is in that state, with a document
+numbered `INWC-…` in Xero. IMS does not fill the blank for those either (logged as
+`sales_invoice_number_capture_refused`): doing so would make the next invoice update try to renumber
+a live document onto the storefront's number.
 
 **WooCommerce "completed" orders** receive special handling: the system auto-allocates stock, creates shipments, applies any tracking information from the WC order meta (AST plugin), and transitions the shipments through to Shipped status.
 

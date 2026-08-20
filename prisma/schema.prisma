@@ -2326,6 +2326,28 @@ model AccountingSyncLog {
   // Not a candidate-query predicate: an unstamped row is a candidate already. It only widens the
   // "back-reference done, follow-ups outstanding" pass that used to be FAILED-only.
   backReferenceFollowUpsPendingAt DateTime?
+  // o3d-k26m.5: the invoice number THIS row set out to post under, recorded BEFORE its first
+  // attempt and only once a live lookup said the ledger did not hold that number yet.
+  //
+  // It exists for exactly one state: the post succeeded and the response was lost. The ledger then
+  // holds our document and IMS holds no id for it (externalTransactionId and the order's
+  // accountingInvoiceId are both written FROM the response). Until now that state healed itself,
+  // because the retry simply re-POSTed and the update-or-create landed back on the same document.
+  // The ownership fence removes that self-healing — on the retry the number IS held, by an id
+  // nothing local knows — so without this column the fence would convert a silent recovery into a
+  // permanent refusal for every crashed post.
+  //
+  // The claim is the missing half of the evidence: "at a moment when nobody held this number, THIS
+  // entry set out to post it". Combined with "somebody holds it now" that identifies the holder as
+  // ours. It is deliberately NOT transferable — a newly enqueued row for the same order does not
+  // inherit it — so a human re-queueing a failed post is fenced in full rather than handed a
+  // licence to overwrite. It is also not proof on its own: it is only consulted when the order
+  // carries no accountingInvoiceId, which is the authoritative record when it exists.
+  //
+  // The NUMBER is stored, not a bare flag, so a payload whose number later changes cannot silently
+  // reuse a claim taken for a different one.
+  invoiceNumberClaim   String?   @map("invoice_number_claim")
+  invoiceNumberClaimedAt DateTime? @map("invoice_number_claimed_at")
 
   // o3d-o97 r6 — THE ONE FACT THAT MAKES A CANCELLED ROW EVIDENCE ABOUT POUNDS.
   //

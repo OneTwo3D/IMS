@@ -1,0 +1,31 @@
+-- o3d-k26m.5: the pre-post invoice-number CLAIM.
+--
+-- Xero's sales-invoice create is `POST /Invoices`, which is update-or-create on InvoiceNumber.
+-- Since o3d-k26m.1 the number is WooCommerce's own `_wcpdf_invoice_number` — the same number the
+-- outgoing xeroom plugin is posting to the same live organisation today — so a create for an
+-- already-invoiced order does not duplicate, it silently REPLACES xeroom's invoice. The fence that
+-- stops that asks the ledger who holds the number and refuses unless the answer is "nobody" or "a
+-- document IMS already owns".
+--
+-- WHY THE FENCE NEEDS A COLUMN. "A document IMS already owns" is normally answered by
+-- sales_orders.accounting_invoice_id, written FROM the create's response. There is one state where
+-- that record cannot exist: the post succeeded and the response was lost. The ledger then holds our
+-- document under our number and nothing local knows its id. Today that heals itself — the retry
+-- re-POSTs and the upsert lands back on the same document — and the fence removes exactly that
+-- healing, because on the retry the number IS held, by an id IMS cannot recognise. Left alone, the
+-- fence would turn every crashed post into a permanent refusal needing a human.
+--
+-- WHAT A CLAIM MEANS. Written immediately before the FIRST attempt, and only after a live lookup
+-- has said the number was unclaimed: "at a moment when nobody held this number, THIS row set out to
+-- post it". Combined with "somebody holds it now", the holder is ours, and the retry may proceed.
+--
+-- SCOPE IS THE ROW, DELIBERATELY. A freshly enqueued row for the same order does not inherit the
+-- claim, so a human re-queueing a failed post is fenced in full instead of inheriting a licence to
+-- overwrite. And the NUMBER is stored rather than a bare timestamp flag, so a payload whose number
+-- later changes cannot reuse a claim that was taken for a different one.
+--
+-- NOTHING IS BACKFILLED. Existing rows arrive NULL, which is the honest answer for every one of
+-- them: no lookup was ever made before those posts, so no claim was ever established. A backfill
+-- computed from the rows would manufacture the exact evidence the fence is built to require.
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "invoice_number_claim" TEXT;
+ALTER TABLE "accounting_sync_logs" ADD COLUMN "invoice_number_claimed_at" TIMESTAMP(3);

@@ -681,11 +681,43 @@ order always wins over one derived at push time.
 is queued and a warning is logged; IMS never substitutes a number of its own. See
 `docs/woocommerce.md` § When WooCommerce has not numbered the invoice yet.
 
+### The ownership check before every sales-invoice create
+
+Because the create upserts on `InvoiceNumber`, posting under a number Xero already holds does not
+produce a duplicate — it **replaces** the document that holds it. IMS therefore asks Xero who holds
+the number immediately before every sales-invoice create, and posts only when the answer is
+*nobody*, or *a document this order is already linked to*.
+
+Anything else is refused. Nothing is sent, the sales order stays un-invoiced, and the reason is on
+the sync row and in the activity log as `sales_invoice_number_not_ours`:
+
+| What the check found | What IMS does | What you do |
+|---|---|---|
+| Nobody holds the number | Posts, after recording that it claimed the number | — |
+| The document this order is linked to holds it | Posts (this is a re-post of our own invoice) | — |
+| **Another document holds it, and IMS does not own that document** | Refuses | This is the cutover case: xeroom almost certainly already invoiced this order. If the existing Xero invoice is the right one, leave it and cancel the IMS sync row. If this order genuinely has no Xero document, link the correct one to the order (or void the wrong one in Xero) and re-queue |
+| The order is linked to one document but a *different* one holds the number | Refuses | Either the link or the number is wrong. Establish which document belongs to this order before anything is posted |
+| A **voided or deleted** document holds it | Refuses | Xero will not accept a modification of a voided document. Resolve it in Xero, then re-queue |
+| **Xero could not be asked** (disconnected, rate-limited, network) | Refuses, and retries by itself | Nothing — the row re-runs once the connection is healthy. If it persists, fix the connection |
+
+The refusals other than the last are verdicts about what is in Xero, not transient errors. The row
+still retries a handful of times before it settles as FAILED with the reason on it — and those
+retries are how a resolved refusal picks itself up: once you have linked the correct Xero document
+to the order (or voided the wrong one), the next retry sees the number as ours and posts. If it
+runs out of retries first, re-queue the invoice from the sales order. Either way, **a refused post
+is recoverable and an overwritten live invoice is not.**
+
+Two limits worth knowing. The check costs one extra Xero API call per sales-invoice create, which
+counts against the 1,000-call rolling daily limit. And it cannot see a document that appears in the
+fraction of a second between the check and the post — it protects against the standing population of
+documents another system has *already* posted, which is the cutover risk, not against a simultaneous
+write.
+
 > **Cutover note.** While the xeroom WordPress plugin is still live it posts the *same* numbers to
-> the *same* Xero organisation. Because the create upserts on the number, an IMS post for an order
-> xeroom has already invoiced will **overwrite that invoice** rather than create a duplicate. Do not
-> enable Sales Invoices in IMS against the live organisation until xeroom is switched off for the
-> orders IMS will handle.
+> the *same* Xero organisation. The check above is what stops an IMS post from overwriting one of
+> those invoices, but it is a backstop, not a plan: expect a refusal for every order xeroom has
+> already invoiced. Switch xeroom off for the orders IMS will handle before enabling Sales Invoices
+> against the live organisation.
 
 ## Multi-Currency FX Rates
 

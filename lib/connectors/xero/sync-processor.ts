@@ -23,6 +23,8 @@ import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { decideInvoiceNumberPost } from '@/lib/domain/accounting/invoice-number-ownership'
+import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { applyBackReference, followUpObligationClaim, releaseFollowUpObligation } from '@/lib/domain/accounting/back-reference'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import {
@@ -1440,6 +1442,129 @@ async function guardCancelledSalesOrderInvoice(
 }
 
 /**
+ * THE OWNERSHIP FENCE ON THE SALES-INVOICE CREATE (o3d-k26m.5).
+ *
+ * `POST /Invoices` is update-or-create on InvoiceNumber. Since o3d-k26m.1 the number is
+ * WooCommerce's own `_wcpdf_invoice_number` — which the outgoing xeroom plugin is posting to this
+ * same live organisation today — so a create for an order xeroom has already invoiced does not
+ * duplicate: it silently REPLACES that invoice. This asks the ledger who holds the number and
+ * lets the post through only when the answer is "nobody" or "a document we own". The rule itself
+ * is `decideInvoiceNumberPost`; this is its wiring, and it is the last thing between the payload
+ * and an irreversible write.
+ *
+ * APPLIED TO EVERY CREATE, not only to storefront-supplied numbers. The hazard is the VERB, not
+ * the number's provenance: an IMS-minted number that collides with anything already in the ledger
+ * overwrites it just as quietly. It costs one GET per invoice create, which is real against a
+ * 1,000-call rolling daily budget and is bought deliberately — the alternative currency is
+ * destroyed documents.
+ *
+ * NOT applied to SALES_INVOICE_UPDATE: that posts to `Invoices/{InvoiceID}`, an id IMS recorded
+ * from the create's own response, so it is already addressing a document we own by identity.
+ *
+ * FAILS CLOSED on an unreadable order and on an unreachable ledger, the same way
+ * guardCancelledSalesOrderInvoice does — a transient read outage must not become permission to
+ * post.
+ *
+ * A REFUSAL IS RETURNED AS AN ORDINARY FAILURE, so the row runs the normal retry ladder and settles
+ * as FAILED with the reason on it. That is not wasted budget: the fence re-asks the ledger each
+ * time, so the operator's remedy — linking the right document to the order, or voiding the wrong
+ * one — is picked up automatically by the next retry instead of needing a re-queue. The ladder is
+ * bounded (MAX_RETRIES), so a refusal nobody acts on costs a handful of reads and then stops.
+ */
+async function guardSalesInvoiceNumberOwnership(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+): Promise<{ post: true } | { post: false; result: EntryResult }> {
+  const invoiceNumber = typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : null
+
+  let ownedInvoiceId: string | null = null
+  let orderLabel = `${referenceType} ${referenceId}`
+  if (referenceType === 'SalesOrder') {
+    try {
+      const so = await db.salesOrder.findUnique({
+        where: { id: referenceId },
+        select: { accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true },
+      })
+      // A missing order is NOT "unowned". It means the thing we are invoicing cannot be read, and
+      // the fence's whole job is to refuse to guess.
+      if (!so) {
+        return {
+          post: false,
+          result: { success: false, error: `Sales order ${referenceId} not found before posting an invoice` },
+        }
+      }
+      ownedInvoiceId = so.accountingInvoiceId
+      orderLabel = `order ${so.orderNumber ?? so.externalOrderNumber ?? referenceId}`
+    } catch (error) {
+      return {
+        post: false,
+        result: { success: false, error: `Could not read sales order ${referenceId} before the invoice-number ownership check: ${String(error)}` },
+      }
+    }
+  }
+
+  let ownClaimInvoiceNumber: string | null = null
+  try {
+    const entry = await db.accountingSyncLog.findUnique({
+      where: { id: entryId },
+      select: { invoiceNumberClaim: true },
+    })
+    ownClaimInvoiceNumber = entry?.invoiceNumberClaim ?? null
+  } catch (error) {
+    return {
+      post: false,
+      result: { success: false, error: `Could not read the invoice-number claim on sync row ${entryId}: ${String(error)}` },
+    }
+  }
+
+  const lookup = await lookupXeroInvoiceNumberClaim(invoiceNumber ?? '')
+  const decision = decideInvoiceNumberPost({ invoiceNumber, lookup, ownedInvoiceId, ownClaimInvoiceNumber, orderLabel })
+
+  if (!decision.post) {
+    await logActivity({
+      entityType: referenceType === 'SalesOrder' ? 'SALES_ORDER' : 'SYSTEM',
+      entityId: referenceType === 'SalesOrder' ? referenceId : undefined,
+      action: 'sales_invoice_number_not_ours',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: decision.reason,
+      metadata: {
+        connector: XERO_CONNECTOR,
+        syncLogId: entryId,
+        invoiceNumber,
+        refusalCode: decision.code,
+        retryable: decision.retryable,
+      },
+      resolveUser: false,
+    }).catch(() => {})
+    return { post: false, result: { success: false, error: decision.reason } }
+  }
+
+  if (decision.recordClaim && invoiceNumber) {
+    // BEFORE the post, never after: the claim's entire meaning is that it was durable at the
+    // moment the request left. Written on the row we are processing, so a retry of THIS entry can
+    // recognise its own document if the response is lost. A failure to write it is a failure to
+    // post — an unclaimed post whose claim was not recorded is precisely the crash-after-post case
+    // the fence can no longer heal.
+    try {
+      await db.accountingSyncLog.update({
+        where: { id: entryId },
+        data: { invoiceNumberClaim: invoiceNumber, invoiceNumberClaimedAt: new Date() },
+      })
+    } catch (error) {
+      return {
+        post: false,
+        result: { success: false, error: `Could not record the invoice-number claim for ${invoiceNumber} on sync row ${entryId} before posting: ${String(error)}` },
+      }
+    }
+  }
+
+  return { post: true }
+}
+
+/**
  * o3d-19gy / o3d-s36z / o3d-gfh: every remote call this entry makes is attributed to this entry's row.
  *
  * WHERE THE PERMISSION IS ACTUALLY GRANTED. Not here. This establishes the INTENT — which row is being
@@ -1510,6 +1635,11 @@ async function processClaimedEntry(
       const guard = await guardCancelledSalesOrderInvoice(entryId, referenceType, referenceId, claimedAt)
       if (!guard.post) return guard.result
       const customerId = guard.customerId
+      // o3d-k26m.5: the number must be ours to post under. Refusing is recoverable; overwriting a
+      // live invoice is not. Runs AFTER the cancelled-order backstop (no point asking the ledger
+      // about an order that must not be invoiced at all) and BEFORE anything is sent.
+      const numberFence = await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload)
+      if (!numberFence.post) return numberFence.result
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,

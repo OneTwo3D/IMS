@@ -11,7 +11,13 @@ import {
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
-import { resolveWcAccountingInvoiceNumber } from './invoice-number'
+import { decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } from './invoice-number'
+import {
+  buildHeldSalesInvoicePayload,
+  buildReleasedSalesInvoicePayload,
+  heldSalesInvoiceQueueWhere,
+  isHeldSalesInvoicePayload,
+} from './held-sales-invoice'
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
@@ -358,19 +364,349 @@ async function updateExistingWcOrderFromPayload(
         paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : undefined,
       },
     })
-    // o3d-k26m.1: capture WooCommerce's invoice number the first time it appears. An order can
-    // legitimately be imported before WooCommerce PDF Invoices has numbered its invoice, and a
-    // later webhook redelivery is the earliest moment IMS can learn the number. Guarded on
-    // `invoiceNumber: null` so a number already recorded — the one a posted accounting document
-    // may already carry — is never rewritten by a later payload.
-    const resolvedInvoiceNumber = resolveWcAccountingInvoiceNumber(wcOrder)
-    if (resolvedInvoiceNumber.ok) {
-      await tx.salesOrder.updateMany({
-        where: { id: orderId, invoiceNumber: null },
-        data: { invoiceNumber: resolvedInvoiceNumber.invoiceNumber },
-      })
-    }
   })
+
+  // o3d-k26m.1: capture WooCommerce's invoice number the first time it appears. An order can
+  // legitimately be imported before WooCommerce PDF Invoices has numbered its invoice, and a later
+  // webhook redelivery — or the modified_after order poll, which sees the order again precisely
+  // because writing that meta touches it — is the earliest moment IMS can learn the number.
+  //
+  // o3d-k26m.6/.7: and the two halves the capture used to be missing. It now RELEASES the invoice
+  // that was held back for want of a number, so the advertised recovery actually produces an
+  // invoice; and it may CORRECT a number captured before anything posted, instead of freezing the
+  // first value WooCommerce ever reported. Both deliberately outside the transaction above: the
+  // enqueue takes the order's row lock itself, and neither should be able to roll back the address
+  // and payment updates that have nothing to do with them.
+  const resolvedInvoiceNumber = resolveWcAccountingInvoiceNumber(wcOrder)
+  if (!resolvedInvoiceNumber.ok) return
+
+  // This runs for EVERY redelivery and for every order the poll re-reads, and the overwhelmingly
+  // common case is "the number is already recorded and has not moved". One indexed read settles
+  // that, so the steady state costs a row lookup rather than a locked transaction plus a queue scan.
+  let so: { invoiceNumber: string | null; accountingInvoiceId: string | null } | null
+  try {
+    so = await db.salesOrder.findUnique({
+      where: { id: orderId },
+      select: { invoiceNumber: true, accountingInvoiceId: true },
+    })
+  } catch (error) {
+    console.error(`[wc-import] could not read the invoice number state for ${orderId}:`, error)
+    return
+  }
+  if (!so) return
+
+  let usableInvoiceNumber = so.invoiceNumber?.trim() || null
+  if (usableInvoiceNumber !== resolvedInvoiceNumber.invoiceNumber) {
+    const applied = await applyResolvedWcInvoiceNumber(orderId, wcOrder, resolvedInvoiceNumber.invoiceNumber)
+    if (!applied.usable) return
+    usableInvoiceNumber = applied.invoiceNumber
+  }
+  if (!usableInvoiceNumber) return
+
+  // An order with a ledger document has nothing held: the hold exists precisely because nothing was
+  // ever queued. Skipping here also refuses, structurally, to release an invoice for an order that
+  // has already been invoiced.
+  if (so.accountingInvoiceId) return
+  await releaseHeldWcSalesInvoice(orderId, wcOrder, usableInvoiceNumber)
+}
+
+/**
+ * Record WooCommerce's invoice number on the order — capturing it, leaving it, or correcting it.
+ *
+ * The rule is `decideStoredInvoiceNumberUpdate`; this is its wiring plus the two facts it needs
+ * that only the database has. Taken under the order's row lock so the decision cannot be made
+ * against a state that a concurrent accounting enqueue is in the middle of changing — that enqueue
+ * takes the same lock (o3d-3zgy), so "nothing has committed to the stored number" stays true for
+ * as long as it takes to act on it.
+ *
+ * Returns the number that is now on the order and whether it is safe to post under, so the caller
+ * releases a held invoice under the CORRECTED number and never under a refused one.
+ */
+async function applyResolvedWcInvoiceNumber(
+  orderId: string,
+  wcOrder: WcFullOrder,
+  incomingInvoiceNumber: string,
+): Promise<{ usable: true; invoiceNumber: string } | { usable: false }> {
+  const outcome = await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, orderId)
+    const so = await tx.salesOrder.findUnique({
+      where: { id: orderId },
+      select: { invoiceNumber: true, accountingInvoiceId: true },
+    })
+    if (!so) return null
+    // Any connector, and every state except CANCELLED: a CANCELLED row is a deliberately abandoned
+    // posting that commits to nothing, while a FAILED one is NOT proof that nothing reached the
+    // ledger — a lost response looks exactly like a failure.
+    const salesInvoiceSyncRowCount = await tx.accountingSyncLog.count({
+      where: {
+        referenceType: 'SalesOrder',
+        referenceId: orderId,
+        type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] },
+        status: { not: 'CANCELLED' },
+      },
+    })
+    const decision = decideStoredInvoiceNumberUpdate({
+      storedInvoiceNumber: so.invoiceNumber,
+      incomingInvoiceNumber,
+      accountingInvoiceId: so.accountingInvoiceId,
+      salesInvoiceSyncRowCount,
+    })
+
+    if (decision.action === 'capture' || decision.action === 'correct') {
+      // Compare-and-swap on the value we decided against, not a blind write.
+      const from = decision.action === 'correct' ? decision.from : null
+      const written = await tx.salesOrder.updateMany({
+        where: { id: orderId, invoiceNumber: from },
+        data: { invoiceNumber: decision.to },
+      })
+      if (written.count !== 1) return { decision, applied: false }
+    }
+    return { decision, applied: true }
+  })
+
+  if (!outcome) return { usable: false }
+  const { decision, applied } = outcome
+
+  if (decision.action === 'refuse-correction') {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'sales_invoice_number_correction_refused',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `WooCommerce order ${wcOrder.number} now reports invoice number ${decision.to}, but IMS keeps `
+        + `${decision.from}: ${decision.reason}`,
+      metadata: {
+        connector: 'woocommerce',
+        externalOrderId: String(wcOrder.id),
+        externalOrderNumber: wcOrder.number,
+        storedInvoiceNumber: decision.from,
+        storefrontInvoiceNumber: decision.to,
+      },
+      resolveUser: false,
+    }).catch(() => {})
+    // The STORED number stays the truth for posting; a held invoice still releases under it.
+    return { usable: true, invoiceNumber: decision.from }
+  }
+
+  if (decision.action === 'refuse-capture') {
+    // o3d-k26m.5: the empty-column case that is NOT an innocent backfill. Every WooCommerce order
+    // invoiced before o3d-k26m.1 has an empty column and a live Xero document numbered `INWC-…`;
+    // writing WooCommerce's number in would make the next SALES_INVOICE_UPDATE try to renumber that
+    // document onto the number xeroom is using.
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'sales_invoice_number_capture_refused',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `WooCommerce order ${wcOrder.number} reports invoice number ${decision.to}, but IMS will not record it: `
+        + decision.reason,
+      metadata: {
+        connector: 'woocommerce',
+        externalOrderId: String(wcOrder.id),
+        externalOrderNumber: wcOrder.number,
+        storefrontInvoiceNumber: decision.to,
+      },
+      resolveUser: false,
+    }).catch(() => {})
+    return { usable: false }
+  }
+
+  if (decision.action === 'correct' && applied) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'sales_invoice_number_corrected',
+      tag: 'accounting',
+      level: 'INFO',
+      description:
+        `WooCommerce order ${wcOrder.number} changed its invoice number from ${decision.from} to ${decision.to}. `
+        + 'Nothing had been posted or queued under the old one, so IMS took the new number.',
+      metadata: {
+        connector: 'woocommerce',
+        externalOrderId: String(wcOrder.id),
+        externalOrderNumber: wcOrder.number,
+        previousInvoiceNumber: decision.from,
+        invoiceNumber: decision.to,
+      },
+      resolveUser: false,
+    }).catch(() => {})
+  }
+
+  if (!applied) {
+    // The compare-and-swap lost to a concurrent writer. Nothing is known about what is on the
+    // order now, so do not release anything under a number we did not write.
+    return { usable: false }
+  }
+  return { usable: true, invoiceNumber: decision.action === 'unchanged' ? decision.stored : decision.to }
+}
+
+/**
+ * Park the sales-invoice payload for an order WooCommerce has not numbered yet (o3d-k26m.6).
+ *
+ * One row per order, replaced rather than appended: a re-import before the number arrives rebuilds
+ * the payload from the newer WooCommerce snapshot, and the invoice that eventually posts should be
+ * the one built from what the storefront says NOW, not from the first snapshot ever seen.
+ */
+async function holdWcSalesInvoiceForMissingNumber(params: {
+  salesOrderId: string
+  wcOrder: WcFullOrder
+  orderNumber: string
+  metaKey: string
+  accountingPayload: Record<string, unknown>
+}): Promise<void> {
+  const held = buildHeldSalesInvoicePayload({
+    externalOrderId: String(params.wcOrder.id),
+    externalOrderNumber: params.wcOrder.number,
+    salesOrderId: params.salesOrderId,
+    orderNumber: params.orderNumber,
+    metaKey: params.metaKey,
+    accountingPayload: params.accountingPayload,
+  })
+  const jsonPayload = JSON.parse(JSON.stringify(held)) as Prisma.InputJsonValue
+  const data = {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR' as const,
+    status: 'PENDING' as const,
+    entityType: 'SalesOrder',
+    entityId: params.salesOrderId,
+    externalId: String(params.wcOrder.id),
+    payload: jsonPayload,
+    errorMessage: `Waiting for ${params.metaKey} on WooCommerce order ${params.wcOrder.number} before the sales invoice can be posted.`,
+    syncedAt: null,
+  }
+
+  const existing = await db.shoppingSyncLog.findFirst({
+    where: heldSalesInvoiceQueueWhere({ salesOrderId: params.salesOrderId }),
+    orderBy: { createdAt: 'desc' },
+    select: { id: true },
+  })
+  if (existing) {
+    await db.shoppingSyncLog.update({ where: { id: existing.id }, data })
+  } else {
+    await db.shoppingSyncLog.create({ data })
+  }
+}
+
+/**
+ * Queue the sales invoice that was held back for want of a number (o3d-k26m.6).
+ *
+ * ENQUEUE FIRST, MARK THE ROW SECOND. A crash between the two leaves the row PENDING, so the next
+ * redelivery or poll releases it again — and the enqueue carries a deterministic idempotency key on
+ * (order, number), which is what `queueXeroSync` dedupes on, so the second release finds the sync
+ * row already there and adds nothing. The other order would be worse in the way that matters: a
+ * crash after marking the row SYNCED but before enqueueing strands the invoice permanently, which
+ * is the exact defect being fixed.
+ */
+async function releaseHeldWcSalesInvoice(
+  orderId: string,
+  wcOrder: WcFullOrder,
+  invoiceNumber: string,
+): Promise<void> {
+  let row: { id: string; payload: Prisma.JsonValue | null } | null = null
+  try {
+    row = await db.shoppingSyncLog.findFirst({
+      where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }),
+      orderBy: { createdAt: 'desc' },
+      select: { id: true, payload: true },
+    })
+  } catch (error) {
+    console.error(`[wc-import] could not look for a held sales invoice for ${orderId}:`, error)
+    return
+  }
+  if (!row) return
+
+  if (!isHeldSalesInvoicePayload(row.payload)) {
+    // Not releasable and not silently droppable: this order will never be invoiced until somebody
+    // acts, so it becomes a FAILED row with a reason rather than a PENDING row nobody reads.
+    await db.shoppingSyncLog.update({
+      where: { id: row.id },
+      data: {
+        status: 'FAILED',
+        errorMessage: 'The held sales-invoice payload is unreadable, so the invoice cannot be released automatically — queue it from the order.',
+        syncedAt: new Date(),
+      },
+    }).catch(() => {})
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'sales_invoice_release_failed',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `WooCommerce order ${wcOrder.number} has its invoice number (${invoiceNumber}) but the held accounting `
+        + 'payload could not be read, so the sales invoice was NOT queued. Queue it from the order.',
+      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), invoiceNumber },
+      resolveUser: false,
+    }).catch(() => {})
+    return
+  }
+
+  const held = row.payload
+  try {
+    const { queueAccountingSync } = await import('@/lib/accounting')
+    await queueAccountingSync({
+      type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+      payload: buildReleasedSalesInvoicePayload(held, invoiceNumber),
+      idempotencyKey: `wc-held-sales-invoice:${orderId}:${invoiceNumber}`,
+    })
+  } catch (error) {
+    // Left PENDING on purpose — the next redelivery or poll retries it.
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'sales_invoice_release_failed',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `WooCommerce order ${wcOrder.number} has its invoice number (${invoiceNumber}) but queueing the held `
+        + 'sales invoice failed; it stays queued for release and retries on the next order sync.',
+      metadata: {
+        connector: 'woocommerce',
+        externalOrderId: String(wcOrder.id),
+        invoiceNumber,
+        errorName: error instanceof Error ? error.name : typeof error,
+      },
+      resolveUser: false,
+    }).catch(() => {})
+    return
+  }
+
+  await db.shoppingSyncLog.update({
+    where: { id: row.id },
+    data: {
+      status: 'SYNCED',
+      errorMessage: `Released: WooCommerce assigned invoice number ${invoiceNumber}, and the sales invoice was queued.`,
+      syncedAt: new Date(),
+    },
+  }).catch((error) => {
+    // The invoice IS queued; only the bookkeeping failed. A repeat release deduplicates on the
+    // idempotency key, so the worst case is one redundant lookup on the next sync.
+    console.error(`[wc-import] released the held sales invoice for ${orderId} but could not mark the queue row:`, error)
+  })
+
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'sales_invoice_number_captured',
+    tag: 'accounting',
+    level: 'INFO',
+    description:
+      `WooCommerce order ${wcOrder.number} is now numbered ${invoiceNumber}; the sales invoice held back for it `
+      + 'has been queued.',
+    metadata: {
+      connector: 'woocommerce',
+      externalOrderId: String(wcOrder.id),
+      externalOrderNumber: wcOrder.number,
+      invoiceNumber,
+    },
+    resolveUser: false,
+  }).catch(() => {})
 }
 
 /**
@@ -925,25 +1261,17 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // InvoiceNumber, so the correction would post a SECOND document rather than replace the
     // first. Holding the order back is recoverable (the number arrives, an operator re-queues);
     // a wrongly-numbered document in a live ledger is not.
-    if (!invoiceNumberResolution.ok) {
-      const reason = `Accounting sales invoice NOT queued — ${invoiceNumberResolution.reason}`
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: so.id,
-        action: 'sales_invoice_number_unavailable',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: `${reason} Re-import order ${wcOrder.number} once WooCommerce PDF Invoices has numbered it, then queue the sales invoice.`,
-        metadata: {
-          connector: 'woocommerce',
-          externalOrderId: String(wcOrder.id),
-          externalOrderNumber: wcOrder.number,
-          orderNumber,
-          metaKey: invoiceNumberResolution.metaKey,
-        },
-      })
-      return await finishWithoutAccounting(reason)
-    }
+    //
+    // o3d-k26m.6: BUT THE PAYLOAD IS PARKED, NOT DISCARDED. "Holding back is recoverable" is only
+    // true if something recovers, and the first cut of this refusal recovered nothing: the
+    // redelivery captured the number onto the order and no invoice was ever queued for it, so the
+    // remedy the warning advertised ran to completion and produced nothing. The payload the import
+    // would have sent is stored against the order and enqueued verbatim — plus the number — the
+    // moment WooCommerce assigns one. See ./held-sales-invoice.ts for why it is parked rather than
+    // rebuilt later.
+    const heldReason = invoiceNumberResolution.ok
+      ? null
+      : `Accounting sales invoice HELD — ${invoiceNumberResolution.reason}`
 
     try {
       const { queueAccountingSync, getAccountingSettings } = await import('@/lib/accounting')
@@ -959,12 +1287,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       // connector sees the original order-currency amounts without a base-currency round-trip.
       // Coupons ride on the per-line discountAmount below (that is where Woo puts them); the
       // order-level leg carries only what Woo left unallocated — see o3d-y14.
-      await queueAccountingSync({
-        type: 'SALES_INVOICE',
-        referenceType: 'SalesOrder',
-        referenceId: so.id,
-        payload: {
-          invoiceNumber: invoiceNumberResolution.invoiceNumber,
+      // Built ONCE, with no invoice number in it, so the held path and the posting path can never
+      // differ in anything but the number (o3d-k26m.6).
+      const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: wcOrder.billing.email || undefined,
           date: new Date(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
@@ -1010,8 +1335,24 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           _paymentMethod: wcOrder.payment_method || undefined,
           _paymentDate: wcOrder.date_paid_gmt || undefined,
           _paymentAmount: resolveWcInvoicePaymentAmount(wcOrder),
-        },
-      })
+      }
+
+      if (invoiceNumberResolution.ok) {
+        await queueAccountingSync({
+          type: 'SALES_INVOICE',
+          referenceType: 'SalesOrder',
+          referenceId: so.id,
+          payload: { invoiceNumber: invoiceNumberResolution.invoiceNumber, ...accountingPayload },
+        })
+      } else {
+        await holdWcSalesInvoiceForMissingNumber({
+          salesOrderId: so.id,
+          wcOrder,
+          orderNumber,
+          metaKey: invoiceNumberResolution.metaKey,
+          accountingPayload,
+        })
+      }
     } catch (accountingError) {
       await logActivity({
         entityType: 'SALES_ORDER',
@@ -1027,6 +1368,31 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           errorName: accountingError instanceof Error ? accountingError.name : typeof accountingError,
         },
       })
+    }
+
+    // o3d-k26m.1/.6: the order imported, nothing was posted, and the reason lands on the sync row.
+    // Logged out here, after the try/catch, so that a failure to PARK the payload still leaves the
+    // operator-facing warning and still refuses to post — the refusal is the safety, the parking is
+    // only the convenience.
+    if (heldReason) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'sales_invoice_number_unavailable',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `${heldReason} The invoice is queued for release: IMS posts it automatically as soon as WooCommerce PDF `
+          + `Invoices numbers order ${wcOrder.number} and the next order sync sees it. Nothing to do unless it stays here.`,
+        metadata: {
+          connector: 'woocommerce',
+          externalOrderId: String(wcOrder.id),
+          externalOrderNumber: wcOrder.number,
+          orderNumber,
+          metaKey: invoiceNumberResolution.ok ? null : invoiceNumberResolution.metaKey,
+        },
+      })
+      return await finishWithoutAccounting(heldReason)
     }
 
     // Log sync
