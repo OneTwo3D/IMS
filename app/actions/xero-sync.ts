@@ -12,10 +12,10 @@ import { processPendingXeroSync } from '@/lib/connectors/xero'
 import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
 import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
-import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
+import { getSettingValue, maskSettingSecret, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
-import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
+import { isMaskedSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
 import {
   assertIntegrationConnectionTestPassed,
   buildIntegrationConnectionFingerprint,
@@ -56,7 +56,7 @@ export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMa
   // Only xero_client_secret is masked, so masking is not the access control.
   await requireSyncPermission()
   const settings = await getXeroSettings()
-  const masked = maskSecret(settings.xero_client_secret)
+  const masked = maskSettingSecret('xero_client_secret', settings.xero_client_secret)
   return { ...settings, xero_client_secret: masked, secretMasked: !!settings.xero_client_secret }
 }
 

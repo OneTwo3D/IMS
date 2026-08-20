@@ -5,7 +5,12 @@
 #     SERIALIZABLE option that suppresses its permission check (o3d-43oz).
 #   * check:server-action-guard-coverage  — every exported async function in a
 #     'use server' module must enforce a guard, delegate to something that does,
-#     or be allowlisted with a stated reason (o3d-1fel).
+#     or be allowlisted with a stated reason (o3d-1fel); plus the fixtures that
+#     pin the DETECTOR itself, because a rule whose own tests run somewhere else
+#     can be quietly weakened until it reports nothing (o3d-512h).
+#   * check:server-action-authorization   — the executable proofs that the gates
+#     actually refuse the principals they claim to: which role, which named
+#     permission, and that no read ran on the refused path (o3d-512h).
 #
 # Both were reachable only via `npm run check:all`, which NO workflow invoked;
 # the coverage test additionally ran inside `npm run test:unit`, but that lives

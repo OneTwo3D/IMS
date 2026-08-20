@@ -315,7 +315,19 @@ const EMAIL_DEFAULTS: EmailSettings = {
 }
 
 export async function getEmailSettings(): Promise<EmailSettings> {
-  await requireAuth()
+  // o3d-512h: 'settings.company', not requireAuth. This export reads the stored
+  // SMTP configuration — host, port, username, the routing mailboxes, and the
+  // leading characters of the DECRYPTED password (email_smtp_pass is in
+  // SENSITIVE_SETTING_KEYS, so getSettingValues decrypts it before the mask is
+  // applied here). Under requireAuth every authenticated role — MANAGER,
+  // WAREHOUSE, FINANCE, READONLY, SUPPLIER — could POST this action directly and
+  // read the lot; masking three-plus characters of a password is not access
+  // control, and neither is the fact that no UI outside the admin pages calls it.
+  //
+  // Both legitimate callers are already ADMIN-only (settings/company gates on
+  // 'settings.company'; onboarding gates on requireAdmin), so this costs no role
+  // anything it could legitimately reach.
+  await requirePermission('settings.company')
   const keys = Object.keys(EMAIL_DEFAULTS).map((k) => `email_${k}`)
   const map = await getSettingValues(keys)
   const result = { ...EMAIL_DEFAULTS }

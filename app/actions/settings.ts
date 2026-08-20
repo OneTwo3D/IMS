@@ -834,7 +834,20 @@ export async function generateMissingQuickBooksTaxRates(_taxRateIds: string[], _
 export type AccountCodeOption = { code: string; name: string; type: string }
 
 export async function getAccountCodes(): Promise<AccountCodeOption[]> {
-  await requireAuth()
+  // o3d-512h round 2 — the THIRD instance of the getEmailSettings class, and the
+  // one the reviewer predicted. listAccountCodes resolves the active connector and
+  // reads the stored chart of accounts (lib/connectors/xero/accounts.ts:
+  // listStoredAccounts → db.accountingAccount), which is EXACTLY the data this
+  // branch already guarded with requirePermission('sync') on
+  // xero-sync.ts:getAccountingAccounts. Guarding one endpoint onto a table while a
+  // sibling serves the same rows under requireAuth is not a boundary, it is a
+  // detour — and it survived the first sweep because the read happens two modules
+  // away, so nothing in this file looks like an accounting read.
+  //
+  // 'sync' matches the gate already established for this table, so ADMIN and
+  // MANAGER keep the reach they had through the sibling; the sole caller
+  // (/settings/inventory) gates on 'settings.company' and is ADMIN-only anyway.
+  await requirePermission('sync')
   const { listAccountCodes } = await import('@/lib/accounting')
   return listAccountCodes()
 }

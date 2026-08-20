@@ -3420,7 +3420,17 @@ export async function updateInvoice(
 // ---------------------------------------------------------------------------
 
 export async function getBillPaymentAccounts(): Promise<AccountingBankAccount[]> {
-  await requireAuth()
+  // o3d-512h round 2 — same class as settings.ts:getAccountCodes. This reaches
+  // listStoredBankAccounts → db.accountingAccount (type BANK), i.e. the connector
+  // chart of accounts again, and under requireAuth it listed the organisation's
+  // bank accounts to every authenticated principal including SUPPLIER.
+  //
+  // Gated on 'purchasing.invoice' — the permission on markBillPaid, the mutation
+  // this list exists to feed — NOT on 'sync' like its sibling reads of the same
+  // table: FINANCE holds 'purchasing.invoice' and not 'sync', and copying the
+  // neighbouring gate would lock the role that actually pays bills out of the
+  // account picker.
+  await requirePermission('purchasing.invoice')
   return listAccountingBankAccounts()
 }
 

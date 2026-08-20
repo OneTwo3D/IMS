@@ -59,8 +59,7 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
 import { getPublicAppUrl } from '@/lib/public-app-url'
-import { getActiveSettingEnvOverrides, serializeSettingValue } from '@/lib/settings-store'
-import { maskSecret } from '@/lib/security/secret-mask'
+import { getActiveSettingEnvOverrides, maskSettingSecret, serializeSettingValue } from '@/lib/settings-store'
 import {
   buildIntegrationConnectionFingerprint,
   getIntegrationConnectionTestState,
@@ -579,12 +578,12 @@ function mapMintsoftConnection(
         + 'Saving and testing are blocked until it is set to "credentials" or "api_key".'
       : null,
     authModeEnvPinned: Boolean(getActiveSettingEnvOverrides(['mintsoft_auth_mode']).mintsoft_auth_mode),
-    staticApiKey: maskSecret(staticApiKey),
+    staticApiKey: maskSettingSecret('mintsoft_static_api_key', staticApiKey),
     staticApiKeyMasked: Boolean(staticApiKey),
     username,
-    password: maskSecret(password),
+    password: maskSettingSecret('mintsoft_password', password),
     passwordMasked: Boolean(password),
-    webhookSecret: maskSecret(webhookSecret),
+    webhookSecret: maskSettingSecret('mintsoft_webhook_secret', webhookSecret),
     webhookSecretMasked: Boolean(webhookSecret),
     envOverrides: getActiveSettingEnvOverrides([
       'mintsoft_api_key',

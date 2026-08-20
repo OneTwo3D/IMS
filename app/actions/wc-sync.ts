@@ -5,11 +5,12 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
-import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
+import { isMaskedSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
 import {
   getActiveSettingEnvOverrides,
   getSettingValue,
   getSettingValues,
+  maskSettingSecret,
   serializeSettingValue,
 } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '@/lib/connectors/woocommerce/url-safety'
@@ -614,9 +615,12 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
   const secret = map.get('wc_consumer_secret') ?? ''
   return {
     url: map.get('wc_url') ?? '',
-    // Never send full credentials to client — mask them
-    key: maskSecret(key, 7),
-    secret: maskSecret(secret, 7),
+    // Never send full credentials to client — mask them.
+    // maskSettingSecret (not maskSecret) so the key each mask covers is declared
+    // against SENSITIVE_SETTING_KEYS: masking here IS the statement that the value
+    // is a credential, and it must reach the gate on getSetting too (o3d-512h).
+    key: maskSettingSecret('wc_consumer_key', key, 7),
+    secret: maskSettingSecret('wc_consumer_secret', secret, 7),
     secretMasked: !!secret,
     // Always empty now, and deliberately still computed rather than hardcoded to `{}`:
     // WC_CONSUMER_KEY / WC_CONSUMER_SECRET are install-time SEEDS, not overrides (o3d-ecbj),
