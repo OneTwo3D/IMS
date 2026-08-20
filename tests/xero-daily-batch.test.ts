@@ -105,9 +105,10 @@ test('o3d-0i5y r5: the residual on a part-journaled order is owed a reclassifica
   // Exactly the residual: 3 allocated less the 2 already accounted. Not 3 (re-posting the journaled
   // part) and not 0 (r4).
   assert.equal(plan.outstandingByAllocation.get('alloc-1')?.toString(), '1')
-  // And the journaled shipment contributes NO value: Group B refuses to journal an unstamped order,
-  // so a journal date is proof A2 already posted that cost once.
-  assert.deepEqual(plan.unjournaledShipments, [])
+  // And the dispatched 2 contribute NO value: the row's own pin already accounts for both of them.
+  // r5 read that off the shipment's JOURNAL DATE instead; r7 reads it off the row, which is the only
+  // record that knows which units A2 posted (a journal date only says the ORDER was stamped once).
+  assert.equal(plan.shipmentAccountedByAllocation.size, 0)
   // The pinned layers are evidence for a posted journal. A2 must not restamp the row to empty.
   assert.deepEqual(plan.stampEmptyAllocationIds, [])
 })
@@ -153,9 +154,12 @@ test('o3d-0i5y r6: a never-stamped row whose quantity has all shipped is RECORDE
   })
 
   assert.equal(plan.outstandingByAllocation.size, 0, 'nothing is on the shelf, so nothing is pinned')
-  assert.equal(plan.shipmentAccountedByAllocation.get('alloc-1')?.toString(), '2')
+  assert.equal(
+    plan.shipmentAccountedByAllocation.get('alloc-1')?.toString(),
+    '2',
+    'the 2 dispatched units are what this pass accounts — and, since r7, exactly what it values',
+  )
   assert.deepEqual(plan.stampEmptyAllocationIds, [], 'and the empty stamp is no longer how it is recorded')
-  assert.equal(plan.unjournaledShipments.length, 1, 'and the shipment is still valued — it has not been journaled')
 })
 
 test('o3d-0i5y r5: a first pass on an unshipped order is unchanged — the whole row is outstanding', () => {
@@ -176,7 +180,11 @@ test('o3d-0i5y r5: an order that both ships and holds residual owes BOTH, rather
     shipments: [shipmentRow({ qty: 6 })],
   })
 
-  assert.equal(plan.unjournaledShipments.length, 1, 'the dispatched 6 are valued from the shipment snapshot')
+  assert.equal(
+    plan.shipmentAccountedByAllocation.get('alloc-1')?.toString(),
+    '6',
+    'the dispatched 6 are valued from the shipment snapshot',
+  )
   assert.equal(plan.outstandingByAllocation.get('alloc-1')?.toString(), '4', 'and the 4 on the shelf are pinned')
 })
 
@@ -288,8 +296,11 @@ test('o3d-0i5y r6: a pass that values dispatched units from the shipment RECORDS
   })
 
   assert.equal(plan.outstandingByAllocation.get('alloc-1')?.toString(), '4', 'the 4 on the shelf are pinned')
-  assert.equal(plan.shipmentAccountedByAllocation.get('alloc-1')?.toString(), '6', 'and the 6 dispatched are recorded')
-  assert.equal(plan.unjournaledShipments.length, 1, 'their value is posted once, from the shipment snapshot')
+  assert.equal(
+    plan.shipmentAccountedByAllocation.get('alloc-1')?.toString(),
+    '6',
+    'and the 6 dispatched are recorded — which is also, since r7, exactly the quantity valued from the shipment',
+  )
   assert.deepEqual(plan.stampEmptyAllocationIds, [])
 })
 
@@ -313,8 +324,11 @@ test('o3d-0i5y r6: the residual beside a pre-A2 shipment is pinned ONCE, not onc
   })
 
   assert.equal(plansOwe(secondPass, 'alloc-1'), '0', 'nothing is owed, so the residual is not pinned and posted twice')
-  assert.equal(secondPass.shipmentAccountedByAllocation.size, 0, 'and there is nothing left to record')
-  assert.deepEqual(secondPass.unjournaledShipments, [], 'the journaled shipment is not re-valued either')
+  assert.equal(
+    secondPass.shipmentAccountedByAllocation.size,
+    0,
+    'and there is nothing left to record — which under r7 is the same statement as nothing left to value',
+  )
 
   // WHY it is nothing: the row itself now says so.
   assert.equal(
@@ -379,27 +393,45 @@ test('o3d-0i5y r6: the record carries the layers the dispatch consumed, and neve
   assert.equal(sumCostLayerSnapshotQty(partial).toString(), '7')
 })
 
-test('o3d-0i5y r6: Group A2 posts value for the layers it pins, never for the units it merely records', () => {
-  // Structural, like the r5 write-loop test above and for the same reason: the property is about what
-  // the batch does NOT add to the journal, and there is no harness that can run it. The recorded
-  // entries name quantity the ledger already holds — posting their value would be the double post
-  // arriving through the other door.
+test('o3d-0i5y r7: Group A2 posts exactly the entries it writes, and reads no shipment journal date', () => {
+  // r6's assertion here is REVERSED rather than dropped. It read "the recorded shipment units are
+  // never added to the journal" as the rule, because the WHOLE unjournaled shipment was valued a few
+  // lines above and adding the record too would have posted those units twice. The whole-shipment
+  // valuation is the defect: on a MIXED shipment it re-posts the part an earlier pass already pinned.
+  // Value now follows the record — `recorded` is by construction the dispatched quantity the row does
+  // NOT already account for — and what A2 posts for a mixed shipment is asserted on the live writer in
+  // tests/accounting/daily-batch-a2-mixed-shipment.test.ts.
+  //
+  // What stays structural is the ABSENCE: A2 must not resurrect a journal-date exclusion, and no
+  // fixture can show that, because a journal date it never reads cannot change an outcome.
   const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/daily-sync.ts'), 'utf8')
   const start = src.indexOf('// --- Group A2: Inventory Reclassification ---')
   const block = src.slice(start, src.indexOf('// --- Group B:', start))
   assert.ok(start > 0 && block.length > 0, 'the Group A2 block must exist')
   assert.ok(
-    block.includes('orderCostValue = addMoney(orderCostValue, sumCostLayerSnapshot(consumed))'),
-    'the freshly pinned layers are what A2 posts',
+    block.includes('addMoney(sumCostLayerSnapshot(recorded), sumCostLayerSnapshot(consumed))'),
+    'A2 posts the units it records from the shipment AND the layers it freshly pins',
   )
   assert.equal(
-    block.indexOf('sumCostLayerSnapshot(recorded)'),
+    block.indexOf('requireShipmentSnapshotValue('),
     -1,
-    'and the recorded shipment units are never added to the journal',
+    'and never values a shipment as a whole, which is what re-posted the pinned part of a mixed one',
   )
   assert.ok(
     block.includes('...recorded,') && block.includes('takeShipmentAccountedEntries('),
-    'while still being written onto the row',
+    'while still writing those units onto the row',
+  )
+  assert.equal(
+    block.indexOf('shipmentJournalDate: true'),
+    -1,
+    'A2 does not even select a shipment journal date: what it owes is decided by the allocation row',
+  )
+  assert.equal(
+    readFileSync(join(process.cwd(), 'lib/connectors/xero/daily-sync.ts'), 'utf8')
+      .slice(src.indexOf('export function planA2Reclassification'), src.indexOf('export function takeShipmentAccountedEntries'))
+      .indexOf('shipmentJournalDate'),
+    -1,
+    'and neither does the plan it decides with',
   )
 })
 

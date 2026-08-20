@@ -34,6 +34,7 @@ import {
   reduceSnapshotByCostLayer,
   reduceSnapshotByQty,
   sumCostLayerSnapshot,
+  sumCostLayerSnapshotQty,
   takeFromSnapshotEntries,
   unaccountedAllocationQty,
   type CostLayerSnapshotEntry,
@@ -181,7 +182,6 @@ export type A2AllocationRow = {
 
 export type A2ShipmentRow<TLine> = {
   warehouseId: string
-  shipmentJournalDate: Date | null
   lines: TLine[]
 }
 
@@ -199,23 +199,36 @@ export type A2ShipmentRow<TLine> = {
  *
  * Two disjoint things can be owed, and they are SUMMED rather than chosen between:
  *
- *   unjournaledShipments        shipped but not yet journaled, valued from their own line snapshots
- *                               because dispatch has already consumed the layers. A journaled
- *                               shipment is excluded: Group B refuses to journal an unstamped order,
- *                               so a journal date is proof A2 already posted that cost.
  *   outstandingByAllocation     allocated quantity nothing has reclassified, to be valued by pinning
  *                               FIFO layers — but only the outstanding PART of each row, per
  *                               {@link unaccountedAllocationQty}.
+ *   shipmentAccountedByAllocation
+ *                               dispatched quantity at the row's scope that no entry on the row
+ *                               accounts for, valued from the SHIPMENT snapshots because dispatch
+ *                               has already consumed those layers and A2 cannot pin them.
  *
- * AND THE PASS RECORDS WHAT IT ACCOUNTED THROUGH A SHIPMENT (o3d-0i5y r6). `shipmentAccountedByAllocation`
- * is dispatched quantity at a row's scope that neither pin covers — units A2 is accounting from the
- * SHIPMENT snapshots rather than by pinning shelf layers. r5 left no record of them, so the next pass
- * saw a residual pin (4 on the shelf) beside a shipment that PREDATES it (6 dispatched) and had to
- * guess whether they were the same units. Its `max` said 6 accounted where 10 were, and it re-pinned
- * and RE-POSTED the residual — every time the order came back. Writing those units onto the row as
- * shipment-source entries makes the pin the complete record of accounted quantity, so the guess is
- * gone: a dispatch can only consume a pin that already existed, and a shipment-source entry is proof
- * that it did not.
+ * THE PASS RECORDS WHAT IT ACCOUNTED THROUGH A SHIPMENT (o3d-0i5y r6). r5 left no record of those
+ * units, so the next pass saw a residual pin (4 on the shelf) beside a shipment that PREDATES it (6
+ * dispatched) and had to guess whether they were the same units. Its `max` said 6 accounted where 10
+ * were, and it re-pinned and RE-POSTED the residual — every time the order came back. Writing those
+ * units onto the row as shipment-source entries makes the pin the complete record of accounted
+ * quantity, so the guess is gone: a dispatch can only consume a pin that already existed, and a
+ * shipment-source entry is proof that it did not.
+ *
+ * AND THE JOURNAL DATE DECIDES NOTHING HERE ANY MORE (o3d-0i5y r7). r5 valued the whole of every
+ * UNJOURNALED shipment and excluded journaled ones, reading a journal date as proof A2 had posted
+ * that shipment's cost. It is not: Group B refuses to journal an unstamped ORDER, which says nothing
+ * about which of that order's units A2 pinned. Both halves of that read are wrong once a shipment is
+ * MIXED — part of it pinned by an earlier pass, part of it not:
+ *
+ *   an unjournaled mixed shipment had its already-pinned part re-posted, on that pass and every
+ *   later one, because the whole shipment was valued;
+ *   a journaled shipment's UNPINNED part was never posted at all, though Group B had already
+ *   credited Allocated Inventory for the whole shipment's value when it journaled it.
+ *
+ * Both disappear when value follows the record: the pass posts exactly the entries it writes, and
+ * `shipmentAccountedByAllocation` is by construction the dispatched quantity the row does not
+ * already account for.
  *
  * `stampEmptyAllocationIds` are rows that owe nothing, have nothing to record and have never been
  * stamped; they keep the pre-existing empty-snapshot stamp. Rows that already carry a snapshot and
@@ -226,7 +239,6 @@ export function planA2Reclassification<TLine extends { lineId: string; productId
   allocations: A2AllocationRow[]
   shipments: TShipment[]
 }): {
-  unjournaledShipments: TShipment[]
   outstandingByAllocation: Map<string, Decimal>
   shipmentAccountedByAllocation: Map<string, Decimal>
   stampEmptyAllocationIds: string[]
@@ -259,7 +271,6 @@ export function planA2Reclassification<TLine extends { lineId: string; productId
   }
 
   return {
-    unjournaledShipments: order.shipments.filter((shipment) => !shipment.shipmentJournalDate),
     outstandingByAllocation,
     shipmentAccountedByAllocation,
     stampEmptyAllocationIds,
@@ -294,37 +305,6 @@ export function takeShipmentAccountedEntries(
     orderAllocationId: allocationId,
     source: 'shipment',
   }).taken
-}
-
-function requireShipmentSnapshotValue(order: {
-  id: string
-  shipments: Array<{
-    id: string
-    status: string
-    lines: Array<{ id: string; qty: Prisma.Decimal | number; costLayerSnapshot: Prisma.JsonValue | null }>
-  }>
-}): Decimal {
-  let total = toDecimal(0)
-  let hasShippedLines = false
-
-  for (const shipment of order.shipments) {
-    if (shipment.status !== 'SHIPPED') continue
-    for (const line of shipment.lines) {
-      if (Number(line.qty) <= 0) continue
-      hasShippedLines = true
-      const snapshot = parseCostLayerSnapshot(line.costLayerSnapshot)
-      if (snapshot.length === 0) {
-        throw new Error(`Missing FIFO snapshot for already-shipped line ${line.id} on order ${order.id}`)
-      }
-      total = addMoney(total, sumCostLayerSnapshot(snapshot))
-    }
-  }
-
-  if (!hasShippedLines) {
-    throw new Error(`Order ${order.id} is marked shipped but has no shipped lines to reclassify`)
-  }
-
-  return roundQuantity(total, 2)
 }
 
 function consumeSnapshotLayers(
@@ -999,10 +979,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             id: true,
             status: true,
             warehouseId: true,
-            // A shipment Group B has already journaled had its cost reclassified by the A2 run that
-            // stamped this order the first time — B refuses to journal an unstamped order — so its
-            // value must NOT be posted again when the order comes back for its residual.
-            shipmentJournalDate: true,
+            // o3d-0i5y r7: the journal date is deliberately NOT read. What a pass owes is decided by
+            // the allocation row's own entries against the dispatched quantity — see
+            // `planA2Reclassification`. Selecting a shipment's journal date here only ever supported
+            // the whole-shipment valuation that re-posted the pinned part of a mixed shipment.
             lines: {
               select: {
                 id: true,
@@ -1047,9 +1027,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
         for (const order of orders) {
           const plan = plans.get(order.id)!
-          let orderCostValue = plan.unjournaledShipments.length > 0
-            ? requireShipmentSnapshotValue({ ...order, shipments: plan.unjournaledShipments })
-            : toDecimal(0)
+          // o3d-0i5y r7: value is accumulated ROW BY ROW, from the entries this pass actually writes.
+          // r6 valued the whole unjournaled shipment here instead, which posts the WHOLE of a MIXED
+          // shipment — part of it already pinned and posted by an earlier pass. See the shipment-
+          // sourced term below.
+          let orderCostValue = toDecimal(0)
 
           // Rows that have never been reclassified at all, owe nothing and have nothing to record are
           // still STAMPED with an empty snapshot, exactly as before.
@@ -1074,6 +1056,24 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
                   alloc.id,
                 )
               : []
+            // o3d-0i5y r7: THE RECORD IS ALSO THE VALUATION, and it must be, because the row is the
+            // only place that says which dispatched units A2 has already posted. `shipmentAccounted`
+            // is dispatched quantity NO entry on the row accounts for, so these entries are exactly
+            // the units whose cost has never reached Allocated Inventory — never the pinned part of
+            // the same shipment, which is what r6's whole-shipment sum re-posted every pass.
+            //
+            // A short take can only mean a dispatched line carries no snapshot to record. r6 let that
+            // stand as a silent under-account; it is now as loud as r5's whole-shipment guard was,
+            // and names the row and the quantity rather than the batch.
+            if (shipmentAccounted) {
+              const recordedQty = sumCostLayerSnapshotQty(recorded)
+              if (recordedQty.lt(shipmentAccounted)) {
+                throw new Error(
+                  `Missing FIFO snapshot on shipped line(s) for allocation ${alloc.id} on order ${order.id}: `
+                  + `${shipmentAccounted.toString()} dispatched unit(s) to account for, only ${recordedQty.toString()} recoverable`,
+                )
+              }
+            }
             const consumed = outstanding
               ? consumeSnapshotLayers(
                   snapshot,
@@ -1092,7 +1092,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
               ...recorded,
               ...consumed,
             ])
-            orderCostValue = addMoney(orderCostValue, sumCostLayerSnapshot(consumed))
+            orderCostValue = addMoney(
+              orderCostValue,
+              addMoney(sumCostLayerSnapshot(recorded), sumCostLayerSnapshot(consumed)),
+            )
           }
           orderCostValue = roundQuantity(orderCostValue, 2)
 
