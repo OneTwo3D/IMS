@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
+
 import {
   allocateSalesOrder,
   allocationSetsMatch,
@@ -477,7 +479,16 @@ function createClient(state: MemoryState): AllocationServiceClient {
     // mis-scoped write.
     salesOrderLine: {
       findMany: async ({ where }: {
-        where?: { orderId?: string; id?: string | { in: string[] }; productId?: { not: null } }
+        where?: {
+          orderId?: string
+          id?: string | { in: string[] }
+          productId?: { not: null }
+          // o3d-kouj: "this line carries a pin" — the filter clearDormantFulfillmentPinsInTx uses to
+          // avoid rewriting lines that never had one. Honoured rather than ignored: a double that
+          // returned every line here would make the dormancy sweep look like it had examined lines
+          // it never selects in Postgres.
+          fulfillmentRequirements?: { not: unknown }
+        }
       } = {}) => state.order.lines
         .filter((line) => where?.orderId == null || state.order.id === where.orderId)
         .filter((line) => {
@@ -485,6 +496,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
           return typeof where.id === 'string' ? line.id === where.id : where.id.in.includes(line.id)
         })
         .filter((line) => where?.productId?.not !== null || line.productId != null)
+        .filter((line) => where?.fulfillmentRequirements == null || line.fulfillmentRequirements != null)
         .map((line) => ({
           id: line.id,
           productId: line.productId,
@@ -506,6 +518,29 @@ function createClient(state: MemoryState): AllocationServiceClient {
           line.fulfillmentRequirements = JSON.parse(JSON.stringify(data.fulfillmentRequirements))
         }
         return line
+      },
+      // o3d-kouj: the dormant-pin retirement. Scoped by BOTH id set and orderId, exactly as
+      // production writes it, so a mis-scoped clear cannot pass here.
+      updateMany: async ({ where, data }: {
+        where: { id: { in: string[] }; orderId?: string }
+        data: { fulfillmentRequirements?: unknown }
+      }) => {
+        let count = 0
+        for (const line of state.order.lines) {
+          if (!where.id.in.includes(line.id)) continue
+          if (where.orderId != null && state.order.id !== where.orderId) continue
+          if ('fulfillmentRequirements' in data) {
+            salesOrderLineSnapshotWrites.push({ lineId: line.id, payload: data.fulfillmentRequirements })
+            // Prisma's DbNull sentinel writes SQL NULL; anything else is a payload. Distinguished
+            // rather than assumed, so this double cannot quietly turn a write into a clear.
+            const payload = data.fulfillmentRequirements
+            line.fulfillmentRequirements = payload == null || payload === Prisma.DbNull
+              ? null
+              : JSON.parse(JSON.stringify(payload))
+          }
+          count += 1
+        }
+        return { count }
       },
     },
     salesOrderRefundLine: {
@@ -3394,5 +3429,113 @@ test('o3d-kouj: the CAS is skipped per LINE, not switched off', () => {
   assert.match(
     String(findStaleFulfillmentGraphAllocation(lines, [{ lineId: 'unpinned', fulfillmentGraphVersion: 1 }])),
     /Allocation for sales line KIT-2 was computed against an older version/,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kouj — DORMANT PINS
+//
+// The capture rule reads correctly forwards (a line pins while it holds nothing in flight, and is
+// untouchable once it holds an allocation row or a committed shipment line) and leaves a gap
+// backwards. When a line's last allocation row goes away the line becomes capturable again, so the
+// NEXT allocation will expand the CURRENT graph — but the OLD pin is still on the row until that
+// happens, and every reader goes through `lineFulfillmentRequirements`, which uses a pin whenever
+// one is present. Between the deallocation and the re-allocation, readers and the next allocation
+// therefore answer from different recipes.
+// ---------------------------------------------------------------------------
+
+/** The pin a line carries after a real capture: one unit of `kit-1` = 2 x `component-1`. */
+function stalePin(productId: string, graphVersion: number) {
+  return {
+    version: 1,
+    productId,
+    graphVersion,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  }
+}
+
+test('o3d-kouj: deallocation retires the pin it just made dormant', async () => {
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PENDING', reservedQty: 13,
+  })
+  const line = state.order.lines[0]
+  line.fulfillmentRequirements = stalePin(line.productId!, 4)
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(ownAllocation(state), undefined, 'the rows really are gone')
+  assert.equal(
+    state.order.lines[0].fulfillmentRequirements,
+    null,
+    'so the pin is retired — a reader must not keep answering from a recipe nothing is committed to',
+  )
+})
+
+test('o3d-kouj: a line whose pin still backs a COMMITTED shipment keeps it', async () => {
+  // The frozen-forever half of the rule. `releaseOrderAllocationsInTx` is the unconditional teardown
+  // and deletes allocation rows even for a line holding a picked shipment, so "no allocation rows"
+  // is NOT on its own evidence that the pin is dormant — the shipment is what still stands against
+  // it, and that is the case this asserts rather than assumes.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PICKING', reservedQty: 13,
+  })
+  const line = state.order.lines[0]
+  const pin = stalePin(line.productId!, 4)
+  line.fulfillmentRequirements = pin
+
+  await releaseOrderAllocationsInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(ownAllocation(state), undefined, 'the teardown deleted the rows regardless')
+  assert.deepEqual(
+    state.order.lines[0].fulfillmentRequirements,
+    pin,
+    'but the committed shipment still stands against that recipe, so the pin survives',
+  )
+})
+
+test('o3d-kouj: cancelling an order retires its pins, AFTER the picked shipments are destroyed', async () => {
+  // Ordering matters and is easy to get backwards: cancellation deletes the PENDING/PICKING/PACKED
+  // shipments, so a clear run BEFORE that delete would see the picked shipment, decide the line was
+  // untouchable, and leave a pin behind with nothing at all still standing against it.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PICKING', reservedQty: 13,
+  })
+  state.order.status = 'PROCESSING'
+  const line = state.order.lines[0]
+  line.fulfillmentRequirements = stalePin(line.productId!, 4)
+
+  await cancelSalesOrderFulfillmentState(createClient(state) as never, { orderId: 'order-1' })
+
+  assert.equal(
+    state.shipments?.filter((shipment) => shipment.orderId === 'order-1' && shipment.status === 'PICKING').length,
+    0,
+    'the picked shipment was destroyed by the cancel',
+  )
+  assert.equal(
+    state.order.lines[0].fulfillmentRequirements,
+    null,
+    'and the pin went with it — nothing is left for that recipe to certify',
+  )
+})
+
+test('o3d-kouj: a line that never carried a pin is not written to at all', async () => {
+  // The sweep selects on "carries a pin". Without that filter it would rewrite every line of every
+  // order on every deallocation, which is a write per line per rotation of the reallocation sweep.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PENDING', reservedQty: 13,
+  })
+  // The client factory resets the recorder, so it has to be built BEFORE the baseline is read —
+  // otherwise the baseline is another test's leftovers and the assertion compares nothing.
+  const client = createClient(state)
+  const writesBefore = salesOrderLineSnapshotWrites.length
+  assert.equal(writesBefore, 0)
+
+  await releaseOrderAllocationsForDeallocationInTx(client as never, 'order-1')
+
+  assert.equal(
+    salesOrderLineSnapshotWrites.length,
+    writesBefore,
+    'no snapshot write of any kind for a line that had nothing pinned',
   )
 })

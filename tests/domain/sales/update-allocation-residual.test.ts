@@ -172,17 +172,52 @@ const tx = {
     },
   },
   salesOrderLine: {
-    // o3d-kouj: also answers `{ id: 'line-x' }` — `addAllocation` reads the ONE line it is about to
-    // pin. The row carries `fulfillmentRequirements`, so a test can seed a stale pin and prove the
-    // pin is what the expansion reads.
+    // o3d-kouj: `addAllocation` reads the ONE line it is about to pin, scoped by BOTH id and
+    // orderId — a line belonging to another order must come back as ABSENT here, or the double
+    // would hide the cross-order write the scoping exists to refuse.
+    findFirst: async ({ where }: { where: { id?: string; orderId?: string } }) => state.lines
+      .filter((line) => where.id == null || line.id === where.id)
+      .filter((line) => where.orderId == null || line.orderId === where.orderId)
+      .map((line) => ({
+        id: line.id,
+        productId: line.productId,
+        qty: line.qty,
+        sku: line.sku,
+        description: line.sku,
+        fulfillmentRequirements: line.fulfillmentRequirements ?? null,
+      }))[0] ?? null,
+    // o3d-kouj: the dormant-pin sweep selects only lines that CARRY a pin, so the filter is
+    // honoured rather than ignored — a double that returned every line would make the sweep look
+    // like it examined rows Postgres never hands it.
+    updateMany: async ({ where, data }: {
+      where: { id: { in: string[] }; orderId?: string }
+      data: { fulfillmentRequirements?: unknown }
+    }) => {
+      let count = 0
+      for (const line of state.lines) {
+        if (!where.id.in.includes(line.id)) continue
+        if (where.orderId != null && line.orderId !== where.orderId) continue
+        if ('fulfillmentRequirements' in data) {
+          state.lineSnapshotWrites.push({ lineId: line.id, payload: data.fulfillmentRequirements })
+          line.fulfillmentRequirements = undefined
+        }
+        count += 1
+      }
+      return { count }
+    },
     findMany: async ({ where }: {
-      where: { orderId?: string; id?: string | { in: string[] } }
+      where: {
+        orderId?: string
+        id?: string | { in: string[] }
+        fulfillmentRequirements?: { not: unknown }
+      }
     }) => state.lines
       .filter((line) => where.orderId == null || line.orderId === where.orderId)
       .filter((line) => {
         if (where.id == null) return true
         return typeof where.id === 'string' ? line.id === where.id : where.id.in.includes(line.id)
       })
+      .filter((line) => where.fulfillmentRequirements == null || line.fulfillmentRequirements != null)
       .map((line) => ({
         id: line.id,
         productId: line.productId,
@@ -235,14 +270,23 @@ const tx = {
     // back), `status: { not: 'PENDING' }` is committed demand. A double that understood only one
     // of them would answer the other with the wrong set (o3d-4kfh).
     findMany: async ({ where }: {
-      where: { shipment: { status: string | { not: string } }; lineId?: { in: string[] } }
+      where: { shipment: { status: string | { not: string } }; lineId?: string | { in: string[] } }
     }) => state.shipmentLines
       .filter((line) => (
         typeof where.shipment.status === 'string'
           ? line.status === where.shipment.status
           : line.status !== where.shipment.status.not
       ))
-      .filter((line) => !where.lineId || where.lineId.in.includes(line.lineId))
+      // BOTH lineId shapes. `addAllocation` asks about ONE line by plain string; the coverage and
+      // residual readers ask with `{ in: [...] }`. Handling only the set form threw on the string
+      // form — invisible for as long as every fixture that reached it had no shipment lines at all,
+      // which is a hole in the double rather than a behaviour.
+      .filter((line) => {
+        if (where.lineId == null) return true
+        return typeof where.lineId === 'string'
+          ? line.lineId === where.lineId
+          : where.lineId.in.includes(line.lineId)
+      })
       .map((line) => ({
         lineId: line.lineId,
         productId: line.productId,
@@ -1202,4 +1246,126 @@ test('o3d-kouj: addAllocation expands the PIN, and never re-pins a line that alr
   assert.equal(reservedAt('warehouse-1'), 4)
   assert.deepEqual(state.lineSnapshotWrites, [], 'and the pin is not touched')
   assert.deepEqual(state.lines[0].fulfillmentRequirements, pinned)
+})
+
+test('o3d-kouj: addAllocation REFUSES a line that belongs to another order', async () => {
+  // `lineId` arrives from the caller and nothing tied it to `orderId`. The lock is on the ORDER, so
+  // a foreign line is outside it — and every in-flight fact the action reads is scoped to
+  // `{ orderId, lineId }`, so another order's fully-allocated, half-picked line read as holding
+  // NOTHING, was judged capturable, and had its pinned recipe overwritten.
+  const pinned = {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 6,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  }
+  seedLines(10)
+  // line-1 belongs to order-1 and is in flight there: pinned, allocated, and picked.
+  state.lines = [{
+    id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1',
+    fulfillmentRequirements: pinned,
+  }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 5 }] }
+  state.graphVersions = { 'kit-1': 11 }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 50, reservedQty: 20 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 20 },
+  ]
+  state.shipmentLines = [
+    { lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', status: 'PICKING', qty: 20 },
+  ]
+  const { addAllocation } = await loadAction()
+
+  // order-2 names order-1's line.
+  const result = await addAllocation('order-2', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, false)
+  assert.match(
+    result.error ?? '',
+    /Line line-1 does not belong to order order-2/,
+    'the refusal names the line and the order, so an operator can see which pairing was wrong',
+  )
+  assert.equal(state.allocations.length, 1, 'no allocation row was attached to the foreign order')
+  assert.equal(state.allocations[0].qty, 20, "and order-1's own row is untouched")
+  assert.equal(reservedAt('warehouse-1'), 20, "nothing was taken out of the shared aggregate")
+  assert.deepEqual(state.lineSnapshotWrites, [], 'and no pin was written')
+  assert.deepEqual(
+    state.lines[0].fulfillmentRequirements,
+    pinned,
+    "order-1's pinned recipe survives — it is what its picked shipment was picked against",
+  )
+})
+
+test('o3d-kouj: a manual addition to a PINNED line stamps the PIN\'s graph version, not the current one', async () => {
+  // The column records the graph version the rows were EXPANDED from. A pinned line's rows come
+  // from the pin, so stamping the current version leaves the row claiming a provenance it does not
+  // have — and certifying itself as current, so that if the pin were ever lost the CAS (skipped per
+  // line only while a pin exists) would come back and find a row agreeing with a recipe it was
+  // never expanded from.
+  const pinned = {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 6,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }, { productId: 'component-2', factor: '1' }],
+  }
+  seedLines(10)
+  state.lines = [{
+    id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1',
+    fulfillmentRequirements: pinned,
+  }]
+  // The current recipe has moved on, both in shape and in version.
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 5 }] }
+  state.graphVersions = { 'kit-1': 11 }
+  state.stockLevels = [
+    { productId: 'component-1', warehouseId: 'warehouse-1', quantity: 50, reservedQty: 2 },
+    { productId: 'component-2', warehouseId: 'warehouse-1', quantity: 50, reservedQty: 0 },
+  ]
+  // NO allocation rows: the line is held in flight by a PICKED shipment instead, so it is not
+  // capturable (its pin stands) and BOTH components are CREATED by this addition — and the create
+  // branch is the only one that stamps a version at all.
+  state.allocations = []
+  // A complete PINNED component set, picked: 2 x component-1 + 1 x component-2 for one kit.
+  state.shipmentLines = [
+    { lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', status: 'PICKING', qty: 2 },
+    { lineId: 'line-1', productId: 'component-2', warehouseId: 'warehouse-1', status: 'PICKING', qty: 1 },
+  ]
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, true, result.error)
+  const componentOne = state.allocations.find((row) => row.productId === 'component-1')
+  const componentTwo = state.allocations.find((row) => row.productId === 'component-2')
+  assert.ok(componentTwo, 'the pinned component the current recipe no longer mentions did get a row')
+  assert.equal(componentOne?.qty, 2, 'expanded from the PIN (factor 2), not the current recipe (5)')
+  assert.equal(componentTwo.qty, 1, 'and the pinned factor-1 component too')
+  assert.equal(
+    componentTwo.fulfillmentGraphVersion,
+    6,
+    "stamped with the PIN's version — the recipe these rows actually came from",
+  )
+  assert.notEqual(componentTwo.fulfillmentGraphVersion, 11, 'and emphatically not the current graph version')
+  assert.equal(componentOne?.fulfillmentGraphVersion, 6, 'both created rows carry the same honest provenance')
+  assert.deepEqual(state.lineSnapshotWrites, [], 'and a pinned line is never re-pinned by this path')
+})
+
+test('o3d-kouj: an UNPINNED line still stamps the CURRENT graph version', async () => {
+  // The bound on the rule. Without a pin the rows really were expanded from the current graph, so
+  // that is the honest stamp — and the CAS still reads it for those lines.
+  seedLines(10)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 5 }] }
+  state.graphVersions = { 'kit-1': 11 }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 50, reservedQty: 0 }]
+  state.allocations = []
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(state.allocations[0].productId, 'component-1')
+  assert.equal(state.allocations[0].fulfillmentGraphVersion, 11)
 })

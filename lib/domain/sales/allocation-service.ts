@@ -529,6 +529,10 @@ export async function releaseOrderAllocationsInTx(
   // The allocation rows are deleted FIRST so the shared helper reads the true post-teardown state
   // (zero open quantity everywhere) rather than being told what to conclude.
   await tx.orderAllocation.deleteMany({ where: { orderId } })
+  // o3d-kouj: the rows are gone, so any pin on a line that holds nothing else is now dormant — a
+  // recipe no reader should still be answering from. Retired here, under the same lock, in the same
+  // transaction as the release that made it dormant.
+  await clearDormantFulfillmentPinsInTx(tx, orderId)
   const pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
     cause: audit.cause ?? 'a release of the order’s allocations',
     userId: audit.userId ?? null,
@@ -540,6 +544,76 @@ export async function releaseOrderAllocationsInTx(
     deletedPendingShipmentCount: pendingShipmentReconciliation.retired.length,
     retiredPendingShipments: pendingShipmentReconciliation.retired,
   }
+}
+
+/**
+ * o3d-kouj: DROP A PIN THAT IS NO LONGER ABOUT ANYTHING IN FLIGHT.
+ *
+ * The capture rule says a line pins while it holds nothing in flight and is untouchable once it
+ * holds an allocation row or a committed shipment line. Read forward that is exactly right; read
+ * backward it leaves a gap. When a line's last allocation row goes away — deallocation, an
+ * allocation edited down to nothing, the rebalancer removing the row, an order cancelled — the line
+ * becomes capturable again, and the NEXT allocation will therefore expand the CURRENT graph. But the
+ * old pin is still sitting on the row until that allocation happens, and every reader goes through
+ * `lineFulfillmentRequirements`, which uses a pin whenever one is present.
+ *
+ * So between the deallocation and the re-allocation, the coverage checks, the backorder report and
+ * the fulfilment analytics answer from a recipe the next allocation has already decided not to use.
+ * `allocateSalesOrder` gets this right for itself by nulling the pin for capturable lines in the set
+ * it resolves against — but that is one reader making a local correction, and the disagreement is
+ * between readers.
+ *
+ * The pin is therefore RETIRED at the moment it goes dormant, so the fallback (expand the current
+ * graph) is what every reader and the next allocation both do. Nothing is lost: a dormant pin
+ * certifies no allocation row, no shipment and no cost — that is precisely what made it dormant.
+ *
+ * DELIBERATELY RE-DERIVED, not passed in. The caller has just deleted rows; asking it which lines
+ * are now empty is asking it to restate a fact the database already holds, and the two would drift.
+ * Lines that still hold a committed shipment keep their pin, which is the frozen-forever half of the
+ * rule — the unconditional teardown (`releaseOrderAllocationsInTx`) deletes allocation rows even for
+ * those lines, so that distinction is load-bearing here rather than theoretical.
+ *
+ * The caller MUST already hold the order's row lock, and must call this AFTER the rows are gone.
+ * Returns how many pins were retired.
+ */
+export async function clearDormantFulfillmentPinsInTx(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<number> {
+  const pinnedLines = await tx.salesOrderLine.findMany({
+    // `not: DbNull` and not `NOT: { equals: DbNull }`: on a nullable Json column Prisma's own
+    // documented form for "the SQL value is not NULL" is the filter shorthand.
+    where: { orderId, fulfillmentRequirements: { not: Prisma.DbNull } },
+    select: { id: true },
+  })
+  if (pinnedLines.length === 0) return 0
+
+  const pinnedLineIds = pinnedLines.map((line) => line.id)
+  const [linesHoldingAllocations, linesHoldingCommittedShipments] = await Promise.all([
+    tx.orderAllocation.findMany({
+      where: { orderId, lineId: { in: pinnedLineIds } },
+      select: { lineId: true },
+    }),
+    tx.shipmentLine.findMany({
+      where: {
+        lineId: { in: pinnedLineIds },
+        shipment: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } },
+      },
+      select: { lineId: true },
+    }),
+  ])
+  const dormant = selectCapturableLineIds({
+    lineIds: pinnedLineIds,
+    lineIdsHoldingAllocations: linesHoldingAllocations.map((row) => row.lineId),
+    lineIdsHoldingCommittedShipments: linesHoldingCommittedShipments.map((row) => row.lineId),
+  })
+  if (dormant.length === 0) return 0
+
+  const cleared = await tx.salesOrderLine.updateMany({
+    where: { id: { in: dormant }, orderId },
+    data: { fulfillmentRequirements: Prisma.DbNull },
+  })
+  return cleared.count
 }
 
 /**
@@ -852,6 +926,11 @@ export async function cancelSalesOrderFulfillmentState(
       status: { in: ['PENDING', 'PICKING', 'PACKED'] },
     },
   })
+  // o3d-kouj: same rule as the release path — a pin with nothing in flight behind it is dormant.
+  // AFTER the shipment delete, not before: the picked/packed shipments this cancel destroys are
+  // exactly what would otherwise still make their lines look untouchable, and a line whose only
+  // remaining evidence is a SHIPPED shipment correctly keeps its pin forever.
+  await clearDormantFulfillmentPinsInTx(tx, input.orderId)
 
   const stockAfter = releasedReservationScopes.length
     ? await tx.stockLevel.findMany({
@@ -2044,6 +2123,13 @@ export async function allocateSalesOrder(
           },
         })
       }
+
+      // ...and drop the pin from any line this run left holding NOTHING. The delete/recreate above
+      // can legitimately end with a line that had rows before and has none now (its stock went to a
+      // line with older demand, or the availability vanished). That line is capturable again, so the
+      // next run will expand the current graph for it — and until then every reader would be
+      // answering from the pin it no longer has any commitment behind (o3d-kouj).
+      await clearDormantFulfillmentPinsInTx(tx, orderId)
 
       // o3d-4kfh r6 (Codex finding 2): THE RESERVE DELTA COMES FROM THE ROWS AS PERSISTED.
       //
