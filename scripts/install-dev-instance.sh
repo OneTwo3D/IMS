@@ -25,9 +25,10 @@
 #      vhssl leaves the origin serving a mismatched cert.
 #   3. /root is mode 700, so the `ims` user cannot traverse it. A dev instance's
 #      workdir must live under /opt.
-#   4. Redis is shared across instances; a second instance needs
-#      RATE_LIMIT_BACKEND=memory or its rate-limit counters collide with stage's.
-#      (Set in the instance .env, asserted here.)
+#   4. Redis is shared across instances; a second instance needs the memory
+#      rate-limit backend or its counters collide with stage's. Asserted here on
+#      the EFFECTIVE value — RATE_LIMIT_BACKEND absent means memory, which is
+#      what this trap wants, so it passes (o3d-g42a).
 #
 set -euo pipefail
 
@@ -75,9 +76,23 @@ fi
 echo "allowedDevOrigins contains ${HOST}: ok"
 
 # Trap 4 — shared Redis.
-grep -qE '^RATE_LIMIT_BACKEND=memory' "$WORKDIR/.env" \
-  && echo "RATE_LIMIT_BACKEND=memory: ok" \
-  || echo "WARNING: RATE_LIMIT_BACKEND=memory not set in .env — Redis is shared across instances; rate-limit counters may collide with another instance."
+#
+# Judge the EFFECTIVE backend, not the presence of one literal line. install.sh
+# only started writing RATE_LIMIT_BACKEND with o3d-g42a, so on every .env it
+# generated before that the old `grep '^RATE_LIMIT_BACKEND=memory'` could never
+# match and this check could only ever print its warning — a check that cannot
+# pass tells you nothing when it fails. An absent variable means the app defaults
+# to 'memory' (lib/security/rate-limit.ts), which is exactly the state this trap
+# wants, so it must read as ok.
+RATE_LIMIT_BACKEND_VALUE="$(grep -m1 -E '^RATE_LIMIT_BACKEND=' "$WORKDIR/.env" | cut -d= -f2- | tr -d "\"' \r" || true)"
+case "${RATE_LIMIT_BACKEND_VALUE,,}" in
+  ""|memory)
+    echo "rate-limit backend: memory (per-instance counters): ok" ;;
+  redis)
+    echo "WARNING: RATE_LIMIT_BACKEND=redis in .env — Redis is shared across instances, so this instance's rate-limit counters collide with stage's. Set RATE_LIMIT_BACKEND=memory unless this instance has its own Redis." ;;
+  *)
+    echo "WARNING: RATE_LIMIT_BACKEND=${RATE_LIMIT_BACKEND_VALUE} is not a backend the app knows (memory|redis) — it throws on the first rate-limited request." ;;
+esac
 
 say "systemd unit"
 SRC_UNIT="$WORKDIR/deploy/systemd/${NAME}-dev.service"

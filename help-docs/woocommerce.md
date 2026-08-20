@@ -83,6 +83,8 @@ With the initial import complete, new and updated WooCommerce orders are importe
 
 **WooCommerce "completed" orders** receive special handling: the system auto-allocates stock, creates shipments, applies any tracking information from the WC order meta (AST plugin), and transitions the shipments through to Shipped status.
 
+If there is **no physical stock to allocate**, the completion is refused rather than recorded: no shipment is created and no stock moves, because IMS will not book a dispatch that did not happen. That refusal is not silent — admins are notified once, the order gets a WARNING activity entry, and the order is listed under [Sync → Exceptions](sync-exceptions.md) with a **Replay** button. Bring the stock in, then replay: the order is re-read from WooCommerce, so stock received since (and any tracking added since) both count. A refusal caused by something transient is not listed there — the webhook delivery simply fails and WooCommerce retries it.
+
 This uses the same shared external-fulfillment path that future WMS plugins will use. WooCommerce does not bypass the IMS shipment model or dispatch stock directly at order level.
 
 ### Webhooks (Recommended)
@@ -97,7 +99,9 @@ Webhooks deliver order changes to One Two Inventory in real-time, rather than wa
    - `order.updated` — syncs status changes and refunds
    - `product.updated` — syncs product changes
 
-Once the first webhook is verified, the polling interval field is replaced with a "Last received" timestamp. Webhooks and polling can coexist safely — order import is idempotent (duplicate imports are silently skipped).
+Once the first webhook is verified, the **Polling cadence** panel shows a "Last received" timestamp instead. Webhooks and polling can coexist safely — order import is idempotent (duplicate imports are silently skipped).
+
+There is no polling-interval field on this page. The cadence is the **WooCommerce Reconcile** cron job (daily at 04:00 by default), edited in **Settings → System → Scheduler**. If you need faster catch-up after a webhook outage, change that schedule — or use **Import Active Orders** for a one-off pull.
 
 ### Status Mapping
 
@@ -173,7 +177,7 @@ When a refusal applies, the row is left **structurally and commercially** untouc
 
 A variation is also only matched to an existing IMS row when that row is genuinely the one the WooCommerce variation owns: not mapped to a different WooCommerce object, not already a child of a *different* IMS parent, not itself a parent, of a type that can sit under a variable parent, and not carrying stock or open documents. A bare SKU match is not enough.
 
-When a refusal means WooCommerce data goes **unimported**, the import is reported as failed, the product is not marked synced, the reconcile cursor does not advance past it, and a row appears in the [Sync Exception Inbox](sync-exceptions.md). Resolve it in IMS or in WooCommerce; the next successful sync clears the row by itself. There are four ways to reach that state, and they are one rule — *the two systems disagree about whether the row is a variable parent*, asked of the row's **type and its actual child rows**, not of its type alone:
+When a refusal means WooCommerce data goes **unimported**, the import is reported as failed, the product is not marked synced, its WooCommerce id is kept in the reconcile's conflict retry set so it is re-fetched by id on every run, and a row appears in the [Sync Exception Inbox](sync-exceptions.md). Resolve it in IMS or in WooCommerce; the next successful sync clears the row by itself. There are four ways to reach that state, and they are one rule — *the two systems disagree about whether the row is a variable parent*, asked of the row's **type and its actual child rows**, not of its type alone:
 
 - a **variable** WooCommerce product paired with an IMS row that cannot be a parent (a kit, a row that is already somebody's variation, a row that already has child rows its type does not allow, or a row carrying stock or open documents) — none of its variations are imported;
 - a **simple** WooCommerce product paired with an IMS **VARIABLE** row — its type and its price are not applied, and the IMS variants stay where they are. The connector will not delete IMS children that WooCommerce never asked it to remove;

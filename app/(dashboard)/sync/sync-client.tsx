@@ -1087,9 +1087,24 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                   ))}
                 </div>
               </div>
+              {/*
+                o3d-potv: this was an editable "Polling interval (minutes)" field
+                bound to `wc_sync_interval_minutes`, a setting NOTHING read. An
+                operator recovering from a webhook outage could set it to 5 and
+                still get the daily 04:00 reconcile, with nothing to say so.
+                Removed rather than wired: the cadence is the wc-reconcile cron
+                schedule, and a second control that rewrote that schedule from a
+                different page — in minutes, where the schedule is a cron
+                expression — would be two controls for one thing. The link is the
+                whole point; the field is not coming back without a consumer.
+              */}
               <div className="space-y-1.5">
-                <Label className={orderWebhookActive ? 'text-muted-foreground' : ''}>Polling interval (minutes)</Label>
-                <Input type="number" min={1} value={s.wc_sync_interval_minutes} onChange={(e) => setS({ ...s, wc_sync_interval_minutes: e.target.value })} className="h-9 text-sm w-24" disabled={orderWebhookActive} />
+                <Label className="text-muted-foreground">Polling cadence</Label>
+                <p className="text-xs text-muted-foreground">
+                  Set by the <strong>WooCommerce Reconcile</strong> job in{' '}
+                  <a className="underline underline-offset-2" href="/settings/system?tab=scheduler">Settings → System → Scheduler</a>
+                  {' '}(daily at 04:00 by default). There is no separate polling interval here.
+                </p>
                 {orderWebhookActive && (
                   <p className="text-xs text-muted-foreground">Primary order polling is disabled — orders are received in real-time via webhook (last received: {formatDateTime(s.wc_order_webhook_last_received_at)}). Cron now acts only as backup reconciliation, roughly daily.</p>
                 )}

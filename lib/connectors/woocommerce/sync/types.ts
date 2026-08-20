@@ -226,6 +226,15 @@ export type SyncResult = {
   synced: number
   skipped: number
   errors: string[]
+  /**
+   * o3d-xbt: the subset of `errors` that a retry can never clear — a deterministic
+   * conflict needing an operator, not a transport blip. Kept as a SUBSET rather
+   * than a separate bucket so every existing surface that renders `errors` keeps
+   * showing them; what the split changes is whether they hold the sync cursor.
+   *
+   * Optional because only the product sweep classifies today.
+   */
+  permanentErrors?: string[]
 }
 
 export type StockSyncResult = SyncResult & {

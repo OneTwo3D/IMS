@@ -59,9 +59,16 @@ After installation, sign in and set the organisation base currency in **Settings
 - **Database password** — auto-generated if not provided
 
 ### Redis
-- **Redis URL** (default: `redis://localhost:6379`)
-- **Redis password** — leave blank if not required
+- **Install Redis** — install on this server, or point at an existing one
+- **Redis port** (local install) or **Redis URL** (default: `redis://localhost:6379`)
+- **Redis password** — leave blank if not required. For a Redis installed by this script the
+  password is written into `redis.conf` as `requirepass` *and* into the generated `REDIS_URL`,
+  percent-encoded, because the URL is what the application connects with
 - **Redis key prefix** — optional namespace for Redis-backed features
+- **Share rate-limit counters through Redis?** — writes `RATE_LIMIT_BACKEND` (`redis` or
+  `memory`) into `.env`. Defaults to `redis` when Redis is installed here, `memory` otherwise.
+  Answer yes when the app runs as more than one replica; a `memory` backend counts per process,
+  so each replica would enforce its own separate limit
 
 ### WooCommerce (Optional)
 - Store URL, consumer key, consumer secret, webhook secret
@@ -273,7 +280,7 @@ Before declaring a deployment production-ready, work through this checklist. Eac
 - [ ] `CRON_SECRET` is set and is a strong random value (32+ chars). The system fails fast on startup if this is unset in production.
 - [ ] `DATABASE_URL` points at the production database; verified by `npx prisma migrate status`.
 - [ ] `SETTINGS_ENCRYPTION_KEY` set and backed up off-server (rotation procedure documented).
-- [ ] If multi-replica: `RATE_LIMIT_BACKEND=redis` and `REDIS_URL` set.
+- [ ] `RATE_LIMIT_BACKEND` is present in `.env` (the installer writes it). If multi-replica it must be `redis`, with `REDIS_URL` reachable and carrying credentials if the server requires them.
 
 ### Cron jobs
 
@@ -378,7 +385,7 @@ Key variables in the `.env` file:
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
 | `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for IMS-session signed invoice PDF download links. Default `600` (10 minutes). Links are bound to the current IMS session and client IP, so customer-facing shopping downloads use `/api/shopping/{connector}/invoice-pdf` via the shopping platform instead. |
 | `INVOICE_PDF_TOKEN_MAX_TTL_SECONDS` | Maximum accepted IMS-session invoice PDF token lifetime. Default and hard cap `2592000` (30 days). Lower this for stricter tenants; raise `INVOICE_PDF_TOKEN_TTL_SECONDS` only up to this cap. |
-| `RATE_LIMIT_BACKEND` | Backend for rate-limit counters (cron quotas, login throttle, etc.). `memory` (default) keeps counters per-process. For multi-replica deployments, set `redis` and configure `REDIS_URL` so the limits are shared across replicas. |
+| `RATE_LIMIT_BACKEND` | Backend for rate-limit counters (cron quotas, login throttle, etc.). `memory` (default when unset) keeps counters per-process. For multi-replica deployments, set `redis` and configure `REDIS_URL` so the limits are shared across replicas. `scripts/install.sh` writes this line from the Redis rate-limiting prompt; installs generated before that prompt existed have no line at all and therefore run `memory`. |
 | `DATABASE_RESTORE_MAX_FILE_BYTES` | Maximum size of database restore upload in bytes. Default `52428800` (50MB). Raise for tenants with larger backups; the server also performs a disk-space preflight before accepting the upload. |
 | `XERO_DAILY_BATCH_LIMIT` | Maximum entities per group per daily batch run. Default `1000`, hard cap `5000`. Larger tenants whose daily volume exceeds the cap get multiple deterministic-reference journals per date. |
 | `WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD` | When the WooCommerce pending-FX retry queue reaches this depth, notify active admins. Default `5`. The queue accumulates when WC orders arrive in a currency without a stored FX rate; it drains automatically after the next FX-rate refresh. |
@@ -389,7 +396,7 @@ Key variables in the `.env` file:
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `PREFLIGHT_DB_CONNECT` | Optional production preflight database connectivity probe. Set `true` during rollout when the preflight process can reach Postgres; default `false` for build-only CI jobs |
-| `REDIS_URL` | Redis connection URL |
+| `REDIS_URL` | Redis connection URL, including credentials when the server requires them (`redis://:password@host:port`). Only the `redis` rate-limit backend connects to it. |
 | `REDIS_PASSWORD` | Redis password (if required) |
 | `REDIS_KEY_PREFIX` | Optional Redis namespace prefix for tenant- or instance-scoped keys |
 | `WC_STORE_URL` | WooCommerce store URL |

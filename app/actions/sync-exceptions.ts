@@ -21,6 +21,8 @@ import {
   buildDeadReceiptEventReplayWhere,
 } from '@/lib/domain/wms/exception-inbox'
 import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { buildExternalFulfillmentRefusalWhere } from '@/lib/fulfillment/external-fulfillment-refusal'
+import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getEnabledWmsConnectorId } from '@/lib/connectors/wms/active-connector'
@@ -123,6 +125,21 @@ export type StuckDispatchRow = {
   kind: 'dead-letter' | 'unresolved'
 }
 
+/**
+ * o3d-xnwu: a WooCommerce order the store marked completed that IMS refused to
+ * fulfil for a reason no retry can clear (today: no physical stock to consume).
+ * Before this the refusal was returned to a caller that threw it away, so the
+ * order simply sat unfulfilled with the storefront showing it as complete.
+ */
+export type FulfillmentRefusalRow = {
+  id: string
+  orderId: string | null
+  orderNumber: string | null
+  externalOrderId: string | null
+  reason: string | null
+  refusedAt: string
+}
+
 export type ProductStructureConflictRow = {
   id: string
   /** The IMS product the WooCommerce object was paired with. */
@@ -184,6 +201,7 @@ export type ExceptionInboxSummary = {
   pennyMismatches: number
   orderReconcileDrift: number
   productStructureConflicts: number
+  fulfillmentRefusals: number
   unresolvedDrift: number
   total: number
 }
@@ -198,6 +216,7 @@ export type ExceptionInboxData = {
   pennyMismatches: PennyMismatchRow[]
   orderReconcileDrift: OrderReconcileDriftRow[]
   productStructureConflicts: ProductStructureConflictRow[]
+  fulfillmentRefusals: FulfillmentRefusalRow[]
   unresolvedDrift: UnresolvedDriftRow[]
 }
 
@@ -322,7 +341,8 @@ async function loadStuckDispatches(): Promise<StuckDispatchRow[]> {
  * Written by the product sync itself, deduplicated to ONE open row per pairing, and DELETED
  * by the next sync that completes cleanly — so this list is live rather than a log, and the
  * rows need no acknowledge action: resolving the conflict is what removes them. The product
- * reconcile cursor does not advance past a conflicted product, so the retry is automatic.
+ * reconcile re-fetches a conflicted product BY ID on every run (o3d-xbt), so the retry is
+ * automatic — the cursor no longer has to be pinned to achieve it.
  */
 const PRODUCT_STRUCTURE_CONFLICT_WHERE = {
   connector: 'woocommerce',
@@ -368,6 +388,43 @@ async function loadProductStructureConflicts(): Promise<ProductStructureConflict
 }
 
 /**
+ * o3d-xnwu: WooCommerce completions IMS refused for a reason a retry cannot
+ * clear. Written by the completion flow, deduplicated to ONE open row per order,
+ * and deleted by the next completion that succeeds — so this is a live list, not
+ * a log. Unlike the product structure conflicts it DOES carry an action: nothing
+ * re-runs a WooCommerce completion on its own (the reconcile sweep only re-syncs
+ * status for withdrawal slugs), so without the replay button the row would name
+ * a problem the operator had no way to finish resolving.
+ */
+function countFulfillmentRefusals(): Promise<number> {
+  return db.shoppingSyncLog.count({ where: buildExternalFulfillmentRefusalWhere() })
+}
+
+async function loadFulfillmentRefusals(): Promise<FulfillmentRefusalRow[]> {
+  const rows = await db.shoppingSyncLog.findMany({
+    where: buildExternalFulfillmentRefusalWhere(),
+    orderBy: { createdAt: 'desc' },
+    take: SECTION_LIMIT,
+    select: { id: true, entityId: true, externalId: true, errorMessage: true, createdAt: true },
+  })
+
+  const orderIds = rows.map((row) => row.entityId).filter((id): id is string => Boolean(id))
+  const orders = orderIds.length > 0
+    ? await db.salesOrder.findMany({ where: { id: { in: orderIds } }, select: { id: true, orderNumber: true } })
+    : []
+  const orderNumberById = new Map(orders.map((order) => [order.id, order.orderNumber]))
+
+  return rows.map((row) => ({
+    id: row.id,
+    orderId: row.entityId,
+    orderNumber: row.entityId ? orderNumberById.get(row.entityId) ?? null : null,
+    externalOrderId: row.externalId,
+    reason: row.errorMessage,
+    refusedAt: row.createdAt.toISOString(),
+  }))
+}
+
+/**
  * q66in.4.4: drift findings are DURABLE wms_order_discrepancies rows — the
  * capped sweep upserts them and resolves a row only when that specific order
  * re-verifies clean, so a newer (necessarily partial) run never clears truth.
@@ -404,7 +461,7 @@ async function loadOrderReconcileDrift(): Promise<OrderReconcileDriftRow[]> {
 
 /** True per-source totals — never capped by the display limit (Codex r3/r5). */
 async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
-  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
+  const [wmsPushDeadLetters, outboxFailures, deadReceipts, deadWebhooks, refundSyncParks, pennyMismatches, stuckDispatches, orderReconcileDrift, productStructureConflicts, fulfillmentRefusals, driftIncidents] = await Promise.all([
     db.wmsOrderPushLink.count({ where: { state: 'DEAD_LETTER' } }),
     db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
@@ -414,6 +471,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     countStuckDispatches(),
     countOrderReconcileDrift(),
     countProductStructureConflicts(),
+    countFulfillmentRefusals(),
     // Only the ACTIVE connector: a disabled one's leftover incident is not
     // blocking anything, and showing it would invite an isolate on stale
     // evidence (o3d-bjc.12).
@@ -430,9 +488,11 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     pennyMismatches,
     orderReconcileDrift,
     productStructureConflicts,
+    fulfillmentRefusals,
     unresolvedDrift: driftIncidents.length,
     total: wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks + stuckDispatches
-      + pennyMismatches + orderReconcileDrift + productStructureConflicts + driftIncidents.length,
+      + pennyMismatches + orderReconcileDrift + productStructureConflicts + fulfillmentRefusals
+      + driftIncidents.length,
   }
 }
 
@@ -451,7 +511,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
   await requirePermission('sync')
 
   const counts = await loadExceptionCounts()
-  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, driftIncidents] = await Promise.all([
+  const [pushLinks, outbox, deadReceiptRows, deadWebhookRows, refundLogs, stuckDispatches, mismatchLinks, orderReconcileDrift, productStructureConflicts, fulfillmentRefusals, driftIncidents] = await Promise.all([
     db.wmsOrderPushLink.findMany({
       where: { state: 'DEAD_LETTER' },
       orderBy: { lastAttemptAt: 'desc' },
@@ -531,6 +591,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     }),
     loadOrderReconcileDrift(),
     loadProductStructureConflicts(),
+    loadFulfillmentRefusals(),
     // Only the ACTIVE connector: a disabled one's leftover incident is not
     // blocking anything, and showing it would invite an isolate on stale
     // evidence (o3d-bjc.12).
@@ -645,6 +706,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     })),
     orderReconcileDrift,
     productStructureConflicts,
+    fulfillmentRefusals,
     unresolvedDrift: driftIncidents.map((incident) => ({
       connector: incident.connector,
       version: incident.version,
@@ -912,6 +974,75 @@ export async function replayStuckDispatch(orderId: string): Promise<MutationResu
       action: 'wms_dispatch_replay',
       description: 'Re-queued a dead-lettered dispatch reconciliation via the exception inbox',
       metadata: { orderId, userId: session.user.id },
+    })
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * o3d-xnwu: re-run a refused WooCommerce completion.
+ *
+ * The order is re-read from WooCommerce rather than replayed from the stored
+ * payload, and that is deliberate — unlike the other replays on this page, the
+ * work is not "re-deliver what we already had" but "try again against the world
+ * as it is now". The refusal is a STOCK refusal, so what changed since is
+ * exactly what decides the outcome, and any tracking the store has added in the
+ * meantime is applied with it.
+ *
+ * Refuses if the store no longer says the order is completed: replaying a
+ * completion for an order the store has since cancelled, refunded or reopened
+ * would consume stock for goods nobody is dispatching.
+ */
+export async function replayFulfillmentRefusal(orderId: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+
+    const open = await db.shoppingSyncLog.findFirst({
+      where: buildExternalFulfillmentRefusalWhere(orderId),
+      select: { id: true, externalId: true },
+    })
+    if (!open) {
+      return { success: false, error: 'This fulfilment refusal has already cleared (replayed, or resolved by a later completion).' }
+    }
+    if (!open.externalId) {
+      return { success: false, error: 'The refusal has no WooCommerce order id recorded, so it cannot be re-read from the store.' }
+    }
+
+    const { wcFetch } = await import('@/lib/connectors/woocommerce/api')
+    const { data, error } = await wcFetch(`/orders/${open.externalId}`)
+    if (error) return { success: false, error: `Could not re-read WooCommerce order ${open.externalId}: ${error}` }
+
+    const wcOrder = data as WcFullOrder | null
+    if (!wcOrder || typeof wcOrder.id !== 'number') {
+      return { success: false, error: `WooCommerce returned no order for id ${open.externalId}.` }
+    }
+    if (wcOrder.status !== 'completed') {
+      return {
+        success: false,
+        error: `WooCommerce now reports this order as "${wcOrder.status}", not completed — fulfilling it would consume stock for an order the store is no longer dispatching.`,
+      }
+    }
+
+    const { processWcCompletion } = await import('@/lib/connectors/woocommerce/sync/completion-flow')
+    const result = await processWcCompletion(orderId, wcOrder)
+    if (!result.success) {
+      // The refusal row has been re-stamped by the completion flow itself, so the
+      // page still shows it — with the reason it failed THIS time.
+      return { success: false, error: result.error ?? 'The fulfilment was refused again.' }
+    }
+
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      tag: 'sync',
+      action: 'wc_completion_replayed',
+      description: 'Re-ran a refused WooCommerce completion via the exception inbox',
+      metadata: { orderId, externalOrderId: open.externalId, userId: session.user.id },
     })
     revalidatePath('/sync/exceptions')
     return { success: true }

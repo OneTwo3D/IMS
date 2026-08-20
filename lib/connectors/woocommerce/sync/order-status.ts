@@ -70,8 +70,11 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
     // Special case: WC completed → run completion flow
     if (wcOrder.status === 'completed') {
       const { processWcCompletion } = await import('./completion-flow')
-      await processWcCompletion(so.id, wcOrder)
-      return { success: true }
+      // o3d-xnwu: propagate the completion's OWN result. Returning a blanket
+      // success acknowledged a webhook for a fulfilment that never landed — the
+      // store showed the order as completed while IMS held no shipment, and no
+      // later delivery retried it. Same reasoning as the withdrawal branch above.
+      return processWcCompletion(so.id, wcOrder)
     }
 
     // Special case: WC refunded → handled by refund sync, not status sync

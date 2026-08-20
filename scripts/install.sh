@@ -158,6 +158,21 @@ prompt() {
   eval "$varname=\"\${input:-$default}\""
 }
 
+# Percent-encode a value for use inside a URL's userinfo section. LC_ALL=C makes
+# bash walk the string BYTE by byte, so a multi-byte password is encoded as the
+# bytes a server will receive rather than as codepoints.
+urlencode() {
+  local LC_ALL=C string="$1" out="" i c
+  for (( i = 0; i < ${#string}; i++ )); do
+    c="${string:i:1}"
+    case "$c" in
+      [a-zA-Z0-9.~_-]) out+="$c" ;;
+      *) out+="$(printf '%%%02X' "'$c")" ;;
+    esac
+  done
+  printf '%s' "$out"
+}
+
 prompt_yn() {
   local varname="$1" question="$2" default="${3:-y}"
   if $NON_INTERACTIVE; then
@@ -274,12 +289,47 @@ if [[ "$INSTALL_REDIS" == "y" ]]; then
   REDIS_HOST="localhost"
   prompt REDIS_PORT     "Redis port" "6379"
   prompt REDIS_PASSWORD "Redis password (leave blank if none)" ""
-  REDIS_URL="redis://${REDIS_HOST}:${REDIS_PORT}"
+  # This script sets `requirepass` on the Redis it installs (step 7), so the URL
+  # it builds for that server has to carry the credential — otherwise the only
+  # password an operator can supply here reaches redis.conf and nothing else, and
+  # every client command comes back NOAUTH (o3d-g42a).
+  if [[ -n "${REDIS_PASSWORD}" ]]; then
+    REDIS_URL="redis://:$(urlencode "${REDIS_PASSWORD}")@${REDIS_HOST}:${REDIS_PORT}"
+  else
+    REDIS_URL="redis://${REDIS_HOST}:${REDIS_PORT}"
+  fi
 else
   prompt REDIS_URL      "Redis URL (redis://host:port[/db])" "redis://localhost:6379"
   prompt REDIS_PASSWORD "Redis password (leave blank if none)" ""
 fi
 prompt REDIS_KEY_PREFIX "Redis key prefix (leave blank for none)" ""
+
+# The rate limiter is the only consumer of REDIS_URL, and it reads
+# RATE_LIMIT_BACKEND to decide whether to use it (lib/security/rate-limit.ts).
+# Leaving that variable unwritten defaults it to 'memory', which is how a host
+# that answered every Redis question above — and had requirepass configured on a
+# local Redis by this very script — still ran with process-local counters and
+# never opened a connection (o3d-g42a). Ask the question, and write the answer.
+REDIS_RATE_LIMIT_DEFAULT="n"
+[[ "$INSTALL_REDIS" == "y" ]] && REDIS_RATE_LIMIT_DEFAULT="y"
+prompt_yn USE_REDIS_RATE_LIMIT \
+  "Share rate-limit counters through Redis? (required if this app runs as more than one replica)" \
+  "$REDIS_RATE_LIMIT_DEFAULT"
+if [[ "$USE_REDIS_RATE_LIMIT" == "y" ]]; then
+  # The same refusal the app makes at first use: RATE_LIMIT_BACKEND=redis with no
+  # REDIS_URL throws on every rate-limited request. Fail here, where it is one
+  # answer away from being fixed, rather than at the first login attempt.
+  [[ -n "${REDIS_URL}" ]] || die "Redis rate limiting needs a Redis URL — re-run and answer the Redis questions above."
+  # A remote Redis whose password was typed here but not into the URL: the URL is
+  # what the client connects with, so say so rather than letting the login rate
+  # limiter fail AUTH — it fails CLOSED on the auth buckets, which locks sign-in.
+  if [[ -n "${REDIS_PASSWORD}" && "${REDIS_URL}" != *"@"* ]]; then
+    warn "REDIS_URL carries no credentials but a Redis password was given — put it in the URL (redis://:PASSWORD@host:port) or the rate limiter may fail AUTH."
+  fi
+  RATE_LIMIT_BACKEND="redis"
+else
+  RATE_LIMIT_BACKEND="memory"
+fi
 
 echo ""
 info "--- WooCommerce (optional — can be configured later in Settings) ---"
@@ -656,6 +706,10 @@ AUTH_URL=https://${APP_DOMAIN}
 REDIS_URL=${REDIS_URL}
 REDIS_PASSWORD=${REDIS_PASSWORD}
 REDIS_KEY_PREFIX=${REDIS_KEY_PREFIX}
+# 'memory' keeps rate-limit counters inside one process — correct for a
+# single-process install, and the value every host got by omission before
+# o3d-g42a. 'redis' shares them across replicas and requires REDIS_URL.
+RATE_LIMIT_BACKEND=${RATE_LIMIT_BACKEND}
 
 WC_STORE_URL=${WC_STORE_URL}
 WC_CONSUMER_KEY=${WC_CONSUMER_KEY}

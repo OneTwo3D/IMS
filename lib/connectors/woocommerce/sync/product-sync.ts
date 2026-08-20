@@ -11,6 +11,13 @@ import { wcFetch, wcPut } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
 import { isPermanentProductSyncConflict } from './product-sync-errors'
 import {
+  WC_PRODUCT_CONFLICT_RETRY_LIMIT,
+  parseWcProductConflictIds,
+  serializeWcProductConflictIds,
+  shouldAdvanceWcProductCursor,
+  wcProductConflictSettingKey,
+} from './product-conflict-cursor'
+import {
   WC_PRODUCT_WRITE_LOCK_NAMESPACE,
   WC_SETTINGS_VERSION_KEY,
   WC_SYNC_ADVISORY_LOCK_KEY,
@@ -85,7 +92,9 @@ const PRODUCT_WRITE_TX_MAX_WAIT_MS = 15_000
  *     forever, which is strictly worse than the type being out of step.
  *   - A WooCommerce object that now exists in WooCommerce and NOWHERE in IMS is a
  *     CONFLICT: the sync records it durably, does not mark the product SYNCED, and reports
- *     failure so the bulk cursor does not advance past it. See recordStructureConflicts.
+ *     failure — a PERMANENT one, so the bulk sweep carries its WooCommerce id in the
+ *     conflict retry set and re-fetches it by id every run (o3d-xbt; the cursor itself
+ *     moves on). See recordStructureConflicts and product-conflict-cursor.ts.
  *
  * Deliberately NOT symmetrical with the create branch: a brand-new IMS row has no structure
  * to protect, so a create takes the WooCommerce type as given.
@@ -1934,18 +1943,31 @@ export async function syncAllWcProducts(
     mode?: 'poll' | 'reconcile' | 'manual_reconcile'
     onProgress?: (progress: ProductSyncProgressSnapshot) => Promise<void> | void
   } = {},
-): Promise<SyncResult> {
-  const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
+  // o3d-xbt: the bulk path ALWAYS classifies, so callers (and its tests) can read
+  // `permanentErrors` without narrowing — the field is optional on SyncResult only
+  // because the other producers do not classify yet.
+): Promise<SyncResult & { permanentErrors: string[] }> {
+  const result: SyncResult & { permanentErrors: string[] } = { synced: 0, skipped: 0, errors: [], permanentErrors: [] }
   const mode = opts.mode ?? 'poll'
   const onProgress = opts.onProgress
   const cursorKey = mode === 'poll' ? 'last_wc_product_sync_at' : 'last_wc_product_reconcile_at'
+  const conflictKey = wcProductConflictSettingKey(mode)
   let totalProducts = 0
   let processedProducts = 0
 
-  const [lastSyncSetting, existingProduct] = await Promise.all([
+  // o3d-xbt: products whose LAST attempt hit a conflict a retry cannot clear.
+  // Carried between runs and re-fetched by id below, which is what lets the
+  // cursor move past them without abandoning them.
+  const processedIds = new Set<number>()
+  const conflictIds = new Set<number>()
+  const conflictSkus: string[] = []
+
+  const [lastSyncSetting, existingProduct, conflictSetting] = await Promise.all([
     db.setting.findUnique({ where: { key: cursorKey } }),
     db.product.findFirst({ select: { id: true } }),
+    db.setting.findUnique({ where: { key: conflictKey } }),
   ])
+  const carriedConflictIds = parseWcProductConflictIds(conflictSetting?.value)
 
   // After a product reset or on a fresh install, there is nothing local to
   // reconcile against. Ignore any stale cursor and force a full import.
@@ -1966,6 +1988,30 @@ export async function syncAllWcProducts(
       totalPages,
       errors: [...result.errors],
     })
+  }
+
+  /**
+   * One place where a per-product outcome is turned into counters (o3d-xbt), so
+   * the modified-after pass and the by-id retry pass below cannot classify the
+   * same failure differently.
+   *
+   * A permanent failure lands in BOTH arrays: `errors` because every existing
+   * surface renders that one and an operator must still see it, `permanentErrors`
+   * because it must not hold the cursor.
+   */
+  function recordProductOutcome(product: WcFullProduct, outcome: { success: boolean; error?: string; permanent?: boolean }) {
+    processedIds.add(product.id)
+    if (outcome.success) {
+      result.synced++
+      return
+    }
+    const line = `SKU ${product.sku}: ${outcome.error}`
+    result.errors.push(line)
+    if (outcome.permanent) {
+      result.permanentErrors.push(line)
+      conflictIds.add(product.id)
+      if (product.sku) conflictSkus.push(product.sku)
+    }
   }
 
   await reportProgress('Preparing WooCommerce product import...', 0)
@@ -2013,8 +2059,7 @@ export async function syncAllWcProducts(
       }
       const r = await syncWcProductToIms(product, pageVersion)
       processedProducts++
-      if (r.success) result.synced++
-      else result.errors.push(`SKU ${product.sku}: ${r.error}`)
+      recordProductOutcome(product, r)
 
       await reportProgress(
         totalProducts > 0
@@ -2026,13 +2071,89 @@ export async function syncAllWcProducts(
     page++
   }
 
-  // Only advance the cursor after a fully clean run. Advancing after a fetch
-  // or import error can permanently skip remote changes older than now.
-  if (result.errors.length === 0) {
+  // o3d-xbt: the re-attempt that replaces the pinned cursor.
+  //
+  // Products that conflicted on a previous run are fetched BY ID, so they are
+  // still tried every single run even though the cursor has moved past them —
+  // which matters because these conflicts are resolved on the IMS side and
+  // change nothing in WooCommerce for a modified-after query to notice.
+  // Anything already seen in the pass above is skipped: it has just been tried.
+  const retryIds = carriedConflictIds.filter((id) => !processedIds.has(id)).slice(0, WC_PRODUCT_CONFLICT_RETRY_LIMIT)
+  if (retryIds.length > 0) {
+    await reportProgress(`Re-attempting ${retryIds.length} previously conflicted product(s)...`)
+    const { creds: retryCreds, syncVersion: retryVersion } = await snapshotProductSyncContext()
+    const { data: retryData, error: retryError } = await wcFetch('/products', {
+      per_page: String(WC_PRODUCT_CONFLICT_RETRY_LIMIT),
+      page: '1',
+      status: 'any',
+      include: retryIds.join(','),
+    }, retryCreds)
+
+    if (retryError) {
+      // Transient by nature (transport/auth), so it holds the cursor exactly as a
+      // failed page fetch does — this run did not see what the cursor would claim.
+      result.errors.push(`Re-attempt of conflicted products failed: ${retryError}`)
+      await reportProgress(`Failed to re-fetch conflicted WooCommerce products: ${retryError}`)
+    } else {
+      // Ids WooCommerce did not return are deleted (or no longer visible to these
+      // credentials). They fall out of the set by not being re-added, so the list
+      // shrinks by itself instead of accumulating dead ids forever.
+      for (const product of retryData as WcFullProduct[]) {
+        if (!product.sku) {
+          result.skipped++
+          continue
+        }
+        const r = await syncWcProductToIms(product, retryVersion)
+        processedProducts++
+        recordProductOutcome(product, r)
+      }
+      await reportProgress('Re-attempted previously conflicted products.')
+    }
+  }
+
+  // Only advance the cursor when nothing TRANSIENT failed. A transient failure
+  // means this run did not see everything the cursor would claim it saw, and
+  // advancing can permanently skip remote changes older than now.
+  //
+  // PERMANENT failures no longer hold it (o3d-xbt): one conflicted product used
+  // to pin the cursor forever, so every cycle re-fetched and re-imported the
+  // whole catalogue to re-fail on the same row. They are carried in the conflict
+  // set above and re-attempted by id instead, so nothing is abandoned.
+  if (shouldAdvanceWcProductCursor(result)) {
     await db.setting.upsert({
       where: { key: cursorKey },
       create: { key: cursorKey, value: new Date().toISOString() },
       update: { value: new Date().toISOString() },
+    })
+  }
+
+  // Written on every run, including the clean one that clears it: this row is the
+  // live set of conflicted products, not a log of past ones.
+  // (Skipped only when there is nothing to say and nothing to clear, so a store
+  // that never conflicts does not grow a settings row it will never read.)
+  const serializedConflicts = serializeWcProductConflictIds(conflictIds)
+  if (conflictIds.size > 0 || conflictSetting) {
+    await db.setting.upsert({
+      where: { key: conflictKey },
+      create: { key: conflictKey, value: serializedConflicts },
+      update: { value: serializedConflicts },
+    })
+  }
+
+  if (conflictIds.size > 0) {
+    // The loud line the bulk path never had. Without it a permanent conflict was
+    // one entry in an errors array nobody reads, with nothing saying it will
+    // never clear on its own.
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_product_sync_conflicts', tag: 'sync', level: 'WARNING',
+      description:
+        `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${conflictIds.size} product(s) cannot be imported until an operator resolves a conflict`
+        + `${conflictSkus.length > 0 ? ` — ${conflictSkus.slice(0, 20).join(', ')}${conflictSkus.length > 20 ? `, +${conflictSkus.length - 20} more` : ''}` : ''}.`
+        + ' Retrying cannot clear these on its own; they are re-attempted by id on every run until resolved.'
+        + ' A structure conflict also carries a row under Sync → Exceptions; a mapping conflict (a GTIN or a WooCommerce id'
+        + ' already held by a different IMS product) is recorded in the WooCommerce sync log as PERMANENT_CONFLICT.',
+      metadata: { mode, conflictedExternalProductIds: [...conflictIds], skus: conflictSkus.slice(0, 50) },
+      resolveUser: false,
     })
   }
 

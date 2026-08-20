@@ -47,7 +47,6 @@ async function requireFreshAdmin() {
 export type WcSyncSettings = {
   wc_sync_enabled: string
   wc_sync_order_statuses: string
-  wc_sync_interval_minutes: string
   wc_sync_product_enabled: string
   wc_sync_product_direction: string
   wc_stock_sync_enabled: string
@@ -70,8 +69,15 @@ export type WcSyncSettings = {
   envOverrides: Record<string, string>
 }
 
+// o3d-potv: `wc_sync_interval_minutes` used to sit here. It was typed, defaulted,
+// saved and rendered as an editable "Polling interval (minutes)" field — and read
+// by nothing. The cadence is the wc-reconcile cron schedule (lib/cron-jobs/
+// woocommerce.ts, edited in Settings -> System -> Scheduler), so an operator who
+// set this to 5 after a webhook outage still got a daily 04:00 reconcile and was
+// never told. Removing the key is what stops it being saved and re-read as if it
+// meant something; the sync page now links to the schedule instead.
 const SYNC_SETTING_KEYS = [
-  'wc_sync_enabled', 'wc_sync_order_statuses', 'wc_sync_interval_minutes',
+  'wc_sync_enabled', 'wc_sync_order_statuses',
   'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled',
   'wc_webhook_secret', 'wc_webhook_last_received_at', 'wc_order_webhook_last_received_at', 'wc_product_webhook_last_received_at',
   'last_wc_order_sync_at', 'last_wc_order_reconcile_at', 'last_wc_product_sync_at', 'last_wc_product_reconcile_at', 'last_wc_stock_sync_at',
@@ -99,7 +105,6 @@ const MACHINE_MANAGED_SYNC_KEYS = new Set<string>([
 const SYNC_DEFAULTS: WcSyncSettings = {
   wc_sync_enabled: 'false',
   wc_sync_order_statuses: '["processing"]',
-  wc_sync_interval_minutes: '5',
   wc_sync_product_enabled: 'false',
   wc_sync_product_direction: 'from_wc',
   wc_stock_sync_enabled: 'false',

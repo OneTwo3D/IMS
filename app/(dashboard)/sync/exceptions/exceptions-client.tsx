@@ -25,6 +25,7 @@ import {
   replayOutboxException,
   isolateUnresolvedDriftCohort,
   replayStuckDispatch,
+  replayFulfillmentRefusal,
   retryUnresolvedDriftCohort,
   repushMissingWmsOrder,
   retryRefundSyncPark,
@@ -599,11 +600,67 @@ export function ExceptionsClient({ data }: Props) {
         </Card>
       ) : null}
 
+      {data.fulfillmentRefusals.length > 0 ? (
+        <Card className="p-4 space-y-3">
+          <SectionHeading
+            title={`WooCommerce completions — refused (${data.summary.fulfillmentRefusals})`}
+            detail="WooCommerce says these orders are completed, but IMS refused to record the dispatch — there was no physical stock to consume, so no shipment exists and no stock has moved, while the customer has been told their order is on its way. Nothing re-runs a storefront completion by itself: bring the stock in (receive it, or correct the stock position), then replay."
+            shown={data.fulfillmentRefusals.length}
+            total={data.summary.fulfillmentRefusals}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[820px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Order</TableHead>
+                <TableHead>WooCommerce id</TableHead>
+                <TableHead>Why it was refused</TableHead>
+                <TableHead>Last refused</TableHead>
+                <TableHead className="text-right">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.fulfillmentRefusals.map((row) => (
+                <TableRow key={row.id}>
+                  <TableCell>
+                    {row.orderId ? (
+                      <Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link>
+                    ) : (
+                      <span className="text-xs text-muted-foreground">&mdash;</span>
+                    )}
+                  </TableCell>
+                  <TableCell className="text-xs font-mono">{row.externalOrderId ?? '\u2014'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground max-w-[420px]" title={row.reason ?? ''}>{row.reason ?? '\u2014'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.refusedAt)}</TableCell>
+                  <TableCell className="text-right">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isPending || !row.orderId}
+                      onClick={() => {
+                        const orderId = row.orderId
+                        if (!orderId) return
+                        runAction(
+                          () => replayFulfillmentRefusal(orderId),
+                          'Fulfilment re-applied — the order is now shipped in IMS.',
+                        )
+                      }}
+                    >
+                      <RotateCcw className="h-3 w-3 mr-1" />Replay
+                    </Button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
       {data.productStructureConflicts.length > 0 ? (
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WooCommerce products — structure conflicts (${data.summary.productStructureConflicts})`}
-            detail="The WooCommerce product sync refused to overwrite IMS-owned structure (bundle/BOM composition, a variable parent's children, a variant's parent), so the WooCommerce objects listed here exist nowhere in IMS — orders for those SKUs will import without a product or an allocation. Decide which side is right, then fix it in IMS or in WooCommerce; there is nothing to acknowledge, the next sync clears the row by itself. The product reconcile does not move past a conflicted product, so it retries automatically."
+            detail="The WooCommerce product sync refused to overwrite IMS-owned structure (bundle/BOM composition, a variable parent's children, a variant's parent), so the WooCommerce objects listed here exist nowhere in IMS — orders for those SKUs will import without a product or an allocation. Decide which side is right, then fix it in IMS or in WooCommerce; there is nothing to acknowledge, the next sync clears the row by itself. The product reconcile re-tries each conflicted product by id on every run, so a fix on either side is picked up without re-importing the catalogue."
             shown={data.productStructureConflicts.length}
             total={data.summary.productStructureConflicts}
           />

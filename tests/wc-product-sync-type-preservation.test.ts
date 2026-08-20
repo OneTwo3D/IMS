@@ -29,6 +29,8 @@ const state = {
   componentDeletes: 0,
   /** Every `Setting` key written by an upsert — the bulk sync's cursor is one of these. */
   settingUpserts: [] as string[],
+  /** Persisted Setting rows, so a value written by one run is visible to the next. */
+  settings: new Map<string, string>(),
 
   // --- what makes a product LIVE (o3d-y89x r2) ---------------------------------
   // The editor refuses a type OR parent change on a product carrying any of these, and the
@@ -131,8 +133,19 @@ function restore(snap: ReturnType<typeof snapshot>) {
 
 let nextId = 1
 let variationPages: Record<string, Row[]> = {}
-/** Pages served for GET /products — only the bulk-cursor test needs a non-empty one. */
+/** Pages served for GET /products — only the bulk-cursor tests need a non-empty one. */
 let productPages: Record<string, Row[]> = {}
+/**
+ * Products the store still holds but that a `modified_after` page would NOT
+ * return — the steady state once the cursor has moved past a conflicted product.
+ * GET /products?include= answers from here (o3d-xbt); an id in neither this map
+ * nor `productPages` models a product deleted in WooCommerce.
+ */
+let productsById: Record<string, Row> = {}
+/** Set to make GET /products fail — the transport failure the split must keep transient. */
+let productFetchError: string | null = null
+/** Same, but only for the by-id re-attempt fetch. */
+let productFetchErrorOnInclude: string | null = null
 
 function wcVariation(id: number, sku: string, option: string): Row {
   return {
@@ -158,6 +171,20 @@ mock.module('@/lib/connectors/woocommerce/api', {
         return { data: variationPages[page] ?? [], totalPages: 1, totalItems: 0, error: null }
       }
       if (path === '/products') {
+        if (productFetchError) return { data: [], totalPages: 1, totalItems: 0, error: productFetchError }
+        if (params.include) {
+          if (productFetchErrorOnInclude) {
+            return { data: [], totalPages: 1, totalItems: 0, error: productFetchErrorOnInclude }
+          }
+          // WooCommerce answers an explicit id list whatever the modification
+          // window, which is exactly why the retry pass uses it.
+          const ids = params.include.split(',')
+          const paged = Object.values(productPages).flat()
+          const rows = ids
+            .map((id) => productsById[id] ?? paged.find((row) => String(row.id) === id))
+            .filter((row): row is Row => Boolean(row))
+          return { data: rows, totalPages: 1, totalItems: rows.length, error: null }
+        }
         const rows = productPages[page] ?? []
         return { data: rows, totalPages: Object.keys(productPages).length || 1, totalItems: rows.length, error: null }
       }
@@ -591,14 +618,21 @@ const txClient = {
     },
   },
   setting: {
-    upsert: async ({ where }: { where: { key: string } }) => {
+    // A REAL key/value store (o3d-xbt). It used to record the key and discard the
+    // value, and answer every read with null — which cannot model a setting the
+    // sync writes on one run and reads on the next, and would let a conflict list
+    // that is never actually persisted look like it worked.
+    upsert: async ({ where, create, update }: { where: { key: string }; create?: { key: string; value: string }; update?: { value: string } }) => {
       state.settingUpserts.push(where.key)
-      return {}
+      const value = (state.settings.has(where.key) ? update?.value : create?.value) ?? ''
+      state.settings.set(where.key, value)
+      return { key: where.key, value }
     },
-    // No rows => credentials null and version '0', which findUnique agrees with, so the
-    // credential-rebind fence (o3d-mlc7) is a consistent no-op here.
+    // Still no rows for the credential keys => credentials null and version '0',
+    // so the credential-rebind fence (o3d-mlc7) stays a consistent no-op here.
     findMany: async () => [],
-    findUnique: async () => null,
+    findUnique: async ({ where }: { where: { key: string } }) =>
+      state.settings.has(where.key) ? { key: where.key, value: state.settings.get(where.key)! } : null,
   },
   $executeRaw: async () => 1,
 }
@@ -698,6 +732,7 @@ function resetState() {
   state.updateData.length = 0
   state.componentDeletes = 0
   state.settingUpserts.length = 0
+  state.settings.clear()
   state.stockLevels.length = 0
   state.salesOrderLines.length = 0
   state.purchaseOrderLines.length = 0
@@ -714,6 +749,9 @@ function resetState() {
   beforeConflictsRecorded = null
   nextId = 1
   productPages = {}
+  productsById = {}
+  productFetchError = null
+  productFetchErrorOnInclude = null
   variationPages = {
     '1': [wcVariation(111, 'VAR-1', 'Red'), wcVariation(112, 'VAR-2', 'Blue')],
   }
@@ -1604,8 +1642,8 @@ test('a repeated sync leaves exactly ONE open conflict row, not one per run (o3d
   resetState()
   state.products.push(imsRow({ id: 'ims-kit', sku: 'PARENT-SKU', name: 'A kit', type: 'KIT' }))
 
-  // The cursor deliberately does not advance past a conflicted product, so the reconcile
-  // re-imports it every run. Without the dedup that is one new actionable row per run.
+  // A conflicted product is re-imported every run (by id, o3d-xbt), so without the
+  // dedup that is one new actionable row per run.
   await capturingWarnings(() => syncWcProductToIms(variableProduct()))
   await capturingWarnings(() => syncWcProductToIms(variableProduct()))
   await capturingWarnings(() => syncWcProductToIms(variableProduct()))
@@ -2118,33 +2156,130 @@ test('a KIT already under THIS parent is still adopted, type intact (o3d-h2cz)',
 
 // --- the bulk cursor --------------------------------------------------------
 
-test('the bulk sync does not advance its cursor past a conflicted product (o3d-y89x)', async () => {
+test('a permanent conflict is re-attempted BY ID instead of pinning the cursor (o3d-y89x, o3d-xbt)', async () => {
   const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
   resetState()
   state.products.push(imsRow({ id: 'ims-kit', sku: 'PARENT-SKU', name: 'A kit', type: 'KIT' }))
   productPages = { '1': [variableProduct() as unknown as Row] }
 
+  const first = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(first.synced, 0, 'a conflicted product is not counted as synced')
+  assert.equal(first.errors.length, 1, 'it is reported as an error')
+  assert.deepEqual(first.permanentErrors, first.errors, 'and classified as one no retry can clear')
+
+  // o3d-xbt: the cursor MOVES. It used to be pinned here, so every later cycle
+  // re-fetched the whole catalogue from an ever-older modified_after and
+  // re-imported all of it just to re-fail on this one row.
+  assert.ok(
+    state.settingUpserts.includes('last_wc_product_reconcile_at'),
+    'the reconcile cursor advances past a purely permanent failure',
+  )
+  assert.equal(
+    state.settings.get('wc_product_reconcile_conflict_ids'),
+    '[77]',
+    'and the conflicted product is recorded by WooCommerce id so it is not abandoned',
+  )
+
+  // The steady state the old code could never reach: the cursor has moved, so a
+  // modified_after page returns NOTHING. The product still exists in the store.
+  state.settingUpserts.length = 0
+  productPages = {}
+  productsById = { '77': variableProduct() as unknown as Row }
+
+  const second = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(second.errors.length, 1, 'the conflicted product is still tried, from the recorded id alone')
+  assert.deepEqual(second.permanentErrors, second.errors)
+  assert.equal(state.settings.get('wc_product_reconcile_conflict_ids'), '[77]', 'and stays on the list while it conflicts')
+
+  // The fix is made on the IMS side — which changes nothing in WooCommerce, so a
+  // modified_after query would never surface this product again. The by-id
+  // re-attempt is the only thing that picks it up.
+  state.products.find((row) => row.id === 'ims-kit')!.type = 'VARIABLE'
+  state.settingUpserts.length = 0
+  const third = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(third.errors.length, 0, 'the resolved product imports on the very next run')
+  assert.equal(third.synced, 1, 'the previously conflicted product imports, counted as a sync')
+  assert.equal(findProductBySku('PARENT-SKU')?.type, 'VARIABLE', 'and the structure WooCommerce asked for is finally applied')
+  assert.equal(findProductBySku('VAR-1')?.parentId, 'ims-kit', 'its variations land under it')
+  assert.ok(state.settingUpserts.includes('last_wc_product_reconcile_at'), 'a clean run advances the cursor as before')
+  assert.equal(
+    state.settings.get('wc_product_reconcile_conflict_ids'),
+    '[]',
+    'and the conflict list clears itself — it is a live set, not a log',
+  )
+})
+
+test('a TRANSIENT failure still holds the cursor (o3d-xbt)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // The rule the split must not weaken: a run that did not see everything the
+  // cursor would claim it saw must not move the cursor, or remote changes older
+  // than now are skipped permanently.
+  productFetchError = 'WooCommerce API 502'
+
   const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
 
-  assert.equal(result.synced, 0, 'a conflicted product is not counted as synced')
-  assert.equal(result.errors.length, 1, 'it is reported as an error')
+  assert.equal(result.errors.length, 1)
+  assert.deepEqual(result.permanentErrors, [], 'a transport failure is not a permanent conflict')
   assert.deepEqual(
     state.settingUpserts.filter((key) => key.includes('reconcile')),
     [],
-    'the reconcile cursor must NOT move — the next run has to re-attempt this product',
+    'so the cursor does not move',
   )
+})
 
-  // And once it is resolved the cursor does move again, so a conflict pins the cursor only
-  // for as long as it is unresolved.
-  state.products.find((row) => row.id === 'ims-kit')!.type = 'VARIABLE'
-  state.settingUpserts.length = 0
-  const after = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+test('a permanent conflict alongside a transient failure holds the cursor too (o3d-xbt)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  state.products.push(imsRow({ id: 'ims-kit', sku: 'PARENT-SKU', name: 'A kit', type: 'KIT' }))
+  productPages = { '1': [variableProduct() as unknown as Row] }
+  // Page 1 imports (and conflicts); the id re-fetch fails. Mixed run: the
+  // permanent failure alone would let the cursor move, the transient one must
+  // still stop it.
+  state.settings.set('wc_product_reconcile_conflict_ids', '[99]')
+  productFetchErrorOnInclude = 'WooCommerce API 500'
 
-  assert.equal(after.errors.length, 0)
-  assert.ok(
-    state.settingUpserts.includes('last_wc_product_reconcile_at'),
-    'a clean run advances the cursor as before',
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.equal(result.permanentErrors.length, 1, 'the structure conflict is permanent')
+  assert.equal(result.errors.length, 2, 'and the failed re-fetch is reported alongside it')
+  assert.deepEqual(
+    state.settingUpserts.filter((key) => key === 'last_wc_product_reconcile_at'),
+    [],
+    'one transient failure is enough to hold the cursor',
   )
+})
+
+test('a conflicted product WooCommerce no longer returns drops off the retry list (o3d-xbt)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  // Deleted in WooCommerce (or no longer visible to these credentials). Nothing
+  // re-adds it, so the list shrinks by itself rather than carrying a dead id and
+  // an extra request for ever.
+  state.settings.set('wc_product_reconcile_conflict_ids', '[4242]')
+
+  const result = await capturingWarnings(() => syncAllWcProducts({ mode: 'reconcile' }))
+
+  assert.deepEqual(result.errors, [])
+  assert.equal(state.settings.get('wc_product_reconcile_conflict_ids'), '[]')
+  assert.ok(state.settingUpserts.includes('last_wc_product_reconcile_at'))
+})
+
+test('the poll and the reconcile keep separate conflict lists (o3d-xbt)', async () => {
+  const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
+  resetState()
+  state.products.push(imsRow({ id: 'ims-kit', sku: 'PARENT-SKU', name: 'A kit', type: 'KIT' }))
+  productPages = { '1': [variableProduct() as unknown as Row] }
+
+  await capturingWarnings(() => syncAllWcProducts({ mode: 'poll' }))
+
+  // They keep separate cursors, so a shared list would let one mode's run
+  // silently satisfy the other's retry.
+  assert.equal(state.settings.get('wc_product_sync_conflict_ids'), '[77]')
+  assert.equal(state.settings.get('wc_product_reconcile_conflict_ids'), undefined)
 })
 
 // ---------------------------------------------------------------------------

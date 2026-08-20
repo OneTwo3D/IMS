@@ -135,12 +135,76 @@ export function shouldPushStorefrontCompletion(
     && orderStatus === 'SHIPPED'
 }
 
+/**
+ * Why an external fulfilment update was refused (o3d-xnwu).
+ *
+ * A caller cannot classify a refusal from its message without matching strings,
+ * and the WooCommerce completion path has to: a refusal a redelivery could clear
+ * must be retried, and one it cannot must be acknowledged and put in front of an
+ * operator instead of being retried 24 times into a dead letter (o3d-bx9/o3d-i0y).
+ */
+export type ExternalFulfillmentRefusalReason =
+  | 'order-not-found'
+  | 'allocation-failed'
+  | 'insufficient-stock'
+  | 'shipment-creation-failed'
+  | 'shipment-transition-failed'
+
+export type ExternalFulfillmentResult = {
+  success: boolean
+  error?: string
+  reason?: ExternalFulfillmentRefusalReason
+}
+
+/**
+ * Every refusal leaves a record on the ORDER (o3d-xnwu).
+ *
+ * Three of these previously returned a bare string to a caller that discarded
+ * it, so "External fulfillment requires physical stock" produced no activity
+ * row, no exception, and no log line anywhere — the order simply stayed
+ * unfulfilled with the storefront showing it as complete.
+ */
+async function logExternalFulfillmentRefusal(
+  update: ExternalFulfillmentUpdate,
+  reason: ExternalFulfillmentRefusalReason,
+  error: string,
+  order: ResolvedOrder | null,
+): Promise<void> {
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: order?.id,
+    action: 'external_fulfillment_refused',
+    tag: 'sync',
+    level: 'WARNING',
+    description: order
+      ? `${update.source} fulfillment update refused for order ${order.externalOrderNumber ?? order.orderNumber ?? order.id}: ${error}`
+      : `${update.source} fulfillment update refused: ${error}`,
+    metadata: {
+      source: update.source,
+      reason,
+      targetShipmentStatus: update.targetShipmentStatus,
+      lookup: update.lookup as unknown as Record<string, unknown>,
+      error,
+    },
+    resolveUser: false,
+  })
+}
+
 export async function applyExternalFulfillmentUpdate(
   update: ExternalFulfillmentUpdate,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<ExternalFulfillmentResult> {
+  const refuse = async (
+    reason: ExternalFulfillmentRefusalReason,
+    error: string,
+    order: ResolvedOrder | null,
+  ): Promise<ExternalFulfillmentResult> => {
+    await logExternalFulfillmentRefusal(update, reason, error, order)
+    return { success: false, error, reason }
+  }
+
   const order = await resolveOrderForExternalFulfillment(update.source, update.lookup)
   if (!order) {
-    return { success: false, error: 'Order not found for external fulfillment update' }
+    return refuse('order-not-found', 'Order not found for external fulfillment update', null)
   }
 
   const { autoAllocateOrder, confirmAllocations, updateShipmentStatus } = await import('@/app/actions/allocation')
@@ -149,13 +213,14 @@ export async function applyExternalFulfillmentUpdate(
   if (allocationCount === 0) {
     const result = await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
     if (!result.success) {
-      return { success: false, error: result.error ?? 'Auto-allocation failed' }
+      return refuse('allocation-failed', result.error ?? 'Auto-allocation failed', order)
     }
     if ((result.allocationCount ?? 0) === 0 && (result.unallocatedQty ?? 0) > 0) {
-      return {
-        success: false,
-        error: `External fulfillment requires physical stock — order has ${result.unallocatedQty} unit(s) on backorder`,
-      }
+      return refuse(
+        'insufficient-stock',
+        `External fulfillment requires physical stock — order has ${result.unallocatedQty} unit(s) on backorder`,
+        order,
+      )
     }
   }
 
@@ -163,7 +228,7 @@ export async function applyExternalFulfillmentUpdate(
   if (shipmentCount === 0) {
     const result = await confirmAllocations(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
     if (!result.success) {
-      return { success: false, error: result.error ?? 'Shipment creation failed' }
+      return refuse('shipment-creation-failed', result.error ?? 'Shipment creation failed', order)
     }
   }
 
@@ -208,7 +273,11 @@ export async function applyExternalFulfillmentUpdate(
           metadata: { source: update.source, shipmentId: shipment.id, target, error: result.error },
           resolveUser: false,
         })
-        return { success: false, error: result.error ?? `Failed to update shipment to ${target}` }
+        return {
+          success: false,
+          error: result.error ?? `Failed to update shipment to ${target}`,
+          reason: 'shipment-transition-failed',
+        }
       }
     }
   }

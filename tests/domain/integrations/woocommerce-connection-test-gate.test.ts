@@ -69,13 +69,13 @@ test('WooCommerce enablement follows the save gate and connection-test record cy
   rows.set('wc_sync_enabled', 'true')
 
   assert.deepEqual(
-    await evaluateWooCommerceEnableConnectionGate({ wc_sync_interval_minutes: '15' }, deps),
+    await evaluateWooCommerceEnableConnectionGate({ wc_sync_product_direction: 'from_wc' }, deps),
     { ok: true },
   )
 
   rows.set('wc_url', 'https://new-store.example.test')
   assert.deepEqual(
-    await evaluateWooCommerceEnableConnectionGate({ wc_sync_interval_minutes: '10' }, deps),
+    await evaluateWooCommerceEnableConnectionGate({ wc_sync_product_direction: 'to_wc' }, deps),
     { ok: false, error: 'Retest the WooCommerce connection because the saved connection settings changed.' },
   )
 })
