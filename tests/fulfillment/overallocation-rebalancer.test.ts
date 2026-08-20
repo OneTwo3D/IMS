@@ -53,6 +53,7 @@ type ShipmentRow = {
 }
 
 type ShipmentLineRow = { id: string; shipmentId: string; lineId: string; productId: string; qty: number }
+type SalesOrderLineRow = { id: string; orderId: string; fulfillmentRequirements?: unknown }
 
 const state = {
   /** Every salesOrder.update payload, in call order. */
@@ -72,6 +73,14 @@ const state = {
   allocations: [] as AllocationRow[],
   shipments: [] as ShipmentRow[],
   shipmentLines: [] as ShipmentLineRow[],
+  /**
+   * o3d-kouj: the sales LINES of the orders under test, and whether each carries a pinned recipe.
+   * The rebalancer can delete a line's LAST allocation row, which is one of the moments a pin goes
+   * dormant — so the retirement sweep runs here too and needs something real to read.
+   */
+  lines: [] as SalesOrderLineRow[],
+  /** Every fulfilment-pin write the sweep performed, in call order. */
+  lineSnapshotWrites: [] as Array<{ lineId: string; payload: unknown }>,
   /** Set when the fixture wants a journaled (Group B posted) shipment on the order. */
   journaledShipment: null as Row | null,
   deletedAllocationIds: [] as string[],
@@ -86,6 +95,8 @@ function reset() {
   state.allocations.length = 0
   state.shipments.length = 0
   state.shipmentLines.length = 0
+  state.lines.length = 0
+  state.lineSnapshotWrites.length = 0
   state.stockLevels.length = 0
   state.deletedAllocationIds.length = 0
   state.journaledShipment = null
@@ -169,17 +180,50 @@ const tx = {
       return { count: rows.length }
     },
   },
+  // o3d-kouj: the dormant-pin retirement reads and clears this table.
+  salesOrderLine: {
+    findMany: async ({ where }: {
+      where: { orderId?: string; fulfillmentRequirements?: { not: unknown } }
+    }) => state.lines
+      .filter((line) => where.orderId == null || line.orderId === where.orderId)
+      // "carries a pin" — honoured, so a line that never had one is never even selected.
+      .filter((line) => where.fulfillmentRequirements == null || line.fulfillmentRequirements != null)
+      .map((line) => ({ id: line.id, fulfillmentRequirements: line.fulfillmentRequirements ?? null })),
+    updateMany: async ({ where, data }: {
+      where: { id: { in: string[] }; orderId?: string }
+      data: { fulfillmentRequirements?: unknown }
+    }) => {
+      let count = 0
+      for (const line of state.lines) {
+        if (!where.id.in.includes(line.id)) continue
+        if (where.orderId != null && line.orderId !== where.orderId) continue
+        if ('fulfillmentRequirements' in data) {
+          state.lineSnapshotWrites.push({ lineId: line.id, payload: data.fulfillmentRequirements })
+          line.fulfillmentRequirements = undefined
+        }
+        count += 1
+      }
+      return { count }
+    },
+  },
   shipmentLine: {
     // The COMMITTED (non-PENDING) set, joined to its shipment for the warehouse. Honours the
     // `not: 'PENDING'` predicate, so a PENDING draft's lines are never mistaken for a commitment.
     findMany: async ({ where }: {
       where: {
         productId?: string
+        lineId?: string | { in: string[] }
         shipment: { orderId?: string; warehouseId?: string; status: string | { not: string } }
       }
     }) => state.shipmentLines.flatMap((line) => {
       const shipment = state.shipments.find((row) => row.id === line.shipmentId)
       if (!shipment) return []
+      if (where.lineId != null) {
+        const matchesLine = typeof where.lineId === 'string'
+          ? line.lineId === where.lineId
+          : where.lineId.in.includes(line.lineId)
+        if (!matchesLine) return []
+      }
       if (where.shipment.orderId != null && shipment.orderId !== where.shipment.orderId) return []
       if (where.shipment.warehouseId != null && shipment.warehouseId !== where.shipment.warehouseId) return []
       if (where.productId != null && line.productId !== where.productId) return []
@@ -703,5 +747,50 @@ test('o3d-4kfh r7: a partial release decrements reservedQty by what the ROW actu
     Math.abs(reserved - state.allocations[0].qty) < 1e-9,
     `reservedQty ${reserved} must equal the only allocation row backing it (${state.allocations[0].qty}) — `
     + 'a difference here is stock this order neither holds nor released, sitting on a shared aggregate',
+  )
+})
+
+test('o3d-kouj: the rebalancer retires the pin on a line it emptied, and leaves the other alone', async () => {
+  // Releasing A@W1 deletes line-a's LAST allocation row, so line-a's pinned recipe now certifies
+  // nothing — and the next allocation of that line will expand the CURRENT graph. Until the pin is
+  // retired, every reader keeps answering from the old recipe instead. line-b keeps its row, and
+  // therefore keeps its pin: this is a per-line rule, not a per-order one.
+  reset()
+  seedTwoWarehouseOrder()
+  const pinA = {
+    version: 1, productId: 'product-a', graphVersion: 3,
+    capturedAt: '2026-08-01T00:00:00.000Z', requirements: [{ productId: 'component-1', factor: '2' }],
+  }
+  const pinB = {
+    version: 1, productId: 'product-b', graphVersion: 4,
+    capturedAt: '2026-08-01T00:00:00.000Z', requirements: [{ productId: 'component-2', factor: '1' }],
+  }
+  state.lines = [
+    { id: 'line-a', orderId: 'order-1', fulfillmentRequirements: pinA },
+    { id: 'line-b', orderId: 'order-1', fulfillmentRequirements: pinB },
+  ]
+  const { releaseOverallocations } = await loadRebalancer()
+
+  await releaseOverallocations(
+    [{ productId: 'product-a', warehouseId: 'warehouse-1' }],
+    { source: 'stock_adjustment', referenceId: 'adj-1' },
+  )
+
+  assertNoSwallowedFailure()
+  assert.deepEqual(state.deletedAllocationIds, ['alloc-a'], 'only line-a lost its row')
+  assert.equal(
+    state.lines.find((line) => line.id === 'line-a')?.fulfillmentRequirements,
+    undefined,
+    'so line-a\'s pin is retired',
+  )
+  assert.deepEqual(
+    state.lines.find((line) => line.id === 'line-b')?.fulfillmentRequirements,
+    pinB,
+    'while line-b still holds a row, so its pin is untouchable',
+  )
+  assert.deepEqual(
+    state.lineSnapshotWrites.map((write) => write.lineId),
+    ['line-a'],
+    'and exactly one line was written to',
   )
 })

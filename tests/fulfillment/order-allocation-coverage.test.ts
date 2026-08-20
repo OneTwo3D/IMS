@@ -16,6 +16,10 @@ mock.module('@/lib/products/kit-fulfillment', {
 
 let allocRows: Array<{ orderId: string; lineId: string; productId: string; qty: number }> = []
 let refundLineRows: Array<{ salesOrderLineId: string | null; qty: number; refund: { orderId: string } }> = []
+// o3d-kouj: the pinned per-line recipes this selector now reads for itself, keyed by line id. Empty
+// means every line is unpinned, which is the pre-snapshot state the tests below were written for —
+// so they still exercise the live-graph fallback, and the pinned path is asserted separately.
+let lineSnapshotRows: Array<{ id: string; productId: string | null; fulfillmentRequirements: unknown }> = []
 
 mock.module('@/lib/db', {
   namedExports: {
@@ -25,6 +29,12 @@ mock.module('@/lib/db', {
       },
       salesOrderRefundLine: {
         findMany: async () => refundLineRows,
+      },
+      salesOrderLine: {
+        // Honours the id filter: a double that answered every id with every row would let a
+        // snapshot seeded for one line silently answer for another.
+        findMany: async ({ where }: { where: { id: { in: string[] } } }) => lineSnapshotRows
+          .filter((row) => where.id.in.includes(row.id)),
       },
     },
   },
@@ -41,6 +51,7 @@ function order(id: string, qty: number, productId: string | null = 'p1') {
 // Every existing test predates the refund netting; default to "nothing refunded".
 function resetRefunds() {
   refundLineRows = []
+  lineSnapshotRows = []
 }
 
 test('an order with no allocations for its ordered line needs allocation', async () => {
@@ -205,4 +216,43 @@ test('a refund linked to ANOTHER order cannot cancel this order\'s demand (o3d-j
     ['SO-1', 'SO-2'],
     'the bad link is inert: it nets against SO-1 (which has no such line) and leaves SO-2 alone',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kouj — THE SELECTOR ASKS THE LINE, NOT THE CATALOGUE.
+//
+// This function decides which orders the 15-minute reallocation sweep and the backorder allocator
+// pick up, by comparing ordered quantity against what the allocation rows cover. Those rows are in
+// the COMPONENT units of the recipe the order was allocated from. Measuring them against the
+// current graph is how a fully-covered kit order reads as permanently outstanding and gets
+// destructively rewritten on every rotation — or, in the other direction, how a genuinely short one
+// drops out of the sweep for good.
+// ---------------------------------------------------------------------------
+
+test('o3d-kouj: a pinned kit line is measured in ITS OWN component units, not the catalogue\'s', async () => {
+  const select = await load()
+  resetRefunds()
+  // 5 kits ordered; the line was allocated when 1 kit = 2 x comp-1, so 10 component units cover it
+  // exactly. The mocked graph says the line's product expands to itself at factor 1 — i.e. the
+  // catalogue no longer describes this kit at all — so the pin is the only thing that can read the
+  // rows correctly.
+  lineSnapshotRows = [{
+    id: 'SO-1-l1',
+    productId: 'p1',
+    fulfillmentRequirements: {
+      version: 1,
+      productId: 'p1',
+      graphVersion: 4,
+      capturedAt: '2026-08-01T00:00:00.000Z',
+      requirements: [{ productId: 'comp-1', factor: '2' }],
+    },
+  }]
+  allocRows = [{ orderId: 'SO-1', lineId: 'SO-1-l1', productId: 'comp-1', qty: 10 }]
+
+  assert.deepEqual(await select([order('SO-1', 5)]), [], 'ten component units ARE five kits')
+
+  // One unit short of the pinned requirement, and it is selected again — the pin makes the
+  // shortfall visible, it does not simply suppress selection.
+  allocRows = [{ orderId: 'SO-1', lineId: 'SO-1-l1', productId: 'comp-1', qty: 9 }]
+  assert.deepEqual((await select([order('SO-1', 5)])).map((o) => o.id), ['SO-1'])
 })

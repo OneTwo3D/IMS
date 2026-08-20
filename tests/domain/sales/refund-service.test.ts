@@ -48,6 +48,12 @@ type SalesLine = {
   qty: number
   totalBase: number
   taxRate?: LineTaxRate | null
+  /**
+   * o3d-kouj: the line's PINNED fulfilment recipe. The refund's component factors — how many
+   * component units one refunded kit unit reverses — now come from here, and the state double
+   * passes the sales-line rows through verbatim, so setting it is all a fixture has to do.
+   */
+  fulfillmentRequirements?: unknown
 }
 
 // o3d-5od: the REAL @prisma/adapter-pg shape (no meta.target, quoted columns).
@@ -3070,4 +3076,98 @@ test('o3d-w00/o3d-n8p: a second refund on an order with a LEGACY-basis refund fa
   assert.equal(result.success === false && result.quarantine, true, 'and it is parked, not merely failed')
   assert.match(result.success === false ? result.error : '', /legacy\/unknown amount basis/)
   assert.equal(state.refunds.length, 1, 'no second refund was written')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kouj — THE COMPONENT FACTORS A REFUND REVERSES COME FROM THE LINE'S PIN.
+//
+// This is the money end of the snapshot. A refund is expressed in KIT units; the basis it relieves
+// was recorded in COMPONENT units — by dispatch onto the shipment line, and by Group A2 onto the
+// allocation row — in the units of the recipe the order was ALLOCATED from. Re-deriving the factors
+// from the current graph makes the reversal reverse the wrong quantity of the right layers: too
+// little and COGS never reconciles against inventory, too much and the take fails closed on
+// "only M available across recorded shipments" and strands the refund in retry.
+// ---------------------------------------------------------------------------
+
+test('o3d-kouj: a kit re-composed AFTER dispatch still reverses the component units that actually shipped', async () => {
+  // 3 kits shipped when 1 kit = 2 x comp-1, so 6 component units left and the shipment snapshot
+  // holds 6. The catalogue has since been re-composed to 1 x comp-1. Reading the CURRENT graph
+  // would reverse 3 units (£30) against 6 units of posted COGS (£60) — a permanent £30 hole
+  // between the ledger and the goods.
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 150,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 150,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 60,
+    }],
+    lines: [{
+      id: 'line-1',
+      orderId: 'order-1',
+      productId: 'kit-1',
+      description: 'Kit',
+      qty: 3,
+      totalBase: 150,
+      fulfillmentRequirements: {
+        version: 1,
+        productId: 'kit-1',
+        graphVersion: 4,
+        capturedAt: '2026-01-01T00:00:00.000Z',
+        requirements: [{ productId: 'comp-1', factor: '2' }],
+      },
+    }],
+    productGraph: {
+      'kit-1': {
+        type: 'KIT',
+        // THE EDIT: the live recipe now needs ONE component per kit.
+        productComponents: [{
+          componentId: 'comp-1',
+          qty: 1,
+          component: { sku: 'COMP-1', type: 'SIMPLE', oversellAllowed: false },
+        }],
+      },
+    },
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 150,
+      cogsBatchAmount: 60,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        productId: 'comp-1',
+        qty: 6,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 6, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'comp-1', poLineId: 'po-line-1', receivedQty: 6, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'kit-1', description: 'Kit', qty: 3, totalBase: 150 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
+    costLayerId: 'layer-1',
+    qty: '6.000000',
+    unitCostBase: '10.000000',
+    shipmentLineId: 'shipment-line-1',
+    source: 'shipment',
+  }], '3 kits x the PINNED factor of 2 = the 6 component units that were dispatched')
+  assert.equal(state.movements[0].productId, 'comp-1')
+  assert.equal(state.movements[0].qty, 6, 'and the same 6 units are restocked, not 3')
 })

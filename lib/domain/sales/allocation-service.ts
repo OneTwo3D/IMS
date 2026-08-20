@@ -1,18 +1,25 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import {
+  availableQtyFromRequirements,
   calculateDecimalCoverageByLine,
   calculateDecimalFulfillmentCoverage,
-  requirementsMapToDecimalRows,
+  scaleFulfillmentRequirements,
   type DecimalFulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
 import {
-  expandFulfillmentRequirementsDecimal,
-  getFulfillmentAvailableQtyDecimal,
-  listFulfillmentLeafProductIds,
   loadFulfillmentProductGraph,
   type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
+import {
+  captureFulfillmentRequirementSnapshot,
+  hasFulfillmentRequirementSnapshot,
+  lineFulfillmentLeafProductIds,
+  lineFulfillmentRequirements,
+  parseFulfillmentRequirementSnapshot,
+  selectCapturableLineIds,
+  type SnapshotResolvableLine,
+} from '@/lib/products/fulfillment-requirement-snapshot'
 import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
 import {
   RESERVATION_RELEASING_SHIPMENT_STATUS,
@@ -530,6 +537,10 @@ export async function releaseOrderAllocationsInTx(
   // The allocation rows are deleted FIRST so the shared helper reads the true post-teardown state
   // (zero open quantity everywhere) rather than being told what to conclude.
   await tx.orderAllocation.deleteMany({ where: { orderId } })
+  // o3d-kouj: the rows are gone, so any pin on a line that holds nothing else is now dormant — a
+  // recipe no reader should still be answering from. Retired here, under the same lock, in the same
+  // transaction as the release that made it dormant.
+  await clearDormantFulfillmentPinsInTx(tx, orderId)
   const pendingShipmentReconciliation = await reconcilePendingShipments(tx, orderId, {
     cause: audit.cause ?? 'a release of the order’s allocations',
     userId: audit.userId ?? null,
@@ -541,6 +552,76 @@ export async function releaseOrderAllocationsInTx(
     deletedPendingShipmentCount: pendingShipmentReconciliation.retired.length,
     retiredPendingShipments: pendingShipmentReconciliation.retired,
   }
+}
+
+/**
+ * o3d-kouj: DROP A PIN THAT IS NO LONGER ABOUT ANYTHING IN FLIGHT.
+ *
+ * The capture rule says a line pins while it holds nothing in flight and is untouchable once it
+ * holds an allocation row or a committed shipment line. Read forward that is exactly right; read
+ * backward it leaves a gap. When a line's last allocation row goes away — deallocation, an
+ * allocation edited down to nothing, the rebalancer removing the row, an order cancelled — the line
+ * becomes capturable again, and the NEXT allocation will therefore expand the CURRENT graph. But the
+ * old pin is still sitting on the row until that allocation happens, and every reader goes through
+ * `lineFulfillmentRequirements`, which uses a pin whenever one is present.
+ *
+ * So between the deallocation and the re-allocation, the coverage checks, the backorder report and
+ * the fulfilment analytics answer from a recipe the next allocation has already decided not to use.
+ * `allocateSalesOrder` gets this right for itself by nulling the pin for capturable lines in the set
+ * it resolves against — but that is one reader making a local correction, and the disagreement is
+ * between readers.
+ *
+ * The pin is therefore RETIRED at the moment it goes dormant, so the fallback (expand the current
+ * graph) is what every reader and the next allocation both do. Nothing is lost: a dormant pin
+ * certifies no allocation row, no shipment and no cost — that is precisely what made it dormant.
+ *
+ * DELIBERATELY RE-DERIVED, not passed in. The caller has just deleted rows; asking it which lines
+ * are now empty is asking it to restate a fact the database already holds, and the two would drift.
+ * Lines that still hold a committed shipment keep their pin, which is the frozen-forever half of the
+ * rule — the unconditional teardown (`releaseOrderAllocationsInTx`) deletes allocation rows even for
+ * those lines, so that distinction is load-bearing here rather than theoretical.
+ *
+ * The caller MUST already hold the order's row lock, and must call this AFTER the rows are gone.
+ * Returns how many pins were retired.
+ */
+export async function clearDormantFulfillmentPinsInTx(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<number> {
+  const pinnedLines = await tx.salesOrderLine.findMany({
+    // `not: DbNull` and not `NOT: { equals: DbNull }`: on a nullable Json column Prisma's own
+    // documented form for "the SQL value is not NULL" is the filter shorthand.
+    where: { orderId, fulfillmentRequirements: { not: Prisma.DbNull } },
+    select: { id: true },
+  })
+  if (pinnedLines.length === 0) return 0
+
+  const pinnedLineIds = pinnedLines.map((line) => line.id)
+  const [linesHoldingAllocations, linesHoldingCommittedShipments] = await Promise.all([
+    tx.orderAllocation.findMany({
+      where: { orderId, lineId: { in: pinnedLineIds } },
+      select: { lineId: true },
+    }),
+    tx.shipmentLine.findMany({
+      where: {
+        lineId: { in: pinnedLineIds },
+        shipment: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } },
+      },
+      select: { lineId: true },
+    }),
+  ])
+  const dormant = selectCapturableLineIds({
+    lineIds: pinnedLineIds,
+    lineIdsHoldingAllocations: linesHoldingAllocations.map((row) => row.lineId),
+    lineIdsHoldingCommittedShipments: linesHoldingCommittedShipments.map((row) => row.lineId),
+  })
+  if (dormant.length === 0) return 0
+
+  const cleared = await tx.salesOrderLine.updateMany({
+    where: { id: { in: dormant }, orderId },
+    data: { fulfillmentRequirements: Prisma.DbNull },
+  })
+  return cleared.count
 }
 
 /**
@@ -853,6 +934,11 @@ export async function cancelSalesOrderFulfillmentState(
       status: { in: ['PENDING', 'PICKING', 'PACKED'] },
     },
   })
+  // o3d-kouj: same rule as the release path — a pin with nothing in flight behind it is dormant.
+  // AFTER the shipment delete, not before: the picked/packed shipments this cancel destroys are
+  // exactly what would otherwise still make their lines look untouchable, and a line whose only
+  // remaining evidence is a SHIPPED shipment correctly keeps its pin forever.
+  await clearDormantFulfillmentPinsInTx(tx, input.orderId)
 
   const stockAfter = releasedReservationScopes.length
     ? await tx.stockLevel.findMany({
@@ -1014,15 +1100,45 @@ export function findUncoveredCommittedShipment(
  * whole content is "were these rows derived from the recipe I am judging them against"; sourcing
  * the two halves from two snapshots reintroduces the race at the checking end, where an old version
  * certifies old rows while the quantities are compared against a new graph.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * o3d-kouj — THIS CHECK IS NOW SKIPPED FOR ANY LINE THAT CARRIES A REQUIREMENT SNAPSHOT, AND THAT
+ * IS THE WHOLE OF o3d-57b0'S SERIALIZATION HALF BEING SUBSUMED. It is not an optimisation and it is
+ * not optional: leaving the CAS running over a snapshot-backed line would be actively wrong.
+ *
+ * Read the escape above again with the snapshot in place. The allocation pins 2xA + 1xB onto the
+ * line in the same transaction as the rows; the editor rescales the kit to 4xA + 2xB; the
+ * allocation commits A=2 / B=1. `findUncoveredCommittedShipment` now expands the PINNED recipe, so
+ * it computes coverage 1.0 against 2xA + 1xB and finds a complete set — because it IS a complete
+ * set of what this order requires. There is no half-kit, so there is nothing for a version
+ * comparison to catch. The current graph stopped being the authority for in-flight work, which is
+ * the only reason the CAS ever had to exist.
+ *
+ * What the CAS WOULD do if it kept running is resurrect the o3d-4kfh r4 defect one layer down.
+ * `bumpFulfillmentGraphVersions` walks the whole KIT-ancestor set, so after ANY component edit
+ * anywhere below a kit, every in-flight order for that kit carries a stamp that no longer matches
+ * the product — permanently, since the snapshot deliberately refuses to be re-captured while the
+ * line holds allocations. Every such order would be refused at commitment and at dispatch, and the
+ * remedy the message names ("re-allocate this order") would not clear it. A refusal with no
+ * operator remedy is exactly what r5 removed from the edit guard.
+ *
+ * It is NOT deleted, because a line with a NULL snapshot — one that has never been allocated since
+ * this column shipped, or whose snapshot was captured for a product the line no longer references —
+ * is still resolved from the current graph, and for those lines every word above the line still
+ * applies. One rule, conditioned on the same predicate the requirement resolution is conditioned on.
+ * ---------------------------------------------------------------------------------------------
  */
 export function findStaleFulfillmentGraphAllocation(
-  lines: Array<{ id: string; sku: string | null; description: string; graphVersion: number }>,
+  lines: Array<{ id: string; sku: string | null; description: string; graphVersion: number; snapshotBacked?: boolean }>,
   allocations: Array<{ lineId: string; fulfillmentGraphVersion: number }>,
 ): string | null {
   const lineById = new Map(lines.map((line) => [line.id, line]))
   for (const allocation of allocations) {
     const line = lineById.get(allocation.lineId)
     if (!line) continue // outside the validated set — not this check's business
+    // o3d-kouj: the line's requirements came from its own pinned snapshot, not from the product's
+    // current graph, so the product's current version says nothing about these rows.
+    if (line.snapshotBacked) continue
     if (allocation.fulfillmentGraphVersion === line.graphVersion) continue
     return `Allocation for sales line ${line.sku ?? line.description} was computed against an older `
       + `version of that product's component graph (allocation ${allocation.fulfillmentGraphVersion}, `
@@ -1088,6 +1204,10 @@ async function loadAllocationIntegrityRows(
       qty: true,
       sku: true,
       description: true,
+      // o3d-kouj: the pinned recipe, if this line has one. Selected HERE rather than resolved by a
+      // second query for the same reason the graph version is taken from the graph node: the
+      // requirements and the thing that certifies them have to come out of one read.
+      fulfillmentRequirements: true,
     },
   })
   if (lines.length === 0) return null
@@ -1100,17 +1220,25 @@ async function loadAllocationIntegrityRows(
   // The CAS input, built in the SAME loop as the requirements and from the SAME graph, so the two
   // cannot drift apart later. A line whose product is missing from the graph (deleted under us)
   // reads 0 and therefore fails closed against any stamped row — there is no recipe left to certify.
-  const versionedLines: Array<{ id: string; sku: string | null; description: string; graphVersion: number }> = []
+  //
+  // o3d-kouj: `snapshotBacked` is computed from the SAME `line` object the requirements were
+  // resolved from, so "these requirements came from the snapshot" and "skip the CAS for this line"
+  // can never disagree — they are one fact read once.
+  const versionedLines: Array<{
+    id: string
+    sku: string | null
+    description: string
+    graphVersion: number
+    snapshotBacked: boolean
+  }> = []
   for (const line of lines) {
-    requirementsByLine.set(
-      line.id,
-      requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId!, 1, graph)),
-    )
+    requirementsByLine.set(line.id, lineFulfillmentRequirements(line, graph))
     versionedLines.push({
       id: line.id,
       sku: line.sku,
       description: line.description,
       graphVersion: graph.get(line.productId!)?.fulfillmentGraphVersion ?? 0,
+      snapshotBacked: hasFulfillmentRequirementSnapshot(line),
     })
   }
 
@@ -1558,6 +1686,48 @@ export async function allocateSalesOrder(
     // cleared inventoryAllocatedDate and the cost snapshots. It now runs only once the computed
     // set is known to DIFFER from the persisted one — see the unchanged-set check below.
     const graph = await loadFulfillmentProductGraph(tx, productIds)
+
+    // ---------------------------------------------------------------------------------------
+    // o3d-kouj: WHICH LINES MAY (RE)PIN THEIR RECIPE, decided BEFORE anything is expanded.
+    //
+    // The order matters and is the whole subtlety. If the capture ran after the expansion, a line
+    // that still carried a snapshot from a PREVIOUS in-flight life (allocated, then deallocated)
+    // would have its rows expanded from the OLD recipe and then be re-pinned to the NEW one — rows
+    // and snapshot describing different kits, on the row set this very run just wrote. So the
+    // capturable set is computed first, and a capturable line is expanded from the CURRENT GRAPH,
+    // which is by construction the same thing the capture below records.
+    //
+    // Both reads are under the order row lock and every writer of this order's allocations and
+    // shipments takes that lock first, so the in-flight set cannot move between here and the
+    // reads further down that use it for the reservation arithmetic. The committed-shipment read
+    // is not folded into the allocation-row read even though a committed shipment line is always
+    // backed by an allocation row (validateCommittedShipmentCoverage enforces exactly that): an
+    // invariant is a reason a check passes, not a reason to delete it.
+    // ---------------------------------------------------------------------------------------
+    const snapshotLines = await tx.salesOrderLine.findMany({
+      where: { orderId },
+      select: { id: true, productId: true, fulfillmentRequirements: true },
+    })
+    const [linesHoldingAllocations, linesHoldingCommittedShipments] = await Promise.all([
+      tx.orderAllocation.findMany({ where: { orderId }, select: { lineId: true } }),
+      tx.shipmentLine.findMany({
+        where: { shipment: { orderId, status: { not: UNCOMMITTED_SHIPMENT_STATUS } } },
+        select: { lineId: true },
+      }),
+    ])
+    const capturableLineIds = new Set(selectCapturableLineIds({
+      lineIds: snapshotLines.map((line) => line.id),
+      lineIdsHoldingAllocations: linesHoldingAllocations.map((row) => row.lineId),
+      lineIdsHoldingCommittedShipments: linesHoldingCommittedShipments.map((row) => row.lineId),
+    }))
+    // A capturable line's stored snapshot is deliberately discarded here: it describes an in-flight
+    // life this line no longer has, and this run is about to replace it.
+    const resolvableLineById = new Map(snapshotLines.map((line) => [line.id, {
+      id: line.id,
+      productId: line.productId,
+      fulfillmentRequirements: capturableLineIds.has(line.id) ? null : line.fulfillmentRequirements,
+    }]))
+
     const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
     // o3d-4kfh r6: THE VERSION OF THE GRAPH THIS RUN IS ABOUT TO EXPAND, per sales line.
     //
@@ -1566,17 +1736,38 @@ export async function allocateSalesOrder(
     // not belong to, and the stamp would then certify a recipe that was never read. A line whose
     // product is missing from the graph (a deleted product) stamps 0 and is left to the existing
     // checks; there is no recipe to be stale about.
+    //
+    // o3d-kouj: the column keeps its meaning — THE GRAPH VERSION THESE ROWS WERE EXPANDED FROM — for
+    // both kinds of line. For an unpinned line that is the current graph's version, and the CAS
+    // still reads it. For a PINNED line the rows are expanded from the pin, so the honest value is
+    // the version the pin recorded; writing the current version instead would leave the row claiming
+    // a provenance it does not have, and would silently certify it as current if the pin were ever
+    // lost. The CAS is skipped per line, not switched off — see findStaleFulfillmentGraphAllocation.
     const graphVersionByLine = new Map<string, number>()
     for (const line of so.lines) {
       if (!line.productId) continue
-      requirementsByLine.set(
+      const resolvable: SnapshotResolvableLine = resolvableLineById.get(line.id)
+        ?? { id: line.id, productId: line.productId, fulfillmentRequirements: null }
+      requirementsByLine.set(line.id, lineFulfillmentRequirements(resolvable, graph))
+      const pin = parseFulfillmentRequirementSnapshot(resolvable.fulfillmentRequirements, line.id)
+      graphVersionByLine.set(
         line.id,
-        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
+        pin && pin.productId === line.productId
+          ? pin.graphVersion
+          : graph.get(line.productId)?.fulfillmentGraphVersion ?? 0,
       )
-      graphVersionByLine.set(line.id, graph.get(line.productId)?.fulfillmentGraphVersion ?? 0)
     }
 
-    const leafProductIds = listFulfillmentLeafProductIds(productIds, graph)
+    // o3d-kouj: the leaves to lock come from the RESOLVED requirements, not from a fresh walk of the
+    // current graph. A line pinned to an older recipe can require a component the current recipe no
+    // longer mentions, and that component's stock row is the one this transaction is about to
+    // reserve — locking the current graph's leaves instead would leave it unlocked.
+    const leafProductIds = lineFulfillmentLeafProductIds(
+      so.lines
+        .filter((line) => line.productId)
+        .map((line) => resolvableLineById.get(line.id) ?? { id: line.id, productId: line.productId }),
+      graph,
+    )
     await lockStockLevels(tx, leafProductIds, sorted.map((warehouse) => warehouse.id))
 
     const stockLevels = await tx.stockLevel.findMany({
@@ -1661,11 +1852,20 @@ export async function allocateSalesOrder(
       }
     }).filter((line) => line.qty.gt(0))
 
+    // o3d-kouj: FEASIBILITY AND EXPANSION NOW COME FROM ONE SOURCE — the line's RESOLVED requirement
+    // set, which is its pinned snapshot when it has one and the current graph when it does not.
+    // Asking `getFulfillmentAvailableQtyDecimal` here would re-walk the CURRENT graph, so a line
+    // pinned to an older recipe would have its feasibility decided by one kit and its rows written
+    // from another: the allocator would authorise three kits' worth of a recipe it is not about to
+    // write. See `availableQtyFromRequirements` for the one place the two forms also differ on a
+    // diamond graph, and why the requirement set is the correct side of that difference.
+    const lineRequirements = (lineId: string) => requirementsByLine.get(lineId) ?? []
+
     const lineOptions = new Map<string, string[]>()
     for (const line of lines) {
       const options: string[] = []
       for (const warehouse of sorted) {
-        const avail = getFulfillmentAvailableQtyDecimal(line.productId, warehouse.id, graph, stockMap)
+        const avail = availableQtyFromRequirements(lineRequirements(line.id), warehouse.id, stockMap)
         if (avail.gte(line.qty)) options.push(warehouse.id)
       }
       lineOptions.set(line.id, options)
@@ -1690,10 +1890,10 @@ export async function allocateSalesOrder(
       }
 
       if (bestWh) {
-        const avail = getFulfillmentAvailableQtyDecimal(line.productId, bestWh, graph, tempStock)
+        const avail = availableQtyFromRequirements(lineRequirements(line.id), bestWh, tempStock)
         const allocQty = Prisma.Decimal.min(remaining, avail)
         if (allocQty.gt(ALLOCATION_EPSILON_DECIMAL)) {
-          const requirements = expandFulfillmentRequirementsDecimal(line.productId, allocQty, graph)
+          const requirements = scaleFulfillmentRequirements(lineRequirements(line.id), allocQty)
           for (const [productId, qty] of requirements) {
             nextAllocationRows.push({ lineId: line.id, productId, warehouseId: bestWh, qty })
           }
@@ -1706,10 +1906,10 @@ export async function allocateSalesOrder(
         for (const warehouse of sorted) {
           if (remaining.lte(ALLOCATION_EPSILON_DECIMAL)) break
           if (bestWh && warehouse.id === bestWh) continue
-          const avail = getFulfillmentAvailableQtyDecimal(line.productId, warehouse.id, graph, tempStock)
+          const avail = availableQtyFromRequirements(lineRequirements(line.id), warehouse.id, tempStock)
           if (avail.lte(ALLOCATION_EPSILON_DECIMAL)) continue
           const allocQty = Prisma.Decimal.min(remaining, avail)
-          const requirements = expandFulfillmentRequirementsDecimal(line.productId, allocQty, graph)
+          const requirements = scaleFulfillmentRequirements(lineRequirements(line.id), allocQty)
           for (const [productId, qty] of requirements) {
             nextAllocationRows.push({ lineId: line.id, productId, warehouseId: warehouse.id, qty })
           }
@@ -1897,6 +2097,47 @@ export async function allocateSalesOrder(
           },
         })
       }
+
+      // -------------------------------------------------------------------------------------
+      // o3d-kouj: PIN THE RECIPE ONTO EVERY LINE THIS RUN JUST PUT IN FLIGHT.
+      //
+      // Written from the SAME graph map the rows above were expanded from, in the SAME transaction,
+      // under the SAME order lock — so the snapshot and the rows cannot describe different kits.
+      //
+      // Only lines that ACTUALLY RECEIVED A ROW are pinned, and only inside this `!unchanged`
+      // branch. Both restrictions exist for the same reason the branch itself does (o3d-i5it): the
+      // reallocation sweep rotates every fifteen minutes over every order with outstanding demand,
+      // including permanent backorders that can never improve. Pinning a line that got no rows
+      // would be a write on every rotation, forever, for a line holding nothing — and it would
+      // freeze a recipe for an order that has committed to nothing, which is the opposite of what
+      // the capturable rule is for.
+      //
+      // A capturable line that receives a row necessarily CHANGES the set (it held no allocation
+      // row before — that is what made it capturable), so there is no reachable case where a line
+      // acquires its first row and the short-circuit skips the pin.
+      // -------------------------------------------------------------------------------------
+      const pinnedLineIds = new Set(
+        persistedAllocations
+          .map((alloc) => alloc.lineId)
+          .filter((lineId) => capturableLineIds.has(lineId)),
+      )
+      for (const lineId of pinnedLineIds) {
+        const productId = resolvableLineById.get(lineId)?.productId
+        if (!productId) continue
+        await tx.salesOrderLine.update({
+          where: { id: lineId },
+          data: {
+            fulfillmentRequirements: captureFulfillmentRequirementSnapshot(productId, graph) as never,
+          },
+        })
+      }
+
+      // ...and drop the pin from any line this run left holding NOTHING. The delete/recreate above
+      // can legitimately end with a line that had rows before and has none now (its stock went to a
+      // line with older demand, or the availability vanished). That line is capturable again, so the
+      // next run will expand the current graph for it — and until then every reader would be
+      // answering from the pin it no longer has any commitment behind (o3d-kouj).
+      await clearDormantFulfillmentPinsInTx(tx, orderId)
 
       // o3d-4kfh r6 (Codex finding 2): THE RESERVE DELTA COMES FROM THE ROWS AS PERSISTED.
       //

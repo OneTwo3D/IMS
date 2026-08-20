@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
+
 import {
   allocateSalesOrder,
   allocationSetsMatch,
@@ -14,6 +16,8 @@ import {
   releaseOrderAllocationsInTx,
   resetAllocationAccountingIfStaged,
   updateSalesOrderStatusUnderLock,
+  validateAllocationIntegrity,
+  validateCommittedShipmentCoverage,
   type AllocationServiceClient,
 } from '@/lib/domain/sales/allocation-service'
 import { residualAllocationRows } from '@/lib/domain/inventory/reservation-residual'
@@ -47,6 +51,13 @@ type OrderLineRow = {
   qty: number
   sku: string | null
   description: string
+  /**
+   * o3d-kouj: the line's PINNED fulfilment recipe. Seeded rows leave it undefined, which is the
+   * NULL a line that has never been allocated holds; `allocateSalesOrder` writes it here through
+   * `salesOrderLine.update` exactly as it does in Postgres, so a test can tell "pinned" from "not
+   * pinned" and can seed a stale pin to prove the pin, and not the current graph, is what is read.
+   */
+  fulfillmentRequirements?: unknown
   product: {
     id: string
     sku: string
@@ -164,6 +175,8 @@ const writeCounts = { allocationCreates: 0, allocationDeletes: 0, allocationUpda
  */
 const activityLogWrites: Array<Record<string, unknown>> = []
 const txWriteOrder: string[] = []
+/** o3d-kouj: every fulfilment-requirement pin the run wrote, in order. */
+const salesOrderLineSnapshotWrites: Array<{ lineId: string; payload: unknown }> = []
 
 function createClient(state: MemoryState): AllocationServiceClient {
   writeCounts.allocationCreates = 0
@@ -171,6 +184,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
   writeCounts.allocationUpdateManys = 0
   activityLogWrites.length = 0
   txWriteOrder.length = 0
+  salesOrderLineSnapshotWrites.length = 0
   const allocations = state.allocations ?? []
   // The column is NOT NULL DEFAULT 0; normalise in place so a seeded row and a written row are
   // indistinguishable to every reader, exactly as they are in Postgres.
@@ -455,6 +469,78 @@ function createClient(state: MemoryState): AllocationServiceClient {
             shipment: { status, warehouseId: shipment.warehouseId ?? 'warehouse-1' },
           }]
         })
+      },
+    },
+    // o3d-kouj: the fulfilment-requirement snapshot lives on the sales LINE, so the allocator both
+    // reads and writes this table now. The double answers the two real shapes — the whole order's
+    // lines, and one line by id — from the SAME array the order carries, and `update` mutates that
+    // array. A double that returned a detached copy would let a test assert a pin that production
+    // never persisted, and a double that answered both shapes with the same rows would hide a
+    // mis-scoped write.
+    salesOrderLine: {
+      findMany: async ({ where }: {
+        where?: {
+          orderId?: string
+          id?: string | { in: string[] }
+          productId?: { not: null }
+          // o3d-kouj: "this line carries a pin" — the filter clearDormantFulfillmentPinsInTx uses to
+          // avoid rewriting lines that never had one. Honoured rather than ignored: a double that
+          // returned every line here would make the dormancy sweep look like it had examined lines
+          // it never selects in Postgres.
+          fulfillmentRequirements?: { not: unknown }
+        }
+      } = {}) => state.order.lines
+        .filter((line) => where?.orderId == null || state.order.id === where.orderId)
+        .filter((line) => {
+          if (where?.id == null) return true
+          return typeof where.id === 'string' ? line.id === where.id : where.id.in.includes(line.id)
+        })
+        .filter((line) => where?.productId?.not !== null || line.productId != null)
+        .filter((line) => where?.fulfillmentRequirements == null || line.fulfillmentRequirements != null)
+        .map((line) => ({
+          id: line.id,
+          productId: line.productId,
+          qty: line.qty,
+          sku: line.sku,
+          description: line.description,
+          fulfillmentRequirements: line.fulfillmentRequirements ?? null,
+        })),
+      update: async ({ where, data }: {
+        where: { id: string }
+        data: { fulfillmentRequirements?: unknown }
+      }) => {
+        const line = state.order.lines.find((row) => row.id === where.id)
+        if (!line) throw new Error(`salesOrderLine.update: no line ${where.id}`)
+        if ('fulfillmentRequirements' in data) {
+          salesOrderLineSnapshotWrites.push({ lineId: where.id, payload: data.fulfillmentRequirements })
+          // Round-tripped through JSON, exactly as jsonb does: a payload that only parses because
+          // it still holds live Decimal objects would pass here and fail in Postgres.
+          line.fulfillmentRequirements = JSON.parse(JSON.stringify(data.fulfillmentRequirements))
+        }
+        return line
+      },
+      // o3d-kouj: the dormant-pin retirement. Scoped by BOTH id set and orderId, exactly as
+      // production writes it, so a mis-scoped clear cannot pass here.
+      updateMany: async ({ where, data }: {
+        where: { id: { in: string[] }; orderId?: string }
+        data: { fulfillmentRequirements?: unknown }
+      }) => {
+        let count = 0
+        for (const line of state.order.lines) {
+          if (!where.id.in.includes(line.id)) continue
+          if (where.orderId != null && state.order.id !== where.orderId) continue
+          if ('fulfillmentRequirements' in data) {
+            salesOrderLineSnapshotWrites.push({ lineId: line.id, payload: data.fulfillmentRequirements })
+            // Prisma's DbNull sentinel writes SQL NULL; anything else is a payload. Distinguished
+            // rather than assumed, so this double cannot quietly turn a write into a clear.
+            const payload = data.fulfillmentRequirements
+            line.fulfillmentRequirements = payload == null || payload === Prisma.DbNull
+              ? null
+              : JSON.parse(JSON.stringify(payload))
+          }
+          count += 1
+        }
+        return { count }
       },
     },
     salesOrderRefundLine: {
@@ -3171,4 +3257,325 @@ test('o3d-4kfh r7: an unchanged run whose stamp is ALREADY current writes nothin
   )
   assert.equal(state.stockLevels[0].reservedQty, 2)
   assert.deepEqual(result.syncProductIds, [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kouj — THE IMMUTABLE PER-LINE FULFILMENT-REQUIREMENT SNAPSHOT, END TO END.
+//
+// The pure halves (capture, parse, resolve, the capturable rule) are in
+// tests/products/fulfillment-requirement-snapshot.test.ts. These are the ones that need the
+// allocator's transaction: WHEN the pin is written, when it is deliberately NOT written, and what
+// stops being true about the graph-version CAS once a line carries one.
+// ---------------------------------------------------------------------------
+
+/** A line of 1 KIT that needs `componentQty` x component-1, with stock for `stockQty` of them. */
+function pinnableKitState(options: {
+  componentQty: number
+  graphVersion?: number
+  stockQty?: number
+  allocations?: AllocationRow[]
+  shipments?: ShipmentRow[]
+  shipmentLines?: ShipmentLineRow[]
+  pinnedRequirements?: unknown
+  reservedQty?: number
+}): MemoryState {
+  return baseState({
+    order: {
+      ...baseState().order,
+      status: 'PROCESSING',
+      lines: [{
+        id: 'line-1',
+        productId: 'kit-1',
+        qty: 1,
+        sku: 'KIT-1',
+        description: 'Kit 1',
+        fulfillmentRequirements: options.pinnedRequirements,
+        product: { id: 'kit-1', sku: 'KIT-1', type: 'KIT', oversellAllowed: false },
+      }],
+    },
+    products: [{
+      id: 'kit-1',
+      type: 'KIT',
+      fulfillmentGraphVersion: options.graphVersion ?? 3,
+      productComponents: [{ componentId: 'component-1', qty: options.componentQty, componentType: 'SIMPLE' }],
+    }],
+    stockLevels: [{
+      productId: 'component-1',
+      warehouseId: 'warehouse-1',
+      quantity: options.stockQty ?? 10,
+      reservedQty: options.reservedQty ?? 0,
+    }],
+    allocations: options.allocations ?? [],
+    shipments: options.shipments ?? [],
+    shipmentLines: options.shipmentLines ?? [],
+  })
+}
+
+test('o3d-kouj: allocating a line PINS the recipe it expanded, in the same run that writes the rows', async () => {
+  const state = pinnableKitState({ componentQty: 2, graphVersion: 3 })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(state.allocations?.[0].qty, 2, 'the rows are the current graph\'s expansion')
+  assert.deepEqual(
+    salesOrderLineSnapshotWrites.map((write) => write.lineId),
+    ['line-1'],
+    'exactly one pin, for the one line that acquired rows',
+  )
+  assert.deepEqual(state.order.lines[0].fulfillmentRequirements, {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 3,
+    capturedAt: (state.order.lines[0].fulfillmentRequirements as { capturedAt: string }).capturedAt,
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  })
+  assert.equal(
+    state.allocations?.[0].fulfillmentGraphVersion,
+    3,
+    'and the row records the version its recipe came from',
+  )
+})
+
+test('o3d-kouj: a line that already holds an allocation row is NEVER re-pinned', async () => {
+  // The kit has since been re-composed 2 -> 5 and the version bumped. The line is mid-flight, so
+  // the pin must not move — and because the pin is what the run expands, the rows must not either.
+  const pinned = {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 3,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  }
+  const state = pinnableKitState({
+    componentQty: 5,
+    graphVersion: 9,
+    reservedQty: 2,
+    pinnedRequirements: pinned,
+    allocations: [{
+      orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1',
+      qty: 2, fulfillmentGraphVersion: 3,
+    }],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(salesOrderLineSnapshotWrites, [], 'no pin write at all')
+  assert.deepEqual(state.order.lines[0].fulfillmentRequirements, pinned, 'the pin is byte-for-byte unchanged')
+  assert.equal(state.allocations?.[0].qty, 2, 'the rebuilt set is the PIN\'s expansion, not 5')
+  assert.equal(writeCounts.allocationCreates, 0, 'and the set is unchanged, so nothing is rewritten')
+  assert.equal(writeCounts.allocationDeletes, 0)
+  assert.equal(state.stockLevels[0].reservedQty, 2, 'the reservation is untouched')
+})
+
+test('o3d-kouj: a line holding NOTHING re-pins, which is what keeps "re-allocate" a real remedy', async () => {
+  // Same re-composed kit, but this line has been deallocated — it holds no row and no committed
+  // shipment, so nothing is committed against the old recipe and adopting the new one costs nothing.
+  const state = pinnableKitState({
+    componentQty: 5,
+    graphVersion: 9,
+    pinnedRequirements: {
+      version: 1,
+      productId: 'kit-1',
+      graphVersion: 3,
+      capturedAt: '2026-08-01T00:00:00.000Z',
+      requirements: [{ productId: 'component-1', factor: '2' }],
+    },
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(salesOrderLineSnapshotWrites.map((write) => write.lineId), ['line-1'])
+  assert.deepEqual(
+    (state.order.lines[0].fulfillmentRequirements as { requirements: unknown }).requirements,
+    [{ productId: 'component-1', factor: '5' }],
+    'the pin is refreshed to the current recipe',
+  )
+  assert.equal(state.allocations?.[0].qty, 5, 'and the rows follow it')
+})
+
+test('o3d-kouj: a line that got NO row is not pinned, so the 15-minute sweep still writes nothing', async () => {
+  // A permanent backorder: no stock, so the run places nothing. Pinning here would be a write on
+  // every rotation forever, for a line that has committed to nothing (o3d-i5it).
+  const state = pinnableKitState({ componentQty: 2, stockQty: 0 })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(state.allocations, [])
+  assert.deepEqual(salesOrderLineSnapshotWrites, [], 'no pin, and therefore no write at all')
+  assert.equal(state.order.lines[0].fulfillmentRequirements, undefined)
+})
+
+test('o3d-kouj: a UNIFORM rescale of the kit cannot move what a pinned, part-committed order requires', async () => {
+  // THE ESCAPE THE CAS EXISTS FOR, replayed with the pin in place. 2xA/kit, one kit allocated and
+  // PICKING; the kit is then rescaled to 4xA — uniform, so every proportionality check is blind to
+  // it, and the CAS was the only thing that caught it. With the pin, the order simply keeps
+  // requiring 2, so there is nothing left to catch.
+  const pinned = {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 3,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  }
+  const state = pinnableKitState({
+    componentQty: 4,
+    graphVersion: 9,
+    reservedQty: 2,
+    pinnedRequirements: pinned,
+    allocations: [{
+      orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1',
+      qty: 2, fulfillmentGraphVersion: 3,
+    }],
+    shipments: [{
+      id: 'shipment-1', orderId: 'order-1', status: 'PICKING', warehouseId: 'warehouse-1',
+      shipmentJournalDate: null,
+    }],
+    shipmentLines: [{ shipmentId: 'shipment-1', lineId: 'line-1', productId: 'component-1', qty: 2 }],
+  })
+  const client = createClient(state)
+
+  // THE COMMITMENT CHECK PASSES. Before the pin this same state was refused at every transition
+  // including dispatch, with "re-allocate this order" — advice that could not clear it, because the
+  // pin deliberately refuses to move while the line holds rows.
+  assert.equal(
+    await validateCommittedShipmentCoverage(client, 'order-1'),
+    null,
+    'a pinned line is judged against its own recipe, so the picked set is complete and proportional',
+  )
+  // The upward half too: one kit ordered still means TWO components, so the retained row of 2 is
+  // exactly the whole claim and nothing is outstanding. Judged against the rescaled recipe the same
+  // rows read as half a kit's worth of a four-component kit.
+  assert.equal(await validateAllocationIntegrity(client, 'order-1'), null)
+
+  // And the same state WITHOUT the pin is refused, which is the behaviour that must survive for
+  // every line that has never been allocated since this column shipped.
+  state.order.lines[0].fulfillmentRequirements = undefined
+  const unpinnedError = await validateCommittedShipmentCoverage(createClient(state), 'order-1')
+  assert.match(String(unpinnedError), /computed against an older version of that product's component graph/)
+  assert.match(String(unpinnedError), /allocation 3, product 9/)
+})
+
+test('o3d-kouj: the CAS is skipped per LINE, not switched off', () => {
+  const lines = [
+    { id: 'pinned', sku: 'KIT-1', description: 'Kit 1', graphVersion: 9, snapshotBacked: true },
+    { id: 'unpinned', sku: 'KIT-2', description: 'Kit 2', graphVersion: 9, snapshotBacked: false },
+  ]
+
+  assert.equal(
+    findStaleFulfillmentGraphAllocation(lines, [{ lineId: 'pinned', fulfillmentGraphVersion: 1 }]),
+    null,
+    'the product moved, but the pinned line was never judged against the product',
+  )
+  assert.match(
+    String(findStaleFulfillmentGraphAllocation(lines, [{ lineId: 'unpinned', fulfillmentGraphVersion: 1 }])),
+    /Allocation for sales line KIT-2 was computed against an older version/,
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kouj — DORMANT PINS
+//
+// The capture rule reads correctly forwards (a line pins while it holds nothing in flight, and is
+// untouchable once it holds an allocation row or a committed shipment line) and leaves a gap
+// backwards. When a line's last allocation row goes away the line becomes capturable again, so the
+// NEXT allocation will expand the CURRENT graph — but the OLD pin is still on the row until that
+// happens, and every reader goes through `lineFulfillmentRequirements`, which uses a pin whenever
+// one is present. Between the deallocation and the re-allocation, readers and the next allocation
+// therefore answer from different recipes.
+// ---------------------------------------------------------------------------
+
+/** The pin a line carries after a real capture: one unit of `kit-1` = 2 x `component-1`. */
+function stalePin(productId: string, graphVersion: number) {
+  return {
+    version: 1,
+    productId,
+    graphVersion,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  }
+}
+
+test('o3d-kouj: deallocation retires the pin it just made dormant', async () => {
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PENDING', reservedQty: 13,
+  })
+  const line = state.order.lines[0]
+  line.fulfillmentRequirements = stalePin(line.productId!, 4)
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(ownAllocation(state), undefined, 'the rows really are gone')
+  assert.equal(
+    state.order.lines[0].fulfillmentRequirements,
+    null,
+    'so the pin is retired — a reader must not keep answering from a recipe nothing is committed to',
+  )
+})
+
+test('o3d-kouj: a line whose pin still backs a COMMITTED shipment keeps it', async () => {
+  // The frozen-forever half of the rule. `releaseOrderAllocationsInTx` is the unconditional teardown
+  // and deletes allocation rows even for a line holding a picked shipment, so "no allocation rows"
+  // is NOT on its own evidence that the pin is dormant — the shipment is what still stands against
+  // it, and that is the case this asserts rather than assumes.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PICKING', reservedQty: 13,
+  })
+  const line = state.order.lines[0]
+  const pin = stalePin(line.productId!, 4)
+  line.fulfillmentRequirements = pin
+
+  await releaseOrderAllocationsInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(ownAllocation(state), undefined, 'the teardown deleted the rows regardless')
+  assert.deepEqual(
+    state.order.lines[0].fulfillmentRequirements,
+    pin,
+    'but the committed shipment still stands against that recipe, so the pin survives',
+  )
+})
+
+test('o3d-kouj: cancelling an order retires its pins, AFTER the picked shipments are destroyed', async () => {
+  // Ordering matters and is easy to get backwards: cancellation deletes the PENDING/PICKING/PACKED
+  // shipments, so a clear run BEFORE that delete would see the picked shipment, decide the line was
+  // untouchable, and leave a pin behind with nothing at all still standing against it.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PICKING', reservedQty: 13,
+  })
+  state.order.status = 'PROCESSING'
+  const line = state.order.lines[0]
+  line.fulfillmentRequirements = stalePin(line.productId!, 4)
+
+  await cancelSalesOrderFulfillmentState(createClient(state) as never, { orderId: 'order-1' })
+
+  assert.equal(
+    state.shipments?.filter((shipment) => shipment.orderId === 'order-1' && shipment.status === 'PICKING').length,
+    0,
+    'the picked shipment was destroyed by the cancel',
+  )
+  assert.equal(
+    state.order.lines[0].fulfillmentRequirements,
+    null,
+    'and the pin went with it — nothing is left for that recipe to certify',
+  )
+})
+
+test('o3d-kouj: a line that never carried a pin is not written to at all', async () => {
+  // The sweep selects on "carries a pin". Without that filter it would rewrite every line of every
+  // order on every deallocation, which is a write per line per rotation of the reallocation sweep.
+  const state = deallocationScope({
+    allocatedQty: 10, committedQty: 10, shipmentStatus: 'PENDING', reservedQty: 13,
+  })
+  // The client factory resets the recorder, so it has to be built BEFORE the baseline is read —
+  // otherwise the baseline is another test's leftovers and the assertion compares nothing.
+  const client = createClient(state)
+  const writesBefore = salesOrderLineSnapshotWrites.length
+  assert.equal(writesBefore, 0)
+
+  await releaseOrderAllocationsForDeallocationInTx(client as never, 'order-1')
+
+  assert.equal(
+    salesOrderLineSnapshotWrites.length,
+    writesBefore,
+    'no snapshot write of any kind for a line that had nothing pinned',
+  )
 })

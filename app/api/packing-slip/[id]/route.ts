@@ -13,7 +13,8 @@ import {
   type PdfTableColumn,
 } from '@/lib/pdf'
 import { formatCountryDisplay } from '@/lib/countries'
-import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirementQuantities } from '@/lib/products/fulfillment-requirement-snapshot'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
 
@@ -35,10 +36,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       createdAt: true,
       lines: {
         select: {
+          id: true,
           productId: true,
           sku: true,
           description: true,
           qty: true,
+          // o3d-kouj: the pinned recipe. A picker must be told to pick what the order was allocated
+          // from — the components its reservation actually holds — not what the kit contains today.
+          fulfillmentRequirements: true,
           product: { select: { sku: true, name: true } },
         },
       },
@@ -133,7 +138,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         }]
       }
 
-      return [...expandFulfillmentRequirementsDecimal(line.productId, line.qty, graph).entries()].map(([productId, qty]) => ({
+      return [...lineFulfillmentRequirementQuantities(line, line.qty, graph).entries()].map(([productId, qty]) => ({
         sku: '',
         name: line.description,
         productId,

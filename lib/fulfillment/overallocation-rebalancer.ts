@@ -2,7 +2,7 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { canonicalAllocationQty } from '@/lib/domain/sales/allocation-service'
+import { canonicalAllocationQty, clearDormantFulfillmentPinsInTx } from '@/lib/domain/sales/allocation-service'
 import { reconcilePendingShipments } from '@/lib/domain/sales/pending-shipment-reconciliation'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -195,6 +195,10 @@ export async function releaseOverallocations(
 
           if (wholeRow) {
             await tx.orderAllocation.delete({ where: { id: alloc.id } })
+            // o3d-kouj: this row may have been the last thing holding that line in flight. A pin
+            // with nothing behind it is dormant — the next allocation would expand the CURRENT
+            // graph, so every reader must too. Retired in the same transaction as the delete.
+            await clearDormantFulfillmentPinsInTx(tx, alloc.orderId)
           } else {
             await tx.orderAllocation.update({
               where: { id: alloc.id },

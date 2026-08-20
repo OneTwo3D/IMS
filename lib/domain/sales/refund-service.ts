@@ -18,8 +18,9 @@ import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { scheduleRefundReservationReleaseOutbox, scheduleRefundUnmatchedWarningOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
-import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
-import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { calculateCoverageByLine, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 import {
   isStockMovementIdempotencyConflict,
   refundInboundMovementKey,
@@ -1008,6 +1009,11 @@ async function stageRefundAccountingReversals(
             description: true,
             qty: true,
             totalBase: true,
+            // o3d-kouj: the recipe this line was ALLOCATED from. The component factors below convert
+            // a refund expressed in kit units into the component units its cost basis is denominated
+            // in, so they must be the same factors dispatch and A2 used — not whatever the catalogue
+            // says today.
+            fulfillmentRequirements: true,
           },
         },
         shipments: {
@@ -1144,6 +1150,7 @@ async function stageRefundAccountingReversals(
       description: line.description,
       qty: refundBoundaryNumber(line.qty),
       totalBase: refundBoundaryNumber(line.totalBase),
+      fulfillmentRequirements: line.fulfillmentRequirements,
     }))
 
     // scjz.20: refund quantities are in SALES-LINE (kit) units, but shipment lines
@@ -1152,17 +1159,28 @@ async function stageRefundAccountingReversals(
     // units per 1 sales-line unit) so the cost consume can convert kit qty to the
     // component qty its snapshot is denominated in, and measure shipped qty as
     // kit-equivalent COVERAGE rather than a raw component-unit sum.
+    //
+    // o3d-kouj: FROM THE LINE'S PINNED RECIPE. This is the money end of the snapshot. These factors
+    // decide how much cost basis a refund reverses, and the basis being relieved was recorded — by
+    // dispatch onto the shipment line, and by Group A2 onto the allocation row — in the component
+    // units of the recipe the order was ALLOCATED from. Re-deriving them from the current graph is
+    // what made a kit re-composed after dispatch reverse the wrong quantity of the right layers:
+    // too little and COGS never reconciles, too much and the reversal eats another line's basis and
+    // the whole refund fails closed on "only M available across recorded shipments".
     const fulfillmentGraph = await loadFulfillmentProductGraph(
       tx,
       (orderAccounting?.lines ?? []).map((line) => line.productId).filter((id): id is string => !!id),
     )
     const componentFactorsByLine = new Map<string, Map<string, number>>()
-    const requirementsByLine = new Map<string, ReturnType<typeof requirementsMapToRows>>()
+    const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
     for (const line of lineContexts) {
       if (!line.productId) continue
-      const requirements = expandFulfillmentRequirementsDecimal(line.productId, 1, fulfillmentGraph)
-      componentFactorsByLine.set(line.id, new Map([...requirements].map(([productId, factor]) => [productId, toDecimal(factor).toNumber()])))
-      requirementsByLine.set(line.id, requirementsMapToRows(requirements))
+      const requirements = lineFulfillmentRequirements(line, fulfillmentGraph)
+      componentFactorsByLine.set(line.id, new Map(requirements.map((requirement) => [requirement.productId, requirement.factor.toNumber()])))
+      requirementsByLine.set(line.id, requirements.map((requirement) => ({
+        productId: requirement.productId,
+        factor: requirement.factor.toNumber(),
+      })))
     }
 
     const shipmentComponentRows = (orderAccounting?.shipments ?? []).flatMap((shipment) =>

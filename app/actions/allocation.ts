@@ -9,13 +9,18 @@ import { requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { decimalToNumber } from '@/lib/decimal'
-import { requirementsMapToRows, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import {
-  expandFulfillmentRequirementsDecimal,
-  getFulfillmentAvailableQtyDecimal,
-  listFulfillmentLeafProductIds,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+  availableQtyFromRequirements,
+  scaleFulfillmentRequirements,
+  type FulfillmentRequirement,
+} from '@/lib/products/fulfillment-coverage'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import {
+  captureFulfillmentRequirementSnapshot,
+  lineFulfillmentRequirements,
+  parseFulfillmentRequirementSnapshot,
+  selectCapturableLineIds,
+} from '@/lib/products/fulfillment-requirement-snapshot'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
@@ -24,6 +29,7 @@ import {
   applyAllocationReservationDelta,
   buildAvailableStockMap,
   canonicalAllocationQty,
+  clearDormantFulfillmentPinsInTx,
   lockSalesOrder,
   lockStockLevels,
   releaseOrderAllocationsForDeallocationInTx,
@@ -263,7 +269,10 @@ export async function getOrderFulfillmentRequirements(
 
   const lines = await db.salesOrderLine.findMany({
     where: { orderId, productId: { not: null } },
-    select: { id: true, productId: true },
+    // o3d-kouj: the fulfilment panel shows what the order requires, and for an in-flight order that
+    // is the PINNED recipe. Showing the current graph here while the allocator, the picker and the
+    // dispatch cap all use the snapshot would make the screen disagree with the refusal messages.
+    select: { id: true, productId: true, fulfillmentRequirements: true },
   })
 
   const graph = await loadFulfillmentProductGraph(
@@ -273,9 +282,10 @@ export async function getOrderFulfillmentRequirements(
 
   return lines.map((line) => ({
     lineId: line.id,
-    requirements: requirementsMapToRows(
-      expandFulfillmentRequirementsDecimal(line.productId!, 1, graph),
-    ),
+    requirements: lineFulfillmentRequirements(line, graph).map((requirement) => ({
+      productId: requirement.productId,
+      factor: requirement.factor.toNumber(),
+    })),
   }))
 }
 
@@ -707,6 +717,12 @@ export async function updateAllocation(
         userId: session.user.id,
       })
 
+      // o3d-kouj: an edit that took this line's last allocation row away (a reduction to zero, or a
+      // merge that emptied the source) leaves its pin dormant — a recipe that certifies nothing, and
+      // that the next allocation has already decided not to use. Retired here, so no reader is left
+      // answering from it.
+      await clearDormantFulfillmentPinsInTx(tx, locked.orderId)
+
       const integrityError = await validateAllocationIntegrity(tx, locked.orderId, [locked.lineId])
       if (integrityError) throw new Error(integrityError)
     }, STOCK_TX_OPTIONS)
@@ -748,11 +764,89 @@ export async function addAllocation(
     await requirePermission('sales.process')
     if (qty <= 0) return { success: false, error: 'Quantity must be positive' }
 
+    // o3d-kouj: the leaves whose reservedQty this action actually moved, carried OUT of the
+    // transaction for the storefront sync below. Re-deriving them from the current graph afterwards
+    // would miss a component that the line's PINNED recipe requires and the current recipe no longer
+    // mentions — precisely the component whose reservation just changed.
+    const reservedLeafProductIds: string[] = []
+
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
       await resetAllocationAccountingIfStaged(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, [productId])
-      const leafProductIds = listFulfillmentLeafProductIds([productId], graph)
+
+      // o3d-kouj: THE LINE MUST BELONG TO THE ORDER WE LOCKED.
+      //
+      // `lineId` arrives from the caller and nothing above ties it to `orderId`. The lock is taken on
+      // the ORDER, so a lineId belonging to a DIFFERENT order is outside it entirely — and every
+      // in-flight fact this action then reads is scoped to the wrong pair: `orderAllocation` is
+      // queried by `{ orderId, lineId }` and `shipmentLine` by `{ lineId, shipment: { orderId } }`,
+      // so another order's fully-allocated, half-picked line reads as holding NOTHING. It is then
+      // judged capturable, and the capture below OVERWRITES the pinned recipe that order was
+      // allocated and picked against — while the allocation rows written above attach that foreign
+      // line to this order.
+      //
+      // Scoped in the SELECT rather than checked afterwards, so there is no version of this where
+      // the fact is read and the check is forgotten. `findFirst` with both keys: absent means either
+      // no such line or not ours, and the two want the same answer — refuse.
+      const linePinState = await tx.salesOrderLine.findFirst({
+        where: { id: lineId, orderId },
+        select: { id: true, productId: true, fulfillmentRequirements: true },
+      })
+      if (!linePinState) {
+        throw new Error(
+          `Line ${lineId} does not belong to order ${orderId} — refusing to allocate against it. `
+          + 'An allocation is only ever meaningful for a line of the order it is raised on.',
+        )
+      }
+      const [lineAllocations, lineCommittedShipments] = await Promise.all([
+        tx.orderAllocation.findMany({ where: { orderId, lineId }, select: { lineId: true } }),
+        tx.shipmentLine.findMany({
+          where: { lineId, shipment: { orderId, status: { not: 'PENDING' } } },
+          select: { lineId: true },
+        }),
+      ])
+      const lineIsCapturable = selectCapturableLineIds({
+        lineIds: [lineId],
+        lineIdsHoldingAllocations: lineAllocations.map((row) => row.lineId),
+        lineIdsHoldingCommittedShipments: lineCommittedShipments.map((row) => row.lineId),
+      }).length === 1
+      // A capturable line's stored snapshot describes an in-flight life it no longer has, so this
+      // action expands the CURRENT graph for it — which is exactly what the capture below records.
+      //
+      // The product is the CALLER'S `productId`, not the line's, because that is the only product
+      // `graph` was loaded for: resolving against a product the graph does not contain would treat
+      // it as a leaf. The two disagree only if the caller named a product the line does not
+      // reference, and then the pin — captured for the line's own product — simply does not match
+      // and the current graph answers, which is what this action did before o3d-kouj.
+      const resolvableLine = {
+        id: lineId,
+        productId,
+        fulfillmentRequirements: lineIsCapturable ? null : linePinState.fulfillmentRequirements,
+      }
+      const lineRequirements = lineFulfillmentRequirements(resolvableLine, graph)
+
+      // o3d-kouj: THE VERSION THESE ROWS WERE EXPANDED FROM — the pin's, whenever the pin is what
+      // answered.
+      //
+      // The column's meaning is fixed and the same rule `allocateSalesOrder` follows: it records the
+      // graph version the rows came from, never "the version that happens to be current". A pinned
+      // line's rows are expanded from the pin, so stamping the CURRENT version leaves the row
+      // claiming a provenance it does not have — and, worse, certifying itself as current: if the
+      // pin were ever lost, the CAS (which is skipped per line while a pin exists) would come back
+      // and find a row that agrees with a recipe it was never expanded from.
+      //
+      // `parseFulfillmentRequirementSnapshot` re-reads the same payload `lineFulfillmentRequirements`
+      // just resolved through, and it is pure — so the two cannot disagree — and the productId test
+      // is the same one the seam applies, because a pin for a different product did not answer here.
+      const activePin = lineIsCapturable
+        ? null
+        : parseFulfillmentRequirementSnapshot(linePinState.fulfillmentRequirements, lineId)
+      const expansionGraphVersion = activePin && activePin.productId === productId
+        ? activePin.graphVersion
+        : graph.get(productId)?.fulfillmentGraphVersion ?? 0
+
+      const leafProductIds = lineRequirements.map((requirement) => requirement.productId)
       await lockStockLevels(tx, leafProductIds, [warehouseId])
 
       const stockLevels = await tx.stockLevel.findMany({
@@ -765,7 +859,7 @@ export async function addAllocation(
       if (requestedQty.lte(0)) {
         throw new Error('Quantity must be at least 0.0001 — allocations are stored to four decimal places')
       }
-      const avail = getFulfillmentAvailableQtyDecimal(productId, warehouseId, graph, stockMap)
+      const avail = availableQtyFromRequirements(lineRequirements, warehouseId, stockMap)
       if (requestedQty.gt(avail)) throw new Error(`Only ${avail.toString()} available`)
       // o3d-4kfh r7: EVERY LEAF QUANTISED, once, here — the single point the rest of this action
       // reads. A KIT expansion multiplies by component factors, so even a whole-number kit quantity
@@ -780,7 +874,7 @@ export async function addAllocation(
       // committing a set the checks disagree with (o3d-i4qd — the atomic per-set canonicalisation
       // is that issue, not this one).
       const requirements = new Map(
-        [...expandFulfillmentRequirementsDecimal(productId, requestedQty, graph)]
+        [...scaleFulfillmentRequirements(lineRequirements, requestedQty)]
           .map(([leafProductId, requiredQty]) => [leafProductId, canonicalAllocationQty(requiredQty)] as const),
       )
 
@@ -814,14 +908,16 @@ export async function addAllocation(
               warehouseId,
               qty: requiredQty,
               // o3d-4kfh r6: stamp the graph version this expansion came from, out of the SAME
-              // statement that loaded the components (`loadFulfillmentProductGraph` above).
+              // statement that loaded the components (`loadFulfillmentProductGraph` above) — or,
+              // for a pinned line, the version the PIN records, because the pin is what the
+              // expansion came from (o3d-kouj, see `expansionGraphVersion`).
               //
               // The `update` branch above deliberately leaves an existing row's stamp alone. If
               // that stamp is stale the whole row stays stale, `validateAllocationIntegrity` below
               // refuses this action, and the operator is told to re-allocate — which is right:
               // re-stamping a row we only ADDED to would bless the part of it that was expanded
               // from a recipe that no longer exists.
-              fulfillmentGraphVersion: graph.get(productId)?.fulfillmentGraphVersion ?? 0,
+              fulfillmentGraphVersion: expansionGraphVersion,
             },
           })
         }
@@ -834,6 +930,35 @@ export async function addAllocation(
       // Reserving the in-memory figure instead is what leaves `reservedQty` and `OrderAllocation`
       // two books that disagree — and the reconciliation of that disagreement is what takes units
       // out of another order's share of the shared (product, warehouse) aggregate.
+      // o3d-kouj: pin the recipe now that this line holds rows. Written from the SAME graph the rows
+      // above were expanded from, in the same transaction and under the same order lock.
+      //
+      // Only when the caller's product IS the line's product. `graph` was loaded for the caller's
+      // product, so that is the only thing this transaction can honestly capture — and a snapshot
+      // recorded under a product the line does not reference is not a pin at all: every reader would
+      // see the mismatch, warn, and fall back to the live graph, leaving the line unprotected while
+      // its row claims otherwise. Better to leave it unpinned, which is exactly what it was.
+      const pinnableProduct = productId === linePinState.productId
+      if (lineIsCapturable && requirements.size > 0 && pinnableProduct) {
+        await tx.salesOrderLine.update({
+          where: { id: lineId },
+          data: {
+            fulfillmentRequirements: captureFulfillmentRequirementSnapshot(
+              resolvableLine.productId,
+              graph,
+            ) as never,
+          },
+        })
+      } else if (lineIsCapturable && requirements.size > 0) {
+        console.warn(
+          `[allocation] manual allocation on line ${lineId} named product ${productId} but the line `
+          + `references ${linePinState.productId ?? '(none)'} — the line was left unpinned rather than `
+          + 'stamped with a recipe that is not about it.',
+        )
+      }
+
+      reservedLeafProductIds.push(...requirements.keys())
+
       const writtenRows = await tx.orderAllocation.findMany({
         where: { lineId, warehouseId, productId: { in: [...requirements.keys()] } },
         select: { productId: true, qty: true },
@@ -854,9 +979,7 @@ export async function addAllocation(
 
     revalidatePath(`/sales/${orderId}`)
     try {
-      const graph = await loadFulfillmentProductGraph(db, [productId])
-      const syncTargets = [...new Set(listFulfillmentLeafProductIds([productId], graph))]
-      await enqueueStockSync(syncTargets, 'IMS_CHANGE')
+      await enqueueStockSync([...new Set(reservedLeafProductIds)], 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }

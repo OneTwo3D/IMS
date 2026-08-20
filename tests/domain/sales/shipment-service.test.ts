@@ -20,7 +20,17 @@ type Order = {
   shippedAt?: Date | null
   trackingNumber?: string | null
 }
-type OrderLine = { id: string; orderId: string; productId: string; qty: number; sku: string; description: string; cogsBase?: number | null }
+type OrderLine = {
+  id: string
+  orderId: string
+  productId: string
+  qty: number
+  sku: string
+  description: string
+  cogsBase?: number | null
+  /** o3d-kouj: the line's PINNED fulfilment recipe; undefined is the NULL of a never-allocated line. */
+  fulfillmentRequirements?: unknown
+}
 type Allocation = {
   id?: string
   orderId: string
@@ -198,6 +208,10 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           qty: line.qty,
           sku: line.sku,
           description: line.description,
+          // o3d-kouj: the pinned recipe the dispatch cap and the build-time refund netting are now
+          // judged against. Answered from the SAME rows the fixture declares, so a test can pin a
+          // line to a recipe the catalogue no longer has.
+          fulfillmentRequirements: line.fulfillmentRequirements ?? null,
           product: {
             fulfillmentGraphVersion:
               state.lineProductGraphVersions?.[line.productId] ?? state.graphVersions?.[line.productId] ?? 0,
@@ -205,7 +219,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         })),
       update: async ({ where, data }: { where: { id: string }; data: { cogsBase?: number | null } }) => {
         const line = state.lines.find((row) => row.id === where.id)
-        if (line) line.cogsBase = data.cogsBase
+        if (line && 'cogsBase' in data) line.cogsBase = data.cogsBase
       },
     },
     product: {
@@ -1761,4 +1775,77 @@ test('o3d-4kfh r6 (finding 4): the discard REFUSES on an order that is not cance
   )
   assert.deepEqual(state.shipments.map((row) => row.id), ['ship-packed'])
   assert.equal(state.activityLogs?.length, 0)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kouj — THE DISPATCH CAP IS JUDGED AGAINST THE RECIPE THE ORDER WAS ALLOCATED FROM.
+//
+// The cap is `ordered − refunded − already-shipped`, expanded to leaf units. Expanding the CURRENT
+// graph made a component-count REDUCTION wedge a legitimate packed shipment: the units are on the
+// pallet, the allocation rows and the shipment lines agree with each other, and the only thing that
+// changed is a catalogue row. The o3d-2uh worked example runs the other way (an increase lets a
+// refunded kit ship); both are the same mistake, and the pin removes both.
+// ---------------------------------------------------------------------------
+
+/** A pinned 1-kit-needs-2-of-A recipe, as `allocateSalesOrder` would have written it. */
+const PINNED_KIT_2A = {
+  version: 1,
+  productId: 'kit-1',
+  graphVersion: 4,
+  capturedAt: '2026-08-01T00:00:00.000Z',
+  requirements: [{ productId: 'comp-a', factor: '2' }],
+}
+
+/** 2 kits ordered, allocated and PACKED at 4 x comp-a. The live recipe now says 1 x comp-a. */
+function reducedKitState(options: { pinned: boolean }) {
+  return baseState({
+    lines: [{
+      id: 'line-1',
+      orderId: 'order-1',
+      productId: 'kit-1',
+      qty: 2,
+      sku: 'KIT-1',
+      description: 'Kit 1',
+      fulfillmentRequirements: options.pinned ? PINNED_KIT_2A : undefined,
+    }],
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 1, sku: 'COMP-A' }] },
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'comp-a', warehouseId: 'warehouse-1', qty: 4 }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-a', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'comp-a', qty: 4 }],
+    stockLevels: [{ productId: 'comp-a', warehouseId: 'warehouse-1', quantity: 4, reservedQty: 4 }],
+    costLayers: [{ id: 'layer-a', productId: 'comp-a', warehouseId: 'warehouse-1', remainingQty: 4, unitCostBase: 5 }],
+  })
+}
+
+test('o3d-kouj: a kit re-composed SMALLER after packing no longer wedges the packed shipment', async () => {
+  const state = reducedKitState({ pinned: true })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true, 'the pinned line still ordered 4 component units, and 4 are packed')
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+  assert.equal(state.stockLevels[0].quantity, 0, 'and the goods actually left')
+  assert.equal(state.stockLevels[0].reservedQty, 0)
+})
+
+test('o3d-kouj: the same shipment WITHOUT a pin is still measured against the catalogue, and is refused', async () => {
+  // The pre-snapshot behaviour, kept for every line that has never been allocated since the column
+  // shipped. The refusal names the exact wedge: 4 packed against 2 "ordered" leaf units.
+  const state = reducedKitState({ pinned: false })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.equal(
+    (result as { error: string }).error,
+    'Shipment quantity for line KIT-1 exceeds ordered quantity. Reload and retry.',
+  )
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 4, 'nothing moved')
 })
