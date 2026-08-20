@@ -1903,4 +1903,119 @@ test('o3d-0i5y r11: the record lock is taken BEFORE the first allocation-row wri
   assert.ok(lockIndex < firstRowWrite, 'the lock comes first, so nothing can revalue the base between the two')
   const orderLock = state.txCalls.findIndex((call) => call.includes('sales_orders') && call.includes('FOR UPDATE'))
   assert.ok(orderLock >= 0 && orderLock < lockIndex, 'and the ORDER lock still comes before it — one ordering, unchanged')
+
+// ---------------------------------------------------------------------------
+// o3d-i4qd — THE INTEGRITY CHECKS MUST NOT REFUSE THE ROWS THE ALLOCATOR JUST WROTE.
+//
+// `OrderAllocation.qty` is `Decimal(12,4)` and a KIT requirement is a PRODUCT of `Decimal(12,4)`
+// factors, so the requirement is routinely NOT representable: 0.5 kits of a 0.3333 component is
+// 0.16665 and the column holds 0.1667. Both arms of `validateAllocationIntegrity` compared a
+// quantity the column had rounded against a coverage derived by dividing that rounded quantity by
+// the UNROUNDED factor, and refused. The refusal lands at shipment confirmation, so the order was
+// allocated and could never be picked.
+
+function allocationFor(productId: string): AllocationRow | undefined {
+  return state.allocations.find((row) => row.orderId === 'order-1' && row.productId === productId)
+}
+
+test('o3d-i4qd: a fractional KIT allocated to exactly its line is not "over-allocated"', async () => {
+  // One component at 0.3333, 0.5 kits ordered and 0.5 kits allocated. The row rounds UP to 0.1667,
+  // so the inferred coverage is 0.50015 against a remaining quantity of 0.5 — 0.00015 over, which
+  // is 150x the 1e-6 epsilon. That is the column's own rounding, not an over-allocation.
+  seedLines(0.5)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 0.3333 }] }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 }]
+  state.allocations = []
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 0.5)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(allocationFor('component-1')?.qty, 0.1667, 'round(0.5 x 0.3333, 4)')
+  assert.equal(reservedAt('warehouse-1'), 0.1667, 'and the reservation follows the persisted row')
+})
+
+test('o3d-i4qd: a fractional KIT with TWO components keeps "matching quantities"', async () => {
+  // The shape that wedged hardest. One factor the column cannot hold beside one it can:
+  // 0.5 kits -> component-1 = 0.16665 stored as 0.1667, component-2 = 0.5 exactly. Inferring one
+  // coverage from the exact component (0.5) and multiplying it back out expects 0.16665, sees
+  // 0.1667, and refuses a set that is as proportional as `Decimal(12,4)` permits.
+  seedLines(0.5)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1' }]
+  state.kits = {
+    'kit-1': [{ componentId: 'component-1', qty: 0.3333 }, { componentId: 'component-2', qty: 1 }],
+  }
+  state.stockLevels = [
+    { productId: 'component-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 },
+    { productId: 'component-2', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 },
+  ]
+  state.allocations = []
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 0.5)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(allocationFor('component-1')?.qty, 0.1667)
+  assert.equal(allocationFor('component-2')?.qty, 0.5)
+})
+
+test('o3d-i4qd: a genuinely disproportionate KIT set is STILL refused, by name', async () => {
+  // The regression guard for the permissiveness the fix buys. A kit re-composed from 2xA + 1xB to
+  // 2xA + 2xB leaves rows of A=2 / B=1: the coverage bands are [0.999975, 1.000025) and
+  // [0.499975, 0.500025), which share nothing. Half a kit, and it must not pass.
+  seedLines(1)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1' }]
+  state.kits = {
+    'kit-1': [{ componentId: 'component-a', qty: 2 }, { componentId: 'component-b', qty: 2 }],
+  }
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-a', warehouseId: 'warehouse-1', qty: 2 },
+    { id: 'alloc-b', orderId: 'order-1', lineId: 'line-1', productId: 'component-b', warehouseId: 'warehouse-1', qty: 1 },
+  ]
+  state.shipmentLines = []
+  const { validateAllocationIntegrity } = await import('@/lib/domain/sales/allocation-service')
+
+  const error = await validateAllocationIntegrity(tx as never, 'order-1')
+
+  assert.equal(error, 'Allocation for sales line KIT-1 in warehouse warehouse-1 must keep bundle components in matching quantities')
+})
+
+test('o3d-i4qd: a MISSING component is still an incomplete set, not a rounding band', async () => {
+  // The other regression guard: the proportionality band must not absorb a component that is
+  // simply absent. Zero of component-b is coverage zero, and the completeness arm owns that
+  // message — the band test must not reach it first with a different one.
+  seedLines(1)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 1, sku: 'KIT-1' }]
+  state.kits = {
+    'kit-1': [{ componentId: 'component-a', qty: 2 }, { componentId: 'component-b', qty: 2 }],
+  }
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-a', warehouseId: 'warehouse-1', qty: 2 },
+  ]
+  state.shipmentLines = []
+  const { validateAllocationIntegrity } = await import('@/lib/domain/sales/allocation-service')
+
+  const error = await validateAllocationIntegrity(tx as never, 'order-1')
+
+  assert.equal(error, 'Allocation for sales line KIT-1 in warehouse warehouse-1 does not contain a complete component set')
+})
+
+test('o3d-i4qd: real over-allocation of a fractional KIT is still refused', async () => {
+  // The slack on the remaining-quantity comparison is `halfUlp / smallestFactor` per warehouse
+  // group plus one — about 0.0003 kits here. A whole extra kit is four thousand times that.
+  seedLines(0.5)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 0.5, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 0.3333 }] }
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 0.5 },
+  ]
+  state.shipmentLines = []
+  const { validateAllocationIntegrity } = await import('@/lib/domain/sales/allocation-service')
+
+  const error = await validateAllocationIntegrity(tx as never, 'order-1')
+
+  assert.equal(error, 'Allocation for sales line KIT-1 exceeds the remaining quantity to fulfill')
 })

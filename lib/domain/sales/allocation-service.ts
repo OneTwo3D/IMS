@@ -6,6 +6,10 @@ import {
   availableQtyFromRequirements,
   calculateDecimalCoverageByLine,
   calculateDecimalFulfillmentCoverage,
+  canonicalFulfillmentQty,
+  findDisproportionateFulfillmentComponent,
+  fulfillmentCoverageQuantisationSlack,
+  requirementsMapToDecimalRows,
   scaleFulfillmentRequirements,
   type DecimalFulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
@@ -66,33 +70,38 @@ const ALLOCATION_EPSILON = 0.000001
 const ALLOCATION_EPSILON_DECIMAL = new Prisma.Decimal('0.000001')
 
 /**
- * The scale `OrderAllocation.qty` is persisted at — `@db.Decimal(12, 4)` (o3d-4kfh r6, Codex
- * finding 2).
+ * Quantise `OrderAllocation.qty` to the scale it is persisted at, with the SAME rounding Postgres
+ * `numeric(12,4)` applies on write (half-up). One name for the whole chain: see
+ * {@link FULFILLMENT_QTY_DP}, which `ShipmentLine.qty`, `SalesOrderLine.qty` and
+ * `ProductComponent.qty` share.
  *
- * THE ONE CANONICAL REPRESENTATION. Everything downstream reads the PERSISTED row: the reservation
- * residual, `confirmSalesOrderShipments`, the draft reconciler, the accounting sub-ledger and the
- * `stock_reserved_source_mismatch` census. So a computed quantity the column cannot hold is not a
- * quantity IMS has — it is a quantity IMS is about to round. Deciding equality, feasibility, the
- * release and the reserve against three different renderings of "the same" number is what let
- * reservedQty and the rows disagree by 0.00002 per fractional-KIT run.
- */
-const ALLOCATION_QTY_DP = 4
-
-/**
- * Quantise to the persisted scale, with the SAME rounding Postgres `numeric(12,4)` applies on write
- * (half-up). Not a floor and not a truncation: flooring each row independently breaks the KIT
- * proportionality invariant (`validateAllocationIntegrity` enforces it to 1e-6) and — worse —
- * disagrees with what the column would have stored anyway, which is the divergence being removed.
+ * THE ONE CANONICAL REPRESENTATION (o3d-4kfh r6, Codex finding 2). Everything downstream reads the
+ * PERSISTED row: the reservation residual, `confirmSalesOrderShipments`, the draft reconciler, the
+ * accounting sub-ledger and the `stock_reserved_source_mismatch` census. So a computed quantity the
+ * column cannot hold is not a quantity IMS has — it is a quantity IMS is about to round. Deciding
+ * equality, feasibility, the release and the reserve against three different renderings of "the
+ * same" number is what let reservedQty and the rows disagree by 0.00002 per fractional-KIT run.
  *
- * This does NOT fix o3d-i4qd. Rounding half-up can still land a row fractionally above the
- * availability the allocator proved, and with the reserve now taken from the persisted value that
- * over-claim reaches `reservedQty` as well as the row instead of only the row. That is a deliberate
- * trade: an over-claim of at most half an ulp that the row and the reservation AGREE about is
- * recoverable and visible to the census, whereas a disagreement between them silently consumed
- * another order's reservation on every subsequent rewrite.
+ * Not a floor and not a truncation: flooring each row independently breaks the KIT proportionality
+ * invariant, and disagrees with what the column would have stored anyway.
+ *
+ * o3d-i4qd — WHAT THIS DOES AND DOES NOT SETTLE. It settles the WRITE: the row, the reservation
+ * delta and the unchanged-set comparison are now one number. It does NOT make the requirement
+ * representable, and nothing can: 0.5 kits of a 0.3333 component is 0.16665 and the column holds
+ * four decimals. So every READER that compares a computed requirement against a stored quantity
+ * must quantise its own side too — `findDisproportionateFulfillmentComponent`,
+ * `fulfillmentCoverageQuantisationSlack` and `selectOrdersNeedingAllocation` are the three places
+ * that do, and before they did, a fractional kit was refused at dispatch by the very rows this
+ * function wrote.
+ *
+ * The residual it keeps: rounding half-up can land a row at most half an ulp ABOVE the availability
+ * the allocator proved, and the reserve now follows the row. That is a deliberate trade — an
+ * over-claim the row and the reservation AGREE about is recoverable and visible to the census,
+ * whereas a disagreement between them silently consumed another order's reservation on every
+ * subsequent rewrite.
  */
 export function canonicalAllocationQty(qty: DecimalInput): Prisma.Decimal {
-  return roundQuantity(qty, ALLOCATION_QTY_DP)
+  return canonicalFulfillmentQty(qty)
 }
 
 export type AllocationServiceClient = Prisma.TransactionClient | typeof db
@@ -2288,13 +2297,15 @@ export function findUncoveredCommittedShipment(
       }
     }
 
-    const committedCoverage = calculateDecimalFulfillmentCoverage(requirements, quantities)
-    for (const requirement of requirements) {
-      const actualQty = quantities.get(requirement.productId) ?? new Prisma.Decimal(0)
-      const expectedQty = committedCoverage.mul(requirement.factor)
-      if (actualQty.sub(expectedQty).abs().gt(ALLOCATION_EPSILON_DECIMAL)) {
-        return `Shipments for sales line ${label} in warehouse ${warehouseId} do not commit a complete component set`
-      }
+    // o3d-i4qd: judged at the PERSISTED scale. `ShipmentLine.qty` is `Decimal(12,4)` and these
+    // rows were built from allocation rows at the same scale, so a kit whose expanded requirement
+    // is not representable at four decimals (0.5 kits of a 0.3333 component -> 0.16665, stored as
+    // 0.1667) is NOT exactly proportional to any coverage and never can be. The old
+    // `coverage * factor` comparison to 1e-6 refused exactly those sets — at dispatch, after the
+    // goods were picked and packed.
+    const breach = findDisproportionateFulfillmentComponent(requirements, quantities)
+    if (breach) {
+      return `Shipments for sales line ${label} in warehouse ${warehouseId} do not commit a complete component set`
     }
   }
 
@@ -2410,8 +2421,11 @@ export function findStaleFulfillmentGraphAllocation(
  *
  * NOT solved here, and not claimed to be: this path still takes no lock against graph writers, so
  * an edit committing AFTER the graph load's verify read is invisible to the whole transaction. That
- * is the serialization gap filed as o3d-57b0 and described in the component-graph guard's
- * docstring. Nor is the CAS a whole-graph CAS — the stamp is still the ROOT's single `Int`, so a
+ * is the serialization gap filed as o3d-57b0 — and it will NOT be closed with a lock: the per-line
+ * immutable fulfilment-requirement snapshot (o3d-kouj) removes the question instead of answering
+ * it, because a line that carries the requirements it was allocated against no longer cares what
+ * the current graph says. See `loadFulfillmentProductGraph` for the full reasoning. Nor is the
+ * CAS a whole-graph CAS — the stamp is still the ROOT's single `Int`, so a
  * descendant edit is caught only because `bumpFulfillmentGraphVersions` walks up to the root; the
  * per-node version set is validated inside the loader, not persisted onto the allocation rows. What
  * r7 and r8 removed are the two AVOIDABLE windows inside our own read sequence: the third snapshot
@@ -2643,12 +2657,14 @@ export async function validateAllocationIntegrity(
         return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} does not contain a complete component set`
       }
 
-      for (const requirement of requirements) {
-        const actualQty = quantities.get(requirement.productId) ?? new Prisma.Decimal(0)
-        const expectedQty = coverage.mul(requirement.factor)
-        if (actualQty.sub(expectedQty).abs().gt(ALLOCATION_EPSILON_DECIMAL)) {
-          return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} must keep bundle components in matching quantities`
-        }
+      // o3d-i4qd: judged at the PERSISTED scale — see
+      // `findDisproportionateFulfillmentComponent`. `coverage.mul(factor)` compared to 1e-6 asked
+      // the rows to be exactly proportional to a coverage inferred by dividing a ROUNDED quantity
+      // by an UNROUNDED factor, which a fractional kit can never satisfy; this refused allocations
+      // `allocateSalesOrder` had just written, and refused them at shipment confirmation, leaving
+      // the order allocated and unpickable for the rest of its life.
+      if (findDisproportionateFulfillmentComponent(requirements, quantities)) {
+        return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} must keep bundle components in matching quantities`
       }
 
       for (const productId of quantities.keys()) {
@@ -2674,7 +2690,15 @@ export async function validateAllocationIntegrity(
 
     const committedCoverage = committedByLine.get(line.id) ?? new Prisma.Decimal(0)
     const remainingQty = Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(committedCoverage))
-    if (openCoverage.sub(remainingQty).abs().gt(ALLOCATION_EPSILON_DECIMAL) && openCoverage.gt(remainingQty)) {
+    // o3d-i4qd: BOTH sides here are coverages inferred by dividing a quantity stored at
+    // `Decimal(12,4)` by an unquantised factor, so each carries up to `halfUlp / smallestFactor`
+    // of error — one band per warehouse group summed into `openCoverage`, plus one for the
+    // committed coverage netted out of `remainingQty`. Without that allowance a component the
+    // COLUMN rounded up (0.16665 -> 0.1667) reads as coverage 0.50015 against a remaining 0.5 and
+    // the order is refused as over-allocated. Only an EXCESS is an error; a shortfall is ordinary
+    // partial allocation, which is why the comparison is one-sided.
+    const coverageSlack = fulfillmentCoverageQuantisationSlack(requirements).mul(byWarehouse.size + 1)
+    if (openCoverage.sub(remainingQty).gt(ALLOCATION_EPSILON_DECIMAL.add(coverageSlack))) {
       return `Allocation for sales line ${line.sku ?? line.description} exceeds the remaining quantity to fulfill`
     }
   }
@@ -2708,10 +2732,12 @@ function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
  * mutating reservations at another is precisely the mismatch that made an earlier version of this
  * check unreliable, so it must not quietly absorb a difference (o3d-i4qd).
  *
- * The consequence is that a computed quantity the column cannot represent exactly — a nested KIT's
- * 0.11102224 against its persisted 0.1110 — reports as a CHANGE, so the short-circuit does not fire
- * and that order keeps being rewritten. That is the pre-existing behaviour and is tracked as
- * o3d-i4qd; the fix belongs in how the set is canonicalised, not in loosening this comparison.
+ * Exactness is affordable only because BOTH sides are at the persisted scale by the time they get
+ * here: `existing` comes from the column and `next` has been through `canonicalAllocationQty`.
+ * While it was fed the raw computed set, a nested KIT's 0.11102224 differed from its own persisted
+ * 0.1110 on every run, the short-circuit never fired for exactly the orders that churn worst, and
+ * each rewrite leaked ~0.000022 into reservedQty (o3d-i4qd). The answer was to canonicalise the
+ * set, never to loosen this comparison.
  *
  * Decimal.eq rather than `===` because two Decimals of equal value can differ in representation.
  *
@@ -3152,29 +3178,32 @@ export async function allocateSalesOrder(
       }
     }
 
-    // NOT canonicalised to the persisted scale here — three attempts at that failed, and the
-    // reasons are worth keeping (o3d-i4qd):
+    // NOT canonicalised HERE, per row (o3d-i4qd). The quantisation happens ONCE, on the MERGED
+    // set below, and the reasons the per-row alternatives were rejected are worth keeping:
     //
-    //   - ROUND_HALF_UP rounds UP, but feasibility was decided against the UNROUNDED value, so
-    //     the row can claim more than was proven available: a 0.999960 residual becomes 1.0000
-    //     and violates the reservedQty <= quantity constraint.
+    //   - rounding a row before the merge accumulates a rounding error per contribution, so a
+    //     scope fed by two warehouse passes ends up a full ulp away from its own total.
     //   - flooring each row INDEPENDENTLY breaks the KIT invariant. Components of one kit are a
-    //     COUPLED, proportional set, and validateAllocationIntegrity enforces that to 1e-6.
-    //     Flooring 0.11108889 -> 0.1110 while 0.3333 stays exact makes the two disagree about
-    //     how many kits they represent, and shipment confirmation then refuses the order with
-    //     "must keep bundle components in matching quantities". Excluding a sub-scale component
-    //     while keeping its siblings is the same corruption by another route.
+    //     COUPLED, proportional set. Flooring 0.11108889 -> 0.1110 while a sibling's 0.3333 stays
+    //     exact makes the two disagree about how many kits they represent, and excluding a
+    //     sub-scale component while keeping its siblings is the same corruption by another route:
+    //     the survivors are persisted AND reserved, the set is incomplete, and the order is
+    //     ALLOCATED but can never dispatch.
     //
-    // Doing it correctly means canonicalising each (line, warehouse) fulfilment set ATOMICALLY:
-    // derive one representable coverage, regenerate every component from it, verify integrity
-    // BEFORE persisting, and drop the whole set — reserving none of it — if no proportional
-    // representation exists. That is o3d-i4qd, and it is a redesign rather than a rounding call.
+    // THE REQUIREMENT ITSELF IS OFTEN NOT REPRESENTABLE, and no rounding policy changes that:
+    // 0.5 kits of a 0.3333 component is 0.16665 and the column holds four decimals. That is why
+    // the fix is not only here. The WRITE is canonical (below), and every READER that compares a
+    // computed requirement against a stored quantity now quantises its own side to match —
+    // `findDisproportionateFulfillmentComponent` at both integrity seams,
+    // `fulfillmentCoverageQuantisationSlack` on the remaining-quantity test, and
+    // `selectOrdersNeedingAllocation` in component units. Before that, the rows this function
+    // wrote were refused by the checks run over them: perpetual re-selection by the sweep, and —
+    // for any kit with two or more components — "must keep bundle components in matching
+    // quantities" at shipment confirmation, leaving the order allocated and unpickable.
     //
-    // Leaving it unrounded is the PRE-EXISTING behaviour: the column rounds on write, so the
-    // reservation drift o3d-i4qd describes remains, and the unchanged-set check below simply does
-    // not fire for a nested KIT whose expanded factor is unrepresentable. Both are unchanged from
-    // before this branch — no new breakage, and the short-circuit still fires for every ordinary
-    // line, which is the overwhelming majority.
+    // What is still NOT done, and is deliberately left: feasibility is decided against the
+    // UNROUNDED value, so a half-up round can land a row at most half an ulp above the
+    // availability that was proven. See `canonicalAllocationQty`.
 
     // The OUTSTANDING allocation: demand this run still had to place, and therefore the only part
     // of the persisted set the allocator was free to choose. The backorder report and the status

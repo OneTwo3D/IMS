@@ -46,6 +46,42 @@ export type FulfillmentGraphNode = {
  */
 const MAX_FULFILLMENT_GRAPH_LOAD_ATTEMPTS = 3
 
+/**
+ * How many levels of KIT NESTING the walk will follow below the roots (o3d-57b0, carried in from
+ * o3d-ryyd).
+ *
+ * WHY A CAP AT ALL. The walk issues one `product.findMany` PER LEVEL and had no bound. Since the
+ * verify-and-re-walk loop above it can run three times, and it runs UNDER THE SALES ORDER LOCK that
+ * allocation and dispatch serialise on, an accidentally deep component graph is an unbounded query
+ * fan-out held inside the lock every other order is waiting behind. `graph.has()` stops it looping
+ * forever on a cycle; it does not stop a hundred round trips on a hundred-deep chain.
+ *
+ * WHY EIGHT. A kit of kits of kits is already unusual; eight levels is far past any real recipe and
+ * still cheap. If a real catalogue ever needs more, raise it deliberately — do not remove it.
+ *
+ * WHAT IT DOES NOT BOUND, stated plainly: `expandFulfillmentRequirementsDecimal` walks the SAME
+ * edges without memoising, so its cost is the number of distinct PATHS, not nodes. A diamond-shaped
+ * graph (many components that are the same kit) is still exponential in the depth this constant
+ * permits. The cap makes that exponent small and finite; it does not make the expansion linear.
+ */
+const MAX_FULFILLMENT_GRAPH_DEPTH = 8
+
+/** Thrown when the component graph nests deeper than {@link MAX_FULFILLMENT_GRAPH_DEPTH}. */
+export class FulfillmentGraphDepthError extends Error {
+  readonly productIds: string[]
+
+  constructor(productIds: string[]) {
+    super(
+      `The component graph nests more than ${MAX_FULFILLMENT_GRAPH_DEPTH} levels of KIT below the `
+      + `products being expanded (reached at ${productIds.join(', ')}). Refusing rather than holding `
+      + 'the sales order lock open for an unbounded number of queries. Flatten the kit structure, or '
+      + 'raise MAX_FULFILLMENT_GRAPH_DEPTH deliberately if the catalogue really is this deep.',
+    )
+    this.name = 'FulfillmentGraphDepthError'
+    this.productIds = productIds
+  }
+}
+
 /** Thrown when the graph could not be read as ONE consistent snapshot. Fail-closed, never silent. */
 export class FulfillmentGraphSnapshotError extends Error {
   readonly movedProductIds: string[]
@@ -136,6 +172,10 @@ export class FulfillmentGraphSnapshotError extends Error {
  * since o3d-kouj shipped — the window above is exactly as open as it was, and the CAS still runs
  * for those lines. It is skipped per line, not switched off; see
  * `findStaleFulfillmentGraphAllocation`.
+ *
+ * What o3d-57b0's subsumption did NOT cover, and is done here, is the DEPTH BOUND — see
+ * {@link MAX_FULFILLMENT_GRAPH_DEPTH}. That defect is about how long this walk holds the order
+ * lock, which no snapshot design changes, and it gets WORSE under any fix that coarsens the lock.
  */
 export async function loadFulfillmentProductGraph(
   client: FulfillmentClient,
@@ -186,11 +226,15 @@ async function walkFulfillmentProductGraph(
 ): Promise<Map<string, FulfillmentGraphNode>> {
   const graph = new Map<string, FulfillmentGraphNode>()
   const queue = [...roots]
+  // Level 0 is the roots themselves, so the cap counts NESTING below them.
+  let depth = 0
 
   while (queue.length > 0) {
     const batch = queue.filter((id) => !graph.has(id))
     queue.length = 0
     if (batch.length === 0) continue
+    if (depth > MAX_FULFILLMENT_GRAPH_DEPTH) throw new FulfillmentGraphDepthError(batch)
+    depth += 1
 
     const rows = await client.product.findMany({
       where: { id: { in: batch } },

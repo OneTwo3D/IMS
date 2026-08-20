@@ -11,6 +11,7 @@ import {
   runInventoryInvariantReport,
   type InventoryInvariantFinding,
   type InventoryInvariantRows,
+  type InventoryInvariantShipmentLineRow,
   type InventoryInvariantSqlClient,
 } from '@/lib/domain/inventory/invariants'
 
@@ -1995,4 +1996,250 @@ test('o3d-4kfh r3: the committed-coverage census does not run on a half-collecte
       false,
     )
   }
+})
+
+// ---------------------------------------------------------------------------
+// o3d-aqke — THE KIT HALF OF THE COMMITTED-COVERAGE CENSUS.
+//
+// `allocation_committed_shipment_uncovered` is flat: per (lineId, warehouseId, productId). A kit
+// committed as 2xA + 1xB against a 2xA + 2xB recipe is covered on every one of those pairs and is
+// still half a kit. The transition seams refuse it; the SWEEP reported nothing.
+
+type CensusShipmentLine = {
+  lineId: string
+  productId: string
+  sku: string
+  qty: number
+  status: string
+  warehouseId: string
+  orderId: string
+  lineProductId: string
+  lineSku: string
+  lineProductType?: 'KIT' | 'SIMPLE'
+}
+
+/**
+ * The double answers the two reads the census makes, and HONOURS both filters production relies on
+ * — non-PENDING, and "the sales line's product is a KIT". Those filters are the entire reason an
+ * unpaged read is affordable, so a double that ignored them would leave the scoping untested and
+ * make the census look cheaper than it is.
+ */
+function kitCensusClient(input: {
+  shipmentLines: CensusShipmentLine[]
+  kits: Record<string, Array<{ componentId: string; qty: number }>>
+  onGraphRead?: () => void
+}) {
+  const seenWhere: unknown[] = []
+  const client = {
+    shipmentLine: {
+      findMany: async ({ where }: {
+        where: {
+          shipment: { status: { not: string }; warehouseId?: string }
+          line: { product: { type: string } }
+        }
+      }) => {
+        seenWhere.push(where)
+        return input.shipmentLines
+          .filter((line) => line.status !== where.shipment.status.not)
+          .filter((line) => where.shipment.warehouseId == null || line.warehouseId === where.shipment.warehouseId)
+          .filter((line) => (line.lineProductType ?? 'KIT') === where.line.product.type)
+          .map((line) => ({
+            lineId: line.lineId,
+            productId: line.productId,
+            qty: line.qty,
+            product: { sku: line.sku },
+            line: { productId: line.lineProductId, sku: line.lineSku, description: line.lineSku },
+            shipment: { orderId: line.orderId, warehouseId: line.warehouseId },
+          }))
+      },
+    },
+    product: {
+      findMany: async ({ where, select }: { where: { id: { in: string[] } }; select: Record<string, unknown> }) => {
+        input.onGraphRead?.()
+        return where.id.in.flatMap((id) => {
+          const components = input.kits[id]
+          if (!('productComponents' in select)) return [{ id, fulfillmentGraphVersion: 0 }]
+          return [{
+            id,
+            type: components ? 'KIT' : 'SIMPLE',
+            fulfillmentGraphVersion: 0,
+            productComponents: (components ?? []).map((component, index) => ({
+              componentId: component.componentId,
+              qty: component.qty,
+              component: { sku: component.componentId.toUpperCase(), type: 'SIMPLE', oversellAllowed: false },
+              sortOrder: index,
+            })),
+          }]
+        })
+      },
+    },
+  }
+  return { client, seenWhere }
+}
+
+const committedKitLine = (overrides: Partial<CensusShipmentLine>): CensusShipmentLine => ({
+  lineId: 'line-1',
+  productId: 'comp-a',
+  sku: 'COMP-A',
+  qty: 2,
+  status: 'PICKING',
+  warehouseId: 'warehouse-1',
+  orderId: 'order-1',
+  lineProductId: 'kit-1',
+  lineSku: 'KIT-1',
+  ...overrides,
+})
+
+test('o3d-aqke: a committed KIT set that is half a kit is reported by the census', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 2 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', sku: 'COMP-A', qty: 2 }),
+      committedKitLine({ productId: 'comp-b', sku: 'COMP-B', qty: 1 }),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].code, 'allocation_committed_kit_disproportionate')
+  assert.equal(findings[0].severity, 'critical')
+  assert.equal(findings[0].productId, 'comp-b', 'comp-b is the short one: 1 committed where 2 are required')
+  assert.equal(findings[0].warehouseId, 'warehouse-1')
+  assert.deepEqual(
+    (findings[0].details as { components: unknown[] }).components,
+    [
+      { productId: 'comp-a', sku: 'COMP-A', requiredPerKit: '2', committedQty: 2 },
+      { productId: 'comp-b', sku: 'COMP-B', requiredPerKit: '2', committedQty: 1 },
+    ],
+  )
+})
+
+test('o3d-aqke: a fractional KIT the column rounded is NOT reported (o3d-i4qd)', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  // 0.5 kits of (0.3333 x comp-a + 1 x comp-b): 0.16665 stored as 0.1667 beside an exact 0.5.
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 0.3333 }, { componentId: 'comp-b', qty: 1 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', sku: 'COMP-A', qty: 0.1667 }),
+      committedKitLine({ productId: 'comp-b', sku: 'COMP-B', qty: 0.5 }),
+    ],
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.deepEqual(findings, [], 'the census must not report what Decimal(12,4) itself rounded')
+})
+
+test('o3d-aqke: the census reads only non-PENDING lines on KIT sales lines', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  let graphReads = 0
+  const { client, seenWhere } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 2 }] },
+    onGraphRead: () => { graphReads += 1 },
+    shipmentLines: [
+      // A PENDING draft is not a commitment, and a SIMPLE line has one requirement of factor 1.
+      committedKitLine({ productId: 'comp-a', qty: 2, status: 'PENDING' }),
+      committedKitLine({ productId: 'comp-b', qty: 1, status: 'PENDING' }),
+      committedKitLine({ lineId: 'line-2', productId: 'simple-1', qty: 5, lineProductType: 'SIMPLE' }),
+    ],
+    ...{},
+  })
+
+  const findings = await collectDisproportionateCommittedKitFindings(client, { warehouseId: 'warehouse-1' })
+
+  assert.deepEqual(findings, [])
+  assert.equal(graphReads, 0, 'no committed kit lines means the graph is never walked at all')
+  assert.deepEqual(seenWhere, [{
+    shipment: { status: { not: 'PENDING' }, warehouseId: 'warehouse-1' },
+    line: { product: { type: 'KIT' } },
+  }])
+})
+
+test('o3d-aqke: a graph the census cannot walk is REPORTED, not thrown', async () => {
+  const { collectDisproportionateCommittedKitFindings } = await import('@/lib/domain/inventory/invariants')
+  const { client } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }] },
+    shipmentLines: [committedKitLine({ productId: 'comp-a', qty: 2 })],
+  })
+  client.product.findMany = async () => { throw new Error('graph is mid-edit') }
+
+  const findings = await collectDisproportionateCommittedKitFindings(client)
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].code, 'allocation_committed_kit_census_unavailable')
+  assert.equal(findings[0].severity, 'warning')
+  assert.equal((findings[0].details as { reason: string }).reason, 'graph is mid-edit')
+})
+
+test('o3d-aqke: runInventoryInvariantReport surfaces the kit census in row mode', async () => {
+  // The wiring, not the pass: a report run the ordinary way must include the finding and count it.
+  const { client: kitClient } = kitCensusClient({
+    kits: { 'kit-1': [{ componentId: 'comp-a', qty: 2 }, { componentId: 'comp-b', qty: 2 }] },
+    shipmentLines: [
+      committedKitLine({ productId: 'comp-a', qty: 2 }),
+      committedKitLine({ productId: 'comp-b', qty: 1 }),
+    ],
+  })
+  const client = {
+    stockLevel: { async findMany() { return [] } },
+    costLayer: { async findMany() { return [] } },
+    stockMovement: { async findMany() { return [] } },
+    shipmentLine: {
+      async findMany(args: { where?: { line?: unknown } }): Promise<InventoryInvariantShipmentLineRow[]> {
+        // The row collector asks for SHIPPED lines; the kit census asks for non-PENDING KIT lines.
+        if (args.where?.line) {
+          return await kitClient.shipmentLine.findMany(args as never) as unknown as InventoryInvariantShipmentLineRow[]
+        }
+        return []
+      },
+    },
+    product: kitClient.product,
+  }
+
+  const report = await runInventoryInvariantReport({ client })
+
+  assert.equal(report.summary.total, 1)
+  assert.equal(report.summary.critical, 1)
+  assert.equal(report.findings[0].code, 'allocation_committed_kit_disproportionate')
+  assert.equal(report.findings[0].productId, 'comp-b')
+})
+
+test('o3d-aqke: the FLAT committed-coverage branch cannot see a half kit — the gap being closed', () => {
+  // Same commitment as the census test above, with allocation rows that match it exactly. Every
+  // (lineId, warehouseId, productId) pair is covered, so the flat branch is silent — which is the
+  // whole reason the graph-aware pass exists rather than a tightening of this one.
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [],
+    shippedShipmentLines: [],
+    orderAllocations: [
+      { lineId: 'line-1', productId: 'comp-a', warehouseId: 'warehouse-1', qty: 2 },
+      { lineId: 'line-1', productId: 'comp-b', warehouseId: 'warehouse-1', qty: 1 },
+    ],
+    committedShipmentLines: [
+      {
+        lineId: 'line-1',
+        productId: 'comp-a',
+        qty: 2,
+        product: { sku: 'COMP-A' },
+        shipment: { orderId: 'order-1', warehouseId: 'warehouse-1' },
+      },
+      {
+        lineId: 'line-1',
+        productId: 'comp-b',
+        qty: 1,
+        product: { sku: 'COMP-B' },
+        shipment: { orderId: 'order-1', warehouseId: 'warehouse-1' },
+      },
+    ],
+  })
+
+  assert.deepEqual(
+    findings.filter((finding) => finding.code === 'allocation_committed_shipment_uncovered'),
+    [],
+    'covered product-by-product, and still half a kit',
+  )
 })

@@ -280,3 +280,52 @@ test('o3d-4kfh r8: a graph that never settles is REFUSED, not expanded half-old'
   )
   assert.equal(batches.length, 9, 'three attempts, each two batches and a verify read')
 })
+
+// ---------------------------------------------------------------------------
+// o3d-57b0 (carried in from o3d-ryyd) — THE WALK IS ONE QUERY PER LEVEL AND RUNS UNDER THE SALES
+// ORDER LOCK. `graph.has()` stops it looping on a cycle; nothing stopped it issuing a hundred
+// round trips on a hundred-deep chain, three times over once the verify-and-re-walk loop was added.
+
+/** A chain kit-0 -> kit-1 -> ... -> kit-N, every level a KIT so the walk must follow it. */
+function kitChain(levels: number): Map<string, FakeProduct> {
+  const products = new Map<string, FakeProduct>()
+  for (let level = 0; level <= levels; level += 1) {
+    products.set(`kit-${level}`, {
+      id: `kit-${level}`,
+      type: 'KIT',
+      version: 0,
+      components: level === levels
+        ? [{ componentId: 'leaf', qty: 1 }]
+        : [{ componentId: `kit-${level + 1}`, qty: 1 }],
+    })
+  }
+  products.set('leaf', { id: 'leaf', type: 'SIMPLE', version: 0, components: [] })
+  return products
+}
+
+test('o3d-57b0: a graph nested to the depth cap still loads, in one query per level', async () => {
+  // Eight levels of KIT below the root is the documented limit, and it must not be refused.
+  const { client, batches } = createGraphClient(kitChain(8))
+
+  const graph = await loadFulfillmentProductGraph(client, ['kit-0'])
+
+  // kit-0..kit-8. The SIMPLE leaf is never enqueued — only KIT components are followed.
+  assert.equal(graph.size, 9)
+  // 9 walk statements (the roots plus 8 nested levels) and one verify read.
+  assert.equal(batches.length, 10)
+})
+
+test('o3d-57b0: a graph nested PAST the cap is refused, naming where it stopped', async () => {
+  const { client } = createGraphClient(kitChain(12))
+
+  await assert.rejects(
+    () => loadFulfillmentProductGraph(client, ['kit-0']),
+    (error: Error) => {
+      assert.equal(error.name, 'FulfillmentGraphDepthError')
+      assert.match(error.message, /nests more than 8 levels of KIT/)
+      assert.deepEqual((error as unknown as { productIds: string[] }).productIds, ['kit-9'])
+      return true
+    },
+    'an unbounded fan-out inside the order lock must fail closed, not run',
+  )
+})

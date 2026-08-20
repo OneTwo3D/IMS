@@ -176,6 +176,11 @@ async function connectorTransformBlockerSummary(
  * across all of them — neither exists (see PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE). This bounds
  * the window; it does not remove it, and nothing in this file may claim otherwise.
  *
+ * AND NEITHER WILL EXIST: o3d-0fok accepted that residual permanently, with the reasoning written
+ * out on PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE and in docs/architecture.md. Read that before
+ * proposing a lock here — the connector is one of five callers, and a lock only one of them takes
+ * is not a lock.
+ *
  * The blocked row's operator-facing WHY is read afterwards, one row at a time, because the set
  * query returns membership only. That read is on a path that has already decided to abort, so
  * it widens nothing. If it finds the row clean again — the blocker cleared between the two

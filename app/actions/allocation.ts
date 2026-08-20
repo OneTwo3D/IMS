@@ -956,11 +956,14 @@ export async function addAllocation(
       // apart on a shared aggregate, which the transaction's own integrity check cannot see because
       // it reads allocation rows and never stock.
       //
-      // Rounded per leaf, matching what `allocateSalesOrder` does to its merged rows. It can put a
-      // fractional-KIT set marginally out of proportion; `validateAllocationIntegrity` at the end
-      // of this action reads the WRITTEN rows, so that fails the action closed rather than
-      // committing a set the checks disagree with (o3d-i4qd — the atomic per-set canonicalisation
-      // is that issue, not this one).
+      // Rounded per leaf, matching what `allocateSalesOrder` does to its merged rows. It puts a
+      // fractional-KIT set marginally out of proportion — 0.5 kits of a 0.3333 component is
+      // 0.16665 and the column holds 0.1667 — and that is unavoidable, not a defect in this write:
+      // no rounding policy makes an unrepresentable requirement representable. o3d-i4qd made the
+      // READERS judge these rows at the scale they are stored at, so `validateAllocationIntegrity`
+      // at the end of this action no longer refuses the set this action just wrote. It still fails
+      // the action closed on a set that is disproportionate by more than the column's own
+      // rounding.
       const requirements = new Map(
         [...scaleFulfillmentRequirements(lineRequirements, requestedQty)]
           .map(([leafProductId, requiredQty]) => [leafProductId, canonicalAllocationQty(requiredQty)] as const),

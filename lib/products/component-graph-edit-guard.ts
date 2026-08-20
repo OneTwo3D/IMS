@@ -8,7 +8,10 @@ import type { Prisma, ProductType } from '@/app/generated/prisma/client'
  *
  * This is NOT the correctness boundary, and it is NOT atomic. r4 claimed both and neither was true:
  *
- *   - NOT A SERIALIZATION BOUNDARY (r5 Codex finding 2). The component writers take
+ *   - NOT A SERIALIZATION BOUNDARY (r5 Codex finding 2), and it will not become one by taking a
+ *     lock: the remaining window is closed by the per-line fulfilment-requirement snapshot
+ *     (o3d-kouj), which makes the current graph stop being the authority for in-flight work at
+ *     all. The reasoning is written out on `loadFulfillmentProductGraph`. The component writers take
  *     `COMPONENT_GRAPH_WRITE_LOCK_KEY`; `allocateSalesOrder`, `confirmSalesOrderShipments` and the
  *     PENDING -> PICKING commitment do NOT take it. Under Postgres' default READ COMMITTED / MVCC
  *     snapshotting, this query can therefore see an empty blocker set while a concurrent transaction
