@@ -1,4 +1,4 @@
-import type { AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
+import type { AccountingLinkSource, AccountingSyncStatus, AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   BACK_REFERENCE_TYPES,
@@ -6,6 +6,7 @@ import {
   backReferenceIsMissing,
   followUpObligationClaim,
   isExternalDocumentIdConflict,
+  recoverPostedBusinessDate,
   resolvePurchaseOrderBackReference,
   syncTypeWritesBackReference,
   type AmbiguousPurchaseOrderAttribution,
@@ -471,6 +472,22 @@ export type BackReferenceCandidateCursor = { createdAt: Date; id: string }
  * one of them ends in a MANUAL action: the sweep has decided it cannot attribute the id safely,
  * and no amount of re-running changes that on its own.
  */
+/**
+ * What the BLOCKING bill's link provenance means for the person being asked to resolve the conflict
+ * (o3d-wf86). Reported, never acted on: telling an operator which candidate to check first is a
+ * different act from IMS deciding, and deciding needs the remote document, which this sweep does
+ * not read.
+ */
+const BLOCKING_LINK_PROVENANCE: Record<AccountingLinkSource | 'UNRECORDED', string> = {
+  BILL_KEYED_SYNC: 'That link was written by a sync row that named that bill directly, so it is the authoritative one and THIS row\'s '
+    + 'reference is the more likely mistake.',
+  PO_KEYED_REPAIR: 'That link was DEDUCED by an earlier repair from the purchase order\'s population, not reported by the ledger, so it '
+    + 'is a candidate for being the wrong one — check the remote bill against both before choosing.',
+  MANUAL: 'That link was set by an operator who confirmed it by hand, so treat it as correct unless you know why that decision changed.',
+  UNRECORDED: 'How that link was written was never recorded (it predates link provenance), so neither claim is proven — check the remote '
+    + 'bill against both.',
+}
+
 const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason'], (a: AmbiguousPurchaseOrderAttribution) => string> = {
   MULTIPLE_SYNC_ROWS: (a) =>
     `${a.syncRowCount} posted bill sync rows reference this PO, so which bill this external id belongs to cannot be determined. Link them manually.`,
@@ -481,7 +498,12 @@ const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason']
     + 'so there is no longer any evidence of which bill it posted. Check the accounting ledger and link the bill manually.',
   EXTERNAL_ID_LINKED_ELSEWHERE: (a) =>
     `this external id is already linked to bill ${a.linkedPurchaseInvoiceId ?? 'unknown'} on purchase order ${a.linkedPurchaseOrderId ?? 'unknown'}, `
-    + 'so it cannot also belong to a bill of this one. Either that link or this sync row is wrong — resolve it manually.',
+    + 'so it cannot also belong to a bill of this one. Either that link or this sync row is wrong — resolve it manually. '
+    // o3d-wf86: SAYS WHICH OF THE TWO IS UNPROVEN, which is the whole point of recording provenance.
+    // The refusal is unchanged — IMS still cannot adjudicate this without reading the remote bill —
+    // but "resolve it manually" with no indication of where to start is a instruction nobody can
+    // act on, and the blocking link having been a GUESS is the single most useful thing to know.
+    + BLOCKING_LINK_PROVENANCE[a.linkedAccountingInvoiceIdSource ?? 'UNRECORDED'],
   EXTERNAL_ID_CLAIMED_CONCURRENTLY: () =>
     'another bill claimed this external id while the repair was being written, so it is already attributed and was not copied. '
     + 'Confirm the surviving link is the right one.',
@@ -504,6 +526,32 @@ const AMBIGUITY_EXPLANATIONS: Record<AmbiguousPurchaseOrderAttribution['reason']
  *     it every cycle would let a backlog of unattributable legacy rows re-fill the head of
  *     the scan ACROSS runs and starve everything newer — the original bug wearing the
  *     other defect's clothes. Deferring it for the interval keeps both properties.
+ *
+ * WHAT THE ROW MUST BE, IS NOW A DISJUNCTION (o3d-p5j3). It used to be one thing — "a posted
+ * back-reference row" — expressed as `type IN (back-reference types) AND externalTransactionId IS
+ * NOT NULL`. r10 then started CLAIMING `backReferenceFollowUpsPendingAt` on the SYNCED write of
+ * EVERY sync type, in both connectors, while this query still admitted only that one shape. The
+ * marker was therefore written truthfully onto rows this sweep could never select, and stranded:
+ *
+ *   • INVOICE_PDF is the one that loses real work. Its own follow-ups are NESTED — a successful
+ *     PDF enqueues INVOICE_EMAIL and WC_INVOICE_NOTE — and the row fails BOTH old predicates at
+ *     once: INVOICE_PDF is not a back-reference type, and the PDF call returns no external id, so
+ *     the row is SYNCED with `externalTransactionId` NULL. A crash between the SYNCED commit and
+ *     the enqueue left a row that says "follow-ups owed" for ever, and the customer's invoice
+ *     email and WooCommerce note simply never happened.
+ *   • INVOICE_EMAIL, WC_INVOICE_NOTE, INVOICE_PAYMENT, BILL_PAYMENT, BILL_ATTACHMENT and the
+ *     journal types owe NOTHING to enqueueFollowUps, so their marker is a FALSE obligation. It is
+ *     harmless in the money direction but it is still a row asserting outstanding work, and while
+ *     nothing could select it, "which rows still owe follow-ups?" had no truthful answer at all.
+ *
+ * So the marker is now a candidate reason IN ITS OWN RIGHT. A row is examined when it is
+ * back-reference evidence OR when it says it owes follow-ups. The false markers drain (the
+ * enqueue is a no-op for their type and the row is stamped), and the real one — the PDF's nested
+ * pair — is finally rebuilt. Dropping the marker for PDF work was the alternative, and it is
+ * explicitly rejected: a row that owes work and says so beats one that owes work silently.
+ *
+ * The status predicate is deliberately NOT widened with it. PENDING/PROCESSING mean a sync is in
+ * flight that will run the follow-ups itself; only a settled row's obligation is this sweep's.
  */
 export function buildBackReferenceCandidateQuery(params: {
   connector: string
@@ -522,8 +570,13 @@ export function buildBackReferenceCandidateQuery(params: {
     connector: params.connector,
     // The same one definition the evidence predicate above reads (o3d-9kek r8).
     status: { in: [...BACK_REFERENCE_REPAIRABLE_STATUSES] },
-    externalTransactionId: { not: null },
-    type: { in: [...BACK_REFERENCE_SWEEP_TYPES] },
+    // Either reason is sufficient on its own (o3d-p5j3). Kept as two named clauses rather than a
+    // flattened condition because they are different questions about different populations, and a
+    // future edit that collapses them re-strands the marker.
+    OR: [
+      { type: { in: [...BACK_REFERENCE_SWEEP_TYPES] }, externalTransactionId: { not: null } },
+      { backReferenceFollowUpsPendingAt: { not: null } },
+    ],
     backReferenceCheckedAt: null,
     // NO PREDICATE ON backReferenceEvidenceCompactedAt, and that absence is deliberate (r4 finding
     // 3). Filtering tombstones out — which an earlier revision did — let RETENTION permanently
@@ -532,7 +585,8 @@ export function buildBackReferenceCandidateQuery(params: {
     // is scheduled by age and says nothing about whether the row is repairable. A tombstone still
     // carries every column the id write reads, so it stays a candidate for that write;
     // only its payload-dependent follow-ups are gone, and the loop handles that explicitly.
-    // Nested under AND because the keyset clause below also needs the top-level OR slot.
+    // Nested under AND because the top-level OR slot is taken by the candidate-reason disjunction
+    // above, and the keyset clause below needs a slot of its own too.
     AND: [notRecentlyAmbiguous],
   }
   if (params.after) {
@@ -695,6 +749,10 @@ export async function repairAccountingBackReferences(
         unlinkedBillCount: attribution.unlinkedBillCount,
         linkedPurchaseInvoiceId: attribution.linkedPurchaseInvoiceId ?? null,
         linkedPurchaseOrderId: attribution.linkedPurchaseOrderId ?? null,
+        // NULL means "never recorded", which is a different claim from "unknown to this report" —
+        // it is the answer for every bill linked before o3d-wf86 and it is deliberately not
+        // backfilled into a confident value.
+        linkedAccountingInvoiceIdSource: attribution.linkedAccountingInvoiceIdSource ?? null,
       },
     }))
   }
@@ -784,6 +842,118 @@ export async function repairAccountingBackReferences(
     return persisted
   }
 
+  /**
+   * MAY THIS REPAIR BE SETTLED, GIVEN WHAT IT COULD RECOVER ABOUT THE INVOICE DATE? (o3d-r5pj.)
+   *
+   * Only the SALES_INVOICE / SalesOrder pair writes `invoicedAt` at all, so every other pair
+   * settles unconditionally. For that one, a recovered business date means the repair reproduced
+   * the original write and there is nothing to report; a missing one means the sale now carries an
+   * accounting invoice id and NO invoice date.
+   *
+   * That is deliberately not treated as an acceptable end state. The old behaviour — `new Date()`
+   * — put the sale in the WRONG period; writing nothing puts it in NO period. Both are wrong, and
+   * the only thing that makes the second acceptable is that it is ANNOUNCED. So this follows the
+   * same terminal policy the discarded follow-ups do, for the same reason: warn naming the
+   * document, and settle only once the warning is CONFIRMED PERSISTED. Stamping past a failed
+   * activity write would freeze a sale out of every VAT return with nothing anywhere saying so, and
+   * a stamped row is never looked at again.
+   *
+   * It settles rather than deferring for ever because the remedy is not something this sweep can
+   * observe: the operator sets the invoice date from the document in the ledger, on the ORDER, and
+   * nothing about the sync row changes when they do. Re-reporting daily for ever would be noise
+   * that never clears itself, which is how a warning stops being read.
+   */
+  const businessDateSettled = async (row: BackReferenceSweepRow, businessDate: Date | null): Promise<boolean> => {
+    if (row.type !== 'SALES_INVOICE' || row.referenceType !== 'SalesOrder') return true
+    if (businessDate !== null) return true
+    const persisted = await deps.logActivity({
+      entityType: 'SYSTEM',
+      action: `${prefix}_backreference_invoice_date_unrecoverable`,
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Linked ${connectorLabel} invoice ${row.externalTransactionId} to sales order ${row.referenceId}, but this sync row `
+        + 'no longer records the date the invoice was posted with, so NO invoice date was written. A repair must not invent one: '
+        + 'stamping the time the repair ran would move the sale into whichever VAT period this sweep happened to run in. Until the '
+        + 'invoice date is set from the document in the ledger, this sale is in NO reporting period.',
+      metadata: {
+        syncLogId: row.id,
+        type: row.type,
+        referenceType: row.referenceType,
+        referenceId: row.referenceId,
+        externalId: row.externalTransactionId,
+        compactedAt: row.backReferenceEvidenceCompactedAt?.toISOString() ?? null,
+      },
+    })
+    if (!persisted) {
+      console.error(`${prefix}: unrecoverable invoice-date warning was not persisted; leaving row eligible`, row.id)
+    }
+    return persisted
+  }
+
+  /**
+   * DISCHARGE A FOLLOW-UP OBLIGATION ON A ROW WITH NO BACK-REFERENCE OF ITS OWN (o3d-p5j3).
+   *
+   * There is no id to repair here — the row's type writes no back-reference, or the call returned
+   * no external id — so the ONLY outstanding work is the enqueue itself. That is the whole point:
+   * `backReferenceFollowUpsPendingAt` was being claimed on every connector SYNCED write while this
+   * sweep could select only back-reference evidence, so the obligation was recorded and then never
+   * consumed. INVOICE_PDF is the row where that cost real work: its follow-ups are NESTED
+   * (INVOICE_EMAIL and WC_INVOICE_NOTE), and it carries no external id, so it could never be a
+   * candidate under either half of the old predicate.
+   *
+   * Returns whether the row may now be STAMPED. Deliberately never touches `status`: unlike the
+   * repair path there is nothing here that turns a FAILED row into a successful one, and flipping
+   * a genuinely failed INVOICE_EMAIL to SYNCED because its marker was discharged would retire a
+   * failure nobody fixed.
+   *
+   * For most types the enqueue is a no-op — the connector's own dispatch has no branch for them —
+   * and that is the correct outcome rather than a special case: the marker was a FALSE obligation,
+   * calling the one function that decides what a type owes is how we find that out truthfully, and
+   * the row is then stamped and drains out of the column for good.
+   */
+  const settleOutstandingFollowUpsOnly = async (row: BackReferenceSweepRow): Promise<boolean> => {
+    if (row.backReferenceFollowUpsPendingAt === null) return true
+    result.checked++
+    // A compacted payload cannot rebuild anything, and enqueueing from `{}` would report success
+    // while doing nothing — the silent version of the loss. Same terminal policy as the linked
+    // case: warn, and settle only if the warning landed.
+    if (row.backReferenceEvidenceCompactedAt !== null) return reportDiscardedFollowUps(row, 'already-applied')
+    try {
+      await deps.enqueueFollowUps(
+        row.id,
+        row.type,
+        row.referenceType,
+        row.referenceId,
+        (row.payload ?? {}) as Record<string, unknown>,
+        { externalId: row.externalTransactionId ?? undefined },
+      )
+    } catch (followUpError) {
+      result.failed++
+      console.error(`${prefix}: outstanding follow-up enqueue failed`, row.id, followUpError)
+      await deps.logActivity({
+        entityType: 'SYSTEM',
+        action: `${prefix}_backreference_followup_deferred`,
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Could not enqueue the outstanding ${connectorLabel} follow-ups recorded against ${row.type} for `
+          + `${row.referenceType} ${row.referenceId}: ${String(followUpError)}. The row is left unsettled and still marked as `
+          + 'owing them, so the next sweep retries them.',
+        metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
+      })
+      return false
+    }
+    await deps.logActivity({
+      entityType: 'SYSTEM',
+      action: `${prefix}_backreference_followups_recovered`,
+      tag: 'sync',
+      level: 'INFO',
+      description: `Enqueued the outstanding ${connectorLabel} follow-ups recorded against ${row.type} for `
+        + `${row.referenceType} ${row.referenceId}; this row carries no back-reference of its own.`,
+      metadata: { syncLogId: row.id, type: row.type, referenceType: row.referenceType, referenceId: row.referenceId },
+    })
+    return true
+  }
+
   // RESUME where the previous run stopped (r3 finding 4). A cursor that reset to null every
   // invocation meant a persistently failing head — rows whose probe, apply, follow-up or activity
   // log write keeps failing, and which must therefore NOT be stamped — consumed the whole budget
@@ -832,12 +1002,27 @@ export async function repairAccountingBackReferences(
         if (!row.externalTransactionId || !syncTypeWritesBackReference(row.type, row.referenceType)) {
           // Structurally incapable of carrying a back-reference. It would otherwise sit in
           // the candidate set for the row's whole retention life, consuming a slot.
+          //
+          // BUT IT CAN STILL OWE FOLLOW-UPS (o3d-p5j3), and stamping it here would clear the
+          // marker in the same write — destroying the obligation instead of discharging it, and
+          // doing so on exactly the row the widened candidate query was opened to reach. An
+          // INVOICE_PDF row is the case that costs real work: no external id, not a back-reference
+          // type, and a nested INVOICE_EMAIL + WC_INVOICE_NOTE pair that only the enqueue rebuilds.
+          if (!(await settleOutstandingFollowUpsOnly(row))) continue
           await markChecked(row.id)
           continue
         }
 
         const payload = (row.payload ?? {}) as Record<string, unknown>
         const invoiceNumber = typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : undefined
+        // THE POSTED DOCUMENT'S OWN BUSINESS DATE, recovered from the request that was sent
+        // (o3d-r5pj). Passed EXPLICITLY on every repair — as a Date when it is known and as `null`
+        // when it is not — so the repair can never fall through to applyBackReference's live-path
+        // default of `new Date()` by simply omitting the field. That default is correct for a post
+        // happening now and wrong for a reconstruction of one that happened months ago: VAT and
+        // currency reporting select on `invoicedAt`, so repair time moves the sale into a period it
+        // was never invoiced in.
+        const businessDate = recoverPostedBusinessDate(payload)
         const params = {
           connector,
           type: row.type,
@@ -845,6 +1030,7 @@ export async function repairAccountingBackReferences(
           referenceId: row.referenceId,
           externalId: row.externalTransactionId,
           invoiceNumber,
+          invoicedAt: businessDate,
         }
 
         // A PO-keyed row is attributed from the whole population for that PO, not from this
@@ -1022,7 +1208,16 @@ export async function repairAccountingBackReferences(
           // A tombstone is stamped CHECKED but never flipped to SYNCED: its id write succeeded, so
           // there is nothing left for any future sweep to do, but its follow-ups were discarded
           // rather than done and calling that SYNCED would erase the only trace of it (r4 finding 3).
-          if (followUpsEnqueued) {
+          //
+          // AND ONLY IF THE SALE ENDED UP IN A REPORTING PERIOD (o3d-r5pj). The repair now refuses
+          // to invent `invoicedAt`, so a row whose posted date could not be recovered leaves the
+          // sale with no invoice date at all — out of EVERY VAT and currency period rather than in
+          // the wrong one. Stamping that is the worse half of the original defect: the row would
+          // become non-repairable at the same moment it became invisible to reporting, and nothing
+          // downstream ever asks why an order has an accounting invoice id and no date. So it is
+          // warned about and DEFERRED — never a verdict, because a human setting the date makes the
+          // row settle by itself on the next lap.
+          if (followUpsEnqueued && await businessDateSettled(row, businessDate)) {
             await markChecked(row.id, row.status === 'FAILED' && !evidenceOnly ? { status: 'SYNCED', errorMessage: null } : undefined)
           }
 

@@ -5,6 +5,7 @@ import {
   UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
   backReferenceEvidenceTombstone,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 
 const RETENTION_KEYS = [
   'retention_sales_orders_months',
@@ -129,9 +130,20 @@ export async function purgeExpiredData(): Promise<{
       // configured retention period indefinitely. That is the same defect as the reverted
       // PROCESSING exemption above, and it is fixed the same way the o3d-nepa note prescribes: a
       // compacted tombstone carrying only what a later reader must be able to see.
+      //
+      // o3d-nepa: and what it does not delete EITHER is a row whose existence is the only local
+      // guard against moving the same money in the ledger twice — a registered INVOICE_PAYMENT, an
+      // applied PURCHASE_CREDIT_NOTE_ALLOCATION, a sent BILL_PAYMENT. Those guards do not fail when
+      // their evidence is deleted; they answer "nothing has been sent" and mean it, and Xero's
+      // idempotency key expired six minutes after the original call, so nothing remote catches the
+      // second one. The back-reference clause above does not cover them: it requires an
+      // externalTransactionId AND one of the four DOCUMENT types, and the harm here comes from
+      // FOLLOW-UP types whose row matters whatever their status. See remote-money-evidence.ts for
+      // the three readers and for why this is not compaction (yet).
       db.accountingSyncLog.deleteMany({
         where: {
           createdAt: { lt: cutoff },
+          type: { notIn: [...REMOTE_MONEY_EVIDENCE_TYPES] },
           NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
         },
       }),
@@ -139,9 +151,16 @@ export async function purgeExpiredData(): Promise<{
     syncLogsDeleted = wc.count + acct.count
 
     // The other half: expired-but-unresolved rows lose their CONTENT and keep their ATTRIBUTION.
-    // Ordered after the delete deliberately — the two predicates are exact complements, so a row
-    // belongs to one pass or the other and never both, and doing the delete first means a crash
-    // between them leaves rows un-compacted (repeated next run) rather than un-deleted.
+    // Ordered after the delete deliberately — the two predicates are MUTUALLY EXCLUSIVE (the delete
+    // requires NOT UNRESOLVED_…, this one requires it), so no row is both deleted and compacted, and
+    // doing the delete first means a crash between them leaves rows un-compacted (repeated next run)
+    // rather than un-deleted.
+    //
+    // They are no longer exact COMPLEMENTS, because o3d-nepa holds the money-evidence types back from
+    // the delete without adding them here: those rows are in NEITHER pass, deliberately. Compaction
+    // writes `payload: {}`, and a money row with a blank body is the worst of both worlds — the
+    // follow-up planner can neither prove from it that nothing was sent nor re-send it, which is
+    // exactly the shape that made money retries permanently unusable in o3d-nepa's parked attempt.
     //
     // `backReferenceEvidenceCompactedAt: null` PERMANENTLY excludes already-compacted rows from THIS
     // PASS, so each daily run rewrites only the newly-eligible slice instead of the whole tombstone

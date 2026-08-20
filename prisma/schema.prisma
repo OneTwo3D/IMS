@@ -145,6 +145,25 @@ enum ProductionOrderStatus {
   CANCELLED
 }
 
+/**
+ * o3d-wf86 — how a local document came to hold an external accounting document id.
+ *
+ * Ordered by how much the link can be TRUSTED, which is the only thing a later reader wants:
+ *
+ *   BILL_KEYED_SYNC  the sync row named this exact bill, so the link is what the connector itself
+ *                    reported. Authoritative; allowed to overwrite a guess.
+ *   PO_KEYED_REPAIR  a legacy PurchaseOrder-keyed row was attributed to this bill by the repair
+ *                    sweep. Carefully guarded, but still a deduction from the local population
+ *                    rather than something the ledger said.
+ *   MANUAL           an operator released a stale claim and re-linked it by hand, having confirmed
+ *                    the holder was stale (scripts/release-accounting-external-id-claim.ts).
+ */
+enum AccountingLinkSource {
+  BILL_KEYED_SYNC
+  PO_KEYED_REPAIR
+  MANUAL
+}
+
 enum AccountingSyncType {
   PURCHASE_INVOICE
   PURCHASE_INVOICE_UPDATE
@@ -1425,6 +1444,17 @@ model PurchaseInvoice {
   // Postgres does not treat NULLs as equal, so this is precisely a partial unique index over the
   // bills that HAVE an external id: any number of bills may be unlinked.
   accountingInvoiceId String?  @unique @map("accounting_invoice_id")
+  // o3d-wf86: HOW this bill acquired that id. NULL means "nobody recorded it" — every row written
+  // before this column existed, and that unknown is exactly the state that makes a conflict
+  // unadjudicable, so it is left honest rather than backfilled with a guess.
+  //
+  // The authoritative bill-keyed sync and the legacy newest-unlinked-bill repair used to write the
+  // same column the same way, so nothing downstream could tell a PROVEN link from a GUESSED one and
+  // the sweep could only ever refuse (EXTERNAL_ID_LINKED_ELSEWHERE). Recording the source is half of
+  // what an automatic resolution would need; the other half is connector-side confirmation — GET the
+  // remote bill and compare it against the local one — which does not exist, so the sweep still
+  // refuses and still names a manual action. This makes the refusal INFORMATIVE, not automatic.
+  accountingInvoiceIdSource AccountingLinkSource? @map("accounting_invoice_id_source")
   paidAt          DateTime?
   paymentAccountId   String?   // connector account id (e.g. Xero bank AccountID) used to pay this bill
   paymentAccountName String?   // snapshot of the bank account name at payment time

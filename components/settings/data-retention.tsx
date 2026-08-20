@@ -57,7 +57,7 @@ export function DataRetentionSetting({
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">
-        Set to 0 to keep records forever. Financial records (orders, customers) are soft-archived — hidden from lists but accessible via direct link. Operational data (movements, sync logs) is permanently deleted. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
+        Set to 0 to keep records forever. Financial records (orders, customers) are soft-archived — hidden from lists but accessible via direct link. Operational data (movements, sync logs) is permanently deleted, with two exceptions kept for correctness rather than for history: an accounting sync row whose back-reference is still unresolved has its <em>content</em> cleared on schedule but keeps its identifying record, and a row for a payment or credit-note allocation already sent to the ledger is kept in full, because its existence is what stops the same money being sent twice. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
       </p>
       <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-6 gap-x-4 max-w-4xl">
         {FIELDS.map((f) => (

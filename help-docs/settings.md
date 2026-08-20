@@ -289,7 +289,17 @@ This means an admin viewing the activity log can see who did what but not see se
   deliberately no repair sweep at all — a QuickBooks document id is a per-company integer, so a sweep
   could not tell a previously connected company's id from the current one's — and an unresolved row
   is compacted on the same schedule but only ever links by hand. See *Back-Reference Repair* in the
-  accounting sync guide
+  accounting sync guide.
+  One further set of accounting sync rows is **never deleted by age at all**: registered invoice
+  payments, applied supplier-credit-note allocations and sent bill payments (`INVOICE_PAYMENT`,
+  `PURCHASE_CREDIT_NOTE_ALLOCATION`, `BILL_PAYMENT`). For those, the row's existence *is* the record
+  that the money movement already happened — it is what stops the same payment or allocation being
+  sent to the ledger a second time, and for an imported order it is the only such record anywhere.
+  Xero's own duplicate protection expires six minutes after the original call, so nothing at the far
+  end would catch the repeat. These rows hold only external ids, a bank account id, an amount, a date
+  and a reference — no customer names, addresses or line detail — and there is one per payment or
+  allocation ever made. Everything else, including invoice PDFs, emails and WooCommerce notes,
+  expires on the schedule you configure.
 - **System health** — at-a-glance status of FX sync, accounting sync, integration outbox depth, recent cron runs, and invariant check results
 - **Database reset** — reset system data with three levels of severity:
   - **Transactions only** — clears orders, invoices, and movements but keeps products and settings

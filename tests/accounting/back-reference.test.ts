@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import type { AccountingLinkSource } from '@/app/generated/prisma/client'
+
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
@@ -37,6 +39,8 @@ type FakeBill = {
   id: string
   poId: string
   accountingInvoiceId: string | null
+  /** o3d-wf86: how the link above was made. Undefined = never recorded (a pre-provenance row). */
+  accountingInvoiceIdSource?: AccountingLinkSource | null
   createdAt: number
 }
 /** A competing PURCHASE_INVOICE sync row for the PO. Counted, not canned (see below). */
@@ -225,7 +229,9 @@ function makeDeps(overrides: {
         // wrong reason and silently breaking the already-linked one.
         calls.billFindFirstWheres.push(args.where)
         const bill = matchBills(args.where)[0]
-        return bill ? { id: bill.id, poId: bill.poId } : null
+        // o3d-wf86: the provenance is returned because production SELECTS it and puts it in the
+        // refusal. A double that dropped it would report every blocking link as unrecorded.
+        return bill ? { id: bill.id, poId: bill.poId, accountingInvoiceIdSource: bill.accountingInvoiceIdSource ?? null } : null
       },
       // Honours the predicates production depends on: a double that returned every bill
       // regardless of poId / accountingInvoiceId would make the ambiguity tests vacuous.
@@ -1990,9 +1996,99 @@ test('[o3d-9kek r7 f1] the holder table is derived from BACK_REFERENCE_PAIRS, no
   // would be the same defect with a new name, so the (model, column) facts live on the pairs table.
   assert.deepEqual(backReferenceHolder('SALES_INVOICE', 'SalesOrder'), { model: 'SalesOrder', column: 'accountingInvoiceId' })
   assert.deepEqual(backReferenceHolder('CREDIT_NOTE', 'SalesOrderRefund'), { model: 'SalesOrderRefund', column: 'accountingCreditNoteId' })
-  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseInvoice'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId' })
+  // o3d-wf86: the PROVENANCE column rides on the same table, so the release path can clear the link
+  // and the record of how it was made in one statement without a second per-model list. Only the
+  // bill has one — it is the only document an id can be attributed to by DEDUCTION.
+  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseInvoice'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId', sourceColumn: 'accountingInvoiceIdSource' })
   // A PO-keyed row names the ORDER; the id still lands on one of its bills.
-  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseOrder'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId' })
+  assert.deepEqual(backReferenceHolder('PURCHASE_INVOICE', 'PurchaseOrder'), { model: 'PurchaseInvoice', column: 'accountingInvoiceId', sourceColumn: 'accountingInvoiceIdSource' })
   assert.deepEqual(backReferenceHolder('PURCHASE_CREDIT_NOTE', 'SupplierCreditNote'), { model: 'SupplierCreditNote', column: 'accountingCreditNoteId' })
   assert.equal(backReferenceHolder('COGS_JOURNAL', 'Shipment'), null)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-wf86 — a bill's link now records HOW it was made.
+//
+// o3d-9kek made purchase_invoices.accounting_invoice_id unique and made the PO-keyed repair refuse
+// rather than overwrite an id another bill holds. That refusal is permanent because nothing recorded
+// whether the blocking link came from the authoritative bill-keyed sync or from the old
+// newest-unlinked-bill guess: two identical column writes, no way to tell them apart afterwards.
+//
+// NOTHING HERE CHANGES A DECISION. Automatic adjudication also needs connector-side confirmation —
+// reading the remote bill and comparing it against both candidates — which does not exist, so the
+// sweep still refuses and still names a manual action. What is now possible is telling the operator
+// WHICH of the two links is the unproven one.
+// ---------------------------------------------------------------------------
+
+test('[o3d-wf86] the bill-keyed write records an AUTHORITATIVE link', async () => {
+  const { deps, calls } = makeDeps({ bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }] })
+
+  await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: 'bill-1', externalId: 'XBILL-1' })
+
+  assert.equal(calls.lastUpdateData?.accountingInvoiceIdSource, 'BILL_KEYED_SYNC')
+})
+
+test('[o3d-wf86] the PO-keyed repair records a DEDUCED one, in the same statement as the id', async () => {
+  // Same statement deliberately: a provenance written separately could fail on its own and leave a
+  // guess wearing an authoritative link's clothes, which is the state the column exists to end.
+  const { deps, calls } = makeDeps({
+    bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
+    poSyncRows: [{ id: 'log-1', connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: 'XBILL-1' }],
+  })
+
+  const applied = await applyBackReference(deps, { connector: 'xero', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'XBILL-1' })
+
+  assert.equal(applied.outcome, 'applied')
+  assert.equal(calls.lastUpdateData?.accountingInvoiceId, 'XBILL-1')
+  assert.equal(calls.lastUpdateData?.accountingInvoiceIdSource, 'PO_KEYED_REPAIR',
+    'a link reached by elimination over the PO population is not something the ledger told us')
+})
+
+test('[o3d-wf86] the conflict refusal carries the blocking link\'s provenance', async () => {
+  const { deps } = makeDeps({
+    bills: [
+      { id: 'bill-other', poId: 'po-other', accountingInvoiceId: 'XBILL-1', accountingInvoiceIdSource: 'PO_KEYED_REPAIR', createdAt: 1 },
+      { id: 'bill-mine', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+    ],
+  })
+
+  const attribution = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
+
+  assert.equal(attribution.outcome, 'ambiguous')
+  assert.equal(attribution.outcome === 'ambiguous' ? attribution.reason : undefined, 'EXTERNAL_ID_LINKED_ELSEWHERE')
+  assert.equal(attribution.outcome === 'ambiguous' ? attribution.linkedAccountingInvoiceIdSource : undefined, 'PO_KEYED_REPAIR',
+    'the operator is being told the blocker is itself a guess — which is the whole point of recording it')
+})
+
+test('[o3d-wf86] a pre-provenance link reports as UNRECORDED, never as authoritative', async () => {
+  // Every bill linked before this column existed answers null, and null is the honest answer: the
+  // two writers were indistinguishable, so the value cannot be reconstructed. Backfilling them as
+  // BILL_KEYED_SYNC would manufacture confidence on exactly the legacy rows least entitled to it.
+  const { deps } = makeDeps({
+    bills: [
+      { id: 'bill-other', poId: 'po-other', accountingInvoiceId: 'XBILL-1', createdAt: 1 },
+      { id: 'bill-mine', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+    ],
+  })
+
+  const attribution = await resolvePurchaseOrderBackReference(deps, { connector: 'xero', purchaseOrderId: 'po-1', externalId: 'XBILL-1' })
+
+  assert.equal(attribution.outcome === 'ambiguous' ? attribution.linkedAccountingInvoiceIdSource : 'missing', null)
+})
+
+test('[o3d-wf86] an operator relink records MANUAL, and the loser keeps no record of a link it lost', async () => {
+  const { claimDeps, bills } = makeClaimDeps({
+    bills: [
+      { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
+      { id: 'bill-retired', poId: 'po-old', accountingInvoiceId: '145', accountingInvoiceIdSource: 'BILL_KEYED_SYNC', createdAt: 1 },
+    ],
+  })
+
+  const result = await releaseAndRelinkExternalDocumentId(claimDeps, { ...RELEASE_PARAMS, confirmedHolderId: 'bill-retired' }, recordRelease)
+
+  assert.equal(result.outcome, 'relinked')
+  assert.equal(bills.find((bill) => bill.id === 'bill-target')?.accountingInvoiceIdSource, 'MANUAL',
+    'a human comparing two documents is the strongest provenance there is, and recording it as a sync would lose it')
+  assert.equal(bills.find((bill) => bill.id === 'bill-retired')?.accountingInvoiceIdSource, null,
+    'a bill with no link must not keep a record of how it acquired one — the next conflict report would read it as a claim')
 })

@@ -61,6 +61,7 @@ import {
   backReferenceHolder,
   backReferenceIsMissing,
   findExternalDocumentIdClaim,
+  recoverPostedBusinessDate,
   releaseAndRelinkExternalDocumentId,
   type ExternalDocumentIdReleaseRecorder,
 } from '../lib/domain/accounting/back-reference'
@@ -105,6 +106,9 @@ async function main() {
       id: true, connector: true, type: true, referenceType: true, referenceId: true,
       externalTransactionId: true, status: true, errorMessage: true,
       backReferenceAmbiguousLoggedAt: true, backReferenceEvidenceCompactedAt: true,
+      // o3d-r5pj: read for ONE thing — the business date the document was posted with, so this
+      // relink reproduces it instead of re-dating the sale to whenever an operator ran the command.
+      payload: true,
     },
   })
   if (!row) throw new Error(`No accounting sync row ${syncLogId}`)
@@ -121,6 +125,14 @@ async function main() {
     referenceType: row.referenceType,
     referenceId: row.referenceId,
     externalId: row.externalTransactionId,
+    // A RELINK IS A REPAIR, and a repair must not invent a business date (o3d-r5pj). Passed
+    // explicitly — as the posted date when the payload still records it and as `null` when it does
+    // not (a retention tombstone's payload is `{}`) — because OMITTING it is what selects
+    // applyBackReference's live-path default of `new Date()`. That default would stamp the sale with
+    // the date somebody happened to run this command, moving it into that VAT period; writing
+    // nothing leaves whatever invoice date the order already had, which on this path is the date its
+    // invoice number was generated with.
+    invoicedAt: recoverPostedBusinessDate((row.payload ?? {}) as Record<string, unknown>),
   }
 
   console.log(`sync row:        ${row.id} (${row.connector} ${row.type} ${row.referenceType} ${row.referenceId}, ${row.status})`)

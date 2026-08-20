@@ -82,9 +82,10 @@ function matches(row: Row, where: Record<string, unknown>): boolean {
     }
     if (typeof condition === 'object' && !(condition instanceof Date)) {
       const operators = condition as Record<string, unknown>
-      const unsupported = Object.keys(operators).filter((op) => !['in', 'not', 'lt'].includes(op))
+      const unsupported = Object.keys(operators).filter((op) => !['in', 'notIn', 'not', 'lt'].includes(op))
       if (unsupported.length > 0) throw new Error(`unsupported operator(s) ${unsupported.join(', ')} on "${key}"`)
       if ('in' in operators && !(operators.in as unknown[]).includes(value)) return false
+      if ('notIn' in operators && (operators.notIn as unknown[]).includes(value)) return false
       if ('not' in operators) {
         if (operators.not === null) { if (value === null) return false } else if (value === operators.not) return false
       }
@@ -164,7 +165,6 @@ test('[o3d-9kek r2 f2] retention still deletes everything the sweep has SETTLED 
   // Deliberately abandoned (audit-46ry), and types that carry no back-reference at all.
   assert.equal(matches(row({ status: 'CANCELLED' }), where), true)
   assert.equal(matches(row({ type: 'COGS_JOURNAL' }), where), true)
-  assert.equal(matches(row({ type: 'INVOICE_PAYMENT' }), where), true)
   // Age is still the primary rule: nothing inside the retention window is deleted.
   assert.equal(matches(row({ createdAt: NOW }), where), false)
 })
@@ -223,4 +223,79 @@ test('[o3d-9kek r3 f3] the tombstone keeps the attribution and drops the persona
   // evidence, not a verdict, and stamping it checked would also make it deletable next run.
   assert.equal('backReferenceCheckedAt' in compact.data, false)
   assert.equal('status' in compact.data, false)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-nepa — retention must not delete the row that is the only local guard against moving the
+// same money twice.
+//
+// The back-reference exemption above is about DOCUMENTS: rows carrying an external id whose local
+// link is missing. It requires `externalTransactionId IS NOT NULL` and one of four document types,
+// so it says nothing about the follow-up rows whose bare EXISTENCE is what suppresses a second
+// remote call:
+//
+//   • hasExistingSyncLog counts PENDING/PROCESSING/SYNCED for the scope — a SYNCED INVOICE_PAYMENT
+//     is the entire suppression, and for an imported order it is the only record anywhere that the
+//     ledger was told (decideInvoicePaymentRegistration says so in as many words);
+//   • reenqueueMissingCreditNoteAllocations treats a PURCHASE_CREDIT_NOTE_ALLOCATION row of ANY
+//     status, terminal ones included, as ownership evidence and skips the credit note;
+//   • latestBillPaymentSyncRows derives a bill's settlement status from its newest BILL_PAYMENT row.
+//
+// None of those guards FAILS when its row is deleted. Each answers "nothing has been sent" and
+// means it — and Xero's idempotency key expired six minutes after the original call, so nothing
+// remote catches the second one.
+// ---------------------------------------------------------------------------
+
+test('[o3d-nepa] a SETTLED payment registration is never deleted by age', async () => {
+  const where = await captureDeletePredicate()
+
+  // SYNCED with no external id is the ordinary shape for these — and the back-reference exemption
+  // above cannot see it, because that one requires an external id.
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'SYNCED', externalTransactionId: null }), where), false)
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'SYNCED', externalTransactionId: 'XPAY-1' }), where), false)
+  // ...and CANCELLED, which every status-based exemption releases the moment the row terminalises.
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'CANCELLED', externalTransactionId: null }), where), false)
+  // A stamped verdict does not release it either: backReferenceCheckedAt is about a LINK, and these
+  // rows are not evidence of a link — they are evidence that a call was made.
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'SYNCED', externalTransactionId: null, backReferenceCheckedAt: OLD }), where), false)
+})
+
+test('[o3d-nepa] an applied credit-note allocation is never deleted by age, at ANY status', async () => {
+  const where = await captureDeletePredicate()
+
+  // The re-enqueue sweep reads CANCELLED rows as ownership too, so a status-scoped exemption would
+  // miss the case that duplicates an allocation (o3d-nepa round 1 finding 4).
+  for (const status of ['SYNCED', 'CANCELLED', 'FAILED']) {
+    assert.equal(
+      matches(row({ type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', status, externalTransactionId: null }), where),
+      false,
+      `a ${status} allocation row still keeps its credit note out of the re-enqueue sweep`,
+    )
+  }
+})
+
+test('[o3d-nepa] a sent bill payment is never deleted by age', async () => {
+  const where = await captureDeletePredicate()
+  assert.equal(matches(row({ type: 'BILL_PAYMENT', status: 'SYNCED', externalTransactionId: 'XPAY-2' }), where), false)
+})
+
+test('[o3d-nepa] the exemption is scoped to money, not applied to every follow-up', async () => {
+  const where = await captureDeletePredicate()
+
+  // A duplicate PDF, email or WooCommerce note is not a financial error, and a retention policy that
+  // never deletes anything is not a retention policy. These still expire.
+  for (const type of ['INVOICE_PDF', 'INVOICE_EMAIL', 'WC_INVOICE_NOTE', 'BILL_ATTACHMENT', 'COGS_JOURNAL']) {
+    assert.equal(matches(row({ type, status: 'SYNCED', externalTransactionId: null }), where), true, `${type} expires normally`)
+  }
+})
+
+test('[o3d-nepa] money-evidence rows are NOT compacted either — a blanked payload cannot be pinned', async () => {
+  const { compact } = await runRetention()
+
+  // The compaction pass is scoped to the back-reference document types, and it must stay that way:
+  // compaction writes `payload: {}`, and the follow-up planner would then have a money row whose
+  // stored body can neither prove anything nor be re-sent. That exact shape made money-moving
+  // retries permanently unusable in o3d-nepa's own parked attempt (round 1 finding 2).
+  assert.equal(matches(row({ type: 'INVOICE_PAYMENT', status: 'SYNCED', externalTransactionId: 'XPAY-1' }), compact.where), false)
+  assert.equal(matches(row({ type: 'PURCHASE_CREDIT_NOTE_ALLOCATION', status: 'SYNCED', externalTransactionId: 'XALLOC-1' }), compact.where), false)
 })

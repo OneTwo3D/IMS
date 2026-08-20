@@ -213,11 +213,42 @@ function fieldIsPresent(value: unknown, kind: 'id' | 'amount'): boolean {
   return kind === 'amount' ? value !== undefined && value !== null : Boolean(value)
 }
 
+/**
+ * Could this stored body be SENT — i.e. would the connector build a request from it rather than
+ * reject it out of hand? Used to choose which body to pin, so `null` (unreadable, but it was a real
+ * request once) answers true and falls through to the fresh-body branch, while a body missing a
+ * required field answers false because pinning it would strand the payment behind a request that
+ * can never succeed.
+ */
 function bodyCouldHaveReachedTheLedger(type: string, stored: FollowUpPayload | null): boolean {
   const required = REQUIRED_BODY_FIELDS[type]
   if (!required) return true
   if (stored === null) return true
   return required.every(({ field, kind }) => fieldIsPresent(stored[field], kind))
+}
+
+/**
+ * PROOF that a stored attempt never reached the ledger — the opposite question, and deliberately
+ * NOT the negation of the one above (o3d-qsbs).
+ *
+ * The two differ on exactly the cases where "no information" must not be read as "no call". A
+ * `null` payload is unreadable, and an EMPTY one is indistinguishable from a payload retention
+ * compacted away; neither proves anything about what left the process, so neither is proof. Only a
+ * body that is present, readable and missing a field the connector rejects PRE-CALL proves it —
+ * both connectors validate before they build a request, which is the one sound "this did not post"
+ * signal available here, since errorMessage carries no provenance (r3 blocker A) and o3d-ju8t
+ * established that FAILED alone proves nothing.
+ *
+ * Negating `bodyCouldHaveReachedTheLedger` instead would turn a compacted `{}` into a claim that
+ * the attempt provably never posted — retention manufacturing evidence about a remote call, which
+ * is the one direction that ends in a duplicate payment.
+ */
+function bodyProvesNoCallLeft(type: string, stored: FollowUpPayload | null): boolean {
+  const required = REQUIRED_BODY_FIELDS[type]
+  if (!required) return false
+  if (stored === null) return false
+  if (Object.keys(stored).length === 0) return false
+  return !required.every(({ field, kind }) => fieldIsPresent(stored[field], kind))
 }
 
 /** Fields whose value defines the remote request, so a divergence is worth reporting. */
@@ -298,7 +329,20 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // several rows share one token, whichever committed committed under that same token, and
   // pinning it is unambiguous. Refusing on count alone stranded exactly that case -- reruns
   // of one QuickBooks receipt all carry `invoice-payment:payment:<id>` (Codex r5 #3).
-  const candidateTokens = new Set(couldHaveCommitted.map((row) => row.effectiveToken))
+  //
+  // ...and only among attempts that could have SENT anything (o3d-qsbs). A stored body missing a
+  // field its connector validates before building a request never reached the ledger, so its token
+  // was never used remotely and it is not a candidate for "one of these may have committed".
+  // Counting it was how an anchorless legacy row — anchorless precisely because it lacks
+  // `accountingInvoiceId`, which is also one of the fields that proves it never posted — could make
+  // a scope REFUSE for ever, so a genuinely new payment against a replacement invoice was blocked
+  // by history that could not have touched it. `carried` is added unconditionally: it is a token
+  // this very call has already committed to posting under, not a historical attempt.
+  const candidateTokens = new Set(
+    couldHaveCommitted
+      .filter((row) => !bodyProvesNoCallLeft(input.type, asPayload(row.payload)))
+      .map((row) => row.effectiveToken),
+  )
   if (carried) candidateTokens.add(carried)
   if (candidateTokens.size > 1 && moneyMoving) {
     return {
@@ -343,7 +387,15 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     // under a token the remote system has already seen returns the ORIGINAL payment, and we
     // would record a settlement for an amount never posted — local evidence that disagrees
     // with the ledger (Codex r1 #3).
-    if (stored && moneyMoving) {
+    //
+    // UNLESS THAT BODY CANNOT BE SENT (o3d-qsbs). `pinnable` falls back to the oldest same-token
+    // row when NONE of them is postable, and pinning an incomplete body there re-sent a request the
+    // connector rejects before it builds anything — for ever, on every retry, with the payment
+    // stranded behind it. That fallback contradicted the rule stated two branches up, which is that
+    // an incomplete body provably never posted. It provably never posted, so the token it carries
+    // was never seen remotely and the RECOMPUTED body is safe to send under it: the token stays
+    // pinned (nothing is rotated), only the unusable body is replaced.
+    if (stored && moneyMoving && bodyCouldHaveReachedTheLedger(input.type, stored)) {
       return {
         action: 'reuse',
         syncLogId: pinnable.id,
@@ -355,7 +407,8 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
     }
 
     // Non-money follow-ups (PDF, email, note, attachment) are safe to re-drive with fresh
-    // inputs; only the token is carried back.
+    // inputs; only the token is carried back. A money-moving row whose stored body could never have
+    // been sent lands here too, for the reason given just above.
     const { [FOLLOW_UP_IDEMPOTENCY_KEY]: _discarded, ...rest } = input.payload
     return {
       action: 'reuse',
