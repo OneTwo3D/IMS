@@ -13,6 +13,10 @@ import {
   type BackReferenceDeps,
   type PurchaseOrderAttribution,
 } from './back-reference'
+import {
+  buildCompactedFollowUpLossActivity,
+  type CompactedFollowUpLossPhase,
+} from '@/lib/domain/accounting/compacted-followup-loss'
 
 // ---------------------------------------------------------------------------
 // Connector-agnostic back-reference repair sweep (audit-H3, fixed by o3d-9kek)
@@ -823,30 +827,18 @@ export async function repairAccountingBackReferences(
    */
   const reportDiscardedFollowUps = async (
     row: BackReferenceSweepRow,
-    phase: 'repaired' | 'already-applied',
+    phase: Extract<CompactedFollowUpLossPhase, 'repaired' | 'already-applied'>,
   ): Promise<boolean> => {
     result.followUpsDiscarded++
-    const preamble = phase === 'repaired'
-      ? `Re-applied the ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId}, but`
-      : `The ${connectorLabel} back-reference for ${row.referenceType} ${row.referenceId} is already applied, but`
-    const persisted = await deps.logActivity({
-      entityType: 'SYSTEM',
-      action: `${prefix}_backreference_followups_discarded`,
-      tag: 'sync',
-      level: 'WARNING',
-      description: `${preamble} its outstanding follow-ups (invoice PDF, payment registration or bill attachment) can no longer be `
-        + 'enqueued: this sync row outlived the retention period unresolved, so its payload was compacted away. The document is linked '
-        + `to external id ${row.externalTransactionId}; check whether its PDF, payment or attachment is missing and re-drive it manually.`,
-      metadata: {
-        syncLogId: row.id,
-        type: row.type,
-        referenceType: row.referenceType,
-        referenceId: row.referenceId,
-        externalId: row.externalTransactionId,
-        compactedAt: row.backReferenceEvidenceCompactedAt?.toISOString() ?? null,
-        phase,
-      },
-    })
+    // o3d-nepa r3: the message and its metadata come from the SHARED builder, because the connector
+    // processors announce the same loss from their own short-circuit and two hand-written copies of
+    // an operator-facing warning drift. See compacted-followup-loss.ts.
+    const persisted = await deps.logActivity(buildCompactedFollowUpLossActivity({
+      connectorLabel,
+      activityActionPrefix: prefix,
+      row,
+      phase,
+    }))
     if (!persisted) {
       console.error(`${prefix}: back-reference follow-up discard warning was not persisted; leaving row eligible`, row.id)
     }

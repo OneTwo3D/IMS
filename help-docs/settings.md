@@ -284,9 +284,12 @@ This means an admin viewing the activity log can see who did what but not see se
   On **Xero**, a compacted accounting sync row is **still repaired**: the repair sweep can still
   write its external id onto the order or bill, because everything that write needs survives
   compaction. What cannot survive is the follow-up work built from the payload (invoice PDF, payment
-  registration, bill attachment). If the sweep repairs one of these rows it writes a WARNING to the
-  activity log (`xero_backreference_followups_discarded`) naming the document, so you can check
-  whether its PDF or payment is missing and re-drive it by hand. On **QuickBooks** there is
+  registration, bill attachment). If the sweep repairs one of these rows — or if you retry one by hand
+  from the Accounting Sync page, which settles it against the id it already has rather than
+  re-sending it — a WARNING is written to the activity log
+  (`xero_backreference_followups_discarded`) naming the document, so you can check whether its PDF or
+  payment is missing and re-drive it by hand. In both cases the row is settled only once that warning
+  has been written, so a retry can never turn one of these rows green without saying what it lost. On **QuickBooks** there is
   deliberately no repair sweep at all — a QuickBooks document id is a per-company integer, so a sweep
   could not tell a previously connected company's id from the current one's — and an unresolved row
   is compacted on the same schedule but only ever links by hand. See *Back-Reference Repair* in the

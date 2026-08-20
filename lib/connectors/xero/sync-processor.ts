@@ -25,6 +25,10 @@ import {
   type BackReferenceRepairResult,
 } from '@/lib/domain/accounting/back-reference-sweep'
 import { planFollowUpEnqueue, readFollowUpIdempotencyKey } from '@/lib/domain/accounting/followup-idempotency'
+import {
+  buildCompactedFollowUpLossActivity,
+  isCompactedFollowUpEvidence,
+} from '@/lib/domain/accounting/compacted-followup-loss'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
@@ -52,6 +56,59 @@ const XERO_CONNECTOR = 'xero'
 const XERO_ACCOUNTING_WORKER_ID = 'xero-accounting-sync'
 
 class XeroOutboxCompletionError extends Error {}
+
+/**
+ * The warning about a retention tombstone's unrebuildable follow-ups could not be written down.
+ *
+ * Thrown, not swallowed, so both short-circuit sites route it into their EXISTING follow-up-failure
+ * handling: the row goes back to PENDING (or FAILED at MAX_RETRIES) still carrying
+ * `backReferenceFollowUpsPendingAt`, so the obligation stays owed and the next pass — this
+ * processor's own retry, or the repair sweep — gets another chance to announce it.
+ */
+class CompactedFollowUpLossUnrecorded extends Error {}
+
+/**
+ * o3d-nepa r3 — SAY SO WHEN A RETRY SETTLES A ROW WHOSE FOLLOW-UPS CANNOT BE REBUILT.
+ *
+ * The short-circuit below is reached when a sync row already carries an external id: the document
+ * posted, so the retry must NOT re-post it, and the row goes straight to SYNCED. That branch then
+ * calls `enqueueFollowUps` with the row's payload and releases the follow-up obligation.
+ *
+ * On a RETENTION TOMBSTONE the payload is `{}`. The enqueue does not fail on it — it takes no
+ * branch, enqueues nothing and returns normally — so the release ran on the strength of work that
+ * never happened, and `backReferenceFollowUpsPendingAt`, the last record that a payment or
+ * attachment was still owed, was cleared. A bulk "Retry all" over old failures therefore lost them
+ * silently. The repair sweep had announced exactly this loss since o3d-9kek r4; the processors had
+ * not, and the processors are the path an operator actually triggers.
+ *
+ * So the loss is announced, from the SAME shared message the sweep uses, and the obligation is
+ * released only once the announcement is on record. A no-op for every row that is not a tombstone.
+ */
+async function announceCompactedFollowUpLoss(entry: {
+  id: string
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  externalTransactionId: string | null
+  backReferenceEvidenceCompactedAt: Date | null
+}): Promise<void> {
+  if (!isCompactedFollowUpEvidence(entry)) return
+  // logActivityPersisted, NOT logActivity: the release below is conditional on having warned, and
+  // logActivity swallows its own write failures and resolves regardless — which is the same
+  // "reported success, did nothing" shape as the empty enqueue this exists to catch.
+  const persisted = await logActivityPersisted(buildCompactedFollowUpLossActivity({
+    connectorLabel: 'Xero',
+    activityActionPrefix: XERO_CONNECTOR,
+    row: entry,
+    phase: 'processor-short-circuit',
+  }))
+  if (persisted) return
+  throw new CompactedFollowUpLossUnrecorded(
+    `Xero sync entry ${entry.id} outlived the retention period and was compacted, so its follow-ups cannot be rebuilt — `
+    + 'and the warning about that could not be written. The row keeps its follow-up obligation so the loss is announced '
+    + 'by a later pass instead of disappearing with it.',
+  )
+}
 
 type ProcessResult = {
   processed: number
@@ -765,6 +822,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         })
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          // BEFORE the enqueue, because the enqueue is what LOOKS like it succeeded. On a tombstone
+          // `payload` is `{}` and everything built from it is silently skipped; the enqueue is still
+          // called, since some follow-ups are rebuilt from columns that survive compaction, but the
+          // release below must never happen on the strength of it alone (o3d-nepa r3).
+          await announceCompactedFollowUpLoss(entry)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
@@ -1029,6 +1091,11 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         })
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          // BEFORE the enqueue, because the enqueue is what LOOKS like it succeeded. On a tombstone
+          // `payload` is `{}` and everything built from it is silently skipped; the enqueue is still
+          // called, since some follow-ups are rebuilt from columns that survive compaction, but the
+          // release below must never happen on the strength of it alone (o3d-nepa r3).
+          await announceCompactedFollowUpLoss(entry)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {

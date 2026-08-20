@@ -43,6 +43,13 @@ type SyncRow = {
   createdAt: Date
   backReferenceCheckedAt: Date | null
   backReferenceFollowUpsPendingAt: Date | null
+  /**
+   * o3d-nepa r3: when data retention compacted this row to an attribution-only tombstone. NULL =
+   * the payload is intact. The double carries it because it is the ONLY thing that distinguishes a
+   * row whose follow-ups can still be rebuilt from one whose body was thrown away — `payload: {}`
+   * looks identical either way, which is exactly why the loss was silent.
+   */
+  backReferenceEvidenceCompactedAt: Date | null
 }
 
 type BillRow = { id: string; accountingInvoiceId: string | null }
@@ -50,7 +57,7 @@ type BillRow = { id: string; accountingInvoiceId: string | null }
 const SYNC_COLUMNS = new Set([
   'id', 'connector', 'type', 'referenceType', 'referenceId', 'externalTransactionId', 'status',
   'payload', 'retryCount', 'processingStartedAt', 'syncedAt', 'errorMessage', 'createdAt',
-  'backReferenceCheckedAt', 'backReferenceFollowUpsPendingAt',
+  'backReferenceCheckedAt', 'backReferenceFollowUpsPendingAt', 'backReferenceEvidenceCompactedAt',
 ])
 
 /**
@@ -113,6 +120,13 @@ const state = {
   failFollowUpsFor: new Set<string>(),
   /** Sync-log ids whose obligation RELEASE must fail. */
   failReleaseFor: new Set<string>(),
+  /**
+   * Activity actions whose PERSISTED write must report failure (o3d-nepa r3). `logActivityPersisted`
+   * returns false rather than throwing when the row cannot be written, and a double that always
+   * returned true could not tell a warning that landed from one that did not — which is the whole
+   * of the "settle only if the announcement is on record" property.
+   */
+  unpersistableActivityActions: new Set<string>(),
 }
 
 function marker(): Date | null {
@@ -221,7 +235,10 @@ mock.module('@/lib/db', { namedExports: { db } })
 mock.module('@/lib/activity-log', {
   namedExports: {
     logActivity: async (entry: { action: string }) => { state.activities.push(entry) },
-    logActivityPersisted: async (entry: { action: string }) => { state.activities.push(entry); return true },
+    logActivityPersisted: async (entry: { action: string }) => {
+      state.activities.push(entry)
+      return !state.unpersistableActivityActions.has(entry.action)
+    },
   },
 })
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
@@ -266,6 +283,7 @@ function blankRow(): SyncRow {
     createdAt: new Date('2026-01-01T00:00:00Z'),
     backReferenceCheckedAt: null,
     backReferenceFollowUpsPendingAt: null,
+    backReferenceEvidenceCompactedAt: null,
   }
 }
 
@@ -278,6 +296,7 @@ function reset(connector = 'xero') {
   state.outbox = []
   state.failFollowUpsFor.clear()
   state.failReleaseFor.clear()
+  state.unpersistableActivityActions.clear()
 }
 
 /** The single sync row under test (the follow-up rows the run creates are appended after it). */
@@ -431,6 +450,117 @@ test('[o3d-9kek r10 f1] a failed follow-up enqueue on the OUTBOX path leaves the
   assert.ok(subjectOutboxJob(), 'the outbox loop is the one under test here')
   assert.equal(state.bills[0].accountingInvoiceId, 'XBILL-1')
   assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-nepa r3 — A RETRY OVER A COMPACTED ROW MUST NOT DISCHARGE THE OBLIGATION IN SILENCE.
+//
+// Data retention compacts an expired-but-unresolved sync row to an attribution-only tombstone: the
+// columns the back-reference write needs survive, and `payload` — which is what the FOLLOW-UPS are
+// built from — becomes `{}`. Handed `{}` the enqueue takes no branch, enqueues nothing and returns
+// NORMALLY, so the short-circuit below read it as success and released
+// `backReferenceFollowUpsPendingAt`: the last record that a payment, PDF or attachment was still
+// owed. A bulk "Retry all" over old failures therefore destroyed the evidence of its own loss.
+//
+// The repair sweep had announced exactly this since o3d-9kek r4. The processors — the path an
+// operator actually triggers — did not. These tests are that announcement, on both loops, plus the
+// asymmetry that makes it worth having: the obligation is released only once the warning LANDED.
+//
+// A tombstone is seeded with an empty payload, because that is what compaction leaves; the
+// BILL_ATTACHMENT follow-up therefore cannot be built, and its absence is asserted so the warning
+// is about a real loss rather than a decoration.
+// ---------------------------------------------------------------------------
+
+const DISCARD_ACTION = 'xero_backreference_followups_discarded'
+
+function compactedRow(): SyncRow {
+  return {
+    ...blankRow(),
+    status: 'PENDING',
+    payload: {},
+    backReferenceEvidenceCompactedAt: new Date('2026-01-05T00:00:00Z'),
+  }
+}
+
+function discardWarning() {
+  return state.activities.find((entry) => entry.action === DISCARD_ACTION)
+}
+
+test('[o3d-nepa r3] retrying a COMPACTED row announces the follow-ups it can no longer rebuild', async () => {
+  reset()
+  state.syncRows = [compactedRow()]
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1, 'the row still settles — the document really did post')
+  // The loss is real: nothing was enqueued, because there is nothing left to enqueue it from.
+  assert.equal(
+    state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length,
+    0,
+    'the attachment follow-up could not be rebuilt from an emptied payload',
+  )
+  const warning = discardWarning()
+  assert.ok(warning, `expected the discard warning; saw ${JSON.stringify(state.activities.map((entry) => entry.action))}`)
+  assert.equal(warning.level, 'WARNING')
+  assert.match(String(warning.description), /had already posted, so this retry settled the sync row without re-sending it/)
+  assert.match(String(warning.description), /its payload was compacted away/)
+  assert.match(String(warning.description), /XBILL-1/, 'names the external id the operator has to go and look at')
+  assert.match(String(warning.description), /re-drive it manually/)
+  // Settled only because the warning landed.
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null)
+  assert.equal(subject().status, 'SYNCED')
+})
+
+test('[o3d-nepa r3] the OUTBOX loop announces it too — that is the loop production runs', async () => {
+  reset()
+  state.syncRows = [compactedRow()]
+
+  const result = await runViaOutbox()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(subjectOutboxJob()?.status, 'SUCCEEDED', 'the outbox loop, not the direct one')
+  assert.ok(discardWarning(), 'the same warning, from the loop that handles nearly every row')
+  assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 0)
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null)
+})
+
+test('[o3d-nepa r3] a discard warning that could NOT be written leaves the obligation claimed', async () => {
+  // The asymmetry the sweep already applies: repeating a warning is noise, losing it is silence —
+  // and this loss cannot be undone by a later run, so settling past a failed write would destroy the
+  // work and the notice in one step. The row goes back to PENDING still owing its follow-ups, so
+  // the next pass (or the repair sweep) gets another chance to say so.
+  reset()
+  state.syncRows = [compactedRow()]
+  state.unpersistableActivityActions.add(DISCARD_ACTION)
+
+  const result = await runDirect()
+
+  assert.equal(result.failed, 1, 'an unannounceable loss is not a success')
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the obligation survives — it is the only remaining trace that the payment or attachment is owed',
+  )
+  assert.equal(subject().status, 'PENDING')
+  assert.equal(subject().retryCount, 1)
+  assert.match(
+    String(subject().errorMessage),
+    /compacted/,
+    'and the row says why it did not settle, rather than reporting a generic follow-up failure',
+  )
+})
+
+test('[o3d-nepa r3] an INTACT row is not warned about — the check is the stamp, not an empty payload', async () => {
+  // A row whose type carries no body has `payload: {}` too. Warning on emptiness would fire on
+  // every one of them and train the operator to ignore the line that matters, so the tombstone
+  // STAMP is what decides.
+  reset()
+  state.syncRows = [{ ...blankRow(), payload: {} }]
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(discardWarning(), undefined, 'an empty payload is not the same fact as a compacted one')
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null)
 })
 
 // ---------------------------------------------------------------------------

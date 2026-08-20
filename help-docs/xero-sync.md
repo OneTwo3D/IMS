@@ -1081,6 +1081,14 @@ check for a missing PDF or payment and re-drive it by hand. The row is only clos
 has been written, so the loss is never absorbed silently. A compacted row also still counts as a claim when the
 sweep decides whether a purchase order's bill is ambiguous.
 
+**Retrying a compacted row by hand reports the same loss.** If you press *Retry* (or *Retry all*) on
+the Accounting Sync page and the row already carries an external id, IMS does **not** re-send the
+document — it settles the row against the id that is already there. On a compacted row that means
+the follow-ups built from the payload cannot be rebuilt either, so the retry writes the same
+`xero_backreference_followups_discarded` WARNING naming the document, and the row is settled only
+once that warning has been written. A retry that turns such a row green is therefore never silent
+about what it could not do: check the activity log after a bulk retry over old failures.
+
 **Do not cancel one of these rows to tidy it away.** Cancelling is irreversible in two ways the row
 gives no warning about: a cancelled row is no longer a repair candidate, so the link that was still
 perfectly possible is given up permanently; and it no longer counts as a competing claim, so an
