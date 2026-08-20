@@ -681,23 +681,104 @@ test('o3d-a3wx r6: neither runner releases a claim with an unfenced write', () =
   // Structural, and paired with the behavioural tests above: the fence is only worth anything if EVERY
   // release carries it. `update({ where: { id } })` cannot express "only while I still hold it" —
   // Prisma's unique-where update takes no extra predicate — so a release must go through updateMany.
+  //
+  // r7, after Codex found this test inspecting nothing: the r6 version scanned for
+  // `accountingSyncLog.update(`, which never matches `accountingSyncLog.updateMany(` — the shape EVERY
+  // release actually uses. It therefore examined zero release sites and passed unconditionally, and its
+  // one real assertion was a bare `includes` that a single fenced site anywhere satisfied on behalf of
+  // all the others. Removing the fence from any individual release still passed it.
+  //
+  // So it now scans the WHOLE FILE rather than the two runner blocks (three fenced releases live in
+  // helpers outside them), reads each call's argument by balancing braces, and asserts PER SITE. The
+  // two deliberate unfenced writers are named here rather than pattern-matched, so a NEW unfenced
+  // release fails even though the documented ones pass.
   const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
-  const direct = src.slice(
-    src.indexOf('async function processPendingXeroSyncDirect('),
-    src.indexOf('async function processPendingXeroSyncViaOutbox('),
-  )
-  const outbox = src.slice(src.indexOf('async function processPendingXeroSyncViaOutbox('))
-  for (const [name, block] of [['direct', direct], ['outbox', outbox]] as const) {
-    for (const [index, chunk] of block.split('accountingSyncLog.update(').slice(1).entries()) {
-      const data = chunk.slice(0, chunk.indexOf('})'))
-      assert.ok(
-        !data.includes("status: 'PENDING'"),
-        `the ${name} runner must not hand a claimed row back to PENDING with an unfenced update (site ${index + 1})`,
-      )
+
+  // Slicing to the first `})` — as r6 did — truncates at the first nested object, and a regex cannot
+  // balance braces at all.
+  const callArgument = (from: number): string => {
+    const open = src.indexOf('{', from)
+    let depth = 0
+    for (let i = open; i < src.length; i += 1) {
+      if (src[i] === '{') depth += 1
+      else if (src[i] === '}') {
+        depth -= 1
+        if (depth === 0) return src.slice(open, i + 1)
+      }
     }
+    throw new Error('unbalanced call argument in sync-processor.ts')
+  }
+  const enclosingFunction = (offset: number): string => {
+    const before = src.slice(0, offset)
+    const declarations = [...before.matchAll(/(?:export )?(?:async )?function (\w+)/g)]
+    return declarations.length > 0 ? declarations[declarations.length - 1][1] : '<top level>'
+  }
+
+  // Both are documented in sync-processor.ts with the reason they cannot carry the claim fence.
+  const DELIBERATELY_UNFENCED = new Map([
+    // Runs only AFTER the post succeeded and the row was written SYNCED with processingStartedAt: null,
+    // so there is no claim left to match and the row is out of the live set either way.
+    ['markSyncLogForFollowUpRetry', 'post-success follow-up retry'],
+  ])
+
+  let fencedReleases = 0
+  let revivals = 0
+  let exempt = 0
+  const pattern = /accountingSyncLog\.(updateMany|update)\(/g
+  for (let match = pattern.exec(src); match !== null; match = pattern.exec(src)) {
+    const arg = callArgument(match.index)
+    if (!arg.includes('data:')) continue
+    const data = arg.slice(arg.indexOf('data:'))
+    const where = arg.includes('where:') ? arg.slice(arg.indexOf('where:'), arg.indexOf('data:')) : ''
+    const fn = enclosingFunction(match.index)
+    const line = src.slice(0, match.index).split('\n').length
+    const site = `${fn} (${match[1]} at line ${line})`
+
+    // Ternary-aware: `status: finalFailure ? 'FAILED' : 'PENDING'` is a release too, and matching only
+    // the literal `status: 'PENDING'` would skip it.
+    const writesQueued = /status:[^,]*'PENDING'/.test(data) || /status:[^,]*'FAILED'/.test(data)
+    if (!writesQueued) continue
+
+    // A revival takes a row that is already FAILED — nobody holds a claim on it — back to PENDING, and
+    // is fenced on that status instead. It is not a claim holder giving its own claim back.
+    if (where.includes("status: 'FAILED'")) {
+      revivals += 1
+      continue
+    }
+
+    if (DELIBERATELY_UNFENCED.has(fn)) {
+      assert.ok(
+        !where.includes('heldClaimWhere('),
+        `${site} is recorded as deliberately unfenced (${DELIBERATELY_UNFENCED.get(fn)}) but now carries ` +
+          `the claim fence — update the exemption list rather than leaving the two disagreeing`,
+      )
+      exempt += 1
+      continue
+    }
+
+    fencedReleases += 1
     assert.ok(
-      block.includes('heldClaimWhere(entry.id, claimedAt)'),
-      `the ${name} runner must release the claim it holds under its own fence`,
+      where.includes('heldClaimWhere('),
+      `${site} hands a claimed row back to the queue without the claim fence: a worker whose claim was ` +
+        `already taken over would erase the replacement's claim and reopen the post slot while the ` +
+        `replacement's request is still on the wire`,
+    )
+    assert.equal(
+      match[1],
+      'updateMany',
+      `${site} releases a claim through update(), which cannot carry the fence predicate`,
     )
   }
+
+  // The r6 version was wrong by inspecting nothing and passing. These bounds make that failure loud:
+  // if the call shape moves again, the scan finds too few sites and this test fails instead of going
+  // quietly vacuous.
+  assert.equal(
+    fencedReleases,
+    8,
+    `expected to reach all 8 claim-release sites; found ${fencedReleases}. Either a release was added ` +
+      `(raise this number and confirm it is fenced) or the call shape moved and this test is inspecting nothing`,
+  )
+  assert.equal(revivals, 1, `expected exactly the one FAILED→PENDING revival; found ${revivals}`)
+  assert.equal(exempt, 1, `expected exactly the one deliberately unfenced writer; found ${exempt}`)
 })
