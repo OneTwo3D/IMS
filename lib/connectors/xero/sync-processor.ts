@@ -285,6 +285,16 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
  * when the two land together the holder is swapped for the lease and all six releases keep fencing on
  * the claim this worker actually holds. A carried-down `Date` would compile there and match nothing —
  * and these fences fail closed, so the symptom is silent refusal, not an error.
+ *
+ * WHAT A MISSING FENCE COSTS ON THIS BRANCH SPECIFICALLY (o3d-a3wx r6). A displaced owner that writes
+ * the row back erases the replacement's PROCESSING claim and drops the row to PENDING/FAILED WHILE THE
+ * REPLACEMENT'S REQUEST IS STILL ON THE WIRE — and that reopens the post slot with nothing to show a
+ * post is in flight. For an order-scoped INVOICE_PAYMENT that is the double post: the exclusion test
+ * ({@link decideInvoicePaymentClaim}) admits a sibling the moment no row for the reference is
+ * PROCESSING, the sibling posts, and the same invoice is settled twice. Nothing downstream catches it,
+ * because the capacity guard counts SYNCED rows and neither request has landed yet. A re-claim does not
+ * advance retryCount, so the `{ id, retryCount }` guard those writers used to carry does not stop any
+ * of it.
  */
 export { claimHeldFrom, heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 
@@ -761,6 +771,12 @@ export async function buryOutboxJobForUnwrittenPostedEvidence(
   )
 }
 
+/**
+ * NOT fenced on the claim, deliberately (o3d-a3wx r6). This runs only AFTER the post succeeded and the
+ * row was written SYNCED with `processingStartedAt: null`, so there is no claim left to match — the
+ * row is already out of the live set either way. A displaced owner reaching here has posted, and its
+ * SYNCED row is what the post-time capacity guard counts, so the slot it frees is not a silent one.
+ */
 export async function markSyncLogForFollowUpRetry(
 
   entry: { id: string; retryCount: number },

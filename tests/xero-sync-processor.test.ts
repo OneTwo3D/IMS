@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 
 import {
+  applyMainSyncFailureRetry,
   buildXeroIdempotencyKey,
   decideInvoicePaymentClaim,
   findInvoicePaymentsBlockedByEarlierLiveLogs,
@@ -12,6 +13,7 @@ import {
   invoicePaymentDeferralMessage,
   isXeroAccountingOutboxEnabled,
 } from '@/lib/connectors/xero/sync-processor'
+import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 
 /**
  * Xero 400s an Idempotency-Key over 128 chars and the document never reaches the ledger.
@@ -559,5 +561,143 @@ test('both runners take the claim through the same helper — neither may claim 
       `the ${name} runner must not take a raw, unserialised claim`,
     )
     assert.ok(block.includes("claim.outcome === 'deferred'"), `the ${name} runner must handle a declined claim`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// ROUND 6: A DISPLACED OWNER COULD ERASE THE REPLACEMENT'S CLAIM AND REOPEN THE POST SLOT.
+//
+// Round 5 admitted the holder of the slot past the ordering test and rested the safety on the stale
+// cutoff being "the only re-claim authority". It is — but a re-claim only helps if the worker it
+// displaced can no longer write the row. Its failure write was fenced on `{ id, retryCount }`, and a
+// re-claim does not advance retryCount, so the displaced owner's update matched and landed: the
+// replacement's PROCESSING claim was overwritten with PENDING while its request was still on the wire.
+//
+// Nothing then holds the slot, so decideInvoicePaymentClaim admits a sibling for the same order and a
+// second payment posts against the same invoice — with no SYNCED row anywhere for the capacity guard
+// to count. The release is now fenced on the claim INSTANT, so only the owner can give the row back.
+// ---------------------------------------------------------------------------
+
+const T_DISPLACED_CLAIM = new Date('2026-03-01T09:00:00.000Z')
+const T_REPLACEMENT_CLAIM = new Date('2026-03-01T09:20:00.000Z')
+
+/**
+ * A one-row store that HONOURS the where clause, because the whole property under test is which
+ * writes match and which do not. A double that ignored `where` would report the fix as working and
+ * the defect as working equally well.
+ */
+function makeRowStore(row: { id: string; status: string; processingStartedAt: Date | null; retryCount: number }) {
+  const state = { ...row }
+  const matches = (where: Record<string, unknown>) => (
+    (where.id === undefined || where.id === state.id)
+    && (where.status === undefined || where.status === state.status)
+    && (where.retryCount === undefined || where.retryCount === state.retryCount)
+    && (where.processingStartedAt === undefined
+      || (where.processingStartedAt as Date | null)?.valueOf() === state.processingStartedAt?.valueOf())
+  )
+  const accountingSyncLog = {
+    updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+      if (!matches(where)) return { count: 0 }
+      Object.assign(state, data)
+      return { count: 1 }
+    },
+    findUnique: async () => ({ retryCount: state.retryCount, status: state.status }),
+  }
+  const tx = new Proxy({ accountingSyncLog }, {
+    get(_target, prop: string) {
+      if (prop === 'accountingSyncLog') return accountingSyncLog
+      return new Proxy({}, { get: () => async () => undefined })
+    },
+  })
+  return { tx: tx as never, state }
+}
+
+const PAYMENT_ENTRY = {
+  id: 'payment-claimed',
+  retryCount: 2,
+  type: 'INVOICE_PAYMENT' as const,
+  referenceType: 'SalesOrder',
+  referenceId: 'order-1',
+}
+
+test('o3d-a3wx r6: a displaced owner cannot un-claim the replacement, so the post slot stays shut', async () => {
+  // The row was re-taken at 09:20 after the 09:00 claim went stale. The 09:00 worker is still alive —
+  // a timeout cannot recall a request already on the wire — and now reports its failure.
+  const { tx, state } = makeRowStore({
+    id: 'payment-claimed',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+    retryCount: 2,
+  })
+
+  await applyMainSyncFailureRetry(tx, PAYMENT_ENTRY, 'connection reset', {}, claimHeldFrom(T_DISPLACED_CLAIM))
+
+  assert.equal(state.status, 'PROCESSING', 'the replacement still holds the row')
+  assert.equal(state.processingStartedAt?.valueOf(), T_REPLACEMENT_CLAIM.valueOf())
+  assert.equal(state.retryCount, 2, 'and its attempt budget was not spent by a worker that no longer owns it')
+
+  // THE CONSEQUENCE, which is the reason this matters: the slot is still held, so the sibling waiting
+  // to settle the same order is refused. With the row dropped to PENDING it would have been admitted
+  // and posted a second payment against an invoice the replacement is settling right now.
+  const sibling = decideInvoicePaymentClaim({
+    entryId: 'payment-sibling',
+    live: [
+      { id: 'payment-sibling', status: 'PENDING', createdAt: new Date('2026-03-01T08:59:00.000Z') },
+      { id: state.id, status: state.status, createdAt: new Date('2026-03-01T09:00:05.000Z') },
+    ],
+  })
+  assert.equal(sibling.claim, false)
+  assert.equal(sibling.claim === false && sibling.reason, 'ANOTHER_ENTRY_IS_POSTING')
+  assert.equal(sibling.claim === false && sibling.blockedBy, 'payment-claimed')
+})
+
+test('o3d-a3wx r6: the worker that DOES own the claim still records its failure and frees the slot', async () => {
+  // The counter-guard. Fencing must not freeze the row: the actual owner writes, the row leaves
+  // PROCESSING, and the sibling it was blocking is admitted on the next pass.
+  const { tx, state } = makeRowStore({
+    id: 'payment-claimed',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+    retryCount: 2,
+  })
+
+  const result = await applyMainSyncFailureRetry(tx, PAYMENT_ENTRY, 'connection reset', {}, claimHeldFrom(T_REPLACEMENT_CLAIM))
+
+  assert.equal(state.status, 'PENDING')
+  assert.equal(state.retryCount, 3)
+  assert.equal(result.finalFailure, false)
+
+  const sibling = decideInvoicePaymentClaim({
+    entryId: 'payment-sibling',
+    live: [
+      { id: 'payment-sibling', status: 'PENDING', createdAt: new Date('2026-03-01T08:59:00.000Z') },
+      { id: state.id, status: state.status, createdAt: new Date('2026-03-01T09:00:05.000Z') },
+    ],
+  })
+  assert.equal(sibling.claim, true, 'the earliest unclaimed row goes next once nothing is posting')
+})
+
+test('o3d-a3wx r6: neither runner releases a claim with an unfenced write', () => {
+  // Structural, and paired with the behavioural tests above: the fence is only worth anything if EVERY
+  // release carries it. `update({ where: { id } })` cannot express "only while I still hold it" —
+  // Prisma's unique-where update takes no extra predicate — so a release must go through updateMany.
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
+  const direct = src.slice(
+    src.indexOf('async function processPendingXeroSyncDirect('),
+    src.indexOf('async function processPendingXeroSyncViaOutbox('),
+  )
+  const outbox = src.slice(src.indexOf('async function processPendingXeroSyncViaOutbox('))
+  for (const [name, block] of [['direct', direct], ['outbox', outbox]] as const) {
+    for (const [index, chunk] of block.split('accountingSyncLog.update(').slice(1).entries()) {
+      const data = chunk.slice(0, chunk.indexOf('})'))
+      assert.ok(
+        !data.includes("status: 'PENDING'"),
+        `the ${name} runner must not hand a claimed row back to PENDING with an unfenced update (site ${index + 1})`,
+      )
+    }
+    assert.ok(
+      block.includes('heldClaimWhere(entry.id, claimedAt)'),
+      `the ${name} runner must release the claim it holds under its own fence`,
+    )
   }
 })
