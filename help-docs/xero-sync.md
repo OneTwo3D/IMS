@@ -1018,6 +1018,34 @@ If the active accounting connector is QuickBooks (not Xero), IMS records a
 `sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
 behaviour is symmetric with the purchase bill path.
 
+### Cancelling an order while its invoice is posting
+
+Cancelling a sales order retires any invoice work still queued for it, so the ledger never receives
+an ACCREC invoice for a sale that did not happen. There is one moment where that is not enough: the
+worker has already decided to post and its request is on its way to Xero. Nothing local can recall
+a request that has left, so **the cancellation is refused instead**:
+
+> Cannot cancel this order while its xero SALES_INVOICE is being posted (sync log …). The invoice
+> request may already be on the wire, and cancelling now would leave a receivable in the ledger for
+> a sale that never happened. Wait for the post to settle — at most 15 minutes — then cancel: if it
+> posted, the cancellation will need an explicit credit note.
+
+**This refusal is temporary and needs no action.** The claim it names clears as soon as the post
+settles, and in any case within fifteen minutes. Try the cancel again then. A WooCommerce
+cancellation arriving over the webhook is retried automatically — it is not dropped.
+
+Once the post has settled, which outcome you get is visible on the sync row:
+
+| Row after the post | What cancelling now means |
+| --- | --- |
+| Failed or Pending, no external ID | Nothing reached Xero. Cancel normally; the queued row is retired with it. |
+| Synced, with an external ID | The invoice IS in Xero. Cancelling the IMS order does **not** reverse it — raise a credit note in Xero. |
+
+The opposite order is handled too: if the cancellation commits first, the worker re-reads the order
+immediately before posting, finds it cancelled, and retires its own row instead of posting. The two
+paths take the same lock on the order, so exactly one of them wins and neither can act on a stale
+view.
+
 ### Rejected Update Sync Alerts
 
 When Xero rejects a `SALES_INVOICE_UPDATE` or `PURCHASE_INVOICE_UPDATE` (e.g. the external invoice

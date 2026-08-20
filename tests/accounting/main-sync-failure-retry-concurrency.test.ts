@@ -3,6 +3,13 @@ import test from 'node:test'
 
 import { applyMainSyncFailureRetry } from '@/lib/connectors/xero/sync-processor'
 
+// o3d-550x: every call now carries the instant the caller stamped its claim, and the update lands only
+// while the row still bears it. A re-claim does NOT advance retryCount, so the guard this file was
+// written about could not tell a displaced owner from the worker that actually holds the row. The
+// BEHAVIOURAL proof lives in tests/accounting/xero-claim-fence.test.ts, against a store that honours
+// its where clause — the double below returns a canned count and cannot observe a fence at all.
+const CLAIMED_AT = new Date('2026-03-01T09:00:00.000Z')
+
 // audit-om4e: the inline MAIN-sync failure retry updates must advance retryCount
 // optimistically (where: { id, retryCount }) like markSyncLogForFollowUpRetry, so
 // two workers on the same row can't double-write the failure transition / mirrored
@@ -59,8 +66,13 @@ const entry = { id: 'log-1', retryCount: 2, type: 'SALES_INVOICE' as const, refe
 
 test('optimistic update keys on the observed retryCount; non-terminal stays PENDING', async () => {
   const { tx, calls } = makeTx({ updateCount: 1 })
-  const result = await applyMainSyncFailureRetry(tx, entry, 'boom', {})
-  assert.deepEqual(calls.updateMany[0].where, { id: 'log-1', retryCount: 2 })
+  const result = await applyMainSyncFailureRetry(tx, entry, 'boom', {}, CLAIMED_AT)
+  assert.deepEqual(calls.updateMany[0].where, {
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: CLAIMED_AT,
+    retryCount: 2,
+  })
   assert.equal(calls.updateMany[0].data.retryCount, 3)
   assert.equal(calls.updateMany[0].data.status, 'PENDING')
   assert.equal(calls.findUnique, 0) // won the race → no re-read
@@ -69,25 +81,25 @@ test('optimistic update keys on the observed retryCount; non-terminal stays PEND
 
 test('reaching MAX_RETRIES marks FAILED (and writes the mirror on the winning path)', async () => {
   const { tx } = makeTx({ updateCount: 1 })
-  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 4 }, 'boom', {})
+  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 4 }, 'boom', {}, CLAIMED_AT)
   assert.equal(result.finalFailure, true)
 })
 
 test('lost race (count 0) reports the PERSISTED terminal state, not the stale view', async () => {
   const { tx, calls } = makeTx({ updateCount: 0, current: { retryCount: 5, status: 'FAILED' } })
-  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 1 }, 'boom', {})
+  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 1 }, 'boom', {}, CLAIMED_AT)
   assert.equal(calls.findUnique, 1)
   assert.equal(result.finalFailure, true)
 })
 
 test('lost race where the winner left the row retryable reports finalFailure=false', async () => {
   const { tx } = makeTx({ updateCount: 0, current: { retryCount: 2, status: 'PENDING' } })
-  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 1 }, 'boom', {})
+  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 1 }, 'boom', {}, CLAIMED_AT)
   assert.equal(result.finalFailure, false)
 })
 
 test('lost race with a vanished row falls back to the computed view', async () => {
   const { tx } = makeTx({ updateCount: 0, current: null })
-  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 4 }, 'boom', {})
+  const result = await applyMainSyncFailureRetry(tx, { ...entry, retryCount: 4 }, 'boom', {}, CLAIMED_AT)
   assert.equal(result.finalFailure, true) // 4 → 5 == MAX
 })

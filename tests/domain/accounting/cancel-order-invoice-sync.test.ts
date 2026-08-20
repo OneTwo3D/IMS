@@ -8,16 +8,25 @@ import {
 
 type Call = { where?: unknown; data?: unknown }
 
-function mockTx(pendingEventIds: string[]) {
+function mockTx(pendingEventIds: string[], livePostingClaim: unknown = null) {
   const calls: {
+    syncFindFirst: Call[]
     syncUpdateMany: Call[]
     eventFindMany: Call[]
     eventUpdateMany: Call[]
     eventLogCreateMany: Call[]
-  } = { syncUpdateMany: [], eventFindMany: [], eventUpdateMany: [], eventLogCreateMany: [] }
+  } = { syncFindFirst: [], syncUpdateMany: [], eventFindMany: [], eventUpdateMany: [], eventLogCreateMany: [] }
 
   const tx = {
     accountingSyncLog: {
+      // o3d-7o0: the posting-intent probe. The sweep refuses outright while a fresh PROCESSING claim
+      // exists for the order, so the default here is "nothing in flight" — which is what every
+      // pre-existing test in this file assumes. The refusal itself is exercised in
+      // tests/accounting/cancel-invoice-posting-intent.test.ts against a where-honouring store.
+      findFirst: async (args: Call) => {
+        calls.syncFindFirst.push(args)
+        return livePostingClaim
+      },
       updateMany: async (args: Call) => {
         calls.syncUpdateMany.push(args)
         return { count: 1 }
@@ -176,7 +185,8 @@ test('cancelPendingSalesInvoiceSyncForOrder does not clobber an event a worker p
   const eventUpdateMany: Array<{ where?: unknown; data?: unknown }> = []
   const eventLogCreateMany: unknown[] = []
   const tx = {
-    accountingSyncLog: { updateMany: async () => ({ count: 1 }) },
+    // o3d-7o0: findFirst is the posting-intent probe; nothing is in flight in this scenario.
+    accountingSyncLog: { findFirst: async () => null, updateMany: async () => ({ count: 1 }) },
     accountingEvent: {
       findMany: async ({ where }: { where: { status?: unknown } }) => {
         const status = (where as { status?: { in?: string[] } | string }).status

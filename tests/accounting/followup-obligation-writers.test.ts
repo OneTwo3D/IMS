@@ -360,7 +360,10 @@ test('[o3d-9kek r10 f1] the direct Xero writer claims the follow-up obligation I
   // The claim is not a call of its own: it rides the update that flips the row to SYNCED, so there
   // is no interval — not even one statement wide — in which the row is SYNCED with an external id
   // and silent about what it still owes.
-  const synced = state.journal.find((entry) => entry.op === 'syncLog.update' && entry.data?.status === 'SYNCED')
+  // o3d-550x: the SYNCED transition is an updateMany now — its where carries the "do not overwrite a
+  // DIFFERENT document" precondition, which Prisma's unique-where update cannot express. The property
+  // this file is about is unchanged: the obligation is claimed in the SAME write.
+  const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
   assert.ok(synced, 'the row must be marked SYNCED')
   assert.ok(
     synced.data?.backReferenceFollowUpsPendingAt instanceof Date,
@@ -444,7 +447,10 @@ test('[o3d-9kek r10 f1] the OUTBOX Xero writer claims and releases it the same w
 
   assert.equal(result.succeeded, 1, 'the outbox loop must have processed the row, not skipped it')
   assert.equal(subjectOutboxJob()?.status, 'SUCCEEDED', 'and it really went through the outbox, not the direct loop')
-  const synced = state.journal.find((entry) => entry.op === 'syncLog.update' && entry.data?.status === 'SYNCED')
+  // o3d-550x: the SYNCED transition is an updateMany now — its where carries the "do not overwrite a
+  // DIFFERENT document" precondition, which Prisma's unique-where update cannot express. The property
+  // this file is about is unchanged: the obligation is claimed in the SAME write.
+  const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
   assert.ok(synced?.data?.backReferenceFollowUpsPendingAt instanceof Date, 'claimed in the SYNCED write')
   assert.ok(
     firstJournalEntry('backReference.written').markerAtThisPoint instanceof Date,
@@ -687,7 +693,10 @@ test('[o3d-9kek r10 f1] a FRESHLY POSTED Xero row claims the obligation in the w
   const result = await runDirect()
 
   assert.equal(result.succeeded, 1)
-  const synced = state.journal.find((entry) => entry.op === 'syncLog.update' && entry.data?.status === 'SYNCED')
+  // o3d-550x: the SYNCED transition is an updateMany now — its where carries the "do not overwrite a
+  // DIFFERENT document" precondition, which Prisma's unique-where update cannot express. The property
+  // this file is about is unchanged: the obligation is claimed in the SAME write.
+  const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
   assert.ok(synced, 'the row must be marked SYNCED')
   assert.equal(synced.data?.externalTransactionId, 'XBILL-1', 'this is the write that records the id')
   assert.ok(
@@ -707,7 +716,10 @@ test('[o3d-9kek r10 f1] the same holds on the OUTBOX fresh-post branch', async (
 
   assert.equal(result.succeeded, 1)
   assert.equal(subjectOutboxJob()?.status, 'SUCCEEDED', 'the outbox loop, not the direct one')
-  const synced = state.journal.find((entry) => entry.op === 'syncLog.update' && entry.data?.status === 'SYNCED')
+  // o3d-550x: the SYNCED transition is an updateMany now — its where carries the "do not overwrite a
+  // DIFFERENT document" precondition, which Prisma's unique-where update cannot express. The property
+  // this file is about is unchanged: the obligation is claimed in the SAME write.
+  const synced = state.journal.find((entry) => entry.op === 'syncLog.updateMany' && entry.data?.status === 'SYNCED')
   assert.equal(synced?.data?.externalTransactionId, 'XBILL-1')
   assert.ok(synced?.data?.backReferenceFollowUpsPendingAt instanceof Date)
   assert.ok(firstJournalEntry('backReference.written').markerAtThisPoint instanceof Date)
@@ -759,6 +771,7 @@ test('[o3d-9kek r10 f1] the QuickBooks writer claims the obligation IN the SYNCE
   const result = await runQuickBooks()
 
   assert.equal(result.succeeded, 1)
+  // QuickBooks is unchanged by o3d-550x (out of scope), so its SYNCED transition is still `update`.
   const synced = state.journal.find((entry) => entry.op === 'syncLog.update' && entry.data?.status === 'SYNCED')
   assert.ok(synced, 'the row must be marked SYNCED')
   assert.ok(
@@ -781,6 +794,7 @@ test('[o3d-9kek r10 f1] a FRESHLY POSTED QuickBooks row claims it in the write t
   const result = await runQuickBooks()
 
   assert.equal(result.succeeded, 1)
+  // QuickBooks is unchanged by o3d-550x (out of scope), so its SYNCED transition is still `update`.
   const synced = state.journal.find((entry) => entry.op === 'syncLog.update' && entry.data?.status === 'SYNCED')
   assert.equal(synced?.data?.externalTransactionId, 'XBILL-1')
   assert.ok(synced?.data?.backReferenceFollowUpsPendingAt instanceof Date)

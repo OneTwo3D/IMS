@@ -26,6 +26,7 @@ import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/acc
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
+import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { applyBackReference, followUpObligationClaim, releaseFollowUpObligation } from '@/lib/domain/accounting/back-reference'
 import { stampSyncedAtFromDatabaseClock } from './synced-at-clock'
 import {
@@ -228,6 +229,169 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
   })
 }
 
+/**
+ * "I STILL OWN THIS ROW" — the where-fence every RELEASE of a claim must carry (o3d-550x).
+ *
+ * A claim is `{ status: PROCESSING, processingStartedAt: <the instant I stamped> }`, and the stale
+ * cutoff in {@link accountingSyncLogClaimWhere} lets a NEW worker re-take a row whose claim has aged
+ * out. Nothing stops the OLD worker: a timeout cannot reach into a request already on the wire, so it
+ * comes back later and writes. The `{ id, retryCount }` guard those writers carried does not stop it
+ * either — A RE-CLAIM DOES NOT ADVANCE retryCount ({@link accountingSyncLogClaimWhere} writes status
+ * and the claim instant only), so the displaced owner's predicate still matches and its update lands:
+ * the replacement's PROCESSING claim is erased and the row drops back to PENDING/FAILED WHILE THE
+ * REPLACEMENT'S REQUEST IS STILL ON THE WIRE. The row then looks idle, is re-claimed a third time, and
+ * a second document posts for the same reference.
+ *
+ * Matching on the claim INSTANT rather than on `status: 'PROCESSING'` alone is the point: the
+ * replacement's row is PROCESSING too. Only the worker that stamped that exact timestamp owns it.
+ *
+ * WHAT THIS FENCE IS DELIBERATELY NOT PUT ON: the write that RECORDS A POSTED DOCUMENT. A displaced
+ * owner that really posted must still be able to record its external id, or the document becomes
+ * untracked — evidence of a post must never be conditional on winning a race. That write is protected
+ * differently, by {@link recordPostedSyncResult}, whose only precondition is the fact it protects.
+ */
+export function heldClaimWhere(entryId: string, claimedAt: Date) {
+  return { id: entryId, status: 'PROCESSING' as const, processingStartedAt: claimedAt }
+}
+
+/**
+ * The outcome of trying to record a posted document on its sync row (o3d-550x).
+ *
+ * `ANOTHER_DOCUMENT_NAMED` is the case the claim fence must NOT be used for: the row already carries a
+ * DIFFERENT externalTransactionId, so a newer claim posted its own document while this worker was on
+ * the wire. Both documents are real and in the ledger. Overwriting would destroy the only local record
+ * of one of them, so the row keeps what it already names and the displaced id is escalated instead.
+ */
+export type PostedSyncRecord =
+  | { recorded: true }
+  | { recorded: false; reason: 'ANOTHER_DOCUMENT_NAMED'; namedExternalId: string | null }
+  | { recorded: false; reason: 'ROW_MISSING' }
+
+/**
+ * Record a posted document on its sync row — NOT fenced on claim ownership, on purpose (o3d-550x).
+ *
+ * o3d-550x asked for every result write to be fenced on the claim, `count === 0` meaning "discard my
+ * result". That is right for the FAILURE and DEFERRAL writes ({@link heldClaimWhere}) and WRONG here,
+ * and the difference is the whole point: a failure write asserts a state the row can be talked out of,
+ * while this one records A FACT ABOUT THE EXTERNAL LEDGER that has already happened. Making it
+ * conditional on still holding the claim would mean the displaced worker — the one that DID post —
+ * writes nothing, and the document exists in Xero with nothing in IMS naming it.
+ *
+ * So the only precondition is the fact it protects: the row must not already name a DIFFERENT
+ * document. `externalTransactionId: null` (nothing recorded yet) or the same id again (an idempotent
+ * re-record) both land; a different id refuses and is reported so the caller can escalate with BOTH
+ * ids. Whichever worker gets there first is recorded unconditionally — no race decides it.
+ */
+export async function recordPostedSyncResult(
+  // `$executeRaw` because the database-clock stamp below is raw SQL (o3d-batch-billpay / o3d-clxw r4).
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | '$executeRaw'>,
+  params: {
+    entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+    externalId: string | null
+    payload: SyncPayload
+    /**
+     * o3d-cvj9: the revision stamp Xero put on the document as it applied THIS write. Supplied ONLY
+     * by the call sites where a connector write actually landed in this attempt. The short-circuit
+     * sites — the row already carried an external id, so nothing was called — omit it entirely, and
+     * that ABSENCE (not `null`) is what `resolveDocumentRevisionOrder` decides those paths on: an
+     * attempt that called nothing changed nothing about the document and takes no claim on it.
+     */
+    externalRevisionAt?: Date | null
+  },
+): Promise<PostedSyncRecord> {
+  const { entry, externalId, payload } = params
+  const written = await tx.accountingSyncLog.updateMany({
+    where: {
+      id: entry.id,
+      OR: [
+        { externalTransactionId: null },
+        ...(externalId ? [{ externalTransactionId: externalId }] : []),
+      ],
+    },
+    data: {
+      status: 'SYNCED',
+      externalTransactionId: externalId,
+      syncedAt: new Date(),
+      errorMessage: null,
+      processingStartedAt: null,
+      // Claimed IN this transaction, so the row can never be SYNCED-with-an-id and silent about the
+      // follow-ups it still owes (r10 finding 1).
+      ...followUpObligationClaim(),
+    },
+  })
+  if (written.count === 0) {
+    const current = await tx.accountingSyncLog.findUnique({
+      where: { id: entry.id },
+      select: { externalTransactionId: true },
+    })
+    if (!current) return { recorded: false, reason: 'ROW_MISSING' }
+    return { recorded: false, reason: 'ANOTHER_DOCUMENT_NAMED', namedExternalId: current.externalTransactionId }
+  }
+  // The registration's completion time is stamped by the DATABASE, in this transaction and strictly
+  // after the POST returned (o3d-clxw round 4, merged as o3d-batch-billpay). The payment poller fences
+  // its reversal verdict on this value against a `clock_timestamp()` it reads from the same database,
+  // so no application host's clock can order — or misorder — a supplier payment.
+  //
+  // AFTER the Prisma write above, never before: the SYNCED write changes `status` without assigning
+  // the provenance marker, so it trips the trigger that clears the marker; this statement then mints
+  // the new pair. Swapped, the transaction would erase its own stamp.
+  await stampSyncedAtFromDatabaseClock(tx, entry.id)
+  await updateMirroredEventForSyncLog(tx, {
+    syncLogId: entry.id,
+    type: entry.type,
+    referenceType: entry.referenceType,
+    referenceId: entry.referenceId,
+    payload,
+    status: 'POSTED',
+    externalId,
+    // Spread, not `externalRevisionAt: params.externalRevisionAt`: the mirror distinguishes an
+    // absent field from an explicit `null`, and a replay that called nothing must leave the stamp
+    // an earlier write established alone rather than wiping it.
+    ...(params.externalRevisionAt !== undefined ? { externalRevisionAt: params.externalRevisionAt } : {}),
+  })
+  return { recorded: true }
+}
+
+/**
+ * A posted document could NOT be recorded on its row, so say so where an operator will see it
+ * (o3d-550x). Both ids are named: the one the row keeps and the one this worker posted. Without this
+ * the displaced document exists only in the external ledger and nothing in IMS knows it is there.
+ *
+ * Persisted (not the fire-and-forget logger): this is the only local record of a real document.
+ */
+async function escalateUnrecordablePostedDocument(
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string },
+  externalId: string | null,
+  record: Exclude<PostedSyncRecord, { recorded: true }>,
+): Promise<string> {
+  const description = record.reason === 'ROW_MISSING'
+    ? `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as ${externalId ?? '(no id returned)'}, `
+      + `but its sync row ${entry.id} no longer exists, so nothing in IMS references the document. `
+      + 'Reconcile it in Xero by hand.'
+    : `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as ${externalId ?? '(no id returned)'}, `
+      + `but sync row ${entry.id} already names a DIFFERENT document (${record.namedExternalId ?? 'unknown'}) — a newer `
+      + 'claim posted while this attempt was on the wire. BOTH documents exist in Xero. The row was left naming the '
+      + 'first one; void or credit the duplicate in Xero by hand.'
+  await logActivityPersisted({
+    entityType: 'SYSTEM',
+    entityId: entry.id,
+    action: 'xero_posted_document_unrecorded',
+    tag: 'sync',
+    level: 'ERROR',
+    description,
+    metadata: {
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      postedExternalId: externalId,
+      rowNamesExternalId: record.reason === 'ANOTHER_DOCUMENT_NAMED' ? record.namedExternalId : null,
+      reason: record.reason,
+    },
+  })
+  return description
+}
+
 export async function markSyncLogForFollowUpRetry(
   entry: { id: string; retryCount: number },
   error: unknown,
@@ -279,17 +443,27 @@ export async function markSyncLogForFollowUpRetry(
  * compound where makes the update a no-op for the loser; on a lost race we
  * re-read so the caller's outbox permanent/retry decision reflects reality and
  * we skip the mirrored-event write the winner already did.
+ *
+ * o3d-550x: RETRYCOUNT WAS NEVER THE LOSER-DETECTOR IT WAS WRITTEN AS, for the stale-claim reclaim
+ * this header names first. Re-claiming a row does not advance retryCount, so both workers observe the
+ * same value and BOTH updates match. The displaced owner therefore wins here, un-claims the
+ * replacement mid-flight and drops the row back to PENDING/FAILED, which frees the row for a third
+ * claim while a request is still on the wire. This write now also carries {@link heldClaimWhere}: a
+ * failure is recorded only by the worker that still holds the claim it took, and a displaced one falls
+ * through to the lost-race branch and reports the row as it actually stands.
  */
 export async function applyMainSyncFailureRetry(
   tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog'>,
   entry: { id: string; retryCount: number; type: AccountingSyncType; referenceType: string; referenceId: string },
   errorMessage: string,
   payload: SyncPayload,
+  /** The instant THIS worker stamped its claim. Required: an unfenced release is the o3d-550x defect. */
+  claimedAt: Date,
 ): Promise<{ finalFailure: boolean }> {
   const retryCount = entry.retryCount + 1
   const computedFinal = retryCount >= MAX_RETRIES
   const updated = await tx.accountingSyncLog.updateMany({
-    where: { id: entry.id, retryCount: entry.retryCount },
+    where: { ...heldClaimWhere(entry.id, claimedAt), retryCount: entry.retryCount },
     data: {
       status: computedFinal ? 'FAILED' : 'PENDING',
       retryCount,
@@ -589,9 +763,11 @@ export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
   return blocked
 }
 
-async function deferPaymentUntilEarlierLogsPost(entry: { id: string }): Promise<void> {
-  await db.accountingSyncLog.update({
-    where: { id: entry.id },
+async function deferPaymentUntilEarlierLogsPost(entry: { id: string }, claimedAt: Date): Promise<void> {
+  // o3d-550x: the caller holds the claim, so this gives it back under its own fence — an
+  // unconditional write here would stamp PENDING over a claim another worker has since taken.
+  await db.accountingSyncLog.updateMany({
+    where: heldClaimWhere(entry.id, claimedAt),
     data: {
       status: 'PENDING',
       // Future processingStartedAt is the existing retry gate for PENDING sync
@@ -667,9 +843,10 @@ export async function findInvoiceUpdatesBlockedByPendingCreate(
   return blocked
 }
 
-async function deferUpdateUntilCreatePosts(entry: { id: string }): Promise<void> {
-  await db.accountingSyncLog.update({
-    where: { id: entry.id },
+async function deferUpdateUntilCreatePosts(entry: { id: string }, claimedAt: Date): Promise<void> {
+  // o3d-550x: fenced on the claim this worker holds, like every other release of it.
+  await db.accountingSyncLog.updateMany({
+    where: heldClaimWhere(entry.id, claimedAt),
     data: {
       status: 'PENDING',
       processingStartedAt: new Date(Date.now() + 60_000),
@@ -853,57 +1030,28 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
 
     try {
       if (blockedPaymentEntryIds.has(entry.id)) {
-        await deferPaymentUntilEarlierLogsPost(entry)
+        await deferPaymentUntilEarlierLogsPost(entry, claimedAt)
         result.skipped++
         continue
       }
       if (blockedUpdateEntryIds.has(entry.id)) {
-        await deferUpdateUntilCreatePosts(entry)
+        await deferUpdateUntilCreatePosts(entry, claimedAt)
         result.skipped++
         continue
       }
 
       if (entry.externalTransactionId) {
-        await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-              // Claimed IN this transaction, so the row can never be SYNCED-with-an-id and silent
-              // about the follow-ups it still owes (r10 finding 1).
-              ...followUpObligationClaim(),
-            },
-          })
-          // The registration's completion time is stamped by the DATABASE, in this transaction and
-          // strictly after the POST returned (o3d-clxw round 4). The payment poller fences its
-          // reversal verdict on this value against a `clock_timestamp()` it reads from the same
-          // database, so no application host's clock can order — or misorder — a supplier payment.
-          await stampSyncedAtFromDatabaseClock(tx, entry.id)
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            // o3d-cvj9 r3: no connector call was made on this path — the log already carried the
-            // document id from an earlier successful post — so there is no revision stamp to record
-            // and none is invented. `externalRevisionAt` is left UNDEFINED rather than null, so a
-            // stamp an earlier write of this row established is not wiped by a replay that wrote
-            // nothing. o3d-cvj9 r7: and the ABSENCE of the field is what `resolveDocumentRevisionOrder`
-            // decides this path on, in the rule it asks FIRST — an attempt that called nothing changed
-            // nothing about the document and so takes no claim on it. (r3/r4 credited the create
-            // fallback with carrying this path safely. It did not: the fallback matches on the
-            // HOLDER's type, so for the ordinary create-then-revise shape it answered "the create
-            // precedes" and handed a replay that wrote nothing the claim anyway — Codex r6, HIGH.)
-            // A replay that DOES call the connector records the stamp of the write it made, and is
-            // then ordered by that stamp like any other write.
-            externalId: entry.externalTransactionId,
-          })
-        })
+        // o3d-550x: the evidence write, NOT fenced on the claim — see recordPostedSyncResult.
+        const record = await db.$transaction(async (tx) => recordPostedSyncResult(tx, {
+          entry,
+          externalId: entry.externalTransactionId,
+          payload,
+        }))
+        if (!record.recorded) {
+          await escalateUnrecordablePostedDocument(entry, entry.externalTransactionId, record)
+          result.failed++
+          continue
+        }
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
@@ -946,36 +1094,22 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
-        await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              externalTransactionId: syncResult.externalId ?? null,
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-              // Same transaction as the external id itself (r10 finding 1): the two facts that make
-              // the crash-after-post state recoverable become durable together or not at all.
-              ...followUpObligationClaim(),
-            },
-          })
-          // The registration's completion time is stamped by the DATABASE, in this transaction and
-          // strictly after the POST returned (o3d-clxw round 4). The payment poller fences its
-          // reversal verdict on this value against a `clock_timestamp()` it reads from the same
-          // database, so no application host's clock can order — or misorder — a supplier payment.
-          await stampSyncedAtFromDatabaseClock(tx, entry.id)
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            externalId: syncResult.externalId ?? null,
-            externalRevisionAt: syncResult.externalRevisionAt ?? null,
-          })
-        })
+        // o3d-550x: the external id and the follow-up obligation still become durable together
+        // (r10 finding 1); what changed is that this write refuses to OVERWRITE a different
+        // document rather than refusing when a newer claim owns the row.
+        const record = await db.$transaction(async (tx) => recordPostedSyncResult(tx, {
+          entry,
+          externalId: syncResult.externalId ?? null,
+          payload,
+          // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write
+          // it made is recorded and orders the document against other writers.
+          externalRevisionAt: syncResult.externalRevisionAt ?? null,
+        }))
+        if (!record.recorded) {
+          await escalateUnrecordablePostedDocument(entry, syncResult.externalId ?? null, record)
+          result.failed++
+          continue
+        }
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
@@ -992,8 +1126,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       } else {
         const errorMessage = syncResult.error ?? 'Unknown error'
         if (isRateLimitError(errorMessage)) {
-          await db.accountingSyncLog.update({
-            where: { id: entry.id },
+          // o3d-550x: fenced like every other release of the claim (see heldClaimWhere) — a
+          // displaced owner backing off here would hand the row back to PENDING mid-post.
+          await db.accountingSyncLog.updateMany({
+            where: heldClaimWhere(entry.id, claimedAt),
             data: {
               status: 'PENDING',
               errorMessage,
@@ -1002,7 +1138,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           })
         } else {
           await db.$transaction(async (tx) => {
-            await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
+            await applyMainSyncFailureRetry(tx, entry, errorMessage, payload, claimedAt)
           })
         }
         result.failed++
@@ -1010,8 +1146,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     } catch (e) {
       const errorMessage = String(e)
       if (isRateLimitError(errorMessage)) {
-        await db.accountingSyncLog.update({
-          where: { id: entry.id },
+        // o3d-550x: fenced like every other release of the claim (see heldClaimWhere).
+        await db.accountingSyncLog.updateMany({
+          where: heldClaimWhere(entry.id, claimedAt),
           data: {
             status: 'PENDING',
             errorMessage,
@@ -1020,7 +1157,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         })
       } else {
         await db.$transaction(async (tx) => {
-          await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
+          await applyMainSyncFailureRetry(tx, entry, errorMessage, payload, claimedAt)
         })
       }
       result.failed++
@@ -1134,8 +1271,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     try {
       if (blockedPaymentEntryIds.has(entry.id)) {
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
+          // o3d-550x: same fence as deferPaymentUntilEarlierLogsPost on the direct runner.
+          await tx.accountingSyncLog.updateMany({
+            where: heldClaimWhere(entry.id, claimedAt),
             data: {
               status: 'PENDING',
               // Future processingStartedAt is the existing retry gate for
@@ -1152,8 +1290,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
 
       if (blockedUpdateEntryIds.has(entry.id)) {
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
+          // o3d-550x: same fence as deferUpdateUntilCreatePosts on the direct runner.
+          await tx.accountingSyncLog.updateMany({
+            where: heldClaimWhere(entry.id, claimedAt),
             data: {
               status: 'PENDING',
               processingStartedAt: new Date(Date.now() + 60_000),
@@ -1167,46 +1306,20 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       }
 
       if (entry.externalTransactionId) {
-        await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-              // r10 finding 1. The outbox path is the one MOST rows take, and it is also the one
-              // that skips a SYNCED row outright next run — so a crash here left nothing to notice.
-              ...followUpObligationClaim(),
-            },
-          })
-          // The registration's completion time is stamped by the DATABASE, in this transaction and
-          // strictly after the POST returned (o3d-clxw round 4). The payment poller fences its
-          // reversal verdict on this value against a `clock_timestamp()` it reads from the same
-          // database, so no application host's clock can order — or misorder — a supplier payment.
-          await stampSyncedAtFromDatabaseClock(tx, entry.id)
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            // o3d-cvj9 r3: no connector call was made on this path — the log already carried the
-            // document id from an earlier successful post — so there is no revision stamp to record
-            // and none is invented. `externalRevisionAt` is left UNDEFINED rather than null, so a
-            // stamp an earlier write of this row established is not wiped by a replay that wrote
-            // nothing. o3d-cvj9 r7: and the ABSENCE of the field is what `resolveDocumentRevisionOrder`
-            // decides this path on, in the rule it asks FIRST — an attempt that called nothing changed
-            // nothing about the document and so takes no claim on it. (r3/r4 credited the create
-            // fallback with carrying this path safely. It did not: the fallback matches on the
-            // HOLDER's type, so for the ordinary create-then-revise shape it answered "the create
-            // precedes" and handed a replay that wrote nothing the claim anyway — Codex r6, HIGH.)
-            // A replay that DOES call the connector records the stamp of the write it made, and is
-            // then ordered by that stamp like any other write.
-            externalId: entry.externalTransactionId,
-          })
-        })
+        // o3d-550x: the evidence write, NOT fenced on the claim — see recordPostedSyncResult.
+        const record = await db.$transaction(async (tx) => recordPostedSyncResult(tx, {
+          entry,
+          externalId: entry.externalTransactionId,
+          payload,
+        }))
+        if (!record.recorded) {
+          const description = await escalateUnrecordablePostedDocument(entry, entry.externalTransactionId, record)
+          // PERMANENT, not retryable: the document is in Xero and cannot be recorded here, so
+          // another attempt would only post a second one.
+          await markXeroOutboxPermanent(job, description)
+          result.failed++
+          continue
+        }
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
@@ -1257,35 +1370,22 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
-        await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'SYNCED',
-              externalTransactionId: syncResult.externalId ?? null,
-              syncedAt: new Date(),
-              errorMessage: null,
-              processingStartedAt: null,
-              // THE LINE r10 finding 1 NAMED. This is where most successfully posted rows go.
-              ...followUpObligationClaim(),
-            },
-          })
-          // The registration's completion time is stamped by the DATABASE, in this transaction and
-          // strictly after the POST returned (o3d-clxw round 4). The payment poller fences its
-          // reversal verdict on this value against a `clock_timestamp()` it reads from the same
-          // database, so no application host's clock can order — or misorder — a supplier payment.
-          await stampSyncedAtFromDatabaseClock(tx, entry.id)
-          await updateMirroredEventForSyncLog(tx, {
-            syncLogId: entry.id,
-            type: entry.type,
-            referenceType: entry.referenceType,
-            referenceId: entry.referenceId,
-            payload,
-            status: 'POSTED',
-            externalId: syncResult.externalId ?? null,
-            externalRevisionAt: syncResult.externalRevisionAt ?? null,
-          })
-        })
+        // o3d-550x: THE LINE r10 finding 1 NAMED, now refusing to overwrite a different document
+        // rather than refusing when a newer claim owns the row.
+        const record = await db.$transaction(async (tx) => recordPostedSyncResult(tx, {
+          entry,
+          externalId: syncResult.externalId ?? null,
+          payload,
+          // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write
+          // it made is recorded and orders the document against other writers.
+          externalRevisionAt: syncResult.externalRevisionAt ?? null,
+        }))
+        if (!record.recorded) {
+          const description = await escalateUnrecordablePostedDocument(entry, syncResult.externalId ?? null, record)
+          await markXeroOutboxPermanent(job, description)
+          result.failed++
+          continue
+        }
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
@@ -1314,8 +1414,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         if (isRateLimitError(errorMessage)) {
           const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
           await db.$transaction(async (tx) => {
-            await tx.accountingSyncLog.update({
-              where: { id: entry.id },
+            // o3d-550x: fenced like every other release of the claim (see heldClaimWhere).
+            await tx.accountingSyncLog.updateMany({
+              where: heldClaimWhere(entry.id, claimedAt),
               data: {
                 status: 'PENDING',
                 errorMessage,
@@ -1326,7 +1427,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           })
         } else {
           await db.$transaction(async (tx) => {
-            const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
+            const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload, claimedAt)
             if (finalFailure) {
               await markXeroOutboxPermanent(job, errorMessage, tx)
             } else {
@@ -1342,8 +1443,9 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       if (isRateLimitError(errorMessage)) {
         const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
         await db.$transaction(async (tx) => {
-          await tx.accountingSyncLog.update({
-            where: { id: entry.id },
+          // o3d-550x: fenced like every other release of the claim (see heldClaimWhere).
+          await tx.accountingSyncLog.updateMany({
+            where: heldClaimWhere(entry.id, claimedAt),
             data: {
               status: 'PENDING',
               errorMessage,
@@ -1354,7 +1456,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         })
       } else {
         await db.$transaction(async (tx) => {
-          const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload)
+          const { finalFailure } = await applyMainSyncFailureRetry(tx, entry, errorMessage, payload, claimedAt)
           if (finalFailure) {
             await markXeroOutboxPermanent(job, errorMessage, tx)
           } else {
@@ -1413,33 +1515,62 @@ type EntryResult = {
  *  - unreadable / missing → FAIL CLOSED (return a retryable failure, do NOT post): a transient read
  *    outage must not become permission to post.
  *  - live → return the customerId and let the caller post.
- * A residual remains: cancellation can still commit AFTER this read but before the external Xero call
- * (a lock-less TOCTOU shared with the daily-batch's own select-then-post window); closing it fully needs
- * a posting-intent/lock protocol between cancellation and posting (tracked separately).
+ * o3d-7o0 — THE READ IS NOW TAKEN UNDER THE ORDER'S ROW LOCK, IN THE TRANSACTION THAT RETIRES.
+ *
+ * It used to be a bare `findUnique` followed by a separate transaction, so a cancellation could commit
+ * between the answer and the external POST and the invoice landed anyway — a lock-less TOCTOU this
+ * function's own header could only declare. `cancelSalesOrderFulfillmentState` opens with
+ * `lockSalesOrder` on the same row, so taking it here makes the two SERIALISE: either the cancellation
+ * commits first and this read sees CANCELLED, or this transaction holds the lock and the cancellation
+ * waits — and then finds this worker's PROCESSING claim (committed by the runner BEFORE processEntry)
+ * and REFUSES, via assertNoSalesInvoicePostingInFlight. The claim is the posting intent; this lock is
+ * what makes reading it binding. Together they close the window rather than narrowing it.
+ *
+ * LOCK ORDERING: `lockSalesOrder` is the FIRST statement and the ONLY lock this transaction takes,
+ * before any accounting_sync_logs write. The cancellation takes the same order lock first, then stock
+ * levels, then the sync rows. Nothing can cycle.
+ *
+ * Fails CLOSED on an unreadable order, exactly as before: the whole transaction is wrapped, so a lock
+ * timeout or a read error returns a retryable failure rather than permission to post.
  */
-async function guardCancelledSalesOrderInvoice(
+export async function guardCancelledSalesOrderInvoice(
   entryId: string,
   referenceType: string,
   referenceId: string,
   claimedAt: Date,
 ): Promise<{ post: true; customerId?: string } | { post: false; result: EntryResult }> {
   if (referenceType !== 'SalesOrder') return { post: true }
-  let so: { customerId: string | null; status: string } | null
+  let outcome:
+    | { kind: 'missing' }
+    | { kind: 'cancelled' }
+    | { kind: 'live'; customerId?: string }
   try {
-    so = await db.salesOrder.findUnique({ where: { id: referenceId }, select: { customerId: true, status: true } })
+    outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, referenceId)
+      const so = await tx.salesOrder.findUnique({
+        where: { id: referenceId },
+        select: { customerId: true, status: true },
+      })
+      if (!so) return { kind: 'missing' as const }
+      if (so.status === 'CANCELLED') {
+        // Claim-fenced: only retire if this exact claim still owns the row (retire returns false
+        // otherwise). Either way nothing was posted, so skip — a lost fence means another worker
+        // owns/posted it.
+        await retireSalesInvoiceForCancelledOrder(tx, entryId, referenceId, claimedAt)
+        return { kind: 'cancelled' as const }
+      }
+      return { kind: 'live' as const, customerId: so.customerId ?? undefined }
+    })
   } catch (error) {
     return { post: false, result: { success: false, error: `Could not read sales order ${referenceId} status before posting: ${String(error)}` } }
   }
-  if (!so) {
+  if (outcome.kind === 'missing') {
     return { post: false, result: { success: false, error: `Sales order ${referenceId} not found before posting an invoice` } }
   }
-  if (so.status === 'CANCELLED') {
-    // Claim-fenced: only retire if this exact claim still owns the row (retire returns false otherwise).
-    // Either way nothing was posted, so skip — a lost fence means another worker owns/posted it.
-    await db.$transaction((tx) => retireSalesInvoiceForCancelledOrder(tx, entryId, referenceId, claimedAt))
+  if (outcome.kind === 'cancelled') {
     return { post: false, result: { success: true, skipped: true } }
   }
-  return { post: true, customerId: so.customerId ?? undefined }
+  return { post: true, customerId: outcome.customerId }
 }
 
 /**

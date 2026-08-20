@@ -33,7 +33,10 @@ import {
   type RetiredPendingShipment,
 } from '@/lib/domain/sales/pending-shipment-reconciliation'
 import { resolveStagedAllocationDebit } from '@/lib/domain/accounting/allocated-inventory-debit'
-import { cancelPendingSalesInvoiceSyncForOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import {
+  assertNoSalesInvoicePostingInFlight,
+  cancelPendingSalesInvoiceSyncForOrder,
+} from '@/lib/domain/accounting/cancel-order-invoice-sync'
 import { PermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 import {
   validateManualSalesOrderStatusTransition,
@@ -903,6 +906,17 @@ export async function cancelSalesOrderFulfillmentState(
     select: { status: true },
   })
   if (!lockedOrder) throw new Error('Order not found')
+
+  // o3d-7o0: REFUSE WHILE AN INVOICE POST IS ON THE WIRE, under the row lock just taken and BEFORE any
+  // write. The processor's PROCESSING claim is the posting intent, and `guardCancelledSalesOrderInvoice`
+  // now reads the order status under this same lock — so a post that gets past its guard is one this
+  // check can see, and a post whose guard has not run yet will read the CANCELLED this cancellation is
+  // about to commit. The refusal is transient: the claim ages out within fifteen minutes.
+  //
+  // Also asserted again at the end of this function, inside cancelPendingSalesInvoiceSyncForOrder — the
+  // invariant lives with the module that owns it, and this earlier call only avoids doing work that a
+  // rollback would undo anyway.
+  await assertNoSalesInvoicePostingInFlight(tx, input.orderId, new Date())
 
   // Durable evidence that goods actually left. Read BEFORE the status guard because it is what decides
   // whether a refusal is PERMANENT: SalesOrder.status alone is not proof of dispatch — importWcOrder
