@@ -133,6 +133,10 @@ test('the Sync page says the selection governs the webhook too, and what it does
   assert.match(filterSection, /orders pushed by the order webhook, which are imported\s+only if they arrive in a selected status/)
   assert.match(filterSection, /if it later moves into a\s+selected status it is imported then/)
   assert.match(filterSection, /never stops updates to an order\s+you already have/)
+  // r4: and that ticking a status later recovers what was skipped, which is the half an operator
+  // cannot otherwise discover — nothing in WooCommerce redelivers an order because IMS changed a
+  // setting. Keep in step with the cursor rewind in sync/order-import.ts.
+  assert.match(filterSection, /reaches back and imports the orders that were skipped/)
   // ...and which fetch routes it governs, so the statement is still complete.
   assert.match(filterSection, /polling sweep/)
   assert.match(filterSection, /backup reconciliation/)

@@ -4,7 +4,7 @@ import { logActivity } from '@/lib/activity-log'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { scheduleInboxDrain } from '@/lib/jobs/shopping/drain-inbox'
-import { importWcOrder } from '@/lib/connectors/woocommerce/sync/order-import'
+import { importWcOrder, noteWcOrderAdmissionRefusal } from '@/lib/connectors/woocommerce/sync/order-import'
 import { syncWcOrderStatus } from '@/lib/connectors/woocommerce/sync/order-status'
 import { syncRefundsForOrder, syncWcRefund } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import { shouldSuppressWcOrderWebhookEcho } from '@/lib/connectors/woocommerce/sync/order-webhook-echo'
@@ -17,11 +17,7 @@ import {
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import { judgeWebhookOrigin, type WebhookOriginJudgement } from '@/lib/connectors/webhook-origin'
 import { readWcDeliveryOrigin } from '@/lib/connectors/woocommerce/webhook-origin'
-import {
-  isWcOrderAdmittedByStatus,
-  parseWcSyncOrderStatuses,
-  WC_SYNC_ORDER_STATUSES_SETTING_KEY,
-} from '@/lib/connectors/woocommerce/order-status-filter'
+import { resolveWcOrderCreateAdmission } from '@/lib/connectors/woocommerce/sync/order-admission'
 import {
   createShoppingWebhookEventRepository,
   persistWcWebhookEvent,
@@ -195,45 +191,6 @@ async function logInitialImportPendingSkip(): Promise<void> {
 // initial-import key so one silent drop cannot mask the other, sharing the same window.
 const STATUS_NOT_ADMITTED_LOG_KEY = 'wc_order_webhook_status_not_admitted_last_logged_at'
 
-type WcOrderWebhookAdmission =
-  | { admitted: true; reason: 'already_linked' | 'status_selected'; configured?: undefined }
-  | { admitted: false; reason: 'status_not_selected'; configured: string[] }
-
-/**
- * Whether a pushed order may enter IMS — the DATABASE half of the admission boundary; the rule
- * itself is the pure `isWcOrderAdmittedByStatus`.
- *
- * THE LINK CHECK COMES FIRST, and it is what keeps round 2's real concern intact. An order IMS
- * already holds keeps updating whatever status it moves into: ship it, let the store mark it
- * `on-hold` or `refunded` or anything else the operator never ticked, and IMS still follows. The
- * selection decides what IMS TAKES ON, not what it is allowed to keep hearing about.
- *
- * Same identity `importWcOrder` uses to decide create-vs-update, so the two cannot disagree about
- * whether this order is new.
- */
-async function resolveWcOrderWebhookAdmission(wcOrder: WcFullOrder): Promise<WcOrderWebhookAdmission> {
-  const linked = await db.salesOrder.findFirst({
-    where: {
-      shoppingLinks: {
-        some: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) },
-      },
-    },
-    select: { id: true },
-  })
-  if (linked) return { admitted: true, reason: 'already_linked' }
-
-  const { getWithdrawalStatuses } = await import('./sync/withdrawal')
-  const [setting, withdrawal] = await Promise.all([
-    db.setting.findUnique({ where: { key: WC_SYNC_ORDER_STATUSES_SETTING_KEY } }),
-    getWithdrawalStatuses(),
-  ])
-  const configured = parseWcSyncOrderStatuses(setting?.value)
-
-  return isWcOrderAdmittedByStatus(wcOrder.status, configured, withdrawal)
-    ? { admitted: true, reason: 'status_selected' }
-    : { admitted: false, reason: 'status_not_selected', configured }
-}
-
 /**
  * Make the admission refusal visible. The delivery is ACKed, so without this the boundary would be
  * enforced exactly as silently as it was previously ignored — and an operator who unticked a status
@@ -347,23 +304,21 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   //
   // It governs the webhook as an ADMISSION boundary, not as a filter on every event: an order IMS
   // ALREADY HAS is never gated (that is what stops IMS silently disagreeing with the store about an
-  // order it holds — see `resolveWcOrderWebhookAdmission`), while an order IMS has never seen is
-  // created only if the status it currently carries is admitted. An excluded order that later moves
-  // into an admitted status is imported by THAT update, from its own full payload — it never needed
-  // an `order.created` behind it.
+  // order it holds), while an order IMS has never seen is created only if the status it currently
+  // carries is admitted. An excluded order that later moves into an admitted status is imported by
+  // THAT update, from its own full payload — it never needed an `order.created` behind it.
+  //
+  // WHAT IS RESOLVED HERE IS THE SELECTION ONLY (r4). Round 3 also read the order link here and
+  // refused on that read, minutes of database and live-store work before the create it was
+  // guarding — so a delivery that lost a race against a concurrent create was refused on an answer
+  // that had since become false. The "does IMS hold this?" half now belongs to the one statement
+  // that can answer it without going stale: `importWcOrder`'s own create-vs-update read, via
+  // `admitCreate`. See lib/connectors/woocommerce/sync/order-import.ts.
   //
   // Kept in step with app/(dashboard)/sync/sync-client.tsx and docs/installation.md.
-  if (topic === 'order.created' || topic === 'order.updated') {
-    const admission = await resolveWcOrderWebhookAdmission(wcOrder)
-    if (!admission.admitted) {
-      await logWcOrderWebhookNotAdmitted(wcOrder, topic, admission.configured)
-      // ACK 200. WooCommerce's retries are finite and a redelivery re-hits the identical rule, so a
-      // non-2xx here would burn them down to a dead letter for an order the operator EXCLUDED. The
-      // cursor is deliberately NOT advanced: this delivery imported nothing, so it must not stand in
-      // for the poll sweep's progress.
-      return NextResponse.json({ ok: true, skipped: 'status_not_selected_for_import' })
-    }
-  }
+  const admission = topic === 'order.created' || topic === 'order.updated'
+    ? await resolveWcOrderCreateAdmission(wcOrder)
+    : null
 
   const failures: string[] = []
   // Failures a stable business rule caused. Re-delivering the identical payload re-hits the identical
@@ -377,9 +332,13 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
   // suppression check or the post-import compensation (o3d-d82p).
   let suppressionHandled = false
   if (topic === 'order.created' || topic === 'order.updated') {
+    // The withdrawal wrapper runs for an excluded order TOO, and deliberately: its tombstone is
+    // the fence that stops a withdrawn order being pushed to the warehouse, and an order the
+    // operator excluded from import still must not ship. Only the CREATE is withheld, by
+    // `admitCreate` — the check the wrapper cannot make and this handler must not make early.
     const guarded = await importWcOrderGuarded(
       wcOrder,
-      () => importWcOrder(wcOrder),
+      () => importWcOrder(wcOrder, { admitCreate: admission?.admitted ?? true }),
     )
     if (guarded.outcome === 'skipped-withdrawal') {
       return NextResponse.json({ ok: true, skipped: 'unlinked-withdrawal' })
@@ -400,6 +359,18 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       // land. Acknowledging would leave the IMS lifecycle wrong until an
       // independent reconciliation, so fail the delivery and let WC redeliver.
       failures.push('withdrawal compensation failed for a raced import — the order is live and withdrawn')
+    }
+    if (guarded.result.skipped === 'status_not_admitted') {
+      await logWcOrderWebhookNotAdmitted(wcOrder, topic, admission?.configured ?? [])
+      // ACK 200. WooCommerce's retries are finite and a redelivery re-hits the identical rule, so a
+      // non-2xx here would burn them down to a dead letter for an order the operator EXCLUDED. The
+      // cursor is deliberately NOT advanced: this delivery imported nothing, so it must not stand in
+      // for the poll sweep's progress. Not advancing it is not enough on its own, though: the very
+      // next ADMITTED delivery advances it, leaving this order behind the cursor for good. So the
+      // refusal also records how far back a later widening of the selection has to reach — see
+      // `noteWcOrderAdmissionRefusal` and the rewind in syncNewWcOrders.
+      await noteWcOrderAdmissionRefusal(wcOrder.date_modified_gmt ?? wcOrder.date_created_gmt)
+      return NextResponse.json({ ok: true, skipped: 'status_not_selected_for_import' })
     }
     if (!guarded.result.success) {
       failures.push(`importWcOrder: ${guarded.result.error ?? 'unknown error'}`)

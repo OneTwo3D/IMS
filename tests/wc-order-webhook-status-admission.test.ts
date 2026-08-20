@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { WEBHOOK_ORIGIN_NOT_APPLICABLE } from '@/lib/connectors/webhook-origin'
 
 // o3d-tj6v r3: the "Import order statuses" selection reaches the ORDER WEBHOOK.
 //
@@ -20,6 +21,8 @@ const activityLog: LoggedActivity[] = []
 const settingUpserts: string[] = []
 const imported: number[] = []
 const guarded: number[] = []
+/** Every timestamp handed to the refusal watermark, so a refusal that records nothing is visible. */
+const refusalWatermarks: Array<string | null> = []
 
 /** Orders IMS already holds, by WooCommerce id. */
 let linkedExternalOrderIds: string[] = []
@@ -67,11 +70,31 @@ mock.module('@/lib/db', {
   },
 })
 
+/**
+ * MODELS THE REAL CONTRACT, not a convenient shape. `importWcOrder` is where the admission gate is
+ * enforced (o3d-tj6v r4) — it is the only reader that knows, from its own create-vs-update query,
+ * whether IMS already holds the order — so a double that imported unconditionally would make every
+ * assertion below vacuous. It refuses an option shape it does not model for the same reason.
+ *
+ * That the REAL importWcOrder honours `admitCreate` is pinned separately, against the real
+ * function, in tests/wc-order-admission-create-gate.test.ts.
+ */
 mock.module('@/lib/connectors/woocommerce/sync/order-import', {
   namedExports: {
-    importWcOrder: async (order: { id: number }) => {
+    importWcOrder: async (order: { id: number }, options: Record<string, unknown> = {}) => {
+      const unmodelled = Object.keys(options).filter((key) => key !== 'admitCreate')
+      if (unmodelled.length > 0) {
+        throw new Error(`importWcOrder double got an unmodelled option: ${unmodelled.join(', ')}`)
+      }
+      const held = linkedExternalOrderIds.includes(String(order.id))
+      if (!held && options.admitCreate === false) {
+        return { success: true, skipped: 'status_not_admitted' }
+      }
       imported.push(order.id)
-      return { success: true, orderId: 'so-new' }
+      return { success: true, orderId: held ? 'so-existing' : 'so-new' }
+    },
+    noteWcOrderAdmissionRefusal: async (modifiedAtIso: string | null | undefined) => {
+      refusalWatermarks.push(modifiedAtIso ?? null)
     },
   },
 })
@@ -114,12 +137,27 @@ mock.module('@/lib/connectors/woocommerce/sync/order-webhook-echo', {
 const WDRAW = { submitted: 'pending-wdraw', approved: 'withdrawn' }
 
 function wcOrder(id: number, status: string) {
-  return { id, number: String(id), status, line_items: [], meta_data: [] }
+  return {
+    id,
+    number: String(id),
+    status,
+    date_modified_gmt: '2026-08-01T10:00:00',
+    line_items: [],
+    meta_data: [],
+  }
 }
 
 async function pushOrder(order: ReturnType<typeof wcOrder>, topic = 'order.created') {
   const { processWcWebhookPayload } = await import('@/lib/connectors/woocommerce/webhooks')
-  return processWcWebhookPayload({ resource: 'orders', topic, payload: order })
+  // o3d-s36z (merged since): every delivery carries what the STORE said about its own origin.
+  // The ORDER path does not consult it — only the product path judges a foreign store — so the
+  // honest value here is the marker for a delivery whose origin was never stated.
+  return processWcWebhookPayload({
+    resource: 'orders',
+    topic,
+    payload: order,
+    originAttestation: WEBHOOK_ORIGIN_NOT_APPLICABLE,
+  })
 }
 
 function reset() {
@@ -127,6 +165,7 @@ function reset() {
   settingUpserts.length = 0
   imported.length = 0
   guarded.length = 0
+  refusalWatermarks.length = 0
   linkedExternalOrderIds = []
   statusSettingValue = JSON.stringify(['processing'])
   notAdmittedLastLoggedAt = null
@@ -138,7 +177,10 @@ test('a pushed order in an UNSELECTED status is not imported', async () => {
   const response = await pushOrder(wcOrder(101, 'pending'))
 
   assert.deepEqual(imported, [], 'the operator excluded `pending`; the webhook must not import it')
-  assert.deepEqual(guarded, [], 'and it must be refused BEFORE the import wrapper, not inside it')
+  // The withdrawal wrapper DOES run (r4). Its tombstone is the fence that stops a withdrawn order
+  // being pushed to the warehouse, and an order the operator excluded from import still must not
+  // ship — so only the CREATE is withheld, at the one place that knows whether IMS holds the order.
+  assert.deepEqual(guarded, [101], 'the withdrawal fence is not skipped for an excluded order')
   assert.equal(response.status, 200)
   assert.deepEqual(await response.json(), { ok: true, skipped: 'status_not_selected_for_import' })
 })
@@ -212,6 +254,7 @@ test('the gate keys on WHETHER IMS HOLDS THE ORDER, not on the status alone', as
 
   await pushOrder(wcOrder(106, 'on-hold'), 'order.updated')
   assert.deepEqual(imported, [], 'IMS has never seen it, and on-hold is not selected')
+  reset()
 
   linkedExternalOrderIds = ['116']
   await pushOrder(wcOrder(116, 'on-hold'), 'order.updated')
@@ -245,10 +288,11 @@ test('a withdrawal status is admitted even though no operator ever ticks it', as
   reset()
 
   await pushOrder(wcOrder(118, 'pending'))
-  assert.deepEqual(guarded, [], 'an ordinary unselected status is refused')
+  assert.deepEqual(imported, [], 'an ordinary unselected status is refused')
 
   await pushOrder(wcOrder(108, WDRAW.submitted))
-  assert.deepEqual(guarded, [108], 'importWcOrderGuarded still decides what to do with it')
+  assert.deepEqual(imported, [108], 'a withdrawal status is admitted whatever the selection')
+  assert.deepEqual(guarded, [118, 108], 'importWcOrderGuarded still decides what to do with both')
 })
 
 test('an EMPTY selection admits nothing by webhook either', async () => {

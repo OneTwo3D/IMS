@@ -34,6 +34,7 @@ import {
 import { getSettingValue } from '@/lib/settings-store'
 import { notify } from '@/lib/notifications'
 import { parsePositiveIntegerEnv } from '@/lib/env'
+import { findWcStatusMapping, isWcStatus } from './status-mapping'
 import {
   parseWcSyncOrderStatuses,
   resolveWcPullStatuses,
@@ -50,6 +51,19 @@ export type ImportWcOrderOptions = {
   skipAccounting?: boolean
   useWcDateAsCreatedAt?: boolean
   pendingFxRetryLogId?: string
+  /**
+   * May this import CREATE an order IMS has never seen? (o3d-tj6v r4)
+   *
+   * `undefined` — the default — means yes, and is what every PULL route passes: those already
+   * asked WooCommerce for `?status=<selection>`, so a row that came back is admitted by
+   * construction, and re-judging it here would drop the reconcile sweep's `completed` backstop.
+   *
+   * `false` is passed by the routes that receive an order WITHOUT having asked for a status —
+   * the order webhook and the withdrawal recovery sweep. It is enforced at the one point that
+   * knows the answer to "does IMS already hold this order?", which is the `findFirst` below.
+   * See the note there for why the check cannot live anywhere else.
+   */
+  admitCreate?: boolean
 }
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
@@ -1385,9 +1399,36 @@ async function resolveDirectCreateShortfall(orderId: string): Promise<void> {
   }
 }
 
-export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
+export type ImportWcOrderResult = {
+  success: boolean
+  orderId?: string
+  error?: string
+  /**
+   * Set when nothing was imported because the order is NEW and its status is outside the
+   * operator's "Import order statuses" selection. `success` is true: this is a resolved
+   * decision, not a failure to retry.
+   */
+  skipped?: 'status_not_admitted'
+}
+
+export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<ImportWcOrderResult> {
   try {
-    // Skip if already imported
+    // THE SINGLE PIVOT (o3d-tj6v r4). This one read answers both "create or update?" and "is this
+    // order gated?", and the two answers cannot disagree because there is only one of them.
+    //
+    // Round 3 asked the same question a second time, in webhooks.ts, and refused on THAT answer.
+    // Between the two reads sat a settings read, a withdrawal-status read and the whole of
+    // `importWcOrderGuarded` — which itself does database work and can read the live store. Two
+    // deliveries for an order IMS had never seen therefore both read "not held", and the one that
+    // lost the race was refused and ACKed on an answer that was already false: by the time it
+    // acted, IMS DID hold the order, and round 3's whole design rests on an order IMS holds never
+    // being gated.
+    //
+    // With the decision taken here there is nothing between the read and the act — the gate below
+    // is an in-memory branch on this row. And the case the read genuinely cannot see, two creates
+    // in flight at once, is settled by the DATA: `@@unique([connector, externalOrderId])` on
+    // shopping_order_links lets exactly one create win, and the loser's P2002 handler turns itself
+    // into the UPDATE of an order IMS now holds — which is never gated.
     const existing = await db.salesOrder.findFirst({
       where: {
         shoppingLinks: {
@@ -1411,15 +1452,18 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       return { success: true, orderId: existing.id }
     }
 
-    // Resolve IMS status from WC status
-    const statusMapping = await db.shoppingStatusMapping.findUnique({
-      where: {
-        connector_externalStatus: {
-          connector: 'woocommerce',
-          externalStatus: wcOrder.status,
-        },
-      },
-    })
+    // IMS does not hold this order, so the selection decides whether it may take it on. Placed
+    // immediately after the pivot read and before any mapping work, so an excluded order costs one
+    // query rather than a full import's worth of lookups.
+    if (options.admitCreate === false) {
+      return { success: true, skipped: 'status_not_admitted' }
+    }
+
+    // Resolve IMS status from WC status. Read through `findWcStatusMapping` so a mapping saved as
+    // `wc-processing` is not invisible to a store that reports `processing` — the admission
+    // boundary already compares those as one status, and this default-to-PROCESSING fallback is
+    // exactly where that disagreement used to be silent (o3d-tj6v r4).
+    const statusMapping = await findWcStatusMapping(wcOrder.status)
     const imsStatus = statusMapping?.imsStatus ?? 'PROCESSING'
     // Refund state is orthogonal to the lifecycle status: never store
     // REFUNDED/PARTIALLY_REFUNDED as `status`. A refunded-at-import order keeps a base
@@ -1822,6 +1866,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         return created
       }, { maxWait: 5_000, timeout: 20_000 })
     } catch (error) {
+      // The constraint arbitrating a concurrent create (o3d-tj6v r4). Losing this race means IMS
+      // DOES hold the order, so this payload becomes an UPDATE — and an update is never gated,
+      // whatever `admitCreate` said, because the selection decides what IMS takes on and not what
+      // it may keep hearing about.
       if (!isUniqueConstraintError(error)) throw error
       const concurrent = await db.salesOrder.findFirst({
         where: {
@@ -2301,6 +2349,84 @@ export async function getWcPullStatuses(route: WcOrderPullRoute): Promise<string
   return resolveWcPullStatuses(route, parseWcSyncOrderStatuses(setting?.value), withdrawal)
 }
 
+/**
+ * WHERE THE PULL CURSORS LIVE, and what makes one valid (o3d-tj6v r4).
+ *
+ * `last_wc_order_sync_at` / `last_wc_order_reconcile_at` become `?modified_after=` on the next
+ * sweep, so an order older than the cursor is simply never fetched again. That is fine while the
+ * order was never wanted — and it was the hole under round 3's acknowledged admission refusals.
+ *
+ * A refusal correctly does not advance the cursor, but the cursor is advanced by everything ELSE:
+ * the very next admitted delivery calls `advanceWcOrderSyncCursor()` and stamps it at `now`. The
+ * refused order's `date_modified` is now BEHIND the cursor. While its status stays excluded that
+ * is exactly right. The moment the operator TICKS that status, though, nothing brings it back:
+ * WooCommerce fires no webhook for a setting IMS changed, and the sweep will not reach back past
+ * its cursor. The order the operator has just asked for is invisible for good.
+ *
+ * Two settings close that, and both are facts rather than checks:
+ *
+ *   `<cursorKey>_statuses`             the resolved status list the cursor was last advanced
+ *                                      under. Compared against the current one, it says whether
+ *                                      the selection has WIDENED — i.e. whether anything that was
+ *                                      previously refused could now be wanted.
+ *   `wc_order_admission_refused_since` the earliest modification time of anything the admission
+ *                                      boundary has ever turned away. It says how far back a
+ *                                      widening has to reach, so a widening costs one bounded
+ *                                      re-fetch instead of the whole order history.
+ *
+ * Both are needed. The fingerprint alone would re-fetch on every widening even when nothing was
+ * ever refused; the watermark alone would re-fetch on every run for as long as any status stays
+ * excluded.
+ */
+export const WC_ORDER_ADMISSION_REFUSED_SINCE_KEY = 'wc_order_admission_refused_since'
+
+function wcCursorStatusesKey(cursorKey: string): string {
+  return `${cursorKey}_statuses`
+}
+
+function parseStoredStatusList(raw: string | null | undefined): string[] | null {
+  if (!raw) return null
+  try {
+    const parsed: unknown = JSON.parse(raw)
+    if (!Array.isArray(parsed) || parsed.some((entry) => typeof entry !== 'string')) return null
+    return parsed as string[]
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Record that the admission boundary turned an order away, at the order's own modification time.
+ *
+ * MONOTONIC MINIMUM, and never cleared. A refusal that has been swept past under a wider selection
+ * is not proof that no OTHER excluded status still has orders behind it — those orders will not be
+ * refused a second time, because nothing redelivers them. Keeping the oldest refusal we have ever
+ * seen means the next widening reaches back far enough for them too, and it is still bounded by the
+ * first refusal rather than by the store's whole history.
+ *
+ * Never throws: this is recovery bookkeeping attached to an acknowledged skip, and turning that
+ * skip into a retried failure would be a worse outcome than a missed watermark.
+ */
+export async function noteWcOrderAdmissionRefusal(modifiedAtIso: string | null | undefined): Promise<void> {
+  try {
+    const parsed = modifiedAtIso ? Date.parse(`${modifiedAtIso}${/[zZ]|[+-]\d{2}:?\d{2}$/.test(modifiedAtIso) ? '' : 'Z'}`) : NaN
+    // An unreadable or absent timestamp falls back to NOW, which is the newest the refusal can
+    // possibly be — never to "the beginning of time", which would make one malformed payload
+    // rewind the whole store on the next widening.
+    const refusedAt = new Date(Number.isFinite(parsed) ? parsed : Date.now())
+    const existing = await db.setting.findUnique({ where: { key: WC_ORDER_ADMISSION_REFUSED_SINCE_KEY } })
+    const existingMs = existing?.value ? Date.parse(existing.value) : NaN
+    if (Number.isFinite(existingMs) && existingMs <= refusedAt.getTime()) return
+    await db.setting.upsert({
+      where: { key: WC_ORDER_ADMISSION_REFUSED_SINCE_KEY },
+      create: { key: WC_ORDER_ADMISSION_REFUSED_SINCE_KEY, value: refusedAt.toISOString() },
+      update: { value: refusedAt.toISOString() },
+    })
+  } catch (e) {
+    console.error('o3d-tj6v r4: failed to record an admission-refusal watermark', e)
+  }
+}
+
 export async function syncNewWcOrders(
   opts: { mode?: 'poll' | 'reconcile' | 'manual_reconcile' } = {},
 ): Promise<SyncResult> {
@@ -2319,8 +2445,11 @@ export async function syncNewWcOrders(
   // statuses in every live mode — is resolved by the shared filter module so
   // the initial import cannot drift away from it (see order-status-filter.ts).
   const { getWithdrawalStatuses } = await import('./withdrawal')
-  const [lastSyncSetting, existingOrder, statuses, wdraw] = await Promise.all([
+  const cursorStatusesKey = wcCursorStatusesKey(cursorKey)
+  const [lastSyncSetting, cursorStatusesSetting, refusedSinceSetting, existingOrder, statuses, wdraw] = await Promise.all([
     db.setting.findUnique({ where: { key: cursorKey } }),
+    db.setting.findUnique({ where: { key: cursorStatusesKey } }),
+    db.setting.findUnique({ where: { key: WC_ORDER_ADMISSION_REFUSED_SINCE_KEY } }),
     db.salesOrder.findFirst({ select: { id: true } }),
     getWcPullStatuses(mode),
     getWithdrawalStatuses(),
@@ -2335,7 +2464,31 @@ export async function syncNewWcOrders(
 
   // After a transaction reset or on a fresh install, there is nothing local to
   // reconcile against. Ignore any stale cursor and force a full import.
-  const lastSync = existingOrder ? (lastSyncSetting?.value || null) : null
+  let lastSync = existingOrder ? (lastSyncSetting?.value || null) : null
+
+  // A WIDENED selection re-opens the window (o3d-tj6v r4). Anything the admission boundary turned
+  // away is behind this cursor — a refusal does not advance it, but the next admitted delivery
+  // does — and WooCommerce fires nothing when IMS's own setting changes. So when a status that was
+  // not in the list the cursor was earned under is in it now, rewind to the earliest refusal we
+  // have ever recorded. Bounded by that watermark rather than reaching back to the whole history,
+  // and taken only on the run after the selection actually changed.
+  const cursorStatuses = parseStoredStatusList(cursorStatusesSetting?.value)
+  const widened = cursorStatuses !== null && statuses.some((status) => !cursorStatuses.includes(status))
+  const refusedSinceMs = refusedSinceSetting?.value ? Date.parse(refusedSinceSetting.value) : NaN
+  if (lastSync && widened && Number.isFinite(refusedSinceMs) && refusedSinceMs < Date.parse(lastSync)) {
+    lastSync = refusedSinceSetting!.value
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_order_sync_cursor_rewound',
+      tag: 'sync',
+      level: 'INFO',
+      description: `The "Import order statuses" selection widened to ${statuses.join(', ')}, so the ${mode} sweep `
+        + `re-reads WooCommerce from ${lastSync} — the earliest order the previous selection turned away. `
+        + 'Orders that were skipped while their status was unselected are imported by this run.',
+      metadata: { mode, cursorKey, previousStatuses: cursorStatuses, statuses, rewoundTo: lastSync },
+      resolveUser: false,
+    })
+  }
 
   // Fetch orders page by page
   let page = 1
@@ -2358,7 +2511,10 @@ export async function syncNewWcOrders(
     const orders = data as WcFullOrder[]
 
     for (const order of orders) {
-      const isWithdrawal = order.status === wdraw.submitted || order.status === wdraw.approved
+      // Normalised on both sides (o3d-tj6v r4). `getWithdrawalStatuses` already returns normalised
+      // slugs, so a store reporting `wc-withdrawn` compared raw would miss the backstop that stops
+      // a withdrawn order carrying on to the warehouse.
+      const isWithdrawal = isWcStatus(order.status, wdraw.submitted) || isWcStatus(order.status, wdraw.approved)
 
       // o3d-e1yb: a withdrawal-status order that IMS has never seen must not be
       // imported first. importWcOrder would create it with the ordinary mapping
@@ -2446,11 +2602,23 @@ export async function syncNewWcOrders(
   // Only advance the cursor after a fully clean run. Advancing after a fetch
   // or import error can permanently skip remote changes older than now.
   if (result.errors.length === 0) {
-    await db.setting.upsert({
-      where: { key: cursorKey },
-      create: { key: cursorKey, value: new Date().toISOString() },
-      update: { value: new Date().toISOString() },
-    })
+    const now = new Date().toISOString()
+    const fingerprint = JSON.stringify([...statuses].sort())
+    await db.$transaction([
+      db.setting.upsert({
+        where: { key: cursorKey },
+        create: { key: cursorKey, value: now },
+        update: { value: now },
+      }),
+      // Written WITH the cursor, in one transaction: a cursor and the selection it was earned
+      // under are one fact, and a cursor advanced without its fingerprint would make the next
+      // widening undetectable.
+      db.setting.upsert({
+        where: { key: cursorStatusesKey },
+        create: { key: cursorStatusesKey, value: fingerprint },
+        update: { value: fingerprint },
+      }),
+    ])
   }
 
   if (result.synced > 0) {

@@ -30,6 +30,7 @@ import {
   buildWooCommerceConnectionFingerprint,
   evaluateWooCommerceEnableConnectionGate,
 } from '@/lib/connectors/woocommerce/connection-test-gate'
+import { normaliseWcOrderStatus } from '@/lib/connectors/woocommerce/order-status-filter'
 
 // All mutating exports in this file require the `sync` permission. Renamed from `requireAdmin`,
 // which shadowed the ADMIN-only helper of that name in @/lib/auth/server.
@@ -759,14 +760,21 @@ export async function upsertShoppingStatusMapping(externalStatus: string, imsSta
       'A WooCommerce status cannot map to SHIPPED — SHIPPED is set only by a real dispatch, not a '
       + 'storefront status (o3d-gz6).')
   }
+  // o3d-tj6v r4: store the CANONICAL slug. WooCommerce reports `on-hold`; the Sync page lets an
+  // operator type `wc-on-hold`, and every reader compared raw strings, so the mapping silently
+  // never matched — while the "Import order statuses" selection, which normalises, treated the two
+  // as the same status. Normalising at the write boundary means the table can only hold one
+  // spelling from here on; `findWcStatusMapping` still reads the older spellings already stored.
+  const canonicalStatus = normaliseWcOrderStatus(externalStatus)
+  if (!canonicalStatus) throw new Error('A WooCommerce status mapping needs a status slug.')
   await db.shoppingStatusMapping.upsert({
     where: {
       connector_externalStatus: {
         connector: 'woocommerce',
-        externalStatus,
+        externalStatus: canonicalStatus,
       },
     },
-    create: { connector: 'woocommerce', externalStatus, imsStatus: imsStatus as never },
+    create: { connector: 'woocommerce', externalStatus: canonicalStatus, imsStatus: imsStatus as never },
     update: { imsStatus: imsStatus as never },
   })
   revalidatePath('/sync')

@@ -1110,8 +1110,10 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
                 </p>
                 <p className="text-xs text-muted-foreground">
                   An order in an unselected status is skipped, not lost: if it later moves into a
-                  selected status it is imported then. Once IMS has an order it keeps following it
-                  whatever status it moves to afterwards — this setting never stops updates to an order
+                  selected status it is imported then, and if you tick its status later the next sync
+                  reaches back and imports the orders that were skipped while it was unticked. Once IMS
+                  has an order it keeps following it whatever status it moves to afterwards — this
+                  setting never stops updates to an order
                   you already have.
                 </p>
                 {noOrderStatusesSelected && (

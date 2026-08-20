@@ -676,7 +676,7 @@ type SuppressionClaim = { token: string; wcStatus: string; revision: number }
  * can hide it. Unresolved reads stay put and are retried next run.
  */
 export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
-  scanned: number; imported: number; stillWithdrawn: number; unresolved: number
+  scanned: number; imported: number; stillWithdrawn: number; unresolved: number; notAdmitted: number
 }> {
   const staleBefore = new Date(Date.now() - SUPPRESSION_LEASE_MS)
   const rows = await db.wcWithdrawalSuppression.findMany({
@@ -694,8 +694,9 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
     select: { externalOrderId: true, retiredAt: true },
   })
 
-  const result = { scanned: rows.length, imported: 0, stillWithdrawn: 0, unresolved: 0 }
+  const result = { scanned: rows.length, imported: 0, stillWithdrawn: 0, unresolved: 0, notAdmitted: 0 }
   const { importWcOrder } = await import('./order-import')
+  const { resolveWcOrderCreateAdmission } = await import('./order-admission')
   for (const row of rows) {
     // Fetch the FULL order by id — no status filter, no modified cursor — then
     // put it through the ordinary guarded importer. Resolving the tombstone
@@ -732,9 +733,24 @@ export async function sweepWithdrawalSuppressions(limit = 50): Promise<{
     }
 
     try {
-      const guarded = await importWcOrderGuarded(live, () => importWcOrder(live))
+      // o3d-tj6v r4: THIS PATH IS AN IMPORT TOO, and round 3 left it outside the boundary it had
+      // just built. The sweep reads the order by ID — no `?status=` query, no cursor — so nothing
+      // upstream has filtered it, and an order whose withdrawal was rejected back into a status the
+      // operator excluded was created here regardless of the selection. Same resolver the webhook
+      // uses, so the two ingress paths that create UNHELD orders without asking WooCommerce for a
+      // status cannot disagree about which orders IMS takes on.
+      //
+      // The tombstone is NOT resolved on this path: `admitCreate: false` withholds only the create,
+      // and the row stays as the durable retry signal (it has already been rotated to the back of
+      // the queue by the lastCheckedAt stamp above). Tick the status and the next sweep imports it.
+      const admission = await resolveWcOrderCreateAdmission(live)
+      const guarded = await importWcOrderGuarded(
+        live,
+        () => importWcOrder(live, { admitCreate: admission.admitted }),
+      )
       if (guarded.outcome === 'skipped-withdrawal') result.stillWithdrawn++
       else if (guarded.outcome === 'unresolved') result.unresolved++
+      else if (guarded.outcome === 'imported' && guarded.result.skipped === 'status_not_admitted') result.notAdmitted++
       else if (guarded.result.success && !guarded.compensationFailed) result.imported++
       else result.unresolved++
     } catch (e) {
