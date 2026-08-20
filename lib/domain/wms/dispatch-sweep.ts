@@ -595,6 +595,11 @@ export type WmsDispatchSweepDeps = {
  * shipment (idempotent per part), and only mark the IMS order SHIPPED once every part has
  * despatched — line-level at the storefront, atomic IMS-side. A partially-despatched order
  * stays pending.
+ *
+ * THIS is where completion is decided for a WMS-fulfilled order, and it is decided per WMS PART.
+ * `applyDispatch` therefore declares `EXTERNAL` completion authority downstream, so the IMS-side
+ * shortfall check (`findOrderShipmentShortfall`, o3d-0i5y) does not re-derive the same verdict from
+ * IMS shipment rows that were back-filled after the fact — see `OrderCompletionAuthority`.
  */
 async function reconcileSplitOrder(
   deps: WmsDispatchSweepDeps,

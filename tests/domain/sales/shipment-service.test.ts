@@ -1329,6 +1329,75 @@ test('o3d-0i5y: the shortfall is measured in LEAF units, so a half-shipped KIT i
   )
 })
 
+// --- o3d-0i5y r2: the completion check is IMS's answer, and IMS does not always own the question --
+//
+// An externally fulfilled order (WooCommerce "completed", or a WMS/3PL dispatch) is completed by
+// the system that shipped it — the WMS dispatch sweep reaches its own per-part verdict in
+// reconcileSplitOrder and only applies a dispatch once EVERY part has despatched. The IMS shipment
+// rows on such an order are back-filled by applyExternalFulfillmentUpdate from whatever IMS stock
+// was on hand, so they routinely under-cover the ordered qty for reasons that say nothing about
+// what the 3PL shipped. Running the shortfall check over them contradicted the owner: the order
+// was held out of SHIPPED, the storefront completion push (and the customer despatch email it
+// fires) was suppressed, and a `shipped_short` WARNING was raised on EVERY external dispatch.
+
+test('o3d-0i5y r2: EXTERNAL completion authority promotes the order — the shortfall check does not run', async () => {
+  // The EXACT fixture the IMS-authority test above holds open: 10 ordered, 4 shipped. The only
+  // difference is who is reporting the dispatch.
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 4 }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 4 },
+    ],
+    settings: { invoice_trigger: 'on_shipped' },
+  })
+
+  const result = await reconcileOrderAfterShipment(
+    createClient(state),
+    { orderId: 'order-1' },
+    undefined,
+    { completionAuthority: 'EXTERNAL' },
+  )
+
+  assert.equal(state.orders[0].status, 'SHIPPED')
+  assert.ok(state.orders[0].shippedAt instanceof Date)
+  assert.equal(state.orders[0].trackingNumber, 'TRACK-1')
+  // No shortfall REPORTED, which is the specific thing that matters: it is what the caller turns
+  // into the `shipped_short` WARNING, so a present-but-ignored shortfall would still be a false alarm.
+  assert.equal(result.shortfall, undefined)
+  assert.equal(result.shouldGenerateInvoice, true)
+})
+
+test('o3d-0i5y r2: authority DEFAULTS to IMS — an options object that omits it still holds a short order', async () => {
+  // Pins the default against the `options?.completionAuthority ?? 'IMS'` reading specifically: a
+  // caller may pass options for an unrelated reason, and that must not silently disable the check.
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 4 }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 4 },
+    ],
+    settings: { invoice_trigger: 'on_shipped' },
+  })
+
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' }, undefined, {})
+
+  assert.equal(state.orders[0].status, 'ALLOCATED')
+  assert.equal(result.shouldGenerateInvoice, false)
+  assert.deepEqual(
+    result.shortfall?.map((line) => [line.lineId, line.outstandingQty]),
+    [['line-1', 6]],
+  )
+})
+
 test('reconcileOrderAfterShipment does not rewrite terminal orders', async () => {
   const shippedAt = new Date('2026-01-01T00:00:00.000Z')
   const state = baseState({

@@ -47,6 +47,7 @@ import {
   discardCancelledOrderShipmentsInTx,
   reconcileOrderAfterShipment,
   transitionShipmentStatus,
+  type OrderCompletionAuthority,
 } from '@/lib/domain/sales/shipment-service'
 import {
   allocationScopeKey,
@@ -1167,7 +1168,16 @@ export async function updateShipmentStatus(
   shipmentId: string,
   targetStatus: string,
   extra?: { trackingNumber?: string; shippingService?: string },
-  options?: { internalBypassToken?: symbol },
+  options?: {
+    internalBypassToken?: symbol
+    /**
+     * o3d-0i5y r2: who owns the "is the ORDER fulfilled?" decision for this dispatch — see
+     * `OrderCompletionAuthority`. Omitted (the default) means IMS is working the order and the
+     * completion check below derives the answer from the shipment rows. `applyExternalFulfillmentUpdate`
+     * passes `EXTERNAL`, because the storefront/WMS driving it has already made that decision.
+     */
+    completionAuthority?: OrderCompletionAuthority
+  },
 ): Promise<{ success: boolean; error?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
@@ -1188,13 +1198,18 @@ export async function updateShipmentStatus(
     }
 
     if (targetStatus === 'SHIPPED') {
-      const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra)
+      const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra, {
+        completionAuthority: options?.completionAuthority ?? 'IMS',
+      })
       // o3d-0i5y: every shipment raised on this order has now shipped, but the order still owes
       // quantity, so it was deliberately left in its pre-shipment status instead of being declared
-      // complete. Nothing re-allocates such an order automatically (both allocation sweeps exclude
-      // orders holding shipments), so this WARNING is the operator queue for it — same pattern as
-      // the paid_without_invoice warning. Logged on EVERY shipped transition, not only the one that
-      // first exposed the shortfall, so a retry after a crashed log still surfaces it.
+      // complete. Only ever set under IMS completion authority — an externally fulfilled order is
+      // completed by the storefront/WMS that shipped it, and reporting it short here would be a
+      // false warning on EVERY external dispatch. Nothing re-allocates such an order automatically
+      // (both allocation sweeps exclude orders holding shipments), so this WARNING is the operator
+      // queue for it — same pattern as the paid_without_invoice warning. Logged on EVERY shipped
+      // transition, not only the one that first exposed the shortfall, so a retry after a crashed
+      // log still surfaces it.
       if (reconciliation.shortfall) {
         const orderRef = result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber
         const outstandingSummary = reconciliation.shortfall

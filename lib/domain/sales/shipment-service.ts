@@ -70,6 +70,37 @@ export type ShipmentTransitionResult =
       stockSyncProductIds: string[]
     }
 
+/**
+ * WHO DECIDES that the ORDER — not this one shipment — is fulfilled (o3d-0i5y r2).
+ *
+ * There are exactly two fulfilment paths in this system and they answer that question from
+ * different evidence, so the answer has to be declared by the caller rather than guessed at here:
+ *
+ *  - `IMS` — the warehouse works the order inside IMS and dispatches shipment by shipment. The
+ *    shipment rows ARE the fulfilment record, so "is the order done?" is derived from them:
+ *    `findOrderShipmentShortfall` compares shipped leaf units against ordered-minus-refunded, and
+ *    an order that shipped short is held open. This is the default, and the only path that has
+ *    the evidence to make that comparison mean anything.
+ *
+ *  - `EXTERNAL` — a storefront or WMS/3PL fulfilled the order and is telling us so after the fact
+ *    (`applyExternalFulfillmentUpdate`). THAT system owns completion and has already decided it:
+ *    the WooCommerce completion flow treats Woo as "the dispatch authority for external storefront
+ *    orders", and the WMS dispatch sweep reaches its own verdict per WMS part in
+ *    `reconcileSplitOrder`, only applying a dispatch once EVERY part has despatched. IMS shipment
+ *    rows on such an order are a back-filled projection of a decision taken elsewhere — auto-
+ *    allocated and confirmed on the spot by `applyExternalFulfillmentUpdate`, and capped by
+ *    whatever IMS stock happened to be on hand — so they routinely under-cover the ordered qty for
+ *    reasons that say nothing about what the 3PL actually shipped.
+ *
+ * Re-deriving completion from those rows would therefore CONTRADICT the owner: it would hold the
+ * order open, suppress the storefront completion push (and with it the customer despatch email),
+ * and log a `shipped_short` WARNING on every external dispatch — training operators to ignore the
+ * one signal that means something. So the shortfall check does not run when the caller declares
+ * `EXTERNAL`; it is not that WMS is a special case of the check, it is that the check is IMS's
+ * answer to a question already answered.
+ */
+export type OrderCompletionAuthority = 'IMS' | 'EXTERNAL'
+
 export type ShipmentReconciliationResult = {
   shouldGenerateInvoice: boolean
   orderId: string
@@ -77,6 +108,9 @@ export type ShipmentReconciliationResult = {
    * o3d-0i5y: present only when every shipment on the order has SHIPPED but the order still owes
    * quantity, in which case the order was deliberately NOT promoted to SHIPPED. Absent on the
    * ordinary path, so a caller that ignores it is unchanged.
+   *
+   * NEVER present under `EXTERNAL` completion authority — the shortfall is not evaluated there at
+   * all, because a different mechanism has already decided the order is complete.
    */
   shortfall?: OrderShipmentShortfallLine[]
 }
@@ -1041,7 +1075,16 @@ export async function reconcileOrderAfterShipment(
   client: ShipmentServiceClient,
   shipment: { orderId: string },
   extra?: { trackingNumber?: string },
+  options?: {
+    /**
+     * Who owns the "is this order fulfilled?" decision — see `OrderCompletionAuthority`.
+     * Defaults to `IMS`, which is the path every in-app dispatch takes; only
+     * `applyExternalFulfillmentUpdate` declares `EXTERNAL`.
+     */
+    completionAuthority?: OrderCompletionAuthority
+  },
 ): Promise<ShipmentReconciliationResult> {
+  const completionAuthority: OrderCompletionAuthority = options?.completionAuthority ?? 'IMS'
   const allShipments = await client.shipment.findMany({
     where: { orderId: shipment.orderId },
     select: { id: true, status: true },
@@ -1096,7 +1139,15 @@ export async function reconcileOrderAfterShipment(
     // both pre-exclude orders that hold shipments (the sweep excludes ANY shipment, the backorder
     // allocator any committed one), precisely because rebuilding allocations under a live ShipmentLine
     // is unsafe. So a shipped-short order waits for a human, and the caller logs a WARNING saying so.
-    const outstanding = await findOrderShipmentShortfall(tx, shipment.orderId)
+    //
+    // ...but only where IMS is the one deciding. Under `EXTERNAL` authority the storefront/WMS has
+    // already completed this order by its own reckoning, and these shipment rows are a projection of
+    // that decision rather than the evidence for it, so re-deriving completion from them would
+    // second-guess the owner and report a correctly-fulfilled order as short. See
+    // `OrderCompletionAuthority`.
+    const outstanding = completionAuthority === 'IMS'
+      ? await findOrderShipmentShortfall(tx, shipment.orderId)
+      : null
     if (outstanding) return outstanding
 
     const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')

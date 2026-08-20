@@ -551,7 +551,25 @@ export async function applyExternalFulfillmentUpdate(
               shippingService: tracking.shippingService ?? undefined,
             }
           : undefined,
-        { internalBypassToken: INTERNAL_ACTION_BYPASS },
+        {
+          internalBypassToken: INTERNAL_ACTION_BYPASS,
+          // o3d-0i5y r2: THE EXTERNAL SYSTEM OWNS COMPLETION on this path, so IMS must not
+          // re-derive it. Everything that reaches here has already decided the order is fulfilled
+          // and is reporting it: the WooCommerce completion flow only runs on a WC order that went
+          // to "completed" ("WooCommerce is treated as the dispatch authority for external
+          // storefront orders"), and the WMS dispatch sweep only applies a dispatch once the WMS
+          // says the order — or, for a split order, every one of its parts — has despatched
+          // (`reconcileSplitOrder`).
+          //
+          // The shipment rows this function drives to SHIPPED are a projection of that decision,
+          // not the evidence for it: they were auto-allocated and confirmed a few lines above from
+          // whatever IMS stock happened to be on hand, so they can under-cover the ordered qty
+          // while the 3PL shipped the lot. Letting the IMS shortfall check run over them would
+          // hold the order out of SHIPPED, suppress the storefront completion push below (and the
+          // customer despatch email it exists to fire), and raise a `shipped_short` WARNING on
+          // every external dispatch. See `OrderCompletionAuthority`.
+          completionAuthority: 'EXTERNAL',
+        },
       )
 
       if (!result.success) {
