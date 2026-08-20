@@ -8,7 +8,9 @@ import {
   coherentSplitPartIds,
   SPLIT_PROBE_BUDGET_PER_SWEEP,
   isUnresolvedDriftSystemic,
+  saveMintsoftDeltaCursors,
 } from '../lib/domain/wms/dispatch-sweep.ts'
+import { mintsoftDeltaScopeToken } from '../lib/connectors/mintsoft/settings/schema.ts'
 import type { WmsDispatchSweepDeps, WmsDispatchCandidate } from '../lib/domain/wms/dispatch-sweep.ts'
 import type { WmsOrderStatus, WmsOrderTracking, WmsOrderPart } from '../lib/connectors/wms/types.ts'
 
@@ -1993,4 +1995,127 @@ test('[o3d-bjc.12] a clean pass retracts the incident, not just the counter', as
   assert.deepEqual(h.drift.linkIds, [], 'the offer must not outlive the condition')
   assert.equal(h.drift.firstSeenAt, null)
   assert.equal(h.drift.lastSeenAt, null)
+})
+
+// ---------------------------------------------------------------------------------------------
+// q66in.7.2 r3 (Codex r2 finding 2) — AN IN-FLIGHT OLD-SCOPE SWEEP MUST NOT RESURRECT THE CURSORS
+// A SCOPE CHANGE DISCARDED.
+//
+// `saveMintsoftOrderDispatchSettings` deletes both delta cursors when ClientId/ChannelId/
+// WarehouseId move: they describe orders the new scope cannot see. Round 2 made that decision
+// trustworthy (the before-image is read under a row lock, so the audit cannot claim a transition
+// that never happened) but the cursors are written by the SWEEP, from another process, and a pass
+// that started under the old scope put them straight back. The reset was undone by a writer that
+// had never heard of it, and the first query under the new scope resumed from an old-scope point.
+// ---------------------------------------------------------------------------------------------
+
+const OLD_SCOPE = { mintsoft_client_id: '89', mintsoft_channel_id: '', mintsoft_warehouse_id: '' }
+const NEW_SCOPE = { mintsoft_client_id: '101', mintsoft_channel_id: '', mintsoft_warehouse_id: '' }
+
+function cursorTx() {
+  const upserts: Array<{ key: string; value: string }> = []
+  return {
+    upserts,
+    tx: {
+      setting: {
+        async upsert(args: { where: { key: string }; create: { key: string; value: string }; update: { value: string } }) {
+          upserts.push({ key: args.where.key, value: args.update.value })
+          return {}
+        },
+      },
+      async $executeRaw() { return 0 },
+      async $queryRaw<T>() { return [] as unknown as T },
+    },
+  }
+}
+
+test('q66in.7.2 r3: the cursor write is REFUSED when the delta scope moved during the pass', async () => {
+  const { tx, upserts } = cursorTx()
+  let locked = 0
+
+  const result = await saveMintsoftDeltaCursors(
+    tx,
+    { watermark: NOW.toISOString(), lastReconcile: NOW.toISOString(), scope: mintsoftDeltaScopeToken(OLD_SCOPE) },
+    async () => { locked += 1; return NEW_SCOPE },
+  )
+
+  assert.deepEqual(result, { written: false, reason: 'scope_changed' })
+  assert.deepEqual(upserts, [], 'neither cursor may be recreated over the reset')
+  assert.equal(locked, 1, 'the scope is read under the same row lock the settings save takes')
+})
+
+test('q66in.7.2 r3: the cursor write goes ahead when the scope is still the one the pass read', async () => {
+  const { tx, upserts } = cursorTx()
+
+  const result = await saveMintsoftDeltaCursors(
+    tx,
+    { watermark: NOW.toISOString(), lastReconcile: NOW.toISOString(), scope: mintsoftDeltaScopeToken(OLD_SCOPE) },
+    async () => OLD_SCOPE,
+  )
+
+  assert.deepEqual(result, { written: true })
+  assert.deepEqual(upserts, [
+    { key: 'mintsoft_order_delta_since', value: NOW.toISOString() },
+    { key: 'mintsoft_order_reconcile_at', value: NOW.toISOString() },
+  ])
+})
+
+test('q66in.7.2 r3: a caller that supplies no scope asks for no check, and its cursors are written', async () => {
+  // A connector with no scope, or a test double — the guard must not become a way for the delta
+  // cursors to stop advancing at all.
+  const { tx, upserts } = cursorTx()
+  let locked = 0
+
+  const result = await saveMintsoftDeltaCursors(
+    tx,
+    { watermark: NOW.toISOString() },
+    async () => { locked += 1; return NEW_SCOPE },
+  )
+
+  assert.deepEqual(result, { written: true })
+  assert.equal(locked, 0, 'no token, no lock taken')
+  assert.deepEqual(upserts, [{ key: 'mintsoft_order_delta_since', value: NOW.toISOString() }])
+})
+
+test('q66in.7.2 r3: the sweep hands back the scope token it read, so the write can be refused at all', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string; scope?: string | null }> = []
+
+  await runWmsDispatchSweepCore(
+    deps({
+      listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      fetchDelta: async () => [],
+      getDeltaState: async () => ({
+        watermark: '2026-07-15T11:00:00Z',
+        lastReconcile: RECENT,
+        scope: 'scope-at-run-start',
+      }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+
+  assert.equal(saved.length, 1)
+  assert.equal(saved[0].watermark, NOW.toISOString())
+  assert.equal(
+    saved[0].scope,
+    'scope-at-run-start',
+    'without the token round-trip the repository has nothing to compare and the guard cannot fire',
+  )
+})
+
+test('q66in.7.2 r3: a deps pair with no scope sends NO token rather than inventing one', async () => {
+  const saved: Array<{ watermark?: string; lastReconcile?: string; scope?: string | null }> = []
+
+  await runWmsDispatchSweepCore(
+    deps({
+      listCandidates: async () => [candidate({ linkId: 'l1', orderId: 'o1' })],
+      fetchDelta: async () => [],
+      getDeltaState: async () => ({ watermark: '2026-07-15T11:00:00Z', lastReconcile: RECENT }),
+      saveDeltaState: async (state) => { saved.push(state) },
+    }),
+    { now: NOW },
+  )
+
+  assert.equal(saved.length, 1)
+  assert.ok(!('scope' in saved[0]), 'an absent token is how "do not check" is expressed')
 })

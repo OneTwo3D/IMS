@@ -42,3 +42,50 @@ test('isBindingSyncStale: stale after 3× its own cadence, floored at an hour', 
   // advancing lastStockSyncAt must not count as freshness).
   assert.equal(watchdog.isBindingSyncStale({ lastStockSyncSuccessAt: null, syncFrequencyMinutes: 60, createdAt: mins(200) }, NOW), true)
 })
+
+// ---------------------------------------------------------------------------
+// o3d-hl8l r3 (Codex r2 finding 1): this alert is the ONLY push a refused booked-in callback ever
+// produces, so it is the only place the remedy can be said. "Chase the shipment / callback in the
+// WMS" sent the reader looking for a receipt-event row that a refused callback never created.
+// ---------------------------------------------------------------------------
+
+test('o3d-hl8l r3: the overdue-ASN alert names the Re-check remedy, not a callback that left no row', () => {
+  const { breach, creditNote } = watchdog.describeAsnOverdueBreach(
+    { eta: days(2), lastCallbackAt: null, createdAt: days(10) },
+    [],
+    NOW,
+  )
+  const message = watchdog.buildAsnOverdueAlertMessage({
+    externalAsnId: 'ASN-77',
+    warehouseCode: 'CAM',
+    breach,
+    creditNote,
+  })
+
+  assert.match(message, /^ASN ASN-77 \(CAM\) is past its ETA \(2026-07-10\) with no booked-in callback\./)
+  assert.match(message, /"Re-check"/, 'the reader must be told the action that exists')
+  assert.match(message, /purchase order → ASNs/, 'and where to find it')
+  assert.match(message, /books in only what is still outstanding/, 'and that pressing it is safe')
+  assert.doesNotMatch(message, /Chase the shipment/, 'the old text named no remedy at all')
+})
+
+test('o3d-hl8l r3: the remedy is appended after the alignment-credit blast radius, not instead of it', () => {
+  const { breach, creditNote } = watchdog.describeAsnOverdueBreach(
+    { eta: null, lastCallbackAt: days(8), createdAt: days(30) },
+    [{ sku: 'SKU-1' }, { sku: 'SKU-2' }],
+    NOW,
+  )
+  const message = watchdog.buildAsnOverdueAlertMessage({
+    externalAsnId: 'ASN-88',
+    warehouseCode: 'EAR2',
+    breach,
+    creditNote,
+  })
+
+  assert.match(message, /no further booked-in callback for 8 days/)
+  assert.match(message, /2 line\(s\) carry unreconciled alignment credits \(e\.g\. SKU-1\)/)
+  assert.ok(
+    message.indexOf('alignment credits') < message.indexOf('"Re-check"'),
+    'the breach and its blast radius come first; the remedy closes the message',
+  )
+})

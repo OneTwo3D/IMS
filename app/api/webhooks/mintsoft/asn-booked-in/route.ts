@@ -41,6 +41,24 @@ export type MintsoftBookedInWebhookRouteDependencies = {
   logActivity: typeof logActivity
   repository: MintsoftWebhookEventRepository
   now?: () => Date
+  /**
+   * o3d-hl8l r3 (Codex r2 finding 1): RECORD THAT A CALLBACK WAS REFUSED — without touching the
+   * database, which is the one thing the fence exists to prevent.
+   *
+   * Round 2 left the refusal leaving no trace anywhere. The only thing that noticed was the WMS
+   * watchdog, a day after the ETA at the earliest and seven days later when the ASN has no ETA, and
+   * only if the WMS plugin is enabled and an active admin exists to notify. Between the refusal and
+   * that alert there was nothing at all: no row, no log line, nothing an operator running a restore
+   * could see even while standing over it.
+   *
+   * The server log is the only sink available here — persisting is what the fence refuses, and it
+   * would mean writing rows from unauthenticated callers besides, since this runs before signature
+   * verification. So the claim is deliberately small: the refusal is emitted at the moment it
+   * happens, to the process log, and it is NOT an alert. The alert is still the watchdog's, and
+   * `MAINTENANCE_MODE_REACH` in app/api/backup/restore/route.ts states its delay rather than
+   * implying the loss is covered promptly.
+   */
+  recordMaintenanceRefusal: (detail: { route: string; reason: 'maintenance_mode' }) => void
 }
 
 class RequestBodyTooLargeError extends Error {
@@ -110,6 +128,15 @@ const defaultMintsoftBookedInWebhookDependencies: MintsoftBookedInWebhookRouteDe
   logActivity,
   repository: createMintsoftWebhookEventRepository(),
   now: () => new Date(),
+  recordMaintenanceRefusal(detail) {
+    // console, NOT logActivity: logActivity writes a row, and a row written into this window is
+    // being replayed over — which is the whole reason the callback is being refused.
+    console.warn(
+      `[mintsoft-webhook] refused an ASN booked-in callback (${detail.reason}) at ${detail.route} — `
+        + 'the trigger is dropped unless the sender retries; recover it with "Re-check" on the ASN, '
+        + 'which reconstructs the trigger and re-reads the quantities from the WMS',
+    )
+  },
 }
 
 export async function handleMintsoftBookedInWebhook(
@@ -155,7 +182,16 @@ export async function handleMintsoftBookedInWebhook(
   // valid secret and a 256KB body is not read to be thrown away. That does disclose the flag's
   // state to an unauthenticated caller — the same trade the WooCommerce fence already makes.
   const maintenance = await dependencies.getMaintenanceModeResponse('webhook')
-  if (maintenance) return maintenance
+  if (maintenance) {
+    // Emitted before the response is returned, and to the PROCESS LOG only — see
+    // `recordMaintenanceRefusal`. Without it a refused callback left no trace whatsoever, and the
+    // earliest anything noticed was the watchdog's overdue-ASN alert a day (or a week) later.
+    dependencies.recordMaintenanceRefusal({
+      route: 'app/api/webhooks/mintsoft/asn-booked-in',
+      reason: 'maintenance_mode',
+    })
+    return maintenance
+  }
 
   let rawBody: string
   try {

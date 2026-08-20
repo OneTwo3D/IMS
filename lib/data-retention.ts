@@ -323,6 +323,7 @@ export async function purgeExpiredData(): Promise<{
   //     schedule, so a single binding left unconfirmed pinned every run and every line for that
   //     warehouse indefinitely — the highest-volume table here, exempted without bound by a
   //     condition nothing forces anyone to clear. The exemption is now exactly the row
+  //     wms-connector-boundary-ok: q66in.7.4: naming the confirm helper the exemption mirrors is the point of the comment.
   //     `confirmMintsoftAlignmentMode` would read, resolved through the SHARED query so the two
   //     cannot drift: narrower than the confirm predicate deletes the evidence the operator is about
   //     to be asked for, wider re-opens the unbounded exemption.

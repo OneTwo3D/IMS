@@ -4,6 +4,11 @@ import { logActivity } from '@/lib/activity-log'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { getMintsoftSettings, mintsoftDeltaScopeToken, type MintsoftDeltaScope } from '@/lib/connectors/mintsoft/settings/schema'
+import {
+  lockMintsoftDispatchSettings,
+  type MintsoftDispatchSettingsLockTx,
+} from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
 import type { WmsConnector, WmsConnectorId, WmsOrderStatus, WmsOrderTracking } from '@/lib/connectors/wms/types'
 import { isWmsUnresolvableRecordError } from '@/lib/connectors/wms/errors'
 import { withDispatchSweepLockOrSkip } from '@/lib/domain/wms/dispatch-sweep-lock'
@@ -462,8 +467,20 @@ export type WmsDispatchSweepDeps = {
   // per-order reconcile. getDeltaState/saveDeltaState persist the watermark +
   // last-reconcile cursors (advanced only on a clean pass).
   fetchDelta?(sinceIso: string): Promise<import('@/lib/connectors/wms/types').WmsOrderStatus[]>
-  getDeltaState?(): Promise<{ watermark: string | null; lastReconcile: string | null }>
-  saveDeltaState?(state: { watermark?: string; lastReconcile?: string }): Promise<void>
+  //
+  // q66in.7.2 r3 (Codex r2 finding 2): `scope` is an OPAQUE identity of the delta's configured
+  // scope, read with the cursors at the start of the run and handed straight back to
+  // `saveDeltaState`. It exists because the cursor RESET and the cursor WRITE happen in different
+  // processes: `saveMintsoftOrderDispatchSettings` deletes both cursors when the scope moves, and a
+  // sweep already running under the OLD scope then re-upserts them from its own run — restoring an
+  // old-scope watermark over the reset, so the first query after the correction starts from a stale
+  // point and outstanding new-scope orders predating it never enter the delta. The reset was
+  // undone by a writer that had never heard of it. Handing the token back lets the implementation
+  // refuse its own write when the scope has moved underneath it; a `getDeltaState` that returns no
+  // token asks for no such check, which is what keeps a connector with no scope (or a test double)
+  // working unchanged.
+  getDeltaState?(): Promise<{ watermark: string | null; lastReconcile: string | null; scope?: string | null }>
+  saveDeltaState?(state: { watermark?: string; lastReconcile?: string; scope?: string | null }): Promise<void>
   // Active links (same eligibility as listCandidates) whose STABLE
   // externalOrderId is in the given set. This is the primary delta candidate
   // lookup: order numbers can be renamed while the Mintsoft ID remains stable.
@@ -848,15 +865,22 @@ export async function runWmsDispatchSweepCore(
   // batch). Every active link was then authoritatively per-order verified, which is
   // the only sound basis for reseeding a watermark whose window had been truncated.
   let reconcileCoveredAllActive = false
+  // The identity of the delta SCOPE this run read its cursors under, handed back at save time so an
+  // in-flight old-scope pass cannot re-write cursors a scope change has since discarded
+  // (q66in.7.2 r3). Null when the deps expose no scope — no check is then asked for.
+  let deltaScopeToken: string | null = null
   // Set when the delta fetch fails: the sweep still fails safe to the per-order
   // reconcile, but the failure is surfaced (job PARTIAL + errors) so a broken
   // primary path can't hide behind a SUCCEEDED job.
   let deltaError: string | null = null
 
   if (deltaActive) {
-    const state = deps.getDeltaState
-      ? await deps.getDeltaState()
-      : { watermark: null, lastReconcile: null }
+    const state: { watermark: string | null; lastReconcile: string | null; scope?: string | null } =
+      deps.getDeltaState
+        ? await deps.getDeltaState()
+        : { watermark: null, lastReconcile: null }
+    // Carried for the whole run and handed back at save time — see `getDeltaState` on the deps.
+    deltaScopeToken = state.scope ?? null
     const overlapMs = (options?.deltaOverlapSeconds ?? DISPATCH_DELTA_DEFAULT_OVERLAP_SECONDS) * 1000
     const lookbackMs = (options?.deltaLookbackSeconds ?? DISPATCH_DELTA_DEFAULT_LOOKBACK_SECONDS) * 1000
     const intervalMs = (options?.reconcileIntervalSeconds ?? DISPATCH_DELTA_DEFAULT_RECONCILE_INTERVAL_SECONDS) * 1000
@@ -1549,7 +1573,7 @@ export async function runWmsDispatchSweepCore(
   // instead of honouring the interval. The clean + fully-covered guard applies to
   // the WATERMARK, which is the thing that can lose data.
   if (deltaActive && deps.saveDeltaState) {
-    const toSave: { watermark?: string; lastReconcile?: string } = {}
+    const toSave: { watermark?: string; lastReconcile?: string; scope?: string | null } = {}
     // Watermark advances only when the delta pass covered EVERY changed link
     // (deltaCoverageComplete) — else a changed order beyond the batch would be
     // aged out. lastReconcile just tracks the per-order reconcile cadence.
@@ -1566,7 +1590,15 @@ export async function runWmsDispatchSweepCore(
     }
     if (ranReconcile) toSave.lastReconcile = now.toISOString()
     if (toSave.watermark !== undefined || toSave.lastReconcile !== undefined) {
-      await deps.saveDeltaState(toSave)
+      // The scope this run READ its cursors under. The implementation writes only if it still
+      // holds — an in-flight old-scope pass must not resurrect the cursors a scope change discarded.
+      // OMITTED, not nulled, when the deps expose no scope: absent is what "no check asked for"
+      // means on an optional field, and it keeps the saved payload byte-identical for a connector
+      // that has no scope at all.
+      await deps.saveDeltaState({
+        ...toSave,
+        ...(deltaScopeToken !== null ? { scope: deltaScopeToken } : {}),
+      })
     }
   }
 
@@ -1597,6 +1629,86 @@ export type WmsDispatchSweepResult = {
   pending: number
   errors: number
   skippedReason?: string
+}
+
+/**
+ * q66in.7.2 r3 (Codex r2 finding 2) — WRITE THE INBOUND-DELTA CURSORS ONLY IF THE SCOPE IS STILL
+ * THE ONE THE RUN READ THEM UNDER.
+ *
+ * `saveMintsoftOrderDispatchSettings` DELETES both cursors, inside its own transaction, when the
+ * inbound-delta scope (ClientId / ChannelId / WarehouseId) moves — they describe orders the new
+ * scope cannot see. Round 2 made that decision trustworthy by reading the before-image under a row
+ * lock, so the audit can no longer claim a transition that never happened. It did not stop the
+ * cursors coming BACK: a sweep that started before the scope change commits is still holding an
+ * old-scope watermark, and its unconditional upsert put it straight back. The reset was undone by a
+ * writer that had never heard of it, the first query under the new scope resumed from a point
+ * belonging to the old one, and outstanding new-scope orders predating that point never entered the
+ * delta at all. Nothing about it was visible afterwards — the key is simply present again,
+ * indistinguishable from a sweep that ran normally.
+ *
+ * The guard is a compare-and-swap against the scope the run started under, taken under the SAME row
+ * lock the save takes. Reading the scope without the lock would not close the window: Postgres runs
+ * READ COMMITTED, so an unlocked SELECT inside this transaction is exactly as stale as one outside
+ * it, and the delete could still commit between the read and the upserts. Locking the five dispatch
+ * setting rows serialises this against the save outright — whichever transaction takes the lock
+ * first runs to completion, and the other sees the result.
+ *
+ * LOCK ORDER is identical on both sides (the five dispatch keys, then the two cursor keys), so the
+ * pair cannot cycle.
+ *
+ * A refused write is NOT an error. The pass did its work; its cursors are simply no longer
+ * meaningful. The next run reads the cleared cursors and restarts from the lookback window, which
+ * is exactly what the reset asked for. The refusal is returned (and logged) because a silently
+ * dropped advance is otherwise indistinguishable from a pass that never ran.
+ *
+ * `scope == null` means the caller asked for no check — a connector with no scope, or a test double
+ * that supplies no token — and the cursors are written unconditionally, as before.
+ */
+export type MintsoftDeltaCursorTx = MintsoftDispatchSettingsLockTx & {
+  setting: {
+    upsert(args: {
+      where: { key: string }
+      create: { key: string; value: string }
+      update: { value: string }
+    }): Promise<unknown>
+  }
+}
+
+export type MintsoftDeltaCursorWriteResult =
+  | { written: true }
+  | { written: false; reason: 'scope_changed' }
+
+export async function saveMintsoftDeltaCursors(
+  tx: MintsoftDeltaCursorTx,
+  state: { watermark?: string; lastReconcile?: string; scope?: string | null },
+  lockScope: (tx: MintsoftDeltaCursorTx) => Promise<MintsoftDeltaScope>,
+): Promise<MintsoftDeltaCursorWriteResult> {
+  if (state.scope != null) {
+    const current = mintsoftDeltaScopeToken(await lockScope(tx))
+    if (current !== state.scope) {
+      console.warn(
+        '[wms-dispatch-sweep] inbound delta scope changed during this pass — discarding the cursor '
+          + 'advance rather than restoring the cursors the scope change cleared',
+      )
+      return { written: false, reason: 'scope_changed' }
+    }
+  }
+
+  if (state.watermark !== undefined) {
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_order_delta_since' },
+      create: { key: 'mintsoft_order_delta_since', value: state.watermark },
+      update: { value: state.watermark },
+    })
+  }
+  if (state.lastReconcile !== undefined) {
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_order_reconcile_at' },
+      create: { key: 'mintsoft_order_reconcile_at', value: state.lastReconcile },
+      update: { value: state.lastReconcile },
+    })
+  }
+  return { written: true }
 }
 
 /** Prisma + active-connector wiring of the deps. */
@@ -1754,28 +1866,17 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
               select: { key: true, value: true },
             })
             const map = new Map(rows.map((row) => [row.key, row.value]))
+            // The scope these cursors belong to, resolved exactly as the SAVE resolves it
+            // (env override, then stored value, then default) so the two are comparable.
+            const scope = await getMintsoftSettings()
             return {
               watermark: map.get('mintsoft_order_delta_since') || null,
               lastReconcile: map.get('mintsoft_order_reconcile_at') || null,
+              scope: mintsoftDeltaScopeToken(scope),
             }
           },
-          async saveDeltaState(state: { watermark?: string; lastReconcile?: string }) {
-            const writes: Array<Promise<unknown>> = []
-            if (state.watermark !== undefined) {
-              writes.push(db.setting.upsert({
-                where: { key: 'mintsoft_order_delta_since' },
-                create: { key: 'mintsoft_order_delta_since', value: state.watermark },
-                update: { value: state.watermark },
-              }))
-            }
-            if (state.lastReconcile !== undefined) {
-              writes.push(db.setting.upsert({
-                where: { key: 'mintsoft_order_reconcile_at' },
-                create: { key: 'mintsoft_order_reconcile_at', value: state.lastReconcile },
-                update: { value: state.lastReconcile },
-              }))
-            }
-            await Promise.all(writes)
+          async saveDeltaState(state: { watermark?: string; lastReconcile?: string; scope?: string | null }) {
+            await db.$transaction((tx) => saveMintsoftDeltaCursors(tx, state, lockMintsoftDispatchSettings))
           },
         }
       : {}),

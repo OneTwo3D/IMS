@@ -161,6 +161,9 @@ function makeMintsoftDependencies(
     async getMaintenanceModeResponse() {
       return null
     },
+    recordMaintenanceRefusal() {
+      throw new Error('the fence must not fire with maintenance mode off')
+    },
     async getMintsoftApiConfiguration() {
       return mintsoftConfig()
     },

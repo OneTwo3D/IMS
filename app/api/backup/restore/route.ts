@@ -604,9 +604,35 @@ export type RestoreLockContext = {
  * Persisting loses either way: the ONLY caller that enables this flag is this endpoint, and the
  * window it stays on for is a restore that may still be replaying — a row written into it is
  * overwritten, so `202 accepted` would be a promise the restore breaks. A 503 promises nothing and
- * is the standard retry signal. The residual risk (a sender that does not retry drops the trigger)
- * is bounded by the watchdog's open-ASN-past-ETA alert and the ASN replay, and is written out at
- * the fence itself rather than here.
+ * is the standard retry signal.
+ *
+ * WHAT THE RESIDUAL RISK IS ACTUALLY BOUNDED BY (round 3, finding 1 — the third consecutive round in
+ * which this sentence claimed more than the code does). It said "the watchdog's open-ASN-past-ETA
+ * wms-connector-boundary-ok: o3d-hl8l: naming the recovery helper that cannot reach a refused callback is the correction itself.
+ * alert and the ASN replay". THE ASN REPLAY CANNOT REACH IT: `replayMintsoftBookedInEventsForAsn`
+ * re-drives receipt-event rows that already exist, and a refused callback leaves none — which
+ * o3d-hl8l round 2 established at the fence itself and then did not correct here. The recovery is
+ * wms-connector-boundary-ok: o3d-hl8l: naming the recovery that CAN reach it is the correction itself.
+ * `enqueueMintsoftBookedInRecheckForAsn` ("Re-check" on the purchase order's ASN table), which
+ * reconstructs the trigger and re-reads the quantities from the warehouse.
+ *
+ * And the detection is slower and more conditional than "the watchdog alerts" implies. Stated in
+ * full, so the next reader does not have to take it on trust:
+ *   • AT REFUSAL — the process log, and nothing else. `recordMaintenanceRefusal` in the webhook
+ *     route emits a line naming the route and the remedy. It writes NO database row, deliberately:
+ *     a row written into this window is being replayed over, and the fence runs before signature
+ *     verification, so persisting would mean writing rows from unauthenticated callers.
+ *   • THE 503 carries `Retry-After: 300`, so a sender that retries at all has a defined schedule
+ *     rather than whatever its own backoff decides.
+ *   • THE ALERT — the WMS watchdog, and only after ETA + 24h, or 7 days for an ASN with no ETA
+ *     recorded, or 7 days of renewed silence for one that had already had a partial callback. It
+ *     also requires a WMS connector to be enabled and at least one active ADMIN to notify, and it
+ *     fires ONCE per ASN (deduped by `sloAlertedAt`, cleared only by a fresh callback or a close).
+ *     Its message names the Re-check remedy.
+ *
+ * So: a refused callback is recorded immediately in the log, retried by any sender that honours a
+ * 503, alerted on a scale of days if neither happened, and recoverable by one operator action. It
+ * is NOT recovered automatically, and this note does not claim it is.
  *
  * So ONE inbound webhook entry point and one OAuth callback still write to the database throughout
  * a held restore, and the operator message below names them.

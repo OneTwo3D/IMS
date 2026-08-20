@@ -155,13 +155,44 @@ export function parseMintsoftPositiveId(value: string | null | undefined): numbe
  */
 export function mintsoftDeltaScopeChanged(
   next: { clientId: string; channelId: string; warehouseId: string },
-  prev: Pick<MintsoftSettings, 'mintsoft_client_id' | 'mintsoft_channel_id' | 'mintsoft_warehouse_id'>,
+  prev: MintsoftDeltaScope,
 ): boolean {
-  return (
-    next.clientId !== prev.mintsoft_client_id ||
-    next.channelId !== prev.mintsoft_channel_id ||
-    next.warehouseId !== prev.mintsoft_warehouse_id
-  )
+  return mintsoftDeltaScopeToken({
+    mintsoft_client_id: next.clientId,
+    mintsoft_channel_id: next.channelId,
+    mintsoft_warehouse_id: next.warehouseId,
+  }) !== mintsoftDeltaScopeToken(prev)
+}
+
+/** The three settings that define which orders the inbound delta can see. */
+export type MintsoftDeltaScope = Pick<
+  MintsoftSettings,
+  'mintsoft_client_id' | 'mintsoft_channel_id' | 'mintsoft_warehouse_id'
+>
+
+/**
+ * q66in.7.2 r3 (Codex r2 finding 2) — THE SCOPE AS ONE COMPARABLE VALUE.
+ *
+ * `saveMintsoftOrderDispatchSettings` discards the delta cursors when the scope moves, but the
+ * cursors are written by the SWEEP, from a separate process, and an in-flight sweep that started
+ * under the OLD scope re-upserts them after the delete — restoring an old-scope watermark and
+ * undoing the reset entirely. The sweep therefore has to carry the scope it started under and
+ * refuse to write cursors if it has since moved, which needs the scope as a single value it can
+ * hold across the run rather than a three-way comparison done at one call site.
+ *
+ * Values are already normalised (`''` = unset) and joined on NUL, which no setting value contains,
+ * so the token is injective: two different scopes can never collapse to one string. It is compared
+ * for EQUALITY only and never parsed back — it is an identity, not a serialization format.
+ *
+ * `mintsoftDeltaScopeChanged` is expressed in terms of it so the save's "did the scope move?" and
+ * the sweep's "is the scope still mine?" cannot drift into disagreeing about what the scope is.
+ */
+export function mintsoftDeltaScopeToken(scope: MintsoftDeltaScope): string {
+  return [
+    scope.mintsoft_client_id,
+    scope.mintsoft_channel_id,
+    scope.mintsoft_warehouse_id,
+  ].join('\u0000')
 }
 
 export async function getMintsoftSettings(): Promise<MintsoftSettings> {

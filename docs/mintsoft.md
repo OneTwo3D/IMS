@@ -116,7 +116,9 @@ ${timestamp}.${rawBody}
 
 ### Maintenance-mode fence (o3d-hl8l)
 
-The booked-in webhook route consults maintenance mode as its **first** statement — before the body is read and before the signature is verified — and returns `503 {"skipped":true,"reason":"maintenance_mode"}` while the flag is on. Nothing is persisted and no activity row is written.
+The booked-in webhook route consults maintenance mode as its **first** statement — before the body is read and before the signature is verified — and returns `503 {"skipped":true,"reason":"maintenance_mode"}` with `Retry-After: 300` while the flag is on. Nothing is persisted and no activity row is written.
+
+The refusal is written to the **process log** at the moment it happens (route + reason + the remedy). That is the only sink available: an activity row is a database write, and a row written into this window is being replayed over — which is the whole reason the callback is being refused. Treat it as a log line, not an alert.
 
 The flag is set only by the database **restore** endpoint, and it stays on when a restore backend cannot be confirmed dead. A row written into that window is being replayed over, so persisting the event would return `202 accepted` for something the restore then destroys; a `503` promises nothing and is the standard retry signal.
 
@@ -124,7 +126,9 @@ The flag is set only by the database **restore** endpoint, and it stays on when 
 
 **Re-check** (purchase order → the connector ASN table, needs `purchasing.receive`) asks the warehouse directly. It reconstructs the *trigger* only: the webhook carries an ASN id and nothing else that is used, and processing re-fetches the ASN from Mintsoft and applies just the delta over what each line has already accounted. So the warehouse stays the authority for the quantities, pressing it when nothing is outstanding books nothing in, and a real callback arriving afterwards finds the delta applied. If the ASN already has outstanding receipt events (dead-lettered, mid-retry, awaiting review) those are re-driven instead of a second row being created alongside them.
 
-The loss is also detected rather than silent: the `wms-watchdog` cron alerts on an open ASN past its ETA with no booked-in callback (or, with no ETA, one that has been silent for a week). Recovery is operator-initiated, not automatic — nothing but this route and the re-check creates a receipt-event row. Every re-check writes a `mintsoft_asn_booked_in_recheck` activity entry recording whether it minted a trigger or re-drove existing work.
+The loss is also detected rather than silent — but on a scale of **days**, so it is worth stating exactly. The `wms-watchdog` cron alerts on an open ASN past its ETA + 24h with no booked-in callback; with no ETA recorded, after 7 days of complete silence; and for an ASN that had already had a partial callback, after 7 days of renewed silence. It requires a WMS connector to be enabled and at least one active `ADMIN` to notify, and it alerts **once** per ASN (deduped by `sloAlertedAt`, which clears only on a fresh callback or a close). Its message names the Re-check remedy so the reader is not sent looking for a receipt-event row that a refused callback never created.
+
+Recovery is operator-initiated, not automatic — nothing but this route and the re-check creates a receipt-event row. Every re-check writes a `mintsoft_asn_booked_in_recheck` activity entry recording whether it minted a trigger or re-drove existing work.
 
 The `timestamp` string must be the exact header value IMS uses for freshness validation. Prefer ISO-8601 timestamp strings. Numeric timestamp headers are accepted, but the signature prefix must match the exact header value; for example, `1776852000.0` and `1776852000` are different signature prefixes. Body-only signatures and payload-only timestamps are rejected.
 
@@ -214,6 +218,8 @@ Connection, binding, courier-map and order-dispatch saves all write an activity 
 | Order dispatch save | `mintsoft_order_dispatch_settings_updated` — logged at `WARNING` when the ClientId/ChannelId/WarehouseId delta scope changes, because that also **discards the delta cursors** |
 
 Both the connection save and the order-dispatch save read their **before** image inside the write transaction, behind a row lock on the rows being replaced. Reading it beforehand let two concurrent saves produce an entry describing a transition that never happened — and, for the dispatch save, decide the delta-cursor reset from the same stale value.
+
+Discarding the cursors is not enough on its own, because the sweep is what **writes** them, from another process. A dispatch sweep that started before the scope change commits is still holding an old-scope watermark, and an unconditional write would put it straight back — restoring the reset cursors from a scope that no longer exists, with nothing afterwards to show it happened. So the sweep carries the scope it read its cursors under and writes them only if that scope still holds, checked under the **same row lock** the settings save takes. A refused write is not an error: the pass did its work, its cursors are simply no longer meaningful, and the next run restarts from the lookback window exactly as the reset intended. It is logged (`inbound delta scope changed during this pass`) because a silently dropped advance would otherwise look identical to a pass that never ran.
 
 ### Retention (q66in.7.4)
 

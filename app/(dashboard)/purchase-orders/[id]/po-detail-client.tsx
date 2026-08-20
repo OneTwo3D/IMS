@@ -2857,6 +2857,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 /**
  * o3d-hl8l: the operator end of the booked-in recovery path.
  *
+ * wms-connector-boundary-ok: o3d-hl8l: this button is the operator end of the Mintsoft-only 503 fence; naming the fenced connector IS the doc.
  * The Mintsoft webhook REFUSES a callback (503) while maintenance mode is on rather than persisting
  * into a window a restore may replay over, and a sender that does not retry drops the trigger. It
  * leaves no receipt-event row, so the exception inbox — which re-drives rows that exist — cannot
