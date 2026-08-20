@@ -1089,9 +1089,16 @@ either:
 
 | Retry | When it happens | Inside the 6-minute window? |
 | --- | --- | --- |
-| In-request `429` retry (inside one API call) | up to 3 waits of at most 90s | **Yes** — but a `429` was refused before Xero processed it, so there is nothing to deduplicate |
-| First queued retry of a failed row | 5-minute backoff floor, then the next 5-minute `accounting-sync` tick | At or past the line |
+| In-request `429` retry (inside one API call) | up to 3 waits of at most 90s, **plus** up to 60s of minute-rate-limit waiting before each attempt | **Yes, and now enforced** — the loop refuses any wait that would put the next attempt past six minutes and hands the work back to the queue instead. (A `429` was refused before Xero processed it, so there was nothing to deduplicate either way.) |
+| First queued retry of a failed row | 5-minute backoff floor + tail jitter, then the next 5-minute `accounting-sync` tick | **Undetermined** — the floor alone (5 min) is inside the window; jitter, the tick, and however long the failed call itself took push it out. You cannot tell which happened |
 | Second and later retries | 10, 20, 40 minutes (capped at 60) | **No** |
+
+An earlier version of this table said the in-request retry was inside the window because 3 × 90s is
+4m30s. That was the arithmetic of the Retry-After sleeps only and ignored the minute-limit wait taken
+before each attempt (worst case 7m30s), and it said the first queued retry was "at or past the line"
+when its floor is in fact inside it. Both are corrected above: the first is now a bound the code
+enforces, the second is honestly undetermined. **A protection you cannot tell is present is not one
+you may rely on** — which is why the local record below, not the key, is what the design depends on.
 
 So an automatic retry gets no more duplicate protection from the key than a manual one, and the
 cases where it matters most — a request that reached Xero but whose response was lost — are never
@@ -1103,8 +1110,20 @@ safe.** What does the work instead:
   invoice it already created rather than adding a second one.
 - **Everything else** — purchase bills, payments, credit-note allocations, manual journals — relies
   on the **local record**: once the external id is written on the sync log, the next attempt
-  short-circuits and posts nothing. That write is treated as unlosable (it is retried across
-  database connection-pool exhaustion rather than abandoned) precisely because it is the protection.
+  short-circuits and posts nothing. That write is treated as unlosable precisely because it is the
+  protection: when the database connection pool is exhausted it is re-driven rather than abandoned,
+  for as long as this worker's 15-minute claim on the row allows (minus a minute held back for the
+  give-up path, so it can never still be running when another worker may reclaim the row and post the
+  document a second time).
+- **If the re-drive still cannot record it**, the id is written to the service log as a single line
+  beginning `[UNRECORDED-REMOTE-WRITE]`, containing the external id, the sync log id and the
+  reference — because at that moment that id exists nowhere else. IMS then makes one more attempt
+  with a single statement (which waits on the pool rather than being cut short by the transaction
+  bound); if it lands, the row goes back to `PENDING` **with the external id recorded** and an error
+  message saying so, and the next run completes it without posting anything. **Do not re-queue such a
+  row by hand** — it does not need re-posting. If even that write fails, the log line says
+  `"recorded": false` and names itself as the only record; grep the service log for the marker and
+  reconcile the document in Xero manually.
 - **If that record is lost anyway** (the post landed, the process died before recording it), nothing
   prevents a duplicate — IMS does not query Xero before re-posting a payment. It is then *detected*,
   not prevented, by the settlement status on the order/PO (`over-settled`, `awaiting ledger`), the

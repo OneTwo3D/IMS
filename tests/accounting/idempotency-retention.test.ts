@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
-import test from 'node:test'
+import test, { mock } from 'node:test'
 
 import {
   accountingRetryDuplicateCaution,
@@ -63,49 +63,191 @@ test('o3d-wahn: the caution is offered for Xero and WITHHELD where no window was
  * Round 2, finding 1 — THE SAME ARITHMETIC CONDEMNS THE AUTOMATIC PATH.
  *
  * Round 1 established the window and then reasoned only about the button a human presses. But six
- * minutes is not a fact about humans: the retries a WORKER schedules are minutes apart too, so the
- * "deterministic key, therefore safe" argument the automatic path is documented to rest on has never
- * held either. These compare the real constants rather than restating the claim — the day someone
- * shortens the backoff or lengthens the in-request retry budget, the prose above becomes false and
- * this is what says so.
+ * minutes is not a fact about humans: the retries a WORKER schedules are minutes apart too.
+ *
+ * ROUND 3, FINDING 4 — AND ROUND 2'S TESTS PROVED NEITHER BOUND IT CLAIMED. They multiplied
+ * XERO_MAX_RETRIES by XERO_MAX_RETRY_AFTER_MS, called the product "the in-request retry", and compared
+ * it to the window. THE PRODUCT IS NOT THE LOOP: `performRequest` awaits `waitForBudget` before EVERY
+ * attempt as well, and a minute-limit wait there sleeps up to 60s, so the real worst case is
+ * 3 x 90s + 3 x 60s = 450s — OUTSIDE the six minutes the comment claimed it was inside. The other test
+ * added a made-up 60_000 to DEFAULT_RETRY_BASE_DELAY_MS until the inequality came out true, which
+ * establishes nothing about when a queued retry actually lands.
+ *
+ * So both bounds are now taken from the code that produces them: the first by DRIVING the retry loop
+ * and timing its attempts, the second by asking the real backoff calculator for its real extremes.
  */
-test('o3d-wahn r2: the only retry inside the window is the in-request 429 loop', async () => {
-  const { XERO_MAX_RETRIES, XERO_MAX_RETRY_AFTER_MS } = await import('@/lib/connectors/xero/api')
 
-  // Read from the connector, not restated here: a claim about a retry budget that does not read the
-  // budget is a claim about nothing.
-  assert.equal(typeof XERO_MAX_RETRIES, 'number', 'the in-request retry budget must be readable to be compared')
-  assert.equal(typeof XERO_MAX_RETRY_AFTER_MS, 'number', 'and so must the longest wait per attempt')
+/** Let queued microtasks run without letting real time pass. */
+async function settle() {
+  for (let i = 0; i < 8; i++) await Promise.resolve()
+}
 
-  // Worst case for one API call: every attempt 429s and waits the longest we are willing to block.
-  const worstCaseElapsedMs = XERO_MAX_RETRIES * XERO_MAX_RETRY_AFTER_MS
+/**
+ * Advance the MOCKED clock until `isDone()`, or give up. Bounded on purpose: a reverted budget check
+ * must fail this test, and a test that waits for ever instead of failing has proved nothing.
+ */
+async function runClock(isDone: () => boolean, stepMs = 1_000, maxSteps = 1_200) {
+  for (let step = 0; step < maxSteps && !isDone(); step++) {
+    await settle()
+    if (!isDone()) mock.timers.tick(stepMs)
+  }
+  await settle()
+}
+
+let currentTenantId = 'tenant-unset'
+let connectorFetchHandler: (url: string, init: RequestInit) => Promise<Response> = async () => {
+  throw new Error('no connectorFetch handler installed')
+}
+
+mock.module('@/lib/connectors/xero/auth', {
+  namedExports: {
+    getAccessToken: async () => ({ accessToken: 'test-token', tenantId: currentTenantId }),
+    getStoredTenantBlockReason: async () => null,
+    getGrantedScopes: async () => [],
+  },
+})
+
+mock.module('@/lib/security/connector-fetch', {
+  namedExports: {
+    connectorFetch: (url: string, init: RequestInit) => connectorFetchHandler(url, init),
+  },
+})
+
+test('o3d-wahn r3 #4: the in-request retry loop is MEASURED, and it stays inside the window', async (t) => {
+  currentTenantId = 'tenant-retry-loop'
+  const { xeroGet, XERO_IN_REQUEST_RETRY_BUDGET_MS, XERO_MAX_RETRIES } = await import('@/lib/connectors/xero/api')
+
+  const attemptsAt: number[] = []
+  connectorFetchHandler = async () => {
+    attemptsAt.push(Date.now())
+    return new Response('rate limited', { status: 429, headers: { 'Retry-After': '90' } })
+  }
+
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  t.after(() => mock.timers.reset())
+
+  let done = false
+  const call = xeroGet('Invoices').then((result) => { done = true; return result })
+  await runClock(() => done)
+
+  assert.equal(done, true, 'the call finished rather than blocking for ever on Retry-After')
+  const response = await call
+  assert.equal(response.ok, false)
+  assert.equal(attemptsAt.length, XERO_MAX_RETRIES + 1,
+    'one attempt plus XERO_MAX_RETRIES, which is what the loop is written to do')
+
+  // THE BOUND, measured from the first HTTP call — which is where Xero starts the key's clock.
+  const spanMs = attemptsAt[attemptsAt.length - 1] - attemptsAt[0]
   assert.ok(
-    worstCaseElapsedMs < XERO_IDEMPOTENCY_KEY_RETENTION_MS,
-    `an in-request retry can take at most ${worstCaseElapsedMs}ms, which must stay inside the `
-      + `${XERO_IDEMPOTENCY_KEY_RETENTION_MS}ms Xero keeps the key for — it re-sends the SAME header, so `
-      + 'this is the one retry the key was designed for',
+    spanMs <= XERO_IN_REQUEST_RETRY_BUDGET_MS,
+    `the last in-request attempt went out ${spanMs}ms after the first, past the `
+      + `${XERO_IN_REQUEST_RETRY_BUDGET_MS}ms Xero remembers the Idempotency-Key for`,
+  )
+  assert.deepEqual(
+    attemptsAt.map((at) => at - attemptsAt[0]), [0, 90_000, 180_000, 270_000],
+    'and the schedule is the real one: three Retry-After sleeps of 90s, not a product of two constants',
+  )
+
+  // Round 2's arithmetic, kept but correctly LABELLED: this is the Retry-After leg alone, and it is a
+  // tripwire on two constants, not the bound. It is why the budget check on that leg is defensive
+  // today — the leg that can actually exhaust the budget is the minute-limit wait, driven below.
+  const { XERO_MAX_RETRY_AFTER_MS } = await import('@/lib/connectors/xero/api')
+  assert.ok(
+    XERO_MAX_RETRIES * XERO_MAX_RETRY_AFTER_MS < XERO_IN_REQUEST_RETRY_BUDGET_MS,
+    'raise either constant and the Retry-After sleeps alone can leave the window — at which point the '
+      + 'budget check on that leg stops being defensive and starts firing',
   )
 })
 
-test('o3d-wahn r2: a queued retry lands outside the window, so the key protects nothing there', async () => {
-  const { DEFAULT_RETRY_BASE_DELAY_MS } = await import('@/lib/domain/integrations/outbox')
+test('o3d-wahn r3 #4: the minute-limit wait — the leg round 2 forgot — answers to the same budget', async (t) => {
+  currentTenantId = 'tenant-minute-budget'
+  const { xeroGet, waitForBudget, XERO_IN_REQUEST_RETRY_BUDGET_MS } = await import('@/lib/connectors/xero/api')
+  void XERO_IN_REQUEST_RETRY_BUDGET_MS
 
-  // The first retry is scheduled a full backoff after the failure, and the failure is itself after the
-  // call. Measured from the first call — which is where Xero measures from — that is already at the
-  // line, with only a minute of slack that a slow request or a cron tick eats.
+  connectorFetchHandler = async () => new Response('{}', { status: 200, headers: { 'Content-Type': 'application/json' } })
+
+  mock.timers.enable({ apis: ['setTimeout', 'Date'] })
+  t.after(() => mock.timers.reset())
+
+  // Fill this tenant's minute bucket to the limit, using real calls, so the wait under test is a real
+  // wait rather than a state a test asserted into existence.
+  // No clock ticks here: while the bucket is under the limit these calls take no wait at all, so the
+  // 55 timestamps all land on the same instant — which is what makes the wait below a full minute.
+  for (let i = 0; i < 55; i++) await xeroGet('Organisation')
+
+  // 1. A wait that will not fit the remaining window is REFUSED, and refused WITHOUT SLEEPING: the
+  //    assertion runs before any tick, so a reverted budget check fails here immediately instead of
+  //    hanging the run.
+  type BudgetOutcome = Awaited<ReturnType<typeof waitForBudget>>
+  const refusals: BudgetOutcome[] = []
+  void waitForBudget(currentTenantId, 30_000).then((result) => { refusals.push(result) })
+  await settle()
+  assert.equal(refusals.length, 1,
+    'it answered without sleeping, because the wait it wanted does not fit the budget')
+  const refusal = refusals[0]
+  assert.equal(refusal.ok, false)
+  assert.equal(refusal.ok === false && refusal.reason, 'budget')
+  assert.equal(refusal.ok === false && refusal.waitMs, 60_000,
+    'and it says how long it would have slept: a full minute')
+
+  // 2. The refusal is not vacuous: with no budget imposed, the SAME state really does sleep a minute.
+  //    Without this, a helper that refused everything would pass part 1 just as well.
+  const startedAt = Date.now()
+  const allowed: BudgetOutcome[] = []
+  void waitForBudget(currentTenantId).then((result) => { allowed.push(result) })
+  await settle()
+  assert.equal(allowed.length, 0, 'unbudgeted, it is asleep on the minute limit')
+  await runClock(() => allowed.length > 0, 1_000, 120)
+  assert.equal(allowed[0]?.ok, true)
+  assert.equal(Date.now() - startedAt, 60_000, 'having slept exactly the minute the refusal declined to spend')
+})
+
+test('o3d-wahn r3 #4: what a QUEUED retry is worth, from the real backoff calculator', async () => {
+  const { calculateIntegrationOutboxRetryDelayMs, DEFAULT_RETRY_BASE_DELAY_MS } =
+    await import('@/lib/domain/integrations/outbox')
+
+  // The real extremes of the real function: jitter is tail-only, so random()=0 is the floor and
+  // random()=1 the ceiling. Nothing here is restated arithmetic — these are the delays production
+  // schedules with.
+  const firstFloor = calculateIntegrationOutboxRetryDelayMs({ attemptsBeforeFailure: 0, random: () => 0 })
+  const firstCeiling = calculateIntegrationOutboxRetryDelayMs({ attemptsBeforeFailure: 0, random: () => 1 })
+  const secondFloor = calculateIntegrationOutboxRetryDelayMs({ attemptsBeforeFailure: 1, random: () => 0 })
+
+  assert.equal(firstFloor, DEFAULT_RETRY_BASE_DELAY_MS, 'the first retry is never sooner than the base delay')
+  assert.ok(firstCeiling > firstFloor, 'and jitter only ever pushes it later')
+
+  // THE HONEST BOUND, and it is not the one round 2 claimed. The first queued retry can land at
+  // 300s — INSIDE the six-minute window — when jitter is minimal and the failed call was quick. So
+  // "a queued retry lands outside the window" is FALSE as a universal claim, and asserting it with a
+  // hand-added 60_000 was the tripwire admitting as much.
+  assert.ok(firstFloor < XERO_IDEMPOTENCY_KEY_RETENTION_MS,
+    'the earliest first retry is inside the window, so the window cannot be what makes it safe or unsafe')
+  assert.equal(isWithinXeroIdempotencyWindow(new Date(Date.now() - firstFloor)), true,
+    'stated the other way round: a row whose attempt was one floor-delay ago is still inside')
+
+  // What IS provable is that nothing keeps it there. The ceiling alone does not clear the window, but
+  // the elapsed time Xero measures also includes the failed call itself — and that call may have spent
+  // the whole in-request budget before failing.
+  const { XERO_IN_REQUEST_RETRY_BUDGET_MS } = await import('@/lib/connectors/xero/api')
   assert.ok(
-    DEFAULT_RETRY_BASE_DELAY_MS + 60_000 >= XERO_IDEMPOTENCY_KEY_RETENTION_MS,
-    'the first automatic retry is not comfortably inside the window; it sits on the boundary',
+    firstCeiling + XERO_IN_REQUEST_RETRY_BUDGET_MS > XERO_IDEMPOTENCY_KEY_RETENTION_MS,
+    'measured from the first call, a slow failure plus a jittered backoff is already past the window',
   )
-  // And the second is not arguable at all: the backoff doubles.
+
+  // And from the second retry on it is not arguable at all: the floor alone clears the window.
   assert.ok(
-    DEFAULT_RETRY_BASE_DELAY_MS * 2 > XERO_IDEMPOTENCY_KEY_RETENTION_MS,
-    'from the second automatic retry on, the key has certainly expired and the re-post is a NEW request',
+    secondFloor > XERO_IDEMPOTENCY_KEY_RETENTION_MS,
+    'from the second automatic retry the key has certainly expired and the re-post is a NEW request',
   )
-  assert.equal(
-    isWithinXeroIdempotencyWindow(new Date(Date.now() - DEFAULT_RETRY_BASE_DELAY_MS * 2)),
-    false,
-    'stated the other way round: a row whose attempt was two backoffs ago is outside the window',
+  assert.equal(isWithinXeroIdempotencyWindow(new Date(Date.now() - secondFloor)), false)
+
+  // The conclusion the module has to state: a protection you cannot tell is present is not one you may
+  // rely on. Whether a queued retry still has its key is UNDETERMINED at the floor and gone above it,
+  // so nothing may be built on it either way.
+  assert.notEqual(
+    isWithinXeroIdempotencyWindow(new Date(Date.now() - firstFloor)),
+    isWithinXeroIdempotencyWindow(new Date(Date.now() - secondFloor)),
+    'the two automatic retries fall on opposite sides of the window — the schedule does not respect it',
   )
 })
 
@@ -122,6 +264,15 @@ test('o3d-wahn r2: the module says plainly what protects an automatic retry inst
     'and says plainly that once that record is lost nothing prevents the duplicate')
   assert.match(source, /settlement-status\.ts|settlementStatus/,
     'naming the detective control that is left, rather than implying a preventive one')
+
+  // r3 #4: the two claims round 2 could not support must not survive as prose either. The in-request
+  // bound is now enforced, and the queued-retry claim is corrected rather than repeated.
+  assert.match(source, /XERO_IN_REQUEST_RETRY_BUDGET_MS/,
+    'the in-request bound is named as an enforced budget, not asserted as a product of two constants')
+  assert.doesNotMatch(source, /the first retry sits at or past the six-minute line/,
+    'the queued-retry claim round 2 could not prove — and which the real floor contradicts — is gone')
+  assert.match(source, /A PROTECTION YOU CANNOT TELL IS PRESENT IS NOT ONE YOU MAY RELY ON/,
+    'and what replaces it is a statement an operator can act on')
 })
 
 test('o3d-wahn r2: the runbook covers the automatic retries too', () => {

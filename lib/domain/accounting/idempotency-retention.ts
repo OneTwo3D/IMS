@@ -28,19 +28,37 @@
  * sentence above was written about the manual control, but nothing in it is specific to a human. Put
  * the real numbers side by side:
  *
- *   in-request 429 retry (connectors/xero/api.ts)   <= XERO_MAX_RETRIES (3) waits of at most
- *                                                   XERO_MAX_RETRY_AFTER_MS (90s) = 4m30s worst case,
- *                                                   same `init`, same Idempotency-Key header.
- *                                                   INSIDE the window. Also the case that needs it
+ *   in-request 429 retry (connectors/xero/api.ts)   Same `init`, same Idempotency-Key header, and now
+ *                                                   BOUNDED BY THIS WINDOW rather than compared to it:
+ *                                                   XERO_IN_REQUEST_RETRY_BUDGET_MS is this constant,
+ *                                                   and `performRequest` refuses any wait that would
+ *                                                   put the next attempt past it. Inside the window
+ *                                                   BY CONSTRUCTION. Also the case that needs it
  *                                                   least: a 429 was refused before Xero processed it.
  *
  *   row/outbox retry (integrations/outbox.ts)       DEFAULT_RETRY_BASE_DELAY_MS = 5 MINUTES for the
  *                                                   first retry, doubling to 10, 20, 40 (capped 60),
- *                                                   and only claimable on the next 5-minute
- *                                                   `accounting-sync` cron tick. Measured from the
- *                                                   FIRST call — which happened before that backoff
- *                                                   started — the first retry sits at or past the
- *                                                   six-minute line and every later one is far past it.
+ *                                                   plus tail jitter, and only claimable on the next
+ *                                                   5-minute `accounting-sync` cron tick. UNDETERMINED
+ *                                                   against the window at the first retry and clearly
+ *                                                   past it from the second — see below.
+ *
+ * ROUND 3, FINDING 4 — THE FIRST OF THOSE TWO LINES WAS AN ARITHMETIC COINCIDENCE AND THE SECOND WAS
+ * WRONG. Round 2 wrote "3 x 90s = 4m30s, INSIDE the window", which is the product of two constants
+ * and not the loop: `performRequest` also awaits `waitForBudget` before every attempt, and its
+ * minute-limit sleep is up to 60s, making the true worst case 3 x 90s + 3 x 60s = 7m30s. The claim was
+ * false, so the loop was given the budget above and the claim is now enforced rather than asserted.
+ *
+ * And round 2 said a queued retry "sits at or past the six-minute line". It does not, necessarily: the
+ * backoff calculator's FLOOR for the first retry is exactly DEFAULT_RETRY_BASE_DELAY_MS = 5 minutes,
+ * which is INSIDE the window — a quick failure followed by a minimally-jittered backoff can re-post
+ * with a key Xero still remembers. What is true, and provable from the same function, is that nothing
+ * keeps it there: jitter, the cron tick and the failed call's own duration all push it out, and the
+ * SECOND retry's floor (10 minutes) clears the window unconditionally. So the honest statement is not
+ * "queued retries are outside the window" but "a queued retry may or may not still hold its key, and
+ * nothing in the schedule cares" — which is the same conclusion for anyone deciding what to rely on:
+ * A PROTECTION YOU CANNOT TELL IS PRESENT IS NOT ONE YOU MAY RELY ON. Both bounds are now measured
+ * from the real code in tests/accounting/idempotency-retention.test.ts rather than restated here.
  *
  * So the retries that could actually duplicate something — the ones where the first attempt may have
  * REACHED Xero (a timeout, a dropped response, a crash between the post and its local record) are

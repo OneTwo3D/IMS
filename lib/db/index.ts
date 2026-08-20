@@ -34,6 +34,28 @@ export const DB_POOL_MAX = 20
  */
 export const DB_POOL_ACQUISITION_TIMEOUT_MS = 10_000
 
+/**
+ * The transaction options a POST-REMOTE persist must use (o3d-xl63 r3 #1).
+ *
+ * An interactive `$transaction` carries its own start bound — `maxWait`, DEFAULT 2000ms — and it is
+ * five times shorter than the pool bound above, so on the default it is Prisma, not the pool, that
+ * decides how long a caller waits for a connection. Measured against @prisma/client 7.7.0 with the
+ * pool exhausted, `db.$transaction(async tx => ...)` rejects after 2002ms with
+ * `PrismaClientKnownRequestError` P2028 "Unable to start a transaction in the given time" and NO
+ * `cause` — the pg-pool text never appears at all. Round 2 built its whole detector around that text.
+ *
+ * Raising `maxWait` above the pool bound puts the decision back where the comment above says it is:
+ * the pool times out first, and the failure that surfaces is the honest "timeout exceeded when trying
+ * to connect". `persistAfterRemoteWrite` recognises BOTH shapes regardless, because a caller that
+ * forgets these options must still be re-driven — but the ones that matter do not have to depend on
+ * that. `timeout` bounds the BODY (two small writes) and is generous for the same reason: a body that
+ * expired mid-flight is not something we may repeat.
+ */
+export const POST_REMOTE_PERSIST_TX_OPTIONS = {
+  maxWait: DB_POOL_ACQUISITION_TIMEOUT_MS + 1_000,
+  timeout: 15_000,
+} as const
+
 function createPrismaClient() {
   // Config form, NOT `new PrismaPg(pool)` (o3d-4ajo) — the same trap the
   // concurrency tests already guard against, which this runtime path never

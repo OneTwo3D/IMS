@@ -6,6 +6,7 @@ import { getAccessToken, getStoredTenantBlockReason } from './auth'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { accountingPostingIntentRefusal } from '@/lib/connectors/accounting-posting-intent'
 import { accountingEgressRefusal } from '@/lib/connectors/accounting-egress-authorization'
+import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
 const XERO_CONNECTOR = 'xero'
@@ -52,6 +53,26 @@ const XERO_DAY_LIMIT = 950
  * returns is one an operator can see (o3d-2it).
  */
 export const XERO_MAX_RETRY_AFTER_MS = 90_000
+
+/**
+ * THE IN-REQUEST RETRY BUDGET, AND WHY IT IS THE IDEMPOTENCY WINDOW (o3d-wahn r3 #4).
+ *
+ * `idempotency-retention.ts` says the in-request 429 loop is the one retry Xero's Idempotency-Key
+ * still covers, and round 2 "proved" it by multiplying XERO_MAX_RETRIES by XERO_MAX_RETRY_AFTER_MS:
+ * 3 x 90s = 4m30s, inside six minutes. THAT PRODUCT IS NOT THE LOOP. `performRequest` also awaits
+ * `waitForBudget` before EVERY attempt, and a minute-limit wait there sleeps up to 60s — so the real
+ * worst case between the first HTTP call and the last is 3 x 90s of Retry-After plus 3 x 60s of
+ * minute-limit waiting = 7m30s, comfortably OUTSIDE the window the comment claimed it was inside.
+ *
+ * Rather than correct the prose down to "usually inside", the loop now ENFORCES the bound: no wait is
+ * taken that would put the next attempt past this budget, measured from the first HTTP call, which is
+ * where Xero starts the key's clock. Past it the call hands back a 429 and the outbox defers the work
+ * — which is strictly better than blocking a cron for another minute to send a header Xero has
+ * forgotten. `tests/accounting/idempotency-retention.test.ts` drives the real loop and measures the
+ * gap between first and last attempt, so the claim is a measurement rather than an arithmetic
+ * coincidence between two constants.
+ */
+export const XERO_IN_REQUEST_RETRY_BUDGET_MS = XERO_IDEMPOTENCY_KEY_RETENTION_MS
 
 const minuteBuckets = new Map<string, number[]>()
 const dayBuckets = new Map<string, number[]>()
@@ -126,8 +147,22 @@ function pushRequestTimestamp(bucket: Map<string, number[]>, key: string, now: n
  * the local bucket ever filled, so the day branch was dead code. Correcting the limit to 950
  * makes it live, so it has to report exhaustion instead of sleeping on it. Callers turn this
  * into a 429 and let the outbox defer with backoff.
+ *
+ * EXPORTED so its refusal can be driven directly (o3d-wahn r3 #4). This minute-limit sleep is the
+ * third wait in `performRequest` and the one round 2's `MAX_RETRIES x MAX_RETRY_AFTER` arithmetic
+ * left out; a test that cannot reach it cannot prove the budget covers it.
  */
-async function waitForBudget(tenantId: string): Promise<{ ok: true } | { ok: false; waitMs: number }> {
+export async function waitForBudget(
+  tenantId: string,
+  /**
+   * The most this may sleep in total. Not a nicety: the minute-limit wait is the third sleep in the
+   * retry loop and the one round 2's arithmetic forgot, so it has to answer to the same budget as the
+   * Retry-After sleeps do (o3d-wahn r3 #4). Infinity before the first HTTP call, when no key clock is
+   * running yet.
+   */
+  budgetMs: number = Number.POSITIVE_INFINITY,
+): Promise<{ ok: true } | { ok: false; reason: 'day' | 'budget'; waitMs: number }> {
+  let sleptMs = 0
   while (true) {
     const now = Date.now()
     const minute = (minuteBuckets.get(tenantId) ?? []).filter((ts) => ts >= now - 60_000)
@@ -137,12 +172,14 @@ async function waitForBudget(tenantId: string): Promise<{ ok: true } | { ok: fal
 
     // Day first: no amount of waiting inside this request will fix it.
     if (day.length >= XERO_DAY_LIMIT) {
-      return { ok: false, waitMs: 86_400_000 - (now - day[0]) }
+      return { ok: false, reason: 'day', waitMs: 86_400_000 - (now - day[0]) }
     }
 
     const minuteWait = minute.length >= XERO_MINUTE_LIMIT ? 60_000 - (now - minute[0]) : 0
     if (minuteWait <= 0) return { ok: true }
+    if (sleptMs + minuteWait > budgetMs) return { ok: false, reason: 'budget', waitMs: minuteWait }
     await sleep(minuteWait)
+    sleptMs += minuteWait
   }
 }
 
@@ -232,6 +269,24 @@ function parseRetryAfterMs(value: string | null): number {
 
 async function performRequest(auth: { accessToken: string; tenantId: string }, init: RequestInit, url: string) {
   let lastRateLimitMs = 0
+  /**
+   * When Xero started this request's Idempotency-Key clock. Null until the first attempt actually
+   * goes out: waiting for minute budget BEFORE the first call costs nothing from the window, because
+   * the key has not been sent yet.
+   */
+  let firstCallAt: number | null = null
+  /** What is left of XERO_IN_REQUEST_RETRY_BUDGET_MS, from the first call. */
+  const budgetRemainingMs = () =>
+    firstCallAt === null ? Number.POSITIVE_INFINITY : XERO_IN_REQUEST_RETRY_BUDGET_MS - (Date.now() - firstCallAt)
+  const outOfBudgetResponse = (waitMs: number, elapsedMs: number) => ({
+    ok: false,
+    status: 429,
+    text: async () =>
+      `Rate limited; the next in-request retry would wait ${Math.round(waitMs / 1000)}s, which puts it ` +
+      `past the ${XERO_IN_REQUEST_RETRY_BUDGET_MS / 1000}s Xero remembers an Idempotency-Key for ` +
+      `(${Math.round(elapsedMs / 1000)}s already spent on this call). Not waiting — the work must be ` +
+      `deferred, where the local record of the external id is what prevents a duplicate.`,
+  } as Response)
 
   // THE ONE PLACE the queued row's connection is authorised, and the last statement before anything
   // leaves this process (o3d-gfh, Codex r1 finding 3).
@@ -251,8 +306,10 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
   }
 
   for (let attempt = 0; attempt <= XERO_MAX_RETRIES; attempt++) {
-    const budget = await waitForBudget(auth.tenantId)
+    const remainingBeforeCall = budgetRemainingMs()
+    const budget = await waitForBudget(auth.tenantId, remainingBeforeCall)
     if (!budget.ok) {
+      if (budget.reason === 'budget') return outOfBudgetResponse(budget.waitMs, XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingBeforeCall)
       return {
         ok: false,
         status: 429,
@@ -289,6 +346,7 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     }
 
     noteRequest(auth.tenantId)
+    firstCallAt ??= Date.now()
 
     const res = await connectorFetch(url, init, { connectorName: 'Xero' })
     noteLimitHeaders(auth.tenantId, res)
@@ -299,6 +357,18 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     // Give up rather than sleep out a daily limit. Retry-After is measured in seconds for the
     // minute limit and in HOURS for the daily one; waiting out the latter hangs this request
     // (and its cron) with nothing to show for it. Hand the 429 back and let the caller defer.
+    // The wait must fit the window as well as the per-sleep cap: a retry sent after Xero has forgotten
+    // the key is a NEW request to Xero, so blocking a cron for it buys nothing (o3d-wahn r3 #4).
+    //
+    // THIS HALF IS DEFENSIVE AT TODAY'S CONSTANTS and says so rather than pretending to be load-bearing:
+    // XERO_MAX_RETRIES x XERO_MAX_RETRY_AFTER_MS is 270s, inside the 360s budget, so the Retry-After
+    // sleeps alone cannot exhaust it — only the minute-limit waits above can, which is why THEY are
+    // what the tests drive. It exists so that raising either constant cannot silently reintroduce the
+    // overrun; the test pins that relationship so the day it stops holding, this becomes live.
+    const remaining = budgetRemainingMs()
+    if (lastRateLimitMs > remaining && attempt !== XERO_MAX_RETRIES) {
+      return outOfBudgetResponse(lastRateLimitMs, XERO_IN_REQUEST_RETRY_BUDGET_MS - remaining)
+    }
     if (lastRateLimitMs > XERO_MAX_RETRY_AFTER_MS || attempt === XERO_MAX_RETRIES) {
       return {
         ok: false,

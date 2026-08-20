@@ -5,9 +5,13 @@
 
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
-import { db } from '@/lib/db'
+import { db, POST_REMOTE_PERSIST_TX_OPTIONS } from '@/lib/db'
 import { XERO_INVOICE_NUMBER_SLOT_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
-import { persistAfterRemoteWrite } from '@/lib/db/post-remote-persist'
+import {
+  persistAfterRemoteWrite,
+  reportUnrecordedRemoteWrite,
+  UnrecordedRemoteWriteError,
+} from '@/lib/db/post-remote-persist'
 import { logActivity, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
@@ -542,6 +546,14 @@ export async function recordPostedDocumentDurably(
    * different answers to the mirror, so this stays optional rather than defaulting to `null`.
    */
   externalRevisionAt?: Date | null,
+  /**
+   * o3d-xl63 r3 #2: the transaction options for a POST-REMOTE persist. Prisma's default `maxWait` is
+   * 2 seconds, which is right for work that has not started and wrong for the record of a document
+   * the external ledger already holds — it gives up long before the pool's own acquisition bound and
+   * turns a busy moment into a lost identifier. Callers persisting after a remote write pass
+   * `POST_REMOTE_PERSIST_TX_OPTIONS`; everyone else keeps Prisma's defaults.
+   */
+  txOptions?: { maxWait?: number; timeout?: number },
 ): Promise<PostedSyncRecord> {
   const revision = externalRevisionAt !== undefined ? { externalRevisionAt } : {}
   let unwritten: PostedDocumentEvidenceUnwritten | undefined
@@ -577,7 +589,7 @@ export async function recordPostedDocumentDurably(
         payload,
         ...revision,
         onConflictObserved: (incident) => { observed = incident },
-      }))
+      }), txOptions)
     } catch (error) {
       if (error instanceof PostedDocumentEvidenceUnwritten) {
         // Both halves: the ready-made failure to throw if we run out of attempts, AND the incident
@@ -1264,6 +1276,189 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
   }
 }
 
+/**
+ * RECORD A DOCUMENT XERO HAS ALREADY ACCEPTED (o3d-xl63 r2 #2, r3 #1-#3).
+ *
+ * Both processors reach the same point: `POST /Invoices` (or /Payments, /ManualJournals ...) has
+ * returned an id, and the ONLY thing standing between that id and a duplicate on the next run is this
+ * local write. Three properties, none of which the round-2 shape had:
+ *
+ *  1. IT IS RE-DRIVEN ACROSS A FAILURE TO START, using the transaction options that put the wait back
+ *     under the pool's bound rather than Prisma's 2-second default (`POST_REMOTE_PERSIST_TX_OPTIONS`).
+ *
+ *  2. ITS DEADLINE IS THE CLAIM'S, NOT A CHOSEN NUMBER. `claim` is this row's actual claim —
+ *     `processingStartedAt` and the cutoff another worker measures staleness against — so
+ *     `persistAfterRemoteWrite` derives a deadline that always ends before this worker could be
+ *     overtaken. That matters because the Xero post in front of it can itself burn minutes on
+ *     rate-limit waits: a fixed two minutes measured from HERE could have run straight through the
+ *     moment the claim lapsed, which is the double-post this is all for.
+ *
+ *  3. WHEN IT GIVES UP, THE EVIDENCE IS NOT WRITTEN THROUGH THE POOL THAT JUST REFUSED IT. Returning
+ *     false used to drop the caller into the generic failure handler, whose first act is another
+ *     `db.$transaction` — a connection from the pool that has spent the whole deadline handing none
+ *     out. The record of what went unrecorded therefore could not be written in exactly the case it
+ *     existed for. Now the id goes to fd 2 first (`reportUnrecordedRemoteWrite`), with no precondition
+ *     beyond this process still holding it, and only then is a database record ATTEMPTED — as a single
+ *     statement rather than an interactive transaction, because that path waits the full pool bound
+ *     instead of being cut off after 2s, and because one statement needs a connection for an instant
+ *     rather than for a transaction.
+ *
+ * Returns true when the row was recorded normally. On false the caller must NOT touch the database for
+ * this row: the pool is exhausted, and everything worth saying has already been said by the reporter.
+ */
+// Exported for tests/accounting/xero-unrecorded-remote-write.test.ts: the give-up path is the one
+// that runs when the database is unreachable, so it has to be drivable without one.
+export type PostedDocumentPersistOutcome =
+  | { persisted: true }
+  /**
+   * THE POOL refused this attempt for the whole deadline (o3d-xl63 r3). The identifier has already
+   * been reported on a channel that does not need a connection, and the caller must NOT touch the
+   * database again for this row — the next thing it would do is ask the same exhausted pool.
+   */
+  | { persisted: false; reason: 'pool-exhausted' }
+  /**
+   * THE ROW ALREADY NAMES A DIFFERENT DOCUMENT (o3d-550x, merged as #639). Nothing is wrong with the
+   * pool and the conflict evidence IS durable — both identifiers are filed. This is a settled,
+   * permanent outcome, and it is deliberately distinct from the one above: retrying it would only
+   * post a second document, whereas the pool case is transient.
+   */
+  | { persisted: false; reason: 'not-recorded'; evidence: string }
+
+export async function persistPostedXeroDocument(input: {
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+  payload: SyncPayload
+  externalId: string | null | undefined
+  claimedAt: Date
+  /**
+   * o3d-cvj9 (merged into development as o3d-batch-cvj9): the revision stamp Xero put on the document
+   * as it applied THIS write. Supplied by the call sites where a connector write actually landed; a
+   * site that called nothing omits it, and the ABSENCE — not `null` — is what the mirror's ordering
+   * rule decides such a path on.
+   */
+  externalRevisionAt?: Date | null
+}): Promise<PostedDocumentPersistOutcome> {
+  const { entry, payload, claimedAt } = input
+  const externalId = input.externalId ?? null
+  const what = `xero sync log ${entry.id} (${entry.type})`
+
+  try {
+    // WHAT IS WRITTEN IS o3d-550x'S; WHETHER WE GET A CONNECTION TO WRITE IT IS THIS BRANCH'S.
+    //
+    // Until #639 merged, this function spelt the SYNCED transition out inline. It must not any more,
+    // and re-introducing that inline write is the silent regression this rebase had to avoid: the
+    // merged `recordPostedDocumentDurably` is not the same statement in a different place. It refuses
+    // to overwrite a row that already names a DIFFERENT document, files the conflict evidence inside
+    // the transaction that observed it, re-drives that evidence transaction on its own budget, and
+    // reports the displaced identifier rather than losing it. An inline `update({ where: { id } })`
+    // has none of those and would look identical in a green test run.
+    //
+    // So the delegation is total: this function contributes only the things o3d-550x has no opinion
+    // about — the post-remote transaction options (r3 #2), the pool re-drive, the deadline derived
+    // from this worker's own claim, and the off-pool give-up report.
+    const record = await persistAfterRemoteWrite(
+      what,
+      () => recordPostedDocumentDurably(
+        entry,
+        externalId,
+        payload,
+        input.externalRevisionAt,
+        POST_REMOTE_PERSIST_TX_OPTIONS,
+      ),
+      { claim: { heldFrom: claimedAt, staleAfterMs: CLAIM_STALE_MS } },
+    )
+    // Not a pool problem and not this branch's to report: a newer claim posted its own document while
+    // this attempt was on the wire, and o3d-550x has already made both identifiers durable.
+    if (!record.recorded) return { persisted: false, reason: 'not-recorded', evidence: record.evidence }
+    return { persisted: true }
+  } catch (error) {
+    // Only the pool's own give-up is handled here. Everything else — including the unwritten-evidence
+    // throw o3d-550x raises when it cannot file a conflict — is left to the runner, untouched.
+    if (!(error instanceof UnrecordedRemoteWriteError)) throw error
+    await reportUnrecordedXeroWrite({ entry, externalId, claimedAt, error })
+    return { persisted: false, reason: 'pool-exhausted' }
+  }
+}
+
+/**
+ * The give-up path: say what went unrecorded somewhere the exhausted pool cannot reach, then try the
+ * database anyway.
+ *
+ * The fallback write is deliberately the SMALLEST one that removes the duplicate hazard: record the
+ * external id and hand the row back as PENDING. The next run claims it, takes the
+ * `if (entry.externalTransactionId)` short-circuit at the top of the loop, posts NOTHING, and finishes
+ * the mirrored event and follow-ups properly. Its WHERE clause is this worker's own claim, so if the
+ * claim has since been taken the write does nothing rather than trampling another worker's row.
+ *
+ * With no external id there is nothing that would stop a re-post, so the row keeps its claim and only
+ * gains an errorMessage: re-queueing it would be the duplicate, and saying so is all we honestly can.
+ */
+async function reportUnrecordedXeroWrite(input: {
+  entry: { id: string; type: AccountingSyncType; referenceType: string; referenceId: string }
+  externalId: string | null
+  claimedAt: Date
+  error: UnrecordedRemoteWriteError
+}): Promise<void> {
+  const { entry, externalId, claimedAt, error } = input
+  const base = {
+    what: `xero sync log ${entry.id} (${entry.type})`,
+    externalId,
+    detail: {
+      connector: XERO_CONNECTOR,
+      syncLogId: entry.id,
+      type: entry.type,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      claimedAt: claimedAt.toISOString(),
+    },
+    attempts: error.attempts,
+    elapsedMs: error.elapsedMs,
+  }
+
+  // FIRST, and unconditionally: the id, on a channel with no database in it.
+  reportUnrecordedRemoteWrite({ ...base, recorded: false, reason: error.message })
+
+  const errorMessage = externalId
+    ? `Xero accepted this document (${externalId}) but the record of it could not be written for `
+      + `${error.elapsedMs}ms (${error.attempts} attempts): no database transaction could be started. `
+      + `The external id was recovered by a single-statement write; this row will finish on the next run `
+      + `WITHOUT posting again. Do not re-queue it.`
+    : `Xero accepted this document but returned no id, and the record of the attempt could not be `
+      + `written for ${error.elapsedMs}ms (${error.attempts} attempts). CHECK XERO before re-queueing: `
+      + `a re-post would create a second document.`
+
+  try {
+    const recovery = await db.accountingSyncLog.updateMany({
+      where: {
+        id: entry.id,
+        connector: XERO_CONNECTOR,
+        status: 'PROCESSING',
+        processingStartedAt: claimedAt,
+        ...(externalId ? { externalTransactionId: null } : {}),
+      },
+      data: externalId
+        ? { externalTransactionId: externalId, status: 'PENDING', processingStartedAt: null, errorMessage }
+        : { errorMessage },
+    })
+    reportUnrecordedRemoteWrite({
+      ...base,
+      recorded: recovery.count === 1 && externalId !== null,
+      reason: recovery.count === 0
+        ? 'the fallback write matched no row: this claim was already lost, so another worker owns it'
+        : externalId
+          ? 'the external id was recorded by the single-statement fallback; the next run will not re-post'
+          : 'there is no external id to record — the row carries the warning and nothing else',
+    })
+  } catch (fallbackError) {
+    reportUnrecordedRemoteWrite({
+      ...base,
+      recorded: false,
+      reason: `the single-statement fallback write failed as well, so THIS LINE IS THE ONLY RECORD of `
+        + `${externalId ?? 'an unidentified document'} in Xero: `
+        + `${fallbackError instanceof Error ? fallbackError.message : String(fallbackError)}`,
+    })
+  }
+}
+
 async function deferOutboxForRateLimit(
   client: Pick<Prisma.TransactionClient, 'integrationOutbox'>,
   job: IntegrationOutboxRow,
@@ -1452,27 +1647,24 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
-        // o3d-550x: the external id and the follow-up obligation still become durable together
-        // (r10 finding 1); what changed is that this write refuses to OVERWRITE a different
-        // document rather than refusing when a newer claim owns the row.
-        // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it made
-        // is recorded and orders the document against other writers.
-        //
-        // POST-REMOTE PERSIST, NOT A PRE-FLIGHT ONE (o3d-xl63 r2 #2), and the two fit together rather
-        // than competing. o3d-550x owns WHAT is written and on what precondition — the evidence write
-        // is not fenced on the claim, and it refuses to overwrite a DIFFERENT document. This wrapper
-        // owns whether the attempt gets a connection at all: the pool's 10s acquisition bound is
-        // right for work that has not started and wrong for the record of a document Xero already
-        // holds, so the whole persist is RE-DRIVEN across an exhausted pool instead of being denied
-        // by it. Only a connection-acquisition timeout is re-driven; every other error — including
-        // the unwritten-evidence throw o3d-550x raises when it cannot file the conflict — is
-        // rethrown untouched, so the escalation path above it is unchanged.
-        const record = await persistAfterRemoteWrite(
-          `xero sync log ${entry.id} (${entry.type})`,
-          () => recordPostedDocumentDurably(entry, syncResult.externalId ?? null, payload, syncResult.externalRevisionAt ?? null),
-        )
-        if (!record.recorded) {
-          // See above: the evidence is already durable, or this line was never reached.
+        // POST-REMOTE PERSIST, NOT A PRE-FLIGHT ONE (o3d-xl63 r2 #2, r3 #1-#3). The document is
+        // already in Xero; this write is the only thing that will ever say so — and WHAT it writes is
+        // o3d-550x's durable record, not a re-spelt SYNCED update. See persistPostedXeroDocument.
+        const persisted = await persistPostedXeroDocument({
+          entry,
+          payload,
+          externalId: syncResult.externalId,
+          claimedAt,
+          // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
+          // made is recorded and orders the document against other writers.
+          externalRevisionAt: syncResult.externalRevisionAt ?? null,
+        })
+        if (!persisted.persisted) {
+          // Both reasons end the same way on THIS path, and for the same reason they end differently
+          // on the outbox path below: there is no job here to bury or to leave locked. Either the
+          // conflict evidence is durable (o3d-550x) or the identifier was reported off-pool
+          // (o3d-xl63) — in both cases it has been recorded somewhere an operator can reach, and
+          // anything further here would be another transaction against a pool that may have none.
           result.failed++
           continue
         }
@@ -1886,21 +2078,31 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         continue
       }
       if (syncResult.success) {
-        // o3d-550x: THE LINE r10 finding 1 NAMED, now refusing to overwrite a different document
-        // rather than refusing when a newer claim owns the row.
-        // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it made
-        // is recorded and orders the document against other writers.
-        //
-        // Same post-remote persist as the direct path (o3d-xl63 r2 #2), and this is the one MOST rows
-        // take: denying it a connection loses the external id of a document Xero already holds.
-        const record = await persistAfterRemoteWrite(
-          `xero sync log ${entry.id} (${entry.type})`,
-          () => recordPostedDocumentDurably(entry, syncResult.externalId ?? null, payload, syncResult.externalRevisionAt ?? null),
-        )
-        if (!record.recorded) {
-          // See above: permanent only because the evidence is already durable, and see above for why
-          // no batch answer is kept for it.
-          await markXeroOutboxPermanent(job, record.evidence)
+        // Same post-remote persist as the direct path (o3d-xl63 r2 #2, r3 #1-#3), and this is the one
+        // MOST rows take: losing it loses the external id of a document Xero already holds.
+        const persisted = await persistPostedXeroDocument({
+          entry,
+          payload,
+          externalId: syncResult.externalId,
+          claimedAt,
+          // o3d-cvj9: this attempt DID call the connector, so the revision stamp of the write it
+          // made is recorded and orders the document against other writers.
+          externalRevisionAt: syncResult.externalRevisionAt ?? null,
+        })
+        if (!persisted.persisted) {
+          // THE TWO FAILURES ARE NOT THE SAME JOB OUTCOME, and collapsing them would be wrong in
+          // whichever direction it collapsed.
+          //
+          //  • not-recorded (o3d-550x): the row already names a DIFFERENT document and the evidence
+          //    is durable. Bury the job PERMANENTLY — a retry could only post a second document —
+          //    and the burial is safe to attempt because nothing here says the pool is unavailable.
+          //  • pool-exhausted (o3d-xl63 r3): completing OR failing the job needs the very pool that
+          //    just refused this persist for the whole deadline. So the job is left locked and lapses
+          //    into a stale lock, which is the correct outcome: when it is re-claimed, the row's
+          //    recovered external id makes the retry a no-op short-circuit.
+          if (persisted.reason === 'not-recorded') {
+            await markXeroOutboxPermanent(job, persisted.evidence)
+          }
           result.failed++
           continue
         }
