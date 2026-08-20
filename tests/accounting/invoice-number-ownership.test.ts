@@ -40,7 +40,7 @@ function heldBy(...claims: LedgerInvoiceClaim[]): InvoiceNumberLookup {
 
 const UNCLAIMED: InvoiceNumberLookup = { ok: true, claims: [] }
 
-test('a number nobody holds is posted, and the attempt is recorded first', () => {
+test('a number nobody holds is posted', () => {
   const decision = decideInvoiceNumberPost({
     invoiceNumber: '164981',
     lookup: UNCLAIMED,
@@ -49,9 +49,6 @@ test('a number nobody holds is posted, and the attempt is recorded first', () =>
   })
   assert.equal(decision.post, true)
   assert.equal(decision.post && decision.basis, 'unclaimed')
-  // Written before the request leaves. It licenses nothing (see below) — it is the local record
-  // without which the post's own outcome could not be recorded either.
-  assert.equal(decision.post && decision.recordAttempt, true)
 })
 
 test('the number held by the document this order is linked to is our own — post', () => {
@@ -64,8 +61,6 @@ test('the number held by the document this order is linked to is our own — pos
   assert.equal(decision.post, true)
   assert.equal(decision.post && decision.basis, 'own-document')
   assert.equal(decision.post && decision.claimedInvoiceId, OURS)
-  // Nothing to record: the authoritative link already exists.
-  assert.equal(decision.post && decision.recordAttempt, false)
 })
 
 test('a number held by a document IMS does not own is REFUSED, naming the number and the overwrite', () => {
@@ -291,4 +286,37 @@ test('several voided holders and no live one is a voided refusal that names the 
   const reason = decision.post === false ? decision.reason : ''
   assert.match(reason, /a VOIDED document \(invoice xero-invoice-id-old/)
   assert.match(reason, /1 voided\/deleted document also holds that number \(invoice xero-invoice-id-theirs/)
+})
+
+// ---------------------------------------------------------------------------
+// An unaskable number is not an unreachable ledger (Codex round 4).
+// ---------------------------------------------------------------------------
+
+test('a number the ledger’s filter cannot express is refused PERMANENTLY, with its own remedy', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: 'INV,1',
+    lookup: { ok: false, unaskable: true, error: 'invoice number "INV,1" contains a comma, which Xero\'s InvoiceNumbers filter reads as the separator between two numbers' },
+    ownedInvoiceId: null,
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post, false)
+  assert.equal(decision.post === false && decision.code, 'NUMBER_NOT_ASKABLE')
+  // Waiting changes nothing: the number has to change, or a human has to post the invoice.
+  assert.equal(decision.post === false && decision.retryable, false)
+  const reason = decision.post === false ? decision.reason : ''
+  assert.match(reason, /NOTHING WAS SENT/)
+  assert.match(reason, /comma/)
+  assert.match(reason, /_wcpdf_invoice_number/)
+  assert.doesNotMatch(reason, /reachable again/, 'this is not the wait-for-the-connection refusal')
+})
+
+test('an ordinary lookup failure is still the RETRYABLE one — the two must not be conflated', () => {
+  const decision = decideInvoiceNumberPost({
+    invoiceNumber: '164981',
+    lookup: { ok: false, error: 'HTTP 503' },
+    ownedInvoiceId: null,
+    orderLabel: 'order WC-164981',
+  })
+  assert.equal(decision.post === false && decision.code, 'LEDGER_LOOKUP_UNAVAILABLE')
+  assert.equal(decision.post === false && decision.retryable, true)
 })

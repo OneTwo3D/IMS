@@ -110,7 +110,9 @@ test('a redelivery captures the number, may correct it before anything posts, an
   // The regression (o3d-k26m.6): capturing the number and queueing nothing, leaving the order
   // numbered, PROCESSING and permanently un-invoiced.
   assert.ok(
-    body.includes('await releaseHeldWcSalesInvoice(orderId, wcOrder, usableInvoiceNumber)'),
+    body.includes(
+      'await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber)',
+    ),
     'capturing the number must RELEASE the invoice that was held back for it',
   )
   assert.ok(
@@ -262,7 +264,7 @@ function salesInvoiceCase(): string {
 
 test('the sales-invoice CREATE asks who owns the number before it sends anything', () => {
   const body = salesInvoiceCase()
-  const fence = body.indexOf('await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload)')
+  const fence = body.indexOf('await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, claimedAt)')
   const push = body.indexOf('await pushSalesInvoice({')
   assert.ok(fence > 0, 'the create must consult the ownership fence')
   assert.ok(fence < push, 'the fence must run BEFORE the post, not after it')
@@ -290,20 +292,42 @@ function ownershipFenceBody(): string {
   return src.slice(start, src.indexOf('\nasync function processEntry(', start))
 }
 
+function postSlotBody(): string {
+  const src = source(XERO_PROCESSOR)
+  const start = src.indexOf('export async function takeInvoiceNumberPostSlot(')
+  assert.ok(start > 0, 'the in-flight number claim must exist')
+  return src.slice(start, src.indexOf('\n/**\n * THE OWNERSHIP FENCE', start))
+}
+
 test('the attempt is written BEFORE the post, and a failure to write it blocks the post', () => {
   const body = ownershipFenceBody()
-  const guard = body.indexOf('if (decision.recordAttempt && invoiceNumber) {')
-  const write = body.indexOf('data: { attemptedInvoiceNumber: invoiceNumber, attemptedInvoiceNumberAt: new Date() },')
+  const slot = body.indexOf('await takeInvoiceNumberPostSlot({ entryId, claimedAt, invoiceNumber, orderLabel })')
   const allow = body.lastIndexOf('return { post: true }')
-  assert.ok(guard > 0, 'the write must be reached whenever the decision asks for it')
-  assert.ok(guard < write, 'and it must be the thing that reaches the write')
+  assert.ok(slot > 0, 'every post must take the number slot, which is what writes the attempt')
+  assert.ok(slot < allow, 'the record must be durable before the caller is allowed to post')
+  assert.ok(
+    body.includes('if (!slot.ok) {'),
+    'and a slot that is refused must return the refusal, not fall through to the post',
+  )
+
+  const claim = postSlotBody()
+  const write = claim.indexOf('data: { attemptedInvoiceNumber: params.invoiceNumber, attemptedInvoiceNumberAt: stampedAt },')
+  const read = claim.indexOf('await db.accountingSyncLog.findFirst({')
   assert.ok(write > 0, 'the number about to be posted must be recorded on the row first')
-  assert.ok(write < allow, 'the record must be durable before the caller is allowed to post')
+  // THE WRITE MUST PRECEDE THE READ. That order is the entire soundness argument: two workers
+  // cannot both miss each other only because each stamped before it looked.
+  assert.ok(write < read, 'the stamp must be written before the search for a rival, or both workers can miss each other')
   // Not because the record licenses anything — because a create whose local record cannot be
   // written is a create whose OUTCOME cannot be written either.
   assert.ok(
-    body.includes('Could not record the invoice-number attempt for ${invoiceNumber} on sync row ${entryId} before posting'),
+    claim.includes('Could not record the invoice-number attempt for ${params.invoiceNumber} on sync row ${params.entryId} '),
     'failing to record the attempt must refuse the post, not proceed without it',
+  )
+  // Fenced on the claim INSTANT: a worker whose claim aged out and was re-taken must not stamp,
+  // and must not post — the sibling branch o3d-batch-payidx fences every claim release the same way.
+  assert.ok(
+    claim.includes('where: heldClaimWhere(params.entryId, params.claimedAt),'),
+    'the stamp must be conditioned on this worker still holding the claim it took',
   )
   // Fails closed on an unreadable order, matching guardCancelledSalesOrderInvoice.
   assert.ok(

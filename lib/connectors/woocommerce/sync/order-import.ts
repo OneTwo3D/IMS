@@ -408,7 +408,7 @@ async function updateExistingWcOrderFromPayload(
   // ever queued. Skipping here also refuses, structurally, to release an invoice for an order that
   // has already been invoiced.
   if (so.accountingInvoiceId) return
-  await releaseHeldWcSalesInvoice(orderId, wcOrder, usableInvoiceNumber)
+  await releaseHeldWcSalesInvoice(orderId, { externalOrderId: String(wcOrder.id), externalOrderNumber: wcOrder.number }, usableInvoiceNumber)
 }
 
 /**
@@ -595,8 +595,8 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
 /**
  * Queue the sales invoice that was held back for want of a number (o3d-k26m.6).
  *
- * ENQUEUE FIRST, MARK THE ROW SECOND. A crash between the two leaves the row PENDING, so the next
- * redelivery or poll releases it again — and the enqueue carries a deterministic idempotency key on
+ * ENQUEUE FIRST, MARK THE ROW SECOND. A crash between the two leaves the row PENDING, so the
+ * release sweep does it again — and the enqueue carries a deterministic idempotency key on
  * (order, number), which is what `queueXeroSync` dedupes on, so the second release finds the sync
  * row already there and adds nothing. The other order would be worse in the way that matters: a
  * crash after marking the row SYNCED but before enqueueing strands the invoice permanently, which
@@ -613,15 +613,46 @@ async function holdWcSalesInvoiceForMissingNumber(params: {
  *
  * So the release ASKS THE DATABASE whether the sync row is really there, under the same key and
  * the same status set the enqueue itself dedupes on — the answer comes from the same place the
- * work has to come from, rather than from a return value the callee does not give. If it is not
- * there the held row stays PENDING and says so, so the next redelivery or poll retries it once the
- * connector is switched on.
+ * work has to come from, rather than from a return value the callee does not give.
+ *
+ * AND A FAILURE HAS SOMEWHERE TO GO (Codex round 4). "It stays PENDING and the next redelivery or
+ * poll retries it" was not true: this function is only ever reached from an import of the order,
+ * and the storefront event that would cause one — WooCommerce writing the number — is the very
+ * event that has just been consumed. The failure that is left is therefore permanent by
+ * construction, which is precisely the shape of retry that never fires. The row still stays PENDING
+ * and now says WHY on its own errorMessage, and {@link retryHeldWcSalesInvoiceReleases} — driven by
+ * the reconcile cron, not by an order event — is what comes back for it.
  */
+type HeldReleaseOrderRef = {
+  externalOrderId: string
+  externalOrderNumber: string
+}
+
+/**
+ * What happened to the invoice that was held back. The import path ignores it; the sweep counts it.
+ *
+ * `not-queued` is the one that matters: the hold is still PENDING, still owed an invoice, and the
+ * only thing that will try again is the sweep.
+ */
+export type HeldSalesInvoiceReleaseOutcome = 'no-hold' | 'released' | 'unreadable' | 'not-queued'
+
+/** Keep the hold PENDING, but stop it claiming to be waiting for a number that has already arrived. */
+async function noteHeldReleaseFailure(rowId: string, message: string): Promise<void> {
+  await db.shoppingSyncLog.update({
+    where: { id: rowId },
+    data: { errorMessage: message, syncedAt: null },
+  }).catch((error) => {
+    console.error(`[wc-import] could not record why the held sales invoice ${rowId} was not released:`, error)
+  })
+}
+
 async function releaseHeldWcSalesInvoice(
   orderId: string,
-  wcOrder: WcFullOrder,
+  wcOrder: HeldReleaseOrderRef,
   invoiceNumber: string,
-): Promise<void> {
+  options?: { logFailure?: boolean },
+): Promise<HeldSalesInvoiceReleaseOutcome> {
+  const logFailure = options?.logFailure ?? true
   let row: { id: string; payload: Prisma.JsonValue | null } | null = null
   try {
     row = await db.shoppingSyncLog.findFirst({
@@ -631,9 +662,9 @@ async function releaseHeldWcSalesInvoice(
     })
   } catch (error) {
     console.error(`[wc-import] could not look for a held sales invoice for ${orderId}:`, error)
-    return
+    return 'no-hold'
   }
-  if (!row) return
+  if (!row) return 'no-hold'
 
   if (!isHeldSalesInvoicePayload(row.payload)) {
     // Not releasable and not silently droppable: this order will never be invoiced until somebody
@@ -653,12 +684,12 @@ async function releaseHeldWcSalesInvoice(
       tag: 'accounting',
       level: 'WARNING',
       description:
-        `WooCommerce order ${wcOrder.number} has its invoice number (${invoiceNumber}) but the held accounting `
+        `WooCommerce order ${wcOrder.externalOrderNumber} has its invoice number (${invoiceNumber}) but the held accounting `
         + 'payload could not be read, so the sales invoice was NOT queued. Queue it from the order.',
-      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), invoiceNumber },
+      metadata: { connector: 'woocommerce', externalOrderId: wcOrder.externalOrderId, invoiceNumber },
       resolveUser: false,
     }).catch(() => {})
-    return
+    return 'unreadable'
   }
 
   const held = row.payload
@@ -673,25 +704,33 @@ async function releaseHeldWcSalesInvoice(
       idempotencyKey,
     })
   } catch (error) {
-    // Left PENDING on purpose — the next redelivery or poll retries it.
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: 'sales_invoice_release_failed',
-      tag: 'accounting',
-      level: 'WARNING',
-      description:
-        `WooCommerce order ${wcOrder.number} has its invoice number (${invoiceNumber}) but queueing the held `
-        + 'sales invoice failed; it stays queued for release and retries on the next order sync.',
-      metadata: {
-        connector: 'woocommerce',
-        externalOrderId: String(wcOrder.id),
-        invoiceNumber,
-        errorName: error instanceof Error ? error.name : typeof error,
-      },
-      resolveUser: false,
-    }).catch(() => {})
-    return
+    // Left PENDING on purpose — the release sweep retries it (see retryHeldWcSalesInvoiceReleases).
+    await noteHeldReleaseFailure(
+      row.id,
+      `WooCommerce numbered this invoice ${invoiceNumber}, but queueing the held sales invoice failed `
+      + `(${error instanceof Error ? error.name : typeof error}). It stays queued for release and is retried by the `
+      + 'WooCommerce reconcile sweep.',
+    )
+    if (logFailure) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'sales_invoice_release_failed',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `WooCommerce order ${wcOrder.externalOrderNumber} has its invoice number (${invoiceNumber}) but queueing the held `
+          + 'sales invoice failed; it stays queued for release and is retried by the WooCommerce reconcile sweep.',
+        metadata: {
+          connector: 'woocommerce',
+          externalOrderId: wcOrder.externalOrderId,
+          invoiceNumber,
+          errorName: error instanceof Error ? error.name : typeof error,
+        },
+        resolveUser: false,
+      }).catch(() => {})
+    }
+    return 'not-queued'
   }
 
   // The enqueue can no-op silently — see the note above. A row that is not there was not queued,
@@ -705,27 +744,36 @@ async function releaseHeldWcSalesInvoice(
     })
   } catch (error) {
     console.error(`[wc-import] could not confirm the released sales invoice for ${orderId} was queued:`, error)
-    return
+    return 'not-queued'
   }
   if (!queued) {
-    // Left PENDING on purpose, exactly as the throwing case is: the next redelivery or poll tries
-    // again, and the deterministic key means a later success adds one row, not two.
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: 'sales_invoice_release_not_queued',
-      tag: 'accounting',
-      level: 'WARNING',
-      description:
-        `WooCommerce order ${wcOrder.number} has its invoice number (${invoiceNumber}), but queueing the held `
-        + 'sales invoice produced no accounting sync row, so NOTHING will post. The usual cause is that the '
-        + 'accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to off; the '
-        + 'other is that the sales order was deleted. The order stays queued for release and retries on the next '
-        + 'order sync.',
-      metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), invoiceNumber, idempotencyKey },
-      resolveUser: false,
-    }).catch(() => {})
-    return
+    // Left PENDING on purpose, exactly as the throwing case is: the sweep tries again, and the
+    // deterministic key means a later success adds one row, not two.
+    await noteHeldReleaseFailure(
+      row.id,
+      `WooCommerce numbered this invoice ${invoiceNumber}, but queueing the held sales invoice produced no `
+      + 'accounting sync row, so NOTHING will post. The usual cause is that the accounting connector is '
+      + 'disconnected, its sync is switched off, or Sales Invoices are set to off. Retried by the WooCommerce '
+      + 'reconcile sweep.',
+    )
+    if (logFailure) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'sales_invoice_release_not_queued',
+        tag: 'accounting',
+        level: 'WARNING',
+        description:
+          `WooCommerce order ${wcOrder.externalOrderNumber} has its invoice number (${invoiceNumber}), but queueing the held `
+          + 'sales invoice produced no accounting sync row, so NOTHING will post. The usual cause is that the '
+          + 'accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to off; the '
+          + 'other is that the sales order was deleted. The order stays queued for release and is retried by the '
+          + 'WooCommerce reconcile sweep.',
+        metadata: { connector: 'woocommerce', externalOrderId: wcOrder.externalOrderId, invoiceNumber, idempotencyKey },
+        resolveUser: false,
+      }).catch(() => {})
+    }
+    return 'not-queued'
   }
 
   await db.shoppingSyncLog.update({
@@ -748,16 +796,177 @@ async function releaseHeldWcSalesInvoice(
     tag: 'accounting',
     level: 'INFO',
     description:
-      `WooCommerce order ${wcOrder.number} is now numbered ${invoiceNumber}; the sales invoice held back for it `
+      `WooCommerce order ${wcOrder.externalOrderNumber} is now numbered ${invoiceNumber}; the sales invoice held back for it `
       + 'has been queued.',
     metadata: {
       connector: 'woocommerce',
-      externalOrderId: String(wcOrder.id),
-      externalOrderNumber: wcOrder.number,
+      externalOrderId: wcOrder.externalOrderId,
+      externalOrderNumber: wcOrder.externalOrderNumber,
       invoiceNumber,
     },
     resolveUser: false,
   }).catch(() => {})
+  return 'released'
+}
+
+/**
+ * THE THING THAT ACTUALLY RETRIES A FAILED RELEASE (o3d-k26m.6, Codex round 4).
+ *
+ * Round 3 made the release CONFIRM the sync row exists before closing the hold, which was right and
+ * is what turned a silent no-op into a visible one. What it left was a hold sitting PENDING with
+ * "the next redelivery or poll retries it" written next to it — AND NOTHING SCHEDULING EITHER.
+ * `releaseHeldWcSalesInvoice` is reached only from an import of that order, and an import happens
+ * only when WooCommerce touches the order again. The number arriving IS that touch, and it has
+ * already been spent by the time the release runs. So the commonest failure — the accounting
+ * connector disconnected, its sync off, or sales-invoice posting off — leaves an order numbered,
+ * PROCESSING and permanently un-invoiced, which is the exact defect the hold exists to end.
+ *
+ * A RETRY WITH NO DRIVER IS NOT A RETRY. This is the driver: the WooCommerce reconcile cron, which
+ * runs on a timer rather than on an order event, so it comes back whether or not the storefront
+ * ever mentions the order again. (It is gated on the WooCommerce plugin and `wc_sync_enabled`, the
+ * same gate the import itself is behind — with those off there is no importer to owe an invoice.)
+ *
+ * IT ASKS THE ORDER, NOT THE ROW. A hold is releasable when the SalesOrder has a number and no
+ * ledger document; both facts live on the order, and reading them is what tells a hold that is
+ * legitimately WAITING (no number yet — the ordinary state, and not a failure) apart from one that
+ * is STUCK.
+ *
+ * TERMINAL HOLDS ARE CLOSED RATHER THAN RE-SCANNED. A hold whose order was deleted, or whose order
+ * has since been invoiced by another route, can never be released; left PENDING it would sit at the
+ * head of an oldest-first scan forever and, once enough of them accumulate, starve every newer hold
+ * behind them — the starvation the pending-FX queue documents one function below. So each is
+ * settled with a reason: FAILED when the order is gone, SYNCED when the invoice exists.
+ *
+ * FAILURES ARE COUNTED, NOT RE-WARNED. The per-order WARNING is the import path's, where it is news.
+ * Repeating it every few minutes for every stuck hold for the duration of a connector outage would
+ * bury the log, so the sweep records the reason on each row and raises ONE warning naming the total.
+ */
+export async function retryHeldWcSalesInvoiceReleases(options?: {
+  /** How many holds to attempt to release per run. */
+  limit?: number
+  /** How many held rows to look at. Terminal rows are closed, so this is not a moving cap. */
+  scanLimit?: number
+}): Promise<{
+  scanned: number
+  released: number
+  stillWaiting: number
+  stillStuck: number
+  closed: number
+  scanCapReached: boolean
+}> {
+  const limit = Math.min(Math.max(options?.limit ?? 50, 1), 250)
+  const scanLimit = Math.min(Math.max(options?.scanLimit ?? 500, limit), 2000)
+  const result = { scanned: 0, released: 0, stillWaiting: 0, stillStuck: 0, closed: 0, scanCapReached: false }
+
+  let rows: Array<{ id: string; entityId: string | null; payload: Prisma.JsonValue | null }>
+  try {
+    rows = await db.shoppingSyncLog.findMany({
+      where: heldSalesInvoiceQueueWhere(),
+      orderBy: { createdAt: 'asc' },
+      take: scanLimit,
+      select: { id: true, entityId: true, payload: true },
+    })
+  } catch (error) {
+    console.error('[wc-held-release] could not read the held sales-invoice queue:', error)
+    return result
+  }
+  result.scanned = rows.length
+  result.scanCapReached = rows.length >= scanLimit
+  if (rows.length === 0) return result
+
+  const orderIds = [...new Set(rows.map((row) => row.entityId).filter((id): id is string => !!id))]
+  let orders: Array<{ id: string; invoiceNumber: string | null; accountingInvoiceId: string | null }>
+  try {
+    orders = await db.salesOrder.findMany({
+      where: { id: { in: orderIds } },
+      select: { id: true, invoiceNumber: true, accountingInvoiceId: true },
+    })
+  } catch (error) {
+    console.error('[wc-held-release] could not read the orders behind the held sales invoices:', error)
+    return result
+  }
+  const byId = new Map(orders.map((order) => [order.id, order]))
+
+  const stuck: string[] = []
+  for (const row of rows) {
+    const order = row.entityId ? byId.get(row.entityId) : undefined
+    if (!order) {
+      // The order is gone (hard-deleted, or the row never named one). Nothing can ever release it.
+      await db.shoppingSyncLog.update({
+        where: { id: row.id },
+        data: {
+          status: 'FAILED',
+          errorMessage:
+            'The sales order this invoice was held for cannot be found, so it can never be released. Nothing was posted.',
+          syncedAt: new Date(),
+        },
+      }).catch(() => {})
+      result.closed++
+      continue
+    }
+    if (order.accountingInvoiceId) {
+      // Already invoiced by another route. Releasing now would post a SECOND document under the
+      // same number, which is the very hazard the ownership fence exists for.
+      await db.shoppingSyncLog.update({
+        where: { id: row.id },
+        data: {
+          status: 'SYNCED',
+          errorMessage:
+            `Superseded: this order already carries ledger document ${order.accountingInvoiceId}, so the held sales `
+            + 'invoice was not released.',
+          syncedAt: new Date(),
+        },
+      }).catch(() => {})
+      result.closed++
+      continue
+    }
+    const invoiceNumber = order.invoiceNumber?.trim() || null
+    if (!invoiceNumber) {
+      // The ordinary state: WooCommerce has not numbered it yet. Not a failure, nothing to do.
+      result.stillWaiting++
+      continue
+    }
+    if (result.released + result.stillStuck >= limit) break
+
+    // The release re-selects the order's newest hold rather than taking this row's id. That is the
+    // same row by construction — the importer REPLACES an order's hold instead of appending a second
+    // one — and going through the one release path is what keeps the swept and the imported case
+    // byte-for-byte identical, including the confirmation that the sync row really exists.
+    const payload = isHeldSalesInvoicePayload(row.payload) ? row.payload : null
+    const outcome = await releaseHeldWcSalesInvoice(
+      order.id,
+      {
+        externalOrderId: payload?.externalOrderId ?? '',
+        externalOrderNumber: payload?.externalOrderNumber ?? payload?.orderNumber ?? order.id,
+      },
+      invoiceNumber,
+      { logFailure: false },
+    )
+    if (outcome === 'released') result.released++
+    else if (outcome === 'unreadable') result.closed++
+    else if (outcome === 'not-queued') {
+      result.stillStuck++
+      stuck.push(payload?.externalOrderNumber ?? order.id)
+    }
+  }
+
+  if (stuck.length > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'sales_invoice_release_still_stuck',
+      tag: 'accounting',
+      level: 'WARNING',
+      description:
+        `${stuck.length} WooCommerce order(s) are numbered and still waiting for their held sales invoice to be `
+        + `queued (${stuck.slice(0, 10).join(', ')}${stuck.length > 10 ? ', …' : ''}). The usual cause is that the `
+        + 'accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to off. The '
+        + 'sweep retries them on every run; each order says why on its own queue row.',
+      metadata: { connector: 'woocommerce', stuck: stuck.length },
+      resolveUser: false,
+    }).catch(() => {})
+  }
+
+  return result
 }
 
 /**

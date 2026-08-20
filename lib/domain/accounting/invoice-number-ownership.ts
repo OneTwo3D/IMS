@@ -57,7 +57,7 @@
  * lib/connectors/xero/invoice-number-claim.ts.
  *
  * WHAT THE PRE-POST RECORD PROVES. `attemptedInvoiceNumber` records, before the request leaves,
- * that this row was about to post under this number at a moment when the ledger said nobody held
+ * that this row was about to post under this number at a moment when the ledger's answer permitted
  * it. Round 2 turned that into a licence to post — "nobody held it then, somebody holds it now,
  * therefore the holder is ours". The RECORD is kept; the INFERENCE is retired, and not only
  * because a foreign writer could take the number in between:
@@ -72,12 +72,21 @@
  *   - and the window it was meant to cover is not a foreign-system race any more. With xeroom gone
  *     the only things that can take a number between the lookup and the post are ANOTHER IMS
  *     WORKER — local, bounded (each sync row is claimed by exactly one worker, so this needs two
- *     rows carrying the same number), and closable here if it ever matters — or a person typing an
- *     invoice into Xero by hand. Neither is a reason to reintroduce the inference, and neither is
- *     described here as unclosable.
+ *     rows carrying the same number) — or a person typing an invoice into Xero by hand. Neither is
+ *     a reason to reintroduce the inference.
  *
  * The record therefore survives as MESSAGE MATERIAL and as a durability gate before an
- * irreversible write, and licenses nothing (see `attemptedInvoiceNumber` and `recordAttempt`).
+ * irreversible write, and licenses nothing.
+ *
+ * AND THE WORKER RACE IS NOW CLOSED RATHER THAN MERELY DESCRIBED (Codex round 4). It is the one
+ * race that survives the cutover, and it is local, so it is fenced where it happens: the same
+ * `attemptedInvoiceNumber` record is written BEFORE every post that lands on the number and doubles
+ * as an EXCLUSIVE IN-FLIGHT CLAIM on it, so two workers cannot both find themselves unopposed. The
+ * mechanism and its proof are in `takeInvoiceNumberPostSlot` in
+ * lib/connectors/xero/sync-processor.ts; it only ever REFUSES, so it still licenses nothing. That
+ * is also why this decision no longer carries a `recordAttempt` flag: the record is not a
+ * conclusion of the ownership rule, it is what the connector must do before any post at all, and a
+ * flag that was true in both post branches would only have disguised that.
  *
  * THE PRICE, STATED. The create carries an Idempotency-Key derived from the queue entry
  * (`buildXeroIdempotencyKey`), and Xero replays the original response for a repeated key inside
@@ -119,13 +128,25 @@ export type LedgerInvoiceClaim = {
  */
 export type InvoiceNumberLookup =
   | { ok: true; claims: LedgerInvoiceClaim[] }
-  | { ok: false; error: string }
+  | {
+      ok: false
+      error: string
+      /**
+       * The question could not be ASKED, as opposed to not answered — the number carries a
+       * character the ledger's filter reads as syntax (see the comma case in
+       * lib/connectors/xero/invoice-number-claim.ts). Nothing about waiting or reconnecting changes
+       * that, so the refusal it produces is permanent and names a different remedy.
+       */
+      unaskable?: boolean
+    }
 
 export type InvoiceNumberRefusalCode =
   /** The payload has no invoice number at all. */
   | 'NO_INVOICE_NUMBER'
   /** The ledger could not be asked, or could not be shown to have answered in full. Retryable. */
   | 'LEDGER_LOOKUP_UNAVAILABLE'
+  /** The number itself cannot be expressed in the ledger's filter, so the question is unaskable. */
+  | 'NUMBER_NOT_ASKABLE'
   /** Held by a document IMS has never recorded. The cutover case: almost certainly xeroom's. */
   | 'NUMBER_HELD_BY_FOREIGN_DOCUMENT'
   /** Held by a document IMS owns — but for a DIFFERENT order than the one being posted. */
@@ -146,14 +167,6 @@ export type InvoiceNumberPostDecision =
       basis: 'unclaimed' | 'own-document'
       /** The document the post will land on, when one already exists. */
       claimedInvoiceId?: string
-      /**
-       * True only for `unclaimed`: record, on the queue entry and BEFORE the request leaves, the
-       * number this attempt is about to post under. It licenses nothing (see the header) — it is
-       * kept because a post whose local record cannot be written is a post whose OUTCOME cannot be
-       * written either, and because a later refusal can then tell the operator that this row had
-       * already set out under this number.
-       */
-      recordAttempt: boolean
     }
   | {
       post: false
@@ -226,6 +239,23 @@ export function decideInvoiceNumberPost(params: {
     }
   }
 
+  if (!params.lookup.ok && params.lookup.unaskable) {
+    // NOT retryable, and that distinction is the whole reason this code exists: an unreachable
+    // ledger comes back, a number the filter cannot express does not. Telling an operator to wait
+    // for the connection would be telling them to wait for something that has already happened.
+    return {
+      post: false,
+      code: 'NUMBER_NOT_ASKABLE',
+      retryable: false,
+      reason:
+        `Refusing to post ${params.orderLabel} as invoice number ${invoiceNumber}: the ledger cannot be asked who `
+        + `holds that number — ${params.lookup.error}. NOTHING WAS SENT. The create is update-or-create on the `
+        + 'number, so posting without a trustworthy answer risks silently replacing a document that already '
+        + 'carries it. Renumber the invoice in WooCommerce (the number is taken verbatim from '
+        + '_wcpdf_invoice_number) and re-queue this order, or post it by hand and link the document to the order.',
+    }
+  }
+
   if (!params.lookup.ok) {
     return {
       post: false,
@@ -240,7 +270,7 @@ export function decideInvoiceNumberPost(params: {
   }
 
   const claims = params.lookup.claims
-  if (claims.length === 0) return { post: true, basis: 'unclaimed', recordAttempt: true }
+  if (claims.length === 0) return { post: true, basis: 'unclaimed' }
 
   // A voided document HOLDS its number but cannot be modified, so it can never be the document an
   // upsert lands on. Partitioning first is what stops an arbitrary holder being picked out of
@@ -279,7 +309,7 @@ export function decideInvoiceNumberPost(params: {
 
   const holder = live[0]
   if (owned && owned === holder.invoiceId) {
-    return { post: true, basis: 'own-document', claimedInvoiceId: holder.invoiceId, recordAttempt: false }
+    return { post: true, basis: 'own-document', claimedInvoiceId: holder.invoiceId }
   }
 
   if (owned) {

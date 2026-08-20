@@ -57,6 +57,38 @@
  * from two live documents), and picking `find()`'s first match answered it by accident of
  * ordering — Xero pages oldest-first, so that was systematically the OLDEST holder.
  *
+ * ------------------------------------------------------------------------------------------------
+ * AND THE QUESTION MUST BE ASKABLE IN THE FIRST PLACE (Codex round 4)
+ * ------------------------------------------------------------------------------------------------
+ * `InvoiceNumbers` is a LIST parameter: `InvoiceNumbers=A,B` asks about two numbers. A number that
+ * CONTAINS a comma therefore has a second reading, and which one Xero takes decides whether the
+ * fence works at all:
+ *
+ *   - if the value is split AFTER percent-decoding, `A,1` asks about `A` and `1` — two numbers
+ *     nobody may hold — and the answer comes back EMPTY. Empty is exactly what authorises the post,
+ *     so the one document actually numbered `A,1` gets silently replaced;
+ *   - if it is split BEFORE decoding, `%2C` stays literal and the question is the intended one.
+ *
+ * WE CANNOT TELL WHICH, and finding out means a live call against an organisation holding ~14,415
+ * real documents. The response-side re-comparison does not save it either: that catches EXTRA rows,
+ * and this defect produces MISSING ones. So the same rule round 3 established for a page that
+ * cannot prove it is complete applies to a question that cannot be asked precisely — IT REFUSES.
+ * The refusal is marked `unaskable`, because unlike an unreachable ledger it will never come right
+ * on its own: the number has to change in WooCommerce, or a human has to post the invoice.
+ *
+ * WHAT `_wcpdf_invoice_number` CAN ACTUALLY CONTAIN. Any non-blank string. The plugin's number
+ * format is `[prefix][number][suffix]` with all three free-text and admin-editable, and
+ * lib/connectors/woocommerce/sync/invoice-number.ts takes the value VERBATIM by design (a prefix of
+ * our own would disagree with the customer's PDF and with every historical document). Nothing
+ * between that meta field and this request rejects, escapes or normalises punctuation, so a comma
+ * is not hypothetical — it is one settings change away.
+ *
+ * A `where=InvoiceNumber=="A,1"` fallback was considered and REJECTED. A quoted where-clause has no
+ * list grammar, so it would express the question — but it is a DIFFERENT filter with different
+ * matching, reached only in the case we cannot test, and the fence's soundness would then rest on
+ * an unverified premise in exactly the branch that carries the irreversible write. Refusing a
+ * handful of orders is recoverable; guessing right about Xero's parser is not.
+ *
  * ACCREC ONLY. Purchase bills (ACCPAY) share the endpoint and their numbers are the SUPPLIER's,
  * explicitly non-unique, and posted create-only via PUT (see bills.ts). A bill that happens to
  * carry the same number as a sales invoice is not a claim on the sales-invoice sequence and must
@@ -81,6 +113,12 @@ type XeroInvoiceNumberLookupResponse = {
   pagination?: { pageCount?: unknown; itemCount?: unknown }
 }
 
+/**
+ * `InvoiceNumbers` is a comma-separated LIST. A number containing one cannot be asked about — see
+ * the header — and percent-encoding it does not settle which reading Xero takes.
+ */
+const LIST_SEPARATOR = ','
+
 type LookupDeps = {
   get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
 }
@@ -104,6 +142,20 @@ export async function lookupXeroInvoiceNumberClaim(
 ): Promise<InvoiceNumberLookup> {
   const wanted = invoiceNumber.trim()
   if (!wanted) return { ok: false, error: 'no invoice number to look up' }
+
+  // The list separator, and the one character that makes this request ask a DIFFERENT question
+  // from the one intended — see the header. Refused before anything is sent, and marked as a
+  // refusal no retry can clear.
+  if (wanted.includes(LIST_SEPARATOR)) {
+    return {
+      ok: false,
+      unaskable: true,
+      error:
+        `invoice number ${JSON.stringify(wanted)} contains a comma, which Xero's InvoiceNumbers filter reads as `
+        + 'the separator between two numbers, so IMS cannot ask who holds THIS number and must not treat the '
+        + 'answer to a different question as "nobody holds it"',
+    }
+  }
 
   let res: { ok: boolean; status: number; data?: XeroInvoiceNumberLookupResponse; error?: string }
   try {

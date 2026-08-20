@@ -1442,6 +1442,156 @@ async function guardCancelledSalesOrderInvoice(
 }
 
 /**
+ * "I STILL HOLD THE CLAIM I TOOK" — the where-fence a worker must carry into any write that
+ * assumes it still owns the row (o3d-a3wx r6, adopted here by o3d-k26m.5 round 4).
+ *
+ * A claim is `{ status: PROCESSING, processingStartedAt: <the instant I stamped> }`, and the stale
+ * cutoff in {@link accountingSyncLogClaimWhere} lets a NEW worker re-take a row whose claim has aged
+ * out. The displaced worker is not stopped by that — a timeout cannot reach into work already in
+ * flight — so matching on `status: 'PROCESSING'` alone is not ownership: the replacement's row is
+ * PROCESSING too. Only the worker that stamped that exact instant owns it.
+ *
+ * IDENTICAL, DELIBERATELY, to the helper of the same name on the sibling branch o3d-batch-payidx,
+ * which fences every RELEASE of a claim with it. The two branches must not disagree about what
+ * holding a claim means; if both land, keep one definition.
+ */
+export function heldClaimWhere(entryId: string, claimedAt: Date) {
+  return { id: entryId, status: 'PROCESSING' as const, processingStartedAt: claimedAt }
+}
+
+/**
+ * THE OTHER WRITER IS US: ONE IMS WORKER AT A TIME MAY POST UNDER A GIVEN NUMBER (o3d-k26m.5 r4).
+ *
+ * The ledger lookup answers "who holds this number NOW", and between that answer and the POST there
+ * is a window. Once xeroom is removed the only thing that can take a number inside that window is
+ * another IMS worker holding a DIFFERENT sync row that carries the SAME number — two rows for one
+ * order, or two orders WooCommerce numbered alike. Both workers would read "unclaimed", both would
+ * post, and because the create is update-or-create on the number the second silently REPLACES the
+ * first. One invoice, one survivor, nothing anywhere recording that there had been two.
+ *
+ * It is the only race that survives the cutover, and unlike a foreign writer it is entirely ours to
+ * close. This closes it with the record that was already being written: `attemptedInvoiceNumber` is
+ * stamped BEFORE the post, and then the row looks for any OTHER live row staking the same number.
+ *
+ * WHY STAMP-THEN-LOOK IS SOUND, with no unique index and no lock spanning an HTTP request:
+ *
+ *   - each worker WRITES its stamp before it READS for rivals, and the write is committed before
+ *     the read begins (separate awaited statements, read-committed);
+ *   - so two workers cannot both miss each other: if A's read preceded B's write, then A's write
+ *     preceded A's read, so B — reading after its own later write — sees A;
+ *   - a worker yields to any rival whose stamp is NOT STRICTLY LATER than its own. Suppose both
+ *     proceeded: whichever wrote first, say X, must not have been seen by the other, so the other
+ *     read before X wrote, so the other also WROTE before X wrote — and then X, reading after that
+ *     write, saw it and yielded. Contradiction.
+ *
+ * WHY NOT A ROW-ID TIE-BREAK on equal stamps, which would be tidier. Timestamps are milliseconds,
+ * so two stamps can record as equal while one genuinely preceded the other — and an id ordering
+ * that disagrees with the real one lets BOTH through (the earlier writer sees nobody; the later one
+ * sees an "outranked" rival and posts anyway). At an exact tie both may instead yield, and both then
+ * come back on the ordinary retry ladder. Refusing twice costs a cycle; posting twice costs a
+ * document.
+ *
+ * WHAT COUNTS AS A LIVE RIVAL. Still PROCESSING, and stamped within {@link CLAIM_STALE_MS}. Both
+ * halves matter: a loser's row drops back to PENDING as it fails, which frees the number
+ * immediately, and a worker that DIED mid-post leaves its row PROCESSING forever — so the stamp is
+ * honoured only for as long as the claim itself is honoured, after which the row is re-claimable
+ * anyway. Any longer and one crash would fence a number off permanently.
+ *
+ * NOT filtered by sync type. The question is "is another worker about to write this number", and
+ * the only writer of this column is this fence, so a type filter could only ever hide a rival.
+ *
+ * IT LICENSES NOTHING. Finding no rival is not permission to post — the ledger's answer is, and it
+ * is asked separately. This can only ever refuse.
+ *
+ * EXPORTED so the exclusion can be exercised directly, against a database double and with no Xero
+ * client anywhere near it — the property being pinned is about two workers and one column, and
+ * driving it through `processEntry` would need the whole connector to say nothing more.
+ *
+ * AND A LOST CLAIM REFUSES. If the stamp updates no row, this worker no longer owns the entry: it
+ * was re-claimed after aging out, another worker is on it, and continuing would post from a row
+ * whose outcome this worker may no longer write.
+ */
+export async function takeInvoiceNumberPostSlot(params: {
+  entryId: string
+  claimedAt: Date
+  invoiceNumber: string
+  orderLabel: string
+}): Promise<{ ok: true } | { ok: false; reason: string }> {
+  const stampedAt = new Date()
+  let stamped: { count: number }
+  try {
+    // BEFORE the post, never after — and a failure to write it REFUSES the post. Not because the
+    // record licenses anything (it does not: see invoice-number-ownership.ts), but because a
+    // create whose local record cannot be written is a create whose OUTCOME cannot be written
+    // either. A database that will not take this row will not take the InvoiceID the response
+    // carries, and that is exactly the lost-response state the fence can no longer heal.
+    stamped = await db.accountingSyncLog.updateMany({
+      where: heldClaimWhere(params.entryId, params.claimedAt),
+      data: { attemptedInvoiceNumber: params.invoiceNumber, attemptedInvoiceNumberAt: stampedAt },
+    })
+  } catch (error) {
+    return {
+      ok: false,
+      reason:
+        `Could not record the invoice-number attempt for ${params.invoiceNumber} on sync row ${params.entryId} `
+        + `before posting: ${String(error)}`,
+    }
+  }
+  if (stamped.count === 0) {
+    return {
+      ok: false,
+      reason:
+        `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: this worker no longer `
+        + `holds the claim on sync row ${params.entryId} — it aged out and another worker re-claimed it. NOTHING `
+        + 'WAS SENT; the worker that holds the row now will post it.',
+    }
+  }
+
+  let rival: { id: string; referenceId: string; attemptedInvoiceNumberAt: Date | null } | null
+  try {
+    rival = await db.accountingSyncLog.findFirst({
+      where: {
+        id: { not: params.entryId },
+        connector: XERO_CONNECTOR,
+        status: 'PROCESSING',
+        attemptedInvoiceNumber: params.invoiceNumber,
+        attemptedInvoiceNumberAt: { gte: new Date(stampedAt.getTime() - CLAIM_STALE_MS) },
+      },
+      // The MINIMUM of the total order, so the one row fetched is the one to compare against.
+      orderBy: [{ attemptedInvoiceNumberAt: 'asc' }, { id: 'asc' }],
+      select: { id: true, referenceId: true, attemptedInvoiceNumberAt: true },
+    })
+  } catch (error) {
+    // Fails closed like every other read on this path: not knowing whether a sibling is mid-post is
+    // not permission to post.
+    return {
+      ok: false,
+      reason:
+        `Could not check whether another sync row is already posting under invoice number `
+        + `${params.invoiceNumber} for ${params.orderLabel}: ${String(error)}. NOTHING WAS SENT.`,
+    }
+  }
+
+  const rivalAt = rival?.attemptedInvoiceNumberAt?.getTime()
+  // Not strictly later than mine — see the header for why an equal stamp must yield rather than
+  // be broken in someone's favour.
+  const rivalIsNotLater = rival !== null && rivalAt !== undefined && rivalAt <= stampedAt.getTime()
+  if (rival && rivalIsNotLater) {
+    return {
+      ok: false,
+      reason:
+        `Refusing to post ${params.orderLabel} as invoice number ${params.invoiceNumber}: sync row ${rival.id} `
+        + `(reference ${rival.referenceId}) is already in flight under that same number. The create is `
+        + 'update-or-create on the number, so both posts would land on ONE document and the later one would '
+        + 'silently replace the earlier. NOTHING WAS SENT — this retries once that row settles, and if both rows '
+        + 'genuinely describe the same invoice, cancel the duplicate.',
+    }
+  }
+
+  return { ok: true }
+}
+
+/**
  * THE OWNERSHIP FENCE ON THE SALES-INVOICE CREATE (o3d-k26m.5).
  *
  * `POST /Invoices` is update-or-create on InvoiceNumber. Since o3d-k26m.1 the number is
@@ -1465,6 +1615,12 @@ async function guardCancelledSalesOrderInvoice(
  * guardCancelledSalesOrderInvoice does — a transient read outage must not become permission to
  * post.
  *
+ * AND ON THE WORKER NEXT TO IT. The ledger's answer is about a moment; {@link takeInvoiceNumberPostSlot}
+ * covers the window between that moment and the request, which after the cutover only another IMS
+ * worker can occupy. Both fences must pass, in that order — asking the ledger first means the
+ * common refusals cost no writes, and the slot is taken as late as possible so it is held for the
+ * shortest time.
+ *
  * A REFUSAL IS RETURNED AS AN ORDINARY FAILURE, so the row runs the normal retry ladder and settles
  * as FAILED with the reason on it. That is not wasted budget: the fence re-asks the ledger each
  * time, so the operator's remedy — linking the right document to the order, or voiding the wrong
@@ -1476,6 +1632,8 @@ async function guardSalesInvoiceNumberOwnership(
   referenceType: string,
   referenceId: string,
   payload: SyncPayload,
+  /** The instant this worker stamped its claim — the fence's own writes are conditioned on it. */
+  claimedAt: Date,
 ): Promise<{ post: true } | { post: false; result: EntryResult }> {
   const invoiceNumber = typeof payload.invoiceNumber === 'string' ? payload.invoiceNumber : null
 
@@ -1545,23 +1703,32 @@ async function guardSalesInvoiceNumberOwnership(
     return { post: false, result: { success: false, error: decision.reason } }
   }
 
-  if (decision.recordAttempt && invoiceNumber) {
-    // BEFORE the post, never after — and a failure to write it REFUSES the post. Not because the
-    // record licenses anything (it does not: see invoice-number-ownership.ts), but because a
-    // create whose local record cannot be written is a create whose OUTCOME cannot be written
-    // either. A database that will not take this row will not take the InvoiceID the response
-    // carries, and that is exactly the lost-response state the fence can no longer heal.
-    try {
-      await db.accountingSyncLog.update({
-        where: { id: entryId },
-        data: { attemptedInvoiceNumber: invoiceNumber, attemptedInvoiceNumberAt: new Date() },
-      })
-    } catch (error) {
-      return {
-        post: false,
-        result: { success: false, error: `Could not record the invoice-number attempt for ${invoiceNumber} on sync row ${entryId} before posting: ${String(error)}` },
-      }
+  // EVERY post that lands on the number takes the slot first — the `unclaimed` create and the
+  // `own-document` update alike. Both write to the ledger addressing it BY NUMBER, so both are
+  // capable of being the second of two writes that collapse into one document. The stamp is also
+  // the durability gate it always was; only its condition has changed (from "the ledger said
+  // nobody holds it" to "we are about to post"), which is the honest one for both jobs.
+  if (!invoiceNumber) {
+    // Unreachable: a missing number is refused by the rule above. Kept as a refusal rather than a
+    // non-null assertion, because the one thing that must never happen here is posting unfenced.
+    return {
+      post: false,
+      result: { success: false, error: `No invoice number to fence before posting ${orderLabel}` },
     }
+  }
+  const slot = await takeInvoiceNumberPostSlot({ entryId, claimedAt, invoiceNumber, orderLabel })
+  if (!slot.ok) {
+    await logActivity({
+      entityType: referenceType === 'SalesOrder' ? 'SALES_ORDER' : 'SYSTEM',
+      entityId: referenceType === 'SalesOrder' ? referenceId : undefined,
+      action: 'sales_invoice_number_in_flight_elsewhere',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: slot.reason,
+      metadata: { connector: XERO_CONNECTOR, syncLogId: entryId, invoiceNumber },
+      resolveUser: false,
+    }).catch(() => {})
+    return { post: false, result: { success: false, error: slot.reason } }
   }
 
   return { post: true }
@@ -1641,7 +1808,7 @@ async function processClaimedEntry(
       // o3d-k26m.5: the number must be ours to post under. Refusing is recoverable; overwriting a
       // live invoice is not. Runs AFTER the cancelled-order backstop (no point asking the ledger
       // about an order that must not be invoiced at all) and BEFORE anything is sent.
-      const numberFence = await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload)
+      const numberFence = await guardSalesInvoiceNumberOwnership(entryId, referenceType, referenceId, payload, claimedAt)
       if (!numberFence.post) return numberFence.result
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice', payload)
       const invoiceResult = await pushSalesInvoice({

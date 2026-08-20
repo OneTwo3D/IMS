@@ -256,3 +256,44 @@ test('a document of unknown Type still counts as a claim', async () => {
   assert.equal(lookup.ok && lookup.claims[0]?.invoiceId, 'xero-id-3')
   assert.equal(lookup.ok && lookup.claims[0]?.status, 'AUTHORISED')
 })
+
+// ---------------------------------------------------------------------------
+// The question has to be ASKABLE (Codex round 4).
+//
+// `InvoiceNumbers` is a comma-separated LIST, so a number containing a comma has a second reading:
+// split after percent-decoding, `A,1` asks about `A` and `1`, and comes back EMPTY — which is
+// precisely the answer that authorises the post. The response-side re-comparison cannot save it,
+// because it removes rows that should not be there and this defect removes rows that should.
+// Xero is live and cannot be asked which reading it takes, so the lookup refuses.
+// ---------------------------------------------------------------------------
+
+test('a number containing the list separator is REFUSED, and NOTHING is asked', async () => {
+  const { get, paths } = getter({ ok: true, status: 200, data: { Invoices: [] } })
+  const lookup = await lookupXeroInvoiceNumberClaim('INV,1', { get })
+
+  assert.equal(lookup.ok, false)
+  assert.equal(lookup.ok === false && lookup.unaskable, true, 'nothing about waiting makes this number askable')
+  assert.match(lookup.ok === false ? lookup.error : '', /comma/)
+  assert.match(lookup.ok === false ? lookup.error : '', /INV,1/)
+  // The request must not go out at all: an answer to a different question is worse than no answer,
+  // because "no documents" is what licenses the overwrite.
+  assert.deepEqual(paths, [])
+})
+
+test('percent-encoding is NOT treated as settling it — the refusal comes before the request', async () => {
+  // encodeURIComponent turns the comma into %2C, and whether Xero splits before or after decoding
+  // decides whether the fence works. That cannot be established without a live call against an
+  // organisation holding real documents, so the ambiguity itself is the refusal.
+  const { get, paths } = getter({ ok: true, status: 200, data: { Invoices: [] } })
+  await lookupXeroInvoiceNumberClaim('2026,0042', { get })
+  assert.deepEqual(paths, [], 'no request may be built from a number the filter reads as two')
+})
+
+test('a number WITHOUT a comma is still asked, exactly as before', async () => {
+  // The refusal must be narrow: it costs an order its invoice until the number is changed, so it
+  // may not spread to ordinary numbers with punctuation the filter has no opinion about.
+  const { get, paths } = getter({ ok: true, status: 200, data: { Invoices: [] } })
+  const lookup = await lookupXeroInvoiceNumberClaim('INV-2026/0042 A', { get })
+  assert.deepEqual(lookup, { ok: true, claims: [] })
+  assert.deepEqual(paths, [`Invoices?InvoiceNumbers=INV-2026%2F0042%20A&page=1&pageSize=${PAGE_SIZE}`])
+})

@@ -127,9 +127,18 @@ running. You can always queue the sales invoice from the sales order by hand onc
 One case is called out separately, because the release can be a no-op through no fault of the order:
 if the accounting connector is disconnected, its sync is switched off, or Sales Invoices are set to
 **off**, queueing the released invoice does nothing at all. IMS checks that the accounting sync row
-really exists before it closes the hold, so the order stays held and logs
-`sales_invoice_release_not_queued` naming the likely cause. Switch the connector or the Sales
-Invoices setting back on and the next order sync releases it.
+really exists before it closes the hold, so the order stays held, its queue row says why, and the
+activity log gets `sales_invoice_release_not_queued`.
+
+**That one does not wait for the storefront.** Waiting for another order sync would be waiting for
+nothing: the event that would have caused one — WooCommerce writing the number — has already
+happened. Instead the WooCommerce reconcile job retries every held order that has a number and no
+accounting document, on its own schedule, so switching the connector or the Sales Invoices setting
+back on is enough — the invoices queue themselves on the next run without anyone touching the
+orders. While orders are stuck this way you get one `sales_invoice_release_still_stuck` warning per
+run naming the total, rather than one per order. Holds that can never be released — the sales order
+was deleted, or it has since been invoiced another way — are closed with a reason instead of being
+retried forever.
 
 #### If WooCommerce changes an order's invoice number
 
