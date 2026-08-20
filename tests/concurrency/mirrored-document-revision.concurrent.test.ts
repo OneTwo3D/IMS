@@ -44,6 +44,17 @@ function probeId(label: string) {
   return `CVJ9-${label}-${process.pid}-${randomUUID()}`
 }
 
+/**
+ * o3d-cvj9 r3: the stamp XERO puts on the invoice as it applies a write, out of the response to
+ * that write. It is what orders two revisions of one document — nothing local can, because
+ * `accounting_events.createdAt` defaults to `CURRENT_TIMESTAMP`, which PostgreSQL evaluates at
+ * TRANSACTION START, so every row a probe like this one writes shares a stamp no matter how far
+ * apart the writes were.
+ */
+function xeroAppliedAt(secondsAfterCreate: number) {
+  return new Date(Date.UTC(2026, 7, 19, 12, 0, secondsAfterCreate))
+}
+
 test(
   'a posted invoice revision takes the external id from the event it revises, in one live transaction (o3d-cvj9)',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
@@ -178,9 +189,9 @@ test(
       .$transaction(async (tx) => {
         const base = { connector: 'xero', referenceType: 'SalesOrder', referenceId: orderId, currency: 'GBP' }
         const steps = [
-          { type: 'SALES_INVOICE', key: keys[0], amount: 100, syncLogId: 'log-create' },
-          { type: 'SALES_INVOICE_UPDATE', key: keys[1], amount: 120, syncLogId: 'log-rev1' },
-          { type: 'SALES_INVOICE_UPDATE', key: keys[2], amount: 140, syncLogId: 'log-rev2' },
+          { type: 'SALES_INVOICE', key: keys[0], amount: 100, syncLogId: 'log-create', appliedAt: xeroAppliedAt(0) },
+          { type: 'SALES_INVOICE_UPDATE', key: keys[1], amount: 120, syncLogId: 'log-rev1', appliedAt: xeroAppliedAt(10) },
+          { type: 'SALES_INVOICE_UPDATE', key: keys[2], amount: 140, syncLogId: 'log-rev2', appliedAt: xeroAppliedAt(20) },
         ]
 
         for (const step of steps) {
@@ -193,15 +204,16 @@ test(
             payload,
             status: 'POSTED',
             externalId: invoiceId,
+            externalRevisionAt: step.appliedAt,
           })
         }
 
         const events = await tx.accountingEvent.findMany({
           where: { sourceEntityType: 'SalesOrder', sourceEntityId: orderId },
-          // o3d-cvj9 r2: `now()` is TRANSACTION start time, so every row this probe writes shares a
-          // createdAt and `createdAt asc` alone leaves the order to the planner. `id` is the tie-
-          // break — the same one the takeover's recency test uses — so the sequence asserted below
-          // is the mint order the probe actually wrote in.
+          // `now()` is TRANSACTION start time, so every row this probe writes shares a createdAt
+          // and `createdAt asc` alone leaves the order to the planner. `id` makes the READ
+          // deterministic — it is a reporting tie-break for this probe only, and o3d-cvj9 r3 no
+          // longer uses either column to decide which revision holds the document.
           orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
           select: { type: true, status: true, externalId: true, linesJson: true },
         })
@@ -280,6 +292,7 @@ test(
           payload: otherPayload,
           status: 'POSTED',
           externalId: invoiceId,
+          externalRevisionAt: xeroAppliedAt(0),
         })
 
         // A revision of a DIFFERENT sales order that somehow claims that invoice is a genuine
@@ -299,6 +312,7 @@ test(
             payload,
             status: 'POSTED',
             externalId: invoiceId,
+            externalRevisionAt: xeroAppliedAt(10),
           })
         } catch (error) {
           raised = error
@@ -352,19 +366,21 @@ test(
 )
 
 test(
-  'an OLDER revision arriving after a newer one does not take the invoice back (o3d-cvj9 r2)',
+  'a revision Xero applied EARLIER, arriving after the one it applied later, does not take the invoice back (o3d-cvj9 r3)',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async () => {
     // THE DEFECT r1 LEFT: the takeover established that the holder was a legitimate predecessor for
-    // the same document, but not that the arriving revision was NEWER than it. Edits are replayed
-    // (a retry after a crash, a redelivered webhook) and processed out of order, so an older edit
-    // could arrive after a newer one had already taken the id — and take it straight back, leaving
-    // the mirror naming a superseded edit as the document's current state.
+    // the same document, but not that the arriving revision described a LATER state. Two workers
+    // can have their writes land at Xero in one order and record them in the other, so the edit
+    // Xero applied FIRST can arrive here after the one it applied second — and take the id straight
+    // back, leaving the mirror naming an overwritten edit as the document's current state.
     //
-    // Both revisions are mirrored here BEFORE either posts, which is what a queue holding two edits
-    // looks like, and then they post in reverse order. Every row in one transaction shares a
-    // `now()`, so this also exercises the id tie-break against a REAL Postgres transaction rather
-    // than against a double that can stamp whatever timestamps it likes.
+    // r2 answered this from the mirrored event's `createdAt`. THIS PROBE IS WHY THAT COULD NOT
+    // WORK: every row it writes is inside ONE transaction, `now()` is transaction start time, and
+    // so all three rows carry an IDENTICAL createdAt in a real database — the ordering r2 read was
+    // not merely imprecise here, it was absent, and the cuid tie-break underneath it was mint order,
+    // which is the same quantity again. The stamps below are Xero's, applied to the document by the
+    // writes themselves, and they are the only thing that orders the two edits.
     loadEnv()
     const { db } = await import('@/lib/db')
     const { mirrorAccountingSyncLogToEvent, updateMirroredAccountingEventStatus } = await import(
@@ -394,19 +410,24 @@ test(
         await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-create', type: 'SALES_INVOICE', payload: create, status: 'PENDING' })
         await updateMirroredAccountingEventStatus(tx, {
           ...base, syncLogId: 'log-create', type: 'SALES_INVOICE', payload: create, status: 'POSTED', externalId: invoiceId,
+          externalRevisionAt: xeroAppliedAt(0),
         })
 
-        // Both edits enqueued, in edit order — so the earlier edit's row is minted first.
+        // Both edits enqueued — a queue holding two edits of one invoice.
         await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-rev-earlier', type: 'SALES_INVOICE_UPDATE', payload: earlier, status: 'PENDING' })
         await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-rev-later', type: 'SALES_INVOICE_UPDATE', payload: later, status: 'PENDING' })
 
-        // ...and processed in the WRONG order: the later edit posts first and takes the invoice.
+        // Recorded in the OPPOSITE order to the one Xero applied them in: the edit Xero applied
+        // second (t+20) is recorded first and takes the invoice...
         await updateMirroredAccountingEventStatus(tx, {
           ...base, syncLogId: 'log-rev-later', type: 'SALES_INVOICE_UPDATE', payload: later, status: 'POSTED', externalId: invoiceId,
+          externalRevisionAt: xeroAppliedAt(20),
         })
-        // Then the earlier edit arrives. It must NOT take the invoice back.
+        // ...then the edit Xero applied FIRST (t+10) arrives. It was overwritten at Xero, so it must
+        // NOT take the invoice back.
         await updateMirroredAccountingEventStatus(tx, {
           ...base, syncLogId: 'log-rev-earlier', type: 'SALES_INVOICE_UPDATE', payload: earlier, status: 'POSTED', externalId: invoiceId,
+          externalRevisionAt: xeroAppliedAt(10),
         })
 
         // The transaction must still be usable — the stale path goes through the same savepoint.
@@ -447,7 +468,7 @@ test(
     assert.deepEqual(
       seen.rows.map((row) => row.status),
       ['SUPERSEDED', 'SUPERSEDED', 'POSTED'],
-      'the LATEST edit is the current row, whatever order the two edits were processed in',
+      'the edit Xero applied last is the current row, whatever order the two were recorded in',
     )
     assert.deepEqual(
       seen.rows.map((row) => row.externalId),
@@ -457,6 +478,123 @@ test(
     assert.ok(
       seen.logs.includes('revision_superseded_by_newer'),
       `the declined claim must be audited: ${seen.logs.join(', ')}`,
+    )
+
+    const leftovers = await db.accountingEvent.count({
+      where: { sourceEntityType: 'SalesOrder', sourceEntityId: orderId },
+    })
+    assert.equal(leftovers, 0, 'the probe must leave nothing behind')
+    await db.$disconnect()
+  },
+)
+
+test(
+  'two revisions with no external revision stamp are refused, and the transaction survives it (o3d-cvj9 r3)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // The pair nothing orders. Both rows are written inside ONE transaction, so in a real database
+    // they carry an IDENTICAL `createdAt` — r2 would have fallen through to its cuid tie-break and
+    // handed the invoice over on the strength of mint order. r3 refuses, which leaves the P2002
+    // fatal so the sync log retries and an operator sees it, and the refusal must go through the
+    // savepoint like every other outcome or the enclosing transaction is dead.
+    loadEnv()
+    const { db } = await import('@/lib/db')
+    const { mirrorAccountingSyncLogToEvent, updateMirroredAccountingEventStatus } = await import(
+      '@/lib/domain/accounting/accounting-event-mirror'
+    )
+
+    const orderId = probeId('so')
+    const invoiceId = probeId('inv')
+
+    const observed: Array<{
+      code: unknown
+      constraint: unknown
+      rows: Array<{ status: string; externalId: string | null; amount: number }>
+      logActions: string[]
+      transactionStillUsable: boolean
+    }> = []
+
+    await db
+      .$transaction(async (tx) => {
+        const base = { connector: 'xero', referenceType: 'SalesOrder', referenceId: orderId, currency: 'GBP' }
+        const create = invoicePayload(probeId('create'), 'INV-CVJ9R3', 100)
+        const first = invoicePayload(probeId('rev-first'), 'INV-CVJ9R3', 120)
+        const second = invoicePayload(probeId('rev-second'), 'INV-CVJ9R3', 140)
+
+        await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-create', type: 'SALES_INVOICE', payload: create, status: 'PENDING' })
+        await updateMirroredAccountingEventStatus(tx, {
+          ...base, syncLogId: 'log-create', type: 'SALES_INVOICE', payload: create, status: 'POSTED', externalId: invoiceId,
+        })
+
+        // The first edit takes the invoice from the CREATE — that pairing needs no stamp, because a
+        // document cannot be revised before it exists.
+        await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-rev-first', type: 'SALES_INVOICE_UPDATE', payload: first, status: 'PENDING' })
+        await updateMirroredAccountingEventStatus(tx, {
+          ...base, syncLogId: 'log-rev-first', type: 'SALES_INVOICE_UPDATE', payload: first, status: 'POSTED', externalId: invoiceId,
+        })
+
+        // The second edit contends with a REVISION, and neither side carries a stamp.
+        await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-rev-second', type: 'SALES_INVOICE_UPDATE', payload: second, status: 'PENDING' })
+        let raised: unknown = null
+        try {
+          await updateMirroredAccountingEventStatus(tx, {
+            ...base, syncLogId: 'log-rev-second', type: 'SALES_INVOICE_UPDATE', payload: second, status: 'POSTED', externalId: invoiceId,
+          })
+        } catch (error) {
+          raised = error
+        }
+
+        // Reading at all is the savepoint assertion: Postgres aborts a transaction on 23505, so an
+        // unguarded catch would make this fail with 25P02 instead.
+        const events = await tx.accountingEvent.findMany({
+          where: { sourceEntityType: 'SalesOrder', sourceEntityId: orderId },
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: { id: true, status: true, externalId: true, linesJson: true },
+        })
+        const logs = await tx.accountingEventLog.findMany({
+          where: { accountingEventId: { in: events.map((event) => event.id) } },
+          select: { action: true },
+        })
+
+        observed.push({
+          code: (raised as { code?: unknown })?.code,
+          constraint: (raised as { meta?: { driverAdapterError?: { cause?: { constraint?: unknown } } } })
+            ?.meta?.driverAdapterError?.cause?.constraint,
+          rows: events.map((event) => ({
+            status: event.status,
+            externalId: event.externalId,
+            amount: (event.linesJson as { lines: Array<{ unitAmount: number }> }).lines[0].unitAmount,
+          })),
+          logActions: logs.map((log) => log.action),
+          transactionStillUsable: true,
+        })
+
+        throw new Error(ROLLBACK)
+      }, TX)
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error)
+        assert.match(message, new RegExp(ROLLBACK), `expected our own rollback, got: ${message}`)
+      })
+
+    assert.equal(observed.length, 1, 'the transaction must have reached its assertions')
+    const [seen] = observed
+    assert.equal(seen.transactionStillUsable, true)
+    assert.equal(seen.code, 'P2002', 'an unordered pair must leave the unique violation fatal')
+    assert.deepEqual(
+      seen.constraint,
+      { fields: ['"externalSystem"', '"externalId"'] },
+      'and it must be the external-reference index that rejected it, not some other constraint',
+    )
+    assert.deepEqual(seen.rows.map((row) => row.amount), [100, 120, 140])
+    assert.deepEqual(
+      seen.rows.map((row) => row.status),
+      ['SUPERSEDED', 'POSTED', 'PENDING'],
+      'the first edit still holds the invoice; the unordered second edit was not posted',
+    )
+    assert.deepEqual(seen.rows.map((row) => row.externalId), [null, invoiceId, null])
+    assert.ok(
+      !seen.logActions.includes('revision_superseded_by_newer'),
+      `an unordered pair must not be audited as a supersession: ${seen.logActions.join(', ')}`,
     )
 
     const leftovers = await db.accountingEvent.count({

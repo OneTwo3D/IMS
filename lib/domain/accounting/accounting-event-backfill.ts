@@ -2,6 +2,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { buildAccountingEventLog } from './accounting-event-builder'
 import {
+  accountingDocumentRevisionFamily,
   buildMirroredAccountingEventDraft,
   isDocumentRevisionAccountingSyncType,
   MIRRORED_ACCOUNTING_SYNC_TYPES,
@@ -17,9 +18,11 @@ import {
 } from './reconciliation'
 
 /**
- * o3d-cvj9 r2: `createdAt` is selected on top of the shared reconciliation row shape because the
- * revision repair below has to establish which of two rows describes the document as it now
- * stands, and the sync log's enqueue time is this path's half of that comparison.
+ * `createdAt` is selected on top of the shared reconciliation row shape so a backfilled event can
+ * be stamped with the time its sync log was enqueued rather than the repair's own clock (see
+ * `writeBackfilledEvent`). o3d-cvj9 r3: it is NOT an ordering key. `accounting_events.createdAt`
+ * defaults to `CURRENT_TIMESTAMP`, which PostgreSQL evaluates at TRANSACTION START, so it orders
+ * neither the edits nor even the enqueues — see `documentRevisionHolderPrecedes`.
  */
 type AccountingBackfillSyncLogRow = AccountingReconciliationRows['syncLogs'][number] & { createdAt: Date }
 /** The holder row `resolveDocumentRevisionExternalIdClaim` reads when an external id is contested. */
@@ -28,7 +31,7 @@ type AccountingBackfillClaimHolderRow = {
   type: string
   sourceEntityType: string
   sourceEntityId: string
-  createdAt: Date
+  externalRevisionAt: Date | null
 }
 type AccountingBackfillWriteClient = {
   accountingEvent: {
@@ -243,8 +246,7 @@ async function collectAccountingBackfillCandidateSyncLogs(
         referenceId: true,
         externalTransactionId: true,
         payload: true,
-        // o3d-cvj9 r2: the revision repair needs the enqueue time to establish which of two rows
-        // describes the document as it now stands.
+        // Stamped onto the repaired event so its age is the work's age, not the repair's.
         createdAt: true,
       },
     })
@@ -270,13 +272,17 @@ async function writeBackfilledEvent(
   draft: AccountingEventDraft,
 ): Promise<{ id: string }> {
   const event = await tx.accountingEvent.create({
-    // o3d-cvj9 r2: `createdAt` is stamped from the SYNC LOG, not left to now(). A mirrored event's
-    // createdAt means "when this sync was enqueued" — that is what makes it usable as the ordering
-    // key when two events of one document contend for its external id — and a backfilled row has to
-    // mean the same thing or the two kinds of row cannot be compared. Left to the column default,
-    // every row repaired in one pass would carry the same repair-time stamp, and a document with
-    // two historical revisions could not be ordered at all. It also makes the oldest-PENDING
-    // staleness signal in ops/health report the real age of the work rather than the repair's.
+    // `createdAt` is stamped from the SYNC LOG, not left to the column default: left to `now()`
+    // every row repaired in one pass would carry the same repair-time stamp, and the oldest-PENDING
+    // staleness signal in ops/health would report the age of the repair instead of the age of the
+    // work. o3d-cvj9 r3: this is a reporting stamp ONLY. It is not, and after r2 is no longer read
+    // as, the key that orders two revisions of one document.
+    //
+    // `externalRevisionAt` is deliberately left NULL. The only honest value is the stamp the
+    // external system returned for the write, and a historical sync log never recorded the
+    // connector response. Substituting the log's `syncedAt` or `createdAt` would put a second clock
+    // into a comparison key that only means anything with one, so the row is repaired without a
+    // stamp and the pairs it cannot order are refused rather than guessed at.
     data: { ...draft, createdAt: log.createdAt } as never,
     select: { id: true },
   })
@@ -297,6 +303,82 @@ async function writeBackfilledEvent(
 }
 
 /**
+ * o3d-cvj9 r3: repair a historical revision WITHOUT contending for the document id.
+ *
+ * Used wherever the backfill knows the edit posted but cannot establish that it is the write the
+ * document now reflects. The row is created so the sync log stops being invisible to
+ * reconciliation, it takes no claim, and its audit log says in as many words that the ordering was
+ * not established — as opposed to `revision_superseded_by_newer`, which asserts that it was.
+ */
+async function writeUnclaimedRevisionEvent(
+  tx: AccountingBackfillWriteClient,
+  log: AccountingBackfillSyncLogRow,
+  draft: AccountingEventDraft,
+): Promise<{ id: string }> {
+  const externalId = draft.externalId?.trim() ? draft.externalId : null
+  const holder = externalId
+    ? await tx.accountingEvent.findUnique({
+        where: { externalSystem_externalId: { externalSystem: log.connector, externalId } },
+        select: { id: true },
+      })
+    : null
+  const event = await writeBackfilledEvent(tx, log, { ...draft, status: 'SUPERSEDED', externalId: null })
+  await tx.accountingEventLog.create({
+    data: buildAccountingEventLog({
+      accountingEventId: event.id,
+      action: 'revision_claim_order_unverified',
+      message: 'This revision posted, but which of it and the event holding the document id describes the '
+        + 'document now could not be established, so the claim was left where it is.',
+      metadata: {
+        connector: log.connector,
+        syncLogId: log.id,
+        syncType: log.type,
+        referenceType: log.referenceType,
+        referenceId: log.referenceId,
+        externalId: draft.externalId ?? null,
+        externalIdHeldByEventId: holder?.id ?? null,
+        orderingBasis: 'unestablished',
+      },
+    }) as never,
+  })
+  return event
+}
+
+/**
+ * o3d-cvj9 r3: does this pass hold MORE THAN ONE unmirrored revision of the same document?
+ *
+ * If it does, none of them may take the document id — not even from the CREATE. "The create
+ * precedes its revisions" is true of every one of them, so it says which of them is the LATEST
+ * exactly not at all, and taking the claim on whichever the pager happened to reach first is a
+ * guess wearing a proof's clothes. (r2 ordered them by the sync log's enqueue time, which is
+ * `CURRENT_TIMESTAMP` — transaction start — and so was never edit order either.) With no external
+ * revision stamp on any historical row there is nothing left that orders them, so all of them are
+ * repaired unclaimed and the id stays wherever it already is.
+ *
+ * A document with exactly ONE unmirrored revision is unaffected: it contends only with the create,
+ * and that pairing IS ordered.
+ */
+function contestedRevisionDocuments(candidates: AccountingBackfillSyncLogRow[]): Set<string> {
+  const seen = new Map<string, number>()
+  for (const log of candidates) {
+    if (!isDocumentRevisionAccountingSyncType(log.type)) continue
+    const key = revisionDocumentKey(log)
+    seen.set(key, (seen.get(key) ?? 0) + 1)
+  }
+  return new Set([...seen].filter(([, count]) => count > 1).map(([key]) => key))
+}
+
+function revisionDocumentKey(log: AccountingBackfillSyncLogRow): string {
+  return [
+    log.connector,
+    accountingDocumentRevisionFamily(log.type) ?? log.type,
+    log.referenceType,
+    log.referenceId,
+    log.externalTransactionId ?? '',
+  ].join('\u0000')
+}
+
+/**
  * o3d-cvj9 r2 — BACKFILLING A DOCUMENT REVISION THAT POSTED BEFORE THE MIRROR COULD RECORD IT.
  *
  * Round 1 fixed the live mirror and knowingly left this: every `*_INVOICE_UPDATE` that posted
@@ -309,13 +391,29 @@ async function writeBackfilledEvent(
  * It now resolves the claim the same way the live path does, through the SAME function, so the two
  * cannot drift on what a legitimate takeover is:
  *
- *  - `takeover` — the holder is an older event for this document. Release its claim and create the
- *    revision holding the id, auditing the supersession on the released row exactly as the mirror does.
- *  - `stale`    — a NEWER revision already holds the id. The historical edit still deserves a
+ *  - `takeover` — the holder is the document's CREATE, which provably precedes any revision of it.
+ *    Release its claim and create the revision holding the id, auditing the supersession on the
+ *    released row exactly as the mirror does.
+ *  - `stale`    — a LATER write already holds the id. The historical edit still deserves a
  *    mirrored row, so it is created as SUPERSEDED with no claim, rather than yanking the id back
  *    off the revision that supersedes it.
- *  - `refused`  — a genuine collision (another document holds this id), or two revisions that cannot
- *    be ordered. Skipped with the SPECIFIC reason, so the report names it instead of a raw driver string.
+ *  - `refused: recency_indeterminate` — TWO REVISIONS THAT CANNOT BE ORDERED. o3d-cvj9 r3: this is
+ *    the backfill's ordinary case, not an edge one, and it must not be a skip. Ordering two
+ *    revisions of one document requires the stamp the external system put on the document as it
+ *    applied each write (`externalRevisionAt`), and a historical sync log never recorded the
+ *    connector response — so the backfill has no stamp for its own row and often none for the
+ *    holder either. Skipping strands exactly the rows this repair exists to rescue: the sync log
+ *    stays SYNCED with no mirrored event at all, invisible to reconciliation, and every later run
+ *    re-skips it.
+ *
+ *    So the row IS repaired, and the claim is NOT moved: the event is created with no external id,
+ *    audited as `revision_claim_order_unverified` naming the row that keeps the claim, and reported
+ *    as created-without-a-reference. That is the whole of what is known — this edit posted, and
+ *    which of it and the holder describes the document now was not established — with nothing
+ *    invented in either direction.
+ *  - every other `refused` — a genuine collision: another document, or an unrelated event type,
+ *    holds this id. Those must stay skipped and visible, with the SPECIFIC reason, so the report
+ *    names it instead of a raw driver string.
  *
  * The whole repair runs in ONE transaction, so a released claim can never be left with no row
  * holding it. No savepoint is needed here (unlike the live mirror): the failed create rolled its own
@@ -339,10 +437,18 @@ async function backfillDocumentRevisionEvent(
         status: draft.status,
         externalId: draft.externalId,
       },
-      { createdAt: log.createdAt },
+      // No connector response was ever recorded for a historical post, so this side of the
+      // comparison has no external revision stamp and never pretends to.
+      { externalRevisionAt: null },
     )
 
-    if (claim.claim === 'refused') return { claim: 'refused' as const, reason: claim.reason }
+    if (claim.claim === 'refused' && claim.reason !== 'recency_indeterminate') {
+      return { claim: 'refused' as const, reason: claim.reason }
+    }
+
+    if (claim.claim === 'refused') {
+      return { claim: 'unordered' as const, eventId: (await writeUnclaimedRevisionEvent(tx, log, draft)).id }
+    }
 
     if (claim.claim === 'stale') {
       const event = await writeBackfilledEvent(tx, log, {
@@ -396,12 +502,16 @@ async function backfillDocumentRevisionEvent(
     }
   }
 
+  const reason = outcome.claim === 'stale'
+    ? 'created_missing_mirror_as_superseded_revision'
+    : outcome.claim === 'unordered'
+      ? 'created_missing_mirror_unclaimed_revision_order_unverified'
+      : 'created_missing_mirror_after_superseding_prior_revision'
+
   return {
     ...syncLogResultBase(log),
     action: 'created',
-    reason: outcome.claim === 'stale'
-      ? 'created_missing_mirror_as_superseded_revision'
-      : 'created_missing_mirror_after_superseding_prior_revision',
+    reason,
     idempotencyKey: draft.idempotencyKey,
     accountingEventId: outcome.eventId,
   }
@@ -411,7 +521,23 @@ async function createBackfilledEvent(
   client: AccountingBackfillClient,
   log: AccountingBackfillSyncLogRow,
   draft: AccountingEventDraft,
+  options: { contested: boolean },
 ): Promise<AccountingEventBackfillResult> {
+  // o3d-cvj9 r3: several unmirrored revisions of one document — nothing orders them, so none of
+  // them claims it. Decided BEFORE the insert, not in the collision handler: whichever of them the
+  // pager reaches first would otherwise find no holder at all, take the id unopposed, and the
+  // arbitrary winner would look like a resolved claim.
+  if (options.contested) {
+    const event = await client.$transaction((tx) => writeUnclaimedRevisionEvent(tx, log, draft))
+    return {
+      ...syncLogResultBase(log),
+      action: 'created',
+      reason: 'created_missing_mirror_unclaimed_revision_order_unverified',
+      idempotencyKey: draft.idempotencyKey,
+      accountingEventId: event.id,
+    }
+  }
+
   try {
     const created = await client.$transaction((tx) => writeBackfilledEvent(tx, log, draft))
 
@@ -458,6 +584,7 @@ export async function runAccountingEventBackfill(
   const limit = Math.max(1, Math.floor(options.limit ?? DEFAULT_BACKFILL_LIMIT))
   const baseCurrency = await resolveBaseCurrency(options)
   const candidates = await collectAccountingBackfillCandidateSyncLogs(client, { lookbackDays: options.lookbackDays, limit })
+  const contestedDocuments = contestedRevisionDocuments(candidates)
 
   const results: AccountingEventBackfillResult[] = []
   for (const log of candidates) {
@@ -503,7 +630,9 @@ export async function runAccountingEventBackfill(
     }
 
     try {
-      results.push(await createBackfilledEvent(client, log, draft))
+      results.push(await createBackfilledEvent(client, log, draft, {
+        contested: isDocumentRevisionAccountingSyncType(log.type) && contestedDocuments.has(revisionDocumentKey(log)),
+      }))
     } catch (error) {
       results.push({
         ...syncLogResultBase(log),

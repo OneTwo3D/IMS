@@ -195,6 +195,13 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
   payload: SyncPayload
   status: 'POSTED' | 'FAILED'
   externalId?: string | null
+  /**
+   * o3d-cvj9 r3: the revision stamp Xero put on the document as it applied THIS write, out of the
+   * response to that write. Supplied only where a write actually landed in this attempt — the
+   * short-circuit for a sync log that already carries an external id makes no connector call, so it
+   * supplies nothing and can never take a document id off the row that holds it.
+   */
+  externalRevisionAt?: Date | null
   message?: string
 }): Promise<void> {
   await updateMirroredAccountingEventStatus(client, {
@@ -206,6 +213,7 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
     payload: params.payload,
     status: params.status,
     externalId: params.externalId,
+    ...(params.externalRevisionAt !== undefined ? { externalRevisionAt: params.externalRevisionAt } : {}),
     message: params.message,
   })
 }
@@ -821,6 +829,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             referenceId: entry.referenceId,
             payload,
             status: 'POSTED',
+            // o3d-cvj9 r3: no connector call was made on this path — the log already carried the
+            // document id from an earlier successful post — so there is no revision stamp to record
+            // and none is invented. A revision arriving here can still take the id from the
+            // document's CREATE (a document exists before it is revised) but never from another
+            // revision, which is the pair nothing here can order.
             externalId: entry.externalTransactionId,
           })
         })
@@ -888,6 +901,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             payload,
             status: 'POSTED',
             externalId: syncResult.externalId ?? null,
+            externalRevisionAt: syncResult.externalRevisionAt ?? null,
           })
         })
 
@@ -1101,6 +1115,11 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             referenceId: entry.referenceId,
             payload,
             status: 'POSTED',
+            // o3d-cvj9 r3: no connector call was made on this path — the log already carried the
+            // document id from an earlier successful post — so there is no revision stamp to record
+            // and none is invented. A revision arriving here can still take the id from the
+            // document's CREATE (a document exists before it is revised) but never from another
+            // revision, which is the pair nothing here can order.
             externalId: entry.externalTransactionId,
           })
         })
@@ -1175,6 +1194,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             payload,
             status: 'POSTED',
             externalId: syncResult.externalId ?? null,
+            externalRevisionAt: syncResult.externalRevisionAt ?? null,
           })
         })
 
@@ -1286,7 +1306,15 @@ function resolveJournalStatus(mode: unknown): string {
   return mode === 'draft' ? 'DRAFT' : 'POSTED'
 }
 
-type EntryResult = { success: boolean; externalId?: string; invoiceNumber?: string; error?: string; skipped?: boolean }
+type EntryResult = {
+  success: boolean
+  externalId?: string
+  invoiceNumber?: string
+  /** o3d-cvj9 r3: the external system's revision stamp for the document this write just changed. */
+  externalRevisionAt?: Date | null
+  error?: string
+  skipped?: boolean
+}
 
 /**
  * Post-time backstop for the cancel-time sweep (o3d-5rs), shared by SALES_INVOICE and its UPDATE. A row
@@ -1372,7 +1400,7 @@ async function processEntry(
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId })
-      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, error: invoiceResult.error }
+      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 
     case 'SALES_INVOICE_UPDATE': {
@@ -1405,7 +1433,7 @@ async function processEntry(
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId })
-      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, error: invoiceResult.error }
+      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
 
     case 'PURCHASE_INVOICE': {
@@ -1426,7 +1454,7 @@ async function processEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
-      return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
+      return { success: billResult.success, externalId: billResult.invoiceId, externalRevisionAt: billResult.externalRevisionAt, error: billResult.error }
     }
 
     case 'PURCHASE_INVOICE_UPDATE': {
@@ -1451,7 +1479,7 @@ async function processEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
-      return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
+      return { success: billResult.success, externalId: billResult.invoiceId, externalRevisionAt: billResult.externalRevisionAt, error: billResult.error }
     }
 
     case 'INVOICE_PAYMENT': {

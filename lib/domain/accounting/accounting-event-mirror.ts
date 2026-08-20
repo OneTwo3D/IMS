@@ -311,40 +311,61 @@ export function accountingDocumentRevisionFamily(type: string): string | null {
 }
 
 /**
- * o3d-cvj9 r2: WHICH OF TWO EVENTS DESCRIBES THE DOCUMENT AS IT NOW STANDS.
+ * o3d-cvj9 r3: WHICH OF TWO EVENTS DESCRIBES THE DOCUMENT AS IT NOW STANDS.
  *
- * `createdAt` on the mirrored event is the ordering key, because a mirrored event is created by
- * `mirrorAccountingSyncLogToEvent` at the moment its sync log is ENQUEUED — so the events of a
- * document's edits are created in edit order even when the queue later processes them out of
- * order, and even when an edit is replayed long afterwards. (`updatedAt` would say the opposite:
- * a replay touches the stale row last.)
+ * Round 2 answered this from `accounting_events.createdAt`, arguing that a mirrored event is
+ * written at ENQUEUE and so a document's edits are stamped in edit order. THAT IS NOT WHAT THE
+ * COLUMN CONTAINS. Its default is `CURRENT_TIMESTAMP`, and in PostgreSQL that is TRANSACTION START
+ * time, not the time the row was written — verified against onetwo3d_ims_dev in a rolled-back
+ * transaction: after `pg_sleep(0.75)`, a row inserted with `DEFAULT now()` came back stamped
+ * `clock_timestamp() - created_at = 00:00:00.774525` in the past, and `created_at =
+ * transaction_timestamp()` was true. So an enqueue inside a long-running transaction carries an
+ * EARLIER stamp than an enqueue that began and committed after it, and the ordering is neither
+ * edit order nor even enqueue order. The row-`id` tie-break r2 layered on top ordered by cuid mint
+ * time, which is the same quantity measured a different way, so it went with it.
  *
- * Returns true when the HOLDER is the older row and may hand its claim over, false when the holder
- * is the newer one (the arriving row is a stale replay), and `null` when the two cannot be ordered.
+ * There are exactly two things we can say truthfully about which of two events describes the
+ * document now, and this function says only those two:
  *
- * EQUAL TIMESTAMPS ARE ROUTINE, not exotic: `now()` in Postgres is TRANSACTION start time, so every
- * event mirrored inside one transaction carries the same stamp — including a document's create and
- * its first revision when both are enqueued together. The row `id` breaks that tie. It is a `cuid`,
- * whose leading component is a timestamp and whose next component is a per-process counter, so two
- * ids minted in sequence by one process sort in mint order — and mint order here IS enqueue order,
- * because these rows are written one per enqueue in program order. The point of the tie-break is
- * that the resulting order is TOTAL and STABLE: whichever way a same-millisecond, cross-process tie
- * falls, it falls the same way every time, so two revisions can never take the claim off each other
- * in turn for ever.
+ * 1. THE CREATE ALWAYS PRECEDES ITS REVISIONS. A document cannot be revised before it exists, so
+ *    the event that CREATED it cannot describe a later state than an event that revises it. No
+ *    clock is involved and none is needed. This is the ordinary create -> first-edit handover, so
+ *    it keeps working for every document whose create predates the `externalRevisionAt` column.
+ *    (A replayed create never re-applies an edit after the fact: the processor short-circuits a
+ *    sync log that already carries an external id without calling the connector, and a genuine
+ *    replay that does call it goes out under the same Xero idempotency key, which returns the
+ *    original record rather than writing a new revision.)
  *
- * `null` is reserved for the one caller that has no id to compare — the administrative backfill,
- * which is deciding about a row it has not created yet. It refuses rather than guessing.
+ * 2. REVISION AGAINST REVISION IS ORDERED BY THE EXTERNAL SYSTEM, OR NOT AT ALL. Xero stamps
+ *    `Invoice.UpdatedDateUTC` on the document as it applies each write and hands it back in the
+ *    response to that write. Two writes to one invoice are serialised by Xero, against one clock,
+ *    so those stamps are the order in which the edits were APPLIED — which is the only order that
+ *    decides what the document says. `externalRevisionAt` carries that value and nothing else; it
+ *    is never derived from a local clock, because a comparison key mixing two clocks is not a key.
+ *
+ * Anything else is `null` — NOT ORDERED. A missing stamp on either side (the row predates the
+ * column, the connector returned none, an administrative backfill wrote the row) and an exact tie
+ * both land here. `null` is refused by the caller, which keeps the underlying P2002 fatal: the sync
+ * log retries and an operator sees it, rather than a stale revision quietly taking the document id.
+ *
+ * Returns true when the HOLDER is the earlier write and may hand its claim over, false when the
+ * holder is the later one (the arriving row is a stale replay), `null` when the two are not ordered.
  */
 function documentRevisionHolderPrecedes(
-  holder: { id: string; createdAt: Date },
-  arriving: { id?: string; createdAt: Date },
+  holder: { type: string; externalRevisionAt: Date | null },
+  arriving: { externalRevisionAt?: Date | null },
+  createType: string,
 ): boolean | null {
-  const holderAt = holder.createdAt.getTime()
-  const arrivingAt = arriving.createdAt.getTime()
-  if (holderAt < arrivingAt) return true
-  if (holderAt > arrivingAt) return false
-  if (arriving.id === undefined || arriving.id === holder.id) return null
-  return holder.id < arriving.id
+  // Rule 1: the holder is the document's CREATE, and the arriving row revises it.
+  if (holder.type === createType) return true
+
+  // Rule 2: two revisions of one document — only the external system's stamp orders them.
+  const holderAt = holder.externalRevisionAt?.getTime()
+  const arrivingAt = arriving.externalRevisionAt?.getTime()
+  if (holderAt === undefined || arrivingAt === undefined) return null
+  if (!Number.isFinite(holderAt) || !Number.isFinite(arrivingAt)) return null
+  if (holderAt === arrivingAt) return null
+  return holderAt < arrivingAt
 }
 
 /**
@@ -384,30 +405,34 @@ export type DocumentRevisionClaimOutcome =
  *
  * o3d-cvj9 r2 — `stale` IS THE OTHER HALF, and r1 did not have it. r1 established that the holder
  * was a legitimate PREDECESSOR TYPE for the same document, but never that the arriving revision
- * was NEWER than it (see `documentRevisionHolderPrecedes` for how that is established). Edits are
- * replayed (a retry after a crash, a redelivered webhook) and processed out of order, so an OLDER
- * revision could arrive after a newer one had already taken the id — and it would take it straight back, leaving the mirror naming a superseded edit as the
- * document's current state. A stale arrival takes nothing: the caller records it as SUPERSEDED
- * without the id, which is what it truthfully is.
+ * described a LATER state than it (see `documentRevisionHolderPrecedes` for the two things that
+ * can be said truthfully about that). Two workers can have their writes land at Xero in one order
+ * and record them in the other, so a revision whose write landed FIRST can arrive here after the
+ * one that landed second has already taken the id — and it would take it straight back, leaving
+ * the mirror naming an overwritten edit as the document's current state. A stale arrival takes
+ * nothing: the caller records it as SUPERSEDED without the id, which is what it truthfully is.
  *
  * Everything else is `refused`, which keeps the P2002 fatal — a genuine cross-document collision is
- * never silently absorbed into a no-op.
+ * never silently absorbed into a no-op, and neither is a pair we cannot order.
  */
 export async function resolveDocumentRevisionExternalIdClaim(
   client: AccountingEventMirrorTransactionClient,
   params: { connector: string; type: string; referenceType: string; referenceId: string; status: AccountingEventStatus; externalId?: string | null },
-  // `id` is absent only for the backfill, which is deciding about a row it has not written yet.
-  arriving: { id?: string; createdAt: Date },
+  // The external system's revision stamp for the write this arrival just made, when it made one.
+  // Absent for the administrative backfill, which is repairing a historical post whose connector
+  // response was never recorded — see `documentRevisionHolderPrecedes` rule 2.
+  arriving: { externalRevisionAt?: Date | null },
 ): Promise<DocumentRevisionClaimOutcome> {
   const externalId = params.externalId?.trim() ? params.externalId : null
   // Only a successful post owns a document id, and only a revision may take one over.
   if (!externalId || params.status !== 'POSTED') return { claim: 'refused', reason: 'not_a_revision_claim' }
   const predecessorTypes = DOCUMENT_REVISION_PREDECESSOR_TYPES[params.type]
-  if (!predecessorTypes) return { claim: 'refused', reason: 'not_a_revision_claim' }
+  const createType = DOCUMENT_REVISION_FAMILY_BY_TYPE[params.type]
+  if (!predecessorTypes || !createType) return { claim: 'refused', reason: 'not_a_revision_claim' }
 
   const holder = await client.accountingEvent.findUnique({
     where: { externalSystem_externalId: { externalSystem: params.connector, externalId } },
-    select: { id: true, type: true, sourceEntityType: true, sourceEntityId: true, createdAt: true },
+    select: { id: true, type: true, sourceEntityType: true, sourceEntityId: true, externalRevisionAt: true },
   })
   if (!holder) return { claim: 'refused', reason: 'no_holder' }
   // The holder must be an earlier revision of the SAME source document. Anything else sharing an
@@ -417,7 +442,7 @@ export async function resolveDocumentRevisionExternalIdClaim(
   }
   if (!predecessorTypes.includes(holder.type)) return { claim: 'refused', reason: 'unrelated_event_type' }
 
-  const holderPrecedes = documentRevisionHolderPrecedes(holder, arriving)
+  const holderPrecedes = documentRevisionHolderPrecedes(holder, arriving, createType)
   if (holderPrecedes === null) return { claim: 'refused', reason: 'recency_indeterminate' }
   if (!holderPrecedes) return { claim: 'stale', holderEventId: holder.id }
 
@@ -448,6 +473,14 @@ export async function updateMirroredAccountingEventStatus(
     payload: unknown
     status: AccountingEventStatus
     externalId?: string | null
+    /**
+     * o3d-cvj9 r3: the EXTERNAL system's revision stamp for the write this attempt just made —
+     * Xero's `Invoice.UpdatedDateUTC`, out of the response to that write. It is recorded because it
+     * is the only thing that orders two revisions of one document (see
+     * `documentRevisionHolderPrecedes`), and it is left undefined whenever no write was made in
+     * this attempt or the connector returned none. It is never synthesised from a local clock.
+     */
+    externalRevisionAt?: Date | null
     message?: string | null
   },
 ): Promise<void> {
@@ -467,6 +500,9 @@ export async function updateMirroredAccountingEventStatus(
         ...(params.externalId !== undefined && override?.claimExternalId !== false
           ? { externalId: params.externalId }
           : {}),
+        // The stamp is a true fact about THIS row's write whether or not the row keeps the claim,
+        // so the stale path records it too — it is what a later comparison against this row needs.
+        ...(params.externalRevisionAt !== undefined ? { externalRevisionAt: params.externalRevisionAt } : {}),
       },
       select: { id: true },
     })
@@ -488,18 +524,14 @@ export async function updateMirroredAccountingEventStatus(
       // not write.
       if (!isExternalAccountingReferenceUniqueError(error)) throw error
 
-      // o3d-cvj9 r2: WHICH revision is current has to be established, not assumed. The arriving
-      // row's own `createdAt` is the other half of that comparison, so read it before deciding —
-      // this is the error path, so the extra statement costs nothing on the ordinary one.
-      const arriving = await client.accountingEvent.findUnique({
-        where: { idempotencyKey: key },
-        select: { id: true, createdAt: true },
+      // o3d-cvj9 r3: WHICH revision describes the document has to be established, not assumed —
+      // and the arriving half of that comparison is the stamp the connector returned for the write
+      // this attempt just made, which the caller already holds. r2 re-read the arriving ROW here to
+      // get its `createdAt`; that column is `DEFAULT CURRENT_TIMESTAMP`, i.e. transaction START
+      // time, so it never carried the ordering it was read for. The read goes with it.
+      const claim = await resolveDocumentRevisionExternalIdClaim(client, params, {
+        externalRevisionAt: params.externalRevisionAt,
       })
-      // The update raised a UNIQUE violation, so the row it targeted exists; a miss here means the
-      // conflict is not ours to resolve. Stay fatal.
-      if (!arriving) throw error
-
-      const claim = await resolveDocumentRevisionExternalIdClaim(client, params, arriving)
       // Nothing legitimate to supersede: this is a real collision (a different document claiming
       // an external id that is already spoken for), or two revisions we cannot order. Either way it
       // must stay fatal and visible.
