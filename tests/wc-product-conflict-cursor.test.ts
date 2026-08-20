@@ -8,6 +8,7 @@ const cursor = 'default' in cursorNs
 
 const {
   WC_PRODUCT_CONFLICT_RETRY_LIMIT,
+  capWcProductConflictIds,
   parseWcProductConflictIds,
   serializeWcProductConflictIds,
   shouldAdvanceWcProductCursor,
@@ -72,4 +73,47 @@ test('ids round-trip, de-duplicate, and are capped at one WooCommerce page', () 
     'the re-attempt must stay one extra request — an unbounded list would recreate the unbounded work this fixes',
   )
   assert.equal(kept[0], 1, 'the cap keeps the head of the list, so the ids just observed survive it')
+})
+
+// o3d-xbt round 2, Codex finding 2 — a bound that says what it dropped.
+
+test('the cap reports what it kept AND what it dropped', () => {
+  const many = Array.from({ length: WC_PRODUCT_CONFLICT_RETRY_LIMIT + 5 }, (_, i) => i + 1)
+  const { kept, dropped } = capWcProductConflictIds(many)
+
+  assert.equal(kept.length, WC_PRODUCT_CONFLICT_RETRY_LIMIT)
+  assert.deepEqual(dropped, many.slice(WC_PRODUCT_CONFLICT_RETRY_LIMIT))
+  assert.deepEqual(
+    kept.filter((id) => dropped.includes(id)),
+    [],
+    'an id is carried or dropped, never both — the caller reports the second as abandoned',
+  )
+})
+
+test('the cap drops nothing when it does not need to, and de-duplicates first', () => {
+  assert.deepEqual(capWcProductConflictIds([]), { kept: [], dropped: [] })
+  assert.deepEqual(capWcProductConflictIds([77, 77, 88]), { kept: [77, 88], dropped: [] })
+  // Duplicates and junk are removed BEFORE the cap, so a list of the same id
+  // repeated 200 times does not report 100 abandoned products.
+  const repeated = Array.from({ length: WC_PRODUCT_CONFLICT_RETRY_LIMIT * 2 }, () => 77)
+  assert.deepEqual(capWcProductConflictIds(repeated), { kept: [77], dropped: [] })
+  assert.deepEqual(capWcProductConflictIds([0, -3, 1.5, 5]), { kept: [5], dropped: [] })
+})
+
+test('serialize is the cap — the two cannot report different truncations', () => {
+  const many = Array.from({ length: WC_PRODUCT_CONFLICT_RETRY_LIMIT + 5 }, (_, i) => i + 1)
+  assert.equal(serializeWcProductConflictIds(many), JSON.stringify(capWcProductConflictIds(many).kept))
+})
+
+test('the READ cap never exceeds the RETRY cap — nothing carried goes unattempted', () => {
+  // syncAllWcProducts slices the carried list to WC_PRODUCT_CONFLICT_RETRY_LIMIT
+  // before re-fetching. That slice is only harmless while the parse cap is no
+  // larger; if it grew, the overflow would be dropped by that line in silence —
+  // which is the very defect the truncation log above exists to prevent. Pinned,
+  // rather than left as a property two constants happen to have.
+  const many = Array.from({ length: WC_PRODUCT_CONFLICT_RETRY_LIMIT * 3 }, (_, i) => i + 1)
+  assert.ok(
+    parseWcProductConflictIds(JSON.stringify(many)).length <= WC_PRODUCT_CONFLICT_RETRY_LIMIT,
+    'the read cap must stay at or below the retry cap',
+  )
 })

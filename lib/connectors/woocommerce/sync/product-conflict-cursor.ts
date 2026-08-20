@@ -68,7 +68,29 @@ export function parseWcProductConflictIds(raw: string | null | undefined): numbe
   return ids.slice(0, WC_PRODUCT_CONFLICT_RETRY_LIMIT)
 }
 
-export function serializeWcProductConflictIds(ids: Iterable<number>): string {
+/**
+ * What the cap KEPT and what it DROPPED.
+ *
+ * o3d-xbt round 2, Codex finding 2. `serializeWcProductConflictIds` capped the
+ * list at one WooCommerce page and returned a string, so an id beyond the cap
+ * vanished with nothing said. That is the failure mode a bounded sweep is
+ * supposed to make impossible: truncating silently reads, to every operator and
+ * every later reader of the code, as "covered everything". A dropped id is a
+ * product that conflicts, is not re-attempted, and — because the cursor has
+ * already moved past it — will not be seen again until it changes in WooCommerce
+ * or somebody resets the cursor by hand.
+ *
+ * The bound stays (an unbounded retry recreates the unbounded work o3d-xbt
+ * fixed). What changes is that the caller is now TOLD, and can say so out loud.
+ */
+export type WcProductConflictCarry = {
+  /** The ids that will be carried to the next run, newest first. */
+  kept: number[]
+  /** The ids the cap could not carry, in the order they were offered. */
+  dropped: number[]
+}
+
+export function capWcProductConflictIds(ids: Iterable<number>): WcProductConflictCarry {
   const unique: number[] = []
   for (const id of ids) {
     if (Number.isInteger(id) && id > 0 && !unique.includes(id)) unique.push(id)
@@ -76,7 +98,14 @@ export function serializeWcProductConflictIds(ids: Iterable<number>): string {
   // Newest first, so the cap drops the STALEST conflict rather than the one just
   // observed — an id kept in the list is only worth keeping while it is still
   // being re-attempted.
-  return JSON.stringify(unique.slice(0, WC_PRODUCT_CONFLICT_RETRY_LIMIT))
+  return {
+    kept: unique.slice(0, WC_PRODUCT_CONFLICT_RETRY_LIMIT),
+    dropped: unique.slice(WC_PRODUCT_CONFLICT_RETRY_LIMIT),
+  }
+}
+
+export function serializeWcProductConflictIds(ids: Iterable<number>): string {
+  return JSON.stringify(capWcProductConflictIds(ids).kept)
 }
 
 /**

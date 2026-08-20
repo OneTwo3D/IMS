@@ -12,8 +12,8 @@ import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-m
 import { isPermanentProductSyncConflict } from './product-sync-errors'
 import {
   WC_PRODUCT_CONFLICT_RETRY_LIMIT,
+  capWcProductConflictIds,
   parseWcProductConflictIds,
-  serializeWcProductConflictIds,
   shouldAdvanceWcProductCursor,
   wcProductConflictSettingKey,
 } from './product-conflict-cursor'
@@ -2078,6 +2078,27 @@ export async function syncAllWcProducts(
   // which matters because these conflicts are resolved on the IMS side and
   // change nothing in WooCommerce for a modified-after query to notice.
   // Anything already seen in the pass above is skipped: it has just been tried.
+  //
+  // o3d-xbt round 2, Codex finding 1 — A CARRIED ID IS ONLY DROPPED ON EVIDENCE.
+  //
+  // The retry set is the mechanism that stops one permanent conflict pinning the
+  // sweep, so the ids ARE the safety net: the cursor has already moved past these
+  // products and nothing else will ever fetch them. They used to be re-added to
+  // the list only by being re-attempted and re-failing, which meant any run that
+  // did not reach them dropped them for good — a re-fetch that errored, or an id
+  // the cap could not fit. Losing them is worse than the defect the retry set was
+  // built to fix, because it is silent and permanent.
+  //
+  // So a carried id leaves the list on EVIDENCE and nothing else: it imported
+  // cleanly, or WooCommerce answered a by-id fetch without it (deleted, or no
+  // longer visible to these credentials). Not reaching it is not evidence.
+  //
+  // The slice below can never truncate, and that is a property of two constants
+  // agreeing rather than a coincidence: parseWcProductConflictIds reads at most
+  // WC_PRODUCT_CONFLICT_RETRY_LIMIT ids, so everything carried is attempted. It
+  // is stated here — and pinned in tests/wc-product-conflict-cursor.test.ts —
+  // because if the read cap ever grew past the retry cap, the overflow would be
+  // dropped by this line with nothing said, which is the defect one paragraph up.
   const retryIds = carriedConflictIds.filter((id) => !processedIds.has(id)).slice(0, WC_PRODUCT_CONFLICT_RETRY_LIMIT)
   if (retryIds.length > 0) {
     await reportProgress(`Re-attempting ${retryIds.length} previously conflicted product(s)...`)
@@ -2093,6 +2114,10 @@ export async function syncAllWcProducts(
       // Transient by nature (transport/auth), so it holds the cursor exactly as a
       // failed page fetch does — this run did not see what the cursor would claim.
       result.errors.push(`Re-attempt of conflicted products failed: ${retryError}`)
+      // …and the ids survive it. A failed fetch says nothing about whether these
+      // products still conflict, and dropping them here abandoned every one of
+      // them permanently (o3d-xbt round 2, finding 1).
+      for (const id of retryIds) conflictIds.add(id)
       await reportProgress(`Failed to re-fetch conflicted WooCommerce products: ${retryError}`)
     } else {
       // Ids WooCommerce did not return are deleted (or no longer visible to these
@@ -2119,24 +2144,96 @@ export async function syncAllWcProducts(
   // to pin the cursor forever, so every cycle re-fetched and re-imported the
   // whole catalogue to re-fail on the same row. They are carried in the conflict
   // set above and re-attempted by id instead, so nothing is abandoned.
-  if (shouldAdvanceWcProductCursor(result)) {
-    await db.setting.upsert({
-      where: { key: cursorKey },
-      create: { key: cursorKey, value: new Date().toISOString() },
-      update: { value: new Date().toISOString() },
-    })
-  }
+  //
+  // ORDER MATTERS (o3d-xbt round 2, finding 1). The conflict list is written
+  // FIRST, and the cursor only moves if that write landed. The other way round —
+  // which is how this was — an unwritable settings row left the cursor advanced
+  // past products whose ids were never recorded: nothing re-fetches them, nothing
+  // knows they exist, and the sweep reports a clean run. Persisting the safety
+  // net before stepping off the ledge is the whole of the fix.
+  const { kept: keptConflictIds, dropped: droppedConflictIds } = capWcProductConflictIds(conflictIds)
 
   // Written on every run, including the clean one that clears it: this row is the
   // live set of conflicted products, not a log of past ones.
   // (Skipped only when there is nothing to say and nothing to clear, so a store
   // that never conflicts does not grow a settings row it will never read.)
-  const serializedConflicts = serializeWcProductConflictIds(conflictIds)
+  let conflictsPersisted = true
   if (conflictIds.size > 0 || conflictSetting) {
+    const serializedConflicts = JSON.stringify(keptConflictIds)
+    try {
+      await db.setting.upsert({
+        where: { key: conflictKey },
+        create: { key: conflictKey, value: serializedConflicts },
+        update: { value: serializedConflicts },
+      })
+    } catch (error) {
+      conflictsPersisted = false
+      const reason = error instanceof Error ? error.message : String(error)
+      // TRANSIENT on purpose: it goes in `errors` and NOT in `permanentErrors`,
+      // which is on its own enough to hold the cursor through
+      // shouldAdvanceWcProductCursor. `conflictsPersisted` below is therefore
+      // belt-and-braces TODAY, and it is kept deliberately: "the cursor is held
+      // because the error line makes a count comparison unequal" is a coupling
+      // nobody would notice breaking, and the rule this enforces — never step
+      // past products whose ids were not recorded — deserves to be written down
+      // where the cursor is written, not inferred two functions away.
+      result.errors.push(`Failed to record the conflicted-product list (${conflictKey}): ${reason}`)
+      await logActivity({
+        entityType: 'SYNC', action: 'wc_product_sync_conflicts_unrecorded', tag: 'sync', level: 'ERROR',
+        description:
+          `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: the list of ${conflictIds.size} conflicted product(s)`
+          + ` could not be written to ${conflictKey} (${reason}). The sync cursor has been HELD so the same products are`
+          + ' fetched again next run — nothing is abandoned, but this run did less than it appears to have done.',
+        metadata: { mode, conflictedExternalProductIds: keptConflictIds, error: reason },
+        resolveUser: false,
+      })
+      await reportProgress(`Failed to record conflicted WooCommerce products: ${reason}`)
+    }
+  }
+
+  if (droppedConflictIds.length > 0) {
+    // o3d-xbt round 2, finding 2. The cap is deliberate — the retry pass must stay
+    // one extra request — but a truncation nobody is told about reads as full
+    // coverage. Named ids, not a count: an operator who has to go and look at
+    // these needs to know which.
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_product_sync_conflicts_truncated', tag: 'sync', level: 'WARNING',
+      description:
+        `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${conflictIds.size} product(s) conflicted but only`
+        + ` ${keptConflictIds.length} can be carried to the next run (one WooCommerce page). ${droppedConflictIds.length}`
+        + ` id(s) were DROPPED and will NOT be re-attempted: ${droppedConflictIds.slice(0, 50).join(', ')}`
+        + `${droppedConflictIds.length > 50 ? `, +${droppedConflictIds.length - 50} more` : ''}.`
+        + ' The cursor has moved past them, so they will only be seen again if they change in WooCommerce or the cursor'
+        + ' is reset. Resolve the carried conflicts to make room, or reset the cursor to re-import from scratch.',
+      metadata: {
+        mode,
+        droppedExternalProductIds: droppedConflictIds.slice(0, 200),
+        droppedCount: droppedConflictIds.length,
+        carriedCount: keptConflictIds.length,
+        retryLimit: WC_PRODUCT_CONFLICT_RETRY_LIMIT,
+      },
+      resolveUser: false,
+    })
+    result.errors.push(
+      `${droppedConflictIds.length} conflicted product(s) exceeded the ${WC_PRODUCT_CONFLICT_RETRY_LIMIT}-id retry list`
+      + ` and were dropped: ${droppedConflictIds.slice(0, 20).join(', ')}`
+      + `${droppedConflictIds.length > 20 ? `, +${droppedConflictIds.length - 20} more` : ''}`,
+    )
+    // Permanent as well: a full retry list is not a transport hiccup, and holding
+    // the cursor on it would re-import the whole catalogue every cycle — the very
+    // defect o3d-xbt exists to fix.
+    result.permanentErrors.push(
+      `${droppedConflictIds.length} conflicted product(s) exceeded the ${WC_PRODUCT_CONFLICT_RETRY_LIMIT}-id retry list`
+      + ` and were dropped: ${droppedConflictIds.slice(0, 20).join(', ')}`
+      + `${droppedConflictIds.length > 20 ? `, +${droppedConflictIds.length - 20} more` : ''}`,
+    )
+  }
+
+  if (conflictsPersisted && shouldAdvanceWcProductCursor(result)) {
     await db.setting.upsert({
-      where: { key: conflictKey },
-      create: { key: conflictKey, value: serializedConflicts },
-      update: { value: serializedConflicts },
+      where: { key: cursorKey },
+      create: { key: cursorKey, value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
     })
   }
 

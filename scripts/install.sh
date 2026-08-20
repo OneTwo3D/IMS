@@ -173,6 +173,46 @@ urlencode() {
   printf '%s' "$out"
 }
 
+# Encode a value as a Redis CONFIGURATION STRING — the double-quoted form
+# redis.conf's own parser reads back byte for byte (o3d-xnwu round 2).
+#
+# THE DEFECT THIS FIXES. The password reached two places in two different
+# encodings: percent-encoded inside REDIS_URL, and RAW into `requirepass`. Only
+# the first was an encoding at all. redis.conf is not a raw key/value file — the
+# server trims each line and then splits it with sdssplitargs, the same tokenizer
+# redis-cli uses. Written bare, a password therefore loses leading and trailing
+# whitespace, splits into two arguments at any inner space or tab (which is a
+# startup error, not a truncation), is re-tokenized by a `\"` or a `'`, and has
+# its backslash escapes processed. The two sides then disagree about what the
+# secret IS: the app authenticates with the percent-decoded password while the
+# server expects whatever survived the config parser. AUTH fails, and the login
+# rate limiter fails CLOSED on the auth buckets — so the symptom is that nobody
+# can sign in.
+#
+# It was worse than a disagreement, because the value was interpolated into a
+# `sed` REPLACEMENT: an `&` there expands to the whole matched line, a `|` ends
+# the s|| expression, and a backslash escapes. A password containing any of them
+# wrote something that was not the password at all, silently.
+#
+# So: quote for the parser that reads it, and never build the line with sed.
+# Everything outside printable ASCII goes out as \xHH, which redis decodes back
+# to the exact byte — the same byte urlencode percent-encoded for the URL. The
+# two encodings are then provably the same secret, which is what the check after
+# `systemctl restart redis-server` makes the server itself confirm.
+redis_conf_quote() {
+  local LC_ALL=C string="$1" out='"' i c
+  for (( i = 0; i < ${#string}; i++ )); do
+    c="${string:i:1}"
+    case "$c" in
+      '"') out+='\"' ;;
+      '\') out+='\\' ;;
+      [\ -\~]) out+="$c" ;;
+      *) out+="$(printf '\\x%02x' "'$c")" ;;
+    esac
+  done
+  printf '%s"' "$out"
+}
+
 prompt_yn() {
   local varname="$1" question="$2" default="${3:-y}"
   if $NON_INTERACTIVE; then
@@ -491,11 +531,11 @@ if [[ "$INSTALL_REDIS" == "y" ]]; then
     sed -i -E "s/^bind .*/bind 127.0.0.1 ::1/" "${REDIS_CONF}" || true
     sed -i -E "s/^protected-mode .*/protected-mode yes/" "${REDIS_CONF}" || true
     if [[ -n "${REDIS_PASSWORD}" ]]; then
-      if grep -qE '^[#[:space:]]*requirepass ' "${REDIS_CONF}"; then
-        sed -i -E "s|^[#[:space:]]*requirepass .*|requirepass ${REDIS_PASSWORD}|" "${REDIS_CONF}"
-      else
-        printf '\nrequirepass %s\n' "${REDIS_PASSWORD}" >> "${REDIS_CONF}"
-      fi
+      # Drop every existing requirepass line, then APPEND the quoted one. The
+      # password is never interpolated into a sed replacement, where `&`, `|` and
+      # `\` are syntax rather than characters (o3d-xnwu round 2).
+      sed -i -E '/^[#[:space:]]*requirepass /d' "${REDIS_CONF}"
+      printf '\nrequirepass %s\n' "$(redis_conf_quote "${REDIS_PASSWORD}")" >> "${REDIS_CONF}"
     else
       sed -i -E "s|^[#[:space:]]*requirepass .*|# requirepass foobared|" "${REDIS_CONF}" || true
     fi
@@ -503,6 +543,20 @@ if [[ "$INSTALL_REDIS" == "y" ]]; then
 
   systemctl enable redis-server
   systemctl restart redis-server
+
+  # The two encodings agree, or the install stops here. This is the only authority
+  # on the question — the server is what decoded redis.conf, and AUTH is what the
+  # app will do. Left to first use, the failure surfaces as "nobody can sign in",
+  # because the login rate limiter fails CLOSED on the auth buckets.
+  if [[ -n "${REDIS_PASSWORD}" ]] && command -v redis-cli &>/dev/null; then
+    REDIS_AUTH_CHECK="$(redis-cli -h 127.0.0.1 -p "${REDIS_PORT}" -a "${REDIS_PASSWORD}" --no-auth-warning ping 2>&1 || true)"
+    if [[ "${REDIS_AUTH_CHECK}" != "PONG" ]]; then
+      die "Redis rejected the password this script just wrote to ${REDIS_CONF} (got: ${REDIS_AUTH_CHECK}). \
+The password in redis.conf and the one in REDIS_URL must be the same bytes — fix redis.conf and re-run."
+    fi
+    success "Redis AUTH verified — redis.conf and REDIS_URL carry the same secret."
+  fi
+
   success "Redis configured and started."
 fi
 
