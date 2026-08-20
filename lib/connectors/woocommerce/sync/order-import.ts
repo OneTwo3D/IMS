@@ -11,6 +11,7 @@ import {
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
 } from './field-mapping'
+import { resolveWcAccountingInvoiceNumber } from './invoice-number'
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
@@ -357,6 +358,18 @@ async function updateExistingWcOrderFromPayload(
         paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : undefined,
       },
     })
+    // o3d-k26m.1: capture WooCommerce's invoice number the first time it appears. An order can
+    // legitimately be imported before WooCommerce PDF Invoices has numbered its invoice, and a
+    // later webhook redelivery is the earliest moment IMS can learn the number. Guarded on
+    // `invoiceNumber: null` so a number already recorded — the one a posted accounting document
+    // may already carry — is never rewritten by a later payload.
+    const resolvedInvoiceNumber = resolveWcAccountingInvoiceNumber(wcOrder)
+    if (resolvedInvoiceNumber.ok) {
+      await tx.salesOrder.updateMany({
+        where: { id: orderId, invoiceNumber: null },
+        data: { invoiceNumber: resolvedInvoiceNumber.invoiceNumber },
+      })
+    }
   })
 }
 
@@ -706,9 +719,18 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // Read unified numbering settings via the shopping connector registry
     // (Settings → Company → Numbering → Shopping Connectors → WooCommerce)
     const { getShoppingConnectorPrefixes } = await import('@/lib/connectors/shopping-registry')
-    const { orderPrefix: wcOrderPrefix, invPrefix: wcInvPrefix } =
+    // NB: only the ORDER prefix is read here. The accounting invoice prefix
+    // (`woocommerce_inv_prefix`) no longer participates in the invoice number — o3d-k26m.1.
+    const { orderPrefix: wcOrderPrefix } =
       await getShoppingConnectorPrefixes('woocommerce')
     const orderNumber = `${wcOrderPrefix}${wcOrder.number}`
+
+    // o3d-k26m.1: the accounting invoice number is WooCommerce's, not ours. Resolved here —
+    // before the order row is written — so the SAME value is persisted on the SalesOrder and
+    // sent to the accounting connector, and so a later re-queue from the IMS side cannot post a
+    // second, differently-numbered document for the same order. `wcInvPrefix` is deliberately
+    // NOT applied to it; see lib/connectors/woocommerce/sync/invoice-number.ts.
+    const invoiceNumberResolution = resolveWcAccountingInvoiceNumber(wcOrder)
 
     // Find the default WC warehouse — prefer isDefault + syncToStore,
     // fall back to any syncToStore warehouse.
@@ -727,6 +749,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         data: {
           externalOrderNumber: wcOrder.number,
           orderNumber,
+          // o3d-k26m.1: persist WooCommerce's own invoice number so IMS shows, prints and posts
+          // the same document number the customer's PDF already carries. Left null when the PDF
+          // plugin has not numbered the invoice yet — a null here is the honest record that no
+          // number exists, and `generateInvoiceNumber` must not be used to fill it for a
+          // WooCommerce order.
+          ...(invoiceNumberResolution.ok ? { invoiceNumber: invoiceNumberResolution.invoiceNumber } : {}),
           paymentMethod: wcOrder.payment_method || null,
           paymentMethodTitle: wcOrder.payment_method_title || null,
           externalCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
@@ -862,20 +890,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       await resolveDirectCreateShortfall(so.id)
     }
 
-    // Queue accounting sales invoice — only for PROCESSING orders and when
-    // accounting is not explicitly skipped (e.g. initial import).
-    const shouldInvoice = imsStatus === 'PROCESSING' && !options.skipAccounting
-    if (!shouldInvoice) {
-      // Log sync but skip accounting
+    // Queue accounting sales invoice — only for PROCESSING orders, when accounting is not
+    // explicitly skipped (e.g. initial import), and when WooCommerce has actually numbered the
+    // invoice.
+    const finishWithoutAccounting = async (reason: string) => {
       if (options.pendingFxRetryLogId) {
         await db.shoppingSyncLog.update({
           where: { id: options.pendingFxRetryLogId },
-          data: {
-            entityId: so.id,
-            status: 'SYNCED',
-            errorMessage: `Imported as ${imsStatus}${options.skipAccounting ? ' (initial import)' : ''} — skipped accounting sync`,
-            syncedAt: new Date(),
-          },
+          data: { entityId: so.id, status: 'SYNCED', errorMessage: reason, syncedAt: new Date() },
         })
       } else {
         await db.shoppingSyncLog.create({
@@ -885,12 +907,44 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             entityId: so.id,
             externalId: String(wcOrder.id),
             status: 'SYNCED',
-            errorMessage: `Imported as ${imsStatus}${options.skipAccounting ? ' (initial import)' : ''} — skipped accounting sync`,
+            errorMessage: reason,
           },
         })
       }
-      return { success: true, orderId: so.id }
+      return { success: true as const, orderId: so.id }
     }
+
+    if (imsStatus !== 'PROCESSING' || options.skipAccounting) {
+      return await finishWithoutAccounting(
+        `Imported as ${imsStatus}${options.skipAccounting ? ' (initial import)' : ''} — skipped accounting sync`,
+      )
+    }
+
+    // o3d-k26m.1: NO INVOICE NUMBER MEANS NO POST. The alternative — post now under a number of
+    // our own and correct it later — is not available: the sales-invoice create is an upsert on
+    // InvoiceNumber, so the correction would post a SECOND document rather than replace the
+    // first. Holding the order back is recoverable (the number arrives, an operator re-queues);
+    // a wrongly-numbered document in a live ledger is not.
+    if (!invoiceNumberResolution.ok) {
+      const reason = `Accounting sales invoice NOT queued — ${invoiceNumberResolution.reason}`
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'sales_invoice_number_unavailable',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `${reason} Re-import order ${wcOrder.number} once WooCommerce PDF Invoices has numbered it, then queue the sales invoice.`,
+        metadata: {
+          connector: 'woocommerce',
+          externalOrderId: String(wcOrder.id),
+          externalOrderNumber: wcOrder.number,
+          orderNumber,
+          metaKey: invoiceNumberResolution.metaKey,
+        },
+      })
+      return await finishWithoutAccounting(reason)
+    }
+
     try {
       const { queueAccountingSync, getAccountingSettings } = await import('@/lib/accounting')
       const settings = await getAccountingSettings()
@@ -910,7 +964,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         referenceType: 'SalesOrder',
         referenceId: so.id,
         payload: {
-          invoiceNumber: `${wcInvPrefix}${wcOrder.number}`,
+          invoiceNumber: invoiceNumberResolution.invoiceNumber,
           contactName: customerName,
           contactEmail: wcOrder.billing.email || undefined,
           date: new Date(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),

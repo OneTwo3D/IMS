@@ -626,6 +626,26 @@ Refunds create a Xero credit note in all cases. Additional reversal journals dep
 | Allocated but not shipped | Credit note + DR Unearned / CR Sales + DR Inventory / CR Allocated |
 | Partially or fully shipped | Credit note + DR Inventory / CR COGS (shipped portion) + unearned reversal (unshipped portion) |
 
+### Chargebacks and the order-level discount
+
+When the payment poller sees a payment reversed, IMS raises a **chargeback** credit note that
+unwinds the whole remaining order. Whether that credit note carries an order-level discount line is
+decided by **what the sales invoice actually posted**, not by the current Account Mapping:
+
+| What the posted invoice carried | What the chargeback does |
+|---|---|
+| A discount line, to an account that is still the configured Discount account | Mirrors the discount line |
+| A discount line, but the Discount account has since been removed or changed | Refuses — raise the credit note manually (logged as `chargeback_requires_manual_handling`) |
+| No discount line (the invoice charged the full goods value) | Credits the full goods value, no discount line (logged as `chargeback_discount_line_omitted`) |
+| Unreadable | Refuses — raise the credit note manually |
+
+Orders with no recorded accounting document for the invoice fall back to the older rule: the
+Discount account being configured is taken as the signal that a discount line was posted.
+
+This is why it matters: if the Discount account was configured *after* an invoice posted, that
+invoice charged the full goods value. Reversing it with a discount line would credit less than was
+charged and silently leave the difference on the customer's account.
+
 ## Transaction Types
 
 Configure which documents are synced to Xero under **Integrations → Xero → Transaction Types**. Each type can be set to **Off**, **Draft**, or **Submitted** (AUTHORISED in Xero):
@@ -639,6 +659,33 @@ Configure which documents are synced to Xero under **Integrations → Xero → T
 | COGS Reversals | Reverse COGS on stock returns |
 | Inventory Adjustments | Journal for manual stock adjustments |
 | Manufacturing Journal | Capitalise per-run overhead (labour, machine, etc.) on assembly/disassembly: DR Inventory / CR Manufacturing Overhead. Includes the retro-recalc reclass (`MANUFACTURING_RECLASS`) when cost lines are edited after completion. |
+
+## Invoice Numbers
+
+**IMS supplies the invoice number; Xero does not allocate it.** The number sent as `InvoiceNumber`
+is the one already recorded on the sales order:
+
+| Order origin | Number sent to Xero |
+|---|---|
+| WooCommerce | `_wcpdf_invoice_number` from the WooCommerce order, verbatim — the same number printed on the customer's PDF |
+| Manual / IMS-created | The order's own invoice number if one has been generated, otherwise the Invoice Prefix from Settings → Company → Document Numbering plus the order reference |
+
+Two things follow from this, and both matter.
+
+**One order, one number.** The create is an *update-or-create on `InvoiceNumber`*, so re-posting the
+same order replaces its own document instead of adding a second one. That property only holds while
+every route posts the *same* number for an order — which is why the number recorded on the sales
+order always wins over one derived at push time.
+
+**A missing number stops the post.** If a WooCommerce order has no `_wcpdf_invoice_number`, nothing
+is queued and a warning is logged; IMS never substitutes a number of its own. See
+`docs/woocommerce.md` § When WooCommerce has not numbered the invoice yet.
+
+> **Cutover note.** While the xeroom WordPress plugin is still live it posts the *same* numbers to
+> the *same* Xero organisation. Because the create upserts on the number, an IMS post for an order
+> xeroom has already invoiced will **overwrite that invoice** rather than create a duplicate. Do not
+> enable Sales Invoices in IMS against the live organisation until xeroom is switched off for the
+> orders IMS will handle.
 
 ## Multi-Currency FX Rates
 

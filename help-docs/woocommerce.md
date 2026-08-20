@@ -97,7 +97,26 @@ With the initial import complete, new and updated WooCommerce orders are importe
 - Multi-currency orders are converted to the IMS base currency using the FX rate from `frankfurter.dev` (ECB) at import time. The same rate is stamped on the order's `fxRateToBase` field and forwarded to Xero as `CurrencyRate` on the resulting invoice — so the WooCommerce store, IMS, and Xero all see the same base-currency total for the order. See `docs/xero-sync.md` § Multi-Currency FX Rates.
 - Tax rates are resolved using the tax rate mappings you configure (see Tax Rates below)
 - The order number uses your configured WooCommerce prefix (e.g. `WC-1234`, set in Settings > Company > Document Numbering)
+- **The accounting invoice number comes from WooCommerce, not from IMS.** IMS reads `_wcpdf_invoice_number` — the number WooCommerce PDF Invoices & Packing Slips assigned and printed on the customer's PDF — and uses it *verbatim* as both the IMS invoice number and the `InvoiceNumber` on the Xero invoice. No prefix is added, so the Xero document, the customer's PDF and the WooCommerce order all carry the same number. The **Invoice Prefix** field for WooCommerce under Settings > Company > Document Numbering no longer affects it
 - Stock is auto-allocated from warehouses marked **Sync to Store**
+
+#### When WooCommerce has not numbered the invoice yet
+
+The PDF plugin assigns `_wcpdf_invoice_number` when it first creates the invoice document, which can
+happen slightly after IMS imports the order. When the number is missing, **IMS does not invent one
+and does not post anything to the accounting system.** The order still imports normally; the
+accounting sales invoice is held back and a warning appears in the activity log
+(`sales_invoice_number_unavailable`), naming the order and the meta key it looked for.
+
+This is deliberate. The accounting sales-invoice create is an *update-or-create on the invoice
+number*, so a document posted under a stand-in number cannot be renumbered later — a second post
+under the real number would create a **second invoice** rather than replacing the first. Holding the
+order back is recoverable; a wrongly numbered document in a live ledger is not.
+
+To clear one: make sure WooCommerce has generated the invoice for that order, then let the order
+resync (a webhook redelivery or the next poll). IMS records the number the moment it appears. The
+accounting invoice itself is not queued automatically by the resync — queue it from the sales order
+once the number is showing.
 
 **WooCommerce "completed" orders** receive special handling: the system auto-allocates stock, creates shipments, applies any tracking information from the WC order meta (AST plugin), and transitions the shipments through to Shipped status.
 
