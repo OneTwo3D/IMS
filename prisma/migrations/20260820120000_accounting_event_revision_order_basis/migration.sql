@@ -1,0 +1,30 @@
+-- o3d-cvj9 r4 (Codex r3 finding 3): a backfilled revision that HOLDS a document id carries no
+-- external revision stamp, and there is no honest one to give it — a historical sync log never
+-- recorded the connector response. Under r3 that made the row permanently unorderable: it is not
+-- the document's CREATE, so the create rule could not order it, and it has no stamp, so the stamp
+-- rule could not either. Every later live revision of that document was refused for ever, the sync
+-- log retried to FAILED, and the ledger stayed frozen naming a historical edit as the document's
+-- current state. Fail-closed, but permanent — and permanence is its own defect.
+--
+-- This column records the one thing that IS provable about such a row, as a category rather than a
+-- timestamp:
+--
+--   'historical_backfill_repair' — the write this row mirrors had already been recorded complete on
+--                                  its sync log when the backfill selected it, AND the backfill
+--                                  only selects sync logs for a document with NO mirrored event of
+--                                  that revision type at all.
+--
+-- The second half is what makes it usable. A live revision's mirrored event row is created at
+-- ENQUEUE, in the same transaction as its sync log, and the backfill's candidate scan excludes any
+-- document that already has such a row. So every live revision able to contend with a repaired row
+-- was enqueued after that row's write had finished, and its write is therefore the later one. That
+-- is a causal ordering — no local clock is read, and no local clock is compared with Xero's, which
+-- is the mistake r2 made and r3 removed.
+--
+-- Deliberately a nullable text category with no default and no backfill:
+--   * NULL is the correct value for every existing row and for every row the live mirror writes —
+--     a live write records `externalRevisionAt` instead, and that is compared first.
+--   * It is never parsed as a time, so it cannot be dragged back into a comparison key.
+-- Adding a nullable column with no default is metadata-only on Postgres (no table rewrite).
+ALTER TABLE "accounting_events"
+  ADD COLUMN "revisionOrderBasis" TEXT;

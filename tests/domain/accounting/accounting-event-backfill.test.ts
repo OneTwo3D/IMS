@@ -44,6 +44,12 @@ type EventRow = {
    * which is exactly why the backfill cannot order two revisions against each other.
    */
   externalRevisionAt?: Date | null
+  /**
+   * o3d-cvj9 r4: how a stamp-less row may be ordered against another revision. The backfill stamps
+   * `historical_backfill_repair` on the rows it writes, which is what stops a repaired claimant
+   * refusing every later live revision of the document for ever.
+   */
+  revisionOrderBasis?: string | null
 }
 
 type MockTransactionClient = {
@@ -66,6 +72,24 @@ type MockBackfillClient = MockTransactionClient & {
   $transaction<T>(fn: (tx: MockTransactionClient) => Promise<T>): Promise<T>
 }
 
+/**
+ * o3d-cvj9 r4: the sync-log reader answers TWO shapes now, and the double has to tell them apart or
+ * it silently answers "every log" to the second one:
+ *
+ *  - the CANDIDATE scan   — `where.type.in` plus an `OR` of status/lookback branches;
+ *  - the CONTEST scan     — an `OR` of one branch per document (connector + reference + the
+ *                           family's revision types), asked of the whole table so the limit, the
+ *                           page boundary and the lookback cannot hide a document's other revision.
+ */
+type MockSyncLogWhereBranch = {
+  status?: { in?: string[] }
+  createdAt?: { gte?: Date }
+  connector?: string
+  referenceType?: string
+  referenceId?: string
+  type?: { in?: string[] }
+}
+
 type MockFindManyArgs = {
   cursor?: { id: string }
   skip?: number
@@ -73,10 +97,7 @@ type MockFindManyArgs = {
   orderBy?: { id?: 'asc' | 'desc' }
   where?: {
     type?: { in?: string[] }
-    OR?: Array<{
-      status?: { in?: string[] }
-      createdAt?: { gte?: Date }
-    }>
+    OR?: MockSyncLogWhereBranch[]
   }
 }
 
@@ -118,11 +139,20 @@ function makeClient(input: {
     return []
   }
 
+  function syncLogMatchesBranch(log: SyncLog, branch: MockSyncLogWhereBranch): boolean {
+    if (branch.connector !== undefined && log.connector !== branch.connector) return false
+    if (branch.referenceType !== undefined && log.referenceType !== branch.referenceType) return false
+    if (branch.referenceId !== undefined && log.referenceId !== branch.referenceId) return false
+    if (branch.type?.in && !branch.type.in.includes(log.type)) return false
+    if (branch.status?.in && !branch.status.in.includes(log.status)) return false
+    return true
+  }
+
   function syncLogMatchesWhere(log: SyncLog, where: MockFindManyArgs['where']): boolean {
     const types = where?.type?.in
     if (types && !types.includes(log.type)) return false
-    const statusBranches = where?.OR?.flatMap((branch) => branch.status?.in ?? [])
-    return !statusBranches?.length || statusBranches.includes(log.status)
+    if (!where?.OR) return true
+    return where.OR.some((branch) => syncLogMatchesBranch(log, branch))
   }
 
   function pageSyncLogs(args: MockFindManyArgs): SyncLog[] {
@@ -874,4 +904,180 @@ test('o3d-cvj9 r3: a genuine cross-document collision is still SKIPPED with its 
   assert.equal(result.action, 'skipped')
   assert.equal(result.reason, 'external_reference_claimed_elsewhere: unrelated_event_type')
   assert.equal(createdEvents.length, 0, 'a refused claim writes nothing')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r4 — Codex r3 finding 1: CONTESTEDNESS IS A PROPERTY OF THE DOCUMENT, NOT OF THE BATCH.
+//
+// r3 decided contested documents BEFORE the insert so an arbitrary winner could not look like a
+// resolved claim — and then counted only the revisions present in the candidate list. The scan
+// stops at `limit` and its `where` drops SYNCED logs older than the lookback, so two revisions of
+// one document are routinely not in front of the repair together, and the guard silently does not
+// fire. It is asked of the sync-log table now.
+// ---------------------------------------------------------------------------------------------
+
+function secondInvoiceUpdateLog(overrides: Partial<SyncLog> = {}): SyncLog {
+  return syncedInvoiceUpdateLog({
+    id: 'sync-invoice-update-2',
+    payload: {
+      ...(syncedInvoiceUpdateLog().payload as Record<string, unknown>),
+      _idempotencyKey: 'sales-invoice-update:so-1:inv-9:second',
+    },
+    ...overrides,
+  })
+}
+
+test('o3d-cvj9 r4: a revision the LIMIT cut out of the batch still contests the document', async () => {
+  // Two historical edits of one invoice, both SYNCED and both unmirrored — but `limit: 1` means the
+  // repair only ever sees one of them. r3 counted the batch, found one revision, called the
+  // document uncontested and handed it the id off the create: an arbitrary winner (the pager's `id`
+  // order, which is cuid mint order) wearing a resolved claim. The other edit would then arrive in
+  // a later run, find the id held by a stamp-less backfilled revision, and be repaired unclaimed —
+  // so the guess would never be revisited.
+  const { client, createdEvents, createdLogs } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog(), secondInvoiceUpdateLog()],
+    events: [postedInvoiceEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false, limit: 1 })
+
+  assert.equal(report.summary.candidates, 1, 'the limit really did cut the second edit out of the batch')
+  const result = resultBySyncLog(report, 'sync-invoice-update')
+  assert.equal(result.action, 'created', 'the row must still be repaired, only the claim withheld')
+  assert.equal(result.reason, 'created_missing_mirror_unclaimed_revision_order_unverified')
+  assert.equal(createdEventData(createdEvents).externalId, null)
+  assert.equal(createdEventData(createdEvents).status, 'SUPERSEDED')
+  // The create keeps the id: nothing established that either edit is the one the invoice reflects.
+  const unverified = logsByAction(createdLogs, 'revision_claim_order_unverified')
+  assert.equal(unverified.length, 1)
+  assert.equal(
+    (unverified[0].metadata as { externalIdHeldByEventId?: string }).externalIdHeldByEventId,
+    'event-invoice',
+  )
+  assert.equal(logsByAction(createdLogs, 'superseded_by_revision').length, 0, 'no claim moved, so nothing may say one did')
+})
+
+test('o3d-cvj9 r4: a sibling revision that never posted does NOT contest the document', async () => {
+  // The other direction, and the reason contestedness is not simply "more than one revision log
+  // exists": a PENDING edit that never reached the connector cannot be the write the invoice now
+  // reflects. When it does post it posts through the LIVE mirror, which carries Xero's stamp and
+  // can order itself against this repair. Refusing the ordinary single-edit handover on account of
+  // it would strand the repair for nothing.
+  const { client, createdEvents, createdLogs } = makeClient({
+    syncLogs: [
+      syncedInvoiceUpdateLog(),
+      secondInvoiceUpdateLog({ status: 'PENDING', externalTransactionId: null }),
+    ],
+    events: [postedInvoiceEvent()],
+  })
+
+  // Both are candidates this time, so a repair that counted the BATCH would find two revisions of
+  // one document and refuse the handover on the strength of an edit that never left the queue.
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  assert.equal(report.summary.candidates, 2)
+  const result = resultBySyncLog(report, 'sync-invoice-update')
+  assert.equal(result.reason, 'created_missing_mirror_after_superseding_prior_revision')
+  assert.equal(createdEventData(createdEvents).externalId, 'INV-9')
+  assert.equal(logsByAction(createdLogs, 'superseded_by_revision').length, 1)
+  // The queued edit is still repaired, as PENDING, claiming nothing.
+  assert.equal(resultBySyncLog(report, 'sync-invoice-update-2').reason, 'created_missing_mirror')
+  assert.equal(createdEventData(createdEvents, 1).externalId, null)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r4 — Codex r3 finding 2: THE CONTESTED BRANCH SKIPPED THE COLLISION CHECKS.
+//
+// Writing the repaired row with no external id is exactly what stops the insert violating
+// `@@unique([externalSystem, externalId])` — and that violation was the only thing that carried the
+// ordinary path into the cross-document checks. So a contested repair whose external id belonged to
+// a DIFFERENT document was written anyway, audited as "we could not order these", and reported as
+// `created`: the double post the unique index exists to catch, laundered into a benign repair.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-cvj9 r4: a CONTESTED revision whose id belongs to another source document is skipped, not repaired', async () => {
+  const { client, createdEvents, createdLogs } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog(), secondInvoiceUpdateLog()],
+    events: [postedInvoiceEvent({ id: 'event-other-order', sourceEntityId: 'so-2' })],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  for (const syncLogId of ['sync-invoice-update', 'sync-invoice-update-2']) {
+    const result = resultBySyncLog(report, syncLogId)
+    assert.equal(result.action, 'skipped', `${syncLogId} must not be repaired over a real collision`)
+    assert.equal(result.reason, 'external_reference_claimed_elsewhere: different_source_document')
+  }
+  assert.equal(createdEvents.length, 0, 'a refused claim writes nothing, contested or not')
+  assert.equal(
+    logsByAction(createdLogs, 'revision_claim_order_unverified').length,
+    0,
+    'a cross-document collision must never be audited as an unorderable pair',
+  )
+  assert.equal(report.summary.created, 0)
+})
+
+test('o3d-cvj9 r4: a CONTESTED revision whose id is held by an unrelated event type is skipped, not repaired', async () => {
+  const { client, createdEvents } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog(), secondInvoiceUpdateLog()],
+    events: [postedInvoiceEvent({ id: 'event-credit-note', type: 'CREDIT_NOTE' })],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  for (const syncLogId of ['sync-invoice-update', 'sync-invoice-update-2']) {
+    assert.equal(resultBySyncLog(report, syncLogId).reason, 'external_reference_claimed_elsewhere: unrelated_event_type')
+  }
+  assert.equal(createdEvents.length, 0)
+})
+
+test('o3d-cvj9 r4: a CONTESTED revision whose id is FREE is still repaired unclaimed', async () => {
+  // `no_holder` is not a collision — nothing else claims this id. The repair still declines to take
+  // it, because two edits of one document are still unordered, but it must not be reported as a
+  // cross-document refusal.
+  const { client, createdEvents } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog(), secondInvoiceUpdateLog()],
+    events: [],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  for (const syncLogId of ['sync-invoice-update', 'sync-invoice-update-2']) {
+    const result = resultBySyncLog(report, syncLogId)
+    assert.equal(result.action, 'created')
+    assert.equal(result.reason, 'created_missing_mirror_unclaimed_revision_order_unverified')
+  }
+  assert.deepEqual(createdEvents.map((_, index) => createdEventData(createdEvents, index).externalId), [null, null])
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r4 — Codex r3 finding 3: a repaired row that HOLDS the id must stay orderable.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-cvj9 r4: a repaired revision records the basis on which it can later be superseded', async () => {
+  const { client, createdEvents } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog({ id: 'sync-only-edit' })],
+    events: [postedInvoiceEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  assert.equal(resultBySyncLog(report, 'sync-only-edit').reason, 'created_missing_mirror_after_superseding_prior_revision')
+  assert.equal(createdEventData(createdEvents).externalId, 'INV-9')
+  assert.equal(
+    createdEventData(createdEvents).revisionOrderBasis,
+    'historical_backfill_repair',
+    'without it the repaired claimant has no stamp and no create rule, so every later live revision is refused for ever',
+  )
+  // The stamp itself stays null: no honest value exists for a historical post.
+  assert.equal(createdEventData(createdEvents).externalRevisionAt ?? null, null)
+})
+
+test('o3d-cvj9 r4: a repaired JOURNAL row records no revision-ordering basis', async () => {
+  // A journal batch never contends for a document id, so a basis on it would assert nothing.
+  const { client, createdEvents } = makeClient({ syncLogs: [syncedJournalLog()] })
+
+  await runTestBackfill({ client: client as never, dryRun: false })
+
+  assert.equal(createdEventData(createdEvents).revisionOrderBasis ?? null, null)
 })

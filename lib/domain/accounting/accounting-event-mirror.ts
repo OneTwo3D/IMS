@@ -311,6 +311,41 @@ export function accountingDocumentRevisionFamily(type: string): string | null {
 }
 
 /**
+ * o3d-cvj9 r4: every sync type that REVISES the document a family's CREATE type posted.
+ *
+ * Read by the administrative backfill, which has to ask "how many revisions of this document could
+ * already have posted?" against the sync-log table rather than against whatever happens to be in
+ * the batch in front of it (see `findContestedRevisionDocuments`). Derived from the SAME family
+ * table as the mirror's lineage guard and reconciliation's exemption, so a family added in one
+ * place cannot be missed by the other two.
+ */
+export function accountingDocumentRevisionSyncTypes(family: string): readonly string[] {
+  return DOCUMENT_REVISION_FAMILIES[family] ?? []
+}
+
+/**
+ * o3d-cvj9 r4: `accounting_events.revisionOrderBasis` for a row the ADMINISTRATIVE BACKFILL wrote.
+ *
+ * It is a CATEGORY, never a clock, and it records one specific provable fact about the row:
+ *
+ *   the write this row mirrors had ALREADY been recorded complete on its sync log when the backfill
+ *   selected it, and the backfill only selects a sync log for a document that has NO mirrored event
+ *   of that revision type at all.
+ *
+ * Both halves are load-bearing, and both are enforced in `accounting-event-backfill.ts`: a claimant
+ * is only ever built from a POSTED draft carrying the external id the log recorded, and
+ * `hasMirroredAccountingEvent` matches on (connector, type, sourceEntityType, sourceEntityId), so a
+ * document with ANY mirrored revision event — including the PENDING row every live revision gets at
+ * ENQUEUE — is excluded from the candidate set entirely.
+ *
+ * Together they say: every live revision that can later contend with this row was enqueued after
+ * this row's write had finished, so its write is the later one. That is a causal ordering, not a
+ * comparison of two clocks, which is why `documentRevisionHolderPrecedes` may act on it without
+ * inventing a tie-break. See rule 3 there.
+ */
+export const HISTORICAL_BACKFILL_REVISION_ORDER_BASIS = 'historical_backfill_repair'
+
+/**
  * o3d-cvj9 r3: WHICH OF TWO EVENTS DESCRIBES THE DOCUMENT AS IT NOW STANDS.
  *
  * Round 2 answered this from `accounting_events.createdAt`, arguing that a mirrored event is
@@ -327,21 +362,46 @@ export function accountingDocumentRevisionFamily(type: string): string | null {
  * There are exactly two things we can say truthfully about which of two events describes the
  * document now, and this function says only those two:
  *
- * 1. THE CREATE ALWAYS PRECEDES ITS REVISIONS. A document cannot be revised before it exists, so
- *    the event that CREATED it cannot describe a later state than an event that revises it. No
- *    clock is involved and none is needed. This is the ordinary create -> first-edit handover, so
- *    it keeps working for every document whose create predates the `externalRevisionAt` column.
- *    (A replayed create never re-applies an edit after the fact: the processor short-circuits a
- *    sync log that already carries an external id without calling the connector, and a genuine
- *    replay that does call it goes out under the same Xero idempotency key, which returns the
- *    original record rather than writing a new revision.)
- *
- * 2. REVISION AGAINST REVISION IS ORDERED BY THE EXTERNAL SYSTEM, OR NOT AT ALL. Xero stamps
+ * 1. THE EXTERNAL SYSTEM'S OWN STAMPS, WHENEVER BOTH SIDES HAVE ONE. Xero stamps
  *    `Invoice.UpdatedDateUTC` on the document as it applies each write and hands it back in the
  *    response to that write. Two writes to one invoice are serialised by Xero, against one clock,
  *    so those stamps are the order in which the edits were APPLIED — which is the only order that
  *    decides what the document says. `externalRevisionAt` carries that value and nothing else; it
  *    is never derived from a local clock, because a comparison key mixing two clocks is not a key.
+ *
+ *    o3d-cvj9 r4 (Codex r3 finding 4): this rule is checked FIRST, including when the holder is the
+ *    document's CREATE. r3 short-circuited on the holder's TYPE before ever looking at the stamps,
+ *    on the argument that a replayed create can never re-apply itself after an edit: the processor
+ *    short-circuits a sync log that already carries an external id without calling the connector,
+ *    and a genuine replay that does call it goes out under the same Xero `Idempotency-Key`, which
+ *    returns the original record. THE SECOND HALF OF THAT IS NOT A GUARANTEE. Xero honours an
+ *    idempotency key for SIX MINUTES; past that window the same request is a fresh one, and
+ *    `POST /Invoices` carrying an `InvoiceNumber` that already exists UPDATES that invoice. So a
+ *    create whose sync log is re-claimed and re-posted more than six minutes later DOES write the
+ *    create's content over an edit that landed in between — and Xero stamps that write, so the
+ *    create row ends up carrying a LATER `externalRevisionAt` than the revision it overwrote.
+ *    Comparing the stamps first is what makes rule 2 safe to keep.
+ *
+ * 2. THE CREATE PRECEDES ITS REVISIONS — as the fallback, when the stamps cannot answer. A document
+ *    cannot be revised before it exists, so the event that CREATED it cannot describe a later state
+ *    than an event that revises it. No clock is involved and none is needed. This is what carries
+ *    the ordinary create -> first-edit handover for every document whose create predates the
+ *    `externalRevisionAt` column, and for the processor's short-circuit path, which makes no
+ *    connector call and so records no stamp.
+ *
+ *    It applies only while the holding CREATE has NO stamp of its own. A stamped create has made a
+ *    write this code can see the time of; if the arriving revision brings no stamp to compare it
+ *    with, there is nothing to decide the pair on and it is refused rather than assumed.
+ *
+ * 3. A HISTORICAL BACKFILL REPAIR PRECEDES ANY LIVE WRITE — see
+ *    `HISTORICAL_BACKFILL_REVISION_ORDER_BASIS` for why this is causal rather than a clock
+ *    comparison. o3d-cvj9 r4 (Codex r3 finding 3): without it, a backfilled revision that holds a
+ *    claim carries no stamp and is not the create, so rule 1 cannot order it and rule 2 does not
+ *    reach it — every later live revision of that document is refused, FOR EVER, and the ledger is
+ *    frozen naming a historical edit as the document's current state. Fail-closed, but permanent,
+ *    and permanence is its own defect. The arriving side must carry a real external stamp, which is
+ *    what makes it a live write made after the repair row existed: a second backfill run brings no
+ *    stamp, so backfill-against-backfill stays unordered.
  *
  * Anything else is `null` — NOT ORDERED. A missing stamp on either side (the row predates the
  * column, the connector returned none, an administrative backfill wrote the row) and an exact tie
@@ -351,21 +411,35 @@ export function accountingDocumentRevisionFamily(type: string): string | null {
  * Returns true when the HOLDER is the earlier write and may hand its claim over, false when the
  * holder is the later one (the arriving row is a stale replay), `null` when the two are not ordered.
  */
+function finiteRevisionStamp(at: Date | null | undefined): number | null {
+  const time = at?.getTime()
+  if (time === undefined || !Number.isFinite(time)) return null
+  return time
+}
+
 function documentRevisionHolderPrecedes(
-  holder: { type: string; externalRevisionAt: Date | null },
+  holder: { type: string; externalRevisionAt: Date | null; revisionOrderBasis?: string | null },
   arriving: { externalRevisionAt?: Date | null },
   createType: string,
 ): boolean | null {
-  // Rule 1: the holder is the document's CREATE, and the arriving row revises it.
-  if (holder.type === createType) return true
+  const holderAt = finiteRevisionStamp(holder.externalRevisionAt)
+  const arrivingAt = finiteRevisionStamp(arriving.externalRevisionAt)
 
-  // Rule 2: two revisions of one document — only the external system's stamp orders them.
-  const holderAt = holder.externalRevisionAt?.getTime()
-  const arrivingAt = arriving.externalRevisionAt?.getTime()
-  if (holderAt === undefined || arrivingAt === undefined) return null
-  if (!Number.isFinite(holderAt) || !Number.isFinite(arrivingAt)) return null
-  if (holderAt === arrivingAt) return null
-  return holderAt < arrivingAt
+  // Rule 1: the external system stamped both writes, so it has already said which it applied last.
+  if (holderAt !== null && arrivingAt !== null) {
+    if (holderAt === arrivingAt) return null
+    return holderAt < arrivingAt
+  }
+
+  // Rule 2: the holder is the document's CREATE and has made no stamped write of its own.
+  if (holder.type === createType) return holderAt === null ? true : null
+
+  // Rule 3: the holder is a historical repair; the arrival is a live, externally stamped write.
+  if (holder.revisionOrderBasis === HISTORICAL_BACKFILL_REVISION_ORDER_BASIS && arrivingAt !== null) {
+    return true
+  }
+
+  return null
 }
 
 /**
@@ -390,6 +464,81 @@ export type DocumentRevisionClaimOutcome =
     }
 
 /**
+ * o3d-cvj9 r4: the LINEAGE half of a revision claim, decided without touching anything.
+ *
+ * Split out of `resolveDocumentRevisionExternalIdClaim` for Codex r3 finding 2: the administrative
+ * backfill has a path that writes an UNCLAIMED row (several revisions of one document, nothing
+ * orders them), and because that path never puts an external id on the insert it never raises the
+ * P2002 that used to carry it into the checks below. So it repaired rows whose external id belonged
+ * to a DIFFERENT source document, or to an unrelated event type, without ever noticing — the exact
+ * cross-document double post the unique index exists to catch, silently absorbed into a benign
+ * "we could not order these" repair.
+ *
+ * Both callers now go through this one function, so "what counts as a legitimate predecessor" is
+ * decided in a single place and the id-taking path and the id-declining path cannot drift apart.
+ *
+ * These four refusals are exactly the ones that are NOT about ordering:
+ *  - `not_a_revision_claim`    — nothing here claims a document id (no id, or not a POSTED revision).
+ *  - `no_holder`               — the id is free; there is no collision to classify.
+ *  - `different_source_document` / `unrelated_event_type` — a genuine collision. Fatal, always.
+ */
+export type DocumentRevisionClaimLineage =
+  | {
+      lineage: 'eligible'
+      externalId: string
+      holder: { id: string; type: string; externalRevisionAt: Date | null; revisionOrderBasis: string | null }
+      createType: string
+    }
+  | {
+      lineage: 'refused'
+      reason: 'not_a_revision_claim' | 'no_holder' | 'different_source_document' | 'unrelated_event_type'
+    }
+
+/**
+ * The refusals that mean "this external id belongs to something else", as opposed to "we could not
+ * order these two writes". A caller that declines to take a claim still has to fail on these.
+ */
+export function isCrossDocumentRevisionClaimRefusal(reason: string): boolean {
+  return reason === 'different_source_document' || reason === 'unrelated_event_type'
+}
+
+export async function inspectDocumentRevisionExternalIdClaim(
+  client: AccountingEventMirrorTransactionClient,
+  params: { connector: string; type: string; referenceType: string; referenceId: string; status: AccountingEventStatus; externalId?: string | null },
+): Promise<DocumentRevisionClaimLineage> {
+  const externalId = params.externalId?.trim() ? params.externalId : null
+  // Only a successful post owns a document id, and only a revision may take one over.
+  if (!externalId || params.status !== 'POSTED') return { lineage: 'refused', reason: 'not_a_revision_claim' }
+  const predecessorTypes = DOCUMENT_REVISION_PREDECESSOR_TYPES[params.type]
+  const createType = DOCUMENT_REVISION_FAMILY_BY_TYPE[params.type]
+  if (!predecessorTypes || !createType) return { lineage: 'refused', reason: 'not_a_revision_claim' }
+
+  const holder = await client.accountingEvent.findUnique({
+    where: { externalSystem_externalId: { externalSystem: params.connector, externalId } },
+    select: { id: true, type: true, sourceEntityType: true, sourceEntityId: true, externalRevisionAt: true, revisionOrderBasis: true },
+  })
+  if (!holder) return { lineage: 'refused', reason: 'no_holder' }
+  // The holder must be an earlier revision of the SAME source document. Anything else sharing an
+  // external id is the duplicate-post the unique index exists to catch.
+  if (holder.sourceEntityType !== params.referenceType || holder.sourceEntityId !== params.referenceId) {
+    return { lineage: 'refused', reason: 'different_source_document' }
+  }
+  if (!predecessorTypes.includes(holder.type)) return { lineage: 'refused', reason: 'unrelated_event_type' }
+
+  return {
+    lineage: 'eligible',
+    externalId,
+    createType,
+    holder: {
+      id: holder.id,
+      type: holder.type,
+      externalRevisionAt: holder.externalRevisionAt,
+      revisionOrderBasis: holder.revisionOrderBasis,
+    },
+  }
+}
+
+/**
  * o3d-cvj9: hand a document's external id from the event that last described it to the revision
  * that now does, so the revision can reach POSTED.
  *
@@ -405,7 +554,7 @@ export type DocumentRevisionClaimOutcome =
  *
  * o3d-cvj9 r2 — `stale` IS THE OTHER HALF, and r1 did not have it. r1 established that the holder
  * was a legitimate PREDECESSOR TYPE for the same document, but never that the arriving revision
- * described a LATER state than it (see `documentRevisionHolderPrecedes` for the two things that
+ * described a LATER state than it (see `documentRevisionHolderPrecedes` for the three things that
  * can be said truthfully about that). Two workers can have their writes land at Xero in one order
  * and record them in the other, so a revision whose write landed FIRST can arrive here after the
  * one that landed second has already taken the id — and it would take it straight back, leaving
@@ -420,27 +569,15 @@ export async function resolveDocumentRevisionExternalIdClaim(
   params: { connector: string; type: string; referenceType: string; referenceId: string; status: AccountingEventStatus; externalId?: string | null },
   // The external system's revision stamp for the write this arrival just made, when it made one.
   // Absent for the administrative backfill, which is repairing a historical post whose connector
-  // response was never recorded — see `documentRevisionHolderPrecedes` rule 2.
+  // response was never recorded — see `documentRevisionHolderPrecedes` rules 1 and 3.
   arriving: { externalRevisionAt?: Date | null },
 ): Promise<DocumentRevisionClaimOutcome> {
-  const externalId = params.externalId?.trim() ? params.externalId : null
-  // Only a successful post owns a document id, and only a revision may take one over.
-  if (!externalId || params.status !== 'POSTED') return { claim: 'refused', reason: 'not_a_revision_claim' }
-  const predecessorTypes = DOCUMENT_REVISION_PREDECESSOR_TYPES[params.type]
-  const createType = DOCUMENT_REVISION_FAMILY_BY_TYPE[params.type]
-  if (!predecessorTypes || !createType) return { claim: 'refused', reason: 'not_a_revision_claim' }
-
-  const holder = await client.accountingEvent.findUnique({
-    where: { externalSystem_externalId: { externalSystem: params.connector, externalId } },
-    select: { id: true, type: true, sourceEntityType: true, sourceEntityId: true, externalRevisionAt: true },
-  })
-  if (!holder) return { claim: 'refused', reason: 'no_holder' }
-  // The holder must be an earlier revision of the SAME source document. Anything else sharing an
-  // external id is the duplicate-post the unique index exists to catch.
-  if (holder.sourceEntityType !== params.referenceType || holder.sourceEntityId !== params.referenceId) {
-    return { claim: 'refused', reason: 'different_source_document' }
-  }
-  if (!predecessorTypes.includes(holder.type)) return { claim: 'refused', reason: 'unrelated_event_type' }
+  // The lineage half — is there a holder at all, and is it a legitimate predecessor of THIS
+  // document? — is shared with the backfill's decline path so the two cannot drift on what a
+  // genuine cross-document collision is. See `inspectDocumentRevisionExternalIdClaim`.
+  const lineage = await inspectDocumentRevisionExternalIdClaim(client, params)
+  if (lineage.lineage === 'refused') return { claim: 'refused', reason: lineage.reason }
+  const { holder, createType, externalId } = lineage
 
   const holderPrecedes = documentRevisionHolderPrecedes(holder, arriving, createType)
   if (holderPrecedes === null) return { claim: 'refused', reason: 'recency_indeterminate' }

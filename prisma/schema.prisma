@@ -2274,6 +2274,13 @@ model AccountingEvent {
   // established" (the connector returned none, the row predates this column, or an administrative
   // backfill wrote it) and is never guessed at — see documentRevisionHolderPrecedes.
   externalRevisionAt DateTime?
+  // o3d-cvj9 r4: on what basis this row can be ordered against another revision of the same
+  // document when neither side has an `externalRevisionAt` to compare. A CATEGORY, never a clock.
+  // The only value written is `historical_backfill_repair`, set by the administrative backfill —
+  // see HISTORICAL_BACKFILL_REVISION_ORDER_BASIS for the fact it asserts and why that fact is
+  // causal rather than a comparison of two clocks. Null everywhere else, including on every row
+  // the live mirror writes: a live write records its stamp instead.
+  revisionOrderBasis String?
   reversalOfId     String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
