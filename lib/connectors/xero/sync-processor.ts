@@ -2264,6 +2264,22 @@ const POST_EFFECT_JOURNAL = {
   effect: 'POSTED a manual journal to the Xero ledger',
   remedy: 'The journal is in the ledger: post a reversing journal there if it should not exist.',
 } as const
+/**
+ * o3d-e2mz r5 (Codex finding 2): A DRAFT JOURNAL'S REMEDY IS NOT A REVERSAL — IT IS A DELETION.
+ *
+ * `_postingMode` is a per-sync-type operator setting, and on `draft` the journal is created in Xero
+ * with status DRAFT (see resolveJournalStatus). A draft manual journal has not reached the ledger:
+ * no account balance has moved. Telling an operator to "post a reversing journal" for one is the most
+ * dangerous line in this table — the reversal WOULD post, so following the advice takes a document
+ * that moved nothing and turns it into a real, one-sided movement of exactly the amount they were
+ * trying to undo. The draft is then still sitting there as well.
+ */
+const POST_EFFECT_DRAFT_JOURNAL = {
+  effect: 'created a DRAFT manual journal in Xero (nothing posted to the ledger)',
+  remedy: 'The journal is a DRAFT — it has not reached the ledger and no balances have moved. DELETE the draft '
+    + 'in Xero if it should not exist. Do NOT post a reversing journal: a reversal posts for real, so it would '
+    + 'move the accounts by exactly the amount this draft never moved.',
+} as const
 const POST_EFFECT_PAYMENT = {
   effect: 'APPLIED a payment in Xero',
   remedy: 'A payment is applied against the document named above: remove or reverse THAT PAYMENT in Xero if it '
@@ -2335,6 +2351,21 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
 }
 
 /**
+ * The table above answers "what does posting this TYPE do"; the posting mode answers "did it actually
+ * reach the ledger". Only the journal types have a mode that changes the answer, and the branch is
+ * keyed on the shared constant rather than on a type list, so a journal type added to the table gets
+ * the draft wording for free. `resolveJournalStatus` is reused rather than re-tested so the remedy
+ * cannot drift from the status the request was actually sent with.
+ */
+function postEffectFor(type: AccountingSyncType, payload: SyncPayload): { effect: string; remedy: string } {
+  const effect = POST_EFFECT[type]
+  if (effect === POST_EFFECT_JOURNAL && resolveJournalStatus(payload._postingMode) === 'DRAFT') {
+    return POST_EFFECT_DRAFT_JOURNAL
+  }
+  return effect
+}
+
+/**
  * o3d-e2mz: DID AN OPERATOR DECIDE ABOUT THIS ATTEMPT WHILE IT WAS POSTING?
  *
  * ESCALATION ONLY. It writes NOTHING to the sync row, and that is the whole of this branch's rebase
@@ -2357,13 +2388,15 @@ async function reportPostOnMovedAttempt(
   attempt: AttemptRef,
   entry: { type: AccountingSyncType; referenceType: string; referenceId: string },
   externalId: string | null,
+  /** Read ONLY for `_postingMode` — see postEffectFor, and why a DRAFT journal's remedy differs. */
+  payload: SyncPayload,
 ): Promise<void> {
   const current = await db.accountingSyncLog.findUnique({
     where: { id: attempt.id },
     select: { status: true, attemptRevision: true },
   })
   if (current && current.attemptRevision === attempt.attemptRevision) return
-  const effect = POST_EFFECT[entry.type]
+  const effect = postEffectFor(entry.type, payload)
   await logActivity({
     entityType: 'SYSTEM',
     action: 'xero_sync_post_fenced_out',
@@ -2492,7 +2525,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         }
         // o3d-e2mz: the record above is deliberately unfenced, so it lands even when the attempt has
         // moved. Whether it moved is still news for whoever moved it — see reportPostOnMovedAttempt.
-        await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId)
+        await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId, payload)
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
@@ -2603,7 +2636,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           continue
         }
         // o3d-e2mz: see reportPostOnMovedAttempt — the persist is unfenced by design, the news is not.
-        await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null)
+        await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null, payload)
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
@@ -2980,7 +3013,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         }
         // o3d-e2mz: see reportPostOnMovedAttempt — the record above is unfenced by design, the news
         // that an operator's decision about this attempt is now known to be wrong is not.
-        await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId)
+        await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId, payload)
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
@@ -3115,7 +3148,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           continue
         }
         // o3d-e2mz: see reportPostOnMovedAttempt.
-        await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null)
+        await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null, payload)
 
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)

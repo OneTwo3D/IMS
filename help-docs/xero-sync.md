@@ -1836,9 +1836,11 @@ in the Activity log with the action `xero_sync_post_fenced_out`, which:
   applied payment, an in-place edit of an existing document, or an effect that creates nothing in the
   ledger at all (an invoice PDF, an invoice email, a WooCommerce note, a bill attachment, a
   credit-note allocation);
-- and states the remedy that matches: void or credit-note the document, post a reversing journal,
-  remove the payment, correct the edited document — or, for the effects that create nothing, that
-  there is nothing to reverse.
+- and states the remedy that matches: void or credit-note the document, post a reversing journal
+  (or, for a journal sent in **draft** posting mode, **delete the draft** — a draft has not reached
+  the ledger, so posting a reversal would move the accounts by exactly the amount the draft never
+  moved), remove the payment, correct the edited document — or, for the effects that create nothing,
+  that there is nothing to reverse.
 
 So if you settled a row as "it did NOT post" and it turns out it did, you are told, with the id and
 with the right remedy, rather than the assertion being quietly believed.

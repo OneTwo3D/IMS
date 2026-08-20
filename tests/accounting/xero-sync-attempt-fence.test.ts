@@ -25,8 +25,25 @@ const accountingSyncLog = new Proxy({}, {
   get: (_target, prop: string) => (args: never) => (store.delegate[prop] as (a: never) => Promise<unknown>)(args),
 })
 
+/**
+ * o3d-e2mz r5: the SALES ORDER behind a row, which the fence-loss recovery now reads to decide
+ * whether there is still a sale for the work to belong to. `null` makes the read THROW, which is the
+ * unreadable case.
+ *
+ * A DOUBLE CORRECTION, not an addition: without this delegate every SalesOrder-referenced test in
+ * this file was silently taking the unreadable branch (the stub had no `salesOrder`, so the read
+ * threw), and the "a live sale still settles" property could not have been observed at all.
+ */
+let salesOrders: Map<string, { status: string }> | null = null
+
 const dbStub = {
   accountingSyncLog,
+  salesOrder: {
+    findUnique: async ({ where }: { where: { id: string } }) => {
+      if (!salesOrders) throw new Error('sales order read unavailable')
+      return salesOrders.get(where.id) ?? null
+    },
+  },
   $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => {
     const hook = interleave
     interleave = null
@@ -69,6 +86,7 @@ function reset(rows: Parameters<typeof createSyncLogStore>[0]) {
   store = createSyncLogStore(rows)
   interleave = null
   activity.length = 0
+  salesOrders = new Map([['order-1', { status: 'PROCESSING' }]])
 }
 
 const POSTED_ROW = {
@@ -465,4 +483,152 @@ test('o3d-e2mz r4: a fence loss on a type that creates NO document says so, and 
   )
   assert.equal(escalation.metadata?.externalId, null)
   assert.equal(escalation.metadata?.evidence, 'NO_EXTERNAL_ID')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-e2mz r5 (Codex finding 1) — DETECTING THE CANCELLATION WINDOW IS NOT THE SAME AS NOT WALKING
+// THROUGH IT.
+//
+// r4 routed a fence-losing worker into the evidence path: the id is recorded, an ERROR names the
+// document. It then left the row SYNCED with an external id — which is exactly the candidate shape
+// repairXeroBackReferences selects on (`status IN (SYNCED, FAILED) AND externalTransactionId IS NOT
+// NULL`). Minutes later that sweep stamped the Xero id onto the CANCELLED order and enqueued its
+// follow-ups: the PDF, the email, the WooCommerce note, and the PAYMENT. Cancellation exists to stop
+// exactly that work, and the recovery restarted it automatically with no operator involved.
+//
+// The row is now terminalised as CANCELLED instead. Both statuses stop a second post; only SYNCED
+// re-enters the pipeline.
+// ---------------------------------------------------------------------------
+
+const SALES_ROW = {
+  id: 'log-1',
+  type: 'SALES_INVOICE',
+  referenceType: 'SalesOrder',
+  referenceId: 'order-1',
+  externalTransactionId: 'XERO-INV-1',
+}
+
+/** The candidate shape repairXeroBackReferences selects on. */
+function wouldBeSweptForRepair(row: { status: string; externalTransactionId: string | null } | undefined): boolean {
+  return !!row && row.externalTransactionId !== null && (row.status === 'SYNCED' || row.status === 'FAILED')
+}
+
+test('o3d-e2mz r5: a fence loss on a CANCELLED sale records the document but does NOT hand the sweep its work', async () => {
+  // The window itself: the cancellation sweep retired this claimed row and bumped the attempt while
+  // the worker was mid-post. Under r4 the row came back SYNCED and the back-reference sweep then
+  // wrote the invoice id onto the cancelled order and enqueued its payment.
+  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
+  salesOrders = new Map([['order-1', { status: 'CANCELLED' }]])
+  interleave = () => {
+    Object.assign(store.get('log-1')!, {
+      status: 'CANCELLED',
+      attemptRevision: 9,
+      externalTransactionId: null,
+      errorMessage: 'Cancelled: order cancelled before this invoice posted (no revenue to recognise).',
+    })
+  }
+
+  await (await loadProcessor())()
+
+  const row = store.get('log-1')
+  assert.equal(row?.externalTransactionId, 'XERO-INV-1', 'the document that exists is still named on the row')
+  assert.equal(row?.status, 'CANCELLED', 'and the row is NOT promoted to SYNCED')
+  assert.equal(
+    wouldBeSweptForRepair(row),
+    false,
+    'so repairXeroBackReferences will never pick it up and enqueue the cancelled sale\'s follow-ups',
+  )
+  assert.equal(row?.syncedAt, null, 'a cancelled sale has no successful sync to date-stamp')
+
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.level, 'ERROR')
+  assert.equal(escalation?.metadata?.evidence, 'RECORDED_ON_CANCELLED_SALE')
+  assert.match(escalation?.description ?? '', /SALE IT BELONGS TO IS CANCELLED/)
+  assert.match(escalation?.description ?? '', /none of its follow-ups \(PDF, email, payment, attachment\) are enqueued/)
+})
+
+test('o3d-e2mz r5: a fence loss on a LIVE sale still settles the row, so the legitimate repair is untouched', async () => {
+  // THE COUNTER-GUARD. The other reason a row reads CANCELLED is an operator settling it as "did not
+  // post" — and for that row the sweep's back-reference and follow-ups ARE the correct repair. A fix
+  // that keyed on the ROW's status instead of the SALE's would have stopped this one too.
+  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
+  interleave = () => {
+    Object.assign(store.get('log-1')!, {
+      status: 'CANCELLED',
+      attemptRevision: 9,
+      externalTransactionId: null,
+      errorMessage: 'Operator verified: never posted',
+    })
+  }
+
+  await (await loadProcessor())()
+
+  const row = store.get('log-1')
+  assert.equal(row?.status, 'SYNCED', 'the sale is live, so the document is a real posting to reconcile')
+  assert.equal(wouldBeSweptForRepair(row), true, 'and the back-reference sweep must still be able to finish the job')
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
+})
+
+test('o3d-e2mz r5: a sale that cannot be read fails CLOSED — the work is held, not released', async () => {
+  // Same rule guardCancelledSalesOrderInvoice applies: a transient read outage must not become
+  // permission to carry on for a sale that may not exist. The evidence note says how to release it.
+  reset([syncLogRow({ ...SALES_ROW, status: 'PENDING', attemptRevision: 3 })])
+  salesOrders = null
+  interleave = () => {
+    Object.assign(store.get('log-1')!, { status: 'CANCELLED', attemptRevision: 9, externalTransactionId: null })
+  }
+
+  await (await loadProcessor())()
+
+  const row = store.get('log-1')
+  assert.equal(row?.externalTransactionId, 'XERO-INV-1')
+  assert.equal(row?.status, 'CANCELLED')
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'RECORDED_SALE_UNREADABLE')
+  assert.match(escalation?.description ?? '', /retry the row from the sync log/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-e2mz r5 (Codex finding 2) — A DRAFT JOURNAL IS NOT REVERSED, IT IS DELETED.
+//
+// `_postingMode: 'draft'` sends the journal to Xero as DRAFT, which moves no balances. "Post a
+// reversing journal" is then the most dangerous sentence in the remedy table: the reversal DOES post,
+// so an operator following it moves the accounts by exactly the amount the draft never moved.
+// ---------------------------------------------------------------------------
+
+test('o3d-e2mz r5: a DRAFT journal fence loss says DELETE THE DRAFT, and never says post a reversing journal', async () => {
+  reset([syncLogRow({
+    ...POSTED_ROW,
+    status: 'PENDING',
+    attemptRevision: 3,
+    payload: { _postingMode: 'draft' },
+  })])
+  fenceOutOnWriteback()
+
+  await (await loadProcessor())()
+
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.ok(escalation)
+  assert.match(escalation.description, /created a DRAFT manual journal in Xero \(nothing posted to the ledger\)/)
+  assert.match(escalation.description, /DELETE the draft/)
+  assert.doesNotMatch(
+    escalation.description,
+    /post a reversing journal there/,
+    'a reversal of a draft posts for real and moves the accounts by itself',
+  )
+  assert.equal(escalation.metadata?.postEffect, 'created a DRAFT manual journal in Xero (nothing posted to the ledger)')
+})
+
+test('o3d-e2mz r5: a SUBMITTED journal keeps the reversing-journal remedy', async () => {
+  // The counter-guard for the branch above: the draft wording must not leak onto a journal that
+  // really is in the ledger, where deleting it is not an option and a reversal is the answer.
+  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3, payload: { _postingMode: 'submitted' } })])
+  fenceOutOnWriteback()
+
+  await (await loadProcessor())()
+
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.match(escalation?.description ?? '', /post a reversing journal there/)
+  assert.doesNotMatch(escalation?.description ?? '', /DELETE the draft/)
 })
