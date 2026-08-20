@@ -27,24 +27,35 @@ const state = {
   invoices: [] as XeroInvoice[],
   salesOrders: [] as Row[],
   purchaseInvoices: [] as Row[],
+  /** AccountingSyncLog rows: the BILL_PAYMENT / INVOICE_PAYMENT registrations IMS holds. */
+  syncLogs: [] as Row[],
   attempts: 0,
   activity: [] as LoggedActivity[],
-  notifications: [] as { title?: string; message?: string }[],
+  notifications: [] as { title?: string; message?: string; userId?: string | null }[],
   chargebacks: [] as string[],
   purchaseInvoiceUpdates: [] as { id: unknown; data: Row }[],
   salesOrderUpdates: [] as { id: unknown; data: Row }[],
+  /** Every cursor write the drain made. Empty means the chunk was NOT checkpointed. */
+  settingUpserts: [] as unknown[],
+  /** Set to make the activity-log / notification write REPORT failure, as the real ones do. */
+  activityWriteFails: false,
+  notificationWriteFails: false,
 }
 
 function reset(): void {
   state.invoices = []
   state.salesOrders = []
   state.purchaseInvoices = []
+  state.syncLogs = []
   state.attempts = 0
   state.activity = []
   state.notifications = []
   state.chargebacks = []
   state.purchaseInvoiceUpdates = []
   state.salesOrderUpdates = []
+  state.settingUpserts = []
+  state.activityWriteFails = false
+  state.notificationWriteFails = false
 }
 
 /** Just enough Prisma `where` to answer the poller's own queries honestly. */
@@ -70,11 +81,27 @@ function rowMatches(row: Row, where: Row | undefined): boolean {
   return true
 }
 
+// Both real helpers SWALLOW their write failures and report them through the *Persisted variants —
+// the doubles do the same, so a test can make the write fail without making the call throw.
 mock.module('@/lib/activity-log', {
-  namedExports: { logActivity: async (entry: LoggedActivity) => { state.activity.push(entry) } },
+  namedExports: {
+    logActivity: async (entry: LoggedActivity) => { if (!state.activityWriteFails) state.activity.push(entry) },
+    logActivityPersisted: async (entry: LoggedActivity) => {
+      if (state.activityWriteFails) return false
+      state.activity.push(entry)
+      return true
+    },
+  },
 })
 mock.module('@/lib/notifications', {
-  namedExports: { notify: async (n: { title?: string; message?: string }) => { state.notifications.push(n) } },
+  namedExports: {
+    notify: async (n: { title?: string; message?: string }) => { if (!state.notificationWriteFails) state.notifications.push(n) },
+    notifyPersisted: async (n: { title?: string; message?: string }) => {
+      if (state.notificationWriteFails) return false
+      state.notifications.push(n)
+      return true
+    },
+  },
 })
 mock.module('@/lib/connectors/xero/payment-write-lock', {
   namedExports: {
@@ -105,7 +132,7 @@ mock.module('@/lib/db', {
     db: {
       setting: {
         findUnique: async () => ({ key: 'xero_last_payment_poll', value: new Date(Date.now() - 60_000).toISOString() }),
-        upsert: async () => ({}),
+        upsert: async (args: unknown) => { state.settingUpserts.push(args); return {} },
       },
       user: { findMany: async () => [{ id: 'admin_1' }] },
       salesOrderRefund: { findFirst: async () => null },
@@ -116,6 +143,9 @@ mock.module('@/lib/db', {
           state.salesOrderUpdates.push({ id: where.id, data })
           return {}
         },
+      },
+      accountingSyncLog: {
+        findMany: async ({ where }: { where: Row }) => state.syncLogs.filter((r) => rowMatches(r, where)),
       },
       purchaseInvoice: {
         findMany: async ({ where }: { where: Row }) => state.purchaseInvoices.filter((r) => rowMatches(r, where)),
@@ -261,7 +291,10 @@ test('a PART-paid sales invoice raises NO chargeback and keeps paidAt (o3d-clxw)
   assert.deepEqual(clearedPaidAt(state.salesOrderUpdates), [])
   assert.equal(result.salesReversed, 0)
   assert.equal(result.salesReversalsWithheld, 1)
-  assert.deepEqual(state.notifications, [], 'no "payment reversal detected" alert for a payment that is present')
+  assert.equal(state.notifications.some((n) => n.title === 'Payment reversal detected'), false,
+    'no "payment reversal detected" alert for a payment that is present')
+  assert.equal(state.notifications.filter((n) => n.title === 'Payment reversal withheld').length, 1,
+    'the disagreement itself IS alerted — an activity row in a firehose is a record, not an alert (o3d-clxw r2)')
 
   const withheld = state.activity.find((a) => a.action === 'payment_reversal_withheld')
   assert.ok(withheld)
@@ -282,4 +315,222 @@ test('a sales invoice whose payment really is gone is still reversed and charged
   assert.equal(result.salesReversed, 1)
   assert.equal(result.salesReversalsWithheld, 0)
   assert.equal(state.notifications.length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-clxw ROUND 2 — WHOSE PAYMENT IS GONE?
+//
+// Round 1 asked "does the ledger hold ANY payment". A residual payment somebody applied in Xero
+// AFTER deleting the one IMS registered answers yes, so the reversal was withheld for ever: the
+// supplier payment IMS believes it made is gone, the cursor moves past the invoice, and the bill
+// reads settled until a human happens to reconcile it.
+// ---------------------------------------------------------------------------
+
+/** A BILL_PAYMENT registration IMS holds against bill pi_1. */
+function billRegistration(overrides: Row = {}): Row {
+  return {
+    id: 'log_1',
+    connector: 'xero',
+    type: 'BILL_PAYMENT',
+    referenceType: 'PurchaseInvoice',
+    referenceId: 'pi_1',
+    status: 'SYNCED',
+    externalTransactionId: 'PAY-OURS',
+    syncedAt: new Date(Date.now() - 5 * 60_000),
+    ...overrides,
+  }
+}
+
+function salesRegistration(overrides: Row = {}): Row {
+  return {
+    id: 'log_s1',
+    connector: 'xero',
+    type: 'INVOICE_PAYMENT',
+    referenceType: 'SalesOrder',
+    referenceId: 'so_1',
+    status: 'SYNCED',
+    externalTransactionId: 'PAY-OURS-S',
+    syncedAt: new Date(Date.now() - 5 * 60_000),
+    ...overrides,
+  }
+}
+
+test('OUR supplier payment deleted with a smaller one left behind IS a reversal, not a part payment (o3d-clxw r2)', async () => {
+  reset()
+  // IMS registered 500 (payment PAY-OURS). Somebody in Xero deleted it and applied 20 of their own.
+  // Round 1 reads AmountPaid 20 as "a payment is present" and keeps paidAt for ever.
+  state.invoices = [bill({ AmountPaid: 20, AmountDue: 480, Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates).map((u) => u.id), ['pi_1'],
+    'the payment IMS registered is not among the payments Xero lists, so it is gone and paidAt must be cleared')
+  assert.equal(result.billsReversed, 1)
+  assert.equal(result.billReversalsWithheld, 0)
+
+  const detected = state.activity.find((a) => a.action === 'bill_payment_reversal_detected')
+  assert.ok(detected, 'the reversal must be logged')
+  assert.match(detected.description ?? '', /PAY-OURS/)
+  assert.match(detected.description ?? '', /still shows 20\.00 paid/)
+  assert.match(detected.description ?? '', /residual payment is somebody else's/)
+})
+
+test('a residual payment that IS ours is still a part payment: paidAt kept, and the warning says whose it is', async () => {
+  reset()
+  // Xero lists our payment, so the shortfall is a genuine part payment (the bill was edited upward).
+  state.invoices = [bill({ AmountPaid: 400, AmountDue: 100, Payments: [{ PaymentID: 'pay-ours' }] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [],
+    'our payment is still in the ledger — clearing paidAt would re-arm Mark Paid over money already sent')
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
+
+  const withheld = state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')
+  assert.equal(withheld?.metadata?.registrationVerdict, 'STILL_HELD')
+  assert.match(withheld?.description ?? '', /payment IMS registered \(PAY-OURS\) is still among the payments/)
+})
+
+test('a registration that finished AFTER the Xero read cannot be declared gone by it', async () => {
+  reset()
+  // The Mark Paid race: paidAt is set locally at once, the worker posts the payment a few seconds
+  // later. A read taken in between lists a payment that is not ours and does not list ours YET —
+  // and declaring a reversal there re-arms Mark Paid over a payment that was just made.
+  state.invoices = [bill({ AmountPaid: 20, AmountDue: 480, Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({ syncedAt: new Date(Date.now() + 60_000) })]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [],
+    'a registration this read cannot speak for withholds the verdict — the next press of Mark Paid pays a supplier')
+  assert.equal(result.billsReversed, 0)
+  assert.equal(result.billReversalsWithheld, 1)
+  const withheld = state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')
+  assert.equal(withheld?.metadata?.registrationVerdict, 'REGISTRATION_UNDECIDED')
+  assert.match(withheld?.description ?? '', /log_1/)
+})
+
+test('an in-flight (PROCESSING) registration withholds the verdict too', async () => {
+  reset()
+  state.invoices = [bill({ AmountPaid: 20, AmountDue: 480, Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration({ status: 'PROCESSING', externalTransactionId: null, syncedAt: null })]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.equal(result.billReversalsWithheld, 1)
+  assert.equal(state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')?.metadata?.registrationVerdict,
+    'REGISTRATION_UNDECIDED')
+})
+
+test('a payload that does not list the payments cannot prove ours is absent', async () => {
+  reset()
+  // No Payments array at all. Absent is not empty: reading it as "the ledger holds no payments" would
+  // manufacture the proof, which is the Number('') === 0 mistake one field over.
+  state.invoices = [bill({ AmountPaid: 20, AmountDue: 480 })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.equal(result.billReversalsWithheld, 1)
+  assert.equal(state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')?.metadata?.registrationVerdict,
+    'LEDGER_DID_NOT_LIST_PAYMENTS')
+})
+
+test('a bill IMS never registered a payment for stays a part payment: IMS has no payment to be missing', async () => {
+  reset()
+  state.invoices = [bill({ AmountPaid: 20, AmountDue: 480, Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = []
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.purchaseInvoiceUpdates), [])
+  assert.equal(result.billReversalsWithheld, 1)
+  assert.equal(state.activity.find((a) => a.action === 'bill_payment_reversal_withheld')?.metadata?.registrationVerdict,
+    'NOTHING_REGISTERED')
+})
+
+test('OUR sales payment gone with a residual one left: paidAt clears but NO chargeback is raised', async () => {
+  reset()
+  state.invoices = [{
+    InvoiceID: 'XS1', Type: 'ACCREC', Status: 'AUTHORISED', AmountPaid: 15, AmountDue: 85,
+    Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }],
+  }]
+  state.salesOrders = [paidOrderRow()]
+  state.syncLogs = [salesRegistration()]
+
+  const result = await poll()
+
+  assert.deepEqual(clearedPaidAt(state.salesOrderUpdates).map((u) => u.id), ['so_1'],
+    'the payment IMS registered is gone, so the order is not paid')
+  assert.equal(result.salesReversed, 1)
+  assert.deepEqual(state.chargebacks, [],
+    'a chargeback unwinds the WHOLE recognised revenue, and the ledger is still holding 15 against this invoice')
+  const detected = state.activity.find((a) => a.action === 'payment_reversal_detected')
+  assert.match(detected?.description ?? '', /PAY-OURS-S/)
+  assert.match(detected?.description ?? '', /NO chargeback credit note was raised automatically/)
+  const alert = state.notifications.find((n) => n.title === 'Payment reversal detected')
+  assert.match(alert?.message ?? '', /revenue was NOT unwound automatically/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-clxw ROUND 2 — A WITHHELD VERDICT THAT LEFT NO RECORD MUST NOT BE CHECKPOINTED PAST
+//
+// A withheld verdict writes nothing to the database; the warning is its only artefact. logActivity
+// and notify both swallow their own write failures, so round 1 could count a verdict, write nothing,
+// and let the drain move the cursor past an invoice the delta will never return again.
+// ---------------------------------------------------------------------------
+
+test('a withheld verdict whose warning did not reach the activity log holds the poll cursor', async () => {
+  reset()
+  state.invoices = [bill({ AmountPaid: 400, AmountDue: 100, Payments: [{ PaymentID: 'pay-ours' }] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+  state.activityWriteFails = true
+
+  const result = await poll()
+
+  assert.deepEqual(state.settingUpserts, [],
+    'checkpointing here loses the disagreement for good: the delta only returns an invoice when it CHANGES')
+  assert.equal(result.errors.length, 1)
+  assert.match(result.errors[0], /left no durable signal: the activity warning could not be written/)
+  assert.match(result.errors[0], /PO PO-0001/)
+})
+
+test('a withheld verdict whose operator alert did not land holds the poll cursor too', async () => {
+  reset()
+  state.invoices = [bill({ AmountPaid: 400, AmountDue: 100, Payments: [{ PaymentID: 'pay-ours' }] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+  state.notificationWriteFails = true
+
+  const result = await poll()
+
+  assert.deepEqual(state.settingUpserts, [])
+  assert.equal(result.errors.length, 1)
+  assert.match(result.errors[0], /left no durable signal: the operator alert could not be written/)
+})
+
+test('a withheld verdict that WAS recorded checkpoints normally', async () => {
+  reset()
+  state.invoices = [bill({ AmountPaid: 400, AmountDue: 100, Payments: [{ PaymentID: 'pay-ours' }] })]
+  state.purchaseInvoices = [paidBillRow()]
+  state.syncLogs = [billRegistration()]
+
+  const result = await poll()
+
+  assert.deepEqual(result.errors, [])
+  assert.equal(state.settingUpserts.length, 1,
+    'a recorded disagreement must not stall the poller — the cursor is held only when nothing was written')
+  assert.equal(state.notifications.filter((n) => n.title === 'Bill payment reversal withheld').length, 1)
 })

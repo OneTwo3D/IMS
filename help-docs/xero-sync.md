@@ -714,6 +714,31 @@ matters most on bills: clearing `paidAt` re-arms **Mark Paid** in the UI, and pr
 **second** supplier payment on top of the part payment. Settle the balance in Xero, or correct the
 bill total in IMS.
 
+**But a payment that is present need not be *ours*.** If somebody in Xero deletes the payment the IMS
+registered and applies a different one in its place, the ledger still holds *a* payment — and reading
+only the amount would keep the bill marked paid for ever, with the supplier never actually paid. So
+every withheld document is asked the narrower question as well: is the payment **the IMS registered**
+still listed on the invoice? The IMS records the Xero payment id when its registration posts, and
+compares it against the payments Xero lists. Only when every payment the IMS registered is provably
+absent is the reversal acted on — `paidAt` is cleared, and the log names the payment id that vanished
+and the residual amount that is somebody else's.
+
+Everything else stays withheld, and the warning now says why: the registered payment is still there
+(a genuine part payment), the IMS never registered one, Xero did not list the payments, or a
+registration had not finished when Xero was asked — the last being the few seconds between **Mark
+Paid** setting the flag and the payment actually posting, where "not listed yet" must never be read as
+"removed".
+
+On the sales side a reversal established this way clears `paidAt` but raises **no** chargeback credit
+note: a chargeback unwinds the whole recognised revenue, and the invoice still carries a payment. The
+alert says so — unwind revenue by hand if that is what the removal means.
+
+**A withheld verdict is now an alert, not just a log line.** Withholding writes nothing to the
+database, so the warning is its only record — and the poll then moves its cursor past the invoice,
+which the delta returns only when it changes again. Each withheld verdict therefore raises a
+notification to every active admin as well as the activity warning, and if either write fails the poll
+**holds its cursor** so the disagreement is re-derived on the next poll rather than lost.
+
 All four checks are answered by a **single** request that asks Xero only for invoices changed since
 the last successful poll, using the `If-Modified-Since` header. The poll advances its cursor only
 when it succeeds, and deliberately re-reads the last couple of minutes each time, so a payment can

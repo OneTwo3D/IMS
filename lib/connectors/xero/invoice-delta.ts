@@ -32,6 +32,20 @@ export type XeroInvoice = {
    */
   AmountPaid?: number | string
   AmountDue?: number | string
+  /**
+   * The payments the ledger CURRENTLY HOLDS against this invoice, each carrying the id Xero issued
+   * when it created it. Returned by the Invoices LIST endpoint — the same response shape
+   * `scripts/audit-xero-live-e2e-footprint.ts` reads against the live tenant to find which payments
+   * must be released before an invoice can be voided.
+   *
+   * THIS IS THE ONLY FIELD THAT CAN ANSWER THE QUESTION THAT MATTERS (o3d-clxw round 2). AmountPaid
+   * answers "does the ledger hold ANY payment"; this answers "is the payment IMS REGISTERED still
+   * here". They are the same question only while there is exactly one payment, and they diverge the
+   * moment somebody in Xero deletes ours and leaves a smaller one behind.
+   *
+   * Optional, and absence is never read as emptiness: see listedLedgerPaymentIds.
+   */
+  Payments?: Array<{ PaymentID?: string } | null>
 }
 
 export type XeroInvoicesResponse = {
@@ -926,4 +940,136 @@ export function partitionPaymentReversals(
   }
 
   return { reversed, partPaid, unverifiable }
+}
+
+// ---------------------------------------------------------------------------
+// WHOSE PAYMENT IS GONE? (o3d-clxw round 2)
+// ---------------------------------------------------------------------------
+//
+// Round 1 fixed a reading that treated "not fully paid" as "the payment was removed". It replaced it
+// with "does the ledger hold ANY payment", which is right whenever the invoice has only ever had one.
+// It is WRONG the moment a second one exists, and then it fails in the direction that hides money:
+//
+//   IMS registers a supplier payment of 500 (Xero creates payment P1). Somebody in Xero deletes P1 —
+//   wrong bank account, wrong bill, a duplicate they are unwinding — and applies a 20 payment, P2, in
+//   its place. The invoice is AUTHORISED with AmountPaid 20. Round 1 sees a payment, calls it a PART
+//   payment, and keeps `paidAt`. The 500 IMS believes it paid is GONE and IMS will never say so: the
+//   cursor moves past the invoice, the bill reads settled for ever, and the supplier is never paid.
+//
+// The residual payment is not evidence about OUR payment. It is evidence about somebody else's. So
+// the reversal question is asked against the identity IMS recorded — the PaymentID Xero returned when
+// the BILL_PAYMENT / INVOICE_PAYMENT registration posted, stored on the sync row as
+// externalTransactionId — and answered against the payments the ledger LISTS on the invoice.
+//
+// Everything here still fails closed. A reversal verdict re-arms Mark Paid, and pressing it pays a
+// supplier twice, so "our payment is gone" must be PROVED, never inferred: proof needs a registration
+// that certainly posted before the ledger was read, and a ledger answer that certainly enumerates the
+// payments it holds. Anything less stays withheld exactly as round 1 left it.
+
+/**
+ * The payment ids the ledger states it holds against this invoice, or NULL when the payload does not
+ * state them.
+ *
+ * NULL AND EMPTY ARE DIFFERENT ANSWERS, and conflating them is the same mistake `Number('') === 0`
+ * was: an absent array means "Xero did not tell us", and reading that as "Xero holds no payments"
+ * would manufacture the proof this module exists to demand. An array containing an entry with no
+ * usable PaymentID is also NULL — a list we cannot fully read cannot establish that a particular id
+ * is missing from it.
+ *
+ * Ids are lower-cased: Xero serialises GUIDs in lower case, but a stored id that came back from a
+ * POST is compared against one that came back from a GET, and a case difference between the two must
+ * not read as "a different payment".
+ */
+export function listedLedgerPaymentIds(invoice: XeroInvoice): Set<string> | null {
+  if (!Array.isArray(invoice.Payments)) return null
+  const ids = new Set<string>()
+  for (const entry of invoice.Payments) {
+    if (entry == null || typeof entry !== 'object') return null
+    const id = (entry as { PaymentID?: unknown }).PaymentID
+    if (typeof id !== 'string') return null
+    const trimmed = id.trim()
+    if (trimmed === '') return null
+    ids.add(trimmed.toLowerCase())
+  }
+  return ids
+}
+
+/** One payment registration IMS holds for a document, reduced to what the verdict depends on. */
+export type RegisteredPaymentRow = {
+  /** The sync-log row id, so a withheld verdict can name the entry an operator has to look at. */
+  id: string
+  status: string
+  /** The ledger's id for the payment this registration created, if it got that far. */
+  externalTransactionId: string | null
+  /** When IMS recorded the registration as complete. */
+  syncedAt: Date | null
+}
+
+export type RegisteredPaymentVerdict =
+  /** Every payment IMS registered has been proved absent from the ledger's own list. A REVERSAL. */
+  | { verdict: 'GONE'; paymentIds: string[] }
+  /** At least one payment IMS registered is still listed on the invoice. Not a reversal. */
+  | { verdict: 'STILL_HELD'; paymentIds: string[] }
+  /** IMS never told the ledger about a payment, so it holds no opinion about the residual one. */
+  | { verdict: 'NOTHING_REGISTERED' }
+  /** The payload did not enumerate the payments, so absence cannot be established from it. */
+  | { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
+  /** A registration exists whose effect on the ledger this read cannot speak for. */
+  | { verdict: 'REGISTRATION_UNDECIDED'; entryIds: string[] }
+
+/**
+ * Is the payment IMS registered still in the ledger?
+ *
+ * `ledgerObservedBefore` is the instant Xero WAS ASKED. A registration that finished after it may
+ * have created a payment this snapshot never saw, so its absence from the list proves nothing — and
+ * that case is the dangerous one, because it is exactly the fifteen minutes between Mark Paid setting
+ * `paidAt` locally and the worker posting the payment. Declaring a reversal there would clear the
+ * flag over a payment that had just been made and invite a second one. It is the same fence, on the
+ * same clock, that the registration retirement on the o3d-batch-payidx sibling uses, deliberately so:
+ * the two decisions must not be able to disagree about which registrations a read can speak for.
+ *
+ * Undecided beats everything: one registration this read cannot account for withholds the whole
+ * verdict, because the document is one document and paidAt is one flag.
+ */
+export function classifyRegisteredPayment(
+  invoice: XeroInvoice,
+  registrations: RegisteredPaymentRow[],
+  ledgerObservedBefore: Date,
+): RegisteredPaymentVerdict {
+  const undecided: string[] = []
+  const posted: string[] = []
+
+  for (const row of registrations) {
+    // CANCELLED is the one status this tree only ever asserts where "nothing was sent" is true, so it
+    // holds no payment and blocks nothing.
+    if (row.status === 'CANCELLED') continue
+    // SYNCED with an id, finished before the ledger was read: the ledger's answer covers it.
+    if (
+      row.status === 'SYNCED'
+      && typeof row.externalTransactionId === 'string'
+      && row.externalTransactionId.trim() !== ''
+      && row.syncedAt != null
+      && row.syncedAt.getTime() <= ledgerObservedBefore.getTime()
+    ) {
+      posted.push(row.externalTransactionId.trim())
+      continue
+    }
+    // Everything else is a registration whose ledger effect is unknown to THIS read: PENDING (about
+    // to be sent), PROCESSING (may be on the wire now), FAILED (attempted, outcome unknown — the
+    // processor posts before it persists, so a lost response is written down as a rejection), SYNCED
+    // with no id (posted, but we do not know what it created), and SYNCED after the read.
+    undecided.push(row.id)
+  }
+
+  if (undecided.length > 0) return { verdict: 'REGISTRATION_UNDECIDED', entryIds: undecided }
+  if (posted.length === 0) return { verdict: 'NOTHING_REGISTERED' }
+
+  const listed = listedLedgerPaymentIds(invoice)
+  if (listed === null) return { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' }
+
+  const stillHeld = posted.filter((id) => listed.has(id.toLowerCase()))
+  // ALL of them, not any: with two registrations a bill can have one payment removed and one intact,
+  // and clearing paidAt there re-arms Mark Paid for the WHOLE total on top of the surviving payment.
+  if (stillHeld.length > 0) return { verdict: 'STILL_HELD', paymentIds: stillHeld }
+  return { verdict: 'GONE', paymentIds: posted }
 }

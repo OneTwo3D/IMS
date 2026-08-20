@@ -2,11 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  classifyRegisteredPayment,
   drainInvoicesModifiedSince,
   fetchInvoicesModifiedSince,
   idsWhere,
   parseLedgerAmount,
   partitionPaymentReversals,
+  listedLedgerPaymentIds,
   PAYMENT_PRESENT_EPSILON,
   MAX_CHUNKS_PER_POLL,
   MAX_PAGES,
@@ -559,4 +561,94 @@ test('parseLedgerAmount refuses to turn an empty field into zero', () => {
   assert.equal(parseLedgerAmount(0), 0)
   assert.equal(parseLedgerAmount('0'), 0)
   assert.equal(parseLedgerAmount(' 42.5 '), 42.5)
+})
+
+// ---------------------------------------------------------------------------
+// WHOSE payment is gone (o3d-clxw round 2)
+//
+// "Does the ledger hold ANY payment" and "is the payment IMS registered still here" are the same
+// question only while there is exactly one payment. They diverge the moment somebody deletes ours
+// and leaves a smaller one behind — and the first question then hides the removal for ever.
+// ---------------------------------------------------------------------------
+
+const READ_AT = new Date('2026-08-20T12:00:00.000Z')
+const BEFORE_READ = new Date('2026-08-20T11:00:00.000Z')
+const AFTER_READ = new Date('2026-08-20T12:00:01.000Z')
+
+const postedRegistration = (overrides: Partial<Parameters<typeof classifyRegisteredPayment>[1][number]> = {}) => ({
+  id: 'log_1', status: 'SYNCED', externalTransactionId: 'PAY-1', syncedAt: BEFORE_READ, ...overrides,
+})
+
+test('a listed payments array with an unreadable entry states nothing at all', () => {
+  assert.equal(listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED' }), null,
+    'an ABSENT array is "Xero did not tell us", never "Xero holds no payments"')
+  assert.equal(listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED', Payments: [{}] }), null,
+    'a list we cannot fully read cannot establish that a particular id is missing from it')
+  assert.equal(listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED', Payments: [null] }), null)
+  assert.equal(listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED', Payments: [{ PaymentID: ' ' }] }), null)
+  // An EMPTY array is a real answer: the ledger listed its payments and there are none.
+  assert.deepEqual([...listedLedgerPaymentIds({ InvoiceID: 'i', Type: 'ACCPAY', Status: 'AUTHORISED', Payments: [] })!], [])
+})
+
+test('our payment absent from a list we could read fully is GONE, even with a residual payment present', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', {
+    AmountPaid: 20, AmountDue: 480, Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }],
+  })
+  assert.deepEqual(classifyRegisteredPayment(invoice, [postedRegistration()], READ_AT),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] })
+})
+
+test('our payment still listed is STILL_HELD, whatever else the invoice carries', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', {
+    AmountPaid: 420, AmountDue: 80, Payments: [{ PaymentID: 'pay-1' }, { PaymentID: 'PAY-OTHER' }],
+  })
+  // Case-insensitive: the stored id came back from a POST, the listed one from a GET.
+  assert.deepEqual(classifyRegisteredPayment(invoice, [postedRegistration()], READ_AT),
+    { verdict: 'STILL_HELD', paymentIds: ['PAY-1'] })
+})
+
+test('one surviving registration of two keeps the whole document held', () => {
+  // Clearing paidAt here re-arms Mark Paid for the WHOLE total on top of the surviving payment.
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-2' }] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [
+      postedRegistration(),
+      postedRegistration({ id: 'log_2', externalTransactionId: 'PAY-2' }),
+    ], READ_AT),
+    { verdict: 'STILL_HELD', paymentIds: ['PAY-2'] })
+})
+
+test('a registration this read cannot speak for withholds the whole verdict', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  const cases: Array<[string, Parameters<typeof classifyRegisteredPayment>[1][number]]> = [
+    ['still queued', postedRegistration({ status: 'PENDING', externalTransactionId: null, syncedAt: null })],
+    ['on the wire', postedRegistration({ status: 'PROCESSING', externalTransactionId: null, syncedAt: null })],
+    ['attempted, outcome unknown', postedRegistration({ status: 'FAILED', externalTransactionId: null, syncedAt: null })],
+    ['posted, but we do not know what it created', postedRegistration({ externalTransactionId: null })],
+    ['finished after the ledger was read', postedRegistration({ syncedAt: AFTER_READ })],
+  ]
+  for (const [label, row] of cases) {
+    assert.deepEqual(classifyRegisteredPayment(invoice, [row], READ_AT),
+      { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_1'] }, label)
+  }
+  // And one undecided registration beats a proved-absent one: the document is one document.
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration(), postedRegistration({ id: 'log_2', syncedAt: AFTER_READ })], READ_AT),
+    { verdict: 'REGISTRATION_UNDECIDED', entryIds: ['log_2'] })
+})
+
+test('CANCELLED holds no payment and blocks nothing', () => {
+  const invoice = ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { Payments: [{ PaymentID: 'PAY-SOMEONE-ELSE' }] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ id: 'log_x', status: 'CANCELLED' }), postedRegistration()], READ_AT),
+    { verdict: 'GONE', paymentIds: ['PAY-1'] })
+  assert.deepEqual(
+    classifyRegisteredPayment(invoice, [postedRegistration({ id: 'log_x', status: 'CANCELLED' })], READ_AT),
+    { verdict: 'NOTHING_REGISTERED' })
+})
+
+test('a payload that does not list its payments cannot prove ours is absent', () => {
+  assert.deepEqual(
+    classifyRegisteredPayment(ledgerInv('b1', 'ACCPAY', 'AUTHORISED', { AmountPaid: 20 }), [postedRegistration()], READ_AT),
+    { verdict: 'LEDGER_DID_NOT_LIST_PAYMENTS' })
 })

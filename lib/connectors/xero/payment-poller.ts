@@ -30,8 +30,8 @@
 import { xeroHttpAttemptCount } from '@/lib/connectors/xero/api'
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
-import { logActivity } from '@/lib/activity-log'
-import { notify } from '@/lib/notifications'
+import { logActivity, logActivityPersisted } from '@/lib/activity-log'
+import { notify, notifyPersisted } from '@/lib/notifications'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { detectPaymentReversals } from '@/lib/domain/accounting/payment-reversal'
 import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
@@ -39,26 +39,41 @@ import { withPaymentWriteLockOrSkip, isLockSkipped } from './payment-write-lock'
 
 import {
   advanceCheckpoint,
+  classifyRegisteredPayment,
   CURSOR_OVERLAP_MS,
   drainInvoicesModifiedSince,
   idsWhere,
   parseLedgerAmount,
   partitionPaymentReversals,
   type PaymentReversalReading,
+  type RegisteredPaymentRow,
+  type RegisteredPaymentVerdict,
   type XeroInvoice,
   type XeroInvoicesResponse,
 } from './invoice-delta'
+
+/** A Xero reversal can only ever speak about rows Xero itself issued. */
+const XERO_CONNECTOR = 'xero'
 
 // A detected payment reversal / chargeback needs a human to reconcile (dispute the
 // chargeback, revert fulfilment, chase re-payment). Broadcast a warning to active
 // admins — status is never auto-reverted, so the alert is the only prompt to review a
 // shipped-but-reversed order. Fires even when a recent WC refund covered the revenue
 // side (wcHandled), since that refund may only partially explain a full payment removal.
-async function notifyReversalAdmins(order: DetectedReversalOrder, wcHandled: boolean): Promise<void> {
+async function notifyReversalAdmins(
+  order: DetectedReversalOrder,
+  wcHandled: boolean,
+  // The reversal was proved by the payment's IDENTITY while the invoice still carries a payment, so
+  // no chargeback was raised — the alert must say that, or finance reads "reversed" as "unwound".
+  registeredPaymentGone = false,
+): Promise<void> {
   const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
-  const message = wcHandled
+  const message = (wcHandled
     ? `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). A WooCommerce refund in this window already reversed revenue (no duplicate credit note raised) and paidAt was cleared — verify the refund fully covers the reversal and whether the order status should revert.`
-    : `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). paidAt was cleared and revenue unwound where applicable — review whether the order status should revert.`
+    : `Payment for order ${ref} is no longer present in Xero (status: ${order.status}). paidAt was cleared and revenue unwound where applicable — review whether the order status should revert.`)
+    + (registeredPaymentGone
+      ? ` The payment IMS registered is gone from the invoice but ANOTHER payment (or an amount Xero did not state) remains, so revenue was NOT unwound automatically — decide the credit note by hand.`
+      : '')
   const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
   await Promise.all(
     admins.map((admin) =>
@@ -73,19 +88,46 @@ async function notifyReversalAdmins(order: DetectedReversalOrder, wcHandled: boo
   )
 }
 
-/**
- * WHY A WITHHELD REVERSAL IS LOUD (o3d-clxw).
- *
- * A withheld reversal is a real disagreement: Xero says this document is not fully paid and IMS says
- * it is paid. What must NOT follow from that is the automatic reconciliation — clearing paidAt
- * re-arms Mark Paid over a supplier payment that has already been made, and on the sales side raises
- * a chargeback credit note against a payment the ledger is still holding. So the write is withheld
- * and the disagreement is reported instead, naming the amounts, for a human to settle.
- *
- * Only documents IMS currently holds as PAID are reported: the rest are ordinary unpaid invoices
- * sitting at AUTHORISED, which is what almost every AUTHORISED invoice in the window is.
- */
-function withheldReason(invoice: XeroInvoice): 'part-payment' | 'amount-not-stated' {
+// ---------------------------------------------------------------------------
+// WHY A WITHHELD REVERSAL IS LOUD, AND WHAT MAKES IT DURABLE (o3d-clxw)
+// ---------------------------------------------------------------------------
+//
+// A withheld reversal is a real disagreement: Xero says this document is not fully paid and IMS says
+// it is paid. What must NOT follow from that is the automatic reconciliation — clearing paidAt
+// re-arms Mark Paid over a supplier payment that has already been made, and on the sales side raises
+// a chargeback credit note against a payment the ledger is still holding. So the write is withheld
+// and the disagreement is reported instead, naming the amounts, for a human to settle.
+//
+// Only documents IMS currently holds as PAID are reported: the rest are ordinary unpaid invoices
+// sitting at AUTHORISED, which is what almost every AUTHORISED invoice in the window is.
+//
+// ROUND 2: REPORTING IT WAS NOT THE SAME AS RECORDING IT.
+//
+// A withheld verdict writes NOTHING to the database. It is the one outcome of this poll whose only
+// artefact is the warning — and round 1 wrote that warning with `logActivity`, which swallows its own
+// failures by design and says so in its own doc comment: "AWAITING IT PROVES NOTHING about whether the
+// entry was written. Callers that make a DECISION on the strength of having warned somebody ... must
+// use logActivityPersisted". This is exactly such a caller, and the decision is the largest one this
+// poll makes: leave a document IMS shows as PAID disagreeing with the ledger about money.
+//
+// The cursor then moved past the invoice. A checkpoint is one-way and the delta returns an invoice
+// only when it CHANGES, so a warning that failed to write was not merely lost — the disagreement
+// could never be re-derived. The bill reads settled for ever and nobody was ever told.
+//
+// So the signal is now DURABLE and FENCED:
+//   - `logActivityPersisted` and `notifyPersisted` each REPORT whether they landed, and the verdict
+//     reaches an operator through the same notification channel a DETECTED reversal uses. A row in an
+//     activity firehose is a record; it is not an alert.
+//   - if either fails, an error is pushed onto the poll result, and that is what stops the drain from
+//     checkpointing this chunk. The window is re-read on the next poll and the verdict re-derived.
+//
+// Holding the cursor on a write that did not land is the rule every other pass in this poll already
+// follows. The alternative is checkpointing past a money disagreement nobody was told about, which is
+// the defect itself.
+
+type WithheldAmountReason = 'part-payment' | 'amount-not-stated'
+
+function withheldReason(invoice: XeroInvoice): WithheldAmountReason {
   return parseLedgerAmount(invoice.AmountPaid) === null ? 'amount-not-stated' : 'part-payment'
 }
 
@@ -94,89 +136,259 @@ function ledgerAmountText(value: unknown): string {
   return parsed === null ? 'an amount Xero did not state' : parsed.toFixed(2)
 }
 
-async function reportWithheldBillReversals(reading: PaymentReversalReading, result: PollResult): Promise<void> {
-  const withheld = new Map([...reading.partPaid, ...reading.unverifiable].map((i) => [i.InvoiceID, i]))
-  if (withheld.size === 0) return
-
-  const bills = await db.purchaseInvoice.findMany({
-    where: { accountingInvoiceId: { in: [...withheld.keys()] }, paidAt: { not: null } },
-    select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true } } },
-  })
-  for (const bill of bills) {
-    const invoice = bill.accountingInvoiceId ? withheld.get(bill.accountingInvoiceId) : undefined
-    if (!invoice) continue
-    const reason = withheldReason(invoice)
-    result.billReversalsWithheld++
-    await logActivity({
-      entityType: 'PURCHASE_ORDER',
-      entityId: bill.poId,
-      action: 'bill_payment_reversal_withheld',
-      tag: 'sync',
-      level: 'WARNING',
-      description: reason === 'part-payment'
-        ? `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the ledger `
-          + `still holds a payment of ${ledgerAmountText(invoice.AmountPaid)} against it with `
-          + `${ledgerAmountText(invoice.AmountDue)} still due. That is a PART payment, NOT a reversal, so `
-          + `paidAt was left set: clearing it would re-arm Mark Paid over a supplier payment that has `
-          + `already been made, and pressing it again would pay the supplier twice. Settle the balance in `
-          + `Xero, or correct the bill total in IMS.`
-        : `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the invoice `
-          + `payload did not state how much has been paid, so IMS cannot tell a part payment from a `
-          + `removed one. paidAt was left set rather than guessed — clearing it would re-arm Mark Paid and `
-          + `risk a second supplier payment. Check the bill in Xero and reconcile it by hand.`,
-      metadata: {
-        reason,
-        accountingInvoiceId: invoice.InvoiceID,
-        xeroStatus: invoice.Status,
-        amountPaid: parseLedgerAmount(invoice.AmountPaid),
-        amountDue: parseLedgerAmount(invoice.AmountDue),
-      },
-      resolveUser: false,
-    })
+/**
+ * What the REGISTRATION reading adds to a withheld warning: WHOSE payment the ledger is holding.
+ *
+ * The amount reading can only say "a payment is present". This says whether it is the one IMS
+ * registered, or why IMS could not tell — which is the difference between "settle the balance" and
+ * "our payment has been deleted and nobody noticed".
+ */
+function registrationText(verdict: RegisteredPaymentVerdict): string {
+  switch (verdict.verdict) {
+    case 'STILL_HELD':
+      return ` The payment IMS registered (${verdict.paymentIds.join(', ')}) is still among the payments the `
+        + `ledger lists on this invoice, so this is a genuine PART payment and not a removal of ours.`
+    case 'NOTHING_REGISTERED':
+      return ` IMS holds no payment registration for this document, so it cannot say whether the payment `
+        + `the ledger is holding is the one IMS recorded.`
+    case 'LEDGER_DID_NOT_LIST_PAYMENTS':
+      return ` The payload did not list the payments held against the invoice, so IMS could not check `
+        + `whether the payment it registered is still among them.`
+    case 'REGISTRATION_UNDECIDED':
+      return ` ${verdict.entryIds.length} payment registration(s) (${verdict.entryIds.join(', ')}) had not `
+        + `finished when this Xero read was taken, so the read cannot say whether the payment they created `
+        + `is still there.`
+    case 'GONE':
+      return ''
   }
 }
 
-async function reportWithheldSalesReversals(reading: PaymentReversalReading, result: PollResult): Promise<void> {
-  const withheld = new Map([...reading.partPaid, ...reading.unverifiable].map((i) => [i.InvoiceID, i]))
-  if (withheld.size === 0) return
+/**
+ * Alert every active admin, and REPORT whether every alert landed.
+ *
+ * A notification with no recipient is not a signal, so an installation with no active admin gets one
+ * BROADCAST notification (userId null is visible to all users) rather than silently nothing.
+ */
+async function alertAdmins(params: { title: string; message: string; actionUrl: string }): Promise<boolean> {
+  const admins = await db.user.findMany({ where: { role: 'ADMIN', active: true }, select: { id: true } })
+  const targets: Array<string | null> = admins.length > 0 ? admins.map((a) => a.id) : [null]
+  const landed = await Promise.all(
+    targets.map((userId) => notifyPersisted({ userId, type: 'warning', ...params })),
+  )
+  return landed.every(Boolean)
+}
 
-  const orders = await db.salesOrder.findMany({
-    where: { accountingInvoiceId: { in: [...withheld.keys()] }, paidAt: { not: null } },
-    select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true },
+/**
+ * Write the durable record of a withheld verdict, and say so on the poll result if it did not land.
+ *
+ * The error is not decorative: `processDeltaChunk`'s caller stops the drain on any new error, which is
+ * what keeps the cursor behind an unsignalled disagreement.
+ */
+async function signalWithheldReversal(
+  entry: {
+    label: string
+    activity: Parameters<typeof logActivityPersisted>[0]
+    alert: { title: string; message: string; actionUrl: string }
+  },
+  result: PollResult,
+): Promise<void> {
+  const logged = await logActivityPersisted(entry.activity)
+  const alerted = await alertAdmins(entry.alert)
+  if (logged && alerted) return
+  const failures = [logged ? null : 'the activity warning', alerted ? null : 'the operator alert']
+    .filter((f): f is string => f !== null)
+    .join(' and ')
+  result.errors.push(
+    `Withheld payment reversal for ${entry.label} left no durable signal: ${failures} could not be written. `
+    + `Holding the poll cursor so the disagreement is re-derived on the next poll instead of being `
+    + `checkpointed past.`,
+  )
+}
+
+// ---------------------------------------------------------------------------
+// IS IT OUR PAYMENT THAT IS GONE? (o3d-clxw round 2)
+// ---------------------------------------------------------------------------
+//
+// Round 1 asked the ledger whether it holds ANY payment. A residual payment — one somebody applied in
+// Xero after deleting the one IMS registered — answers YES, and the reversal is withheld for ever:
+// the supplier payment IMS believes it made is gone, the cursor moves past the invoice, and the bill
+// reads settled until somebody reconciles by hand.
+//
+// So every withheld document is asked the narrower question against the identity IMS recorded (the
+// PaymentID Xero returned when the registration posted, stored as `externalTransactionId`) and the
+// payments the ledger LISTS on the invoice. Only `GONE` — every registered payment proved absent from
+// a list we could fully read, from registrations that certainly posted before the read — is promoted
+// to a reversal. Every other answer stays withheld exactly as round 1 left it, with the reason now
+// naming whose payment is in question.
+
+type ResidualDoc<T> = { doc: T; invoice: XeroInvoice; verdict: RegisteredPaymentVerdict }
+
+type ResidualReading<T> = {
+  /** Invoice id -> the document whose OWN registered payment is provably gone. Promoted to a reversal. */
+  provenGone: Map<string, { doc: T; invoice: XeroInvoice; paymentIds: string[] }>
+  /** Still withheld, with the reason the registration reading gives. */
+  withheld: ResidualDoc<T>[]
+}
+
+function emptyResidual<T>(): ResidualReading<T> {
+  return { provenGone: new Map(), withheld: [] }
+}
+
+/**
+ * Ask, for each document IMS holds as paid whose invoice regressed, whether the payment IMS
+ * registered against it is still in the ledger.
+ *
+ * `ledgerObservedBefore` is the instant Xero was asked; see classifyRegisteredPayment for why a
+ * registration that finished after it cannot be decided by this read.
+ */
+async function readResidualVerdicts<T extends { id: string; accountingInvoiceId: string | null }>(
+  docs: T[],
+  withheldInvoices: Map<string, XeroInvoice>,
+  registrationType: 'BILL_PAYMENT' | 'INVOICE_PAYMENT',
+  referenceType: 'PurchaseInvoice' | 'SalesOrder',
+  ledgerObservedBefore: Date,
+): Promise<ResidualReading<T>> {
+  const out = emptyResidual<T>()
+  if (docs.length === 0) return out
+
+  const rows = await db.accountingSyncLog.findMany({
+    where: {
+      connector: XERO_CONNECTOR,
+      type: registrationType,
+      referenceType,
+      referenceId: { in: docs.map((d) => d.id) },
+    },
+    select: { id: true, referenceId: true, status: true, externalTransactionId: true, syncedAt: true },
   })
-  for (const order of orders) {
-    const invoice = order.accountingInvoiceId ? withheld.get(order.accountingInvoiceId) : undefined
+  const byDocument = new Map<string, RegisteredPaymentRow[]>()
+  for (const row of rows) {
+    const list = byDocument.get(row.referenceId) ?? []
+    list.push({
+      id: row.id,
+      status: row.status,
+      externalTransactionId: row.externalTransactionId,
+      syncedAt: row.syncedAt,
+    })
+    byDocument.set(row.referenceId, list)
+  }
+
+  for (const doc of docs) {
+    const invoice = doc.accountingInvoiceId ? withheldInvoices.get(doc.accountingInvoiceId) : undefined
     if (!invoice) continue
+    const verdict = classifyRegisteredPayment(invoice, byDocument.get(doc.id) ?? [], ledgerObservedBefore)
+    if (verdict.verdict === 'GONE') {
+      out.provenGone.set(invoice.InvoiceID, { doc, invoice, paymentIds: verdict.paymentIds })
+    } else {
+      out.withheld.push({ doc, invoice, verdict })
+    }
+  }
+  return out
+}
+
+type WithheldBillDoc = {
+  id: string
+  accountingInvoiceId: string | null
+  poId: string
+  po: { reference: string; status: string }
+}
+
+type WithheldOrderDoc = {
+  id: string
+  accountingInvoiceId: string | null
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  status: string
+}
+
+async function signalWithheldBillReversals(residual: ResidualReading<WithheldBillDoc>, result: PollResult): Promise<void> {
+  for (const { doc: bill, invoice, verdict } of residual.withheld) {
+    const reason = withheldReason(invoice)
+    result.billReversalsWithheld++
+    const description = (reason === 'part-payment'
+      ? `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the ledger `
+        + `still holds a payment of ${ledgerAmountText(invoice.AmountPaid)} against it with `
+        + `${ledgerAmountText(invoice.AmountDue)} still due. That is a PART payment, NOT a reversal, so `
+        + `paidAt was left set: clearing it would re-arm Mark Paid over a supplier payment that has `
+        + `already been made, and pressing it again would pay the supplier twice. Settle the balance in `
+        + `Xero, or correct the bill total in IMS.`
+      : `Bill for PO ${bill.po.reference} is ${invoice.Status} in Xero (not fully paid), but the invoice `
+        + `payload did not state how much has been paid, so IMS cannot tell a part payment from a `
+        + `removed one. paidAt was left set rather than guessed — clearing it would re-arm Mark Paid and `
+        + `risk a second supplier payment. Check the bill in Xero and reconcile it by hand.`)
+      + registrationText(verdict)
+
+    await signalWithheldReversal({
+      label: `PO ${bill.po.reference}`,
+      activity: {
+        entityType: 'PURCHASE_ORDER',
+        entityId: bill.poId,
+        action: 'bill_payment_reversal_withheld',
+        tag: 'sync',
+        level: 'WARNING',
+        description,
+        metadata: {
+          reason,
+          registrationVerdict: verdict.verdict,
+          accountingInvoiceId: invoice.InvoiceID,
+          xeroStatus: invoice.Status,
+          amountPaid: parseLedgerAmount(invoice.AmountPaid),
+          amountDue: parseLedgerAmount(invoice.AmountDue),
+        },
+        resolveUser: false,
+      },
+      alert: {
+        title: 'Bill payment reversal withheld',
+        message: description,
+        actionUrl: `/purchasing/${bill.poId}`,
+      },
+    }, result)
+  }
+}
+
+async function signalWithheldSalesReversals(residual: ResidualReading<WithheldOrderDoc>, result: PollResult): Promise<void> {
+  for (const { doc: order, invoice, verdict } of residual.withheld) {
     const reason = withheldReason(invoice)
     const ref = order.orderNumber ?? order.externalOrderNumber ?? order.id
     result.salesReversalsWithheld++
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: order.id,
-      action: 'payment_reversal_withheld',
-      tag: 'sync',
-      level: 'WARNING',
-      description: reason === 'part-payment'
-        ? `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the ledger still `
-          + `holds a payment of ${ledgerAmountText(invoice.AmountPaid)} against it with `
-          + `${ledgerAmountText(invoice.AmountDue)} still due. That is a PART payment, NOT a reversal, so `
-          + `paidAt was left set and NO chargeback credit note was raised — unwinding revenue against a `
-          + `payment the ledger is still holding would be wrong. Settle the balance in Xero, or correct `
-          + `the order total in IMS.`
-        : `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the invoice payload `
-          + `did not state how much has been paid, so IMS cannot tell a part payment from a removed one. `
-          + `paidAt was left set and NO chargeback credit note was raised. Check the invoice in Xero and `
-          + `reconcile it by hand.`,
-      metadata: {
-        reason,
-        accountingInvoiceId: invoice.InvoiceID,
-        xeroStatus: invoice.Status,
-        orderStatus: order.status,
-        amountPaid: parseLedgerAmount(invoice.AmountPaid),
-        amountDue: parseLedgerAmount(invoice.AmountDue),
+    const description = (reason === 'part-payment'
+      ? `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the ledger still `
+        + `holds a payment of ${ledgerAmountText(invoice.AmountPaid)} against it with `
+        + `${ledgerAmountText(invoice.AmountDue)} still due. That is a PART payment, NOT a reversal, so `
+        + `paidAt was left set and NO chargeback credit note was raised — unwinding revenue against a `
+        + `payment the ledger is still holding would be wrong. Settle the balance in Xero, or correct `
+        + `the order total in IMS.`
+      : `Invoice for order ${ref} is ${invoice.Status} in Xero (not fully paid), but the invoice payload `
+        + `did not state how much has been paid, so IMS cannot tell a part payment from a removed one. `
+        + `paidAt was left set and NO chargeback credit note was raised. Check the invoice in Xero and `
+        + `reconcile it by hand.`)
+      + registrationText(verdict)
+
+    await signalWithheldReversal({
+      label: `order ${ref}`,
+      activity: {
+        entityType: 'SALES_ORDER',
+        entityId: order.id,
+        action: 'payment_reversal_withheld',
+        tag: 'sync',
+        level: 'WARNING',
+        description,
+        metadata: {
+          reason,
+          registrationVerdict: verdict.verdict,
+          accountingInvoiceId: invoice.InvoiceID,
+          xeroStatus: invoice.Status,
+          orderStatus: order.status,
+          amountPaid: parseLedgerAmount(invoice.AmountPaid),
+          amountDue: parseLedgerAmount(invoice.AmountDue),
+        },
+        resolveUser: false,
       },
-      resolveUser: false,
-    })
+      alert: {
+        title: 'Payment reversal withheld',
+        message: description,
+        actionUrl: `/sales/${order.id}`,
+      },
+    }, result)
   }
 }
 
@@ -209,19 +421,64 @@ type PollResult = {
  * Errors are pushed onto `result` rather than thrown: the caller reads that to decide whether this
  * chunk may be checkpointed.
  */
-async function processDeltaChunk(changed: XeroInvoice[], result: PollResult, windowStart: Date): Promise<void> {
+async function processDeltaChunk(
+  changed: XeroInvoice[],
+  result: PollResult,
+  { windowStart, ledgerObservedBefore }: { windowStart: Date; ledgerObservedBefore: Date },
+): Promise<void> {
   const paidSalesIds = idsWhere(changed, 'ACCREC', ['PAID'])
   // NOT `idsWhere(..., ['AUTHORISED', 'VOIDED'])` any more (o3d-clxw). AUTHORISED means "approved and
   // not fully paid", which a bill carrying a real PART payment satisfies — reading it as a removal
   // cleared paidAt over money that had already left the bank. partitionPaymentReversals asks the
   // payload what the ledger HOLDS, and withholds the verdict when it cannot tell.
   const salesReversal = partitionPaymentReversals(changed, 'ACCREC')
-  const reversedSalesIds = salesReversal.reversed
   const voidedSalesIds = idsWhere(changed, 'ACCREC', ['VOIDED'])
   const paidBillIds = idsWhere(changed, 'ACCPAY', ['PAID'])
   const billReversal = partitionPaymentReversals(changed, 'ACCPAY')
-  const reversedBillIds = billReversal.reversed
   const invoiceById = new Map(changed.map((i) => [i.InvoiceID, i]))
+
+  // --- Whose payment is gone? (o3d-clxw round 2) ---
+  //
+  // Read BEFORE either reversal pass, because its answer decides which documents those passes act on.
+  // A read that throws leaves the reading empty, which is round 1's behaviour exactly — every withheld
+  // document stays withheld — and pushes an error, so the chunk is not checkpointed and the question is
+  // asked again next poll rather than silently answered "no".
+  const billWithheldInvoices = new Map(
+    [...billReversal.partPaid, ...billReversal.unverifiable].map((i) => [i.InvoiceID, i]),
+  )
+  let billResidual = emptyResidual<WithheldBillDoc>()
+  try {
+    const withheldBills = billWithheldInvoices.size === 0 ? [] : await db.purchaseInvoice.findMany({
+      where: { accountingInvoiceId: { in: [...billWithheldInvoices.keys()] }, paidAt: { not: null } },
+      select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true, status: true } } },
+    })
+    billResidual = await readResidualVerdicts(
+      withheldBills, billWithheldInvoices, 'BILL_PAYMENT', 'PurchaseInvoice', ledgerObservedBefore,
+    )
+  } catch (e) {
+    result.errors.push(`Bills registered-payment reading error: ${String(e)}`)
+  }
+
+  const salesWithheldInvoices = new Map(
+    [...salesReversal.partPaid, ...salesReversal.unverifiable].map((i) => [i.InvoiceID, i]),
+  )
+  let salesResidual = emptyResidual<WithheldOrderDoc>()
+  try {
+    const withheldOrders = salesWithheldInvoices.size === 0 ? [] : await db.salesOrder.findMany({
+      where: { accountingInvoiceId: { in: [...salesWithheldInvoices.keys()] }, paidAt: { not: null } },
+      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true },
+    })
+    salesResidual = await readResidualVerdicts(
+      withheldOrders, salesWithheldInvoices, 'INVOICE_PAYMENT', 'SalesOrder', ledgerObservedBefore,
+    )
+  } catch (e) {
+    result.errors.push(`Sales registered-payment reading error: ${String(e)}`)
+  }
+
+  // A document whose OWN registered payment is proved absent from the ledger's list IS reversed, even
+  // though a residual payment somebody else applied is still sitting there.
+  const reversedSalesIds = new Set([...salesReversal.reversed, ...salesResidual.provenGone.keys()])
+  const reversedBillIds = new Set([...billReversal.reversed, ...billResidual.provenGone.keys()])
 
   // --- Sales invoices (manual orders only — no shopping connector link) ---
   try {
@@ -316,7 +573,18 @@ async function processDeltaChunk(changed: XeroInvoice[], result: PollResult, win
         // separate credit note would double-reverse — only auto-chargeback an
         // AUTHORISED payment removal where the invoice is still live (Codex P2).
         const invoiceVoided = order.accountingInvoiceId != null && voidedSalesIds.has(order.accountingInvoiceId)
-        const { outcome, error } = await handleDetectedReversal(order, { invoiceVoided }, {
+        // A reversal PROVED by the payment's identity rather than by a zero balance (o3d-clxw r2). The
+        // invoice still carries a payment — somebody else's, or an amount Xero did not state — so the
+        // revenue unwind is suppressed: a chargeback credit note reverses the WHOLE recognised revenue,
+        // and against an invoice the ledger is still holding money for that over-reverses. This is
+        // round 1's rule kept intact, not relaxed: no automatic chargeback while the ledger holds a
+        // payment. paidAt is still cleared, because the payment IMS recorded is genuinely gone.
+        const registeredPaymentGone = order.accountingInvoiceId != null
+          && salesResidual.provenGone.has(order.accountingInvoiceId)
+        const { outcome, error } = await handleDetectedReversal(order, {
+          invoiceVoided,
+          ledgerStillHoldsPayment: registeredPaymentGone,
+        }, {
           // Dedup (window-scoped): a WC-side refund (SalesOrderRefund carrying the WC
           // externalRefundId) recorded within THIS poll window means the WC refund
           // webhook already owns the revenue reversal — skip the redundant chargeback
@@ -348,16 +616,19 @@ async function processDeltaChunk(changed: XeroInvoice[], result: PollResult, win
           clearPaidAt: async (orderId) => {
             await db.salesOrder.update({ where: { id: orderId }, data: { paidAt: null } })
           },
-          notifyNeedsAttention: (o, { wcHandled }) => notifyReversalAdmins(o, wcHandled),
+          notifyNeedsAttention: (o, { wcHandled }) => notifyReversalAdmins(o, wcHandled, registeredPaymentGone),
           logReversalDetected: (o, { wcHandled }) => logActivity({
             entityType: 'SALES_ORDER',
             entityId: o.id,
             action: 'payment_reversal_detected',
             tag: 'sync',
             level: 'WARNING',
-            description: wcHandled
+            description: (wcHandled
               ? `Payment reversed in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — a WooCommerce refund in this window already reversed revenue (no duplicate credit note raised); cleared paidAt. Verify the WC refund fully covers the reversal and whether the order status should revert.`
-              : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — cleared paidAt. Review whether the order status should revert.`,
+              : `Payment no longer present in Xero for order ${o.orderNumber ?? o.externalOrderNumber} (status: ${o.status}) — cleared paidAt. Review whether the order status should revert.`)
+              + (registeredPaymentGone
+                ? ` The payment IMS registered (${salesResidual.provenGone.get(o.accountingInvoiceId ?? '')?.paymentIds.join(', ')}) is no longer among the payments Xero lists on this invoice, but the invoice still carries another payment or an amount Xero did not state — so NO chargeback credit note was raised automatically. Unwind revenue by hand if that is what the removal means.`
+                : ''),
             resolveUser: false,
           }),
         })
@@ -375,7 +646,7 @@ async function processDeltaChunk(changed: XeroInvoice[], result: PollResult, win
   // Reported in its own pass so a reporting failure cannot lose a reversal that DID reconcile, and a
   // reversal pass that threw still leaves the withheld ones described.
   try {
-    await reportWithheldSalesReversals(salesReversal, result)
+    await signalWithheldSalesReversals(salesResidual, result)
   } catch (e) {
     result.errors.push(`Sales withheld-reversal reporting error: ${String(e)}`)
   }
@@ -430,7 +701,12 @@ async function processDeltaChunk(changed: XeroInvoice[], result: PollResult, win
           action: 'bill_payment_reversal_detected',
           tag: 'sync',
           level: 'WARNING',
-          description: `Bill payment no longer present in Xero for PO ${bill.po.reference} (PO status: ${bill.po.status}) — cleared paidAt.`,
+          description: `Bill payment no longer present in Xero for PO ${bill.po.reference} (PO status: ${bill.po.status}) — cleared paidAt.`
+            + (billResidual.provenGone.has(bill.accountingInvoiceId ?? '')
+              // Named, because this is the case an amount reading calls a part payment: the ledger is
+              // still holding money against this bill — just not ours.
+              ? ` The payment IMS registered (${billResidual.provenGone.get(bill.accountingInvoiceId ?? '')?.paymentIds.join(', ')}) is no longer among the payments Xero lists on this invoice, though the invoice still shows ${ledgerAmountText(invoiceById.get(bill.accountingInvoiceId ?? '')?.AmountPaid)} paid — that residual payment is somebody else's, not the one IMS made.`
+              : ''),
           resolveUser: false,
         })
       }
@@ -440,7 +716,7 @@ async function processDeltaChunk(changed: XeroInvoice[], result: PollResult, win
   }
 
   try {
-    await reportWithheldBillReversals(billReversal, result)
+    await signalWithheldBillReversals(billResidual, result)
   } catch (e) {
     result.errors.push(`Bills withheld-reversal reporting error: ${String(e)}`)
   }
@@ -522,7 +798,13 @@ async function pollXeroPaymentsLocked(): Promise<PollResult> {
     (path, opts) => xeroGet<XeroInvoicesResponse>(path, opts),  // budget-reconciled inside the drain
     async ({ invoices, through }) => {
       const errorsBefore = result.errors.length
-      await processDeltaChunk(invoices, result, lastPollDate)
+      await processDeltaChunk(invoices, result, {
+        windowStart: lastPollDate,
+        // The instant Xero WAS ASKED, not the start of the window it covers: "had this registration
+        // already posted when the ledger gave us this answer?" is a question about the READ. Stamped
+        // before the fetch, so every chunk is read after it.
+        ledgerObservedBefore: pollStartedAt,
+      })
       // A pass that errored may have left work undone inside this chunk, so the chunk is not
       // checkpointed and the drain stops here — the same "hold the cursor on error" rule as before,
       // now applied per chunk instead of per poll.
