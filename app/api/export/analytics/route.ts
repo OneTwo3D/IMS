@@ -101,9 +101,14 @@ export async function GET(req: NextRequest) {
         refundedAt: r.refundedAt.slice(0, 10), salesRep: r.salesRep, qty: r.qty,
         // o3d-iigc: an unestablishable proportion exports EMPTY, not 0 — a 0 in a spreadsheet
         // column averages and charts as a real zero.
-        totalBase: r.totalBase.toFixed(2), pctOfSale: r.pctOfSale ?? '', reason: r.reason,
+        //
+        // o3d-lvk: and the basis travels with it, because that blank has to be READABLE. In the UI
+        // the cause is a tooltip; a spreadsheet has none, so without this column a reader sees a gap
+        // and no reason for it. Same argument as round 3's `netAmount` -> `netAmountExVat` rename.
+        totalBase: r.totalBase.toFixed(2), totalsBasis: r.totalsBasis,
+        pctOfSale: r.pctOfSale ?? '', reason: r.reason,
       }))
-      return csvResponse(toCsv(data, ['productName', 'orderNumber', 'creditNoteNumber', 'refundedAt', 'salesRep', 'qty', 'totalBase', 'pctOfSale', 'reason']), `refunds-${date}.csv`)
+      return csvResponse(toCsv(data, ['productName', 'orderNumber', 'creditNoteNumber', 'refundedAt', 'salesRep', 'qty', 'totalBase', 'totalsBasis', 'pctOfSale', 'reason']), `refunds-${date}.csv`)
     }
 
     case 'aging': {
@@ -114,6 +119,8 @@ export async function GET(req: NextRequest) {
         salesTotal: r.salesTotal.toFixed(2), refundsTotal: r.refundsTotal.toFixed(2),
         // o3d-iigc: withheld when the order's credits are not all on one proven basis. Empty, not
         // 0, and the basis of the figure is exported beside it so the column is readable at all.
+        // (o3d-lvk called this column `refundsBasis`; it is the same fact, and `netTotalBasis` is
+        // the better name because it says which figure the basis qualifies.)
         netTotal: r.netTotal?.toFixed(2) ?? '', netTotalBasis: r.netTotalBasis,
         dueAmount: r.dueAmount.toFixed(2), avgDso: r.avgDso,
         overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2),

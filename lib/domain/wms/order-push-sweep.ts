@@ -65,6 +65,8 @@ export function shouldGrantCreateClaim(
   return attemptedAt.getTime() - existing.lastAttemptAt.getTime() >= leaseMs
 }
 const DEFAULT_BATCH_SIZE = 25
+/** o3d-rbyg: shared empty result for the live withdrawal screen — "nothing withdrawn", not "unknown". */
+const EMPTY_ORDER_ID_SET: ReadonlySet<string> = new Set<string>()
 
 export type WmsOrderPushSweepResult = {
   skipped?: string
@@ -386,6 +388,14 @@ export interface WmsOrderPushPort {
    *  before the claim. Optional so existing test ports keep compiling; when
    *  absent the fence simply does not apply. */
   verifyWithdrawalFence?(orderId: string): Promise<boolean>
+  /** o3d-rbyg: ONE batched storefront read per create batch — the subset of these orders the
+   *  storefront currently reports withdrawn, whether or not IMS has ever heard of it. Optional so
+   *  existing test ports keep compiling; when absent, no screening happens. */
+  screenLiveWithdrawals?(orderIds: string[]): Promise<ReadonlySet<string>>
+  /** o3d-rbyg: the LIVE storefront withdrawal verdict for one order. `null` means the storefront
+   *  could not be read, which is NOT the same as "not withdrawn". Optional; absent = no live
+   *  recheck, and the IMS markers remain the only trigger. */
+  readLiveWithdrawal?(orderId: string): Promise<{ withdrawn: boolean; approved: boolean } | null>
   updateLinkByOrder?(orderId: string, data: LinkWrite): Promise<void>
   updateLink(id: string, data: LinkWrite): Promise<void>
   /** q66in.4.6: audit-grade timeline row for a connector mutation — must never throw. */
@@ -483,7 +493,32 @@ export async function runWmsOrderPushSweepCore(
   // --- Create pass ---
   if (externalWarehouseByWarehouse.size > 0) {
     const candidates = await port.createCandidates(connectorId, [...externalWarehouseByWarehouse.keys()], batchSize)
+
+    // o3d-rbyg: screen the WHOLE batch against the live storefront before pushing any of it.
+    //
+    // verifyWithdrawalFence below only asks about orders that already have a withdrawal history —
+    // with no suppression row it passes them without reading anything. So an order whose FIRST
+    // withdrawal webhook was missed carries no row and no marker, and this sweep would push it.
+    // The screen is what asks about those orders, and it is BATCHED — one request for the batch,
+    // filtered server-side to the withdrawal statuses — rather than a by-ID read per created
+    // order on the hot path.
+    //
+    // A screening failure leaves the batch with exactly the fence it had before; it must not stop
+    // the sweep, or an unreachable storefront would halt warehouse fulfilment shop-wide.
+    let liveWithdrawn: ReadonlySet<string> = EMPTY_ORDER_ID_SET
+    try {
+      liveWithdrawn = (await port.screenLiveWithdrawals?.(candidates.map((candidate) => candidate.id))) ?? EMPTY_ORDER_ID_SET
+    } catch (e) {
+      console.error(`[wms-order-push] live withdrawal screen failed: ${scrubWmsError(e, 'screen failed')}`)
+    }
+
     for (const order of candidates) {
+      // Refused on the storefront's own word. The screen has already written the suppression row,
+      // so this order stays fenced from here on without needing another read.
+      if (liveWithdrawn.has(order.id)) {
+        console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} is withdrawn on the storefront but IMS had no record of it — not pushed`)
+        continue
+      }
       const externalWarehouseId = order.shipFromWarehouseId ? externalWarehouseByWarehouse.get(order.shipFromWarehouseId) : undefined
       if (!externalWarehouseId) continue
 
@@ -573,8 +608,34 @@ export async function runWmsOrderPushSweepCore(
           raced = { withdrawalHoldAt: new Date(), withdrawalApprovedAt: null } // fail closed
         }
 
-        if (raced && (raced.withdrawalHoldAt || raced.withdrawalApprovedAt)) {
-          const approved = Boolean(raced.withdrawalApprovedAt)
+        let racedWithdrawn = Boolean(raced && (raced.withdrawalHoldAt || raced.withdrawalApprovedAt))
+        let racedApproved = Boolean(raced?.withdrawalApprovedAt)
+
+        // o3d-rbyg part 2: the IMS markers describe what IMS has been TOLD. A withdrawal filed
+        // during the read-to-create window arrives by webhook, and this compensation runs long
+        // before that webhook is processed — so the markers can be clean for an order the customer
+        // has already withdrawn. Ask the storefront directly, once, now that the order exists in
+        // the warehouse and the compensation machinery is right here.
+        //
+        // NOT fail-closed, and that asymmetry is deliberate: unlike the pre-claim fence, acting on
+        // no evidence here means CANCELLING a warehouse order that was just created. An unreadable
+        // storefront (null) therefore leaves the markers as the only trigger, exactly as before —
+        // the hold pass, the withdrawal sweep and the daily reconcile still cover it.
+        if (!racedWithdrawn) {
+          let liveWithdrawal: { withdrawn: boolean; approved: boolean } | null = null
+          try {
+            liveWithdrawal = (await port.readLiveWithdrawal?.(order.id)) ?? null
+          } catch (e) {
+            console.error(`[wms-order-push] post-create live withdrawal read failed for ${order.id}: ${scrubWmsError(e, 'read failed')}`)
+          }
+          if (liveWithdrawal?.withdrawn) {
+            racedWithdrawn = true
+            racedApproved = liveWithdrawal.approved
+          }
+        }
+
+        if (racedWithdrawn) {
+          const approved = racedApproved
           try {
             // NEVER cancel an id we have not proved is ours. PENDING_VERIFY
             // means exactly that, and this file already documents that a wrong
@@ -728,8 +789,31 @@ export async function runWmsOrderPushSweepCore(
         // leaves a verified, active WMS order that neither pass picks up —
         // with the explicit warning erased. Re-read the markers first.
         const held = await port.readWithdrawalState?.(link.orderId)
-        if (held && (held.withdrawalHoldAt || held.withdrawalApprovedAt)) {
-          const approved = Boolean(held.withdrawalApprovedAt)
+        let heldNow = Boolean(held && (held.withdrawalHoldAt || held.withdrawalApprovedAt))
+        let heldApproved = Boolean(held?.withdrawalApprovedAt)
+
+        // o3d-rbyg: promotion to SYNCED is a fulfilment decision — a SYNCED link is what the
+        // dispatch passes act on — and until now it consulted only the IMS markers. An order
+        // withdrawn on the storefront while its ownership was being proved carries no marker if
+        // its webhook was missed, so it was promoted and shipped. Ask the storefront too.
+        //
+        // Same asymmetry as the post-create recheck: an unreadable storefront (null) must not
+        // cancel a warehouse order we have just proved is ours, so it falls back to the markers.
+        if (!heldNow) {
+          let liveWithdrawal: { withdrawn: boolean; approved: boolean } | null = null
+          try {
+            liveWithdrawal = (await port.readLiveWithdrawal?.(link.orderId)) ?? null
+          } catch (e) {
+            console.error(`[wms-order-push] verify-pass live withdrawal read failed for ${link.orderId}: ${scrubWmsError(e, 'read failed')}`)
+          }
+          if (liveWithdrawal?.withdrawn) {
+            heldNow = true
+            heldApproved = liveWithdrawal.approved
+          }
+        }
+
+        if (heldNow) {
+          const approved = heldApproved
           let pulled = false
           try {
             const cancel = await connector.cancelOrder?.(link.externalOrderId)
@@ -1189,6 +1273,14 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
     async verifyWithdrawalFence(orderId) {
       const { verifyWithdrawalFenceForPush } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
       return verifyWithdrawalFenceForPush(orderId)
+    },
+    async screenLiveWithdrawals(orderIds) {
+      const { screenLiveWithdrawalsForPush } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+      return screenLiveWithdrawalsForPush(orderIds)
+    },
+    async readLiveWithdrawal(orderId) {
+      const { readLiveWithdrawalForOrder } = await import('@/lib/connectors/woocommerce/sync/withdrawal')
+      return readLiveWithdrawalForOrder(orderId)
     },
     async readWithdrawalState(orderId) {
       return db.salesOrder.findUnique({

@@ -131,6 +131,7 @@ const REFUND_FIELDS: FieldDef[] = [
   { key: 'salesRep', label: 'Sales Rep', type: 'text' },
   { key: 'qty', label: 'Qty', type: 'number' },
   { key: 'totalBase', label: 'Total', type: 'number' },
+  { key: 'totalsBasis', label: 'Basis', type: 'select', options: ['NET', 'GROSS', 'UNKNOWN'] },
   { key: 'pctOfSale', label: '% of Sale', type: 'number' },
   { key: 'reason', label: 'Reason', type: 'text' },
   { key: 'customerName', label: 'Customer', type: 'text' },
@@ -144,6 +145,8 @@ const AGING_FIELDS: FieldDef[] = [
   { key: 'createdAt', label: 'Date', type: 'text' },
   { key: 'salesTotal', label: 'Sales', type: 'number' },
   { key: 'refundsTotal', label: 'Refunds', type: 'number' },
+  // o3d-lvk offered this same fact as `refundsBasis`; o3d-iigc's `netTotalBasis` below is the one
+  // the row actually carries, and it names the figure the basis qualifies.
   { key: 'netTotal', label: 'Net Total', type: 'number' },
   // o3d-iigc: which total Net Total IS. Opt-in — every order without credits reads NONE.
   { key: 'netTotalBasis', label: 'Net Total Basis', type: 'select', options: ['NONE', 'NET', 'GROSS', 'UNKNOWN'] },
@@ -554,6 +557,10 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'refundedAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
       if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono text-destructive">{fmtBase(v)}</span>
+      // o3d-lvk: what the credit's stored total MEANS, rendered the same way the aging tab renders
+      // `netTotalBasis`. It is the stated cause of the dash in `% of Sale` below, so the reader is
+      // not left with an unexplained gap when they are not hovering.
+      if (key === 'totalsBasis') return <span className="text-xs text-muted-foreground">{v}</span>
       // o3d-iigc: null means the credit's basis is unproven (or no comparable order total exists),
       // so no proportion is established. A 0% here would read as "refunded nothing".
       if (key === 'pctOfSale') return v == null ? <span className="text-xs text-muted-foreground" title="No proportion is established: this credit's basis is unproven, so there is no order total it is comparable with">—</span> : <span className="tabular-nums text-xs text-muted-foreground">{v}%</span>

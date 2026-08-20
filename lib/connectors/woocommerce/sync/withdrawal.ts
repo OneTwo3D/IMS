@@ -800,6 +800,129 @@ export async function verifyWithdrawalFenceForPush(salesOrderId: string): Promis
   return true
 }
 
+/**
+ * o3d-rbyg: how many orders one screening read may ask about.
+ *
+ * The response is a SUBSET of what was asked for (it is filtered to the two withdrawal statuses),
+ * so with `per_page` set to the same number a chunk can never be truncated and the read needs no
+ * paging of its own. Raising the chunk without raising `per_page` would silently reintroduce it.
+ */
+const WC_WITHDRAWAL_SCREEN_CHUNK = 100
+
+/**
+ * o3d-rbyg part 1: which of these orders does the STOREFRONT currently consider withdrawn?
+ *
+ * verifyWithdrawalFenceForPush answers "may this order be pushed" only for orders that already
+ * have a withdrawal history — with no suppression row it returns true without asking anyone. So a
+ * FIRST withdrawal whose webhook was missed leaves no row and no IMS marker, and the create sweep
+ * pushes the order before the poll or the daily reconcile notices. That gap is the one this closes.
+ *
+ * BATCHED, not per order. A by-ID read before every create would add an API call to the hot path
+ * for every order the shop ever ships. Instead the whole candidate batch is screened in ONE
+ * request, filtered server-side to the two withdrawal slugs, so the answer costs a single call per
+ * sweep and comes back as a positive list of the orders that are actually withdrawn.
+ *
+ * IT WRITES THE TOMBSTONE, which is the durable half. Skipping the push once would only defer the
+ * problem to the next sweep; recording the suppression is what makes the order stay fenced —
+ * including through a later WooCommerce outage, when nothing can be read at all.
+ *
+ * WHAT AN UNREADABLE STOREFRONT MEANS HERE, deliberately: the chunk is skipped and its orders are
+ * left to the fence they already had. This is the one place in the withdrawal code that does NOT
+ * fail closed, and the reason is that it is not adjudicating evidence — it is an EXTRA read for
+ * orders about which nothing is known either way. Failing closed here would convert any
+ * WooCommerce outage into a total halt of warehouse fulfilment for every order in the shop, which
+ * is a far larger failure than the one being prevented; orders that DO have a suppression row are
+ * unaffected and keep failing closed in verifyWithdrawalFenceForPush.
+ */
+export async function screenLiveWithdrawalsForPush(
+  salesOrderIds: string[],
+): Promise<ReadonlySet<string>> {
+  const withdrawn = new Set<string>()
+  if (salesOrderIds.length === 0) return withdrawn
+
+  const links = await db.shoppingOrderLink.findMany({
+    where: { orderId: { in: salesOrderIds }, connector: 'woocommerce' },
+    select: { orderId: true, externalOrderId: true },
+  })
+  // No WooCommerce orders in this batch — spend no API call at all. The push sweep is
+  // connector-agnostic and most of its batches may have nothing to do with WooCommerce.
+  if (links.length === 0) return withdrawn
+
+  const salesOrderIdsByExternal = new Map<string, string[]>()
+  for (const link of links) {
+    const existing = salesOrderIdsByExternal.get(link.externalOrderId)
+    if (existing) existing.push(link.orderId)
+    else salesOrderIdsByExternal.set(link.externalOrderId, [link.orderId])
+  }
+
+  const { submitted, approved } = await getWithdrawalStatuses()
+  // A Set, so a shop that has configured BOTH slugs to the same value sends one value rather than
+  // a duplicate pair.
+  const statusFilter = [...new Set([submitted, approved])].join(',')
+  const { wcFetch } = await import('../api')
+  const externalIds = [...salesOrderIdsByExternal.keys()]
+
+  for (let offset = 0; offset < externalIds.length; offset += WC_WITHDRAWAL_SCREEN_CHUNK) {
+    const chunk = externalIds.slice(offset, offset + WC_WITHDRAWAL_SCREEN_CHUNK)
+    const { data, error } = await wcFetch('/orders', {
+      include: chunk.join(','),
+      status: statusFilter,
+      per_page: String(WC_WITHDRAWAL_SCREEN_CHUNK),
+    })
+    if (error || !Array.isArray(data)) {
+      console.error(
+        `[wc-withdrawal-screen] could not screen ${chunk.length} order(s) against WooCommerce: `
+        + `${error ?? 'unexpected (non-list) response'} — those orders keep the fence they already had`,
+      )
+      continue
+    }
+    for (const entry of data) {
+      if (!entry || typeof entry !== 'object' || !('id' in entry) || !('status' in entry)) continue
+      const live = entry as WcFullOrder
+      // Re-check the status locally rather than trusting the filter to have been applied: an
+      // ignored `status` param would otherwise return the whole order list and mark every
+      // candidate withdrawn, which would halt fulfilment shop-wide.
+      const recorded = await recordWithdrawalSuppressionIfWithdrawn(live)
+      if (!recorded) continue
+      for (const orderId of salesOrderIdsByExternal.get(String(live.id)) ?? []) withdrawn.add(orderId)
+    }
+  }
+
+  return withdrawn
+}
+
+/**
+ * o3d-rbyg parts 1+2: the live storefront withdrawal verdict for ONE order.
+ *
+ * `null` means the storefront could not be read — a genuinely different answer from "not
+ * withdrawn", and callers must treat it as such rather than as a clean bill of health.
+ *
+ * An order with no WooCommerce link is reported not-withdrawn without any API call: there is no
+ * storefront to ask, and no withdrawal can exist.
+ *
+ * Records the tombstone on a positive answer, for the same reason the batch screen does — the
+ * durable fence is what survives the next outage, not this one read.
+ */
+export async function readLiveWithdrawalForOrder(
+  salesOrderId: string,
+): Promise<{ withdrawn: boolean; approved: boolean } | null> {
+  const link = await db.shoppingOrderLink.findFirst({
+    where: { orderId: salesOrderId, connector: 'woocommerce' },
+    select: { externalOrderId: true },
+  })
+  if (!link) return { withdrawn: false, approved: false }
+
+  const live = await readLiveWcOrder(link.externalOrderId)
+  if (!live) return null
+
+  const { submitted, approved } = await getWithdrawalStatuses()
+  const status = normaliseStatus(live.status)
+  if (status !== submitted && status !== approved) return { withdrawn: false, approved: false }
+
+  await recordWithdrawalSuppressionIfWithdrawn(live)
+  return { withdrawn: true, approved: status === approved }
+}
+
 /** The live order, or null when it cannot be read. */
 async function readLiveWcOrder(externalOrderId: string): Promise<WcFullOrder | null> {
   try {

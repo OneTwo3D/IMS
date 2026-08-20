@@ -7,7 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
-import { marginFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, type DerivedFigureBound, type RefundSetBasis } from '@/lib/domain/sales/refund-basis-analytics'
+import { marginFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, refundTotalsBasis, type DerivedFigureBound, type RefundSetBasis, type RefundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -441,6 +441,16 @@ export type RefundRow = {
   qty: number
   totalBase: number
   /**
+   * What this credit's stored totals MEAN — NET (ex-VAT), GROSS (VAT-inclusive), or UNKNOWN for a
+   * row that was never stamped (o3d-lvk).
+   *
+   * It exists because `pctOfSale` below is withheld on an unproven basis, and a withheld figure
+   * with no stated cause is just a gap. In the UI the cause is a tooltip; in the CSV there are no
+   * tooltips at all — the same reason o3d-iigc round 3 renamed `netAmount` to `netAmountExVat` —
+   * so the basis travels as its own column and the blank is legible in a spreadsheet too.
+   */
+  totalsBasis: RefundTotalsBasis
+  /**
    * The credit as a proportion of the order total ON THE CREDIT'S OWN BASIS.
    *
    * o3d-iigc: `null` when the refund's basis is unproven, or when no comparable order total exists.
@@ -479,6 +489,9 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
         customerName: r.order.customerName ?? '—', salesRep: r.order.salesRep,
         reason: r.reason, refundedAt: r.refundedAt.toISOString(),
         qty: Number(l.qty), totalBase: lineTotal,
+        // o3d-lvk: the same classifier `pctOfSale` consults, so the stated basis and the decision to
+        // withhold the proportion can never disagree about the same row.
+        totalsBasis: refundTotalsBasis(r.totalsBasis),
         // o3d-iigc: divided by the order total on the CREDIT'S basis. Against the GROSS total a
         // full NET refund of a 20%-taxable order read as 83.3% — a full credit shown as partial.
         pctOfSale: refundPctOfSale(l.totalBase, r.order, r.totalsBasis),
