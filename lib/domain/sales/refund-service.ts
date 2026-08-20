@@ -1474,12 +1474,54 @@ async function stageRefundAccountingReversals(
       (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'allocation')
     ))
 
+    // o3d-o97 — THE ALLOCATED CONTRA THIS REFUND'S LINES DID NOT REACH.
+    //
+    // Group A2 (DAILY_BATCH_INVENTORY_ALLOC) posted DR Allocated Inventory / CR Inventory for this
+    // order's allocated cost. Exactly three things relieve that contra and there is no fourth: a
+    // Group B shipment journal (DR COGS / CR Allocated), a refund's allocation reversal (DR
+    // Inventory / CR Allocated), and nothing else. Once refundStatus is FULL, BOTH daily-batch
+    // windows exclude this order permanently — Group A2 and Group B each filter
+    // `refundStatus: { not: 'FULL' }` — so no later run can ever post either side of it again.
+    // The un-stage immediately below is therefore the last moment anything in IMS will look at
+    // this order's A2 posting.
+    //
+    // The line-driven reversal (`allocationRefundSnapshot`) only covers allocation cost the refund
+    // LINES consumed, but `newStatus` is decided by AMOUNT (isFullRefundAmount), not by line
+    // coverage. A monetary-only full refund — the WooCommerce shape carrying no productId and no
+    // qty (o3d-w00) — consumes NO allocation cost at all, so today it reaches this un-stage with an
+    // empty allocation snapshot: the stamp is cleared, and the whole A2 debit is stranded in
+    // Allocated Inventory with nothing left in IMS that knows it is owed. The same happens, in
+    // part, to any full-by-amount refund whose lines cover fewer units than the order allocated.
+    //
+    // `allocationAvailability` is exactly that residue: each allocation row's pinned layers, less
+    // every JOURNALED shipment's relief, less every prior refund's relief, less this refund's own
+    // consumption immediately above. Reversing it applies the SAME rule the line-driven path
+    // already applies — an allocation pin that no posted journal has relieved is reversible
+    // allocated contra — to the part no line reached. It is not a new judgement about the units:
+    // `orderAccounting.shipments` is filtered to journaled shipments only, so a dispatched-but-
+    // unjournaled unit is already reversed this way by `consumeAllocationCostForLine`.
+    //
+    // NOT a fix for the other un-stage sites. `resetAllocationAccountingIfStaged` and
+    // `releaseOverallocations` un-stage an order that is NOT refunded, so A2 re-runs and posts a
+    // SECOND debit; there is no refund credit note to carry a reversal, and reversing from there
+    // needs its own sync type. That half of o3d-o97 is untouched here.
+    let residualAllocationSnapshot: CostLayerSnapshotEntry[] = []
     if (params.newStatus === 'REFUNDED') {
+      // Gated on the A2 STAMP, read before the update below clears it. An order A2 never staged
+      // has no Allocated Inventory contra, and crediting that account for its pins would move a
+      // balance the daily batch never posted.
+      const stagedA2 = await tx.salesOrder.findUnique({
+        where: { id: params.orderId },
+        select: { inventoryAllocatedDate: true },
+      })
+      if (stagedA2?.inventoryAllocatedDate) {
+        residualAllocationSnapshot = [...allocationAvailability.values()].flat()
+      }
       // o3d-0qoo: each batch ref is cleared IN THE SAME UPDATE as the stamp it pairs with. A row
       // left holding a ref with no stamp would make the delete guard match a batch the row is no
-      // longer part of, and block that order forever. Clearing both preserves EXACTLY today's
-      // behaviour — it is not an endorsement of it: this discards the only handle the guard and
-      // the invariants have on an A1/A2 journal that may already be POSTED (pre-existing, o3d-o97).
+      // longer part of, and block that order forever. The refs still go — what changed above is
+      // only that the A2 AMOUNT is now reversed before they do. The A1 ref is still discarded
+      // with nothing checking that the deferral reversal below covers what A1 posted.
       await tx.salesOrder.update({
         where: { id: params.orderId },
         data: {
@@ -1501,7 +1543,16 @@ async function stageRefundAccountingReversals(
         remainingUnearned,
         Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
       ),
-      allocationReversal: roundQuantity(sumCostLayerSnapshot(allocationRefundSnapshot), 2).toNumber(),
+      // o3d-o97: the lines' own allocation cost PLUS, on a full refund that un-stages A2, the
+      // residue nothing else will ever relieve. Summed at full precision and rounded once, so the
+      // two halves cannot each shed half a penny.
+      allocationReversal: roundQuantity(
+        addMoney(
+          sumCostLayerSnapshot(allocationRefundSnapshot),
+          sumCostLayerSnapshot(residualAllocationSnapshot),
+        ),
+        2,
+      ).toNumber(),
     }
   })
 
@@ -1551,7 +1602,18 @@ async function stageRefundAccountingReversals(
   }
 
   if (journalLines.length > 0) {
+    // o3d-o97: this journal now has an ALLOCATION-ONLY shape. It is reached when a full refund
+    // un-stages A2 on an order whose deferral is already fully recognised (remainingUnearned 0)
+    // but whose allocation pin is not fully relieved — allocate 3, ship and journal 2, refund in
+    // full. Naming it "Unearned revenue + allocation reversal" would describe a debit to the
+    // unearned account that this journal does not contain, so the label follows the lines.
     const hasInventoryReversal = reversalAmounts.allocationReversal > 0
+    const hasUnearnedReversal = reversalAmounts.unearnedReversal > 0
+    const subject = hasUnearnedReversal && hasInventoryReversal
+      ? 'Unearned revenue + allocation reversal'
+      : hasUnearnedReversal
+        ? 'Unearned revenue reversal'
+        : 'Allocation reversal'
     accountingSyncs.push({
       type: 'UNEARNED_REV_REVERSAL',
       referenceType: 'SalesOrderRefund',
@@ -1559,10 +1621,10 @@ async function stageRefundAccountingReversals(
       idempotencyKey: `sales-order-refund:${params.refundId}:unearned-reversal`,
       payload: {
         date: new Date().toISOString().slice(0, 10),
-        reference: `Unearned reversal: ${params.orderRef}`,
-        narration: hasInventoryReversal
-          ? `Unearned revenue + allocation reversal — refund on order ${params.orderRef}`
-          : `Unearned revenue reversal — refund on order ${params.orderRef}`,
+        reference: hasUnearnedReversal
+          ? `Unearned reversal: ${params.orderRef}`
+          : `Allocation reversal: ${params.orderRef}`,
+        narration: `${subject} — refund on order ${params.orderRef}`,
         lines: journalLines,
       },
     })
