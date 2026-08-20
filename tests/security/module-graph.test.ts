@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { createSourceGraph, declarationBody } from './module-graph'
+import ts from 'typescript'
+
+import { createSourceGraph, declarationBody, hasLexicalShadow } from './module-graph'
 
 /**
  * o3d-512h round 3 — tests for the RESOLVER, not for the app tree.
@@ -218,3 +220,178 @@ test('referrers ignores a same-named symbol declared somewhere else', () => {
 function pick(decl: { file: string; name: string } | null): { file: string; name: string } | null {
   return decl ? { file: decl.file, name: decl.name } : null
 }
+
+// ---------------------------------------------------------------------------
+// o3d-512h round 5, finding 1 — a shadow one scope in
+// ---------------------------------------------------------------------------
+
+/** The identifier `name` at its first CALL site in `file`. */
+function calleeAt(g: ReturnType<typeof createSourceGraph>, file: string, name: string): ts.Identifier {
+  const sf = g.sourceFile(file)
+  assert.ok(sf, `${file} is not in the graph`)
+  let found: ts.Identifier | undefined
+  const visit = (n: ts.Node) => {
+    if (found) return
+    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === name) {
+      found = n.expression
+      return
+    }
+    ts.forEachChild(n, visit)
+  }
+  ts.forEachChild(sf, visit)
+  assert.ok(found, `no call to ${name} in ${file}`)
+  return found
+}
+
+test('a FUNCTION-LOCAL shadow is not the imported primitive — round 4 pinned only the module-level one', () => {
+  // `locals` records top-level declarations only, so without a position the graph
+  // answers with the import: the exact "credited, not established" failure the
+  // resolver exists to stop, sitting inside the resolver.
+  const g = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/a.ts': `import { requirePermission } from '@/lib/auth/server'
+export async function go() {
+  const requirePermission = async (_p: string) => {}
+  await requirePermission('sync')
+}`,
+  })
+  // The module-scope answer is still the import — that is what it means.
+  assert.equal(g.resolve('app/actions/a.ts', 'requirePermission')?.file, 'lib/auth/server.ts')
+  // At the call site, it is not.
+  assert.equal(g.resolve('app/actions/a.ts', 'requirePermission', calleeAt(g, 'app/actions/a.ts', 'requirePermission')), null)
+})
+
+test('a PARAMETER shadows, and so does a destructured one', () => {
+  const plain = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/p.ts': `import { requireAuth } from '@/lib/auth/server'
+export async function go(requireAuth: () => Promise<void>) { await requireAuth() }`,
+  })
+  assert.equal(plain.resolve('app/actions/p.ts', 'requireAuth', calleeAt(plain, 'app/actions/p.ts', 'requireAuth')), null)
+
+  const destructured = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/d.ts': `import { requireAuth } from '@/lib/auth/server'
+export async function go({ requireAuth }: { requireAuth: () => Promise<void> }) { await requireAuth() }`,
+  })
+  assert.equal(destructured.resolve('app/actions/d.ts', 'requireAuth', calleeAt(destructured, 'app/actions/d.ts', 'requireAuth')), null)
+})
+
+test('a CATCH binding and a `for` initializer shadow too', () => {
+  const g = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/c.ts': `import { requireAuth } from '@/lib/auth/server'
+export async function go() { try { void 0 } catch (requireAuth) { await requireAuth() } }`,
+  })
+  assert.equal(g.resolve('app/actions/c.ts', 'requireAuth', calleeAt(g, 'app/actions/c.ts', 'requireAuth')), null)
+
+  const loop = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/l.ts': `import { requireAuth } from '@/lib/auth/server'
+export async function go(xs: Array<() => Promise<void>>) { for (const requireAuth of xs) { await requireAuth() } }`,
+  })
+  assert.equal(loop.resolve('app/actions/l.ts', 'requireAuth', calleeAt(loop, 'app/actions/l.ts', 'requireAuth')), null)
+})
+
+test('a `var` shadow declared in a nested block still shadows — it hoists to the function', () => {
+  const g = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/v.ts': `import { requireAuth } from '@/lib/auth/server'
+export async function go(flag: boolean) {
+  await requireAuth()
+  if (flag) { var requireAuth = async () => {} }
+}`,
+  })
+  assert.equal(g.resolve('app/actions/v.ts', 'requireAuth', calleeAt(g, 'app/actions/v.ts', 'requireAuth')), null)
+})
+
+test('a shadow in ONE function does not follow the name into another', () => {
+  const g = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/s.ts': `import { requireAuth } from '@/lib/auth/server'
+async function shadowed() { const requireAuth = async () => {}; await requireAuth() }
+export async function go() { void shadowed; await requireAuth() }`,
+  })
+  const sf = g.sourceFile('app/actions/s.ts')
+  assert.ok(sf)
+  const calls: ts.Identifier[] = []
+  const visit = (n: ts.Node) => {
+    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'requireAuth') calls.push(n.expression)
+    ts.forEachChild(n, visit)
+  }
+  ts.forEachChild(sf, visit)
+  assert.equal(calls.length, 2)
+  assert.equal(g.resolve('app/actions/s.ts', 'requireAuth', calls[0]), null, 'the shadowed one')
+  assert.equal(g.resolve('app/actions/s.ts', 'requireAuth', calls[1])?.file, 'lib/auth/server.ts', 'the real one')
+})
+
+test('resolveCallTarget checks the position itself — a caller cannot forget to ask', () => {
+  const g = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/t.ts': `import { requirePermission } from '@/lib/auth/server'
+export async function go() { const requirePermission = async (_p: string) => {}; await requirePermission('sync') }`,
+  })
+  const callee = calleeAt(g, 'app/actions/t.ts', 'requirePermission')
+  assert.equal(g.resolveCallTarget('app/actions/t.ts', callee), null)
+})
+
+test('a NAMESPACE shadowed at the call site resolves to nothing', () => {
+  const g = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/n.ts': `import * as guards from '@/lib/auth/server'
+export async function go() { const guards = { requireAuth: async () => {} }; await guards.requireAuth() }`,
+  })
+  const sf = g.sourceFile('app/actions/n.ts')
+  assert.ok(sf)
+  let ns: ts.Identifier | undefined
+  const visit = (n: ts.Node) => {
+    if (!ns && ts.isPropertyAccessExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'guards') ns = n.expression
+    ts.forEachChild(n, visit)
+  }
+  ts.forEachChild(sf, visit)
+  assert.ok(ns)
+  assert.equal(g.resolveMember('app/actions/n.ts', 'guards', 'requireAuth', ns), null)
+  // Without a position it is still the namespace — the module-scope answer.
+  assert.equal(g.resolveMember('app/actions/n.ts', 'guards', 'requireAuth')?.file, 'lib/auth/server.ts')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-512h round 5, finding 2 — is that global the global?
+// ---------------------------------------------------------------------------
+
+test('bindsAtModuleScope sees a binding `resolve` cannot — an unfollowable import', () => {
+  // This is the whole reason the question needed its own answer: `resolve`
+  // returns null both for an untouched global and for an import into a package
+  // the graph does not cover, and "null, therefore built-in" is the defect.
+  const g = createSourceGraph({
+    'lib/a.ts': "import { Symbol } from 'symbol-compat'\nexport const S = Symbol('x')\n",
+    'lib/b.ts': "export const S = Symbol('x')\n",
+    'lib/c.ts': "const Symbol = (s: string) => s\nexport const S = Symbol('x')\n",
+  })
+  assert.equal(g.resolve('lib/a.ts', 'Symbol'), null, 'resolve cannot follow it')
+  assert.equal(g.bindsAtModuleScope('lib/a.ts', 'Symbol'), true, 'but the name IS taken')
+  assert.equal(g.bindsAtModuleScope('lib/b.ts', 'Symbol'), false)
+  assert.equal(g.bindsAtModuleScope('lib/c.ts', 'Symbol'), true)
+  // A module nobody can read cannot vouch for a global.
+  assert.equal(g.bindsAtModuleScope('lib/missing.ts', 'Symbol'), true)
+})
+
+test('hasLexicalShadow is exported and answers about a position, not a file', () => {
+  const g = createSourceGraph({
+    'lib/auth/server.ts': AUTH,
+    'app/actions/h.ts': `import { requireAuth } from '@/lib/auth/server'
+export async function go() { const requireAuth = async () => {}; await requireAuth() }
+export async function ok() { await requireAuth() }`,
+  })
+  const sf = g.sourceFile('app/actions/h.ts')
+  assert.ok(sf)
+  const calls: ts.Identifier[] = []
+  const visit = (n: ts.Node) => {
+    if (ts.isCallExpression(n) && ts.isIdentifier(n.expression) && n.expression.text === 'requireAuth') calls.push(n.expression)
+    ts.forEachChild(n, visit)
+  }
+  ts.forEachChild(sf, visit)
+  assert.equal(calls.length, 2)
+  assert.equal(hasLexicalShadow(calls[0], 'requireAuth'), true)
+  assert.equal(hasLexicalShadow(calls[1], 'requireAuth'), false)
+})

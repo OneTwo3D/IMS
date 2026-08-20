@@ -51,6 +51,67 @@ export type RecordingDb = {
 export type QueryContext = { model: string; op: string; args: unknown[] }
 
 /**
+ * The part of a query that CONSTRAINS WHICH ROWS it touches.
+ *
+ * o3d-512h round 5, Codex finding 4. The self-scoping proof asked whether the
+ * caller's id appeared anywhere in the argument object:
+ *
+ *   JSON.stringify(ctx.args).includes(CALLER_ID)
+ *
+ * which every one of these satisfies without scoping anything to the caller:
+ *
+ *   db.user.findMany({ where: { role: 'ADMIN' }, select: { id: true, ownerId: true } })
+ *   db.thing.updateMany({ where: { id }, data: { updatedById: session.user.id } })
+ *   db.thing.findMany({ orderBy: { ownerId: 'asc' } })
+ *
+ * `data` records who ACTED; `where` records whose rows were REACHED, and only the
+ * second is the question. A proof that reads the whole argument object credits
+ * the audit trail as if it were the constraint — the branch's own defect, this
+ * time inside the test written to replace a withdrawn static claim.
+ *
+ * So the constraint is named per operation rather than assumed:
+ *   * a read/update/delete is scoped by `where`;
+ *   * a `create` has no `where` — the row is attached to the caller by its
+ *     `data`, so that IS the constraint for a create and nothing else is;
+ *   * an operation not on either list, and a call with no argument at all
+ *     (`findMany()` reads the table), has NO constraint. That is unscoped, which
+ *     is the direction that turns the test red.
+ */
+const WHERE_SCOPED_OPS = new Set([
+  'findUnique', 'findUniqueOrThrow', 'findFirst', 'findFirstOrThrow', 'findMany',
+  'update', 'updateMany', 'updateManyAndReturn', 'upsert',
+  'delete', 'deleteMany', 'count', 'aggregate', 'groupBy',
+])
+
+const DATA_SCOPED_OPS = new Set(['create', 'createMany', 'createManyAndReturn'])
+
+/** The constraint region of a query, or undefined when it has none. */
+export function queryConstraint(ctx: QueryContext): unknown {
+  const arg = ctx.args[0]
+  if (!arg || typeof arg !== 'object') return undefined
+  const record = arg as Record<string, unknown>
+  if (WHERE_SCOPED_OPS.has(ctx.op)) return record.where
+  if (DATA_SCOPED_OPS.has(ctx.op)) return record.data
+  return undefined
+}
+
+/**
+ * Does the query's CONSTRAINT carry `needle`?
+ *
+ * Only the constraint is searched — never `select`, `include`, `orderBy`, or a
+ * `data` payload on an operation that also has a `where`.
+ */
+export function constraintMentions(ctx: QueryContext, needle: string): boolean {
+  const constraint = queryConstraint(ctx)
+  if (constraint === undefined) return false
+  try {
+    return JSON.stringify(constraint)?.includes(needle) ?? false
+  } catch {
+    return false
+  }
+}
+
+/**
  * `result` may be a value, or a function of the query — the latter is how a test
  * asks "what would this action do if the row belonged to SOMEONE ELSE", which is
  * the only way to test a row-scoping control rather than a permission check.

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import path from 'node:path'
 import test, { before, mock } from 'node:test'
 
-import { createRecordingDb, type QueryContext } from './recording-db'
+import { constraintMentions, createRecordingDb, queryConstraint, type QueryContext } from './recording-db'
 import {
   createRepoGraph,
   scanActionsDir,
@@ -36,13 +36,22 @@ import {
  * one, and every query it issues must carry the caller's own user id.
  *
  * WHAT THIS PROVES, and what it does not:
- *   * proves — the caller's id was present as a constraint in the query that was
- *     actually sent, for every read this endpoint performed on this path;
+ *   * proves — the caller's id was present IN THE CONSTRAINT of every query this
+ *     endpoint actually sent on this path: the `where` of a read, update or
+ *     delete, the `data` of a create;
  *   * does NOT prove that the constraint is conjunctive (a `where` with an `OR`
  *     would satisfy it), and does not reach paths this call did not take. It is a
  *     lower bound on scoping, observed rather than assumed — which is strictly
  *     more than a static pin can offer, and stated as a bound rather than sold as
  *     a guarantee.
+ *
+ * ROUND 5, Codex finding 4 — the proof had the same defect it was written to
+ * replace. It searched the WHOLE argument object for the caller's id, so
+ * `{ where: { role: 'ADMIN' }, data: { updatedById: 'u1' } }` passed: the audit
+ * field credited as the constraint, `select` and `orderBy` credited as the
+ * constraint, an id mentioned anywhere at all credited as the constraint. The
+ * constraint is now named per operation — see queryConstraint in ./recording-db —
+ * and nothing outside it counts.
  */
 
 const CALLER_ID = 'u1'
@@ -120,21 +129,26 @@ before(async () => {
 // The queries an endpoint issued, described precisely enough to pin
 // ---------------------------------------------------------------------------
 
-/** `user.findUnique where {email}` — model, operation, and the filter's shape. */
+/** `user.findUnique where {email}` — model, operation, and the CONSTRAINT's shape. */
 function describe(ctx: QueryContext): string {
-  const arg = ctx.args[0]
-  const where = (arg as { where?: Record<string, unknown> } | undefined)?.where
-  const keys = where && typeof where === 'object' ? Object.keys(where).sort() : []
+  const constraint = queryConstraint(ctx)
+  const keys = constraint && typeof constraint === 'object'
+    ? Object.keys(constraint as Record<string, unknown>).sort()
+    : []
   return `${ctx.model}.${ctx.op} where {${keys.join(',')}}`
 }
 
-/** Does the query carry the CALLER's own identity? */
+/**
+ * Does the query's CONSTRAINT carry the CALLER's own identity?
+ *
+ * Round 5, Codex finding 4: this used to stringify the WHOLE argument object, so
+ * `{ where: { role: 'ADMIN' }, data: { updatedById: 'u1' } }` counted as scoped —
+ * the audit field credited as the constraint. `constraintMentions` searches the
+ * `where` of a read/update/delete and the `data` of a create, and nothing else;
+ * an operation with no constraint at all is unscoped by definition.
+ */
 function mentionsCaller(ctx: QueryContext): boolean {
-  try {
-    return JSON.stringify(ctx.args)?.includes(CALLER_ID) ?? false
-  } catch {
-    return false
-  }
+  return constraintMentions(ctx, CALLER_ID)
 }
 
 /**
@@ -298,4 +312,61 @@ test('the non-self-scoped pin names no endpoint that has left the inventory', ()
   for (const key of Object.keys(NON_SELF_SCOPED_READS)) {
     assert.ok(keys.has(key), `${key} is pinned as having a non-self-scoped read but is no longer covered`)
   }
+})
+
+// ---------------------------------------------------------------------------
+// The scoping predicate itself — round 5, Codex finding 4
+// ---------------------------------------------------------------------------
+
+/**
+ * The nine tests above are only worth their run time if "carries the caller's id"
+ * means what it says. Round 4's version did not: it stringified the whole
+ * argument object, and everything below passed it while scoping nothing.
+ */
+const q = (op: string, args: unknown): QueryContext => ({ model: 'thing', op, args: [args] })
+
+test('an id in `data` does not scope a query that also has a `where`', () => {
+  assert.equal(
+    constraintMentions(q('updateMany', { where: { role: 'ADMIN' }, data: { updatedById: CALLER_ID } }), CALLER_ID),
+    false,
+    '`data` records who ACTED; `where` records whose rows were REACHED',
+  )
+})
+
+test('an id in `select` / `include` / `orderBy` does not scope a query', () => {
+  for (const args of [
+    { where: { role: 'ADMIN' }, select: { [CALLER_ID]: true } },
+    { where: { role: 'ADMIN' }, include: { owner: { where: { id: CALLER_ID } } } },
+    { where: { role: 'ADMIN' }, orderBy: { [CALLER_ID]: 'asc' } },
+  ]) {
+    assert.equal(constraintMentions(q('findMany', args), CALLER_ID), false)
+  }
+})
+
+test('an id in `where` — however deep — does scope it', () => {
+  assert.equal(constraintMentions(q('findUnique', { where: { id: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(
+    constraintMentions(q('deleteMany', { where: { AND: [{ id: 'x' }, { userId: CALLER_ID }] } }), CALLER_ID),
+    true,
+  )
+  // The one-time-token shape: the caller's id inside a composed key.
+  assert.equal(
+    constraintMentions(q('upsert', { where: { key: `passkey_challenge:reg:${CALLER_ID}` }, create: {}, update: {} }), CALLER_ID),
+    true,
+  )
+})
+
+test('a create IS scoped by its `data` — it has no `where` to be scoped by', () => {
+  assert.equal(constraintMentions(q('create', { data: { userId: CALLER_ID } }), CALLER_ID), true)
+  assert.equal(constraintMentions(q('create', { data: { userId: 'someone-else' } }), CALLER_ID), false)
+})
+
+test('a query with NO constraint is unscoped — findMany() reads the table', () => {
+  assert.equal(constraintMentions({ model: 'thing', op: 'findMany', args: [] }, CALLER_ID), false)
+  assert.equal(constraintMentions(q('findMany', { select: { id: true } }), CALLER_ID), false)
+  assert.equal(queryConstraint(q('findMany', { select: { id: true } })), undefined)
+})
+
+test('an operation the predicate does not know is unscoped, not waved through', () => {
+  assert.equal(constraintMentions(q('someNewPrismaOp', { where: { id: CALLER_ID } }), CALLER_ID), false)
 })

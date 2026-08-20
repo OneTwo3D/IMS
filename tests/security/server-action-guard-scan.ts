@@ -60,6 +60,31 @@
  *     it is decidable — by execution, in
  *     tests/security/authentication-only-self-scoping.test.ts.
  *
+ * ---------------------------------------------------------------------------
+ * o3d-512h round 5 — THE MACHINERY NEEDED THE DISCIPLINE IT ENFORCES.
+ *
+ * Codex round 5 found the same failure three more times, and every instance was
+ * in the verification code itself rather than in the app:
+ *
+ *   * resolution answered a call site with the MODULE-SCOPE binding, so a guard
+ *     name shadowed by a local, a parameter or a destructured argument resolved
+ *     to the imported primitive. Round 4's fixture asserted a shadow "counts for
+ *     nothing" — it pinned the one kind of shadow `locals` can see. Resolution is
+ *     now position-aware (module-graph.ts:hasLexicalShadow), and an intervening
+ *     binding makes the answer NOT VERIFIED;
+ *   * the sentinel check required a `const` initialised with a call to something
+ *     SPELLED `Symbol` — a name match, in the rule written to replace a name
+ *     match. A local or imported `Symbol` satisfied it, and the value it produces
+ *     is one a client can send. The global is now verified as a global, and the
+ *     binding must be `const` (see isBuiltinGlobal);
+ *   * position analysis answered whether a guard runs and never when, so a guard
+ *     after the write was credited (see firstDataMutationPosition).
+ *
+ * The fourth finding of the round is against the self-scoping proof rather than
+ * this file: it searched the whole query argument for the caller's id instead of
+ * the query's CONSTRAINT, so an id in `data` or `select` counted as scoping. Its
+ * answer lives in ./recording-db.ts:queryConstraint.
+ *
  * Not named *.test.ts on purpose — `npm run test:unit` globs tests/**\/*.test.ts.
  */
 import { readdirSync, readFileSync } from 'node:fs'
@@ -71,6 +96,7 @@ import {
   calleeRootName,
   createRepoGraph,
   declarationBody,
+  hasLexicalShadow,
   type Declaration,
   type ModuleGraph,
 } from './module-graph'
@@ -217,6 +243,7 @@ const MAX_GUARD_DEPTH = 3
 type Verifier = {
   graph: ModuleGraph
   memo: Map<string, Set<GuardKind>>
+  writeMemo: Map<string, boolean>
   active: Set<string>
 }
 
@@ -225,7 +252,7 @@ const verifiers = new WeakMap<ModuleGraph, Verifier>()
 function verifierFor(graph: ModuleGraph): Verifier {
   let v = verifiers.get(graph)
   if (!v) {
-    v = { graph, memo: new Map(), active: new Set() }
+    v = { graph, memo: new Map(), writeMemo: new Map(), active: new Set() }
     verifiers.set(graph, v)
   }
   return v
@@ -396,16 +423,45 @@ function isSymbolSentinel(
 ): boolean {
   if (!graph) return false
   const decl = ts.isIdentifier(expr)
-    ? graph.resolve(file, expr.text)
+    ? graph.resolve(file, expr.text, expr)
     : ts.isPropertyAccessExpression(expr) && ts.isIdentifier(expr.expression) && ts.isIdentifier(expr.name)
-      ? graph.resolveMember(file, expr.expression.text, expr.name.text)
+      ? graph.resolveMember(file, expr.expression.text, expr.name.text, expr.expression)
       : null
   if (!decl || !ts.isVariableDeclaration(decl.node)) return false
+  // A `let` or `var` holding a Symbol can be reassigned to something a client can
+  // send, so the const-ness is part of the control, not a stylistic detail.
+  const list = decl.node.parent
+  if (!ts.isVariableDeclarationList(list) || (list.flags & ts.NodeFlags.Const) === 0) return false
   const init = decl.node.initializer
-  return !!init
-    && ts.isCallExpression(init)
-    && ts.isIdentifier(init.expression)
-    && init.expression.text === 'Symbol'
+  if (!init || !ts.isCallExpression(init) || !ts.isIdentifier(init.expression)) return false
+  if (init.expression.text !== 'Symbol') return false
+  return isBuiltinGlobal(decl.file, init.expression, graph)
+}
+
+/**
+ * o3d-512h round 5, Codex finding 2 — WHOSE `Symbol` IS THIS?
+ *
+ * The whole force of the sentinel argument is a property of the BUILT-IN
+ * `Symbol`: its result has no wire representation, so a deserialized argument can
+ * never equal it. Round 4 verified the shape — a `const` initialised with a call
+ * to something spelled `Symbol` — and stopped there, which is the name match this
+ * branch exists to refuse. A module is free to write
+ *
+ *   const Symbol = (s: string) => s          // or: import { Symbol } from './compat'
+ *   const INTERNAL_ACTION_BYPASS = Symbol('internal')
+ *
+ * and every guard behind that sentinel would have been credited while a client
+ * could send the string `'internal'` and take the bypass arm.
+ *
+ * So the global is verified as a global: nothing in the declaring module may bind
+ * the name at module scope, and nothing may shadow it at the initialiser's
+ * position. `bindsAtModuleScope` is asked rather than `resolve`, because an
+ * import the graph cannot follow resolves to null exactly as an untouched global
+ * does — and answering "null, therefore built-in" is how this defect got in.
+ */
+function isBuiltinGlobal(file: string, ident: ts.Identifier, graph: ModuleGraph): boolean {
+  if (graph.bindsAtModuleScope(file, ident.text)) return false
+  return !hasLexicalShadow(ident, ident.text)
 }
 
 type SentinelPolarity = 'miss' | 'match' | null
@@ -583,6 +639,129 @@ export function collectExecutedCalls(
   return calls
 }
 
+// ---------------------------------------------------------------------------
+// Round 5, Codex finding 3 — DOES THE GUARD RUN *BEFORE* THE DAMAGE?
+// ---------------------------------------------------------------------------
+
+/**
+ * Prisma operations that CHANGE something.
+ *
+ * Round 4 answered "does the guard run" and left "when" unasked, and the two are
+ * not the same question:
+ *
+ *   export async function deleteThing(id: string) {
+ *     await db.thing.delete({ where: { id } })   // already gone
+ *     await requireAdmin()                        // credited by position analysis
+ *   }
+ *
+ * Every rule in this file said that endpoint was guarded. The row is deleted
+ * before the refusal is ever raised, and the refusal the caller receives is
+ * indistinguishable from one where nothing happened — which makes it worse than
+ * no guard, because the denial reads as proof the write did not land.
+ *
+ * Narrow on purpose: MUTATIONS, not reads. A read placed before a guard is a
+ * disclosure question this rule does not decide (the secret-read rule and the
+ * self-scoping proof cover that ground), and widening this to every `db.` access
+ * would turn a rule with no false positives today into one answered by allowlist
+ * entries. What is claimed is exactly what is checked: no credited guard sits
+ * after a write.
+ */
+const MUTATING_PRISMA_OPS = new Set([
+  'create', 'createMany', 'createManyAndReturn',
+  'update', 'updateMany', 'updateManyAndReturn',
+  'upsert', 'delete', 'deleteMany',
+])
+
+const RAW_MUTATION_METHODS = new Set(['$executeRaw', '$executeRawUnsafe'])
+
+/** `db.thing.delete(...)` / `db.$executeRaw(...)` — a call that writes. */
+function isDataMutationCall(call: ts.CallExpression): boolean {
+  const callee = call.expression
+  if (!ts.isPropertyAccessExpression(callee) || !ts.isIdentifier(callee.name)) return false
+  const root = calleeRootName(callee)
+  if (root === null || !DATA_CLIENT_ROOTS.has(root)) return false
+  if (RAW_MUTATION_METHODS.has(callee.name.text)) return true
+  return MUTATING_PRISMA_OPS.has(callee.name.text)
+}
+
+/**
+ * Source position of the first write in this body, or Infinity.
+ *
+ * Deliberately over-reporting: EVERY mutation in the body counts, including one
+ * inside a branch, a loop or a `$transaction` callback. A write that might happen
+ * before the guard is still a write the guard did not gate, and this rule's
+ * errors must land on the side that turns the build red. It is the mirror of
+ * collectExecutedCalls, which under-credits for the same reason.
+ *
+ * WHAT IT MEASURES, said plainly: `getStart()` is a SOURCE OFFSET, not an
+ * execution order. For straight-line code the two agree, and that is the shape
+ * this rule is about. Where they can disagree — a write inside a closure defined
+ * above the guard and invoked below it — the rule refuses credit for a guard it
+ * cannot place. That is a false POSITIVE (a red build on code that is fine), and
+ * it is the direction to be wrong in; the live tree produces none today, and one
+ * would be answered by moving the guard above the closure, not by an allowlist.
+ */
+export function firstDataMutationPosition(body: ts.ConciseBody | undefined): number {
+  if (!body) return Infinity
+  let first = Infinity
+  const visit = (n: ts.Node) => {
+    if (ts.isCallExpression(n) && isDataMutationCall(n)) {
+      first = Math.min(first, n.getStart())
+    }
+    ts.forEachChild(n, visit)
+  }
+  if (ts.isBlock(body)) ts.forEachChild(body, visit)
+  else visit(body)
+  return first
+}
+
+/**
+ * Does this declaration write, itself or through anything the graph can follow?
+ *
+ * The endpoint's own body is not the only place a write can be. A helper called
+ * before the guard writes just as permanently as an inline `db.thing.delete`, and
+ * a rule that only read the endpoint's text would be answered by moving one line
+ * into a function — a shape check, which is what round 3 abolished.
+ *
+ * LIMIT, stated: an UNRESOLVABLE callee is not counted as a write. That is the
+ * opposite of the direction the guard walk takes with an unresolvable callee, and
+ * deliberately so — here, treating the unknown as a write would refuse credit to
+ * a correctly guarded endpoint (a false positive, a red build on good code) every
+ * time a guard sat below any call the graph cannot follow, which is most of them.
+ * So this half under-reports: it catches a laundered write it can see, and says
+ * nothing about one it cannot.
+ */
+function declarationWrites(decl: Declaration, v: Verifier, depth: number): boolean {
+  if (depth > MAX_GUARD_DEPTH) return false
+  const key = `writes:${decl.file}:${decl.name}:${depth}`
+  const cached = v.writeMemo.get(key)
+  if (cached !== undefined) return cached
+  if (v.active.has(key)) return false // recursion: prove nothing, claim nothing
+  v.active.add(key)
+  try {
+    const body = declarationBody(decl)
+    if (!body) return false
+    if (firstDataMutationPosition(body) < Infinity) {
+      v.writeMemo.set(key, true)
+      return true
+    }
+    for (const call of collectCalls(body)) {
+      const root = calleeRootName(call.expression)
+      if (root !== null && DATA_CLIENT_ROOTS.has(root)) continue
+      const target = v.graph.resolveCallTarget(decl.file, call.expression)
+      if (!target) continue
+      if (declarationWrites(target, v, depth + 1)) {
+        v.writeMemo.set(key, true)
+        return true
+      }
+    }
+    v.writeMemo.set(key, false)
+    return false
+  } finally {
+    v.active.delete(key)
+  }
+}
+
 /**
  * The guard kinds a body PROVABLY establishes: every call that PROVABLY EXECUTES
  * (collectExecutedCalls) and whose callee RESOLVES to a pinned guard declaration,
@@ -591,6 +770,14 @@ export function collectExecutedCalls(
  * Both halves are verification. Round 3 added the second; round 4 added the
  * first, because a guard that resolves perfectly and sits in a branch nothing
  * takes is credit given for work not done.
+ *
+ * Round 5 adds a third: the call must also sit BEFORE the first write in the body
+ * (firstDataMutationPosition). "Does it run" and "does it run in time" are
+ * different questions, and only the first had ever been asked — so
+ * `await db.thing.delete(...)` followed by `await requireAdmin()` was a guarded
+ * endpoint by every rule in this file. Reads before a guard are deliberately NOT
+ * covered here; that limit is stated at firstDataMutationPosition rather than
+ * left for a reader to discover.
  *
  * Without a graph nothing resolves, so nothing is credited. That is the correct
  * failure direction for a rule whose job is to have no false negatives, and it
@@ -606,20 +793,33 @@ export function guardKindsOfBody(
   const kinds = new Set<GuardKind>()
   if (!body || !graph || depth > MAX_GUARD_DEPTH) return kinds
   const v = verifierFor(graph)
+  const executed = collectExecutedCalls(file, body, graph)
 
-  for (const call of collectExecutedCalls(file, body, graph)) {
+  // Everything the body reaches, resolved once: what each call is, and whether it
+  // is a guard. The guard question is asked FIRST because a guard is not a write
+  // even when its own body records the refusal — a denial that logs itself would
+  // otherwise disqualify itself.
+  const resolved = executed.map((call) => {
     const root = calleeRootName(call.expression)
-    if (root !== null && DATA_CLIENT_ROOTS.has(root)) continue
-
+    if (root !== null && DATA_CLIENT_ROOTS.has(root)) return { call, target: null, kinds: new Set<GuardKind>() }
     const target = graph.resolveCallTarget(file, call.expression)
-    if (!target) continue // NOT VERIFIED — never credited.
-
+    if (!target) return { call, target: null, kinds: new Set<GuardKind>() }
     const direct = guardKindOfDeclaration(target)
-    if (direct) {
-      kinds.add(direct)
-      continue
-    }
-    for (const kind of guardKindsOfDeclaration(target, v, depth + 1)) kinds.add(kind)
+    const kinds = direct ? new Set<GuardKind>([direct]) : guardKindsOfDeclaration(target, v, depth + 1)
+    return { call, target, kinds }
+  })
+
+  let firstWrite = firstDataMutationPosition(body)
+  for (const entry of resolved) {
+    if (!entry.target || entry.kinds.size > 0) continue
+    if (entry.call.getStart() >= firstWrite) continue
+    if (declarationWrites(entry.target, v, depth + 1)) firstWrite = entry.call.getStart()
+  }
+
+  for (const entry of resolved) {
+    // A guard that runs after the row is already written gated nothing (round 5).
+    if (entry.call.getStart() > firstWrite) continue
+    for (const kind of entry.kinds) kinds.add(kind)
   }
 
   return kinds
@@ -814,7 +1014,7 @@ export function readsSettingSecret(
       } else {
         // Every identifier, not only the ones already spelled like a reader:
         // that name test was the aliasing hole (round 4, finding 3).
-        const decl = graph.resolve(file, n.text)
+        const decl = graph.resolve(file, n.text, n)
         if (isSecretReaderDeclaration(decl)) { found = true; return }
         if (!decl && SETTINGS_SECRET_READERS.has(n.text)) { found = true; return }
       }
@@ -898,8 +1098,9 @@ function rekey(graph: ModuleGraph, shortKey: string, realKey: string): ModuleGra
     files: () => graph.files(),
     source: (f) => graph.source(map(f)),
     sourceFile: (f) => graph.sourceFile(map(f)),
-    resolve: (f, n) => graph.resolve(map(f), n),
-    resolveMember: (f, ns, m) => graph.resolveMember(map(f), ns, m),
+    bindsAtModuleScope: (f, n) => graph.bindsAtModuleScope(map(f), n),
+    resolve: (f, n, at) => graph.resolve(map(f), n, at),
+    resolveMember: (f, ns, m, at) => graph.resolveMember(map(f), ns, m, at),
     resolveCallTarget: (f, c) => graph.resolveCallTarget(map(f), c),
     referrers: (f, n, p) => graph.referrers(map(f), n, p),
   }

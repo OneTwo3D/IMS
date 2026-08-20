@@ -56,10 +56,27 @@ export type ModuleGraph = {
   /**
    * The declaration an identifier written inside `file` refers to, or null when
    * it cannot be resolved (a node_modules import, a parameter, a global).
+   *
+   * `at` is the identifier's own node. Pass it whenever you have it: without a
+   * position the answer is a MODULE-SCOPE answer, and a name bound in an
+   * enclosing function, block, parameter list or catch clause is a different
+   * binding entirely. With `at`, an intervening binding makes the answer null —
+   * NOT VERIFIED — rather than the module-scope import (o3d-512h round 5).
    */
-  resolve(file: string, name: string): Declaration | null
+  resolve(file: string, name: string, at?: ts.Node): Declaration | null
   /** The declaration `<ns>.<member>` refers to, when `ns` is a namespace import. */
-  resolveMember(file: string, ns: string, member: string): Declaration | null
+  resolveMember(file: string, ns: string, member: string, at?: ts.Node): Declaration | null
+  /**
+   * Is `name` bound at MODULE scope in `file` — by any declaration or any import,
+   * resolvable or not?
+   *
+   * The question a global needs answered: `Symbol(...)` means the built-in only
+   * while nothing in the module has taken the name. `resolve` cannot answer it,
+   * because an import the graph cannot follow (`import { Symbol } from 'x'`)
+   * resolves to null exactly as an untouched global does. Returns true when the
+   * file cannot be read: a module nobody looked at cannot vouch for a global.
+   */
+  bindsAtModuleScope(file: string, name: string): boolean
   /**
    * The declaration a call target refers to: `f()`, `ns.f()`, `mod.f()`.
    * Returns null for anything whose target is a value the graph cannot follow
@@ -87,6 +104,145 @@ export function declarationBody(decl: Declaration | null): ts.ConciseBody | unde
     if (ts.isArrowFunction(init) || ts.isFunctionExpression(init)) return init.body
   }
   return undefined
+}
+
+/**
+ * Is `name` bound by a scope BETWEEN `node` and the module top level?
+ *
+ * o3d-512h round 5, Codex finding 1. The resolver was built so aliasing could not
+ * defeat a name match, and round 4's own fixture asserted that a shadow "counts
+ * for nothing" — but the shadow it tested was a MODULE-LEVEL one, which is the
+ * only kind `locals` records. A shadow one scope in is invisible to it:
+ *
+ *   import { requirePermission } from '@/lib/auth/server'
+ *   export async function deleteThing(id: string) {
+ *     const requirePermission = async () => {}   // does nothing
+ *     await requirePermission('sales.delete')     // credited as the real guard
+ *   }
+ *
+ * `locals` holds top-level declarations only, so `resolveLocal` fell straight
+ * through to `imports` and answered with the security primitive. That is the
+ * branch's own defect once more: the checker crediting something it had not
+ * established.
+ *
+ * So resolution becomes position-aware. Every binding form that can take a name
+ * away from the module scope counts — parameters and their destructuring
+ * patterns, `const`/`let`/`var` in any enclosing block, block-scoped function and
+ * class declarations, a named function expression's own name, a `catch` binding,
+ * a `for`/`for…of` initializer — and `var`/function hoisting is applied at the
+ * enclosing function rather than at the block that spells it.
+ *
+ * A shadow makes the answer NULL, not "the local declaration": the local binding
+ * is an arbitrary runtime value the graph has no declaration site for, and every
+ * caller already treats null as not-verified. Under-crediting is the direction
+ * that turns the build red.
+ */
+export function hasLexicalShadow(node: ts.Node, name: string): boolean {
+  let cur: ts.Node | undefined = node.parent
+  while (cur && !ts.isSourceFile(cur)) {
+    if (scopeBinds(cur, name)) return true
+    cur = cur.parent
+  }
+  return false
+}
+
+function addBindingNames(name: ts.BindingName | undefined, out: Set<string>): void {
+  if (!name) return
+  if (ts.isIdentifier(name)) {
+    out.add(name.text)
+    return
+  }
+  for (const el of name.elements) {
+    if (ts.isOmittedExpression(el)) continue
+    addBindingNames(el.name, out)
+  }
+}
+
+function addStatementBindings(st: ts.Statement, out: Set<string>): void {
+  if (ts.isVariableStatement(st)) {
+    for (const d of st.declarationList.declarations) addBindingNames(d.name, out)
+    return
+  }
+  if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st)) && st.name) {
+    out.add(st.name.text)
+    return
+  }
+  if (ts.isEnumDeclaration(st) || ts.isModuleDeclaration(st)) {
+    if (ts.isIdentifier(st.name as ts.Node)) out.add((st.name as ts.Identifier).text)
+    return
+  }
+  if (ts.isImportEqualsDeclaration(st)) out.add(st.name.text)
+}
+
+/** `var` and function declarations belong to the enclosing FUNCTION, not the block. */
+function addHoistedBindings(node: ts.Node, out: Set<string>): void {
+  const visit = (n: ts.Node) => {
+    if (isScopeFunctionLike(n)) return // its own hoisting, not ours
+    if (ts.isVariableStatement(n) && (n.declarationList.flags & ts.NodeFlags.Let) === 0
+      && (n.declarationList.flags & ts.NodeFlags.Const) === 0) {
+      for (const d of n.declarationList.declarations) addBindingNames(d.name, out)
+    }
+    if (ts.isFunctionDeclaration(n) && n.name) out.add(n.name.text)
+    ts.forEachChild(n, visit)
+  }
+  ts.forEachChild(node, visit)
+}
+
+const isScopeFunctionLike = (n: ts.Node): boolean =>
+  ts.isArrowFunction(n)
+  || ts.isFunctionExpression(n)
+  || ts.isFunctionDeclaration(n)
+  || ts.isMethodDeclaration(n)
+  || ts.isConstructorDeclaration(n)
+  || ts.isGetAccessorDeclaration(n)
+  || ts.isSetAccessorDeclaration(n)
+
+/** Names this one node binds directly. */
+function scopeBinds(node: ts.Node, name: string): boolean {
+  const out = new Set<string>()
+
+  if (isScopeFunctionLike(node)) {
+    for (const p of (node as ts.SignatureDeclaration).parameters ?? []) addBindingNames(p.name, out)
+    // A named function expression binds its own name inside itself.
+    if ((ts.isFunctionExpression(node) || ts.isFunctionDeclaration(node)) && node.name) {
+      out.add(node.name.text)
+    }
+    const body = (node as { body?: ts.Node }).body
+    if (body) addHoistedBindings(body, out)
+    return out.has(name)
+  }
+
+  if (ts.isClassDeclaration(node) || ts.isClassExpression(node)) {
+    if (node.name) out.add(node.name.text)
+    return out.has(name)
+  }
+
+  if (ts.isBlock(node) || ts.isModuleBlock(node)) {
+    for (const st of node.statements) addStatementBindings(st, out)
+    return out.has(name)
+  }
+
+  if (ts.isCaseBlock(node)) {
+    for (const clause of node.clauses) {
+      for (const st of clause.statements) addStatementBindings(st, out)
+    }
+    return out.has(name)
+  }
+
+  if (ts.isCatchClause(node)) {
+    addBindingNames(node.variableDeclaration?.name, out)
+    return out.has(name)
+  }
+
+  if (ts.isForStatement(node) || ts.isForInStatement(node) || ts.isForOfStatement(node)) {
+    const init = node.initializer
+    if (init && ts.isVariableDeclarationList(init)) {
+      for (const d of init.declarations) addBindingNames(d.name, out)
+    }
+    return out.has(name)
+  }
+
+  return false
 }
 
 /** `db.setting.findMany` -> `db`; `f` -> `f`. Null when the root is not an identifier. */
@@ -292,11 +448,21 @@ function createGraph(
     source,
     sourceFile: (file) => info(file)?.sf,
 
-    resolve(file, name) {
+    bindsAtModuleScope(file, name) {
+      const fi = info(file)
+      if (!fi) return true // unreadable module: cannot vouch for anything
+      return fi.locals.has(name) || fi.imports.has(name)
+    },
+
+    resolve(file, name, at) {
+      // A binding between `at` and the module top level is a DIFFERENT binding,
+      // and the graph has no declaration site for it. Not verified.
+      if (at && hasLexicalShadow(at, name)) return null
       return resolveLocal(file, name, new Set())
     },
 
-    resolveMember(file, ns, member) {
+    resolveMember(file, ns, member, at) {
+      if (at && hasLexicalShadow(at, ns)) return null
       const fi = info(file)
       if (!fi) return null
       const imported = fi.imports.get(ns)
@@ -307,9 +473,11 @@ function createGraph(
     },
 
     resolveCallTarget(file, callee) {
-      if (ts.isIdentifier(callee)) return graph.resolve(file, callee.text)
+      // The callee node carries its own position, so shadowing is always checked
+      // here — a caller cannot forget to ask for it.
+      if (ts.isIdentifier(callee)) return graph.resolve(file, callee.text, callee)
       if (ts.isPropertyAccessExpression(callee) && ts.isIdentifier(callee.expression) && ts.isIdentifier(callee.name)) {
-        return graph.resolveMember(file, callee.expression.text, callee.name.text)
+        return graph.resolveMember(file, callee.expression.text, callee.name.text, callee.expression)
       }
       return null
     },

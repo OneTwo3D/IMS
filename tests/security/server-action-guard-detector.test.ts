@@ -978,3 +978,285 @@ test('a guard in a try whose FINALLY returns is not credited — finally swallow
     [`${F}:a`],
   )
 })
+
+// ---------------------------------------------------------------------------
+// o3d-512h round 5 — the verification machinery crediting what it never checked
+// ---------------------------------------------------------------------------
+
+test('a guard name SHADOWED inside the function body is not the guard — round 5, finding 1', () => {
+  // The resolver was built so aliasing could not defeat a name match, and round 4
+  // pinned a MODULE-LEVEL shadow. This is the same defect one scope in: `locals`
+  // holds top-level declarations only, so resolution fell through to the import
+  // and answered with the real primitive while every call here runs a no-op.
+  assert.deepEqual(
+    scan(`export async function a() {
+      const requirePermission = async (_p: string) => {}
+      await requirePermission('sync')
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a PARAMETER shadowing a guard name is not the guard either', () => {
+  // The caller supplies it. `a(async () => {})` disarms the endpoint from the wire.
+  assert.deepEqual(
+    scan(`export async function a(requirePermission: (p: string) => Promise<void>) {
+      await requirePermission('sync')
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a DESTRUCTURED parameter shadowing a guard name is not the guard', () => {
+  assert.deepEqual(
+    scan(`export async function a({ requirePermission }: { requirePermission: (p: string) => Promise<void> }) {
+      await requirePermission('sync')
+      return db.thing.findMany()
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a shadow in a SIBLING function does not disarm the real guard elsewhere', () => {
+  // The other direction, and the one that keeps the rule usable: shadowing is a
+  // property of a position, not of a file.
+  assert.deepEqual(
+    scan(`async function helper() { const requirePermission = async (_p: string) => {}; await requirePermission('x') }
+    export async function a() {
+      void helper
+      await requirePermission('sync')
+      return db.thing.findMany()
+    }`),
+    [],
+  )
+})
+
+test('a shadowed SECRET READER still counts as a read — shadowing fails closed both ways', () => {
+  // Resolution says "not verified", and the secret-read rule treats an
+  // unresolvable name that is spelled like a reader as a read rather than
+  // waving it through. Under an authentication-only gate that is a violation.
+  assert.deepEqual(
+    scanSecrets(`export async function a() {
+      await requireAuth()
+      const getSettingValue = async (_k: string) => 'x'
+      return getSettingValue('smtp_password')
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a sentinel built from a LOCAL function named Symbol earns nothing — round 5, finding 2', () => {
+  // The sentinel argument rests entirely on the BUILT-IN Symbol: its result has
+  // no wire representation. A module-level binding of the name produces a value
+  // a client can send — here, the string 'internal-bypass'.
+  const fake = {
+    'lib/fakesym.ts':
+      "const Symbol = (s: string) => s\nexport const FAKE_BYPASS = Symbol('internal-bypass')\n",
+  }
+  assert.deepEqual(
+    scan(`import { FAKE_BYPASS } from '@/lib/fakesym'
+    export async function a(options?: { t?: unknown }) {
+      if (options?.t !== FAKE_BYPASS) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, fake),
+    [`${F}:a`],
+  )
+})
+
+test('a sentinel built from an IMPORTED binding named Symbol earns nothing', () => {
+  const fake = {
+    'lib/symcompat.ts': "export const Symbol = (s: string) => s\n",
+    'lib/fakesym2.ts':
+      "import { Symbol } from '@/lib/symcompat'\nexport const FAKE_BYPASS = Symbol('internal-bypass')\n",
+  }
+  assert.deepEqual(
+    scan(`import { FAKE_BYPASS } from '@/lib/fakesym2'
+    export async function a(options?: { t?: unknown }) {
+      if (options?.t !== FAKE_BYPASS) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, fake),
+    [`${F}:a`],
+  )
+})
+
+test('a sentinel held in a LET, not a const, earns nothing — it can be reassigned', () => {
+  const fake = { 'lib/letsym.ts': "export let LET_BYPASS = Symbol('internal-bypass')\n" }
+  assert.deepEqual(
+    scan(`import { LET_BYPASS } from '@/lib/letsym'
+    export async function a(options?: { t?: unknown }) {
+      if (options?.t !== LET_BYPASS) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, fake),
+    [`${F}:a`],
+  )
+})
+
+test('the real Symbol sentinel still passes — the round 4 shape does not regress', () => {
+  assert.deepEqual(
+    scan(`${BYPASS_IMPORT}export async function a(options?: { t?: symbol }) {
+      if (options?.t !== INTERNAL_BYPASS) { await requirePermission('sync') }
+      return db.thing.findMany()
+    }`, {}, BYPASS),
+    [],
+  )
+})
+
+test('a guard AFTER a write is not credited — round 5, finding 3', () => {
+  // Position analysis answered "does it run" and never asked "when". The row is
+  // gone before the refusal is raised, and the caller receives a denial that
+  // reads as proof nothing happened.
+  assert.deepEqual(
+    scan(`export async function a(id: string) {
+      await db.thing.delete({ where: { id } })
+      await requirePermission('sync')
+      return { ok: true }
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a guard BEFORE the write is credited — ordering is the whole rule', () => {
+  assert.deepEqual(
+    scan(`export async function a(id: string) {
+      await requirePermission('sync')
+      await db.thing.delete({ where: { id } })
+      return { ok: true }
+    }`),
+    [],
+  )
+})
+
+test('a write inside a $transaction callback still precedes a later guard', () => {
+  assert.deepEqual(
+    scan(`export async function a(id: string) {
+      await db.$transaction(async (tx) => { await tx.thing.update({ where: { id }, data: {} }) })
+      await requirePermission('sync')
+      return { ok: true }
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a write in a branch that may not run still disqualifies a later guard', () => {
+  // The rule over-reports writes for the same reason the position rule
+  // under-credits guards: a write that MIGHT happen first is one the guard did
+  // not gate.
+  assert.deepEqual(
+    scan(`export async function a(id: string, flag: boolean) {
+      if (flag) { await db.thing.deleteMany({ where: { id } }) }
+      await requirePermission('sync')
+      return { ok: true }
+    }`),
+    [`${F}:a`],
+  )
+})
+
+test('a READ before the guard is not this rule — reads are left to the other rules', () => {
+  // Stated as a limit rather than implied: widening to every db access would be
+  // answered with allowlist entries, so the rule claims exactly what it checks.
+  assert.deepEqual(
+    scan(`export async function a(id: string) {
+      const row = await db.thing.findUnique({ where: { id } })
+      await requirePermission('sync')
+      return row
+    }`),
+    [],
+  )
+})
+
+test('a DELEGATE that writes before its own guard does not launder the guard', () => {
+  assert.deepEqual(
+    scan(`import { doIt } from '@/lib/late'
+    export async function a(id: string) { return doIt(id) }`, {}, {
+      'lib/late.ts':
+        "import { requirePermission } from '@/lib/auth/server'\n"
+        + 'export async function doIt(id: string) {\n'
+        + '  await db.thing.delete({ where: { id } })\n'
+        + "  await requirePermission('sync')\n"
+        + '}\n',
+    }),
+    [`${F}:a`],
+  )
+})
+
+test('a write LAUNDERED through a helper still disqualifies a later guard', () => {
+  // Otherwise the rule is answered by moving one line into a function, which is a
+  // shape check — exactly what resolution replaced.
+  assert.deepEqual(
+    scan(`import { wipe } from '@/lib/wipe'
+    export async function a(id: string) {
+      await wipe(id)
+      await requirePermission('sync')
+      return { ok: true }
+    }`, {}, {
+      'lib/wipe.ts': 'export async function wipe(id: string) { await db.thing.deleteMany({ where: { id } }) }',
+    }),
+    [`${F}:a`],
+  )
+})
+
+test('a READING helper before the guard is not a write — the limit holds in both directions', () => {
+  assert.deepEqual(
+    scan(`import { load } from '@/lib/load'
+    export async function a(id: string) {
+      const row = await load(id)
+      await requirePermission('sync')
+      return row
+    }`, {}, {
+      'lib/load.ts': 'export async function load(id: string) { return db.thing.findUnique({ where: { id } }) }',
+    }),
+    [],
+  )
+})
+
+test('a guard that RECORDS its own refusal does not disqualify the guards after it', () => {
+  // A denial that writes an activity row is still a denial. If the write question
+  // were asked first, this endpoint would lose the AUTHORIZATION check that comes
+  // after the logging one and be reported as reading a secret behind
+  // authentication alone — a violation manufactured by the checker.
+  const GUARD_LOG = {
+    'lib/authlog.ts':
+      "import { requireAuth } from '@/lib/auth/server'\n"
+      + 'export async function authAndLog() {\n'
+      + '  await requireAuth()\n'
+      + "  await db.activityLog.create({ data: { action: 'seen' } })\n"
+      + '}\n',
+  }
+  assert.deepEqual(
+    scanSecrets(`import { authAndLog } from '@/lib/authlog'
+    export async function a() {
+      await authAndLog()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, GUARD_LOG),
+    [],
+  )
+  // …and the write it performs is still a write when it is NOT a guard.
+  assert.deepEqual(
+    scanSecrets(`import { justLog } from '@/lib/justlog'
+    export async function a() {
+      await justLog()
+      await requirePermission('settings.read')
+      return getSettingValue('smtp_password')
+    }`, {
+      'lib/justlog.ts': "export async function justLog() { await db.activityLog.create({ data: { action: 'seen' } }) }",
+    }),
+    [`${F}:a`],
+  )
+})
+
+test('an UNRESOLVABLE callee before the guard is not treated as a write', () => {
+  // The stated limit: counting the unknown as a write would put a red build on
+  // every correctly guarded endpoint that calls anything the graph cannot follow.
+  assert.deepEqual(
+    scan(`import { connector } from 'some-package'
+    export async function a(id: string) {
+      await connector.doSomething(id)
+      await requirePermission('sync')
+      return { ok: true }
+    }`),
+    [],
+  )
+})
