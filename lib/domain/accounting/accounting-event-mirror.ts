@@ -30,7 +30,7 @@ export type MirroredDocumentAccountingSyncType =
 
 export type MirroredAccountingSyncType = MirroredJournalAccountingSyncType | MirroredDocumentAccountingSyncType
 
-type AccountingEventMirrorTransactionClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>
+export type AccountingEventMirrorTransactionClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>
 
 export const MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -257,24 +257,116 @@ export async function mirrorAccountingSyncLogToEvent(
 }
 
 /**
- * Sync types that REVISE an external document that already exists, mapped to the event types that
- * may legitimately be holding that document's external id when the revision posts.
+ * The DOCUMENT REVISION FAMILIES: the sync type that CREATES an external document, mapped to the
+ * sync types that REVISE that same document afterwards.
  *
  * A Xero `updateSalesInvoice` returns the SAME InvoiceID as the original post, so the revision's
  * mirrored event and the event it revises compete for one `(externalSystem, externalId)` row —
- * see `supersedePriorDocumentRevision`. `SALES_INVOICE_UPDATE` may follow the original
- * `SALES_INVOICE` *or* an earlier `SALES_INVOICE_UPDATE`, because a document can be revised any
- * number of times (each edit hashes to its own sync log, and so to its own mirrored event).
+ * see `resolveDocumentRevisionExternalIdClaim`. A document can be revised any number of times
+ * (each edit hashes to its own sync log, and so to its own mirrored event), so a revision may
+ * follow the original create *or* an earlier revision of the same family.
+ *
+ * ONE TABLE, because three things have to agree about what a family is and they are read in three
+ * different files: the takeover's lineage guard, the "is this a revision?" predicate, and
+ * reconciliation's duplicate-reference exemption. Deriving all three from here is what keeps
+ * reconciliation from exempting a pairing the mirror would refuse.
  */
-const DOCUMENT_REVISION_PREDECESSOR_TYPES: Record<string, readonly string[]> = {
-  SALES_INVOICE_UPDATE: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'],
-  PURCHASE_INVOICE_UPDATE: ['PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE'],
+const DOCUMENT_REVISION_FAMILIES: Record<string, readonly string[]> = {
+  SALES_INVOICE: ['SALES_INVOICE_UPDATE'],
+  PURCHASE_INVOICE: ['PURCHASE_INVOICE_UPDATE'],
 }
+
+/** Revision type -> the event types that may legitimately hold the document id when it posts. */
+const DOCUMENT_REVISION_PREDECESSOR_TYPES: Record<string, readonly string[]> = Object.fromEntries(
+  Object.entries(DOCUMENT_REVISION_FAMILIES).flatMap(([createType, revisionTypes]) =>
+    revisionTypes.map((revisionType) => [revisionType, [createType, ...revisionTypes]] as const),
+  ),
+)
+
+/** Every type in a family (create and revisions alike) -> the family's key, its CREATE type. */
+const DOCUMENT_REVISION_FAMILY_BY_TYPE: Record<string, string> = Object.fromEntries(
+  Object.entries(DOCUMENT_REVISION_FAMILIES).flatMap(([createType, revisionTypes]) => [
+    [createType, createType] as const,
+    ...revisionTypes.map((revisionType) => [revisionType, createType] as const),
+  ]),
+)
 
 /** Does this sync type revise an existing external document rather than create a new one? */
 export function isDocumentRevisionAccountingSyncType(type: string): boolean {
   return type in DOCUMENT_REVISION_PREDECESSOR_TYPES
 }
+
+/**
+ * Which document-revision family this sync type belongs to, or `null` for a type that neither
+ * creates nor revises a revisable document (a journal batch, a credit note, ...).
+ *
+ * Two logs may only share one external reference when they are in the SAME family: a sales invoice
+ * and a purchase bill are different documents in the ledger however their source rows are keyed,
+ * so one Xero id across both is a real duplicate whatever the source entity says. This is the same
+ * lineage rule `resolveDocumentRevisionExternalIdClaim` enforces when it refuses to take an id from
+ * an unrelated event type — exported so reconciliation cannot drift laxer than the mirror.
+ */
+export function accountingDocumentRevisionFamily(type: string): string | null {
+  return DOCUMENT_REVISION_FAMILY_BY_TYPE[type] ?? null
+}
+
+/**
+ * o3d-cvj9 r2: WHICH OF TWO EVENTS DESCRIBES THE DOCUMENT AS IT NOW STANDS.
+ *
+ * `createdAt` on the mirrored event is the ordering key, because a mirrored event is created by
+ * `mirrorAccountingSyncLogToEvent` at the moment its sync log is ENQUEUED — so the events of a
+ * document's edits are created in edit order even when the queue later processes them out of
+ * order, and even when an edit is replayed long afterwards. (`updatedAt` would say the opposite:
+ * a replay touches the stale row last.)
+ *
+ * Returns true when the HOLDER is the older row and may hand its claim over, false when the holder
+ * is the newer one (the arriving row is a stale replay), and `null` when the two cannot be ordered.
+ *
+ * EQUAL TIMESTAMPS ARE ROUTINE, not exotic: `now()` in Postgres is TRANSACTION start time, so every
+ * event mirrored inside one transaction carries the same stamp — including a document's create and
+ * its first revision when both are enqueued together. The row `id` breaks that tie. It is a `cuid`,
+ * whose leading component is a timestamp and whose next component is a per-process counter, so two
+ * ids minted in sequence by one process sort in mint order — and mint order here IS enqueue order,
+ * because these rows are written one per enqueue in program order. The point of the tie-break is
+ * that the resulting order is TOTAL and STABLE: whichever way a same-millisecond, cross-process tie
+ * falls, it falls the same way every time, so two revisions can never take the claim off each other
+ * in turn for ever.
+ *
+ * `null` is reserved for the one caller that has no id to compare — the administrative backfill,
+ * which is deciding about a row it has not created yet. It refuses rather than guessing.
+ */
+function documentRevisionHolderPrecedes(
+  holder: { id: string; createdAt: Date },
+  arriving: { id?: string; createdAt: Date },
+): boolean | null {
+  const holderAt = holder.createdAt.getTime()
+  const arrivingAt = arriving.createdAt.getTime()
+  if (holderAt < arrivingAt) return true
+  if (holderAt > arrivingAt) return false
+  if (arriving.id === undefined || arriving.id === holder.id) return null
+  return holder.id < arriving.id
+}
+
+/**
+ * What may be done with an external document id that another event row already holds.
+ *
+ * `refused` carries the SPECIFIC reason rather than a bare no: every refusal keeps the underlying
+ * P2002 fatal, and which one fired is the difference between "a second document is claiming this
+ * invoice" and "we could not tell these two revisions apart".
+ */
+export type DocumentRevisionClaimOutcome =
+  | { claim: 'takeover'; supersededEventId: string }
+  | { claim: 'stale'; holderEventId: string }
+  | {
+      claim: 'refused'
+      reason:
+        | 'not_a_revision_claim'
+        | 'no_holder'
+        | 'different_source_document'
+        | 'unrelated_event_type'
+        | 'recency_indeterminate'
+        | 'claim_moved_concurrently'
+    }
 
 /**
  * o3d-cvj9: hand a document's external id from the event that last described it to the revision
@@ -286,45 +378,63 @@ export function isDocumentRevisionAccountingSyncType(type: string): boolean {
  * P2002 and, before this, took the entire enclosing transaction down with it, so a remotely
  * SUCCESSFUL invoice update was recorded locally as a failure and retried to FAILED.
  *
- * The claim therefore MOVES: the row that held the id becomes SUPERSEDED with a null externalId
- * (its payload and its log stay, so the revision chain is still readable), and the revision takes
- * the id together with the payload that matches what the ledger now holds.
+ * On `takeover` the claim MOVES: the row that held the id becomes SUPERSEDED with a null
+ * externalId (its payload and its log stay, so the revision chain is still readable), and the
+ * caller writes the id onto the arriving revision.
  *
- * Returns the superseded event's id, or `null` when nothing may legitimately be superseded — a
- * holder for a DIFFERENT source document, an unrelated event type, a non-POSTED transition, or a
- * caller that was not writing an external id at all. `null` keeps the P2002 fatal, so a genuine
- * cross-document collision is never silently absorbed into a no-op.
+ * o3d-cvj9 r2 — `stale` IS THE OTHER HALF, and r1 did not have it. r1 established that the holder
+ * was a legitimate PREDECESSOR TYPE for the same document, but never that the arriving revision
+ * was NEWER than it (see `documentRevisionHolderPrecedes` for how that is established). Edits are
+ * replayed (a retry after a crash, a redelivered webhook) and processed out of order, so an OLDER
+ * revision could arrive after a newer one had already taken the id — and it would take it straight back, leaving the mirror naming a superseded edit as the
+ * document's current state. A stale arrival takes nothing: the caller records it as SUPERSEDED
+ * without the id, which is what it truthfully is.
+ *
+ * Everything else is `refused`, which keeps the P2002 fatal — a genuine cross-document collision is
+ * never silently absorbed into a no-op.
  */
-async function supersedePriorDocumentRevision(
+export async function resolveDocumentRevisionExternalIdClaim(
   client: AccountingEventMirrorTransactionClient,
   params: { connector: string; type: string; referenceType: string; referenceId: string; status: AccountingEventStatus; externalId?: string | null },
-): Promise<string | null> {
+  // `id` is absent only for the backfill, which is deciding about a row it has not written yet.
+  arriving: { id?: string; createdAt: Date },
+): Promise<DocumentRevisionClaimOutcome> {
   const externalId = params.externalId?.trim() ? params.externalId : null
   // Only a successful post owns a document id, and only a revision may take one over.
-  if (!externalId || params.status !== 'POSTED') return null
+  if (!externalId || params.status !== 'POSTED') return { claim: 'refused', reason: 'not_a_revision_claim' }
   const predecessorTypes = DOCUMENT_REVISION_PREDECESSOR_TYPES[params.type]
-  if (!predecessorTypes) return null
+  if (!predecessorTypes) return { claim: 'refused', reason: 'not_a_revision_claim' }
 
   const holder = await client.accountingEvent.findUnique({
     where: { externalSystem_externalId: { externalSystem: params.connector, externalId } },
-    select: { id: true, type: true, sourceEntityType: true, sourceEntityId: true },
+    select: { id: true, type: true, sourceEntityType: true, sourceEntityId: true, createdAt: true },
   })
-  if (!holder) return null
+  if (!holder) return { claim: 'refused', reason: 'no_holder' }
   // The holder must be an earlier revision of the SAME source document. Anything else sharing an
   // external id is the duplicate-post the unique index exists to catch.
-  if (holder.sourceEntityType !== params.referenceType || holder.sourceEntityId !== params.referenceId) return null
-  if (!predecessorTypes.includes(holder.type)) return null
+  if (holder.sourceEntityType !== params.referenceType || holder.sourceEntityId !== params.referenceId) {
+    return { claim: 'refused', reason: 'different_source_document' }
+  }
+  if (!predecessorTypes.includes(holder.type)) return { claim: 'refused', reason: 'unrelated_event_type' }
+
+  const holderPrecedes = documentRevisionHolderPrecedes(holder, arriving)
+  if (holderPrecedes === null) return { claim: 'refused', reason: 'recency_indeterminate' }
+  if (!holderPrecedes) return { claim: 'stale', holderEventId: holder.id }
 
   // Compare-and-swap on the id we are taking, not just on the row: if a concurrent worker released
   // or moved this claim between the read and here, we must not stamp SUPERSEDED over whatever it
-  // did. `count === 0` leaves the P2002 fatal, and the sync log retries against the new reality.
+  // did. A refusal leaves the P2002 fatal, and the sync log retries against the new reality.
+  //
+  // This is also what protects the recency decision from a concurrent NEWER revision: taking the
+  // claim is exactly what nulls the holder's `externalId`, so a winner between the two statements
+  // makes this predicate match nothing and the loser re-reads the new reality on its retry.
   const released = await client.accountingEvent.updateMany({
     where: { id: holder.id, externalSystem: params.connector, externalId },
     data: { status: 'SUPERSEDED', externalId: null },
   })
-  if (released.count === 0) return null
+  if (released.count === 0) return { claim: 'refused', reason: 'claim_moved_concurrently' }
 
-  return holder.id
+  return { claim: 'takeover', supersededEventId: holder.id }
 }
 
 export async function updateMirroredAccountingEventStatus(
@@ -344,12 +454,19 @@ export async function updateMirroredAccountingEventStatus(
   const idempotencyKey = buildMirroredAccountingEventIdempotencyKey(params)
   if (!idempotencyKey) return
 
-  async function applyStatus(key: string) {
+  async function applyStatus(
+    key: string,
+    // o3d-cvj9 r2: the STALE path records the same transition without claiming the document id,
+    // because a newer revision already holds it. Both overrides are set together and only there.
+    override?: { status: AccountingEventStatus; claimExternalId: false },
+  ) {
     return client.accountingEvent.update({
       where: { idempotencyKey: key },
       data: {
-        status: params.status,
-        ...(params.externalId !== undefined ? { externalId: params.externalId } : {}),
+        status: override?.status ?? params.status,
+        ...(params.externalId !== undefined && override?.claimExternalId !== false
+          ? { externalId: params.externalId }
+          : {}),
       },
       select: { id: true },
     })
@@ -371,15 +488,51 @@ export async function updateMirroredAccountingEventStatus(
       // not write.
       if (!isExternalAccountingReferenceUniqueError(error)) throw error
 
-      const supersededEventId = await supersedePriorDocumentRevision(client, params)
+      // o3d-cvj9 r2: WHICH revision is current has to be established, not assumed. The arriving
+      // row's own `createdAt` is the other half of that comparison, so read it before deciding —
+      // this is the error path, so the extra statement costs nothing on the ordinary one.
+      const arriving = await client.accountingEvent.findUnique({
+        where: { idempotencyKey: key },
+        select: { id: true, createdAt: true },
+      })
+      // The update raised a UNIQUE violation, so the row it targeted exists; a miss here means the
+      // conflict is not ours to resolve. Stay fatal.
+      if (!arriving) throw error
+
+      const claim = await resolveDocumentRevisionExternalIdClaim(client, params, arriving)
       // Nothing legitimate to supersede: this is a real collision (a different document claiming
-      // an external id that is already spoken for), so it must stay fatal and visible.
-      if (supersededEventId === null) throw error
+      // an external id that is already spoken for), or two revisions we cannot order. Either way it
+      // must stay fatal and visible.
+      if (claim.claim === 'refused') throw error
+
+      if (claim.claim === 'stale') {
+        // A NEWER revision of this document already holds the id. This edit did post remotely, but
+        // it no longer describes the ledger, so it is recorded for what it is — SUPERSEDED, with no
+        // claim on the document — instead of yanking the id back off the revision that supersedes
+        // it. Idempotent: a further replay finds the row already in exactly this state.
+        const event = await withSavepoint(client, () => applyStatus(key, { status: 'SUPERSEDED', claimExternalId: false }))
+        await client.accountingEventLog.create({
+          data: buildAccountingEventLog({
+            accountingEventId: event.id,
+            action: 'revision_superseded_by_newer',
+            metadata: {
+              connector: params.connector,
+              ...(params.syncLogId ? { syncLogId: params.syncLogId } : {}),
+              syncType: params.type,
+              referenceType: params.referenceType,
+              referenceId: params.referenceId,
+              externalId: params.externalId ?? null,
+              externalIdHeldByEventId: claim.holderEventId,
+            },
+          }) as never,
+        })
+        return event
+      }
 
       const event = await withSavepoint(client, () => applyStatus(key))
       await client.accountingEventLog.create({
         data: buildAccountingEventLog({
-          accountingEventId: supersededEventId,
+          accountingEventId: claim.supersededEventId,
           action: 'superseded_by_revision',
           metadata: {
             connector: params.connector,

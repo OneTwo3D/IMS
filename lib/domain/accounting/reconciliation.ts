@@ -2,7 +2,11 @@ import { db } from '@/lib/db'
 import { toJsonInputValue } from '@/lib/db/json-input'
 // decimal-boundary-ok: report-only (accounting reconciliation finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
-import { isDocumentRevisionAccountingSyncType, isMirrorableAccountingSyncType } from './accounting-event-mirror'
+import {
+  accountingDocumentRevisionFamily,
+  isDocumentRevisionAccountingSyncType,
+  isMirrorableAccountingSyncType,
+} from './accounting-event-mirror'
 
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
 export type AccountingReconciliationRunStatus = 'COMPLETED' | 'FAILED' | 'PARTIAL'
@@ -645,13 +649,28 @@ export function evaluateAccountingReconciliationRows(
   // revisions legitimately share one external reference. Grouping the documents each reference is
   // claimed by, and counting the CREATE rows separately, keeps both real duplicates reportable:
   // one reference spanning two source documents, or one document posted by two create rows.
-  const syncLogReferences = new Map<string, { logIds: string[]; documents: Set<string>; creates: number }>()
+  //
+  // o3d-cvj9 r2: and the FAMILY, because a shared source key is not the same thing as a shared
+  // document. `referenceType`/`referenceId` name the source row a sync log was raised from, and one
+  // source row can feed more than one kind of external document — so an exemption resting on the
+  // source key alone waves through pairings the mirror itself refuses (a sales invoice and a
+  // purchase bill are different ledger documents however their source rows are keyed, and
+  // `resolveDocumentRevisionExternalIdClaim` will not let one take the other's id). Requiring a
+  // single family makes reconciliation exempt EXACTLY what the mirror permits and no more.
+  const syncLogReferences = new Map<
+    string,
+    { logIds: string[]; documents: Set<string>; families: Set<string>; creates: number }
+  >()
   for (const log of rows.syncLogs) {
     if (!log.connector.trim() || !log.externalTransactionId?.trim()) continue
     const key = `${log.connector}|${log.externalTransactionId}`
-    const entry = syncLogReferences.get(key) ?? { logIds: [], documents: new Set<string>(), creates: 0 }
+    const entry = syncLogReferences.get(key)
+      ?? { logIds: [], documents: new Set<string>(), families: new Set<string>(), creates: 0 }
     entry.logIds.push(log.id)
     entry.documents.add(`${log.referenceType}\x00${log.referenceId}`)
+    // A type outside every revision family is its own family, so it can never be exempted as
+    // somebody else's revision — the fallback has to be the TYPE, not a shared "none" bucket.
+    entry.families.add(accountingDocumentRevisionFamily(log.type) ?? `type\x00${log.type}`)
     if (!isDocumentRevisionAccountingSyncType(log.type)) entry.creates += 1
     syncLogReferences.set(key, entry)
   }
@@ -672,7 +691,7 @@ export function evaluateAccountingReconciliationRows(
 
   for (const [reference, entry] of syncLogReferences) {
     if (entry.logIds.length <= 1) continue
-    if (entry.documents.size <= 1 && entry.creates <= 1) continue
+    if (entry.documents.size <= 1 && entry.families.size <= 1 && entry.creates <= 1) continue
     findings.push({
       severity: 'critical',
       code: 'duplicate_external_reference',

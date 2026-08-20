@@ -483,6 +483,12 @@ type FakeAccountingEventRow = {
   status: string
   externalSystem: string | null
   externalId: string | null
+  /**
+   * o3d-cvj9 r2: WHEN the row was mirrored, which is when its sync log was ENQUEUED — so it orders
+   * a document's edits even when the queue processes or replays them out of order. This is the only
+   * thing that distinguishes "a newer revision taking over" from "a stale replay taking back".
+   */
+  createdAt: Date
 }
 
 function uniqueViolation(fields: string[]): Error {
@@ -552,9 +558,12 @@ function createAccountingEventStore(seed: FakeAccountingEventRow[]) {
         return { count: matched.length }
       },
       findUnique: async (args: {
-        where: { externalSystem_externalId?: { externalSystem: string; externalId: string } }
+        where: { externalSystem_externalId?: { externalSystem: string; externalId: string }; idempotencyKey?: string }
       }) => {
         statements.push('findUnique')
+        if (args.where.idempotencyKey !== undefined) {
+          return table.find((row) => row.idempotencyKey === args.where.idempotencyKey) ?? null
+        }
         const key = args.where.externalSystem_externalId
         if (!key) return null
         return table.find((row) => row.externalSystem === key.externalSystem && row.externalId === key.externalId) ?? null
@@ -583,6 +592,11 @@ const REVISION_PAYLOAD = {
 
 const REVISION_EVENT_KEY = 'accounting-sync:xero:sales_invoice_update:sales-invoice-update:so-1:inv-9'
 
+/** The document's original post — the earliest row in every fixture below. */
+const CREATE_MIRRORED_AT = new Date('2026-08-19T09:00:00.000Z')
+/** The edit under test, mirrored after the create. */
+const REVISION_MIRRORED_AT = new Date('2026-08-19T10:00:00.000Z')
+
 function invoiceCreateRow(overrides: Partial<FakeAccountingEventRow> = {}): FakeAccountingEventRow {
   return {
     id: 'event-create',
@@ -593,6 +607,7 @@ function invoiceCreateRow(overrides: Partial<FakeAccountingEventRow> = {}): Fake
     status: 'POSTED',
     externalSystem: 'xero',
     externalId: 'INV-9',
+    createdAt: CREATE_MIRRORED_AT,
     ...overrides,
   }
 }
@@ -607,6 +622,7 @@ function revisionRow(overrides: Partial<FakeAccountingEventRow> = {}): FakeAccou
     status: 'PENDING',
     externalSystem: 'xero',
     externalId: null,
+    createdAt: REVISION_MIRRORED_AT,
     ...overrides,
   }
 }
@@ -636,9 +652,10 @@ test('a posted sales invoice revision takes the external id from the invoice eve
     { id: 'event-create', status: 'SUPERSEDED', externalId: null },
     { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
   ])
-  // The rejected write, the release of the claim, then the write that now succeeds — the P2002 is
-  // handled where it was raised, not by rewriting the transition into something that cannot fail.
-  assert.deepEqual(store.statements, ['update', 'findUnique', 'updateMany', 'update', 'log', 'log'])
+  // The rejected write, the read of the arriving row's own mirror time, the read of the holder, the
+  // release of the claim, then the write that now succeeds — the P2002 is handled where it was
+  // raised, not by rewriting the transition into something that cannot fail.
+  assert.deepEqual(store.statements, ['update', 'findUnique', 'findUnique', 'updateMany', 'update', 'log', 'log'])
   assert.deepEqual(store.logs, [
     {
       accountingEventId: 'event-create',
@@ -739,6 +756,123 @@ test('re-posting a revision that already holds the external id is a no-op, not a
   await postRevision(store)
 
   assert.deepEqual(store.statements, ['update', 'log'], 'the retry path must not run when nothing conflicts')
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
+  ])
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r2: r1 established that the holder was a legitimate PREDECESSOR TYPE for the same
+// document, but never that the arriving revision was NEWER than it. Edits get replayed (a retry
+// after a crash, a redelivered webhook) and processed out of order, so an OLDER revision could
+// arrive after a newer one had already taken the id — and take it straight back, leaving the
+// mirror naming a superseded edit as the document's current state.
+// ---------------------------------------------------------------------------------------------
+
+/** A LATER edit of the same invoice, already posted and already holding the document id. */
+function newerRevisionRow(overrides: Partial<FakeAccountingEventRow> = {}): FakeAccountingEventRow {
+  return {
+    id: 'event-revision-newer',
+    type: 'SALES_INVOICE_UPDATE',
+    sourceEntityType: 'SalesOrder',
+    sourceEntityId: 'so-1',
+    idempotencyKey: 'accounting-sync:xero:sales_invoice_update:sales-invoice-update:so-1:inv-9:later',
+    status: 'POSTED',
+    externalSystem: 'xero',
+    externalId: 'INV-9',
+    createdAt: new Date('2026-08-19T11:00:00.000Z'),
+    ...overrides,
+  }
+}
+
+test('o3d-cvj9 r2: a replayed OLDER revision does not take the document id back off a newer one', async () => {
+  const store = createAccountingEventStore([
+    // The original post, already handed over.
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    // Edit 1 — posted, then superseded by edit 2 below. This is the row being replayed.
+    revisionRow({ status: 'SUPERSEDED', externalId: null }),
+    // Edit 2 — the current state of the document.
+    newerRevisionRow(),
+  ])
+
+  await postRevision(store)
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    // The replay is recorded for what it is, and claims nothing.
+    { id: 'event-revision', status: 'SUPERSEDED', externalId: null },
+    // Untouched: the newest edit still names the document.
+    { id: 'event-revision-newer', status: 'POSTED', externalId: 'INV-9' },
+  ])
+  assert.equal(
+    store.logs.find((entry) => entry.action === 'superseded_by_revision'),
+    undefined,
+    'a stale replay must never be audited as a takeover',
+  )
+  const declined = store.logs.find((entry) => entry.action === 'revision_superseded_by_newer')
+  assert.ok(declined, 'the declined claim is audited on the arriving row')
+  assert.equal((declined!.metadata as { externalIdHeldByEventId?: string }).externalIdHeldByEventId, 'event-revision-newer')
+})
+
+test('o3d-cvj9 r2: replaying the stale revision again is idempotent, not a fresh supersession', async () => {
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    revisionRow({ status: 'SUPERSEDED', externalId: null }),
+    newerRevisionRow(),
+  ])
+
+  await postRevision(store)
+  await postRevision(store)
+
+  assert.equal(store.table.find((row) => row.id === 'event-revision-newer')?.externalId, 'INV-9')
+  assert.equal(store.table.find((row) => row.id === 'event-revision')?.status, 'SUPERSEDED')
+})
+
+// `now()` is TRANSACTION start time in Postgres, so events mirrored inside one transaction all
+// carry the same stamp — the ordinary case when a document's create and its first edit are enqueued
+// together, not an exotic one. The row id breaks that tie, and the two tests below pin BOTH
+// directions of it, because a tie-break that only ever answers "takeover" is not one.
+
+test('o3d-cvj9 r2: on an identical mirror timestamp the row order decides — an EARLIER row hands over', async () => {
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    revisionRow(),
+    // Same stamp, and minted BEFORE the arriving revision (`event-earlier-edit` < `event-revision`).
+    newerRevisionRow({ id: 'event-earlier-edit', createdAt: REVISION_MIRRORED_AT }),
+  ])
+
+  await postRevision(store)
+
+  assert.equal(store.table.find((row) => row.id === 'event-earlier-edit')?.status, 'SUPERSEDED')
+  assert.equal(store.table.find((row) => row.id === 'event-revision')?.externalId, 'INV-9')
+})
+
+test('o3d-cvj9 r2: on an identical mirror timestamp a LATER row is not handed over to', async () => {
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    revisionRow(),
+    // Same stamp, minted AFTER the arriving revision (`event-revision` < `event-revision-newer`).
+    newerRevisionRow({ createdAt: REVISION_MIRRORED_AT }),
+  ])
+
+  await postRevision(store)
+
+  assert.equal(store.table.find((row) => row.id === 'event-revision-newer')?.externalId, 'INV-9')
+  assert.equal(store.table.find((row) => row.id === 'event-revision')?.status, 'SUPERSEDED')
+  assert.equal(store.table.find((row) => row.id === 'event-revision')?.externalId, null)
+})
+
+test('o3d-cvj9 r2: a create and its revision enqueued in ONE transaction still hand over', async () => {
+  // The everyday consequence of the tie-break: an invoice posted and edited inside one transaction
+  // shares a stamp with its own revision, and the ordinary takeover has to keep working.
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ createdAt: REVISION_MIRRORED_AT }),
+    revisionRow(),
+  ])
+
+  await postRevision(store)
+
   assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
     { id: 'event-create', status: 'SUPERSEDED', externalId: null },
     { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },

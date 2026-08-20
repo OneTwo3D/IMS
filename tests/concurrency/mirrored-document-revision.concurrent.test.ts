@@ -198,7 +198,11 @@ test(
 
         const events = await tx.accountingEvent.findMany({
           where: { sourceEntityType: 'SalesOrder', sourceEntityId: orderId },
-          orderBy: { createdAt: 'asc' },
+          // o3d-cvj9 r2: `now()` is TRANSACTION start time, so every row this probe writes shares a
+          // createdAt and `createdAt asc` alone leaves the order to the planner. `id` is the tie-
+          // break — the same one the takeover's recency test uses — so the sequence asserted below
+          // is the mint order the probe actually wrote in.
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
           select: { type: true, status: true, externalId: true, linesJson: true },
         })
         observed.push(events.map((event) => ({
@@ -341,6 +345,122 @@ test(
 
     const leftovers = await db.accountingEvent.count({
       where: { sourceEntityId: { in: [orderId, otherOrderId] } },
+    })
+    assert.equal(leftovers, 0, 'the probe must leave nothing behind')
+    await db.$disconnect()
+  },
+)
+
+test(
+  'an OLDER revision arriving after a newer one does not take the invoice back (o3d-cvj9 r2)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    // THE DEFECT r1 LEFT: the takeover established that the holder was a legitimate predecessor for
+    // the same document, but not that the arriving revision was NEWER than it. Edits are replayed
+    // (a retry after a crash, a redelivered webhook) and processed out of order, so an older edit
+    // could arrive after a newer one had already taken the id — and take it straight back, leaving
+    // the mirror naming a superseded edit as the document's current state.
+    //
+    // Both revisions are mirrored here BEFORE either posts, which is what a queue holding two edits
+    // looks like, and then they post in reverse order. Every row in one transaction shares a
+    // `now()`, so this also exercises the id tie-break against a REAL Postgres transaction rather
+    // than against a double that can stamp whatever timestamps it likes.
+    loadEnv()
+    const { db } = await import('@/lib/db')
+    const { mirrorAccountingSyncLogToEvent, updateMirroredAccountingEventStatus } = await import(
+      '@/lib/domain/accounting/accounting-event-mirror'
+    )
+
+    const orderId = probeId('so')
+    const invoiceId = probeId('inv')
+    const createKey = probeId('create')
+    const earlierKey = probeId('rev-earlier')
+    const laterKey = probeId('rev-later')
+
+    const observed: Array<{
+      rows: Array<{ type: string; status: string; externalId: string | null; amount: number }>
+      logs: string[]
+      transactionStillUsable: boolean
+    }> = []
+
+    await db
+      .$transaction(async (tx) => {
+        const base = { connector: 'xero', referenceType: 'SalesOrder', referenceId: orderId, currency: 'GBP' }
+        const create = invoicePayload(createKey, 'INV-CVJ9R2', 100)
+        const earlier = invoicePayload(earlierKey, 'INV-CVJ9R2', 120)
+        const later = invoicePayload(laterKey, 'INV-CVJ9R2', 140)
+
+        // The invoice, posted.
+        await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-create', type: 'SALES_INVOICE', payload: create, status: 'PENDING' })
+        await updateMirroredAccountingEventStatus(tx, {
+          ...base, syncLogId: 'log-create', type: 'SALES_INVOICE', payload: create, status: 'POSTED', externalId: invoiceId,
+        })
+
+        // Both edits enqueued, in edit order — so the earlier edit's row is minted first.
+        await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-rev-earlier', type: 'SALES_INVOICE_UPDATE', payload: earlier, status: 'PENDING' })
+        await mirrorAccountingSyncLogToEvent(tx, { ...base, syncLogId: 'log-rev-later', type: 'SALES_INVOICE_UPDATE', payload: later, status: 'PENDING' })
+
+        // ...and processed in the WRONG order: the later edit posts first and takes the invoice.
+        await updateMirroredAccountingEventStatus(tx, {
+          ...base, syncLogId: 'log-rev-later', type: 'SALES_INVOICE_UPDATE', payload: later, status: 'POSTED', externalId: invoiceId,
+        })
+        // Then the earlier edit arrives. It must NOT take the invoice back.
+        await updateMirroredAccountingEventStatus(tx, {
+          ...base, syncLogId: 'log-rev-earlier', type: 'SALES_INVOICE_UPDATE', payload: earlier, status: 'POSTED', externalId: invoiceId,
+        })
+
+        // The transaction must still be usable — the stale path goes through the same savepoint.
+        const events = await tx.accountingEvent.findMany({
+          where: { sourceEntityType: 'SalesOrder', sourceEntityId: orderId },
+          orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+          select: { id: true, type: true, status: true, externalId: true, linesJson: true },
+        })
+        const logs = await tx.accountingEventLog.findMany({
+          where: { accountingEventId: { in: events.map((event) => event.id) } },
+          select: { action: true },
+        })
+
+        observed.push({
+          rows: events.map((event) => ({
+            type: event.type,
+            status: event.status,
+            externalId: event.externalId,
+            amount: (event.linesJson as { lines: Array<{ unitAmount: number }> }).lines[0].unitAmount,
+          })),
+          logs: logs.map((log) => log.action),
+          transactionStillUsable: true,
+        })
+
+        throw new Error(ROLLBACK)
+      }, TX)
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error)
+        assert.match(message, new RegExp(ROLLBACK), `expected our own rollback, got: ${message}`)
+      })
+
+    assert.equal(observed.length, 1, 'the transaction must have reached its assertions')
+    const [seen] = observed
+    assert.equal(seen.transactionStillUsable, true)
+    assert.equal(seen.rows.length, 3, 'one event per sync log')
+    // Mint order: create, earlier edit, later edit.
+    assert.deepEqual(seen.rows.map((row) => row.amount), [100, 120, 140])
+    assert.deepEqual(
+      seen.rows.map((row) => row.status),
+      ['SUPERSEDED', 'SUPERSEDED', 'POSTED'],
+      'the LATEST edit is the current row, whatever order the two edits were processed in',
+    )
+    assert.deepEqual(
+      seen.rows.map((row) => row.externalId),
+      [null, null, invoiceId],
+      'the stale edit must not have taken the invoice id back',
+    )
+    assert.ok(
+      seen.logs.includes('revision_superseded_by_newer'),
+      `the declined claim must be audited: ${seen.logs.join(', ')}`,
+    )
+
+    const leftovers = await db.accountingEvent.count({
+      where: { sourceEntityType: 'SalesOrder', sourceEntityId: orderId },
     })
     assert.equal(leftovers, 0, 'the probe must leave nothing behind')
     await db.$disconnect()

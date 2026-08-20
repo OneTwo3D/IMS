@@ -17,6 +17,8 @@ type SyncLog = {
   referenceId: string
   externalTransactionId: string | null
   payload: unknown
+  /** o3d-cvj9 r2: when the log was ENQUEUED — this path's half of the "which edit is newer" test. */
+  createdAt: Date
 }
 
 type EventRow = {
@@ -29,12 +31,16 @@ type EventRow = {
   idempotencyKey: string
   externalSystem: string | null
   externalId: string | null
+  /** o3d-cvj9 r2: when the event was mirrored; absent on rows a fixture does not order. */
+  createdAt?: Date
 }
 
 type MockTransactionClient = {
   accountingEvent: {
     findMany(args?: unknown): Promise<EventRow[]>
     create(args: { data: EventRow }): Promise<{ id: string }>
+    findUnique(args: unknown): Promise<EventRow | null>
+    updateMany(args: unknown): Promise<{ count: number }>
   }
   accountingEventLog: {
     create(args: unknown): Promise<{ id: string }>
@@ -155,10 +161,36 @@ function makeClient(input: {
         } else if (input.eventCreateError) {
           throw input.eventCreateError
         }
+        // o3d-cvj9 r2: ENFORCE `@@unique([externalSystem, externalId])` rather than only ever
+        // simulating it through an injected error. The revision repair's whole shape is "the insert
+        // is rejected, the claim is resolved, the insert is retried", and an injected error either
+        // fires on both attempts or on neither.
+        const claimed = args.data.externalId !== null && args.data.externalId !== undefined
+          && events.some((row) => row.externalSystem === args.data.externalSystem && row.externalId === args.data.externalId)
+        if (claimed) throw uniqueError(['externalSystem', 'externalId'])
         createdEvents.push(args)
+        // `createdAt` is whatever the caller wrote — the backfill stamps it from the sync log
+        // (o3d-cvj9 r2) precisely so a backfilled row is comparable with a live-mirrored one.
         const event = { ...args.data, id: `event-${createdEvents.length}` }
         events.push(event)
         return { id: event.id }
+      },
+      async findUnique(args: unknown) {
+        const where = (args as { where?: { externalSystem_externalId?: { externalSystem: string; externalId: string } } }).where
+        const key = where?.externalSystem_externalId
+        if (!key) return null
+        return events.find((row) => row.externalSystem === key.externalSystem && row.externalId === key.externalId) ?? null
+      },
+      async updateMany(args: unknown) {
+        const { where, data } = args as {
+          where: { id?: string; externalSystem?: string; externalId?: string }
+          data: Record<string, unknown>
+        }
+        const matched = events.filter((row) => (where.id === undefined || row.id === where.id)
+          && (where.externalSystem === undefined || row.externalSystem === where.externalSystem)
+          && (where.externalId === undefined || row.externalId === where.externalId))
+        for (const row of matched) Object.assign(row, data)
+        return { count: matched.length }
       },
     },
     accountingEventLog: {
@@ -169,7 +201,10 @@ function makeClient(input: {
       },
     },
     async $transaction<T>(fn: (tx: MockTransactionClient) => Promise<T>) {
-      const eventRowsSnapshot = [...events]
+      // Copies, not references: the revision repair MUTATES an existing row (it releases the
+      // holder's claim), and a shallow array snapshot would leave that mutation in place after a
+      // rollback — i.e. it would hide exactly the atomicity failure worth catching.
+      const eventRowsSnapshot = events.map((row) => ({ ...row }))
       const createdEventCount = createdEvents.length
       const createdLogCount = createdLogs.length
       try {
@@ -204,6 +239,7 @@ function syncedJournalLog(overrides: Partial<SyncLog> = {}): SyncLog {
     referenceType: 'DailyBatch',
     referenceId: 'A1-2026-04-26',
     externalTransactionId: 'journal-a1',
+    createdAt: new Date('2026-04-26T09:00:00.000Z'),
     payload: {
       date: '2026-04-26',
       _idempotencyKey: 'daily-batch:a1:2026-04-26',
@@ -225,6 +261,7 @@ function syncedDocumentLog(overrides: Partial<SyncLog> = {}): SyncLog {
     referenceType: 'SalesOrderRefund',
     referenceId: 'refund-1',
     externalTransactionId: 'credit-note-1',
+    createdAt: new Date('2026-04-26T09:00:00.000Z'),
     payload: {
       date: '2026-04-26',
       currency: 'GBP',
@@ -248,6 +285,7 @@ function mirroredEventForLog(log: SyncLog): EventRow {
     idempotencyKey: `event-key-${log.id}`,
     externalSystem: log.connector,
     externalId: log.externalTransactionId,
+    createdAt: log.createdAt,
   }
 }
 
@@ -605,4 +643,177 @@ test('accounting event backfill skips unsupported payloads with a reason', async
   const result = resultBySyncLog(report, 'sync-bad')
   assert.equal(result.action, 'skipped')
   assert.match(result.reason, /payload_validation_failed/)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r2: every `*_INVOICE_UPDATE` that posted while the mirror could not hand over an
+// external id has a SYNCED sync log carrying the document id and NO mirrored event. The backfill
+// is the administrative repair for exactly that shape — and it could not perform it: its create
+// hit the same `@@unique([externalSystem, externalId])` the mirror hit, and the outer handler
+// recorded the P2002 as an opaque `db_error:` string. The one historical gap the backfill exists
+// to close was the one it could not close.
+// ---------------------------------------------------------------------------------------------
+
+const INVOICE_CREATED_AT = new Date('2026-04-25T09:00:00.000Z')
+const REVISION_QUEUED_AT = new Date('2026-04-25T10:00:00.000Z')
+
+function syncedInvoiceUpdateLog(overrides: Partial<SyncLog> = {}): SyncLog {
+  return {
+    id: 'sync-invoice-update',
+    connector: 'xero',
+    type: 'SALES_INVOICE_UPDATE',
+    status: 'SYNCED',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    externalTransactionId: 'INV-9',
+    createdAt: REVISION_QUEUED_AT,
+    payload: {
+      date: '2026-04-25',
+      currency: 'GBP',
+      _idempotencyKey: 'sales-invoice-update:so-1:inv-9',
+      invoiceNumber: 'INV-1001',
+      contactName: 'Customer One',
+      lines: [{ description: 'Widget', quantity: 1, unitAmount: 120, accountCode: '200' }],
+    },
+    ...overrides,
+  }
+}
+
+/** The original post, already mirrored and holding the Xero invoice id. */
+function postedInvoiceEvent(overrides: Partial<EventRow> = {}): EventRow {
+  return {
+    id: 'event-invoice',
+    type: 'SALES_INVOICE',
+    sourceEntityType: 'SalesOrder',
+    sourceEntityId: 'so-1',
+    businessDate: '2026-04-25',
+    status: 'POSTED',
+    idempotencyKey: 'accounting-sync:xero:sales_invoice:sales-invoice:so-1',
+    externalSystem: 'xero',
+    externalId: 'INV-9',
+    createdAt: INVOICE_CREATED_AT,
+    ...overrides,
+  }
+}
+
+function createdEventData(createdEvents: unknown[], index = 0): EventRow {
+  return (createdEvents[index] as { data: EventRow }).data
+}
+
+function logsByAction(createdLogs: unknown[], action: string) {
+  return createdLogs
+    .map((entry) => (entry as { data: { action: string; metadata?: Record<string, unknown> } }).data)
+    .filter((entry) => entry.action === action)
+}
+
+test('o3d-cvj9 r2: a historical invoice revision is backfilled by taking the id from the create it revises', async () => {
+  const { client, createdEvents, createdLogs } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog()],
+    events: [postedInvoiceEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  const result = resultBySyncLog(report, 'sync-invoice-update')
+  assert.equal(result.action, 'created')
+  assert.equal(result.reason, 'created_missing_mirror_after_superseding_prior_revision')
+  // The revision now names the document...
+  assert.equal(createdEventData(createdEvents).externalId, 'INV-9')
+  assert.equal(createdEventData(createdEvents).status, 'POSTED')
+  // ...and the create it revises released the claim, audited exactly as the live mirror audits it.
+  const superseded = logsByAction(createdLogs, 'superseded_by_revision')
+  assert.equal(superseded.length, 1)
+  assert.equal((superseded[0].metadata as { referenceId?: string }).referenceId, 'so-1')
+})
+
+test('o3d-cvj9 r2: a historical revision whose id a NEWER revision holds is backfilled as SUPERSEDED, not by taking it back', async () => {
+  // Two historical edits of one invoice, neither mirrored. Candidates are worked in id order, so
+  // this fixture deliberately hands the LATER edit to the backfill FIRST — which is the ordering
+  // the repair must survive, since sync-log ids say nothing about edit order.
+  const { client, createdEvents, createdLogs } = makeClient({
+    syncLogs: [
+      syncedInvoiceUpdateLog({
+        id: 'sync-a-later-edit',
+        createdAt: new Date('2026-04-25T11:00:00.000Z'),
+        payload: { ...(syncedInvoiceUpdateLog().payload as Record<string, unknown>), _idempotencyKey: 'sales-invoice-update:so-1:inv-9:b' },
+      }),
+      syncedInvoiceUpdateLog({ id: 'sync-b-earlier-edit', createdAt: REVISION_QUEUED_AT }),
+    ],
+    events: [postedInvoiceEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  // The later edit takes the id from the create it revises...
+  assert.equal(resultBySyncLog(report, 'sync-a-later-edit').reason, 'created_missing_mirror_after_superseding_prior_revision')
+  assert.equal(createdEventData(createdEvents, 0).externalId, 'INV-9')
+  // ...and the earlier one, arriving second, does NOT take it back off the later edit.
+  const earlier = resultBySyncLog(report, 'sync-b-earlier-edit')
+  assert.equal(earlier.action, 'created')
+  assert.equal(earlier.reason, 'created_missing_mirror_as_superseded_revision')
+  assert.equal(createdEventData(createdEvents, 1).status, 'SUPERSEDED')
+  assert.equal(createdEventData(createdEvents, 1).externalId, null)
+  assert.equal(logsByAction(createdLogs, 'superseded_by_revision').length, 1)
+  assert.equal(logsByAction(createdLogs, 'revision_superseded_by_newer').length, 1)
+})
+
+test('o3d-cvj9 r2: a CHAIN of historical revisions is repaired in order, the newest ending up holding the id', async () => {
+  // The case that made the sync log's enqueue time the stamp on a backfilled row: repaired in one
+  // pass, every row would otherwise carry the same repair-time createdAt and could not be ordered.
+  const { client } = makeClient({
+    syncLogs: [
+      syncedInvoiceUpdateLog({ id: 'sync-edit-1', createdAt: new Date('2026-04-25T10:00:00.000Z') }),
+      syncedInvoiceUpdateLog({
+        id: 'sync-edit-2',
+        createdAt: new Date('2026-04-25T11:00:00.000Z'),
+        payload: { ...(syncedInvoiceUpdateLog().payload as Record<string, unknown>), _idempotencyKey: 'sales-invoice-update:so-1:inv-9:b' },
+      }),
+    ],
+    events: [postedInvoiceEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  assert.equal(resultBySyncLog(report, 'sync-edit-1').reason, 'created_missing_mirror_after_superseding_prior_revision')
+  assert.equal(resultBySyncLog(report, 'sync-edit-2').reason, 'created_missing_mirror_after_superseding_prior_revision')
+})
+
+test('o3d-cvj9 r2: the backfill refuses an external id claimed by a DIFFERENT source document, and says so', async () => {
+  const { client, createdEvents } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog()],
+    events: [postedInvoiceEvent({ id: 'event-other-order', sourceEntityId: 'so-2' })],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  const result = resultBySyncLog(report, 'sync-invoice-update')
+  assert.equal(result.action, 'skipped')
+  assert.equal(result.reason, 'external_reference_claimed_elsewhere: different_source_document')
+  assert.equal(createdEvents.length, 0, 'a refused claim writes nothing')
+})
+
+test('o3d-cvj9 r2: two revisions the backfill cannot order are refused rather than guessed at', async () => {
+  // Both edits enqueued in one transaction, so they carry the same stamp. Between two REVISIONS
+  // that is genuinely undecidable, and the repair says so instead of picking one.
+  const { client, createdEvents } = makeClient({
+    syncLogs: [
+      syncedInvoiceUpdateLog({ id: 'sync-a-edit', createdAt: REVISION_QUEUED_AT }),
+      syncedInvoiceUpdateLog({
+        id: 'sync-b-edit',
+        createdAt: REVISION_QUEUED_AT,
+        payload: { ...(syncedInvoiceUpdateLog().payload as Record<string, unknown>), _idempotencyKey: 'sales-invoice-update:so-1:inv-9:b' },
+      }),
+    ],
+    events: [postedInvoiceEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  // The first still repairs against the CREATE, which an equal stamp does order.
+  assert.equal(resultBySyncLog(report, 'sync-a-edit').reason, 'created_missing_mirror_after_superseding_prior_revision')
+  // The second contends with a revision it cannot be ordered against.
+  const second = resultBySyncLog(report, 'sync-b-edit')
+  assert.equal(second.action, 'skipped')
+  assert.equal(second.reason, 'external_reference_claimed_elsewhere: recency_indeterminate')
+  assert.equal(createdEvents.length, 1, 'a refused claim writes nothing')
 })

@@ -3,20 +3,40 @@ import { db } from '@/lib/db'
 import { buildAccountingEventLog } from './accounting-event-builder'
 import {
   buildMirroredAccountingEventDraft,
+  isDocumentRevisionAccountingSyncType,
   MIRRORED_ACCOUNTING_SYNC_TYPES,
+  resolveDocumentRevisionExternalIdClaim,
+  type AccountingEventMirrorTransactionClient,
 } from './accounting-event-mirror'
 import type { AccountingEventDraft } from './accounting-event-types'
-import { isIdempotencyKeyUniqueError } from './prisma-errors'
+import { isExternalAccountingReferenceUniqueError, isIdempotencyKeyUniqueError } from './prisma-errors'
 import {
   DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
   reconciliationLookbackDate,
   type AccountingReconciliationRows,
 } from './reconciliation'
 
-type AccountingBackfillSyncLogRow = AccountingReconciliationRows['syncLogs'][number]
+/**
+ * o3d-cvj9 r2: `createdAt` is selected on top of the shared reconciliation row shape because the
+ * revision repair below has to establish which of two rows describes the document as it now
+ * stands, and the sync log's enqueue time is this path's half of that comparison.
+ */
+type AccountingBackfillSyncLogRow = AccountingReconciliationRows['syncLogs'][number] & { createdAt: Date }
+/** The holder row `resolveDocumentRevisionExternalIdClaim` reads when an external id is contested. */
+type AccountingBackfillClaimHolderRow = {
+  id: string
+  type: string
+  sourceEntityType: string
+  sourceEntityId: string
+  createdAt: Date
+}
 type AccountingBackfillWriteClient = {
   accountingEvent: {
     create(args: unknown): Promise<{ id: string }>
+    // o3d-cvj9 r2: the revision repair reads the current holder of an external id and releases it
+    // under a compare-and-swap, exactly as the live mirror does.
+    findUnique(args: unknown): Promise<AccountingBackfillClaimHolderRow | null>
+    updateMany(args: unknown): Promise<{ count: number }>
   }
   accountingEventLog: {
     create(args: unknown): Promise<unknown>
@@ -223,6 +243,9 @@ async function collectAccountingBackfillCandidateSyncLogs(
         referenceId: true,
         externalTransactionId: true,
         payload: true,
+        // o3d-cvj9 r2: the revision repair needs the enqueue time to establish which of two rows
+        // describes the document as it now stands.
+        createdAt: true,
       },
     })
     if (page.length === 0) break
@@ -241,32 +264,156 @@ async function collectAccountingBackfillCandidateSyncLogs(
   return candidates
 }
 
-async function createBackfilledEvent(
+async function writeBackfilledEvent(
+  tx: AccountingBackfillWriteClient,
+  log: AccountingBackfillSyncLogRow,
+  draft: AccountingEventDraft,
+): Promise<{ id: string }> {
+  const event = await tx.accountingEvent.create({
+    // o3d-cvj9 r2: `createdAt` is stamped from the SYNC LOG, not left to now(). A mirrored event's
+    // createdAt means "when this sync was enqueued" — that is what makes it usable as the ordering
+    // key when two events of one document contend for its external id — and a backfilled row has to
+    // mean the same thing or the two kinds of row cannot be compared. Left to the column default,
+    // every row repaired in one pass would carry the same repair-time stamp, and a document with
+    // two historical revisions could not be ordered at all. It also makes the oldest-PENDING
+    // staleness signal in ops/health report the real age of the work rather than the repair's.
+    data: { ...draft, createdAt: log.createdAt } as never,
+    select: { id: true },
+  })
+  await tx.accountingEventLog.create({
+    data: buildAccountingEventLog({
+      accountingEventId: event.id,
+      action: 'backfilled_from_sync_log',
+      metadata: {
+        connector: log.connector,
+        syncLogId: log.id,
+        syncType: log.type,
+        referenceType: log.referenceType,
+        referenceId: log.referenceId,
+      },
+    }) as never,
+  })
+  return event
+}
+
+/**
+ * o3d-cvj9 r2 — BACKFILLING A DOCUMENT REVISION THAT POSTED BEFORE THE MIRROR COULD RECORD IT.
+ *
+ * Round 1 fixed the live mirror and knowingly left this: every `*_INVOICE_UPDATE` that posted
+ * while the mirror could not hand over an external id has a SYNCED sync log carrying the document
+ * id, and no mirrored event. The backfill is the administrative repair for exactly that shape — and
+ * it could not perform it, because its `create` hits the same `@@unique([externalSystem, externalId])`
+ * the mirror hits, and the outer handler recorded the P2002 as an opaque `db_error:` string. The one
+ * historical gap the backfill exists to close was the one it could not close.
+ *
+ * It now resolves the claim the same way the live path does, through the SAME function, so the two
+ * cannot drift on what a legitimate takeover is:
+ *
+ *  - `takeover` — the holder is an older event for this document. Release its claim and create the
+ *    revision holding the id, auditing the supersession on the released row exactly as the mirror does.
+ *  - `stale`    — a NEWER revision already holds the id. The historical edit still deserves a
+ *    mirrored row, so it is created as SUPERSEDED with no claim, rather than yanking the id back
+ *    off the revision that supersedes it.
+ *  - `refused`  — a genuine collision (another document holds this id), or two revisions that cannot
+ *    be ordered. Skipped with the SPECIFIC reason, so the report names it instead of a raw driver string.
+ *
+ * The whole repair runs in ONE transaction, so a released claim can never be left with no row
+ * holding it. No savepoint is needed here (unlike the live mirror): the failed create rolled its own
+ * transaction back, and this runs in a fresh one.
+ */
+async function backfillDocumentRevisionEvent(
   client: AccountingBackfillClient,
   log: AccountingBackfillSyncLogRow,
   draft: AccountingEventDraft,
 ): Promise<AccountingEventBackfillResult> {
-  try {
-    const created = await client.$transaction(async (tx) => {
-      const event = await tx.accountingEvent.create({
-        data: draft as never,
-        select: { id: true },
+  const outcome = await client.$transaction(async (tx) => {
+    const claim = await resolveDocumentRevisionExternalIdClaim(
+      // The backfill client is declared structurally (the real `db`, and the doubles the tests
+      // inject); the shared resolver is typed against Prisma's transaction client.
+      tx as unknown as AccountingEventMirrorTransactionClient,
+      {
+        connector: log.connector,
+        type: log.type,
+        referenceType: log.referenceType,
+        referenceId: log.referenceId,
+        status: draft.status,
+        externalId: draft.externalId,
+      },
+      { createdAt: log.createdAt },
+    )
+
+    if (claim.claim === 'refused') return { claim: 'refused' as const, reason: claim.reason }
+
+    if (claim.claim === 'stale') {
+      const event = await writeBackfilledEvent(tx, log, {
+        ...draft,
+        status: 'SUPERSEDED',
+        externalId: null,
       })
       await tx.accountingEventLog.create({
         data: buildAccountingEventLog({
           accountingEventId: event.id,
-          action: 'backfilled_from_sync_log',
+          action: 'revision_superseded_by_newer',
           metadata: {
             connector: log.connector,
             syncLogId: log.id,
             syncType: log.type,
             referenceType: log.referenceType,
             referenceId: log.referenceId,
+            externalId: draft.externalId ?? null,
+            externalIdHeldByEventId: claim.holderEventId,
           },
         }) as never,
       })
-      return event
+      return { claim: 'stale' as const, eventId: event.id }
+    }
+
+    const event = await writeBackfilledEvent(tx, log, draft)
+    await tx.accountingEventLog.create({
+      data: buildAccountingEventLog({
+        accountingEventId: claim.supersededEventId,
+        action: 'superseded_by_revision',
+        metadata: {
+          connector: log.connector,
+          syncLogId: log.id,
+          syncType: log.type,
+          referenceType: log.referenceType,
+          referenceId: log.referenceId,
+          externalId: draft.externalId ?? null,
+          supersededByEventId: event.id,
+        },
+      }) as never,
     })
+    return { claim: 'takeover' as const, eventId: event.id }
+  })
+
+  if (outcome.claim === 'refused') {
+    return {
+      ...syncLogResultBase(log),
+      action: 'skipped',
+      reason: `external_reference_claimed_elsewhere: ${outcome.reason}`,
+      idempotencyKey: draft.idempotencyKey,
+    }
+  }
+
+  return {
+    ...syncLogResultBase(log),
+    action: 'created',
+    reason: outcome.claim === 'stale'
+      ? 'created_missing_mirror_as_superseded_revision'
+      : 'created_missing_mirror_after_superseding_prior_revision',
+    idempotencyKey: draft.idempotencyKey,
+    accountingEventId: outcome.eventId,
+  }
+}
+
+async function createBackfilledEvent(
+  client: AccountingBackfillClient,
+  log: AccountingBackfillSyncLogRow,
+  draft: AccountingEventDraft,
+): Promise<AccountingEventBackfillResult> {
+  try {
+    const created = await client.$transaction((tx) => writeBackfilledEvent(tx, log, draft))
 
     return {
       ...syncLogResultBase(log),
@@ -283,6 +430,13 @@ async function createBackfilledEvent(
         reason: 'accounting_event_already_exists',
         idempotencyKey: draft.idempotencyKey,
       }
+    }
+    // o3d-cvj9 r2: the external-document id is already claimed. For a REVISION that is expected —
+    // it is what the whole feature is about — so resolve the claim instead of reporting a driver
+    // error. Classified from the statement that raised it, so an idempotency-key clash above still
+    // takes its own branch.
+    if (isExternalAccountingReferenceUniqueError(error) && isDocumentRevisionAccountingSyncType(log.type)) {
+      return backfillDocumentRevisionEvent(client, log, draft)
     }
     throw error
   }

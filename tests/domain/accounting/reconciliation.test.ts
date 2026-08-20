@@ -1005,3 +1005,79 @@ test('one document posted by two create sync logs is still a duplicate reference
     ['sync-invoice-1', 'sync-invoice-2', 'sync-invoice-update'],
   )
 })
+
+// o3d-cvj9 r2: the exemption above rests on `referenceType`/`referenceId`, which name the SOURCE
+// ROW a sync log was raised from — not the ledger document it posted. Those are not the same thing,
+// so a source key alone waved through pairings the mirror itself refuses: a sales invoice and a
+// purchase bill are different documents in Xero however their source rows happen to be keyed, and
+// `resolveDocumentRevisionExternalIdClaim` will not let one take the other's id. Reconciliation now
+// exempts exactly what the mirror permits — one document-revision FAMILY — and no more.
+
+function familySyncLog(id: string, type: string, referenceType: string, referenceId: string, externalTransactionId: string) {
+  return {
+    id,
+    connector: 'xero',
+    type,
+    status: 'SYNCED',
+    referenceType,
+    referenceId,
+    externalTransactionId,
+    payload: { date: '2026-04-25' },
+  }
+}
+
+test('o3d-cvj9 r2: a purchase-bill revision may not share a sales invoice reference, however the source rows are keyed', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    familySyncLog('sync-sales-invoice', 'SALES_INVOICE', 'SalesOrder', 'order-1', 'INV-9'),
+    familySyncLog('sync-bill-update', 'PURCHASE_INVOICE_UPDATE', 'SalesOrder', 'order-1', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1, 'a bill revision is not a revision of a sales invoice')
+  assert.equal(findings[0].severity, 'critical')
+  assert.deepEqual(
+    (findings[0].details as { syncLogIds: string[] }).syncLogIds,
+    ['sync-sales-invoice', 'sync-bill-update'],
+  )
+})
+
+test('o3d-cvj9 r2: two revisions of DIFFERENT families sharing one reference are a duplicate, create or no create', () => {
+  // No create row at all, so the `creates <= 1` half cannot see this one either.
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    familySyncLog('sync-invoice-update', 'SALES_INVOICE_UPDATE', 'SalesOrder', 'order-1', 'INV-9'),
+    familySyncLog('sync-bill-update', 'PURCHASE_INVOICE_UPDATE', 'SalesOrder', 'order-1', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].severity, 'critical')
+})
+
+test('o3d-cvj9 r2: a type in NO revision family is its own family, never somebody else\'s revision', () => {
+  // CREDIT_NOTE neither creates nor revises a revisable document, so it counts as one create and
+  // would otherwise be exempted as the "create" a sales-invoice revision is allowed to follow.
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    familySyncLog('sync-credit-note', 'CREDIT_NOTE', 'SalesOrder', 'order-1', 'INV-9'),
+    familySyncLog('sync-invoice-update', 'SALES_INVOICE_UPDATE', 'SalesOrder', 'order-1', 'INV-9'),
+  )
+
+  const findings = duplicateReferenceFindings(rows, 'xero|INV-9')
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0].severity, 'critical')
+})
+
+test('o3d-cvj9 r2: a purchase bill and ITS OWN update on one PO still share a reference legitimately', () => {
+  // The non-regression half: PURCHASE_INVOICE and PURCHASE_INVOICE_UPDATE are one family, and both
+  // are raised against the PurchaseOrder row, so this is the ordinary edited-bill shape.
+  const rows = cleanRows()
+  rows.syncLogs.push(
+    familySyncLog('sync-bill', 'PURCHASE_INVOICE', 'PurchaseOrder', 'po-1', 'BILL-3'),
+    familySyncLog('sync-bill-update-1', 'PURCHASE_INVOICE_UPDATE', 'PurchaseOrder', 'po-1', 'BILL-3'),
+    familySyncLog('sync-bill-update-2', 'PURCHASE_INVOICE_UPDATE', 'PurchaseOrder', 'po-1', 'BILL-3'),
+  )
+
+  assert.deepEqual(duplicateReferenceFindings(rows, 'xero|BILL-3'), [])
+})
