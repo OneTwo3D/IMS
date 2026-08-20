@@ -110,40 +110,66 @@ export function sumCostLayerSnapshotQty(entries: CostLayerSnapshotEntry[]): Deci
 }
 
 /**
- * How much of an allocation row's quantity Group A2 has NOT yet reclassified into Allocated
- * Inventory (o3d-0i5y r5).
+ * What Group A2 has already reclassified at one (line, warehouse, product) scope, and how much of the
+ * dispatched quantity NO record on the row accounts for yet (o3d-0i5y r6).
  *
- * THE STAMP IS AN ORDER-LEVEL FACT ABOUT A ROW-LEVEL QUESTION, and that is where the hole was. A2
- * marks the ORDER `inventoryAllocatedDate`, so "already reclassified" was read as all-or-nothing for
- * the order — and once a shipment on it had been journaled the stamp was deliberately kept (clearing
- * it would re-post the shipped value it had already posted). Residual quantity allocated AFTER that
- * point therefore had no route into the ledger at all: A2 never looked at the order again, and Group
- * B still CREDITED Allocated Inventory when the residual shipped, for a debit that was never made.
+ * THE STAMP IS AN ORDER-LEVEL FACT ABOUT A ROW-LEVEL QUESTION, and that is where the original hole
+ * was. A2 marks the ORDER `inventoryAllocatedDate`, so "already reclassified" was read as
+ * all-or-nothing for the order — and once a shipment on it had been journaled the stamp was
+ * deliberately kept (clearing it would re-post the shipped value it had already posted). Residual
+ * quantity allocated AFTER that point therefore had no route into the ledger at all: A2 never looked
+ * at the order again, and Group B still CREDITED Allocated Inventory when the residual shipped, for a
+ * debit that was never made.
  *
- * The quantity A2 has accounted for one (line, warehouse, product) scope is recorded twice over, and
- * the two records do not add up — they OVERLAP, because a dispatch consumes the very allocation it
- * ships:
+ * The quantity A2 has accounted at a scope is recorded twice over, and the two records do not add up
+ * — they OVERLAP, because a dispatch consumes the very allocation it ships:
  *
- *   `snapshotQty`  the FIFO layers A2 pinned on the allocation row when it reclassified it. Written
- *                  once and never reduced afterwards (Group B relieves its contra from an in-memory
- *                  copy), so it stays a truthful record of what was posted.
- *   `shippedQty`   quantity already dispatched at this scope. A2 writes an EMPTY snapshot when it
- *                  reclassifies an order that has already shipped — it takes the value from the
- *                  SHIPMENT snapshots instead — so for those rows `snapshotQty` is 0 while the cost
- *                  is genuinely in the ledger.
+ *   `snapshotQty`  the FIFO layers A2 pinned on the allocation row. Written once and never reduced
+ *                  afterwards (Group B relieves its contra from an in-memory copy), so it stays a
+ *                  truthful record of what was posted.
+ *   `shippedQty`   quantity already dispatched at this scope.
  *
  * So the accounted quantity is the LARGER of the two, never the sum. Taking the sum would double-count
  * an ordinary allocate-then-ship row (pinned 6, shipped 6, accounted 6 — not 12) and strand the very
- * residual this exists to account for.
+ * residual r5 exists to account for.
+ *
+ * THAT HOLDS ONLY WHILE BOTH RECORDS DESCRIBE THE SAME UNITS, and r5 left one case where they do not.
+ * A dispatch can consume a pin that already existed; it cannot consume one written afterwards. When
+ * A2 first meets a scope that has ALREADY shipped it does not pin those units at all — dispatch has
+ * consumed their layers, so it takes their VALUE from the shipment snapshots and pins only the
+ * remainder. The row then holds a pin (4 on the shelf) BESIDE a shipment that predates it (6 gone),
+ * describing disjoint units that total 10 — and `max` answers 6. The next pass therefore found 4
+ * "unaccounted", re-pinned them and POSTED THEM A SECOND TIME, every time the order came back.
+ *
+ * The fix is not a cleverer inference over two ambiguous records; there is nothing on the row that
+ * distinguishes the two cases. It is `unrecordedShippedQty`: dispatched quantity the pin does not
+ * account for, which A2 now WRITES ONTO THE ROW as shipment-source entries in the same pass that
+ * values it. The pin becomes the complete record of accounted quantity, `max` is never again asked a
+ * question it cannot answer, and the residual is pinned once.
+ */
+export function accountedAllocationQty(input: {
+  snapshot: CostLayerSnapshotEntry[]
+  shippedQty: DecimalInput
+}): { accounted: Decimal; unrecordedShippedQty: Decimal } {
+  const pinned = sumCostLayerSnapshotQty(input.snapshot)
+  const uncovered = roundQuantity(toDecimal(input.shippedQty).sub(pinned), 6)
+  const unrecordedShippedQty = uncovered.gt('0.0000001') ? uncovered : toDecimal(0)
+  // pinned + max(0, shipped - pinned) is max(pinned, shipped) — r5's rule, unchanged — split so the
+  // part that is accounted but UNRECORDED can be written down instead of re-derived next pass.
+  return { accounted: pinned.add(unrecordedShippedQty), unrecordedShippedQty }
+}
+
+/**
+ * How much of an allocation row's quantity Group A2 has NOT yet reclassified into Allocated
+ * Inventory — the row's allocated quantity less {@link accountedAllocationQty}, floored at zero
+ * because a refund or a shrunk row can leave more accounted than allocated.
  */
 export function unaccountedAllocationQty(input: {
   allocatedQty: DecimalInput
   snapshot: CostLayerSnapshotEntry[]
   shippedQty: DecimalInput
 }): Decimal {
-  const pinned = sumCostLayerSnapshotQty(input.snapshot)
-  const shipped = toDecimal(input.shippedQty)
-  const accounted = pinned.gte(shipped) ? pinned : shipped
+  const { accounted } = accountedAllocationQty(input)
   const outstanding = roundQuantity(toDecimal(input.allocatedQty).sub(accounted), 6)
   return outstanding.gt('0.0000001') ? outstanding : toDecimal(0)
 }

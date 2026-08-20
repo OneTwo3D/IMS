@@ -2657,6 +2657,63 @@ test('o3d-0i5y r5: quantity accounted through a SHIPMENT rather than a pinned sn
   assert.deepEqual(salesOrderUpdates, [])
 })
 
+test('o3d-0i5y r6: a residual pinned BESIDE a pre-A2 shipment is accounted, so an unchanged rebuild keeps the stamp', async () => {
+  // 10 allocated, 6 dispatched before A2 ever ran and since journaled, 4 pinned on the shelf. Those
+  // are DISJOINT units — a dispatch cannot consume a pin written after it — so 10 are accounted, and
+  // A2 now says so on the row: the 6 are recorded as shipment-source entries carrying the layers the
+  // dispatch consumed. Reading the row's entries as one pinned quantity (r5 read them as a bare total
+  // and maxed it against the shipped 6) called this order 4 short and handed it back to A2, which
+  // pinned and POSTED those 4 a second time — the double post this guard exists to prevent.
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 6 }],
+    persistedAllocations: [{
+      ...ACCOUNTED_SCOPE,
+      costLayerSnapshot: [
+        { costLayerId: 'layer-dispatched', qty: 6, unitCostBase: 3, shipmentLineId: 'shipment-line-1', source: 'shipment' },
+        { costLayerId: 'layer-on-the-shelf', qty: 4, unitCostBase: 5 },
+      ],
+    }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(10) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [], 'all 10 are accounted, so there is nothing to send back to A2')
+})
+
+test('o3d-0i5y r6: and one more unit than the row records still releases the stamp', async () => {
+  // The counter-guard, on the same state: the record must not become a blanket "this row is done".
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 6 }],
+    persistedAllocations: [{
+      ...ACCOUNTED_SCOPE,
+      costLayerSnapshot: [
+        { costLayerId: 'layer-dispatched', qty: 6, unitCostBase: 3, shipmentLineId: 'shipment-line-1', source: 'shipment' },
+        { costLayerId: 'layer-on-the-shelf', qty: 4, unitCostBase: 5 },
+      ],
+    }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(11) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [{
+    inventoryAllocatedDate: null,
+    inventoryAllocatedBatchRef: null,
+    allocationBatchAmount: null,
+  }], 'the eleventh unit is genuinely unaccounted')
+})
+
 test('resetAllocationAccountingIfStaged refuses (and clears no ref) once a shipment is journaled (o3d-0qoo)', async () => {
   // The Group B guard runs BEFORE the un-stage, so a posted shipment leaves both the stamp and
   // the ref intact — the order stays findable against its A2 batch instead of silently losing it.

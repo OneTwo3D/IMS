@@ -29,6 +29,7 @@ import { scheduleXeroAccountingOutbox } from '@/lib/connectors/xero/outbox'
 import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
 import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
 import {
+  accountedAllocationQty,
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
   reduceSnapshotByQty,
@@ -206,10 +207,20 @@ export type A2ShipmentRow<TLine> = {
  *                               FIFO layers — but only the outstanding PART of each row, per
  *                               {@link unaccountedAllocationQty}.
  *
- * `stampEmptyAllocationIds` are rows that owe nothing and have never been stamped; they keep the
- * pre-existing empty-snapshot stamp, since their value came through the shipment. Rows that already
- * carry a snapshot appear in NEITHER list and must be left completely alone — that snapshot is the
- * posted evidence Group B and the refund reversal resolve their cost basis through.
+ * AND THE PASS RECORDS WHAT IT ACCOUNTED THROUGH A SHIPMENT (o3d-0i5y r6). `shipmentAccountedByAllocation`
+ * is dispatched quantity at a row's scope that neither pin covers — units A2 is accounting from the
+ * SHIPMENT snapshots rather than by pinning shelf layers. r5 left no record of them, so the next pass
+ * saw a residual pin (4 on the shelf) beside a shipment that PREDATES it (6 dispatched) and had to
+ * guess whether they were the same units. Its `max` said 6 accounted where 10 were, and it re-pinned
+ * and RE-POSTED the residual — every time the order came back. Writing those units onto the row as
+ * shipment-source entries makes the pin the complete record of accounted quantity, so the guess is
+ * gone: a dispatch can only consume a pin that already existed, and a shipment-source entry is proof
+ * that it did not.
+ *
+ * `stampEmptyAllocationIds` are rows that owe nothing, have nothing to record and have never been
+ * stamped; they keep the pre-existing empty-snapshot stamp. Rows that already carry a snapshot and
+ * owe nothing appear in NO list and must be left completely alone — that snapshot is the posted
+ * evidence Group B and the refund reversal resolve their cost basis through.
  */
 export function planA2Reclassification<TLine extends { lineId: string; productId: string | null; qty: Prisma.Decimal | number }, TShipment extends A2ShipmentRow<TLine>>(order: {
   allocations: A2AllocationRow[]
@@ -217,6 +228,7 @@ export function planA2Reclassification<TLine extends { lineId: string; productId
 }): {
   unjournaledShipments: TShipment[]
   outstandingByAllocation: Map<string, Decimal>
+  shipmentAccountedByAllocation: Map<string, Decimal>
   stampEmptyAllocationIds: string[]
 } {
   const scopeKey = (lineId: string, warehouseId: string, productId: string) => `${lineId}|${warehouseId}|${productId}`
@@ -230,22 +242,58 @@ export function planA2Reclassification<TLine extends { lineId: string; productId
   }
 
   const outstandingByAllocation = new Map<string, Decimal>()
+  const shipmentAccountedByAllocation = new Map<string, Decimal>()
   const stampEmptyAllocationIds: string[] = []
   for (const alloc of order.allocations) {
-    const outstanding = unaccountedAllocationQty({
-      allocatedQty: alloc.qty,
-      snapshot: parseCostLayerSnapshot(alloc.costLayerSnapshot),
-      shippedQty: shippedQtyByScope.get(scopeKey(alloc.lineId, alloc.warehouseId, alloc.productId)) ?? 0,
-    })
+    const snapshot = parseCostLayerSnapshot(alloc.costLayerSnapshot)
+    const shippedQty = shippedQtyByScope.get(scopeKey(alloc.lineId, alloc.warehouseId, alloc.productId)) ?? 0
+    const { accounted, unrecordedShippedQty } = accountedAllocationQty({ snapshot, shippedQty })
+    const outstanding = unaccountedAllocationQty({ allocatedQty: alloc.qty, snapshot, shippedQty })
     if (outstanding.gt(0)) outstandingByAllocation.set(alloc.id, outstanding)
-    else if (alloc.costLayerSnapshot === null) stampEmptyAllocationIds.push(alloc.id)
+    // Recorded even when the row owes nothing else: the record is what stops the NEXT pass
+    // re-deriving these units from an overlap it cannot resolve, which is the double post.
+    if (unrecordedShippedQty.gt(0)) shipmentAccountedByAllocation.set(alloc.id, unrecordedShippedQty)
+    else if (accounted.lte(0) && outstanding.lte(0) && alloc.costLayerSnapshot === null) {
+      stampEmptyAllocationIds.push(alloc.id)
+    }
   }
 
   return {
     unjournaledShipments: order.shipments.filter((shipment) => !shipment.shipmentJournalDate),
     outstandingByAllocation,
+    shipmentAccountedByAllocation,
     stampEmptyAllocationIds,
   }
+}
+
+/**
+ * The entries that RECORD dispatched units as accounted, taken from the shipment lines that dispatched
+ * them (o3d-0i5y r6).
+ *
+ * They carry the layers dispatch actually consumed, so the record is a truthful cost basis and not a
+ * placeholder: Group B and the refund reversal both relieve the Allocated-Inventory contra by QTY
+ * against these same entries, and both already subtract every shipment line's quantity from the row,
+ * so recording the shipped units leaves the row holding exactly the UNSHIPPED remainder instead of
+ * being driven straight through zero.
+ *
+ * They are decorated with `source: 'shipment'`, which is the marker {@link accountedAllocationQty}
+ * reads to know these units are DISJOINT from the allocated pin rather than overlapping it.
+ */
+export function takeShipmentAccountedEntries(
+  lines: Array<{ id: string; costLayerSnapshot: Prisma.JsonValue | null }>,
+  qty: Decimal,
+  allocationId: string,
+): CostLayerSnapshotEntry[] {
+  const available = lines.flatMap((line) => (
+    parseCostLayerSnapshot(line.costLayerSnapshot).map((entry) => ({
+      ...entry,
+      shipmentLineId: entry.shipmentLineId ?? line.id,
+    }))
+  ))
+  return takeFromSnapshotEntries(available, qty.toNumber(), {
+    orderAllocationId: allocationId,
+    source: 'shipment',
+  }).taken
 }
 
 function requireShipmentSnapshotValue(order: {
@@ -1003,22 +1051,47 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             ? requireShipmentSnapshotValue({ ...order, shipments: plan.unjournaledShipments })
             : toDecimal(0)
 
-          // Rows that have never been reclassified at all but owe nothing are still STAMPED with an
-          // empty snapshot, exactly as before — their cost came from the shipment snapshots above.
+          // Rows that have never been reclassified at all, owe nothing and have nothing to record are
+          // still STAMPED with an empty snapshot, exactly as before.
           for (const allocationId of plan.stampEmptyAllocationIds) allocationSnapshots.set(allocationId, [])
 
           for (const alloc of order.allocations) {
             const outstanding = plan.outstandingByAllocation.get(alloc.id)
-            if (!outstanding) continue
-            const consumed = consumeSnapshotLayers(
-              snapshot,
-              alloc.productId,
-              alloc.warehouseId,
-              outstanding.toNumber(),
-            )
+            const shipmentAccounted = plan.shipmentAccountedByAllocation.get(alloc.id)
+            if (!outstanding && !shipmentAccounted) continue
+            // o3d-0i5y r6: units this pass is accounting from the SHIPMENT snapshots, written onto the
+            // row so a later pass reads them as evidence instead of inferring them from an overlap.
+            // They add NO value here — the shipment value is posted once, above, and only while the
+            // shipment is unjournaled — this is a record of quantity already in the ledger.
+            const recorded = shipmentAccounted
+              ? takeShipmentAccountedEntries(
+                  order.shipments
+                    .filter((shipment) => shipment.warehouseId === alloc.warehouseId)
+                    .flatMap((shipment) => shipment.lines.filter((line) => (
+                      line.lineId === alloc.lineId && line.productId === alloc.productId
+                    ))),
+                  shipmentAccounted,
+                  alloc.id,
+                )
+              : []
+            const consumed = outstanding
+              ? consumeSnapshotLayers(
+                  snapshot,
+                  alloc.productId,
+                  alloc.warehouseId,
+                  outstanding.toNumber(),
+                )
+              : []
             // APPENDED, not replaced, so `snapshotQty` keeps naming everything ever posted against
-            // this row — which is what makes the next pass's outstanding calculation right.
-            allocationSnapshots.set(alloc.id, [...parseCostLayerSnapshot(alloc.costLayerSnapshot), ...consumed])
+            // this row — which is what makes the next pass's outstanding calculation right. The
+            // shipped record goes BEFORE the fresh pin, so the qty-based contra relief that Group B
+            // and the refund reversal run for each shipment line consumes exactly those units and
+            // leaves the unshipped pin standing.
+            allocationSnapshots.set(alloc.id, [
+              ...parseCostLayerSnapshot(alloc.costLayerSnapshot),
+              ...recorded,
+              ...consumed,
+            ])
             orderCostValue = addMoney(orderCostValue, sumCostLayerSnapshot(consumed))
           }
           orderCostValue = roundQuantity(orderCostValue, 2)

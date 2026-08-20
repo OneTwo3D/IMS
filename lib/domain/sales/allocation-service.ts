@@ -46,7 +46,7 @@ import {
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { parseCostLayerSnapshot, sumCostLayerSnapshotQty } from '@/lib/cost-layer-snapshots'
+import { accountedAllocationQty, parseCostLayerSnapshot, type CostLayerSnapshotEntry } from '@/lib/cost-layer-snapshots'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -499,16 +499,20 @@ export async function journaledAllocationFloors(
  * Inventory drifts short by the residual's cost and Inventory stays overstated by it, permanently.
  *
  * So the stamp is cleared exactly when there is something new to account, and the decision is made at
- * the same (line, warehouse, product) grain as {@link journaledAllocationFloors}, using the same
- * accounted-quantity rule A2 itself now applies ({@link unaccountedAllocationQty}):
+ * the same (line, warehouse, product) grain as {@link journaledAllocationFloors}, by asking the same
+ * accounted-quantity rule A2 itself applies (`accountedAllocationQty`) with the same two inputs:
  *
  *   * `costLayerSnapshot` on the persisted row — the layers a previous A2 pinned. Kept, never cleared
- *     here, because a journal was posted against them.
- *   * quantity already DISPATCHED at that scope — the rows A2 stamped with an empty snapshot because
- *     it took their value from the shipment instead.
+ *     here, because a journal was posted against them. Entries marked `source: 'shipment'` are units
+ *     A2 accounted THROUGH a dispatch it arrived after, and they are DISJOINT from the allocated pin.
+ *   * quantity already DISPATCHED at that scope — which overlaps the allocated pin, because a
+ *     dispatch consumes the allocation it ships, and overlaps NOTHING that was recorded as shipped.
  *
  * A rebuild that only re-states what is already accounted (the common case: the residual reconciler
- * re-declaring committed shipment rows unchanged) leaves the stamp exactly where r4 put it.
+ * re-declaring committed shipment rows unchanged) leaves the stamp exactly where r4 put it — including
+ * the case r5 got wrong, a residual pinned beside a shipment that predates A2, where reading the two
+ * records as one made an unchanged rebuild look like new work and sent the residual back to be posted
+ * a second time (o3d-0i5y r6).
  *
  * Cleared, the order is picked up by the very next A2 pass, which posts the residual ALONE — the
  * journaled shipment's value is excluded there by its journal date. Group B is held for one pass at
@@ -537,12 +541,13 @@ async function declaresUnaccountedAllocationQty(
     }),
   ])
 
-  const pinnedByKey = new Map<string, Prisma.Decimal>()
+  const pinnedByKey = new Map<string, CostLayerSnapshotEntry[]>()
   for (const row of persisted) {
-    pinnedByKey.set(
-      allocationScopeKey(row),
-      sumCostLayerSnapshotQty(parseCostLayerSnapshot(row.costLayerSnapshot)),
-    )
+    const key = allocationScopeKey(row)
+    pinnedByKey.set(key, [
+      ...(pinnedByKey.get(key) ?? []),
+      ...parseCostLayerSnapshot(row.costLayerSnapshot),
+    ])
   }
   const shippedByKey = new Map<string, Prisma.Decimal>()
   for (const line of shippedLines) {
@@ -555,9 +560,15 @@ async function declaresUnaccountedAllocationQty(
   }
 
   for (const [key, nextQty] of nextByKey) {
-    const pinned = pinnedByKey.get(key) ?? new Prisma.Decimal(0)
-    const shipped = shippedByKey.get(key) ?? new Prisma.Decimal(0)
-    const accounted = pinned.gte(shipped) ? pinned : shipped
+    // o3d-0i5y r6: ONE accounted-quantity rule, shared with A2 itself. Asking it here with the row's
+    // own entries — rather than re-deriving it from a bare quantity — is what keeps a residual pinned
+    // beside a pre-A2 shipment out of this test: A2 records those shipped units on the row, so they
+    // and the pin ADD UP instead of being maxed, and a rebuild that changes nothing no longer reads
+    // as "there is something new to account" and hands the order back to A2 to post a second time.
+    const { accounted } = accountedAllocationQty({
+      snapshot: pinnedByKey.get(key) ?? [],
+      shippedQty: shippedByKey.get(key) ?? 0,
+    })
     if (nextQty.gt(accounted.add(ALLOCATION_EPSILON_DECIMAL))) return true
   }
   return false

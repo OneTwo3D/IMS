@@ -10,9 +10,16 @@ import {
   buildDailyBatchReferenceId,
   planA2Reclassification,
   resolveXeroDailyBatchLimit,
+  takeShipmentAccountedEntries,
   takeDailyBatchWindow,
 } from '@/lib/connectors/xero/daily-sync'
-import { unaccountedAllocationQty } from '@/lib/cost-layer-snapshots'
+import {
+  parseCostLayerSnapshot,
+  sumCostLayerSnapshotQty,
+  unaccountedAllocationQty,
+  type CostLayerSnapshotEntry,
+} from '@/lib/cost-layer-snapshots'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 test('Xero daily batch limit defaults, floors, and clamps operator input', () => {
   assert.equal(resolveXeroDailyBatchLimit(''), XERO_DAILY_BATCH_DEFAULT_LIMIT)
@@ -135,16 +142,19 @@ test('o3d-0i5y r5: a row A2 already pinned and that owes nothing is left ALONE, 
   assert.deepEqual(plan.stampEmptyAllocationIds, [])
 })
 
-test('o3d-0i5y r5: a never-stamped row whose quantity has all shipped still gets its empty stamp', () => {
-  // The pre-existing shipped-order behaviour, unchanged: the value comes from the shipment snapshot
-  // and the allocation row is stamped empty so it is not mistaken for unaccounted next time.
+test('o3d-0i5y r6: a never-stamped row whose quantity has all shipped is RECORDED, not stamped empty', () => {
+  // r5 stamped this row with an EMPTY snapshot, on the reasoning that its value came through the
+  // shipment. That is true and it is exactly the ambiguity: an empty snapshot beside 2 dispatched
+  // units cannot tell the next pass whether those units were accounted, so the moment the order comes
+  // back the pass has to guess. It no longer guesses — the 2 units are recorded on the row.
   const plan = planA2Reclassification({
     allocations: [allocationRow({ qty: 2, costLayerSnapshot: null })],
     shipments: [shipmentRow({ qty: 2 })],
   })
 
-  assert.equal(plan.outstandingByAllocation.size, 0)
-  assert.deepEqual(plan.stampEmptyAllocationIds, ['alloc-1'])
+  assert.equal(plan.outstandingByAllocation.size, 0, 'nothing is on the shelf, so nothing is pinned')
+  assert.equal(plan.shipmentAccountedByAllocation.get('alloc-1')?.toString(), '2')
+  assert.deepEqual(plan.stampEmptyAllocationIds, [], 'and the empty stamp is no longer how it is recorded')
   assert.equal(plan.unjournaledShipments.length, 1, 'and the shipment is still valued — it has not been journaled')
 })
 
@@ -199,3 +209,201 @@ test('o3d-0i5y r5: Group A2 writes a snapshot only where its plan named one', ()
     'A2 must not default an unnamed row to an empty snapshot',
   )
 })
+
+
+// ---------------------------------------------------------------------------
+// o3d-0i5y r6 — A RESIDUAL PINNED BESIDE A SHIPMENT THAT PREDATES A2 POSTED TWICE.
+//
+// r5 established that the two records of "already reclassified" OVERLAP — a dispatch consumes the
+// allocation it ships — so accounted quantity is max(pinned, shipped) and never the sum. That holds
+// while both records describe the same units. They do not when the shipment came FIRST: A2 cannot pin
+// units whose layers dispatch has already consumed, so it takes their value from the shipment
+// snapshots and pins only the remainder. The row is then left holding 4 pinned BESIDE 6 dispatched —
+// disjoint units totalling 10 — and max answers 6. Every later pass found the same 4 "unaccounted",
+// re-pinned them and posted them again.
+//
+// There is nothing on the row that tells the two cases apart, so A2 stops inferring: it RECORDS the
+// units it accounted through a shipment, on the row, as shipment-source entries carrying the layers
+// the dispatch actually consumed. The pin becomes the whole record of accounted quantity.
+// ---------------------------------------------------------------------------
+
+function shipmentLineWithSnapshot(overrides: { id?: string; qty?: number; layerId?: string } = {}) {
+  const qty = overrides.qty ?? 6
+  return {
+    id: overrides.id ?? 'shipment-line-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    qty,
+    costLayerSnapshot: [{
+      costLayerId: overrides.layerId ?? 'layer-dispatched',
+      qty,
+      unitCostBase: 3,
+      shipmentLineId: overrides.id ?? 'shipment-line-1',
+      source: 'shipment',
+    }],
+  }
+}
+
+function shipmentWithLines(
+  lines: ReturnType<typeof shipmentLineWithSnapshot>[],
+  shipmentJournalDate: Date | null = null,
+) {
+  return { warehouseId: 'warehouse-1', shipmentJournalDate, lines }
+}
+
+/**
+ * The A2 write loop, applied to one row: the units this pass accounted through the shipment, then the
+ * layers it freshly pinned, APPENDED to what the row already held. Deliberately mirrors
+ * `runDailyBatchSync` rather than re-deriving anything, so the two-pass property below is about the
+ * plan and the write together — which is where the double post lived.
+ */
+function applyA2Pass(
+  row: ReturnType<typeof allocationRow>,
+  plan: ReturnType<typeof planA2Reclassification>,
+  shipmentLines: ReturnType<typeof shipmentLineWithSnapshot>[],
+): ReturnType<typeof allocationRow> {
+  const recordQty = plan.shipmentAccountedByAllocation.get(row.id)
+  const recorded = recordQty ? takeShipmentAccountedEntries(shipmentLines, recordQty, row.id) : []
+  const outstanding = plan.outstandingByAllocation.get(row.id)
+  const pinned: CostLayerSnapshotEntry[] = outstanding
+    ? [{ costLayerId: 'layer-on-the-shelf', qty: outstanding.toString(), unitCostBase: 5 }]
+    : []
+  return {
+    ...row,
+    costLayerSnapshot: [
+      ...parseCostLayerSnapshot(row.costLayerSnapshot),
+      ...recorded,
+      ...pinned,
+    ] as never,
+  }
+}
+
+test('o3d-0i5y r6: a pass that values dispatched units from the shipment RECORDS them on the row', () => {
+  // 10 allocated, 6 of them dispatched before A2 ever ran. The 4 on the shelf are pinned, as r5 does;
+  // the 6 gone are what r5 left no record of at all.
+  const line = shipmentLineWithSnapshot({ qty: 6 })
+  const plan = planA2Reclassification({
+    allocations: [allocationRow({ qty: 10, costLayerSnapshot: null })],
+    shipments: [shipmentWithLines([line])],
+  })
+
+  assert.equal(plan.outstandingByAllocation.get('alloc-1')?.toString(), '4', 'the 4 on the shelf are pinned')
+  assert.equal(plan.shipmentAccountedByAllocation.get('alloc-1')?.toString(), '6', 'and the 6 dispatched are recorded')
+  assert.equal(plan.unjournaledShipments.length, 1, 'their value is posted once, from the shipment snapshot')
+  assert.deepEqual(plan.stampEmptyAllocationIds, [])
+})
+
+test('o3d-0i5y r6: the residual beside a pre-A2 shipment is pinned ONCE, not once per pass', () => {
+  // THE DEFECT, end to end. Pass one accounts all 10 units. Pass two — the order comes back because a
+  // sibling row changed, or the rebuild re-declared the same set — must find NOTHING owed. Under r5
+  // it found the same 4 outstanding (max(pinned 4, shipped 6) = 6 of 10 accounted) and pinned and
+  // posted them a second time, and again on every pass after that.
+  const line = shipmentLineWithSnapshot({ qty: 6 })
+  const journaledShipment = shipmentWithLines([line], JOURNALED)
+
+  const firstPass = planA2Reclassification({
+    allocations: [allocationRow({ qty: 10, costLayerSnapshot: null })],
+    shipments: [shipmentWithLines([line])],
+  })
+  const afterFirstPass = applyA2Pass(allocationRow({ qty: 10, costLayerSnapshot: null }), firstPass, [line])
+
+  const secondPass = planA2Reclassification({
+    allocations: [afterFirstPass],
+    shipments: [journaledShipment],
+  })
+
+  assert.equal(plansOwe(secondPass, 'alloc-1'), '0', 'nothing is owed, so the residual is not pinned and posted twice')
+  assert.equal(secondPass.shipmentAccountedByAllocation.size, 0, 'and there is nothing left to record')
+  assert.deepEqual(secondPass.unjournaledShipments, [], 'the journaled shipment is not re-valued either')
+
+  // WHY it is nothing: the row itself now says so.
+  assert.equal(
+    sumCostLayerSnapshotQty(parseCostLayerSnapshot(afterFirstPass.costLayerSnapshot)).toString(),
+    '10',
+    'the row records all 10 accounted units, not just the 4 it could pin',
+  )
+  assert.equal(
+    parseCostLayerSnapshot(afterFirstPass.costLayerSnapshot)
+      .filter((entry) => entry.source === 'shipment')
+      .reduce((sum, entry) => sum + Number(entry.qty), 0),
+    6,
+    'the 6 dispatched units are recorded as accounted THROUGH the shipment, with the layers dispatch consumed',
+  )
+})
+
+test('o3d-0i5y r6: a genuine residual added AFTER the record is still owed, and only the residual', () => {
+  // The counter-guard: r5 exists to get residual quantity into the ledger, and r6 must not buy its
+  // idempotence by stranding it again. 3 more units allocated after the pass -> exactly 3 owed.
+  const line = shipmentLineWithSnapshot({ qty: 6 })
+  const recorded = takeShipmentAccountedEntries([line], toDecimal(6), 'alloc-1')
+  const plan = planA2Reclassification({
+    allocations: [allocationRow({
+      qty: 13,
+      costLayerSnapshot: [
+        ...recorded,
+        { costLayerId: 'layer-on-the-shelf', qty: 4, unitCostBase: 5 },
+      ] as never,
+    })],
+    shipments: [shipmentWithLines([line], JOURNALED)],
+  })
+
+  assert.equal(plan.outstandingByAllocation.get('alloc-1')?.toString(), '3')
+  assert.equal(plan.shipmentAccountedByAllocation.size, 0)
+})
+
+test('o3d-0i5y r6: the record carries the layers the dispatch consumed, and never more than was dispatched', () => {
+  const lines = [
+    shipmentLineWithSnapshot({ id: 'shipment-line-1', qty: 4, layerId: 'layer-a' }),
+    shipmentLineWithSnapshot({ id: 'shipment-line-2', qty: 3, layerId: 'layer-b' }),
+  ]
+
+  const taken = takeShipmentAccountedEntries(lines, toDecimal(6), 'alloc-1')
+
+  assert.equal(sumCostLayerSnapshotQty(taken).toString(), '6')
+  assert.deepEqual(
+    taken.map((entry) => [entry.costLayerId, entry.qty, entry.shipmentLineId, entry.source, entry.orderAllocationId]),
+    [
+      ['layer-a', '4.000000', 'shipment-line-1', 'shipment', 'alloc-1'],
+      ['layer-b', '2.000000', 'shipment-line-2', 'shipment', 'alloc-1'],
+    ],
+    'FIFO across the dispatching lines, at the cost each line actually consumed',
+  )
+
+  // A legacy line with no snapshot cannot be recorded. Recording less is the safe direction: the row
+  // keeps looking under-accounted rather than over-accounted, which is r5's behaviour, not worse.
+  const partial = takeShipmentAccountedEntries(
+    [...lines, { id: 'shipment-line-3', costLayerSnapshot: null }],
+    toDecimal(9),
+    'alloc-1',
+  )
+  assert.equal(sumCostLayerSnapshotQty(partial).toString(), '7')
+})
+
+test('o3d-0i5y r6: Group A2 posts value for the layers it pins, never for the units it merely records', () => {
+  // Structural, like the r5 write-loop test above and for the same reason: the property is about what
+  // the batch does NOT add to the journal, and there is no harness that can run it. The recorded
+  // entries name quantity the ledger already holds — posting their value would be the double post
+  // arriving through the other door.
+  const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/daily-sync.ts'), 'utf8')
+  const start = src.indexOf('// --- Group A2: Inventory Reclassification ---')
+  const block = src.slice(start, src.indexOf('// --- Group B:', start))
+  assert.ok(start > 0 && block.length > 0, 'the Group A2 block must exist')
+  assert.ok(
+    block.includes('orderCostValue = addMoney(orderCostValue, sumCostLayerSnapshot(consumed))'),
+    'the freshly pinned layers are what A2 posts',
+  )
+  assert.equal(
+    block.indexOf('sumCostLayerSnapshot(recorded)'),
+    -1,
+    'and the recorded shipment units are never added to the journal',
+  )
+  assert.ok(
+    block.includes('...recorded,') && block.includes('takeShipmentAccountedEntries('),
+    'while still being written onto the row',
+  )
+})
+
+/** The outstanding quantity a plan owes a row, as a string, with "0" for "owes nothing". */
+function plansOwe(plan: ReturnType<typeof planA2Reclassification>, allocationId: string): string {
+  return (plan.outstandingByAllocation.get(allocationId) ?? toDecimal(0)).toString()
+}
