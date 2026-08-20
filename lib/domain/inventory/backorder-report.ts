@@ -4,13 +4,10 @@ import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { roundQuantity } from '@/lib/domain/math/decimal'
 import {
   calculateCoverageByLine,
-  requirementsMapToRows,
   type FulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
-import {
-  expandFulfillmentRequirementsDecimal,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 import {
   isStockTrackedProductType,
   STOCK_TRACKED_PRODUCT_TYPES,
@@ -30,6 +27,8 @@ export type BackorderReportLineRow = {
   sku: string | null
   description: string
   qty: DecimalLike
+  /** o3d-kouj: the line's pinned fulfilment recipe, when it has one. See `collectBackorderReportInput`. */
+  fulfillmentRequirements?: unknown
   product: {
     id: string
     sku: string
@@ -280,6 +279,11 @@ export async function collectBackorderReportRows(
         sku: true,
         description: true,
         qty: true,
+        // o3d-kouj: what this line was ALLOCATED against. Backorder demand is "ordered minus
+        // covered", and both halves have to be in the same component units — reading the current
+        // graph while the allocation rows hold an older recipe is what makes a fully-covered order
+        // report a permanent shortfall (or hides a real one).
+        fulfillmentRequirements: true,
         product: {
           select: {
             id: true,
@@ -349,7 +353,10 @@ export async function collectBackorderReportRows(
     requirementsByLine.set(
       line.id,
       line.productId
-        ? requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph))
+        ? lineFulfillmentRequirements(line, graph).map((requirement) => ({
+          productId: requirement.productId,
+          factor: requirement.factor.toNumber(),
+        }))
         : defaultRequirements(line),
     )
   }

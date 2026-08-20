@@ -1,0 +1,26 @@
+-- o3d-kouj: the immutable per-line fulfilment-requirement snapshot.
+--
+-- WHAT IT REPLACES. Everything IMS knows about "what does this sales line require" is
+-- recomputed from the CURRENT component graph on every read, by fourteen modules. A kit
+-- re-composed after an order shipped therefore rewrites what that order appears to have
+-- required, and a kit re-composed mid-fulfilment can make a UNIFORM rescale read as a
+-- perfectly proportional half-kit that every quantity check passes. The mitigations that
+-- shipped before this (the component-graph edit guard, the graph-version CAS) both work
+-- by REFUSING, because refusal is the only tool available while the current graph is the
+-- authority.
+--
+-- NULLABLE WITH NO BACKFILL, ON PURPOSE. NULL means "no pinned recipe", and every reader
+-- resolves through one function that falls back to expanding the current graph — which is
+-- exactly the behaviour of every line before this column existed. So the deploy changes
+-- nothing for existing rows, and a line adopts the snapshot the first time it is
+-- allocated. Backfilling from today's graph would be strictly WORSE than NULL: it would
+-- pin the CURRENT recipe onto lines whose allocation rows were built from an older one,
+-- and (because the graph-version CAS is skipped for snapshot-backed lines) it would
+-- silently certify that disagreement instead of surfacing it.
+--
+-- jsonb, not json: it is read far more often than written, and the b-tree-free
+-- normalisation is what makes an operator-readable payload cheap to inspect during an
+-- incident. Adding a nullable column with no default is metadata-only on Postgres — no
+-- table rewrite, no lock held beyond the catalogue update.
+ALTER TABLE "sales_order_lines"
+  ADD COLUMN "fulfillment_requirements" JSONB;

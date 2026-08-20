@@ -9,13 +9,10 @@ import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 import {
   calculateDecimalCoverageByLine,
-  requirementsMapToDecimalRows,
   type DecimalFulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
-import {
-  expandFulfillmentRequirementsDecimal,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -149,6 +146,8 @@ type BackorderSalesLineRow = {
   sku: string | null
   description: string
   qty: DecimalInput
+  /** o3d-kouj: the line's pinned fulfilment recipe, when it has one. */
+  fulfillmentRequirements?: unknown
   order: {
     orderNumber: string | null
     createdAt: Date
@@ -1174,6 +1173,9 @@ export async function getBackorderDemandReport(
         sku: true,
         description: true,
         qty: true,
+        // o3d-kouj: replenishment demand for a kit's components is only right in the units the
+        // order's allocation rows are denominated in — the recipe it was allocated from.
+        fulfillmentRequirements: true,
         order: { select: { orderNumber: true, createdAt: true, expectedDelivery: true, status: true } },
         product: {
           select: {
@@ -1234,10 +1236,7 @@ export async function getBackorderDemandReport(
   const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
   for (const line of lines) {
     if (!line.productId) continue
-    requirementsByLine.set(
-      line.id,
-      requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
-    )
+    requirementsByLine.set(line.id, lineFulfillmentRequirements(line, graph))
   }
 
   const committedShipmentLines = shipmentLines.filter((shipmentLine) => (

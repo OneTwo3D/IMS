@@ -18,7 +18,8 @@ import {
   saleDispatchMovementKey,
 } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { buildStockMovementValueFieldsFromConsumed } from '@/lib/domain/inventory/stock-movement-value'
-import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirementQuantities } from '@/lib/products/fulfillment-requirement-snapshot'
 import { withSavepoint } from '@/lib/db/savepoint'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -133,7 +134,16 @@ async function validateActiveShipmentTotalsWithinOrder(
   const [orderLines, activeShipmentLines, refundLines] = await Promise.all([
     client.salesOrderLine.findMany({
       where: { orderId },
-      select: { id: true, productId: true, qty: true, sku: true, description: true },
+      // o3d-kouj: `fulfillmentRequirements` is the line's PINNED recipe — see the note below on
+      // which graph this cap is judged against.
+      select: {
+        id: true,
+        productId: true,
+        qty: true,
+        sku: true,
+        description: true,
+        fulfillmentRequirements: true,
+      },
     }),
     client.shipmentLine.findMany({
       where: { shipment: { orderId, status: { not: 'PENDING' } } },
@@ -160,30 +170,38 @@ async function validateActiveShipmentTotalsWithinOrder(
   // parent-kit ordered/refunded qty would let a fractional-component kit slip refunded units past the
   // cap (e.g. two kits needing 0.1 of a component ship 0.2, but a per-kit cap of 1 would pass it).
   //
-  // NB: this expands ordered/refunded qty through the CURRENT kit graph, matching the existing
-  // build-time refund netting (confirmSalesOrderShipments) and the allocation path — the codebase has
-  // no immutable per-order BOM snapshot, so a kit re-composed BETWEEN packing and dispatch can drift
-  // this cap. o3d-4kfh r4 closed the hole from BOTH ends instead of taking the snapshot: the
-  // component editor, the KIT-conversion paths and the CSV component pass now REFUSE while an
-  // affected order holds allocations or a non-PENDING shipment
-  // (`findComponentGraphEditBlockers`), and `validateCommittedShipmentCoverage` — the only check
-  // that expands the graph and demands a COMPLETE PROPORTIONAL component set — now runs at every
-  // shipment transition INCLUDING the dispatch below. This cap remains a per-leaf upper bound and
-  // cannot see a disproportionate set on its own: A=2/B=1 against a 2xA+2xB kit exceeds neither
-  // leaf. The durable per-line requirement snapshot is still the right long-term fix and is still
-  // NOT implemented.
+  // o3d-kouj: THE CAP IS NOW JUDGED AGAINST THE RECIPE THE ORDER WAS ALLOCATED FROM, not the
+  // current one. `lineFulfillmentRequirementQuantities` returns the line's pinned per-unit
+  // requirement set scaled by the quantity asked about, and falls back to expanding the current
+  // graph only for a line that has never been allocated — which is the pre-snapshot behaviour, and
+  // for such a line there is nothing in flight for a graph edit to drift.
+  //
+  // What that removes is the drift this comment used to describe: a kit re-composed BETWEEN packing
+  // and dispatch changed what `orderedByLeaf` said the customer had bought, so a packed set could
+  // become over- or under-shipped without anyone touching the order. The two bounded mitigations
+  // that stood in for it remain and are still doing their own jobs — the component-graph edit guard
+  // (`findComponentGraphEditBlockers`) stops the edit reaching an order mid-pick at all, and
+  // `validateCommittedShipmentCoverage` still demands a COMPLETE PROPORTIONAL component set at every
+  // transition including the dispatch below, which this per-leaf cap cannot see on its own
+  // (A=2/B=1 against a 2xA+2xB kit exceeds neither leaf).
+  //
+  // Refund lines are expanded through THE ORDER LINE they refund, not through their own product:
+  // refunding N units of a line reverses N times what that LINE requires, and the line is the thing
+  // carrying the pinned recipe. A refund line whose product disagrees with the line it names is a
+  // data anomaly with no pinned answer, so it falls back to expanding its own product.
   const productIds = [...new Set([
     ...orderLines.map((line) => line.productId).filter((id): id is string => !!id),
     ...refundLines.map((refundLine) => refundLine.productId).filter((id): id is string => !!id),
   ])]
   const graph = productIds.length > 0 ? await loadFulfillmentProductGraph(client, productIds) : new Map()
 
+  const orderLineById = new Map(orderLines.map((line) => [line.id, line]))
   const lineLabelById = new Map<string, string>()
   const orderedByLeaf = new Map<string, Prisma.Decimal>()
   for (const line of orderLines) {
     lineLabelById.set(line.id, line.sku ?? line.description ?? line.id)
     if (!line.productId) continue // a description-only line has no product to ship
-    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(line.productId, toDecimal(line.qty), graph)) {
+    for (const [componentId, componentQty] of lineFulfillmentRequirementQuantities(line, toDecimal(line.qty), graph)) {
       const key = `${line.id}|${componentId}`
       orderedByLeaf.set(key, (orderedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
     }
@@ -193,7 +211,11 @@ async function validateActiveShipmentTotalsWithinOrder(
   for (const refundLine of refundLines) {
     // An unmatched external refund (no order line / no product) can't be attributed to a leaf — skip it.
     if (!refundLine.salesOrderLineId || !refundLine.productId) continue
-    for (const [componentId, componentQty] of expandFulfillmentRequirementsDecimal(refundLine.productId, toDecimal(refundLine.qty), graph)) {
+    const refundedLine = orderLineById.get(refundLine.salesOrderLineId)
+    const refundedResolvable = refundedLine?.productId === refundLine.productId
+      ? refundedLine
+      : { id: refundLine.salesOrderLineId, productId: refundLine.productId }
+    for (const [componentId, componentQty] of lineFulfillmentRequirementQuantities(refundedResolvable, toDecimal(refundLine.qty), graph)) {
       const key = `${refundLine.salesOrderLineId}|${componentId}`
       refundedByLeaf.set(key, (refundedByLeaf.get(key) ?? new Prisma.Decimal(0)).add(componentQty))
     }
@@ -303,9 +325,27 @@ export async function confirmSalesOrderShipments(
     const refundGraph = refundProductIds.length > 0
       ? await loadFulfillmentProductGraph(tx, refundProductIds)
       : new Map()
+    // o3d-kouj: netted against the ORDER LINE's pinned recipe, for the same reason the dispatch cap
+    // is. This build-time netting and `validateActiveShipmentTotalsWithinOrder` must agree unit for
+    // unit — the cap is the backstop for a shipment that predates the refund, so if the two expanded
+    // different recipes the backstop would refuse shipments this builder had just written.
+    const refundedOrderLines = shipmentRefundLines.some((refundLine) => refundLine.salesOrderLineId)
+      ? await tx.salesOrderLine.findMany({
+        where: { orderId },
+        select: { id: true, productId: true, fulfillmentRequirements: true },
+      })
+      : []
+    const refundedOrderLineById = new Map(refundedOrderLines.map((line) => [line.id, line]))
     for (const refundLine of shipmentRefundLines) {
       if (!refundLine.salesOrderLineId || !refundLine.productId || shipmentBoundaryNumber(refundLine.qty) <= 0) continue
-      const requirements = expandFulfillmentRequirementsDecimal(refundLine.productId, toDecimal(refundLine.qty), refundGraph)
+      const refundedLine = refundedOrderLineById.get(refundLine.salesOrderLineId)
+      const requirements = lineFulfillmentRequirementQuantities(
+        refundedLine?.productId === refundLine.productId
+          ? refundedLine
+          : { id: refundLine.salesOrderLineId, productId: refundLine.productId },
+        toDecimal(refundLine.qty),
+        refundGraph,
+      )
       for (const [componentId, componentQty] of requirements) {
         let remaining = shipmentBoundaryNumber(componentQty)
         for (const alloc of allocAfterShipments) {

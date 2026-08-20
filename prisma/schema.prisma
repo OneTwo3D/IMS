@@ -1747,6 +1747,22 @@ model SalesOrderLine {
   totalForeign    Decimal    @db.Decimal(18, 4)
   totalBase        Decimal    @db.Decimal(18, 4)
   cogsBase         Decimal?   @db.Decimal(18, 4) // set on dispatch
+  /// o3d-kouj: THE IMMUTABLE FULFILMENT-REQUIREMENT SNAPSHOT — the flat leaf requirement set for ONE
+  /// unit of this line's product, as expanded from the component graph at the moment this line first
+  /// acquired in-flight state (an allocation row). While the line holds an allocation row or a
+  /// committed shipment line it is never rewritten, so a later component-graph edit cannot change
+  /// what this order requires, what its picked set is judged against, or what its refund reverses.
+  ///
+  /// NULL means "no pinned recipe": the line has never been allocated, or predates this column. Every
+  /// reader resolves through `lineFulfillmentRequirements`, which falls back to expanding the current
+  /// graph — exactly the pre-snapshot behaviour — so there is ONE rule rather than a snapshot-aware
+  /// and a live-graph population that disagree about the same order.
+  ///
+  /// Shape: { version, productId, graphVersion, capturedAt, requirements: [{ productId, factor }] }
+  /// with `factor` an exact decimal STRING. See lib/products/fulfillment-requirement-snapshot.ts,
+  /// which is the only thing allowed to parse it and refuses rather than falling back when the
+  /// payload is present but unreadable.
+  fulfillmentRequirements Json? @map("fulfillment_requirements")
 
   order           SalesOrder @relation(fields: [orderId], references: [id])
   product         Product?   @relation(fields: [productId], references: [id])

@@ -47,14 +47,15 @@ import {
   type DailyBatchLiveRefs,
   type DailyBatchRecreateBucket,
 } from '@/lib/domain/accounting/daily-batch-reference'
-import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
+import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
   sumPostedUnearnedReversal,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
 } from '@/lib/domain/accounting/deferred-trueup'
-import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
 type MutableLayer = {
   id: string
@@ -896,7 +897,18 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
               refundStatus: true,
               totalBase: true,
               unearnedRevenueAmount: true,
-              lines: { select: { id: true, productId: true, qty: true, totalBase: true } },
+              lines: {
+                select: {
+                  id: true,
+                  productId: true,
+                  qty: true,
+                  totalBase: true,
+                  // o3d-kouj: the recipe this line was allocated from. Group B's per-line component
+                  // requirements decide which shipped component units belong to which sales line, and
+                  // the basis it relieves was recorded in exactly those units at dispatch.
+                  fulfillmentRequirements: true,
+                },
+              },
               shipments: {
                 select: {
                   id: true,
@@ -1099,7 +1111,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             .filter((line) => !!line.productId)
             .map((line) => [
               line.id,
-              requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId!, 1, graph)),
+              lineFulfillmentRequirements(line, graph).map((requirement) => ({
+                productId: requirement.productId,
+                factor: requirement.factor.toNumber(),
+              })),
             ]),
         )
         const orderLineById = new Map(firstShipment.order.lines.map((line) => [line.id, line]))

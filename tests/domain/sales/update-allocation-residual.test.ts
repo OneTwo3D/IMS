@@ -32,6 +32,8 @@ type SalesOrderLineRow = {
   productId: string
   qty: number
   sku: string
+  /** o3d-kouj: the line's PINNED fulfilment recipe; undefined is the NULL of a never-allocated line. */
+  fulfillmentRequirements?: unknown
 }
 /** A PENDING draft, with the label metadata a retirement has to report (o3d-4kfh r4). */
 type PendingShipmentRow = {
@@ -53,6 +55,8 @@ const state = {
   // anything, so every assertion about the post-edit state was made against a validator that had
   // been switched off (Codex review of o3d-4kfh).
   lines: [] as SalesOrderLineRow[],
+  /** o3d-kouj: every fulfilment-requirement pin written, in order. */
+  lineSnapshotWrites: [] as Array<{ lineId: string; payload: unknown }>,
   /**
    * o3d-4kfh r7 (Codex finding 1): `Product.fulfillmentGraphVersion`, keyed by productId, served
    * from `product.findMany` — the graph read.
@@ -168,21 +172,41 @@ const tx = {
     },
   },
   salesOrderLine: {
-    findMany: async ({ where }: { where: { orderId: string; id?: { in: string[] } } }) => state.lines
-      .filter((line) => line.orderId === where.orderId)
-      .filter((line) => !where.id || where.id.in.includes(line.id))
+    // o3d-kouj: also answers `{ id: 'line-x' }` — `addAllocation` reads the ONE line it is about to
+    // pin. The row carries `fulfillmentRequirements`, so a test can seed a stale pin and prove the
+    // pin is what the expansion reads.
+    findMany: async ({ where }: {
+      where: { orderId?: string; id?: string | { in: string[] } }
+    }) => state.lines
+      .filter((line) => where.orderId == null || line.orderId === where.orderId)
+      .filter((line) => {
+        if (where.id == null) return true
+        return typeof where.id === 'string' ? line.id === where.id : where.id.in.includes(line.id)
+      })
       .map((line) => ({
         id: line.id,
         productId: line.productId,
         qty: line.qty,
         sku: line.sku,
         description: line.sku,
+        fulfillmentRequirements: line.fulfillmentRequirements ?? null,
         // The r6 read, kept alive on purpose — see `state.lineProductGraphVersions`.
         product: {
           fulfillmentGraphVersion:
             state.lineProductGraphVersions[line.productId] ?? state.graphVersions[line.productId] ?? 0,
         },
       })),
+    // o3d-kouj: the pin write, mutating the SAME rows `findMany` answers from and round-tripping
+    // through JSON as jsonb does.
+    update: async ({ where, data }: { where: { id: string }; data: { fulfillmentRequirements?: unknown } }) => {
+      const line = state.lines.find((row) => row.id === where.id)
+      if (!line) throw new Error(`salesOrderLine.update: no line ${where.id}`)
+      if ('fulfillmentRequirements' in data) {
+        state.lineSnapshotWrites.push({ lineId: where.id, payload: data.fulfillmentRequirements })
+        line.fulfillmentRequirements = JSON.parse(JSON.stringify(data.fulfillmentRequirements))
+      }
+      return line
+    },
   },
   // SIMPLE unless `state.kits` says otherwise. validateAllocationIntegrity really does load the
   // graph, so it has to be answerable — and `addAllocation` EXPANDS it, so a double that could only
@@ -380,6 +404,7 @@ function seedLines(qty: number) {
   state.pendingShipments = []
   state.activity.length = 0
   state.txActivity.length = 0
+  state.lineSnapshotWrites.length = 0
 }
 
 /**
@@ -1112,4 +1137,69 @@ test('o3d-4kfh r7: addAllocation reserves the PERSISTED component quantity, not 
     3.3334,
     'and the reservation moved by the persisted row, so order B\'s 3 is neither topped up nor eaten into',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-kouj — `addAllocation` IS THE SECOND DOOR ONTO IN-FLIGHT STATE, AND IT PINS TOO.
+//
+// `allocateSalesOrder` is not the only writer of `OrderAllocation`. If the manual editor could give
+// a line its first allocation row without pinning, every reader would keep answering that line from
+// a graph free to move under it — a line the rest of the system believes is protected, and is not.
+// ---------------------------------------------------------------------------
+
+test('o3d-kouj: addAllocation pins the recipe when it gives a line its FIRST row', async () => {
+  seedLines(10)
+  state.lines = [{ id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1' }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 2 }] }
+  state.graphVersions = { 'kit-1': 6 }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 0 }]
+  state.allocations = []
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, true, result.error)
+  assert.deepEqual(state.lineSnapshotWrites.map((write) => write.lineId), ['line-1'])
+  assert.deepEqual(state.lines[0].fulfillmentRequirements, {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 6,
+    capturedAt: (state.lines[0].fulfillmentRequirements as { capturedAt: string }).capturedAt,
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  })
+})
+
+test('o3d-kouj: addAllocation expands the PIN, and never re-pins a line that already holds rows', async () => {
+  // The kit has since been re-composed 2 -> 5. Adding one more kit to a line that is already
+  // in flight must add the PINNED two components, not five: the row it is topping up, the
+  // reservation behind it and the shipment lines already committed are all in the pinned units.
+  const pinned = {
+    version: 1,
+    productId: 'kit-1',
+    graphVersion: 6,
+    capturedAt: '2026-08-01T00:00:00.000Z',
+    requirements: [{ productId: 'component-1', factor: '2' }],
+  }
+  seedLines(10)
+  state.lines = [{
+    id: 'line-1', orderId: 'order-1', productId: 'kit-1', qty: 10, sku: 'KIT-1',
+    fulfillmentRequirements: pinned,
+  }]
+  state.kits = { 'kit-1': [{ componentId: 'component-1', qty: 5 }] }
+  state.graphVersions = { 'kit-1': 11 }
+  state.stockLevels = [{ productId: 'component-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 2 }]
+  state.allocations = [
+    { id: 'alloc-a', orderId: 'order-1', lineId: 'line-1', productId: 'component-1', warehouseId: 'warehouse-1', qty: 2 },
+  ]
+  state.shipmentLines = []
+  const { addAllocation } = await loadAction()
+
+  const result = await addAllocation('order-1', 'line-1', 'kit-1', 'warehouse-1', 1)
+
+  assert.equal(result.success, true, result.error)
+  assert.equal(state.allocations[0].qty, 4, '2 already there plus the PINNED 2, not plus 5')
+  assert.equal(reservedAt('warehouse-1'), 4)
+  assert.deepEqual(state.lineSnapshotWrites, [], 'and the pin is not touched')
+  assert.deepEqual(state.lines[0].fulfillmentRequirements, pinned)
 })

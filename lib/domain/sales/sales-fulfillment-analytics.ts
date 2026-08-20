@@ -13,13 +13,10 @@ import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 import {
   calculateDecimalCoverageByLine,
-  requirementsMapToDecimalRows,
   type DecimalFulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
-import {
-  expandFulfillmentRequirementsDecimal,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -227,7 +224,7 @@ type ShipmentRow = {
     id: string
     createdAt: Date
     expectedDelivery: Date | null
-    lines: Array<{ id: string; productId: string | null; qty: DecimalInput }>
+    lines: Array<{ id: string; productId: string | null; qty: DecimalInput; fulfillmentRequirements?: unknown }>
   }
 }
 
@@ -1015,7 +1012,12 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
       // o3d-4kfh r3: productId on BOTH sides. Without it there is no way to tell that a shipment
       // line's quantity is in a different unit from the order line's.
       lines: { select: { lineId: true, productId: true, qty: true } },
-      order: { select: { id: true, createdAt: true, expectedDelivery: true, lines: { select: { id: true, productId: true, qty: true } } } },
+      // o3d-kouj: `fulfillmentRequirements` — a shipped order is reported against the recipe it
+      // SHIPPED under, not against whatever the kit contains at report time. This was the residual
+      // o3d-4kfh r5 left open when it stopped freezing the catalogue: completed history was still
+      // read from the current graph, so editing a KIT rewrote what past orders appeared to require
+      // and moved their shipped-coverage figures with it.
+      order: { select: { id: true, createdAt: true, expectedDelivery: true, lines: { select: { id: true, productId: true, qty: true, fulfillmentRequirements: true } } } },
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as ShipmentRow[]
@@ -1046,10 +1048,7 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
   for (const shipment of shipments) {
     for (const line of shipment.order.lines) {
       if (!line.productId || requirementsByLine.has(line.id)) continue
-      requirementsByLine.set(
-        line.id,
-        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
-      )
+      requirementsByLine.set(line.id, lineFulfillmentRequirements(line, graph))
     }
   }
   // Line ids are unique across orders, so one pass covers every shipment of every order.

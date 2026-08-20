@@ -87,9 +87,10 @@ export class FulfillmentGraphSnapshotError extends Error {
  *     `sortOrder`, the KIT/SIMPLE split, cycle handling, the `?? 0` defaults — in a second language.
  *     The atomicity is worth having; a second divergent implementation of the expansion is not the
  *     price to pay for it here.
- *   - CAPTURING EVERY NODE'S VERSION AND VALIDATING THE COMPLETE SET AT THE CAS is the real end
- *     state, but it needs `OrderAllocation.fulfillmentGraphVersion` to become a set rather than one
- *     `Int`. That is the full graph-version CAS filed as o3d-57b0 and explicitly out of scope.
+ *   - CAPTURING EVERY NODE'S VERSION AND VALIDATING THE COMPLETE SET AT THE CAS was once described
+ *     as the real end state, needing `OrderAllocation.fulfillmentGraphVersion` to become a set
+ *     rather than one `Int`. It is not the end state and it is not going to be built — see the
+ *     closing note on o3d-57b0 below.
  *
  * So: walk as before, then RE-READ the version of every node the walk visited, in ONE statement,
  * and compare it against what the walk captured. Versions only ever increment
@@ -117,11 +118,24 @@ export class FulfillmentGraphSnapshotError extends Error {
  *
  * WHAT REMAINS OPEN, STATED PLAINLY. An edit committing AFTER tR is invisible to this function and
  * to the whole calling transaction — nothing on these paths takes `COMPONENT_GRAPH_WRITE_LOCK_KEY`
- * against graph writers. This NARROWS the window to "after the graph read" instead of closing it;
- * serialising allocation and commitment against component writers is o3d-57b0 and is not done here.
+ * against graph writers. This NARROWS the window to "after the graph read" instead of closing it.
  * Nor does this make the CAS a whole-graph CAS: the stamp is still the ROOT's version, so a
  * descendant edit is caught only because the bump reaches the root. What changed is that the root
  * version now certifies the recipe the caller actually expanded.
+ *
+ * AND THE REMAINING WINDOW IS NOW HARMLESS, WHICH IS WHY THE LOCK IS NOT COMING (o3d-57b0, SUBSUMED
+ * BY o3d-kouj). Closing it would mean making allocation and commitment take the component-graph
+ * write lock — a change to the allocation and commitment WRITE PROTOCOLS that coarsens the lock
+ * every order already serialises on. The per-line immutable fulfilment-requirement snapshot removes
+ * the question instead of answering it: `allocateSalesOrder` pins THIS map's expansion onto the
+ * sales line in the same transaction as the rows, and from that moment every reader asks the line,
+ * not the product. An edit committing after tR changes the catalogue and changes nothing about what
+ * that order requires — so there is no interleaving left for a lock to exclude or a CAS to detect.
+ *
+ * What the loss of the CAS costs, stated honestly: for a line with NO snapshot — never allocated
+ * since o3d-kouj shipped — the window above is exactly as open as it was, and the CAS still runs
+ * for those lines. It is skipped per line, not switched off; see
+ * `findStaleFulfillmentGraphAllocation`.
  */
 export async function loadFulfillmentProductGraph(
   client: FulfillmentClient,
@@ -282,6 +296,19 @@ export function listFulfillmentLeafProductIds(
   return [...ids]
 }
 
+/**
+ * How many whole units of `productId` one warehouse's stock can cover, by WALKING the graph.
+ *
+ * o3d-kouj — NO PRODUCTION PATH USES THIS ANY MORE, and new ones should not. Feasibility has to be
+ * decided from the same requirement set the allocation rows are expanded from
+ * (`availableQtyFromRequirements` in fulfillment-coverage.ts), or a line pinned to an older recipe
+ * has its feasibility judged by one kit and its rows written from another. The walk also asks each
+ * branch of a DIAMOND independently, so it sees a shared leaf's whole stock once per path and can
+ * authorise an allocation whose own merged rows exceed what is there.
+ *
+ * Kept because it is the reference the requirement-set form is checked against, and because the two
+ * agree exactly for a tree — which is the argument that the change was a fix and not a rewrite.
+ */
 export function getFulfillmentAvailableQtyDecimal(
   productId: string,
   warehouseId: string,

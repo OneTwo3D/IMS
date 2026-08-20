@@ -2,13 +2,10 @@ import { db } from '@/lib/db'
 import type { Prisma } from '@/app/generated/prisma/client'
 import {
   calculateCoverageByLine,
-  requirementsMapToRows,
   type FulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
-import {
-  expandFulfillmentRequirementsDecimal,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
 export type CoverageOrderLine = { id: string; qty: unknown; productId: string | null }
 export type CoverageOrder = {
@@ -71,13 +68,32 @@ export async function selectOrdersNeedingAllocation<T extends CoverageOrder>(
   // allocations look complete against the old graph while being short against the new one,
   // so the shortfall is never recorded (Codex review, o3d-c9mi r3).
   const graph = await loadFulfillmentProductGraph(client, lineProductIds)
+
+  // o3d-kouj: the PINNED recipe wins over the current graph, and this function loads it itself
+  // rather than requiring it in `CoverageOrderLine`. This is documented as the single source of
+  // truth for "which orders still need allocation", and its four callers each build their candidate
+  // lines with their own `select`; a caller that simply forgot the column would silently answer
+  // from the live graph while every other reader answered from the snapshot, which is exactly the
+  // reader disagreement o3d-kouj exists to prevent. One indexed read on ids already in hand is the
+  // cheaper half of that trade. Through the SAME client as everything else here, for the reasons in
+  // the note above the graph load.
+  const snapshotLines = await client.salesOrderLine.findMany({
+    where: { id: { in: candidates.flatMap((order) => order.lines.map((line) => line.id)) } },
+    select: { id: true, productId: true, fulfillmentRequirements: true },
+  })
+  const snapshotLineById = new Map(snapshotLines.map((line) => [line.id, line]))
+
   const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
   for (const order of candidates) {
     for (const line of order.lines) {
       if (!line.productId) continue
+      const resolvable = snapshotLineById.get(line.id) ?? { id: line.id, productId: line.productId }
       requirementsByLine.set(
         line.id,
-        requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
+        lineFulfillmentRequirements(resolvable, graph).map((requirement) => ({
+          productId: requirement.productId,
+          factor: requirement.factor.toNumber(),
+        })),
       )
     }
   }

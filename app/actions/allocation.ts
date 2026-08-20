@@ -9,13 +9,17 @@ import { requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { decimalToNumber } from '@/lib/decimal'
-import { requirementsMapToRows, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import {
-  expandFulfillmentRequirementsDecimal,
-  getFulfillmentAvailableQtyDecimal,
-  listFulfillmentLeafProductIds,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+  availableQtyFromRequirements,
+  scaleFulfillmentRequirements,
+  type FulfillmentRequirement,
+} from '@/lib/products/fulfillment-coverage'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import {
+  captureFulfillmentRequirementSnapshot,
+  lineFulfillmentRequirements,
+  selectCapturableLineIds,
+} from '@/lib/products/fulfillment-requirement-snapshot'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
@@ -263,7 +267,10 @@ export async function getOrderFulfillmentRequirements(
 
   const lines = await db.salesOrderLine.findMany({
     where: { orderId, productId: { not: null } },
-    select: { id: true, productId: true },
+    // o3d-kouj: the fulfilment panel shows what the order requires, and for an in-flight order that
+    // is the PINNED recipe. Showing the current graph here while the allocator, the picker and the
+    // dispatch cap all use the snapshot would make the screen disagree with the refusal messages.
+    select: { id: true, productId: true, fulfillmentRequirements: true },
   })
 
   const graph = await loadFulfillmentProductGraph(
@@ -273,9 +280,10 @@ export async function getOrderFulfillmentRequirements(
 
   return lines.map((line) => ({
     lineId: line.id,
-    requirements: requirementsMapToRows(
-      expandFulfillmentRequirementsDecimal(line.productId!, 1, graph),
-    ),
+    requirements: lineFulfillmentRequirements(line, graph).map((requirement) => ({
+      productId: requirement.productId,
+      factor: requirement.factor.toNumber(),
+    })),
   }))
 }
 
@@ -741,11 +749,53 @@ export async function addAllocation(
     await requirePermission('sales.process')
     if (qty <= 0) return { success: false, error: 'Quantity must be positive' }
 
+    // o3d-kouj: the leaves whose reservedQty this action actually moved, carried OUT of the
+    // transaction for the storefront sync below. Re-deriving them from the current graph afterwards
+    // would miss a component that the line's PINNED recipe requires and the current recipe no longer
+    // mentions — precisely the component whose reservation just changed.
+    const reservedLeafProductIds: string[] = []
+
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
       await resetAllocationAccountingIfStaged(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, [productId])
-      const leafProductIds = listFulfillmentLeafProductIds([productId], graph)
+
+      // o3d-kouj: the SAME capturable rule as `allocateSalesOrder`, on the same line-level facts,
+      // read under the same order lock. Without it this action is a second door onto the in-flight
+      // state: a line could acquire its first allocation row here and never be pinned at all, and
+      // every reader would then keep answering it from a graph that is free to move under it.
+      const [linePinState] = await tx.salesOrderLine.findMany({
+        where: { id: lineId },
+        select: { id: true, fulfillmentRequirements: true },
+      })
+      const [lineAllocations, lineCommittedShipments] = await Promise.all([
+        tx.orderAllocation.findMany({ where: { orderId, lineId }, select: { lineId: true } }),
+        tx.shipmentLine.findMany({
+          where: { lineId, shipment: { orderId, status: { not: 'PENDING' } } },
+          select: { lineId: true },
+        }),
+      ])
+      const lineIsCapturable = selectCapturableLineIds({
+        lineIds: [lineId],
+        lineIdsHoldingAllocations: lineAllocations.map((row) => row.lineId),
+        lineIdsHoldingCommittedShipments: lineCommittedShipments.map((row) => row.lineId),
+      }).length === 1
+      // A capturable line's stored snapshot describes an in-flight life it no longer has, so this
+      // action expands the CURRENT graph for it — which is exactly what the capture below records.
+      //
+      // The product is the CALLER'S `productId`, not the line's, because that is the only product
+      // `graph` was loaded for: resolving against a product the graph does not contain would treat
+      // it as a leaf. The two disagree only if the caller named a product the line does not
+      // reference, and then the pin — captured for the line's own product — simply does not match
+      // and the current graph answers, which is what this action did before o3d-kouj.
+      const resolvableLine = {
+        id: lineId,
+        productId,
+        fulfillmentRequirements: lineIsCapturable ? null : linePinState?.fulfillmentRequirements,
+      }
+      const lineRequirements = lineFulfillmentRequirements(resolvableLine, graph)
+
+      const leafProductIds = lineRequirements.map((requirement) => requirement.productId)
       await lockStockLevels(tx, leafProductIds, [warehouseId])
 
       const stockLevels = await tx.stockLevel.findMany({
@@ -758,7 +808,7 @@ export async function addAllocation(
       if (requestedQty.lte(0)) {
         throw new Error('Quantity must be at least 0.0001 — allocations are stored to four decimal places')
       }
-      const avail = getFulfillmentAvailableQtyDecimal(productId, warehouseId, graph, stockMap)
+      const avail = availableQtyFromRequirements(lineRequirements, warehouseId, stockMap)
       if (requestedQty.gt(avail)) throw new Error(`Only ${avail.toString()} available`)
       // o3d-4kfh r7: EVERY LEAF QUANTISED, once, here — the single point the rest of this action
       // reads. A KIT expansion multiplies by component factors, so even a whole-number kit quantity
@@ -773,7 +823,7 @@ export async function addAllocation(
       // committing a set the checks disagree with (o3d-i4qd — the atomic per-set canonicalisation
       // is that issue, not this one).
       const requirements = new Map(
-        [...expandFulfillmentRequirementsDecimal(productId, requestedQty, graph)]
+        [...scaleFulfillmentRequirements(lineRequirements, requestedQty)]
           .map(([leafProductId, requiredQty]) => [leafProductId, canonicalAllocationQty(requiredQty)] as const),
       )
 
@@ -827,6 +877,22 @@ export async function addAllocation(
       // Reserving the in-memory figure instead is what leaves `reservedQty` and `OrderAllocation`
       // two books that disagree — and the reconciliation of that disagreement is what takes units
       // out of another order's share of the shared (product, warehouse) aggregate.
+      // o3d-kouj: pin the recipe now that this line holds rows. Written from the SAME graph the rows
+      // above were expanded from, in the same transaction and under the same order lock.
+      if (lineIsCapturable && requirements.size > 0) {
+        await tx.salesOrderLine.update({
+          where: { id: lineId },
+          data: {
+            fulfillmentRequirements: captureFulfillmentRequirementSnapshot(
+              resolvableLine.productId,
+              graph,
+            ) as never,
+          },
+        })
+      }
+
+      reservedLeafProductIds.push(...requirements.keys())
+
       const writtenRows = await tx.orderAllocation.findMany({
         where: { lineId, warehouseId, productId: { in: [...requirements.keys()] } },
         select: { productId: true, qty: true },
@@ -847,9 +913,7 @@ export async function addAllocation(
 
     revalidatePath(`/sales/${orderId}`)
     try {
-      const graph = await loadFulfillmentProductGraph(db, [productId])
-      const syncTargets = [...new Set(listFulfillmentLeafProductIds([productId], graph))]
-      await enqueueStockSync(syncTargets, 'IMS_CHANGE')
+      await enqueueStockSync([...new Set(reservedLeafProductIds)], 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
