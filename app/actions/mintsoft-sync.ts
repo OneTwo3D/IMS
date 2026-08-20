@@ -7,6 +7,8 @@ import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sa
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
+import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
+import { lockMintsoftDispatchSettings } from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
 import {
   configChangeMetadata,
   describeConfigChange,
@@ -50,7 +52,7 @@ import {
   runMintsoftReturnsSync,
   type MintsoftReturnsInboxRow,
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
-import { replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
+import { enqueueMintsoftBookedInRecheckForAsn, replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
@@ -531,6 +533,7 @@ const MintsoftBindingInputSchema = z.object({
 })
 
 const MintsoftBindingDeleteSchema = z.string().min(1, 'Binding ID is required.')
+const MintsoftExternalAsnIdSchema = z.string().trim().min(1, 'ASN ID is required.')
 const MintsoftReturnRestockInputSchema = z.object({
   id: z.string().min(1, 'Return inbox item ID is required.'),
   warehouseId: z.string().min(1, 'Warehouse is required.'),
@@ -969,43 +972,53 @@ export async function saveMintsoftOrderDispatchSettings(input: {
   // new-scope orders predating the overlap would never enter the delta. Detect a
   // change and clear BOTH cursors in the SAME transaction so the next sweep restarts
   // from the lookback window and reconciles immediately.
-  const existing = await getMintsoftSettings()
-  const scopeChanged = mintsoftDeltaScopeChanged(
-    { clientId: clientId.value, channelId: channelId.value, warehouseId: warehouseId.value },
-    existing,
-  )
+  //
+  // q66in.7.2 / Codex r10 #2: THE BEFORE-IMAGE IS READ INSIDE THIS TRANSACTION, behind a row lock on
+  // the very rows the upserts replace — the same correction persistMintsoftConnectionAuth already
+  // carries. It was previously a `getMintsoftSettings()` call out here, and BOTH things decided from
+  // it were wrong under concurrency: the audit entry could describe a transition that never happened
+  // (two saves reading `clientId = 89`, one committing `101`, the other committing `89` back and
+  // logging "no change"), and `scopeChanged` — which DISCARDS the delta cursors — was decided from
+  // the same stale value. See dispatch-settings-lock.ts for why reading inside the transaction is
+  // not sufficient on its own.
+  const { before, scopeChanged } = await db.$transaction(async (tx) => {
+    const existing = await lockMintsoftDispatchSettings(tx)
+    const changed = mintsoftDeltaScopeChanged(
+      { clientId: clientId.value, channelId: channelId.value, warehouseId: warehouseId.value },
+      existing,
+    )
 
-  await db.$transaction([
-    db.setting.upsert({
-      where: { key: 'mintsoft_admin_order_url_template' },
-      create: { key: 'mintsoft_admin_order_url_template', value: serializeSettingValue('mintsoft_admin_order_url_template', template) },
-      update: { value: serializeSettingValue('mintsoft_admin_order_url_template', template) },
-    }),
-    db.setting.upsert({
-      where: { key: 'mintsoft_default_courier_service_id' },
-      create: { key: 'mintsoft_default_courier_service_id', value: serializeSettingValue('mintsoft_default_courier_service_id', courierRaw) },
-      update: { value: serializeSettingValue('mintsoft_default_courier_service_id', courierRaw) },
-    }),
-    db.setting.upsert({
-      where: { key: 'mintsoft_client_id' },
-      create: { key: 'mintsoft_client_id', value: serializeSettingValue('mintsoft_client_id', clientId.value) },
-      update: { value: serializeSettingValue('mintsoft_client_id', clientId.value) },
-    }),
-    db.setting.upsert({
-      where: { key: 'mintsoft_channel_id' },
-      create: { key: 'mintsoft_channel_id', value: serializeSettingValue('mintsoft_channel_id', channelId.value) },
-      update: { value: serializeSettingValue('mintsoft_channel_id', channelId.value) },
-    }),
-    db.setting.upsert({
-      where: { key: 'mintsoft_warehouse_id' },
-      create: { key: 'mintsoft_warehouse_id', value: serializeSettingValue('mintsoft_warehouse_id', warehouseId.value) },
-      update: { value: serializeSettingValue('mintsoft_warehouse_id', warehouseId.value) },
-    }),
+    for (const [key, value] of [
+      ['mintsoft_admin_order_url_template', template],
+      ['mintsoft_default_courier_service_id', courierRaw],
+      ['mintsoft_client_id', clientId.value],
+      ['mintsoft_channel_id', channelId.value],
+      ['mintsoft_warehouse_id', warehouseId.value],
+    ] as const) {
+      const serialized = serializeSettingValue(key, value)
+      await tx.setting.upsert({
+        where: { key },
+        create: { key, value: serialized },
+        update: { value: serialized },
+      })
+    }
+
     // Reset the delta cursors when the scope changed (no-op count when they don't exist).
-    ...(scopeChanged
-      ? [db.setting.deleteMany({ where: { key: { in: ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] } } })]
-      : []),
-  ])
+    if (changed) {
+      await tx.setting.deleteMany({ where: { key: { in: ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'] } } })
+    }
+
+    return {
+      before: {
+        adminOrderUrlTemplate: existing.mintsoft_admin_order_url_template,
+        defaultCourierServiceId: existing.mintsoft_default_courier_service_id,
+        clientId: existing.mintsoft_client_id,
+        channelId: existing.mintsoft_channel_id,
+        warehouseId: existing.mintsoft_warehouse_id,
+      },
+      scopeChanged: changed,
+    }
+  })
 
   // q66in.7.2: this save logged NOTHING either, and it is the same defect class as the courier map
   // — routing configuration written with no audit entry. It is the more consequential of the two:
@@ -1013,13 +1026,7 @@ export async function saveMintsoftOrderDispatchSettings(input: {
   // and a scope change also DISCARDS the delta cursors. `cursorsReset` is recorded because a
   // silently-restarted watermark is otherwise indistinguishable from a sweep that simply ran again.
   const dispatchDiff = diffConfigSnapshots(
-    {
-      adminOrderUrlTemplate: existing.mintsoft_admin_order_url_template,
-      defaultCourierServiceId: existing.mintsoft_default_courier_service_id,
-      clientId: existing.mintsoft_client_id,
-      channelId: existing.mintsoft_channel_id,
-      warehouseId: existing.mintsoft_warehouse_id,
-    },
+    before,
     {
       // Resolved the same way getMintsoftSettings resolves the stored value, or every save that
       // leaves the template blank (meaning "use the proven default") would diff as a change from
@@ -2313,20 +2320,11 @@ export async function confirmMintsoftAlignmentMode(
     return { success: true }
   }
 
+  // q66in.7.4: the SHARED query, not a local restatement. Data retention protects exactly the row
+  // this finds from deletion, so the two asking different questions would either delete the evidence
+  // an operator is about to be asked for, or exempt far more than the decision needs.
   const latestDryRun = await db.wmsSyncJob.findFirst({
-    where: {
-      connector: 'mintsoft',
-      type: 'STOCK_SYNC',
-      warehouseId: binding.warehouseId,
-      status: {
-        in: ['SUCCEEDED', 'PARTIAL'],
-      },
-      finishedAt: {
-        not: null,
-      },
-      AND: [{ summary: { path: ['dryRun'], equals: true } }],
-    },
-    orderBy: [{ finishedAt: 'desc' }],
+    ...alignmentDryRunEvidenceQuery({ connector: 'mintsoft', warehouseId: binding.warehouseId }),
     select: {
       id: true,
     },
@@ -2499,6 +2497,78 @@ export async function runMintsoftReturnsSyncNow(): Promise<{
     success: true,
     jobId: result.jobId,
     message: `Checked ${result.totalChecked} returns, staged ${result.corrected} new inbox items, ${result.errors} errors.`,
+  }
+}
+
+/**
+ * o3d-hl8l — RE-CHECK AN ASN'S BOOKED-IN STATE WITH THE WAREHOUSE.
+ *
+ * The recovery the maintenance fence's 503 depends on. A callback refused during a restore window
+ * (or simply never sent, or sent and lost) leaves NO receipt-event row, so nothing the exception
+ * inbox or `replayMintsoftBookedInEventsForAsn` can reach — both re-drive rows that already exist.
+ * The watchdog's overdue-ASN alert names the ASN; this is what an operator does about it.
+ *
+ * It reconstructs the TRIGGER, not the quantities: the booked-in processor re-fetches the ASN from
+ * Mintsoft and applies only the delta over what was already accounted, so running this when nothing
+ * is outstanding books nothing in, and a real callback arriving afterwards finds the delta applied.
+ *
+ * Gated on `purchasing.receive` — the same permission that creates the ASN and the one
+ * getMintsoftPurchaseOrderAsnState already reports as `canManage`, so the button appears exactly
+ * where the action is allowed.
+ */
+export async function recheckMintsoftAsnBookedIn(
+  externalAsnId: unknown,
+): Promise<{ success: boolean; error?: string; message?: string }> {
+  await requirePermission('purchasing.receive')
+
+  const parsed = MintsoftExternalAsnIdSchema.safeParse(externalAsnId)
+  if (!parsed.success) {
+    return { success: false, error: getValidationErrorMessage(parsed.error) }
+  }
+
+  if (!await isIntegrationPluginEnabled('mintsoft')) {
+    return { success: false, error: 'Mintsoft is disabled.' }
+  }
+
+  try {
+    const result = await enqueueMintsoftBookedInRecheckForAsn(parsed.data, { reason: 'operator recheck' })
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: parsed.data,
+      tag: 'sync',
+      action: 'mintsoft_asn_booked_in_recheck',
+      level: result.failed > 0 ? 'WARNING' : 'INFO',
+      description: result.created
+        ? `Re-checked Mintsoft ASN ${parsed.data} with the warehouse — no booked-in callback had been recorded`
+        : `Re-drove the outstanding booked-in events for Mintsoft ASN ${parsed.data}`,
+      metadata: {
+        externalAsnId: parsed.data,
+        createdSyntheticEvent: result.created,
+        processed: result.processed,
+        duplicates: result.duplicates,
+        pending: result.pending,
+        requiresReview: result.requiresReview,
+        failed: result.failed,
+      },
+    })
+
+    revalidatePath('/sync/exceptions')
+    if (result.failed > 0) {
+      return { success: false, error: 'The booked-in re-check did not complete. See the sync exception inbox.' }
+    }
+    if (result.requiresReview > 0) {
+      return { success: true, message: 'The re-check found changes that need review in the sync exception inbox.' }
+    }
+    if (result.processed > 0) {
+      return { success: true, message: 'Booked-in quantities re-applied from the warehouse.' }
+    }
+    return { success: true, message: 'Nothing outstanding — the warehouse reports no unaccounted booked-in quantity.' }
+  } catch (error) {
+    console.error(error)
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Could not re-check the ASN with the warehouse.',
+    }
   }
 }
 

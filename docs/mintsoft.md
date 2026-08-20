@@ -120,7 +120,11 @@ The booked-in webhook route consults maintenance mode as its **first** statement
 
 The flag is set only by the database **restore** endpoint, and it stays on when a restore backend cannot be confirmed dead. A row written into that window is being replayed over, so persisting the event would return `202 accepted` for something the restore then destroys; a `503` promises nothing and is the standard retry signal.
 
-**If the sender does not retry, the booked-in trigger is dropped.** That is recoverable, because the webhook carries only an ASN id — the authoritative booked-in quantities are re-fetched from Mintsoft when the event is processed — and it is detected: the `wms-watchdog` cron alerts on an open ASN past its ETA with no booked-in callback, and the ASN dialog replays the callback for a named ASN. Recovery is operator-initiated, not automatic: nothing but this route creates a receipt-event row.
+**If the sender does not retry, the booked-in trigger is dropped** — so there is an explicit way to recreate it. Neither of the existing replay paths could: the sync exception inbox's replay and `replayMintsoftBookedInEventsForAsn` both re-drive receipt-event rows that already exist, and a refused callback leaves none.
+
+**Re-check** (purchase order → the connector ASN table, needs `purchasing.receive`) asks the warehouse directly. It reconstructs the *trigger* only: the webhook carries an ASN id and nothing else that is used, and processing re-fetches the ASN from Mintsoft and applies just the delta over what each line has already accounted. So the warehouse stays the authority for the quantities, pressing it when nothing is outstanding books nothing in, and a real callback arriving afterwards finds the delta applied. If the ASN already has outstanding receipt events (dead-lettered, mid-retry, awaiting review) those are re-driven instead of a second row being created alongside them.
+
+The loss is also detected rather than silent: the `wms-watchdog` cron alerts on an open ASN past its ETA with no booked-in callback (or, with no ETA, one that has been silent for a week). Recovery is operator-initiated, not automatic — nothing but this route and the re-check creates a receipt-event row. Every re-check writes a `mintsoft_asn_booked_in_recheck` activity entry recording whether it minted a trigger or re-drove existing work.
 
 The `timestamp` string must be the exact header value IMS uses for freshness validation. Prefer ISO-8601 timestamp strings. Numeric timestamp headers are accepted, but the signature prefix must match the exact header value; for example, `1776852000.0` and `1776852000` are different signature prefixes. Body-only signatures and payload-only timestamps are rejected.
 
@@ -209,12 +213,14 @@ Connection, binding, courier-map and order-dispatch saves all write an activity 
 | Courier map save | `mintsoft_courier_map_updated` — added / changed / **removed** service names, plus both maps. A removal is logged at `WARNING`: a dropped entry silently falls back to the default courier id |
 | Order dispatch save | `mintsoft_order_dispatch_settings_updated` — logged at `WARNING` when the ClientId/ChannelId/WarehouseId delta scope changes, because that also **discards the delta cursors** |
 
+Both the connection save and the order-dispatch save read their **before** image inside the write transaction, behind a row lock on the rows being replaced. Reading it beforehand let two concurrent saves produce an entry describing a transition that never happened — and, for the dispatch save, decide the delta-cursor reset from the same stale value.
+
 ### Retention (q66in.7.4)
 
 Two System Settings → Data Retention windows cover the WMS tables:
 
 - **WMS Inbound Events** (default 3 months) — **compacts** resolved (`PROCESSED`) rows in `wms_inbound_receipt_events` and `wms_webhook_events`: the `payload` (and the receipt table's `reviewDetails` dry-run image) is cleared, the row itself is kept because `(connector, externalEventId)` is the idempotency key that stops a redelivered callback booking stock twice. `DEAD`, `REQUIRES_REVIEW`, `PENDING`, `PENDING_RETRY` and `FAILED_RETRY` rows are **never** touched — a dead letter is replayable evidence, not an old row.
-- **WMS Sync Runs** (default 12 months) — deletes **finished** `wms_sync_jobs` rows, which cascades their per-SKU `wms_sync_logs` lines. Unfinished (`PENDING`/`RUNNING`) runs are kept, and so is every stock-sync run for a warehouse whose binding is in `ALIGN_TO_WMS` but not yet confirmed, because those runs are the unmet precondition of an outstanding operator confirmation. The 12-month default matches the 365-day mutation-audit window the runs are correlated with.
+- **WMS Sync Runs** (default 12 months) — deletes **finished** `wms_sync_jobs` rows, which cascades their per-SKU `wms_sync_logs` lines. Unfinished (`PENDING`/`RUNNING`) runs are kept: an old timestamp on a stuck run is a reason to keep it, not to remove it. So is **the one dry run** each unconfirmed `ALIGN_TO_WMS` binding is waiting on — the exact row `confirmMintsoftAlignmentMode` reads, resolved through the shared `alignmentDryRunEvidenceQuery` so retention and the confirm action cannot ask different questions. It is deliberately one row and not the whole warehouse: a stock sync writes one log line per checked SKU per run and runs on a schedule, so pinning every run for a warehouse would have exempted the highest-volume table here without bound, for as long as an operator left the decision open. A binding with no qualifying dry run pins nothing. The 12-month default matches the 365-day mutation-audit window the runs are correlated with.
 
 ## Operational Notes
 

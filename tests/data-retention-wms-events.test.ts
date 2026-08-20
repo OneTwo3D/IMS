@@ -19,13 +19,18 @@ const capture: {
   webhookUpdate?: ManyArgs
   jobDelete?: ManyArgs
   bindingQuery?: ManyArgs
-  pendingAlignmentWarehouses: Array<{ warehouseId: string }>
+  dryRunQueries: ManyArgs[]
+  pendingAlignmentWarehouses: Array<{ connector: string; warehouseId: string }>
+  /** Keyed `connector:warehouseId` — the dry-run job id that scope's confirmation would read. */
+  dryRunEvidence: Map<string, string>
   receiptCount: number
   webhookCount: number
   jobCount: number
 } = {
   settingRows: [],
+  dryRunQueries: [],
   pendingAlignmentWarehouses: [],
+  dryRunEvidence: new Map(),
   receiptCount: 0,
   webhookCount: 0,
   jobCount: 0,
@@ -72,6 +77,15 @@ mock.module('@/lib/db', {
         },
       },
       wmsSyncJob: {
+        // Backed by the evidence map rather than stubbed: retention must protect the row the
+        // confirm action would actually FIND, so a double that answered the same thing for every
+        // scope could not tell a correct exemption from one that names the wrong job.
+        findFirst: async (args: ManyArgs) => {
+          capture.dryRunQueries.push(args)
+          const where = args.where as { connector?: string; warehouseId?: string }
+          const id = capture.dryRunEvidence.get(`${where.connector}:${where.warehouseId}`)
+          return id ? { id } : null
+        },
         deleteMany: async (args: ManyArgs) => {
           capture.jobDelete = args
           return { count: capture.jobCount }
@@ -96,7 +110,9 @@ function reset() {
   capture.webhookUpdate = undefined
   capture.jobDelete = undefined
   capture.bindingQuery = undefined
+  capture.dryRunQueries = []
   capture.pendingAlignmentWarehouses = []
+  capture.dryRunEvidence = new Map()
   capture.receiptCount = 0
   capture.webhookCount = 0
   capture.jobCount = 0
@@ -189,14 +205,22 @@ test('WMS sync runs are deleted only when FINISHED, which cascades their per-SKU
   assert.equal(args.where.NOT, undefined)
 })
 
-test('a stock-sync run a pending ALIGN_TO_WMS confirmation still depends on is NOT deleted', async () => {
+test('the ONE dry run a pending ALIGN_TO_WMS confirmation depends on is NOT deleted', async () => {
   const purgeExpiredData = await loadPurge()
   reset()
   capture.settingRows = [
     { key: 'retention_wms_events_months', value: '0' },
     { key: 'retention_wms_sync_jobs_months', value: '12' },
   ]
-  capture.pendingAlignmentWarehouses = [{ warehouseId: 'wh-1' }, { warehouseId: 'wh-2' }, { warehouseId: 'wh-1' }]
+  capture.pendingAlignmentWarehouses = [
+    { connector: 'mintsoft', warehouseId: 'wh-1' },
+    { connector: 'mintsoft', warehouseId: 'wh-2' },
+    { connector: 'mintsoft', warehouseId: 'wh-1' },
+  ]
+  capture.dryRunEvidence = new Map([
+    ['mintsoft:wh-1', 'job-dry-1'],
+    ['mintsoft:wh-2', 'job-dry-2'],
+  ])
   capture.jobCount = 3
 
   await purgeExpiredData()
@@ -206,13 +230,45 @@ test('a stock-sync run a pending ALIGN_TO_WMS confirmation still depends on is N
 
   const args = capture.jobDelete
   if (!args) throw new Error('wmsSyncJob.deleteMany was not called')
-  assert.deepEqual(
-    args.where.NOT,
-    { AND: [{ type: 'STOCK_SYNC' }, { warehouseId: { in: ['wh-1', 'wh-2'] } }] },
-    'confirmMintsoftAlignmentMode refuses to arm live corrections without a completed dry run for that '
-      + 'warehouse, so those runs are the unmet precondition of an outstanding operator decision — deleting '
-      + 'them silently revokes a confirmation nobody made yet',
+  // THE ROW, NOT THE WAREHOUSE (Codex r10 #3). A warehouse-wide NOT pinned every scheduled stock
+  // sync and every per-SKU log line it wrote, for as long as the binding stayed unconfirmed.
+  assert.deepEqual(args.where.id, { notIn: ['job-dry-1', 'job-dry-2'] })
+  assert.equal(args.where.NOT, undefined, 'no warehouse-wide exclusion survives')
+  assert.equal(
+    JSON.stringify(args.where).includes('wh-1'),
+    false,
+    'the predicate must not key on the warehouse at all — that is what made the exemption unbounded',
   )
+
+  // Resolved through the SAME query confirmMintsoftAlignmentMode uses, once per distinct scope.
+  assert.equal(capture.dryRunQueries.length, 2, 'two bindings on one warehouse resolve one job, once')
+  const dryRun = capture.dryRunQueries[0]
+  assert.equal(dryRun.where.connector, 'mintsoft')
+  assert.equal(dryRun.where.type, 'STOCK_SYNC')
+  assert.deepEqual(dryRun.where.status, { in: ['SUCCEEDED', 'PARTIAL'] })
+  assert.deepEqual(dryRun.where.finishedAt, { not: null })
+  assert.deepEqual(dryRun.where.AND, [{ summary: { path: ['dryRun'], equals: true } }])
+})
+
+test('an unconfirmed binding with NO dry run protects nothing', async () => {
+  const purgeExpiredData = await loadPurge()
+  reset()
+  capture.settingRows = [
+    { key: 'retention_wms_events_months', value: '0' },
+    { key: 'retention_wms_sync_jobs_months', value: '12' },
+  ]
+  capture.pendingAlignmentWarehouses = [{ connector: 'mintsoft', warehouseId: 'wh-1' }]
+  capture.dryRunEvidence = new Map()
+  capture.jobCount = 5
+
+  await purgeExpiredData()
+
+  const args = capture.jobDelete
+  if (!args) throw new Error('wmsSyncJob.deleteMany was not called')
+  // There is no decision pending on a row that does not exist, and the operator must run a fresh
+  // dry run either way — so the ordinary age rule applies and nothing is pinned.
+  assert.equal(args.where.id, undefined)
+  assert.equal(args.where.NOT, undefined)
 })
 
 test('a 0-month setting disables each WMS retention pass independently', async () => {

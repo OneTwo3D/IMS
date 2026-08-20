@@ -2,6 +2,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { WC_WEBHOOK_EVENT_STATUS } from '@/lib/connectors/shopping-webhook-inbox'
+import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
 import {
   UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
   backReferenceEvidenceTombstone,
@@ -311,29 +312,50 @@ export async function purgeExpiredData(): Promise<{
   //   • A job that has not FINISHED (PENDING/RUNNING, or any row with a null finishedAt). An
   //     unfinished run is either in flight or stuck; either way its lines are live state, and an old
   //     timestamp on a stuck job is a REASON to keep it, not to remove it.
-  //   • Every STOCK_SYNC job for a warehouse whose binding is in ALIGN_TO_WMS but has never been
-  //     confirmed. The confirm-alignment action refuses to arm live downward corrections unless a
-  //     completed dry run exists for that warehouse, so those jobs ARE the unmet precondition of an
-  //     outstanding operator decision. Deleting them silently revokes a confirmation the operator
-  //     was one click away from making. The exclusion is by warehouse rather than by
-  //     `summary.dryRun`, which over-retains a little and needs no JSON-path predicate inside a NOT.
+  //   • THE ONE DRY RUN each unconfirmed ALIGN_TO_WMS binding is waiting on. The confirm-alignment
+  //     action refuses to arm live downward corrections without a completed dry run for that
+  //     warehouse, so that job is the unmet precondition of an outstanding operator decision and
+  //     deleting it silently revokes a confirmation nobody has made yet.
+  //
+  //     IT IS ONE ROW, NOT A WAREHOUSE (Codex r10 #3). An earlier revision excluded every STOCK_SYNC
+  //     job for the warehouse and called the imprecision "over-retains a little". It is not a
+  //     little: a stock sync writes one wms_sync_logs line per checked SKU per run and runs on a
+  //     schedule, so a single binding left unconfirmed pinned every run and every line for that
+  //     warehouse indefinitely — the highest-volume table here, exempted without bound by a
+  //     condition nothing forces anyone to clear. The exemption is now exactly the row
+  //     `confirmMintsoftAlignmentMode` would read, resolved through the SHARED query so the two
+  //     cannot drift: narrower than the confirm predicate deletes the evidence the operator is about
+  //     to be asked for, wider re-opens the unbounded exemption.
+  //
+  //     A binding with no qualifying dry run protects nothing — there is no decision pending on a
+  //     row that does not exist, and the operator has to run a fresh dry run either way.
   const wmsJobMonths = settings.retention_wms_sync_jobs_months
   if (wmsJobMonths > 0) {
     const cutoff = monthsAgo(wmsJobMonths)
     const pendingAlignmentBindings = await db.externalWmsBinding.findMany({
       where: { stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmedAt: null },
-      select: { warehouseId: true },
+      select: { connector: true, warehouseId: true },
     })
-    const protectedWarehouseIds = [...new Set(pendingAlignmentBindings.map((row) => row.warehouseId))]
+    // Deduplicated on the SCOPE the query keys on, so two bindings of one connector on one warehouse
+    // resolve the same single job once.
+    const scopes = new Map(
+      pendingAlignmentBindings.map((row) => [`${row.connector}:${row.warehouseId}`, row] as const),
+    )
+    const protectedJobIds: string[] = []
+    for (const scope of scopes.values()) {
+      const evidence = await db.wmsSyncJob.findFirst({
+        ...alignmentDryRunEvidenceQuery(scope),
+        select: { id: true },
+      })
+      if (evidence) protectedJobIds.push(evidence.id)
+    }
 
     const { count } = await db.wmsSyncJob.deleteMany({
       where: {
         startedAt: { lt: cutoff },
         finishedAt: { not: null },
         status: { in: ['SUCCEEDED', 'FAILED', 'PARTIAL'] },
-        ...(protectedWarehouseIds.length > 0
-          ? { NOT: { AND: [{ type: 'STOCK_SYNC' as const }, { warehouseId: { in: protectedWarehouseIds } }] } }
-          : {}),
+        ...(protectedJobIds.length > 0 ? { id: { notIn: protectedJobIds } } : {}),
       },
     })
     wmsSyncJobsDeleted = count

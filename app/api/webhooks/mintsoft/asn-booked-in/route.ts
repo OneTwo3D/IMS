@@ -130,12 +130,26 @@ export async function handleMintsoftBookedInWebhook(
   // the standard retry signal, so a sender that retries at all is not lost.
   //
   // WHAT IS THEREFORE ACCEPTED, stated rather than implied: if the sender does NOT retry, the
-  // booked-in TRIGGER is dropped. It is not silent, and it is recoverable, because the webhook
-  // carries only an ASN id — the authoritative booked-in quantities are re-fetched from the WMS by
-  // fetchMintsoftBookedInAsn when the event is processed. The wms-watchdog cron alerts on an open
-  // ASN past its ETA with no booked-in callback, and the ASN dialog replays the callback for a
-  // named ASN. What is genuinely lost is the automatic path: nothing but this route creates a
-  // receipt-event row, so recovery is operator-initiated rather than self-healing.
+  // booked-in TRIGGER is dropped. That is only defensible because the trigger can be RECREATED, and
+  // an earlier revision of this comment claimed a recovery that did not exist — `replayDeadReceiptEvent`
+  // and `replayMintsoftBookedInEventsForAsn` both re-drive rows that ALREADY EXIST, and a refused
+  // callback leaves none, so neither could reach it. The wms-watchdog cron detected the loss (an
+  // open ASN past its ETA with no callback) and then named no remedy.
+  //
+  // The recovery now exists: `enqueueMintsoftBookedInRecheckForAsn`, reachable from the ASN table on
+  // the purchase order as "Re-check". It reconstructs the TRIGGER only — the webhook carries an ASN
+  // id and nothing else that is used, and `processBookedInEvent` re-fetches the ASN from the WMS and
+  // applies just the delta over what was already accounted. So the warehouse stays the authority for
+  // the quantities, pressing it when nothing is outstanding books nothing in, and a real callback
+  // arriving later finds the delta applied.
+  //
+  // WHY NOT PERSIST INSTEAD, weighed rather than asserted. Persisting returns `202 accepted` for a
+  // row the restore may then destroy — the sender stops retrying AND the row is gone, which is a
+  // lost trigger with the alarm switched off. A 503 at least leaves a retrying sender a path. And
+  // decisively: this fence runs BEFORE signature verification (deliberately — see below), so
+  // persisting here would mean creating receipt-event rows from unauthenticated callers. Verifying
+  // first to make persistence safe would mean reading a 256KB body and doing HMAC work during a
+  // restore window, and would let the flag's state be probed with a valid-signature oracle.
   //
   // Deliberately BEFORE signature verification, so a maintenance window cannot be probed for a
   // valid secret and a 256KB body is not read to be thrown away. That does disclose the flag's

@@ -286,8 +286,9 @@ This means an admin viewing the activity log can see who did what but not see se
   dead-lettered, or that is waiting for you to approve it, keeps its full payload however old it
   gets — that payload is what a replay re-attempts, so clearing it would turn a problem you can
   still fix into one you cannot. The same applies to sync runs: **WMS Sync Runs** deletes finished
-  runs and their per-item lines, but never a run that has not finished, and never a stock-sync run
-  that an unconfirmed "Align To WMS" binding is still waiting on.
+  runs and their per-item lines, but never a run that has not finished, and never the dry run an
+  unconfirmed "Align To WMS" binding is still waiting on — that one run is kept until you confirm
+  or change the binding, and the rest of that warehouse's runs expire normally.
   On **Xero**, a compacted accounting sync row is **still repaired**: the repair sweep can still
   write its external id onto the order or bill, because everything that write needs survives
   compaction. What cannot survive is the follow-up work built from the payload (invoice PDF, payment

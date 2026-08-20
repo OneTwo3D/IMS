@@ -37,7 +37,7 @@ import type {
   WmsCreateAsnInput,
   WmsPurchaseOrderAsnState,
 } from '@/lib/connectors/wms/asn-types'
-import { createWmsPurchaseOrderAsn } from '@/app/actions/wms-asn'
+import { createWmsPurchaseOrderAsn, recheckWmsAsnBookedIn } from '@/app/actions/wms-asn'
 import { getTrackingUrl } from '@/lib/tracking'
 import type { AccountingBankAccount } from '@/lib/accounting'
 import type { RejectedAccountingDocumentUpdateWarning } from '@/lib/domain/accounting/rejected-sync-warnings'
@@ -2327,6 +2327,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                   <TableHead className="text-xs text-right">Expected</TableHead>
                   <TableHead className="text-xs text-right">Received</TableHead>
                   <TableHead className="text-xs">Created</TableHead>
+                  {wmsAsnState.canManage && <TableHead className="text-xs text-right">Booked in</TableHead>}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -2345,6 +2346,16 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     <TableCell className="text-xs text-muted-foreground">
                       {formatDateTime(asn.createdAt, { day: 'numeric', month: 'short', year: 'numeric' })}
                     </TableCell>
+                    {wmsAsnState.canManage && (
+                      <TableCell className="text-right">
+                        <AsnBookedInRecheck
+                          externalAsnId={asn.externalAsnId}
+                          lastCallbackAt={asn.lastCallbackAt}
+                          closed={Boolean(asn.closedAt)}
+                          connectorLabel={wmsAsnState.connectorLabel}
+                        />
+                      </TableCell>
+                    )}
                   </TableRow>
                 ))}
               </TableBody>
@@ -2839,6 +2850,67 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
         hasInvoices={po.invoices.length > 0}
         creditNotes={po.supplierCreditNotes}
       />
+    </div>
+  )
+}
+
+/**
+ * o3d-hl8l: the operator end of the booked-in recovery path.
+ *
+ * The Mintsoft webhook REFUSES a callback (503) while maintenance mode is on rather than persisting
+ * into a window a restore may replay over, and a sender that does not retry drops the trigger. It
+ * leaves no receipt-event row, so the exception inbox — which re-drives rows that exist — cannot
+ * reach it. This asks the warehouse directly. The processor applies only the delta over what was
+ * already accounted, so it is safe to press when nothing is outstanding, and the label says which
+ * case an ASN is in rather than making the operator infer it from a timestamp.
+ */
+function AsnBookedInRecheck({
+  externalAsnId,
+  lastCallbackAt,
+  closed,
+  connectorLabel,
+}: {
+  externalAsnId: string
+  lastCallbackAt: string | null
+  closed: boolean
+  connectorLabel: string
+}) {
+  const router = useRouter()
+  const formatDateTime = useFormatDateTime()
+  const [isPending, startTransition] = useTransition()
+  const [message, setMessage] = useState('')
+  const [failed, setFailed] = useState(false)
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={isPending}
+        onClick={() => {
+          setMessage('')
+          setFailed(false)
+          startTransition(async () => {
+            const result = await recheckWmsAsnBookedIn(externalAsnId)
+            setFailed(!result.success)
+            setMessage(result.success
+              ? (result.message ?? 'Re-checked.')
+              : (result.error ?? `Could not re-check with ${connectorLabel}.`))
+            if (result.success) router.refresh()
+          })
+        }}
+      >
+        {isPending ? 'Re-checking…' : 'Re-check'}
+      </Button>
+      <span className="text-xs text-muted-foreground">
+        {message
+          ? <span className={failed ? 'text-destructive' : undefined}>{message}</span>
+          : closed
+            ? 'Closed'
+            : lastCallbackAt
+              ? `Last callback ${formatDateTime(lastCallbackAt, { dateStyle: 'medium' })}`
+              : 'No callback received'}
+      </span>
     </div>
   )
 }

@@ -19,6 +19,25 @@ const deletedSettingKeys: string[] = []
 let existingBindingRow: Record<string, unknown> | null = null
 const bindingUpdates: Array<Record<string, unknown>> = []
 
+// q66in.7.2 / Codex r10 #2 — the harness models WHEN a value is read, not just what it holds.
+//
+// `trace` records every settings operation in order, tagged with whether it happened inside the
+// write transaction. `concurrentWrite` fires ONCE, immediately after the first read that happens
+// OUTSIDE the transaction: that is the interleaving the row lock exists to exclude — another save
+// committing between your snapshot and your write. A save that takes its before-image outside the
+// transaction sees the pre-concurrent value and audits a transition that never happened; one that
+// reads under the lock sees what it is actually replacing.
+const trace: string[] = []
+let lockedKeys: string[] = []
+let inTransaction = false
+let concurrentWrite: Map<string, string> | null = null
+
+function applyConcurrentWrite(): void {
+  if (!concurrentWrite) return
+  for (const [key, value] of concurrentWrite) settingRows.set(key, value)
+  concurrentWrite = null
+}
+
 mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
 mock.module('@/lib/auth/server', {
   namedExports: {
@@ -36,54 +55,97 @@ mock.module('@/lib/activity-log', {
     sanitizeActivityLogMetadata: (value: unknown) => value,
   },
 })
-mock.module('@/lib/db', {
-  namedExports: {
-    db: {
-      wmsConnection: {
-        findFirst: async () => ({ id: 'conn-1' }),
-        create: async () => ({ id: 'conn-1' }),
-        updateMany: async () => ({ count: 0 }),
-      },
-      externalWmsBinding: {
-        findFirst: async () => existingBindingRow,
-        update: async ({ data }: { data: Record<string, unknown> }) => {
-          bindingUpdates.push(data)
-          return { id: 'bind-1' }
-        },
-        create: async ({ data }: { data: Record<string, unknown> }) => {
-          bindingUpdates.push(data)
-          return { id: 'bind-new' }
-        },
-      },
-      adjustmentReason: { findUnique: async () => ({ active: true, accountCode: '5000' }) },
-      shoppingOrderLink: { findMany: async () => [] },
-      // The array form: Prisma has already evaluated each delegate call by the time it gets here,
-      // so this only has to settle them.
-      $transaction: async (operations: unknown[]) => Promise.all(operations),
-      setting: {
-        findMany: async ({ where }: { where?: { key?: { in?: string[] } } } = {}) => {
-          const keys = where?.key?.in
-          const rows = [...settingRows].map(([key, value]) => ({ key, value }))
-          return keys ? rows.filter((row) => keys.includes(row.key)) : rows
-        },
-        findUnique: async ({ where }: { where: { key: string } }) =>
-          settingRows.has(where.key) ? { key: where.key, value: settingRows.get(where.key) } : null,
-        upsert: async ({ where, update }: { where: { key: string }; update: { value: string } }) => {
-          upserts.push({ key: where.key, value: update.value })
-          settingRows.set(where.key, update.value)
-          return { key: where.key, value: update.value }
-        },
-        deleteMany: async ({ where }: { where?: { key?: { in?: string[] } } } = {}) => {
-          const keys = where?.key?.in ?? []
-          let count = 0
-          for (const key of keys) if (settingRows.delete(key)) count += 1
-          deletedSettingKeys.push(...keys)
-          return { count }
-        },
-      },
+const db: Record<string, unknown> = {
+  wmsConnection: {
+    findFirst: async () => ({ id: 'conn-1' }),
+    create: async () => ({ id: 'conn-1' }),
+    updateMany: async () => ({ count: 0 }),
+  },
+  externalWmsBinding: {
+    findFirst: async () => existingBindingRow,
+    update: async ({ data }: { data: Record<string, unknown> }) => {
+      bindingUpdates.push(data)
+      return { id: 'bind-1' }
+    },
+    create: async ({ data }: { data: Record<string, unknown> }) => {
+      bindingUpdates.push(data)
+      return { id: 'bind-new' }
     },
   },
-})
+  adjustmentReason: { findUnique: async () => ({ active: true, accountCode: '5000' }) },
+  shoppingOrderLink: { findMany: async () => [] },
+  // BOTH forms. Prisma's array form has already evaluated each delegate call by the time it
+  // gets here, so that branch only settles them; the callback form is the one the dispatch save
+  // uses, and it must hand back a client that can take the row lock — a double without
+  // $executeRaw/$queryRaw would force the production code back out of the transaction.
+  $transaction: async (arg: unknown) => {
+    if (typeof arg !== 'function') return Promise.all(arg as unknown[])
+    inTransaction = true
+    try {
+      return await (arg as (tx: unknown) => Promise<unknown>)(txClient)
+    } finally {
+      inTransaction = false
+    }
+  },
+  $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const sql = strings.join(' ')
+    if (!/INSERT INTO settings/i.test(sql) || !/ON CONFLICT/i.test(sql)) {
+      throw new Error(`unexpected $executeRaw: ${sql}`)
+    }
+    trace.push('materialise')
+    for (const key of values[0] as string[]) if (!settingRows.has(key)) settingRows.set(key, '')
+    // The LAST legal moment for the competing save: after this transaction has touched the table
+    // and before it holds the lock. Once FOR UPDATE returns, Postgres would make the other writer
+    // wait, which is the whole point of taking it.
+    applyConcurrentWrite()
+    return 0
+  },
+  $queryRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+    const sql = strings.join(' ')
+    if (!/FOR UPDATE/i.test(sql)) throw new Error(`the before-image read must take a row lock: ${sql}`)
+    if (!inTransaction) throw new Error('the row lock must be taken INSIDE the write transaction')
+    lockedKeys = [...(values[0] as string[])].sort()
+    trace.push('locked-read')
+    return lockedKeys
+      .filter((key) => settingRows.has(key))
+      .map((key) => ({ key, value: settingRows.get(key) ?? '' }))
+  },
+  setting: {
+    findMany: async ({ where }: { where?: { key?: { in?: string[] } } } = {}) => {
+      const keys = where?.key?.in
+      const rows = [...settingRows].map(([key, value]) => ({ key, value }))
+      const result = keys ? rows.filter((row) => keys.includes(row.key)) : rows
+      trace.push(inTransaction ? 'tx-findMany' : 'unlocked-findMany')
+      if (!inTransaction) applyConcurrentWrite()
+      return result
+    },
+    findUnique: async ({ where }: { where: { key: string } }) => {
+      const row = settingRows.has(where.key) ? { key: where.key, value: settingRows.get(where.key) } : null
+      trace.push(inTransaction ? 'tx-findUnique' : 'unlocked-findUnique')
+      if (!inTransaction) applyConcurrentWrite()
+      return row
+    },
+    upsert: async ({ where, update }: { where: { key: string }; update: { value: string } }) => {
+      upserts.push({ key: where.key, value: update.value })
+      settingRows.set(where.key, update.value)
+      trace.push(`upsert:${where.key}`)
+      return { key: where.key, value: update.value }
+    },
+    deleteMany: async ({ where }: { where?: { key?: { in?: string[] } } } = {}) => {
+      const keys = where?.key?.in ?? []
+      let count = 0
+      for (const key of keys) if (settingRows.delete(key)) count += 1
+      deletedSettingKeys.push(...keys)
+      trace.push('deleteMany')
+      return { count }
+    },
+  },
+}
+
+// A transaction client is the same delegate surface, minus the transaction control Prisma strips.
+const txClient = db
+
+mock.module('@/lib/db', { namedExports: { db } })
 
 async function loadActions() {
   return import('@/app/actions/mintsoft-sync')
@@ -94,6 +156,10 @@ function reset() {
   upserts.length = 0
   deletedSettingKeys.length = 0
   bindingUpdates.length = 0
+  trace.length = 0
+  lockedKeys = []
+  inTransaction = false
+  concurrentWrite = null
   existingBindingRow = null
   settingRows.clear()
 }
@@ -208,6 +274,86 @@ test('an order-dispatch save that leaves the delta scope alone is INFO with no c
   assert.deepEqual(entry.metadata?.before, { defaultCourierServiceId: '12' })
 })
 
+
+test('the dispatch before-image is read under a lock INSIDE the write transaction, not before it', async () => {
+  // Codex r10 #2. Two saves in flight: this one reads `clientId = 89`, another commits `101`, and
+  // this one commits `89` back. A snapshot taken outside the transaction says "nothing changed" —
+  // an audit entry describing a transition that never occurred, while the one it DID cause
+  // (101 -> 89) is recorded nowhere. Under the row lock the other save cannot commit in that
+  // window, so what this reads is what it replaces.
+  const { saveMintsoftOrderDispatchSettings } = await loadActions()
+  reset()
+  settingRows.set('mintsoft_client_id', '89')
+  settingRows.set('mintsoft_channel_id', '')
+  settingRows.set('mintsoft_warehouse_id', '')
+  settingRows.set('mintsoft_default_courier_service_id', '12')
+  settingRows.set('mintsoft_admin_order_url_template', '')
+  concurrentWrite = new Map([['mintsoft_client_id', '101']])
+
+  const result = await saveMintsoftOrderDispatchSettings({
+    adminOrderUrlTemplate: '',
+    defaultCourierServiceId: '12',
+    clientId: '89',
+    channelId: '',
+    warehouseId: '',
+  })
+  assert.equal(result.success, true)
+
+  const entry = logs.find((log) => log.action === 'mintsoft_order_dispatch_settings_updated')
+  if (!entry) throw new Error('no dispatch-settings audit entry was written')
+  assert.deepEqual(
+    entry.metadata?.before,
+    { clientId: '101' },
+    'the entry must name the value it actually replaced, not one a concurrent save had already moved on from',
+  )
+  assert.deepEqual(entry.metadata?.after, { clientId: '89' })
+  assert.deepEqual(entry.metadata?.changed, ['clientId'])
+
+  // ...and the SAME snapshot decides the cursor reset. Deciding it from the stale read would leave
+  // the delta watermark pointing at the 101 scope while the connector queries the 89 one.
+  assert.equal(entry.metadata?.scopeChanged, true)
+  assert.equal(entry.metadata?.cursorsReset, true)
+  assert.deepEqual(deletedSettingKeys, ['mintsoft_order_delta_since', 'mintsoft_order_reconcile_at'])
+
+  // No unlocked read of the settings table happened at all on this path.
+  assert.equal(
+    trace.some((step) => step.startsWith('unlocked-')),
+    false,
+    `an unlocked settings read is the defect itself; trace was ${trace.join(' -> ')}`,
+  )
+})
+
+test('the dispatch lock covers exactly the five keys the save overwrites, before it writes any of them', async () => {
+  const { saveMintsoftOrderDispatchSettings } = await loadActions()
+  reset()
+  settingRows.set('mintsoft_client_id', '89')
+
+  await saveMintsoftOrderDispatchSettings({
+    adminOrderUrlTemplate: '',
+    defaultCourierServiceId: '',
+    clientId: '89',
+    channelId: '',
+    warehouseId: '',
+  })
+
+  assert.deepEqual(lockedKeys, [
+    'mintsoft_admin_order_url_template',
+    'mintsoft_channel_id',
+    'mintsoft_client_id',
+    'mintsoft_default_courier_service_id',
+    'mintsoft_warehouse_id',
+  ], 'a key left out of the lock is a key another save can move under this one')
+
+  // Rows are MATERIALISED before they are locked — FOR UPDATE locks only rows that exist, so an
+  // absent key could otherwise be INSERTed by a concurrent writer between the read and the upsert
+  // and the before-image would report "unset" for a value that had just been set.
+  assert.equal(trace.indexOf('materialise') >= 0, true)
+  assert.ok(trace.indexOf('materialise') < trace.indexOf('locked-read'))
+  assert.ok(
+    trace.indexOf('locked-read') < trace.findIndex((step) => step.startsWith('upsert:')),
+    'a lock taken after the write it protects protects nothing',
+  )
+})
 
 // ---------------------------------------------------------------------------
 // The case the issue actually names: a BINDING save. It logged after-values only — five of them —
