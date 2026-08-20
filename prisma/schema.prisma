@@ -2556,14 +2556,15 @@ model ShoppingWebhookEvent {
   topic           String?
   payloadHash     String
   payloadJson     Json
-  /// o3d-wgl6: the connector's settings version (WooCommerce `wc_settings_version`) that was
-  /// current when this delivery was ACCEPTED. The payload is frozen at receipt, so a retry
-  /// after a credential rebind would otherwise import the previous store's data under the new
-  /// store's credentials with every version the import observes consistently pointing at the
-  /// new one. Recorded here rather than in payloadJson because idempotency hashes the body.
-  /// NULL = accepted before this column existed, or a connector with no version concept; those
-  /// keep the pre-existing behaviour rather than being refused wholesale.
-  settingsVersion String?
+  /// o3d-wgl6: which STORE sent this delivery, as the store itself stated it at receipt
+  /// (`store:<host>`), or one of the `unproven:*` markers saying positively why no store could
+  /// be recorded. The payload is frozen at receipt, so a retry after a credential rebind would
+  /// otherwise import the previous store's data under the new store's credentials with every
+  /// settings version the import observes consistently pointing at the new one. Recorded here
+  /// rather than in payloadJson because idempotency hashes the body. NOT NULL: a nullable
+  /// column would mean both "pre-migration" and "nothing found", and the pre-migration rows
+  /// would silently read as fine. See lib/connectors/webhook-origin.ts.
+  originAttestation String
   status          String
   attempts        Int       @default(0)
   nextAttemptAt   DateTime?

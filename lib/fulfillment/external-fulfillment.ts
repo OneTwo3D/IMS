@@ -173,11 +173,26 @@ const EXTERNAL_FULFILLMENT_QTY_EPSILON = new Prisma.Decimal('0.000001')
  * allocations skipped the allocator — and therefore the refusal — entirely.
  *
  * BASIS. Ordered minus refunded, in LEAF (component) units keyed (orderLineId, productId) —
- * the same basis `validateActiveShipmentTotalsWithinOrder` caps dispatches against and
- * `selectOrdersNeedingAllocation` selects on, so "may this ship?" and "has everything
- * shipped?" cannot disagree. A FULL refund is unconditional zero demand, as in the coverage
- * selector: a monetary-only refund nets nothing per line, so without the short-circuit a
- * fully refunded order would read as permanently short and could never be dispatched.
+ * the same basis `validateActiveShipmentTotalsWithinOrder` caps dispatches against, so "may
+ * this ship?" and "has everything shipped?" cannot disagree.
+ *
+ * A FULL refund is NOT a short-circuit here, and that is the one place this deliberately parts
+ * company with `selectOrdersNeedingAllocation` and `allocateSalesOrder`. Those ask a
+ * PROSPECTIVE question — what still needs allocating or shipping — and for that a fully
+ * refunded order is dead: zero demand is right, and skipping it is also what stops the o3d-jby
+ * rewrite loop. This asks a RETROSPECTIVE one. The 3PL has already dispatched; a refund is a
+ * monetary event and cannot un-ship goods that left the warehouse.
+ *
+ * `refundStatus` reaches FULL on a monetary-only refund — store credit, a shipping-only
+ * refund, an unlinked external refund — with no quantity returned on any line. Treating that
+ * as zero demand skipped the coverage check on precisely the orders that DID dispatch, which
+ * is the under-booking this function exists to catch.
+ *
+ * A refund that genuinely cancels goods still nets to zero, one leaf at a time, through the
+ * per-line subtraction below: that is what quantity-bearing refund lines are for. A refund
+ * that returned no quantities leaves demand standing, and the shipment lines have to cover it
+ * or the dispatch is refused. Nothing loops on that refusal — this gate runs once, on an
+ * inbound dispatch, not on a rotating selector.
  *
  * WHICH LINES COUNT. Only stock-tracked lines with a product. A description-only line has no
  * product to ship (the same exclusion `validateActiveShipmentTotalsWithinOrder` makes), and
@@ -187,8 +202,7 @@ const EXTERNAL_FULFILLMENT_QTY_EPSILON = new Prisma.Decimal('0.000001')
 export async function findExternalFulfillmentShortfall(
   orderId: string,
 ): Promise<ExternalFulfillmentShortfall[]> {
-  const [order, orderLines, shipmentLines, refundLines] = await Promise.all([
-    db.salesOrder.findUnique({ where: { id: orderId }, select: { refundStatus: true } }),
+  const [orderLines, shipmentLines, refundLines] = await Promise.all([
     db.salesOrderLine.findMany({
       where: { orderId },
       select: {
@@ -213,8 +227,6 @@ export async function findExternalFulfillmentShortfall(
       select: { salesOrderLineId: true, productId: true, qty: true },
     }),
   ])
-
-  if (order?.refundStatus === 'FULL') return []
 
   const shippableLines = orderLines.filter(
     (line): line is typeof line & { productId: string } =>

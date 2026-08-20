@@ -37,7 +37,10 @@ mock.module('@/lib/db', {
   namedExports: {
     db: {
       setting: {
-        findUnique: async () => null,
+        // o3d-wgl6: the handler reads the bound store URL first; these tests are about the
+        // permanent/transient split, so every delivery names the store that is bound.
+        findUnique: async ({ where }: { where: { key: string } }) =>
+          where.key === 'wc_url' ? { key: 'wc_url', value: 'https://shop.example.com' } : null,
         upsert: async ({ where }: { where: { key: string } }) => {
           settingUpserts.push(where.key)
           return {}
@@ -66,7 +69,12 @@ const PRODUCT_PAYLOAD = {
 
 async function processProductWebhook() {
   const { processWcWebhookPayload } = await import('@/lib/connectors/woocommerce/webhooks')
-  return processWcWebhookPayload({ resource: 'products', topic: 'product.updated', payload: PRODUCT_PAYLOAD })
+  return processWcWebhookPayload({
+    resource: 'products',
+    topic: 'product.updated',
+    payload: PRODUCT_PAYLOAD,
+    originAttestation: 'store:shop.example.com',
+  })
 }
 
 function reset() {

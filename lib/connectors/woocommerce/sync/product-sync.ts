@@ -763,7 +763,7 @@ export async function syncWcProductToIms(
    * under; a mismatch means the payload is stale and none of it may be written.
    */
   observedVersion?: string,
-): Promise<{ success: boolean; error?: string; permanent?: boolean; staleSettingsVersion?: boolean }> {
+): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
   try {
     const sku = asTrimmedString(wcProduct.sku)
     if (!sku) return { success: true } // skip products without SKU
@@ -1333,12 +1333,6 @@ export async function syncWcProductToIms(
     return { success: true }
   } catch (e) {
     const permanent = isPermanentProductSyncConflict(e)
-    // o3d-wgl6: reported as a distinct FACT, not folded into `permanent`. Whether a rebind makes
-    // this payload unretryable depends on the CALLER, and only the caller knows: a sweep re-FETCHES
-    // the product on its next run, so for it the version move is transient and the retry is the
-    // fix (see WcSettingsVersionChangedError's own note). A webhook delivery holds a FROZEN
-    // payload that can never be re-fetched, so for it the same condition is terminal.
-    const staleSettingsVersion = e instanceof WcSettingsVersionChangedError
     await db.shoppingSyncLog.create({
       data: {
         direction: 'FROM_CONNECTOR',
@@ -1351,7 +1345,7 @@ export async function syncWcProductToIms(
         syncedAt: new Date(),
       },
     })
-    return { success: false, error: String(e), permanent, staleSettingsVersion }
+    return { success: false, error: String(e), permanent }
   }
 }
 

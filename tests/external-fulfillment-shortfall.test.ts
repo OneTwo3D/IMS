@@ -211,16 +211,48 @@ test('refunded units are netted out of demand, so a part-refunded order is not p
   assert.deepEqual(result, { success: true })
 })
 
-test('a FULL refund is unconditional zero demand — a monetary-only refund must not wedge the dispatch', async () => {
+test('a MONETARY-only FULL refund does not exempt an uncovered dispatch', async () => {
+  reset()
+  // `refundStatus` reaches FULL on a refund that returned no goods at all — store credit, a
+  // shipping-only refund, an unlinked external refund. Treating FULL as blanket zero demand
+  // skipped the coverage check on exactly the orders that DID dispatch: a monetary refund
+  // cannot un-ship what the 3PL already sent.
+  state.order.refundStatus = 'FULL'
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  // No refund LINES at all, so per-line netting yields nothing and demand stands at 10.
+  state.shipmentLines = []
+
+  const result = await apply()
+
+  assert.equal(result.success, false)
+  assert.match(result.error ?? '', /WIDGET \(10 of 10 uncovered\)/)
+  assert.equal(state.transitions.length, 0)
+})
+
+test('a FULL refund that really returned the goods nets to zero and proceeds', async () => {
   reset()
   state.order.refundStatus = 'FULL'
   state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
-  // No refund LINES at all: the refund was monetary-only, so per-line netting yields nothing.
+  // Quantity-bearing refund lines are what actually cancel goods, and the per-leaf
+  // subtraction already handles them. No short-circuit is needed to reach zero demand.
+  state.refundLines = [{ salesOrderLineId: 'line-1', productId: 'p-1', qty: 10 }]
   state.shipmentLines = []
 
   const result = await apply()
 
   assert.deepEqual(result, { success: true })
+})
+
+test('a fully refunded order that DID ship in full is still dispatchable', async () => {
+  reset()
+  state.order.refundStatus = 'FULL'
+  state.orderLines = [{ id: 'line-1', productId: 'p-1', qty: 10, sku: 'WIDGET', description: 'Widget', product: { type: 'SIMPLE' } }]
+  state.shipmentLines = [{ shipmentId: 'shp-1', lineId: 'line-1', productId: 'p-1', qty: 10 }]
+
+  const result = await apply()
+
+  assert.deepEqual(result, { success: true })
+  assert.deepEqual(state.transitions, [['shp-1', 'SHIPPED']])
 })
 
 test('lines that can never receive shipment coverage do not refuse the dispatch', async () => {

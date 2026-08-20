@@ -58,7 +58,7 @@ function wcDependencies(overrides: Partial<WcWebhookDependencies> = {}): WcWebho
     topic: 'product.updated',
     payloadHash: 'hash',
     payloadJson: {},
-    settingsVersion: null,
+    originAttestation: 'unproven:not-applicable',
     status: 'PENDING',
     attempts: 0,
     nextAttemptAt: null,
@@ -76,9 +76,6 @@ function wcDependencies(overrides: Partial<WcWebhookDependencies> = {}): WcWebho
       return signature === wcSignature(body)
     },
     async recordWebhookReceipt() {},
-    async getCurrentWcSettingsVersion() {
-      return '0'
-    },
     async getWebhookProcessingGate() {
       return { enabled: true }
     },
@@ -369,7 +366,7 @@ test('WooCommerce webhook persists valid signed JSON fixtures without inline pro
             topic: input.topic,
             payloadHash: 'hash',
             payloadJson: input.payload,
-            settingsVersion: input.settingsVersion ?? null,
+            originAttestation: input.originAttestation ?? 'unproven:not-applicable',
             status: 'PENDING',
             attempts: 0,
             nextAttemptAt: null,
@@ -421,7 +418,7 @@ test('WooCommerce webhook PERSISTS (deferred) when WC sync is disabled — the e
             topic: input.topic,
             payloadHash: 'hash',
             payloadJson: input.payload,
-            settingsVersion: input.settingsVersion ?? null,
+            originAttestation: input.originAttestation ?? 'unproven:not-applicable',
             status: 'PENDING',
             attempts: 0,
             nextAttemptAt: null,
@@ -470,7 +467,7 @@ test('WooCommerce webhook returns accepted duplicate responses for repeated payl
             topic: input.topic,
             payloadHash: 'hash',
             payloadJson: input.payload,
-            settingsVersion: input.settingsVersion ?? null,
+            originAttestation: input.originAttestation ?? 'unproven:not-applicable',
             status: 'PENDING',
             attempts: 0,
             nextAttemptAt: null,
@@ -672,7 +669,7 @@ test('Shopify webhook persists valid signed JSON without inline processing', asy
             topic: input.topic,
             payloadHash: 'hash',
             payloadJson: input.payload,
-            settingsVersion: input.settingsVersion ?? null,
+            originAttestation: input.originAttestation ?? 'unproven:not-applicable',
             status: 'PENDING',
             attempts: 0,
             nextAttemptAt: null,
@@ -783,7 +780,7 @@ test('Shopify webhook returns accepted duplicate responses for repeated payloads
             topic: input.topic,
             payloadHash: 'hash',
             payloadJson: input.payload,
-            settingsVersion: input.settingsVersion ?? null,
+            originAttestation: input.originAttestation ?? 'unproven:not-applicable',
             status: 'PENDING',
             attempts: 0,
             nextAttemptAt: null,

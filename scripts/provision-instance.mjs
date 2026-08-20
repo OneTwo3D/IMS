@@ -189,6 +189,25 @@ async function main() {
       )
     }
 
+    // The STORE URL is deliberately not seeded from here (o3d-ecbj). `wc_url` never had an
+    // environment fallback — it has always had to be entered in Settings — so nothing on this
+    // branch regressed it, and the seed for it belongs to the change that owns WC_STORE_URL
+    // (o3d-esha). Two independent seeds for the same setting, with two independent ideas of
+    // how to normalise a URL, is the drift this issue was about in the first place.
+    //
+    // What IS new is that the credentials can now be present while the URL is not, which reads
+    // to an operator as a configured connector that silently cannot reach anything. So say so.
+    const wcRows = await db.query(
+      `select key from settings where key in ('wc_url', 'wc_consumer_key', 'wc_consumer_secret')`,
+    )
+    const present = new Set(wcRows.rows.map((row) => row.key))
+    if (present.has('wc_consumer_key') && !present.has('wc_url')) {
+      console.log(
+        '[WARN] WooCommerce credentials are stored but no store URL is. The connector cannot reach '
+        + 'the store until Settings -> Sync -> WooCommerce -> Connection has the store URL.',
+      )
+    }
+
     if (smtp.host && smtp.fromEmail) {
       await upsertSetting(db, 'email_smtp_host', smtp.host)
       await upsertSetting(db, 'email_smtp_port', smtp.port)

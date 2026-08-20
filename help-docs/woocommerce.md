@@ -52,12 +52,18 @@ This means a credential rotation can't silently leave sync running with old (or 
 
 ### What happens to in-flight work when you rebind
 
-Changing the URL, key or secret is a **rebind**. It clears every cached WooCommerce product id (the next sync re-matches products by SKU) and moves the connector to a new settings version. Work that was already in flight under the old binding is then refused rather than applied:
+Changing the URL, key or secret is a **rebind**. It clears every cached WooCommerce product id (the next sync re-matches products by SKU). Work that belongs to the old binding is then refused rather than applied:
 
 - A product import or stock push that started before the rebind abandons its writes instead of writing the old store's ids over the freshly cleared cache.
-- A **webhook delivery that arrived before the rebind** is refused when it is retried afterwards, and is acknowledged rather than retried again — its payload describes the previous store, and no number of retries can make it describe the new one. These appear in the activity log as *"received under the previous store binding"* at ERROR level. The reconcile sync re-imports the affected products from the store you are now connected to, so nothing needs to be replayed by hand.
+- A **product webhook sent by the previous store** is refused, and is acknowledged rather than retried — its payload describes that store, and no number of retries can make it describe the new one. Nothing is imported and no stock is corrected from it. These appear in the activity log at ERROR level, naming the store that sent the delivery and the store you are bound to. The reconcile sync re-imports the affected products from the current store, so nothing needs replaying by hand.
 
-A burst of those log entries after a rebind is normal for a few minutes (the old store's queued deliveries draining). A burst that keeps going means the old store is still sending webhooks — remove the webhook in that store's WooCommerce admin.
+Every delivery is judged on **which store sent it**, taken from the store's own statement of its address in the delivery (`X-WC-Webhook-Source`, or the product's own link in the signed body) and compared against the store URL in your Connection settings. That is deliberately not the same as "did anything change since the delivery arrived":
+
+- Rotating the key or secret **for the same store**, or pressing *Reset cached product IDs*, is not a rebind of the store. Deliveries keep flowing normally through both.
+- A delivery that was already on its way when you changed the store URL is still recognised as coming from the old store, even though it lands afterwards.
+- A delivery that does not say which store sent it is refused as well, rather than assumed to be current. If that happens for every delivery, something between WooCommerce and IMS is stripping headers.
+
+A burst of refusals after a store change is normal for a few minutes (the old store's queued deliveries draining). A burst that keeps going means the old store is still sending webhooks — remove the webhook in that store's WooCommerce admin.
 
 ## Order Sync
 

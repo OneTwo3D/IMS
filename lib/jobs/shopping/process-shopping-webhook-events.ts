@@ -35,12 +35,12 @@ export type ShoppingWebhookProcessorOptions = {
     externalEventId: string | null
     payload: unknown
     /**
-     * The connector settings version stamped on the delivery at RECEIPT (o3d-wgl6). Passed to
-     * the connector handler on EVERY attempt, including retries — that is the whole point: the
-     * payload is frozen, so only a value captured at receipt can tell a retry that the store it
-     * describes is no longer the store this installation is bound to.
+     * What the delivery said about the store that sent it, recorded at RECEIPT (o3d-wgl6).
+     * Passed to the connector handler on EVERY attempt, including retries — that is the whole
+     * point: the payload is frozen, so only the sending store's own identity, captured with it,
+     * can tell a retry that the store it describes is no longer the one we are bound to.
      */
-    settingsVersion: string | null
+    originAttestation: string
   }) => Promise<Response>
   now?: Date
   staleProcessingBefore?: Date
@@ -133,7 +133,7 @@ export async function processShoppingWebhookEvent(
       topic: claimed.topic,
       externalEventId: claimed.externalEventId,
       payload: claimed.payloadJson,
-      settingsVersion: claimed.settingsVersion,
+      originAttestation: claimed.originAttestation,
     })
     await assertSuccessfulResponse(response, options.connectorLabel)
     await options.repository.markProcessed(claimed.id, now)
