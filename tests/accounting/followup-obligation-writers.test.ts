@@ -564,6 +564,94 @@ test('[o3d-nepa r3] an INTACT row is not warned about — the check is the stamp
 })
 
 // ---------------------------------------------------------------------------
+// o3d-nepa r4 (Codex finding 1) — AN UNWRITABLE WARNING MUST NOT WITHHOLD THE WORK THAT SURVIVED.
+//
+// r3 announced the loss BEFORE calling the enqueue and threw when the announcement could not be
+// written. But r3's own stated reason for still calling the enqueue on a tombstone is that SOME
+// follow-ups are rebuilt from columns compaction KEEPS: a SALES_INVOICE tombstone still carries its
+// external id and its referenceId, which is everything the INVOICE_PDF follow-up is built from. With
+// the announcement first, a failed activity-log write stopped that enqueue from ever running — so
+// the refusal to settle the row, which exists to protect the follow-ups, was withholding the very
+// follow-ups it could still deliver, and the retry meets the same unwritable log next pass.
+//
+// The enqueue now runs first. What the announcement gates is the RELEASE, which is the property r3
+// was actually defending.
+// ---------------------------------------------------------------------------
+
+/**
+ * A tombstone whose follow-up SURVIVES compaction. `enqueueSalesInvoiceFollowUps` builds the
+ * INVOICE_PDF row from `externalTransactionId` and `referenceId` alone — no payload — while the
+ * payment follow-up it also owns is gated on `payload._registerPayment` and is genuinely lost. That
+ * mixture is the case the finding is about; the PURCHASE_INVOICE tombstone above loses everything,
+ * so it could never have shown the difference.
+ */
+function compactedSalesInvoiceRow(): SyncRow {
+  return {
+    ...blankRow(),
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    externalTransactionId: 'XINV-1',
+    status: 'PENDING',
+    payload: {},
+    backReferenceEvidenceCompactedAt: new Date('2026-01-05T00:00:00Z'),
+  }
+}
+
+function pdfFollowUps(): SyncRow[] {
+  return state.syncRows.filter((row) => row.type === 'INVOICE_PDF')
+}
+
+test('[o3d-nepa r4] a compacted row still gets the follow-ups compaction did not destroy', async () => {
+  // The baseline, so the test below is about the WARNING failing rather than about this row having
+  // no rebuildable follow-up in the first place.
+  reset()
+  state.syncRows = [compactedSalesInvoiceRow()]
+
+  const result = await runDirect()
+
+  assert.equal(result.succeeded, 1)
+  assert.equal(pdfFollowUps().length, 1, 'the PDF follow-up is built from columns the tombstone keeps')
+  assert.ok(discardWarning(), 'and the loss of the payload-built ones is still announced')
+  assert.equal(subject().backReferenceFollowUpsPendingAt, null, 'the warning landed, so the obligation is discharged')
+})
+
+test('[o3d-nepa r4] and it gets them even when the loss warning cannot be written down', async () => {
+  // THE DEFECT. Under r3 this run enqueued NOTHING: the announcement threw before the enqueue was
+  // reached, so the PDF that was perfectly rebuildable was withheld — every pass, for as long as the
+  // activity write kept failing.
+  reset()
+  state.syncRows = [compactedSalesInvoiceRow()]
+  state.unpersistableActivityActions.add(DISCARD_ACTION)
+
+  const result = await runDirect()
+
+  assert.equal(pdfFollowUps().length, 1, 'the rebuildable follow-up is released regardless of the log write')
+  // AND the property r3 was defending is untouched: an unannounced loss does not settle.
+  assert.equal(result.failed, 1)
+  assert.ok(
+    subject().backReferenceFollowUpsPendingAt instanceof Date,
+    'the obligation still survives, so a later pass announces what was lost',
+  )
+  assert.equal(subject().status, 'PENDING')
+  assert.match(String(subject().errorMessage), /compacted/)
+})
+
+test('[o3d-nepa r4] the OUTBOX loop releases the surviving follow-ups on an unwritable warning too', async () => {
+  // Both short-circuit sites carry the same ordering; a fix applied to one loop is not a fix.
+  reset()
+  state.syncRows = [compactedSalesInvoiceRow()]
+  state.unpersistableActivityActions.add(DISCARD_ACTION)
+
+  const result = await runViaOutbox()
+
+  assert.equal(subjectOutboxJob()?.status !== 'SUCCEEDED', true, 'the job is not completed on an unannounced loss')
+  assert.equal(pdfFollowUps().length, 1)
+  assert.equal(result.failed, 1)
+  assert.ok(subject().backReferenceFollowUpsPendingAt instanceof Date)
+})
+
+// ---------------------------------------------------------------------------
 // THE FRESH-POST BRANCH — sync-processor.ts:1071-1074, the exact lines the finding cited.
 //
 // The tests above drive the already-posted branch, which is the same shape but not the same code.

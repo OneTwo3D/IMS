@@ -83,6 +83,10 @@ class CompactedFollowUpLossUnrecorded extends Error {}
  *
  * So the loss is announced, from the SAME shared message the sweep uses, and the obligation is
  * released only once the announcement is on record. A no-op for every row that is not a tombstone.
+ *
+ * r4 finding 1: it runs AFTER `enqueueFollowUps`, not before. Throwing from here is how the release
+ * is withheld, and putting it first made that throw withhold the ENQUEUE as well — including the
+ * follow-ups that survive compaction and would have gone out fine. The gate is on the release only.
  */
 async function announceCompactedFollowUpLoss(entry: {
   id: string
@@ -822,12 +826,23 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         })
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
-          // BEFORE the enqueue, because the enqueue is what LOOKS like it succeeded. On a tombstone
-          // `payload` is `{}` and everything built from it is silently skipped; the enqueue is still
-          // called, since some follow-ups are rebuilt from columns that survive compaction, but the
-          // release below must never happen on the strength of it alone (o3d-nepa r3).
-          await announceCompactedFollowUpLoss(entry)
+          // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
+          //
+          // r3 put the announcement first and then threw when it could not be written, so a failed
+          // ACTIVITY-LOG WRITE stopped the enqueue from being called at all — and r3's own reason for
+          // still calling it on a tombstone is that SOME follow-ups are rebuilt from columns that
+          // survive compaction (an INVOICE_PDF is enqueued from `externalTransactionId` and
+          // `referenceId` alone). Those are real, recoverable work, and refusing to settle the row is
+          // no reason to withhold them: the retry will just meet the same unwritable log next pass.
+          //
+          // What the announcement gates is the RELEASE, which is the property r3 was actually
+          // defending — the obligation marker must never be discharged on the strength of an enqueue
+          // that silently did nothing. That still holds exactly: a throw here skips the release, the
+          // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
+          // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
+          // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          await announceCompactedFollowUpLoss(entry)
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           // NOT released: the follow-ups did not run. The row goes back to PENDING (or FAILED at
@@ -1091,12 +1106,23 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         })
         try {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
-          // BEFORE the enqueue, because the enqueue is what LOOKS like it succeeded. On a tombstone
-          // `payload` is `{}` and everything built from it is silently skipped; the enqueue is still
-          // called, since some follow-ups are rebuilt from columns that survive compaction, but the
-          // release below must never happen on the strength of it alone (o3d-nepa r3).
-          await announceCompactedFollowUpLoss(entry)
+          // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
+          //
+          // r3 put the announcement first and then threw when it could not be written, so a failed
+          // ACTIVITY-LOG WRITE stopped the enqueue from being called at all — and r3's own reason for
+          // still calling it on a tombstone is that SOME follow-ups are rebuilt from columns that
+          // survive compaction (an INVOICE_PDF is enqueued from `externalTransactionId` and
+          // `referenceId` alone). Those are real, recoverable work, and refusing to settle the row is
+          // no reason to withhold them: the retry will just meet the same unwritable log next pass.
+          //
+          // What the announcement gates is the RELEASE, which is the property r3 was actually
+          // defending — the obligation marker must never be discharged on the strength of an enqueue
+          // that silently did nothing. That still holds exactly: a throw here skips the release, the
+          // catch below returns the row to PENDING still carrying `backReferenceFollowUpsPendingAt`,
+          // and the next pass announces. Re-running the enqueue on that pass is a no-op — it is
+          // idempotent through `hasExistingSyncLog` and the partial unique index (audit-42co).
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+          await announceCompactedFollowUpLoss(entry)
           await releaseFollowUpObligation(db, { syncLogId: entry.id, connector: XERO_CONNECTOR })
         } catch (followUpError) {
           const retry = await db.$transaction(async (tx) => {

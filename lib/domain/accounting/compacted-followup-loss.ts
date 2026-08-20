@@ -29,6 +29,11 @@ import type { AccountingSyncType } from '@/app/generated/prisma/client'
  * `referenceId` alone), and the processor path would lose them if it stopped calling. What both
  * callers agree on is the part that matters here: a compacted row is ANNOUNCED, and its obligation
  * is released only once the announcement is on record.
+ *
+ * AND THE PROCESSOR ANNOUNCES AFTER IT ENQUEUES (o3d-nepa r4). Announcing first meant an
+ * unwritable warning threw before the enqueue ran, so the rebuildable follow-ups above were
+ * withheld too — the refusal to settle, which exists to protect follow-ups, destroying the ones it
+ * could still deliver. The announcement gates the RELEASE; it must never gate the enqueue.
  */
 
 /** The columns the announcement is built from — a tombstone still carries every one of them. */

@@ -1089,6 +1089,11 @@ the follow-ups built from the payload cannot be rebuilt either, so the retry wri
 once that warning has been written. A retry that turns such a row green is therefore never silent
 about what it could not do: check the activity log after a bulk retry over old failures.
 
+The follow-ups that **do** survive compaction are still queued in that situation. A sales invoice
+tombstone, for example, keeps everything the invoice-PDF job needs, so the retry enqueues it even
+when the warning itself could not be written down — only the *settling* of the row waits for the
+warning, never the work.
+
 **Do not cancel one of these rows to tidy it away.** Cancelling is irreversible in two ways the row
 gives no warning about: a cancelled row is no longer a repair candidate, so the link that was still
 perfectly possible is given up permanently; and it no longer counts as a competing claim, so an
