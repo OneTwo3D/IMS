@@ -860,6 +860,27 @@ follow-ups are outstanding and the next sweep runs them. Rows that were synced *
 introduced cannot be assessed retrospectively — a completed row and an interrupted one look identical
 afterwards — so nothing was back-filled; the protection applies from that point on.
 
+**Every follow-up obligation is now swept, not only the ones attached to a document.** The record of
+"this row still owes its follow-ups" is written for every sync type, but the sweep used to look only
+at rows that carry an external id *and* are one of the four document types. That left the invoice
+PDF stranded: its own follow-ups are nested — a successful PDF is what queues the customer invoice
+email and the WooCommerce order note — and the PDF step returns no external id, so it matched
+neither condition. A restart between saving the PDF and queueing those two lost them silently. The
+sweep now treats an outstanding obligation as a reason to look at a row in its own right, so that
+pair is rebuilt, and the row keeps its own status: discharging an obligation never turns a failed
+email into a successful one.
+
+**A repair never invents an invoice date.** When the sweep links a sales order after the fact, it
+stamps the order's invoice date with the date the invoice was actually *posted with*, read back out
+of the request that was sent — not the moment the repair runs. Repairs happen an arbitrary time
+later, sometimes months, and VAT and currency reporting select on that date, so using the repair time
+would quietly move the sale into whichever period the sweep happened to run in. If the row can no
+longer tell us the posted date — a payload compacted away by retention, or a legacy row — **no date
+is written at all** and a WARNING goes to the activity log
+(`xero_backreference_invoice_date_unrecoverable`) naming the order. Set the invoice date from the
+document in Xero: until you do, that sale is in no reporting period. An invoice date the order
+already has is never overwritten.
+
 **The sweep runs for Xero only.** There is deliberately no QuickBooks equivalent, and that is not an
 oversight to be reported. A QuickBooks document id is a per-company integer, and disconnecting clears
 the company pin, so a sweep scoped to "the QuickBooks connector" could not tell an id issued by a
@@ -896,6 +917,20 @@ ever links does not go quiet. Reasons you may see:
 | `NO_LIVE_SYNC_ROW` | No live sync row for this PO carries this external id any more — it was cancelled, or its external id was cleared, mid-repair — so nothing evidences the attribution |
 | `EXTERNAL_ID_LINKED_ELSEWHERE` | Another bill — on another PO — already carries this Xero bill id |
 | `EXTERNAL_ID_CLAIMED_CONCURRENTLY` | Another bill claimed the id while this repair was being written |
+
+For `EXTERNAL_ID_LINKED_ELSEWHERE` the warning also says **how the blocking bill got its link**,
+which is usually the fastest way to decide which of the two candidates to check in Xero first:
+
+| Blocking link | What the warning tells you |
+|---|---|
+| Written by a sync that named that bill | Authoritative — the refused row's own reference is the likelier mistake |
+| Deduced by an earlier repair | A deduction from the purchase order, not something Xero reported — a candidate for being wrong |
+| Set by an operator | Someone compared both documents and chose; treat it as correct unless you know why that changed |
+| Never recorded | The bill was linked before IMS recorded this, so neither claim is proven — check the Xero bill against both |
+
+IMS still refuses either way. Deciding automatically would need IMS to read the Xero bill and compare
+it against both local candidates, which it does not do; the provenance narrows the search, it does not
+make the decision.
 
 **One ledger document, one local record — enforced by the database.** Two purchase invoices can
 never carry the same bill id, two sales orders can never carry the same invoice id, and two credit
@@ -1045,6 +1080,19 @@ was already there — it logs `*_backreference_followups_discarded` naming the d
 check for a missing PDF or payment and re-drive it by hand. The row is only closed once that warning
 has been written, so the loss is never absorbed silently. A compacted row also still counts as a claim when the
 sweep decides whether a purchase order's bill is ambiguous.
+
+**Retrying a compacted row by hand reports the same loss.** If you press *Retry* (or *Retry all*) on
+the Accounting Sync page and the row already carries an external id, IMS does **not** re-send the
+document — it settles the row against the id that is already there. On a compacted row that means
+the follow-ups built from the payload cannot be rebuilt either, so the retry writes the same
+`xero_backreference_followups_discarded` WARNING naming the document, and the row is settled only
+once that warning has been written. A retry that turns such a row green is therefore never silent
+about what it could not do: check the activity log after a bulk retry over old failures.
+
+The follow-ups that **do** survive compaction are still queued in that situation. A sales invoice
+tombstone, for example, keeps everything the invoice-PDF job needs, so the retry enqueues it even
+when the warning itself could not be written down — only the *settling* of the row waits for the
+warning, never the work.
 
 **Do not cancel one of these rows to tidy it away.** Cancelling is irreversible in two ways the row
 gives no warning about: a cancelled row is no longer a repair candidate, so the link that was still
