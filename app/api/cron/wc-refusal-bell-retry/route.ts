@@ -3,7 +3,10 @@ import { verifyCron } from '@/lib/cron-auth'
 import { CRON_RATE_LIMIT_FIFTEEN_MINUTE_MAX, enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
-import { retryUnnotifiedWcCompletionRefusalBells } from '@/lib/connectors/woocommerce/sync/completion-flow'
+import {
+  WC_REFUSAL_BELL_ATTEMPT_LIMIT,
+  retryUnnotifiedWcCompletionRefusalBells,
+} from '@/lib/connectors/woocommerce/sync/completion-flow'
 
 /**
  * o3d-xnwu round 4, finding 2 — THE DRIVER FOR A FAILED BELL.
@@ -40,9 +43,21 @@ export async function GET(request: Request) {
       // defect, one level up. The run itself carries the state, so the health
       // page and the cron log show it without an ERROR activity row per order
       // per quarter-hour — which is how a real signal gets filtered away.
-      if (sweep.stillUndelivered > 0) {
+      //
+      // An EXHAUSTED row is counted here for the ONE run in which it gives up,
+      // and never again (o3d-xnwu round 5, finding 3). Going red every quarter of
+      // an hour for ever over a bell that cannot be delivered is not a signal —
+      // it is what teaches an operator to filter this job's alerts, which is the
+      // same failure as never alerting at all, arrived at by the other road. The
+      // durable record of a given-up bell is its ERROR activity row and the
+      // QUARANTINED refusal still sitting on /sync/exceptions.
+      if (sweep.stillUndelivered > 0 || sweep.exhausted > 0) {
         throw new Error(
           `${sweep.stillUndelivered} refused WooCommerce completion(s) still have no delivered admin notification`
+          + (sweep.exhausted > 0
+            ? `, and ${sweep.exhausted} gave up after ${WC_REFUSAL_BELL_ATTEMPT_LIMIT} attempts and will not be`
+              + ' retried — they stay open on /sync/exceptions'
+            : '')
           + (sweep.adminCount === 0 ? ' — there is no active ADMIN user to notify' : '')
           + ` (scanned ${sweep.scanned}, delivered ${sweep.delivered})`,
         )

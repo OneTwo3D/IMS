@@ -47,6 +47,15 @@ let syncLogWriteError: string | null = null
  * delivered" unfalsifiable.
  */
 let notifyFailsFor: Set<string> = new Set()
+/**
+ * Orders whose bell `notify` REFUSES, by WooCommerce order number.
+ *
+ * Per-ADMIN failure cannot express a poison ROW: it makes every refusal
+ * undeliverable at once, and the finding is about one row that can never be
+ * delivered sitting in front of rows that can (o3d-xnwu round 5, finding 3). The
+ * message names the order, which is what a real notifier would reject on.
+ */
+let notifyFailsForOrder: Set<string> = new Set()
 /** Active ADMIN users. An install can genuinely have none. */
 let adminUsers: Array<{ id: string }> = [{ id: 'admin-1' }, { id: 'admin-2' }]
 let nextSyncLogId = 1
@@ -73,13 +82,14 @@ let onFirstNotify: (() => void) | null = null
 
 mock.module('@/lib/notifications', {
   namedExports: {
-    notify: async (params: { userId?: string | null }) => {
+    notify: async (params: { userId?: string | null; message?: string }) => {
       if (onFirstNotify) {
         const hook = onFirstNotify
         onFirstNotify = null
         hook()
       }
       if (params.userId && notifyFailsFor.has(params.userId)) return false
+      if ([...notifyFailsForOrder].some((order) => params.message?.includes(`order ${order} `))) return false
       notifications.push(params)
       return true
     },
@@ -164,6 +174,10 @@ mock.module('@/lib/db', {
           take?: number
           orderBy?: { createdAt?: 'asc' | 'desc' }
         }) => {
+          // `take` is honoured below, and it is what makes the queue's shape
+          // observable: a double that returned everything would ring the row
+          // behind a poison one on the very first sweep and report no starvation
+          // at all.
           const found = syncLogs.filter((row) => matches(row, where))
           if (orderBy?.createdAt === 'asc') {
             found.sort((a, b) => Number(a.createdAt as Date) - Number(b.createdAt as Date))
@@ -211,6 +225,7 @@ function reset() {
   notifications.length = 0
   syncLogWriteError = null
   notifyFailsFor = new Set()
+  notifyFailsForOrder = new Set()
   onFirstNotify = null
   adminUsers = [{ id: 'admin-1' }, { id: 'admin-2' }]
   fulfillmentResult = { success: true }
@@ -492,9 +507,11 @@ test('a PARTIAL delivery is retried rather than counted as done (o3d-xnwu r3)', 
   await runCompletion()
   assert.deepEqual(
     notifications.map((row) => row.userId),
-    ['admin-1', 'admin-1', 'admin-2'],
-    'admin-1 gets a second copy, deliberately: one duplicate bell is a far better failure than an admin never told',
+    ['admin-1', 'admin-2'],
+    'and the retry targets the admin who was NOT told: round 4 re-rang admin-1 too, which is a duplicate bell about the'
+    + ' same order aimed at the person already looking at it (o3d-xnwu r5, finding 3)',
   )
+  assert.equal(belled(), true, 'and now that both have a row, the bell is done')
 })
 
 test('an install with NO active admin is a failed bell, not a satisfied one (o3d-xnwu r3)', async () => {
@@ -522,9 +539,9 @@ test('an install with NO active admin is a failed bell, not a satisfied one (o3d
 // therefore the case least likely to recur.
 // ---------------------------------------------------------------------------
 
-async function runBellRetry() {
+async function runBellRetry(opts: { limit?: number } = {}) {
   const { retryUnnotifiedWcCompletionRefusalBells } = await import('@/lib/connectors/woocommerce/sync/completion-flow')
-  return retryUnnotifiedWcCompletionRefusalBells()
+  return retryUnnotifiedWcCompletionRefusalBells(opts)
 }
 
 /** Refuse the order once, with the bell failing, and leave the row parked. */
@@ -695,9 +712,193 @@ test('the retry is SCHEDULED, not merely reachable', async () => {
     route.includes('sweep.stillUndelivered > 0'),
     'a silent 200 over an order nobody has been told about is the defect, one level up',
   )
+  assert.ok(
+    route.includes('sweep.stillUndelivered > 0 || sweep.exhausted > 0'),
+    'and giving up on a bell makes the run red too — in the ONE run it happens, which is why the count is of this run'
+    + ' and not of the table. Asserted on the CONDITION, not on the message, which mentions it either way',
+  )
   assert.equal(
     /wc_sync_enabled/.test(route),
     false,
     'not gated on the sync switch: it calls nothing external, and pausing sync is not asking to stop hearing about refusals already made',
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xnwu round 5, finding 3 — A BELL THAT CANNOT BE DELIVERED MUST NOT STARVE
+// THE ONES THAT CAN, OR ALERT FOR EVER.
+//
+// Round 4 gave the bell a driver and no way to stop. A refusal whose bell can
+// never land — no active ADMIN user, a notifier that rejects that row, an admin
+// whose insert always fails — then did two harmful things every fifteen minutes,
+// for ever: it held its place at the front of an oldest-first window, so a
+// refusal filed after it waited behind it; and it made the cron run red, which
+// is how an alert that means something becomes an alert everybody filters.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read from production rather than restated here: a bound the test carries its
+ * own copy of is a bound that can be raised to infinity without a single test
+ * noticing.
+ */
+async function bellAttemptLimit(): Promise<number> {
+  const mod = await import('@/lib/connectors/woocommerce/sync/completion-flow')
+  return mod.WC_REFUSAL_BELL_ATTEMPT_LIMIT
+}
+
+/** Park an open refusal directly, so its age and its order number can be stated. */
+function parkRefusal(opts: { id: string; orderId: string; orderNumber: string; createdAt: Date }) {
+  syncLogs.push({
+    id: opts.id,
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    status: 'QUARANTINED',
+    entityType: 'SalesOrderFulfillment',
+    entityId: opts.orderId,
+    externalId: opts.orderNumber,
+    errorMessage: 'External fulfillment requires physical stock',
+    payload: { wcStatus: 'completed', wcOrderNumber: opts.orderNumber, adminNotified: false },
+    createdAt: opts.createdAt,
+  })
+}
+
+function payloadOf(id: string): Record<string, unknown> {
+  return syncLogs.find((row) => row.id === id)!.payload as Record<string, unknown>
+}
+
+test('a bell that can NEVER be delivered stops being retried, and says so (o3d-xnwu r5, finding 3)', async () => {
+  reset()
+  const WC_REFUSAL_BELL_ATTEMPT_LIMIT = await bellAttemptLimit()
+  await refuseWithFailedBell()
+  const rowId = openRefusals()[0].id as string
+
+  // The first attempt was the refusal itself, so the budget is one down already.
+  let last = await runBellRetry()
+  for (let attempt = 2; attempt < WC_REFUSAL_BELL_ATTEMPT_LIMIT; attempt++) {
+    assert.equal(last.exhausted, 0, `gave up on attempt ${attempt} — the budget must be ${WC_REFUSAL_BELL_ATTEMPT_LIMIT}`)
+    assert.equal(last.stillUndelivered, 1, 'and until it does, the run is visibly red')
+    last = await runBellRetry()
+  }
+
+  assert.equal(last.exhausted, 1, 'the budget runs out')
+  assert.equal(last.stillUndelivered, 0, 'and the row is no longer counted as one that is still being tried')
+  assert.equal(payloadOf(rowId).adminNotified, 'exhausted', 'recorded as given up — never as delivered')
+  assert.equal(payloadOf(rowId).adminBellAttempts, WC_REFUSAL_BELL_ATTEMPT_LIMIT)
+
+  const gaveUp = activityLog.find((entry) => entry.action === 'wc_completion_refusal_bell_exhausted')
+  assert.ok(gaveUp, 'giving up is reported ONCE, loudly, with the order on it')
+  assert.equal(gaveUp.level, 'ERROR')
+  assert.match(String(gaveUp.description), /still QUARANTINED on \/sync\/exceptions/)
+
+  // And that is the end of it: no further sweep selects the row, so no further
+  // alert and no further notification attempt.
+  activityLog.length = 0
+  const after = await runBellRetry()
+  assert.equal(after.scanned, 0, 'the row has left the sweep — this is the escape a poison row needs')
+  assert.equal(after.stillUndelivered, 0)
+  assert.equal(after.exhausted, 0, 'and it is not re-reported every quarter of an hour')
+  assert.deepEqual(activityLog, [])
+})
+
+test('an undeliverable row does not hold the queue against the refusals behind it', async () => {
+  reset()
+  const WC_REFUSAL_BELL_ATTEMPT_LIMIT = await bellAttemptLimit()
+  // Oldest first, so the poison row is at the head of every window. One row per
+  // sweep, which is the shape of a full window: what must not happen is the
+  // newer refusal never being reached at all.
+  parkRefusal({ id: 'poison', orderId: 'so-poison', orderNumber: '5555', createdAt: new Date(1_000) })
+  parkRefusal({ id: 'later', orderId: 'so-later', orderNumber: '6666', createdAt: new Date(2_000) })
+  notifyFailsForOrder = new Set(['5555'])
+
+  for (let attempt = 1; attempt < WC_REFUSAL_BELL_ATTEMPT_LIMIT; attempt++) {
+    const sweep = await runBellRetry({ limit: 1 })
+    assert.equal(sweep.scanned, 1, 'the window is full of the row that cannot be delivered')
+    assert.equal(sweep.delivered, 0)
+  }
+  assert.equal(notifications.length, 0, 'precondition: the later refusal has been starved this whole time')
+
+  const givingUp = await runBellRetry({ limit: 1 })
+  assert.equal(givingUp.exhausted, 1, 'the poison row uses up its budget and leaves the selection')
+
+  const next = await runBellRetry({ limit: 1 })
+  assert.equal(next.scanned, 1)
+  assert.equal(next.delivered, 1, 'and the refusal behind it is finally rung')
+  assert.deepEqual(
+    notifications.map((row) => row.userId),
+    ['admin-1', 'admin-2'],
+    'the bound is what converts "never" into "after three hours"',
+  )
+  assert.equal(payloadOf('later').adminNotified, true)
+  assert.equal(payloadOf('poison').adminNotified, 'exhausted', 'and the poison row still says nobody was told')
+})
+
+test('a reachable admin is rung ONCE, not once per sweep', async () => {
+  reset()
+  // The half of the spam that a bound cannot fix: two admins, one permanently
+  // unreachable, so the row is never complete and the sweep keeps coming back.
+  // Round 4 re-notified the admin who COULD be reached on every one of those
+  // attempts — four bells an hour about one order, at the person already looking
+  // at it.
+  notifyFailsFor = new Set(['admin-2'])
+  fulfillmentResult = { success: false, reason: 'insufficient-stock', error: 'no stock: 3 unit(s) on backorder' }
+  await runCompletion()
+  assert.deepEqual(notifications.map((row) => row.userId), ['admin-1'], 'precondition: one landed, one did not')
+
+  for (let sweep = 0; sweep < 5; sweep++) await runBellRetry()
+
+  assert.deepEqual(
+    notifications.map((row) => row.userId),
+    ['admin-1'],
+    'admin-1 has a row already, so the retry has nothing to tell them',
+  )
+  assert.deepEqual(
+    payloadOf(openRefusals()[0].id as string).adminBellDeliveredTo,
+    ['admin-1'],
+    'and the row remembers WHO, so the retry can target only who is left',
+  )
+
+  // The moment admin-2 becomes reachable, they are told — and admin-1 still is not.
+  notifyFailsFor = new Set()
+  const sweep = await runBellRetry()
+  assert.equal(sweep.delivered, 1)
+  assert.deepEqual(notifications.map((row) => row.userId), ['admin-1', 'admin-2'])
+  assert.equal(belled(), true)
+})
+
+test('a REFUSAL that recurs does not re-ring the admins already told', async () => {
+  reset()
+  notifyFailsFor = new Set(['admin-2'])
+  fulfillmentResult = { success: false, reason: 'insufficient-stock', error: 'no stock: 3 unit(s) on backorder' }
+  await runCompletion()
+  assert.deepEqual(notifications.map((row) => row.userId), ['admin-1'])
+
+  // The daily reconcile finds the same unfulfillable order again. The row is
+  // deleted and re-created, so the delivered set has to survive that or every
+  // reconcile re-bells admin-1 for as long as the order stays unfulfillable.
+  await runCompletion()
+  await runCompletion()
+
+  assert.deepEqual(
+    notifications.map((row) => row.userId),
+    ['admin-1'],
+    'admin-1 was told on the first refusal and is not told again by the next two',
+  )
+  assert.equal(openRefusals().length, 1, 'and it is still one open row')
+})
+
+test('an exhausted bell rings again when the order is refused afresh', async () => {
+  reset()
+  const WC_REFUSAL_BELL_ATTEMPT_LIMIT = await bellAttemptLimit()
+  await refuseWithFailedBell()
+  for (let attempt = 1; attempt < WC_REFUSAL_BELL_ATTEMPT_LIMIT; attempt++) await runBellRetry()
+  assert.equal(payloadOf(openRefusals()[0].id as string).adminNotified, 'exhausted', 'precondition: given up')
+  assert.equal(openRefusals()[0].status, 'QUARANTINED', 'and still parked where an operator will find it')
+
+  // A new refusal is new evidence, and it is also the operator-reachable way
+  // back: nothing about "we stopped ringing" may mean "we decided you knew".
+  notifyFailsFor = new Set()
+  await runCompletion()
+
+  assert.deepEqual(notifications.map((row) => row.userId), ['admin-1', 'admin-2'], 'the bell rings again')
+  assert.equal(belled(), true)
 })
