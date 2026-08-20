@@ -74,6 +74,7 @@ import {
 } from '@/lib/domain/accounting/invoice-payment-capacity'
 import { logFollowUpRevival, resolveLostFollowUpRevival } from '@/lib/domain/accounting/followup-revival'
 import {
+  UNCLAIMED_ATTEMPT_REVISION,
   claimAttemptWhere,
   nextAttemptRevision,
   updateAtAttemptRevision,
@@ -973,7 +974,12 @@ type FollowUpOriginEvidence =
   /** Nothing in hand observed the origin. The row is created carrying no record, and cannot post. */
   | { from: 'unobserved' }
 
-async function enqueueFollowUpSyncLog(
+/**
+ * Exported for unit tests (o3d-e2mz r3): the revival compare-and-swap in here is the one write on a
+ * money-moving path that a whole processor run has to be driven to reach, and the fence on it is
+ * cheaper to pin directly than through a full post-and-follow-up loop.
+ */
+export async function enqueueFollowUpSyncLog(
   type: FollowUpSyncType,
   referenceType: string,
   referenceId: string,
@@ -1017,8 +1023,11 @@ async function enqueueFollowUpSyncLog(
   const failedLogs = liveRowExists ? [] : await db.accountingSyncLog.findMany({
     where: { connector: XERO_CONNECTOR, type, referenceType, referenceId, status: 'FAILED' },
     orderBy: { createdAt: 'desc' },
-    select: { id: true, payload: true },
+    // o3d-e2mz r3: the attempt each candidate row is AT when it was read. Reviving one is a write to
+    // that attempt and must be fenced on it — see the compare-and-swap below.
+    select: { id: true, payload: true, attemptRevision: true },
   })
+  const failedAttemptRevisions = new Map(failedLogs.map((row) => [row.id, row.attemptRevision]))
   const failedRows = failedLogs.map((row) => ({
     id: row.id,
     payload: row.payload,
@@ -1047,20 +1056,65 @@ async function enqueueFollowUpSyncLog(
     })
     return
   }
+  // o3d-e2mz r3: A REVIVAL IS A WRITE TO AN ATTEMPT, AND WAS THE LAST UNFENCED ONE.
+  //
+  // The compare-and-swap below used to key on `(id, status: 'FAILED')`. That is exactly the ABA the
+  // manual retry path was fenced to close, and this automatic path was left with it: status is not
+  // an identity, and a row leaves FAILED and comes back to it every time it is retried. Between the
+  // read above and this write, the row can be revived by another run, claimed by a worker, posted or
+  // failed, and land back on FAILED as a DIFFERENT attempt — which the status CAS matches. It would
+  // then reset that attempt's outcome to PENDING and, worse, overwrite its `payload`, which is where
+  // the pinned idempotency token lives; the row would go out under a token chosen for the attempt we
+  // read, not the one that actually ran. Fencing on `attemptRevision` makes the write land on the
+  // attempt it was planned against or on nothing at all, and ADVANCES it so a worker still holding
+  // the old attempt finds out rather than writing over the revival.
+  //
+  // A candidate at revision 0 carries no attempt to name, so this REFUSES rather than reviving it
+  // unfenced — the same rule the operator path applies, and the same one that keeps revision 0 from
+  // being forged into 1. That is the pre-fence legacy shape (and any connector whose processor does
+  // not stamp an attempt); it fails closed, visibly, instead of risking a duplicate money movement.
+  const reuseAttempt: AttemptRef | null = plan.action === 'reuse'
+    ? { id: plan.syncLogId, attemptRevision: failedAttemptRevisions.get(plan.syncLogId) ?? UNCLAIMED_ATTEMPT_REVISION }
+    : null
+  if (reuseAttempt && reuseAttempt.attemptRevision === UNCLAIMED_ATTEMPT_REVISION) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_followup_enqueue_refused',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Refused to re-enqueue Xero ${type} for ${referenceType} ${referenceId}: the FAILED row it would `
+        + `revive (${reuseAttempt.id}) carries no attempt revision, so the revival cannot be tied to the attempt it `
+        + 'was planned against and could land on a later one. Retry the row from the sync log once it has been '
+        + 'claimed under the attempt fence.',
+      metadata: {
+        type,
+        referenceType,
+        referenceId,
+        syncLogId: reuseAttempt.id,
+        reason: 'unfenced_reuse_target',
+        failedRowIds: failedRows.map((row) => row.id),
+      },
+    })
+    return
+  }
+
   try {
     const outcome = await db.$transaction(async (tx) => {
       if (plan.action === 'reuse') {
-        // Fenced on status: if another run revived the same row first — or retention
-        // deleted it between the read and here (o3d-nepa) — this updates nothing rather
-        // than resetting a claim it does not own.
+        if (!reuseAttempt) throw new Error(`Xero follow-up revival for ${plan.syncLogId} reached its write with no attempt to fence on`)
+        // Fenced on the ATTEMPT, not on the status: if another run revived the same row first, a
+        // worker claimed it, or retention deleted it between the read and here (o3d-nepa), this
+        // updates nothing rather than resetting an attempt it does not own. The bump is what stops
+        // the previous attempt's holder writing back over the revival.
         const revived = await tx.accountingSyncLog.updateMany({
-          where: { id: plan.syncLogId, status: 'FAILED' },
+          where: { id: reuseAttempt.id, status: 'FAILED', attemptRevision: reuseAttempt.attemptRevision },
           data: {
             status: 'PENDING',
             payload: plan.payload as never,
             retryCount: 0,
             errorMessage: null,
             processingStartedAt: null,
+            attemptRevision: nextAttemptRevision(reuseAttempt.attemptRevision),
           },
         })
         if (revived.count === 0) return 'cas-lost' as const

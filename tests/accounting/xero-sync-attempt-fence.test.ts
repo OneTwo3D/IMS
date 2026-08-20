@@ -164,9 +164,11 @@ test('a SECOND fence loss does not discard the id of a document that is known to
   assert.equal(escalation?.metadata?.evidence, 'RECORDED')
 })
 
-test('a document whose row has vanished is reported as the log being the only record of it', async () => {
-  // The one case where the id genuinely cannot be recorded anywhere durable. The operator must be told
-  // that plainly rather than reading an escalation that implies something downstream will catch it.
+test('a document whose row has vanished is reported as unrecordable, without claiming to be its only record', async () => {
+  // The one case where the id genuinely cannot be recorded on the row. o3d-e2mz r3: what the failed
+  // write establishes is that NOTHING KEYED ON THE ROW can see the document — not that this log entry
+  // is the only record of it anywhere, which it cannot know (an earlier attempt may have left a
+  // mirrored event or a back-reference).
   reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
   interleave = () => {
     Object.assign(store.get('log-1')!, { status: 'CANCELLED', attemptRevision: 5, externalTransactionId: null })
@@ -178,7 +180,12 @@ test('a document whose row has vanished is reported as the log being the only re
   const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
   assert.equal(escalation?.level, 'ERROR')
   assert.equal(escalation?.metadata?.evidence, 'ROW_MISSING')
-  assert.match(escalation?.description ?? '', /ONLY record/)
+  assert.match(escalation?.description ?? '', /nothing keyed on that row will see this document/)
+  assert.doesNotMatch(
+    escalation?.description ?? '',
+    /ONLY record/,
+    'the write establishes what the row can show, never what other records exist',
+  )
   assert.match(escalation?.description ?? '', /XERO-1/)
 })
 
@@ -199,9 +206,67 @@ test('a settled row that already names a document is left exactly as the decisio
   assert.equal(store.get('log-1')?.attemptRevision, 5)
   const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
   assert.equal(escalation?.metadata?.evidence, 'ALREADY_NAMED')
-  // The id we posted exists only in this entry, and the operator is told to check BOTH.
+  // The ids genuinely differ, so the operator is told to check BOTH.
   assert.match(escalation?.description ?? '', /DIFFERENT document/)
   assert.match(escalation?.description ?? '', /XERO-1/)
+})
+
+test('o3d-e2mz r3: a row that already names THE SAME document is not reported as a second document', async () => {
+  // Round 2 returned ALREADY_NAMED for every miss on a surviving row — "a DIFFERENT document ...
+  // check the accounting system for BOTH ids" — without ever reading which document the row names.
+  // The ordinary case is that it names the one we just posted (a replay, or a writeback that landed
+  // after all), and that reading sent an operator hunting for an invoice that does not exist.
+  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
+  interleave = () => {
+    Object.assign(store.get('log-1')!, {
+      status: 'SYNCED',
+      attemptRevision: 5,
+      // The SAME document this attempt posted.
+      externalTransactionId: 'XERO-1',
+      errorMessage: 'Recorded by another attempt',
+    })
+  }
+
+  await (await loadProcessor())()
+
+  assert.equal(store.get('log-1')?.externalTransactionId, 'XERO-1')
+  assert.equal(store.get('log-1')?.attemptRevision, 5, 'nothing was written, so nothing advanced the attempt')
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'ALREADY_RECORDED')
+  assert.match(escalation?.description ?? '', /THIS SAME document/)
+  assert.match(escalation?.description ?? '', /no second document is implied/)
+  assert.doesNotMatch(
+    escalation?.description ?? '',
+    /DIFFERENT document/,
+    'the ids match, so nothing may claim they do not',
+  )
+})
+
+test('o3d-e2mz r3: RECORDED does not promise a delete guard that may not apply to this entry', async () => {
+  // The note claimed "the order cannot be deleted while it exists". The delete guard keys on
+  // externalTransactionId for entries keyed to a SalesOrder or a Shipment; this row is a COGS_JOURNAL
+  // keyed to a CogsEntry, which the guard never looks at.
+  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
+  interleave = () => {
+    Object.assign(store.get('log-1')!, {
+      status: 'CANCELLED',
+      attemptRevision: 5,
+      externalTransactionId: null,
+      errorMessage: 'Operator verified: never posted',
+    })
+  }
+
+  await (await loadProcessor())()
+
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'RECORDED')
+  assert.match(escalation?.description ?? '', /now recorded on the sync row/)
+  assert.match(
+    escalation?.description ?? '',
+    /where this entry is keyed to a sales order or shipment/,
+    'the guard is stated as conditional on the reference, because that is what it is',
+  )
+  assert.doesNotMatch(escalation?.description ?? '', /the order cannot be deleted/)
 })
 
 test('a stale PROCESSING claim is reclaimed onto a new attempt, so the old holder cannot write', async () => {
@@ -268,4 +333,36 @@ test('a follow-up failure from an attempt that was settled mid-flight does not r
   assert.equal(settledStore.get('log-1')?.retryCount, 2)
   // The caller's outbox decision must still be driven by what is PERSISTED, not by the stale view.
   assert.equal(outcome.finalFailure, false)
+})
+
+test('o3d-e2mz r3: a lost evidence write on a row still naming NO document is reported as not recorded', async () => {
+  // The third thing a missed evidence write can mean, and the one r2 could not say. Its predicate is
+  // "the row names no document"; r2 read a miss on a surviving row as proof that the row now names
+  // one, and reported a DIFFERENT document. If the row still names none, neither reading is true —
+  // something moved it in between, and the id was simply not recorded.
+  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
+  interleave = () => {
+    Object.assign(store.get('log-1')!, {
+      status: 'CANCELLED',
+      attemptRevision: 5,
+      externalTransactionId: null,
+      errorMessage: 'Operator verified: never posted',
+    })
+  }
+  // Only the evidence write is made to match nothing — it is the one keyed on "names no document".
+  const inner = store.delegate.updateMany as (args: never) => Promise<unknown>
+  store.delegate.updateMany = (async (args: { where?: Record<string, unknown> }) => {
+    if (args?.where && args.where.externalTransactionId === null) return { count: 0 }
+    return inner(args as never)
+  }) as never
+
+  await (await loadProcessor())()
+
+  const row = store.get('log-1')
+  assert.equal(row?.externalTransactionId, null, 'nothing was recorded, and the report must say only that')
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.equal(escalation?.metadata?.evidence, 'NOT_RECORDED')
+  assert.match(escalation?.description ?? '', /was NOT recorded on it/)
+  assert.doesNotMatch(escalation?.description ?? '', /DIFFERENT document/)
+  assert.match(escalation?.description ?? '', /XERO-1/)
 })

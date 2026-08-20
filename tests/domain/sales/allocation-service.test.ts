@@ -746,6 +746,11 @@ function createClient(state: MemoryState): AllocationServiceClient {
     // in flight" is what every pre-existing cancellation test assumes. The dedicated refusal tests
     // live in tests/accounting/cancel-invoice-posting-intent.test.ts against a where-honouring store.
     accountingSyncLog: {
+      // o3d-e2mz r3: the sweep decides and retires in ONE `updateManyAndReturn`, then bumps the fence
+      // on the ids that statement returned. Nothing here is retirable, so it is empty. This branch's
+      // own `findFirst` is deliberately NOT re-added beside it — development's dispatching one below
+      // answers the same probe better, and a second key in this literal would silently shadow it.
+      updateManyAndReturn: async () => [],
       updateMany: async () => ({ count: 0 }),
       // o3d-0i5y r10 + o3d-7o0: ONE `findFirst` serves two different probes here, so it dispatches
       // on WHAT WAS ASKED FOR rather than answering both with the same fixture.

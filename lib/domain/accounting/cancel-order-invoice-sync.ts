@@ -157,19 +157,45 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
   // fence. Bumping it means the worker's writeback finds nothing and reports it, and a worker that had
   // already posted escalates with the external id instead of quietly re-opening a cancelled sale.
   //
-  // Two statements, because revision 0 must STAY 0. Zero means "nothing that stamps an attempt has ever
-  // claimed this row", and every decision naming a revision is refused on such a row. Bumping an
-  // unfenced row to 1 would forge an attempt that never existed and let a later decision believe it was
-  // fenced. An unfenced row is retired on its remaining guards alone (status, and no external id) —
-  // exactly what it got before the fence existed, no better and no worse.
-  const fencedRetirement = await tx.accountingSyncLog.updateMany({
-    where: { ...retirable, attemptRevision: { not: UNCLAIMED_ATTEMPT_REVISION } },
-    data: { ...retirement, attemptRevision: { increment: 1 } },
-  })
-  const unfencedRetirement = await tx.accountingSyncLog.updateMany({
-    where: { ...retirable, attemptRevision: UNCLAIMED_ATTEMPT_REVISION },
+  // Revision 0 must nevertheless STAY 0: zero means "nothing that stamps an attempt has ever claimed
+  // this row", every decision naming a revision is refused on such a row, and bumping one to 1 would
+  // forge an attempt that never existed and let a later decision believe it was fenced.
+  //
+  // r3 — WHICH ROWS ARE RETIRED IS DECIDED BY ONE STATEMENT, NOT TWO. Round 2 got the "0 stays 0" rule
+  // by splitting this into two updateManys partitioned on `attemptRevision`: the fenced set (retire and
+  // advance) and the unfenced set (retire, no bump). That partition is not stable under concurrency. A
+  // sync log is created at revision 0 and only reaches 1 when a processor CLAIMS it — so the ORDINARY
+  // case here, a PENDING invoice nobody has picked up, sits in the unfenced half until the moment a
+  // worker takes it. A claim landing between the two statements carried the row across the boundary:
+  // the fenced statement had already passed it by at revision 0, and the unfenced statement no longer
+  // matched it at revision 1. The row escaped cancellation entirely, the sweep counted nothing, the
+  // worker's fence was intact, and it posted an ACCREC invoice for a cancelled order — the silent
+  // collision this branch exists to make detectable, back again inside the fence.
+  //
+  // Retiring in ONE statement puts the sweep and the claim in contention for the same row lock, so
+  // exactly one of them wins: either this transaction retires the row and the claim's compare-and-swap
+  // then matches nothing, or the claim gets there first and leaves a FRESH PROCESSING row the sweep
+  // deliberately does not touch (retireSalesInvoiceForCancelledOrder is the post-time backstop for
+  // that, and for anything enqueued after this sweep ran).
+  //
+  // `updateManyAndReturn` is what lets the fence bump stay a separate statement without reopening the
+  // race: it names the rows this statement actually retired, and this transaction now holds their locks,
+  // so nothing can move them before the bump lands. The bump is scoped to those ids and to the ones
+  // that carry a fence, which is read from the returned rows rather than from a prior read.
+  const retired = await tx.accountingSyncLog.updateManyAndReturn({
+    where: retirable,
     data: retirement,
+    select: { id: true, attemptRevision: true },
   })
+  const fencedIds = retired
+    .filter((row) => row.attemptRevision !== UNCLAIMED_ATTEMPT_REVISION)
+    .map((row) => row.id)
+  if (fencedIds.length > 0) {
+    await tx.accountingSyncLog.updateMany({
+      where: { id: { in: fencedIds } },
+      data: { attemptRevision: { increment: 1 } },
+    })
+  }
 
   // Terminalise the mirrored events too, or a dangling PENDING mirror reads as work still owed.
   await voidMirroredAccountingEventsForOrder(tx, {
@@ -179,7 +205,7 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
     reason,
   })
 
-  return fencedRetirement.count + unfencedRetirement.count
+  return retired.length
 }
 
 /**

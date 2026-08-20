@@ -38,11 +38,12 @@ type Call = { where?: unknown; data?: unknown }
 function mockTx(pendingEventIds: string[], livePostingClaim: unknown = null) {
   const calls: {
     syncFindFirst: Call[]
+    syncRetire: Call[]
     syncUpdateMany: Call[]
     eventFindMany: Call[]
     eventUpdateMany: Call[]
     eventLogCreateMany: Call[]
-  } = { syncFindFirst: [], syncUpdateMany: [], eventFindMany: [], eventUpdateMany: [], eventLogCreateMany: [] }
+  } = { syncFindFirst: [], syncRetire: [], syncUpdateMany: [], eventFindMany: [], eventUpdateMany: [], eventLogCreateMany: [] }
 
   const tx = {
     accountingSyncLog: {
@@ -53,6 +54,11 @@ function mockTx(pendingEventIds: string[], livePostingClaim: unknown = null) {
       findFirst: async (args: Call) => {
         calls.syncFindFirst.push(args)
         return livePostingClaim
+      },
+      // o3d-e2mz r3: the retirement is ONE statement that also names the rows it retired.
+      updateManyAndReturn: async (args: Call) => {
+        calls.syncRetire.push(args)
+        return [{ id: 'synclog-1', attemptRevision: 2 }]
       },
       updateMany: async (args: Call) => {
         calls.syncUpdateMany.push(args)
@@ -90,16 +96,25 @@ test('cancelPendingSalesInvoiceSyncForOrder cancels the sync log with the CANCEL
   const { tx, calls } = mockTx(['event-1'])
   await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
 
-  // Two statements, one per fence class (o3d-e2mz): fenced rows advance the attempt, unfenced rows stay
-  // at revision 0. Both carry the same retirement.
-  assert.equal(calls.syncUpdateMany.length, 2)
-  const where = calls.syncUpdateMany[0].where as {
+  // o3d-e2mz r3: ONE statement decides and retires, whatever fence class each row is in — the fence
+  // bump that follows is scoped to the ids that statement returned, not to a second predicate.
+  assert.equal(calls.syncRetire.length, 1)
+  const where = calls.syncRetire[0].where as {
     referenceId: string
     type: { in: string[] }
     externalTransactionId: unknown
     OR: Array<{ status: string; processingStartedAt?: unknown }>
   }
-  const data = calls.syncUpdateMany[0].data as { status: string; processingStartedAt: unknown }
+  const data = calls.syncRetire[0].data as { status: string; processingStartedAt: unknown; attemptRevision?: unknown }
+  assert.equal(
+    data.attemptRevision,
+    undefined,
+    'the retiring statement must not carry a blanket bump — that would forge an attempt on an unfenced row',
+  )
+  // The bump names the fenced rows the retirement returned, and nothing else.
+  assert.equal(calls.syncUpdateMany.length, 1)
+  assert.deepEqual(calls.syncUpdateMany[0].where, { id: { in: ['synclog-1'] } })
+  assert.deepEqual(calls.syncUpdateMany[0].data, { attemptRevision: { increment: 1 } })
 
   // CANCELLED (not FAILED) so reconciliation/backfill sweeps ignore it.
   assert.equal(data.status, 'CANCELLED')
@@ -115,13 +130,10 @@ test('cancelPendingSalesInvoiceSyncForOrder targets PENDING/FAILED and stale-PRO
   const { tx, calls } = mockTx([])
   await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
 
-  // Both statements share the same retirable set; the only difference is the fence class.
-  for (const call of calls.syncUpdateMany) {
-    const shared = call.where as { referenceId: string; externalTransactionId: unknown }
-    assert.equal(shared.referenceId, 'order-1')
-    assert.equal(shared.externalTransactionId, null)
-  }
-  const or = (calls.syncUpdateMany[0].where as { OR: Array<{ status: string; processingStartedAt?: { lt?: Date } | null }> }).OR
+  const shared = calls.syncRetire[0].where as { referenceId: string; externalTransactionId: unknown }
+  assert.equal(shared.referenceId, 'order-1')
+  assert.equal(shared.externalTransactionId, null)
+  const or = (calls.syncRetire[0].where as { OR: Array<{ status: string; processingStartedAt?: { lt?: Date } | null }> }).OR
   // PENDING and FAILED (both would otherwise still post — a drain or a "Retry All"), plus PROCESSING
   // with a null/stale claim. A freshly-claimed (recent processingStartedAt) row is deliberately NOT
   // matched, so an in-flight post is left to finish; SYNCED rows are already posted and out of scope.
@@ -156,7 +168,7 @@ test('cancelPendingSalesInvoiceSyncForOrder writes no mirror updates when there 
   await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
 
   // The sync log is still cancelled, but nothing touches the mirror when there is nothing un-posted.
-  assert.equal(calls.syncUpdateMany.length, 2)
+  assert.equal(calls.syncRetire.length, 1)
   assert.equal(calls.eventUpdateMany.length, 0)
   assert.equal(calls.eventLogCreateMany.length, 0)
 })
@@ -339,7 +351,11 @@ test('cancelPendingSalesInvoiceSyncForOrder does not clobber an event a worker p
   const eventLogCreateMany: unknown[] = []
   const tx = {
     // o3d-7o0: findFirst is the posting-intent probe; nothing is in flight in this scenario.
-    accountingSyncLog: { findFirst: async () => null, updateMany: async () => ({ count: 1 }) },
+    accountingSyncLog: {
+      findFirst: async () => null,
+      updateManyAndReturn: async () => [{ id: 'synclog-1', attemptRevision: 0 }],
+      updateMany: async () => ({ count: 1 }),
+    },
     accountingEvent: {
       findMany: async ({ where }: { where: { status?: unknown } }) => {
         const status = (where as { status?: { in?: string[] } | string }).status
@@ -366,3 +382,90 @@ test('cancelPendingSalesInvoiceSyncForOrder does not clobber an event a worker p
   assert.equal(eventLogCreateMany.length, 0)
 })
 
+/**
+ * o3d-e2mz r3 (Codex r2 finding 1) — A CLAIM MUST NOT BE ABLE TO SLIP THROUGH THE SWEEP.
+ *
+ * Round 2 split the retirement into two statements partitioned on `attemptRevision`: the fenced set
+ * (retire and advance) and the unfenced set (retire, no bump). A sync log is CREATED at revision 0
+ * and only reaches 1 when a processor claims it — so the ordinary case here, a PENDING invoice
+ * nobody has picked up yet, is in the unfenced half. A claim landing between the two statements
+ * carried the row across the partition: the fenced statement had already passed it by at revision 0,
+ * and the unfenced statement no longer matched it at revision 1. The row was never cancelled, the
+ * sweep counted nothing, and the worker's fence was intact — a silent escape, in the branch built to
+ * make exactly this collision detectable.
+ *
+ * The wrapper below fires a real processor-shaped claim (a compare-and-swap on the revision it read)
+ * after the sweep's FIRST write to accountingSyncLog, which is where that window was.
+ */
+function txWithClaimAfterFirstWrite(store: SyncLogStore, rowId: string) {
+  const claims: boolean[] = []
+  let fired = false
+  const claimOnce = async () => {
+    if (fired) return
+    fired = true
+    const claimed = await (store.delegate.updateMany as (args: unknown) => Promise<{ count: number }>)({
+      // Exactly the claim `accountingSyncLogClaimWhere` builds: the row, at the revision that was
+      // read, in a claimable status.
+      where: { id: rowId, attemptRevision: 0, OR: [{ status: 'PENDING' }, { status: 'PROCESSING' }] },
+      data: { status: 'PROCESSING', processingStartedAt: new Date(), attemptRevision: { increment: 1 } },
+    })
+    claims.push(claimed.count > 0)
+  }
+
+  const wrapped = new Proxy({}, {
+    get: (_target, prop: string) => async (args: never) => {
+      const result = await (store.delegate[prop] as (a: never) => Promise<unknown>)(args)
+      if (prop === 'updateMany' || prop === 'updateManyAndReturn') await claimOnce()
+      return result
+    },
+  })
+
+  const tx = {
+    accountingSyncLog: wrapped,
+    accountingEvent: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
+    accountingEventLog: { createMany: async () => ({ count: 0 }) },
+  }
+  return { tx: tx as never, claims }
+}
+
+test('a claim landing mid-sweep cannot carry an unclaimed row out of the sweep (o3d-e2mz r3)', async () => {
+  const store = createSyncLogStore([syncLogRow({
+    ...CLAIMED_ROW,
+    id: 'synclog-fresh',
+    status: 'PENDING',
+    attemptRevision: 0,
+  })])
+  const { tx, claims } = txWithClaimAfterFirstWrite(store, 'synclog-fresh')
+
+  const retired = await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
+
+  assert.equal(retired, 1, 'the sweep must account for the row it retired')
+  assert.equal(store.get('synclog-fresh')?.status, 'CANCELLED', 'the row must not escape cancellation')
+  assert.deepEqual(claims, [false], 'the claim must lose: one statement decided this row, and it decided CANCELLED')
+  assert.equal(
+    store.get('synclog-fresh')?.attemptRevision,
+    0,
+    'and the row it never claimed must still be at revision 0 — no forged attempt',
+  )
+})
+
+test('a fenced row swept alongside an unfenced one advances only its own attempt (o3d-e2mz r3)', async () => {
+  // Both fence classes retired by the SAME statement, and only the fenced one bumped — the property
+  // the two-statement split existed to get, without the window it opened.
+  const store = createSyncLogStore([
+    syncLogRow({ ...CLAIMED_ROW, id: 'unfenced-1', status: 'PENDING', attemptRevision: 0 }),
+    syncLogRow({ ...CLAIMED_ROW, id: 'fenced-1', status: 'FAILED', attemptRevision: 7 }),
+  ])
+  const { tx } = storeTx(store)
+
+  const retired = await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
+
+  assert.equal(retired, 2)
+  assert.equal(store.get('unfenced-1')?.status, 'CANCELLED')
+  assert.equal(store.get('unfenced-1')?.attemptRevision, 0)
+  assert.equal(store.get('fenced-1')?.status, 'CANCELLED')
+  assert.equal(store.get('fenced-1')?.attemptRevision, 8)
+  // The bump statement names ids, so it can never reach a row this sweep did not retire.
+  const bump = store.updateManyWheres.at(-1) as { id?: { in?: string[] } }
+  assert.deepEqual(bump.id?.in, ['fenced-1'])
+})

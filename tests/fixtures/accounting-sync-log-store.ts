@@ -103,9 +103,20 @@ export function matchesWhere(row: SyncLogRow, where: Record<string, unknown> | u
  */
 function applyData(row: SyncLogRow, data: Record<string, unknown>): void {
   for (const [key, value] of Object.entries(data)) {
-    if (value && typeof value === 'object' && !(value instanceof Date) && !Array.isArray(value)) {
+    const current = (row as unknown as Record<string, unknown>)[key]
+    // An object is an ATOMIC OPERATION only on a numeric column, or when it is an explicit `{ set }`.
+    // `payload` is a Json column, so an object written there is the VALUE — treating it as an
+    // operation spec is what a naive stub does, and it would make a revival that rewrites the pinned
+    // idempotency token look like an unsupported operation rather than the write it is.
+    const isOperation = value !== null
+      && typeof value === 'object'
+      && !(value instanceof Date)
+      && !Array.isArray(value)
+      && ('set' in (value as Record<string, unknown>)
+        || (typeof current === 'number'
+          && ('increment' in (value as Record<string, unknown>) || 'decrement' in (value as Record<string, unknown>))))
+    if (isOperation) {
       const spec = value as Record<string, unknown>
-      const current = (row as unknown as Record<string, unknown>)[key]
       if ('increment' in spec) {
         ;(row as unknown as Record<string, unknown>)[key] = (current as number) + (spec.increment as number)
         continue
@@ -114,11 +125,12 @@ function applyData(row: SyncLogRow, data: Record<string, unknown>): void {
         ;(row as unknown as Record<string, unknown>)[key] = (current as number) - (spec.decrement as number)
         continue
       }
-      if ('set' in spec) {
-        ;(row as unknown as Record<string, unknown>)[key] = spec.set
-        continue
-      }
-      throw new Error(`accounting-sync-log-store: unsupported update operation on ${key}`)
+      ;(row as unknown as Record<string, unknown>)[key] = spec.set
+      continue
+    }
+    if (value !== null && typeof value === 'object' && !(value instanceof Date) && !Array.isArray(value)
+      && ('increment' in (value as Record<string, unknown>) || 'decrement' in (value as Record<string, unknown>))) {
+      throw new Error(`accounting-sync-log-store: atomic operation on non-numeric column ${key}`)
     }
     ;(row as unknown as Record<string, unknown>)[key] = value
   }
@@ -166,6 +178,22 @@ export function createSyncLogStore(initial: SyncLogRow[] = []): SyncLogStore {
         count += 1
       }
       return { count }
+    },
+    /**
+     * o3d-e2mz r3: the cancel sweep decides and retires in ONE statement and then names the rows it
+     * retired, so the fence bump can be scoped to exactly those without reopening the race. This
+     * returns the rows AS UPDATED, which is what Prisma returns and what the caller reads the
+     * attempt revision from — returning the pre-update rows would make an unfenced row look fenced.
+     */
+    updateManyAndReturn: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
+      updateManyWheres.push(where)
+      const updated: SyncLogRow[] = []
+      for (const row of rows) {
+        if (!matchesWhere(row, where)) continue
+        applyData(row, data)
+        updated.push({ ...row })
+      }
+      return updated
     },
     update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
       const row = rows.find((candidate) => candidate.id === where.id)
