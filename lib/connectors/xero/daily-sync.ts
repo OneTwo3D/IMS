@@ -34,6 +34,7 @@ import {
   reduceSnapshotByQty,
   sumCostLayerSnapshot,
   takeFromSnapshotEntries,
+  unaccountedAllocationQty,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -166,6 +167,85 @@ async function buildLayerSnapshot(
   }
 
   return snapshot
+}
+
+export type A2AllocationRow = {
+  id: string
+  lineId: string
+  productId: string
+  warehouseId: string
+  qty: Prisma.Decimal | number
+  costLayerSnapshot: Prisma.JsonValue | null
+}
+
+export type A2ShipmentRow<TLine> = {
+  warehouseId: string
+  shipmentJournalDate: Date | null
+  lines: TLine[]
+}
+
+/**
+ * WHAT GROUP A2 STILL OWES AN ORDER, ROW BY ROW (o3d-0i5y r5).
+ *
+ * A2 used to answer that per ORDER: has this order been stamped? On a first pass that is the same
+ * question, and while a first pass was the only pass it was harmless. It stopped being the only pass
+ * when the journal-safe allocation change let an order that has ALREADY been stamped and part-
+ * journaled come back holding MORE allocated quantity than it did then. Per order, the answer for
+ * such an order is either "all of it" — re-posting a shipped value the ledger already holds and
+ * overwriting the snapshots a journal was posted against — or "none of it", which is what r4 chose
+ * and is why the residual never reached the ledger at all. Group B still CREDITS Allocated Inventory
+ * when that residual ships, against a debit nothing ever made.
+ *
+ * Two disjoint things can be owed, and they are SUMMED rather than chosen between:
+ *
+ *   unjournaledShipments        shipped but not yet journaled, valued from their own line snapshots
+ *                               because dispatch has already consumed the layers. A journaled
+ *                               shipment is excluded: Group B refuses to journal an unstamped order,
+ *                               so a journal date is proof A2 already posted that cost.
+ *   outstandingByAllocation     allocated quantity nothing has reclassified, to be valued by pinning
+ *                               FIFO layers — but only the outstanding PART of each row, per
+ *                               {@link unaccountedAllocationQty}.
+ *
+ * `stampEmptyAllocationIds` are rows that owe nothing and have never been stamped; they keep the
+ * pre-existing empty-snapshot stamp, since their value came through the shipment. Rows that already
+ * carry a snapshot appear in NEITHER list and must be left completely alone — that snapshot is the
+ * posted evidence Group B and the refund reversal resolve their cost basis through.
+ */
+export function planA2Reclassification<TLine extends { lineId: string; productId: string | null; qty: Prisma.Decimal | number }, TShipment extends A2ShipmentRow<TLine>>(order: {
+  allocations: A2AllocationRow[]
+  shipments: TShipment[]
+}): {
+  unjournaledShipments: TShipment[]
+  outstandingByAllocation: Map<string, Decimal>
+  stampEmptyAllocationIds: string[]
+} {
+  const scopeKey = (lineId: string, warehouseId: string, productId: string) => `${lineId}|${warehouseId}|${productId}`
+  const shippedQtyByScope = new Map<string, Decimal>()
+  for (const shipment of order.shipments) {
+    for (const line of shipment.lines) {
+      if (!line.productId) continue
+      const key = scopeKey(line.lineId, shipment.warehouseId, line.productId)
+      shippedQtyByScope.set(key, (shippedQtyByScope.get(key) ?? toDecimal(0)).add(toDecimal(line.qty)))
+    }
+  }
+
+  const outstandingByAllocation = new Map<string, Decimal>()
+  const stampEmptyAllocationIds: string[] = []
+  for (const alloc of order.allocations) {
+    const outstanding = unaccountedAllocationQty({
+      allocatedQty: alloc.qty,
+      snapshot: parseCostLayerSnapshot(alloc.costLayerSnapshot),
+      shippedQty: shippedQtyByScope.get(scopeKey(alloc.lineId, alloc.warehouseId, alloc.productId)) ?? 0,
+    })
+    if (outstanding.gt(0)) outstandingByAllocation.set(alloc.id, outstanding)
+    else if (alloc.costLayerSnapshot === null) stampEmptyAllocationIds.push(alloc.id)
+  }
+
+  return {
+    unjournaledShipments: order.shipments.filter((shipment) => !shipment.shipmentJournalDate),
+    outstandingByAllocation,
+    stampEmptyAllocationIds,
+  }
 }
 
 function requireShipmentSnapshotValue(order: {
@@ -856,9 +936,13 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         allocations: {
           select: {
             id: true,
+            lineId: true,
             productId: true,
             warehouseId: true,
             qty: true,
+            // o3d-0i5y r5: what THIS row has already had reclassified. Without it A2 can only ask an
+            // order-level question, and the residual added to a part-journaled order is invisible.
+            costLayerSnapshot: true,
           },
         },
         shipments: {
@@ -866,9 +950,16 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           select: {
             id: true,
             status: true,
+            warehouseId: true,
+            // A shipment Group B has already journaled had its cost reclassified by the A2 run that
+            // stamped this order the first time — B refuses to journal an unstamped order — so its
+            // value must NOT be posted again when the order comes back for its residual.
+            shipmentJournalDate: true,
             lines: {
               select: {
                 id: true,
+                lineId: true,
+                productId: true,
                 qty: true,
                 costLayerSnapshot: true,
               },
@@ -889,37 +980,48 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
       await db.$transaction(async (tx) => {
         let totalAllocatedValue = toDecimal(0)
-        const unshippedOrders = orders.filter((order) => order.shipments.length === 0)
+        const plans = new Map(orders.map((order) => [order.id, planA2Reclassification(order)]))
+
         const snapshot = await buildLayerSnapshot(
           tx,
-          unshippedOrders.flatMap((order) =>
-            order.allocations.map((alloc) => ({
-              productId: alloc.productId,
-              warehouseId: alloc.warehouseId,
-            })),
-          ),
+          orders.flatMap((order) => {
+            const plan = plans.get(order.id)!
+            return order.allocations
+              .filter((alloc) => plan.outstandingByAllocation.has(alloc.id))
+              .map((alloc) => ({
+                productId: alloc.productId,
+                warehouseId: alloc.warehouseId,
+              }))
+          }),
         )
         const orderValues = new Map<string, number>()
         const allocationSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
 
         for (const order of orders) {
-          let orderCostValue = toDecimal(0)
+          const plan = plans.get(order.id)!
+          let orderCostValue = plan.unjournaledShipments.length > 0
+            ? requireShipmentSnapshotValue({ ...order, shipments: plan.unjournaledShipments })
+            : toDecimal(0)
 
-          if (order.shipments.length > 0) {
-            orderCostValue = requireShipmentSnapshotValue(order)
-          } else {
-            for (const alloc of order.allocations) {
-              const allocationSnapshot = consumeSnapshotLayers(
-                snapshot,
-                alloc.productId,
-                alloc.warehouseId,
-                Number(alloc.qty),
-              )
-              allocationSnapshots.set(alloc.id, allocationSnapshot)
-              orderCostValue = addMoney(orderCostValue, sumCostLayerSnapshot(allocationSnapshot))
-            }
-            orderCostValue = roundQuantity(orderCostValue, 2)
+          // Rows that have never been reclassified at all but owe nothing are still STAMPED with an
+          // empty snapshot, exactly as before — their cost came from the shipment snapshots above.
+          for (const allocationId of plan.stampEmptyAllocationIds) allocationSnapshots.set(allocationId, [])
+
+          for (const alloc of order.allocations) {
+            const outstanding = plan.outstandingByAllocation.get(alloc.id)
+            if (!outstanding) continue
+            const consumed = consumeSnapshotLayers(
+              snapshot,
+              alloc.productId,
+              alloc.warehouseId,
+              outstanding.toNumber(),
+            )
+            // APPENDED, not replaced, so `snapshotQty` keeps naming everything ever posted against
+            // this row — which is what makes the next pass's outstanding calculation right.
+            allocationSnapshots.set(alloc.id, [...parseCostLayerSnapshot(alloc.costLayerSnapshot), ...consumed])
+            orderCostValue = addMoney(orderCostValue, sumCostLayerSnapshot(consumed))
           }
+          orderCostValue = roundQuantity(orderCostValue, 2)
 
           totalAllocatedValue = addMoney(totalAllocatedValue, orderCostValue)
           orderValues.set(order.id, orderCostValue.toNumber())
@@ -956,18 +1058,30 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
         for (const order of orders) {
           for (const alloc of order.allocations) {
-            const allocationSnapshot = allocationSnapshots.get(alloc.id) ?? []
+            const next = allocationSnapshots.get(alloc.id)
+            // `undefined` means "this row was already accounted and is not being changed". It is NOT
+            // the same as `[]`, which is a deliberate stamp; writing `?? []` here would erase the
+            // pinned layers of every row a previous pass posted (o3d-0i5y r5).
+            if (!next) continue
+            const priorPosted = parseCostLayerSnapshot(alloc.costLayerSnapshot)
             await tx.orderAllocation.update({
               where: { id: alloc.id },
               data: {
-                costLayerSnapshot: allocationSnapshot as never,
+                costLayerSnapshot: next as never,
                 // o3d-o97 r3: the pounds this row contributed to the DR above, pinned beside the
                 // layers it was pinned from. Revaluation rewrites those layers' unitCostBase in
                 // the snapshot; it never posts to Allocated Inventory, so this figure is what a
                 // refund of part of this row has to reverse at.
+                //
+                // o3d-0i5y r5 (rebase): `next` is the APPENDED snapshot, so this is the total ever
+                // posted against the row rather than one pass's share — which is the figure a
+                // partial refund of the row needs, and it stays in step with `snapshotQty`.
+                // And where THIS pass raised no journal, an EARLIER pass's record is left alone
+                // rather than nulled: `undefined` is "do not update", while `null` would erase a
+                // debit that is still standing and is the evidence-deletion o3d-o97 r4 refused.
                 allocationBatchAmount: a2SyncLogId
-                  ? roundQuantity(sumCostLayerSnapshot(allocationSnapshot), 4).toNumber()
-                  : null,
+                  ? roundQuantity(sumCostLayerSnapshot(next), 4).toNumber()
+                  : priorPosted.length > 0 ? undefined : null,
               },
             })
           }

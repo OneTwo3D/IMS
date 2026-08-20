@@ -1174,7 +1174,10 @@ test('o3d-0i5y r4: a JOURNALED short order can still be RE-ALLOCATED for its res
       productId: 'product-1',
       warehouseId: 'warehouse-1',
       qty: 2,
-      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCost: 4 }],
+      // r5: `unitCostBase`, not `unitCost`. parseCostLayerSnapshot DROPS an entry without it, so the
+      // r4 fixture pinned nothing — every assertion about what a previous A2 pass had accounted for
+      // this row would have been made against an empty snapshot.
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 4 }],
     }],
     shipments: [{
       id: 'shipment-1',
@@ -1198,13 +1201,19 @@ test('o3d-0i5y r4: a JOURNALED short order can still be RE-ALLOCATED for its res
   assert.equal(own?.id, 'alloc-posted', 'the allocation identity the shipment snapshot references survives')
   assert.deepEqual(
     own?.costLayerSnapshot,
-    [{ costLayerId: 'layer-1', qty: 2, unitCost: 4 }],
+    [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 4 }],
     'and so does the cost snapshot the refund reversal relieves against',
   )
+  // r5 REVERSES r4's verdict here, and the reason r4 gave is now handled where it belongs. r4 kept
+  // the stamp because a re-stage would re-post the journaled shipment's value and blank the pinned
+  // snapshots — both true of the A2 pass r4 was looking at, and neither true of the one that runs
+  // now: it excludes journaled shipments and leaves an already-pinned row alone. Keeping the stamp
+  // meant the third unit — the whole reason this rebuild is permitted — was never reclassified at
+  // all, while Group B still credited Allocated Inventory for it on despatch.
   assert.equal(
-    state.order.inventoryAllocatedDate?.toISOString(),
-    '2026-01-01T00:00:00.000Z',
-    'the A2 stamp is KEPT — re-staging a journaled order re-posts its reclassification and wipes the snapshots',
+    state.order.inventoryAllocatedDate,
+    null,
+    'the A2 stamp is released so the residual unit can be reclassified — keeping it strands the unit outside accounting',
   )
   // Only the residual unit is newly reserved; the despatched 2 gave their reservation back already.
   assert.equal(state.stockLevels[0].reservedQty, 1)
@@ -2365,6 +2374,19 @@ function createResetTx(options: {
    * proposed allocation, including one that drops every row.
    */
   journaledShipmentLines?: Array<{ lineId: string; productId: string; warehouseId: string; qty: number }>
+  /**
+   * o3d-0i5y r5: every SHIPPED line on the order, journaled or not. Defaults to the journaled set,
+   * because a journaled shipment is SHIPPED by construction — but the two questions are asked
+   * SEPARATELY now (the floors read journaled lines; the accounted-quantity read wants all shipped
+   * ones), so the double answers each with its own set rather than conflating them.
+   */
+  shippedShipmentLines?: Array<{ lineId: string; productId: string; warehouseId: string; qty: number }>
+  /**
+   * o3d-0i5y r5: the rows as they stand, with the layers a previous A2 pass pinned. Without these
+   * the accounted quantity is zero for every scope, so EVERY declared set would look like new
+   * quantity and the "no new quantity keeps the stamp" assertion could not fail.
+   */
+  persistedAllocations?: Array<{ lineId: string; productId: string; warehouseId: string; costLayerSnapshot?: unknown }>
 }) {
   const salesOrderUpdates: Array<Record<string, unknown>> = []
   const allocationUpdates: Array<Record<string, unknown>> = []
@@ -2398,14 +2420,30 @@ function createResetTx(options: {
       },
     },
     shipmentLine: {
-      findMany: async () => (options.journaledShipmentLines ?? []).map((line) => ({
-        lineId: line.lineId,
-        productId: line.productId,
-        qty: line.qty,
-        shipment: { warehouseId: line.warehouseId },
-      })),
+      // The predicate is HONOURED: `shipmentJournalDate: { not: null }` is the floor read and
+      // `status: 'SHIPPED'` is the accounted-quantity read. A double that answered both with the
+      // journaled set would hide a fix that read the wrong one.
+      findMany: async ({ where }: {
+        where: { shipment: { orderId: string; status?: string; shipmentJournalDate?: { not: null } } }
+      }) => {
+        const rows = where.shipment.shipmentJournalDate?.not === null
+          ? (options.journaledShipmentLines ?? [])
+          : (options.shippedShipmentLines ?? options.journaledShipmentLines ?? [])
+        return rows.map((line) => ({
+          lineId: line.lineId,
+          productId: line.productId,
+          qty: line.qty,
+          shipment: { warehouseId: line.warehouseId },
+        }))
+      },
     },
     orderAllocation: {
+      findMany: async () => (options.persistedAllocations ?? []).map((row) => ({
+        lineId: row.lineId,
+        productId: row.productId,
+        warehouseId: row.warehouseId,
+        costLayerSnapshot: row.costLayerSnapshot ?? null,
+      })),
       updateMany: async ({ data }: { data: Record<string, unknown> }) => {
         allocationUpdates.push(data)
         return { count: 1 }
@@ -2525,6 +2563,95 @@ test('resetAllocationAccountingIfStaged writes nothing when A2 never staged the 
   await resetAllocationAccountingIfStaged(
     tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
     'order-1',
+  )
+
+  assert.deepEqual(salesOrderUpdates, [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0i5y r5 — THE PERMITTED CHANGE HAS TO SAY WHETHER ANYTHING NEW NEEDS ACCOUNTING.
+//
+// r4 permitted the journal-safe rebuild and then KEPT the A2 stamp unconditionally, on the reasoning
+// that a re-stage would re-post the shipped value and blank the pinned snapshots. Both were true of
+// the A2 pass r4 was looking at; neither is true of the one that runs now. What r4's choice did do is
+// leave the residual — the quantity the rebuild exists to add — outside accounting for good: A2 never
+// looks at a stamped order again, and Group B still credits Allocated Inventory when it ships.
+//
+// The stamp is now released exactly when the declared set holds quantity nothing has accounted, and
+// the snapshots are never cleared on this path either way.
+// ---------------------------------------------------------------------------
+
+const ACCOUNTED_SCOPE = { lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1' }
+
+test('o3d-0i5y r5: a permitted rebuild that ADDS allocated quantity releases the A2 stamp, keeping the snapshots', async () => {
+  // 2 units allocated, pinned by an earlier A2 pass, dispatched and journaled. The rebuild declares 3
+  // — the residual unit stock has since arrived for. Under r4 the stamp stayed and that unit was
+  // never reclassified.
+  const { tx, salesOrderUpdates, allocationUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 2 }],
+    persistedAllocations: [{
+      ...ACCOUNTED_SCOPE,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 4 }],
+    }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(3) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [{
+    inventoryAllocatedDate: null,
+    inventoryAllocatedBatchRef: null,
+    allocationBatchAmount: null,
+  }], 'the order goes back to A2 so the residual unit is reclassified')
+  assert.deepEqual(
+    allocationUpdates,
+    [],
+    'and the pinned layers are NOT cleared — they are the basis Group B and the refund reversal resolve through',
+  )
+})
+
+test('o3d-0i5y r5: a permitted rebuild that adds NO new quantity keeps the stamp exactly where r4 put it', async () => {
+  // The common case: the residual reconciler re-declaring the committed rows unchanged. Releasing the
+  // stamp here would send the order back to A2 with nothing to post, and r4's objection would apply.
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 2 }],
+    persistedAllocations: [{
+      ...ACCOUNTED_SCOPE,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 4 }],
+    }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(2) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [], 'nothing new to account, so nothing is un-staged')
+})
+
+test('o3d-0i5y r5: quantity accounted through a SHIPMENT rather than a pinned snapshot still counts as accounted', async () => {
+  // The order shipped before A2 ever ran, so A2 took the value from the shipment and stamped the row
+  // with an EMPTY snapshot. Reading only the snapshot would call those 2 units unaccounted and
+  // re-stage an order that owes nothing.
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 2 }],
+    persistedAllocations: [{ ...ACCOUNTED_SCOPE, costLayerSnapshot: [] }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(2) }] },
   )
 
   assert.deepEqual(salesOrderUpdates, [])

@@ -46,6 +46,7 @@ import {
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { parseCostLayerSnapshot, sumCostLayerSnapshotQty } from '@/lib/cost-layer-snapshots'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -485,6 +486,84 @@ export async function journaledAllocationFloors(
 }
 
 /**
+ * Does the declared allocation set leave quantity that Group A2 has never reclassified? (o3d-0i5y r5)
+ *
+ * THIS IS THE HALF r4 LEFT OUT. r4 was right that a journaled order must keep its A2 stamp for what
+ * has already shipped — clearing it would re-post a reclassification the ledger already holds, and
+ * re-snapshot nothing, because A2 values a shipped order from its SHIPMENT snapshots. But keeping the
+ * stamp unconditionally answers a question nobody asked: the stamp is order-level, and the residual
+ * rebuild this branch exists to enable ADDS allocated quantity to that same order. The added quantity
+ * was never reclassified by anything. A2 never looks at a stamped order again, so DR Allocated /
+ * CR Inventory never happens for it — and when the residual finally ships, Group B still posts
+ * DR COGS / CR Allocated. The credit stands against a debit that was never made, so Allocated
+ * Inventory drifts short by the residual's cost and Inventory stays overstated by it, permanently.
+ *
+ * So the stamp is cleared exactly when there is something new to account, and the decision is made at
+ * the same (line, warehouse, product) grain as {@link journaledAllocationFloors}, using the same
+ * accounted-quantity rule A2 itself now applies ({@link unaccountedAllocationQty}):
+ *
+ *   * `costLayerSnapshot` on the persisted row — the layers a previous A2 pinned. Kept, never cleared
+ *     here, because a journal was posted against them.
+ *   * quantity already DISPATCHED at that scope — the rows A2 stamped with an empty snapshot because
+ *     it took their value from the shipment instead.
+ *
+ * A rebuild that only re-states what is already accounted (the common case: the residual reconciler
+ * re-declaring committed shipment rows unchanged) leaves the stamp exactly where r4 put it.
+ *
+ * Cleared, the order is picked up by the very next A2 pass, which posts the residual ALONE — the
+ * journaled shipment's value is excluded there by its journal date. Group B is held for one pass at
+ * most, since the batch runs A1 → A2 → B in that order within a single run.
+ */
+async function declaresUnaccountedAllocationQty(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  nextAllocations: ReadonlyArray<{ lineId: string; productId: string; warehouseId: string; qty: Prisma.Decimal }>,
+): Promise<boolean> {
+  const nextByKey = new Map<string, Prisma.Decimal>()
+  for (const row of nextAllocations) {
+    const key = allocationScopeKey(row)
+    nextByKey.set(key, (nextByKey.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)))
+  }
+  if (nextByKey.size === 0) return false
+
+  const [persisted, shippedLines] = await Promise.all([
+    tx.orderAllocation.findMany({
+      where: { orderId },
+      select: { lineId: true, productId: true, warehouseId: true, costLayerSnapshot: true },
+    }),
+    tx.shipmentLine.findMany({
+      where: { shipment: { orderId, status: 'SHIPPED' } },
+      select: { lineId: true, productId: true, qty: true, shipment: { select: { warehouseId: true } } },
+    }),
+  ])
+
+  const pinnedByKey = new Map<string, Prisma.Decimal>()
+  for (const row of persisted) {
+    pinnedByKey.set(
+      allocationScopeKey(row),
+      sumCostLayerSnapshotQty(parseCostLayerSnapshot(row.costLayerSnapshot)),
+    )
+  }
+  const shippedByKey = new Map<string, Prisma.Decimal>()
+  for (const line of shippedLines) {
+    const key = allocationScopeKey({
+      lineId: line.lineId,
+      productId: line.productId,
+      warehouseId: line.shipment.warehouseId,
+    })
+    shippedByKey.set(key, (shippedByKey.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(line.qty)))
+  }
+
+  for (const [key, nextQty] of nextByKey) {
+    const pinned = pinnedByKey.get(key) ?? new Prisma.Decimal(0)
+    const shipped = shippedByKey.get(key) ?? new Prisma.Decimal(0)
+    const accounted = pinned.gte(shipped) ? pinned : shipped
+    if (nextQty.gt(accounted.add(ALLOCATION_EPSILON_DECIMAL))) return true
+  }
+  return false
+}
+
+/**
  * If the daily batch A2 has already staged this order's allocations for
  * accounting (inventoryAllocatedDate is set), any subsequent allocation
  * edit would orphan the FIFO snapshots that Group B and refund reversals
@@ -559,7 +638,20 @@ export async function resetAllocationAccountingIfStaged(
   })
   if (journaledShipment) {
     await assertJournalSafeAllocationChange(tx, orderId, options.nextAllocations)
-    // Permitted — and deliberately no un-stage and no snapshot clear. See the block comment above.
+    // Permitted. The snapshots stay — they are the posted evidence — but the ORDER goes back to A2
+    // when, and only when, this change leaves quantity nothing has reclassified. See the block
+    // comment above and {@link declaresUnaccountedAllocationQty}.
+    if (await declaresUnaccountedAllocationQty(tx, orderId, options.nextAllocations ?? [])) {
+      await tx.salesOrder.update({
+        where: { id: orderId },
+        data: {
+          // o3d-0qoo: stamp and batch ref move together, as everywhere else that un-stages.
+          inventoryAllocatedDate: null,
+          inventoryAllocatedBatchRef: null,
+          allocationBatchAmount: null,
+        },
+      })
+    }
     return
   }
 

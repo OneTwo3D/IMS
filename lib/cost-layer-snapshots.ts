@@ -104,6 +104,50 @@ export function sumCostLayerSnapshot(entries: CostLayerSnapshotEntry[]): Decimal
   )
 }
 
+/** Total QUANTITY a snapshot pins, as opposed to {@link sumCostLayerSnapshot}'s value. */
+export function sumCostLayerSnapshotQty(entries: CostLayerSnapshotEntry[]): Decimal {
+  return entries.reduce((sum, entry) => sum.add(toDecimal(entry.qty)), toDecimal(0))
+}
+
+/**
+ * How much of an allocation row's quantity Group A2 has NOT yet reclassified into Allocated
+ * Inventory (o3d-0i5y r5).
+ *
+ * THE STAMP IS AN ORDER-LEVEL FACT ABOUT A ROW-LEVEL QUESTION, and that is where the hole was. A2
+ * marks the ORDER `inventoryAllocatedDate`, so "already reclassified" was read as all-or-nothing for
+ * the order — and once a shipment on it had been journaled the stamp was deliberately kept (clearing
+ * it would re-post the shipped value it had already posted). Residual quantity allocated AFTER that
+ * point therefore had no route into the ledger at all: A2 never looked at the order again, and Group
+ * B still CREDITED Allocated Inventory when the residual shipped, for a debit that was never made.
+ *
+ * The quantity A2 has accounted for one (line, warehouse, product) scope is recorded twice over, and
+ * the two records do not add up — they OVERLAP, because a dispatch consumes the very allocation it
+ * ships:
+ *
+ *   `snapshotQty`  the FIFO layers A2 pinned on the allocation row when it reclassified it. Written
+ *                  once and never reduced afterwards (Group B relieves its contra from an in-memory
+ *                  copy), so it stays a truthful record of what was posted.
+ *   `shippedQty`   quantity already dispatched at this scope. A2 writes an EMPTY snapshot when it
+ *                  reclassifies an order that has already shipped — it takes the value from the
+ *                  SHIPMENT snapshots instead — so for those rows `snapshotQty` is 0 while the cost
+ *                  is genuinely in the ledger.
+ *
+ * So the accounted quantity is the LARGER of the two, never the sum. Taking the sum would double-count
+ * an ordinary allocate-then-ship row (pinned 6, shipped 6, accounted 6 — not 12) and strand the very
+ * residual this exists to account for.
+ */
+export function unaccountedAllocationQty(input: {
+  allocatedQty: DecimalInput
+  snapshot: CostLayerSnapshotEntry[]
+  shippedQty: DecimalInput
+}): Decimal {
+  const pinned = sumCostLayerSnapshotQty(input.snapshot)
+  const shipped = toDecimal(input.shippedQty)
+  const accounted = pinned.gte(shipped) ? pinned : shipped
+  const outstanding = roundQuantity(toDecimal(input.allocatedQty).sub(accounted), 6)
+  return outstanding.gt('0.0000001') ? outstanding : toDecimal(0)
+}
+
 export function reduceSnapshotByCostLayer(
   baseEntries: CostLayerSnapshotEntry[],
   deductions: Array<{ costLayerId: string; qty: DecimalInput }>,
