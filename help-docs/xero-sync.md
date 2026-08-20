@@ -1677,6 +1677,8 @@ The sync log at **Integrations → Xero** shows queued transactions for the **cu
 - **Synced** — Successfully pushed to Xero (shows Xero transaction ID)
 - **Failed** — Failed after 5 retries (shows error message)
 
+- **Cancelled** — Retired without posting (for example the sales order was cancelled before its invoice went out). Not an error, and not re-queued by any sweep.
+
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
 
 ### Settling a row IMS cannot resolve for itself
@@ -1817,6 +1819,29 @@ writing the completion, because the entry may be filed by another worker in betw
 that gap the completion is retracted and the job is put back to permanently failed. So a job you find
 closed green never had one of these entries against it, and the presence of an entry always shows up as
 a failed job you can find on **Integrations**, no matter which worker or which run detected it.
+
+### A post that landed after its attempt had moved on
+
+A worker claims a sync row, mints an **attempt** for it, and only then calls Xero. Almost always the
+row is still on that attempt when the result comes back. Occasionally it is not — a settlement you
+recorded about that attempt, or a retirement, moved it while the request was on the wire.
+
+The result is still recorded: the document id goes onto the row exactly as it would have, because
+evidence that something posted must never depend on winning a race. What also happens is an **ERROR**
+in the Activity log with the action `xero_sync_post_fenced_out`, which:
+
+- names the attempt that posted and the attempt the row is on now, so a decision you made about the
+  first one is visibly a decision made without this outcome;
+- says what the post actually *did* for that sync type — a ledger document, a manual journal, an
+  applied payment, an in-place edit of an existing document, or an effect that creates nothing in the
+  ledger at all (an invoice PDF, an invoice email, a WooCommerce note, a bill attachment, a
+  credit-note allocation);
+- and states the remedy that matches: void or credit-note the document, post a reversing journal,
+  remove the payment, correct the edited document — or, for the effects that create nothing, that
+  there is nothing to reverse.
+
+So if you settled a row as "it did NOT post" and it turns out it did, you are told, with the id and
+with the right remedy, rather than the assertion being quietly believed.
 
 ### Rows stranded on a connector you switched away from
 

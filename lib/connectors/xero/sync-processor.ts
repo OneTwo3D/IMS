@@ -2238,6 +2238,103 @@ async function markXeroOutboxSuccess(job: IntegrationOutboxRow): Promise<void> {
 }
 
 /**
+ * WHAT A SUCCESSFUL POST OF EACH SYNC TYPE ACTUALLY DID, and what an operator can do about it
+ * (o3d-e2mz r4, Codex finding 3).
+ *
+ * The fence-loss escalation used to end with one sentence for every type: "The document is in the
+ * ledger: reverse or credit-note it there if it should not exist." That is true of an invoice and
+ * false of most of the queue. Several types return no external id because they CREATE NO DOCUMENT:
+ * INVOICE_PDF saves a file locally, INVOICE_EMAIL sends an email, WC_INVOICE_NOTE writes a note on
+ * the WooCommerce order, BILL_ATTACHMENT attaches a file (and is a no-op when uploads are disabled),
+ * PURCHASE_CREDIT_NOTE_ALLOCATION applies an existing credit note to a bill. Sending an operator to
+ * credit-note a document that does not exist is not merely useless — the nearest matching document
+ * is a real receivable or payable, and the instruction points straight at it.
+ *
+ * Exhaustive over `AccountingSyncType` ON PURPOSE: a `Record<AccountingSyncType, …>` means a new
+ * member fails the type-check here rather than silently inheriting the invoice wording, which is
+ * exactly how the generic sentence came to cover types nobody had thought about.
+ *
+ * `effect` completes "…{effect} on attempt N"; `remedy` is a whole sentence.
+ */
+const POST_EFFECT_LEDGER_DOCUMENT = {
+  effect: 'POSTED a document to the Xero ledger',
+  remedy: 'The document is in the ledger: void or credit-note it there if it should not exist.',
+} as const
+const POST_EFFECT_JOURNAL = {
+  effect: 'POSTED a manual journal to the Xero ledger',
+  remedy: 'The journal is in the ledger: post a reversing journal there if it should not exist.',
+} as const
+const POST_EFFECT_PAYMENT = {
+  effect: 'APPLIED a payment in Xero',
+  remedy: 'A payment is applied against the document named above: remove or reverse THAT PAYMENT in Xero if it '
+    + 'should not exist. Do not credit-note the invoice — the invoice itself was not created here.',
+} as const
+const POST_EFFECT_DOCUMENT_UPDATE = {
+  effect: 'MODIFIED an existing Xero document',
+  remedy: 'No new document was created — an existing one was changed. Compare it against IMS and correct it in '
+    + 'Xero if the change should not stand; there is nothing to void or credit-note.',
+} as const
+
+const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }> = {
+  SALES_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
+  PURCHASE_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
+  CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
+  PURCHASE_CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
+  SALES_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
+  PURCHASE_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
+  INVOICE_PAYMENT: POST_EFFECT_PAYMENT,
+  BILL_PAYMENT: POST_EFFECT_PAYMENT,
+  COGS_JOURNAL: POST_EFFECT_JOURNAL,
+  COGS_REVERSAL: POST_EFFECT_JOURNAL,
+  INVENTORY_ADJUSTMENT: POST_EFFECT_JOURNAL,
+  STOCK_IN_TRANSIT: POST_EFFECT_JOURNAL,
+  STOCK_RECEIPT: POST_EFFECT_JOURNAL,
+  STOCK_ALLOCATION: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_REVENUE_DEFERRAL: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_INVENTORY_ALLOC: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_GROUP_B: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_INVENTORY_RECONCILIATION: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_COGS_RECONCILIATION: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_TRANSIT_RECONCILIATION: POST_EFFECT_JOURNAL,
+  UNEARNED_REV_REVERSAL: POST_EFFECT_JOURNAL,
+  REALISED_FX_JOURNAL: POST_EFFECT_JOURNAL,
+  UNREALISED_FX_JOURNAL: POST_EFFECT_JOURNAL,
+  MANUFACTURING_JOURNAL: POST_EFFECT_JOURNAL,
+  MANUFACTURING_RECLASS: POST_EFFECT_JOURNAL,
+  PURCHASE_CREDIT_NOTE_ALLOCATION: {
+    effect: 'ALLOCATED an existing supplier credit note against a bill in Xero',
+    remedy: 'NO document was created — the allocation is a sub-resource of a credit note that already existed. '
+      + 'Undo the allocation on that credit note in Xero if it should not stand; there is nothing to reverse or '
+      + 'credit-note.',
+  },
+  BILL_ATTACHMENT: {
+    effect: 'ATTACHED the supplier PDF to an existing Xero bill (a no-op when attachment upload is disabled)',
+    remedy: 'NO ledger document was created and no money moved. Remove the attachment from the bill in Xero if it '
+      + 'should not be there; nothing needs reversing or credit-noting.',
+  },
+  INVOICE_PDF: {
+    effect: 'DOWNLOADED and stored the invoice PDF in IMS',
+    remedy: 'NO ledger document was created and nothing in Xero changed — the effect is a file held by IMS. '
+      + 'Nothing needs reversing or credit-noting.',
+  },
+  INVOICE_EMAIL: {
+    effect: 'SENT the invoice email to the customer',
+    remedy: 'NO ledger document was created, and the email CANNOT be recalled. If the invoice should not have been '
+      + 'sent, contact the customer; there is nothing in Xero to reverse or credit-note for this row.',
+  },
+  WC_INVOICE_NOTE: {
+    effect: 'ADDED an invoice note to the WooCommerce order',
+    remedy: 'NO ledger document was created and nothing in Xero changed. Remove the note on the WooCommerce order '
+      + 'if it should not be there.',
+  },
+  TAX_RATE_SYNC: {
+    effect: 'CREATED or UPDATED a tax rate in Xero',
+    remedy: 'NO ledger document was created and no money moved, but the tax rate is now live and documents posted '
+      + 'after it will use it. Correct or archive the tax rate in Xero if it should not exist.',
+  },
+}
+
+/**
  * o3d-e2mz: DID AN OPERATOR DECIDE ABOUT THIS ATTEMPT WHILE IT WAS POSTING?
  *
  * ESCALATION ONLY. It writes NOTHING to the sync row, and that is the whole of this branch's rebase
@@ -2266,24 +2363,29 @@ async function reportPostOnMovedAttempt(
     select: { status: true, attemptRevision: true },
   })
   if (current && current.attemptRevision === attempt.attemptRevision) return
+  const effect = POST_EFFECT[entry.type]
   await logActivity({
     entityType: 'SYSTEM',
     action: 'xero_sync_post_fenced_out',
     tag: 'sync',
     level: 'ERROR',
-    description: `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} POSTED as `
-      + `${externalId ?? 'a document whose id Xero did not return'} on attempt ${attempt.attemptRevision}, but sync `
+    // o3d-e2mz r4 (Codex finding 3): the effect and its remedy are looked up from the SYNC TYPE, not
+    // asserted. Several types succeed without creating any ledger document at all, and telling an
+    // operator to credit-note one points them at whatever real receivable is nearest.
+    description: `Xero ${entry.type} for ${entry.referenceType} ${entry.referenceId} ${effect.effect}`
+      + `${externalId === null ? '' : ` (${externalId})`} on attempt ${attempt.attemptRevision}, but sync `
       + `row ${attempt.id} had already moved to attempt ${current?.attemptRevision ?? 'a deleted row'} `
       + `(${current?.status ?? 'gone'}). Anything decided about attempt ${attempt.attemptRevision} was decided `
       + 'without this outcome. The document id IS recorded on the sync row — this runs only after the '
-      + 'record landed — so the order cannot be deleted while the document exists. The document is in '
-      + 'the ledger: reverse or credit-note it there if it should not exist.',
+      + `record landed — so anything keyed on that row can see it. ${effect.remedy}`,
     metadata: {
       syncLogId: attempt.id,
       claimedAttemptRevision: attempt.attemptRevision,
       currentAttemptRevision: current?.attemptRevision ?? null,
       currentStatus: current?.status ?? null,
       externalId,
+      /** o3d-e2mz r4: what the successful post actually did, so a dashboard can filter on it. */
+      postEffect: effect.effect,
       type: entry.type,
       referenceType: entry.referenceType,
       referenceId: entry.referenceId,

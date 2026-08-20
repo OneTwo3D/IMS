@@ -50,6 +50,16 @@ mock.module('@/lib/domain/accounting/accounting-event-mirror', {
     voidMirroredAccountingEventsForOrder: async () => {},
   },
 })
+// o3d-e2mz r4: only the fence-loss REMEDY tests at the end of this file reach `processEntry` (every
+// other test uses a row that already carries an external id and short-circuits before it). These two
+// stubs are what let one of them drive a sync type that posts SUCCESSFULLY WITHOUT creating any
+// ledger document — the case the generic "reverse or credit-note it" sentence was wrong about.
+mock.module('@/lib/connectors/xero/auth', {
+  namedExports: { getGrantedScopes: async () => null },
+})
+mock.module('@/lib/connectors/woocommerce/sync/invoice-note', {
+  namedExports: { pushInvoiceNoteToWc: async () => ({ success: true }) },
+})
 
 async function loadProcessor() {
   return (await import('@/lib/connectors/xero/sync-processor')).processPendingXeroSync
@@ -365,4 +375,94 @@ test('o3d-e2mz r3: a lost evidence write on a row still naming NO document is re
   assert.match(escalation?.description ?? '', /was NOT recorded on it/)
   assert.doesNotMatch(escalation?.description ?? '', /DIFFERENT document/)
   assert.match(escalation?.description ?? '', /XERO-1/)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-e2mz r4 (Codex finding 3) — THE ESCALATION MUST NOT PRESCRIBE A REMEDY FOR A DOCUMENT THAT
+// DOES NOT EXIST.
+//
+// `recordPostAfterFenceLoss` used to end every escalation with the same sentence: "The document is
+// in the ledger: reverse or credit-note it there if it should not exist." That is true of an
+// invoice and false of most of the queue — INVOICE_PDF saves a file, INVOICE_EMAIL sends an email,
+// WC_INVOICE_NOTE writes a note on the WooCommerce order, BILL_ATTACHMENT attaches a file,
+// PURCHASE_CREDIT_NOTE_ALLOCATION applies a credit note that already existed. Telling an operator
+// to credit-note one of those is worse than saying nothing: the nearest matching document is a real
+// receivable or payable, and that is what they will reach for.
+// ---------------------------------------------------------------------------
+
+/** Bump the row out from under the worker, so its writeback CAS misses and the escalation runs. */
+function fenceOutOnWriteback() {
+  interleave = () => {
+    Object.assign(store.get('log-1')!, { status: 'CANCELLED', attemptRevision: 9 })
+  }
+}
+
+test('o3d-e2mz r4: a JOURNAL fence loss says REVERSING JOURNAL, not credit-note', async () => {
+  reset([syncLogRow({ ...POSTED_ROW, status: 'PENDING', attemptRevision: 3 })])
+  fenceOutOnWriteback()
+
+  await (await loadProcessor())()
+
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.ok(escalation)
+  assert.match(escalation.description, /POSTED a manual journal to the Xero ledger \(XERO-1\)/)
+  assert.match(escalation.description, /post a reversing journal there/)
+  assert.doesNotMatch(escalation.description, /credit-note/, 'a journal is not credit-noted')
+  assert.equal(escalation.metadata?.postEffect, 'POSTED a manual journal to the Xero ledger')
+})
+
+test('o3d-e2mz r4: a SALES_INVOICE fence loss still says void or credit-note', async () => {
+  // The wording that was right all along must survive the classification — otherwise the fix would
+  // have traded one wrong instruction for another.
+  reset([syncLogRow({
+    id: 'log-1',
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    externalTransactionId: 'XERO-INV-1',
+    status: 'PENDING',
+    attemptRevision: 3,
+  })])
+  fenceOutOnWriteback()
+
+  await (await loadProcessor())()
+
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.ok(escalation)
+  assert.match(escalation.description, /POSTED a document to the Xero ledger \(XERO-INV-1\)/)
+  assert.match(escalation.description, /void or credit-note it there/)
+})
+
+test('o3d-e2mz r4: a fence loss on a type that creates NO document says so, and prescribes nothing in the ledger', async () => {
+  // WC_INVOICE_NOTE succeeds by writing a note on the WooCommerce order and returns no external id.
+  // Before this, the escalation announced a ledger document, named "a document whose id Xero did not
+  // return", and sent the operator to reverse or credit-note it.
+  reset([syncLogRow({
+    id: 'log-1',
+    type: 'WC_INVOICE_NOTE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    externalTransactionId: null,
+    payload: { referenceId: 'order-1' },
+    status: 'PENDING',
+    attemptRevision: 3,
+  })])
+  fenceOutOnWriteback()
+
+  await (await loadProcessor())()
+
+  const escalation = activity.find((entry) => entry.action === 'xero_sync_post_fenced_out')
+  assert.ok(escalation, 'a fence loss is still an ERROR whatever the effect was')
+  assert.equal(escalation.level, 'ERROR')
+  assert.match(escalation.description, /ADDED an invoice note to the WooCommerce order/)
+  assert.match(escalation.description, /NO ledger document was created and nothing in Xero changed/)
+  assert.doesNotMatch(escalation.description, /credit-note/, 'there is no document to credit-note')
+  assert.doesNotMatch(escalation.description, /reversing journal/)
+  assert.doesNotMatch(
+    escalation.description,
+    /a document whose id Xero did not return/,
+    'and it must not imply a document was created whose id went missing',
+  )
+  assert.equal(escalation.metadata?.externalId, null)
+  assert.equal(escalation.metadata?.evidence, 'NO_EXTERNAL_ID')
 })

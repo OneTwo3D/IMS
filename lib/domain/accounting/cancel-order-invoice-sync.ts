@@ -112,7 +112,11 @@ export async function assertNoSalesInvoicePostingInFlight(
  * being retired commit atomically — a drain cannot slip between them. Uses the existing terminal states
  * the reconciliation/backfill sweeps already exclude: AccountingSyncStatus.CANCELLED for the sync log
  * (audit-46ry: distinct from FAILED so it is not re-queued or dashboarded as an error) and VOID for the
- * mirrored event. PENDING and stale-PROCESSING rows only — an actively-claimed post is left to finish.
+ * mirrored event.
+ *
+ * EVERY not-yet-posted row is retired, including a FRESHLY CLAIMED one — see the note on the `retirable`
+ * predicate below for why the "leave an in-flight claim to finish" exemption was the last silent hole in
+ * this fence.
  */
 export async function cancelPendingSalesInvoiceSyncForOrder(
   tx: Prisma.TransactionClient,
@@ -140,14 +144,48 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
       // FAILED rows stay eligible for the "Retry All" actions, so a cancelled order's failed invoice
       // would otherwise still post on a retry — retire it too.
       { status: 'FAILED' as const },
-      { status: 'PROCESSING' as const, processingStartedAt: null },
-      { status: 'PROCESSING' as const, processingStartedAt: { lt: staleProcessingCutoff } },
+      // o3d-e2mz r4 — AND EVERY PROCESSING ROW, however recently it was claimed.
+      //
+      // This clause used to be split on `processingStartedAt` against a 15-minute staleness cutoff, so
+      // a FRESHLY claimed row was deliberately skipped on the grounds that its worker "may be mid-post
+      // and clobbering it would race the external call". That exemption is what left CLAIM-FIRST
+      // CANCELLATION undetectable, and it is the last shape in which a cancelled sale could still grow
+      // an ACCREC invoice with nobody told:
+      //
+      //   1. the cancellation transaction writes the order to CANCELLED — uncommitted, so nothing
+      //      outside it can see that yet;
+      //   2. a worker claims this row, mints attempt N+1, and reads the order with an ordinary
+      //      `findUnique` that still sees the LIVE, previously committed status. `guardCancelledSalesOrderInvoice`
+      //      therefore passes it for posting — correctly, on the facts it can see;
+      //   3. this sweep runs, finds a PROCESSING row claimed seconds ago, and skips it — leaving its
+      //      attempt revision exactly where the worker left it;
+      //   4. the cancellation commits. The worker posts, and its writeback compare-and-swap SUCCEEDS,
+      //      because the fence it holds is still current.
+      //
+      // Every guard in the chain was satisfied and the invoice exists against a cancelled sale. The
+      // post-time backstop cannot cover it (its read happened at step 2) and the fence cannot report
+      // it (nothing moved the fence).
+      //
+      // Retiring the row is what breaks step 4: the retirement bumps the revision, so the worker's
+      // writeback CAS finds nothing and takes `recordPostAfterFenceLoss` instead — which records the
+      // external id on the row and raises an ERROR naming the document to reverse or credit-note. A
+      // worker whose post FAILED loses the same CAS in `applyMainSyncFailureRetry`, which is already a
+      // graceful no-op, so the row stays CANCELLED.
+      //
+      // The exemption's original worry survives, and is answered rather than dismissed: nothing here
+      // races the external call, because nothing here can reach it. This statement cannot stop an HTTP
+      // request that has already left; what it decides is only whether the RESULT of that request can
+      // be written back in silence. Skipping the row bought the worker a clean writeback onto a sale
+      // that no longer exists — the outcome, not the race, is what was wrong.
+      //
+      // Rows that already carry a document are still excluded by `externalTransactionId: null` above,
+      // so a cancel-after-post is untouched and still needs its explicit reversal.
+      { status: 'PROCESSING' as const },
     ],
   }
-  // CANCELLED (not FAILED) so reconciliation/backfill sweeps and error dashboards ignore it. A freshly
-  // claimed PROCESSING row (recent processingStartedAt) is intentionally NOT matched — it is left to
-  // finish; SYNCED rows are already posted and out of scope for retirement (a cancel-after-post needs
-  // an explicit reversal, tracked separately).
+  // CANCELLED (not FAILED) so reconciliation/backfill sweeps and error dashboards ignore it. SYNCED rows
+  // are already posted and out of scope for retirement (a cancel-after-post needs an explicit reversal,
+  // tracked separately).
   const retirement = { status: 'CANCELLED' as const, errorMessage: reason, processingStartedAt: null }
 
   // o3d-e2mz: A WRITER THAT RETIRES A ROW MUST ADVANCE THE FENCE. This sweep retires stale-PROCESSING
@@ -174,9 +212,10 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
   //
   // Retiring in ONE statement puts the sweep and the claim in contention for the same row lock, so
   // exactly one of them wins: either this transaction retires the row and the claim's compare-and-swap
-  // then matches nothing, or the claim gets there first and leaves a FRESH PROCESSING row the sweep
-  // deliberately does not touch (retireSalesInvoiceForCancelledOrder is the post-time backstop for
-  // that, and for anything enqueued after this sweep ran).
+  // then matches nothing, or the claim gets there first — and r4 now retires THAT row too, advancing its
+  // fence so the claim holder cannot write back in silence. `retireSalesInvoiceForCancelledOrder`
+  // remains the post-time backstop for what this sweep genuinely cannot see: a row enqueued or
+  // re-queued AFTER it ran.
   //
   // `updateManyAndReturn` is what lets the fence bump stay a separate statement without reopening the
   // race: it names the rows this statement actually retired, and this transaction now holds their locks,

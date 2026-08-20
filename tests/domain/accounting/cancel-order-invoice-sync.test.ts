@@ -126,23 +126,137 @@ test('cancelPendingSalesInvoiceSyncForOrder cancels the sync log with the CANCEL
   assert.equal(where.externalTransactionId, null)
 })
 
-test('cancelPendingSalesInvoiceSyncForOrder targets PENDING/FAILED and stale-PROCESSING rows, never a fresh claim', async () => {
+test('cancelPendingSalesInvoiceSyncForOrder targets every not-yet-posted row, INCLUDING a fresh claim', async () => {
   const { tx, calls } = mockTx([])
   await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
 
   const shared = calls.syncRetire[0].where as { referenceId: string; externalTransactionId: unknown }
   assert.equal(shared.referenceId, 'order-1')
+  // SYNCED rows and anything that already names a document are out of scope — a cancel-after-post
+  // needs an explicit reversal, and recording it as never-posted would hide a real receivable.
   assert.equal(shared.externalTransactionId, null)
-  const or = (calls.syncRetire[0].where as { OR: Array<{ status: string; processingStartedAt?: { lt?: Date } | null }> }).OR
-  // PENDING and FAILED (both would otherwise still post — a drain or a "Retry All"), plus PROCESSING
-  // with a null/stale claim. A freshly-claimed (recent processingStartedAt) row is deliberately NOT
-  // matched, so an in-flight post is left to finish; SYNCED rows are already posted and out of scope.
-  assert.deepEqual(or.map((clause) => clause.status), ['PENDING', 'FAILED', 'PROCESSING', 'PROCESSING'])
-  const staleClause = or.find((clause) => clause.processingStartedAt && 'lt' in clause.processingStartedAt)
-  assert.ok(staleClause, 'a stale-processing cutoff clause is present')
-  const cutoff = (staleClause!.processingStartedAt as { lt: Date }).lt
-  // Cutoff is 15 minutes before "now".
-  assert.equal(NOW.getTime() - cutoff.getTime(), 15 * 60 * 1000)
+  const or = (calls.syncRetire[0].where as { OR: Array<{ status: string; processingStartedAt?: unknown }> }).OR
+  // PENDING and FAILED (both would otherwise still post — a drain or a "Retry All"), and PROCESSING
+  // WITHOUT QUALIFICATION.
+  assert.deepEqual(or.map((clause) => clause.status), ['PENDING', 'FAILED', 'PROCESSING'])
+  // o3d-e2mz r4: no staleness predicate at all. The 15-minute cutoff was what excluded a freshly
+  // claimed row, and that exclusion is the claim-first hole — asserted structurally as well as
+  // behaviourally (below) because a cutoff reintroduced at any interval brings the hole back.
+  assert.deepEqual(
+    or.filter((clause) => clause.processingStartedAt !== undefined),
+    [],
+    'no processingStartedAt predicate may narrow the PROCESSING clause',
+  )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-e2mz r4 — THE CLAIM-FIRST SCHEDULE.
+//
+// The one interleaving in which a cancelled sale could still grow an ACCREC invoice with nothing
+// anywhere recording it:
+//
+//   1. the cancellation transaction writes the order to CANCELLED — uncommitted;
+//   2. a worker claims the invoice row (minting attempt N+1) and reads the order with an ordinary
+//      findUnique that still sees the LIVE status, so the post-time backstop passes it;
+//   3. the cancel-time sweep runs and — before r4 — skipped the freshly-claimed PROCESSING row;
+//   4. the cancellation commits, the worker posts, and its writeback CAS SUCCEEDS because nothing
+//      moved its fence.
+//
+// Step 3 is the only step this transaction controls, so that is where it is closed.
+// ---------------------------------------------------------------------------
+
+test('o3d-e2mz r4: the sweep retires a claim taken SECONDS ago, and fences its holder out', async () => {
+  const claimedAt = new Date(NOW.getTime() - 2_000)
+  const store = createSyncLogStore([syncLogRow({
+    ...CLAIMED_ROW,
+    status: 'PROCESSING',
+    attemptRevision: 4,
+    processingStartedAt: claimedAt,
+  })])
+  const { tx } = storeTx(store)
+
+  const retired = await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
+
+  assert.equal(retired, 1, 'a two-second-old claim is retired, not left to finish')
+  assert.equal(store.get('synclog-42')?.status, 'CANCELLED')
+  assert.equal(store.get('synclog-42')?.attemptRevision, 5, 'and its attempt is advanced as it is retired')
+
+  // STEP 4, the one that used to succeed: the worker posted and now tries to stamp the row SYNCED
+  // with the external id. It must find nothing — that miss is what routes it into the fence-loss
+  // escalation instead of silently reopening a cancelled sale.
+  const wroteBack = await updateAtAttemptRevision(
+    { accountingSyncLog: store.delegate } as never,
+    { id: 'synclog-42', attemptRevision: 4 },
+    { status: 'SYNCED', externalTransactionId: 'XERO-INV-9', syncedAt: NOW },
+  )
+  assert.equal(wroteBack, false, 'the claim holder cannot write back onto the cancelled row')
+  assert.equal(store.get('synclog-42')?.status, 'CANCELLED')
+  assert.equal(
+    store.get('synclog-42')?.externalTransactionId,
+    null,
+    'and it certainly cannot record a receivable against a cancelled sale by the back door',
+  )
+})
+
+test('o3d-e2mz r4: a fresh claim that FAILS its post also loses the CAS, leaving the row cancelled', async () => {
+  // The other outcome of the same schedule. `applyMainSyncFailureRetry` is fenced on the attempt, so
+  // this must not drag the row back to PENDING and round the queue again on a sale that is gone.
+  const store = createSyncLogStore([syncLogRow({
+    ...CLAIMED_ROW,
+    status: 'PROCESSING',
+    attemptRevision: 4,
+    retryCount: 0,
+    processingStartedAt: new Date(NOW.getTime() - 1_000),
+  })])
+  const { tx } = storeTx(store)
+
+  await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
+
+  const requeued = await updateAtAttemptRevision(
+    { accountingSyncLog: store.delegate } as never,
+    { id: 'synclog-42', attemptRevision: 4 },
+    { status: 'PENDING', retryCount: 1, errorMessage: 'Xero timed out' },
+  )
+  assert.equal(requeued, false)
+  assert.equal(store.get('synclog-42')?.status, 'CANCELLED')
+  assert.equal(store.get('synclog-42')?.retryCount, 0, 'the retired row is not re-armed for another attempt')
+})
+
+test('o3d-e2mz r4: a fresh claim that ALREADY POSTED is still excluded — its document must not be denied', async () => {
+  // The boundary of the widening. `externalTransactionId` is the only thing separating "a post is in
+  // flight" from "a post landed", and a row that names a document is a real receivable: retiring it
+  // would record that it never posted and hide it from every recovery path.
+  const store = createSyncLogStore([syncLogRow({
+    ...CLAIMED_ROW,
+    status: 'PROCESSING',
+    attemptRevision: 4,
+    externalTransactionId: 'XERO-77',
+    processingStartedAt: new Date(NOW.getTime() - 1_000),
+  })])
+  const { tx } = storeTx(store)
+
+  const retired = await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
+
+  assert.equal(retired, 0)
+  assert.equal(store.get('synclog-42')?.status, 'PROCESSING')
+  assert.equal(store.get('synclog-42')?.attemptRevision, 4, 'and its fence is untouched, so its own writeback still lands')
+})
+
+test('o3d-e2mz r4: a freshly claimed UNFENCED row is retired and STAYS at revision 0', async () => {
+  // Widening the predicate must not widen the forgery. A connector whose processor stamps no attempt
+  // sits at revision 0 permanently; bumping it to 1 here would invent an attempt that never existed.
+  const store = createSyncLogStore([syncLogRow({
+    ...CLAIMED_ROW,
+    connector: 'quickbooks',
+    status: 'PROCESSING',
+    attemptRevision: 0,
+    processingStartedAt: new Date(NOW.getTime() - 1_000),
+  })])
+  const { tx } = storeTx(store)
+
+  assert.equal(await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW), 1)
+  assert.equal(store.get('synclog-42')?.status, 'CANCELLED')
+  assert.equal(store.get('synclog-42')?.attemptRevision, 0)
 })
 
 test('cancelPendingSalesInvoiceSyncForOrder voids the not-yet-posted mirrored events', async () => {
