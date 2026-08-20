@@ -9,6 +9,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
+import { refundLineBucket } from '@/lib/domain/sales/refund-basis-analytics'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,7 +29,21 @@ export type KpiSummary = {
   ordersCurrent: number
   grossSalesCurrent: number
   discountsCurrent: number
+  /**
+   * NET-basis refund value only. o3d-iigc: this used to be every refund's totalBase regardless of
+   * basis, subtracted from an ex-VAT sales figure — so a legacy GROSS credit removed its VAT too.
+   */
   refundsCurrent: number
+  /** Refund value recorded on the GROSS basis. EXCLUDED from netSalesCurrent — it is not net. */
+  refundsGrossBasisCurrent: number
+  /** Refund value whose basis was never proved. EXCLUDED rather than guessed at. */
+  refundsUnknownBasisCurrent: number
+  /**
+   * False when the period carried refund value that could not be placed on the net basis. Every
+   * figure derived from net sales — netSalesCurrent, profitCurrent, marginCurrent, avgOrderValue —
+   * is then an UPPER BOUND, too high by at most refundsGrossBasisCurrent + refundsUnknownBasisCurrent.
+   */
+  refundBasisCompleteCurrent: boolean
   netSalesCurrent: number
   cogsCurrent: number
   profitCurrent: number
@@ -37,6 +52,8 @@ export type KpiSummary = {
   // Comparison period
   ordersComparison: number
   grossSalesComparison: number
+  /** As refundBasisCompleteCurrent, for the comparison period. */
+  refundBasisCompleteComparison: boolean
   netSalesComparison: number
   cogsComparison: number
   marginComparison: number
@@ -59,9 +76,16 @@ export type ChartPoint = {
   netSales: number
   cogs: number
   marginPct: number
+  /**
+   * o3d-iigc: false when this bucket held refund value that is not on the net basis. netSales and
+   * marginPct are then upper bounds — the unplaceable credit was left out rather than subtracted
+   * in the wrong unit.
+   */
+  netSalesUpperBound: boolean
   compNetSales: number
   compCogs: number
   compMarginPct: number
+  compNetSalesUpperBound: boolean
 }
 
 export type IncomingPO = {
@@ -191,7 +215,7 @@ export async function getDashboardData(
         totalBase: true, subtotalBase: true, shippingBase: true, discountAmount: true, fxRateToBase: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
         lines: { select: { cogsBase: true, qty: true, totalBase: true, discountAmount: true, productId: true, sku: true, description: true, taxRate: { select: { rate: true } } } },
-        refunds: { select: { totalBase: true } },
+        refunds: { select: { totalsBasis: true, totalBase: true } },
       },
       orderBy: { createdAt: 'desc' },
     }),
@@ -245,21 +269,37 @@ export async function getDashboardData(
   // Period helpers
   function ordersInRange(from: Date, to: Date) { return orders.filter((o) => o.createdAt >= from && o.createdAt <= to) }
 
-  type OrderAgg = { gross: number; discounts: number; refunds: number; net: number; cogs: number; shipping: number }
+  type OrderAgg = {
+    gross: number; discounts: number; refunds: number
+    refundsGrossBasis: number; refundsUnknownBasis: number; refundBasisComplete: boolean
+    net: number; cogs: number; shipping: number
+  }
   function aggregate(list: typeof orders): OrderAgg {
     let gross = 0, discounts = 0, refunds = 0, cogs = 0, shipping = 0
+    let refundsGrossBasis = 0, refundsUnknownBasis = 0, refundBasisComplete = true
     for (const o of list) {
       const lineTotal = o.lines.reduce((s, l) => s + Number(l.totalBase), 0)
       const lineDisc = o.lines.reduce((sum, line) => sum + normalizeLineDiscountBase(o, line.discountAmount, line.taxRate?.rate), 0)
       const orderDisc = normalizeOrderDiscountBase(o, o.lines)
       gross += lineTotal + lineDisc + orderDisc
       discounts += lineDisc + orderDisc
-      refunds += o.refunds.reduce((s, r) => s + Number(r.totalBase), 0)
+      // o3d-iigc: `gross` and `discounts` above are built from ex-VAT line totals, so `net` is a NET
+      // figure and only a NET-basis refund is the same unit. A GROSS credit over-subtracts by its
+      // whole VAT and an unstamped one cannot be placed at all; both are counted separately and left
+      // OUT of `net`, which is then flagged as an upper bound rather than quietly wrong.
+      for (const r of o.refunds) {
+        const amount = Number(r.totalBase)
+        const placement = refundLineBucket(r.totalsBasis, r.totalBase)
+        if (placement.bucket === 'net') refunds += amount
+        else if (placement.bucket === 'gross') refundsGrossBasis += amount
+        else refundsUnknownBasis += amount
+        if (!placement.placeableOnNetBasis) refundBasisComplete = false
+      }
       cogs += o.lines.reduce((s, l) => s + Number(l.cogsBase ?? 0), 0)
       shipping += Number(o.shippingBase ?? 0)
     }
     const net = gross - discounts - refunds
-    return { gross, discounts, refunds, net, cogs, shipping }
+    return { gross, discounts, refunds, refundsGrossBasis, refundsUnknownBasis, refundBasisComplete, net, cogs, shipping }
   }
 
   const currentOrders = ordersInRange(periodFrom, periodTo)
@@ -274,6 +314,9 @@ export async function getDashboardData(
     grossSalesCurrent: r2(cur.gross),
     discountsCurrent: r2(cur.discounts),
     refundsCurrent: r2(cur.refunds),
+    refundsGrossBasisCurrent: r2(cur.refundsGrossBasis),
+    refundsUnknownBasisCurrent: r2(cur.refundsUnknownBasis),
+    refundBasisCompleteCurrent: cur.refundBasisComplete,
     netSalesCurrent: r2(cur.net),
     cogsCurrent: r2(cur.cogs),
     profitCurrent: r2(cur.net - cur.cogs),
@@ -281,6 +324,7 @@ export async function getDashboardData(
     shippingCurrent: r2(cur.shipping),
     ordersComparison: compOrders.length,
     grossSalesComparison: r2(comp.gross),
+    refundBasisCompleteComparison: comp.refundBasisComplete,
     netSalesComparison: r2(comp.net),
     cogsComparison: r2(comp.cogs),
     marginComparison: comp.net > 0 ? Math.round(((comp.net - comp.cogs) / comp.net) * 1000) / 10 : 0,
@@ -318,8 +362,10 @@ export async function getDashboardData(
       label,
       grossSales: r2(c.gross), netSales: r2(c.net), cogs: r2(c.cogs),
       marginPct: c.net > 0 ? Math.round(((c.net - c.cogs) / c.net) * 1000) / 10 : 0,
+      netSalesUpperBound: !c.refundBasisComplete,
       compNetSales: r2(p.net), compCogs: r2(p.cogs),
       compMarginPct: p.net > 0 ? Math.round(((p.net - p.cogs) / p.net) * 1000) / 10 : 0,
+      compNetSalesUpperBound: !p.refundBasisComplete,
     }
   }
 

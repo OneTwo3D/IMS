@@ -23,7 +23,11 @@ type Props = {
   showOnboardingBanner?: boolean
 }
 
-function ChangeBadge({ current, previous }: { current: number; previous: number }) {
+function ChangeBadge({ current, previous, comparable = true, incomparableReason }: { current: number; previous: number; comparable?: boolean; incomparableReason?: string }) {
+  // o3d-iigc: when either side of the comparison is an upper bound of unknown tightness, the SIGN
+  // of the change is not established — a period whose credits are all legacy GROSS has more of
+  // them withheld than one whose credits are all NET. A dash with the reason, not a direction.
+  if (!comparable) return <span className="text-[11px] text-muted-foreground" title={incomparableReason}>—</span>
   if (previous === 0 && current === 0) return <span className="text-[11px] text-muted-foreground">—</span>
   if (previous === 0) return <span className="text-[11px] text-green-600 flex items-center gap-0.5"><TrendingUp className="h-3 w-3" />New</span>
   const pct = Math.round(((current - previous) / previous) * 100)
@@ -128,6 +132,16 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
   const baseCurrency = useBaseCurrency()
   const fmtBase = (value: number) => formatCompactMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const fmtBaseFull = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
+  // o3d-iigc: a bucket that held refund value not on the net basis has an UPPER-BOUNDED netSales —
+  // the unplaceable credit was left out rather than subtracted in the wrong unit. The bar cannot
+  // show that, so the tooltip says it.
+  const netSalesTooltipFormatter = (value: unknown, name: unknown, item?: { payload?: ChartPoint }): [string, string] => {
+    const isComp = name !== 'netSales'
+    const point = item?.payload
+    const bounded = point ? (isComp ? point.compNetSalesUpperBound : point.netSalesUpperBound) : false
+    const amount = fmtBaseFull(Number(value))
+    return [bounded ? `${amount} ≤ (upper bound — refunds not on the net basis are not subtracted)` : amount, isComp ? compLabel : periodLabel]
+  }
   const [isPending, startTransition] = useTransition()
   const [isNarrow, setIsNarrow] = useState<boolean | null>(null)
   const [period, setPeriod] = useState<Period>(initialPeriod)
@@ -183,6 +197,8 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
   const bridge = [
     { name: 'Gross Sales', value: kpi.grossSalesCurrent, fill: 'hsl(221, 83%, 53%)' },
     { name: 'Discounts', value: -kpi.discountsCurrent, fill: 'hsl(25, 95%, 53%)' },
+    // o3d-iigc: NET-basis credits only — the bridge must balance to Net Sales, and the two buckets
+    // below are exactly what was NOT subtracted from it. They are surfaced on the card instead.
     { name: 'Refunds', value: -kpi.refundsCurrent, fill: 'hsl(0, 84%, 60%)' },
     { name: 'Net Sales', value: kpi.netSalesCurrent, fill: 'hsl(221, 83%, 63%)' },
     { name: 'COGS', value: -kpi.cogsCurrent, fill: 'hsl(0, 72%, 51%)' },
@@ -229,10 +245,21 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">Net Sales</p>
-            <ChangeBadge current={kpi.netSalesCurrent} previous={kpi.netSalesComparison} />
+            <ChangeBadge
+              current={kpi.netSalesCurrent} previous={kpi.netSalesComparison}
+              comparable={kpi.refundBasisCompleteCurrent && kpi.refundBasisCompleteComparison}
+              incomparableReason="One of these periods holds refunds on the gross basis or with no proven basis. Those are not subtracted from net sales, so each side is an upper bound and the direction of the change is not established."
+            />
           </div>
-          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtBase(kpi.netSalesCurrent)}</p>
+          {/* o3d-iigc: when refundBasisCompleteCurrent is false this is an UPPER BOUND — refund value
+              that is not on the net basis was left out of it rather than subtracted in the wrong unit. */}
+          <p className={`text-xl sm:text-2xl font-bold mt-1 ${kpi.refundBasisCompleteCurrent ? '' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : 'Upper bound: some refunds in this period are on the gross basis or have no proven basis, so they are not subtracted here'}>{fmtBase(kpi.netSalesCurrent)}{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
           <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{kpi.discountsCurrent > 0 ? `${fmtBase(kpi.discountsCurrent)} discounts` : 'No discounts'} &middot; {kpi.refundsCurrent > 0 ? `${fmtBase(kpi.refundsCurrent)} refunds` : 'No refunds'}</p>
+          {!kpi.refundBasisCompleteCurrent && (
+            <p className="text-[11px] text-orange-600 mt-0.5 truncate" title="Refund value that is not on the net basis. It is reported here rather than folded into net sales, because subtracting a VAT-inclusive credit from an ex-VAT sales figure removes the VAT twice, and an unstamped credit cannot be placed at all.">
+              Not subtracted: {fmtBase(kpi.refundsGrossBasisCurrent)} gross-basis &middot; {fmtBase(kpi.refundsUnknownBasisCurrent)} basis unknown
+            </p>
+          )}
         </Card>
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
@@ -240,15 +267,21 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
             <ChangeBadge current={kpi.cogsCurrent} previous={kpi.cogsComparison} />
           </div>
           <p className="text-xl sm:text-2xl font-bold mt-1">{fmtBase(kpi.cogsCurrent)}</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">Profit: {fmtBase(kpi.profitCurrent)}</p>
+          {/* o3d-iigc: profit is net sales less COGS, so it inherits net sales' upper bound. */}
+          <p className={`text-[11px] mt-0.5 truncate ${kpi.refundBasisCompleteCurrent ? 'text-muted-foreground' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : 'Upper bound: derived from net sales, which does not subtract this period\u2019s gross-basis or unproven-basis refunds'}>Profit: {fmtBase(kpi.profitCurrent)}{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
         </Card>
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">Margin %</p>
-            <ChangeBadge current={kpi.marginCurrent} previous={kpi.marginComparison} />
+            <ChangeBadge
+              current={kpi.marginCurrent} previous={kpi.marginComparison}
+              comparable={kpi.refundBasisCompleteCurrent && kpi.refundBasisCompleteComparison}
+              incomparableReason="Margin is derived from net sales, and one of these periods holds refunds that net sales cannot subtract, so the direction of the change is not established."
+            />
           </div>
-          <p className="text-xl sm:text-2xl font-bold mt-1">{kpi.marginCurrent}%</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">Comp: {kpi.marginComparison}%</p>
+          {/* o3d-iigc: margin is (net - COGS) / net, so an upper-bounded net makes it an upper bound too. */}
+          <p className={`text-xl sm:text-2xl font-bold mt-1 ${kpi.refundBasisCompleteCurrent ? '' : 'text-orange-600'}`} title={kpi.refundBasisCompleteCurrent ? undefined : 'Upper bound: derived from net sales, which does not subtract this period\u2019s gross-basis or unproven-basis refunds'}>{kpi.marginCurrent}%{kpi.refundBasisCompleteCurrent ? '' : ' ≤'}</p>
+          <p className={`text-[11px] mt-0.5 truncate ${kpi.refundBasisCompleteComparison ? 'text-muted-foreground' : 'text-orange-600'}`}>Comp: {kpi.marginComparison}%{kpi.refundBasisCompleteComparison ? '' : ' ≤'}</p>
         </Card>
       </div>
 
@@ -264,7 +297,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                   <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={mobileXInterval} angle={0} textAnchor="middle" height={30} />
                   <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={36} />
-                  <Tooltip formatter={(value, name) => [fmtBaseFull(Number(value)), name === 'netSales' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                  <Tooltip formatter={netSalesTooltipFormatter} contentStyle={{ fontSize: 11 }} />
                   <Bar dataKey="netSales" fill="hsl(221, 83%, 53%)" radius={[2, 2, 0, 0]} name="netSales" />
                   <Line type="monotone" dataKey="compNetSales" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compNetSales" />
                 </BarChart>
@@ -275,7 +308,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={40} />
-                <Tooltip formatter={(value, name) => [fmtBaseFull(Number(value)), name === 'netSales' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                <Tooltip formatter={netSalesTooltipFormatter} contentStyle={{ fontSize: 11 }} />
                 <Bar dataKey="netSales" fill="hsl(221, 83%, 53%)" radius={[2, 2, 0, 0]} name="netSales" />
                 <Line type="monotone" dataKey="compNetSales" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compNetSales" />
               </BarChart>
