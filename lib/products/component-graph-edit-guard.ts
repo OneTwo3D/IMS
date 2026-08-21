@@ -338,7 +338,7 @@ const TERMINAL_REFUSING_ORDER_STATUSES = new Set(['CANCELLED'])
  *   - a PICKING/PACKED SHIPMENT blocker on a LIVE order clears by DISPATCHING that shipment, or by
  *     cancelling the whole order — `cancelSalesOrderFulfillmentState` deletes PENDING/PICKING/PACKED
  *     shipments outright. `SHIPMENT_TRANSITIONS` is forward-only and IMS has no per-shipment cancel
- *     (o3d-tv1q), which is why the message must not offer one;
+ *     (o3d-q8r6), which is why the message must not offer one;
  *   - a PICKING/PACKED SHIPMENT blocker on a CANCELLED order clears ONLY through the repair action
  *     (`discardCancelledOrderShipments`), which deletes the order's remaining non-dispatched
  *     shipments. Dispatch is refused on a cancelled order now (`transitionShipmentStatus`), and

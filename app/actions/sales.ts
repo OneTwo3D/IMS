@@ -2889,6 +2889,10 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       const released = await releaseOrderAllocationsInTx(tx, id, {
         cause: 'deleting the sales order',
         userId: session.user.id,
+        // o3d-0i5y r10: the order does not survive this transaction, so a reversal journal keyed to
+        // it would resolve to nothing. The teardown refuses a posted A2 debit here rather than
+        // orphaning the journal or stranding the debit — see releaseOrderAllocationsInTx.
+        orderIsBeingDeleted: true,
       })
       await tx.salesOrderLine.deleteMany({ where: { orderId: id } })
       await tx.salesOrder.delete({ where: { id } })

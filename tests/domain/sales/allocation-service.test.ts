@@ -1,5 +1,65 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { mock } from 'node:test'
+
+// o3d-0i5y r9 — THE ORPHANED-ALLOCATION REVERSAL IS A JOURNAL, so the only assertion worth making
+// about it is the AMOUNT it posts. `@/lib/accounting` is the connector-agnostic enqueue the
+// allocator reaches for (dynamically, at call time, which is why registering the mock here works);
+// capturing it gives the tests below the journal lines production would have written, rather than a
+// plan-level proxy that cannot tell £16 from £36.
+type QueuedAccountingSync = {
+  type: string
+  referenceType: string
+  referenceId: string
+  payload: {
+    _reversalToken?: string
+    lines?: Array<{ accountCode: string; debit?: number; credit?: number }>
+  }
+}
+
+/** Every enqueue ATTEMPT, whether or not it ended up writing a row. */
+const queuedAccountingSyncs: QueuedAccountingSync[] = []
+
+/**
+ * The AccountingSyncLog rows the enqueue actually wrote (o3d-0i5y r10).
+ *
+ * Kept apart from the attempt log above because that separation IS the defect finding 3 is about:
+ * `queueAccountingSyncTx` returns without writing anything at all when the order was deleted under
+ * it, when no active connector posts the type, or when the posting is suppressed — and it throws in
+ * none of those cases. A double whose enqueue could only ever succeed can neither exercise the
+ * verification nor observe its absence, so it is settable per test.
+ */
+const accountingSyncRows: QueuedAccountingSync[] = []
+
+/**
+ * What the enqueue DOES this test. `'writes'` is production's happy path; `'silent-no-op'` is the
+ * shape production takes with no connector configured — the call returns, nothing is written, and
+ * nothing is thrown.
+ */
+let accountingEnqueueOutcome: 'writes' | 'silent-no-op' = 'writes'
+
+function resetAccountingQueue(outcome: 'writes' | 'silent-no-op' = 'writes'): void {
+  queuedAccountingSyncs.length = 0
+  accountingSyncRows.length = 0
+  accountingEnqueueOutcome = outcome
+  lockedAllocationRecords = null
+}
+
+mock.module('@/lib/accounting', {
+  namedExports: {
+    getAccountingSettings: async () => ({
+      inventoryAccount: '630',
+      allocatedInventoryAccount: '631',
+    }),
+    queueAccountingSyncTx: async (_tx: unknown, params: QueuedAccountingSync) => {
+      queuedAccountingSyncs.push(params)
+      if (accountingEnqueueOutcome === 'silent-no-op') return false
+      accountingSyncRows.push(params)
+      return true
+    },
+    isAccountingSyncTypeEnabled: async () => true,
+    isDailyBatchPostingEnabled: async () => true,
+  },
+})
 
 import { Prisma } from '@/app/generated/prisma/client'
 
@@ -27,6 +87,11 @@ import {
   type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
 import { toDecimal } from '@/lib/domain/math/decimal'
+import {
+  parseCostLayerSnapshot,
+  sumCostLayerSnapshot,
+  sumCostLayerSnapshotQty,
+} from '@/lib/cost-layer-snapshots'
 import { isPermanentStatusTransitionError } from '@/lib/domain/sales/status-transition-errors'
 
 type ProductRow = {
@@ -79,6 +144,9 @@ type OrderRow = {
   // o3d-o97 r4: the A2 journal the order was staged into. Whether the un-stage may clear the stamp
   // now depends on whether that journal's debit is still standing.
   allocationBatchSyncLogId?: string | null
+  // o3d-xlk7: the running total an ALLOCATION_REVERSAL credits back out of Allocated Inventory for
+  // this order. The refund's open balance nets it off; without it the same units are credited twice.
+  allocationReversalAmount?: number | null
   lines: OrderLineRow[]
 }
 
@@ -185,6 +253,19 @@ const writeCounts = { allocationCreates: 0, allocationDeletes: 0, allocationUpda
  * written after the rows it describes have already gone.
  */
 const activityLogWrites: Array<Record<string, unknown>> = []
+/**
+ * o3d-0i5y r11: what the LOCKED re-read of the order's allocation rows sees, keyed
+ * `lineId|warehouseId|productId`.
+ *
+ * This is how a test models the ONE writer the sales-order lock does not cover:
+ * `updateSnapshotsForCostLayerChange` rewrites `unitCostBase` in place on `order_allocations` when a
+ * landed cost lands late, and takes no order lock. Setting an entry here leaves the ORDINARY reads
+ * answering the pre-correction array while the FOR UPDATE read answers the corrected one — the only
+ * way a revert of the fix can be seen to write the stale value back out. null = the live rows.
+ */
+let lockedAllocationRecords: Record<string, unknown> | null = null
+/** Every statement the transaction issued, in order. */
+const txStatements: string[] = []
 const txWriteOrder: string[] = []
 /** o3d-kouj: every fulfilment-requirement pin the run wrote, in order. */
 const salesOrderLineSnapshotWrites: Array<{ lineId: string; payload: unknown }> = []
@@ -195,6 +276,10 @@ function createClient(state: MemoryState): AllocationServiceClient {
   writeCounts.allocationUpdateManys = 0
   activityLogWrites.length = 0
   txWriteOrder.length = 0
+  txStatements.length = 0
+  // Cleared per client, so a fixture that models a mid-flight revaluation cannot leak into the next
+  // test. Tests therefore set it AFTER `createClient`.
+  lockedAllocationRecords = null
   salesOrderLineSnapshotWrites.length = 0
   const allocations = state.allocations ?? []
   // The column is NOT NULL DEFAULT 0; normalise in place so a seeded row and a written row are
@@ -206,7 +291,43 @@ function createClient(state: MemoryState): AllocationServiceClient {
   const shipmentLines = state.shipmentLines ?? []
   const refundLines = state.refundLines ?? []
   const client = {
-    $queryRaw: async () => [],
+    /**
+     * o3d-0i5y r11: TWO call shapes reach here and they are not the same question. `lockSalesOrder`
+     * and `lockStockLevels` take a lock and want nothing back; `lockAccountedRecordsForOrder` is a
+     * ROW-RETURNING lock — it hands back the record each row holds AS OF THE LOCK, which is the base
+     * the carry-over re-authors. Answering it with `[]`, as this double did while every raw statement
+     * here was only ever a lock, hands the rewrite an EMPTY BASE: no record to carry, nothing
+     * orphaned, no reversal — which made NINE existing tests in this file decide nothing.
+     */
+    $queryRaw: async (...args: unknown[]) => {
+      const first = args[0]
+      const text = first && typeof first === 'object' && 'sql' in (first as Record<string, unknown>)
+        ? String((first as { sql: unknown }).sql)
+        : Array.isArray(first)
+        ? first.join(' ')
+        : String(first)
+      const sql = text.replace(/\s+/g, ' ').trim()
+      txStatements.push(`$queryRaw:${sql}`)
+      if (sql.includes('order_allocations') && sql.includes('FOR UPDATE')) {
+        // Honours the orderId predicate: a double that returned every row would hand the carry-over
+        // another order's records to pool.
+        const [orderId] = ((first as { values?: unknown[] }).values ?? []) as string[]
+        return allocations
+          .filter((row) => orderId == null || row.orderId === orderId)
+          .map((row) => {
+            const key = `${row.lineId}|${row.warehouseId}|${row.productId}`
+            return {
+              lineId: row.lineId,
+              productId: row.productId,
+              warehouseId: row.warehouseId,
+              costLayerSnapshot: lockedAllocationRecords && key in lockedAllocationRecords
+                ? lockedAllocationRecords[key]
+                : row.costLayerSnapshot ?? null,
+            }
+          })
+      }
+      return []
+    },
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(client),
     salesOrder: {
       findUnique: async ({ where }: { where: { id: string } }) => {
@@ -214,13 +335,21 @@ function createClient(state: MemoryState): AllocationServiceClient {
         return { ...state.order }
       },
       update: async ({ data }: {
-        data: { status?: string; inventoryAllocatedDate?: Date | null; allocationBatchAmount?: number | null }
+        data: {
+          status?: string
+          inventoryAllocatedDate?: Date | null
+          allocationBatchAmount?: number | null
+          allocationReversalAmount?: number | null
+        }
       }) => {
         if (data.status) state.order.status = data.status
         // resetAllocationAccountingIfStaged clears these. The double used to ignore them, which
         // made any assertion about the A2 stamp vacuous — o3d-i5it turns on exactly that write.
         if ('inventoryAllocatedDate' in data) state.order.inventoryAllocatedDate = data.inventoryAllocatedDate ?? null
         if ('allocationBatchAmount' in data) state.order.allocationBatchAmount = data.allocationBatchAmount ?? null
+        // o3d-xlk7: the reversal's own record. Ignoring this write would make every assertion about
+        // the relief a later refund can see vacuous — which is the exact shape of the defect.
+        if ('allocationReversalAmount' in data) state.order.allocationReversalAmount = data.allocationReversalAmount ?? null
         return state.order
       },
     },
@@ -311,11 +440,25 @@ function createClient(state: MemoryState): AllocationServiceClient {
       count: async ({ where }: { where: { orderId: string } }) => allocations
         .filter((allocation) => allocation.orderId === where.orderId)
         .length,
-      deleteMany: async ({ where }: { where: { orderId: string } }) => {
+      // o3d-0i5y r4: the SCOPE predicate is honoured. The allocator no longer wipes the order and
+      // rebuilds it — it deletes only the (line, warehouse, product) scopes the new set dropped —
+      // so a double that ignored those keys would report a targeted delete as having destroyed
+      // every row on the order, and the identity-preservation assertions would be vacuous.
+      deleteMany: async ({ where }: {
+        where: { orderId: string; lineId?: string; productId?: string; warehouseId?: string }
+      }) => {
         writeCounts.allocationDeletes += 1
+        // o3d-0i5y r11: recorded in the interleaving, because "the evidence is preserved before the
+        // rows carrying it are destroyed" is a claim about ORDER, not just about a row existing.
+        txWriteOrder.push('orderAllocation.deleteMany')
         const before = allocations.length
         for (let index = allocations.length - 1; index >= 0; index -= 1) {
-          if (allocations[index].orderId === where.orderId) allocations.splice(index, 1)
+          const row = allocations[index]
+          if (row.orderId !== where.orderId) continue
+          if (where.lineId != null && row.lineId !== where.lineId) continue
+          if (where.productId != null && row.productId !== where.productId) continue
+          if (where.warehouseId != null && row.warehouseId !== where.warehouseId) continue
+          allocations.splice(index, 1)
         }
         return { count: before - allocations.length }
       },
@@ -334,21 +477,42 @@ function createClient(state: MemoryState): AllocationServiceClient {
       // `lineId` and a `fulfillmentGraphVersion: { not }` predicate. Both are honoured — a double
       // that ignored them would report a re-stamp scoped to one stale line as having touched every
       // row on the order, so a test could not tell a targeted repair from a blanket rewrite.
+      //
+      // o3d-0i5y r4: it is ALSO the allocator's in-place quantity write now, so it honours the full
+      // (line, warehouse, product) scope and coerces `qty` to the column's 4dp exactly as `create`
+      // does. A double that took the qty verbatim would let a test observe a precision Postgres
+      // would have rounded away, and one that ignored productId/warehouseId would silently apply
+      // one scope's new quantity to every row on the order.
       updateMany: async ({ where, data }: {
-        where: { orderId: string; lineId?: string; fulfillmentGraphVersion?: { not?: number } }
-        data: { costLayerSnapshot?: unknown; fulfillmentGraphVersion?: number }
+        where: {
+          orderId: string
+          lineId?: string
+          productId?: string
+          warehouseId?: string
+          fulfillmentGraphVersion?: { not?: number }
+        }
+        data: { costLayerSnapshot?: unknown; fulfillmentGraphVersion?: number; qty?: number | { toNumber(): number } }
       } = { where: { orderId: '' }, data: {} }) => {
         writeCounts.allocationUpdateManys += 1
         const rows = allocations
           .filter((allocation) => allocation.orderId === where.orderId)
           .filter((allocation) => where.lineId == null || allocation.lineId === where.lineId)
+          .filter((allocation) => where.productId == null || allocation.productId === where.productId)
+          .filter((allocation) => where.warehouseId == null || allocation.warehouseId === where.warehouseId)
           .filter((allocation) => (
             where.fulfillmentGraphVersion?.not == null
             || (allocation.fulfillmentGraphVersion ?? 0) !== where.fulfillmentGraphVersion.not
           ))
         for (const row of rows) {
-          if ('costLayerSnapshot' in data) row.costLayerSnapshot = null
+          // o3d-0i5y r8: the WRITTEN VALUE is honoured, not hardcoded to null. Forcing null asserted
+          // a destructive rewrite as a REQUIREMENT — whatever the allocator wrote, the row came back
+          // empty — so a test could observe Group A2's posted record being destroyed but never being
+          // CARRIED onto the row that inherits its units, which is the fix.
+          if ('costLayerSnapshot' in data) {
+            row.costLayerSnapshot = data.costLayerSnapshot === Prisma.DbNull ? null : data.costLayerSnapshot
+          }
           if (data.fulfillmentGraphVersion !== undefined) row.fulfillmentGraphVersion = data.fulfillmentGraphVersion
+          if (data.qty !== undefined) row.qty = persistAllocationQty(decimalLikeToNumber(data.qty))
         }
         return { count: rows.length }
       },
@@ -461,17 +625,32 @@ function createClient(state: MemoryState): AllocationServiceClient {
       // two DIFFERENT questions of this table and they must not be conflated: demand netting uses
       // every non-PENDING shipment, while the reservation residual uses only SHIPPED — the single
       // status at which reservedQty is actually decremented (o3d-4kfh).
+      //
+      // o3d-0i5y r4 adds a THIRD question to the same table: which lines belong to a shipment Group
+      // B has already POSTED (`shipmentJournalDate: { not: null }`, no status predicate at all).
+      // That is the floor the journal-safe permit is checked against, so a double that answered it
+      // with the unfiltered set would let a test pass with the floor computed from shipments no
+      // journal ever touched.
       findMany: async ({ where }: {
-        where: { shipment: { orderId: string; status: string | { not: string } } }
+        where: {
+          shipment: {
+            orderId: string
+            status?: string | { not: string }
+            shipmentJournalDate?: { not: null }
+          }
+        }
       }) => {
         const statusFilter = where.shipment.status
         return shipmentLines.flatMap((line) => {
           const shipment = shipments.find((row) => row.id === line.shipmentId)
           if (!shipment || shipment.orderId !== where.shipment.orderId) return []
           const status = shipment.status ?? 'PENDING'
-          const matches = typeof statusFilter === 'string'
-            ? status === statusFilter
-            : status !== statusFilter.not
+          if (where.shipment.shipmentJournalDate?.not === null && shipment.shipmentJournalDate == null) return []
+          const matches = statusFilter == null
+            ? true
+            : typeof statusFilter === 'string'
+              ? status === statusFilter
+              : status !== statusFilter.not
           if (!matches) return []
           return [{
             lineId: line.lineId,
@@ -567,8 +746,40 @@ function createClient(state: MemoryState): AllocationServiceClient {
     // in flight" is what every pre-existing cancellation test assumes. The dedicated refusal tests
     // live in tests/accounting/cancel-invoice-posting-intent.test.ts against a where-honouring store.
     accountingSyncLog: {
-      findFirst: async () => state.syncPostingClaim ?? null,
       updateMany: async () => ({ count: 0 }),
+      // o3d-0i5y r10 + o3d-7o0: ONE `findFirst` serves two different probes here, so it dispatches
+      // on WHAT WAS ASKED FOR rather than answering both with the same fixture.
+      //
+      //   * the post-enqueue verification asks the DATABASE for the row the enqueue was supposed to
+      //     create, under that enqueue's own predicate — same type, same reference, plus the
+      //     `_reversalToken` JSON path that identifies one call and no other. Answering it with a
+      //     hardcoded row (or with `null`) would decide the outcome of every such test in the double
+      //     rather than in production, so it really searches `accountingSyncRows` — the rows the
+      //     enqueue wrote — and really honours the JSON path filter.
+      //   * the posting-intent probe (o3d-7o0) asks whether an invoice post for the order is on the
+      //     wire. `state.syncPostingClaim` is what it finds, and the default of "nothing in flight"
+      //     is what every pre-existing cancellation test assumes.
+      findFirst: async (args?: {
+        where?: {
+          type?: string
+          referenceType?: string
+          referenceId?: string
+          payload?: { path: string[]; equals: unknown }
+        }
+      }) => {
+        const where = args?.where ?? {}
+        if (where.payload == null) return state.syncPostingClaim ?? null
+        return accountingSyncRows.find((row) => {
+          if (where.type != null && row.type !== where.type) return false
+          if (where.referenceType != null && row.referenceType !== where.referenceType) return false
+          if (where.referenceId != null && row.referenceId !== where.referenceId) return false
+          const value = where.payload!.path.reduce<unknown>(
+            (node, key) => (node == null ? undefined : (node as Record<string, unknown>)[key]),
+            row.payload,
+          )
+          return value === where.payload!.equals
+        }) ?? null
+      },
       // o3d-o97 r4: the A2 journal probed by its own id. A missing row is NOT "no journal" —
       // retention deletes terminal rows — so the un-stage keeps the stamp for it.
       findUnique: async ({ where }: { where: { id: string } }) => (
@@ -1102,22 +1313,140 @@ test('onReconciledInTx does NOT run on the refused path — the backstop stays p
   assert.equal(calls, 0, 'a refuse must not resolve the backstop')
 })
 
-test('allocateSalesOrder blocks allocation edits after shipment accounting is journaled', async () => {
+// ---------------------------------------------------------------------------
+// o3d-0i5y r4 — A JOURNALED PARTIAL SHIPMENT MUST NOT TAKE THE REMEDY AWAY.
+//
+// r1 stops promoting a short order, r3 makes "re-allocate, create the residual shipments, dispatch
+// them" reachable from PICKING/PACKING. But the FIRST step of that remedy is a re-allocation, and
+// the re-allocation went through `resetAllocationAccountingIfStaged`, which refused outright once
+// Group B had posted the despatched part. So the orders r3 was rescuing — part despatched, part
+// posted — were stranded again.
+//
+// The refusal is now the invariant it stood in for: no row a journal posted against may be dropped
+// or shrunk below the posted quantity. These two tests are the permit and the refusal.
+// ---------------------------------------------------------------------------
+
+test('o3d-0i5y r4: a JOURNALED short order can still be RE-ALLOCATED for its residual', async () => {
+  // The exact shape r1 leaves behind, one daily batch later. 3 ordered, 2 allocated and despatched,
+  // Group B has posted that shipment, and stock for the last unit has since arrived. Before this,
+  // the re-allocation the operator is told to perform threw before writing anything.
   const state = baseState({
     order: {
       ...baseState().order,
+      status: 'PICKING',
       inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
     },
-    shipments: [{ id: 'shipment-1', orderId: 'order-1', shipmentJournalDate: new Date('2026-01-02T00:00:00Z') }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 3, reservedQty: 0 }],
+    allocations: [{
+      id: 'alloc-posted',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+      // r5: `unitCostBase`, not `unitCost`. parseCostLayerSnapshot DROPS an entry without it, so the
+      // r4 fixture pinned nothing — every assertion about what a previous A2 pass had accounted for
+      // this row would have been made against an empty snapshot.
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 4 }],
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      warehouseId: 'warehouse-1',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00Z'),
+    }],
+    shipmentLines: [{ shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.success, true)
+  // The whole claim: 1 outstanding + the 2 already posted, per the o3d-4kfh contract. That is what
+  // `confirmSalesOrderShipments` subtracts the committed 2 from to raise the residual shipment.
+  const own = (state.allocations ?? []).find((row) => row.orderId === 'order-1')
+  assert.equal(Number(own?.qty), 3)
+  // AND the evidence Group B posted through is untouched: same row, same id, same pinned layers.
+  // A delete+recreate would leave the numbers identical and break both.
+  assert.equal(own?.id, 'alloc-posted', 'the allocation identity the shipment snapshot references survives')
+  assert.deepEqual(
+    own?.costLayerSnapshot,
+    [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 4 }],
+    'and so does the cost snapshot the refund reversal relieves against',
+  )
+  // r5 REVERSES r4's verdict here, and the reason r4 gave is now handled where it belongs. r4 kept
+  // the stamp because a re-stage would re-post the journaled shipment's value and blank the pinned
+  // snapshots — both true of the A2 pass r4 was looking at, and neither true of the one that runs
+  // now: it excludes journaled shipments and leaves an already-pinned row alone. Keeping the stamp
+  // meant the third unit — the whole reason this rebuild is permitted — was never reclassified at
+  // all, while Group B still credited Allocated Inventory for it on despatch.
+  assert.equal(
+    state.order.inventoryAllocatedDate,
+    null,
+    'the A2 stamp is released so the residual unit can be reclassified — keeping it strands the unit outside accounting',
+  )
+  // Only the residual unit is newly reserved; the despatched 2 gave their reservation back already.
+  assert.equal(state.stockLevels[0].reservedQty, 1)
+})
+
+test('o3d-0i5y r4: an allocation that would SHRINK a posted row is still refused, and says which row', async () => {
+  // The case the original blanket refusal genuinely existed for. Declared directly against the
+  // guard, because `allocateSalesOrder` cannot produce it — `persistedAllocations` re-adds every
+  // committed shipment line — and a refusal that only exists inside a caller that can never reach
+  // it is not a guard.
+  const { tx, salesOrderUpdates, allocationUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
   })
 
   await assert.rejects(
-    () => allocateSalesOrder(createClient(state), { orderId: 'order-1' }),
-    /Cannot modify allocations after shipments have been posted to accounting/,
+    () => resetAllocationAccountingIfStaged(
+      tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+      'order-1',
+      {
+        nextAllocations: [{
+          lineId: 'line-1',
+          productId: 'product-1',
+          warehouseId: 'warehouse-1',
+          qty: toDecimal('1'),
+        }],
+      },
+    ),
+    (error: Error) => {
+      assert.match(error.message, /Cannot reduce an allocation below the quantity already posted/)
+      assert.match(error.message, /product-1 @ warehouse-1 on line line-1/, 'names the row')
+      assert.match(error.message, /posted 2, allocation would keep 1/, 'and the size of the shortfall')
+      assert.match(error.message, /Process a refund or return/, 'and a remedy the operator can actually perform')
+      return true
+    },
   )
-  assert.deepEqual(state.allocations, [])
-  assert.equal(state.stockLevels[0].reservedQty, 0)
-  assert.equal(state.order.status, 'PROCESSING')
+  assert.deepEqual(salesOrderUpdates, [], 'and it refuses BEFORE touching the A2 stamp')
+  assert.deepEqual(allocationUpdates, [], 'or the cost snapshots')
+})
+
+test('o3d-0i5y r4: a caller that declares NO set is still refused — and is told which button does declare one', async () => {
+  // updateAllocation / addAllocation / the cancellation and teardown releases all call the guard
+  // without a set. They cannot be permitted, because there is nothing to check them against; what
+  // changes is that the refusal now names a remedy that exists, instead of "contact finance".
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+  })
+
+  await assert.rejects(
+    () => resetAllocationAccountingIfStaged(
+      tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+      'order-1',
+    ),
+    (error: Error) => {
+      assert.match(error.message, /Cannot modify allocations one row at a time/)
+      assert.match(error.message, /Use Re-Allocate on the order instead/)
+      return true
+    },
+  )
+  assert.deepEqual(salesOrderUpdates, [])
 })
 
 test('assertReservationReleaseDelta verifies exact per-scope reservation release', () => {
@@ -1762,6 +2091,7 @@ test('a genuine allocation change still resets accounting state (o3d-i5it), keep
     },
     stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 2 }],
     allocations: [{
+      id: 'alloc-a',
       orderId: 'order-1',
       lineId: 'line-1',
       productId: 'product-1',
@@ -1784,8 +2114,55 @@ test('a genuine allocation change still resets accounting state (o3d-i5it), keep
     'and the retention is recorded where an operator can see it',
   )
   assert.ok(result.syncProductIds.includes('product-1'), 'and still pushes the storefront update')
-  assert.ok(writeCounts.allocationDeletes > 0, 'and the destructive cycle DID run for a real change')
-  assert.ok(writeCounts.allocationCreates > 0)
+  // o3d-0i5y r4: the cycle is no longer DESTRUCTIVE. The quantity moved on the row that was
+  // already there, so the row keeps the id a dispatched shipment line's cost snapshot references
+  // (`orderAllocationId`) — a delete+recreate would leave these same numbers behind a new id, and
+  // the next refund would relieve nothing and over-reverse.
+  assert.equal(state.allocations?.[0].id, 'alloc-a', 'and the row was updated in place, not replaced')
+  assert.equal(writeCounts.allocationDeletes, 0, 'nothing was deleted — the scope is still wanted')
+  assert.equal(writeCounts.allocationCreates, 0, 'and nothing re-created')
+  assert.ok(writeCounts.allocationUpdateManys > 0, 'the change was written, as an in-place update')
+})
+
+test('o3d-0i5y r4: a scope the new set DROPS is deleted, and only that scope', async () => {
+  // The other half of the reconcile-by-key rewrite. Warehouse-2 loses its stock, so the whole claim
+  // moves to warehouse-1: the w2 row must go, and the w1 row must survive with its identity.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      lines: [{
+        id: 'line-1',
+        productId: 'product-1',
+        qty: 3,
+        sku: 'SKU-1',
+        description: 'Product 1',
+        product: { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false },
+      }],
+    },
+    warehouses: [
+      { id: 'warehouse-1', code: 'MAIN', name: 'Main', active: true, availableForSale: true, isDefault: true, syncToStore: false },
+      { id: 'warehouse-2', code: 'SEC', name: 'Second', active: true, availableForSale: true, isDefault: false, syncToStore: false },
+    ],
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 2 },
+      { productId: 'product-1', warehouseId: 'warehouse-2', quantity: 1, reservedQty: 1 },
+    ],
+    allocations: [
+      { id: 'alloc-w1', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 },
+      { id: 'alloc-w2', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-2', qty: 1 },
+    ],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const remaining = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(
+    remaining.map((row) => `${row.id}:${row.warehouseId}:${Number(row.qty)}`),
+    ['alloc-w1:warehouse-1:3'],
+    'the surviving scope kept its identity, the dropped one really was removed',
+  )
+  assert.equal(state.stockLevels[1].reservedQty, 0, 'and warehouse-2 got its reservation back')
 })
 
 test('an allocation change does NOT clear the A2 stamp on a CANCELLED journal either (o3d-o97 r5)', async () => {
@@ -1872,6 +2249,516 @@ test('an allocation change DOES clear the A2 stamp when A2 recorded a debit of e
   assert.equal(
     activityLogWrites.filter((entry) => (entry as { action: string }).action === 'allocation_accounting_stage_retained').length,
     0,
+  )
+})
+
+/**
+ * o3d-0i5y r8 — THE POSTED RECORD FOLLOWS THE UNITS, NOT THE ROW.
+ *
+ * `costLayerSnapshot` on an allocation row is the record that Group A2 has already debited
+ * Allocated Inventory for those units. The rewrite used to destroy it in the ordinary course of
+ * business: move a residual to another warehouse and the old scope's row is deleted, the new one
+ * created blank, and A2 — which decides what it owes by reading the record — pins and posts every
+ * unit a second time. Nothing reverses the first posting.
+ *
+ * 10 units posted at £5 = £50 in Allocated Inventory. The stock moves to warehouse-1 and 4 more
+ * units are allocated there. The money half of this is asserted on the real Group A2 writer in
+ * tests/accounting/daily-batch-a2-mixed-shipment.test.ts, on the row shape these two tests prove
+ * the allocator now writes.
+ */
+function movedState(lineQty: number): ReturnType<typeof baseState> {
+  const product = { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false }
+  return baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      // A2 has run: these rows are POSTED, which is exactly what the stamp means.
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: 50,
+      lines: [{ id: 'line-1', productId: 'product-1', qty: lineQty, sku: 'SKU-1', description: 'Product 1', product }],
+    },
+    warehouses: [
+      { id: 'warehouse-1', code: 'MAIN', name: 'Main', active: true, availableForSale: true, isDefault: true, syncToStore: false },
+      { id: 'warehouse-2', code: 'SEC', name: 'Second', active: true, availableForSale: true, isDefault: false, syncToStore: false },
+    ],
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: lineQty, reservedQty: 0 },
+      { productId: 'product-1', warehouseId: 'warehouse-2', quantity: 10, reservedQty: 10 },
+    ],
+    allocations: [{
+      id: 'alloc-w2',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-2',
+      qty: 10,
+      costLayerSnapshot: [{ costLayerId: 'layer-w2', qty: '10.000000', unitCostBase: '5.000000' }],
+    }],
+  })
+}
+
+test('o3d-0i5y r8: a warehouse MOVE carries the posted A2 record onto the row that inherits the units', async () => {
+  // 10 posted at warehouse-2, 14 now wanted and warehouse-1 (the default) can cover all of them.
+  const state = movedState(14)
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(
+    rows.map((row) => `${row.warehouseId}:${Number(row.qty)}`),
+    ['warehouse-1:14'],
+    'the whole claim moved to warehouse-1',
+  )
+  const record = parseCostLayerSnapshot(rows[0].costLayerSnapshot)
+  assert.equal(
+    sumCostLayerSnapshotQty(record).toString(),
+    '10',
+    'the 10 units A2 already posted are still recorded — on the row that now holds them',
+  )
+  assert.equal(
+    sumCostLayerSnapshot(record).toString(),
+    '50',
+    'at the £50 that is actually in Allocated Inventory, so A2 owes the 4 new units and nothing else',
+  )
+  assert.equal(
+    state.order.inventoryAllocatedDate,
+    null,
+    'and the order does go back to A2, because 4 units genuinely are unaccounted',
+  )
+})
+
+test('o3d-0i5y r8: a move with nothing new to account keeps the A2 stamp — the order is not handed back to post again', async () => {
+  // The same move without the residual. Every unit is already accounted, so there is nothing for a
+  // second A2 pass to do and the order must not be selected for one.
+  const state = movedState(10)
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(
+    rows.map((row) => `${row.warehouseId}:${Number(row.qty)}`),
+    ['warehouse-1:10'],
+  )
+  assert.equal(
+    sumCostLayerSnapshot(parseCostLayerSnapshot(rows[0].costLayerSnapshot)).toString(),
+    '50',
+    'the record moved with the units',
+  )
+  assert.deepEqual(
+    state.order.inventoryAllocatedDate,
+    new Date('2026-01-01T00:00:00Z'),
+    'the stamp stands: a move is not new quantity, and clearing it is what invited the second posting',
+  )
+  assert.equal(state.order.allocationBatchAmount, 50, 'and so does the amount A2 recorded posting')
+})
+
+/**
+ * o3d-0i5y r9 — A SHRUNK RECORD IS A DEBIT TO REVERSE, NOT A FLOOR TO TOLERATE.
+ *
+ * WORKED, and this is the whole finding. Line L is allocated 10 units at warehouse-1. Group A2
+ * pins them and posts DR Allocated Inventory / CR Inventory £40 — 10 x £4 — and records the pin and
+ * the £4 a unit it posted on the row. The customer then drops the line to 6, and the re-allocation
+ * leaves the row holding 6.
+ *
+ *   BEFORE (r8)  the row still records 10 units, which the accounted-quantity floor tolerates. The
+ *                floor's job is to stop those units being posted a SECOND time and it does that
+ *                perfectly. It says nothing about the money: Group B credits Allocated Inventory
+ *                6 x £4 = £24 when the 6 ship, no refund exists to credit the other 4, and £16 of a
+ *                real debit stays in Allocated Inventory for ever with Inventory £16 understated.
+ *                Nothing in IMS ever names that £16 again.
+ *   AFTER  (r9)  the record is trimmed to the 6 units the row will hold, and the 4 orphaned units
+ *                are reversed at the £4 a unit A2 RECORDED posting — DR Inventory £16 /
+ *                CR Allocated Inventory £16, in the same transaction as the rewrite. Allocated
+ *                Inventory is left holding exactly the £24 Group B will relieve.
+ */
+function shrunkState(options: {
+  lineQty: number
+  record: Array<Record<string, string>> | null
+}): ReturnType<typeof baseState> {
+  const product = { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false }
+  return baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      // A2 has run and posted: 10 units, £40.
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: 40,
+      lines: [{ id: 'line-1', productId: 'product-1', qty: options.lineQty, sku: 'SKU-1', description: 'Product 1', product }],
+    },
+    warehouses: [
+      { id: 'warehouse-1', code: 'MAIN', name: 'Main', active: true, availableForSale: true, isDefault: true, syncToStore: false },
+    ],
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 },
+    ],
+    allocations: [{
+      id: 'alloc-w1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 10,
+      costLayerSnapshot: options.record,
+    }],
+  })
+}
+
+/** What A2 wrote when it posted: the pin, AND the amount it posted for each unit. */
+const POSTED_TEN_AT_FOUR = [{
+  costLayerId: 'layer-1',
+  qty: '10.000000',
+  unitCostBase: '4.000000',
+  postedUnitCostBase: '4.000000',
+}]
+
+test('o3d-0i5y r9: shrinking a recorded allocation REVERSES the part of the A2 debit nothing will relieve', async () => {
+  const state = shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(rows.map((row) => `${row.warehouseId}:${Number(row.qty)}`), ['warehouse-1:6'])
+  assert.equal(
+    sumCostLayerSnapshotQty(parseCostLayerSnapshot(rows[0].costLayerSnapshot)).toString(),
+    '6',
+    'the record is trimmed to the units the row will actually hold',
+  )
+
+  assert.equal(queuedAccountingSyncs.length, 1, 'a reversal journal is raised for the 4 units that left')
+  const reversal = queuedAccountingSyncs[0]
+  assert.equal(reversal.type, 'ALLOCATION_REVERSAL')
+  assert.equal(reversal.referenceType, 'SalesOrder')
+  assert.equal(reversal.referenceId, 'order-1')
+  assert.deepEqual(
+    reversal.payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [
+      ['630', 16, null],
+      ['631', null, 16],
+    ],
+    'CR Allocated Inventory £16, DR Inventory £16 — 4 units at the £4 A2 recorded posting',
+  )
+})
+
+test('o3d-0i5y r9: the reversal is valued at what A2 POSTED, never at the pin a revaluation rewrote', async () => {
+  // The same 4 orphaned units, but a landed cost has since arrived and
+  // `updateSnapshotsForCostLayerChange` has rewritten `unitCostBase` on this very row from £4 to
+  // £9. That revaluation posted to COGS/Inventory and never touched Allocated Inventory, so the
+  // debit standing against these units is still £4 a unit. Reversing the live pin would move £36
+  // out of an account that only ever received £40 for ten units — and £12 out of it had the layers
+  // fallen instead.
+  const state = shrunkState({
+    lineQty: 6,
+    record: [{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '9.000000', postedUnitCostBase: '4.000000' }],
+  })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(queuedAccountingSyncs.length, 1)
+  assert.deepEqual(
+    queuedAccountingSyncs[0].payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [
+      ['630', 16, null],
+      ['631', null, 16],
+    ],
+    'still £16 — the recorded amount, not 4 x the revalued £9',
+  )
+})
+
+test('o3d-0i5y r9: a record that cannot say what was posted for it reverses NOTHING, and is reported', async () => {
+  // Every entry written before r9 is this shape, and so is any entry a future path forgets to
+  // stamp. A reversal posted wrongly is as bad as the original, so this path needs POSITIVE
+  // evidence of the original — and the pin is not it, because a revaluation rewrites the pin
+  // without ever touching Allocated Inventory. Fail closed and tell someone.
+  const state = shrunkState({
+    lineQty: 6,
+    record: [{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '4.000000' }],
+  })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs, [], 'no journal is invented from the live pin')
+  const reported = activityLogWrites.filter((row) => row.action === 'allocation_reversal_unevidenced')
+  assert.equal(reported.length, 1, 'and the units that left are named for a human to settle by hand')
+  assert.match(String(reported[0].description), /4 recorded unit\(s\)/)
+  assert.match(String(reported[0].description), /layer-1/)
+})
+
+test('o3d-0i5y r9: a rewrite that orphans NOTHING raises no reversal at all', async () => {
+  // The guard against the opposite failure: a reversal fired on an ordinary re-allocation would
+  // credit Allocated Inventory for units that are still on the order and still going to ship.
+  const state = shrunkState({ lineQty: 10, record: POSTED_TEN_AT_FOUR })
+  state.stockLevels[0].quantity = 20
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(queuedAccountingSyncs, [])
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r10 (Codex round 10) — THE ENQUEUE THAT DID NOTHING, AND THE TEARDOWN THAT DELETED
+// EVERYTHING.
+//
+// r9 raised the reversal but trusted the queue to have taken it, and left the one path that
+// destroys the MOST evidence — the teardown release — out of the fix entirely, flagging it as the
+// cancellation path's problem. Both are on the money path and both are asserted on the amount.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-0i5y r10: a reversal the queue silently DROPPED is detected, and the amount is reported', async () => {
+  // `queueAccountingSyncTx` writes nothing and throws nothing when no active connector posts the
+  // type, when the posting is suppressed, or when the order was deleted under it. r9 awaited it and
+  // moved on, so all three read as "reversed" — while the rows carrying the evidence had already
+  // been trimmed in this same transaction. The debit stranded AND the record gone.
+  const state = shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR })
+  resetAccountingQueue('silent-no-op')
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(queuedAccountingSyncs.length, 1, 'the enqueue was attempted')
+  assert.equal(accountingSyncRows.length, 0, 'and it wrote nothing — which is what production has to notice')
+
+  const reported = activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued')
+  assert.equal(reported.length, 1, 'the dropped reversal is recorded, not assumed')
+  assert.equal(reported[0].level, 'ERROR')
+  assert.match(
+    String(reported[0].description),
+    /Allocation reversal of £16\.00 on order order-1 was NOT queued/,
+    'and it names the exact amount a human now has to post by hand — £16.00, not "a reversal failed"',
+  )
+  assert.match(String(reported[0].description), /4 recorded unit\(s\) left the order/)
+})
+
+test('o3d-0i5y r10: a reversal the queue DID take is not reported as dropped', async () => {
+  // The guard against the opposite failure. The verification asks for the row under the enqueue's
+  // own predicate; a predicate that could never match would turn every successful reversal into an
+  // ERROR-level false alarm and train whoever reads the log to ignore it.
+  const state = shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR })
+  resetAccountingQueue()
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(accountingSyncRows.length, 1)
+  assert.equal(
+    typeof accountingSyncRows[0].payload._reversalToken,
+    'string',
+    'the row carries the token the verification looks it up by',
+  )
+  assert.deepEqual(activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued'), [])
+})
+
+/**
+ * o3d-0i5y r10 — THE DEALLOCATION TEARDOWN, WHICH DELETES EVERY ROW ON THE ORDER.
+ *
+ *   line L holds 10 units at warehouse-1. A2 pinned them at £4 and posted DR Allocated /
+ *   CR Inventory £40.
+ *   the operator presses Deallocate. There is no committed shipment, so nothing refuses it.
+ *   BEFORE r10: `deleteMany({ orderId })` takes all ten rows and the record with them. The units
+ *     will never ship, so Group B never credits Allocated Inventory; they were never invoiced, so
+ *     no refund reversal sees them. £40 sits in Allocated Inventory for ever, Inventory is
+ *     understated by £40, and not one row survives that could say how much it was.
+ *   AFTER r10: CR Allocated £40 / DR Inventory £40, in the same transaction as the delete.
+ */
+function deallocatedState(record: Array<Record<string, string>> | null): ReturnType<typeof baseState> {
+  const state = shrunkState({ lineQty: 10, record })
+  state.stockLevels[0].reservedQty = 10
+  return state
+}
+
+test('o3d-0i5y r10: the deallocation teardown REVERSES the posted debit of the rows it deletes', async () => {
+  const state = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue()
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.deepEqual(state.allocations, [], 'the rows are gone, as this path has always intended')
+  assert.equal(queuedAccountingSyncs.length, 1, 'and their posted debit does not go with them')
+  assert.deepEqual(
+    queuedAccountingSyncs[0].payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [
+      ['630', 40, null],
+      ['631', null, 40],
+    ],
+    'CR Allocated Inventory £40, DR Inventory £40 — all ten units, at the £4 A2 recorded posting',
+  )
+  assert.equal(queuedAccountingSyncs[0].type, 'ALLOCATION_REVERSAL')
+  assert.equal(queuedAccountingSyncs[0].referenceId, 'order-1')
+})
+
+test('o3d-xlk7: the reversal RECORDS its credit on the order, where the refund\'s open balance looks', async () => {
+  // THE OTHER HALF OF THE REVERSAL, and it is not optional. o3d-o97 (merged as PR #635) computes how
+  // many pounds of A2's debit are still open as `allocationBatchAmount` less relief it can PROVE,
+  // and it knows two relief sources: Group B's per-shipment figure and each prior refund's. An
+  // ALLOCATION_REVERSAL is NEITHER, so without a record of it a later full refund's residue credits
+  // these same units a SECOND time.
+  //
+  // The refund proves the figure from the reversal journal's own lines; this column is what survives
+  // `retention_sync_logs_months` hard-deleting that journal, which it will long before an order
+  // orphaned today is refunded.
+  const state = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue()
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(
+    Number(state.order.allocationReversalAmount),
+    40,
+    'the £40 credited back out of Allocated Inventory is recorded on the order',
+  )
+  assert.equal(
+    Number(state.order.allocationBatchAmount),
+    40,
+    'and A2\'s own record of what it POSTED is left alone — netting the reversal into it would read '
+    + 'as "A2 recorded a debit of zero", which is o3d-o97\'s positive proof that no debit stands, and '
+    + 'the order would clear its stamp and be posted all over again',
+  )
+})
+
+test('o3d-xlk7: a reversal the queue silently dropped records NO relief', async () => {
+  // `queueAccountingSyncTx` does nothing at all under three ordinary conditions (no active
+  // connector, the posting suppressed, the order deleted mid-enqueue) and throws in none of them.
+  // Recording relief there would shrink the refund's open balance for a credit that never happened,
+  // which strands real pounds in Allocated Inventory — the silent direction of this error. The
+  // ERROR-level "post this by hand" record is raised instead, and it already was.
+  const state = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue('silent-no-op')
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.equal(accountingSyncRows.length, 0, 'the queue really did drop it — nothing was written')
+  assert.equal(
+    state.order.allocationReversalAmount ?? null,
+    null,
+    'so no relief is claimed against a credit that was never raised',
+  )
+  assert.equal(
+    activityLogWrites.filter((entry) => (entry as { action: string }).action === 'allocation_reversal_unqueued').length,
+    1,
+    'and the un-queued reversal is still reported for a human to post by hand',
+  )
+})
+
+test('o3d-0i5y r10: the teardown reverses at what A2 RECORDED, never at the revalued pin', async () => {
+  // Same ten units, but a landed cost has since rewritten `unitCostBase` on the row from £4 to £9.
+  // That revaluation posted to COGS/Inventory and never to Allocated Inventory, so £40 is still
+  // what stands there. Reversing the live pin would take £90 out of an account that received £40.
+  const state = deallocatedState([{
+    costLayerId: 'layer-1',
+    qty: '10.000000',
+    unitCostBase: '9.000000',
+    postedUnitCostBase: '4.000000',
+  }])
+  resetAccountingQueue()
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.deepEqual(
+    queuedAccountingSyncs[0].payload.lines?.map((line) => [line.accountCode, line.debit ?? null, line.credit ?? null]),
+    [
+      ['630', 40, null],
+      ['631', null, 40],
+    ],
+    'still £40 — the recorded amount, not 10 x the revalued £9',
+  )
+})
+
+test('o3d-0i5y r10: a teardown of rows with NO record raises no reversal', async () => {
+  // The guard against the opposite failure: an order A2 never posted for has no debit to credit
+  // back, and a journal raised for it would move £40 out of an account that never received it.
+  const state = deallocatedState(null)
+  resetAccountingQueue()
+
+  await releaseOrderAllocationsForDeallocationInTx(createClient(state) as never, 'order-1')
+
+  assert.deepEqual(state.allocations, [])
+  assert.deepEqual(queuedAccountingSyncs, [])
+})
+
+test('o3d-0i5y r10: a HARD DELETE of an order carrying a posted debit is refused, not silently reversed', async () => {
+  // The delete path cannot take the reversal: a journal enqueued as `referenceType: 'SalesOrder'`
+  // against an order that ceases to exist a few statements later resolves to nothing, which is the
+  // o3d-hrak orphan the enqueue lock exists to prevent. Deleting without one strands the £40. So
+  // neither is available, and the refusal names the amount and the remedy.
+  const state = deallocatedState(POSTED_TEN_AT_FOUR)
+  resetAccountingQueue()
+
+  await assert.rejects(
+    () => releaseOrderAllocationsInTx(createClient(state) as never, 'order-1', { orderIsBeingDeleted: true }),
+    /Group A2 has already posted £40\.00 of Allocated Inventory/,
+  )
+  assert.deepEqual(queuedAccountingSyncs, [], 'and no journal is raised against an order about to vanish')
+})
+
+test('o3d-0i5y r10: a hard delete of an order with NO posted debit is still allowed', async () => {
+  // The guard against the opposite failure — the refusal above must not turn every order delete
+  // into an error. Legacy rows carry no `postedUnitCostBase`, so they evidence nothing and cannot
+  // be the basis of a refusal either.
+  const state = deallocatedState([{ costLayerId: 'layer-1', qty: '10.000000', unitCostBase: '4.000000' }])
+  resetAccountingQueue()
+
+  const released = await releaseOrderAllocationsInTx(createClient(state) as never, 'order-1', { orderIsBeingDeleted: true })
+
+  assert.equal(released.allocations.length, 1)
+  assert.deepEqual(state.allocations, [])
+  assert.deepEqual(queuedAccountingSyncs, [])
+})
+
+test('o3d-0i5y r8: a record moving onto a scope that SURVIVES is added to the record already there', async () => {
+  // The in-place half of the carry: warehouse-1 already holds 2 posted units of its own and takes
+  // warehouse-2's 10 as well. Adding them is the point — writing only the arrivals would drop the
+  // £10 the surviving row was already evidence for, and A2 would post those 2 units again.
+  const product = { id: 'product-1', sku: 'SKU-1', type: 'SIMPLE' as const, oversellAllowed: false }
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: 60,
+      lines: [{ id: 'line-1', productId: 'product-1', qty: 12, sku: 'SKU-1', description: 'Product 1', product }],
+    },
+    warehouses: [
+      { id: 'warehouse-1', code: 'MAIN', name: 'Main', active: true, availableForSale: true, isDefault: true, syncToStore: false },
+      { id: 'warehouse-2', code: 'SEC', name: 'Second', active: true, availableForSale: true, isDefault: false, syncToStore: false },
+    ],
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 12, reservedQty: 2 },
+      { productId: 'product-1', warehouseId: 'warehouse-2', quantity: 10, reservedQty: 10 },
+    ],
+    allocations: [
+      {
+        id: 'alloc-w1',
+        orderId: 'order-1',
+        lineId: 'line-1',
+        productId: 'product-1',
+        warehouseId: 'warehouse-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-w1', qty: '2.000000', unitCostBase: '5.000000' }],
+      },
+      {
+        id: 'alloc-w2',
+        orderId: 'order-1',
+        lineId: 'line-1',
+        productId: 'product-1',
+        warehouseId: 'warehouse-2',
+        qty: 10,
+        costLayerSnapshot: [{ costLayerId: 'layer-w2', qty: '10.000000', unitCostBase: '5.000000' }],
+      },
+    ],
+  })
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(rows.map((row) => `${row.id}:${row.warehouseId}:${Number(row.qty)}`), ['alloc-w1:warehouse-1:12'])
+  const record = parseCostLayerSnapshot(rows[0].costLayerSnapshot)
+  assert.equal(sumCostLayerSnapshotQty(record).toString(), '12', 'both records are on the row, not just the arriving one')
+  assert.equal(sumCostLayerSnapshot(record).toString(), '60', 'the whole £60 already in Allocated Inventory')
+  assert.deepEqual(
+    state.order.inventoryAllocatedDate,
+    new Date('2026-01-01T00:00:00Z'),
+    'and with all 12 units accounted there is nothing to hand back to A2',
   )
 })
 
@@ -2160,6 +3047,26 @@ function createResetTx(options: {
   allocationBatchAmount?: number | null
   allocationBatchSyncLogId?: string | null
   a2JournalStatus?: string | null
+  /**
+   * o3d-0i5y r4: the lines the journaled shipment posted, at allocation-row grain. These ARE the
+   * floors the journal-safe permit is checked against — a double that returned none would make
+   * every permit assertion vacuous, because an empty floor set is trivially satisfied by any
+   * proposed allocation, including one that drops every row.
+   */
+  journaledShipmentLines?: Array<{ lineId: string; productId: string; warehouseId: string; qty: number }>
+  /**
+   * o3d-0i5y r5: every SHIPPED line on the order, journaled or not. Defaults to the journaled set,
+   * because a journaled shipment is SHIPPED by construction — but the two questions are asked
+   * SEPARATELY now (the floors read journaled lines; the accounted-quantity read wants all shipped
+   * ones), so the double answers each with its own set rather than conflating them.
+   */
+  shippedShipmentLines?: Array<{ lineId: string; productId: string; warehouseId: string; qty: number }>
+  /**
+   * o3d-0i5y r5: the rows as they stand, with the layers a previous A2 pass pinned. Without these
+   * the accounted quantity is zero for every scope, so EVERY declared set would look like new
+   * quantity and the "no new quantity keeps the stamp" assertion could not fail.
+   */
+  persistedAllocations?: Array<{ lineId: string; productId: string; warehouseId: string; costLayerSnapshot?: unknown }>
 }) {
   const salesOrderUpdates: Array<Record<string, unknown>> = []
   const allocationUpdates: Array<Record<string, unknown>> = []
@@ -2192,7 +3099,31 @@ function createResetTx(options: {
         return data
       },
     },
+    shipmentLine: {
+      // The predicate is HONOURED: `shipmentJournalDate: { not: null }` is the floor read and
+      // `status: 'SHIPPED'` is the accounted-quantity read. A double that answered both with the
+      // journaled set would hide a fix that read the wrong one.
+      findMany: async ({ where }: {
+        where: { shipment: { orderId: string; status?: string; shipmentJournalDate?: { not: null } } }
+      }) => {
+        const rows = where.shipment.shipmentJournalDate?.not === null
+          ? (options.journaledShipmentLines ?? [])
+          : (options.shippedShipmentLines ?? options.journaledShipmentLines ?? [])
+        return rows.map((line) => ({
+          lineId: line.lineId,
+          productId: line.productId,
+          qty: line.qty,
+          shipment: { warehouseId: line.warehouseId },
+        }))
+      },
+    },
     orderAllocation: {
+      findMany: async () => (options.persistedAllocations ?? []).map((row) => ({
+        lineId: row.lineId,
+        productId: row.productId,
+        warehouseId: row.warehouseId,
+        costLayerSnapshot: row.costLayerSnapshot ?? null,
+      })),
       updateMany: async ({ data }: { data: Record<string, unknown> }) => {
         allocationUpdates.push(data)
         return { count: 1 }
@@ -2232,7 +3163,15 @@ test('resetAllocationAccountingIfStaged clears inventoryAllocatedBatchRef in the
     allocationBatchConnector: null,
     allocationBatchAccountCode: null,
   })
-  assert.equal(allocationUpdates.length, 1, 'and the cost snapshots are still nulled alongside it')
+  // o3d-0i5y r9 asserted `allocationUpdates.length === 0` here — "the posted records are LEFT
+  // ALONE" — on the reasoning that erasing them makes the next A2 pass post the whole order again.
+  // SUPERSEDED on the rebase onto o3d-o97 / PR #635, and this fixture is precisely the case where
+  // the reasoning does not apply: A2 recorded a debit of exactly £0.00, which is positive evidence
+  // that NOTHING was posted for this order. There is no record to preserve and no second debit to
+  // fear, and the pins are being replaced by the caller in any case. Where a debit DOES stand the
+  // merged rule keeps the STAMP instead, and A2 — which selects on `inventoryAllocatedDate: null` —
+  // never looks at the order again, so the re-post r9 was defending against is unreachable there.
+  assert.equal(allocationUpdates.length, 1, 'the pins go with the debit that is provably not standing')
 })
 
 test('resetAllocationAccountingIfStaged KEEPS the stamp and the recorded debit when A2 posted (o3d-o97 r4)', async () => {
@@ -2315,6 +3254,220 @@ test('resetAllocationAccountingIfStaged writes nothing when A2 never staged the 
   )
 
   assert.deepEqual(salesOrderUpdates, [])
+})
+
+// ---------------------------------------------------------------------------
+// o3d-0i5y r5 — THE PERMITTED CHANGE HAS TO SAY WHETHER ANYTHING NEW NEEDS ACCOUNTING.
+//
+// r4 permitted the journal-safe rebuild and then KEPT the A2 stamp unconditionally, on the reasoning
+// that a re-stage would re-post the shipped value and blank the pinned snapshots. Both were true of
+// the A2 pass r4 was looking at; neither is true of the one that runs now. What r4's choice did do is
+// leave the residual — the quantity the rebuild exists to add — outside accounting for good: A2 never
+// looks at a stamped order again, and Group B still credits Allocated Inventory when it ships.
+//
+// The stamp is now released exactly when the declared set holds quantity nothing has accounted, and
+// the snapshots are never cleared on this path either way.
+// ---------------------------------------------------------------------------
+
+const ACCOUNTED_SCOPE = { lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1' }
+
+test('o3d-0i5y r5: a permitted rebuild that ADDS allocated quantity releases the A2 stamp, keeping the snapshots', async () => {
+  // 2 units allocated, pinned by an earlier A2 pass, dispatched and journaled. The rebuild declares 3
+  // — the residual unit stock has since arrived for. Under r4 the stamp stayed and that unit was
+  // never reclassified.
+  const { tx, salesOrderUpdates, allocationUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 2 }],
+    persistedAllocations: [{
+      ...ACCOUNTED_SCOPE,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 4 }],
+    }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(3) }] },
+  )
+
+  // o3d-0i5y r12 (rebase onto o3d-o97 / PR #635): `allocationBatchAmount: null` was in this
+  // expected payload and is deliberately gone. A2 is being handed the order back to post the
+  // INCREMENT — it reads the records this test asserts survive and posts the residual alone — so
+  // the pounds it has ALREADY debited are still standing, and o3d-o97 made that figure the basis of
+  // the refund's open balance. Nulling it here would leave the order recording only the increment
+  // and strand the first posting for ever.
+  assert.deepEqual(salesOrderUpdates, [{
+    inventoryAllocatedDate: null,
+    inventoryAllocatedBatchRef: null,
+  }], 'the order goes back to A2 so the residual unit is reclassified — with its posted record intact')
+  assert.deepEqual(
+    allocationUpdates,
+    [],
+    'and the pinned layers are NOT cleared — they are the basis Group B and the refund reversal resolve through',
+  )
+})
+
+test('o3d-0i5y r5: a permitted rebuild that adds NO new quantity keeps the stamp exactly where r4 put it', async () => {
+  // The common case: the residual reconciler re-declaring the committed rows unchanged. Releasing the
+  // stamp here would send the order back to A2 with nothing to post, and r4's objection would apply.
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 2 }],
+    persistedAllocations: [{
+      ...ACCOUNTED_SCOPE,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 4 }],
+    }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(2) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [], 'nothing new to account, so nothing is un-staged')
+})
+
+test('o3d-xlk7: a rebuild that adds quantity to a row RECORDING NOTHING keeps the stamp, and says why', async () => {
+  // THE HOLE THE MERGED RULE CLOSES, and the reason the release is gated rather than unconditional.
+  //
+  // r5 released the stamp whenever the declared set held quantity nothing had accounted. That is
+  // safe while the ROWS say what A2 already accounted, because A2's next pass reads those records
+  // and posts the DIFFERENCE. It is not safe here: the order is stamped (A2 ran) and recorded a £40
+  // debit, and yet no row records accounting for a single unit — the legacy shape, and the shape a
+  // blanket un-stage leaves behind. Hand this order back and A2 finds an empty record, concludes
+  // nothing has been reclassified, and posts ALL THREE units a second time on top of the £40. That
+  // is o3d-o97 r4's worked failure reached from the other direction, and nothing reverses the first
+  // debit.
+  //
+  // So the stamp stays and the refusal is REPORTED. It costs the new unit a pass, not a posting.
+  const { tx, salesOrderUpdates, activityLogs } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    allocationBatchAmount: 40,
+    persistedAllocations: [{ ...ACCOUNTED_SCOPE, costLayerSnapshot: null }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(3) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [], 'the stamp is NOT released against a record that accounts for nothing')
+  assert.equal(activityLogs.length, 1)
+  assert.equal((activityLogs[0] as { action: string }).action, 'allocation_accounting_stage_retained')
+  assert.match(
+    String((activityLogs[0] as { description: string }).description),
+    /NO allocation row records what A2 already accounted, so handing this order back would re-value and re-post every unit/,
+  )
+})
+
+test('o3d-xlk7: the same rebuild DOES release the stamp once A2 recorded a debit of exactly £0.00', async () => {
+  // The proof the gate above is a gate and not a blanket refusal, on o3d-o97's own positive
+  // evidence: a recorded £0.00 is A2 saying it staged this order and valued it at nothing. There is
+  // no debit to double and no record worth keeping, so the whole attribution goes with the stamp
+  // and A2 values the order afresh.
+  const { tx, salesOrderUpdates, activityLogs } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    allocationBatchAmount: 0,
+    persistedAllocations: [{ ...ACCOUNTED_SCOPE, costLayerSnapshot: null }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(3) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [{
+    inventoryAllocatedDate: null,
+    inventoryAllocatedBatchRef: null,
+    allocationBatchAmount: null,
+    allocationBatchSyncLogId: null,
+    allocationBatchConnector: null,
+    allocationBatchAccountCode: null,
+  }], 'a known debit of zero leaves nothing to preserve, so the attribution goes too')
+  assert.deepEqual(activityLogs, [])
+})
+
+test('o3d-0i5y r5: quantity accounted through a SHIPMENT rather than a pinned snapshot still counts as accounted', async () => {
+  // The order shipped before A2 ever ran, so A2 took the value from the shipment and stamped the row
+  // with an EMPTY snapshot. Reading only the snapshot would call those 2 units unaccounted and
+  // re-stage an order that owes nothing.
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 2 }],
+    persistedAllocations: [{ ...ACCOUNTED_SCOPE, costLayerSnapshot: [] }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(2) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [])
+})
+
+test('o3d-0i5y r6: a residual pinned BESIDE a pre-A2 shipment is accounted, so an unchanged rebuild keeps the stamp', async () => {
+  // 10 allocated, 6 dispatched before A2 ever ran and since journaled, 4 pinned on the shelf. Those
+  // are DISJOINT units — a dispatch cannot consume a pin written after it — so 10 are accounted, and
+  // A2 now says so on the row: the 6 are recorded as shipment-source entries carrying the layers the
+  // dispatch consumed. Reading the row's entries as one pinned quantity (r5 read them as a bare total
+  // and maxed it against the shipped 6) called this order 4 short and handed it back to A2, which
+  // pinned and POSTED those 4 a second time — the double post this guard exists to prevent.
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 6 }],
+    persistedAllocations: [{
+      ...ACCOUNTED_SCOPE,
+      costLayerSnapshot: [
+        { costLayerId: 'layer-dispatched', qty: 6, unitCostBase: 3, shipmentLineId: 'shipment-line-1', source: 'shipment' },
+        { costLayerId: 'layer-on-the-shelf', qty: 4, unitCostBase: 5 },
+      ],
+    }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(10) }] },
+  )
+
+  assert.deepEqual(salesOrderUpdates, [], 'all 10 are accounted, so there is nothing to send back to A2')
+})
+
+test('o3d-0i5y r6: and one more unit than the row records still releases the stamp', async () => {
+  // The counter-guard, on the same state: the record must not become a blanket "this row is done".
+  const { tx, salesOrderUpdates } = createResetTx({
+    inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    journaledShipmentId: 'shipment-1',
+    journaledShipmentLines: [{ ...ACCOUNTED_SCOPE, qty: 6 }],
+    persistedAllocations: [{
+      ...ACCOUNTED_SCOPE,
+      costLayerSnapshot: [
+        { costLayerId: 'layer-dispatched', qty: 6, unitCostBase: 3, shipmentLineId: 'shipment-line-1', source: 'shipment' },
+        { costLayerId: 'layer-on-the-shelf', qty: 4, unitCostBase: 5 },
+      ],
+    }],
+  })
+
+  await resetAllocationAccountingIfStaged(
+    tx as unknown as Parameters<typeof resetAllocationAccountingIfStaged>[0],
+    'order-1',
+    { nextAllocations: [{ ...ACCOUNTED_SCOPE, qty: toDecimal(11) }] },
+  )
+
+  // o3d-0i5y r12: `allocationBatchAmount: null` removed for the reason given at the r5 test above —
+  // A2 comes back for the INCREMENT, so what it already debited stays on record.
+  assert.deepEqual(salesOrderUpdates, [{
+    inventoryAllocatedDate: null,
+    inventoryAllocatedBatchRef: null,
+  }], 'the eleventh unit is genuinely unaccounted')
 })
 
 test('resetAllocationAccountingIfStaged refuses (and clears no ref) once a shipment is journaled (o3d-0qoo)', async () => {
@@ -3833,4 +4986,150 @@ test('o3d-kouj: a line that never carried a pin is not written to at all', async
     writesBefore,
     'no snapshot write of any kind for a line that had nothing pinned',
   )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-0i5y r11 (Codex round 11, finding 3) — A CANCELLATION KEEPS THE EVIDENCE OF WHAT A2 POSTED,
+// AND STILL RAISES NO REVERSAL.
+//
+// The cancel path un-stages the order (clearing `inventoryAllocatedDate`, its batch ref and
+// `allocationBatchAmount`) and then `deleteMany`s every allocation row — so both copies of the
+// record die in one committed transaction and nothing anywhere says the pounds standing in
+// Allocated Inventory for this order exist.
+//
+// It does NOT reverse, deliberately: `o3d-batch-cancelrb` owns this contra on the refund side, its
+// open balance is `SalesOrder.allocationBatchAmount` less relief it can prove from Group B's and
+// earlier refunds' own journal lines, and an ALLOCATION_REVERSAL raised here is neither of those —
+// so a cancelled-then-refunded order would credit Allocated Inventory twice for the same units.
+// A record cannot double-count; a journal can.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-0i5y r11: cancelling an order RECORDS the Group A2 debit its deleted rows were the only evidence of', async () => {
+  resetAccountingQueue()
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    stockLevels: [{ productId: 'product-a', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }],
+    allocations: [{
+      id: 'alloc-a',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-a',
+      warehouseId: 'warehouse-1',
+      qty: 10,
+      // 10 units A2 pinned and posted at £4 — £40 of DR Allocated Inventory / CR Inventory.
+      costLayerSnapshot: [{
+        costLayerId: 'layer-1',
+        qty: '10.000000',
+        unitCostBase: '4.000000',
+        postedUnitCostBase: '4.000000',
+      }],
+    }],
+  })
+  const client = createClient(state)
+
+  const result = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+
+  assert.equal(result.previousStatus, 'ALLOCATED')
+  assert.deepEqual(state.allocations, [], 'the rows are gone, as cancellation requires')
+  const recorded = activityLogWrites.filter((row) => row.action === 'allocation_debit_standing_on_cancel')
+  assert.equal(recorded.length, 1, 'and what they recorded is not gone with them')
+  assert.equal(recorded[0].level, 'WARNING')
+  assert.equal(recorded[0].tag, 'accounting')
+  assert.match(
+    String(recorded[0].description),
+    /£40\.00 of DR Allocated Inventory \/ CR Inventory stands against this order/,
+    'the exact amount A2 recorded posting — 10 units at £4 — which nothing else can now say',
+  )
+  assert.equal(
+    (recorded[0].metadata as { postedAmountBase: number }).postedAmountBase,
+    40,
+    'and machine-readable, so a later repair does not have to parse prose',
+  )
+  assert.deepEqual(
+    queuedAccountingSyncs,
+    [],
+    'and NO reversal journal is raised here: the refund side of this contra owns it, and its open '
+    + 'balance cannot see an ALLOCATION_REVERSAL, so one raised here would be credited a second time',
+  )
+  const recordIndex = txWriteOrder.indexOf('activityLog.create')
+  const deleteIndex = txWriteOrder.indexOf('orderAllocation.deleteMany')
+  assert.ok(recordIndex >= 0 && deleteIndex >= 0)
+  assert.ok(
+    recordIndex < deleteIndex,
+    'written BEFORE the delete — after it there is nothing left to read the amount from',
+  )
+})
+
+test('o3d-0i5y r11: a cancellation whose record cannot say what was posted names those units instead of valuing them', async () => {
+  // The bound on the rule, and the same one the reversal path applies: an entry with no
+  // `postedUnitCostBase` — every entry written before r9 — is not evidence of £0, it is evidence of
+  // nothing. Valuing it from the pin would report an amount a landed-cost revaluation has rewritten.
+  resetAccountingQueue()
+  const state = baseState({
+    order: { ...baseState().order, status: 'ALLOCATED' },
+    stockLevels: [{ productId: 'product-a', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 10 }],
+    allocations: [{
+      id: 'alloc-a',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-a',
+      warehouseId: 'warehouse-1',
+      qty: 10,
+      costLayerSnapshot: [
+        { costLayerId: 'layer-1', qty: '6.000000', unitCostBase: '4.000000', postedUnitCostBase: '4.000000' },
+        // Pinned by a pre-r9 pass: the pin says £9 today, and says nothing about what was posted.
+        { costLayerId: 'layer-2', qty: '4.000000', unitCostBase: '9.000000' },
+      ],
+    }],
+  })
+  const client = createClient(state)
+
+  await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+
+  const recorded = activityLogWrites.filter((row) => row.action === 'allocation_debit_standing_on_cancel')
+  assert.equal(recorded.length, 1)
+  assert.match(
+    String(recorded[0].description),
+    /£24\.00 of DR Allocated Inventory/,
+    'only the 6 evidenced units are valued — 6 x £4 — and emphatically not 6 x £4 + 4 x £9 = £60',
+  )
+  assert.match(
+    String(recorded[0].description),
+    /4 of those unit\(s\) carry no record of what was posted for them \(cost layer\(s\) layer-2\)/,
+    'the rest are NAMED, with their layer, so a human can decide rather than a guess being filed',
+  )
+  assert.equal((recorded[0].metadata as { unevidencedQty: string }).unevidencedQty, '4')
+  assert.deepEqual(queuedAccountingSyncs, [])
+})
+
+test('o3d-0i5y r11: a warehouse move KEEPS a landed-cost correction that lands between the plan and the rewrite', async () => {
+  // The fourth caller of the carry-over rule, and the same defect r10 fixed in Group A2 and r11
+  // fixed in the manual editor: the plan was drawn from `existingAllocs`, read at the top of the
+  // transaction, and the rewrite serialized it back out. `updateSnapshotsForCostLayerChange` takes
+  // no sales-order lock, so it commits freely in that window.
+  //
+  // 10 units posted at warehouse-2 and pinned at £5 a unit; while the re-allocation runs, a landed
+  // cost reprices that layer £5 -> £7 (the correction posts the £20 to COGS/Inventory and never to
+  // Allocated Inventory). The whole claim then moves to warehouse-1.
+  resetAccountingQueue()
+  const state = movedState(10)
+  const client = createClient(state)
+  lockedAllocationRecords = {
+    'line-1|warehouse-2|product-1': [{ costLayerId: 'layer-w2', qty: '10.000000', unitCostBase: '7.000000' }],
+  }
+
+  await allocateSalesOrder(client, { orderId: 'order-1' })
+
+  const rows = (state.allocations ?? []).filter((row) => row.orderId === 'order-1')
+  assert.deepEqual(rows.map((row) => `${row.warehouseId}:${Number(row.qty)}`), ['warehouse-1:10'])
+  const record = parseCostLayerSnapshot(rows[0].costLayerSnapshot)
+  assert.equal(sumCostLayerSnapshotQty(record).toString(), '10', 'the 10 posted units still move with the units')
+  assert.equal(
+    sumCostLayerSnapshot(record).toString(),
+    '70',
+    'and they arrive at the CORRECTED £7 a unit. Carried off the plan they would land at £5 = £50, the '
+    + 'correction would be gone, and Group B would relieve those ten at £5 — £20 of real cost never '
+    + 'reaching cost of sales',
+  )
+  assert.deepEqual(queuedAccountingSyncs, [], 'nothing left the order, so nothing is reversed')
 })

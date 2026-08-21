@@ -29,11 +29,16 @@ import { scheduleXeroAccountingOutbox } from '@/lib/connectors/xero/outbox'
 import { activeAccountingIdProvenance } from '@/lib/connectors/accounting-id-provenance'
 import { stampAccountingPayloadConnection } from '@/lib/connectors/accounting-connection-provenance'
 import {
+  accountedAllocationQty,
   parseCostLayerSnapshot,
+  recordedPostedBasis,
   reduceSnapshotByCostLayer,
   reduceSnapshotByQty,
   sumCostLayerSnapshot,
+  sumCostLayerSnapshotQty,
   takeFromSnapshotEntries,
+  unaccountedAllocationQty,
+  unrecordedShipmentEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
@@ -168,35 +173,163 @@ async function buildLayerSnapshot(
   return snapshot
 }
 
-function requireShipmentSnapshotValue(order: {
+export type A2AllocationRow = {
   id: string
-  shipments: Array<{
-    id: string
-    status: string
-    lines: Array<{ id: string; qty: Prisma.Decimal | number; costLayerSnapshot: Prisma.JsonValue | null }>
-  }>
-}): Decimal {
-  let total = toDecimal(0)
-  let hasShippedLines = false
+  lineId: string
+  productId: string
+  warehouseId: string
+  qty: Prisma.Decimal | number
+  costLayerSnapshot: Prisma.JsonValue | null
+}
 
+export type A2ShipmentRow<TLine> = {
+  warehouseId: string
+  lines: TLine[]
+}
+
+/**
+ * WHAT GROUP A2 STILL OWES AN ORDER, ROW BY ROW (o3d-0i5y r5).
+ *
+ * A2 used to answer that per ORDER: has this order been stamped? On a first pass that is the same
+ * question, and while a first pass was the only pass it was harmless. It stopped being the only pass
+ * when the journal-safe allocation change let an order that has ALREADY been stamped and part-
+ * journaled come back holding MORE allocated quantity than it did then. Per order, the answer for
+ * such an order is either "all of it" — re-posting a shipped value the ledger already holds and
+ * overwriting the snapshots a journal was posted against — or "none of it", which is what r4 chose
+ * and is why the residual never reached the ledger at all. Group B still CREDITS Allocated Inventory
+ * when that residual ships, against a debit nothing ever made.
+ *
+ * Two disjoint things can be owed, and they are SUMMED rather than chosen between:
+ *
+ *   outstandingByAllocation     allocated quantity nothing has reclassified, to be valued by pinning
+ *                               FIFO layers — but only the outstanding PART of each row, per
+ *                               {@link unaccountedAllocationQty}.
+ *   shipmentAccountedByAllocation
+ *                               dispatched quantity at the row's scope that no entry on the row
+ *                               accounts for, valued from the SHIPMENT snapshots because dispatch
+ *                               has already consumed those layers and A2 cannot pin them.
+ *
+ * THE PASS RECORDS WHAT IT ACCOUNTED THROUGH A SHIPMENT (o3d-0i5y r6). r5 left no record of those
+ * units, so the next pass saw a residual pin (4 on the shelf) beside a shipment that PREDATES it (6
+ * dispatched) and had to guess whether they were the same units. Its `max` said 6 accounted where 10
+ * were, and it re-pinned and RE-POSTED the residual — every time the order came back. Writing those
+ * units onto the row as shipment-source entries makes the pin the complete record of accounted
+ * quantity, so the guess is gone: a dispatch can only consume a pin that already existed, and a
+ * shipment-source entry is proof that it did not.
+ *
+ * AND THE JOURNAL DATE DECIDES NOTHING HERE ANY MORE (o3d-0i5y r7). r5 valued the whole of every
+ * UNJOURNALED shipment and excluded journaled ones, reading a journal date as proof A2 had posted
+ * that shipment's cost. It is not: Group B refuses to journal an unstamped ORDER, which says nothing
+ * about which of that order's units A2 pinned. Both halves of that read are wrong once a shipment is
+ * MIXED — part of it pinned by an earlier pass, part of it not:
+ *
+ *   an unjournaled mixed shipment had its already-pinned part re-posted, on that pass and every
+ *   later one, because the whole shipment was valued;
+ *   a journaled shipment's UNPINNED part was never posted at all, though Group B had already
+ *   credited Allocated Inventory for the whole shipment's value when it journaled it.
+ *
+ * Both disappear when value follows the record: the pass posts exactly the entries it writes, and
+ * `shipmentAccountedByAllocation` is by construction the dispatched quantity the row does not
+ * already account for.
+ *
+ * `stampEmptyAllocationIds` are rows that owe nothing, have nothing to record and have never been
+ * stamped; they keep the pre-existing empty-snapshot stamp. Rows that already carry a snapshot and
+ * owe nothing appear in NO list and must be left completely alone — that snapshot is the posted
+ * evidence Group B and the refund reversal resolve their cost basis through.
+ */
+export function planA2Reclassification<TLine extends { lineId: string; productId: string | null; qty: Prisma.Decimal | number }, TShipment extends A2ShipmentRow<TLine>>(order: {
+  allocations: A2AllocationRow[]
+  shipments: TShipment[]
+}): {
+  outstandingByAllocation: Map<string, Decimal>
+  shipmentAccountedByAllocation: Map<string, Decimal>
+  stampEmptyAllocationIds: string[]
+} {
+  const scopeKey = (lineId: string, warehouseId: string, productId: string) => `${lineId}|${warehouseId}|${productId}`
+  const shippedQtyByScope = new Map<string, Decimal>()
   for (const shipment of order.shipments) {
-    if (shipment.status !== 'SHIPPED') continue
     for (const line of shipment.lines) {
-      if (Number(line.qty) <= 0) continue
-      hasShippedLines = true
-      const snapshot = parseCostLayerSnapshot(line.costLayerSnapshot)
-      if (snapshot.length === 0) {
-        throw new Error(`Missing FIFO snapshot for already-shipped line ${line.id} on order ${order.id}`)
-      }
-      total = addMoney(total, sumCostLayerSnapshot(snapshot))
+      if (!line.productId) continue
+      const key = scopeKey(line.lineId, shipment.warehouseId, line.productId)
+      shippedQtyByScope.set(key, (shippedQtyByScope.get(key) ?? toDecimal(0)).add(toDecimal(line.qty)))
     }
   }
 
-  if (!hasShippedLines) {
-    throw new Error(`Order ${order.id} is marked shipped but has no shipped lines to reclassify`)
+  const outstandingByAllocation = new Map<string, Decimal>()
+  const shipmentAccountedByAllocation = new Map<string, Decimal>()
+  const stampEmptyAllocationIds: string[] = []
+  for (const alloc of order.allocations) {
+    const snapshot = parseCostLayerSnapshot(alloc.costLayerSnapshot)
+    const shippedQty = shippedQtyByScope.get(scopeKey(alloc.lineId, alloc.warehouseId, alloc.productId)) ?? 0
+    const { accounted, unrecordedShippedQty } = accountedAllocationQty({ snapshot, shippedQty })
+    const outstanding = unaccountedAllocationQty({ allocatedQty: alloc.qty, snapshot, shippedQty })
+    if (outstanding.gt(0)) outstandingByAllocation.set(alloc.id, outstanding)
+    // Recorded even when the row owes nothing else: the record is what stops the NEXT pass
+    // re-deriving these units from an overlap it cannot resolve, which is the double post.
+    if (unrecordedShippedQty.gt(0)) shipmentAccountedByAllocation.set(alloc.id, unrecordedShippedQty)
+    else if (accounted.lte(0) && outstanding.lte(0) && alloc.costLayerSnapshot === null) {
+      stampEmptyAllocationIds.push(alloc.id)
+    }
   }
 
-  return roundQuantity(total, 2)
+  return {
+    outstandingByAllocation,
+    shipmentAccountedByAllocation,
+    stampEmptyAllocationIds,
+  }
+}
+
+/**
+ * The entries that RECORD dispatched units as accounted, taken from the shipment lines that dispatched
+ * them (o3d-0i5y r6).
+ *
+ * They carry the layers dispatch actually consumed, so the record is a truthful cost basis and not a
+ * placeholder: Group B and the refund reversal both relieve the Allocated-Inventory contra by QTY
+ * against these same entries, and both already subtract every shipment line's quantity from the row,
+ * so recording the shipped units leaves the row holding exactly the UNSHIPPED remainder instead of
+ * being driven straight through zero.
+ *
+ * They are decorated with `source: 'shipment'`, which is the marker {@link accountedAllocationQty}
+ * reads to know these units are DISJOINT from the allocated pin rather than overlapping it.
+ *
+ * o3d-0i5y r8: AND THE POOL IS NETTED BY THE ROW'S OWN RECORD FIRST. Taking from every dispatched
+ * line at the scope, as r6/r7 did, re-offers the entries an earlier pass already recorded and
+ * posted — so a second shipment's units were valued at the FIRST shipment's layers, posting its
+ * cost a second time. `recorded` is that row's existing snapshot, and
+ * {@link unrecordedShipmentEntries} subtracts it before anything is taken, which makes valuing an
+ * entry twice impossible rather than merely unlikely. See the worked example there.
+ */
+export function takeShipmentAccountedEntries(
+  recorded: CostLayerSnapshotEntry[],
+  lines: Array<{ id: string; costLayerSnapshot: Prisma.JsonValue | null }>,
+  qty: Decimal,
+  allocationId: string,
+): CostLayerSnapshotEntry[] {
+  const dispatched = lines.flatMap((line) => (
+    parseCostLayerSnapshot(line.costLayerSnapshot).map((entry) => ({
+      ...entry,
+      shipmentLineId: entry.shipmentLineId ?? line.id,
+    }))
+  ))
+  const available = unrecordedShipmentEntries(recorded, dispatched)
+  return takeFromSnapshotEntries(available, qty.toNumber(), {
+    orderAllocationId: allocationId,
+    source: 'shipment',
+  }).taken
+}
+
+/**
+ * Stamp an entry with the amount the pass that is writing it is posting for it (o3d-0i5y r9).
+ *
+ * Called ONLY on entries the current A2 pass values into its own journal, so the stamp and the
+ * posting are the same event. An entry that already carries a stamp keeps it — that entry was
+ * valued by an earlier pass, and its posting was a different journal for a possibly different
+ * amount.
+ */
+function withPostedUnitCost(entry: CostLayerSnapshotEntry): CostLayerSnapshotEntry {
+  return entry.postedUnitCostBase != null
+    ? entry
+    : { ...entry, postedUnitCostBase: entry.unitCostBase }
 }
 
 function consumeSnapshotLayers(
@@ -291,6 +424,41 @@ async function createPendingSyncLog(
   return log.id
 }
 
+/**
+ * The orders Group A2 may reclassify. Held as one constant because it is asked TWICE — once to
+ * pick candidates, once again under their row locks — and the second ask is the one that
+ * authorises the posting, so the two must not be able to drift apart (o3d-0i5y r9).
+ */
+const A2_ELIGIBLE_ORDER: Prisma.SalesOrderWhereInput = {
+  revenueDeferredDate: { not: null },
+  inventoryAllocatedDate: null,
+  status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'] },
+  refundStatus: { not: 'FULL' },
+}
+
+const A2_ORDER_SELECTION_ORDER: Prisma.SalesOrderOrderByWithRelationInput[] = [
+  { revenueDeferredDate: 'asc' },
+  { id: 'asc' },
+]
+
+/**
+ * Row-lock every order this A2 pass is about to plan from and stamp (o3d-0i5y r9).
+ *
+ * Locked in ID order, and BEFORE any other lock this transaction takes, which is what keeps it
+ * deadlock-free against the allocation path: every writer in this domain takes its sales-order
+ * lock first (`lockSalesOrder`) and its stock/cost-layer locks after, so a transaction holding a
+ * lock A2 wants can never be waiting on a lock A2 holds.
+ */
+async function lockSalesOrders(
+  tx: Prisma.TransactionClient,
+  ids: string[],
+): Promise<void> {
+  if (ids.length === 0) return
+  await tx.$queryRaw(
+    Prisma.sql`SELECT id FROM "sales_orders" WHERE id IN (${Prisma.join(ids)}) ORDER BY id FOR UPDATE`,
+  )
+}
+
 async function lockCostLayers(
   tx: Prisma.TransactionClient,
   ids: string[],
@@ -299,6 +467,35 @@ async function lockCostLayers(
   await tx.$queryRaw(
     Prisma.sql`SELECT id FROM "cost_layers" WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`,
   )
+}
+
+/**
+ * Row-lock the allocation rows this A2 pass is about to write, and hand back the record each one
+ * holds AS OF THE LOCK (o3d-0i5y r10 — Codex round 10, finding 4).
+ *
+ * The sales-order lock r9 introduced does not cover these rows. `updateSnapshotsForCostLayerChange`
+ * — the late-landed-cost correction — rewrites `unitCostBase` on `order_allocations` directly,
+ * selecting them by `costLayerSnapshot @> [{costLayerId}] FOR UPDATE` and taking NO sales-order
+ * lock at all, because it is a purchasing-side sweep that does not know which orders it will touch.
+ * So it is the one writer that can move a row A2 has already read.
+ *
+ * TAKEN HERE, NOT AT THE TOP OF THE TRANSACTION. Locking these rows before `buildLayerSnapshot`
+ * would put A2 on order_allocations → cost_layers while the correction runs cost_layers →
+ * order_allocations, which is a deadlock cycle between two writers that both matter. Taken at the
+ * point the `UPDATE` would take the row lock anyway, the ordering is unchanged and nothing new can
+ * wait on anything new.
+ *
+ * Ordered by id so two lockers of the same set queue rather than interleave.
+ */
+async function lockAllocationRecords(
+  tx: Prisma.TransactionClient,
+  ids: string[],
+): Promise<Map<string, Prisma.JsonValue | null>> {
+  if (ids.length === 0) return new Map()
+  const rows = await tx.$queryRaw<Array<{ id: string; costLayerSnapshot: Prisma.JsonValue | null }>>(
+    Prisma.sql`SELECT id, "costLayerSnapshot" FROM "order_allocations" WHERE id IN (${Prisma.join(ids)}) ORDER BY id FOR UPDATE`,
+  )
+  return new Map(rows.map((row) => [row.id, row.costLayerSnapshot ?? null]))
 }
 
 async function resetFailedDailyBatchLogs(): Promise<void> {
@@ -840,157 +1037,384 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     // so from that moment another batch — or a refund, which shares this domain
     // — can start while we are still writing. Stop instead.
     batchLock.assertHeld('Group A2 (inventory reclassification)')
-    const orderWindow = takeDailyBatchWindow(await db.salesOrder.findMany({
-      where: {
-        revenueDeferredDate: { not: null },
-        inventoryAllocatedDate: null,
-        status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'] },
-        refundStatus: { not: 'FULL' },
-      },
-      orderBy: [{ revenueDeferredDate: 'asc' }, { id: 'asc' }],
-      select: {
-        id: true,
-        orderNumber: true,
-        externalOrderNumber: true,
-        status: true,
-        allocations: {
-          select: {
-            id: true,
-            productId: true,
-            warehouseId: true,
-            qty: true,
+    // o3d-0i5y r9 — THE PLAN AND THE STAMP NOW DESCRIBE THE SAME STATE OF THE ORDER.
+    //
+    // This selection used to run on `db`, OUTSIDE the transaction below and under no row lock. Every
+    // input A2 decides on — the allocation rows, their records, the dispatched lines — was therefore
+    // a snapshot of a moment that had already passed by the time the transaction opened, while the
+    // writes at the end of it (the row records, the stamp, the batch ref, the amount) landed
+    // unconditionally on the rows as they stood THEN. Between the two, the very paths that share
+    // this domain move exactly these rows: `allocateSalesOrder` rewrites the allocation set and
+    // carries the records between scopes, a refund un-stages and reverses, a dispatch writes
+    // shipment snapshots. The batch's session lock does not close this — it excludes another BATCH,
+    // not an operator re-allocating an order from the UI.
+    //
+    // Three concrete losses, all of them money:
+    //
+    //   * a re-allocation that lands in the gap has its NEW record overwritten by `next`, which was
+    //     computed from the OLD one — so units the rewrite carried to another warehouse are
+    //     re-presented as unaccounted and posted a second time, or a record is erased outright.
+    //   * an allocation row deleted in the gap makes the per-row `update` throw, aborting a
+    //     transaction that has already valued every other order in the window.
+    //   * quantity ADDED in the gap is stamped as accounted without ever being valued: the stamp is
+    //     order-level, so A2 never looks at the order again, and Group B still credits Allocated
+    //     Inventory for it when it ships.
+    //
+    // So the read moves inside the transaction that writes, and the orders are ROW-LOCKED before
+    // anything is read off them — the shape `e2mz`, `small2` and `settle` all closed tonight, and
+    // the shape `buildLayerSnapshot` just below already uses for cost layers: select the candidates,
+    // lock them, then re-read under the lock and re-apply the eligibility test, so an order that
+    // stopped qualifying while we waited for the lock is dropped rather than posted.
+    const groupA2 = await db.$transaction(async (tx) => {
+      const candidateWindow = takeDailyBatchWindow(await tx.salesOrder.findMany({
+        where: A2_ELIGIBLE_ORDER,
+        orderBy: A2_ORDER_SELECTION_ORDER,
+        select: { id: true },
+        take: batchLimit + 1,
+      }), batchLimit)
+      const candidateIds = candidateWindow.rows.map((row) => row.id)
+      if (candidateIds.length === 0) return { count: 0, hasMore: candidateWindow.hasMore }
+      await lockSalesOrders(tx, candidateIds)
+
+      // Re-read UNDER THE LOCK, and re-apply the eligibility test as a WHERE rather than trusting
+      // the candidate list: the permission to post this order is evaluated in exactly one place,
+      // immediately before the act it authorises. An order that was stamped, fully refunded or
+      // cancelled while we blocked on its lock simply is not in this result.
+      const orders = await tx.salesOrder.findMany({
+        where: { id: { in: candidateIds }, ...A2_ELIGIBLE_ORDER },
+        orderBy: A2_ORDER_SELECTION_ORDER,
+        select: {
+          id: true,
+          orderNumber: true,
+          externalOrderNumber: true,
+          status: true,
+          // o3d-0i5y r5 (rebase onto o3d-o97): what EARLIER A2 passes already recorded posting for
+          // this order. Since the residual rebuild hands a stamped order back for the INCREMENT,
+          // this pass is no longer necessarily the first, and the order-level record has to be the
+          // running total rather than the latest instalment. Read under the same lock as everything
+          // else A2 plans from.
+          allocationBatchAmount: true,
+          allocations: {
+            select: {
+              id: true,
+              lineId: true,
+              productId: true,
+              warehouseId: true,
+              qty: true,
+              // o3d-0i5y r5: what THIS row has already had reclassified. Without it A2 can only ask an
+              // order-level question, and the residual added to a part-journaled order is invisible.
+              costLayerSnapshot: true,
+            },
           },
-        },
-        shipments: {
-          where: { status: 'SHIPPED' },
-          select: {
-            id: true,
-            status: true,
-            lines: {
-              select: {
-                id: true,
-                qty: true,
-                costLayerSnapshot: true,
+          shipments: {
+            where: { status: 'SHIPPED' },
+            select: {
+              id: true,
+              status: true,
+              warehouseId: true,
+              // o3d-0i5y r7: the journal date is deliberately NOT read. What a pass owes is decided by
+              // the allocation row's own entries against the dispatched quantity — see
+              // `planA2Reclassification`. Selecting a shipment's journal date here only ever supported
+              // the whole-shipment valuation that re-posted the pinned part of a mixed shipment.
+              lines: {
+                select: {
+                  id: true,
+                  lineId: true,
+                  productId: true,
+                  qty: true,
+                  costLayerSnapshot: true,
+                },
               },
             },
           },
         },
-      },
-      take: batchLimit + 1,
-    }), batchLimit)
-    const orders = orderWindow.rows
-    result.hasMore.groupA2 = orderWindow.hasMore
+      })
+      if (orders.length === 0) return { count: 0, hasMore: candidateWindow.hasMore }
 
-    if (orders.length > 0) {
       // o3d-0qoo: batch identity, computed once from the run-start date and this batch's own
       // order set, then persisted on every member row alongside its stage stamp. See the A1
       // note above for why deriving it back from inventoryAllocatedDate is not equivalent.
+      // o3d-0i5y r9: derived from the LOCKED set, so the ref names the orders the journal is
+      // actually built from rather than the ones a pre-transaction read happened to see.
       const referenceId = buildDailyBatchReferenceId('A2', today, orders.map((order) => order.id))
 
-      await db.$transaction(async (tx) => {
-        let totalAllocatedValue = toDecimal(0)
-        const unshippedOrders = orders.filter((order) => order.shipments.length === 0)
-        const snapshot = await buildLayerSnapshot(
-          tx,
-          unshippedOrders.flatMap((order) =>
-            order.allocations.map((alloc) => ({
+      let totalAllocatedValue = toDecimal(0)
+      const plans = new Map(orders.map((order) => [order.id, planA2Reclassification(order)]))
+
+      const snapshot = await buildLayerSnapshot(
+        tx,
+        orders.flatMap((order) => {
+          const plan = plans.get(order.id)!
+          return order.allocations
+            .filter((alloc) => plan.outstandingByAllocation.has(alloc.id))
+            .map((alloc) => ({
               productId: alloc.productId,
               warehouseId: alloc.warehouseId,
-            })),
-          ),
-        )
-        const orderValues = new Map<string, number>()
-        const allocationSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
+            }))
+        }),
+      )
+      const orderValues = new Map<string, number>()
+      const allocationSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
+      /**
+       * o3d-0i5y r10: the entries THIS pass adds to a row, kept apart from the ones it merely read.
+       *
+       * A2 appends; it never authors what is already on the row. Holding the two halves separately
+       * is what lets the write rebase its append onto the record AS LOCKED instead of replaying the
+       * base it planned from — see `lockAllocationRecords`.
+       */
+      const allocationAppends = new Map<string, CostLayerSnapshotEntry[]>()
+      /** The quantity the planned-from base recorded, so a base that MOVED can be told from one that was revalued. */
+      const allocationBaseQty = new Map<string, Decimal>()
 
-        for (const order of orders) {
-          let orderCostValue = toDecimal(0)
+      for (const order of orders) {
+        const plan = plans.get(order.id)!
+        // o3d-0i5y r7: value is accumulated ROW BY ROW, from the entries this pass actually writes.
+        // r6 valued the whole unjournaled shipment here instead, which posts the WHOLE of a MIXED
+        // shipment — part of it already pinned and posted by an earlier pass. See the shipment-
+        // sourced term below.
+        let orderCostValue = toDecimal(0)
 
-          if (order.shipments.length > 0) {
-            orderCostValue = requireShipmentSnapshotValue(order)
-          } else {
-            for (const alloc of order.allocations) {
-              const allocationSnapshot = consumeSnapshotLayers(
+        // Rows that have never been reclassified at all, owe nothing and have nothing to record are
+        // still STAMPED with an empty snapshot, exactly as before.
+        for (const allocationId of plan.stampEmptyAllocationIds) {
+          allocationSnapshots.set(allocationId, [])
+          allocationAppends.set(allocationId, [])
+          allocationBaseQty.set(allocationId, toDecimal(0))
+        }
+
+        for (const alloc of order.allocations) {
+          const outstanding = plan.outstandingByAllocation.get(alloc.id)
+          const shipmentAccounted = plan.shipmentAccountedByAllocation.get(alloc.id)
+          if (!outstanding && !shipmentAccounted) continue
+          // o3d-0i5y r8: the row's RECORD — what earlier passes already accounted and posted. It
+          // is both the base the new entries are appended to and the pool the shipment take is
+          // netted by, so a dispatched entry this row has already valued can never be valued again.
+          const alreadyRecorded = parseCostLayerSnapshot(alloc.costLayerSnapshot)
+          // o3d-0i5y r6: units this pass is accounting from the SHIPMENT snapshots, written onto the
+          // row so a later pass reads them as evidence instead of inferring them from an overlap.
+          // They add NO value here — the shipment value is posted once, above, and only while the
+          // shipment is unjournaled — this is a record of quantity already in the ledger.
+          const recorded = shipmentAccounted
+            ? takeShipmentAccountedEntries(
+                alreadyRecorded,
+                order.shipments
+                  .filter((shipment) => shipment.warehouseId === alloc.warehouseId)
+                  .flatMap((shipment) => shipment.lines.filter((line) => (
+                    line.lineId === alloc.lineId && line.productId === alloc.productId
+                  ))),
+                shipmentAccounted,
+                alloc.id,
+              )
+            : []
+          // o3d-0i5y r7: THE RECORD IS ALSO THE VALUATION, and it must be, because the row is the
+          // only place that says which dispatched units A2 has already posted. `shipmentAccounted`
+          // is dispatched quantity NO entry on the row accounts for, so these entries are exactly
+          // the units whose cost has never reached Allocated Inventory — never the pinned part of
+          // the same shipment, which is what r6's whole-shipment sum re-posted every pass.
+          //
+          // A short take can only mean a dispatched line carries no snapshot to record. r6 let that
+          // stand as a silent under-account; it is now as loud as r5's whole-shipment guard was,
+          // and names the row and the quantity rather than the batch.
+          if (shipmentAccounted) {
+            const recordedQty = sumCostLayerSnapshotQty(recorded)
+            if (recordedQty.lt(shipmentAccounted)) {
+              throw new Error(
+                `Missing FIFO snapshot on shipped line(s) for allocation ${alloc.id} on order ${order.id}: `
+                + `${shipmentAccounted.toString()} dispatched unit(s) to account for, only ${recordedQty.toString()} recoverable`,
+              )
+            }
+          }
+          const consumed = outstanding
+            ? consumeSnapshotLayers(
                 snapshot,
                 alloc.productId,
                 alloc.warehouseId,
-                Number(alloc.qty),
+                outstanding.toNumber(),
               )
-              allocationSnapshots.set(alloc.id, allocationSnapshot)
-              orderCostValue = addMoney(orderCostValue, sumCostLayerSnapshot(allocationSnapshot))
-            }
-            orderCostValue = roundQuantity(orderCostValue, 2)
-          }
-
-          totalAllocatedValue = addMoney(totalAllocatedValue, orderCostValue)
-          orderValues.set(order.id, orderCostValue.toNumber())
+            : []
+          // APPENDED, not replaced, so `snapshotQty` keeps naming everything ever posted against
+          // this row — which is what makes the next pass's outstanding calculation right. The
+          // shipped record goes BEFORE the fresh pin, so the qty-based contra relief that Group B
+          // and the refund reversal run for each shipment line consumes exactly those units and
+          // leaves the unshipped pin standing.
+          //
+          // o3d-0i5y r9: the entries THIS pass values are stamped with WHAT IT VALUED THEM AT, in
+          // this same statement — and the journal for that amount is raised in this same
+          // transaction, a few lines below. `alreadyRecorded` is left exactly as it is: an earlier
+          // pass stamped it with the amount IT posted, and re-stamping at today's cost would turn
+          // a record of a historical posting into a revaluation of it. That is the whole point of
+          // the field — a landed-cost correction rewrites `unitCostBase` on these very rows
+          // without touching Allocated Inventory, so the pin stops being able to say what was
+          // debited the moment it is revalued.
+          //
+          // o3d-0i5y r10: the append is kept SEPARATE from `alreadyRecorded`, because the write is
+          // no longer allowed to replay the base it planned from — see `lockAllocationRecords` and
+          // the write loop below.
+          const appended = [
+            ...recorded.map(withPostedUnitCost),
+            ...consumed.map(withPostedUnitCost),
+          ]
+          allocationAppends.set(alloc.id, appended)
+          allocationBaseQty.set(alloc.id, sumCostLayerSnapshotQty(alreadyRecorded))
+          allocationSnapshots.set(alloc.id, [...alreadyRecorded, ...appended])
+          orderCostValue = addMoney(
+            orderCostValue,
+            addMoney(sumCostLayerSnapshot(recorded), sumCostLayerSnapshot(consumed)),
+          )
         }
+        orderCostValue = roundQuantity(orderCostValue, 2)
 
-        const totalAllocatedValueNumber = round2Decimal(totalAllocatedValue)
-        // o3d-o97 r3: null when NO journal was raised. The guard below is on the batch's ROUNDED
-        // total, so a window whose only member values at £0.004 stamps that order with an amount
-        // and creates no journal at all — which is exactly the inference ("an amount implies a
-        // pass that created a journal") the refund reversal used to rest on.
-        let a2SyncLogId: string | null = null
-        if (totalAllocatedValueNumber > 0) {
-          a2SyncLogId = await createPendingSyncLog(tx, {
-            type: 'DAILY_BATCH_INVENTORY_ALLOC',
-            referenceId,
-            currency: baseCurrency,
-            payload: {
-              date: today,
-              reference: `Inventory Allocation ${today} ${referenceId.slice(-8)}`,
-              narration: `Daily inventory reclassification: ${orders.length} order(s), £${totalAllocatedValueNumber.toFixed(2)}`,
-              lines: [
-                { accountCode: settings.xero_allocated_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, debit: totalAllocatedValueNumber },
-                { accountCode: settings.xero_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, credit: totalAllocatedValueNumber },
-              ],
-              batchReferenceId: referenceId,
-              batchDate: today,
-              batchGroup: 'A2',
-              batchEntityCount: orders.length,
-              splitBatch: result.hasMore.groupA2,
-              _postingMode: 'submitted',
-            },
-          })
-        }
+        totalAllocatedValue = addMoney(totalAllocatedValue, orderCostValue)
+        orderValues.set(order.id, orderCostValue.toNumber())
+      }
 
-        for (const order of orders) {
-          for (const alloc of order.allocations) {
-            const allocationSnapshot = allocationSnapshots.get(alloc.id) ?? []
-            await tx.orderAllocation.update({
-              where: { id: alloc.id },
-              data: {
-                costLayerSnapshot: allocationSnapshot as never,
-                // o3d-o97 r3: the pounds this row contributed to the DR above, pinned beside the
-                // layers it was pinned from. Revaluation rewrites those layers' unitCostBase in
-                // the snapshot; it never posts to Allocated Inventory, so this figure is what a
-                // refund of part of this row has to reverse at.
-                allocationBatchAmount: a2SyncLogId
-                  ? roundQuantity(sumCostLayerSnapshot(allocationSnapshot), 4).toNumber()
-                  : null,
-              },
-            })
+      const totalAllocatedValueNumber = round2Decimal(totalAllocatedValue)
+      // o3d-o97 r3: null when NO journal was raised. The guard below is on the batch's ROUNDED
+      // total, so a window whose only member values at £0.004 stamps that order with an amount
+      // and creates no journal at all — which is exactly the inference ("an amount implies a
+      // pass that created a journal") the refund reversal used to rest on.
+      let a2SyncLogId: string | null = null
+      if (totalAllocatedValueNumber > 0) {
+        a2SyncLogId = await createPendingSyncLog(tx, {
+          type: 'DAILY_BATCH_INVENTORY_ALLOC',
+          referenceId,
+          currency: baseCurrency,
+          payload: {
+            date: today,
+            reference: `Inventory Allocation ${today} ${referenceId.slice(-8)}`,
+            narration: `Daily inventory reclassification: ${orders.length} order(s), £${totalAllocatedValueNumber.toFixed(2)}`,
+            lines: [
+              { accountCode: settings.xero_allocated_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, debit: totalAllocatedValueNumber },
+              { accountCode: settings.xero_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, credit: totalAllocatedValueNumber },
+            ],
+            batchReferenceId: referenceId,
+            batchDate: today,
+            batchGroup: 'A2',
+            batchEntityCount: orders.length,
+            splitBatch: result.hasMore.groupA2,
+            _postingMode: 'submitted',
+          },
+        })
+      }
+
+      // -----------------------------------------------------------------------------------
+      // o3d-0i5y r10 (Codex round 10, finding 4) — THE WRITE REBASES ONTO THE ROW AS LOCKED.
+      //
+      // r9 moved the PLAN inside the transaction and under the orders' row locks, which was the
+      // right half of the fix. This is the other half: the write the plan leads to. It rewrites the
+      // WHOLE `costLayerSnapshot` array, and the front of that array is `alreadyRecorded` — entries
+      // read at the top of this transaction and not touched by A2 since.
+      //
+      // One writer can change them in that window, and it is not covered by the sales-order lock:
+      // `updateSnapshotsForCostLayerChange` rewrites `unitCostBase` in place on `order_allocations`
+      // when a landed cost lands late. It takes no order lock (it selects by cost layer, across
+      // every table that carries a snapshot), so it commits freely between A2's read and A2's
+      // write — and then A2 writes the array it read and the correction is gone.
+      //
+      //   a layer bought at £4 is corrected to £5 while the batch runs. 10 recorded units on the
+      //   row are repriced £40 -> £50 and the revaluation posts that £10 to COGS/Inventory.
+      //   A2 then writes back its planned array, at £4. The row says £40 again while the ledger
+      //   says £50, and Group B relieves those units at £4 when they ship: £10 of real cost never
+      //   reaches COGS, permanently, and the refund reversal reverses the same £10 short.
+      //
+      // So the base is RE-READ under the row lock at the moment of writing, and this pass's own
+      // entries are appended to THAT. A2 appends; it does not author what it merely read. The
+      // append is unaffected — `recorded` and `consumed` are this pass's own valuations, stamped
+      // with `postedUnitCostBase` — and a correction that lands after the lock waits for it, then
+      // patches the array A2 committed.
+      //
+      // A base whose QUANTITY moved is a different matter and is refused: the revaluation cannot
+      // change quantities or entry counts (it maps each entry to itself), so a base that grew or
+      // shrank means a writer nothing here can account for, and the plan built on it — `outstanding`
+      // above all — is describing a row that no longer exists. It cannot be reached today, because
+      // every path that changes WHICH units are recorded takes the order lock this pass holds.
+      const lockedRecords = await lockAllocationRecords(
+        tx,
+        orders.flatMap((order) => order.allocations
+          .filter((alloc) => allocationSnapshots.has(alloc.id))
+          .map((alloc) => alloc.id)),
+      )
+
+      for (const order of orders) {
+        for (const alloc of order.allocations) {
+          const next = allocationSnapshots.get(alloc.id)
+          // `undefined` means "this row was already accounted and is not being changed". It is NOT
+          // the same as `[]`, which is a deliberate stamp; writing `?? []` here would erase the
+          // pinned layers of every row a previous pass posted (o3d-0i5y r5).
+          if (!next) continue
+          const lockedBase = parseCostLayerSnapshot(lockedRecords.get(alloc.id) ?? null)
+          const plannedBaseQty = allocationBaseQty.get(alloc.id) ?? toDecimal(0)
+          const lockedBaseQty = sumCostLayerSnapshotQty(lockedBase)
+          if (!lockedBaseQty.eq(plannedBaseQty)) {
+            throw new Error(
+              `Allocation ${alloc.id} on order ${order.id} recorded ${plannedBaseQty.toString()} unit(s) when this `
+              + `pass planned from it and ${lockedBaseQty.toString()} unit(s) under the write lock — the record moved `
+              + 'under Group A2 and the plan built on it cannot be trusted',
+            )
           }
-          await tx.salesOrder.update({
-            where: { id: order.id },
+          const written = [...lockedBase, ...(allocationAppends.get(alloc.id) ?? [])]
+          await tx.orderAllocation.update({
+            where: { id: alloc.id },
             data: {
-              inventoryAllocatedDate: new Date(),
-              inventoryAllocatedBatchRef: referenceId,
-              allocationBatchAmount: orderValues.get(order.id) ?? 0,
-              // o3d-o97 r3: the journal's identity and DESTINATION, recorded with the amount it
-              // carried. All three stay null when no journal was raised, so a refund reading them
-              // back can tell "A2 debited £x on ledger L, account A" from "A2 valued this order at
-              // £x and posted nothing".
-              allocationBatchSyncLogId: a2SyncLogId,
-              allocationBatchConnector: a2SyncLogId ? XERO_CONNECTOR : null,
-              allocationBatchAccountCode: a2SyncLogId ? settings.xero_allocated_inventory_account : null,
+              costLayerSnapshot: written as never,
+              // o3d-o97 r3: the pounds this row contributed to the DR above, pinned beside the
+              // layers it was pinned from. Revaluation rewrites those layers' unitCostBase in
+              // the snapshot; it never posts to Allocated Inventory, so this figure is what a
+              // refund of part of this row has to reverse at.
+              //
+              // o3d-0i5y r10 (rebase): read off the array actually WRITTEN — the record re-read
+              // under the write lock plus this pass's appends — never the array this pass planned
+              // from. A landed-cost correction landing mid-batch rewrites the former and not the
+              // latter, and writing the planned copy back is how £10 of real cost never reaches
+              // COGS. And the figure is the POSTED basis where the entries carry one, so an
+              // earlier pass's pounds are the pounds it debited rather than what its layers have
+              // been revalued to since; pre-r9 entries carry no posted basis, and for those the pin
+              // is the only evidence there is, exactly as before.
+              //
+              // Where THIS pass raised no journal an EARLIER pass's record is left alone rather
+              // than nulled: `undefined` is "do not update", while `null` would erase a debit that
+              // is still standing and is the evidence-deletion o3d-o97 r4 refused.
+              allocationBatchAmount: a2SyncLogId
+                ? roundQuantity(recordedPostedBasis(written), 4).toNumber()
+                : lockedBase.length > 0 ? undefined : null,
             },
           })
         }
-      })
+        await tx.salesOrder.update({
+          where: { id: order.id },
+          data: {
+            inventoryAllocatedDate: new Date(),
+            inventoryAllocatedBatchRef: referenceId,
+            // o3d-o97 r3 + o3d-0i5y r5: the pounds A2 has debited to Allocated Inventory for this
+            // order — ACCUMULATED, not replaced. o3d-o97 wrote this as one pass's figure because
+            // the stamp only ever came off an order A2 was about to re-value in full. It does not
+            // any more: `resetAllocationAccountingIfStaged` hands a stamped order back when the
+            // declared set leaves NEW quantity, and A2 then posts that increment alone. Replacing
+            // the figure would leave the order recording £20 of a £70 debit, and the refund's open
+            // balance would strand the other £50 permanently.
+            allocationBatchAmount: roundQuantity(
+              addMoney(
+                toDecimal(order.allocationBatchAmount ?? 0),
+                toDecimal(orderValues.get(order.id) ?? 0),
+              ),
+              4,
+            ).toNumber(),
+            // o3d-o97 r3: the journal's identity and DESTINATION, recorded with the amount it
+            // carried. All three stay null when no journal was raised, so a refund reading them
+            // back can tell "A2 debited £x on ledger L, account A" from "A2 valued this order at
+            // £x and posted nothing".
+            allocationBatchSyncLogId: a2SyncLogId,
+            allocationBatchConnector: a2SyncLogId ? XERO_CONNECTOR : null,
+            allocationBatchAccountCode: a2SyncLogId ? settings.xero_allocated_inventory_account : null,
+          },
+        })
+      }
 
-      result.groupA2 = orders.length
-    }
+      return { count: orders.length, hasMore: candidateWindow.hasMore }
+    })
+
+    result.groupA2 = groupA2.count
+    result.hasMore.groupA2 = groupA2.hasMore
   } catch (e) {
     result.errors.push(`Group A2 error: ${String(e)}`)
   }

@@ -998,6 +998,10 @@ async function stageRefundAccountingReversals(
         // order's recorded debit BEFORE the consume loop runs. Same transaction, same read-only
         // point, no write between the two.
         allocationBatchAmount: true,
+        // o3d-0i5y r12 / o3d-xlk7: the pounds ALLOCATION_REVERSAL journals have already credited
+        // back out of Allocated Inventory for this order — the THIRD relief source, and the one
+        // that did not exist when the open balance below was written. See the netting there.
+        allocationReversalAmount: true,
         allocations: {
           select: {
             id: true,
@@ -1098,7 +1102,10 @@ async function stageRefundAccountingReversals(
             referenceId: { in: (orderAccounting?.refunds ?? []).map((refund) => refund.id) },
           },
         ],
-        type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'] },
+        // o3d-0i5y r12 / o3d-xlk7: ALLOCATION_REVERSAL joins the list. It is order-scoped, it
+        // credits the same Allocated Inventory account, and until it was read here the open balance
+        // below could not see it — so a cancelled-then-refunded order credited the same units twice.
+        type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL', 'ALLOCATION_REVERSAL'] },
       },
       select: { type: true, status: true, referenceType: true, referenceId: true, payload: true },
     })
@@ -1737,6 +1744,94 @@ async function stageRefundAccountingReversals(
       priorRefundReliefUnresolved = `prior refund ${priorRefund.id} claimed allocated units but its reversal journal is no longer on record (retention), so how much it already credited Allocated Inventory cannot be established`
     }
 
+    // o3d-0i5y r12 / o3d-xlk7 — THE THIRD RELIEF SOURCE: WHAT AN ALLOCATION_REVERSAL ALREADY
+    // CREDITED BACK OUT OF ALLOCATED INVENTORY.
+    //
+    // THE DEFECT THIS CLOSES, measured on both branches rather than guessed. Group A2 debits
+    // Allocated Inventory for an order's allocated units. o3d-o97 (merged as #635) says how many of
+    // those pounds are still open — `allocationBatchAmount` less relief it can PROVE — and it knows
+    // exactly two relief sources: Group B's per-shipment `allocatedReliefAmount`, and each earlier
+    // refund's `allocatedReliefAmount`. o3d-batch-shiporder raises ALLOCATION_REVERSAL journals from
+    // four callers (the allocator's re-file, the deallocation teardown, the manual editor, the
+    // over-allocation rebalancer) for units ORPHANED off an order — units that will not ship and
+    // were not refunded, so NEITHER of those two sources will ever describe them.
+    //
+    // An ALLOCATION_REVERSAL is neither, so it was invisible to the subtraction. Reverse £30 of
+    // orphaned units in March, refund the order in full in June, and the residue credits the SAME
+    // £30 a second time: Allocated Inventory ends £30 to the good with nothing in IMS saying so.
+    // Nothing double-counts on either branch alone — this only becomes reachable when both are
+    // present, which is why it is fixed here, on the side that arrived second.
+    //
+    // WHY COUNTING IT HERE, RATHER THAN REMOVING THE REVERSAL. The reversal is not redundant with
+    // anything merged: o3d-o97 states in `allocated-inventory-debit.ts` that reversing an orphaned
+    // debit is deliberately NOT attempted there ("there is no credit note to carry that reversal and
+    // it needs a sync type of its own"), and it is the refund side of the contra that it owns. The
+    // two halves are complementary, and the only thing they disagreed about is this arithmetic.
+    //
+    // AND IT IS PROVED THE SAME WAY EVERY OTHER RELIEF HERE IS PROVED — from the journal's OWN
+    // LINES, netted (`proveJournalPosting`), never from a status and never from a recorded figure
+    // taken on trust. Four outcomes, matching the prior-refund block above exactly:
+    //
+    //   PROVED       every reversal row settled and legible: the relief is what those journals
+    //                actually credited to the configured Allocated Inventory account, netted, so a
+    //                journal that touches the account on both sides counts only its net movement.
+    //   ASSUMED      the order records reversals whose journals can no longer be read — deleted by
+    //                `retention_sync_logs_months` (it deletes CANCELLED rows as well as SYNCED
+    //                ones), or with their payload compacted off a settled row. The recorded figure
+    //                is counted, because that is the reading that MOVES THE LEAST MONEY: counting
+    //                it can only UNDER-reverse, leaving a visible standing debit, while ignoring it
+    //                credits the account pounds it does not hold. The assumption is recorded on the
+    //                refund row so retention cannot quietly turn it into a resolution.
+    //   UNRESOLVED   a reversal row that is present and NOT SYNCED — PENDING, PROCESSING, FAILED or
+    //                CANCELLED. None of those says what reached the ledger (o3d-ju8t for FAILED,
+    //                o3d-o97 r5 for CANCELLED: a status is not a posting), and guessing either way
+    //                moves real money, so the refund refuses and says which journal.
+    //   NONE         the order has never had a reversal raised for it, which is every order until
+    //                one is.
+    //
+    // The RECORDED figure is the durable half and the journals are the provable half, and both are
+    // needed: `retention_sync_logs_months` hard-deletes these rows once terminal, and an orphaning
+    // can precede its order's refund by many months.
+    let allocationReversalRelief = 0
+    let allocationReversalReliefUnresolved: string | null = null
+    {
+      const reversalRows = priorReversals.filter((row) => (
+        row.type === 'ALLOCATION_REVERSAL' && row.referenceType === 'SalesOrder'
+      ))
+      const recordedReversalTotal = orderAccounting?.allocationReversalAmount != null
+        ? refundBoundaryNumber(orderAccounting.allocationReversalAmount)
+        : 0
+      const unsettled = reversalRows.filter((row) => row.status !== 'SYNCED')
+      const settledRows = reversalRows.filter((row) => row.status === 'SYNCED')
+      const legible = settledRows.filter((row) => payloadLinesLegible(row.payload))
+      if (unsettled.length > 0) {
+        // Deliberately BEFORE the arithmetic, and a refusal rather than a partial figure: an
+        // in-flight or abandoned reversal is pounds that may or may not have moved, and either
+        // guess is wrong in the ledger. The refusal names the statuses so an operator can see which.
+        allocationReversalReliefUnresolved = `this order has ${unsettled.length} Allocated Inventory reversal journal(s) recorded ${[...new Set(unsettled.map((row) => row.status))].join('/')}, not SYNCED — whether those pounds have left Allocated Inventory is not established, so how much of the A2 debit is still open cannot be either`
+      } else {
+        const proof = proveJournalPosting(legible, settings.allocatedInventoryAccount, 'credit')
+        // `proveJournalPosting` answers 'unproved'/'absent' for an EMPTY list, which here means only
+        // that no legible reversal survives — not that none was raised. The recorded total is what
+        // answers that, below.
+        const provedRelief = legible.length > 0 && proof.kind === 'proved' ? proof.amount : 0
+        allocationReversalRelief = provedRelief
+        // Whatever the record claims beyond what the surviving journals can account for belongs to
+        // a reversal retention has taken or compacted. Counted, and SAID to be counted on the
+        // record rather than on a journal (the o3d-o97 r6 'assumed' verdict, same wording, same
+        // reason).
+        const unreadable = roundQuantity(
+          subtractMoney(toDecimal(recordedReversalTotal), toDecimal(provedRelief)),
+          2,
+        ).toNumber()
+        if (unreadable > 0.005) {
+          allocationReversalRelief += unreadable
+          assumedReliefTotal += unreadable
+          assumedReliefNotes.push(`£${unreadable.toFixed(2)} of this order's recorded Allocated Inventory reversal relief was counted from its own record because the journal(s) that raised it can no longer be read — deleted by retention, or compacted off a settled row — and retention deletes cancelled journals as well as settled ones, so whether those pounds ever left the account is not established`)
+        }
+      }
+    }
+
     // o3d-o97 r2: THE RECORD of the Allocated Inventory contra Group B relieved — its CR Allocated
     // equals the dispatch COGS it debited, per journaled shipment. Valued at the ORIGINALLY-POSTED
     // basis (immutable CogsEntry rows, 6oyu.5), never at the current layer cost: a later landed-cost
@@ -2223,16 +2318,25 @@ async function stageRefundAccountingReversals(
     //             row read as zero relief credits the same pounds twice. The sync is still consulted
     //             for pre-column refunds, and where it says nothing at all this refuses too.
     //
+    //   relieved  o3d-0i5y r12 / o3d-xlk7 — every ALLOCATION_REVERSAL raised for this order, for
+    //             units ORPHANED off it (re-allocated away, deallocated, edited out, rebalanced)
+    //             that will therefore never reach either of the two sources above. This source did
+    //             not exist when the list was written and an allocation reversal is NEITHER of the
+    //             other two, so omitting it credited the same units a second time on the residue.
+    //             Proved from those journals' own lines, netted; recorded durably on
+    //             `SalesOrder.allocationReversalAmount` because retention hard-deletes the journals.
+    //
     // The open balance is the arithmetic on those records — posted, less relieved — and it both
     // CAPS what this refund's lines may reverse and, on a full refund, supplies the residue no line
     // reached. No layer cost is consulted, so nothing downstream of A2 can revalue it.
     //
-    // NOT a fix for the other un-stage sites. `resetAllocationAccountingIfStaged` and
-    // `releaseOverallocations` un-stage an order that is NOT refunded, so A2 re-runs and posts a
-    // SECOND debit — and they null `allocationBatchAmount` with the stamp, so the FIRST debit's
-    // record goes with it and the residue here can only ever cover the latest posting. There is no
-    // refund credit note to carry a reversal for the orphaned one, and reversing from there needs
-    // its own sync type. That half of o3d-o97 is untouched here.
+    // NOT a fix for the other un-stage sites — and o3d-0i5y r12 now IS, which is worth saying here
+    // because this paragraph used to describe the gap as open. `resetAllocationAccountingIfStaged`
+    // and `releaseOverallocations` un-stage an order that is NOT refunded; o3d-o97 r4 stopped them
+    // nulling `allocationBatchAmount` where the debit stands, and o3d-batch-shiporder added the
+    // sync type this note said was missing (`ALLOCATION_REVERSAL`) so those sites credit the
+    // orphaned units instead of stranding them. What that costs is the netting above: a reversal is
+    // relief, and relief this arithmetic cannot see is a debit reversed twice.
 
     // Read BEFORE the update at the bottom of this block clears the stamp. Read on EVERY refund,
     // not only a full one: the open balance it yields is what caps a PARTIAL line-driven reversal.
@@ -2322,7 +2426,10 @@ async function stageRefundAccountingReversals(
       }
     }
     if (!allocationBasisUnresolved) {
-      allocationBasisUnresolved = groupBReliefUnresolved ?? priorRefundReliefUnresolved
+      // o3d-0i5y r12: the reversal relief refuses on the same terms as the other two. It is last
+      // only because it is the newest source; the order of the three carries no meaning beyond
+      // which reason an operator is shown first.
+      allocationBasisUnresolved = groupBReliefUnresolved ?? priorRefundReliefUnresolved ?? allocationReversalReliefUnresolved
     }
     // o3d-o97 r6: the apportionment prices only SOME of the pool's unrecorded units and this refund
     // is PARTIAL, so neither of the two things that make the blend safe applies — the cap only bites
@@ -2339,7 +2446,14 @@ async function stageRefundAccountingReversals(
       // THE LEDGER BALANCE: what A2 debited, less every relief already credited against it. This
       // is a per-order figure derived from records the postings wrote — not a pool of entries
       // netted to choose units, which is the sibling's rule and would be the wrong shape here.
-      const relieved = addMoney(postedGroupBAllocationRelief, toDecimal(priorRefundAllocationRelief))
+      // o3d-0i5y r12 / o3d-xlk7: THREE relief sources now, not two — Group B for what dispatched,
+      // earlier refunds for what they took back, and ALLOCATION_REVERSAL for what was ORPHANED off
+      // the order and will never reach either of the first two. Omitting the third is what credited
+      // the same units twice on a cancelled-then-refunded order.
+      const relieved = addMoney(
+        addMoney(postedGroupBAllocationRelief, toDecimal(priorRefundAllocationRelief)),
+        toDecimal(allocationReversalRelief),
+      )
       const open = subtractMoney(toDecimal(postedAllocationDebit), relieved)
       openAllocatedContra = open.gt(0) ? roundQuantity(open, 2).toNumber() : 0
     }

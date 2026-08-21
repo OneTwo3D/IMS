@@ -199,6 +199,11 @@ enum AccountingSyncType {
   // rounding residue (same guard — sub-penny swept, material gaps flagged never swept).
   DAILY_BATCH_TRANSIT_RECONCILIATION
   UNEARNED_REV_REVERSAL
+  // o3d-0i5y r9: reverses the part of a Group A2 Allocated-Inventory debit that an allocation
+  // rewrite has ORPHANED — units A2 posted for that no longer sit on any allocation row, so no
+  // dispatch will ever credit them and no refund will ever reach them. DR Inventory /
+  // CR Allocated Inventory, raised inside the same transaction as the rewrite that orphaned them.
+  ALLOCATION_REVERSAL
   BILL_PAYMENT
   REALISED_FX_JOURNAL
   UNREALISED_FX_JOURNAL
@@ -1754,6 +1759,34 @@ model SalesOrder {
   allocationBatchSyncLogId   String?            @map("accounting_allocation_batch_sync_log_id")
   allocationBatchConnector   String?            @map("accounting_allocation_batch_connector")
   allocationBatchAccountCode String?            @map("accounting_allocation_batch_account_code")
+  // o3d-0i5y r12 — THE POUNDS ALREADY CREDITED BACK OUT OF ALLOCATED INVENTORY BY AN
+  // ALLOCATION_REVERSAL, ON A ROW RETENTION CANNOT REACH.
+  //
+  // Group A2 debits Allocated Inventory; exactly three things credit it. Group B credits what a
+  // shipment dispatches, a refund credits what it takes back, and — since this branch — an
+  // ALLOCATION_REVERSAL credits units that were ORPHANED off the order and will do neither.
+  // o3d-o97's open-balance arithmetic subtracts the first two from `allocationBatchAmount` and
+  // knew nothing of the third, so a cancelled-then-refunded order would have credited the same
+  // units TWICE (o3d-xlk7).
+  //
+  // The relief is proved from the reversal journals' own lines, netted, exactly as o3d-o97 proves
+  // the other two. This column is the record those journals cannot be, because
+  // `retention_sync_logs_months` HARD-DELETES an AccountingSyncLog row the moment it is terminal
+  // and past the cutoff — and an orphaning can precede its order's refund by many months. A
+  // reversal swept away would read as no relief at all, which is the double-credit again, later
+  // and quieter.
+  //
+  // It is a RUNNING TOTAL, because there is no per-orphaning business row to hang it on and one
+  // order can be trimmed many times. It is written in the same transaction as the enqueue that
+  // raised the journal, so it commits or rolls back with it. It is deliberately NOT reduced from
+  // `allocationBatchAmount`: that figure is what A2 POSTED, it is what
+  // `recreateMissingDailyBatchLogs` rebuilds the batch from, and `resolveStagedAllocationDebit`
+  // reads a recorded ZERO as positive proof that no debit stands — so netting a reversal into it
+  // would let a fully-reversed order clear its stamp and be posted all over again.
+  //
+  // NULL means "no ALLOCATION_REVERSAL has ever been raised for this order", which on and before
+  // deploy day is every row.
+  allocationReversalAmount   Decimal?  @db.Decimal(18, 4) @map("accounting_allocation_reversal_amount")
 
   notes             String?     // customer-visible notes
   internalNotes     String?     // private/staff notes

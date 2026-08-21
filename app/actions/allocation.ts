@@ -30,8 +30,10 @@ import {
   buildAvailableStockMap,
   canonicalAllocationQty,
   clearDormantFulfillmentPinsInTx,
+  lockAccountedRecordsForScope,
   lockSalesOrder,
   lockStockLevels,
+  refileAccountedRecordsForScope,
   releaseOrderAllocationsForDeallocationInTx,
   resetAllocationAccountingIfStaged,
   validateAllocationIntegrity,
@@ -47,6 +49,7 @@ import {
   discardCancelledOrderShipmentsInTx,
   reconcileOrderAfterShipment,
   transitionShipmentStatus,
+  type OrderCompletionAuthority,
 } from '@/lib/domain/sales/shipment-service'
 import {
   allocationScopeKey,
@@ -530,6 +533,7 @@ export async function updateAllocation(
       }
 
       await resetAllocationAccountingIfStaged(tx, locked.orderId)
+
       await lockStockLevels(tx, [locked.productId], Array.from(new Set([locked.warehouseId, newWarehouseId])))
 
       const stockLevels = await tx.stockLevel.findMany({
@@ -630,6 +634,47 @@ export async function updateAllocation(
         qty: releaseQty,
       }], 'release')
 
+      // -------------------------------------------------------------------------------------
+      // o3d-0i5y r11 (Codex round 11, finding 1) — WHERE GROUP A2'S POSTED RECORD STANDS, READ
+      // UNDER THE LOCK THIS WRITE IS ABOUT TO TAKE ANYWAY.
+      //
+      // r10 read it at the top of the action and wrote the plan drawn from it at the bottom, which
+      // is the same defect r10 had just fixed in Group A2 one file away: the record it plans from is
+      // rewritten in place by `updateSnapshotsForCostLayerChange` when a landed cost lands late, and
+      // that sweep takes NO sales-order lock (it selects by cost layer, across every table carrying
+      // a snapshot). So it commits freely in that window and the plan writes it straight back out.
+      //
+      //   the row holds 10 units A2 pinned and posted at £4 (£40 into Allocated Inventory,
+      //   `postedUnitCostBase` 4.000000). The operator reduces it to 6. Mid-edit a landed cost
+      //   reprices that layer £4 -> £5: the correction rewrites `unitCostBase` to 5.000000 on this
+      //   very row and posts the £10 to COGS/Inventory, never to Allocated Inventory — which is why
+      //   `postedUnitCostBase` stays at £4.
+      //   BEFORE r11: the trim is serialized from the £4 array read at the top, so the row is
+      //     written back at £4 and the correction is gone. The row says 6 x £4 = £24 where the
+      //     corrected pin says 6 x £5 = £30, Group B relieves those six at £4 when they ship, and
+      //     £6 of real cost never reaches cost of sales — permanently, and a later refund reverses
+      //     the same £6 short.
+      //   AFTER r11: the base is re-read under the row lock and the trim lands on the CORRECTED
+      //     entry, so the row keeps 6 x £5 = £30. The reversal is unchanged at £16 — 4 units at the
+      //     £4 A2 recorded posting — because no revaluation touches `postedUnitCostBase`.
+      //
+      // TAKEN HERE, NOT AT THE TOP OF THE TRANSACTION, and deliberately: see
+      // `lockAccountedRecordsForScope`. This is the statement before the first allocation-row write,
+      // which is where these rows are locked in any case, so no new lock ordering is created.
+      //
+      // Scoped to this (line, product) because that is the grain the carry-over pools at, and the
+      // only grain this action can honestly speak for: it edits ONE row, and the units it moves can
+      // only ever land on a row of the same line and product. Every other row on the order is
+      // untouched, so including them would be inventing a claim about a set nobody declared — the
+      // exact thing `resetAllocationAccountingIfStaged`'s undeclared-caller path refuses to do.
+      // -------------------------------------------------------------------------------------
+      const lockedScopeRecords = await lockAccountedRecordsForScope(
+        tx,
+        locked.orderId,
+        locked.lineId,
+        locked.productId,
+      )
+
       // o3d-4kfh r7: the DELETE test is on the quantised value, because that is the quantity the
       // row would hold. `newQty === 0` let 0.00004 through to a row Postgres stores as 0.0000 —
       // an allocation row claiming nothing, which every structural check then reads as a component
@@ -722,6 +767,46 @@ export async function updateAllocation(
       // that the next allocation has already decided not to use. Retired here, so no reader is left
       // answering from it.
       await clearDormantFulfillmentPinsInTx(tx, locked.orderId)
+
+      // -------------------------------------------------------------------------------------
+      // o3d-0i5y r10 (Codex round 10, finding 1) — THE MANUAL EDITOR CARRIES AND REVERSES TOO.
+      //
+      // r9 gave the carry-over and the orphan reversal to `allocateSalesOrder`, the one caller that
+      // DECLARES its next set, and left this path out on the reading that an undeclared caller has
+      // nothing to declare. That reading was about the STAMP, and it was right about the stamp. It
+      // was never right about the record, and this action is the single most direct way a recorded
+      // unit leaves an order: an operator types a smaller number into the allocation editor.
+      //
+      // Worked example — the same shape r9 fixed for the allocator, arriving through the UI:
+      //   line L holds 10 units at W1. A2 pinned them at £4 and posted DR Allocated / CR Inventory
+      //   £40, stamping `postedUnitCostBase` 4.000000 on the entry.
+      //   the operator edits the allocation to 6. Nothing is refused: no shipment is committed.
+      //   BEFORE r10: the row keeps a record of 10 units. `unaccountedAllocationQty`'s floor stops
+      //     A2 posting them again — and that is all it does. Group B will credit Allocated
+      //     Inventory 6 x £4 = £24 when the six ship, no refund ever sees the other four (they were
+      //     never invoiced), and £16 of a real debit sits in Allocated Inventory for ever with
+      //     Inventory understated by the same £16.
+      //   AFTER r10: the record is trimmed to the 6 units the row will hold (£24) and the 4 units
+      //     that left the order raise CR Allocated £16.00 / DR Inventory £16.00. Allocated
+      //     Inventory holds exactly the £24 Group B will relieve.
+      //
+      // A reduction to zero is the same thing at its limit: the row is deleted, all 10 units are
+      // orphaned, and £40 is reversed. A warehouse MOVE, by contrast, keeps every unit on the
+      // order — the carry-over moves the record onto the destination row and there is nothing to
+      // reverse, which is exactly what the merge branch above needs, because it DELETES the source
+      // row and its record with it.
+      //
+      // o3d-0i5y r11: the plan is drawn from `lockedScopeRecords` — the base read under the row
+      // lock this action holds from before its first row write until commit — and the rows it
+      // writes onto are read back AS PERSISTED. One implementation, shared with the rebalancer:
+      // see `refileAccountedRecordsForScope`.
+      // -------------------------------------------------------------------------------------
+      await refileAccountedRecordsForScope(
+        tx,
+        locked.orderId,
+        { lineId: locked.lineId, productId: locked.productId },
+        lockedScopeRecords,
+      )
 
       const integrityError = await validateAllocationIntegrity(tx, locked.orderId, [locked.lineId])
       if (integrityError) throw new Error(integrityError)
@@ -1167,7 +1252,16 @@ export async function updateShipmentStatus(
   shipmentId: string,
   targetStatus: string,
   extra?: { trackingNumber?: string; shippingService?: string },
-  options?: { internalBypassToken?: symbol },
+  options?: {
+    internalBypassToken?: symbol
+    /**
+     * o3d-0i5y r2: who owns the "is the ORDER fulfilled?" decision for this dispatch — see
+     * `OrderCompletionAuthority`. Omitted (the default) means IMS is working the order and the
+     * completion check below derives the answer from the shipment rows. `applyExternalFulfillmentUpdate`
+     * passes `EXTERNAL`, because the storefront/WMS driving it has already made that decision.
+     */
+    completionAuthority?: OrderCompletionAuthority
+  },
 ): Promise<{ success: boolean; error?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
@@ -1188,7 +1282,34 @@ export async function updateShipmentStatus(
     }
 
     if (targetStatus === 'SHIPPED') {
-      const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra)
+      const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra, {
+        completionAuthority: options?.completionAuthority ?? 'IMS',
+      })
+      // o3d-0i5y: every shipment raised on this order has now shipped, but the order still owes
+      // quantity, so it was deliberately left in its pre-shipment status instead of being declared
+      // complete. Only ever set under IMS completion authority — an externally fulfilled order is
+      // completed by the storefront/WMS that shipped it, and reporting it short here would be a
+      // false warning on EVERY external dispatch. Nothing re-allocates such an order automatically
+      // (both allocation sweeps exclude orders holding shipments), so this WARNING is the operator
+      // queue for it — same pattern as the paid_without_invoice warning. Logged on EVERY shipped
+      // transition, not only the one that first exposed the shortfall, so a retry after a crashed
+      // log still surfaces it.
+      if (reconciliation.shortfall) {
+        const orderRef = result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber
+        const outstandingSummary = reconciliation.shortfall
+          .map((line) => `${line.label} (${line.outstandingQty} outstanding)`)
+          .join(', ')
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: reconciliation.orderId,
+          action: 'shipped_short',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Order ${orderRef} has despatched every shipment raised against it but is still short: ${outstandingSummary}. `
+            + 'It has NOT been marked SHIPPED. Allocate and ship the remainder, or set the order to SHIPPED explicitly to close it short.',
+          metadata: { orderNumber: orderRef, shortfall: reconciliation.shortfall },
+        })
+      }
       if (reconciliation.shouldGenerateInvoice) {
         const { generateInvoiceNumber } = await import('./sales')
         await generateInvoiceNumber(reconciliation.orderId)

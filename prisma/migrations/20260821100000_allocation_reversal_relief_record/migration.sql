@@ -1,0 +1,42 @@
+-- o3d-0i5y / o3d-xlk7 — RECORD WHAT AN ALLOCATION_REVERSAL CREDITED BACK OUT OF ALLOCATED
+-- INVENTORY, ON A ROW RETENTION CANNOT REACH.
+--
+-- WITHOUT THIS FILE THE BRANCH IS A DOUBLE-CREDIT WITH A LONGER FUSE. `prisma migrate deploy`
+-- applies migrations, not schema.prisma, so on production this column would not exist: every write
+-- of it throws inside the allocation transaction that raised the reversal, and every read of it
+-- returns nothing — which the refund treats as "no reversal has ever been raised for this order".
+--
+-- WHAT IT IS FOR (the full argument lives beside the field in prisma/schema.prisma):
+--
+--   sales_orders.accounting_allocation_reversal_amount
+--     Group A2 debits DR Allocated Inventory / CR Inventory, and exactly three things credit it
+--     back: Group B for what a shipment dispatches, a refund for what it takes back, and — new on
+--     this branch — an ALLOCATION_REVERSAL for units ORPHANED off the order, which will do neither.
+--     o3d-o97's open-balance arithmetic subtracts the first two from
+--     `accounting_allocation_batch_amount`; an allocation reversal is neither, so without this a
+--     cancelled-then-refunded order credits the same units twice.
+--
+--     The relief itself is PROVED from each reversal journal's own lines, netted — the same
+--     standard o3d-o97 applies to the other two — and this column is the record those journals
+--     cannot be, because `retention_sync_logs_months` HARD-DELETES a settled or cancelled
+--     AccountingSyncLog row past the cutoff, while an orphaning can precede its order's refund by
+--     many months. A swept reversal would read as no relief at all.
+--
+--     A RUNNING TOTAL: one order can be trimmed many times and there is no per-orphaning business
+--     row to hang a figure on. Written in the same transaction as the enqueue that raised the
+--     journal, so it commits or rolls back with it.
+--
+-- NULLABLE WITH NO DEFAULT, deliberately, and for the same reason o3d-o97 gave for its ten
+-- columns: a default is a value, and the whole point is that a historical row HAS no value and
+-- must be able to say so. NULL reads as "no ALLOCATION_REVERSAL has ever been raised for this
+-- order", which is true of every row on and before deploy day.
+--
+-- NO FOREIGN KEY to accounting_sync_logs, also deliberately: retention must stay free to delete
+-- settled rows, and this figure has to OUTLIVE them — that is the whole reason it exists.
+--
+-- DEPLOY ORDER. This migration and 20260821040000_allocation_reversal_sync_type (which adds the
+-- ALLOCATION_REVERSAL enum value) must BOTH be applied BEFORE the application code that enqueues a
+-- reversal. Four callers reach `reverseOrphanedAllocationPosting`.
+
+-- AlterTable
+ALTER TABLE "sales_orders" ADD COLUMN "accounting_allocation_reversal_amount" DECIMAL(18,4);

@@ -43,6 +43,11 @@ type Order = {
   allocationBatchSyncLogId?: string | null
   allocationBatchConnector?: string | null
   allocationBatchAccountCode?: string | null
+  // o3d-0i5y r12 / o3d-xlk7: the running total of pounds ALLOCATION_REVERSAL journals have already
+  // credited back out of Allocated Inventory for this order — units orphaned off it, which neither
+  // Group B nor a refund will ever describe. Optional, because it is null on every order until one
+  // is raised.
+  allocationReversalAmount?: number | null
 }
 
 type LineTaxRate = { accountingTaxType: string | null; reverseCharge: boolean | null }
@@ -2211,6 +2216,148 @@ test('a full refund whose lines cover EVERY allocated unit reverses £20 once, n
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), 20, 'exactly the A2 amount, reversed once')
+})
+
+// ---------------------------------------------------------------------------
+// o3d-xlk7 — AN ALLOCATION_REVERSAL IS THE THIRD THING THAT RELIEVES THE A2 CONTRA.
+//
+// o3d-batch-shiporder raises ALLOCATION_REVERSAL journals for units ORPHANED off an order (a
+// re-allocation that drops a scope, the deallocation teardown, the manual editor, the
+// over-allocation rebalancer). Those units will never ship and were never refunded, so NEITHER of
+// o3d-o97's two relief sources — Group B's per-shipment `allocatedReliefAmount` and each prior
+// refund's `allocatedReliefAmount` — will ever describe them.
+//
+// So before this fix the open balance still contained pounds that had already been credited, and
+// the residue on a full refund credited them A SECOND TIME. These assert the FIGURE, because the
+// defect is a reversal of the wrong (too large) amount and a presence check cannot see it.
+// ---------------------------------------------------------------------------
+
+/**
+ * The £20 order after one of its two units was orphaned and reversed for £10:
+ *   * one allocation row left, one unit, £10 of posted basis;
+ *   * `allocationBatchAmount` still 20 — that is what A2 POSTED, and o3d-o97 keeps it deliberately
+ *     (`resolveStagedAllocationDebit` reads a recorded zero as proof no debit stands, so netting a
+ *     reversal into it would let a fully-reversed order clear its stamp and be posted again);
+ *   * `allocationReversalAmount` 10 — the durable record of what the reversal credited back.
+ */
+function a2StagedWithOrphanReversalState(): State {
+  const state = a2StagedAllocatedState()
+  state.orders[0].allocationReversalAmount = 10
+  state.allocations = [{
+    id: 'alloc-1',
+    orderId: 'order-1',
+    lineId: 'line-1',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    qty: 1,
+    costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }],
+    allocationBatchAmount: 10,
+  }]
+  return state
+}
+
+/** The SYNCED reversal journal itself: CR Allocated Inventory £10 / DR Inventory £10. */
+function seedPostedAllocationReversal(state: State, status = 'SYNCED'): void {
+  state.accountingSyncLogs = [{
+    id: 'alloc-reversal-1',
+    connector: 'xero',
+    type: 'ALLOCATION_REVERSAL',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    status,
+    payload: {
+      lines: [
+        { accountCode: accountingSettings.inventoryAccount, debit: 10 },
+        { accountCode: accountingSettings.allocatedInventoryAccount, credit: 10 },
+      ],
+    },
+  }]
+}
+
+test('a full refund does NOT re-credit units an ALLOCATION_REVERSAL already credited (o3d-xlk7)', async () => {
+  // THE DOUBLE-CREDIT, end to end. A2 debited Allocated Inventory £20 for two units. One unit was
+  // later orphaned off the order and an ALLOCATION_REVERSAL credited £10 of it back — so £10 is
+  // open. A monetary-only full refund then closes both daily-batch windows for ever.
+  //
+  //   before  the open balance was `allocationBatchAmount` (£20) less relief from Group B (none)
+  //           and prior refunds (none) = £20, and the residue credited the whole £20. Allocated
+  //           Inventory received £10 + £20 = £30 against a £20 debit, and the SAME UNIT was
+  //           credited twice.
+  //   now     the reversal is proved from its own journal lines (net CR £10) and netted, so the
+  //           open balance is £10 and exactly £10 is credited. £10 + £10 = the £20 debited.
+  const state = a2StagedWithOrphanReversalState()
+  seedPostedAllocationReversal(state)
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].refundStatus, 'FULL', 'full by amount, which is what un-stages A2')
+  assert.equal(
+    findAllocatedInventoryCredit(result),
+    10,
+    'only the £10 still open — NOT the £20 A2 posted, £10 of which the reversal already credited',
+  )
+  assert.equal(findInventoryReversalDebit(result), 10, 'and the matching Inventory debit is £10, not £20')
+})
+
+test('an ALLOCATION_REVERSAL journal retention has swept is still counted, and says it was assumed (o3d-xlk7)', async () => {
+  // The reason the relief is RECORDED on the order and not read off the journal alone.
+  // `retention_sync_logs_months` hard-deletes an AccountingSyncLog row once terminal and past the
+  // cutoff, and an orphaning can precede its order's refund by many months. With the row gone the
+  // proved relief is zero — and reading that as "nothing was ever reversed" is the double-credit
+  // again, later and quieter. The recorded £10 is counted instead (the reading that moves the least
+  // money: it can only UNDER-reverse, which leaves a visible standing debit), and the refund row
+  // says the figure rests on a record rather than on a journal.
+  const state = a2StagedWithOrphanReversalState()
+  state.accountingSyncLogs = []
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(findAllocatedInventoryCredit(result), 10, 'the recorded reversal is still netted off')
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /reversal relief was counted from its own record because the journal\(s\) that raised it can no longer be read/,
+    'and the assumption reaches the refund row, so retention cannot turn it into a resolution',
+  )
+})
+
+test('an ALLOCATION_REVERSAL that has not settled makes the refund REFUSE rather than guess (o3d-xlk7)', async () => {
+  // A queued or abandoned reversal is pounds that may or may not have left the account, and this
+  // repository has established both halves: a FAILED row does not prove nothing posted (o3d-ju8t),
+  // and CANCELLED is an abandonment written by a sweep or an operator who cannot see whether the
+  // remote call landed (o3d-o97 r5). Counting it under-reverses; ignoring it over-credits. Neither
+  // guess is available, so nothing is credited and the refund says which journal.
+  const state = a2StagedWithOrphanReversalState()
+  seedPostedAllocationReversal(state, 'PENDING')
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: null, productId: null, description: 'Monetary refund', qty: 0, totalBase: 100, lineKind: 'sale' }],
+    reason: 'Goodwill full refund',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(findAllocatedInventoryCredit(result), null, 'nothing is credited to an account whose balance is unknown')
+  assert.match(
+    String(state.refunds[0].allocationBasisUnresolved),
+    /Allocated Inventory reversal journal\(s\) recorded PENDING, not SYNCED/,
+  )
+  assert.notEqual(state.orders[0].inventoryAllocatedDate, null, 'and the A2 stamp survives so the order stays reportable')
 })
 
 test('a full refund on an order A2 never staged posts NO allocation reversal (o3d-o97)', async () => {

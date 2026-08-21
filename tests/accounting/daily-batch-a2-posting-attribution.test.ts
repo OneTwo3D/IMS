@@ -49,7 +49,15 @@ const tx = {
     },
   },
   salesOrder: {
-    findMany: async () => [],
+    // o3d-0i5y r9 (merged after this test was written): Group A2 selects its window INSIDE the
+    // transaction and under the orders' row locks, so this delegate has to answer BOTH asks — the
+    // id-only candidate probe and the full re-read under the lock. Answering only the first leaves
+    // A2 with no orders at all and every assertion below vacuous; `db.salesOrder.findMany` outside
+    // the transaction is no longer on A2's path.
+    findMany: async (args?: { where?: OrderWhere; select?: Record<string, unknown> }) => {
+      if (args?.select?.allocations) return [ORDER]
+      return isGroupA2Window(args?.where) ? [{ id: ORDER.id }] : []
+    },
     update: async ({ where, data }: { where: { id: string }; data: Record<string, unknown> }) => {
       orderUpdates.push({ id: where.id, data })
       return { id: where.id }

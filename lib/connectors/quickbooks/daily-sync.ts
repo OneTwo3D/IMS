@@ -623,6 +623,9 @@ export async function runDailyBatchSync(): Promise<{
         orderNumber: true,
         externalOrderNumber: true,
         status: true,
+        // o3d-0i5y r5 (rebase onto o3d-o97): what earlier A2 passes already recorded posting for
+        // this order — the running total the write below adds to. See the Xero batch.
+        allocationBatchAmount: true,
         allocations: {
           select: {
             id: true,
@@ -731,7 +734,16 @@ export async function runDailyBatchSync(): Promise<{
             data: {
               inventoryAllocatedDate: new Date(),
               inventoryAllocatedBatchRef: referenceId,
-              allocationBatchAmount: orderValues.get(order.id) ?? 0,
+              // o3d-o97 r3 + o3d-0i5y r5: ACCUMULATED, not replaced — a stamped order can be handed
+              // back for an INCREMENT now, so the order-level record is the running total of what
+              // A2 has debited. See the Xero batch for the worked strand.
+              allocationBatchAmount: roundQuantity(
+                addMoney(
+                  toDecimal(order.allocationBatchAmount ?? 0),
+                  toDecimal(orderValues.get(order.id) ?? 0),
+                ),
+                4,
+              ).toNumber(),
               // o3d-o97 r3: the journal's identity and DESTINATION. See the Xero batch.
               allocationBatchSyncLogId: a2SyncLogId,
               allocationBatchConnector: a2SyncLogId ? QBO_CONNECTOR : null,

@@ -83,8 +83,10 @@ test('sliceTransferSnapshotForReceipt takes the next cost-layer slice after prio
       qtyReceived: 3,
     }),
     [
-      { costLayerId: 'layer-a', qty: '1.000000', unitCostBase: '10.000000', orderAllocationId: undefined, shipmentLineId: undefined, source: undefined },
-      { costLayerId: 'layer-b', qty: '2.000000', unitCostBase: '12.000000', orderAllocationId: undefined, shipmentLineId: undefined, source: undefined },
+      // o3d-0i5y r9: `postedUnitCostBase` rides through every take, so a rewrite that moves units
+      // between rows carries the record of what was posted for them. A transfer slice never has one.
+      { costLayerId: 'layer-a', qty: '1.000000', unitCostBase: '10.000000', orderAllocationId: undefined, shipmentLineId: undefined, source: undefined, postedUnitCostBase: undefined },
+      { costLayerId: 'layer-b', qty: '2.000000', unitCostBase: '12.000000', orderAllocationId: undefined, shipmentLineId: undefined, source: undefined, postedUnitCostBase: undefined },
     ],
   )
 })

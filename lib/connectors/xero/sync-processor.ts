@@ -3848,6 +3848,9 @@ async function processClaimedEntry(
     case 'DAILY_BATCH_COGS_RECONCILIATION':
     case 'DAILY_BATCH_TRANSIT_RECONCILIATION':
     case 'UNEARNED_REV_REVERSAL':
+    // o3d-0i5y r9: the orphaned-allocation reversal. A plain manual journal like every other type
+    // in this group — the amount is decided (and evidenced) at staging time, not here.
+    case 'ALLOCATION_REVERSAL':
     case 'REALISED_FX_JOURNAL':
     case 'UNREALISED_FX_JOURNAL':
     case 'MANUFACTURING_JOURNAL':
