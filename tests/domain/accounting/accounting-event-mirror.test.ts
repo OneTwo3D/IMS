@@ -496,6 +496,17 @@ type FakeAccountingEventRow = {
    */
   createdAt: Date
   /**
+   * o3d-m26g, merged into development after these fixtures were written: on a POSTED transition the
+   * mirror REBUILDS the event's body from the payload that was actually posted, and logs
+   * `payload_rebuilt_from_posted` when it differs from the enqueued one. A double that carries no
+   * body at all reports a difference against `undefined` on every post, so these fixtures seed the
+   * body they were enqueued with — which, since they post the same payload they were queued from,
+   * is the body the rebuild produces. That keeps these tests about the REVISION CLAIM, which is
+   * what they exist for; the rebuild's own behaviour is pinned in the o3d-m26g tests below.
+   */
+  linesJson?: unknown
+  currency?: string
+  /**
    * o3d-cvj9 r3: the stamp the EXTERNAL system put on the document as it applied this row's write
    * (Xero's `Invoice.UpdatedDateUTC`). Two writes to one invoice are serialised by Xero on one
    * clock, so these stamps are the order the edits were applied — the only order that says which
@@ -634,9 +645,25 @@ const REVISION_MIRRORED_AT = new Date('2026-08-19T10:00:00.000Z')
 /** Xero's stamp for the edit under test, when the fixture gives it one. */
 const REVISION_XERO_REVISION_AT = new Date('2026-08-19T10:00:05.500Z')
 
+/**
+ * The mirrored body these fixtures were enqueued with, built by the SAME builder the rebuild uses,
+ * so "nothing changed between enqueue and post" is true by construction rather than by a hand-copied
+ * literal that would drift the moment the builder does.
+ */
+const REVISION_MIRRORED_BODY = buildMirroredAccountingEventDraft({
+  connector: 'xero',
+  type: 'SALES_INVOICE_UPDATE',
+  referenceType: 'SalesOrder',
+  referenceId: 'so-1',
+  payload: REVISION_PAYLOAD,
+  currency: 'GBP',
+})
+
 function invoiceCreateRow(overrides: Partial<FakeAccountingEventRow> = {}): FakeAccountingEventRow {
   return {
     id: 'event-create',
+    linesJson: REVISION_MIRRORED_BODY?.linesJson,
+    currency: 'GBP',
     type: 'SALES_INVOICE',
     sourceEntityType: 'SalesOrder',
     sourceEntityId: 'so-1',
@@ -656,6 +683,8 @@ function invoiceCreateRow(overrides: Partial<FakeAccountingEventRow> = {}): Fake
 function revisionRow(overrides: Partial<FakeAccountingEventRow> = {}): FakeAccountingEventRow {
   return {
     id: 'event-revision',
+    linesJson: REVISION_MIRRORED_BODY?.linesJson,
+    currency: 'GBP',
     type: 'SALES_INVOICE_UPDATE',
     sourceEntityType: 'SalesOrder',
     sourceEntityId: 'so-1',
@@ -701,7 +730,11 @@ test('a posted sales invoice revision takes the external id from the invoice eve
   // succeeds — the P2002 is handled where it was raised, not by rewriting the transition into
   // something that cannot fail. r2 read the ARRIVING row here too, for a `createdAt` that never
   // meant what it was read for; r3 does not need it and does not read it.
-  assert.deepEqual(store.statements, ['update', 'findUnique', 'updateMany', 'update', 'log', 'log'])
+  // The leading `findUnique` is o3d-m26g's body read (merged into development after this sequence
+  // was pinned): a POSTED transition rebuilds the mirrored body from the payload that was posted,
+  // and needs the enqueued body to compare against. It is a READ taken before anything is written,
+  // so it changes nothing this assertion is about.
+  assert.deepEqual(store.statements, ['findUnique', 'update', 'findUnique', 'updateMany', 'update', 'log', 'log'])
   assert.deepEqual(store.logs, [
     {
       accountingEventId: 'event-create',
@@ -808,7 +841,8 @@ test('re-posting a revision that already holds the external id is a no-op, not a
 
   await postRevision(store, { externalRevisionAt: REVISION_XERO_REVISION_AT })
 
-  assert.deepEqual(store.statements, ['update', 'log'], 'the retry path must not run when nothing conflicts')
+  // Leading `findUnique`: o3d-m26g's body read — see the note on the takeover test above.
+  assert.deepEqual(store.statements, ['findUnique', 'update', 'log'], 'the retry path must not run when nothing conflicts')
   assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
     { id: 'event-create', status: 'SUPERSEDED', externalId: null },
     { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },

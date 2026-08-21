@@ -1045,7 +1045,7 @@ export async function updateMirroredAccountingEventStatus(
   let previousLinesJson: unknown = undefined
   let bodyChanged = false
 
-  async function resolveBodyRebuild(key: string): Promise<void> {
+  async function resolveBodyRebuild(key: string): Promise<'ok' | 'not_found'> {
     rebuilt = null
     rebuildError = null
     previousLinesJson = undefined
@@ -1059,14 +1059,17 @@ export async function updateMirroredAccountingEventStatus(
     // write (see the guard note on `updateByIdempotencyKey`); its `payload` is the stored row's,
     // not something this attempt sent. Rebuilding the event's body from it would rewrite the
     // mirror to describe a post that never happened — the precise inverse of what o3d-m26g is for.
-    if (params.status !== 'POSTED' || guard) return
+    if (params.status !== 'POSTED' || guard) return 'ok'
 
     const existing = await client.accountingEvent.findUnique({
       where: { idempotencyKey: key },
       select: { id: true, currency: true, linesJson: true },
     })
-    // No row: the write below reports `not_found` on its own terms. Nothing to rebuild against.
-    if (!existing) return
+    // We have just read, in this transaction, that there is no such event. Saying so here rather
+    // than letting the write below rediscover it as a P2025 keeps the o3d-m26g contract exact — a
+    // mirrored event that does not exist is a no-op, and nothing is attempted against it — while
+    // leaving the caller's primary/legacy key fallback untouched, since it branches on `not_found`.
+    if (!existing) return 'not_found'
 
     // A REBUILD FAILURE MUST NEVER COST THE POST. This runs inside the same transaction as the
     // sync log's SYNCED transition, so throwing here would roll that transition back on work that
@@ -1089,6 +1092,7 @@ export async function updateMirroredAccountingEventStatus(
     }
     previousLinesJson = existing.linesJson
     bodyChanged = rebuilt != null && canonicalJson(rebuilt.linesJson) !== canonicalJson(previousLinesJson)
+    return 'ok'
   }
 
   function statusWriteData(
@@ -1149,7 +1153,7 @@ export async function updateMirroredAccountingEventStatus(
 
   async function updateByIdempotencyKey(key: string): Promise<{ id: string } | 'not_found' | 'refused'> {
     // Before anything is written for THIS key (o3d-m26g).
-    await resolveBodyRebuild(key)
+    if (await resolveBodyRebuild(key) === 'not_found') return 'not_found'
     // o3d-nf9i: the CAS. `updateMany` rather than `update` because the where has to carry more than
     // the unique key, and because a guard that does not hold must be a zero-row no-op, not a throw.
     //
