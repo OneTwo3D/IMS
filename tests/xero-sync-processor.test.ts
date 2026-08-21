@@ -551,8 +551,12 @@ test('both runners take the claim through the same helper — neither may claim 
   const direct = src.slice(src.indexOf('async function processPendingXeroSyncDirect('), src.indexOf('async function processPendingXeroSyncViaOutbox('))
   const outbox = src.slice(src.indexOf('async function processPendingXeroSyncViaOutbox('))
   for (const [name, block] of [['direct', direct], ['outbox', outbox]] as const) {
+    // RE-POINTED, NOT RELAXED (o3d-e2mz): the helper now also carries the ATTEMPT the claim mints,
+    // so the call is `(entry, claimedAt, staleClaimCutoff, attempt)`. The property this pins is
+    // unchanged and is still exact — the runner reaches the claim ONLY through the one helper — and
+    // the negative below still forbids a raw one.
     assert.ok(
-      block.includes('await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)'),
+      block.includes('await claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff, attempt)'),
       `the ${name} runner must claim through the exclusion helper`,
     )
     assert.equal(
@@ -820,9 +824,17 @@ test('o3d-a3wx r6: neither runner releases a claim with an unfenced write', () =
     release.includes('accountingSyncLog.updateMany('),
     'the shared release must write through updateMany, which is what can carry a predicate',
   )
+  // RE-POINTED, NOT RELAXED (o3d-e2mz): the predicate is now COMPOSED — `heldClaimWhere` spread
+  // together with the optional attempt revision — because the two answer different questions and
+  // neither implies the other. What this pins is what it always pinned: the claim half is the SHARED
+  // `heldClaimWhere`, called with the holder at the point of the write, not re-spelt here.
   assert.ok(
-    release.includes('where: heldClaimWhere(entryId, claim)'),
+    release.includes('...heldClaimWhere(entryId, claim),'),
     'the shared release must fence on the claim the caller holds, read at the point of the write',
+  )
+  assert.ok(
+    release.includes('...(attempt ? { attemptRevision: attempt.attemptRevision } : {}),'),
+    'and on the attempt the caller minted, where it minted one',
   )
   assert.ok(
     release.includes("status: 'PENDING'"),

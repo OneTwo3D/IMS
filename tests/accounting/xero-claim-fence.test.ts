@@ -748,8 +748,11 @@ test('o3d-550x: neither runner writes the sync row except to CLAIM it or through
     // plus that the claim is still taken, through the one helper, so the rule cannot be satisfied by a
     // runner that simply stopped claiming.
     assert.equal(claimSites, 0, `the ${name} runner must make NO direct row write at all`)
+    // RE-POINTED, NOT RELAXED (o3d-e2mz): the helper now also carries the ATTEMPT that claim mints,
+    // so the call reads `(entry, claimedAt, staleClaimCutoff, attempt)`. Still an exact string, and
+    // still the same property — the runner takes its claim, and only through the one helper.
     assert.ok(
-      block.includes('claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff)'),
+      block.includes('claimAccountingSyncLog(entry, claimedAt, staleClaimCutoff, attempt)'),
       `the ${name} runner must still take its claim, and only through the one helper`,
     )
 
