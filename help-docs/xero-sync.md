@@ -1059,6 +1059,116 @@ Operators correct the underlying issue (in IMS or in the accounting system) and 
 sync from the Sync Dashboard. Once the row transitions out of `FAILED`, the alert disappears
 automatically.
 
+#### Retrying is not protected by idempotency — check Xero first
+
+IMS derives every `Idempotency-Key` deterministically from the sync entry id, so a re-post sends the
+same key it sent the first time. That only prevents a duplicate while **Xero still remembers the
+key**, and Xero keeps one for **6 minutes** from the first call
+([Xero: Idempotent requests](https://developer.xero.com/documentation/guides/idempotent-requests/idempotency/)):
+
+> Idempotency keys are intended to help resolve transient issues only and so keys are stored for 6
+> minutes from the time of the first call, after which they expire.
+
+A row only becomes `FAILED` after its automatic retries are exhausted, so by the time the manual
+Retry control appears the key has already expired. **A manual retry is therefore a new request to
+Xero.** If the original attempt actually reached Xero — a timeout or a dropped response looks
+identical to a rejection from here — re-queueing creates a SECOND invoice, bill or payment.
+
+The retry controls (the failed-sync banner, "Retry All Failed", and the per-row retry in the sync
+log) all state this. Before re-queueing an aged row, search Xero for the document. IMS deliberately
+does not block the retry: it is the only remedy for a row whose cause has since been fixed, and
+refusing everything older than six minutes would refuse every retry there is.
+
+QuickBooks' `RequestId` dedupe window has not been established, so no equivalent claim is made for
+that connector and no caution is shown at its retry controls.
+
+#### The same is true of the AUTOMATIC retries
+
+The six minutes are not a fact about operators, and the automatic retry path does not clear them
+either:
+
+| Retry | When it happens | Inside the 6-minute window? |
+| --- | --- | --- |
+| In-request `429` retry (inside one API call) | up to 3 waits of at most 90s, **plus** up to 60s of minute-rate-limit waiting before each attempt | **Yes, and enforced strictly** — the loop refuses any wait that would put the next attempt **at or past** six minutes, and re-reads the clock immediately before each attempt is actually sent so that an over-running timer is refused too. Past the line the work is handed back to the queue instead. (A `429` was refused before Xero processed it, so there was nothing to deduplicate either way.) |
+| First queued retry of a failed row | 5-minute backoff floor + tail jitter, then the next 5-minute `accounting-sync` tick | **Undetermined** — the floor alone (5 min) is inside the window; jitter, the tick, and however long the failed call itself took push it out. You cannot tell which happened |
+| Second and later retries | 10, 20, 40 minutes (capped at 60) | **No** |
+
+An earlier version of this table said the in-request retry was inside the window because 3 × 90s is
+4m30s. That was the arithmetic of the Retry-After sleeps only and ignored the minute-limit wait taken
+before each attempt (worst case 7m30s), and it said the first queued retry was "at or past the line"
+when its floor is in fact inside it. Both are corrected above: the first is now a bound the code
+enforces, the second is honestly undetermined. **A protection you cannot tell is present is not one
+you may rely on** — which is why the local record below, not the key, is what the design depends on.
+
+So an automatic retry gets no more duplicate protection from the key than a manual one. Be exact
+about which retry, because the row above already is: the **first** queued retry may land on either
+side of the six minutes and you cannot tell which from outside, and the **second and later** retries
+are outside it unconditionally. An earlier version of this paragraph said such retries were "never
+retried inside the window at all", which contradicted the table two lines above it and overstated the
+case in the one direction that matters — it made a retry sound safely outside the window when its
+position is exactly what is unknown. **Nothing about "the key is deterministic" makes a queued retry
+safe**, whichever side of the line it lands on. What does the work instead:
+
+- **Sales invoices** are safe by Xero's own semantics, not by the key: `POST /Invoices` is
+  update-or-create on `InvoiceNumber`, and IMS sends the order number, so a re-post replaces the
+  invoice it already created rather than adding a second one.
+- **Everything else** — purchase bills, payments, credit-note allocations, manual journals — relies
+  on the **local record**: once the external id is written on the sync log, the next attempt
+  short-circuits and posts nothing. That write is treated as unlosable precisely because it is the
+  protection: when the database connection pool is exhausted it is re-driven rather than abandoned,
+  for as long as this worker's 15-minute claim on the row allows (minus a minute held back for the
+  give-up path, so it can never still be running when another worker may reclaim the row and post the
+  document a second time). **No attempt is ever started on a deadline that has already passed** — not
+  the first one and not a later one. If the claim has lapsed by the time the record is reached, the
+  ordinary write is not attempted at all; and if the window runs out between attempts — including when
+  a machine under enough pressure to exhaust the pool stalls for far longer than the short pause IMS
+  asked for — the next attempt is not made either. The deadline is re-read from the clock immediately
+  before every attempt rather than inferred from the last one, because every millisecond spent past it
+  is taken out of the minute reserved for the give-up path. The give-up path below is used instead,
+  because its write *is* claim-checked, whereas the ordinary one updates the row by id.
+- **The claim is re-taken at the moment the document is sent — every time, not once.** Posting is not
+  the first thing the worker does after claiming a row: it reads the connection's granted permissions,
+  looks the customer or supplier up in Xero, resolves item codes — and any of those can sit out a Xero
+  rate limit for minutes. Nor is a sync entry a single call: preparing an invoice loops over every
+  distinct item, and a credit-note allocation performs two reads before its write. So IMS re-takes its
+  own claim on the row immediately before **each** remote mutation, not once per entry. If it is still
+  ours, the fifteen minutes restart from there, giving that write and the record that follows it the
+  whole window. If another worker has taken it, **nothing is sent** and the row is left to whoever
+  holds it, with a warning in the activity log (`xero_sync_claim_lost_before_post`). Not sending is
+  the cheapest possible outcome for a lost claim. On the queued path the **outbox job's own lock is
+  renewed by the same fence**, because the queue has its own fifteen-minute staleness and would
+  otherwise hand the job to a second worker while the first is still legitimately working.
+- **One entry gets one lease, and renewals do not extend it.** The fence above stops another worker
+  taking the row; on its own it would also let one entry hold the row for ever, renewing every time it
+  crawled forward behind a rate limit. So the lease has an absolute deadline, fixed when the entry
+  starts — preparation calls included — and unmoved by any renewal. Past it no further remote write is
+  **started**: nothing has been sent, so the row is handed back untouched (it does not spend a retry)
+  and the next run gets a fresh lease, logged as `xero_sync_lease_expired_before_post`.
+- **The record of the post is claim-checked in the database, not just scheduled inside a live claim.**
+  The write that marks the row `SYNCED` and stores the external id carries this worker's claim in its
+  `WHERE`, so it lands on the row this worker still owns or lands nowhere at all. It used to be keyed
+  on the row id alone, which meant that if the claim was taken in the gap between checking it and
+  writing — a gap no amount of pre-checking can close — the write would flip a row another worker was
+  posting under to `SYNCED`, carrying this worker's id: two documents in Xero, one recorded, and the
+  row reading finished. When that fence now matches no row, the transaction is rolled back and the
+  event is reported as `xero_sync_claim_lost_during_persist` (activity log, `ERROR`) as well as on the
+  `[UNRECORDED-REMOTE-WRITE]` service-log line — **this is the case where a duplicate is most likely
+  and IMS cannot prevent it**, so check Xero for the id named in the message.
+- **If the re-drive still cannot record it**, the id is written to the service log as a single line
+  beginning `[UNRECORDED-REMOTE-WRITE]`, containing the external id, the sync log id and the
+  reference — because at that moment that id exists nowhere else. IMS then makes one more attempt
+  with a single statement (which waits on the pool rather than being cut short by the transaction
+  bound); if it lands, the row goes back to `PENDING` **with the external id recorded** and an error
+  message saying so, and the next run completes it without posting anything. **Do not re-queue such a
+  row by hand** — it does not need re-posting. If even that write fails, the log line says
+  `"recorded": false` and names itself as the only record; grep the service log for the marker and
+  reconcile the document in Xero manually.
+- **If that record is lost anyway** (the post landed, the process died before recording it), nothing
+  prevents a duplicate — IMS does not query Xero before re-posting a payment. It is then *detected*,
+  not prevented, by the settlement status on the order/PO (`over-settled`, `awaiting ledger`), the
+  payment poll and the daily payment reconcile sweep, and the accounting reconciliation report's
+  `duplicate_external_reference` finding. All of those need a person to unwind the duplicate in Xero.
+
 ### Tax Rate Sync (Multi-Component Profiles)
 
 When an IMS VAT rate has one or more active components (e.g. Canada `GST 5% + PST 7%`), saving the

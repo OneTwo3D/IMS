@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-// o3d-550x: a claim is a HOLDER asked for its instant as each fenced statement is built, not a
-// bare `Date`. When o3d-k26m.5's second `heldClaimWhere` collapsed into the shared one, the slot
-// fence adopted that contract with it — so these tests hand it the same claim they stamped on the
-// row, wrapped. Statically imported: `sync-claim-fence` is not one of the modules mocked below.
+// o3d-xl63: a claim is a HOLDER asked for its instant as each fenced statement is built, not a
+// bare `Date` — this branch RENEWS the claim before every remote mutation, so a snapshot would
+// fence on an instant the row no longer carries. When o3d-k26m.5's second `heldClaimWhere`
+// collapsed into the shared one, the slot fence adopted that contract with it, so these tests
+// hand it the same instant they stamped on the row, wrapped. Statically imported:
+// `sync-claim-fence` is not one of the modules mocked below.
 import { claimHeldFrom } from '@/lib/domain/accounting/sync-claim-fence'
 
 // ---------------------------------------------------------------------------

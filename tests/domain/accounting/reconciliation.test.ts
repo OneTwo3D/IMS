@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
+  DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS,
   MAX_RECONCILIATION_FINDINGS_PER_RUN,
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
@@ -1200,4 +1201,169 @@ test('o3d-cvj9 r7: fixtures that never read the dataset report neither a finding
         || (finding.details as { dataset?: string })?.dataset === 'revisionClaimLogs'),
     [],
   )
+})
+
+// --- o3d-ecow: the legacy rows o3d-0qoo deliberately left alone ---
+
+/**
+ * The pre-migration Xero shape: the batch ref column is empty (those rows carry no persisted ref and
+ * never will), so the source key can only be DERIVED from the stage stamp and comes out bare — while
+ * the sync log and the mirrored event both carry the live `-<8 hex>` digest, because
+ * accounting-event-mirror copies the referenceId verbatim. Nothing else is wrong with these rows: the
+ * stamps agree with the batch date, and no midnight is crossed.
+ */
+function legacyDigestRows(): AccountingReconciliationRows {
+  const rows = persistedRefRows()
+  rows.salesOrders[0] = {
+    ...rows.salesOrders[0],
+    revenueDeferredBatchRef: null,
+    inventoryAllocatedBatchRef: null,
+  }
+  rows.shipments[0] = { ...rows.shipments[0], shipmentJournalBatchRef: null }
+  return rows
+}
+
+test('o3d-ecow: a LEGACY Xero row and the event it mirrored are one journal, not two findings', () => {
+  // Every healthy legacy Xero daily batch was reported TWICE: `source_*_without_event` going forward,
+  // because the derived `A1-<date>` never equalled the mirrored `A1-<date>-<digest>`, and
+  // `event_without_source` coming back, for the same reason from the other side. o3d-0qoo fixed the
+  // rows staged after its migration and said in as many words that it was leaving these alone.
+  const findings = evaluateAccountingReconciliationRows(legacyDigestRows())
+  const codes = findings.map((finding) => finding.code)
+
+  for (const code of DAILY_BATCH_SOURCE_CODES) {
+    assert.ok(!codes.includes(code), `${code} must not fire for a legacy row whose event carries a digest`)
+  }
+  assert.ok(!codes.includes('event_without_source'),
+    'and the same journal must not come back as an orphan event in the reverse direction')
+  assert.deepEqual(findings, [])
+})
+
+test('o3d-ecow: the bridge matches the batch the row NAMES, not any batch with a digest on it', () => {
+  // The bridge strips a digest; it must not strip the date with it. A legacy row stamped on the 24th
+  // whose only mirrored event belongs to the 23rd is a real gap, and both directions must still say so
+  // — otherwise the fix has replaced double-reporting with under-reporting, which is worse.
+  const rows = legacyDigestRows()
+  const wrongDay = 'A1-2026-04-23-abcd1234'
+  rows.accountingEvents = rows.accountingEvents.map((event) => (
+    event.type === 'DAILY_BATCH_REVENUE_DEFERRAL' ? { ...event, sourceEntityId: wrongDay } : event
+  ))
+  rows.syncLogs = rows.syncLogs.map((log) => (
+    log.type === 'DAILY_BATCH_REVENUE_DEFERRAL' ? { ...log, referenceId: wrongDay } : log
+  ))
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+  const codes = findings.map((finding) => finding.code)
+
+  assert.ok(codes.includes('source_order_revenue_deferral_without_event'),
+    'the row stamped on the 24th still has no mirrored event')
+  const orphan = findings.find((finding) => finding.code === 'event_without_source')
+  assert.ok(orphan, 'and the event on the 23rd still has no source')
+  assert.equal((orphan!.details as { sourceEntityId: string }).sourceEntityId, wrongDay)
+  assert.equal(codes.filter((code) => DAILY_BATCH_SOURCE_CODES.includes(code)).length, 1,
+    'A2 and Group B are untouched and stay clean')
+})
+
+test('o3d-ecow: a PERSISTED ref is matched exactly — the digest is not stripped to meet it', () => {
+  // The split o3d-0qoo drew, and the reason the bridge is carried per key rather than switched on for
+  // the whole module. A persisted ref IS the referenceId the batch wrote; a digest-suffixed event
+  // beside a bare persisted ref is a different journal, and bridging it would vouch for the wrong one.
+  const rows = persistedRefRows()
+  rows.salesOrders[0] = { ...rows.salesOrders[0], revenueDeferredBatchRef: 'A1-2026-04-24' }
+
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+  assert.ok(codes.includes('source_order_revenue_deferral_without_event'),
+    'the persisted ref names a journal that was never mirrored')
+  assert.ok(codes.includes('event_without_source'),
+    'and the digest-suffixed event it sits beside is not that journal')
+})
+
+// --- o3d-ecow round 2: a same-day SPLIT is the one thing a bare key cannot resolve ---
+
+const A1_SPLIT_REF = 'A1-2026-04-24-99999999'
+
+/**
+ * The legacy shape, on a day whose A1 batch was SPLIT into two journals.
+ *
+ * Both journals posted and both mirrored, so the sync-log direction (which matches exactly) is
+ * clean. What is NOT clean is the bridge: strip the digest off either event and you get the same
+ * `A1-2026-04-24` the legacy row derives, so each journal answers for the other.
+ */
+function splitLegacyDigestRows(): AccountingReconciliationRows {
+  const rows = legacyDigestRows()
+  const a1Event = rows.accountingEvents.find((event) => event.type === 'DAILY_BATCH_REVENUE_DEFERRAL')!
+  const a1Log = rows.syncLogs.find((log) => log.type === 'DAILY_BATCH_REVENUE_DEFERRAL')!
+  rows.accountingEvents = [
+    ...rows.accountingEvents,
+    { ...a1Event, id: 'event-a1-split', sourceEntityId: A1_SPLIT_REF, externalId: 'journal-a1-split' },
+  ]
+  rows.syncLogs = [
+    ...rows.syncLogs,
+    { ...a1Log, id: 'sync-a1-split', referenceId: A1_SPLIT_REF, externalTransactionId: 'journal-a1-split' },
+  ]
+  return rows
+}
+
+test('o3d-ecow r2: one same-day split journal no longer vouches for another', () => {
+  // THE DEFECT. The bridge takes the digest off, and the digest is the ONLY thing separating two
+  // journals of the same group and date. So a legacy row whose own journal was never mirrored was
+  // satisfied by the OTHER split's event (forward), and a duplicate or orphaned split journal was
+  // satisfied by the other split's source rows (reverse) — each direction silently answered by a
+  // journal it was not asking about. Round 1 shipped that as a clean pass.
+  const findings = evaluateAccountingReconciliationRows(splitLegacyDigestRows())
+
+  assert.equal(findings.length, 1, `expected exactly one finding, got ${JSON.stringify(findings.map((f) => f.code))}`)
+  const [finding] = findings
+  assert.equal(finding.code, DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS)
+  assert.equal(finding.severity, 'warning')
+  const details = finding.details as { sourceEntityId: string; candidateSourceEntityIds: string[] }
+  assert.equal(details.sourceEntityId, 'A1-2026-04-24', 'reported against the bare key that cannot decide')
+  assert.deepEqual([...details.candidateSourceEntityIds].sort(), [A1_REF, A1_SPLIT_REF].sort(),
+    'and it names every journal the key matches, so a human can check them in the ledger')
+  assert.match(finding.message, /cannot be established/i)
+})
+
+test('o3d-ecow r2: the ambiguity is reported ONCE, not once per staged row', () => {
+  // A split day can carry thousands of staged orders. A finding each would say the same
+  // unresolvable thing thousands of times and push the rest of the report past the per-run cap.
+  const rows = splitLegacyDigestRows()
+  rows.salesOrders = [
+    rows.salesOrders[0],
+    { ...rows.salesOrders[0], id: 'order-2', orderNumber: 'SO-2', inventoryAllocatedDate: null },
+    { ...rows.salesOrders[0], id: 'order-3', orderNumber: 'SO-3', inventoryAllocatedDate: null },
+  ]
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+  assert.equal(findings.filter((f) => f.code === DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS).length, 1)
+  assert.equal(findings.length, 1, 'and nothing else fires: A2 and Group B are unsplit and still match')
+})
+
+test('o3d-ecow r2: an UNSPLIT legacy day still bridges silently — round 1 is not undone', () => {
+  // The whole point of the bridge is that a healthy legacy Xero batch stopped double-reporting. One
+  // journal for the key means the bare match names exactly that journal, and nothing is ambiguous.
+  assert.deepEqual(evaluateAccountingReconciliationRows(legacyDigestRows()), [])
+})
+
+test('o3d-ecow r2: a split day with PERSISTED refs is matched exactly and never goes near the bridge', () => {
+  // Persisted identity is the case o3d-0qoo built for: the row names its own journal, so a split is
+  // not ambiguous at all — and the journal nothing points at is a plain orphan, reported as one.
+  const rows = persistedRefRows()
+  const a1Event = rows.accountingEvents.find((event) => event.type === 'DAILY_BATCH_REVENUE_DEFERRAL')!
+  const a1Log = rows.syncLogs.find((log) => log.type === 'DAILY_BATCH_REVENUE_DEFERRAL')!
+  rows.accountingEvents = [
+    ...rows.accountingEvents,
+    { ...a1Event, id: 'event-a1-split', sourceEntityId: A1_SPLIT_REF, externalId: 'journal-a1-split' },
+  ]
+  rows.syncLogs = [
+    ...rows.syncLogs,
+    { ...a1Log, id: 'sync-a1-split', referenceId: A1_SPLIT_REF, externalTransactionId: 'journal-a1-split' },
+  ]
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+  const codes = findings.map((finding) => finding.code)
+  assert.ok(!codes.includes(DAILY_BATCH_SPLIT_BRIDGE_AMBIGUOUS), 'nothing was bridged, so nothing is ambiguous')
+  const orphan = findings.find((finding) => finding.code === 'event_without_source')
+  assert.ok(orphan, 'the second journal has no source state of its own and is reported')
+  assert.equal((orphan!.details as { sourceEntityId: string }).sourceEntityId, A1_SPLIT_REF)
 })
