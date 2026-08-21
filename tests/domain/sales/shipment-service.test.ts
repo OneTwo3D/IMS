@@ -19,6 +19,14 @@ type Order = {
   status: string
   shippedAt?: Date | null
   trackingNumber?: string | null
+  /**
+   * o3d-rbyg [wdraw]: the EU right-of-withdrawal markers. `withdrawalApprovedAt` is terminal (the
+   * order is cancelled); `withdrawalHoldAt` is the SUBMITTED request, still being decided — and the
+   * dispatch reads both under the order lock, because that is the only place the manual shipment
+   * paths pass through.
+   */
+  withdrawalHoldAt?: Date | null
+  withdrawalApprovedAt?: Date | null
 }
 type OrderLine = {
   id: string
@@ -943,6 +951,67 @@ test('transitionShipmentStatus fails cleanly when dispatch shipment starts with 
   assert.equal(state.stockLevels[0].reservedQty, 2)
   assert.equal(state.movements.length, 0)
   assert.equal(state.cogsEntries.length, 0)
+})
+
+test('transitionShipmentStatus refuses to dispatch under a SUBMITTED withdrawal hold (o3d-rbyg r2)', async () => {
+  // ROUND 2, Codex finding 5: THE SIXTH FULFILMENT PATH. Only the APPROVED marker was checked here,
+  // so a withdrawal the customer had filed and nobody had decided yet did not stop a manual
+  // dispatch — and this transaction is the ONLY thing the manual paths pass through. The WMS paths
+  // never showed it, because a hold pulls the order back out of the warehouse.
+  const state = baseState({
+    orders: [{
+      id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ON_HOLD',
+      withdrawalHoldAt: new Date('2026-08-19T09:00:00.000Z'),
+    }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+    allocations: [{ id: 'allocation-1', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match(
+    result.success ? '' : String(result.error),
+    /right-of-withdrawal hold/,
+    'the refusal names the hold rather than failing generically',
+  )
+  assert.match(
+    result.success ? '' : String(result.error),
+    /Release the withdrawal hold on the order/,
+    'and it names the remedy an operator can actually perform',
+  )
+  // Nothing irreversible happened: the goods are still on the shelf and no despatch was recorded.
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 2, 'no stock was relieved')
+  assert.equal(state.stockLevels[0].reservedQty, 2, 'and the reservation still stands')
+  assert.deepEqual(state.movements, [], 'no dispatch movement was written')
+})
+
+test('transitionShipmentStatus still refuses an APPROVED withdrawal, and says so differently (o3d-rbyg r2)', async () => {
+  // The pair, pinned together: an approval is TERMINAL (the order is cancelled and the goods are
+  // never going), so it throws; a submitted hold is a decision in progress, so it is a refusal with
+  // a remedy. Collapsing the two would either make an approved withdrawal look retryable or make a
+  // hold look permanent.
+  const state = baseState({
+    orders: [{
+      id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'PROCESSING',
+      withdrawalApprovedAt: new Date('2026-08-19T09:00:00.000Z'),
+    }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+    allocations: [{ id: 'allocation-1', orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+  })
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-1', targetStatus: 'SHIPPED' }),
+    /withdrawal request was approved/,
+  )
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.deepEqual(state.movements, [])
 })
 
 test('transitionShipmentStatus rolls back when physical stock is insufficient for dispatch', async () => {

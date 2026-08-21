@@ -1193,7 +1193,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 )) return
                 setError('')
                 startTransition(async () => {
-                  const res = await releaseWithdrawalHold(so.id)
+                  // The request THIS PAGE showed, so a newer withdrawal filed since it was drawn is
+                  // refused rather than silently cleared (o3d-rbyg r4).
+                  const res = await releaseWithdrawalHold(so.id, { generation: so.withdrawalHoldGeneration })
                   if (!res.success) { setError(res.error ?? 'Could not release the withdrawal hold'); return }
                   router.refresh()
                 })

@@ -55,7 +55,7 @@ export type StuckDispatchLink = {
   dispatchUnresolvedCount: number
   dispatchUnresolvedError: string | null
   dispatchUnresolvedAt: Date | null
-  order: { orderNumber: string | null }
+  order: { orderNumber: string | null; status: string }
 }
 
 export type StuckDispatchEntry = {
@@ -67,6 +67,18 @@ export type StuckDispatchEntry = {
   reason: string | null
   deadLetteredAt: string | null
   kind: 'dead-letter' | 'unresolved'
+  /**
+   * o3d-rbyg round 2: the order's lifecycle status, carried so the page can offer the RIGHT remedy
+   * for a link parked by the withdrawal fence — a live order can have its despatch recorded, a
+   * cancelled one cannot (IMS refuses a shipment on a cancelled order, deliberately).
+   */
+  orderStatus: string
+  /**
+   * o3d-rbyg round 2: a withdrawal stands against this order RIGHT NOW — the same local evidence
+   * the dispatch sweep's screen reads. Filled in by the loader, because the reason string alone
+   * cannot be trusted to say why a link is parked, and the remedy differs entirely.
+   */
+  withdrawalStanding: boolean
 }
 
 /**
@@ -99,6 +111,10 @@ export function mergeStuckDispatchRows(links: StuckDispatchLink[], limit: number
         reason: deadLettered ? link.dispatchLastError : link.dispatchUnresolvedError,
         deadLetteredAt: (deadLettered ? link.dispatchDeadLetteredAt : link.dispatchUnresolvedAt)?.toISOString() ?? null,
         kind: deadLettered ? ('dead-letter' as const) : ('unresolved' as const),
+        orderStatus: link.order.status,
+        // Set by the caller, which knows the withdrawal evidence; false here so this stays a pure
+        // merge over the link rows it is given.
+        withdrawalStanding: false,
       }
     })
 }

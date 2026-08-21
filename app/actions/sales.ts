@@ -183,6 +183,9 @@ export type SoRow = {
   refundStatus: 'NONE' | 'PARTIAL' | 'FULL'
   /// o3d-e1yb [wdraw]: set while an EU withdrawal request holds this order.
   withdrawalHoldAt: string | null
+  /// o3d-rbyg r4: WHICH request the hold is — carried to the release so the button cannot clear a
+  /// newer one filed since this page was drawn. Advances per new submission.
+  withdrawalHoldGeneration: number
   currency: string
   fxRateToBase: number
   customerName: string | null
@@ -457,6 +460,7 @@ const SO_SELECT = {
   status: true,
   refundStatus: true,
   withdrawalHoldAt: true,
+  withdrawalHoldGeneration: true,
   currency: true,
   fxRateToBase: true,
   customerName: true,
@@ -518,6 +522,7 @@ function mapSoRow(so: {
   status: string
   refundStatus: string
   withdrawalHoldAt: Date | null
+  withdrawalHoldGeneration: number
   currency: string
   fxRateToBase: unknown
   customerName: string | null
@@ -608,6 +613,7 @@ function mapSoRow(so: {
     status: so.status as SoStatus,
     refundStatus: so.refundStatus as 'NONE' | 'PARTIAL' | 'FULL',
     withdrawalHoldAt: so.withdrawalHoldAt ? so.withdrawalHoldAt.toISOString() : null,
+    withdrawalHoldGeneration: so.withdrawalHoldGeneration,
     currency: so.currency,
     fxRateToBase: Number(so.fxRateToBase),
     customerName: so.customerName,
@@ -4256,8 +4262,28 @@ export async function reverseLedgerPayment(
  * Clearing the marker is all this does. The order stays ON_HOLD and the
  * ordinary release path (moving it back to Processing) then applies, which
  * keeps this action reversible and keeps one code path for re-pushing.
+ *
+ * o3d-rbyg r4 (Codex r3 finding 1) — `expected.generation` IS NOT OPTIONAL, AND IT IS THE CALLER'S.
+ *
+ * The conditional update below was already generation-guarded, and the guard was already the right
+ * mechanism. It was simply being satisfied by a value this function had fetched microseconds
+ * earlier: `where: { withdrawalHoldGeneration: so.withdrawalHoldGeneration }` compares the current
+ * generation against itself, which closes the window between THIS read and THIS write and no other.
+ * The window that matters is longer — the page was drawn, an operator read it and decided, and (in
+ * the exception inbox's despatch remedy) a warehouse round trip happened in between. A customer who
+ * files a NEW withdrawal request inside that window had it cleared by a decision taken before it
+ * existed, silently, with an audit line saying a hold was released.
+ *
+ * So the caller states WHICH request it decided about, and a mismatch is refused BY NAME. Both
+ * checks stay: the explicit comparison is what produces a message an operator can act on, and the
+ * conditional update is what makes the write itself atomic against a submission landing between
+ * them.
  */
-export async function releaseWithdrawalHold(id: string, note?: string) {
+export async function releaseWithdrawalHold(
+  id: string,
+  expected: { generation: number },
+  note?: string,
+) {
   const session = await requirePermission('sales.process')
 
   const so = await db.salesOrder.findUnique({
@@ -4275,8 +4301,21 @@ export async function releaseWithdrawalHold(id: string, note?: string) {
   // `withdrawalHoldAt`, so comparing that cannot tell a new customer request
   // from the same hold — and a stale release would clear a hold the customer
   // has only just asked for. The generation advances per new submission.
+  if (!Number.isInteger(expected.generation)) {
+    return { success: false, error: 'The withdrawal request this release was for could not be identified — reload and try again' }
+  }
+  if (so.withdrawalHoldGeneration !== expected.generation) {
+    return {
+      success: false,
+      error:
+        `A NEWER withdrawal request has been filed against this order since this page was drawn `
+        + `(request ${expected.generation} → ${so.withdrawalHoldGeneration}). The hold was NOT released, `
+        + 'because releasing it would clear a request nobody has looked at. Reload and read the current request first.',
+    }
+  }
+
   const cleared = await db.salesOrder.updateMany({
-    where: { id, withdrawalHoldGeneration: so.withdrawalHoldGeneration, withdrawalHoldAt: { not: null } },
+    where: { id, withdrawalHoldGeneration: expected.generation, withdrawalHoldAt: { not: null } },
     data: { withdrawalHoldAt: null },
   })
   if (cleared.count === 0) {
@@ -4292,7 +4331,7 @@ export async function releaseWithdrawalHold(id: string, note?: string) {
     description:
       `Withdrawal hold released by ${session.user.email ?? session.user.id}`
       + `${note ? `: ${note}` : ''}. The order remains ON HOLD — move it back to Processing to re-push it to the warehouse.`,
-    metadata: { heldSince: so.withdrawalHoldAt, note: note ?? null },
+    metadata: { heldSince: so.withdrawalHoldAt, generation: expected.generation, note: note ?? null },
   })
 
   revalidatePath(`/sales/${id}`)
