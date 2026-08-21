@@ -5,9 +5,13 @@ import { join } from 'node:path'
 
 import {
   applyMainSyncFailureRetry,
-  heldClaimWhere,
+  deferPaymentUntilEarlierLogsPost,
+  deferUpdateUntilCreatePosts,
+  heldClaimWhere as heldClaimWhereFromConnector,
   recordPostedSyncResult,
 } from '@/lib/connectors/xero/sync-processor'
+import { heldClaimWhere, releaseClaimForRetry } from '@/lib/domain/accounting/sync-claim-fence'
+import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
 
 // ---------------------------------------------------------------------------
 // o3d-550x — the accounting processor wrote its result BY ROW ID, unfenced.
@@ -26,6 +30,10 @@ import {
 //    actually posted would write nothing and the document would exist in Xero with nothing in IMS
 //    naming it. Its only precondition is the fact it protects: the row must not already name a
 //    DIFFERENT document. Whichever worker gets there first wins, and no race decides it.
+//
+// AND THE CASE THAT COMPLETES THE PAIR (Codex r1, HIGH): when that record REFUSES, the evidence of the
+// displaced document is irreplaceable — the row will never name it. So it is written in the SAME
+// transaction that observed the refusal, not afterwards by a logger that swallows its own failures.
 // ---------------------------------------------------------------------------
 
 type Row = {
@@ -38,6 +46,8 @@ type Row = {
   errorMessage: string | null
 }
 
+type ActivityWrite = { data: Record<string, unknown> }
+
 /**
  * A one-row store that HONOURS its where clause, including the `OR` the evidence write uses.
  *
@@ -45,9 +55,17 @@ type Row = {
  * not. A double that ignored `where` would report the fix as working and the defect as working equally
  * well — which is exactly what the canned-count double in main-sync-failure-retry-concurrency.test.ts
  * does, and why the behavioural assertions live in this file instead.
+ *
+ * `activityLog` is a real recording delegate rather than one of the null-answering mirror stubs,
+ * because the conflict evidence is now written through it INSIDE the transaction, and "was it written,
+ * and with which two ids" is the property the HIGH turns on. `failActivityLog` expresses the case the
+ * old code could not survive: the evidence write itself failing.
  */
-function makeRowStore(row: Partial<Row> & { id: string }) {
-  const state: Row = {
+function makeRowStore(
+  row: (Partial<Row> & { id: string }) | null,
+  options: { failActivityLog?: boolean } = {},
+) {
+  const state: Row | null = row === null ? null : {
     status: 'PROCESSING',
     processingStartedAt: null,
     retryCount: 0,
@@ -57,8 +75,10 @@ function makeRowStore(row: Partial<Row> & { id: string }) {
     ...row,
   }
   const mirrorWrites: unknown[] = []
+  const activityWrites: ActivityWrite[] = []
 
   const leafMatches = (where: Record<string, unknown>): boolean => {
+    if (state === null) return false
     for (const [key, expected] of Object.entries(where)) {
       if (key === 'OR') continue
       const actual = (state as unknown as Record<string, unknown>)[key]
@@ -75,15 +95,24 @@ function makeRowStore(row: Partial<Row> & { id: string }) {
   const accountingSyncLog = {
     updateMany: async ({ where, data }: { where: Record<string, unknown>; data: Record<string, unknown> }) => {
       if (!leafMatches(where)) return { count: 0 }
-      Object.assign(state, data)
+      Object.assign(state as Row, data)
       return { count: 1 }
     },
-    findUnique: async () => ({ ...state }),
+    findUnique: async () => (state === null ? null : { ...state }),
+  }
+
+  const activityLog = {
+    create: async ({ data }: { data: Record<string, unknown> }) => {
+      if (options.failActivityLog) throw new Error('activity_log insert failed')
+      activityWrites.push({ data })
+      return { id: `activity-${activityWrites.length}` }
+    },
   }
 
   const tx = new Proxy({ accountingSyncLog }, {
     get(_target, prop: string) {
       if (prop === 'accountingSyncLog') return accountingSyncLog
+      if (prop === 'activityLog') return activityLog
       // Mirror-table delegates: record the call so "the mirror was NOT written" is assertable.
       // They answer NOTHING FOUND (null / []), which is the mirror's own "no event to update" path —
       // this file is about the sync row, and a half-built mirror event would only add noise.
@@ -95,7 +124,7 @@ function makeRowStore(row: Partial<Row> & { id: string }) {
       })
     },
   })
-  return { tx: tx as never, state, mirrorWrites }
+  return { tx: tx as never, state, mirrorWrites, activityWrites }
 }
 
 const T_DISPLACED_CLAIM = new Date('2026-03-01T09:00:00.000Z')
@@ -118,6 +147,25 @@ test('o3d-550x: heldClaimWhere names the claim INSTANT, not merely that the row 
   })
 })
 
+test('o3d-550x: there is ONE definition of claim ownership, not one per consumer', () => {
+  // Codex r1, medium 1: the connector re-exports the domain helper rather than owning a second copy,
+  // so a change to what "I still hold this claim" means cannot reach the connector's releases while
+  // missing the cancellation retirement (or vice versa).
+  assert.equal(heldClaimWhereFromConnector, heldClaimWhere)
+})
+
+test('Codex r1 medium 2: the cancellation retirement COMPOSES the fence, it does not re-spell it', () => {
+  // Identity alone cannot catch this: an inline copy that happens to match behaves identically today,
+  // which is exactly why it is dangerous. What must be true is that the predicate is not written out a
+  // second time — so the source is read, with comments stripped so a commented example cannot satisfy it.
+  const src = stripComments(readFileSync(join(process.cwd(), 'lib/domain/accounting/cancel-order-invoice-sync.ts'), 'utf8'))
+  assert.ok(src.includes('heldClaimWhere(syncLogId, claimedAt)'), 'the retirement must compose the shared fence')
+  assert.ok(
+    !/processingStartedAt:\s*claimedAt/.test(src),
+    'and must not hand-spell the claim instant into a where clause of its own',
+  )
+})
+
 test('o3d-550x: a displaced owner cannot release the replacement\'s claim', async () => {
   // The row was re-taken at 09:20 after the 09:00 claim aged out. The 09:00 worker is still alive — a
   // timeout cannot recall a request already on the wire — and now reports its failure.
@@ -130,10 +178,10 @@ test('o3d-550x: a displaced owner cannot release the replacement\'s claim', asyn
 
   await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, T_DISPLACED_CLAIM)
 
-  assert.equal(state.status, 'PROCESSING', 'the replacement still holds the row')
-  assert.equal(state.processingStartedAt?.valueOf(), T_REPLACEMENT_CLAIM.valueOf())
-  assert.equal(state.retryCount, 2, 'and its attempt budget was not spent by a worker that no longer owns it')
-  assert.equal(state.errorMessage, null, 'nor was the replacement\'s row annotated with a stranger\'s error')
+  assert.equal(state!.status, 'PROCESSING', 'the replacement still holds the row')
+  assert.equal(state!.processingStartedAt?.valueOf(), T_REPLACEMENT_CLAIM.valueOf())
+  assert.equal(state!.retryCount, 2, 'and its attempt budget was not spent by a worker that no longer owns it')
+  assert.equal(state!.errorMessage, null, 'nor was the replacement\'s row annotated with a stranger\'s error')
 })
 
 test('o3d-550x: the worker that DOES hold the claim still records its failure', async () => {
@@ -148,11 +196,140 @@ test('o3d-550x: the worker that DOES hold the claim still records its failure', 
 
   const result = await applyMainSyncFailureRetry(tx, ENTRY, 'connection reset', {}, T_REPLACEMENT_CLAIM)
 
-  assert.equal(state.status, 'PENDING')
-  assert.equal(state.retryCount, 3)
-  assert.equal(state.processingStartedAt, null, 'the claim is given back, so the row can be re-taken')
+  assert.equal(state!.status, 'PENDING')
+  assert.equal(state!.retryCount, 3)
+  assert.equal(state!.processingStartedAt, null, 'the claim is given back, so the row can be re-taken')
   assert.equal(result.finalFailure, false)
 })
+
+// ---------------------------------------------------------------------------
+// THE NON-TERMINAL RELEASE — one statement, so every deferral and every backoff in both runners is
+// covered by these two tests rather than by a source scan hoping to spot an unfenced copy.
+// (Codex r1, medium 2: "add behavioural displaced-owner tests for deferral and rate-limit paths".)
+// ---------------------------------------------------------------------------
+
+const T_BACKOFF = new Date('2026-03-01T09:35:00.000Z')
+
+test('o3d-550x: a rate-limit backoff by a DISPLACED owner releases nothing', async () => {
+  const { tx, state } = makeRowStore({
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+  })
+
+  const released = await releaseClaimForRetry(tx, 'log-1', T_DISPLACED_CLAIM, {
+    errorMessage: 'Xero rate limit exceeded',
+    nextAttemptAt: T_BACKOFF,
+  })
+
+  assert.equal(released, false, 'the caller is told the release did not land')
+  assert.equal(state!.status, 'PROCESSING', 'the replacement keeps its claim')
+  assert.equal(state!.processingStartedAt?.valueOf(), T_REPLACEMENT_CLAIM.valueOf(), 'and its claim instant is intact')
+  assert.equal(state!.errorMessage, null, 'a stranger\'s rate-limit error is not stamped on a live claim')
+})
+
+test('o3d-550x: the holder\'s backoff DOES land, with the future instant as the next-claim gate', async () => {
+  const { tx, state } = makeRowStore({
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+  })
+
+  const released = await releaseClaimForRetry(tx, 'log-1', T_REPLACEMENT_CLAIM, {
+    errorMessage: 'Xero rate limit exceeded',
+    nextAttemptAt: T_BACKOFF,
+  })
+
+  assert.equal(released, true)
+  assert.equal(state!.status, 'PENDING')
+  assert.equal(state!.processingStartedAt?.valueOf(), T_BACKOFF.valueOf())
+  assert.equal(state!.errorMessage, 'Xero rate limit exceeded')
+})
+
+test('o3d-550x: the payment-ordering deferral is fenced — a displaced owner cannot defer a live claim', async () => {
+  const { tx, state } = makeRowStore({
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+  })
+
+  const deferred = await deferPaymentUntilEarlierLogsPost(tx, { id: 'log-1' }, T_DISPLACED_CLAIM)
+
+  assert.equal(deferred, false)
+  assert.equal(state!.status, 'PROCESSING')
+  assert.equal(state!.processingStartedAt?.valueOf(), T_REPLACEMENT_CLAIM.valueOf())
+})
+
+test('o3d-550x: the holder\'s payment-ordering deferral lands and says why', async () => {
+  const { tx, state } = makeRowStore({
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+  })
+
+  const deferred = await deferPaymentUntilEarlierLogsPost(tx, { id: 'log-1' }, T_REPLACEMENT_CLAIM)
+
+  assert.equal(deferred, true)
+  assert.equal(state!.status, 'PENDING')
+  assert.equal(state!.errorMessage, 'Deferred until older invoice payment sync logs post')
+  assert.ok((state!.processingStartedAt?.valueOf() ?? 0) > Date.now(), 'deferred, not immediately re-claimable')
+})
+
+test('o3d-550x: the UPDATE-before-CREATE deferral is fenced too', async () => {
+  const displaced = makeRowStore({ id: 'log-1', status: 'PROCESSING', processingStartedAt: T_REPLACEMENT_CLAIM })
+  assert.equal(await deferUpdateUntilCreatePosts(displaced.tx, { id: 'log-1' }, T_DISPLACED_CLAIM), false)
+  assert.equal(displaced.state!.status, 'PROCESSING')
+
+  const holder = makeRowStore({ id: 'log-1', status: 'PROCESSING', processingStartedAt: T_REPLACEMENT_CLAIM })
+  assert.equal(await deferUpdateUntilCreatePosts(holder.tx, { id: 'log-1' }, T_REPLACEMENT_CLAIM), true)
+  assert.equal(holder.state!.status, 'PENDING')
+  assert.equal(holder.state!.errorMessage, 'Deferred until the invoice CREATE for this document posts')
+})
+
+// ---------------------------------------------------------------------------
+// THE RETRACTION PATH — the cancellation retirement releases the SAME claims, and it is the one that
+// terminalises a row, so it is the worst place for a second definition of ownership to drift.
+// ---------------------------------------------------------------------------
+
+test('o3d-550x: a displaced owner cannot RETIRE a row a live worker now holds', async () => {
+  const { tx, state } = makeRowStore({
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+    externalTransactionId: null,
+  })
+
+  const retired = await retireSalesInvoiceForCancelledOrder(tx, 'log-1', 'order-1', T_DISPLACED_CLAIM)
+
+  assert.equal(retired, false)
+  assert.equal(state!.status, 'PROCESSING', 'a retraction by a worker that lost the row must do nothing')
+})
+
+test('o3d-550x: the claim holder DOES retire, and only while the row names no document', async () => {
+  const holder = makeRowStore({
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+    externalTransactionId: null,
+  })
+  assert.equal(await retireSalesInvoiceForCancelledOrder(holder.tx, 'log-1', 'order-1', T_REPLACEMENT_CLAIM), true)
+  assert.equal(holder.state!.status, 'CANCELLED')
+
+  // The arm that is this call site's own, not part of the shared fence: a row that already posted must
+  // never be retired, or a real Xero receivable is hidden behind a CANCELLED row.
+  const posted = makeRowStore({
+    id: 'log-1',
+    status: 'PROCESSING',
+    processingStartedAt: T_REPLACEMENT_CLAIM,
+    externalTransactionId: 'INV-XERO-1',
+  })
+  assert.equal(await retireSalesInvoiceForCancelledOrder(posted.tx, 'log-1', 'order-1', T_REPLACEMENT_CLAIM), false)
+  assert.equal(posted.state!.status, 'PROCESSING')
+})
+
+// ---------------------------------------------------------------------------
+// THE EVIDENCE WRITES
+// ---------------------------------------------------------------------------
 
 test('o3d-550x: a posted document is recorded even by a worker whose claim has been taken away', async () => {
   // THE RULE THIS PINS: evidence of a posted document must NEVER be conditional on winning a race. The
@@ -168,9 +345,9 @@ test('o3d-550x: a posted document is recorded even by a worker whose claim has b
   const record = await recordPostedSyncResult(tx, { entry: ENTRY, externalId: 'INV-XERO-1', payload: {} })
 
   assert.equal(record.recorded, true)
-  assert.equal(state.externalTransactionId, 'INV-XERO-1', 'the document id is on the row, not only in a log')
-  assert.equal(state.status, 'SYNCED')
-  assert.equal(state.processingStartedAt, null)
+  assert.equal(state!.externalTransactionId, 'INV-XERO-1', 'the document id is on the row, not only in a log')
+  assert.equal(state!.status, 'SYNCED')
+  assert.equal(state!.processingStartedAt, null)
 })
 
 test('o3d-550x: a posted document is recorded even when the row is no longer claimed at all', async () => {
@@ -189,8 +366,8 @@ test('o3d-550x: a posted document is recorded even when the row is no longer cla
   const record = await recordPostedSyncResult(tx, { entry: ENTRY, externalId: 'INV-XERO-1', payload: {} })
 
   assert.equal(record.recorded, true, 'the fact that a document exists does not depend on holding a claim')
-  assert.equal(state.externalTransactionId, 'INV-XERO-1')
-  assert.equal(state.status, 'SYNCED')
+  assert.equal(state!.externalTransactionId, 'INV-XERO-1')
+  assert.equal(state!.status, 'SYNCED')
 })
 
 test('o3d-550x: recording a posted document REFUSES to overwrite a different one, and names both', async () => {
@@ -212,14 +389,61 @@ test('o3d-550x: recording a posted document REFUSES to overwrite a different one
     'INV-XERO-FIRST',
     'the caller is told WHICH document the row keeps, so it can escalate with both ids',
   )
-  assert.equal(state.externalTransactionId, 'INV-XERO-FIRST', 'the first document is still the one IMS names')
+  assert.equal(state!.externalTransactionId, 'INV-XERO-FIRST', 'the first document is still the one IMS names')
   assert.deepEqual(mirrorWrites, [], 'and no POSTED mirror event is written for a record that did not land')
 })
 
+test('Codex r1 HIGH: the conflict evidence is written IN the transaction that observed the conflict', async () => {
+  // THE DEFECT: the displaced id was escalated AFTER this transaction closed, through a logger that
+  // catches its own database errors and returns false — a return nobody read. A transient failure there,
+  // or a crash in the gap, lost the ONLY local trace of a real Xero document, and on the outbox path the
+  // job was then buried as permanently failed. So the evidence must commit with the observation.
+  const { tx, activityWrites } = makeRowStore({
+    id: 'log-1',
+    status: 'SYNCED',
+    processingStartedAt: null,
+    externalTransactionId: 'INV-XERO-FIRST',
+  })
+
+  const record = await recordPostedSyncResult(tx, { entry: ENTRY, externalId: 'INV-XERO-SECOND', payload: {} })
+
+  assert.equal(activityWrites.length, 1, 'exactly one durable record of the conflict, written through the tx client')
+  const written = activityWrites[0].data
+  assert.equal(written.action, 'xero_posted_document_unrecorded')
+  assert.equal(written.level, 'ERROR')
+  assert.equal(written.entityId, 'log-1')
+  assert.equal((written.metadata as Record<string, unknown>).postedExternalId, 'INV-XERO-SECOND')
+  assert.equal((written.metadata as Record<string, unknown>).rowNamesExternalId, 'INV-XERO-FIRST')
+  assert.match(String(written.description), /INV-XERO-SECOND/, 'the displaced document is named')
+  assert.match(String(written.description), /INV-XERO-FIRST/, 'and so is the one the row keeps')
+  assert.match(String(written.description), /REMEDY:/, 'and the refusal names something an operator can do')
+
+  // The caller gets that same wording back, so the outbox job's failure message and the activity row
+  // cannot describe the same incident two different ways.
+  assert.equal(record.recorded === false && record.evidence, String(written.description))
+})
+
+test('Codex r1 HIGH: a failed evidence write THROWS — it is never reported as a completed escalation', async () => {
+  // The exact failure the old code swallowed. Throwing is what makes it impossible for a caller to mark
+  // the outbox job permanently failed on evidence that was never written: the transaction aborts and the
+  // job is retried instead of buried.
+  const { tx } = makeRowStore({
+    id: 'log-1',
+    status: 'SYNCED',
+    processingStartedAt: null,
+    externalTransactionId: 'INV-XERO-FIRST',
+  }, { failActivityLog: true })
+
+  await assert.rejects(
+    () => recordPostedSyncResult(tx, { entry: ENTRY, externalId: 'INV-XERO-SECOND', payload: {} }),
+    /activity_log insert failed/,
+  )
+})
+
 test('o3d-550x: re-recording the SAME document is idempotent, not a refusal', async () => {
-  // The crash-after-post replay: the row already carries this exact id (the runner\'s
+  // The crash-after-post replay: the row already carries this exact id (the runner's
   // `entry.externalTransactionId` branch). Refusing here would strand a recoverable row forever.
-  const { tx, state } = makeRowStore({
+  const { tx, state, activityWrites } = makeRowStore({
     id: 'log-1',
     status: 'PROCESSING',
     processingStartedAt: T_REPLACEMENT_CLAIM,
@@ -229,32 +453,104 @@ test('o3d-550x: re-recording the SAME document is idempotent, not a refusal', as
   const record = await recordPostedSyncResult(tx, { entry: ENTRY, externalId: 'INV-XERO-1', payload: {} })
 
   assert.equal(record.recorded, true)
-  assert.equal(state.status, 'SYNCED')
-  assert.equal(state.externalTransactionId, 'INV-XERO-1')
+  assert.equal(state!.status, 'SYNCED')
+  assert.equal(state!.externalTransactionId, 'INV-XERO-1')
+  assert.deepEqual(activityWrites, [], 'the ordinary replay must not file a conflict nobody has')
 })
 
-test('o3d-550x: a vanished row is reported as ROW_MISSING, not as a silent success', async () => {
-  const accountingSyncLog = {
-    updateMany: async () => ({ count: 0 }),
-    findUnique: async () => null,
-  }
-  const tx = new Proxy({ accountingSyncLog }, {
-    get(_t, prop: string) {
-      if (prop === 'accountingSyncLog') return accountingSyncLog
-      return new Proxy({}, { get: () => async () => undefined })
-    },
-  }) as never
+test('o3d-550x: a vanished row is reported as ROW_MISSING, and STILL leaves durable evidence', async () => {
+  const { tx, activityWrites } = makeRowStore(null)
 
   const record = await recordPostedSyncResult(tx, { entry: ENTRY, externalId: 'INV-XERO-1', payload: {} })
   assert.equal(record.recorded, false)
   assert.equal(record.recorded === false && record.reason, 'ROW_MISSING')
+  assert.equal(activityWrites.length, 1, 'a document with no row at all is the case that MOST needs a record')
+  assert.equal((activityWrites[0].data.metadata as Record<string, unknown>).reason, 'ROW_MISSING')
+  assert.match(String(activityWrites[0].data.description), /INV-XERO-1/)
+  assert.match(String(activityWrites[0].data.description), /REMEDY:/)
 })
 
-test('o3d-550x: neither runner releases a claim with an unfenced write', () => {
-  // Structural, and paired with the behavioural tests above: the fence is only worth anything if EVERY
-  // release carries it. `update({ where: { id } })` cannot express "only while I still hold it" —
-  // Prisma's unique-where update takes no extra predicate — so a release must go through updateMany.
+// ---------------------------------------------------------------------------
+// THE STRUCTURAL GUARD
+//
+// Codex r1, medium 2: the previous version of this scan read RAW SOURCE, so a commented-out fence
+// satisfied it; its positive assertion needed only ONE `heldClaimWhere` anywhere in a runner; and its
+// negative scan looked at `accountingSyncLog.update(` while ignoring `updateMany(` — the very call a
+// release must use. A commented fence plus an unfenced `updateMany({ where: { id } })` passed.
+// ---------------------------------------------------------------------------
+
+/**
+ * Remove comments without touching string literals.
+ *
+ * Naive stripping would eat the `//` in a URL inside a message string and shift every offset after it,
+ * which is how a scanner ends up reading a `where` clause that is really the tail of a sentence.
+ */
+function stripComments(source: string): string {
+  let out = ''
+  let i = 0
+  let quote: string | null = null
+  while (i < source.length) {
+    const ch = source[i]
+    const next = source[i + 1]
+    if (quote) {
+      out += ch
+      if (ch === '\\') { out += next ?? ''; i += 2; continue }
+      if (ch === quote) quote = null
+      i++
+      continue
+    }
+    if (ch === '"' || ch === "'" || ch === '`') { quote = ch; out += ch; i++; continue }
+    if (ch === '/' && next === '/') {
+      while (i < source.length && source[i] !== '\n') i++
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i < source.length && !(source[i] === '*' && source[i + 1] === '/')) i++
+      i += 2
+      out += '\n'
+      continue
+    }
+    out += ch
+    i++
+  }
+  return out
+}
+
+/** Balanced-paren argument text for the call whose `(` is at `open`. */
+function callArgs(source: string, open: number): string {
+  let depth = 0
+  for (let i = open; i < source.length; i++) {
+    if (source[i] === '(') depth++
+    else if (source[i] === ')') {
+      depth--
+      if (depth === 0) return source.slice(open + 1, i)
+    }
+  }
+  return source.slice(open + 1)
+}
+
+test('Codex r1 medium 2: the scanner really does remove comments before it asserts anything', () => {
   const src = readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
+  // A sentinel that exists ONLY inside a comment in the file being scanned, so this proves the strip
+  // ran on the real source rather than on a fixture.
+  const SENTINEL = 'o3d-550x: the one fenced release.'
+  assert.ok(src.includes(SENTINEL), 'the sentinel comment must exist in the source being scanned')
+  const stripped = stripComments(src)
+  assert.ok(!stripped.includes(SENTINEL), 'and it must be gone once comments are stripped')
+  // Counter-guard: stripping must not have eaten the code. A scanner that returned '' would pass the
+  // assertion above and every negative assertion below.
+  assert.ok(stripped.includes('export async function recordPostedSyncResult('), 'code survives stripping')
+  assert.ok(stripped.includes('accountingSyncLogClaimWhere('), 'and so do the predicates the scan reads')
+  assert.ok(stripped.length > src.length / 2, 'a stripper that returned nothing would pass every negative assertion')
+})
+
+test('o3d-550x: neither runner writes the sync row except to CLAIM it or through a fenced helper', () => {
+  // Structural, and paired with the behavioural tests above. The rule is stronger than "spot an unfenced
+  // release": a runner may touch accountingSyncLog directly ONLY to take the claim. Every state change
+  // after that goes through a named helper whose fence is part of the statement, so there is no call
+  // shape left in which somebody can forget one.
+  const src = stripComments(readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8'))
   const direct = src.slice(
     src.indexOf('async function processPendingXeroSyncDirect('),
     src.indexOf('async function processPendingXeroSyncViaOutbox('),
@@ -263,26 +559,76 @@ test('o3d-550x: neither runner releases a claim with an unfenced write', () => {
     src.indexOf('async function processPendingXeroSyncViaOutbox('),
     src.indexOf('async function guardCancelledSalesOrderInvoice('),
   )
+
+  // Every write verb, not just `update(` — `updateMany` is the one a release must use, and the previous
+  // scan did not look at it at all.
+  const WRITE_CALLS = ['accountingSyncLog.update(', 'accountingSyncLog.updateMany(', 'accountingSyncLog.upsert(']
+
   for (const [name, block] of [['direct', direct], ['outbox', outbox]] as const) {
     assert.ok(block.length > 0, `the ${name} runner block must be found`)
-    for (const [index, chunk] of block.split('accountingSyncLog.update(').slice(1).entries()) {
-      const data = chunk.slice(0, chunk.indexOf('})'))
-      assert.ok(
-        !data.includes("status: 'PENDING'"),
-        `the ${name} runner must not hand a claimed row back to PENDING with an unfenced update (site ${index + 1})`,
-      )
+
+    let claimSites = 0
+    for (const call of WRITE_CALLS) {
+      let at = block.indexOf(call)
+      while (at !== -1) {
+        const args = callArgs(block, at + call.length - 1)
+        const isClaim = args.includes('accountingSyncLogClaimWhere(')
+        const isFenced = args.includes('heldClaimWhere(entry.id, claimedAt)')
+        if (isClaim) claimSites++
+        assert.ok(
+          isClaim || isFenced,
+          `${name} runner: a direct ${call} whose where is neither the claim predicate nor `
+            + `heldClaimWhere(entry.id, claimedAt) — this is how an unfenced release gets back in:\n${args.slice(0, 300)}`,
+        )
+        assert.ok(
+          !args.includes("status: 'SYNCED'"),
+          `${name} runner: SYNCED must not be written inline — that is the unfenced clobber o3d-550x is about`,
+        )
+        at = block.indexOf(call, at + 1)
+      }
     }
+    assert.equal(claimSites, 1, `the ${name} runner takes exactly one claim, and that is its only direct row write`)
+
+    // And the releases it DOES perform go through the shared statements, which carry the fence.
     assert.ok(
-      block.includes('heldClaimWhere(entry.id, claimedAt)'),
-      `the ${name} runner must release the claim it holds under its own fence`,
+      block.includes('releaseClaimForRetry(') || block.includes('deferPaymentUntilEarlierLogsPost('),
+      `the ${name} runner must release claims through the shared fenced release`,
     )
     assert.ok(
       block.includes('recordPostedSyncResult(tx, {'),
       `the ${name} runner must record a posted document through the unfenced evidence write`,
     )
-    assert.ok(
-      !block.includes("status: 'SYNCED'"),
-      `the ${name} runner must not write SYNCED inline — that is how an unfenced clobber gets back in`,
-    )
+  }
+})
+
+test('Codex r1 HIGH: no runner escalates an unrecordable document through the best-effort logger', () => {
+  // The shape of the defect, pinned so it cannot come back as "just log it afterwards". The evidence is
+  // written by recordPostedSyncResult inside the conflict transaction; a caller that reached for
+  // logActivity/logActivityPersisted on this path would be swallowing failures again.
+  const src = stripComments(readFileSync(join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8'))
+  const outbox = src.slice(
+    src.indexOf('async function processPendingXeroSyncViaOutbox('),
+    src.indexOf('async function guardCancelledSalesOrderInvoice('),
+  )
+  const direct = src.slice(
+    src.indexOf('async function processPendingXeroSyncDirect('),
+    src.indexOf('async function processPendingXeroSyncViaOutbox('),
+  )
+  for (const [name, block] of [['direct', direct], ['outbox', outbox]] as const) {
+    for (const chunk of block.split('if (!record.recorded) {').slice(1)) {
+      const body = chunk.slice(0, chunk.indexOf('\n        }'))
+      assert.ok(
+        !body.includes('logActivity'),
+        `${name} runner: the unrecordable-document branch must not write its evidence through the `
+          + 'best-effort logger — it swallows database failures and returns false',
+      )
+    }
+    // The outbox runner may only bury the job using the evidence the transaction already committed.
+    if (name === 'outbox') {
+      assert.ok(
+        block.includes('markXeroOutboxPermanent(job, record.evidence)'),
+        'the outbox runner must bury the job with the wording of the record it has proof of',
+      )
+    }
   }
 })

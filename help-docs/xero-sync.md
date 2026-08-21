@@ -1593,6 +1593,28 @@ cancelled. Reverse the document in Xero instead.
 Settling needs the **sync** permission and a recently re-verified session; you will be asked to
 confirm your identity if your session is older than that.
 
+### A document posted in Xero that IMS could not record
+
+Very rarely a worker posts a document to Xero and then finds its sync row already naming a **different**
+document — a replacement worker took the row while the first request was still on the wire, and posted
+its own. Both documents are real and in the Xero ledger. IMS refuses to overwrite what the row already
+names, because that would destroy the only local record of one of the two.
+
+When that happens an **ERROR** entry appears in the activity log with the action
+`xero_posted_document_unrecorded`. It names **both** ids — the one the row keeps and the one that could
+not be recorded — and the sync row's reference, and it is written in the same database transaction that
+detected the conflict, so it exists whenever the conflict did. The same wording is put on the outbox job
+as its final error, so the two never describe the incident differently.
+
+**Remedy.** Open both ids in Xero. Keep the document the sync row names; **void or credit-note the
+duplicate**. Nothing further will be retried for either one — the sync row is settled against the first
+document and the outbox job is closed — so this is a one-off manual correction, not something that will
+resolve itself on the next cron run.
+
+A rarer variant of the same entry says the sync row **no longer exists** at all
+(`reason: ROW_MISSING`). The remedy there is to find the document in Xero by the id in the entry and
+either keep it, re-entering the reference by hand, or void it.
+
 ### Rows stranded on a connector you switched away from
 
 Because the sync log is scoped to the active connector, unresolved rows left behind on a connector that has since been turned off appear in **no** sync log. They are listed instead in the amber banner at the top of **Integrations**, which shows each row's connector, type, reference, status, age in days, and last error — plus the external transaction ID if the row already posted something before it stalled.

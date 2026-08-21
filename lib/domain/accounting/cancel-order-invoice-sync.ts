@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
+import { heldClaimWhere } from './sync-claim-fence'
 
 /** SALES_INVOICE sync types that recognise revenue for a sales order. */
 const SALES_INVOICE_SYNC_TYPES = ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] as const
@@ -176,12 +177,18 @@ export async function retireSalesInvoiceForCancelledOrder(
 ): Promise<boolean> {
   const reason = 'Cancelled: order cancelled before this invoice posted (no revenue to recognise).'
   // Claim-fenced compare-and-swap: retire the row ONLY if it is still the exact PROCESSING claim THIS
-  // worker holds (same processingStartedAt) AND has no external id. A stale reclaim refreshes
-  // processingStartedAt, so keying on it stops an old worker cancelling a row a newer worker now owns;
-  // requiring externalTransactionId: null stops cancelling a row that already posted (which would hide a
-  // real Xero receivable). If the CAS matches nothing, leave the row and the mirror untouched.
+  // worker holds AND has no external id. A stale reclaim refreshes processingStartedAt, so keying on it
+  // stops an old worker cancelling a row a newer worker now owns; requiring externalTransactionId: null
+  // stops cancelling a row that already posted (which would hide a real Xero receivable). If the CAS
+  // matches nothing, leave the row and the mirror untouched.
+  //
+  // THE OWNERSHIP HALF IS COMPOSED FROM heldClaimWhere, NOT SPELT OUT AGAIN (Codex r1, medium 1). The
+  // inline copy happened to match, which is the dangerous case: a change to what "I still hold this
+  // claim" means would silently apply to the connector's releases and not to this retirement, and this
+  // one is a RETRACTION — a displaced worker terminalising a row a live worker owns. The extra
+  // `externalTransactionId: null` arm stays this call site's own, because it guards a different fact.
   const retired = await client.accountingSyncLog.updateMany({
-    where: { id: syncLogId, status: 'PROCESSING', processingStartedAt: claimedAt, externalTransactionId: null },
+    where: { ...heldClaimWhere(syncLogId, claimedAt), externalTransactionId: null },
     data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
   })
   if (retired.count === 0) return false
