@@ -283,77 +283,76 @@ test('sync-log id disambiguates mirror keys when payload only has a date fallbac
   assert.equal(second.idempotencyKey, 'accounting-sync-log:xero:sync-2')
 })
 
-test('sync success updates mirrored daily batch event to posted with external id', async () => {
-  const updates: unknown[] = []
-  const logs: unknown[] = []
+/**
+ * A stand-in for the mirrored-event table: one row, looked up by idempotency key, plus the
+ * update/log calls the transition makes against it.
+ */
+function mirrorClient(row: { id?: string; currency?: string; linesJson: unknown } | null) {
+  const updates: Array<Record<string, unknown>> = []
+  const logs: Array<Record<string, unknown>> = []
+  const finds: unknown[] = []
   const client = {
     accountingEvent: {
-      update: async (args: unknown) => {
+      findUnique: async (args: unknown) => {
+        finds.push(args)
+        return row === null ? null : { id: row.id ?? 'event-1', currency: row.currency ?? 'GBP', linesJson: row.linesJson }
+      },
+      update: async (args: Record<string, unknown>) => {
         updates.push(args)
-        return { id: 'event-1' }
+        return { id: row?.id ?? 'event-1' }
       },
     },
     accountingEventLog: {
-      create: async (args: unknown) => {
+      create: async (args: Record<string, unknown>) => {
         logs.push(args)
-        return { id: 'log-1' }
+        return { id: `log-${logs.length}` }
       },
     },
   }
+  const logActions = () => logs.map((l) => (l.data as { action: string }).action)
+  const logFor = (action: string) => logs.map((l) => l.data as Record<string, unknown>).find((d) => d.action === action)
+  return { client, updates, logs, finds, logActions, logFor }
+}
+
+const GROUP_B_KEY = 'accounting-sync:xero:daily_batch_group_b:dailybatch:b-2026-04-26:2026-04-26'
+const groupBLines = [
+  { accountCode: '210', description: 'Revenue recognition', debit: 10 },
+  { accountCode: '400', description: 'Revenue recognition', credit: 10 },
+]
+
+test('sync success updates mirrored daily batch event to posted with external id', async () => {
+  // The ordinary case: the payload posted is the payload queued, so the rebuild is a no-op and
+  // must leave no audit noise behind.
+  const { client, updates, logs } = mirrorClient({ linesJson: groupBLines })
 
   await updateMirroredAccountingEventStatus(client as never, {
     connector: 'xero',
     type: 'DAILY_BATCH_GROUP_B',
     referenceType: 'DailyBatch',
     referenceId: 'B-2026-04-26',
-    payload: {
-      date: '2026-04-26',
-      lines: [
-        { accountCode: '210', description: 'Revenue recognition', debit: 10 },
-        { accountCode: '400', description: 'Revenue recognition', credit: 10 },
-      ],
-    },
+    payload: { date: '2026-04-26', lines: groupBLines },
     status: 'POSTED',
     externalId: 'journal-1',
   })
 
-  assert.deepEqual(updates, [{
-    where: { idempotencyKey: 'accounting-sync:xero:daily_batch_group_b:dailybatch:b-2026-04-26:2026-04-26' },
-    data: { status: 'POSTED', externalId: 'journal-1' },
-    select: { id: true },
-  }])
-  assert.deepEqual(logs, [{
-    data: {
-      accountingEventId: 'event-1',
-      action: 'posted_from_sync_log',
-      metadata: {
-        connector: 'xero',
-        syncType: 'DAILY_BATCH_GROUP_B',
-        referenceType: 'DailyBatch',
-        referenceId: 'B-2026-04-26',
-        externalId: 'journal-1',
-      },
-    },
-  }])
+  assert.equal(updates.length, 1)
+  assert.deepEqual(updates[0].where, { idempotencyKey: GROUP_B_KEY })
+  const data = updates[0].data as Record<string, unknown>
+  assert.equal(data.status, 'POSTED')
+  assert.equal(data.externalId, 'journal-1')
+  assert.deepEqual(data.linesJson, groupBLines)
+  assert.equal(data.currency, 'GBP', 'the row\'s own currency, never re-derived')
+  assert.deepEqual(logs.map((l) => (l.data as { action: string }).action), ['posted_from_sync_log'],
+    'an unchanged payload must not log a rebuild')
 })
 
 test('terminal sync failure updates mirrored refund reversal event to failed', async () => {
-  const updates: unknown[] = []
-  const logs: unknown[] = []
-  const client = {
-    accountingEvent: {
-      update: async (args: unknown) => {
-        updates.push(args)
-        return { id: 'event-1' }
-      },
-    },
-    accountingEventLog: {
-      create: async (args: unknown) => {
-        logs.push(args)
-        return { id: 'log-1' }
-      },
-    },
-  }
+  const { client, updates, logs } = mirrorClient({
+    linesJson: [
+      { accountCode: '120', description: 'COGS reversal', debit: 10 },
+      { accountCode: '500', description: 'COGS reversal', credit: 10 },
+    ],
+  })
 
   await updateMirroredAccountingEventStatus(client as never, {
     connector: 'quickbooks',
@@ -372,6 +371,8 @@ test('terminal sync failure updates mirrored refund reversal event to failed', a
     message: 'connector failed',
   })
 
+  // NOTHING was posted, so the mirrored body is left exactly as it was queued — the rebuild is a
+  // POSTED-only concern (o3d-m26g).
   assert.deepEqual(updates, [{
     where: { idempotencyKey: 'accounting-sync:quickbooks:cogs_reversal:sales-order-refund:refund-1:cogs-reversal' },
     data: { status: 'FAILED' },
@@ -494,6 +495,17 @@ type FakeAccountingEventRow = {
    * `CURRENT_TIMESTAMP` — transaction START time — so it never carried edit order at all.
    */
   createdAt: Date
+  /**
+   * o3d-m26g, merged into development after these fixtures were written: on a POSTED transition the
+   * mirror REBUILDS the event's body from the payload that was actually posted, and logs
+   * `payload_rebuilt_from_posted` when it differs from the enqueued one. A double that carries no
+   * body at all reports a difference against `undefined` on every post, so these fixtures seed the
+   * body they were enqueued with — which, since they post the same payload they were queued from,
+   * is the body the rebuild produces. That keeps these tests about the REVISION CLAIM, which is
+   * what they exist for; the rebuild's own behaviour is pinned in the o3d-m26g tests below.
+   */
+  linesJson?: unknown
+  currency?: string
   /**
    * o3d-cvj9 r3: the stamp the EXTERNAL system put on the document as it applied this row's write
    * (Xero's `Invoice.UpdatedDateUTC`). Two writes to one invoice are serialised by Xero on one
@@ -633,9 +645,25 @@ const REVISION_MIRRORED_AT = new Date('2026-08-19T10:00:00.000Z')
 /** Xero's stamp for the edit under test, when the fixture gives it one. */
 const REVISION_XERO_REVISION_AT = new Date('2026-08-19T10:00:05.500Z')
 
+/**
+ * The mirrored body these fixtures were enqueued with, built by the SAME builder the rebuild uses,
+ * so "nothing changed between enqueue and post" is true by construction rather than by a hand-copied
+ * literal that would drift the moment the builder does.
+ */
+const REVISION_MIRRORED_BODY = buildMirroredAccountingEventDraft({
+  connector: 'xero',
+  type: 'SALES_INVOICE_UPDATE',
+  referenceType: 'SalesOrder',
+  referenceId: 'so-1',
+  payload: REVISION_PAYLOAD,
+  currency: 'GBP',
+})
+
 function invoiceCreateRow(overrides: Partial<FakeAccountingEventRow> = {}): FakeAccountingEventRow {
   return {
     id: 'event-create',
+    linesJson: REVISION_MIRRORED_BODY?.linesJson,
+    currency: 'GBP',
     type: 'SALES_INVOICE',
     sourceEntityType: 'SalesOrder',
     sourceEntityId: 'so-1',
@@ -655,6 +683,8 @@ function invoiceCreateRow(overrides: Partial<FakeAccountingEventRow> = {}): Fake
 function revisionRow(overrides: Partial<FakeAccountingEventRow> = {}): FakeAccountingEventRow {
   return {
     id: 'event-revision',
+    linesJson: REVISION_MIRRORED_BODY?.linesJson,
+    currency: 'GBP',
     type: 'SALES_INVOICE_UPDATE',
     sourceEntityType: 'SalesOrder',
     sourceEntityId: 'so-1',
@@ -700,7 +730,11 @@ test('a posted sales invoice revision takes the external id from the invoice eve
   // succeeds — the P2002 is handled where it was raised, not by rewriting the transition into
   // something that cannot fail. r2 read the ARRIVING row here too, for a `createdAt` that never
   // meant what it was read for; r3 does not need it and does not read it.
-  assert.deepEqual(store.statements, ['update', 'findUnique', 'updateMany', 'update', 'log', 'log'])
+  // The leading `findUnique` is o3d-m26g's body read (merged into development after this sequence
+  // was pinned): a POSTED transition rebuilds the mirrored body from the payload that was posted,
+  // and needs the enqueued body to compare against. It is a READ taken before anything is written,
+  // so it changes nothing this assertion is about.
+  assert.deepEqual(store.statements, ['findUnique', 'update', 'findUnique', 'updateMany', 'update', 'log', 'log'])
   assert.deepEqual(store.logs, [
     {
       accountingEventId: 'event-create',
@@ -807,7 +841,8 @@ test('re-posting a revision that already holds the external id is a no-op, not a
 
   await postRevision(store, { externalRevisionAt: REVISION_XERO_REVISION_AT })
 
-  assert.deepEqual(store.statements, ['update', 'log'], 'the retry path must not run when nothing conflicts')
+  // Leading `findUnique`: o3d-m26g's body read — see the note on the takeover test above.
+  assert.deepEqual(store.statements, ['findUnique', 'update', 'log'], 'the retry path must not run when nothing conflicts')
   assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
     { id: 'event-create', status: 'SUPERSEDED', externalId: null },
     { id: 'event-revision', status: 'POSTED', externalId: 'INV-9' },
@@ -1809,5 +1844,183 @@ test('o3d-cvj9 r7: a handover the external stamps SETTLED is not reported for re
       }],
     }),
     [],
+  )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-m26g: the POSTED mirror must describe what was POSTED, not what was queued.
+//
+// The mirrored event is created at ENQUEUE time from the payload as it stood then. The status
+// transition used to write only `status` and `externalId`, so any path that changed a queued
+// payload before it went out left the internal audit event disagreeing with the ledger, silently.
+// ---------------------------------------------------------------------------------------------
+
+test('a payload changed after enqueue posts the CHANGED figures into the mirror (o3d-m26g)', async () => {
+  // Queued at debit/credit 10.00; the payload that actually went to Xero carried 12.50.
+  const enqueued = [
+    { accountCode: '210', description: 'Revenue recognition', debit: 10 },
+    { accountCode: '400', description: 'Revenue recognition', credit: 10 },
+  ]
+  const posted = [
+    { accountCode: '210', description: 'Revenue recognition', debit: 12.5 },
+    { accountCode: '400', description: 'Revenue recognition', credit: 12.5 },
+  ]
+  const { client, updates, logActions, logFor } = mirrorClient({ linesJson: enqueued })
+
+  await updateMirroredAccountingEventStatus(client as never, {
+    connector: 'xero',
+    type: 'DAILY_BATCH_GROUP_B',
+    referenceType: 'DailyBatch',
+    referenceId: 'B-2026-04-26',
+    payload: { date: '2026-04-26', lines: posted },
+    status: 'POSTED',
+    externalId: 'journal-1',
+  })
+
+  const data = updates[0].data as Record<string, unknown>
+  assert.deepEqual(
+    data.linesJson,
+    posted,
+    'the mirror must carry the 12.50 that was posted, not the 10.00 that was queued',
+  )
+  assert.equal(data.status, 'POSTED')
+
+  // And the queued body is not destroyed by the rewrite — it moves into the audit log.
+  assert.deepEqual(logActions(), ['posted_from_sync_log', 'payload_rebuilt_from_posted'])
+  const rebuild = logFor('payload_rebuilt_from_posted')
+  assert.deepEqual((rebuild?.metadata as Record<string, unknown>).enqueuedLinesJson, enqueued)
+})
+
+test('a document payload rebuilt at post carries the posted amounts and mode', async () => {
+  const enqueued = {
+    kind: 'accounting-document', schemaVersion: 1, documentType: 'SALES_INVOICE',
+    documentNumber: 'WC-INV-1', invoiceNumber: 'WC-INV-1', contact: { name: 'A Customer' },
+    date: '2026-08-20', currency: 'GBP', lineAmountMode: 'INCLUSIVE', lineAmountsIncludeTax: true,
+    lines: [{ description: 'Widget', quantity: 1, unitAmount: 90, accountCode: '200' }],
+  }
+  const { client, updates } = mirrorClient({ linesJson: enqueued, currency: 'GBP' })
+
+  await updateMirroredAccountingEventStatus(client as never, {
+    connector: 'xero',
+    syncLogId: 'sync-log-1',
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    payload: {
+      invoiceNumber: 'WC-INV-1',
+      contactName: 'A Customer',
+      date: '2026-08-20',
+      currency: 'GBP',
+      lineAmountsIncludeTax: false,
+      lines: [{ description: 'Widget', quantity: 1, unitAmount: 100, accountCode: '200', discountAmount: 10 }],
+    },
+    status: 'POSTED',
+    externalId: 'inv-1',
+  })
+
+  const linesJson = (updates[0].data as Record<string, unknown>).linesJson as Record<string, unknown>
+  const lines = linesJson.lines as Array<Record<string, unknown>>
+  assert.equal(lines[0].unitAmount, 100, 'the unit amount that was posted')
+  assert.equal(lines[0].discountAmount, 10, 'and the discount that went with it')
+  assert.equal(linesJson.lineAmountMode, 'EXCLUSIVE', 'the tax convention the document was posted under')
+  assert.equal(linesJson.lineAmountsIncludeTax, false)
+})
+
+test('a rebuild that cannot be built never costs the post — it is recorded, not thrown', async () => {
+  // The transition runs inside the transaction that marks the sync log SYNCED. Throwing here would
+  // roll back a post Xero has already accepted, and the retry would post it a SECOND time.
+  const enqueued = [
+    { accountCode: '210', description: 'Revenue recognition', debit: 10 },
+    { accountCode: '400', description: 'Revenue recognition', credit: 10 },
+  ]
+  const { client, updates, logActions, logFor } = mirrorClient({ linesJson: enqueued })
+
+  await updateMirroredAccountingEventStatus(client as never, {
+    connector: 'xero',
+    type: 'DAILY_BATCH_GROUP_B',
+    referenceType: 'DailyBatch',
+    referenceId: 'B-2026-04-26',
+    // Unbalanced: 10 debit against 7 credit. The canonical builder refuses it.
+    payload: {
+      date: '2026-04-26',
+      lines: [
+        { accountCode: '210', description: 'Revenue recognition', debit: 10 },
+        { accountCode: '400', description: 'Revenue recognition', credit: 7 },
+      ],
+    },
+    status: 'POSTED',
+    externalId: 'journal-1',
+  })
+
+  const data = updates[0].data as Record<string, unknown>
+  assert.equal(data.status, 'POSTED', 'the SYNCED/POSTED transition still stands')
+  assert.equal(data.externalId, 'journal-1')
+  assert.equal('linesJson' in data, false, 'and the mirror keeps its enqueued body rather than a half-built one')
+  assert.deepEqual(logActions(), ['posted_from_sync_log', 'payload_rebuild_failed'])
+  assert.match(
+    String(logFor('payload_rebuild_failed')?.message),
+    /must balance: debit 10 != credit 7/,
+    'the specific reason, so an operator knows which event to re-derive and why',
+  )
+})
+
+test('an unchanged payload logs no rebuild even when the stored key order differs (jsonb)', async () => {
+  // Postgres jsonb does not preserve key order, so a naive stringify comparison would report a
+  // difference on essentially every post and bury the real ones.
+  const { client, logActions } = mirrorClient({
+    linesJson: [
+      { debit: 10, description: 'Revenue recognition', accountCode: '210' },
+      { credit: 10, accountCode: '400', description: 'Revenue recognition' },
+    ],
+  })
+
+  await updateMirroredAccountingEventStatus(client as never, {
+    connector: 'xero',
+    type: 'DAILY_BATCH_GROUP_B',
+    referenceType: 'DailyBatch',
+    referenceId: 'B-2026-04-26',
+    payload: { date: '2026-04-26', lines: groupBLines },
+    status: 'POSTED',
+    externalId: 'journal-1',
+  })
+
+  assert.deepEqual(logActions(), ['posted_from_sync_log'])
+})
+
+test('a mirrored event that does not exist is still a no-op', async () => {
+  const { client, updates, logs } = mirrorClient(null)
+  await updateMirroredAccountingEventStatus(client as never, {
+    connector: 'xero',
+    type: 'DAILY_BATCH_GROUP_B',
+    referenceType: 'DailyBatch',
+    referenceId: 'B-2026-04-26',
+    payload: { date: '2026-04-26', lines: groupBLines },
+    status: 'POSTED',
+    externalId: 'journal-1',
+  })
+  assert.deepEqual(updates, [])
+  assert.deepEqual(logs, [])
+})
+
+test('a posted payload that no longer yields an event at all is recorded, not skipped quietly', async () => {
+  // The row exists, so this type WAS mirrorable at enqueue. A payload that has since lost its lines
+  // must not slip through as "nothing to rebuild".
+  const { client, updates, logActions, logFor } = mirrorClient({ linesJson: groupBLines })
+
+  await updateMirroredAccountingEventStatus(client as never, {
+    connector: 'xero',
+    type: 'DAILY_BATCH_GROUP_B',
+    referenceType: 'DailyBatch',
+    referenceId: 'B-2026-04-26',
+    payload: { date: '2026-04-26', lines: [] },
+    status: 'POSTED',
+    externalId: 'journal-1',
+  })
+
+  assert.equal((updates[0].data as Record<string, unknown>).status, 'POSTED')
+  assert.deepEqual(logActions(), ['posted_from_sync_log', 'payload_rebuild_failed'])
+  assert.match(
+    String(logFor('payload_rebuild_failed')?.message),
+    /no longer builds a mirrorable event/,
   )
 })

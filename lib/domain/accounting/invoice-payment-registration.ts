@@ -97,9 +97,13 @@ export function decideInvoicePaymentRegistration(input: {
   }
 
   // Nothing is registered, so this receipt stands alone — and if it alone exceeds the invoice, the ledger
-  // would reject it. The live case for this is a gross receipt against an imported tax-inclusive invoice,
-  // which posts at NET (o3d-cyn): refusing names the numbers, where letting it through produces a Xero
-  // rejection an operator has to decode.
+  // would reject it. Refusing here names the numbers, where letting it through produces a Xero rejection
+  // an operator has to decode.
+  //
+  // The case this was written for — a gross receipt against an imported tax-inclusive invoice, which
+  // posted at NET — is gone since o3d-cyn: both construction paths now post at the order's gross. What
+  // is left is every OTHER way a receipt can exceed its document (a credited or part-refunded invoice, a
+  // mistyped amount), and the invoices imported and posted before that fix.
   if (input.paymentAmount > input.ledgerTotal + 0.005) {
     return { register: false, refusal: 'WOULD_OVERPAY', alreadyRegistered: 0, ledgerTotal: input.ledgerTotal }
   }

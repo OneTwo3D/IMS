@@ -946,6 +946,56 @@ export type MirroredEventWriteGuard = {
   requireExternalIdNull?: boolean
 }
 
+/**
+ * Key-order-independent rendering of a JSON value, for deciding whether the posted payload
+ * actually DIFFERS from the mirrored one.
+ *
+ * `linesJson` is a Postgres `jsonb` column, and jsonb does not preserve object key order — it
+ * stores keys sorted by length then bytewise. A plain `JSON.stringify` comparison of the stored
+ * value against a freshly built one therefore reports a difference on almost every post, which
+ * would bury the real ones in noise.
+ */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (value !== null && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>)
+      .filter(([, entryValue]) => entryValue !== undefined)
+      .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    return `{${entries.map(([key, entryValue]) => `${JSON.stringify(key)}:${canonicalJson(entryValue)}`).join(',')}}`
+  }
+  return JSON.stringify(value) ?? 'null'
+}
+
+/**
+ * o3d-m26g: THE MIRRORED EVENT'S BODY, REBUILT FROM THE PAYLOAD THAT WAS ACTUALLY POSTED.
+ *
+ * The mirrored `AccountingEvent` is created by `mirrorAccountingSyncLogToEvent` at ENQUEUE time,
+ * from the payload as it stood then. The status transition below used to write only `status` and
+ * `externalId`, so whenever anything changed the queued payload between enqueue and post, the
+ * internal audit event and the ledger disagreed and nothing said so. Rebuilding through the same
+ * canonical builders the enqueue used (`buildAccountingDocumentPayload` for documents,
+ * `buildAccountingEvent`'s line normalisation for journals) makes the POSTED event describe what
+ * was sent.
+ *
+ * ONLY THE BODY MOVES. `type`, `sourceEntityType`, `sourceEntityId` and `idempotencyKey` are the
+ * event's identity — they are what this update located the row by — and are never rewritten. The
+ * idempotency key is not payload-content-derived either (it prefers `payload._idempotencyKey`,
+ * then the sync-log id), so a rebuilt body cannot orphan the event from its next lookup.
+ *
+ * THE CURRENCY IS THE ROW'S OWN, not re-resolved. For a document payload it is only a fallback
+ * (the payload carries its own currency, as it did at enqueue); for a journal payload it IS the
+ * currency, and the enqueue path takes it from `getBaseCurrencyCode()`. Re-deriving it here from
+ * anything else would risk silently re-denominating an event.
+ */
+function rebuildMirroredEventBody(
+  params: Omit<Parameters<typeof buildMirroredAccountingEventDraft>[0], 'currency'>,
+  existing: { currency: string },
+): { linesJson: unknown; businessDate: Date; currency: string } | null {
+  const draft = buildMirroredAccountingEventDraft({ ...params, currency: existing.currency })
+  if (!draft) return null
+  return { linesJson: draft.linesJson, businessDate: draft.businessDate, currency: draft.currency }
+}
+
 export async function updateMirroredAccountingEventStatus(
   client: AccountingEventMirrorTransactionClient,
   params: {
@@ -954,6 +1004,12 @@ export async function updateMirroredAccountingEventStatus(
     type: string
     referenceType: string
     referenceId: string
+    /**
+     * o3d-m26g: THE PAYLOAD THE PROCESSOR ACTUALLY POSTED (or attempted). Both processors read it
+     * from the sync-log row they claimed and hand it straight through, so on a POSTED transition
+     * it is what went to the connector — which is why it, and not the enqueue-time copy, is what
+     * the mirrored event's body is rebuilt from.
+     */
     payload: unknown
     status: AccountingEventStatus
     externalId?: string | null
@@ -978,6 +1034,66 @@ export async function updateMirroredAccountingEventStatus(
   if (!idempotencyKey) return 'not_found'
 
   const guard = params.guard
+
+  // ---------------------------------------------------------------------------------------------
+  // o3d-m26g: the mirrored body, rebuilt from the payload that was actually posted. Resolved per
+  // KEY, immediately before the write for that key, so the primary/legacy fallback below rebuilds
+  // against whichever row it ends up writing — and so the tail's audit logs describe that row.
+  // ---------------------------------------------------------------------------------------------
+  let rebuilt: { linesJson: unknown; businessDate: Date; currency: string } | null = null
+  let rebuildError: string | null = null
+  let previousLinesJson: unknown = undefined
+  let bodyChanged = false
+
+  async function resolveBodyRebuild(key: string): Promise<'ok' | 'not_found'> {
+    rebuilt = null
+    rebuildError = null
+    previousLinesJson = undefined
+    bodyChanged = false
+
+    // Rebuilt ONLY on POSTED. A FAILED attempt put nothing in the ledger, so there is no ledger for
+    // the event to disagree with, and the queued payload remains the honest record of what was
+    // attempted.
+    //
+    // AND NEVER UNDER A GUARD. A guarded caller is an operator ASSERTION that made no connector
+    // write (see the guard note on `updateByIdempotencyKey`); its `payload` is the stored row's,
+    // not something this attempt sent. Rebuilding the event's body from it would rewrite the
+    // mirror to describe a post that never happened — the precise inverse of what o3d-m26g is for.
+    if (params.status !== 'POSTED' || guard) return 'ok'
+
+    const existing = await client.accountingEvent.findUnique({
+      where: { idempotencyKey: key },
+      select: { id: true, currency: true, linesJson: true },
+    })
+    // We have just read, in this transaction, that there is no such event. Saying so here rather
+    // than letting the write below rediscover it as a P2025 keeps the o3d-m26g contract exact — a
+    // mirrored event that does not exist is a no-op, and nothing is attempted against it — while
+    // leaving the caller's primary/legacy key fallback untouched, since it branches on `not_found`.
+    if (!existing) return 'not_found'
+
+    // A REBUILD FAILURE MUST NEVER COST THE POST. This runs inside the same transaction as the
+    // sync log's SYNCED transition, so throwing here would roll that transition back on work that
+    // has ALREADY been accepted by Xero — and the retry would post it a second time. A payload the
+    // builders reject (a line that lost its account code, a date that is no longer parseable) is
+    // therefore recorded as a rebuild failure against the event and the transition stands: the
+    // mirror keeps its enqueue-time body, and the `payload_rebuild_failed` log names the reason so
+    // an operator can see which event to re-derive.
+    try {
+      rebuilt = rebuildMirroredEventBody(params, existing)
+      if (!rebuilt) {
+        // A row exists, so this type WAS mirrorable when it was enqueued. `null` therefore means the
+        // posted payload no longer yields an event at all — journal lines that went missing or lost
+        // their account code / description. Treated exactly like a thrown rebuild rather than skipped
+        // quietly, because a silent skip is the blind spot this whole change exists to close.
+        rebuildError = 'the posted payload no longer builds a mirrorable event (missing or malformed lines)'
+      }
+    } catch (error) {
+      rebuildError = error instanceof Error ? error.message : String(error)
+    }
+    previousLinesJson = existing.linesJson
+    bodyChanged = rebuilt != null && canonicalJson(rebuilt.linesJson) !== canonicalJson(previousLinesJson)
+    return 'ok'
+  }
 
   function statusWriteData(
     // o3d-cvj9 r2: the STALE path records the same transition without claiming the document id,
@@ -1015,6 +1131,12 @@ export async function updateMirroredAccountingEventStatus(
                 : {}),
             }
           : {}),
+        // o3d-m26g: the body this attempt actually posted. Present on the SUPERSEDED paths too —
+        // those rows did make a real connector write, and what they sent is what their body should
+        // say; what they give up is the CLAIM on the document id, not the record of their own write.
+        ...(rebuilt
+          ? { linesJson: rebuilt.linesJson as never, businessDate: rebuilt.businessDate, currency: rebuilt.currency }
+          : {}),
     }
   }
 
@@ -1030,6 +1152,8 @@ export async function updateMirroredAccountingEventStatus(
   }
 
   async function updateByIdempotencyKey(key: string): Promise<{ id: string } | 'not_found' | 'refused'> {
+    // Before anything is written for THIS key (o3d-m26g).
+    if (await resolveBodyRebuild(key) === 'not_found') return 'not_found'
     // o3d-nf9i: the CAS. `updateMany` rather than `update` because the where has to carry more than
     // the unique key, and because a guard that does not hold must be a zero-row no-op, not a throw.
     //
@@ -1243,6 +1367,47 @@ export async function updateMirroredAccountingEventStatus(
       },
     }) as never,
   })
+
+  if (bodyChanged) {
+    // The superseded body travels INTO the log. Rewriting `linesJson` would otherwise destroy the
+    // only record of what was queued, trading one blind spot for another — this way the event says
+    // what was posted and its log still says what it was queued as, and the pair is the evidence
+    // that they differed.
+    await client.accountingEventLog.create({
+      data: buildAccountingEventLog({
+        accountingEventId: event.id,
+        action: 'payload_rebuilt_from_posted',
+        message: 'Mirrored payload rebuilt from the payload that was posted; it differed from the enqueued one.',
+        metadata: {
+          connector: params.connector,
+          ...(params.syncLogId ? { syncLogId: params.syncLogId } : {}),
+          syncType: params.type,
+          referenceType: params.referenceType,
+          referenceId: params.referenceId,
+          externalId: params.externalId ?? null,
+          enqueuedLinesJson: previousLinesJson as never,
+        },
+      }) as never,
+    })
+  }
+
+  if (rebuildError) {
+    await client.accountingEventLog.create({
+      data: buildAccountingEventLog({
+        accountingEventId: event.id,
+        action: 'payload_rebuild_failed',
+        message: `Mirrored payload could not be rebuilt from the posted payload: ${rebuildError}`,
+        metadata: {
+          connector: params.connector,
+          ...(params.syncLogId ? { syncLogId: params.syncLogId } : {}),
+          syncType: params.type,
+          referenceType: params.referenceType,
+          referenceId: params.referenceId,
+          externalId: params.externalId ?? null,
+        },
+      }) as never,
+    })
+  }
   return 'updated'
 }
 

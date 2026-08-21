@@ -96,6 +96,41 @@ With the initial import complete, new and updated WooCommerce orders are importe
 - The customer is matched by WooCommerce customer ID or email, or created if new
 - Multi-currency orders are converted to the IMS base currency using the FX rate from `frankfurter.dev` (ECB) at import time. The same rate is stamped on the order's `fxRateToBase` field and forwarded to Xero as `CurrencyRate` on the resulting invoice — so the WooCommerce store, IMS, and Xero all see the same base-currency total for the order. See `docs/xero-sync.md` § Multi-Currency FX Rates.
 - Tax rates are resolved using the tax rate mappings you configure (see Tax Rates below)
+- **Shipping is taxed at its own rate, not the goods' rate.** A store that charges zero-rated postage
+  beside standard-rated goods (or the reverse) would otherwise post an accounting invoice that does
+  not total to the WooCommerce order — and the payment IMS registers for the order total would only
+  part-settle it, leaving a balance in the ledger while IMS showed the order settled. The shipping
+  line now takes the tax rate that reproduces the tax WooCommerce actually charged on shipping
+- **A document that will not total to the order is NOT posted at all.** Before queueing the invoice,
+  IMS checks the tax the accounting document will produce against the tax WooCommerce charged, per
+  line and for shipping. When they disagree, the invoice is queued but the accounting connector
+  refuses to send it: the sync row fails with the reason on it, no payment is registered, and an
+  ERROR is logged against the order naming each component and both figures. This happens whether or
+  not the order is paid.
+
+  Posting it anyway is the worse option, and is what IMS used to do. Xero accepts a payment smaller
+  than the invoice as a *part* payment, so an invoice built at the wrong total sits AUTHORISED with a
+  balance for ever while IMS — comparing the order total it sent against the order total it holds —
+  shows the order settled. A refusal you can see is recoverable; a receivable in the ledger at the
+  wrong total takes a credit note to undo.
+
+  **The remedy** is named on the failure: map the WooCommerce tax rate the order used (Tax Rates,
+  below) and re-import the order. The rebuilt document posts normally.
+
+  **"Disagree" is measured in the order's own currency.** The allowance is one posted minor unit
+  either way — a penny in GBP/EUR/USD, a whole yen in a 0-decimal currency (JPY, KRW, ISK, CLP, VND),
+  a fils in a 3-decimal one (KWD, BHD, JOD, OMR, TND) — and the figures in the message are printed at
+  that precision. It used to be a penny in every currency, which was wrong in both directions: in a
+  3-decimal currency a real ten-fils error read as "within a penny" and the invoice posted, and in a
+  0-decimal one WooCommerce's own whole-unit rounding read as a mismatch and correct orders were
+  refused.
+
+  **One case has no mapping that will help.** WooCommerce can tax a single shipping line at several
+  rates at once — a standard rate plus a regional surcharge, say — and an accounting invoice carries
+  exactly one tax type on shipping. If those rates happen to add up to a rate IMS holds (15% + 5%
+  where the order is 20%), the invoice is right and posts as usual. If they do not, no tax type
+  expresses the charge, and the message says so rather than sending you looking for a mapping. Such
+  an order has to be invoiced in the ledger by hand
 - The order number uses your configured WooCommerce prefix (e.g. `WC-1234`, set in Settings > Company > Document Numbering)
 - **The accounting invoice number comes from WooCommerce, not from IMS.** IMS reads `_wcpdf_invoice_number` — the number WooCommerce PDF Invoices & Packing Slips assigned and printed on the customer's PDF — and uses it *verbatim* as both the IMS invoice number and the `InvoiceNumber` on the Xero invoice. No prefix is added, so the Xero document, the customer's PDF and the WooCommerce order all carry the same number. The **Invoice Prefix** field for WooCommerce under Settings > Company > Document Numbering no longer affects it
 - Stock is auto-allocated from warehouses marked **Sync to Store**

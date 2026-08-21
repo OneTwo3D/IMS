@@ -251,20 +251,28 @@ test('a tax-exclusive invoice posts at the order total', () => {
   }
 })
 
-test('an IMPORTED tax-inclusive invoice posts at the NET total (o3d-cyn), which is what a payment must match', () => {
-  // Not a claim that net is correct — o3d-cyn is the defect that builds it that way. But a payment that
-  // matches the invoice IMS really posted is not a SETTLEMENT fault, and reporting it as one would send
-  // an operator to the payment when the invoice is what is wrong.
-  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: true }), 100)
-  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows([row({ amount: 100 })])!, totalForeign: 100 })
+test('an IMPORTED tax-inclusive invoice now posts at GROSS too, so the receipt it must match is the gross one (o3d-cyn)', () => {
+  // This used to answer 100 — the net total, because the importer sent Woo's ex-tax amounts flagged
+  // tax-inclusive and Xero extracted the VAT back out of them. The importer now sends every component
+  // ex-tax on both conventions and Xero adds the tax, so the invoice totals to the order's 120 and a
+  // gross receipt of 120 settles it exactly. Answering 100 here would refuse that ordinary receipt as
+  // an over-payment.
+  assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: true }), 120)
+  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows([row({ amount: 120 })])!, totalForeign: 120 })
   assert.equal(v.status, 'SETTLED')
 })
 
-test('a tax-inclusive order raised IN IMS posts at GROSS — the receipt it must match is the gross one', () => {
-  // queueSalesInvoiceSync sends the gross unit prices (and grosses shipping up) before flagging them
-  // inclusive, so o3d-cyn does not touch this path. Keying on pricesIncludeVat alone understated the
-  // invoice, and the over-pay guard then refused every ordinary VAT receipt it exists to allow.
+test('a tax-inclusive order raised IN IMS posts at GROSS — unchanged, and now the same rule as an import', () => {
+  // queueSalesInvoiceForOrder sends the gross unit prices (and grosses shipping up) before flagging them
+  // inclusive. Keying on pricesIncludeVat alone understated the invoice, and the over-pay guard then
+  // refused every ordinary VAT receipt it exists to allow.
   assert.equal(ledgerSalesInvoiceTotalForeign({ totalForeign: 120, taxForeign: 20, pricesIncludeVat: true, importedFromShop: false }), 120)
+})
+
+test('a PART-registered receipt is still measured against the ledger total, not waved through', () => {
+  // The collapse must not have turned the comparison off: 60 of a 120 invoice is still a part payment.
+  const v = settlementStatus({ ...base, payment: aggregatePaymentSyncRows([row({ amount: 60 })])!, totalForeign: 120 })
+  assert.equal(v.status, 'PARTIALLY_SETTLED')
 })
 
 // ---------------------------------------------------------------------------

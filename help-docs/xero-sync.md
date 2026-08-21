@@ -1387,12 +1387,49 @@ releasing it is an explicit, confirmed operator action (see *Releasing a stale e
 The repair sweep reports a refusal it hits as `xero_backreference_id_conflict` and re-reports it once
 a day until it is resolved, rather than retrying silently.
 
-The likeliest causes are a connector reconnected to a different company that has reissued an id (see
-below), and the ledger merging two of our documents because they were posted under the same document
-number. Supplier credit notes are the live case of the second: if two credit notes are raised against
-one purchase order and the **credit-note number is left blank on both**, they post under the purchase
-order's own reference and Xero treats the second as an edit of the first. Give each supplier credit
-note its own number.
+The likeliest cause is a connector reconnected to a different company that has reissued an id (see
+below). The other — the ledger merging two of our documents because they were posted under the same
+document number — used to have a live case in supplier credit notes: two credits raised against one
+purchase order with the number left blank on both posted under the purchase order's own reference,
+and Xero treated the second as an edit of the first.
+
+That is fixed at the source. **A supplier credit note now posts under a document number IMS mints
+from the credit note's own record (`SCN-…`)**, whatever you type in the number field, so two credits
+can never claim one number. What you type is still sent — it travels as the credit note's *Reference*
+in Xero, which is also where the purchase order reference goes when you leave the field blank.
+
+A number that is unique to the record is also what makes the *other* supplier credit-note hazard
+closable. If the response to a post is lost in transit — the request landed, the reply did not — IMS
+has no ledger id for the credit note and the sync row retries. Xero's idempotency key only covers six
+minutes, so a queued retry is a fresh request, and nothing about the posting verb reliably stops it
+becoming a **second credit note**, which understates payables by the duplicate.
+
+So IMS asks the ledger first. Before creating a supplier credit note it looks for one already filed
+under that `SCN-…` number, and because the number is minted from the credit note's own record, a
+document found under it can only be this credit note:
+
+- **Found** — IMS links that document and sends nothing. This is the lost-response case healing
+  itself
+- **Not there, and IMS has never sent a create for this credit note** — it is created
+- **Not there, but a create was already sent** — IMS **refuses** and says so. An empty answer is not
+  proof the earlier attempt failed. Check Xero for the number: if the credit note is there, link it
+  to the IMS record; if it genuinely is not, post it in Xero and link it
+- **The ledger could not answer** (Xero unreachable, or a partial result it cannot vouch for) — IMS
+  refuses and retries later
+
+The last two are deliberate: refusing costs an operator a look at Xero, where a duplicate credit note
+is a mis-stated payables balance nobody goes looking for.
+
+**The number has to be one IMS actually minted, not one that looks like it.** All of the above rests
+on `SCN-<the credit note's own record id>` being unique by construction; a number you typed yourself
+is not, even if you happen to type it starting `SCN-`. A supplier's own reference of the shape
+`SCN-2026-114`, or a purchase order reference every credit against that order shares, would let IMS
+either link the wrong ledger document or refuse this one for ever on the strength of somebody else's.
+So before it asks Xero anything, IMS checks that the queued number is exactly the one this credit
+note's record mints. If it is not — a credit note queued before this change, or one whose sync row no
+longer names its credit note — **nothing is sent at all**, not even the supplier lookup, and the
+failure names both the number found and the number expected. Re-record the credit note so it is
+queued under its own minted number.
 
 ### Releasing a stale external id
 

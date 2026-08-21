@@ -95,7 +95,7 @@ test('sync payload reverses on the transit account with the supplier contact', (
   assert.equal(payload.supplierId, 'sup-1')
   assert.equal(payload.currency, 'EUR')
   assert.equal(payload.currencyRateToBase, 0.85)
-  assert.equal(payload.creditNoteNumber, 'CN-77')
+  assert.equal(payload.creditNoteNumber, 'SCN-scn-1', 'the LEDGER document number is minted from the row id, never from free text')
   const lines = payload.lines as Array<Record<string, unknown>>
   assert.equal(lines.length, 1)
   assert.equal(lines[0].accountCode, '1250')
@@ -178,13 +178,52 @@ test('sync payload posts EXCLUSIVE for reverse-charge (net amount), INCLUSIVE ot
   assert.equal(buildSupplierCreditNoteSyncPayload({ ...base, lineAmountsIncludeTax: false }).lineAmountsIncludeTax, false)
 })
 
-test('sync payload falls back to reference then a synthetic number, and a default line description', () => {
-  const noNumber = buildSupplierCreditNoteSyncPayload({
-    creditNoteId: 'scn-2', creditNoteNumber: null, reference: 'PO-ABC', reason: null,
+test('a BLANK credit-note number never becomes the PO reference — two on one PO would collide (o3d-tfri)', () => {
+  // `recordSupplierCreditNote` sets `reference` to the PO's reference whenever the operator leaves
+  // the number blank, and several credit notes per PO is a supported flow. The number used to fall
+  // back to that reference, so two blank-numbered credits on PO-ABC both posted as
+  // `CreditNoteNumber: 'PO-ABC'` — and Xero's create-or-update on that number meant the second
+  // REPLACED the first in the ledger. Each now gets its own row-id-derived number.
+  const common = {
+    reference: 'PO-ABC', reason: null, creditNoteNumber: null,
+    supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10,
+    transitAccount: 'T', taxType: 'NONE', date: '2026-06-13',
+  }
+  const first = buildSupplierCreditNoteSyncPayload({ ...common, creditNoteId: 'scn-2' })
+  const second = buildSupplierCreditNoteSyncPayload({ ...common, creditNoteId: 'scn-9' })
+
+  assert.equal(first.creditNoteNumber, 'SCN-scn-2')
+  assert.equal(second.creditNoteNumber, 'SCN-scn-9')
+  assert.notEqual(
+    first.creditNoteNumber,
+    second.creditNoteNumber,
+    'two blank-numbered credit notes on ONE purchase order must not share a CreditNoteNumber',
+  )
+  // The PO linkage is not lost — it just stops being the document number.
+  assert.equal(first.reference, 'PO-ABC')
+  assert.equal(second.reference, 'PO-ABC')
+  assert.equal((first.lines as Array<Record<string, unknown>>)[0].description, 'Supplier credit note')
+})
+
+test('an operator-supplied number never becomes the LEDGER document number — it travels as the reference (o3d-tfri r2)', () => {
+  // Production shape: recordSupplierCreditNote stores `reference = creditNoteNumber || po.reference`,
+  // so an operator-typed number arrives here in BOTH fields. Only one of them may reach Xero's
+  // CreditNoteNumber, because a number nothing makes unique is what forced the create-only verb —
+  // and a create-only verb duplicates the credit note after a lost response.
+  const numbered = buildSupplierCreditNoteSyncPayload({
+    creditNoteId: 'scn-4', creditNoteNumber: 'SUPPLIER-CN-77', reference: 'SUPPLIER-CN-77', reason: null,
     supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: 'T', taxType: 'NONE', date: '2026-06-13',
   })
-  assert.equal(noNumber.creditNoteNumber, 'PO-ABC')
-  assert.equal((noNumber.lines as Array<Record<string, unknown>>)[0].description, 'Supplier credit note')
+  assert.equal(numbered.creditNoteNumber, 'SCN-scn-4', 'unique by construction, from this row\'s primary key')
+  assert.equal(numbered.reference, 'SUPPLIER-CN-77', 'and the supplier\'s own number still reaches the ledger')
+
+  // Two credit notes on ONE purchase order whose supplier reused their own reference: distinct
+  // documents in the ledger, which is what they are.
+  const twin = buildSupplierCreditNoteSyncPayload({
+    creditNoteId: 'scn-5', creditNoteNumber: 'SUPPLIER-CN-77', reference: 'SUPPLIER-CN-77', reason: null,
+    supplierName: 'S', supplierId: 's', currency: 'GBP', fxRateToBase: 1, amountForeign: 10, transitAccount: 'T', taxType: 'NONE', date: '2026-06-13',
+  })
+  assert.notEqual(twin.creditNoteNumber, numbered.creditNoteNumber)
 
   const noRef = buildSupplierCreditNoteSyncPayload({
     creditNoteId: 'scn-3', creditNoteNumber: null, reference: null, reason: null,
@@ -192,4 +231,26 @@ test('sync payload falls back to reference then a synthetic number, and a defaul
   })
   assert.equal(noRef.creditNoteNumber, 'SCN-scn-3')
   assert.equal(noRef.reference, undefined)
+})
+
+/**
+ * o3d-tfri r3 retracted the claim that a number unique on OUR side makes a Xero retry CONVERGE — the
+ * verb is not the fence, the pre-create lookup is. The claim survived in one doc comment, which is
+ * how a retraction quietly un-retracts itself.
+ */
+test('the withdrawn "unique number makes the retry converge" claim stays withdrawn', async () => {
+  const { readFileSync } = await import('node:fs')
+  const src = readFileSync('lib/domain/purchasing/supplier-credit-note.ts', 'utf8')
+  const builderDoc = src.slice(
+    src.indexOf('THE DOCUMENT NUMBER IS ALWAYS'),
+    src.indexOf('export function buildSupplierCreditNoteSyncPayload'),
+  )
+  assert.ok(builderDoc.length > 0, 'the builder doc must still be there, or this scan measures nothing')
+  assert.doesNotMatch(
+    builderDoc,
+    /premise\s*\n?\s*\*?\s*that lets the poster go back to the upserting verb and converge on a retry/,
+    'a number unique by construction on OUR side is not evidence that Xero matches a re-post on it',
+  )
+  assert.match(builderDoc, /RECOGNISABILITY|recognisab/i,
+    'what the minted number actually buys is that a document under it can only be THIS credit note')
 })
