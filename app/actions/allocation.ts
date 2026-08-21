@@ -30,6 +30,8 @@ import {
   canonicalAllocationQty,
   clearDormantFulfillmentPinsInTx,
   lockAccountedRecordsForScope,
+
+  floorAvailableStockMapToCanonicalScale,
   lockSalesOrder,
   lockStockLevels,
   refileAccountedRecordsForScope,
@@ -941,7 +943,15 @@ export async function addAllocation(
         where: { productId: { in: leafProductIds }, warehouseId: { in: [warehouseId] } },
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
-      const stockMap = buildAvailableStockMap(stockLevels)
+      // o3d-aqke (Codex r1 finding 2): floored to the canonical scale, for the same reason
+      // `allocateSalesOrder` floors its own map. `updateAllocation` needs no such floor — the
+      // quantity it checks IS the quantity it writes — but this action expands a KIT, so the
+      // per-leaf `canonicalAllocationQty` below happens AFTER the feasibility test and can round a
+      // leaf half an ulp above the stock the kit-unit test was measured against. The reserve then
+      // breaches the VALIDATED `stock_levels_reserved_qty_lte_quantity` constraint and aborts the
+      // transaction, which is a crash rather than a refusal: nothing is written, and the operator
+      // gets a constraint name instead of "only N available".
+      const stockMap = floorAvailableStockMapToCanonicalScale(buildAvailableStockMap(stockLevels))
       // o3d-4kfh r7 (Codex finding 4): quantised BEFORE feasibility, as in `updateAllocation`.
       const requestedQty = canonicalAllocationQty(toDecimal(qty))
       if (requestedQty.lte(0)) {

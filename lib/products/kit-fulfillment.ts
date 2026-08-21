@@ -62,9 +62,63 @@ const MAX_FULFILLMENT_GRAPH_LOAD_ATTEMPTS = 3
  * WHAT IT DOES NOT BOUND, stated plainly: `expandFulfillmentRequirementsDecimal` walks the SAME
  * edges without memoising, so its cost is the number of distinct PATHS, not nodes. A diamond-shaped
  * graph (many components that are the same kit) is still exponential in the depth this constant
- * permits. The cap makes that exponent small and finite; it does not make the expansion linear.
+ * permits. The cap makes that exponent small and finite; it does not make the expansion linear —
+ * and "finite" is not "bounded": eight levels of a kit with five sub-kits each is 5^8 = 390,625
+ * visits, all of them inside the sales order lock. {@link MAX_FULFILLMENT_EXPANSION_VISITS} is the
+ * bound that closes it.
  */
 const MAX_FULFILLMENT_GRAPH_DEPTH = 8
+
+/**
+ * How many component visits ONE expansion may make before it is refused (o3d-0fok, Codex r1
+ * finding 4).
+ *
+ * WHY THE DEPTH CAP IS NOT THIS CAP. {@link MAX_FULFILLMENT_GRAPH_DEPTH} bounds the LOAD: one
+ * `findMany` per level, so eight levels is eight round trips regardless of shape, and the loaded
+ * map holds at most one entry per distinct product. The EXPANSION is a different walk with a
+ * different cost model — `visit` recurses once per (path to a kit), not once per kit, so a diamond
+ * multiplies rather than merges. Both walks run under the sales order lock every other order
+ * serialises behind, which is the reason the depth cap exists at all; the argument for bounding one
+ * is the argument for bounding the other.
+ *
+ * WHY NOT MEMOISE INSTEAD, which would make the expansion linear and refuse nothing. Because
+ * `expand(K, q)` would have to be served as `q * expand(K, 1)`, and that REASSOCIATES the
+ * multiplication: `decimal.js` rounds to its configured precision at every step, and a
+ * `Decimal(12,4)` factor times a `Decimal(12,4)` factor already needs more significant digits than
+ * that. The results differ far below the fourth decimal place and could not change a canonical
+ * quantity — but this branch exists precisely because moving a rounding to a different point in a
+ * multiplication changes the answer, and buying a performance bound with an arithmetic change is
+ * not a trade to make here in passing. A memoised expander is worth building deliberately, with the
+ * associativity question answered on its own terms.
+ *
+ * WHY THIS NUMBER. A real recipe is tens of nodes; a hundred is a large one. Fifty thousand visits
+ * is three orders of magnitude past any catalogue and still tens of milliseconds of pure in-memory
+ * Decimal work, so it refuses only a graph whose expansion is pathological — and for that graph the
+ * alternative is not success, it is the order lock held for minutes while every other order queues.
+ * The remedy is the same one the depth cap names, and the error says so.
+ */
+const MAX_FULFILLMENT_EXPANSION_VISITS = 50_000
+
+/**
+ * Thrown when ONE expansion visits more component paths than {@link MAX_FULFILLMENT_EXPANSION_VISITS}.
+ */
+export class FulfillmentGraphExpansionError extends Error {
+  readonly productId: string
+
+  constructor(productId: string) {
+    super(
+      `Expanding the component requirements of product ${productId} visited more than `
+      + `${MAX_FULFILLMENT_EXPANSION_VISITS} component paths. The graph is within the `
+      + `${MAX_FULFILLMENT_GRAPH_DEPTH}-level nesting limit but is diamond-shaped — the same sub-kit `
+      + 'is reachable by many routes, and the walk costs paths rather than products, so it grows '
+      + 'multiplicatively. Refusing rather than holding the sales order lock open while it runs. '
+      + 'Flatten the repeated sub-kits into the parents that share them, or raise '
+      + 'MAX_FULFILLMENT_EXPANSION_VISITS deliberately if this recipe really is this shape.',
+    )
+    this.name = 'FulfillmentGraphExpansionError'
+    this.productId = productId
+  }
+}
 
 /** Thrown when the component graph nests deeper than {@link MAX_FULFILLMENT_GRAPH_DEPTH}. */
 export class FulfillmentGraphDepthError extends Error {
@@ -283,8 +337,18 @@ export function expandFulfillmentRequirementsDecimal(
   graph: Map<string, FulfillmentGraphNode>,
 ): Map<string, Prisma.Decimal> {
   const totals = new Map<string, Prisma.Decimal>()
+  // o3d-0fok (Codex r1 finding 4): the walk costs PATHS, not products, so a diamond within the
+  // depth cap is still multiplicative. Every visit and every leaf accumulation is one unit of the
+  // budget, so it bounds the whole walk rather than merely its depth.
+  let visits = 0
 
   function addRequirement(componentProductId: string, requiredQty: Prisma.Decimal) {
+    // Counted as work too: a visit is bounded by the budget, but a single visit iterates the whole
+    // component list, so a very WIDE node is unbounded work under one visit.
+    visits += 1
+    if (visits > MAX_FULFILLMENT_EXPANSION_VISITS) {
+      throw new FulfillmentGraphExpansionError(productId)
+    }
     totals.set(
       componentProductId,
       (totals.get(componentProductId) ?? new Prisma.Decimal(0)).add(requiredQty),
@@ -292,6 +356,10 @@ export function expandFulfillmentRequirementsDecimal(
   }
 
   function visit(currentProductId: string, currentQty: Prisma.Decimal, stack: Set<string>) {
+    visits += 1
+    if (visits > MAX_FULFILLMENT_EXPANSION_VISITS) {
+      throw new FulfillmentGraphExpansionError(productId)
+    }
     if (!currentQty.isFinite() || currentQty.lte(0)) return
     const node = graph.get(currentProductId)
     if (!node) {

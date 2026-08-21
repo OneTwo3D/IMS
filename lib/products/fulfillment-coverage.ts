@@ -1,5 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
-import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { floorQuantity, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export type FulfillmentRequirement = {
   productId: string
@@ -62,6 +62,45 @@ export function canonicalFulfillmentQty(qty: DecimalInput): Prisma.Decimal {
 }
 
 /**
+ * The largest quantity at {@link FULFILLMENT_QTY_DP} that a CEILING can still honour (o3d-aqke,
+ * Codex r1 finding 2).
+ *
+ * This is NOT the quantisation rule and does not compete with it. {@link canonicalFulfillmentQty}
+ * is half-up and belongs to the COMPUTED side, once, after the whole multiplication. This one is a
+ * FLOOR, and it belongs to a LIMIT the computed side is not allowed to cross — proven availability,
+ * a dispatch cap, a remaining budget. The two have to be different functions, because a ceiling that
+ * rounded half-UP would authorise a quantity that does not exist: `canonicalFulfillmentQty` may
+ * legitimately move a computed value UP by as much as {@link FULFILLMENT_QTY_HALF_ULP}, so a plan
+ * drawn against a raw 6dp availability can persist a row that exceeds it.
+ *
+ * The guarantee, and it is worth stating because everything below depends on it: for any
+ * `x <= floorFulfillmentQty(A)`, `canonicalFulfillmentQty(x) <= floorFulfillmentQty(A) <= A`.
+ * Rounding half-up is monotone, and it is the identity on a value already at this scale, so the
+ * rounded row can never cross the floored ceiling. Planning against the raw `A` gives no such
+ * guarantee at all.
+ *
+ * What is given up is at most one ulp of availability — a quantity `Decimal(12,4)` cannot represent
+ * and no allocation row could ever have held.
+ */
+export function floorFulfillmentQty(qty: DecimalInput): Prisma.Decimal {
+  return floorQuantity(qty, FULFILLMENT_QTY_DP)
+}
+
+/**
+ * How many independently rounded terms a cumulative quantity is the sum of. One is the floor: a
+ * quantity that came from a single stored row is still one rounding, and a missing, zero, negative
+ * or non-integral count must never NARROW the band below what a single write can move.
+ */
+function fulfillmentRoundingCount(
+  countsByProduct: ReadonlyMap<string, number> | undefined,
+  productId: string,
+): number {
+  const count = countsByProduct?.get(productId)
+  if (typeof count !== 'number' || !Number.isFinite(count) || count < 1) return 1
+  return Math.ceil(count)
+}
+
+/**
  * IS THIS SET OF PERSISTED COMPONENT QUANTITIES A PROPORTIONAL KIT SET, JUDGED AT THE SCALE THEY
  * ARE STORED AT (o3d-i4qd)?
  *
@@ -90,12 +129,28 @@ export function canonicalFulfillmentQty(qty: DecimalInput): Prisma.Decimal {
  * quantity of zero (or less) has no proportional representation at all, and silently treating it
  * as satisfied would let an incomplete set through.
  *
+ * A SUM OF SEPARATELY ROUNDED QUANTITIES CARRIES A SEPARATELY ROUNDED ERROR (o3d-aqke, Codex r1
+ * finding 1). The band above is derived from ONE stored quantity standing for ONE rounding of
+ * `c * f_i`. A cumulative figure — the committed quantity of a component across a SEQUENCE of
+ * partial shipments, each row rounded on its own write — is `sum_k round(c_k * f_i, 4)`, whose
+ * distance from `(sum_k c_k) * f_i` is up to `n * halfUlp`, not `halfUlp`. Judging such a sum
+ * against a one-ulp band is judging it by a rule it was never built to satisfy, and the refusal
+ * lands at dispatch, on goods already picked and packed, with the units permanently unshippable.
+ *
+ * `roundingCountsByProduct` therefore says how many independently rounded terms went into each
+ * quantity; the band for that component widens to exactly that many half-ulps and no more. Absent
+ * or non-positive counts mean one term, which is the single-row case and reproduces the old band
+ * exactly. Widening is proportional to the rounding actually performed — it is not a tolerance,
+ * and it is orders of magnitude below any real disproportion: a kit rescaled from 2xA+1xB to
+ * 2xA+2xB is out by HALF A KIT, which no plausible number of ulps reaches.
+ *
  * Returns the component whose band excludes the rest (the one that is SHORT, which is the useful
  * one to name) together with the component it conflicts with, or null when the set is proportional.
  */
 export function findDisproportionateFulfillmentComponent(
   requirements: Iterable<DecimalFulfillmentRequirement>,
   quantitiesByProduct: Map<string, DecimalInput>,
+  roundingCountsByProduct?: ReadonlyMap<string, number>,
 ): { productId: string; conflictsWithProductId: string } | null {
   let lower: Prisma.Decimal | null = null
   let lowerProductId = ''
@@ -107,8 +162,11 @@ export function findDisproportionateFulfillmentComponent(
       return { productId: requirement.productId, conflictsWithProductId: requirement.productId }
     }
     const qty = toDecimal(quantitiesByProduct.get(requirement.productId))
-    const lowerBound = qty.sub(FULFILLMENT_QTY_HALF_ULP).div(requirement.factor)
-    const upperBound = qty.add(FULFILLMENT_QTY_HALF_ULP).div(requirement.factor)
+    const tolerance = FULFILLMENT_QTY_HALF_ULP.mul(
+      fulfillmentRoundingCount(roundingCountsByProduct, requirement.productId),
+    )
+    const lowerBound = qty.sub(tolerance).div(requirement.factor)
+    const upperBound = qty.add(tolerance).div(requirement.factor)
     if (lower == null || lowerBound.gt(lower)) {
       lower = lowerBound
       lowerProductId = requirement.productId

@@ -8,6 +8,7 @@ import {
   calculateDecimalFulfillmentCoverage,
   canonicalFulfillmentQty,
   findDisproportionateFulfillmentComponent,
+  floorFulfillmentQty,
   fulfillmentCoverageQuantisationSlack,
   requirementsMapToDecimalRows,
   scaleFulfillmentRequirements,
@@ -94,11 +95,26 @@ const ALLOCATION_EPSILON_DECIMAL = new Prisma.Decimal('0.000001')
  * that do, and before they did, a fractional kit was refused at dispatch by the very rows this
  * function wrote.
  *
- * The residual it keeps: rounding half-up can land a row at most half an ulp ABOVE the availability
- * the allocator proved, and the reserve now follows the row. That is a deliberate trade — an
- * over-claim the row and the reservation AGREE about is recoverable and visible to the census,
- * whereas a disagreement between them silently consumed another order's reservation on every
- * subsequent rewrite.
+ * o3d-aqke (Codex r1 finding 2) — THE RESIDUAL THIS USED TO KEEP IS NOW CLOSED AT THE OTHER END,
+ * and the note that stood here was wrong about how it ended. It said that rounding half-up could
+ * land a row at most half an ulp ABOVE the availability the allocator proved, and called that a
+ * deliberate trade because the over-claim was "recoverable and visible to the census". It is
+ * neither. `stock_levels` carries a VALIDATED check constraint
+ * (`stock_levels_reserved_qty_lte_quantity`, migration 20260624120000), so the reserve that follows
+ * the row does not over-claim — it raises a check violation and ABORTS THE WHOLE ALLOCATION
+ * TRANSACTION. Nothing is written, so there is nothing for a census to see; the operator gets a raw
+ * Postgres constraint name and no statement of what IMS was trying to do or how to proceed. It is
+ * the branch's own wedge shape one layer down: the allocator computes a figure its own storage
+ * layer then rejects.
+ *
+ * The fix is NOT to round the row differently — the single half-up rounding after the whole
+ * multiplication is the rule this branch exists to enforce. It is to stop planning against a
+ * ceiling the canonical row cannot honour: availability is now floored to the canonical scale
+ * BEFORE feasibility is decided (see `floorAvailableStockMapToCanonicalScale`), which makes
+ * `canonicalAllocationQty(requirement) <= flooredAvailability <= availability` true by
+ * construction. Quantisation still happens once, here, on the computed side; what moved is the
+ * LIMIT, and a limit is floored rather than rounded precisely because it must never authorise
+ * something that is not there.
  */
 export function canonicalAllocationQty(qty: DecimalInput): Prisma.Decimal {
   return canonicalFulfillmentQty(qty)
@@ -332,6 +348,36 @@ function cloneAvailableStockMap(
   return copy
 }
 
+/**
+ * THE CEILING THE ALLOCATOR PLANS AGAINST, AT THE SCALE IT CAN ACTUALLY WRITE (o3d-aqke, Codex r1
+ * finding 2).
+ *
+ * `StockLevel.quantity` and `reservedQty` are `Decimal(14,6)`; `OrderAllocation.qty` is
+ * `Decimal(12,4)`. So availability routinely carries two decimals an allocation row cannot hold,
+ * and `canonicalAllocationQty` — correctly half-up, once, after the whole multiplication — can move
+ * the computed requirement UP into them. Feasibility decided against the raw 6dp figure therefore
+ * proves something the write cannot honour, and `stock_levels_reserved_qty_lte_quantity` is a
+ * VALIDATED check constraint: the reserve does not over-book, it aborts the transaction.
+ *
+ * Flooring here is not "quantising the stored side". Nothing is written and nothing is re-rounded:
+ * this is the derived `quantity - otherReserved` budget the plan is drawn against, and it is
+ * TRUNCATED (never half-up) because a ceiling that rounded up would authorise stock that does not
+ * exist. The most it discards is one ulp of a column no allocation row could have represented.
+ *
+ * Applied to `tempStock` on every delta too, so the invariant "this map is a canonical-scale
+ * budget" survives multi-line and multi-warehouse passes: `floor4(A - r) = A - ceil4(r)`, which is
+ * never above `A - canonicalAllocationQty(r)`, so each successive line is bounded by what its
+ * predecessors will actually persist rather than by what they computed.
+ */
+export function floorAvailableStockMapToCanonicalScale(stockMap: DecimalStockMap): DecimalStockMap {
+  for (const byWarehouse of stockMap.values()) {
+    for (const [warehouseId, available] of byWarehouse) {
+      byWarehouse.set(warehouseId, floorFulfillmentQty(available))
+    }
+  }
+  return stockMap
+}
+
 function applyRequirementDeltaToAvailableMap(
   stockMap: DecimalStockMap,
   requirements: Map<string, DecimalInput>,
@@ -344,7 +390,11 @@ function applyRequirementDeltaToAvailableMap(
     const delta = toDecimal(qty)
     byWarehouse.set(
       warehouseId,
-      direction === 'reserve' ? current.sub(delta) : current.add(delta),
+      // Floored, not rounded, and for the same reason the map was floored when it was built: this
+      // is the REMAINING BUDGET, and the row that consumed it will be written at the canonical
+      // scale by `canonicalAllocationQty`. Leaving the raw remainder here would hand the next line
+      // a ceiling its own persisted row could exceed, which is the whole of Codex r1 finding 2.
+      floorFulfillmentQty(direction === 'reserve' ? current.sub(delta) : current.add(delta)),
     )
     stockMap.set(productId, byWarehouse)
   }
@@ -2260,7 +2310,16 @@ export function findUncoveredCommittedShipment(
 
   // Grouped per (line, warehouse) because that is the grain a bundle is shipped at: one shipment
   // belongs to one warehouse, and its component lines are only a complete kit together.
+  //
+  // o3d-aqke (Codex r1 finding 1): the ROW COUNT is grouped with the sum, because the sum is what
+  // gets judged. Every `ShipmentLine.qty` is its own half-up rounding to `Decimal(12,4)`, so a
+  // component shipped across three partials is three roundings deep, and the one-ulp band that
+  // describes a single row describes nothing about their total. See
+  // `findDisproportionateFulfillmentComponent` — without the count, a LEGITIMATE sequence of
+  // proportional partial shipments is refused as disproportionate, and it is refused at dispatch,
+  // after the goods are picked and packed, on an order that can then never be completed.
   const committedByLineWarehouse = new Map<string, Map<string, Prisma.Decimal>>()
+  const committedRowCounts = new Map<string, Map<string, number>>()
   for (const shipmentLine of committedShipmentLines) {
     // Lines outside the validated set (or with no product) have no requirements to judge against.
     if (!requirementsByLine.has(shipmentLine.lineId)) continue
@@ -2271,6 +2330,9 @@ export function findUncoveredCommittedShipment(
       (quantities.get(shipmentLine.productId) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)),
     )
     committedByLineWarehouse.set(group, quantities)
+    const counts = committedRowCounts.get(group) ?? new Map<string, number>()
+    counts.set(shipmentLine.productId, (counts.get(shipmentLine.productId) ?? 0) + 1)
+    committedRowCounts.set(group, counts)
   }
 
   for (const [group, quantities] of committedByLineWarehouse) {
@@ -2303,7 +2365,11 @@ export function findUncoveredCommittedShipment(
     // 0.1667) is NOT exactly proportional to any coverage and never can be. The old
     // `coverage * factor` comparison to 1e-6 refused exactly those sets — at dispatch, after the
     // goods were picked and packed.
-    const breach = findDisproportionateFulfillmentComponent(requirements, quantities)
+    const breach = findDisproportionateFulfillmentComponent(
+      requirements,
+      quantities,
+      committedRowCounts.get(group),
+    )
     if (breach) {
       return `Shipments for sales line ${label} in warehouse ${warehouseId} do not commit a complete component set`
     }
@@ -2604,6 +2670,16 @@ export async function validateAllocationIntegrity(
   // o3d-4kfh: committed quantity per ALLOCATION ROW, the subtrahend that turns a retained row into
   // the open (still-to-ship) quantity this check is about. Same non-PENDING set as committedByLine
   // above, so the two sides of the final comparison net the SAME shipments out.
+  // o3d-aqke (Codex r1 finding 1): HOW MANY SEPARATELY ROUNDED VALUES EACH ALLOCATION ROW IS THE
+  // SUM OF. An `OrderAllocation.qty` is canonicalised ONCE — but the value it canonicalises is
+  // `mergeAllocationRows([...fresh requirement, ...committed ShipmentLine quantities])`, and every
+  // one of those shipment quantities was itself rounded to `Decimal(12,4)` on its own write. So a
+  // row that retains three partial shipments is four roundings deep, not one, and the one-ulp band
+  // is not the band that describes it. Three legitimate partials of a 0.3333 x A + 0.6667 x B kit
+  // are enough: the row lands at A = 1.5000 / B = 3.0003, whose one-ulp bands are disjoint — and
+  // `validateAllocationIntegrity` then refuses the rows `allocateSalesOrder` had just written,
+  // at the next shipment transition, with the goods already picked.
+  const committedRowsByAllocationScope = new Map<string, number>()
   const committedByAllocationScope = new Map<string, Prisma.Decimal>()
   for (const shipmentLine of activeShipmentLines) {
     const key = `${shipmentLine.lineId}|${shipmentLine.shipment.warehouseId}|${shipmentLine.productId}`
@@ -2611,6 +2687,7 @@ export async function validateAllocationIntegrity(
       key,
       (committedByAllocationScope.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)),
     )
+    committedRowsByAllocationScope.set(key, (committedRowsByAllocationScope.get(key) ?? 0) + 1)
   }
 
   // o3d-4kfh r3: THE COMMITMENT MUST BE BACKED, and this is the only check that looks DOWNWARD.
@@ -2637,6 +2714,11 @@ export async function validateAllocationIntegrity(
     const requiredProductIds = new Set(requirements.map((requirement) => requirement.productId))
     const lineAllocations = allocations.filter((allocation) => allocation.lineId === line.id)
     const byWarehouse = new Map<string, Map<string, Prisma.Decimal>>()
+    // o3d-aqke (Codex r1 finding 1): the row's own canonicalisation, PLUS one for each committed
+    // shipment quantity the row retains — see `committedRowsByAllocationScope`. Counting the rows
+    // themselves rather than assuming one also removes the assumption that the scope is unique,
+    // which the schema does not enforce.
+    const rowCountsByWarehouse = new Map<string, Map<string, number>>()
 
     for (const allocation of lineAllocations) {
       const quantities = byWarehouse.get(allocation.warehouseId) ?? new Map<string, Prisma.Decimal>()
@@ -2645,6 +2727,14 @@ export async function validateAllocationIntegrity(
         (quantities.get(allocation.productId) ?? new Prisma.Decimal(0)).add(toDecimal(allocation.qty)),
       )
       byWarehouse.set(allocation.warehouseId, quantities)
+      const counts = rowCountsByWarehouse.get(allocation.warehouseId) ?? new Map<string, number>()
+      counts.set(
+        allocation.productId,
+        (counts.get(allocation.productId) ?? 0)
+          + 1
+          + (committedRowsByAllocationScope.get(`${line.id}|${allocation.warehouseId}|${allocation.productId}`) ?? 0),
+      )
+      rowCountsByWarehouse.set(allocation.warehouseId, counts)
     }
 
     // o3d-4kfh: the STRUCTURAL checks below (complete component set, proportional components, no
@@ -2663,7 +2753,11 @@ export async function validateAllocationIntegrity(
       // by an UNROUNDED factor, which a fractional kit can never satisfy; this refused allocations
       // `allocateSalesOrder` had just written, and refused them at shipment confirmation, leaving
       // the order allocated and unpickable for the rest of its life.
-      if (findDisproportionateFulfillmentComponent(requirements, quantities)) {
+      if (findDisproportionateFulfillmentComponent(
+        requirements,
+        quantities,
+        rowCountsByWarehouse.get(warehouseId),
+      )) {
         return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} must keep bundle components in matching quantities`
       }
 
@@ -3077,7 +3171,11 @@ export async function allocateSalesOrder(
     // healthy steady state (ownQty > reservedQty by exactly the shipped amount) as an integrity
     // ERROR. Both are the same arithmetic mistake as the release paths.
     const ownReservationRows = residualAllocationRows(ownAllocations, dispatchedAllocationLines)
-    const stockMap = buildAvailableStockMapIncludingOwnReservations(stockLevels, ownReservationRows)
+    // o3d-aqke (Codex r1 finding 2): floored to the canonical scale before ANY feasibility question
+    // is asked of it, so a proven-available quantity is one the canonical row can actually hold.
+    const stockMap = floorAvailableStockMapToCanonicalScale(
+      buildAvailableStockMapIncludingOwnReservations(stockLevels, ownReservationRows),
+    )
 
     const committedByLine = calculateDecimalCoverageByLine(
       requirementsByLine,

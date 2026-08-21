@@ -12,13 +12,10 @@ import { RESERVATION_RELEASING_SHIPMENT_STATUS } from '@/lib/domain/inventory/re
 import { HISTORICAL_IMPORT_REFERENCE_TYPES } from '@/lib/domain/inventory/stock-movement-value'
 import {
   findDisproportionateFulfillmentComponent,
-  requirementsMapToDecimalRows,
   type DecimalFulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
-import {
-  expandFulfillmentRequirementsDecimal,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
 
 export type InventoryInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -227,7 +224,18 @@ export type InventoryInvariantKitGraphClient = {
       productId: string
       qty: DecimalInput
       product: { sku: string }
-      line: { productId: string | null; sku: string | null; description: string } | null
+      line: {
+        productId: string | null
+        sku: string | null
+        description: string
+        /**
+         * o3d-kouj's per-line pin (PR #625), selected unconditionally. Optional only so a double
+         * may omit it: an absent pin is the pre-snapshot state, which
+         * {@link lineFulfillmentRequirements} answers from the current graph, exactly as this
+         * census did before the column existed.
+         */
+        fulfillmentRequirements?: unknown
+      } | null
       shipment: { orderId: string; warehouseId: string }
     }>>
   }
@@ -2046,6 +2054,19 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
  * requirement is a product of `Decimal(12,4)` factors, so an exact proportionality test would
  * report every fractional kit ever shipped. Same helper, same bands, as the seams.
  *
+ * IT ASKS THE PIN, NOT THE CURRENT GRAPH, WHERE ONE EXISTS (o3d-aqke, Codex r1 finding 3). Every
+ * row this census reads belongs to a COMMITTED shipment, and a line holding one is a line o3d-kouj
+ * has pinned: its requirements were frozen at allocation and cannot move again. Expanding the
+ * current graph for such a line therefore judges the shipment against a recipe it was never
+ * allocated from — reporting healthy rows as broken after any component edit, and (the money
+ * direction) reporting a genuinely half-shipped kit as proportional after a uniform rescale, which
+ * is the precise escape o3d-kouj exists to close. The pin is read through o3d-kouj's own seam,
+ * `lineFulfillmentRequirements` — imported, not re-implemented and not injected, so this census
+ * cannot drift from the thirteen other readers of the same question — and NOTHING here quantises
+ * it: the stored side is a set of factors, the computed side is the band, and the single rounding
+ * stays where o3d-i4qd put it. A line with no pin is answered from the current graph by that same
+ * function, which is exactly what this census did before the column existed.
+ *
  * WHAT IT STILL DOES NOT REPORT: a STALE GRAPH STAMP. `findStaleFulfillmentGraphAllocation` catches
  * a uniform rescale, which is proportional on the numbers and therefore invisible to this pass too;
  * surfacing it here needs the allocation rows joined to their products and is not attempted.
@@ -2068,7 +2089,17 @@ export async function collectDisproportionateCommittedKitFindings(
       productId: true,
       qty: true,
       product: { select: { sku: true } },
-      line: { select: { productId: true, sku: true, description: true } },
+      line: {
+        select: {
+          productId: true,
+          sku: true,
+          description: true,
+          // Unconditional: the column shipped with o3d-kouj (PR #625), so every client this census
+          // can be handed has it. It was briefly selected only when a resolver was injected, which
+          // is a conditional this branch removed along with the seam.
+          fulfillmentRequirements: true,
+        },
+      },
       shipment: { select: { orderId: true, warehouseId: true } },
     },
   })
@@ -2078,22 +2109,47 @@ export async function collectDisproportionateCommittedKitFindings(
     ...new Set(shipmentLines.map((row) => row.line?.productId).filter((id): id is string => !!id)),
   ]
 
+  const unreadablePinFindings: InventoryInvariantFinding[] = []
   let requirementsByLine: Map<string, DecimalFulfillmentRequirement[]>
   try {
     const graph = await loadFulfillmentProductGraph(
       client as unknown as Parameters<typeof loadFulfillmentProductGraph>[0],
       rootProductIds,
     )
-    requirementsByLine = new Map(
-      shipmentLines
-        .filter((row) => row.line?.productId)
-        .map((row) => [
+    requirementsByLine = new Map()
+    // One finding per LINE, not per shipment row: a line with four committed component rows would
+    // otherwise report the same unreadable pin four times, and the pin is a property of the line.
+    const unreadablePinLineIds = new Set<string>()
+    for (const row of shipmentLines) {
+      if (!row.line?.productId) continue
+      if (requirementsByLine.has(row.lineId) || unreadablePinLineIds.has(row.lineId)) continue
+      try {
+        requirementsByLine.set(
           row.lineId,
-          requirementsMapToDecimalRows(
-            expandFulfillmentRequirementsDecimal(row.line!.productId!, 1, graph),
+          lineFulfillmentRequirements(
+            { id: row.lineId, productId: row.line.productId, fulfillmentRequirements: row.line.fulfillmentRequirements },
+            graph,
           ),
-        ]),
-    )
+        )
+      } catch (error) {
+        // A line whose pin cannot be read is NOT judged against the current graph — that is the
+        // exact substitution o3d-kouj forbids, and it would be made silently, on the one line that
+        // already has something wrong with it. It is reported instead, and left out of the census.
+        unreadablePinLineIds.add(row.lineId)
+        unreadablePinFindings.push({
+          severity: 'warning',
+          code: 'allocation_committed_kit_pin_unreadable',
+          warehouseId: row.shipment.warehouseId,
+          message: `The pinned fulfilment requirements for sales line ${row.line.sku || row.line.description || row.lineId} could not be read, so its committed components were not judged`,
+          details: {
+            orderId: row.shipment.orderId,
+            lineId: row.lineId,
+            lineSku: row.line.sku ?? null,
+            reason: error instanceof Error ? error.message : String(error),
+          },
+        })
+      }
+    }
   } catch (error) {
     // A census must not take the whole report down because the catalogue is mid-edit or too deep
     // to walk. Report the gap instead of throwing — a silent skip is how a check stops being one.
@@ -2117,6 +2173,10 @@ export async function collectDisproportionateCommittedKitFindings(
     orderId: string
     lineLabel: string
     quantities: Map<string, Prisma.Decimal>
+    // o3d-aqke (Codex r1 finding 1): how many separately rounded `ShipmentLine.qty` rows each
+    // component's total is the sum of. A component shipped across three partials is three
+    // roundings, and the one-ulp band that describes a single row does not describe their sum.
+    rowCounts: Map<string, number>
     skuByProductId: Map<string, string>
   }>()
   for (const row of shipmentLines) {
@@ -2128,21 +2188,27 @@ export async function collectDisproportionateCommittedKitFindings(
       orderId: row.shipment.orderId,
       lineLabel: row.line?.sku || row.line?.description || row.lineId,
       quantities: new Map<string, Prisma.Decimal>(),
+      rowCounts: new Map<string, number>(),
       skuByProductId: new Map<string, string>(),
     }
     group.quantities.set(
       row.productId,
       (group.quantities.get(row.productId) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)),
     )
+    group.rowCounts.set(row.productId, (group.rowCounts.get(row.productId) ?? 0) + 1)
     group.skuByProductId.set(row.productId, row.product.sku)
     groups.set(key, group)
   }
 
-  const findings: InventoryInvariantFinding[] = []
+  const findings: InventoryInvariantFinding[] = [...unreadablePinFindings]
   for (const group of groups.values()) {
     const requirements = requirementsByLine.get(group.lineId) ?? []
     if (requirements.length === 0) continue
-    const breach = findDisproportionateFulfillmentComponent(requirements, group.quantities)
+    const breach = findDisproportionateFulfillmentComponent(
+      requirements,
+      group.quantities,
+      group.rowCounts,
+    )
     if (!breach) continue
     findings.push({
       severity: 'critical',
@@ -2312,7 +2378,9 @@ export async function runInventoryInvariantReport(options: {
   const kitFindings = options.severity != null && options.severity !== 'critical'
     ? []
     : options.productId == null && isKitGraphInvariantClient(kitGraphClient)
-      ? await collectDisproportionateCommittedKitFindings(kitGraphClient, { warehouseId: options.warehouseId })
+      ? await collectDisproportionateCommittedKitFindings(kitGraphClient, {
+        warehouseId: options.warehouseId,
+      })
       : []
   const findings = kitFindings.length > 0
     ? [...collection.findings, ...kitFindings]
