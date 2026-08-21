@@ -1746,11 +1746,23 @@ test('a genuine allocation change still resets accounting state (o3d-i5it), keep
   assert.ok(writeCounts.allocationCreates > 0)
 })
 
-test('an allocation change DOES clear the A2 stamp when the recorded journal was CANCELLED (o3d-o97 r4)', async () => {
-  // The mirror, and the proof the retention above is a gate rather than a blanket refusal. A
-  // CANCELLED A2 journal is positive evidence that nothing was ever debited to Allocated Inventory
-  // for this order, so there is no record worth keeping and no second debit to worry about — the
-  // stamp is cleared exactly as it always was, and A2 will value the order afresh.
+test('an allocation change does NOT clear the A2 stamp on a CANCELLED journal either (o3d-o97 r5)', async () => {
+  // r4 made a CANCELLED journal one of the three POSITIVE proofs that no pounds stand, and cleared
+  // the stamp, the amount and the attribution on it. CANCELLED is not that. It is written by the
+  // cross-connector orphan sweep (whose own comment records an unscoped run cancelling the rows of
+  // the connector that had just become ACTIVE), by `cancelPendingSalesInvoiceSyncForOrder`, and by
+  // an operator — and a claimed row is retired without anyone being able to see whether the remote
+  // call already landed, because the processors post BEFORE persisting SYNCED.
+  //
+  // WORKED. A2 debits £40 under journal a2-log-1 and it reaches Xero; the row is later marked
+  // CANCELLED. This allocation edit then runs:
+  //   r4  the stamp and the £40 are nulled. Group A2 selects on `inventoryAllocatedDate: null`, so
+  //       the next run re-values the order at its new pins — 3 units now, say £52 — and raises a
+  //       SECOND debit. Allocated Inventory holds £92 with £52 on record; the eventual refund
+  //       reverses the £52 it can see and the original £40 stands for ever, with the only evidence
+  //       of it deleted by the very write that made the second debit possible.
+  //   r5  the record is KEPT, A2 never re-posts, and `recreateMissingDailyBatchLogs` re-raises the
+  //       journal if it genuinely never landed (a CANCELLED log does not count as live there).
   const state = baseState({
     order: {
       ...baseState().order,
@@ -1772,7 +1784,48 @@ test('an allocation change DOES clear the A2 stamp when the recorded journal was
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
-  assert.equal(state.order.inventoryAllocatedDate, null, 'nothing was debited, so nothing is kept')
+  assert.equal(state.allocations?.[0].qty, 3, 'the allocation change itself still happens')
+  assert.equal(
+    state.order.inventoryAllocatedDate?.toISOString(),
+    '2026-01-01T00:00:00.000Z',
+    'the stamp SURVIVES, so Group A2 cannot raise a second debit at the new pins',
+  )
+  assert.equal(state.order.allocationBatchAmount, 40, 'and the only record of the £40 survives with it')
+  const retained = activityLogWrites.filter((entry) => (entry as { action: string }).action === 'allocation_accounting_stage_retained')
+  assert.equal(retained.length, 1)
+  assert.match(
+    String((retained[0] as { description: string }).description),
+    /recorded CANCELLED, which says the row was abandoned and not that the ledger was never reached/,
+  )
+})
+
+test('an allocation change DOES clear the A2 stamp when A2 recorded a debit of exactly £0.00 (o3d-o97 r5)', async () => {
+  // The proof the retention above is a gate rather than a blanket refusal — and that the gate now
+  // opens only on a record A2 WROTE ABOUT ITSELF rather than on a status some later sweep imposed.
+  // A recorded £0.00 is A2 saying it valued this order at nothing: a KNOWN debit of zero, so there
+  // is no record worth keeping and no second debit to worry about.
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+      allocationBatchAmount: 0,
+      allocationBatchSyncLogId: 'a2-log-1',
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 2 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+    }],
+  })
+  state.accountingSyncLogs = [{ id: 'a2-log-1', status: 'SYNCED' }]
+
+  await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(state.order.inventoryAllocatedDate, null, 'a known debit of zero leaves nothing to keep')
   assert.equal(state.order.allocationBatchAmount, null)
   assert.equal(
     activityLogWrites.filter((entry) => (entry as { action: string }).action === 'allocation_accounting_stage_retained').length,
@@ -2109,10 +2162,12 @@ function createResetTx(options: {
 
 test('resetAllocationAccountingIfStaged clears inventoryAllocatedBatchRef in the same update as the stamp (o3d-0qoo)', async () => {
   // o3d-o97 r4: the clear only happens where the A2 debit is positively known NOT to stand, so the
-  // fixture says so — a recorded journal that ended CANCELLED debited nothing anywhere.
+  // fixture says so. o3d-o97 r5: and it says so with A2's OWN RECORD — a recorded debit of exactly
+  // £0.00 — rather than with a journal STATUS. r4 used a CANCELLED journal here, which is an
+  // abandonment written by a sweep or an operator and proves nothing about whether pounds moved.
   const { tx, salesOrderUpdates, allocationUpdates } = createResetTx({
     inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
-    allocationBatchAmount: 40,
+    allocationBatchAmount: 0,
     allocationBatchSyncLogId: 'a2-log-1',
     a2JournalStatus: 'CANCELLED',
   })

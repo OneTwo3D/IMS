@@ -93,6 +93,13 @@ type SalesOrderAccountingRow = {
  * pounds do not stop sitting in the account because the order reached a terminal state or because
  * six months went by, and both daily-batch windows exclude a fully-refunded order for ever, so no
  * automatic path will ever take them out. The finding stands until the refund's note is cleared.
+ *
+ * o3d-o97 r5: "almost exclusively on a FULL refund" is no longer true, and the query is what makes
+ * that safe. r4 made a refusal WITHHOLD the line reversal rather than un-cap it, so a PARTIAL
+ * refund that could not establish the open balance now credits nothing where it would have credited
+ * pounds — and r5 records that on the refund row for exactly the same reason a full one is
+ * recorded. Such an order is still inside both batch windows, so a later refund may yet settle it;
+ * the finding names what was withheld until one does.
  */
 type UnresolvedAllocationBasisRefundRow = {
   id: string
@@ -810,8 +817,11 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
   // exclusively on a FULL refund, so r3's version reported nothing an operator would ever be shown.
   //
   // Critical, and standing: the refund reversed less than the Allocated Inventory account holds (or
-  // nothing at all), both daily-batch windows exclude a fully-refunded order for ever, and no sweep
-  // will take the remainder out. It clears only when the refund's own note clears.
+  // nothing at all). On a FULL refund both daily-batch windows exclude the order for ever and no
+  // sweep will take the remainder out; on a partial (o3d-o97 r5, which records those too) the order
+  // is still in both windows and a later refund may settle it. Either way the pounds are open and
+  // unexplained now, so the finding stands until the refund's own note clears — `refundStatus` in
+  // the details is what tells an operator which of the two they are looking at.
   for (const refund of rows.unresolvedAllocationBasisRefunds) {
     const note = refund.allocationBasisUnresolved?.trim()
     if (!note) continue

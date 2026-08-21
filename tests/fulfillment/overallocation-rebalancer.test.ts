@@ -420,9 +420,11 @@ function shipmentIds(): string[] {
 
 test('releaseOverallocations clears inventoryAllocatedBatchRef in the same update as the stamp (o3d-0qoo)', async () => {
   // o3d-o97 r4: the clear only happens where the A2 debit is positively known NOT to stand, so the
-  // fixture says so — a recorded journal that ended CANCELLED debited nothing anywhere.
+  // fixture says so. o3d-o97 r5: and it says so with A2's OWN RECORD — a recorded debit of exactly
+  // £0.00 — rather than with a journal STATUS. r4 used a CANCELLED journal here, which is an
+  // abandonment written by a sweep or an operator and proves nothing about whether pounds moved.
   reset()
-  seedStagedOverallocation({ allocationBatchAmount: 40, allocationBatchSyncLogId: 'a2-log-1', journalStatus: 'CANCELLED' })
+  seedStagedOverallocation({ allocationBatchAmount: 0, allocationBatchSyncLogId: 'a2-log-1', journalStatus: 'CANCELLED' })
   const { releaseOverallocations } = await loadRebalancer()
 
   const result = await releaseOverallocations(
@@ -477,6 +479,39 @@ test('releaseOverallocations KEEPS the A2 stamp and its recorded debit when the 
   assert.match(
     String(stageRetainedEntries()[0].description),
     /Group A2 debited Allocated Inventory £40\.00 for this order under journal a2-log-1 \(SYNCED\)/,
+  )
+  assert.equal(state.allocationUpdates.length, 1, 'the pins this pass changed are still cleared')
+})
+
+test('releaseOverallocations KEEPS the A2 stamp when the journal is CANCELLED too (o3d-o97 r5)', async () => {
+  // r4 let one status through the gate: a CANCELLED journal cleared the stamp, the £40 and the
+  // attribution outright. CANCELLED is written by the cross-connector orphan sweep, by an order
+  // cancellation and by an operator, and a claimed row is retired without anyone being able to see
+  // whether the remote call had already landed — the processors post BEFORE persisting SYNCED.
+  //
+  // WORKED. A2 debits £40 under a2-log-1, which reaches Xero; the row is later marked CANCELLED.
+  // The rebalancer then releases an over-allocated unit:
+  //   r4  the stamp and the £40 are nulled, so Group A2 — which selects on
+  //       `inventoryAllocatedDate: null` — re-values the order at its new pins and raises a SECOND
+  //       debit. Allocated Inventory holds both; only the second is on record; the first is
+  //       stranded for ever with its only evidence deleted by the same write.
+  //   r5  the release still happens and the record survives it.
+  reset()
+  seedStagedOverallocation({ allocationBatchAmount: 40, allocationBatchSyncLogId: 'a2-log-1', journalStatus: 'CANCELLED' })
+  const { releaseOverallocations } = await loadRebalancer()
+
+  const result = await releaseOverallocations(
+    [{ productId: 'product-1', warehouseId: 'warehouse-1' }],
+    { source: 'stock_adjustment', referenceId: 'adj-1' },
+  )
+
+  assertNoSwallowedFailure()
+  assert.equal(result.released, 1, 'the over-allocated unit is still released')
+  assert.equal(unstageWrite(), undefined, 'and no un-stage write happened at all — the £40 record stays')
+  assert.equal(stageRetainedEntries().length, 1)
+  assert.match(
+    String(stageRetainedEntries()[0].description),
+    /£40\.00 debit is recorded CANCELLED, which says the row was abandoned and not that the ledger was never reached/,
   )
   assert.equal(state.allocationUpdates.length, 1, 'the pins this pass changed are still cleared')
 })

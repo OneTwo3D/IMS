@@ -32,6 +32,39 @@
  * or the order is cancelled outright. There is no credit note to carry that reversal and it needs a
  * sync type of its own; keeping the record is what makes that repair possible later instead of
  * impossible.
+ *
+ * o3d-o97 r5 — AND A *STATUS* IS NEVER THE POSITIVE EVIDENCE. r4 built the gate above and then let
+ * one status through it: a journal recorded CANCELLED counted as proof that nothing was debited, so
+ * the stamp, the amount and the attribution were destroyed on sight. CANCELLED does not mean that.
+ * It means SOMEBODY OR SOMETHING ABANDONED THE ROW, and three separate writers reach it without any
+ * of them knowing whether pounds moved:
+ *
+ *   * the cross-connector orphan sweep (`app/actions/accounting-sync.ts`), whose own comment records
+ *     that an UNSCOPED run once cancelled the rows of the connector that had just become ACTIVE;
+ *   * `cancelPendingSalesInvoiceSyncForOrder`, which retires rows when an order is cancelled;
+ *   * an operator, from the accounting-sync screen.
+ *
+ * And a claimed row is cancelled without proof either way, because the processors POST BEFORE they
+ * persist SYNCED and the external id — the same reasoning o3d-ju8t used to establish that a FAILED
+ * row does not prove nothing posted. CANCELLED is that same class of fact, not its opposite.
+ *
+ * WORKED. A2 debits £40 for this order under journal J and J reaches Xero. J is later marked
+ * CANCELLED — by any of the three above. An allocation edit then runs the un-stage:
+ *
+ *   r4    CANCELLED reads as "nothing was debited", so the stamp, the £40 and the attribution are
+ *         nulled. Group A2 selects on `inventoryAllocatedDate: null`, so the next run re-values the
+ *         order at its new pins — say £52 — and raises a SECOND debit under a new journal. Allocated
+ *         Inventory now holds £92 and IMS has a record of £52. The eventual full refund reverses the
+ *         £52 it can see; the original £40 stands for ever, and NOTHING ANYWHERE POINTS AT IT,
+ *         because the evidence was deleted by the very write that made the second debit possible.
+ *   r5    the debit STANDS. The stamp and the £40 are kept, so A2 never re-posts and the refund's
+ *         open balance still finds the £40. If J genuinely never reached a ledger,
+ *         `recreateMissingDailyBatchLogs` re-raises it — a CANCELLED log does not count as live
+ *         there — so the honest outcome is reached without anyone having to guess. Either way
+ *         exactly £40 is on record and reversible.
+ *
+ * TWO facts still clear the stamp, and both are records A2 WROTE ABOUT ITSELF rather than statuses
+ * some later sweep imposed: no stamp at all, and a recorded debit of exactly zero.
  */
 
 /** Minimal client: the journal probe is a primary-key read. */
@@ -68,15 +101,20 @@ function recordedAmount(value: StagedAllocationDebitInput['allocationBatchAmount
  *   no stamp             A2 never staged the order. Nothing was debited. Not standing.
  *   recorded ZERO        A2 staged it and valued it at nothing. A KNOWN debit of zero, which is not
  *                        the same fact as an unknown one. Not standing.
- *   journal CANCELLED    the journal was abandoned before it reached a ledger (the cross-connector
- *                        orphan sweep), so nothing was debited anywhere. Not standing.
- *   anything else        standing. That covers SYNCED (it posted), PENDING/PROCESSING (it is going
- *                        to post — clearing the stamp now would let A2 raise a second debit while
- *                        the first is still in the outbox), FAILED (o3d-ju8t: a FAILED row does not
- *                        prove nothing was posted), a journal row retention has since deleted, and
- *                        an order stamped before the attribution columns existed, where the recorded
- *                        amount is the only evidence there is and nothing can retroactively prove
- *                        the batch it belonged to never posted.
+ *   anything else        standing — and o3d-o97 r5 means ANYTHING, because no status the journal row
+ *                        can be carrying is evidence about pounds. That covers SYNCED (it posted),
+ *                        PENDING/PROCESSING (it is going to post — clearing the stamp now would let
+ *                        A2 raise a second debit while the first is still in the outbox), FAILED
+ *                        (o3d-ju8t: a FAILED row does not prove nothing was posted), CANCELLED (r5:
+ *                        an abandonment written by a sweep or an operator, which says nothing about
+ *                        what the row did before it was abandoned — see the header), a journal row
+ *                        retention has since deleted, and an order stamped before the attribution
+ *                        columns existed, where the recorded amount is the only evidence there is
+ *                        and nothing can retroactively prove the batch it belonged to never posted.
+ *
+ * The journal is still READ, and its status still appears in the reason an operator sees — a
+ * standing debit under a CANCELLED journal is a different thing to repair than one under a SYNCED
+ * journal. What r5 removes is the status DECIDING anything.
  */
 export async function resolveStagedAllocationDebit(
   client: AllocatedInventoryDebitClient,
@@ -107,9 +145,14 @@ export async function resolveStagedAllocationDebit(
     }
   }
   if (journal.status === 'CANCELLED') {
+    // o3d-o97 r5: NOT a clearance. A cancelled row is an abandoned row, and abandonment is written
+    // by sweeps and operators that cannot see whether the remote call had already landed. Keeping
+    // the record costs nothing (A2 will not re-post; `recreateMissingDailyBatchLogs` re-raises the
+    // journal if it truly never posted) while clearing it destroys the only evidence of the debit
+    // AND lets A2 raise a second one.
     return {
-      standing: false,
-      reason: `the Group A2 journal carrying this order's ${amountLabel} debit was CANCELLED, so nothing was debited to Allocated Inventory`,
+      standing: true,
+      reason: `the Group A2 journal carrying this order's ${amountLabel} debit is recorded CANCELLED, which says the row was abandoned and not that the ledger was never reached, so that debit cannot be treated as un-posted`,
     }
   }
   return {
