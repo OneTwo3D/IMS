@@ -1713,7 +1713,7 @@ const LEDGER_ANSWER_MAX_AGE_MS = CLAIM_STALE_MS
 const monotonicNowMs = (): number => performance.now()
 
 /**
- * THE CHECK THAT RUNS IMMEDIATELY BEFORE THE REQUEST LEAVES (o3d-k26m.5 round 5, finding #2).
+ * THE CHECK THAT RUNS IMMEDIATELY BEFORE THE REQUEST LEAVES (o3d-k26m.5 round 5 #2, round 6).
  *
  * THE PROBLEM IT FIXES. Round 4 asked the ledger, then took the post slot, then called
  * `pushSalesInvoice` — and `pushSalesInvoice` does not post first. It PREPARES: `findOrCreateContact`
@@ -1730,13 +1730,21 @@ const monotonicNowMs = (): number => performance.now()
  * answer that authorised the post was stale in every way at once.
  *
  * THE FIX IS PLACEMENT, NOT ANOTHER CHECK. The slot is no longer taken before preparation; it is
- * taken by this closure, which `pushSalesInvoice` calls after the payload is fully built and
- * immediately before `xeroPost`. So the sequence is now:
+ * taken by this closure, which is now scoped around the create and run from inside `performRequest`
+ * as the last statement before the socket. So the sequence is now:
  *
  *     ask the ledger → [unbounded preparation] → take the slot → POST
  *
- * and the slot cannot expire during preparation because it does not yet exist during preparation. The
- * gap it has to cover shrinks from "the whole entry" to "one HTTP request".
+ * and the slot cannot expire during preparation because it does not yet exist during preparation.
+ *
+ * ROUND 6 MOVED THE EVALUATION ONE LAYER FURTHER DOWN, because "immediately before `xeroPost`" was
+ * not immediately before the write: `xeroPost` resolves auth (a token refresh is a network call),
+ * then blocks in `waitForBudget` until the tenant's minute window clears, then retries a 429 with
+ * sleeps of up to 90 seconds, up to four attempts. The slot is a fifteen-minute lease and A RETRY CAN
+ * OUTLIVE IT — so this closure now runs ON EVERY ATTEMPT, immediately before the bytes move, which is
+ * also what keeps the lease refreshed for as long as we are still trying. See
+ * lib/connectors/accounting-egress-authorization.ts. The gap it has to cover shrinks from "the whole
+ * entry" to "the width of one socket write".
  *
  * WHAT HAPPENS TO EACH OF THE THREE THINGS THAT COULD GO STALE:
  *
@@ -1744,7 +1752,9 @@ const monotonicNowMs = (): number => performance.now()
  *   - THE CLAIM ON THE ROW: RE-CHECKED, in the database, at the same instant. The stamp is fenced on
  *     `heldClaimWhere`, so a worker whose claim aged out during preparation writes nothing and posts
  *     nothing. That check is not advisory: it is the same statement that takes the slot.
- *   - THE LEDGER'S ANSWER: BOUNDED, and refused past the bound. It is deliberately NOT re-asked. The
+ *   - THE LEDGER'S ANSWER: BOUNDED, and refused past the bound — re-measured on every attempt, so a
+ *     retry ladder that sleeps past the bound refuses instead of sending on a lapsed answer. It is
+ *     deliberately NOT re-asked. The
  *     fence is costed at ONE lookup per create against a 1,000-call daily budget, and a second call
  *     would buy almost nothing: the only writers that could have taken the number since are another
  *     IMS worker — which the slot excludes, and now excludes at the instant of the post rather than
@@ -1763,7 +1773,12 @@ const monotonicNowMs = (): number => performance.now()
  * alternatives: small2 proves the ROW is still ours, this proves the NUMBER is still ours, and after a
  * merge both belong in the same place — `lease.fenceBeforeRemoteWrite('sales-invoice')` should move
  * from the call site into this closure, so the claim re-take and the slot are taken at one instant
- * immediately before `xeroPost` rather than one before preparation and one after.
+ * immediately before the socket rather than one before preparation and one after.
+ *
+ * RE-ENTRANCY. Because this now runs once per HTTP attempt rather than once per call, everything it
+ * does must be safe to repeat: it is. The rival scan is a read; the stamp is an idempotent write of
+ * the SAME number with a refreshed database timestamp, fenced on the claim, so a repeat either
+ * renews our own lease or discovers the row is no longer ours and refuses.
  *
  * A REFUSAL HERE IS AN ORDINARY FAILURE, like every other refusal this fence produces: nothing was
  * sent, the row runs the normal retry ladder, and the next run re-asks the ledger from scratch. (On
@@ -2067,8 +2082,9 @@ async function processClaimedEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
-        // o3d-k26m.5 round 5: the number fence's LAST word, run after the contact and item calls and
-        // immediately before the create leaves. Nothing is sent if it refuses.
+        // o3d-k26m.5 round 5/6: the number fence's LAST word. Handed in here, scoped around the
+        // create by pushSalesInvoice, and evaluated inside the HTTP client on every attempt as the
+        // last statement before the socket. Nothing is sent if it refuses.
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: numberFence.beforePost })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }

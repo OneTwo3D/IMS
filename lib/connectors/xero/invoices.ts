@@ -7,10 +7,11 @@ import { findOrCreateContact } from './contacts'
 import { findOrCreateItem } from './items'
 import { xeroDocumentRevisionAt } from './document-revision'
 import { imsRateToXeroCurrencyRate } from './fx'
+import { withAccountingEgressAuthorization } from '@/lib/connectors/accounting-egress-authorization'
 import type { InvoiceData, InvoiceLine } from '../types'
 
 /**
- * A LAST CHECK THAT RUNS AFTER THE PAYLOAD IS BUILT AND BEFORE THE REQUEST LEAVES (o3d-k26m.5 r5).
+ * A PRECONDITION THAT MUST STILL HOLD WHEN THE REQUEST ACTUALLY LEAVES (o3d-k26m.5 r5, moved r6).
  *
  * `pushSalesInvoice` does not post first. It PREPARES — `findOrCreateContact` is a Xero round trip
  * and `findOrCreateItem` is another one per distinct item code, each through the same rate-limited
@@ -19,16 +20,56 @@ import type { InvoiceData, InvoiceLine } from '../types'
  * ownership fence that gap is the whole hazard: the create is update-or-create on the number, and an
  * exclusion that lapsed during preparation is an exclusion that is not there when the write happens.
  *
- * So the caller hands in a closure instead of checking first, and it runs HERE, at the last
- * instruction before `xeroPost`. A refusal is returned as an ordinary failure and NOTHING IS SENT.
+ * ROUND 5 RAN THIS HERE, as the last statement before `xeroPost`. ROUND 6 STOPPED RUNNING IT HERE,
+ * because `xeroPost` is not the write: it resolves auth (which can refresh a token over the network),
+ * then waits for rate-limit budget, then retries a 429 with sleeps of up to 90 seconds. "Immediately
+ * before `xeroPost`" was still minutes before the socket, and the gap round 5 meant to close was
+ * simply moved one layer down.
+ *
+ * So this module no longer EVALUATES the precondition. It SCOPES it — see
+ * accounting-egress-authorization.ts — around the one call whose write it authorises, and the
+ * evaluation happens inside `performRequest`, on every attempt, as the last statement before the
+ * bytes move. A refusal comes back as an ordinary failure with `status: 0`, and NOTHING IS SENT.
+ *
+ * The scope is around the write ALONE, never around the preparation calls above it: this precondition
+ * takes an exclusive slot, and taking it before the contact and item lookups is round 4's placement
+ * arriving from the other direction.
  *
  * Deliberately generic and deliberately narrow: this module knows only that some callers have a
  * precondition that must hold at the instant of the write, not what it is. The sibling branch
  * o3d-batch-small2 named this exact seam as the residual its per-mutation claim fence could not
  * reach ("closing that needs a hook threaded through the connector modules"); when the two land
- * together its claim re-take belongs in the same closure rather than at the call site.
+ * together its claim re-take belongs in the same authorisation rather than at the call site.
  */
 export type BeforeRemoteWrite = () => Promise<{ ok: true } | { ok: false; error: string }>
+
+/**
+ * Run `send` with `check` — if there is one — applying at the instant its request reaches the wire.
+ *
+ * The adaptation is one line and it is the whole point of having it here rather than at the caller:
+ * `BeforeRemoteWrite` speaks in results (`{ ok }`) because that is what reads well at the fence, and
+ * the egress seam speaks in refusals (a reason, or `null`) because a refusal that cannot name itself
+ * is not usable in an error message. Neither is converted anywhere else.
+ *
+ * A refusal is not thrown. It comes back as the `xeroPost` result with `status: 0` and the reason in
+ * `error`, which is the same shape a never-connected call already produces — so the caller's existing
+ * `res.error ?? 'Failed to create invoice'` reports the fence's own words, unprefixed by an HTTP
+ * status Xero never issued.
+ */
+function withSalesInvoiceAuthorization<T>(check: BeforeRemoteWrite | undefined, send: () => Promise<T>): Promise<T> {
+  if (!check) return send()
+  return withAccountingEgressAuthorization(
+    {
+      connector: 'xero',
+      name: 'sales-invoice-precondition',
+      authorize: async () => {
+        const cleared = await check()
+        return cleared.ok ? null : cleared.error
+      },
+    },
+    send,
+  )
+}
 
 type XeroInvoiceResponse = {
   Invoices: Array<{
@@ -198,17 +239,18 @@ export async function pushSalesInvoice(
   const prepared = await prepareSalesInvoicePayload(data, status, opts)
   if (!prepared.success) return prepared
 
-  // AFTER preparation, BEFORE the request. Both halves are load-bearing: after, because preparation
-  // is the unbounded part and a check in front of it is a check about a moment that has passed;
-  // before, because the write it guards cannot be taken back.
-  if (opts?.beforePost) {
-    const cleared = await opts.beforePost()
-    if (!cleared.ok) return { success: false, error: cleared.error }
-  }
-
+  // AFTER preparation, and evaluated INSIDE the request rather than in front of it. Both halves are
+  // load-bearing: after, because preparation is the unbounded part and a check in front of it is a
+  // check about a moment that has passed; inside, because token resolution, the rate-limit budget wait
+  // and the retry ladder all happen after this line and before the socket.
+  //
   // The options are rebuilt rather than forwarded: `xeroPost` takes an idempotency key and nothing
-  // else, and a hook that reached the transport layer would be a hook nobody can account for.
-  const res = await xeroPost<XeroInvoiceResponse>('Invoices', prepared.invoice, { idempotencyKey: opts?.idempotencyKey })
+  // else, and a hook that reached the transport layer as an argument would be a hook nobody can
+  // account for. The precondition reaches the transport as AMBIENT SCOPE instead, which is what lets
+  // it be evaluated at the wire without appearing in any transport signature.
+  const res = await withSalesInvoiceAuthorization(opts?.beforePost, () =>
+    xeroPost<XeroInvoiceResponse>('Invoices', prepared.invoice, { idempotencyKey: opts?.idempotencyKey }),
+  )
   if (!res.ok || !res.data?.Invoices?.length) {
     return { success: false, error: res.error ?? 'Failed to create invoice' }
   }
@@ -236,12 +278,9 @@ export async function updateSalesInvoice(
   // path addresses a document by the id IMS recorded from the create's own response, so it is not
   // fenced on the number. A caller with a precondition of its own must still be able to prove it at
   // the instant of the write rather than before the preparation calls.
-  if (opts?.beforePost) {
-    const cleared = await opts.beforePost()
-    if (!cleared.ok) return { success: false, error: cleared.error }
-  }
-
-  const res = await xeroPost<XeroInvoiceResponse>(`Invoices/${accountingInvoiceId}`, prepared.invoice, { idempotencyKey: opts?.idempotencyKey })
+  const res = await withSalesInvoiceAuthorization(opts?.beforePost, () =>
+    xeroPost<XeroInvoiceResponse>(`Invoices/${accountingInvoiceId}`, prepared.invoice, { idempotencyKey: opts?.idempotencyKey }),
+  )
   if (!res.ok || !res.data?.Invoices?.length) {
     return { success: false, error: res.error ?? 'Failed to update invoice' }
   }

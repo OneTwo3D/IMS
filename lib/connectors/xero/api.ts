@@ -5,16 +5,19 @@
 import { getAccessToken, getStoredTenantBlockReason } from './auth'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { accountingPostingIntentRefusal } from '@/lib/connectors/accounting-posting-intent'
+import { accountingEgressRefusal } from '@/lib/connectors/accounting-egress-authorization'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
 const XERO_CONNECTOR = 'xero'
 
 /**
- * The status `performRequest` reports when it refused to send (o3d-gfh, Codex r1 finding 3).
+ * The status `performRequest` reports when it REFUSED TO SEND (o3d-gfh / Codex r1 finding 3, and
+ * o3d-k26m.5 r6 — both refusals report it).
  *
- * Zero, and deliberately not an HTTP code: nothing was sent, so there is no HTTP status to report, and
- * borrowing one (403, 409) would make the row's errorMessage claim Xero answered when Xero was never
- * asked. It matches the `status: 0` `notConnectedResponse` already uses for the same reason.
+ * Zero, and deliberately not an HTTP code: nothing was sent, so there is no HTTP status to report,
+ * and borrowing one (403, 409) would make the row's errorMessage claim Xero answered when Xero was
+ * never asked. It matches the `status: 0` that `notConnectedResponse` already uses for the same
+ * reason, so "0 means nothing left this process" is one rule across the module rather than two.
  */
 const XERO_NOT_SENT_STATUS = 0
 const XERO_MAX_RETRIES = 3
@@ -242,6 +245,25 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
           `the work must be deferred. (Xero's real cap is 1,000/org/rolling-24h since 2026-03-02.)`,
       } as Response
     }
+
+    // THE LAST STATEMENT BEFORE THE SOCKET, AND THE ONE PLACE ANY PRE-EGRESS PERMISSION IS SPENT
+    // (o3d-k26m.5 r6).
+    //
+    // INSIDE THE LOOP, AND AFTER `waitForBudget`, ON PURPOSE. Everything above this line can block:
+    // the budget wait sleeps until the tenant's minute window clears, and a 429 sleeps up to
+    // XERO_MAX_RETRY_AFTER_MS before coming back round. A permission evaluated before the loop would
+    // be spent on an attempt that leaves minutes later — which is the same "true when taken, false
+    // when spent" defect one layer down, and is exactly why "immediately before `xeroPost`" was not
+    // immediately before the write. See accounting-egress-authorization.ts for why per-attempt rather
+    // than per-call, and for how the sibling branch's tenant verdict collapses into this same call.
+    //
+    // BEFORE `noteRequest` because a refusal consumes no Xero budget: nothing is sent, so nothing may
+    // be counted against the rolling day cap. Nothing between here and `connectorFetch` awaits.
+    const egressRefusal = await accountingEgressRefusal(XERO_CONNECTOR)
+    if (egressRefusal) {
+      return { ok: false, status: XERO_NOT_SENT_STATUS, text: async () => egressRefusal } as Response
+    }
+
     noteRequest(auth.tenantId)
 
     const res = await connectorFetch(url, init, { connectorName: 'Xero' })
@@ -345,8 +367,8 @@ async function xeroFetchWithAuth<T = unknown>(
   }
 
   const res = await performRequest(auth, init, url)
-  // Refused before sending. Reported verbatim rather than falling through to the !res.ok branch, which
-  // would prefix it with "HTTP 0:" and so describe a reply Xero never made.
+  // Refused before sending. Reported verbatim rather than falling through to the `!res.ok` branch,
+  // which would prefix it with "HTTP 0:" and so describe a reply Xero never made.
   if (res.status === XERO_NOT_SENT_STATUS) {
     return { ok: false, status: XERO_NOT_SENT_STATUS, error: await res.text(), tenantId: auth.tenantId }
   }

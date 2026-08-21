@@ -728,10 +728,13 @@ document and a silent overwrite.
 
 Three details of that fence matter if you are reading a refusal:
 
-* **The slot is taken at the last possible moment.** Preparing an invoice calls Xero once for the
-  customer contact and once per distinct product, and those calls are rate-limited, so preparation
-  can take minutes. A slot taken before all of that could have expired by the time the invoice was
-  sent — which is why it is now taken after it.
+* **The slot is taken at the last possible moment — and re-taken for every send attempt.** Preparing
+  an invoice calls Xero once for the customer contact and once per distinct product, and those calls
+  are rate-limited, so preparation can take minutes. A slot taken before all of that could have
+  expired by the time the invoice was sent, which is why it is now taken after it. Sending is not
+  instant either: if Xero rate-limits the create, IMS waits and tries again, and a wait can outlast
+  the slot. So the slot is checked and renewed inside each attempt, immediately before the request
+  goes out. A retry that finds the number taken in the meantime stands down instead of sending.
 * **Numbers are matched the way Xero matches them.** Case and surrounding spaces are ignored, because
   Xero treats `INV-1` and `inv-1` as one document; if IMS treated them as two, both workers would
   think they were alone.
