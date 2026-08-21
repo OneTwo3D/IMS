@@ -113,6 +113,11 @@ const db = {
     async findMany() { return [] },
     async updateMany() { return { count: 0 } },
   },
+  // o3d-clxw r6: the SYNCED transaction now stamps `syncedAtDatabaseClock` through $executeRaw, so a
+  // double without it throws INSIDE the transaction and the follow-up is never enqueued — the test then
+  // fails for a reason that has nothing to do with origin provenance. Answering 1 (one row updated) is
+  // what production sees; the stamp's own behaviour is pinned in xero-synced-at-clock.test.ts.
+  async $executeRaw() { return 1 },
   async $transaction(fn: (tx: unknown) => Promise<unknown>) { return fn(db) },
 }
 
