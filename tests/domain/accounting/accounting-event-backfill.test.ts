@@ -101,10 +101,29 @@ type MockFindManyArgs = {
   }
 }
 
+/**
+ * o3d-cvj9 r5: the EVENT scan answers TWO clause shapes now, and a double that only knows the first
+ * silently answers "no mirrored event" to the second — i.e. every revision looks unrepaired and the
+ * candidate-suppression tests below become vacuous:
+ *
+ *  - the DOCUMENT clause  — (externalSystem?, type, sourceEntityType, sourceEntityId), for a
+ *                           journal batch or a document create, where one such event is the most a
+ *                           source row can have;
+ *  - the IDENTITY clause  — `{ idempotencyKey: { in: [...] } }`, for a document REVISION, where the
+ *                           document has one event per EDIT and only the key identifies this one.
+ */
+type MockAccountingEventFindManyClause =
+  | Partial<Pick<EventRow, 'externalSystem' | 'type' | 'sourceEntityType' | 'sourceEntityId'>>
+  | { idempotencyKey: { in: string[] } }
+
 type MockAccountingEventFindManyArgs = {
   where?: {
-    OR?: Array<Partial<Pick<EventRow, 'externalSystem' | 'type' | 'sourceEntityType' | 'sourceEntityId'>>>
+    OR?: MockAccountingEventFindManyClause[]
   }
+}
+
+function isIdempotencyKeyClause(clause: MockAccountingEventFindManyClause): clause is { idempotencyKey: { in: string[] } } {
+  return 'idempotencyKey' in clause && Array.isArray((clause as { idempotencyKey?: { in?: unknown } }).idempotencyKey?.in)
 }
 
 function makeClient(input: {
@@ -171,9 +190,10 @@ function makeClient(input: {
     const clauses = args.where?.OR
     if (!clauses?.length) return events
 
-    return events.filter((event) => clauses.some((clause) => (
-      Object.entries(clause).every(([key, value]) => (event as Record<string, unknown>)[key] === value)
-    )))
+    return events.filter((event) => clauses.some((clause) => {
+      if (isIdempotencyKeyClause(clause)) return clause.idempotencyKey.in.includes(event.idempotencyKey)
+      return Object.entries(clause).every(([key, value]) => (event as Record<string, unknown>)[key] === value)
+    }))
   }
 
   const client: MockBackfillClient = {
@@ -1080,4 +1100,172 @@ test('o3d-cvj9 r4: a repaired JOURNAL row records no revision-ordering basis', a
   await runTestBackfill({ client: client as never, dryRun: false })
 
   assert.equal(createdEventData(createdEvents).revisionOrderBasis ?? null, null)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r5 — Codex r4 finding 1: A REVISION'S IDENTITY IS ITS OWN, NOT ITS DOCUMENT'S.
+//
+// The candidate scan asked "does this document have a mirrored event of this type?" and used the
+// answer for "is this sync log mirrored?". Those coincide only while a source row can have one
+// event of a type — true of a journal batch and of a document create, FALSE of a revision, because
+// an invoice is edited many times and every edit is its own sync log and its own event. So the
+// first revision that happened to be repaired became the document's only mirrored revision, every
+// sibling vanished from the candidate list without even a `skipped` row, and which one won was page
+// and run order.
+// ---------------------------------------------------------------------------------------------
+
+/** The mirrored event the live path would have written for `syncedInvoiceUpdateLog()`. */
+function mirroredRevisionEvent(overrides: Partial<EventRow> = {}): EventRow {
+  return {
+    id: 'event-first-edit',
+    type: 'SALES_INVOICE_UPDATE',
+    sourceEntityType: 'SalesOrder',
+    sourceEntityId: 'so-1',
+    businessDate: '2026-04-25',
+    status: 'POSTED',
+    idempotencyKey: 'accounting-sync:xero:sales_invoice_update:sales-invoice-update:so-1:inv-9',
+    externalSystem: 'xero',
+    externalId: null,
+    createdAt: REVISION_QUEUED_AT,
+    ...overrides,
+  }
+}
+
+test('o3d-cvj9 r5: a SECOND edit of one invoice is still a candidate once its sibling is mirrored', async () => {
+  // One edit already has its mirrored event; the other has none at all. Matching on
+  // (connector, type, source entity) suppressed BOTH, so the unrepaired edit stayed invisible to
+  // reconciliation for ever and no later run could reach it — the arbitrary winner of an earlier
+  // batch left looking like the document's resolved revision.
+  const { client } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog(), secondInvoiceUpdateLog()],
+    events: [postedInvoiceEvent(), mirroredRevisionEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never })
+
+  assert.deepEqual(
+    report.results.map((result) => result.syncLogId),
+    ['sync-invoice-update-2'],
+    'the mirrored edit is suppressed by its OWN key, and the unmirrored one is still reachable',
+  )
+  assert.equal(report.summary.candidates, 1)
+  assert.equal(report.candidateSummary.total, 1)
+})
+
+test('o3d-cvj9 r5: a revision whose own mirrored event exists is not repaired twice', async () => {
+  // The other direction of the same identity rule: matching by key must still SUPPRESS the log that
+  // really is mirrored, or the backfill would write a second event for one edit.
+  const { client } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog()],
+    events: [postedInvoiceEvent(), mirroredRevisionEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never })
+
+  assert.deepEqual(report.results, [])
+  assert.equal(report.summary.candidates, 0)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r5 — Codex r4 finding 2: THE DECLINING PATH STILL SKIPPED THE COLLISION CHECK.
+//
+// r4 routed the contested branch through the shared lineage function — which returned
+// `not_a_revision_claim` before looking up any holder whenever the draft was not POSTED. A revision
+// log that recorded an external document id WITHOUT reaching SYNCED is exactly what the contest
+// scan counts as possibly-posted, so those rows reached the declining path routinely and had no
+// cross-document check run on them at all. Declining writes no external id, so the unique index
+// cannot catch it either.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-cvj9 r5: a CONTESTED revision that never reached SYNCED is still refused over a cross-document id', async () => {
+  const { client, createdEvents, createdLogs } = makeClient({
+    syncLogs: [
+      // Recorded the document id, never reached SYNCED — possibly-posted, so it contests, and its
+      // draft is PENDING, so r4's lineage call returned before the holder lookup.
+      syncedInvoiceUpdateLog({ id: 'sync-inflight-edit', status: 'PROCESSING' }),
+      secondInvoiceUpdateLog(),
+    ],
+    events: [postedInvoiceEvent({ id: 'event-other-order', sourceEntityId: 'so-2' })],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  const inflight = resultBySyncLog(report, 'sync-inflight-edit')
+  assert.equal(inflight.action, 'skipped', 'a cross-document id must not be laundered into an unordered repair')
+  assert.equal(inflight.reason, 'external_reference_claimed_elsewhere: different_source_document')
+  assert.equal(resultBySyncLog(report, 'sync-invoice-update-2').reason, 'external_reference_claimed_elsewhere: different_source_document')
+  assert.equal(createdEvents.length, 0)
+  assert.equal(
+    logsByAction(createdLogs, 'revision_claim_order_unverified').length,
+    0,
+    'a double post must never be audited as a pair we could not order',
+  )
+})
+
+test('o3d-cvj9 r5: a CONTESTED revision that never reached SYNCED is still repaired when the lineage is clean', async () => {
+  // The guard must not turn into a blanket refusal of in-flight edits: with the id held by this
+  // document's own create there is no collision, only an unordered pair, and the repair happens.
+  const { client, createdEvents } = makeClient({
+    syncLogs: [
+      syncedInvoiceUpdateLog({ id: 'sync-inflight-edit', status: 'PROCESSING' }),
+      secondInvoiceUpdateLog(),
+    ],
+    events: [postedInvoiceEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  const inflight = resultBySyncLog(report, 'sync-inflight-edit')
+  assert.equal(inflight.action, 'created')
+  assert.equal(inflight.reason, 'created_missing_mirror_unclaimed_revision_order_unverified')
+  assert.equal(createdEventData(createdEvents).externalId, null)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r5 — Codex r4 finding 3: THE REPAIR MARKER GOES ONLY ON A ROW THAT TAKES THE ID.
+//
+// r4 stamped `historical_backfill_repair` on every repaired revision row, including the ones
+// repaired WITHOUT a claim and the ones whose sync log had not posted — rows for which the fact it
+// asserts is not true. Such a row is not inert: the live mirror can drive it to POSTED later, and
+// it would then hold the document id while still labelled an administrative repair, with nothing in
+// live operation able to take the label off.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-cvj9 r5: a revision repaired WITHOUT a claim records no backfill ordering basis', async () => {
+  const { client, createdEvents } = makeClient({
+    syncLogs: [syncedInvoiceUpdateLog(), secondInvoiceUpdateLog()],
+    events: [],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  for (const syncLogId of ['sync-invoice-update', 'sync-invoice-update-2']) {
+    assert.equal(resultBySyncLog(report, syncLogId).reason, 'created_missing_mirror_unclaimed_revision_order_unverified')
+  }
+  assert.deepEqual(
+    createdEvents.map((_, index) => createdEventData(createdEvents, index).revisionOrderBasis ?? null),
+    [null, null],
+    'a row that claims nothing asserts nothing about the document edit order',
+  )
+})
+
+test('o3d-cvj9 r5: a repaired revision whose sync log never posted records no backfill ordering basis', async () => {
+  // The queued sibling from the uncontested case: it claims no id and its write has not happened,
+  // so the marker would be false — and it is precisely this row the live mirror later drives to
+  // POSTED, at which point the marker would sit on a live claimant.
+  const { client, createdEvents } = makeClient({
+    syncLogs: [
+      syncedInvoiceUpdateLog(),
+      secondInvoiceUpdateLog({ status: 'PENDING', externalTransactionId: null }),
+    ],
+    events: [postedInvoiceEvent()],
+  })
+
+  const report = await runTestBackfill({ client: client as never, dryRun: false })
+
+  assert.equal(resultBySyncLog(report, 'sync-invoice-update-2').reason, 'created_missing_mirror')
+  assert.equal(createdEventData(createdEvents, 1).revisionOrderBasis ?? null, null)
+  // ...while the edit that DID post and DID take the id still records it.
+  assert.equal(createdEventData(createdEvents, 0).externalId, 'INV-9')
+  assert.equal(createdEventData(createdEvents, 0).revisionOrderBasis, 'historical_backfill_repair')
 })

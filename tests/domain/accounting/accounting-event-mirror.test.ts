@@ -1147,3 +1147,154 @@ test('o3d-cvj9 r4: a backfill repair does not hand its claim to an arrival that 
   assert.equal(store.table.find((row) => row.id === 'event-revision')?.status, 'PENDING')
   assert.deepEqual(store.logs, [])
 })
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r5 — Codex r4 finding 3: THE REPAIR MARKER MUST BE CLEARABLE BY LIVE OPERATION.
+//
+// A marker written by an administrative repair that no live operation can ever remove is a
+// permanent fixture of the ledger placed there by a repair — the defect is the permanence, not what
+// the marker says. Two things clear it now: any live write on the row replaces it with that write's
+// stamp, and an arrival that made no write at all is recorded as the stale replay it is instead of
+// failing the sync log for ever against a holder it can never out-order.
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-cvj9 r5: a live stamped write clears the backfill repair marker off the row it wrote', async () => {
+  const store = createAccountingEventStore([
+    invoiceCreateRow(),
+    revisionRow({ revisionOrderBasis: 'historical_backfill_repair' }),
+  ])
+
+  await postRevision(store, { externalRevisionAt: REVISION_XERO_REVISION_AT })
+
+  const revision = store.table.find((row) => row.id === 'event-revision')
+  assert.equal(revision?.externalId, 'INV-9', 'the write landed and the row holds the document')
+  assert.deepEqual(revision?.externalRevisionAt, REVISION_XERO_REVISION_AT)
+  assert.equal(
+    revision?.revisionOrderBasis,
+    null,
+    'the row is ordered by a real external stamp now, so the repair category it was written with is spent',
+  )
+})
+
+test('o3d-cvj9 r5: a replay that made NO connector write is recorded superseded, not refused for ever', async () => {
+  // The processor's short-circuit: a sync log that already carries its document id is replayed
+  // without calling Xero, so it can never acquire a stamp however many times it runs. Against a
+  // BACKFILL-REPAIRED holder r4 had no rule for it — not the create rule, not the stamp rule, and
+  // not the repair rule (which needs a stamped arrival) — so the P2002 stayed fatal and the sync log
+  // retried to FAILED permanently, with nothing in live operation able to clear it.
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    revisionRow(),
+    holdingRevisionRow({ externalRevisionAt: null, revisionOrderBasis: 'historical_backfill_repair' }),
+  ])
+
+  await postRevision(store)
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, status: row.status, externalId: row.externalId })), [
+    { id: 'event-create', status: 'SUPERSEDED', externalId: null },
+    // It wrote nothing, so it cannot be the document's later state — recorded for what it is.
+    { id: 'event-revision', status: 'SUPERSEDED', externalId: null },
+    { id: 'event-revision-holder', status: 'POSTED', externalId: 'INV-9' },
+  ])
+  const declined = store.logs.find((entry) => entry.action === 'revision_superseded_by_newer')
+  assert.ok(declined, 'the arrival records that it did not take the claim')
+  assert.equal((declined!.metadata as { externalIdHeldByEventId?: string }).externalIdHeldByEventId, 'event-revision-holder')
+  assert.equal(
+    store.logs.find((entry) => entry.action === 'superseded_by_revision'),
+    undefined,
+    'nothing was superseded by this replay, so nothing may say so',
+  )
+  assert.equal(
+    store.table.find((row) => row.id === 'event-revision-holder')?.revisionOrderBasis,
+    'historical_backfill_repair',
+    'a replay that wrote nothing does not clear the marker either — it just stops being fatal',
+  )
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-cvj9 r5 — Codex r4 finding 4: A REPLAY PAST SIX MINUTES IS A FRESH CREATE.
+//
+// Xero retains an `Idempotency-Key` for SIX MINUTES. Past that the same request is a new one, and
+// `POST /Invoices` carrying an `InvoiceNumber` that already exists UPDATES that invoice (whence
+// o3d-batch-invnum, which owns invoice-number ownership). r4 answered this by comparing stamps
+// before the create rule — necessary, and not sufficient, because it assumed the re-post came back
+// WITH a stamp. When it does not, the mirror records `externalRevisionAt: null`, wiping whatever
+// stamp the row had; and an unstamped create is exactly what the create rule reads as "this create
+// has made no write, so it precedes every revision of the document".
+// ---------------------------------------------------------------------------------------------
+
+test('o3d-cvj9 r5: a create that re-posted WITHOUT a stamp does not hand the document to an older edit', async () => {
+  const store = createAccountingEventStore([
+    // The re-post landed, and Xero's response carried no readable UpdatedDateUTC — so the stamp is
+    // gone and only the recorded write says the row wrote at all.
+    invoiceCreateRow({ externalRevisionAt: null, revisionOrderBasis: 'live_write_unstamped' }),
+    revisionRow(),
+  ])
+
+  await assert.rejects(
+    () => postRevision(store, { externalRevisionAt: EDIT_XERO_REVISION_AT }),
+    (error: unknown) => (error as { code?: string }).code === 'P2002',
+    'a create that may have overwritten this edit must not be assumed to precede it',
+  )
+  assert.equal(store.table.find((row) => row.id === 'event-create')?.externalId, 'INV-9')
+  assert.equal(store.table.find((row) => row.id === 'event-revision')?.status, 'PENDING')
+  assert.deepEqual(store.logs, [], 'a refused claim is audited as neither a takeover nor a supersession')
+})
+
+test('o3d-cvj9 r5: an UNMARKED unstamped create still hands over, so pre-existing documents keep working', async () => {
+  // The boundary the guard must not cross: every document posted before `externalRevisionAt`
+  // existed has an unstamped create that never recorded a write, and its first edit still has to be
+  // able to take the id.
+  const store = createAccountingEventStore([invoiceCreateRow({ externalRevisionAt: null }), revisionRow()])
+
+  await postRevision(store, { externalRevisionAt: EDIT_XERO_REVISION_AT })
+
+  assert.deepEqual(store.table.map((row) => ({ id: row.id, externalId: row.externalId })), [
+    { id: 'event-create', externalId: null },
+    { id: 'event-revision', externalId: 'INV-9' },
+  ])
+})
+
+test('o3d-cvj9 r5: a write whose response carried no stamp is recorded as a write, not as never having written', async () => {
+  const store = createAccountingEventStore([
+    invoiceCreateRow({ status: 'SUPERSEDED', externalId: null }),
+    revisionRow(),
+  ])
+
+  await postRevision(store, { externalRevisionAt: null })
+
+  const revision = store.table.find((row) => row.id === 'event-revision')
+  assert.equal(revision?.externalRevisionAt, null, 'a stamp from an earlier write no longer describes this one')
+  assert.equal(
+    revision?.revisionOrderBasis,
+    'live_write_unstamped',
+    'without this the wipe is indistinguishable from a row that never wrote',
+  )
+})
+
+test('o3d-cvj9 r5: a JOURNAL row records no revision-ordering basis when it posts', async () => {
+  // Nothing outside a document-revision family ever contends for a document id, so a basis on one
+  // would assert nothing.
+  const store = createAccountingEventStore([
+    revisionRow({
+      id: 'event-journal',
+      type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+      idempotencyKey: 'accounting-sync:xero:daily_batch_revenue_deferral:daily-batch:a1',
+      externalId: null,
+    }),
+  ])
+
+  await updateMirroredAccountingEventStatus(store.client as never, {
+    connector: 'xero',
+    syncLogId: 'log-journal',
+    type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+    referenceType: 'SalesOrder',
+    referenceId: 'so-1',
+    payload: { _idempotencyKey: 'daily-batch:a1', date: '2026-08-19', lines: [] },
+    status: 'POSTED',
+    externalId: 'journal-1',
+    externalRevisionAt: null,
+  })
+
+  assert.equal(store.table.find((row) => row.id === 'event-journal')?.revisionOrderBasis ?? null, null)
+})

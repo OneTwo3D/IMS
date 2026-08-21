@@ -5,6 +5,7 @@ import {
   accountingDocumentRevisionFamily,
   accountingDocumentRevisionSyncTypes,
   buildMirroredAccountingEventDraft,
+  buildMirroredAccountingEventIdempotencyKey,
   HISTORICAL_BACKFILL_REVISION_ORDER_BASIS,
   inspectDocumentRevisionExternalIdClaim,
   isCrossDocumentRevisionClaimRefusal,
@@ -118,7 +119,7 @@ const BACKFILL_CANDIDATE_PAGE_SIZE = 100
 type AccountingBackfillEventRow = Pick<
   AccountingReconciliationRows['accountingEvents'][number],
   'externalSystem' | 'type' | 'sourceEntityType' | 'sourceEntityId'
->
+> & { idempotencyKey: string }
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -181,10 +182,59 @@ function buildDraftForSyncLog(log: AccountingBackfillSyncLogRow, baseCurrency: s
   })
 }
 
+/**
+ * The idempotency keys the mirrored event for THIS sync log is derived from. Both forms are asked
+ * for: a row mirrored before sync-log ids were part of the key carries the legacy one.
+ */
+function mirroredEventIdempotencyKeysForSyncLog(log: AccountingBackfillSyncLogRow): string[] {
+  const base = {
+    connector: log.connector,
+    type: log.type,
+    referenceType: log.referenceType,
+    referenceId: log.referenceId,
+    payload: log.payload,
+  }
+  const keys = new Set<string>()
+  for (const key of [
+    buildMirroredAccountingEventIdempotencyKey({ syncLogId: log.id, ...base }),
+    buildMirroredAccountingEventIdempotencyKey(base),
+  ]) {
+    if (key) keys.add(key)
+  }
+  return [...keys]
+}
+
+/**
+ * o3d-cvj9 r5 (Codex r4 finding 1) — IS *THIS SYNC LOG* MIRRORED, or does its DOCUMENT merely have
+ * a mirrored event of the same type?
+ *
+ * Those are the same question only while a document can have at most ONE event of a given type.
+ * That is true of a journal batch and of a document CREATE. IT IS FALSE OF A REVISION: an invoice
+ * is edited any number of times, every edit raises its own sync log, and every sync log hashes to
+ * its own mirrored event. Answering the revision case from (connector, type, sourceEntityType,
+ * sourceEntityId) made the FIRST revision that happened to be repaired the document's only mirrored
+ * revision for good — every sibling was dropped from the candidate list silently, not skipped and
+ * not reported but absent, so the report showed one revision `created` and nothing at all about the
+ * others. Which one won was whichever the pager reached first: `id` order, across page boundaries,
+ * the row limit and separate runs. A BATCHING ARTEFACT DECIDED WHICH EDIT IS THE DOCUMENT'S
+ * MIRRORED REVISION, and the loser could never be repaired by any later run.
+ *
+ * A revision is therefore matched on its OWN identity — the idempotency key its mirrored event is
+ * built from, by the same function the live mirror builds it with, so the two cannot drift.
+ *
+ * The document-shaped match is kept UNCHANGED for everything else, including the legacy
+ * blank-connector shape (a sync log that recorded no connector whose event carries the real one),
+ * which no idempotency key can bridge.
+ */
 function hasMirroredAccountingEvent(
   accountingEvents: AccountingBackfillEventRow[],
   log: AccountingBackfillSyncLogRow,
 ): boolean {
+  if (isDocumentRevisionAccountingSyncType(log.type)) {
+    const keys = new Set(mirroredEventIdempotencyKeysForSyncLog(log))
+    return accountingEvents.some((event) => keys.has(event.idempotencyKey))
+  }
+
   const connector = log.connector.trim()
   return accountingEvents.some((event) => {
     if (connector && event.externalSystem !== connector) return false
@@ -211,20 +261,35 @@ async function findExistingEventsForSyncLogs(
 ): Promise<AccountingBackfillEventRow[]> {
   if (logs.length === 0) return []
 
+  // Two clause shapes, matching the two questions `hasMirroredAccountingEvent` asks: a revision is
+  // looked up by its OWN idempotency key, everything else by (connector, type, source entity).
+  const revisionKeys = new Set<string>()
+  const documentClauses: unknown[] = []
+  for (const log of logs) {
+    if (isDocumentRevisionAccountingSyncType(log.type)) {
+      for (const key of mirroredEventIdempotencyKeysForSyncLog(log)) revisionKeys.add(key)
+      continue
+    }
+    documentClauses.push({
+      ...(log.connector.trim() ? { externalSystem: log.connector } : {}),
+      type: log.type,
+      sourceEntityType: log.referenceType,
+      sourceEntityId: log.referenceId,
+    })
+  }
+
+  const clauses: unknown[] = [...documentClauses]
+  if (revisionKeys.size > 0) clauses.push({ idempotencyKey: { in: [...revisionKeys] } })
+  if (clauses.length === 0) return []
+
   return client.accountingEvent.findMany({
-    where: {
-      OR: logs.map((log) => ({
-        ...(log.connector.trim() ? { externalSystem: log.connector } : {}),
-        type: log.type,
-        sourceEntityType: log.referenceType,
-        sourceEntityId: log.referenceId,
-      })),
-    },
+    where: { OR: clauses },
     select: {
       externalSystem: true,
       type: true,
       sourceEntityType: true,
       sourceEntityId: true,
+      idempotencyKey: true,
     },
   })
 }
@@ -272,6 +337,26 @@ async function collectAccountingBackfillCandidateSyncLogs(
   return candidates
 }
 
+/**
+ * Does the row we are about to write actually TAKE the document id?
+ *
+ * o3d-cvj9 r5 (Codex r4 finding 3): the ordering basis is written only when it does. r4 stamped it
+ * on every repaired revision row, including the ones repaired WITHOUT a claim and the ones whose
+ * sync log had not posted at all — rows for which the fact the marker asserts (a completed write,
+ * already recorded on the log when the backfill selected it) is simply not true. That mattered
+ * because such a row is not inert: the live mirror can drive it to POSTED later and it would then
+ * hold the document id while still labelled a historical repair, i.e. an administrative artefact
+ * attached to a live row that live operation had no way to remove.
+ */
+function backfilledRevisionClaimsDocument(
+  log: AccountingBackfillSyncLogRow,
+  draft: AccountingEventDraft,
+): boolean {
+  return isDocumentRevisionAccountingSyncType(log.type)
+    && draft.status === 'POSTED'
+    && Boolean(draft.externalId?.trim())
+}
+
 async function writeBackfilledEvent(
   tx: AccountingBackfillWriteClient,
   log: AccountingBackfillSyncLogRow,
@@ -294,16 +379,18 @@ async function writeBackfilledEvent(
     // than a timestamp. A stamp-less row that ends up holding a document id was, under r3, ordered
     // by nothing at all — not the create rule (it is not the create) and not the stamp rule (it has
     // no stamp) — so every later live revision of that document was refused for ever and the ledger
-    // froze on a historical edit. `revisionOrderBasis` says the one provable thing:
-    // this repair mirrors a write the sync log had already recorded complete, for a document that
-    // had no mirrored revision event when the candidate scan ran, so any live revision that can
-    // later contend with it was enqueued afterwards. See HISTORICAL_BACKFILL_REVISION_ORDER_BASIS
-    // and `documentRevisionHolderPrecedes` rule 3. Set only for revision types: nothing else ever
-    // contends for a document id this way, and a basis on a journal row would assert nothing.
+    // froze on a historical edit. `revisionOrderBasis` says the one provable thing: this repair
+    // mirrors a write the sync log had ALREADY recorded complete when the backfill selected it, so
+    // any live write that can later contend with it is being made now, i.e. afterwards. See
+    // HISTORICAL_BACKFILL_REVISION_ORDER_BASIS and `documentRevisionHolderPrecedes` rule 3.
+    //
+    // o3d-cvj9 r5: written only on a row that actually TAKES the document id — see
+    // `backfilledRevisionClaimsDocument` for why a marker on an unclaimed or unposted repair is
+    // both untrue and, once the live mirror drives that row to POSTED, unremovable.
     data: {
       ...draft,
       createdAt: log.createdAt,
-      ...(isDocumentRevisionAccountingSyncType(log.type)
+      ...(backfilledRevisionClaimsDocument(log, draft)
         ? { revisionOrderBasis: HISTORICAL_BACKFILL_REVISION_ORDER_BASIS }
         : {}),
     } as never,
@@ -530,8 +617,36 @@ async function backfillDocumentRevisionEvent(
   client: AccountingBackfillClient,
   log: AccountingBackfillSyncLogRow,
   draft: AccountingEventDraft,
+  options: { contested: boolean },
 ): Promise<AccountingEventBackfillResult> {
   const outcome = await client.$transaction(async (tx) => {
+    // o3d-cvj9 r5 (Codex r4 finding 2): THE LINEAGE IS CHECKED BEFORE THE DECISION TO DECLINE, not
+    // instead of it, and it is checked on the SAME transaction and through the SAME function the
+    // claiming path uses. r4 got the second half right and the first half wrong: the shared lineage
+    // function returned `not_a_revision_claim` before ever looking up a holder whenever the draft
+    // was not POSTED — and a revision log that recorded an external document id WITHOUT reaching
+    // SYNCED is exactly what the contest scan counts as possibly-posted, so those rows reached the
+    // declining path routinely with no cross-document check performed on them at all. Declining
+    // writes no external id, so the unique index cannot catch it either. The gate moved to
+    // `resolveDocumentRevisionExternalIdClaim`, and this call now really does look.
+    if (options.contested) {
+      const lineage = await inspectDocumentRevisionExternalIdClaim(
+        tx as unknown as AccountingEventMirrorTransactionClient,
+        {
+          connector: log.connector,
+          type: log.type,
+          referenceType: log.referenceType,
+          referenceId: log.referenceId,
+          status: draft.status,
+          externalId: draft.externalId,
+        },
+      )
+      if (lineage.lineage === 'refused' && isCrossDocumentRevisionClaimRefusal(lineage.reason)) {
+        return { claim: 'refused' as const, reason: lineage.reason }
+      }
+      return { claim: 'unordered' as const, eventId: (await writeUnclaimedRevisionEvent(tx, log, draft)).id }
+    }
+
     const claim = await resolveDocumentRevisionExternalIdClaim(
       // The backfill client is declared structurally (the real `db`, and the doubles the tests
       // inject); the shared resolver is typed against Prisma's transaction client.
@@ -635,51 +750,10 @@ async function createBackfilledEvent(
   // them is reached first would otherwise find no holder at all, take the id unopposed, and the
   // arbitrary winner would look like a resolved claim.
   //
-  // o3d-cvj9 r4 (Codex r3 finding 2): THE LINEAGE STILL HAS TO BE CHECKED. Writing the row with no
-  // external id is exactly what stops the insert violating `@@unique([externalSystem, externalId])`
-  // — and the P2002 was the only thing that carried the non-contested path into the cross-document
-  // checks. So r3's contested branch repaired rows whose external id belonged to a DIFFERENT source
-  // document, or to an unrelated event type, with a `revision_claim_order_unverified` audit that
-  // says the two could not be ordered: it turned the double post the unique index exists to catch
-  // into a benign-looking repair, and left the sync log reported as `created`. Those refusals are
-  // not about ordering and are not excused by an unorderable pair, so they are asked for directly,
-  // through the SAME lineage function the claiming path uses.
-  if (options.contested) {
-    const outcome = await client.$transaction(async (tx) => {
-      const lineage = await inspectDocumentRevisionExternalIdClaim(
-        tx as unknown as AccountingEventMirrorTransactionClient,
-        {
-          connector: log.connector,
-          type: log.type,
-          referenceType: log.referenceType,
-          referenceId: log.referenceId,
-          status: draft.status,
-          externalId: draft.externalId,
-        },
-      )
-      if (lineage.lineage === 'refused' && isCrossDocumentRevisionClaimRefusal(lineage.reason)) {
-        return { claim: 'refused' as const, reason: lineage.reason }
-      }
-      return { claim: 'unordered' as const, eventId: (await writeUnclaimedRevisionEvent(tx, log, draft)).id }
-    })
-
-    if (outcome.claim === 'refused') {
-      return {
-        ...syncLogResultBase(log),
-        action: 'skipped',
-        reason: `external_reference_claimed_elsewhere: ${outcome.reason}`,
-        idempotencyKey: draft.idempotencyKey,
-      }
-    }
-
-    return {
-      ...syncLogResultBase(log),
-      action: 'created',
-      reason: 'created_missing_mirror_unclaimed_revision_order_unverified',
-      idempotencyKey: draft.idempotencyKey,
-      accountingEventId: outcome.eventId,
-    }
-  }
+  // o3d-cvj9 r5: contested or not, a revision now goes through ONE function, which validates the
+  // lineage inside the repair transaction before it decides anything. Contestedness only chooses
+  // between "decline the claim" and "resolve it"; it never chooses whether the collision checks run.
+  if (options.contested) return backfillDocumentRevisionEvent(client, log, draft, { contested: true })
 
   try {
     const created = await client.$transaction((tx) => writeBackfilledEvent(tx, log, draft))
@@ -705,7 +779,7 @@ async function createBackfilledEvent(
     // error. Classified from the statement that raised it, so an idempotency-key clash above still
     // takes its own branch.
     if (isExternalAccountingReferenceUniqueError(error) && isDocumentRevisionAccountingSyncType(log.type)) {
-      return backfillDocumentRevisionEvent(client, log, draft)
+      return backfillDocumentRevisionEvent(client, log, draft, { contested: false })
     }
     throw error
   }

@@ -112,7 +112,14 @@ function mapStatus(status: string | undefined): AccountingEventStatus {
   }
 }
 
-function buildMirroredAccountingEventIdempotencyKey(params: {
+/**
+ * The idempotency key a sync log's mirrored event is derived from — the row's IDENTITY, and the
+ * only thing that answers "is THIS sync log mirrored?" rather than "does its document have some
+ * event of this type?". o3d-cvj9 r5: exported because the administrative backfill has to ask the
+ * first question about a document revision, where the second one is not the same question (a
+ * document is revised many times, and every edit is its own sync log and its own event).
+ */
+export function buildMirroredAccountingEventIdempotencyKey(params: {
   syncLogId?: string
   connector: string
   type: string
@@ -329,21 +336,63 @@ export function accountingDocumentRevisionSyncTypes(family: string): readonly st
  * It is a CATEGORY, never a clock, and it records one specific provable fact about the row:
  *
  *   the write this row mirrors had ALREADY been recorded complete on its sync log when the backfill
- *   selected it, and the backfill only selects a sync log for a document that has NO mirrored event
- *   of that revision type at all.
+ *   selected it.
  *
- * Both halves are load-bearing, and both are enforced in `accounting-event-backfill.ts`: a claimant
- * is only ever built from a POSTED draft carrying the external id the log recorded, and
- * `hasMirroredAccountingEvent` matches on (connector, type, sourceEntityType, sourceEntityId), so a
- * document with ANY mirrored revision event — including the PENDING row every live revision gets at
- * ENQUEUE — is excluded from the candidate set entirely.
+ * o3d-cvj9 r5: that is the WHOLE fact, and it is enough on its own. Round 4 leaned a second half on
+ * it — "and the backfill only selects a document with no mirrored revision event at all" — which
+ * was both untrue of the candidate scan and unnecessary. The ordering rule it supports (rule 3 in
+ * `documentRevisionHolderPrecedes`) only ever fires against an arrival carrying a LIVE external
+ * stamp, i.e. a write the connector is making NOW; and this row's write had already completed when
+ * the backfill selected it, which is in the past. Now is after then. That is a causal ordering
+ * rather than a comparison of two clocks, and it does not depend on anything about how the
+ * candidate scan happened to be batched.
  *
- * Together they say: every live revision that can later contend with this row was enqueued after
- * this row's write had finished, so its write is the later one. That is a causal ordering, not a
- * comparison of two clocks, which is why `documentRevisionHolderPrecedes` may act on it without
- * inventing a tie-break. See rule 3 there.
+ * It is written ONLY on a row the backfill actually lets CLAIM the document (a POSTED draft that
+ * keeps the external id its sync log recorded) — see `writeBackfilledEvent`. A row repaired without
+ * a claim asserts nothing about the document's edit order and must not carry a marker saying it
+ * does, because such a row can later be driven to POSTED by the live mirror and would then hold the
+ * id while still labelled a historical repair.
+ *
+ * And it is CLEARED by live operation: the moment `updateMirroredAccountingEventStatus` records a
+ * connector write on the row, the marker is replaced by that write's stamp (or by
+ * `live_write_unstamped`). A backfill artefact that no live operation could ever clear would be a
+ * permanent fixture of the ledger written by an administrative repair, which is its own defect
+ * whatever it says.
  */
 export const HISTORICAL_BACKFILL_REVISION_ORDER_BASIS = 'historical_backfill_repair'
+
+/**
+ * o3d-cvj9 r5 (Codex r4 finding 4): `accounting_events.revisionOrderBasis` for a row that MADE A
+ * CONNECTOR WRITE WHOSE TIME WE DO NOT KNOW.
+ *
+ * Round 4 answered "a replayed create cannot re-apply itself over an edit" by comparing external
+ * stamps before the create rule. That is necessary and not sufficient, because it assumes a replay
+ * that re-applied the create came back with a stamp. XERO'S `Idempotency-Key` IS RETAINED FOR SIX
+ * MINUTES. Past that window the same request is a fresh one, and `POST /Invoices` carrying an
+ * `InvoiceNumber` that already exists UPDATES that invoice (which is why invoice-number ownership
+ * is its own piece of work — o3d-batch-invnum). So a create re-posted more than six minutes later
+ * genuinely writes itself over an edit that landed in between; and if that response carries no
+ * readable `UpdatedDateUTC`, the mirror recorded `externalRevisionAt: null` — WIPING whatever stamp
+ * the row had — and a null stamp on a create is exactly what rule 2 reads as "this create has made
+ * no write of its own, so it precedes every revision of the document". The overwritten edit would
+ * then take the document id off the write that overwrote it.
+ *
+ * The wipe is right: a stamp from an earlier write no longer describes this row's latest write. It
+ * is reading the wipe as "never wrote" that is wrong, and the two are only distinguishable if the
+ * write is recorded. This value records it. It makes rule 2 refuse instead of assume, which keeps
+ * the P2002 fatal and visible rather than silently mis-ordering a document.
+ */
+export const LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS = 'live_write_unstamped'
+
+/**
+ * The basis a LIVE write leaves on the row it wrote. o3d-cvj9 r5: a stamped write clears the field
+ * — the stamp is now the basis, and any category the row was created with (an administrative
+ * repair, an earlier unstamped write) is spent. That is what stops a backfill artefact outliving
+ * live operation on the row.
+ */
+export function revisionOrderBasisForLiveWrite(externalRevisionAt: Date | null): string | null {
+  return finiteRevisionStamp(externalRevisionAt) === null ? LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS : null
+}
 
 /**
  * o3d-cvj9 r3: WHICH OF TWO EVENTS DESCRIBES THE DOCUMENT AS IT NOW STANDS.
@@ -403,6 +452,16 @@ export const HISTORICAL_BACKFILL_REVISION_ORDER_BASIS = 'historical_backfill_rep
  *    what makes it a live write made after the repair row existed: a second backfill run brings no
  *    stamp, so backfill-against-backfill stays unordered.
  *
+ * 4. AN ARRIVAL THAT MADE NO WRITE CANNOT BE THE LATER STATE. o3d-cvj9 r5 (Codex r4 finding 3):
+ *    rule 3 alone did not make the repaired holder clearable, because the one arrival that can
+ *    never bring a stamp is the processor's short-circuit replay — a sync log that already carries
+ *    its document id, replayed without calling the connector. It reaches rule 3 with no stamp for
+ *    ever, so the repaired holder refused it for ever and the sync log retried to FAILED with
+ *    nothing in live operation able to move it. It wrote nothing, so it is a stale replay: recorded
+ *    SUPERSEDED with no claim, which is terminal and true. This is decided from the caller's own
+ *    signal — the field ABSENT means no connector call, `null` means a call whose stamp we did not
+ *    get — never from a clock.
+ *
  * Anything else is `null` — NOT ORDERED. A missing stamp on either side (the row predates the
  * column, the connector returned none, an administrative backfill wrote the row) and an exact tie
  * both land here. `null` is refused by the caller, which keeps the underlying P2002 fatal: the sync
@@ -424,6 +483,12 @@ function documentRevisionHolderPrecedes(
 ): boolean | null {
   const holderAt = finiteRevisionStamp(holder.externalRevisionAt)
   const arrivingAt = finiteRevisionStamp(arriving.externalRevisionAt)
+  // o3d-cvj9 r5: `undefined` and `null` are DIFFERENT FACTS on the arriving side, and every caller
+  // already keeps them apart — the processor's short-circuit omits the field because it made no
+  // connector call at all, while a real write whose response carried no readable stamp passes
+  // `null`, and the administrative backfill passes `null` for a historical write it knows happened.
+  // Collapsing the two is what let "we wrote, time unknown" be read as "we never wrote".
+  const arrivingWrote = arriving.externalRevisionAt !== undefined
 
   // Rule 1: the external system stamped both writes, so it has already said which it applied last.
   if (holderAt !== null && arrivingAt !== null) {
@@ -431,13 +496,30 @@ function documentRevisionHolderPrecedes(
     return holderAt < arrivingAt
   }
 
-  // Rule 2: the holder is the document's CREATE and has made no stamped write of its own.
-  if (holder.type === createType) return holderAt === null ? true : null
+  // Rule 2: the holder is the document's CREATE and has made no write this code can place in the
+  // document's edit order. A create that wrote WITHOUT a stamp is not that: past Xero's six-minute
+  // idempotency window a replayed create is a fresh upsert on the invoice number, so it may well
+  // have overwritten the arriving edit. Refuse rather than assume — see
+  // LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS.
+  if (holder.type === createType) {
+    if (holderAt !== null) return null
+    return holder.revisionOrderBasis === LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS ? null : true
+  }
 
   // Rule 3: the holder is a historical repair; the arrival is a live, externally stamped write.
   if (holder.revisionOrderBasis === HISTORICAL_BACKFILL_REVISION_ORDER_BASIS && arrivingAt !== null) {
     return true
   }
+
+  // Rule 4: THE ARRIVAL MADE NO WRITE AT ALL, so it cannot describe a later state of the document
+  // than whatever holds it — whoever the holder is, and with no clock involved. o3d-cvj9 r5 (Codex
+  // r4 finding 3): this is what stops a repaired holder freezing the document permanently. The one
+  // arrival that brings no write is the processor's short-circuit replay of a sync log that already
+  // carries its document id, and it can never acquire a stamp however many times it runs — so
+  // under r4 it hit `recency_indeterminate`, the P2002 stayed fatal, and the sync log retried to
+  // FAILED for ever with no live operation able to clear it. It is a stale replay, and recording it
+  // as one (SUPERSEDED, no claim) is both truthful and terminal.
+  if (!arrivingWrote) return false
 
   return null
 }
@@ -507,8 +589,16 @@ export async function inspectDocumentRevisionExternalIdClaim(
   params: { connector: string; type: string; referenceType: string; referenceId: string; status: AccountingEventStatus; externalId?: string | null },
 ): Promise<DocumentRevisionClaimLineage> {
   const externalId = params.externalId?.trim() ? params.externalId : null
-  // Only a successful post owns a document id, and only a revision may take one over.
-  if (!externalId || params.status !== 'POSTED') return { lineage: 'refused', reason: 'not_a_revision_claim' }
+  // o3d-cvj9 r5 (Codex r4 finding 2): LINEAGE ONLY. "Only a successful post owns a document id" is
+  // a rule about who may TAKE a claim, and it now lives in `resolveDocumentRevisionExternalIdClaim`
+  // where taking happens. It did not belong here, because it made this function return before the
+  // holder lookup — i.e. a no-op — for exactly the rows the backfill's DECLINING path asks about: a
+  // revision log that recorded an external document id without reaching SYNCED. Those are counted
+  // as possibly-posted by the contest scan (`revisionSyncLogMayHavePosted`), so they reach the
+  // decline path routinely, and a genuine cross-document collision on the id they recorded was
+  // never looked for at all. The decline path writes no external id, so the unique index cannot
+  // catch it either: this lookup is the only thing that can.
+  if (!externalId) return { lineage: 'refused', reason: 'not_a_revision_claim' }
   const predecessorTypes = DOCUMENT_REVISION_PREDECESSOR_TYPES[params.type]
   const createType = DOCUMENT_REVISION_FAMILY_BY_TYPE[params.type]
   if (!predecessorTypes || !createType) return { lineage: 'refused', reason: 'not_a_revision_claim' }
@@ -572,6 +662,10 @@ export async function resolveDocumentRevisionExternalIdClaim(
   // response was never recorded — see `documentRevisionHolderPrecedes` rules 1 and 3.
   arriving: { externalRevisionAt?: Date | null },
 ): Promise<DocumentRevisionClaimOutcome> {
+  // Only a SUCCESSFUL post owns a document id: a PENDING or FAILED attempt has nothing to hand over
+  // and nothing to take. o3d-cvj9 r5: checked here rather than in the lineage half, so declining to
+  // claim still gets a cross-document check on the id the sync log recorded.
+  if (params.status !== 'POSTED') return { claim: 'refused', reason: 'not_a_revision_claim' }
   // The lineage half — is there a holder at all, and is it a legitimate predecessor of THIS
   // document? — is shared with the backfill's decline path so the two cannot drift on what a
   // genuine cross-document collision is. See `inspectDocumentRevisionExternalIdClaim`.
@@ -639,7 +733,30 @@ export async function updateMirroredAccountingEventStatus(
           : {}),
         // The stamp is a true fact about THIS row's write whether or not the row keeps the claim,
         // so the stale path records it too — it is what a later comparison against this row needs.
-        ...(params.externalRevisionAt !== undefined ? { externalRevisionAt: params.externalRevisionAt } : {}),
+        //
+        // o3d-cvj9 r5: the BASIS is rewritten in the same statement, because the PRESENCE of this
+        // field is the caller saying a connector write was made in this attempt — the short-circuit
+        // omits it entirely and reaches neither branch. Two things follow:
+        //
+        //  - a STAMPED write CLEARS the basis. The row is now ordered by a real external stamp, so
+        //    whatever category it was created with is spent — including an administrative repair's
+        //    `historical_backfill_repair`. This is what stops a backfill artefact outliving live
+        //    operation on the row it was written on (Codex r4 finding 3): the repair marker is a
+        //    statement about a row nothing live had touched, and the moment something live does, it
+        //    is no longer true and no longer recorded.
+        //  - an UNSTAMPED write records `live_write_unstamped`, so the wiped stamp cannot be read
+        //    as "this row never wrote" — see LIVE_UNSTAMPED_WRITE_REVISION_ORDER_BASIS.
+        //
+        // Only for types that can contend for a document id at all; a journal batch never does, and
+        // a basis on one would assert nothing.
+        ...(params.externalRevisionAt !== undefined
+          ? {
+              externalRevisionAt: params.externalRevisionAt,
+              ...(accountingDocumentRevisionFamily(params.type)
+                ? { revisionOrderBasis: revisionOrderBasisForLiveWrite(params.externalRevisionAt) }
+                : {}),
+            }
+          : {}),
       },
       select: { id: true },
     })
